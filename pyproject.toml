@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "redstone-compiler"
+version = "0.1.0"
+description = "SystemVerilog-to-Redstone compiler with NAND synthesis and PCB routing"
+readme = "Readme.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+redstone-compiler = "Main:Main"
+
+[tool.maturin]
+manifest-path = "RustRouting/Cargo.toml"
+python-source = "."
+module-name = "RedstoneCompiler.RustRouting"

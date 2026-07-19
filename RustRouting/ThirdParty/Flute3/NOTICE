@@ -1,0 +1,11 @@
+FLUTE3 source and lookup data
+
+Upstream project: The OpenROAD Project
+Pinned revision: 566a2df7ea55bb44c530ff0944b9f4b69b306a23
+Upstream directory: src/stt/src/flt
+License: BSD-3-Clause (see LICENSE)
+
+The copied upstream files are retained for audit and isolated-port work. They
+are not compiled into RedstoneCompiler because the pinned implementation still
+depends on OpenROAD stt/utl interfaces. Production policy remains native until
+an isolated wrapper is both dependency-clean and benchmark-selected.

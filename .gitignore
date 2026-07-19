@@ -1,0 +1,17 @@
+.tools/
+# Migration-generated cache
+Cache/
+.cache/
+.pytest_cache/
+**/__pycache__/
+**/*.pyc
+.venv/
+Build/
+Output/
+RustRouting/target/
+RedstoneCompiler/*.so
+Cache/
+Tools/graphviz/
+/**/*.o
+**/__pycache__/
+**/*.pyc
