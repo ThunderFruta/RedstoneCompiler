@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from heapq import heappop, heappush
 from itertools import product
 from pathlib import Path
+from time import monotonic
 from typing import Any
+
+try:
+    from RedstoneCompiler.RustRouting import EvaluateLogicPrograms
+except (ImportError, AttributeError):
+    EvaluateLogicPrograms = None
 
 from ..Routing.Actions import (
     BuildPhysicalGraphs,
@@ -41,6 +47,8 @@ class RedstoneSimulationReport:
     InputNames: tuple[str, ...]
     OutputNames: tuple[str, ...]
     Rows: tuple[RedstoneTruthTableRow, ...]
+    Backend: str = "python"
+    RuntimeSeconds: float = 0.0
 
     @property
     def Passed(self) -> bool:
@@ -301,16 +309,90 @@ def EvaluatePhysicalModule(
     return Values
 
 
-def SimulateRoutedTruthTable(
+def BuildIndexedLogicProgram(
+    Module: Any,
+    InputNames: tuple[str, ...],
+    OutputNames: tuple[str, ...],
+    InputEnabled: dict[tuple[str, int], bool] | None = None,
+) -> tuple[int, list[tuple[int, list[tuple[int, bool]], list[int]]], list[int]]:
+    """Compile combinational gates into deterministic indexed instructions."""
+    KindCodes = {
+        "NAND": 0,
+        "AND": 1,
+        "OR": 2,
+        "XOR": 3,
+        "NOT": 4,
+        "BUFFER": 5,
+    }
+    SignalIndices = {
+        Signal: Index for Index, Signal in enumerate(InputNames)
+    }
+    Instructions = []
+    Pending = [
+        Gate
+        for Gate in Module.Gates
+        if getattr(Gate.Kind, "value", Gate.Kind) not in ("INPUT", "OUTPUT")
+    ]
+    while Pending:
+        Remaining = []
+        Progress = False
+        for Gate in Pending:
+            if any(Signal not in SignalIndices for Signal in Gate.Inputs):
+                Remaining.append(Gate)
+                continue
+            Kind = getattr(Gate.Kind, "value", Gate.Kind)
+            if Kind not in KindCodes:
+                raise ValueError(f"Unsupported native simulated gate kind {Kind}")
+            InputValues = [
+                (
+                    SignalIndices[Signal],
+                    True if InputEnabled is None else InputEnabled.get(
+                        (Gate.Name, InputIndex), False
+                    ),
+                )
+                for InputIndex, Signal in enumerate(Gate.Inputs)
+            ]
+            OutputValues = []
+            for Signal in Gate.Outputs:
+                if Signal not in SignalIndices:
+                    SignalIndices[Signal] = len(SignalIndices)
+                OutputValues.append(SignalIndices[Signal])
+            Instructions.append((KindCodes[Kind], InputValues, OutputValues))
+            Progress = True
+        if not Progress:
+            Names = ", ".join(Gate.Name for Gate in Remaining)
+            raise ValueError(
+                "Native simulation could not order combinational gates: "
+                f"{Names}"
+            )
+        Pending = Remaining
+    MissingOutputs = [
+        Signal for Signal in OutputNames if Signal not in SignalIndices
+    ]
+    if MissingOutputs:
+        raise ValueError(
+            "Native simulation outputs were not produced: "
+            + ", ".join(MissingOutputs)
+        )
+    return (
+        len(SignalIndices),
+        Instructions,
+        [SignalIndices[Signal] for Signal in OutputNames],
+    )
+
+
+def SimulateRoutedTruthTablePython(
     RoutedDesign: Any,
     ReferenceModule: Any | None = None,
+    Delivered: dict[str, set[tuple[str, int]]] | None = None,
 ) -> RedstoneSimulationReport:
-    """Compare every physical input combination with ideal logic."""
+    """Compare every input combination with the original Python evaluator."""
+    Started = monotonic()
     PhysicalModule = RoutedDesign.Module
     ReferenceModule = ReferenceModule or PhysicalModule
     InputNames = tuple(ReferenceModule.Inputs)
     OutputNames = tuple(ReferenceModule.Outputs)
-    Delivered = BuildPhysicalDeliveryMap(RoutedDesign)
+    Delivered = Delivered or BuildPhysicalDeliveryMap(RoutedDesign)
     Rows = []
     for Bits in product((False, True), repeat=len(InputNames)):
         Assignment = dict(zip(InputNames, Bits))
@@ -338,6 +420,96 @@ def SimulateRoutedTruthTable(
         InputNames=InputNames,
         OutputNames=OutputNames,
         Rows=tuple(Rows),
+        Backend="python",
+        RuntimeSeconds=round(monotonic() - Started, 6),
+    )
+
+
+def SimulateRoutedTruthTable(
+    RoutedDesign: Any,
+    ReferenceModule: Any | None = None,
+) -> RedstoneSimulationReport:
+    """Compare every physical input combination using native parallel work."""
+    Started = monotonic()
+    PhysicalModule = RoutedDesign.Module
+    ReferenceModule = ReferenceModule or PhysicalModule
+    if EvaluateLogicPrograms is None:
+        return SimulateRoutedTruthTablePython(RoutedDesign, ReferenceModule)
+    InputNames = tuple(ReferenceModule.Inputs)
+    OutputNames = tuple(ReferenceModule.Outputs)
+    Delivered = BuildPhysicalDeliveryMap(RoutedDesign)
+    ReferenceSignalCount, ReferenceInstructions, ReferenceOutputs = (
+        BuildIndexedLogicProgram(
+            ReferenceModule,
+            InputNames,
+            OutputNames,
+        )
+    )
+    PhysicalInputEnabled = {
+        (Gate.Name, InputIndex): (
+            Gate.Name,
+            InputIndex,
+        ) in Delivered.get(Signal, set())
+        for Gate in RoutedDesign.PlacedGates
+        if Gate.Kind == "NAND"
+        for InputIndex, Signal in enumerate(Gate.Inputs)
+    }
+    PhysicalSignalCount, PhysicalInstructions, PhysicalOutputs = (
+        BuildIndexedLogicProgram(
+            PhysicalModule,
+            InputNames,
+            OutputNames,
+            PhysicalInputEnabled,
+        )
+    )
+    OutputGates = {
+        Gate.Inputs[0]: Gate
+        for Gate in RoutedDesign.PlacedGates
+        if Gate.Kind == "OUTPUT" and Gate.Inputs
+    }
+    PhysicalOutputEnabled = [
+        (
+            OutputGates[Signal].Name,
+            0,
+        ) in Delivered.get(Signal, set())
+        for Signal in OutputNames
+    ]
+    NativeRows = EvaluateLogicPrograms(
+        len(InputNames),
+        ReferenceSignalCount,
+        ReferenceInstructions,
+        ReferenceOutputs,
+        PhysicalSignalCount,
+        PhysicalInstructions,
+        PhysicalOutputs,
+        PhysicalOutputEnabled,
+    )
+    Rows = tuple(
+        RedstoneTruthTableRow(
+            Inputs=tuple(
+                AssignmentIndex
+                & (1 << (len(InputNames) - InputIndex - 1))
+                != 0
+                for InputIndex in range(len(InputNames))
+            ),
+            ExpectedOutputs=tuple(
+                ExpectedMask & (1 << OutputIndex) != 0
+                for OutputIndex in range(len(OutputNames))
+            ),
+            SimulatedOutputs=tuple(
+                SimulatedMask & (1 << OutputIndex) != 0
+                for OutputIndex in range(len(OutputNames))
+            ),
+        )
+        for AssignmentIndex, (ExpectedMask, SimulatedMask) in enumerate(NativeRows)
+    )
+    return RedstoneSimulationReport(
+        ModuleName=ReferenceModule.Name,
+        InputNames=InputNames,
+        OutputNames=OutputNames,
+        Rows=Rows,
+        Backend="native-parallel",
+        RuntimeSeconds=round(monotonic() - Started, 6),
     )
 
 

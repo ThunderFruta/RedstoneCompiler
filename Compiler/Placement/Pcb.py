@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import deque
+from hashlib import sha256
+from itertools import permutations
 from math import ceil, sqrt
 from statistics import median
 from typing import Any
@@ -44,6 +46,9 @@ class PackedNandCluster:
     ExactLocalRoutingBlocks: int = 0
     GlobalEntrances: int = 0
     RejectionReasons: tuple[str, ...] = ()
+    StructuralSignature: str = ""
+    ReusedFromClusterId: int | None = None
+    StructuralMapping: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +228,179 @@ def BuildConnectivityClusters(
         tuple(sorted(Names, key=OriginalOrder.__getitem__))
         for _ClusterId, Names in sorted(Clusters.items())
     )
+
+
+def AnalyzeNandClusterStructure(
+    Module: Any,
+    Names: tuple[str, ...],
+) -> tuple[
+    str,
+    tuple[str, ...],
+    dict[str, int],
+    dict[str, tuple[Any, ...]],
+    frozenset[tuple[str, str, int]],
+]:
+    """Build a name-independent directed signature for one NAND island."""
+    NameSet = set(Names)
+    GateByName = {Gate.Name: Gate for Gate in Module.Gates}
+    Producers = {
+        Signal: Gate.Name
+        for Gate in Module.Gates
+        for Signal in Gate.Outputs
+    }
+    Consumers: dict[str, list[Any]] = {}
+    for Gate in Module.Gates:
+        for Signal in Gate.Inputs:
+            Consumers.setdefault(Signal, []).append(Gate)
+    BoundarySignals = sorted({
+        Signal
+        for Name in Names
+        for Signal in GateByName[Name].Inputs
+        if Producers.get(Signal) not in NameSet
+    })
+    Nodes = tuple(
+        [*(f"B:{Signal}" for Signal in BoundarySignals)]
+        + [*(f"G:{Name}" for Name in Names)]
+    )
+    Edges = set()
+    for Name in Names:
+        Gate = GateByName[Name]
+        for InputIndex, Signal in enumerate(Gate.Inputs):
+            Producer = Producers.get(Signal)
+            Source = (
+                f"G:{Producer}"
+                if Producer in NameSet
+                else f"B:{Signal}"
+            )
+            Edges.add((Source, f"G:{Name}", InputIndex))
+    Incoming: dict[str, list[tuple[str, int]]] = {Node: [] for Node in Nodes}
+    Outgoing: dict[str, list[tuple[str, int]]] = {Node: [] for Node in Nodes}
+    for Source, Target, InputIndex in Edges:
+        Incoming[Target].append((Source, InputIndex))
+        Outgoing[Source].append((Target, InputIndex))
+    Initial: dict[str, tuple[Any, ...]] = {}
+    for Node in Nodes:
+        if Node.startswith("B:"):
+            Initial[Node] = ("BoundaryInput", len(Outgoing[Node]))
+            continue
+        Name = Node[2:]
+        Gate = GateByName[Name]
+        InternalInputs = sum(Source.startswith("G:") for Source, _ in Incoming[Node])
+        HasExternalFanout = any(
+            Consumer.Name not in NameSet
+            for Signal in Gate.Outputs
+            for Consumer in Consumers.get(Signal, ())
+        )
+        Initial[Node] = (
+            "NAND",
+            InternalInputs,
+            len(Incoming[Node]) - InternalInputs,
+            len(Outgoing[Node]),
+            HasExternalFanout,
+        )
+    InitialValues = {Value for Value in Initial.values()}
+    InitialIds = {Value: Index for Index, Value in enumerate(sorted(InitialValues))}
+    Colors = {Node: InitialIds[Initial[Node]] for Node in Nodes}
+    for _Pass in range(len(Nodes) + 1):
+        Descriptors = {
+            Node: (
+                Initial[Node],
+                tuple(sorted((InputIndex, Colors[Source]) for Source, InputIndex in Incoming[Node])),
+                tuple(sorted((InputIndex, Colors[Target]) for Target, InputIndex in Outgoing[Node])),
+            )
+            for Node in Nodes
+        }
+        DescriptorIds = {
+            Value: Index
+            for Index, Value in enumerate(sorted(set(Descriptors.values())))
+        }
+        NextColors = {Node: DescriptorIds[Descriptors[Node]] for Node in Nodes}
+        if NextColors == Colors:
+            break
+        Colors = NextColors
+    Canonical = (
+        tuple(sorted((Initial[Node], Colors[Node]) for Node in Nodes)),
+        tuple(sorted(
+            (Colors[Source], Colors[Target], InputIndex)
+            for Source, Target, InputIndex in Edges
+        )),
+    )
+    Signature = sha256(repr(Canonical).encode("utf-8")).hexdigest()[:16]
+    return Signature, Nodes, Colors, Initial, frozenset(Edges)
+
+
+def FindIsomorphicNandClusterMapping(
+    Module: Any,
+    ReferenceNames: tuple[str, ...],
+    CandidateNames: tuple[str, ...],
+    MaximumMappings: int = 4096,
+) -> tuple[str, dict[str, str]] | None:
+    """Return an exact structural gate mapping without circuit recognition."""
+    Reference = AnalyzeNandClusterStructure(Module, ReferenceNames)
+    Candidate = AnalyzeNandClusterStructure(Module, CandidateNames)
+    ReferenceSignature, ReferenceNodes, ReferenceColors, ReferenceInitial, ReferenceEdges = Reference
+    CandidateSignature, CandidateNodes, CandidateColors, CandidateInitial, CandidateEdges = Candidate
+    if ReferenceSignature != CandidateSignature or len(ReferenceNodes) != len(CandidateNodes):
+        return None
+    ReferenceGroups: dict[tuple[Any, ...], list[str]] = {}
+    CandidateGroups: dict[tuple[Any, ...], list[str]] = {}
+    for Node in ReferenceNodes:
+        ReferenceGroups.setdefault(
+            (ReferenceInitial[Node], ReferenceColors[Node]), []
+        ).append(Node)
+    for Node in CandidateNodes:
+        CandidateGroups.setdefault(
+            (CandidateInitial[Node], CandidateColors[Node]), []
+        ).append(Node)
+    if {
+        Key: len(Values) for Key, Values in ReferenceGroups.items()
+    } != {
+        Key: len(Values) for Key, Values in CandidateGroups.items()
+    }:
+        return None
+    Groups = sorted(
+        ReferenceGroups,
+        key=lambda Key: (len(ReferenceGroups[Key]), repr(Key)),
+    )
+    AttemptCount = 0
+    Mapping: dict[str, str] = {}
+
+    def IsConsistent() -> bool:
+        MappedEdges = {
+            (Mapping[Source], Mapping[Target], InputIndex)
+            for Source, Target, InputIndex in ReferenceEdges
+            if Source in Mapping and Target in Mapping
+        }
+        return MappedEdges.issubset(CandidateEdges)
+
+    def Search(GroupIndex: int) -> bool:
+        nonlocal AttemptCount
+        if GroupIndex == len(Groups):
+            return {
+                (Mapping[Source], Mapping[Target], InputIndex)
+                for Source, Target, InputIndex in ReferenceEdges
+            } == CandidateEdges
+        Key = Groups[GroupIndex]
+        ReferenceValues = sorted(ReferenceGroups[Key])
+        CandidateValues = sorted(CandidateGroups[Key])
+        for Permutation in permutations(CandidateValues):
+            AttemptCount += 1
+            if AttemptCount > MaximumMappings:
+                return False
+            Mapping.update(zip(ReferenceValues, Permutation))
+            if IsConsistent() and Search(GroupIndex + 1):
+                return True
+            for Node in ReferenceValues:
+                Mapping.pop(Node, None)
+        return False
+
+    if not Search(0):
+        return None
+    return ReferenceSignature, {
+        ReferenceNode[2:]: CandidateNode[2:]
+        for ReferenceNode, CandidateNode in Mapping.items()
+        if ReferenceNode.startswith("G:")
+    }
 
 
 def OptimizeClusterSlots(
@@ -1025,6 +1203,9 @@ def PlacePcbGraph(
     LocalRotations: dict[str, int] = {}
     LocalMirrors: dict[str, bool] = {}
     ClusterSizes: dict[int, tuple[int, int]] = {}
+    ClusterStructuralSignatures: dict[int, str] = {}
+    ClusterReuseSources: dict[int, int | None] = {}
+    ClusterStructuralMappings: dict[int, dict[str, str]] = {}
     SignalProducerNames = {
         Signal: Gate.Name
         for Gate in Module.Gates
@@ -1032,6 +1213,72 @@ def PlacePcbGraph(
     }
     for ClusterIndex, Names in enumerate(Clusters):
         ClusterNames = set(Names)
+        ReuseAccepted = False
+        if PackedMode:
+            StructuralSignature = AnalyzeNandClusterStructure(
+                Module, Names
+            )[0]
+            ClusterStructuralSignatures[ClusterIndex] = StructuralSignature
+            ClusterReuseSources[ClusterIndex] = None
+            if PackingPolicy.EnableStructuralReuse:
+                for ReferenceIndex in range(ClusterIndex):
+                    if (
+                        ClusterStructuralSignatures.get(ReferenceIndex)
+                        != StructuralSignature
+                    ):
+                        continue
+                    Match = FindIsomorphicNandClusterMapping(
+                        Module,
+                        Clusters[ReferenceIndex],
+                        Names,
+                        PackingPolicy.MaximumStructuralReuseMappings,
+                    )
+                    if Match is None:
+                        continue
+                    _Signature, Mapping = Match
+                    for ReferenceName, CandidateName in Mapping.items():
+                        LocalPositions[CandidateName] = LocalPositions[ReferenceName]
+                        LocalRotations[CandidateName] = LocalRotations[ReferenceName]
+                        LocalMirrors[CandidateName] = LocalMirrors.get(
+                            ReferenceName, False
+                        )
+                    CandidateGates = [
+                        BuildPlacedGate(
+                            InternalByName[Name],
+                            LocalPositions[Name][0],
+                            1,
+                            LocalPositions[Name][1],
+                            LocalRotations[Name],
+                            LocalMirrors[Name],
+                        )
+                        for Name in Names
+                    ]
+                    CandidatePlaced = PlacedDesign(
+                        Module=Module,
+                        PlacedGates=CandidateGates,
+                    )
+                    try:
+                        # Apply the same hard legality used by the generic
+                        # graph-beam packer. Pin-access proximity is scored
+                        # and later checked by local routing/DRC; it is not a
+                        # cell-overlap violation by itself.
+                        if any(
+                            RectanglesOverlap(First, Second)
+                            for Index, First in enumerate(CandidateGates)
+                            for Second in CandidateGates[Index + 1 :]
+                        ):
+                            raise ValueError("reused NAND placement conflicts")
+                        BuildPlacedCellGeometry(CandidatePlaced)
+                    except ValueError:
+                        for CandidateName in Mapping.values():
+                            LocalPositions.pop(CandidateName, None)
+                            LocalRotations.pop(CandidateName, None)
+                            LocalMirrors.pop(CandidateName, None)
+                        continue
+                    ClusterReuseSources[ClusterIndex] = ReferenceIndex
+                    ClusterStructuralMappings[ClusterIndex] = Mapping
+                    ReuseAccepted = True
+                    break
         LocalLevels: dict[str, int] = {}
         Remaining = set(Names)
         while Remaining:
@@ -1062,7 +1309,20 @@ def PlacePcbGraph(
             Names,
             key=lambda Name: (LocalLevels[Name], Name),
         )
-        if PackedMode:
+        if PackedMode and ReuseAccepted:
+            FoldColumns = 1
+            FoldRows = 1
+            PackedWidth = max(
+                LocalPositions[Name][0]
+                + RotatedCellSize("NAND", LocalRotations[Name])[0]
+                for Name in Names
+            )
+            PackedDepth = max(
+                LocalPositions[Name][1]
+                + RotatedCellSize("NAND", LocalRotations[Name])[1]
+                for Name in Names
+            )
+        elif PackedMode:
             NamesByLevel: dict[int, list[str]] = {}
             for Name in OrderedNames:
                 NamesByLevel.setdefault(LocalLevels[Name], []).append(Name)
@@ -2068,6 +2328,11 @@ def PlacePcbGraph(
                     for Claim in ClaimsByCluster.get(ClusterIndex, ())
                 ),
                 GlobalEntrances=len(BoundarySignals),
+                StructuralSignature=ClusterStructuralSignatures.get(
+                    ClusterIndex, ""
+                ),
+                ReusedFromClusterId=ClusterReuseSources.get(ClusterIndex),
+                StructuralMapping=ClusterStructuralMappings.get(ClusterIndex),
             )
         )
     return PcbPlacement(

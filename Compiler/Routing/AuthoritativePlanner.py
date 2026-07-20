@@ -60,6 +60,17 @@ Position2 = tuple[int, int]
 Position3 = tuple[int, int, int]
 
 
+def GrowAssignmentExpansionLimit(
+    CurrentLimit: int,
+    MaximumLimit: int,
+    GrowthFactor: int,
+) -> int:
+    """Grow exact-assignment work smoothly without exceeding its budget."""
+    if CurrentLimit < 1 or MaximumLimit < 1 or GrowthFactor < 2:
+        raise ValueError("assignment growth controls must be positive and growing")
+    return min(MaximumLimit, CurrentLimit * GrowthFactor)
+
+
 def _BuildGuide(
     Terminals: tuple[Position2, ...],
     Axis: str,
@@ -570,6 +581,8 @@ def RouteAuthoritativeResources(
     NodesByColumn: dict[Position2, list[Position3]] = defaultdict(list)
     for Position in Region.Nodes:
         NodesByColumn[(Position[0], Position[2])].append(Position)
+    PortalRequests = []
+    PortalRequestMetadata = []
     for Signal in sorted(Profiles):
         Profile = Profiles[Signal]
         TerminalPaths = (
@@ -611,18 +624,24 @@ def RouteAuthoritativeResources(
                 )
                 if len(Profiles) > 16:
                     PortalTargets = PortalTargets[: PortalLimit * 4]
-                Values = Context.GeneratePortalCandidates(
+                PortalRequests.append((
                     list(AccessPath),
                     PortalTargets,
                     AllowedNodes,
                     RoutingY,
                     PortalLimit,
                     Policy.DetailedRouting.StrictMaximumExpansions,
-                )
-                Portals[(Signal, Terminal, Layer)] = tuple(
-                    _PortalFromRust(Signal, Terminal, Layer, Value, Resources)
-                    for Value in Values
-                )
+                ))
+                PortalRequestMetadata.append((Signal, Terminal, Layer))
+    PortalResults = Context.GeneratePortalCandidateBatches(PortalRequests)
+    for (Signal, Terminal, Layer), Values in zip(
+        PortalRequestMetadata,
+        PortalResults,
+    ):
+        Portals[(Signal, Terminal, Layer)] = tuple(
+            _PortalFromRust(Signal, Terminal, Layer, Value, Resources)
+            for Value in Values
+        )
 
     StageTimings["PortalGeneration"] = monotonic() - PortalStarted
     CheckRuntimeBudget("Portal")
@@ -667,7 +686,7 @@ def RouteAuthoritativeResources(
     CandidatesBySignal: dict[str, list[NetRouteCandidate]] = defaultdict(list)
     CandidateLimitsBySignal: dict[str, int] = {}
     CandidateDiagnostics: dict[str, dict[str, int]] = {}
-    for Signal in sorted(
+    CandidateSignalOrder = sorted(
         Profiles,
         key=lambda Value: (
             -len(Profiles[Value].Targets),
@@ -678,7 +697,10 @@ def RouteAuthoritativeResources(
             ),
             Value,
         ),
-    ):
+    )
+    RouteRequestsBySignal = {}
+    RouteMetadataBySignal = {}
+    for Signal in CandidateSignalOrder:
         Profile = Profiles[Signal]
         CandidateExpansionLimit = CandidateExpansionLimits[Signal]
         RouteRequests = []
@@ -837,7 +859,24 @@ def RouteAuthoritativeResources(
                         RouteMetadata.append(
                             (SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant)
                         )
-        RoutedTrees = Context.GenerateRouteTrees(RouteRequests)
+        RouteRequestsBySignal[Signal] = RouteRequests
+        RouteMetadataBySignal[Signal] = RouteMetadata
+
+    AllRouteRequests = [
+        Request
+        for Signal in CandidateSignalOrder
+        for Request in RouteRequestsBySignal[Signal]
+    ]
+    AllRoutedTrees = Context.GenerateRouteTrees(AllRouteRequests)
+    RoutedTreeOffset = 0
+    for Signal in CandidateSignalOrder:
+        Profile = Profiles[Signal]
+        CandidateExpansionLimit = CandidateExpansionLimits[Signal]
+        RouteRequests = RouteRequestsBySignal[Signal]
+        RouteMetadata = RouteMetadataBySignal[Signal]
+        NextRoutedTreeOffset = RoutedTreeOffset + len(RouteRequests)
+        RoutedTrees = AllRoutedTrees[RoutedTreeOffset:NextRoutedTreeOffset]
+        RoutedTreeOffset = NextRoutedTreeOffset
         RejectionCounts: Counter[str] = Counter()
         CandidateDiagnostics[Signal] = {
             "Requests": len(RouteRequests),
@@ -1132,6 +1171,29 @@ def RouteAuthoritativeResources(
 
     AssignmentStarted = monotonic()
     Result = PlanAssignment()
+    AssignmentRetryHistory = []
+    while (
+        not Result.Success
+        and Policy.AdaptiveRouting.Enabled
+        and AssignmentExpansionLimit < AdaptiveBudget.AssignmentExpansions
+    ):
+        NextAssignmentExpansionLimit = GrowAssignmentExpansionLimit(
+            AssignmentExpansionLimit,
+            AdaptiveBudget.AssignmentExpansions,
+            Policy.AdaptiveRouting.AssignmentGrowthFactor,
+        )
+        if NextAssignmentExpansionLimit <= AssignmentExpansionLimit:
+            break
+        AssignmentRetryHistory.append({
+            "Stage": "TrackAssignment",
+            "FromAssignmentExpansionLimit": AssignmentExpansionLimit,
+            "ToAssignmentExpansionLimit": NextAssignmentExpansionLimit,
+            "ExactExpansions": Result.ExpansionCount,
+            "Reason": "exact capacity-one assignment exhausted its work budget",
+        })
+        AssignmentExpansionLimit = NextAssignmentExpansionLimit
+        CheckRuntimeBudget("Track")
+        Result = PlanAssignment()
     CheckRuntimeBudget("Track")
     StageTimings["Assignment"] = monotonic() - AssignmentStarted
     if ProgressCallback is not None:
@@ -1642,8 +1704,18 @@ def RouteAuthoritativeResources(
                 "MaximumCandidatesPerNet": MaximumCandidates,
                 "CandidateLimitsBySignal": dict(sorted(CandidateLimitsBySignal.items())),
             },
-            "AdaptiveEscalationHistory": list(EscalationHistory),
+            "AdaptiveEscalationHistory": [
+                *EscalationHistory,
+                *AssignmentRetryHistory,
+            ],
             "RustAssignmentUsed": True,
+            "NativeBatching": {
+                "PortalRequestCount": len(PortalRequests),
+                "RouteTreeRequestCount": len(AllRouteRequests),
+                "PortalBatchCount": 1,
+                "RouteTreeBatchCount": 1,
+                "DeterministicRequestOrdering": True,
+            },
             "RustAssignmentExpansionLimit": AssignmentExpansionLimit,
             "RustAssignmentExpansions": InitialAssignmentExpansionCount,
             "LocalizedRepairPasses": len(RepairIterations),

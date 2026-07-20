@@ -359,6 +359,8 @@ def CompileSvToLitematic(
                     "MaximumNetLengthShare": round(MaximumNetLengthShare, 6),
                     "TruthTablePassed": Simulation.Passed,
                     "TruthTableRows": len(Simulation.Rows),
+                    "SimulationBackend": Simulation.Backend,
+                    "SimulationRuntimeSeconds": Simulation.RuntimeSeconds,
                 },
                 "BlockComposition": Composition.ToDictionary(),
                 "NormalizedQuality": NormalizedQuality,

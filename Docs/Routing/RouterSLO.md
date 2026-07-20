@@ -198,3 +198,82 @@ passes 512/512 at `12.450s` with `length=458`, `bends=122`, `vias=135`,
 not retain a legal assignment within 120 seconds, so its gate remains open.
 Validation: 49 Python tests plus 9 subtests pass, 2 scale tests are skipped,
 and 7 Rust tests pass.
+
+### Structural-reuse v6 checkpoint
+
+The production policy is now `physical-design-v6-structural-reuse-nand`.
+RCA4 automatically reports `UniqueTemplates=1` and `ReusedClusters=3`; each
+reuse has an exact nine-NAND mapping and all local routes are recomputed and
+validated. The retained run passes 512/512 in `9.494s`, below the `25s` RCA4
+ceiling, with `length=458`, `bends=122`, `vias=135`, `overflow_peak=1`, and
+zero conflicts/unresolved claims. FullAdder remains 8/8 in `1.885s` with its
+v5 geometry and route metrics. The observed RCA speed improvement is not yet a
+five-run stability result, and CLA4 remains open, so Phase C is not checked.
+
+Artifacts:
+`Output/Acceptance/2026-07-19/StructuralReuseV6`.
+
+### RCA8 scaling experiment (2026-07-19)
+
+`Examples/RippleCarryAdder8.sv` doubles RCA4 to 72 NANDs. The structural
+matcher found eight isomorphic nine-NAND islands, packed the first, and reused
+its exact mapping for the remaining seven. The first route exposed an adaptive
+control defect: exact assignment exhausted 128 expansions, but assignment
+growth was incorrectly conditional on coarse-guide overflow. Exact assignment
+now doubles its own work limit on exhaustion, independently of guide overflow,
+while remaining bounded by the demand-derived maximum and runtime ceiling.
+
+The retained rerun grew the assignment limit from 128 to 256 and succeeded in
+210 expansions. It passes all 131,072 physical truth-table rows with zero
+conflicts/unresolved claims and `overflow_peak=1`:
+
+| Metric | RCA4 regression | RCA8 experiment | Ratio |
+| --- | ---: | ---: | ---: |
+| NANDs | 36 | 72 | 2.00x |
+| Routed nets | 45 | 89 | 1.98x |
+| Length | 458 | 914 | 2.00x |
+| Exact non-air blocks | 1423 | 2830 | 1.99x |
+| Footprint | 2272 | 4672 | 2.06x |
+| End-to-end runtime | 9.686s | 30.338s | 3.13x |
+
+The physical result therefore scales close to linearly, while runtime is
+superlinear. RCA8's authoritative routing stages total `14.233s`; exhaustive
+simulation also grows from 512 to 131,072 input rows. This is one experiment,
+not a stability or p95 claim.
+
+Artifact:
+`Output/Experiments/2026-07-19/RippleCarryAdder8AdaptiveAssignment`.
+
+### Native batching checkpoint (2026-07-19)
+
+RCA8 design-wide portal and route-tree batching retains zero conflicts,
+zero unresolved claims, `overflow_peak=1`, and all 131072 physical rows. Three
+16-thread end-to-end runs are `26.158675`, `26.249281`, and `26.349448s`
+(median `26.249281s`, maximum deviation `0.38%`). The authoritative routing
+median is `10.005192s`, down `29.7%` from `14.232504s`; total runtime is down
+`13.5%` from `30.338185s`. RCA4 remains 512/512 at `7.624s` and FullAdder
+remains 8/8 at `1.841s` in retained single regression runs.
+
+The 32-thread RCA8 result (`26.152259s`) is statistically indistinguishable
+from 16 threads on this 16-core/32-thread CPU, so SMT oversubscription is not
+the default. Current validation is 55 Python tests passing with 2 opt-in scale
+tests skipped and all 7 Rust tests passing.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/MulticoreBatch`.
+
+### Native parallel simulation checkpoint (2026-07-19)
+
+RCA8 exhaustive physical simulation now runs in `0.391-0.392s` rather than
+`6.692s`, with exact equality to the Python report. Three end-to-end runs are
+`20.022497`, `20.027277`, and `20.096896s`, median `20.027277s`, maximum
+deviation `0.35%`. This is `34.0%` faster than the original RCA8 checkpoint.
+All runs retain 131072/131072 rows, zero conflicts/unresolved claims,
+`overflow_peak=1`, `length=914`, `bends=254`, and `vias=263`.
+
+FullAdder passes 8/8 at `1.832s`; RCA4 passes 512/512 at `7.854s`. Current
+validation is 55 Python tests passing with 2 scale tests skipped and all 8
+Rust tests passing.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/ParallelSimulation`.

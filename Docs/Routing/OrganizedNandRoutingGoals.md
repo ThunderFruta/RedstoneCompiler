@@ -232,6 +232,85 @@ and keeps RCA4 passing 512/512 (`12.450s`, overflow peak `1`). CLA4 remains
 unchecked. The new Rust regression proves that same-signal base claims merge
 while foreign base claims remain capacity-one obstacles.
 
+## Structural-reuse v6 evidence (2026-07-19)
+
+- [x] Repeated-island detection is generic: the unit fixture uses arbitrary
+  NAND/gate/signal names and rejects a pin-swapped non-isomorphic graph.
+- [x] RCA4 automatically finds one unique nine-NAND structural template and
+  three exact nine-gate reuse mappings; no adder, carry, or bit recognizer is
+  present.
+- [x] Reused placement candidates rebuild exact template geometry and rerun
+  local routing plus authoritative validation; fallback packing remains live.
+- [x] RCA4 passes 512/512 at `9.494s`, with `length=458`, `bends=122`,
+  `vias=135`, `overflow_peak=1`, and zero conflicts/unresolved claims.
+- [x] FullAdder remains 8/8 at `1.885s`, with zero structural reuses, proving
+  the optimization is conditional on actual repetition.
+- [x] 52 Python tests pass (2 opt-in scale tests skipped) and all 7 Rust tests
+  pass.
+- [ ] The `9.494s` RCA4 result is one retained observation, not a five-run
+  stability result.
+- [ ] CLA4 and the FullAdder material-share Phase C gates remain open.
+
+Evidence: `Output/Acceptance/2026-07-19/StructuralReuseV6`.
+
+## RCA8 experiment (2026-07-19)
+
+- [x] Eight generic nine-NAND islands collapse to one structural template plus
+  seven validated placement reuses.
+- [x] Adaptive exact-assignment work grows on assignment exhaustion without
+  requiring unrelated coarse-guide overflow.
+- [x] RCA8 passes all 131,072 physical rows with zero conflicts/unresolved
+  claims and `overflow_peak=1`.
+- [x] Physical scaling is close to linear from RCA4: length `458 -> 914`,
+  non-air blocks `1423 -> 2830`, and footprint `2272 -> 4672`.
+- [ ] Runtime scaling is not linear: `9.686s -> 30.338s`. Candidate/placement
+  setup and exhaustive truth-table enumeration remain scale targets.
+
+Artifact:
+`Output/Experiments/2026-07-19/RippleCarryAdder8AdaptiveAssignment`.
+
+## Native batching benchmark (2026-07-19)
+
+- [x] Portal searches from every signal, terminal, and layer execute through
+  one deterministic Rayon batch.
+- [x] Route-tree searches from every net execute through one deterministic
+  all-net Rayon batch rather than stopping at per-net barriers.
+- [x] Request-index ordering and repeated output are covered by focused tests.
+- [x] RCA8 three-run runtime is `26.159-26.349s`, median `26.249s`, maximum
+  median deviation `0.38%`.
+- [x] RCA8 authoritative routing-stage median improved `29.7%`, and total
+  runtime improved `13.5%`, with identical physical metrics and all 131072
+  rows passing.
+- [x] RCA4 remains 512/512 and improved from `9.686s` to `7.624s` in the
+  retained comparison run.
+- [x] FullAdder remains 8/8 with unchanged route metrics.
+- [x] 55 Python tests pass (2 opt-in scale tests skipped); 7 Rust tests pass.
+- [ ] Thirty-two SMT threads do not outperform 16 physical-core threads on
+  RCA8; further gains require reducing serial placement, materialization, and
+  exhaustive-simulation work.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/MulticoreBatch`.
+
+## Native parallel simulation benchmark (2026-07-19)
+
+- [x] Reference and physically delivered programs compile to indexed,
+  deterministic combinational instructions.
+- [x] Exhaustive assignments execute as disjoint native Rayon tasks and return
+  in the original truth-table order.
+- [x] FullAdder native and Python reports are exactly equal.
+- [x] RCA8 native and Python reports are exactly equal across all 131072 rows.
+- [x] RCA8 isolated simulation improves `6.692038s -> 0.392390s` (`17.1x`).
+- [x] RCA8 three-run end-to-end median improves to `20.027277s`, with `0.35%`
+  maximum median deviation and unchanged physical metrics.
+- [x] FullAdder remains 8/8 at `1.832s`; RCA4 remains 512/512 at `7.854s`.
+- [x] 55 Python tests pass with 2 opt-in scale tests skipped; 8 Rust tests pass.
+- [ ] Placement and local-route candidate construction remain the largest
+  serializable stage at approximately 9 seconds on RCA8.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/ParallelSimulation`.
+
 ## Current measured reference
 
 The retained 2026-07-19 v4 checkpoint is evidence for individual checked

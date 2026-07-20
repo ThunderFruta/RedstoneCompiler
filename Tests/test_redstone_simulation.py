@@ -9,7 +9,10 @@ except ImportError:
 
 from SVDecoder.Sv import ParseSvToNetlist
 from Compiler.Placement.PcbFlow import PlaceAndRoutePcb
-from Compiler.Simulation.Redstone import SimulateRoutedTruthTable
+from Compiler.Simulation.Redstone import (
+    SimulateRoutedTruthTable,
+    SimulateRoutedTruthTablePython,
+)
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
 
@@ -36,8 +39,15 @@ class RedstoneSimulationTests(unittest.TestCase):
                 Physical.Routed,
                 ReferenceModule=Optimized.Modules[Optimized.Top],
             )
+            PythonReport = SimulateRoutedTruthTablePython(
+                Physical.Routed,
+                ReferenceModule=Optimized.Modules[Optimized.Top],
+            )
 
         self.assertEqual(len(Report.Rows), 8)
+        self.assertEqual(Report.Rows, PythonReport.Rows)
+        self.assertEqual(Report.Backend, "native-parallel")
+        self.assertEqual(PythonReport.Backend, "python")
         self.assertTrue(Report.Passed)
         self.assertTrue(
             any(

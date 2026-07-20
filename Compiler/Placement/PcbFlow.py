@@ -490,9 +490,28 @@ def _PlaceAndRoutePcbWithPolicy(
             "ExactLocalRoutingBlocks": Cluster.ExactLocalRoutingBlocks,
             "GlobalEntrances": Cluster.GlobalEntrances,
             "RejectionReasons": list(Cluster.RejectionReasons),
+            "StructuralSignature": Cluster.StructuralSignature,
+            "ReusedFromClusterId": Cluster.ReusedFromClusterId,
+            "StructuralMapping": dict(sorted(
+                (Cluster.StructuralMapping or {}).items()
+            )),
         }
         for Cluster in Placement.PackedClusters
     ]
+    PlanningContracts["StructuralReuse"] = {
+        "Enabled": Policy.NandPacking.EnableStructuralReuse,
+        "ReuseScope": "relative-placement",
+        "LocalRoutesRecomputedAndValidated": True,
+        "UniqueTemplates": len({
+            Cluster.StructuralSignature
+            for Cluster in Placement.PackedClusters
+            if Cluster.StructuralSignature
+        }),
+        "ReusedClusters": sum(
+            Cluster.ReusedFromClusterId is not None
+            for Cluster in Placement.PackedClusters
+        ),
+    }
     PlanningContracts["LocalRouteClaims"] = [
         {
             "Signal": Claim.Signal,

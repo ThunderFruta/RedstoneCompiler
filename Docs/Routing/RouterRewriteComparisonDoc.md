@@ -75,6 +75,13 @@
   classifiers are superseded and are not permitted in the implementation.
 - Industry: repeated-module awareness is a standard method for dense datapaths.
 
+As of `physical-design-v6-structural-reuse-nand`, repeated NAND islands are a
+first-class placement optimization. The implementation uses name-independent
+directed-graph isomorphism, reuses only a proven relative placement candidate,
+and then redoes physical local routing and validation in context. This is
+closer to hierarchical/datapath placement reuse than to a hardcoded adder
+macro: every NAND remains individually placed and stamped.
+
 ## Expected outcomes
 
 - Reduced FullAdder routing footprint and fewer pathological snaked nets.
@@ -256,3 +263,62 @@ The v5 JSON records demand, derived budget, effective adaptive controls,
 negotiated/exact expansions, escalation history, and normalized quality. The
 RCA result used the same generic policy as FullAdder; no circuit-name or
 profile-count branch was added.
+
+### Structural-reuse v6 comparison
+
+The retained RCA4 artifact contains four nine-NAND islands with one structural
+signature. Cluster 0 is packed normally; clusters 1-3 map all nine NANDs back
+to cluster 0 and reuse its relative placement candidate. RCA4 still passes all
+512 physical rows with the same `length=458`, `bends=122`, `vias=135`,
+`overflow_peak=1`, and zero conflicts. Its observed wall time fell from the
+preceding `12.450s` ownership checkpoint to `9.494s` (`23.7%`), though this is
+a single-run comparison rather than a stability sample. FullAdder has one
+unique island, so it correctly reports zero reuses and remains 8/8 in
+`1.885s`.
+
+A controlled in-process placement-only comparison alternated the same RCA4
+netlist and policy with structural reuse enabled and disabled. Three enabled
+runs had a `0.839472s` median versus `1.843388s` disabled, a `54.5%` reduction
+in placement time. Both modes retain the same generic legality path; only the
+reuse candidate is toggled.
+
+Artifacts:
+`Output/Acceptance/2026-07-19/StructuralReuseV6`.
+
+### Design-wide native batching comparison
+
+On RCA8 with 16 native routing threads, batching every portal job and every
+all-net route-tree request reduced the authoritative routing-stage median from
+the retained `14.232504s` baseline to `10.005192s` (`29.7%`). Portal generation
+fell from `4.108728s` to a three-run median of `0.683723s` (`83.4%`), while
+candidate generation fell from `5.447679s` to `4.631135s` (`15.0%`).
+
+End-to-end RCA8 times were `26.158675`, `26.249281`, and `26.349448s`, median
+`26.249281s`, versus the retained `30.338185s` baseline (`13.5%` faster). All
+runs produced identical `length=914`, `bends=254`, `vias=263`, footprint
+`4672`, zero conflicts/unresolved claims, and 131072/131072 physical rows.
+
+This host has 16 physical cores and 32 SMT threads. A 32-thread batched run was
+`26.152259s`, effectively equal to 16 threads, so the production default
+remains 16 native threads. The optimization is work decomposition, not thread
+oversubscription.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/MulticoreBatch`.
+
+### Native parallel simulation comparison
+
+On the same routed RCA8 object, the original Python exhaustive simulator took
+`6.692038s`; the native parallel evaluator took `0.392390s`, a `17.1x`
+speedup. Both produced exactly equal 131072-row reports. A final telemetry run
+reports `SimulationBackend=native-parallel` and `SimulationRuntimeSeconds=0.391551`.
+
+Three end-to-end 16-core runs are `20.022497`, `20.027277`, and `20.096896s`
+(median `20.027277s`, maximum deviation `0.35%`). This is `23.7%` faster than
+the design-wide routing-batch median and `34.0%` faster than the original
+`30.338185s` RCA8 checkpoint, with identical geometry, route metrics,
+ownership, and truth-table contents. A 32-thread run at `19.962s` again shows
+no material SMT advantage over the 16 physical-core default.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/ParallelSimulation`.

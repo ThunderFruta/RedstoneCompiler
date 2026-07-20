@@ -1,12 +1,22 @@
 import unittest
 
-from Compiler.Routing.AuthoritativePlanner import _ReserveRepeaters
+from Compiler.Routing.AuthoritativePlanner import (
+    GrowAssignmentExpansionLimit,
+    _ReserveRepeaters,
+)
 from Compiler.Routing.ResourceGraph import RoutingResourceGraph
 from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
 from RedstoneCompiler.RustRouting import GenerateRectilinearTopology, RoutingContext
 
 
 class AuthoritativePlannerTests(unittest.TestCase):
+    def testAssignmentExpansionGrowthIsSmoothAndBounded(self) -> None:
+        self.assertEqual(GrowAssignmentExpansionLimit(128, 50_000, 2), 256)
+        self.assertEqual(GrowAssignmentExpansionLimit(32_768, 50_000, 2), 50_000)
+        self.assertEqual(GrowAssignmentExpansionLimit(50_000, 50_000, 2), 50_000)
+        with self.assertRaises(ValueError):
+            GrowAssignmentExpansionLimit(128, 50_000, 1)
+
     def BuildGraph(self):
         Graph = RoutingResourceGraph(
             ActualBlocks=frozenset(),
@@ -49,6 +59,53 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertEqual(set(Portal.SupportClaims), set(Claims.SupportCells))
         self.assertEqual(set(Portal.AirClaims), set(Claims.RequiredAirCells))
         self.assertEqual(set(Portal.ElectricalClaims), set(Claims.ElectricalCells))
+
+    def testBatchedPortalGenerationPreservesRequestOrder(self) -> None:
+        _Graph, Region, Context = self.BuildGraph()
+        AllowedNodes = sorted(Region.Nodes)
+        Requests = [
+            ([(0, 1, 0)], [Target], AllowedNodes, 1, 8, 1_000)
+            for Target in ((3, 1, 0), (2, 1, 0), (1, 1, 0))
+        ]
+        First = Context.GeneratePortalCandidateBatches(Requests)
+        Second = Context.GeneratePortalCandidateBatches(Requests)
+        self.assertEqual(
+            [Batch[0].Target for Batch in First],
+            [(3, 1, 0), (2, 1, 0), (1, 1, 0)],
+        )
+        self.assertEqual(
+            [[Value.Path for Value in Batch] for Batch in First],
+            [[Value.Path for Value in Batch] for Batch in Second],
+        )
+
+    def testBatchedRouteTreesPreserveRequestOrder(self) -> None:
+        _Graph, _Region, Context = self.BuildGraph()
+        Columns = [(X, 0) for X in range(5)]
+        Requests = [
+            (
+                [(0, 1, 0)],
+                [[Target]],
+                Columns,
+                [(0, 1, 0), Target],
+                [],
+                1,
+                0,
+                0,
+                0,
+                1_000,
+            )
+            for Target in ((4, 1, 0), (2, 1, 0), (3, 1, 0))
+        ]
+        First = Context.GenerateRouteTrees(Requests)
+        Second = Context.GenerateRouteTrees(Requests)
+        self.assertEqual(First, Second)
+        self.assertTrue(all(
+            Target in Tree
+            for Target, Tree in zip(
+                ((4, 1, 0), (2, 1, 0), (3, 1, 0)),
+                First,
+            )
+        ))
 
     def testRustAssignmentSelectsDisjointCandidate(self) -> None:
         _Graph, _Region, Context = self.BuildGraph()

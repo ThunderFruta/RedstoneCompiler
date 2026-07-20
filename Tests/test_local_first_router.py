@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 from contextlib import redirect_stderr
 from io import StringIO
@@ -13,6 +14,7 @@ from Compiler.Pipeline import CompileSvToLitematic
 from Compiler.Placement.PcbFlow import PlaceAndRoutePcb
 from Compiler.Placement.Pcb import (
     BuildTopologicalLevels,
+    FindIsomorphicNandClusterMapping,
     OptimizeClusterSlots,
     PlacePcbGraph,
 )
@@ -30,6 +32,7 @@ from Compiler.Routing.Policy import (
     CompatibilityPhysicalDesignPolicy,
     GlobalRoutingPolicy,
     LocalFirstPhysicalDesignPolicy,
+    NandPackingPolicy,
     RoutingAcceptanceProfiles,
     RoutingStrategy,
 )
@@ -113,9 +116,16 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(Snapshot["Placement"]["RoutingFeedbackIterations"], 2)
         self.assertEqual(
             LocalFirstPhysicalDesignPolicy.PolicyVersion,
-            "physical-design-v5-adaptive-nand",
+            "physical-design-v6-structural-reuse-nand",
         )
         self.assertTrue(Snapshot["NandPacking"]["Enabled"])
+        self.assertTrue(Snapshot["NandPacking"]["EnableStructuralReuse"])
+        self.assertGreaterEqual(
+            Snapshot["NandPacking"]["MaximumStructuralReuseMappings"],
+            1,
+        )
+        with self.assertRaises(ValueError):
+            NandPackingPolicy(MaximumStructuralReuseMappings=0)
         self.assertTrue(Snapshot["Organization"]["Enabled"])
         self.assertEqual(
             Snapshot["MaterialObjective"]["MinimumComponentFunctionalShare"],
@@ -216,6 +226,37 @@ class LocalFirstRouterTests(unittest.TestCase):
             RoutingAcceptanceProfiles["RippleCarryAdder4"].MaximumFootprint
         )
 
+    def testRepeatedNandStructureIsDetectedWithoutCircuitNames(self) -> None:
+        Module = ModuleIR(
+            Name="ArbitraryRepeatedGraph",
+            Inputs=["p", "q", "r", "s"],
+            Outputs=["left", "right"],
+            Gates=[
+                Gate("Alpha", GateKind.NAND, ["u"], ["p", "q"]),
+                Gate("Beta", GateKind.NAND, ["left"], ["u", "p"]),
+                Gate("Gamma", GateKind.NAND, ["v"], ["r", "s"]),
+                Gate("Delta", GateKind.NAND, ["right"], ["v", "r"]),
+            ],
+        )
+        Match = FindIsomorphicNandClusterMapping(
+            Module,
+            ("Alpha", "Beta"),
+            ("Gamma", "Delta"),
+        )
+        self.assertIsNotNone(Match)
+        self.assertEqual(
+            Match[1],
+            {"Alpha": "Gamma", "Beta": "Delta"},
+        )
+        Module.Gates[-1].Inputs = ["r", "v"]
+        self.assertIsNone(
+            FindIsomorphicNandClusterMapping(
+                Module,
+                ("Alpha", "Beta"),
+                ("Gamma", "Delta"),
+            )
+        )
+
     def testPackedNandsRemainIndependentAndDeterministic(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
             Netlist = ToNandOnly(
@@ -282,6 +323,38 @@ class LocalFirstRouterTests(unittest.TestCase):
             PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
             PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
         )
+        self.assertEqual(len(Placement.PackedClusters), 4)
+        self.assertEqual(
+            [
+                Cluster.ReusedFromClusterId
+                for Cluster in Placement.PackedClusters
+            ],
+            [None, 0, 0, 0],
+        )
+        self.assertEqual(
+            len({
+                Cluster.StructuralSignature
+                for Cluster in Placement.PackedClusters
+            }),
+            1,
+        )
+        self.assertTrue(all(
+            len(Cluster.StructuralMapping or {}) == 9
+            for Cluster in Placement.PackedClusters[1:]
+        ))
+        WithoutReuse = PlacePcbGraph(
+            Netlist,
+            RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
+            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PackingPolicy=replace(
+                LocalFirstPhysicalDesignPolicy.NandPacking,
+                EnableStructuralReuse=False,
+            ),
+        )
+        self.assertTrue(all(
+            Cluster.ReusedFromClusterId is None
+            for Cluster in WithoutReuse.PackedClusters
+        ))
         for Claim in Placement.Placed.LocalRouteClaims:
             if Claim.RepeaterReservations:
                 continue

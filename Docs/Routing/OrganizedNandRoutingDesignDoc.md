@@ -24,6 +24,66 @@ policy factors when assignment exhausts the current space. Exact ownership,
 connectivity, signal strength, isolation, DRC, and physical simulation remain
 mandatory. No circuit or net names participate in these decisions.
 
+## Structural-reuse v6 amendment (2026-07-19)
+
+`physical-design-v6-structural-reuse-nand` adds generic repeated-island
+detection before packed placement. Each NAND island is represented as a
+directed, input-pin-labelled graph with abstract boundary-input nodes. Stable
+color refinement creates a lookup signature; a bounded exact isomorphism check
+must then prove the gate mapping before reuse is allowed. Signal, gate, module,
+adder, carry, and bit-index names are absent from the signature.
+
+The first structurally unique island runs the normal graph-beam packer. A
+later isomorphic island receives the first island's relative NAND positions,
+rotations, and mirrors as a candidate. Exact template occupancy is rebuilt for
+the new gates, overlap is checked, and ordinary local routing, ownership,
+isolation, DRC, and simulation are rerun in the island's real surroundings.
+If mapping or legality fails, placement falls back to the normal packer. Local
+route claims are deliberately recomputed rather than blindly translated,
+because neighboring corridors and foreign electrical resources can differ.
+
+The bounded controls are serialized as `EnableStructuralReuse` and
+`MaximumStructuralReuseMappings`. `.PhysicalDesign.json` records each
+cluster's structural signature, source cluster, exact gate mapping, and a
+top-level structural-reuse summary.
+
+The RCA8 experiment additionally separated exact-assignment escalation from
+coarse-guide overflow. Exhausting an exact capacity-one work limit now grows
+that limit by the serialized assignment growth factor, capped by the derived
+assignment budget and runtime ceiling. Layer growth remains driven by physical
+capacity pressure; search-work growth is driven by search exhaustion.
+
+## Native work batching amendment (2026-07-19)
+
+Portal and detailed-route searches now use design-wide indexed batches rather
+than Python-side per-terminal and per-net synchronization. Python constructs
+requests in stable signal/terminal/layer order, Rust executes independent jobs
+through one Rayon queue, and results return in the original indexed order
+before materialization and exact assignment. The searches are distinct portal
+or candidate tasks; the implementation does not launch duplicate whole-design
+attempts.
+
+`RoutingControlEffectiveness.NativeBatching` records portal and route-tree
+request counts, one batch of each kind, and deterministic request ordering.
+The exact capacity-one assignment remains deterministic and mostly serial;
+parallelism is concentrated in independent path searches where it has no
+ownership race.
+
+## Native parallel simulation amendment (2026-07-19)
+
+The physical truth-table validator now compiles both the optimized reference
+module and the physically delivered NAND graph into indexed combinational
+instructions. Rust evaluates disjoint assignment indices through the same
+bounded native thread pool and returns results in assignment order. Physical
+input and output delivery gates are embedded in the instruction contract, so
+parallel evaluation does not bypass routed connectivity. Python still builds
+the authoritative delivery map and retains the original evaluator as a safe
+fallback and equivalence oracle.
+
+The native evaluator supports NAND, AND, OR, XOR, NOT, and BUFFER reference
+instructions, while the placed program remains NAND-only. `.PhysicalDesign.json`
+records `SimulationBackend` and `SimulationRuntimeSeconds`.
+
 The design addresses the remaining FullAdder density problem measured on
 2026-07-19:
 

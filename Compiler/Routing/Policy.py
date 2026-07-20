@@ -58,6 +58,14 @@ class NandPackingPolicy:
     LocalRouteEnvelope: int = 2
     PlacementFeedbackIterations: int = 3
     GraphBeamEnabled: bool = True
+    EnableStructuralReuse: bool = True
+    MaximumStructuralReuseMappings: int = 4096
+
+    def __post_init__(self) -> None:
+        if self.MaximumStructuralReuseMappings < 1:
+            raise ValueError(
+                "MaximumStructuralReuseMappings must be positive"
+            )
 
 
 @dataclass(frozen=True)
@@ -280,7 +288,7 @@ CompatibilityPhysicalDesignPolicy = PhysicalDesignPolicy(
 )
 
 LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
-    PolicyVersion="physical-design-v5-adaptive-nand",
+    PolicyVersion="physical-design-v6-structural-reuse-nand",
     Placement=PlacementPolicy(
         CompactPassLimit=16,
         RoutingSpacing=4,
