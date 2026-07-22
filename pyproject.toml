@@ -15,5 +15,6 @@ redstone-compiler = "Main:Main"
 
 [tool.maturin]
 manifest-path = "RustRouting/Cargo.toml"
+features = ["python-extension"]
 python-source = "."
 module-name = "RedstoneCompiler.RustRouting"

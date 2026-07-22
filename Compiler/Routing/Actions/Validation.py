@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 from ..Models import Position3
-from .Geometry import BuildElectricalExclusions, NeighborPositions
+from .Geometry import NeighborPositions
+
+
+RoutingWorkCheck = Callable[[dict[str, object]], None]
 
 
 def BuildPhysicalGraphs(
@@ -14,9 +17,31 @@ def BuildPhysicalGraphs(
     ActualBlocks: set[Position3],
     Supports: set[Position3],
     SolidBlocks: set[Position3] | frozenset[Position3] | None = None,
+    WorkCheck: RoutingWorkCheck | None = None,
 ) -> dict[str, dict[Position3, list[Position3]]]:
     """Build net graphs using only connections Minecraft can physically make."""
-    AllWires = set().union(*NetWires.values())
+    if WorkCheck is not None:
+        WorkCheck({"Phase": "start", "SignalCount": len(NetWires)})
+    AllWires: set[Position3] = set()
+    CollectedWireCount = 0
+    for SignalIndex, (Signal, Cells) in enumerate(NetWires.items(), start=1):
+        for Cell in Cells:
+            AllWires.add(Cell)
+            CollectedWireCount += 1
+            if WorkCheck is not None and CollectedWireCount % 256 == 0:
+                WorkCheck({
+                    "Phase": "collect-wire-positions",
+                    "Signal": Signal,
+                    "CompletedSignals": SignalIndex - 1,
+                    "ProcessedPositions": CollectedWireCount,
+                })
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "collect-wires",
+                "Signal": Signal,
+                "CompletedSignals": SignalIndex,
+                "WireCount": len(AllWires),
+            })
     SolidBlocks = ActualBlocks if SolidBlocks is None else SolidBlocks
 
     def IsPhysicalEdge(First: Position3, Second: Position3) -> bool:
@@ -43,31 +68,73 @@ def BuildPhysicalGraphs(
         )
         return SupportIsSolid and HeadroomIsClear
 
-    return {
-        Signal: {
-            Cell: [
+    Graphs: dict[str, dict[Position3, list[Position3]]] = {}
+    ProcessedCells = 0
+    for SignalIndex, (Signal, Cells) in enumerate(NetWires.items(), start=1):
+        Graph: dict[Position3, list[Position3]] = {}
+        for Cell in Cells:
+            ProcessedCells += 1
+            if WorkCheck is not None and ProcessedCells % 256 == 0:
+                WorkCheck({
+                    "Phase": "cells",
+                    "Signal": Signal,
+                    "CompletedSignals": SignalIndex - 1,
+                    "ProcessedCells": ProcessedCells,
+                })
+            Graph[Cell] = [
                 Neighbor
                 for Neighbor in NeighborPositions(Cell)
                 if Neighbor in Cells and IsPhysicalEdge(Cell, Neighbor)
             ]
-            for Cell in Cells
-        }
-        for Signal, Cells in NetWires.items()
-    }
+        Graphs[Signal] = Graph
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "signal-complete",
+                "Signal": Signal,
+                "CompletedSignals": SignalIndex,
+                "ProcessedCells": ProcessedCells,
+            })
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "complete",
+            "CompletedSignals": len(Graphs),
+            "ProcessedCells": ProcessedCells,
+        })
+    return Graphs
 
 
 def ValidatePhysicalRoutes(
     PhysicalGraphs: dict[str, dict[Position3, list[Position3]]],
     Producers: dict[str, Any],
     Targets: dict[str, list[Position3]],
+    WorkCheck: RoutingWorkCheck | None = None,
 ) -> None:
     """Reject a compact route if any sink is not physically powered."""
-    for Signal, Graph in PhysicalGraphs.items():
-        Root = Producers[Signal].OutputPin
+    if WorkCheck is not None:
+        WorkCheck({"Phase": "start", "SignalCount": len(PhysicalGraphs)})
+    ExpandedNodes = 0
+    for SignalIndex, (Signal, Graph) in enumerate(
+        PhysicalGraphs.items(),
+        start=1,
+    ):
+        Producer = Producers.get(Signal)
+        if Producer is None:
+            raise ValueError(f"missing source gate for routed signal {Signal}")
+        if Producer.OutputPin is None:
+            raise ValueError(f"routed signal has no source output pin: {Signal}")
+        Root = Producer.OutputPin
         Seen = {Root}
         Queue = deque([Root])
         while Queue:
             Cell = Queue.popleft()
+            ExpandedNodes += 1
+            if WorkCheck is not None and ExpandedNodes % 256 == 0:
+                WorkCheck({
+                    "Phase": "connectivity",
+                    "Signal": Signal,
+                    "CompletedSignals": SignalIndex - 1,
+                    "ExpandedNodes": ExpandedNodes,
+                })
             for Neighbor in Graph[Cell]:
                 if Neighbor not in Seen:
                     Seen.add(Neighbor)
@@ -77,6 +144,19 @@ def ValidatePhysicalRoutes(
             raise ValueError(
                 f"Physically disconnected route for net {Signal}: {Missing}"
             )
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "signal-complete",
+                "Signal": Signal,
+                "CompletedSignals": SignalIndex,
+                "ExpandedNodes": ExpandedNodes,
+            })
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "complete",
+            "CompletedSignals": len(PhysicalGraphs),
+            "ExpandedNodes": ExpandedNodes,
+        })
 
 
 def ValidateTemplateIsolation(
@@ -87,27 +167,82 @@ def ValidateTemplateIsolation(
     Producers: dict[str, Any],
     Targets: dict[str, list[Position3]],
     AccessBySignal: dict[str, set[Position3]] | None = None,
+    WorkCheck: RoutingWorkCheck | None = None,
 ) -> None:
     """Reject routed dust that enters or side-powers a cell template."""
-    TemplateKeepOut = BuildElectricalExclusions(
-        set(ElectricalBlocks) | set(SolidBlocks)
-    )
-    for Signal, Positions in NetWires.items():
-        AllowedPins = {Producers[Signal].OutputPin, *Targets[Signal]}
+    TemplateElectrical = set(ElectricalBlocks) | set(SolidBlocks)
+    TemplateKeepOut = set(TemplateElectrical)
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "start",
+            "SignalCount": len(NetWires),
+            "TemplateElectricalCount": len(TemplateElectrical),
+        })
+    for PositionIndex, Position in enumerate(TemplateElectrical, start=1):
+        TemplateKeepOut.update(NeighborPositions(Position))
+        if WorkCheck is not None and PositionIndex % 256 == 0:
+            WorkCheck({
+                "Phase": "template-keepout",
+                "ProcessedPositions": PositionIndex,
+                "TemplateElectricalCount": len(TemplateElectrical),
+            })
+    ProcessedRoutePositions = 0
+    for SignalIndex, (Signal, Positions) in enumerate(
+        NetWires.items(),
+        start=1,
+    ):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "signal",
+                "Signal": Signal,
+                "CompletedSignals": SignalIndex - 1,
+                "RoutePositionCount": len(Positions),
+            })
+        Producer = Producers.get(Signal)
+        if Producer is None:
+            raise ValueError(f"missing source gate for routed signal {Signal}")
+        if Producer.OutputPin is None:
+            raise ValueError(f"routed signal has no source output pin: {Signal}")
+        AllowedPins = {Producer.OutputPin, *Targets[Signal]}
         if AccessBySignal is not None:
             AllowedPins.update(AccessBySignal.get(Signal, set()))
-        Overlaps = (Positions & set(ActualBlocks)) - AllowedPins
+        Overlaps: set[Position3] = set()
+        SidePowering: set[Position3] = set()
+        for Position in Positions:
+            ProcessedRoutePositions += 1
+            if (
+                WorkCheck is not None
+                and ProcessedRoutePositions % 256 == 0
+            ):
+                WorkCheck({
+                    "Phase": "route-positions",
+                    "Signal": Signal,
+                    "CompletedSignals": SignalIndex - 1,
+                    "ProcessedPositions": ProcessedRoutePositions,
+                })
+            if Position in AllowedPins:
+                continue
+            if Position in ActualBlocks:
+                Overlaps.add(Position)
+            if Position in TemplateKeepOut:
+                SidePowering.add(Position)
         if Overlaps:
             raise ValueError(
                 f"Route for {Signal} overlaps template blocks: "
                 f"{sorted(Overlaps)[:8]}"
             )
-        SidePowering = (Positions & TemplateKeepOut) - AllowedPins
         if SidePowering:
             raise ValueError(
                 f"Route for {Signal} enters template electrical clearance: "
                 f"{sorted(SidePowering)[:8]}"
             )
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "complete",
+            "CompletedSignals": len(NetWires),
+            "ProcessedRoutePositions": ProcessedRoutePositions,
+            "TemplateKeepOutCount": len(TemplateKeepOut),
+        })
 
 
 def SimplifyNetTrees(
@@ -127,7 +262,12 @@ def SimplifyNetTrees(
     Simplified: dict[str, set[Position3]] = {}
 
     for Signal, Graph in Graphs.items():
-        Root = Producers[Signal].OutputPin
+        Producer = Producers.get(Signal)
+        if Producer is None:
+            raise ValueError(f"missing source gate for routed signal {Signal}")
+        if Producer.OutputPin is None:
+            raise ValueError(f"routed signal has no source output pin: {Signal}")
+        Root = Producer.OutputPin
         Parents = {Root: None}
         Queue = deque([Root])
         while Queue:

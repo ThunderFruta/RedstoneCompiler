@@ -149,6 +149,11 @@ def RectanglesOverlap(
     Second: PlacedGate,
 ) -> bool:
     """Return whether two rotated cell footprints occupy the same column."""
+    # Vertically separated placement decks may intentionally share X/Z
+    # columns. Deck pitch and exact electrical geometry are validated by the
+    # PCB legalizer before routing.
+    if First.Y != Second.Y:
+        return False
     FirstWidth, FirstDepth = RotatedCellSize(First.Kind, First.Rotation)
     SecondWidth, SecondDepth = RotatedCellSize(Second.Kind, Second.Rotation)
     return not (

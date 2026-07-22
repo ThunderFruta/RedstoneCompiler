@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from math import isfinite
 from pathlib import Path
 import shutil
 import sys
+import os
 import time
 
 if __package__:
@@ -38,7 +40,46 @@ BuiltInDefaults = {
     "PushToMinecraft": True,
     "MinecraftDirectory": str(MinecraftSchematicsDirectory),
     "PushFilePath": "Output/FullAdder/FullAdder.litematic",
+    "TraceSupportBlocks": [
+        "minecraft:light_gray_concrete",
+        "minecraft:yellow_concrete",
+        "minecraft:green_concrete",
+        "minecraft:light_blue_concrete",
+        "minecraft:red_concrete",
+        "minecraft:orange_concrete",
+        "minecraft:magenta_concrete",
+    ],
 }
+
+
+def ParsePositiveSeconds(Value: str) -> float:
+    """Parse one finite, positive CLI duration in seconds."""
+    try:
+        Seconds = float(Value)
+    except ValueError as Error:
+        raise argparse.ArgumentTypeError(
+            "routing deadline must be a number of seconds"
+        ) from Error
+    if not isfinite(Seconds) or Seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            "routing deadline must be finite and positive"
+        )
+    return Seconds
+
+
+def ParseTraceSupportBlocks(Value: object | None) -> tuple[str, ...]:
+    """Parse a configurable support block palette into block IDs."""
+    if Value is None:
+        return ()
+    if isinstance(Value, str):
+        Values = [Item.strip() for Item in Value.split(",")]
+    elif isinstance(Value, (tuple, list)):
+        Values = [str(Item).strip() for Item in Value]
+    else:
+        raise ValueError(
+            "trace support blocks must be a comma-separated string or list",
+        )
+    return tuple(Item for Item in Values if Item)
 
 
 def BuildParser() -> argparse.ArgumentParser:
@@ -56,15 +97,41 @@ def BuildParser() -> argparse.ArgumentParser:
     Parser.add_argument("--top", "--topmodule", type=str, default=None, help="Top module name")
     Parser.add_argument(
         "--routing-strategy",
-        choices=(RoutingStrategy.NewRouterFirst.value,),
+        choices=tuple(Value.value for Value in RoutingStrategy),
         default=RoutingStrategy.NewRouterFirst.value,
-        help="Organized NAND physical router (the only CLI routing mode)",
+        help=(
+            "Router selection; compatibility is an explicit regression oracle "
+            "and hybrid never falls back automatically"
+        ),
     )
     Parser.add_argument(
         "--workdir",
         type=Path,
         default=Path("Cache/Frontend"),
         help="Working directory for compiler artifacts",
+    )
+    Parser.add_argument(
+        "--routing-threads",
+        type=int,
+        default=None,
+        help="Override Rust routing worker count (RC_ROUTING_THREADS)",
+    )
+    Parser.add_argument(
+        "--routing-deadline-seconds",
+        type=ParsePositiveSeconds,
+        default=None,
+        help=(
+            "Override the selected router policy with one absolute routing "
+            "deadline, starting when PCB placement begins"
+        ),
+    )
+    Parser.add_argument(
+        "--trace-support-blocks",
+        type=str,
+        help=(
+            "Comma-separated block IDs for per-signal route supports; "
+            "defaults to light gray, yellow, green, light blue, red, orange, magenta"
+        ),
     )
     Parser.add_argument(
         "--guided",
@@ -181,6 +248,18 @@ def ConfigureDefaults(
         "Output name (blank means input filename)",
         str(Defaults["OutputName"]),
     )
+    TraceBlocksValue = Defaults.get("TraceSupportBlocks", ())
+    TraceBlocksDisplay = (
+        ",".join(TraceBlocksValue)
+        if isinstance(TraceBlocksValue, (list, tuple))
+        else str(TraceBlocksValue)
+    )
+    Updated["TraceSupportBlocks"] = ParseTraceSupportBlocks(
+        PromptText(
+            "Trace support blocks (comma-separated block IDs)",
+            TraceBlocksDisplay,
+        )
+    )
     Updated["TopModule"] = PromptText(
         "Top module (blank means auto-detect)",
         str(Defaults["TopModule"]),
@@ -238,7 +317,7 @@ def PushToMinecraft(
 
 def PromptCompile(
     Defaults: dict[str, object],
-) -> tuple[Path, Path, Path, str | None, Path, bool]:
+) -> tuple[Path, Path, Path, str | None, Path, bool, tuple[str, ...]]:
     DefaultInput = str(Defaults["InputPath"])
     InputPath = PromptPath(
         "SystemVerilog file",
@@ -258,6 +337,7 @@ def PromptCompile(
         "Push to Minecraft after compiling",
         bool(Defaults["PushToMinecraft"]),
     )
+    TraceSupportBlocks = ParseTraceSupportBlocks(Defaults.get("TraceSupportBlocks"))
     ArtifactDirectory = OutputDirectory / BaseName
     OutputPath = ArtifactDirectory / f"{BaseName}.litematic"
     DiagramPath = ArtifactDirectory / f"{BaseName}.Nand.json"
@@ -269,6 +349,7 @@ def PromptCompile(
         TopValue or None,
         Workdir,
         PushResult,
+        TraceSupportBlocks,
     )
 
 
@@ -276,7 +357,16 @@ def GuidedMenu(
     Defaults: dict[str, object],
     DefaultsFile: Path,
 ) -> tuple[
-    tuple[Path, Path, Path, str | None, Path, bool] | None,
+    tuple[
+        Path,
+        Path,
+        Path,
+        str | None,
+        Path,
+        bool,
+        tuple[str, ...],
+    ]
+    | None,
     dict[str, object],
 ]:
     while True:
@@ -447,6 +537,7 @@ def Main(Args: list[str] | None = None) -> int:
                 TopModule,
                 Workdir,
                 PushResult,
+                TraceSupportBlocks,
             ) = Guided
             MinecraftDirectory = Path(str(Defaults["MinecraftDirectory"]))
         else:
@@ -466,6 +557,11 @@ def Main(Args: list[str] | None = None) -> int:
             TopModule = Parsed.top
             Workdir = Parsed.workdir
             PushResult = Parsed.push
+            TraceSupportBlocks = ParseTraceSupportBlocks(
+                Parsed.trace_support_blocks
+                if Parsed.trace_support_blocks is not None
+                else Defaults.get("TraceSupportBlocks"),
+            )
         if OutputPath.suffix.lower() != ".litematic":
             OutputPath = OutputPath.with_suffix(".litematic")
 
@@ -473,6 +569,10 @@ def Main(Args: list[str] | None = None) -> int:
         print(SearchDescription, file=sys.stderr)
         ProgressReporter = BuildProgressReporter()
         try:
+            if Parsed.routing_threads is not None:
+                if Parsed.routing_threads <= 0:
+                    Parser.error("--routing-threads must be positive")
+                os.environ["RC_ROUTING_THREADS"] = str(Parsed.routing_threads)
             Result = CompileSvToLitematic(
                 InputPath=InputPath,
                 OutputPath=OutputPath,
@@ -480,7 +580,9 @@ def Main(Args: list[str] | None = None) -> int:
                 TopModule=TopModule,
                 Workdir=Workdir,
                 ProgressCallback=ProgressReporter,
-                RoutingStrategyValue=RoutingStrategy.NewRouterFirst,
+                RoutingStrategyValue=Parsed.routing_strategy,
+                RoutingDeadlineSeconds=Parsed.routing_deadline_seconds,
+                TraceSupportBlocks=TraceSupportBlocks,
             )
         finally:
             ProgressReporter.Finish()

@@ -21,7 +21,8 @@ class RoutedDesign:
     Supports: list[Position3]
     Repeaters: dict[Position3, str]
     NetWires: dict[str, list[Position3]]
-    SupportBlock: str = "minecraft:smooth_stone"
+    SupportBlock: str = "minecraft:light_gray_concrete"
+    TraceSupportBlocks: tuple[str, ...] = ()
     TemplateAccessBySignal: dict[str, set[Position3]] = field(default_factory=dict)
     RoutingMetrics: RoutingStageMetrics | None = None
     GlobalPlan: ChannelPlan | None = None
@@ -44,6 +45,7 @@ class RoutedDesign:
     GlobalGuideDiagnostics: dict[str, object] = field(default_factory=dict)
     RoutingControlEffectiveness: dict[str, object] = field(default_factory=dict)
     FrozenNetSignals: tuple[str, ...] = ()
+    NegotiatedRoutingDiagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,7 @@ class RoutingStaticGeometry:
     ActualBlocks: frozenset[Position3]
     ElectricalBlocks: frozenset[Position3]
     SolidBlocks: frozenset[Position3] = frozenset()
+    TemplateElectricalBlocks: frozenset[Position3] = frozenset()
 
 
 @dataclass

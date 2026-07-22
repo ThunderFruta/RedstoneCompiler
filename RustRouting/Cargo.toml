@@ -8,6 +8,10 @@ name = "RustRouting"
 crate-type = ["cdylib"]
 path = "Src/Lib.rs"
 
+[features]
+default = []
+python-extension = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22" }
 rayon = "1.10"

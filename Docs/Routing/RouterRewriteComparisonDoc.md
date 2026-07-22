@@ -1,5 +1,10 @@
 # Routing Rewrite Comparison Document
 
+> **Historical comparison notice (2026-07-21):** Measurements and comparisons
+> below describe the policy version that produced them. They do not override
+> the current [router reliability design](RouterReliabilityDesignDoc.md) or
+> establish v10 acceptance.
+
 ## Current System vs Proposed Rewrite vs Industry Patterns
 
 ## What the current system does well

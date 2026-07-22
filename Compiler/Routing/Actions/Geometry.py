@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
+from typing import Any, Callable
 
 from ...Placement.Rotation import TransformLocalPosition
 from SchemEncoder.Writer262 import LoadTemplate
@@ -34,6 +34,7 @@ def LoadRoutingTemplates() -> dict[str, Any]:
 
 def BuildPlacedCellGeometry(
     Placed: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[set[Position3], set[Position3], set[Position3]]:
     """Return occupied, electrical, and solid template positions."""
     Templates = LoadRoutingTemplates()
@@ -41,9 +42,26 @@ def BuildPlacedCellGeometry(
     ElectricalBlocks: set[Position3] = set()
     SolidBlocks: set[Position3] = set()
 
-    for Gate in Placed.PlacedGates:
+    Gates = list(Placed.PlacedGates)
+    for GateIndex, Gate in enumerate(Gates):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "placed-cell-geometry-gate",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Gates),
+                "GateName": Gate.Name,
+            })
         Template = Templates[Gate.Kind]
-        for LocalPosition, State in Template.Blocks.items():
+        for BlockIndex, (LocalPosition, State) in enumerate(
+            Template.Blocks.items()
+        ):
+            if WorkCheck is not None and BlockIndex % 64 == 0:
+                WorkCheck({
+                    "Phase": "placed-cell-geometry-block",
+                    "GateName": Gate.Name,
+                    "CompletedBlocks": BlockIndex,
+                    "TotalBlocks": len(Template.Blocks),
+                })
             Rotated = TransformLocalPosition(
                 LocalPosition,
                 (Template.Size[0], Template.Size[2]),
@@ -69,21 +87,107 @@ def BuildPlacedCellGeometry(
     return set(OccupiedOwners), ElectricalBlocks, SolidBlocks
 
 
-def BuildRoutingResources(Placed: Any) -> RoutingResources:
+def ValidatePlacedCellElectricalIsolation(
+    Placed: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> None:
+    """Reject template adjacency that can create stateful redstone feedback."""
+    Geometry = []
+    Gates = list(Placed.PlacedGates)
+    for GateIndex, Gate in enumerate(Gates):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "electrical-isolation-geometry",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Gates),
+                "GateName": Gate.Name,
+            })
+        Actual, Electrical, _Solid = BuildPlacedCellGeometry(
+            type("SingleCellPlacement", (), {"PlacedGates": [Gate]})(),
+            WorkCheck=WorkCheck,
+        )
+        Geometry.append((Gate.Name, Actual, Electrical))
+    Technology = DefaultRedstoneRoutingTechnology
+    for Index, (FirstName, FirstActual, FirstElectrical) in enumerate(Geometry):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "electrical-isolation-pairs",
+                "CompletedFirstGates": Index,
+                "TotalGates": len(Geometry),
+                "GateName": FirstName,
+            })
+        FirstKeepOut = Technology.BuildElectricalExclusions(set(FirstElectrical))
+        for PairIndex, (
+            SecondName,
+            SecondActual,
+            SecondElectrical,
+        ) in enumerate(Geometry[Index + 1 :]):
+            if WorkCheck is not None and PairIndex % 32 == 0:
+                WorkCheck({
+                    "Phase": "electrical-isolation-pair",
+                    "FirstGateName": FirstName,
+                    "SecondGateName": SecondName,
+                    "CompletedPairsForGate": PairIndex,
+                })
+            Conflicts = (FirstKeepOut & set(SecondActual)) | (
+                Technology.BuildElectricalExclusions(set(SecondElectrical))
+                & set(FirstActual)
+            )
+            if Conflicts:
+                raise ValueError(
+                    "Placed templates violate electrical isolation: "
+                    f"{FirstName},{SecondName} at {sorted(Conflicts)[:8]}"
+                )
+
+
+def BuildRoutingResources(
+    Placed: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> RoutingResources:
     """Build placement geometry once for reuse across routing retries."""
-    ActualBlocks, ElectricalBlocks, SolidBlocks = BuildPlacedCellGeometry(Placed)
+    if WorkCheck is not None:
+        WorkCheck({"Phase": "routing-resources-start"})
+    ValidatePlacedCellElectricalIsolation(Placed, WorkCheck=WorkCheck)
+    ActualBlocks, ElectricalBlocks, SolidBlocks = BuildPlacedCellGeometry(
+        Placed,
+        WorkCheck=WorkCheck,
+    )
+    TemplateElectricalBlocks = frozenset(ElectricalBlocks)
     # Complete local nets are immutable obstacles to every remaining signal.
     # Partial claims are carried inside their signal's route candidates.
-    ElectricalBlocks.update(
-        Position
-        for Positions in (getattr(Placed, "FrozenNetWires", None) or {}).values()
-        for Position in Positions
-    )
+    FrozenNetWires = getattr(Placed, "FrozenNetWires", None) or {}
+    FrozenPositionCount = 0
+    for SignalIndex, (Signal, Positions) in enumerate(
+        sorted(FrozenNetWires.items())
+    ):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "routing-resources-frozen-net",
+                "CompletedSignals": SignalIndex,
+                "TotalSignals": len(FrozenNetWires),
+                "Signal": Signal,
+            })
+        for Position in Positions:
+            ElectricalBlocks.add(Position)
+            FrozenPositionCount += 1
+            if WorkCheck is not None and FrozenPositionCount % 256 == 0:
+                WorkCheck({
+                    "Phase": "routing-resources-frozen-position",
+                    "Signal": Signal,
+                    "CompletedSignals": SignalIndex,
+                    "ProcessedPositions": FrozenPositionCount,
+                })
     StaticGeometry = RoutingStaticGeometry(
         ActualBlocks=frozenset(ActualBlocks),
         ElectricalBlocks=frozenset(ElectricalBlocks),
         SolidBlocks=frozenset(SolidBlocks),
+        TemplateElectricalBlocks=TemplateElectricalBlocks,
     )
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "routing-resources-complete",
+            "FrozenPositionCount": FrozenPositionCount,
+        })
     return RoutingResources(
         StaticGeometry=StaticGeometry,
         ResourceGraph=RoutingResourceGraph(

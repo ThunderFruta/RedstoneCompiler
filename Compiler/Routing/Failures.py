@@ -30,6 +30,10 @@ class RoutingFailureReason(str, Enum):
     OrganizationPolicyViolation = "OrganizationPolicyViolation"
     LocalMaterialBudgetExceeded = "LocalMaterialBudgetExceeded"
     MultiSourceStagnated = "MultiSourceStagnated"
+    BoundaryEscapeInfeasible = "BoundaryEscapeInfeasible"
+    GlobalCongestionUnresolved = "GlobalCongestionUnresolved"
+    DetailedCongestionUnresolved = "DetailedCongestionUnresolved"
+    RepeaterAccessInfeasible = "RepeaterAccessInfeasible"
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,7 @@ class RoutingFailure:
     Locations: tuple[tuple[int, int, int], ...] = ()
     RepairActions: tuple[str, ...] = ()
     Detail: str = ""
+    Diagnostics: dict[str, object] | None = None
 
     def ToDictionary(self) -> dict[str, object]:
         return asdict(self)

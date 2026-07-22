@@ -1,5 +1,10 @@
 # Open-Source-Informed Router Rewrite Design
 
+> **Historical design notice (2026-07-21):** This document preserves the design
+> lineage that informed earlier policies. The
+> [router reliability design](RouterReliabilityDesignDoc.md) controls the v10
+> implementation and compatibility behavior.
+
 ## Objective
 
 Create a two-stage, iterative routing architecture for the Redstone compiler that pulls proven ideas from open-source physical-design flows (OpenROAD + VTR) while keeping current correctness and output semantics.

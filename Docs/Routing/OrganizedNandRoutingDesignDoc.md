@@ -1,5 +1,10 @@
 # Organized NAND Routing Design
 
+> **Historical checkpoint notice (2026-07-21):** The v4-v8 architecture and
+> dated results below remain useful history. Current v10 behavior and open gates
+> are defined by the [router reliability design](RouterReliabilityDesignDoc.md)
+> and [reliability guide](RouterReliabilityGuide.md).
+
 ## Status
 
 Implemented architecture for `physical-design-v4-organized-nand`, with release
@@ -84,8 +89,7 @@ The native evaluator supports NAND, AND, OR, XOR, NOT, and BUFFER reference
 instructions, while the placed program remains NAND-only. `.PhysicalDesign.json`
 records `SimulationBackend` and `SimulationRuntimeSeconds`.
 
-The design addresses the remaining FullAdder density problem measured on
-2026-07-19:
+## Current measured density (2026-07-19)
 
 | Metric | Current rewrite | Phase C target |
 |---|---:|---:|
@@ -103,6 +107,41 @@ composition: the five global extensions (`A`, `B`, `CarryIn`, `NandNet0`, and
 `NandNet3`) dominate the 105 routed cells. With 67 component-owned functional blocks,
 the 60% component-majority gate requires routing-owned functional blocks to
 fall to approximately 44 or fewer. Penalty tuning alone cannot close that gap.
+
+## Annotation and refresh legalization
+
+The canonical block-map writer places I/O signs only after component, support,
+wire, and repeater material has been finalized. It searches deterministic local
+rings first and an unbounded exterior lane second, so every routed `INPUT` and
+`OUTPUT` receives one supported sign without allowing later route material to
+overwrite it.
+
+Repeater reservation now selects the latest preferred legal point before signal
+strength expires. After a fanout tree is merged, a deterministic pruning pass
+removes each reservation that is not required to power every sink. The pruning
+test and final materialization validation share the exact directed propagation
+implementation used by physical truth-table simulation. The local-first policy
+also carries an explicit repeater penalty so equally legal candidate trees favor
+fewer delay elements.
+
+## Adaptive-assignment v7 amendment (2026-07-19)
+
+Rust assignment results now distinguish `BudgetExhausted` from an exhaustively
+incompatible candidate set. Python grows the MRV work ceiling only for the
+former. The latter immediately regenerates geometry at the next adaptive level,
+which also grows layers, portals, lanes, and retained candidate diversity. Layer
+growth is driven by detailed assignment failure as well as coarse overflow.
+
+Placement attempts share one end-to-end routing deadline. Placement ranking now
+orders measured guide overflow and pin-access conflicts before packed density,
+and routing-spacing feedback includes both tighter and wider alternatives.
+
+Exact template electrical isolation is now a placement and pre-routing
+invariant. Component templates may not occupy the electrical neighborhood of
+another template. This closes a stateful Minecraft failure that the former
+steady-state gate-level truth table missed: `InputA` in the packed FullAdder was
+adjacent to `NandGate0`, allowing update-dependent behavior after a lever cycle.
+
 
 ## Design objective
 

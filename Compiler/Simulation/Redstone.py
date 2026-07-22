@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from heapq import heappop, heappush
+import os
 from itertools import product
 from pathlib import Path
 from time import monotonic
@@ -18,6 +18,7 @@ from ..Routing.Actions import (
     BuildPhysicalGraphs,
     BuildRoutingResources,
     FindFlatRouteConflicts,
+    PropagateRoutePower,
     ValidatePhysicalRoutes,
     ValidateTemplateIsolation,
 )
@@ -106,19 +107,6 @@ def EvaluateLogicModule(
     return Values
 
 
-def RepeaterOutputDelta(Facing: str) -> Position:
-    """Return signal travel direction for the compiler's repeater states."""
-    try:
-        return {
-            "west": (1, 0, 0),
-            "east": (-1, 0, 0),
-            "north": (0, 0, 1),
-            "south": (0, 0, -1),
-        }[Facing]
-    except KeyError as Error:
-        raise ValueError(f"Unsupported repeater facing {Facing}") from Error
-
-
 def SimulatePoweredNet(
     Root: Position,
     Graph: dict[Position, list[Position]],
@@ -127,56 +115,7 @@ def SimulatePoweredNet(
     """Propagate redstone strength through dust and directed repeaters."""
     if Root not in Graph:
         raise ValueError(f"Routed signal root is missing at {Root}")
-    Powers = {Root: 15}
-    Pending: list[tuple[int, Position]] = [(-15, Root)]
-    while Pending:
-        NegativePower, Current = heappop(Pending)
-        Power = -NegativePower
-        if Power != Powers.get(Current):
-            continue
-        CurrentFacing = Repeaters.get(Current)
-        if CurrentFacing is not None:
-            Delta = RepeaterOutputDelta(CurrentFacing)
-            OutputPosition = (
-                Current[0] + Delta[0],
-                Current[1] + Delta[1],
-                Current[2] + Delta[2],
-            )
-            Neighbors = (
-                (OutputPosition, 15)
-                if OutputPosition in Graph[Current]
-                else ()
-            )
-            CandidateValues = (
-                [Neighbors]
-                if Neighbors
-                else []
-            )
-        else:
-            CandidateValues = []
-            for Neighbor in Graph[Current]:
-                NeighborFacing = Repeaters.get(Neighbor)
-                if NeighborFacing is not None:
-                    Delta = RepeaterOutputDelta(NeighborFacing)
-                    InputPosition = (
-                        Neighbor[0] - Delta[0],
-                        Neighbor[1] - Delta[1],
-                        Neighbor[2] - Delta[2],
-                    )
-                    if Current != InputPosition or Power <= 0:
-                        continue
-                    CandidatePower = 15
-                else:
-                    CandidatePower = Power - 1
-                if CandidatePower > 0:
-                    CandidateValues.append((Neighbor, CandidatePower))
-
-        for Neighbor, CandidatePower in CandidateValues:
-            if CandidatePower <= Powers.get(Neighbor, 0):
-                continue
-            Powers[Neighbor] = CandidatePower
-            heappush(Pending, (-CandidatePower, Neighbor))
-    return Powers
+    return PropagateRoutePower(Root, Graph, Repeaters)
 
 
 def BuildPhysicalDeliveryMap(
@@ -433,7 +372,10 @@ def SimulateRoutedTruthTable(
     Started = monotonic()
     PhysicalModule = RoutedDesign.Module
     ReferenceModule = ReferenceModule or PhysicalModule
-    if EvaluateLogicPrograms is None:
+    if (
+        EvaluateLogicPrograms is None
+        or os.environ.get("RCS_FORCE_PYTHON_SIMULATION") == "1"
+    ):
         return SimulateRoutedTruthTablePython(RoutedDesign, ReferenceModule)
     InputNames = tuple(ReferenceModule.Inputs)
     OutputNames = tuple(ReferenceModule.Outputs)

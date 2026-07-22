@@ -23,6 +23,15 @@ from Templates import LitematicTemplates
 LITEMATIC_VERSION = 7
 LITEMATIC_SUBVERSION = 1
 MINECRAFT_DATA_VERSION = 4903
+TRACE_PALETTE = (
+    "minecraft:light_gray_concrete",
+    "minecraft:yellow_concrete",
+    "minecraft:green_concrete",
+    "minecraft:light_blue_concrete",
+    "minecraft:red_concrete",
+    "minecraft:orange_concrete",
+    "minecraft:magenta_concrete",
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,122 @@ class LitematicBuild:
     Provenance: dict[tuple[int, int, int], BlockProvenance]
     Signs: list[tuple[tuple[int, int, int], str]]
     Composition: BlockCompositionMetrics
+
+
+def _PlaceIoSigns(
+    RoutedDesign: Any,
+    Blocks: dict[tuple[int, int, int], dict[str, Any]],
+    Provenance: dict[tuple[int, int, int], BlockProvenance],
+    SupportState: dict[str, Any],
+    SupportSignalByPosition: dict[tuple[int, int, int], str],
+    NetSignalColors: dict[str, str],
+) -> list[tuple[tuple[int, int, int], str]]:
+    """Place one supported, non-overwritten sign for every routed I/O cell."""
+    Signs: list[tuple[tuple[int, int, int], str]] = []
+    NonSupportingBlocks = {
+        "minecraft:air",
+        "minecraft:lever",
+        "minecraft:oak_sign",
+        "minecraft:redstone_torch",
+        "minecraft:redstone_wall_torch",
+        "minecraft:redstone_wire",
+        "minecraft:repeater",
+    }
+
+    def IsOccupiedByGate(Position: tuple[int, int, int]) -> bool:
+        X, _Y, Z = Position
+        return any(
+            Gate.X <= X < Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+            and Gate.Z <= Z < Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+            for Gate in RoutedDesign.PlacedGates
+        )
+
+    def CanPlace(Position: tuple[int, int, int]) -> bool:
+        if Position in Blocks or IsOccupiedByGate(Position):
+            return False
+        SupportPosition = (Position[0], Position[1] - 1, Position[2])
+        Support = Blocks.get(SupportPosition)
+        return Support is None or Support["Name"] not in NonSupportingBlocks
+
+    def CandidatePositions(
+        Pin: tuple[int, int, int],
+        PrimaryDirection: tuple[int, int, int],
+    ):
+        PinX, PinY, PinZ = Pin
+        Preferred = (PrimaryDirection[0], PrimaryDirection[2])
+        for Radius in range(1, 9):
+            Ring = [
+                (DeltaX, DeltaZ)
+                for DeltaX in range(-Radius, Radius + 1)
+                for DeltaZ in range(-Radius, Radius + 1)
+                if max(abs(DeltaX), abs(DeltaZ)) == Radius
+            ]
+            Ring.sort(
+                key=lambda Offset: (
+                    Offset != (Preferred[0] * Radius, Preferred[1] * Radius),
+                    abs(Offset[0] - Preferred[0] * Radius)
+                    + abs(Offset[1] - Preferred[1] * Radius),
+                    Offset,
+                )
+            )
+            for DeltaX, DeltaZ in Ring:
+                yield (PinX + DeltaX, PinY, PinZ + DeltaZ)
+
+        # The bounded local search keeps normal layouts compact. The exterior
+        # search is deliberately unbounded so an annotation can never vanish
+        # merely because routing filled the nearby cells.
+        MinimumX = min(Position[0] for Position in Blocks)
+        MaximumX = max(Position[0] for Position in Blocks)
+        MinimumZ = min(Position[2] for Position in Blocks)
+        MaximumZ = max(Position[2] for Position in Blocks)
+        Distance = 1
+        while True:
+            for X in range(MinimumX - Distance, MaximumX + Distance + 1):
+                yield (X, PinY, MinimumZ - Distance)
+            for X in range(MinimumX - Distance, MaximumX + Distance + 1):
+                yield (X, PinY, MaximumZ + Distance)
+            for Z in range(MinimumZ - (Distance - 1), MaximumZ + (Distance - 1) + 1):
+                yield (MinimumX - Distance, PinY, Z)
+            for Z in range(MinimumZ - (Distance - 1), MaximumZ + (Distance - 1) + 1):
+                yield (MaximumX + Distance, PinY, Z)
+            Distance += 1
+
+    for Gate in RoutedDesign.PlacedGates:
+        if Gate.Kind not in ("INPUT", "OUTPUT") or not Gate.Outputs:
+            continue
+        if Gate.Kind == "INPUT":
+            if Gate.OutputPin is None or Gate.OutputDirection is None:
+                raise ValueError(f"INPUT cell {Gate.Name} has no routed output pin")
+            SignalName = Gate.Outputs[0]
+            Prefix = "IN"
+            Pin = Gate.OutputPin
+            PrimaryDirection = Gate.OutputDirection
+        else:
+            if not Gate.InputPins or not Gate.InputDirections:
+                raise ValueError(f"OUTPUT cell {Gate.Name} has no routed input pin")
+            SignalName = Gate.Inputs[0]
+            Prefix = "OUT"
+            Pin = Gate.InputPins[0]
+            PrimaryDirection = tuple(-Value for Value in Gate.InputDirections[0])
+
+        SignPosition = next(
+            Position
+            for Position in CandidatePositions(Pin, PrimaryDirection)
+            if CanPlace(Position)
+        )
+        SupportPosition = (SignPosition[0], SignPosition[1] - 1, SignPosition[2])
+        if SupportPosition not in Blocks:
+            Signal = SupportSignalByPosition.get(SupportPosition)
+            Blocks[SupportPosition] = (
+                {"Name": NetSignalColors[Signal]}
+                if Signal is not None
+                else SupportState
+            )
+            Provenance[SupportPosition] = BlockProvenance.RouteSupport
+        Blocks[SignPosition] = {"Name": "minecraft:oak_sign"}
+        Provenance[SignPosition] = BlockProvenance.Annotation
+        Signs.append((SignPosition, f"{Prefix} {SignalName}"))
+    return Signs
 
 
 def ReadString(Data: bytes, Offset: int) -> tuple[str, int]:
@@ -443,7 +568,27 @@ def StateTag(State: dict[str, Any]) -> dict[str, NbtValue]:
     return Result
 
 
-def BuildLitematicBlockMap(RoutedDesign: Any) -> LitematicBuild:
+def _NormalizeTracePalette(
+    TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, ...]:
+    if TraceSupportBlocks is None:
+        return TRACE_PALETTE
+    if isinstance(TraceSupportBlocks, (tuple, list)):
+        Normalized = tuple(
+            str(Block).strip()
+            for Block in TraceSupportBlocks
+            if str(Block).strip()
+        )
+        return Normalized or TRACE_PALETTE
+    raise TypeError(
+        "Trace support blocks must be a tuple/list of block IDs or omitted",
+    )
+
+
+def BuildLitematicBlockMap(
+    RoutedDesign: Any,
+    TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
+) -> LitematicBuild:
     """Render the exact final block map and retain ownership provenance."""
     Templates = {
         Name.upper(): LoadTemplate(PathValue)
@@ -452,8 +597,20 @@ def BuildLitematicBlockMap(RoutedDesign: Any) -> LitematicBuild:
     Blocks: dict[tuple[int, int, int], dict[str, Any]] = {}
     Provenance: dict[tuple[int, int, int], BlockProvenance] = {}
     Signs: list[tuple[tuple[int, int, int], str]] = []
-    RoutedPositions = set(RoutedDesign.Wires)
     SignalValues = SimulateDefaultSignals(RoutedDesign)
+    SignalList = sorted(RoutedDesign.NetWires)
+    TracePalette = _NormalizeTracePalette(
+        TraceSupportBlocks
+        or getattr(RoutedDesign, "TraceSupportBlocks", None)
+    )
+    NetSignalColors = {
+        Signal: TracePalette[SignalIndex % len(TracePalette)]
+        for SignalIndex, Signal in enumerate(SignalList)
+    }
+    SupportSignalByPosition: dict[tuple[int, int, int], str] = {}
+    for Signal in SignalList:
+        for X, Y, Z in RoutedDesign.NetWires[Signal]:
+            SupportSignalByPosition[(X, Y - 1, Z)] = Signal
 
     for Gate in RoutedDesign.PlacedGates:
         Template = Templates[Gate.Kind]
@@ -482,82 +639,14 @@ def BuildLitematicBlockMap(RoutedDesign: Any) -> LitematicBuild:
                 if Gate.Kind == "NAND"
                 else BlockProvenance.IoCell
             )
-        # Raised I/O signs are intentionally omitted: flat layouts guarantee
-        # one electrical layer above one support floor.
-    def IsOccupiedByGate(Position: tuple[int, int, int]) -> bool:
-        X, _, Z = Position
-        return any(
-            Gate.X <= X < Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
-            and Gate.Z <= Z < Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
-            for Gate in RoutedDesign.PlacedGates
-        )
-
-    for Gate in RoutedDesign.PlacedGates:
-        if Gate.Kind not in ("INPUT", "OUTPUT"):
-            continue
-        if not Gate.Outputs:
-            continue
-        SignalName = (
-            Gate.Outputs[0]
-            if Gate.Kind == "INPUT"
-            else Gate.Inputs[0]
-        )
-        Prefix = "IN" if Gate.Kind == "INPUT" else "OUT"
-        if Gate.Kind == "INPUT":
-            if Gate.OutputPin is None or Gate.OutputDirection is None:
-                continue
-            Pin = Gate.OutputPin
-            PrimaryDirection = Gate.OutputDirection
-        else:
-            if not Gate.InputPins or not Gate.InputDirections:
-                continue
-            Pin = Gate.InputPins[0]
-            PrimaryDirection = (
-                -Gate.InputDirections[0][0],
-                -Gate.InputDirections[0][1],
-                -Gate.InputDirections[0][2],
-            )
-        PinX, PinY, PinZ = Pin
-        SearchOffsets = [
-            (PrimaryDirection[0], PrimaryDirection[2]),
-            (0, 0),
-            (1, 0),
-            (-1, 0),
-            (0, 1),
-            (0, -1),
-            (1, 1),
-            (1, -1),
-            (-1, 1),
-            (-1, -1),
-        ]
-        SignPosition = None
-        for Radius in range(4):
-            for OffsetX, OffsetZ in SearchOffsets:
-                Candidate = (
-                    PinX + OffsetX * (Radius + 1),
-                    PinY,
-                    PinZ + OffsetZ * (Radius + 1),
-                )
-                if Candidate in Blocks:
-                    continue
-                if Candidate in RoutedPositions:
-                    continue
-                if IsOccupiedByGate(Candidate):
-                    continue
-                SignPosition = Candidate
-                break
-            if SignPosition is not None:
-                break
-        if SignPosition is not None:
-            Signs.append((SignPosition, f"{Prefix} {SignalName}"))
 
     SupportBlock = getattr(
         RoutedDesign,
         "SupportBlock",
-        "minecraft:smooth_stone",
+        "minecraft:light_gray_concrete",
     )
     if not SupportBlock:
-        SupportBlock = "minecraft:smooth_stone"
+        SupportBlock = "minecraft:light_gray_concrete"
     SupportState = {"Name": SupportBlock}
 
     # Support only components that require a floor block. Solid template
@@ -581,22 +670,23 @@ def BuildLitematicBlockMap(RoutedDesign: Any) -> LitematicBuild:
                     Gate.Z + LocalPosition[2],
                 )
                 if SupportPosition not in Blocks:
-                    Blocks[SupportPosition] = SupportState
+                    Signal = SupportSignalByPosition.get(SupportPosition)
+                    Blocks[SupportPosition] = (
+                        {"Name": NetSignalColors[Signal]}
+                        if Signal is not None
+                        else SupportState
+                    )
                     Provenance[SupportPosition] = BlockProvenance.RouteSupport
 
     for Position in RoutedDesign.Supports:
         if Position not in Blocks:
-            Blocks[Position] = SupportState
+            Signal = SupportSignalByPosition.get(Position)
+            Blocks[Position] = (
+                {"Name": NetSignalColors[Signal]}
+                if Signal is not None
+                else SupportState
+            )
             Provenance[Position] = BlockProvenance.RouteSupport
-
-    for Position, _ in Signs:
-        SupportPosition = (Position[0], Position[1] - 1, Position[2])
-        if SupportPosition not in Blocks:
-            Blocks[SupportPosition] = SupportState
-            Provenance[SupportPosition] = BlockProvenance.RouteSupport
-        if Position not in Blocks:
-            Blocks[Position] = {"Name": "minecraft:oak_sign"}
-            Provenance[Position] = BlockProvenance.Annotation
 
     for Signal, Positions in RoutedDesign.NetWires.items():
         NetCells = set(Positions)
@@ -629,6 +719,15 @@ def BuildLitematicBlockMap(RoutedDesign: Any) -> LitematicBuild:
         }
         Provenance.setdefault(Position, BlockProvenance.RouteRefresh)
 
+    Signs = _PlaceIoSigns(
+        RoutedDesign,
+        Blocks,
+        Provenance,
+        SupportState,
+        SupportSignalByPosition,
+        NetSignalColors,
+    )
+
     if not Blocks:
         raise ValueError("Cannot build an empty litematic")
     MinimumX = min(Position[0] for Position in Blocks)
@@ -645,15 +744,14 @@ def BuildLitematicBlockMap(RoutedDesign: Any) -> LitematicBuild:
     AnnotationBlocks = Ownership[BlockProvenance.Annotation.value]
     SupportBlocks = sum(
         1
-        for Position, State in Blocks.items()
-        if State["Name"] == SupportBlock
-        and Provenance[Position] != BlockProvenance.Annotation
+        for Position in Blocks
+        if Provenance[Position] == BlockProvenance.RouteSupport
     )
     FunctionalPositions = {
         Position
         for Position, State in Blocks.items()
-        if State["Name"] != SupportBlock
-        and Provenance[Position] != BlockProvenance.Annotation
+        if Provenance[Position]
+        not in {BlockProvenance.RouteSupport, BlockProvenance.Annotation}
     }
     ComponentProvenance = {
         BlockProvenance.NandCell,

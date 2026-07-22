@@ -1,5 +1,9 @@
 # Hierarchical Region Router Design
 
+> **Future-design notice (2026-07-21):** This is a proposed hierarchical
+> direction, not the active PCB router. Current implementation requirements are
+> in the [router reliability design](Docs/Routing/RouterReliabilityDesignDoc.md).
+
 ## Purpose
 
 Build compact, orderly redstone designs by recognizing repeated logical

@@ -1,5 +1,10 @@
 # Router SLO and Gate-to-Gate Routing Targets
 
+> **Historical SLO notice (2026-07-21):** Earlier policy checkpoints remain
+> below for traceability. The active acceptance matrix and verdict are in the
+> [router reliability guide](RouterReliabilityGuide.md); its gates control when
+> historical text conflicts.
+
 ## Purpose
 
 Define quality targets that keep routing from dominating while preserving correctness.
@@ -277,3 +282,55 @@ Rust tests passing.
 
 Evidence:
 `Output/Benchmarks/2026-07-19/ParallelSimulation`.
+
+### Adaptive assignment and stateful-isolation checkpoint (2026-07-19)
+
+The Rust MRV solver now reports whether it actually hit its expansion ceiling.
+An exhaustive 23-choice failure no longer causes repeated identical searches at
+larger nominal limits; it regenerates routing geometry instead. The CLA4 gate
+remains open: the routability-first retained run exhaustively rejected two
+candidate sets, then reached the shared candidate-generation deadline in
+`121.08s` (maximum RSS `1,738,368 KiB`). This is a measured failure, not an
+accepted CLA artifact.
+
+The FullAdder placement additionally failed a newly added exact template
+electrical-isolation audit: `InputA` touched `NandGate0` electrical clearance.
+The legalizer now rejects that placement. The replacement FullAdder has zero
+template electrical conflicts, passes 8/8 rows, and reports `runtime=2.297s`,
+`length=107`, `bends=27`, `vias=28`, `overflow_peak=0`, `footprint=490`, and
+`350` exact non-air blocks. RCA4 remains correct at 512/512 with zero conflicts,
+`runtime=9.244s`, `length=472`, `bends=129`, `vias=133`, and `overflow_peak=1`.
+
+Automated validation is 59 Python tests passing with 2 opt-in scale tests
+skipped and 9 Rust tests passing. Manual Minecraft lever on-to-off reset remains
+an open verification item because the current simulator checks directed signal
+delivery and steady-state NAND logic, not block-update scheduling.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/StatefulResetFix` and
+`Output/Benchmarks/2026-07-19/AdaptiveClaEscalationFix/Cla4RoutabilityFirst.log`.
+
+### Length-first material compaction checkpoint (2026-07-19)
+
+The authoritative cleanup sweep now ranks complete capacity-one selections by
+route length before bends and vias.  Legality, ownership, corridor overflow,
+template isolation, and physical simulation remain hard gates.  Against the
+stateful-isolation checkpoint, FullAdder improves from `length=107`, `350`
+non-air blocks, and `footprint=490` to `length=102`, `340` blocks, and
+`footprint=476`.  RCA4 improves from `length=472`, `1455` blocks, and `716`
+support blocks to `length=452`, `1415` blocks, and `696` support blocks.
+
+Three retained runs are deterministic in physical metrics. FullAdder runtimes
+are `2.293s`, `2.292s`, and `2.263s` (median `2.292s`, maximum median deviation
+`1.27%`), with 8/8 rows, zero conflicts/unresolved claims, and
+`overflow_peak=1`. RCA4 runtimes are `9.225s`, `9.177s`, and `9.165s` (median
+`9.177s`, maximum median deviation `0.52%`), with 512/512 rows, zero
+conflicts/unresolved claims, and `overflow_peak=1`.
+
+The material reduction trades some shape complexity: FullAdder bends increase
+`27 -> 33` while vias decrease `28 -> 24`; RCA4 bends increase `129 -> 136`
+while vias decrease `133 -> 129`. Phase C remains open because the component,
+routing, dust, and maximum-net-share gates are not met, and manual Minecraft
+reset behavior is still unverified.
+
+Evidence: `Output/Benchmarks/2026-07-19/CompactionV8`.

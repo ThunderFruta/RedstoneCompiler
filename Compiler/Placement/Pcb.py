@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import deque
+from functools import lru_cache
 from hashlib import sha256
 from itertools import permutations
 from math import ceil, sqrt
 from statistics import median
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from .Rotation import RotatedCellSize
 from .Geometry import (
@@ -21,14 +22,417 @@ from .Geometry import (
 from ..Routing.Technology import DefaultRedstoneRoutingTechnology
 from ..Routing.Policy import ClusteringPolicy, NandPackingPolicy, PlacementPolicy
 from ..Routing.Actions.Geometry import BuildPlacedCellGeometry
-from ..Routing.Actions.Validation import ValidateTemplateIsolation
+from ..Routing.Actions.Validation import (
+    BuildPhysicalGraphs,
+    ValidatePhysicalRoutes,
+    ValidateTemplateIsolation,
+)
+from ..Routing.Failures import (
+    RoutingFailure,
+    RoutingFailureReason,
+    RoutingStageError,
+)
 from ..Routing.ResourceGraph import (
     FindClaimConflicts,
     LocalRouteClaim,
     NormalizeRoutingEdge,
+    RoutingResourceClaims,
     RoutingResourceGraph,
     ValidateLocalRouteClaims,
 )
+
+
+@dataclass(frozen=True)
+class BoundaryDemandRecord:
+    """Required cluster-boundary resources for one unresolved signal."""
+
+    Signal: str
+    UnresolvedTargets: int
+    RequiredPortalSlots: int
+    RequiredCorridorLanes: int
+    PreferredBoundarySide: str
+
+
+@dataclass(frozen=True)
+class BoundaryCapacityRecord:
+    """Physically available escape capacity on one cluster boundary."""
+
+    BoundarySide: str
+    LegalPortalSlots: int
+    LegalCorridorLanes: int
+    Overflow: int
+
+
+@dataclass(frozen=True)
+class HardBoundaryFeasibility:
+    """Exact necessary conditions for retaining one placement boundary."""
+
+    ClusterId: int
+    RequiredSignals: tuple[str, ...]
+    LegalEscapeSlotsBySignal: tuple[
+        tuple[str, tuple[tuple[int, int, int], ...]], ...
+    ]
+    MatchedEntrances: tuple[
+        tuple[str, tuple[int, int, int]], ...
+    ]
+    UniqueLegalSlotCount: int
+    RejectionReasons: tuple[str, ...]
+
+    @property
+    def IsFeasible(self) -> bool:
+        return not self.RejectionReasons
+
+
+def EvaluateHardBoundaryFeasibility(
+    ClusterId: int,
+    DemandRecords: tuple[BoundaryDemandRecord, ...],
+    LegalEscapeSlotsBySignal: dict[
+        str, set[tuple[int, int, int]] | tuple[tuple[int, int, int], ...]
+    ],
+) -> HardBoundaryFeasibility:
+    """Prove only no-escape and capacity-one entrance impossibility.
+
+    Fanout and preferred-side overflow are deliberately excluded. One global
+    tree may branch after entering a cluster, so they remain ranking signals
+    rather than hard rejection conditions.
+    """
+    RequiredSignals = tuple(sorted({
+        Record.Signal
+        for Record in DemandRecords
+        if Record.RequiredPortalSlots > 0
+    }))
+    NormalizedSlots = {
+        Signal: tuple(sorted(set(LegalEscapeSlotsBySignal.get(Signal, ()))))
+        for Signal in RequiredSignals
+    }
+    SlotOwner: dict[tuple[int, int, int], str] = {}
+    MatchedSlotBySignal: dict[str, tuple[int, int, int]] = {}
+
+    def TryAssign(
+        Signal: str,
+        SeenSlots: set[tuple[int, int, int]],
+    ) -> bool:
+        for Slot in NormalizedSlots[Signal]:
+            if Slot in SeenSlots:
+                continue
+            SeenSlots.add(Slot)
+            ExistingSignal = SlotOwner.get(Slot)
+            if ExistingSignal is not None and not TryAssign(
+                ExistingSignal,
+                SeenSlots,
+            ):
+                continue
+            SlotOwner[Slot] = Signal
+            MatchedSlotBySignal[Signal] = Slot
+            return True
+        return False
+
+    for Signal in sorted(
+        RequiredSignals,
+        key=lambda Value: (len(NormalizedSlots[Value]), Value),
+    ):
+        TryAssign(Signal, set())
+
+    NoEscapeSignals = tuple(
+        Signal for Signal in RequiredSignals if not NormalizedSlots[Signal]
+    )
+    RejectionReasons = [
+        f"NoBoundaryEscape:Cluster={ClusterId}:Signal={Signal}"
+        for Signal in NoEscapeSignals
+    ]
+    UnmatchedSignals = tuple(
+        Signal
+        for Signal in RequiredSignals
+        if Signal not in MatchedSlotBySignal
+    )
+    UniqueLegalSlots = {
+        Slot
+        for Signal in RequiredSignals
+        for Slot in NormalizedSlots[Signal]
+    }
+    if UnmatchedSignals and not NoEscapeSignals:
+        RejectionReasons.append(
+            "HardEntranceCapacityExceeded:"
+            f"Cluster={ClusterId}:Required={len(RequiredSignals)}:"
+            f"Matched={len(MatchedSlotBySignal)}:"
+            f"UniqueSlots={len(UniqueLegalSlots)}:"
+            f"Unmatched={','.join(UnmatchedSignals)}"
+        )
+    return HardBoundaryFeasibility(
+        ClusterId=ClusterId,
+        RequiredSignals=RequiredSignals,
+        LegalEscapeSlotsBySignal=tuple(
+            (Signal, NormalizedSlots[Signal])
+            for Signal in RequiredSignals
+        ),
+        MatchedEntrances=tuple(sorted(MatchedSlotBySignal.items())),
+        UniqueLegalSlotCount=len(UniqueLegalSlots),
+        RejectionReasons=tuple(RejectionReasons),
+    )
+
+
+def ValidateHardBoundaryFeasibility(
+    Result: HardBoundaryFeasibility,
+) -> None:
+    """Reject before a staged placement or local claim can be retained."""
+    if Result.IsFeasible:
+        return
+    SlotsBySignal = dict(Result.LegalEscapeSlotsBySignal)
+    NoEscapeSignals = tuple(
+        Signal
+        for Signal in Result.RequiredSignals
+        if not SlotsBySignal.get(Signal)
+    )
+    MatchedSignals = {
+        Signal for Signal, _Slot in Result.MatchedEntrances
+    }
+    AffectedSignals = NoEscapeSignals or tuple(
+        Signal
+        for Signal in Result.RequiredSignals
+        if Signal not in MatchedSignals
+    )
+    Reason = (
+        RoutingFailureReason.NoBoundaryEscape
+        if NoEscapeSignals
+        else RoutingFailureReason.ClusterEntranceBudgetExceeded
+    )
+    raise RoutingStageError(
+        RoutingFailure(
+            Reason=Reason,
+            Stage="PlacementBoundaryFeasibility",
+            AffectedNets=AffectedSignals,
+            Detail=(
+                "Hard boundary infeasible: "
+                + "; ".join(Result.RejectionReasons)
+            ),
+            Diagnostics={
+                "ClusterId": Result.ClusterId,
+                "RequiredSignals": list(Result.RequiredSignals),
+                "MatchedEntrances": [
+                    [Signal, list(Slot)]
+                    for Signal, Slot in Result.MatchedEntrances
+                ],
+                "UniqueLegalSlotCount": Result.UniqueLegalSlotCount,
+                "RejectionReasons": list(Result.RejectionReasons),
+            },
+        )
+    )
+
+
+def BuildBoundaryCapacityRecords(
+    DemandRecords: tuple[BoundaryDemandRecord, ...],
+    GeometricCapacityBySide: dict[str, int],
+    LegalPortalSlotsBySide: dict[str, int],
+) -> tuple[BoundaryCapacityRecord, ...]:
+    """Measure soft corridor capacity through physically legal portal slots."""
+    RequiredBySide = {
+        Side: sum(
+            Record.RequiredCorridorLanes
+            for Record in DemandRecords
+            if Record.PreferredBoundarySide == Side
+        )
+        for Side in ("West", "East", "North", "South")
+    }
+    Records = []
+    for Side in ("West", "East", "North", "South"):
+        LegalPortalSlots = max(0, LegalPortalSlotsBySide.get(Side, 0))
+        GeometricCorridorLanes = max(
+            0,
+            GeometricCapacityBySide.get(Side, 0),
+        )
+        LegalCorridorLanes = min(
+            GeometricCorridorLanes,
+            LegalPortalSlots,
+        )
+        Records.append(
+            BoundaryCapacityRecord(
+                BoundarySide=Side,
+                LegalPortalSlots=LegalPortalSlots,
+                LegalCorridorLanes=LegalCorridorLanes,
+                Overflow=max(
+                    0,
+                    RequiredBySide[Side] - LegalCorridorLanes,
+                ),
+            )
+        )
+    return tuple(Records)
+
+
+def AssignBoundaryDemandSides(
+    DemandRecords: tuple[BoundaryDemandRecord, ...],
+    LegalEscapeSlotsBySignal: dict[
+        str, set[tuple[int, int, int]] | tuple[tuple[int, int, int], ...]
+    ],
+    Bounds: tuple[int, int, int, int],
+    CorridorCapacityBySide: dict[str, int],
+) -> tuple[BoundaryDemandRecord, ...]:
+    """Assign packed boundary signals to legal sides without lane overflow."""
+    if not DemandRecords:
+        return ()
+    MinimumX, MaximumX, MinimumZ, MaximumZ = Bounds
+    SideOrder = ("West", "East", "North", "South")
+
+    def SlotSide(Position: tuple[int, int, int]) -> str:
+        X, _Y, Z = Position
+        return min(
+            (
+                (abs(X - MinimumX), 0, "West"),
+                (abs(X - MaximumX), 1, "East"),
+                (abs(Z - MinimumZ), 2, "North"),
+                (abs(Z - MaximumZ), 3, "South"),
+            )
+        )[2]
+
+    AvailableSides = {
+        Record.Signal: tuple(
+            Side
+            for Side in SideOrder
+            if Side in {
+                SlotSide(Position)
+                for Position in LegalEscapeSlotsBySignal.get(Record.Signal, ())
+            }
+            and CorridorCapacityBySide.get(Side, 0) > 0
+        )
+        for Record in DemandRecords
+    }
+    PreferredUsage = {
+        Side: sum(
+            Record.PreferredBoundarySide == Side
+            for Record in DemandRecords
+        )
+        for Side in SideOrder
+    }
+    if all(
+        Record.PreferredBoundarySide in AvailableSides[Record.Signal]
+        for Record in DemandRecords
+    ) and all(
+        PreferredUsage[Side] <= CorridorCapacityBySide.get(Side, 0)
+        for Side in SideOrder
+    ):
+        return DemandRecords
+    OrderedRecords = sorted(
+        DemandRecords,
+        key=lambda Record: (
+            len(AvailableSides[Record.Signal]),
+            -Record.UnresolvedTargets,
+            Record.Signal,
+        ),
+    )
+    Usage = {Side: 0 for Side in SideOrder}
+    Assignment: dict[str, str] = {}
+    Best: tuple[int, tuple[str, ...], dict[str, str]] | None = None
+    SeenCostByState: dict[tuple[int, tuple[int, ...]], int] = {}
+
+    def Search(Index: int, PreferenceMisses: int) -> None:
+        nonlocal Best
+        State = (Index, tuple(Usage[Side] for Side in SideOrder))
+        PriorCost = SeenCostByState.get(State)
+        if PriorCost is not None and PreferenceMisses > PriorCost:
+            return
+        SeenCostByState[State] = PreferenceMisses
+        if Best is not None and PreferenceMisses > Best[0]:
+            return
+        if Index == len(OrderedRecords):
+            StableSides = tuple(
+                Assignment[Record.Signal]
+                for Record in sorted(DemandRecords, key=lambda Value: Value.Signal)
+            )
+            Candidate = (PreferenceMisses, StableSides, dict(Assignment))
+            if Best is None or Candidate[:2] < Best[:2]:
+                Best = Candidate
+            return
+        Record = OrderedRecords[Index]
+        Options = sorted(
+            AvailableSides[Record.Signal],
+            key=lambda Side: (
+                Side != Record.PreferredBoundarySide,
+                Usage[Side],
+                SideOrder.index(Side),
+            ),
+        )
+        for Side in Options:
+            if Usage[Side] >= CorridorCapacityBySide.get(Side, 0):
+                continue
+            Assignment[Record.Signal] = Side
+            Usage[Side] += 1
+            Search(
+                Index + 1,
+                PreferenceMisses + (Side != Record.PreferredBoundarySide),
+            )
+            Usage[Side] -= 1
+            del Assignment[Record.Signal]
+
+    Search(0, 0)
+    if Best is None:
+        return DemandRecords
+    Selected = Best[2]
+    return tuple(
+        BoundaryDemandRecord(
+            Signal=Record.Signal,
+            UnresolvedTargets=Record.UnresolvedTargets,
+            RequiredPortalSlots=Record.RequiredPortalSlots,
+            RequiredCorridorLanes=Record.RequiredCorridorLanes,
+            PreferredBoundarySide=Selected[Record.Signal],
+        )
+        for Record in DemandRecords
+    )
+
+
+def BuildLegalBoundaryEscapeSlots(
+    Signals: set[str],
+    AccessPositionsBySignal: dict[str, set[tuple[int, int, int]]],
+    ResourceGraph: RoutingResourceGraph,
+    FixedAccessClaimsBySignal: dict[str, RoutingResourceClaims],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, set[tuple[int, int, int]]]:
+    """Enumerate exact one-primitive exits from immutable terminal access."""
+    Result: dict[str, set[tuple[int, int, int]]] = {}
+    OrderedSignals = sorted(Signals)
+    for SignalIndex, Signal in enumerate(OrderedSignals):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "boundary-escape-signal",
+                "CompletedSignals": SignalIndex,
+                "TotalSignals": len(OrderedSignals),
+                "Signal": Signal,
+            })
+        AllowedAccess = frozenset(AccessPositionsBySignal.get(Signal, ()))
+        LegalSlots: set[tuple[int, int, int]] = set()
+        for AnchorIndex, Anchor in enumerate(sorted(AllowedAccess)):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "boundary-escape-anchor",
+                    "Signal": Signal,
+                    "CompletedAnchors": AnchorIndex,
+                    "TotalAnchors": len(AllowedAccess),
+                })
+            if not ResourceGraph.IsLegalNode(Anchor, AllowedAccess):
+                continue
+            for Neighbor in sorted(
+                DefaultRedstoneRoutingTechnology.NeighborPositions(Anchor)
+            ):
+                if not ResourceGraph.IsLegalNode(Neighbor, AllowedAccess):
+                    continue
+                Primitive = ResourceGraph.BuildPrimitive(Anchor, Neighbor)
+                if Primitive is None:
+                    continue
+                CandidateClaims = ResourceGraph.BuildRouteClaims(
+                    (Anchor, Neighbor)
+                )
+                if any(
+                    FindClaimConflicts({
+                        Signal: CandidateClaims,
+                        OtherSignal: OtherClaims,
+                    })
+                    for OtherSignal, OtherClaims in (
+                        FixedAccessClaimsBySignal.items()
+                    )
+                    if OtherSignal != Signal
+                ):
+                    continue
+                LegalSlots.add(Neighbor)
+        Result[Signal] = LegalSlots
+    return Result
 
 
 @dataclass(frozen=True)
@@ -49,6 +453,16 @@ class PackedNandCluster:
     StructuralSignature: str = ""
     ReusedFromClusterId: int | None = None
     StructuralMapping: dict[str, str] | None = None
+    StackId: int | None = None
+    StackLevel: int = 0
+    BaseY: int = 1
+    BoundaryDemand: dict[str, int] | None = None
+    EstimatedCorridorLanes: int = 0
+    LocalClaimCoverage: float = 0.0
+    BoundaryDemandRecords: tuple[BoundaryDemandRecord, ...] = ()
+    BoundaryCapacityRecords: tuple[BoundaryCapacityRecord, ...] = ()
+    BoundaryOverflow: int = 0
+    PinScarcityCount: int = 0
 
 
 @dataclass(frozen=True)
@@ -64,6 +478,10 @@ class PackedNandClusterCandidate:
     SupportBlocks: int
     Footprint: int
     RejectionReasons: tuple[str, ...] = ()
+    BoundaryDemandRecords: tuple[BoundaryDemandRecord, ...] = ()
+    BoundaryCapacityRecords: tuple[BoundaryCapacityRecord, ...] = ()
+    BoundaryOverflow: int = 0
+    LocalClaimCoverage: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -77,7 +495,10 @@ class PcbPlacement:
     PackedClusters: tuple[PackedNandCluster, ...] = ()
 
 
-def BuildTopologicalLevels(Module: Any) -> dict[str, int]:
+def BuildTopologicalLevels(
+    Module: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, int]:
     """Assign every gate to a left-to-right combinational depth."""
     Producers = {
         Signal: Gate
@@ -94,9 +515,23 @@ def BuildTopologicalLevels(Module: Any) -> dict[str, int]:
         for Gate in Module.Gates
         if Gate.Kind.value not in ("INPUT", "OUTPUT")
     ]
+    PassIndex = 0
     while Pending:
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "topological-levels",
+                "PassIndex": PassIndex,
+                "PendingGates": len(Pending),
+            })
         Remaining = []
-        for Gate in Pending:
+        for GateIndex, Gate in enumerate(Pending):
+            if WorkCheck is not None and GateIndex % 32 == 0:
+                WorkCheck({
+                    "Phase": "topological-level-gate",
+                    "PassIndex": PassIndex,
+                    "CompletedGates": GateIndex,
+                    "TotalGates": len(Pending),
+                })
             ProducerNames = [
                 Producers[Signal].Name
                 for Signal in Gate.Inputs
@@ -114,6 +549,7 @@ def BuildTopologicalLevels(Module: Any) -> dict[str, int]:
                 f"PCB placement found a combinational cycle: {Names}"
             )
         Pending = Remaining
+        PassIndex += 1
 
     OutputLevel = max(Levels.values(), default=0) + 1
     for Gate in Module.Gates:
@@ -127,8 +563,11 @@ def BuildConnectivityClusters(
     MaximumClusterSize: int = 32,
     Policy: ClusteringPolicy | None = None,
     MaximumBoundaryTerminals: int | None = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[tuple[str, ...], ...]:
     """Agglomerate strongly connected NAND gates without circuit recognition."""
+    if WorkCheck is not None:
+        WorkCheck({"Phase": "connectivity-clusters-start"})
     Internal = [Gate for Gate in Module.Gates if Gate.Kind.value == "NAND"]
     if not Internal:
         return ()
@@ -139,16 +578,31 @@ def BuildConnectivityClusters(
         for Signal in Gate.Outputs
     }
     EdgeWeights: dict[frozenset[str], int] = {}
-    for Gate in Internal:
+    for GateIndex, Gate in enumerate(Internal):
+        if WorkCheck is not None and GateIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "connectivity-cluster-edges",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Internal),
+            })
         for Signal in Gate.Inputs:
             Producer = Producers.get(Signal)
             if Producer not in InternalNames or Producer == Gate.Name:
                 continue
             Key = frozenset((Producer, Gate.Name))
             EdgeWeights[Key] = EdgeWeights.get(Key, 0) + 1
-    Levels = BuildTopologicalLevels(Module)
+    Levels = BuildTopologicalLevels(Module, WorkCheck=WorkCheck)
+    BoundaryEvaluationCount = 0
 
     def BoundaryCount(Names: set[str]) -> int:
+        nonlocal BoundaryEvaluationCount
+        BoundaryEvaluationCount += 1
+        if WorkCheck is not None and BoundaryEvaluationCount % 16 == 1:
+            WorkCheck({
+                "Phase": "connectivity-boundary-count",
+                "BoundaryEvaluationCount": BoundaryEvaluationCount,
+                "ClusterGateCount": len(Names),
+            })
         Result = 0
         for Gate in Module.Gates:
             GateInside = Gate.Name in Names
@@ -164,12 +618,27 @@ def BuildConnectivityClusters(
         return Result
 
     Clusters = {Index: {Gate.Name} for Index, Gate in enumerate(Internal)}
+    MergePass = 0
     while True:
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "connectivity-cluster-merge",
+                "MergePass": MergePass,
+                "ClusterCount": len(Clusters),
+            })
         BestPair = None
         BestScore = None
         ClusterIds = sorted(Clusters)
+        PairCount = 0
         for FirstIndex, FirstId in enumerate(ClusterIds):
             for SecondId in ClusterIds[FirstIndex + 1 :]:
+                PairCount += 1
+                if WorkCheck is not None and PairCount % 32 == 1:
+                    WorkCheck({
+                        "Phase": "connectivity-cluster-pair",
+                        "MergePass": MergePass,
+                        "CompletedPairs": PairCount - 1,
+                    })
                 First = Clusters[FirstId]
                 Second = Clusters[SecondId]
                 if len(First) + len(Second) > MaximumClusterSize:
@@ -219,6 +688,7 @@ def BuildConnectivityClusters(
             break
         FirstId, SecondId = BestPair
         Clusters[FirstId].update(Clusters.pop(SecondId))
+        MergePass += 1
 
     OriginalOrder = {
         Gate.Name: Index
@@ -233,6 +703,7 @@ def BuildConnectivityClusters(
 def AnalyzeNandClusterStructure(
     Module: Any,
     Names: tuple[str, ...],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[
     str,
     tuple[str, ...],
@@ -249,7 +720,13 @@ def AnalyzeNandClusterStructure(
         for Signal in Gate.Outputs
     }
     Consumers: dict[str, list[Any]] = {}
-    for Gate in Module.Gates:
+    for GateIndex, Gate in enumerate(Module.Gates):
+        if WorkCheck is not None and GateIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "structural-analysis-consumers",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Module.Gates),
+            })
         for Signal in Gate.Inputs:
             Consumers.setdefault(Signal, []).append(Gate)
     BoundarySignals = sorted({
@@ -263,7 +740,13 @@ def AnalyzeNandClusterStructure(
         + [*(f"G:{Name}" for Name in Names)]
     )
     Edges = set()
-    for Name in Names:
+    for NameIndex, Name in enumerate(Names):
+        if WorkCheck is not None and NameIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "structural-analysis-edges",
+                "CompletedNodes": NameIndex,
+                "TotalNodes": len(Names),
+            })
         Gate = GateByName[Name]
         for InputIndex, Signal in enumerate(Gate.Inputs):
             Producer = Producers.get(Signal)
@@ -302,6 +785,12 @@ def AnalyzeNandClusterStructure(
     InitialIds = {Value: Index for Index, Value in enumerate(sorted(InitialValues))}
     Colors = {Node: InitialIds[Initial[Node]] for Node in Nodes}
     for _Pass in range(len(Nodes) + 1):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "structural-analysis-coloring",
+                "PassIndex": _Pass,
+                "NodeCount": len(Nodes),
+            })
         Descriptors = {
             Node: (
                 Initial[Node],
@@ -334,10 +823,19 @@ def FindIsomorphicNandClusterMapping(
     ReferenceNames: tuple[str, ...],
     CandidateNames: tuple[str, ...],
     MaximumMappings: int = 4096,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[str, dict[str, str]] | None:
     """Return an exact structural gate mapping without circuit recognition."""
-    Reference = AnalyzeNandClusterStructure(Module, ReferenceNames)
-    Candidate = AnalyzeNandClusterStructure(Module, CandidateNames)
+    Reference = AnalyzeNandClusterStructure(
+        Module,
+        ReferenceNames,
+        WorkCheck=WorkCheck,
+    )
+    Candidate = AnalyzeNandClusterStructure(
+        Module,
+        CandidateNames,
+        WorkCheck=WorkCheck,
+    )
     ReferenceSignature, ReferenceNodes, ReferenceColors, ReferenceInitial, ReferenceEdges = Reference
     CandidateSignature, CandidateNodes, CandidateColors, CandidateInitial, CandidateEdges = Candidate
     if ReferenceSignature != CandidateSignature or len(ReferenceNodes) != len(CandidateNodes):
@@ -385,6 +883,13 @@ def FindIsomorphicNandClusterMapping(
         CandidateValues = sorted(CandidateGroups[Key])
         for Permutation in permutations(CandidateValues):
             AttemptCount += 1
+            if WorkCheck is not None and AttemptCount % 32 == 1:
+                WorkCheck({
+                    "Phase": "structural-mapping-search",
+                    "AttemptCount": AttemptCount,
+                    "MaximumMappings": MaximumMappings,
+                    "GroupIndex": GroupIndex,
+                })
             if AttemptCount > MaximumMappings:
                 return False
             Mapping.update(zip(ReferenceValues, Permutation))
@@ -407,6 +912,7 @@ def OptimizeClusterSlots(
     Module: Any,
     Clusters: tuple[tuple[str, ...], ...],
     Levels: dict[str, int],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[dict[int, tuple[int, int]], int, int]:
     """Place clusters on a compact grid using weighted net length."""
     Count = len(Clusters)
@@ -425,7 +931,13 @@ def OptimizeClusterSlots(
     DirectedWeights: dict[tuple[int, int], int] = {}
     InputWeights = {Index: 0 for Index in range(Count)}
     OutputWeights = {Index: 0 for Index in range(Count)}
-    for Gate in Module.Gates:
+    for GateIndex, Gate in enumerate(Module.Gates):
+        if WorkCheck is not None and GateIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "cluster-slot-net-weights",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Module.Gates),
+            })
         TargetCluster = ClusterByGate.get(Gate.Name)
         for Signal in Gate.Inputs:
             Producer = Producers[Signal]
@@ -451,6 +963,12 @@ def OptimizeClusterSlots(
     PendingClusters = sorted(Index for Index, Degree in Incoming.items() if Degree == 0)
     TopologicalClusters = []
     while PendingClusters:
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "cluster-slot-topology",
+                "CompletedClusters": len(TopologicalClusters),
+                "TotalClusters": Count,
+            })
         Current = PendingClusters.pop(0)
         TopologicalClusters.append(Current)
         for Target in sorted(Outgoing[Current]):
@@ -523,13 +1041,28 @@ def OptimizeClusterSlots(
         return Cost
 
     for _Pass in range(12):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "cluster-slot-optimization",
+                "PassIndex": _Pass,
+                "ClusterCount": Count,
+                "SlotCount": len(Slots),
+            })
         CurrentCost = PlacementCost(Assignment)
         Best = None
         BestCost = CurrentCost
         Occupied = {Slot: Index for Index, Slot in Assignment.items()}
         for ClusterIndex in range(Count):
             CurrentSlot = Assignment[ClusterIndex]
-            for Slot in Slots:
+            for SlotIndex, Slot in enumerate(Slots):
+                if WorkCheck is not None and SlotIndex % 32 == 0:
+                    WorkCheck({
+                        "Phase": "cluster-slot-candidate",
+                        "PassIndex": _Pass,
+                        "ClusterIndex": ClusterIndex,
+                        "CompletedSlots": SlotIndex,
+                        "TotalSlots": len(Slots),
+                    })
                 if IsAcyclic and Slot[0] != CurrentSlot[0]:
                     continue
                 Other = Occupied.get(Slot)
@@ -548,6 +1081,98 @@ def OptimizeClusterSlots(
             break
         Assignment = Best
     return Assignment, Columns, Rows
+
+
+def BuildRelocationClusterSet(
+    Module: Any,
+    Clusters: tuple[tuple[str, ...], ...],
+    RelocationSignals: frozenset[str] = frozenset(),
+) -> frozenset[int]:
+    """Map routing offenders to every producer/consumer cluster they touch."""
+    if not RelocationSignals:
+        return frozenset()
+    ClusterByGate = {
+        GateName: ClusterIndex
+        for ClusterIndex, Names in enumerate(Clusters)
+        for GateName in Names
+    }
+    ProducerBySignal = {
+        Signal: Gate.Name
+        for Gate in Module.Gates
+        for Signal in Gate.Outputs
+    }
+    Result: set[int] = set()
+    for Signal in RelocationSignals:
+        ProducerCluster = ClusterByGate.get(ProducerBySignal.get(Signal, ""))
+        if ProducerCluster is not None:
+            Result.add(ProducerCluster)
+        Result.update(
+            ClusterByGate[Gate.Name]
+            for Gate in Module.Gates
+            if Signal in Gate.Inputs and Gate.Name in ClusterByGate
+        )
+    return frozenset(Result)
+
+
+def PrioritizeRelocationClusters(
+    Module: Any,
+    Clusters: tuple[tuple[str, ...], ...],
+    RelocationSignals: frozenset[str] = frozenset(),
+) -> tuple[int, ...]:
+    """Rank clusters by how many reported conflict signals touch them."""
+    ClusterByGate = {
+        GateName: ClusterIndex
+        for ClusterIndex, Names in enumerate(Clusters)
+        for GateName in Names
+    }
+    ProducerBySignal = {
+        Signal: Gate.Name
+        for Gate in Module.Gates
+        for Signal in Gate.Outputs
+    }
+    Scores: dict[int, int] = {}
+    for Signal in RelocationSignals:
+        Touched = set()
+        ProducerCluster = ClusterByGate.get(ProducerBySignal.get(Signal, ""))
+        if ProducerCluster is not None:
+            Touched.add(ProducerCluster)
+        Touched.update(
+            ClusterByGate[Gate.Name]
+            for Gate in Module.Gates
+            if Signal in Gate.Inputs and Gate.Name in ClusterByGate
+        )
+        for ClusterIndex in Touched:
+            Scores[ClusterIndex] = Scores.get(ClusterIndex, 0) + 1
+    return tuple(sorted(Scores, key=lambda Value: (-Scores[Value], Value)))
+
+
+def RelocateClusterSlots(
+    Assignment: dict[int, tuple[int, int]],
+    ColumnCount: int,
+    RelocationClusters: Iterable[int],
+    StackSuppressedClusters: frozenset[int] = frozenset(),
+) -> tuple[dict[int, tuple[int, int]], int]:
+    """Move unresolved conflict clusters into deterministic dedicated columns."""
+    Result = dict(Assignment)
+    OrderedClusters = (
+        tuple(sorted(RelocationClusters))
+        if isinstance(RelocationClusters, set | frozenset)
+        else tuple(dict.fromkeys(RelocationClusters))
+    )
+    Pending = [
+        ClusterIndex
+        for ClusterIndex in OrderedClusters
+        if ClusterIndex not in StackSuppressedClusters
+    ]
+    if not Pending:
+        return Result, ColumnCount
+    NextColumn = max(
+        (Column for Column, _Row in Result.values()),
+        default=-1,
+    ) + 1
+    for Offset, ClusterIndex in enumerate(Pending):
+        Result[ClusterIndex] = (NextColumn + Offset, 0)
+    return Result, max(ColumnCount, NextColumn + len(Pending))
 
 
 def PlacementWireCost(Placed: PlacedDesign) -> int:
@@ -724,8 +1349,38 @@ def PlacementCompactKey(
     )
 
 
+@lru_cache(maxsize=4096)
+def _PhysicalGateGeometry(
+    Kind: str,
+    X: int,
+    Y: int,
+    Z: int,
+    Rotation: int,
+    MirrorX: bool,
+) -> tuple[frozenset[tuple[int, int, int]], frozenset[tuple[int, int, int]]]:
+    """Cache exact template occupancy used by packed-cell legalization."""
+    Gate = type(
+        "CachedPlacedGate",
+        (),
+        {
+            "Name": "CachedCell",
+            "Kind": Kind,
+            "X": X,
+            "Y": Y,
+            "Z": Z,
+            "Rotation": Rotation,
+            "MirrorX": MirrorX,
+        },
+    )()
+    Actual, Electrical, _Solid = BuildPlacedCellGeometry(
+        type("CachedPlacement", (), {"PlacedGates": [Gate]})()
+    )
+    return frozenset(Actual), frozenset(Electrical)
+
+
 def PcbGatesConflict(First: Any, Second: Any) -> bool:
-    """Reject footprint overlap and access corridors entering another cell."""
+    """Reject footprint, pin-access, and template electrical conflicts."""
+
     def AccessSignals(Gate: Any) -> list[tuple[tuple[int, int, int], str]]:
         Values = []
         if Gate.OutputPin is not None and Gate.OutputDirection is not None:
@@ -747,6 +1402,50 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
 
     if RectanglesOverlap(First, Second):
         return True
+    FirstWidth, FirstDepth = RotatedCellSize(First.Kind, First.Rotation)
+    SecondWidth, SecondDepth = RotatedCellSize(Second.Kind, Second.Rotation)
+    BroadPhaseMargin = 3
+    if (
+        First.X + FirstWidth - 1 + BroadPhaseMargin
+        < Second.X - BroadPhaseMargin
+        or Second.X + SecondWidth - 1 + BroadPhaseMargin
+        < First.X - BroadPhaseMargin
+        or First.Z + FirstDepth - 1 + BroadPhaseMargin
+        < Second.Z - BroadPhaseMargin
+        or Second.Z + SecondDepth - 1 + BroadPhaseMargin
+        < First.Z - BroadPhaseMargin
+    ):
+        return False
+    FirstActual, FirstElectrical = _PhysicalGateGeometry(
+        First.Kind,
+        First.X,
+        First.Y,
+        First.Z,
+        First.Rotation,
+        First.MirrorX,
+    )
+    SecondActual, SecondElectrical = _PhysicalGateGeometry(
+        Second.Kind,
+        Second.X,
+        Second.Y,
+        Second.Z,
+        Second.Rotation,
+        Second.MirrorX,
+    )
+    if (
+        DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+            set(FirstElectrical)
+        )
+        & set(SecondActual)
+    ) or (
+        DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+            set(SecondElectrical)
+        )
+        & set(FirstActual)
+    ):
+        return True
+    if abs(First.Y - Second.Y) >= 3:
+        return False
     FirstWidth, FirstDepth = RotatedCellSize(First.Kind, First.Rotation)
     SecondWidth, SecondDepth = RotatedCellSize(Second.Kind, Second.Rotation)
     FirstAccess = AccessSignals(First)
@@ -798,6 +1497,7 @@ def BuildPinAlignedPackedCluster(
     Names: tuple[str, ...],
     InternalByName: dict[str, Any],
     BeamWidth: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[
     dict[str, tuple[int, int]],
     dict[str, int],
@@ -891,8 +1591,23 @@ def BuildPinAlignedPackedCluster(
 
     while PlacedNames != NameSet:
         Name = ChooseNext()
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "graph-beam-gate",
+                "GateName": Name,
+                "CompletedGates": len(PlacedNames),
+                "TotalGates": len(NameSet),
+                "BeamStates": len(Beam),
+            })
         NextBeam = []
-        for State in Beam:
+        for StateIndex, State in enumerate(Beam):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "graph-beam-state",
+                    "GateName": Name,
+                    "CompletedStates": StateIndex,
+                    "TotalStates": len(Beam),
+                })
             Connections = []
             GateValue = InternalByName[Name]
             for InputIndex, Signal in enumerate(GateValue.Inputs):
@@ -925,6 +1640,14 @@ def BuildPinAlignedPackedCluster(
                             (-1, 0),
                             (0, 1),
                             (0, -1),
+                            (2, 0),
+                            (-2, 0),
+                            (0, 2),
+                            (0, -2),
+                            (1, 1),
+                            (1, -1),
+                            (-1, 1),
+                            (-1, -1),
                         ):
                             CandidateKeys.add(
                                 (
@@ -934,12 +1657,22 @@ def BuildPinAlignedPackedCluster(
                                     MirrorX,
                                 )
                             )
-            for X, Z, Rotation, MirrorX in sorted(CandidateKeys):
+            OrderedCandidateKeys = sorted(CandidateKeys)
+            for CandidateIndex, (X, Z, Rotation, MirrorX) in enumerate(
+                OrderedCandidateKeys
+            ):
+                if WorkCheck is not None and CandidateIndex % 32 == 0:
+                    WorkCheck({
+                        "Phase": "graph-beam-candidate",
+                        "GateName": Name,
+                        "CompletedCandidates": CandidateIndex,
+                        "TotalCandidates": len(OrderedCandidateKeys),
+                    })
                 Candidate = BuildPlacedGate(
                     GateValue, X, 1, Z, Rotation, MirrorX
                 )
                 if any(
-                    RectanglesOverlap(Candidate, Existing)
+                    PcbGatesConflict(Candidate, Existing)
                     for Existing in State.values()
                 ):
                     continue
@@ -969,11 +1702,18 @@ def CompactWeightedPlacement(
     Module: Any,
     Placed: PlacedDesign,
     MaximumPasses: int = 12,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PlacedDesign:
     """Pull every template toward its nets and compact bounds legally."""
     SourceByName = {Gate.Name: Gate for Gate in Module.Gates}
     Current = Placed
     for _Pass in range(MaximumPasses):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "placement-compaction-pass",
+                "PassIndex": _Pass,
+                "MaximumPasses": MaximumPasses,
+            })
         Improved = False
         Producers = {
             Signal: Gate
@@ -984,7 +1724,15 @@ def CompactWeightedPlacement(
         for Gate in Current.PlacedGates:
             for Signal in Gate.Inputs:
                 Consumers.setdefault(Signal, []).append(Gate)
-        for Gate in list(Current.PlacedGates):
+        CurrentGates = list(Current.PlacedGates)
+        for GateIndex, Gate in enumerate(CurrentGates):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "placement-compaction-gate",
+                    "PassIndex": _Pass,
+                    "CompletedGates": GateIndex,
+                    "TotalGates": len(CurrentGates),
+                })
             if Gate.Kind != "NAND":
                 continue
             Connected = []
@@ -1012,7 +1760,15 @@ def CompactWeightedPlacement(
             CurrentKey = PlacementCompactKey(Current)
             BestCandidate = None
             BestKey = CurrentKey
-            for DeltaX, DeltaZ in Directions:
+            for DirectionIndex, (DeltaX, DeltaZ) in enumerate(Directions):
+                if WorkCheck is not None:
+                    WorkCheck({
+                        "Phase": "placement-compaction-candidate",
+                        "PassIndex": _Pass,
+                        "GateName": Gate.Name,
+                        "CompletedDirections": DirectionIndex,
+                        "TotalDirections": len(Directions),
+                    })
                 ShiftedGates = [
                     BuildPlacedGate(
                         SourceByName[Other.Name],
@@ -1145,12 +1901,22 @@ def PlacePcbGraph(
     ClusterPolicy: ClusteringPolicy | None = None,
     MaximumBoundaryTerminals: int | None = None,
     MaximumEntrancesPerSignal: int | None = None,
+    RelocationSignals: frozenset[str] = frozenset(),
+    RelocationPrioritySignals: frozenset[str] = frozenset(),
+    RequiredRelocationSignals: frozenset[str] = frozenset(),
+    RelocationVariant: int = 0,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PcbPlacement:
     """Cluster, optimize, legalize, and guide a generic NAND graph."""
+    def CheckWork(Phase: str, **Diagnostics: object) -> None:
+        if WorkCheck is not None:
+            WorkCheck({"Phase": Phase, **Diagnostics})
+
+    CheckWork("start")
     if RoutingSpacing < 0:
         raise ValueError("RoutingSpacing cannot be negative")
     Module = Netlist.Modules[Netlist.Top]
-    Levels = BuildTopologicalLevels(Module)
+    Levels = BuildTopologicalLevels(Module, WorkCheck=WorkCheck)
     PackedMode = bool(PackingPolicy is not None and PackingPolicy.Enabled)
     NandCount = sum(Gate.Kind.value == "NAND" for Gate in Module.Gates)
     AdaptiveClusterSize = (
@@ -1168,6 +1934,18 @@ def PlacePcbGraph(
             else 32
         )
     )
+    if (
+        PackedMode
+        and NandCount > 3 * PackingPolicy.MaximumClusterCells
+    ):
+        AdaptiveClusterSize = min(
+            AdaptiveClusterSize,
+            max(
+                4,
+                PackingPolicy.MaximumClusterCells
+                - PackingPolicy.MaximumClusterCells // 8,
+            ),
+        )
     Clusters = BuildConnectivityClusters(
         Module,
         MaximumClusterSize=AdaptiveClusterSize,
@@ -1175,12 +1953,26 @@ def PlacePcbGraph(
         MaximumBoundaryTerminals=(
             MaximumBoundaryTerminals if PackedMode else None
         ),
+        WorkCheck=WorkCheck,
     )
+    RelocationClusters = BuildRelocationClusterSet(
+        Module,
+        Clusters,
+        RelocationSignals,
+    )
+    BoundaryEscapeRelocationClusters = BuildRelocationClusterSet(
+        Module,
+        Clusters,
+        RelocationPrioritySignals or RelocationSignals,
+    )
+    CheckWork("connectivity-clusters", ClusterCount=len(Clusters))
     Assignment, ColumnCount, _RowCount = OptimizeClusterSlots(
         Module,
         Clusters,
         Levels,
+        WorkCheck=WorkCheck,
     )
+    CheckWork("cluster-slots", ClusterCount=len(Clusters))
     InternalByName = {
         Gate.Name: Gate
         for Gate in Module.Gates
@@ -1206,17 +1998,28 @@ def PlacePcbGraph(
     ClusterStructuralSignatures: dict[int, str] = {}
     ClusterReuseSources: dict[int, int | None] = {}
     ClusterStructuralMappings: dict[int, dict[str, str]] = {}
+    ClusterStackIds: dict[int, int | None] = {}
+    ClusterStackLevels: dict[int, int] = {}
+    StackSuppressedRelocationClusters: set[int] = set()
+    PhysicallyRelocatedClusters: frozenset[int] = frozenset()
     SignalProducerNames = {
         Signal: Gate.Name
         for Gate in Module.Gates
         for Signal in Gate.Outputs
     }
     for ClusterIndex, Names in enumerate(Clusters):
+        CheckWork(
+            "cluster-placement",
+            CompletedClusters=ClusterIndex,
+            TotalClusters=len(Clusters),
+        )
         ClusterNames = set(Names)
         ReuseAccepted = False
         if PackedMode:
             StructuralSignature = AnalyzeNandClusterStructure(
-                Module, Names
+                Module,
+                Names,
+                WorkCheck=WorkCheck,
             )[0]
             ClusterStructuralSignatures[ClusterIndex] = StructuralSignature
             ClusterReuseSources[ClusterIndex] = None
@@ -1232,24 +2035,33 @@ def PlacePcbGraph(
                         Clusters[ReferenceIndex],
                         Names,
                         PackingPolicy.MaximumStructuralReuseMappings,
+                        WorkCheck=WorkCheck,
                     )
                     if Match is None:
                         continue
                     _Signature, Mapping = Match
-                    for ReferenceName, CandidateName in Mapping.items():
-                        LocalPositions[CandidateName] = LocalPositions[ReferenceName]
-                        LocalRotations[CandidateName] = LocalRotations[ReferenceName]
-                        LocalMirrors[CandidateName] = LocalMirrors.get(
+                    CandidatePositions = {
+                        CandidateName: LocalPositions[ReferenceName]
+                        for ReferenceName, CandidateName in Mapping.items()
+                    }
+                    CandidateRotations = {
+                        CandidateName: LocalRotations[ReferenceName]
+                        for ReferenceName, CandidateName in Mapping.items()
+                    }
+                    CandidateMirrors = {
+                        CandidateName: LocalMirrors.get(
                             ReferenceName, False
                         )
+                        for ReferenceName, CandidateName in Mapping.items()
+                    }
                     CandidateGates = [
                         BuildPlacedGate(
                             InternalByName[Name],
-                            LocalPositions[Name][0],
+                            CandidatePositions[Name][0],
                             1,
-                            LocalPositions[Name][1],
-                            LocalRotations[Name],
-                            LocalMirrors[Name],
+                            CandidatePositions[Name][1],
+                            CandidateRotations[Name],
+                            CandidateMirrors[Name],
                         )
                         for Name in Names
                     ]
@@ -1258,23 +2070,18 @@ def PlacePcbGraph(
                         PlacedGates=CandidateGates,
                     )
                     try:
-                        # Apply the same hard legality used by the generic
-                        # graph-beam packer. Pin-access proximity is scored
-                        # and later checked by local routing/DRC; it is not a
-                        # cell-overlap violation by itself.
                         if any(
-                            RectanglesOverlap(First, Second)
+                            PcbGatesConflict(First, Second)
                             for Index, First in enumerate(CandidateGates)
                             for Second in CandidateGates[Index + 1 :]
                         ):
                             raise ValueError("reused NAND placement conflicts")
                         BuildPlacedCellGeometry(CandidatePlaced)
                     except ValueError:
-                        for CandidateName in Mapping.values():
-                            LocalPositions.pop(CandidateName, None)
-                            LocalRotations.pop(CandidateName, None)
-                            LocalMirrors.pop(CandidateName, None)
                         continue
+                    LocalPositions.update(CandidatePositions)
+                    LocalRotations.update(CandidateRotations)
+                    LocalMirrors.update(CandidateMirrors)
                     ClusterReuseSources[ClusterIndex] = ReferenceIndex
                     ClusterStructuralMappings[ClusterIndex] = Mapping
                     ReuseAccepted = True
@@ -1282,6 +2089,11 @@ def PlacePcbGraph(
         LocalLevels: dict[str, int] = {}
         Remaining = set(Names)
         while Remaining:
+            CheckWork(
+                "cluster-ordering",
+                ClusterIndex=ClusterIndex,
+                RemainingGates=len(Remaining),
+            )
             Progress = False
             for Name in sorted(Remaining):
                 Gate = InternalByName[Name]
@@ -1328,7 +2140,14 @@ def PlacePcbGraph(
                 NamesByLevel.setdefault(LocalLevels[Name], []).append(Name)
             FoldRows = max(NamesByLevel) + 1
             PackedXByName: dict[str, int] = {}
+            PackedMirrorByName: dict[str, bool] = {}
             for Row in range(FoldRows):
+                CheckWork(
+                    "row-beam",
+                    ClusterIndex=ClusterIndex,
+                    CompletedRows=Row,
+                    TotalRows=FoldRows,
+                )
                 RowNames = NamesByLevel.get(Row, [])
                 RowNames.sort(
                     key=lambda Name: (
@@ -1347,12 +2166,17 @@ def PlacePcbGraph(
                 RowBeam: list[
                     tuple[
                         tuple[int, int, tuple[int, ...], int, tuple[int, ...]],
-                        dict[str, int],
+                        dict[str, tuple[int, bool]],
                     ]
                 ] = [
                     ((0, 0, (), 0, ()), {})
                 ]
                 for Name in RowNames:
+                    CheckWork(
+                        "row-beam-gate",
+                        ClusterIndex=ClusterIndex,
+                        GateName=Name,
+                    )
                     ParentItems = [
                         (
                             InputIndex,
@@ -1379,13 +2203,49 @@ def PlacePcbGraph(
                         for CandidateX in sorted(CandidateXs):
                             if any(
                                 abs(CandidateX - ExistingX) < 4
-                                for ExistingX in Assigned.values()
+                                for ExistingX, _ExistingMirror in Assigned.values()
                             ):
                                 continue
-                            Candidate = dict(Assigned)
-                            Candidate[Name] = CandidateX
+                            ExistingGates = [
+                                BuildPlacedGate(
+                                    InternalByName[ExistingName],
+                                    ExistingX,
+                                    1,
+                                    LocalLevels[ExistingName] * CellPitchZ,
+                                    PackedRotation,
+                                    PackedMirrorByName[ExistingName],
+                                )
+                                for ExistingName, ExistingX in PackedXByName.items()
+                            ]
+                            ExistingGates.extend(
+                                BuildPlacedGate(
+                                    InternalByName[ExistingName],
+                                    ExistingX,
+                                    1,
+                                    Row * CellPitchZ,
+                                    PackedRotation,
+                                    ExistingMirror,
+                                )
+                                for ExistingName, (
+                                    ExistingX,
+                                    ExistingMirror,
+                                ) in Assigned.items()
+                            )
                             OrientationOptions = []
                             for MirrorX in (False, True):
+                                CandidateGate = BuildPlacedGate(
+                                    InternalByName[Name],
+                                    CandidateX,
+                                    1,
+                                    Row * CellPitchZ,
+                                    PackedRotation,
+                                    MirrorX,
+                                )
+                                if any(
+                                    PcbGatesConflict(CandidateGate, ExistingGate)
+                                    for ExistingGate in ExistingGates
+                                ):
+                                    continue
                                 Pins = (
                                     (CandidateX, CandidateX + 2)
                                     if not MirrorX
@@ -1407,10 +2267,17 @@ def PlacePcbGraph(
                                 OrientationOptions.append(
                                     (CrossPenalty, sum(Misses), Misses, MirrorX)
                                 )
-                            CrossPenalty, Miss, Misses, _MirrorX = min(
+                            if not OrientationOptions:
+                                continue
+                            CrossPenalty, Miss, Misses, CandidateMirror = min(
                                 OrientationOptions
                             )
-                            Values = tuple(sorted(Candidate.values()))
+                            Candidate = dict(Assigned)
+                            Candidate[Name] = (CandidateX, CandidateMirror)
+                            Values = tuple(sorted(
+                                ExistingX
+                                for ExistingX, _MirrorX in Candidate.values()
+                            ))
                             Span = max(Values) - min(Values) + NandWidth
                             NextBeam.append(
                                 (
@@ -1430,7 +2297,14 @@ def PlacePcbGraph(
                     raise ValueError(
                         f"Could not pack NAND cluster row {ClusterIndex}:{Row}"
                     )
-                PackedXByName.update(RowBeam[0][1])
+                PackedXByName.update({
+                    Name: X
+                    for Name, (X, _MirrorX) in RowBeam[0][1].items()
+                })
+                PackedMirrorByName.update({
+                    Name: MirrorX
+                    for Name, (_X, MirrorX) in RowBeam[0][1].items()
+                })
             MinimumPackedX = min(PackedXByName.values())
             for Name in OrderedNames:
                 LocalPositions[Name] = (
@@ -1438,54 +2312,13 @@ def PlacePcbGraph(
                     LocalLevels[Name] * CellPitchZ,
                 )
                 LocalRotations[Name] = PackedRotation
-                Gate = InternalByName[Name]
-                ParentPositions = [
-                    (
-                        InputIndex,
-                        PackedXByName[Producer] + 1 - MinimumPackedX,
-                        LocalLevels[Producer] * CellPitchZ + NandDepth,
-                    )
-                    if (Producer := SignalProducerNames.get(Signal))
-                    in PackedXByName
-                    else None
-                    for InputIndex, Signal in enumerate(Gate.Inputs)
-                ]
-                ParentPositions = [
-                    Value
-                    for Value in ParentPositions
-                    if Value is not None
-                ]
-                NormalPins = (
-                    LocalPositions[Name][0],
-                    LocalPositions[Name][0] + 2,
-                )
-                MirrorPins = tuple(reversed(NormalPins))
-                InputZ = LocalPositions[Name][1] - 1
-
-                def MirrorKey(Pins: tuple[int, int], MirrorX: bool) -> tuple[Any, ...]:
-                    Misses = tuple(
-                        abs(ParentX - Pins[InputIndex])
-                        for InputIndex, ParentX, _ParentZ in ParentPositions
-                    )
-                    CrossPenalty = sum(
-                        1
-                        for InputIndex, ParentX, ParentZ in ParentPositions
-                        for OtherIndex, OtherPinX in enumerate(Pins)
-                        if OtherIndex != InputIndex
-                        and ParentZ == InputZ
-                        and abs(ParentX - OtherPinX) <= 1
-                    )
-                    return CrossPenalty, sum(Misses), Misses, MirrorX
-
-                LocalMirrors[Name] = min(
-                    MirrorKey(NormalPins, False),
-                    MirrorKey(MirrorPins, True),
-                )[-1]
+                LocalMirrors[Name] = PackedMirrorByName[Name]
             BeamPacked = (
                 BuildPinAlignedPackedCluster(
                     Names,
                     InternalByName,
                     PackingPolicy.BeamWidth,
+                    WorkCheck=WorkCheck,
                 )
                 if PackingPolicy.GraphBeamEnabled
                 else None
@@ -1522,10 +2355,289 @@ def PlacePcbGraph(
                     Row * CellPitchZ,
                 )
                 LocalRotations[Name] = 270 if Row % 2 == 0 else 90
+        if (
+            PackedMode
+            and len(Clusters) > 4
+            and ClusterIndex in BoundaryEscapeRelocationClusters
+        ):
+            BoundaryEscapeGap = max(2, RoutingSpacing)
+            DistinctX = sorted({LocalPositions[Name][0] for Name in Names})
+            XOffset = {
+                Value: Index * BoundaryEscapeGap
+                for Index, Value in enumerate(DistinctX)
+            }
+            for Name in Names:
+                LocalX, LocalZ = LocalPositions[Name]
+                LocalPositions[Name] = (
+                    LocalX + XOffset[LocalX],
+                    LocalZ,
+                )
+            PackedWidth = max(
+                LocalPositions[Name][0]
+                + RotatedCellSize("NAND", LocalRotations[Name])[0]
+                for Name in Names
+            )
+            PackedDepth = max(
+                LocalPositions[Name][1]
+                + RotatedCellSize("NAND", LocalRotations[Name])[1]
+                for Name in Names
+            )
+        if PackedMode:
+            CandidateGates = [
+                BuildPlacedGate(
+                    InternalByName[Name],
+                    LocalPositions[Name][0],
+                    1,
+                    LocalPositions[Name][1],
+                    LocalRotations[Name],
+                    LocalMirrors.get(Name, False),
+                )
+                for Name in Names
+            ]
+            if any(
+                PcbGatesConflict(First, Second)
+                for Index, First in enumerate(CandidateGates)
+                for Second in CandidateGates[Index + 1 :]
+            ):
+                raise ValueError(
+                    f"Could not pack NAND cluster {ClusterIndex} legally"
+                )
         ClusterSizes[ClusterIndex] = (
             PackedWidth if PackedMode else (FoldColumns - 1) * CellPitchX + NandWidth,
             PackedDepth if PackedMode else (FoldRows - 1) * CellPitchZ + NandDepth,
         )
+
+    if PackedMode and PackingPolicy.EnableVerticalClusterStacking:
+        CheckWork("vertical-stacking-start")
+        ClusterByGate = {
+            Name: ClusterIndex
+            for ClusterIndex, Names in enumerate(Clusters)
+            for Name in Names
+        }
+        InterClusterWeights: dict[tuple[int, int], int] = {}
+        for Gate in Module.Gates:
+            TargetCluster = ClusterByGate.get(Gate.Name)
+            if TargetCluster is None:
+                continue
+            for Signal in Gate.Inputs:
+                SourceCluster = ClusterByGate.get(
+                    SignalProducerNames.get(Signal, "")
+                )
+                if SourceCluster is None or SourceCluster == TargetCluster:
+                    continue
+                Edge = SourceCluster, TargetCluster
+                InterClusterWeights[Edge] = InterClusterWeights.get(Edge, 0) + 1
+
+        MaximumClusterStack = PackingPolicy.MaximumClustersPerStack
+        StackByCluster: dict[int, int] = {}
+        StackMembers: dict[int, list[int]] = {}
+        NextStackId = 0
+
+        def StackEndpoints(StackId: int) -> tuple[int, int]:
+            Values = StackMembers[StackId]
+            return Values[0], Values[-1]
+
+        def AddCluster(
+            StackId: int,
+            Endpoint: int,
+            Candidate: int,
+        ) -> None:
+            Members = StackMembers[StackId]
+            if len(Members) >= MaximumClusterStack:
+                return
+            if Endpoint == Members[0]:
+                Members.insert(0, Candidate)
+                Assignment[Candidate] = Assignment[Members[1]]
+            elif Endpoint == Members[-1]:
+                Members.append(Candidate)
+                Assignment[Candidate] = Assignment[Members[-2]]
+            else:
+                raise ValueError(
+                    "Cannot stack cluster on a non-endpoint"
+                )
+            StackByCluster[Candidate] = StackId
+
+        def MergeStacks(
+            SourceStack: int,
+            SourceEndpoint: int,
+            RightStack: int,
+            TargetEndpoint: int,
+        ) -> None:
+            SourceMembers = StackMembers[SourceStack]
+            TargetMembers = StackMembers[RightStack]
+            if len(SourceMembers) + len(TargetMembers) > MaximumClusterStack:
+                return
+            BestMerge: tuple[int, ...] | None = None
+            for OrientedSource in (tuple(SourceMembers), tuple(reversed(SourceMembers))):
+                if SourceEndpoint not in OrientedSource:
+                    continue
+                if OrientedSource[-1] != SourceEndpoint:
+                    continue
+                for OrientedTarget in (tuple(TargetMembers), tuple(reversed(TargetMembers))):
+                    if TargetEndpoint not in OrientedTarget:
+                        continue
+                    if OrientedTarget[0] != TargetEndpoint:
+                        continue
+                    CandidateStack = OrientedSource + OrientedTarget[1:]
+                    if len(set(CandidateStack)) != len(CandidateStack):
+                        continue
+                    if BestMerge is None or CandidateStack < BestMerge:
+                        BestMerge = CandidateStack
+            if BestMerge is None:
+                return
+            StackMembers[SourceStack] = list(BestMerge)
+            for Member in BestMerge:
+                StackByCluster[Member] = SourceStack
+                Assignment[Member] = Assignment[SourceMembers[0]]
+            del StackMembers[RightStack]
+
+        OrderedInterClusterWeights = sorted(
+            InterClusterWeights.items(),
+            key=lambda Value: (-Value[1], Value[0]),
+        )
+        for EdgeIndex, ((Source, Target), Weight) in enumerate(
+            OrderedInterClusterWeights
+        ):
+            CheckWork(
+                "vertical-stacking",
+                CompletedEdges=EdgeIndex,
+                TotalEdges=len(OrderedInterClusterWeights),
+            )
+            if Source in RelocationClusters or Target in RelocationClusters:
+                if (
+                    ClusterStructuralSignatures.get(Source)
+                    == ClusterStructuralSignatures.get(Target)
+                ):
+                    StackSuppressedRelocationClusters.update((Source, Target))
+                continue
+            if (
+                Weight < 1
+                or MaximumClusterStack < 2
+                or (
+                    ClusterStructuralSignatures.get(Source)
+                    != ClusterStructuralSignatures.get(Target)
+                )
+            ):
+                continue
+            SourceStack = StackByCluster.get(Source)
+            TargetStack = StackByCluster.get(Target)
+            if SourceStack is None and TargetStack is None:
+                StackId = NextStackId
+                NextStackId += 1
+                StackMembers[StackId] = [Source, Target]
+                StackByCluster[Source] = StackId
+                StackByCluster[Target] = StackId
+                Assignment[Target] = Assignment[Source]
+                continue
+            if SourceStack is not None and TargetStack is not None:
+                if SourceStack == TargetStack:
+                    continue
+                SourceFirst, SourceLast = StackEndpoints(SourceStack)
+                TargetFirst, TargetLast = StackEndpoints(TargetStack)
+                if Source not in (SourceFirst, SourceLast):
+                    continue
+                if Target not in (TargetFirst, TargetLast):
+                    continue
+                MergeStacks(
+                    SourceStack=SourceStack,
+                    SourceEndpoint=Source,
+                    RightStack=TargetStack,
+                    TargetEndpoint=Target,
+                )
+                continue
+            ActiveStack = SourceStack if SourceStack is not None else TargetStack
+            Candidate = Target if SourceStack is not None else Source
+            Endpoint = Source if SourceStack is not None else Target
+            if len(StackMembers[ActiveStack]) >= MaximumClusterStack:
+                continue
+            AddCluster(ActiveStack, Endpoint, Candidate)
+
+        for ClusterIndex in range(len(Clusters)):
+            StackId = StackByCluster.get(ClusterIndex)
+            if StackId is None:
+                ClusterStackIds[ClusterIndex] = None
+                ClusterStackLevels[ClusterIndex] = 0
+            else:
+                Members = StackMembers[StackId]
+                ClusterStackIds[ClusterIndex] = StackId
+                ClusterStackLevels[ClusterIndex] = Members.index(ClusterIndex)
+
+        for ClusterIndex in range(len(Clusters)):
+            ClusterStackIds.setdefault(ClusterIndex, None)
+            ClusterStackLevels.setdefault(ClusterIndex, 0)
+
+        UsedColumns = sorted({Slot[0] for Slot in Assignment.values()})
+        CompactColumn = {Column: Index for Index, Column in enumerate(UsedColumns)}
+        Assignment = {
+            ClusterIndex: (CompactColumn[Column], Row)
+            for ClusterIndex, (Column, Row) in Assignment.items()
+        }
+        ColumnCount = len(UsedColumns)
+    else:
+        ClusterStackIds = {Index: None for Index in range(len(Clusters))}
+        ClusterStackLevels = {Index: 0 for Index in range(len(Clusters))}
+    # A routing conflict between clusters that were never stack-compatible
+    # still needs to change physical geometry. Move those clusters into
+    # dedicated columns; merely replaying the same slot assignment would turn
+    # conflict feedback into a duplicate placement.
+    RequiredRelocationPriority = PrioritizeRelocationClusters(
+        Module,
+        Clusters,
+        RequiredRelocationSignals,
+    )[:1]
+    CurrentRelocationPriority = PrioritizeRelocationClusters(
+        Module,
+        Clusters,
+        RelocationPrioritySignals or RelocationSignals,
+    )
+    OptionalRelocationPriority = tuple(
+        ClusterIndex
+        for ClusterIndex in CurrentRelocationPriority
+        if ClusterIndex not in StackSuppressedRelocationClusters
+        and ClusterIndex not in RequiredRelocationPriority
+    )
+    # Relocation is cluster-level feedback, so a net conflict can touch many
+    # producer/consumer clusters.  Moving that entire transitive set turned a
+    # three-net diagnosis into a long strip of dedicated columns.  Move the
+    # highest-pressure cluster for each member of the physical conflict (up to
+    # three) and use RelocationVariant to explore the remaining ranked set.
+    MaximumOptionalRelocations = min(
+        3 if len(RelocationPrioritySignals) >= 3 else 2,
+        len(OptionalRelocationPriority),
+    )
+    OptionalRelocationClusters = (
+        tuple(
+            OptionalRelocationPriority[
+                (RelocationVariant + Offset)
+                % len(OptionalRelocationPriority)
+            ]
+            for Offset in range(MaximumOptionalRelocations)
+        )
+        if OptionalRelocationPriority
+        else ()
+    )
+    RelocationPriority = (
+        *RequiredRelocationPriority,
+        *OptionalRelocationClusters,
+    )
+    PhysicallyRelocatedClusters = frozenset(RelocationPriority)
+    MirroredRelocationClusters = (
+        frozenset(
+            RelocationPriority[
+                : min(RelocationVariant, 2, len(RelocationPriority))
+            ]
+        )
+        if RelocationVariant > 0 and RelocationPriority
+        else frozenset()
+    )
+    Assignment, ColumnCount = RelocateClusterSlots(
+        Assignment,
+        ColumnCount,
+        RelocationPriority,
+    )
+    for ClusterIndex in PhysicallyRelocatedClusters:
+        ClusterStackIds[ClusterIndex] = None
+        ClusterStackLevels[ClusterIndex] = 0
     ColumnWidths = {
         Column: max(
             (
@@ -1550,35 +2662,84 @@ def PlacePcbGraph(
     }
     ColumnOrigins: dict[int, int] = {}
     NextX = 0
+    ColumnGap = 2 if PackedMode else 3
+    RowGap = 1 if PackedMode else 2
     for Column in range(ColumnCount):
         ColumnOrigins[Column] = NextX
-        NextX += ColumnWidths[Column] + 3 + RoutingSpacing
+        NextX += ColumnWidths[Column] + ColumnGap + RoutingSpacing
     RowOrigins: dict[int, int] = {}
     NextZ = 0
     for Row in sorted(RowDepths):
         RowOrigins[Row] = NextZ
-        NextZ += RowDepths[Row] + 2 + RoutingSpacing
+        NextZ += RowDepths[Row] + RowGap + RoutingSpacing
     InputMargin = 0
     PlacedGates = []
     for ClusterIndex, Names in enumerate(Clusters):
+        CheckWork(
+            "placement-commit",
+            CompletedClusters=ClusterIndex,
+            TotalClusters=len(Clusters),
+        )
         SlotX, SlotZ = Assignment[ClusterIndex]
         BaseX = InputMargin + ColumnOrigins[SlotX]
         BaseZ = RowOrigins[SlotZ]
+        BaseY = 1 + (
+            ClusterStackLevels[ClusterIndex] * PackingPolicy.ClusterDeckPitch
+            if PackedMode
+            else 0
+        )
+        CandidateClusterGates = []
         for Name in Names:
             LocalX, LocalZ = LocalPositions[Name]
-            PlacedGates.append(
+            Rotation = LocalRotations[Name]
+            MirrorX = LocalMirrors.get(Name, False)
+            if ClusterIndex in MirroredRelocationClusters:
+                GateWidth = RotatedCellSize(
+                    InternalByName[Name].Kind.value,
+                    Rotation,
+                )[0]
+                LocalX = ClusterSizes[ClusterIndex][0] - LocalX - GateWidth
+                MirrorX = not MirrorX
+            CandidateClusterGates.append(
                 BuildPlacedGate(
                     InternalByName[Name],
                     BaseX + LocalX,
-                    1,
+                    BaseY,
                     BaseZ + LocalZ,
-                    LocalRotations[Name],
-                    LocalMirrors.get(Name, False),
+                    Rotation,
+                    MirrorX,
                 )
             )
+        if PackedMode and (
+            any(
+                PcbGatesConflict(Candidate, Existing)
+                for Candidate in CandidateClusterGates
+                for Existing in PlacedGates
+            )
+            or any(
+                PcbGatesConflict(First, Second)
+                for Index, First in enumerate(CandidateClusterGates)
+                for Second in CandidateClusterGates[Index + 1 :]
+            )
+        ):
+            raise ValueError(
+                f"Packed NAND cluster {ClusterIndex} conflicts at placement commit"
+            )
+        PlacedGates.extend(CandidateClusterGates)
 
     InputGates = [Gate for Gate in Module.Gates if Gate.Kind.value == "INPUT"]
     OutputGates = [Gate for Gate in Module.Gates if Gate.Kind.value == "OUTPUT"]
+
+    if PackedMode:
+        ClusterByGate = {
+            Name: ClusterIndex
+            for ClusterIndex, Names in enumerate(Clusters)
+            for Name in Names
+        }
+        TerminalConsumers: dict[str, list[Any]] = {}
+        for ModuleGate in Module.Gates:
+            for Signal in ModuleGate.Inputs:
+                TerminalConsumers.setdefault(Signal, []).append(ModuleGate)
 
     InternalMinimumX = min(Gate.X for Gate in PlacedGates)
     InternalMaximumX = max(
@@ -1619,7 +2780,9 @@ def PlacePcbGraph(
         )
         CenterX = (InternalMinimumX + InternalMaximumX) // 2
         TerminalSpacings = (
-            (2, 3)
+            (3 + RoutingSpacing, 4 + RoutingSpacing)
+            if PackedMode and RelocationSignals and len(Clusters) > 4
+            else (2, 3)
             if PackedMode
             else
             (4 + RoutingSpacing, 3 + RoutingSpacing)
@@ -1628,6 +2791,7 @@ def PlacePcbGraph(
             else (3 + RoutingSpacing, 4 + RoutingSpacing)
         )
         for Spacing in TerminalSpacings:
+            CheckWork("terminal-bank-spacing", Spacing=Spacing)
             BankWidth = max(1, 1 + Spacing * (len(Ordered) - 1))
             StartX = CenterX - BankWidth // 2 + (
                 PlacementPolicy.TerminalBankOffsetX
@@ -1637,6 +2801,11 @@ def PlacePcbGraph(
                 else 0
             )
             for Setback in range(32):
+                CheckWork(
+                    "terminal-bank-setback",
+                    Spacing=Spacing,
+                    Setback=Setback,
+                )
                 CandidateZ = BankZ + Setback * OutwardStep
                 Terminals = [
                     BuildPlacedGate(
@@ -1682,10 +2851,36 @@ def PlacePcbGraph(
         def TerminalSignal(Gate: Any) -> str:
             return Gate.Outputs[0] if Gate.Kind.value == "INPUT" else Gate.Inputs[0]
 
+        def TerminalCluster(Gate: Any) -> int | None:
+            Signal = TerminalSignal(Gate)
+            if Gate.Kind.value == "INPUT":
+                CandidateClusters = {
+                    ClusterByGate[Consumer.Name]
+                    for Consumer in TerminalConsumers.get(Signal, ())
+                    if Consumer.Name in ClusterByGate
+                }
+            else:
+                Producer = Producers.get(Signal)
+                CandidateClusters: set[int] = set()
+                if Producer is not None and Producer.Name in ClusterByGate:
+                    CandidateClusters.add(ClusterByGate[Producer.Name])
+            return min(CandidateClusters) if CandidateClusters else None
+
+        def TerminalOrderKey(Value: Any) -> tuple[Any, ...]:
+            ClusterIndex = TerminalCluster(Value)
+            return (
+                ClusterIndex is None,
+                ClusterIndex if ClusterIndex is not None else 10**6,
+                PortIndexes[TerminalSignal(Value)],
+                Value.Name,
+            )
+
+        Planned = []
         for Gate in sorted(
             Gates,
-            key=lambda Value: (PortIndexes[TerminalSignal(Value)], Value.Name),
+            key=TerminalOrderKey,
         ):
+            CheckWork("localized-terminal", GateName=Gate.Name)
             Signal = TerminalSignal(Gate)
             DesiredPins = (
                 Targets.get(Signal, [])
@@ -1713,6 +2908,11 @@ def PlacePcbGraph(
             }
             Options = []
             for Rotation in (0, 90, 180, 270):
+                CheckWork(
+                    "localized-terminal-rotation",
+                    GateName=Gate.Name,
+                    Rotation=Rotation,
+                )
                 Origin = BuildPlacedGate(Gate, 0, 1, 0, Rotation, False)
                 LocalPin = (
                     Origin.OutputPin
@@ -1723,12 +2923,15 @@ def PlacePcbGraph(
                     Candidate = BuildPlacedGate(
                         Gate,
                         PinPosition[0] - LocalPin[0],
-                        1,
+                        PinPosition[1],
                         PinPosition[2] - LocalPin[2],
                         Rotation,
                         False,
                     )
-                    if any(PcbGatesConflict(Candidate, Existing) for Existing in PlacedGates):
+                    if any(
+                        PcbGatesConflict(Candidate, Existing)
+                        for Existing in (*PlacedGates, *Planned)
+                    ):
                         continue
                     CandidatePin = (
                         Candidate.OutputPin
@@ -1777,12 +2980,57 @@ def PlacePcbGraph(
                         )
                     )
             if not Options:
-                raise ValueError(f"Could not place localized terminal {Gate.Name}")
-            PlacedGates.append(min(Options, key=lambda Value: Value[0])[1])
+                return None
+            Planned.append(min(Options, key=lambda Value: Value[0])[1])
+        return Planned
 
     if PackedMode:
-        PlaceLocalizedTerminals(InputGates, list(Module.Inputs))
-        PlaceLocalizedTerminals(OutputGates, list(Module.Outputs))
+        # Prefer compact, cluster-aware terminals when feasible. If any localized
+        # choice conflicts (including overlap with each other), fall back to
+        # deterministic side banks for reliability.
+        BasePlacement = list(PlacedGates)
+        UseLocalizedTerminals = not (
+            RelocationSignals and len(Clusters) > 4
+        )
+        PlannedInputs = (
+            PlaceLocalizedTerminals(InputGates, list(Module.Inputs))
+            if UseLocalizedTerminals
+            else None
+        )
+        PlannedOutputs = (
+            PlaceLocalizedTerminals(OutputGates, list(Module.Outputs))
+            if UseLocalizedTerminals
+            else None
+        )
+        if PlannedInputs is not None and PlannedOutputs is not None:
+            CandidatePlacement = BasePlacement + PlannedInputs + PlannedOutputs
+            try:
+                if any(
+                    PcbGatesConflict(First, Second)
+                    for Index, First in enumerate(CandidatePlacement)
+                    for Second in CandidatePlacement[Index + 1 :]
+                ):
+                    raise ValueError("localized terminal placement conflicts")
+                _ = BuildPlacedCellGeometry(
+                    PlacedDesign(Module=Module, PlacedGates=CandidatePlacement)
+                )
+                PlacedGates = CandidatePlacement
+            except ValueError:
+                PlannedInputs = None
+        if PlannedInputs is None or PlannedOutputs is None:
+            PlacedGates = BasePlacement
+            PlaceTerminalBank(
+                InputGates,
+                InternalMinimumZ - 4,
+                -1,
+                list(Module.Inputs),
+            )
+            PlaceTerminalBank(
+                OutputGates,
+                InternalMaximumZ + 2,
+                1,
+                list(Module.Outputs),
+            )
     else:
         PlaceTerminalBank(
             InputGates,
@@ -1797,6 +3045,13 @@ def PlacePcbGraph(
             list(Module.Outputs),
         )
 
+    if PackedMode and any(
+        PcbGatesConflict(First, Second)
+        for Index, First in enumerate(PlacedGates)
+        for Second in PlacedGates[Index + 1 :]
+    ):
+        raise ValueError("Packed placement conflicts at final commit")
+    CheckWork("terminal-placement-complete", GateCount=len(PlacedGates))
     Placed = PlacedDesign(Module=Module, PlacedGates=PlacedGates)
     if PackedMode:
         Producers = {
@@ -1807,6 +3062,7 @@ def PlacePcbGraph(
         }
         TargetsBySignal: dict[str, list[tuple[int, int, int]]] = {}
         for Gate in PlacedGates:
+            CheckWork("local-access-geometry", GateName=Gate.Name)
             for InputIndex, Signal in enumerate(Gate.Inputs):
                 TargetsBySignal.setdefault(Signal, []).append(
                     Gate.InputPins[InputIndex]
@@ -1847,9 +3103,18 @@ def PlacePcbGraph(
             Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
             for Gate in PlacedGates
         ) + PackingPolicy.LocalRouteEnvelope
+        MinimumRouteY = min(Gate.Y for Gate in PlacedGates)
+        MaximumRouteY = (
+            max(Gate.Y for Gate in PlacedGates)
+            + PackingPolicy.LocalRouteEnvelope
+        )
         AccessBySignal: dict[str, set[tuple[int, int, int]]] = {}
+        AccessByClusterSignal: dict[
+            tuple[int, str], set[tuple[int, int, int]]
+        ] = {}
         BoundaryAccessBySignal: dict[str, set[tuple[int, int, int]]] = {}
         for Gate in PlacedGates:
+            GateCluster = ClusterByGate.get(Gate.Name)
             if Gate.OutputPin is not None and Gate.OutputDirection is not None:
                 for Signal in Gate.Outputs:
                     OutputAccess = tuple(
@@ -1861,6 +3126,11 @@ def PlacePcbGraph(
                         for Offset in range(3)
                     )
                     AccessBySignal.setdefault(Signal, set()).update(OutputAccess)
+                    if GateCluster is not None:
+                        AccessByClusterSignal.setdefault(
+                            (GateCluster, Signal),
+                            set(),
+                        ).update(OutputAccess)
                     BoundaryAccessBySignal.setdefault(Signal, set()).update(
                         OutputAccess[:2]
                     )
@@ -1876,6 +3146,11 @@ def PlacePcbGraph(
                     for Offset in range(3)
                 )
                 AccessBySignal.setdefault(Signal, set()).update(InputAccess)
+                if GateCluster is not None:
+                    AccessByClusterSignal.setdefault(
+                        (GateCluster, Signal),
+                        set(),
+                    ).update(InputAccess)
                 BoundaryAccessBySignal.setdefault(Signal, set()).update(
                     InputAccess[:2]
                 )
@@ -1920,7 +3195,16 @@ def PlacePcbGraph(
             }
             Distances = {Start: 0 for Start in Starts}
             Pending = deque(sorted(Starts))
+            CompletedNodes = 0
             while Pending and Target not in Parents:
+                CompletedNodes += 1
+                if CompletedNodes % 256 == 0:
+                    CheckWork(
+                        "local-path-search",
+                        Signal=Signal,
+                        CompletedNodes=CompletedNodes,
+                        PendingNodes=len(Pending),
+                    )
                 Current = Pending.popleft()
                 Distance = Distances[Current]
                 if Distance >= MaximumLocalRouteLength:
@@ -1933,7 +3217,7 @@ def PlacePcbGraph(
                     if not (
                         MinimumRouteX <= Neighbor[0] <= MaximumRouteX
                         and MinimumRouteZ <= Neighbor[2] <= MaximumRouteZ
-                        and 1 <= Neighbor[1] <= 5
+                        and MinimumRouteY <= Neighbor[1] <= MaximumRouteY
                     ):
                         continue
                     if Neighbor in ActualBlocks and Neighbor != Target:
@@ -1996,6 +3280,13 @@ def PlacePcbGraph(
             Distances = {Candidate.Root: 0}
             Pending = deque((Candidate.Root,))
             while Pending:
+                if len(Distances) % 256 == 0:
+                    CheckWork(
+                        "local-signal-strength",
+                        Signal=Candidate.Signal,
+                        CompletedNodes=len(Distances),
+                        PendingNodes=len(Pending),
+                    )
                 Current = Pending.popleft()
                 for Neighbor in Graph.get(Current, ()):
                     if Neighbor in Distances:
@@ -2015,6 +3306,30 @@ def PlacePcbGraph(
                     "Local route requires a repeater before its farthest sink: "
                     f"{Candidate.Signal} distance={MaximumDistance}"
                 )
+
+        def ValidateLocalPhysicalConnectivity(
+            Candidate: LocalRouteClaim,
+        ) -> None:
+            """Reject local claims that are connected only in the abstract graph."""
+            CandidateProducer = Producers.get(Candidate.Signal)
+            if CandidateProducer is None:
+                raise ValueError(
+                    f"Local route has no producer: {Candidate.Signal}"
+                )
+            CandidateSupports = set(Candidate.Claims.SupportCells) - ActualBlocks
+            PhysicalGraphs = BuildPhysicalGraphs(
+                {Candidate.Signal: set(Candidate.Nodes)},
+                ActualBlocks,
+                CandidateSupports,
+                SolidBlocks,
+            )
+            ValidatePhysicalRoutes(
+                PhysicalGraphs,
+                {Candidate.Signal: CandidateProducer},
+                {
+                    Candidate.Signal: list(Candidate.ConnectedTargets),
+                },
+            )
 
         def ValidateContinuationPortal(
             Candidate: LocalRouteClaim,
@@ -2064,6 +3379,11 @@ def PlacePcbGraph(
                 Value[0],
             ),
         ):
+            CheckWork(
+                "local-route-signal",
+                Signal=Signal,
+                TargetCount=len(Targets),
+            )
             Producer = Producers.get(Signal)
             if Producer is None or not Targets:
                 continue
@@ -2071,6 +3391,11 @@ def PlacePcbGraph(
             Paths = []
             LocalTargets = []
             for Target in Targets:
+                CheckWork(
+                    "local-route-direct-target",
+                    Signal=Signal,
+                    Target=Target,
+                )
                 DeltaX = Target[0] - Root[0]
                 DeltaY = Target[1] - Root[1]
                 DeltaZ = Target[2] - Root[2]
@@ -2114,6 +3439,11 @@ def PlacePcbGraph(
             for Target in (
                 RemainingTargets if MaximumLocalRouteLength > MaximumLength else ()
             ):
+                CheckWork(
+                    "local-route-search-target",
+                    Signal=Signal,
+                    Target=Target,
+                )
                 Distance = min(
                     abs(Target[0] - Position[0])
                     + abs(Target[1] - Position[1])
@@ -2128,23 +3458,75 @@ def PlacePcbGraph(
                 Paths.append(Path)
                 OwnedNodes.update(Path)
                 LocalTargets.append(Target)
-            if Paths:
-                Nodes = frozenset(Position for Path in Paths for Position in Path)
+            if not Paths:
+                continue
+            Nodes = frozenset(Position for Path in Paths for Position in Path)
+            Edges = frozenset(
+                NormalizeRoutingEdge(First, Second)
+                for Path in Paths
+                for First, Second in zip(Path, Path[1:])
+            )
+            ClusterCandidates = [
+                ClusterByGate[Name]
+                for Target in LocalTargets
+                if (Name := GateByInputPin.get(Target)) in ClusterByGate
+            ]
+            ProducerCluster = ClusterByGate.get(Producer.Name)
+            ClusterId = (
+                ProducerCluster
+                if ProducerCluster is not None
+                else min(ClusterCandidates, default=-1)
+            )
+            CandidateClaim = LocalRouteClaim(
+                Signal=Signal,
+                ClusterId=ClusterId,
+                Root=Root,
+                ConnectedTargets=tuple(sorted(set(LocalTargets))),
+                BoundaryNodes=SelectBoundaryNodes(
+                    Nodes, Targets, LocalTargets
+                ),
+                Nodes=Nodes,
+                Edges=Edges,
+                Claims=LocalResourceGraph.BuildRouteClaims(Nodes),
+                ExactRouteSignalBlocks=len(Nodes),
+                ExactRouteSupportBlocks=len({
+                    (X, Y - 1, Z) for X, Y, Z in Nodes
+                } - ActualBlocks),
+            )
+            TrialClaims = (*LocalRouteClaims, CandidateClaim)
+            try:
+                ValidateLocalSignalStrength(CandidateClaim)
+                ValidateLocalPhysicalConnectivity(CandidateClaim)
+                ValidateContinuationPortal(CandidateClaim, Targets)
+                ValidateBoundaryEscapes(CandidateClaim)
+                ValidateLocalRouteClaims(LocalResourceGraph, TrialClaims)
+                if any(len(Path) - 1 > MaximumLength for Path in Paths):
+                    ValidateTemplateIsolation(
+                        {Signal: set(CandidateClaim.Nodes)},
+                        ActualBlocks,
+                        ElectricalBlocks,
+                        SolidBlocks,
+                        Producers,
+                        TargetsBySignal,
+                        AccessBySignal,
+                    )
+            except ValueError as Error:
+                LocalRouteDiagnostics[Signal] = {
+                    "AttemptedTargets": len(set(LocalTargets)),
+                    "AttemptedNodes": len(Nodes),
+                    "Rejected": str(Error),
+                }
+                if not DirectPaths or len(DirectPaths) == len(Paths):
+                    continue
+                Paths = DirectPaths
+                LocalTargets = DirectTargets
+                Nodes = frozenset(
+                    Position for Path in Paths for Position in Path
+                )
                 Edges = frozenset(
                     NormalizeRoutingEdge(First, Second)
                     for Path in Paths
                     for First, Second in zip(Path, Path[1:])
-                )
-                ClusterCandidates = [
-                    ClusterByGate[Name]
-                    for Target in LocalTargets
-                    if (Name := GateByInputPin.get(Target)) in ClusterByGate
-                ]
-                ProducerCluster = ClusterByGate.get(Producer.Name)
-                ClusterId = (
-                    ProducerCluster
-                    if ProducerCluster is not None
-                    else min(ClusterCandidates, default=-1)
                 )
                 CandidateClaim = LocalRouteClaim(
                     Signal=Signal,
@@ -2162,82 +3544,55 @@ def PlacePcbGraph(
                         (X, Y - 1, Z) for X, Y, Z in Nodes
                     } - ActualBlocks),
                 )
-                TrialClaims = (*LocalRouteClaims, CandidateClaim)
                 try:
                     ValidateLocalSignalStrength(CandidateClaim)
+                    ValidateLocalPhysicalConnectivity(CandidateClaim)
                     ValidateContinuationPortal(CandidateClaim, Targets)
                     ValidateBoundaryEscapes(CandidateClaim)
-                    ValidateLocalRouteClaims(LocalResourceGraph, TrialClaims)
-                    if any(len(Path) - 1 > MaximumLength for Path in Paths):
-                        ValidateTemplateIsolation(
-                            {Signal: set(CandidateClaim.Nodes)},
-                            ActualBlocks,
-                            ElectricalBlocks,
-                            SolidBlocks,
-                            Producers,
-                            TargetsBySignal,
-                            AccessBySignal,
-                        )
-                except ValueError as Error:
-                    LocalRouteDiagnostics[Signal] = {
-                        "AttemptedTargets": len(set(LocalTargets)),
-                        "AttemptedNodes": len(Nodes),
-                        "Rejected": str(Error),
-                    }
-                    if not DirectPaths or len(DirectPaths) == len(Paths):
-                        continue
-                    Paths = DirectPaths
-                    LocalTargets = DirectTargets
-                    Nodes = frozenset(
-                        Position for Path in Paths for Position in Path
+                    ValidateLocalRouteClaims(
+                        LocalResourceGraph,
+                        (*LocalRouteClaims, CandidateClaim),
                     )
-                    Edges = frozenset(
-                        NormalizeRoutingEdge(First, Second)
-                        for Path in Paths
-                        for First, Second in zip(Path, Path[1:])
-                    )
-                    CandidateClaim = LocalRouteClaim(
-                        Signal=Signal,
-                        ClusterId=ClusterId,
-                        Root=Root,
-                        ConnectedTargets=tuple(sorted(set(LocalTargets))),
-                        BoundaryNodes=SelectBoundaryNodes(
-                            Nodes, Targets, LocalTargets
-                        ),
-                        Nodes=Nodes,
-                        Edges=Edges,
-                        Claims=LocalResourceGraph.BuildRouteClaims(Nodes),
-                        ExactRouteSignalBlocks=len(Nodes),
-                        ExactRouteSupportBlocks=len({
-                            (X, Y - 1, Z) for X, Y, Z in Nodes
-                        } - ActualBlocks),
-                    )
-                    try:
-                        ValidateLocalSignalStrength(CandidateClaim)
-                        ValidateContinuationPortal(CandidateClaim, Targets)
-                        ValidateBoundaryEscapes(CandidateClaim)
-                        ValidateLocalRouteClaims(
-                            LocalResourceGraph,
-                            (*LocalRouteClaims, CandidateClaim),
-                        )
-                    except ValueError:
-                        continue
-                LocalRouteClaims.append(CandidateClaim)
+                except ValueError:
+                    continue
+            if (
+                len(Clusters) > 4
+                and RelocationSignals
+                and len(LocalTargets) != len(Targets)
+            ):
                 LocalRouteDiagnostics.setdefault(Signal, {}).update({
-                    "AcceptedTargets": len(set(LocalTargets)),
-                    "AcceptedNodes": len(Nodes),
-                    "UsedLongRoute": any(
-                        len(Path) - 1 > MaximumLength for Path in Paths
-                    ),
+                    "ReleasedForGlobalRelocation": ClusterId,
                 })
-                LocalNetBranches[Signal] = tuple(sorted(Nodes))
-                LocalNetTargets[Signal] = tuple(sorted(LocalTargets))
-                if len(LocalTargets) == len(Targets):
-                    FrozenNetWires[Signal] = LocalNetBranches[Signal]
+                continue
+            LocalRouteClaims.append(CandidateClaim)
+            LocalRouteDiagnostics.setdefault(Signal, {}).update({
+                "AcceptedTargets": len(set(LocalTargets)),
+                "AcceptedNodes": len(Nodes),
+                "UsedLongRoute": any(
+                    len(Path) - 1 > MaximumLength for Path in Paths
+                ),
+            })
+            LocalNetBranches[Signal] = tuple(sorted(Nodes))
+            LocalNetTargets[Signal] = tuple(sorted(LocalTargets))
+            if (
+                len(LocalTargets) == len(Targets)
+                and len(Nodes) <= PackingPolicy.MaximumFrozenLocalNetNodes
+                and len(LocalTargets) <= PackingPolicy.MaximumFrozenLocalTargets
+            ):
+                FrozenNetWires[Signal] = LocalNetBranches[Signal]
         Placed.FrozenNetWires = FrozenNetWires
         Placed.LocalNetBranches = LocalNetBranches
         Placed.LocalNetTargets = LocalNetTargets
         Placed.LocalRouteClaims = tuple(LocalRouteClaims)
+        if RelocationSignals:
+            LocalRouteDiagnostics["__PlacementRelocation__"] = {
+                "Signals": sorted(RelocationSignals),
+                "PrioritySignals": sorted(RelocationPrioritySignals),
+                "RequiredSignals": sorted(RequiredRelocationSignals),
+                "Variant": RelocationVariant,
+                "Clusters": sorted(PhysicallyRelocatedClusters),
+                "MirroredClusters": sorted(MirroredRelocationClusters),
+            }
         Placed.LocalRouteDiagnostics = LocalRouteDiagnostics
     if RoutingSpacing == 0:
         Placed = CompactWeightedPlacement(
@@ -2248,6 +3603,7 @@ def PlacePcbGraph(
                 if PlacementPolicy is not None
                 else 32
             ),
+            WorkCheck=WorkCheck,
         )
     Guided = AddPcbRoutingGuides(
         Placed,
@@ -2259,6 +3615,11 @@ def PlacePcbGraph(
     )
     GateByName = {Gate.Name: Gate for Gate in PlacedGates}
     ConsumersBySignal: dict[str, list[Any]] = {}
+    ProducersBySignal = {
+        Signal: Gate
+        for Gate in Module.Gates
+        for Signal in Gate.Outputs
+    }
     for Gate in Module.Gates:
         for Signal in Gate.Inputs:
             ConsumersBySignal.setdefault(Signal, []).append(Gate)
@@ -2267,6 +3628,11 @@ def PlacePcbGraph(
     for Claim in Placed.LocalRouteClaims:
         ClaimsByCluster.setdefault(Claim.ClusterId, []).append(Claim)
     for ClusterIndex, Names in enumerate(Clusters):
+        CheckWork(
+            "boundary-capacity",
+            CompletedClusters=ClusterIndex,
+            TotalClusters=len(Clusters),
+        )
         NameSet = set(Names)
         Produced = {
             Signal
@@ -2299,6 +3665,172 @@ def PlacePcbGraph(
                 DirectConnections.append(Signal)
         BaseX = min(GateByName[Name].X for Name in Names)
         BaseZ = min(GateByName[Name].Z for Name in Names)
+        MaximumClusterX = max(
+            GateByName[Name].X
+            + RotatedCellSize(
+                GateByName[Name].Kind,
+                GateByName[Name].Rotation,
+            )[0]
+            - 1
+            for Name in Names
+        )
+        MaximumClusterZ = max(
+            GateByName[Name].Z
+            + RotatedCellSize(
+                GateByName[Name].Kind,
+                GateByName[Name].Rotation,
+            )[1]
+            - 1
+            for Name in Names
+        )
+        ClusterCenterX = (BaseX + MaximumClusterX) / 2
+        ClusterCenterZ = (BaseZ + MaximumClusterZ) / 2
+
+        def PreferredBoundarySide(Signal: str) -> str:
+            ExternalGates = [
+                GateByName[Gate.Name]
+                for Gate in ConsumersBySignal.get(Signal, ())
+                if Gate.Name not in NameSet and Gate.Name in GateByName
+            ]
+            Producer = ProducersBySignal.get(Signal)
+            if (
+                Producer is not None
+                and Producer.Name not in NameSet
+                and Producer.Name in GateByName
+            ):
+                ExternalGates.append(GateByName[Producer.Name])
+            if not ExternalGates:
+                return "East"
+            TargetX = sum(Gate.X for Gate in ExternalGates) / len(ExternalGates)
+            TargetZ = sum(Gate.Z for Gate in ExternalGates) / len(ExternalGates)
+            DeltaX = TargetX - ClusterCenterX
+            DeltaZ = TargetZ - ClusterCenterZ
+            if abs(DeltaX) >= abs(DeltaZ):
+                return "East" if DeltaX >= 0 else "West"
+            return "South" if DeltaZ >= 0 else "North"
+
+        BoundaryDemand = {
+            Signal: max(
+                1,
+                sum(
+                    Consumer.Name not in NameSet
+                    for Consumer in ConsumersBySignal.get(Signal, ())
+                ),
+            )
+            for Signal in sorted(BoundarySignals)
+        }
+        BoundaryDemandRecords = tuple(
+            BoundaryDemandRecord(
+                Signal=Signal,
+                UnresolvedTargets=BoundaryDemand[Signal],
+                RequiredPortalSlots=1,
+                RequiredCorridorLanes=1,
+                PreferredBoundarySide=PreferredBoundarySide(Signal),
+            )
+            for Signal in sorted(BoundarySignals)
+        )
+        BoundaryPitch = DefaultRedstoneRoutingTechnology.TrackPitch
+        BoundaryLayerCapacity = (
+            PlacementPolicy.MaximumRoutingLayers
+            if PlacementPolicy is not None
+            and PlacementPolicy.MaximumRoutingLayers > 0
+            else DefaultRedstoneRoutingTechnology.MaximumRoutableLayerCount
+        )
+        GeometricCapacity = {
+            "West": max(1, (MaximumClusterZ - BaseZ + 1) // BoundaryPitch)
+            * BoundaryLayerCapacity,
+            "East": max(1, (MaximumClusterZ - BaseZ + 1) // BoundaryPitch)
+            * BoundaryLayerCapacity,
+            "North": max(1, (MaximumClusterX - BaseX + 1) // BoundaryPitch)
+            * BoundaryLayerCapacity,
+            "South": max(1, (MaximumClusterX - BaseX + 1) // BoundaryPitch)
+            * BoundaryLayerCapacity,
+        }
+        LegalPortalSlotsBySide = dict(GeometricCapacity)
+        if PackedMode:
+            AccessPositionsBySignal = {
+                Signal: set(
+                    AccessByClusterSignal.get((ClusterIndex, Signal), ())
+                )
+                for Signal in BoundarySignals
+            }
+            for Claim in ClaimsByCluster.get(ClusterIndex, ()):
+                if Claim.Signal not in BoundarySignals:
+                    continue
+                AccessPositionsBySignal.setdefault(
+                    Claim.Signal,
+                    set(),
+                ).update(Claim.BoundaryNodes)
+            LegalEscapeSlotsBySignal = BuildLegalBoundaryEscapeSlots(
+                BoundarySignals,
+                AccessPositionsBySignal,
+                LocalResourceGraph,
+                AccessClaimsBySignal,
+                WorkCheck=WorkCheck,
+            )
+            HardBoundary = EvaluateHardBoundaryFeasibility(
+                ClusterIndex,
+                BoundaryDemandRecords,
+                LegalEscapeSlotsBySignal,
+            )
+            ValidateHardBoundaryFeasibility(HardBoundary)
+            SlotsBySide = {
+                "West": set(),
+                "East": set(),
+                "North": set(),
+                "South": set(),
+            }
+            for X, Y, Z in {
+                Slot
+                for Slots in LegalEscapeSlotsBySignal.values()
+                for Slot in Slots
+            }:
+                Side = min(
+                    (
+                        (abs(X - BaseX), "West"),
+                        (abs(X - MaximumClusterX), "East"),
+                        (abs(Z - BaseZ), "North"),
+                        (abs(Z - MaximumClusterZ), "South"),
+                    )
+                )[1]
+                SlotsBySide[Side].add((X, Y, Z))
+            LegalPortalSlotsBySide = {
+                Side: len(Slots) for Side, Slots in SlotsBySide.items()
+            }
+            BoundaryDemandRecords = AssignBoundaryDemandSides(
+                BoundaryDemandRecords,
+                LegalEscapeSlotsBySignal,
+                (BaseX, MaximumClusterX, BaseZ, MaximumClusterZ),
+                {
+                    Side: min(
+                        GeometricCapacity[Side],
+                        LegalPortalSlotsBySide[Side],
+                    )
+                    for Side in GeometricCapacity
+                },
+            )
+        BoundaryCapacityRecords = BuildBoundaryCapacityRecords(
+            BoundaryDemandRecords,
+            GeometricCapacity,
+            LegalPortalSlotsBySide,
+        )
+        BoundaryOverflow = sum(
+            Record.Overflow for Record in BoundaryCapacityRecords
+        )
+        ScarceSides = {
+            Record.BoundarySide
+            for Record in BoundaryCapacityRecords
+            if Record.Overflow > 0
+        }
+        PinScarcityCount = sum(
+            Record.PreferredBoundarySide in ScarceSides
+            for Record in BoundaryDemandRecords
+        )
+        LocalClaimTargets = sum(
+            len(Claim.ConnectedTargets)
+            for Claim in ClaimsByCluster.get(ClusterIndex, ())
+        )
+        BoundaryTargetCount = sum(BoundaryDemand.values())
         PackedClusters.append(
             PackedNandCluster(
                 ClusterId=ClusterIndex,
@@ -2333,8 +3865,27 @@ def PlacePcbGraph(
                 ),
                 ReusedFromClusterId=ClusterReuseSources.get(ClusterIndex),
                 StructuralMapping=ClusterStructuralMappings.get(ClusterIndex),
+                StackId=ClusterStackIds.get(ClusterIndex),
+                StackLevel=ClusterStackLevels.get(ClusterIndex, 0),
+                BaseY=(
+                    1
+                    if not PackedMode
+                    else 1
+                    + ClusterStackLevels.get(ClusterIndex, 0)
+                    * PackingPolicy.ClusterDeckPitch
+                ),
+                BoundaryDemand=BoundaryDemand,
+                EstimatedCorridorLanes=sum(BoundaryDemand.values()),
+                LocalClaimCoverage=(
+                    LocalClaimTargets / max(1, LocalClaimTargets + BoundaryTargetCount)
+                ),
+                BoundaryDemandRecords=BoundaryDemandRecords,
+                BoundaryCapacityRecords=BoundaryCapacityRecords,
+                BoundaryOverflow=BoundaryOverflow,
+                PinScarcityCount=PinScarcityCount,
             )
         )
+    CheckWork("complete", ClusterCount=len(Clusters))
     return PcbPlacement(
         Placed=Guided.Placed,
         Clusters=Clusters,

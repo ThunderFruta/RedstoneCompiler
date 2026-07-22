@@ -67,6 +67,17 @@ class RoutingResourceGraphTests(unittest.TestCase):
 
         self.assertIsNone(Graph.BuildPrimitive((0, 1, 0), (1, 2, 0)))
 
+    def testStairRequiresSolidUpperSupportWhenCellIsOccupied(self) -> None:
+        OccupiedSupport = (1, 1, 0)
+        NonSolid = self.BuildGraph(Actual={OccupiedSupport})
+        Solid = self.BuildGraph(
+            Actual={OccupiedSupport},
+            Solid={OccupiedSupport},
+        )
+
+        self.assertIsNone(NonSolid.BuildPrimitive((0, 1, 0), (1, 2, 0)))
+        self.assertIsNotNone(Solid.BuildPrimitive((0, 1, 0), (1, 2, 0)))
+
     def testRegionContainsOnlyAuthoritativeLegalEdges(self) -> None:
         Graph = self.BuildGraph()
         Region = Graph.BuildRegion(
@@ -83,6 +94,53 @@ class RoutingResourceGraphTests(unittest.TestCase):
         self.assertEqual(Graph.CachedNodeCount, len(Region.Nodes))
         self.assertEqual(Graph.CachedEdgeCount, len(Region.Edges))
 
+    def testRegionConstructionCanBeStoppedBeforePublishingPartialCache(self) -> None:
+        Graph = self.BuildGraph()
+        Phases = []
+
+        def StopDuringEdges(Diagnostics):
+            Phases.append(Diagnostics["Phase"])
+            if Diagnostics["Phase"] == "edges":
+                raise RuntimeError("adaptive slice expired")
+
+        with self.assertRaisesRegex(RuntimeError, "adaptive slice expired"):
+            Graph.BuildRegion(
+                (0, 20, 1, 3, 0, 20),
+                WorkCheck=StopDuringEdges,
+            )
+
+        self.assertIn("nodes", Phases)
+        self.assertIn("edges", Phases)
+        self.assertEqual(Graph.CachedNodeCount, 0)
+        self.assertEqual(Graph.CachedEdgeCount, 0)
+
+    def testEscalatedRegionReusesPriorColumnsAndLayers(self) -> None:
+        Graph = self.BuildGraph()
+        FirstColumns = frozenset({(0, 0), (1, 0)})
+        First = Graph.BuildRegion(
+            (0, 2, 1, 2, 0, 0),
+            AllowedColumns=FirstColumns,
+        )
+        Diagnostics = []
+        Second = Graph.BuildRegion(
+            (0, 2, 1, 3, 0, 0),
+            AllowedColumns=frozenset({(0, 0), (1, 0), (2, 0)}),
+            WorkCheck=Diagnostics.append,
+        )
+
+        Complete = Diagnostics[-1]
+        self.assertTrue(Complete["ReusedRegion"])
+        self.assertGreater(Complete["ReusedNodeCount"], 0)
+        self.assertLess(Complete["BuiltNodeCount"], len(Second.Nodes))
+        self.assertTrue(First.Nodes.issubset(Second.Nodes))
+        self.assertIs(
+            Graph.BuildRegion(
+                (0, 2, 1, 3, 0, 0),
+                AllowedColumns=frozenset({(0, 0), (1, 0), (2, 0)}),
+            ),
+            Second,
+        )
+
     def testForeignElectricalClaimsConflictButSameNetClaimsDoNot(self) -> None:
         Graph = self.BuildGraph()
         First = Graph.BuildRouteClaims({(0, 1, 0), (1, 1, 0)})
@@ -94,6 +152,19 @@ class RoutingResourceGraphTests(unittest.TestCase):
         self.assertTrue(
             any(Resource.Kind == RoutingResourceKind.Electrical for Resource in Conflicts)
         )
+
+    def testForeignSupportCannotOccupyAnotherSignalsWire(self) -> None:
+        Graph = self.BuildGraph()
+        Upper = Graph.BuildRouteClaims({(0, 1, 0)})
+        Lower = Graph.BuildRouteClaims({(0, 0, 0)})
+
+        Conflicts = FindClaimConflicts({"Upper": Upper, "Lower": Lower})
+
+        self.assertTrue(any(
+            Resource.Kind == RoutingResourceKind.Support
+            and Resource.Position == (0, 0, 0)
+            for Resource in Conflicts
+        ))
 
 
 if __name__ == "__main__":

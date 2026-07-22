@@ -27,6 +27,7 @@ from .Actions import (
 )
 from .ChannelPlanner import MeasureRoutingStage
 from .Models import RoutedDesign
+from .Reliability import RoutingDeadline
 from .Failures import RoutingStageError
 from .Failures import RoutingFailure, RoutingFailureReason
 from .ResourceGraph import (
@@ -48,13 +49,34 @@ def CompactRoutedTrees(
     Routed: RoutedDesign,
     AccessLength: int = 3,
     Resources: Any | None = None,
+    Deadline: RoutingDeadline | None = None,
 ) -> RoutedDesign:
     """Remove routed loops and branches that reach no required terminal."""
+    def CheckDeadline(Phase: str, **Diagnostics: object) -> None:
+        if Deadline is not None:
+            Deadline.RaiseIfExpired(
+                "RouteCompaction",
+                {"Phase": Phase, **Diagnostics},
+            )
+
+    def CheckWork(
+        Phase: str,
+    ) -> Callable[[dict[str, object]], None] | None:
+        if Deadline is None:
+            return None
+        return lambda Diagnostics: CheckDeadline(Phase, Work=Diagnostics)
+
+    CheckDeadline("start")
     Placed = Placement.Placed
     if Resources is None:
-        Resources = BuildRoutingResources(Placed)
+        Resources = BuildRoutingResources(
+            Placed,
+            WorkCheck=CheckWork("resource-construction"),
+        )
     ActualBlocks = set(Resources.StaticGeometry.ActualBlocks)
-    ElectricalBlocks = set(Resources.StaticGeometry.ElectricalBlocks)
+    TemplateElectricalBlocks = set(
+        Resources.StaticGeometry.TemplateElectricalBlocks
+    )
     SolidBlocks = set(Resources.StaticGeometry.SolidBlocks)
     Producers = {
         Signal: Gate
@@ -106,13 +128,23 @@ def CompactRoutedTrees(
         ActualBlocks,
         set(Routed.Supports),
         SolidBlocks,
+        WorkCheck=CheckWork("initial-physical-graphs"),
     )
     for Signal, Graph in Graphs.items():
+        CheckDeadline("prune-signal", Signal=Signal)
         Root = Producers[Signal].OutputPin
         Parents = {Root: None}
         Pending = deque([Root])
+        ExpandedNodes = 0
         while Pending:
             Current = Pending.popleft()
+            ExpandedNodes += 1
+            if ExpandedNodes % 256 == 0:
+                CheckDeadline(
+                    "prune-expansion",
+                    Signal=Signal,
+                    ExpandedNodes=ExpandedNodes,
+                )
             for Neighbor in Graph[Current]:
                 if Neighbor in Parents:
                     continue
@@ -150,6 +182,7 @@ def CompactRoutedTrees(
             *ReservedPositions,
             *PinAccessPositions,
         ):
+            CheckDeadline("retain-required-path", Signal=Signal)
             if Target not in Parents:
                 raise ValueError(f"PCB route compaction disconnected net {Signal}")
             Current = Target
@@ -158,35 +191,60 @@ def CompactRoutedTrees(
                 Current = Parents[Current]
         NetWires[Signal].intersection_update(Required)
 
-    Supports = {
-        (X, Y - 1, Z)
-        for Positions in NetWires.values()
-        for X, Y, Z in Positions
-    } - ActualBlocks
+    Supports: set[tuple[int, int, int]] = set()
+    SupportPositionCount = 0
+    for Signal, Positions in NetWires.items():
+        for X, Y, Z in Positions:
+            SupportPositionCount += 1
+            if SupportPositionCount % 256 == 0:
+                CheckDeadline(
+                    "support-rebuild",
+                    Signal=Signal,
+                    ProcessedPositions=SupportPositionCount,
+                )
+            Supports.add((X, Y - 1, Z))
+    Supports.difference_update(ActualBlocks)
+    CheckDeadline("rebuild-physical-graphs")
     PhysicalGraphs = BuildPhysicalGraphs(
         NetWires,
         ActualBlocks,
         Supports,
         SolidBlocks,
+        WorkCheck=CheckWork("rebuild-physical-graphs"),
     )
-    ValidatePhysicalRoutes(PhysicalGraphs, Producers, Targets)
+    CheckDeadline("physical-validation")
+    ValidatePhysicalRoutes(
+        PhysicalGraphs,
+        Producers,
+        Targets,
+        WorkCheck=CheckWork("physical-validation"),
+    )
+    CheckDeadline("template-isolation-validation")
     ValidateTemplateIsolation(
         NetWires,
         ActualBlocks,
-        ElectricalBlocks,
+        TemplateElectricalBlocks,
         SolidBlocks,
         Producers,
         Targets,
         AccessBySignal,
+        WorkCheck=CheckWork("template-isolation-validation"),
     )
     TrackAssignmentValue = Routed.TrackAssignment
     if TrackAssignmentValue is None:
         raise ValueError("Routed design is missing authoritative track assignment")
-    FinalClaims = {
-        Signal: Resources.ResourceGraph.BuildRouteClaims(Positions)
-        for Signal, Positions in NetWires.items()
-    }
-    FinalConflicts = FindClaimConflicts(FinalClaims)
+    CheckDeadline("claim-rebuild")
+    FinalClaims = {}
+    for Signal, Positions in NetWires.items():
+        CheckDeadline("claim-rebuild", Signal=Signal)
+        FinalClaims[Signal] = Resources.ResourceGraph.BuildRouteClaims(
+            Positions,
+            WorkCheck=CheckWork("claim-rebuild"),
+        )
+    FinalConflicts = FindClaimConflicts(
+        FinalClaims,
+        WorkCheck=CheckWork("claim-conflict-validation"),
+    )
     if FinalConflicts:
         First = min(FinalConflicts, key=str)
         raise RoutingStageError(
@@ -201,25 +259,42 @@ def CompactRoutedTrees(
         )
     FinalOwners = defaultdict(list)
     FinalTracks = {}
+    OwnershipResourceCount = 0
+    OwnershipEdgeCount = 0
     for Signal, Track in TrackAssignmentValue.Tracks.items():
+        CheckDeadline("ownership-rebuild", Signal=Signal)
         ReservedResources = frozenset(
             Resource
             for Resource in FinalClaims[Signal].ResourceIds
             if Resource.Kind != RoutingResourceKind.Electrical
         )
         for Resource in ReservedResources:
+            OwnershipResourceCount += 1
+            if OwnershipResourceCount % 256 == 0:
+                CheckDeadline(
+                    "ownership-resources",
+                    Signal=Signal,
+                    ProcessedResources=OwnershipResourceCount,
+                )
             FinalOwners[Resource].append(Signal)
         Graph = PhysicalGraphs[Signal]
+        OwnedEdges = set()
+        for Position, Neighbors in Graph.items():
+            for Neighbor in Neighbors:
+                OwnershipEdgeCount += 1
+                if OwnershipEdgeCount % 256 == 0:
+                    CheckDeadline(
+                        "ownership-edges",
+                        Signal=Signal,
+                        ProcessedEdges=OwnershipEdgeCount,
+                    )
+                if Position < Neighbor:
+                    OwnedEdges.add(NormalizeRoutingEdge(Position, Neighbor))
         FinalTracks[Signal] = replace(
             Track,
             ReservedResources=ReservedResources,
             OwnedNodes=frozenset(NetWires[Signal]),
-            OwnedEdges=frozenset(
-                NormalizeRoutingEdge(Position, Neighbor)
-                for Position, Neighbors in Graph.items()
-                for Neighbor in Neighbors
-                if Position < Neighbor
-            ),
+            OwnedEdges=frozenset(OwnedEdges),
         )
     TrackAssignmentValue = TrackAssignment(
         Tracks=FinalTracks,
@@ -228,12 +303,14 @@ def CompactRoutedTrees(
             for Resource, Signals in FinalOwners.items()
         },
     )
+    CheckDeadline("repeater-materialization")
     Repeaters = MaterializeReservedRepeaters(
         NetWires,
         Producers,
         Targets,
         PhysicalGraphs,
         TrackAssignmentValue.Tracks,
+        WorkCheck=CheckWork("repeater-materialization"),
     )
     Wires = set().union(*NetWires.values()) if NetWires else set()
     PreviousMetrics = Routed.RoutingMetrics
@@ -248,6 +325,7 @@ def CompactRoutedTrees(
         if Routed.RoutingAssignment is not None
         else None
     )
+    CheckDeadline("complete")
     return RoutedDesign(
         Module=Placed.Module,
         PlacedGates=Placed.PlacedGates,
@@ -316,8 +394,23 @@ def RoutePcbAttempt(
     ProgressCallback: Callable[[int, int], None] | None = None,
     StatusCallback: Callable[[str], None] | None = None,
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
+    Deadline: RoutingDeadline | None = None,
 ) -> RoutedDesign:
     """Run the single authoritative routing configuration."""
+    def CheckRoutingDeadline(
+        Stage: str,
+        Diagnostics: dict[str, object] | None = None,
+    ) -> None:
+        if Deadline is not None:
+            Deadline.RaiseIfExpired(Stage, Diagnostics)
+
+    def CheckRoutingWork(
+        Stage: str,
+    ) -> Callable[[dict[str, object]], None] | None:
+        if Deadline is None:
+            return None
+        return lambda Diagnostics: CheckRoutingDeadline(Stage, Diagnostics)
+
     SearchMargin = Configuration.SearchMargin
     GuidePenalty = Configuration.GuidePenalty
     DetourRatio = Configuration.MaximumDetourRatio
@@ -325,7 +418,10 @@ def RoutePcbAttempt(
     Iterations = Configuration.MaximumIterations
     OrderMode = Configuration.OrderMode
     if Resources is None:
-        Resources = BuildRoutingResources(Placement.Placed)
+        Resources = BuildRoutingResources(
+            Placement.Placed,
+            WorkCheck=CheckRoutingWork("RoutingResourceConstruction"),
+        )
     CompletedRoutingPasses = 0
     MaximumRoutingHeight = 2 * Placement.LayerCount + 2
     RouteLayers = Placement.Placed.RouteLayers or {}
@@ -362,7 +458,11 @@ def RoutePcbAttempt(
 
         def ReportIteration(Completed: int, Total: int) -> None:
             nonlocal LastCompleted
-            LastCompleted = max(LastCompleted, Completed)
+            EffectiveTotal = max(1, Total)
+            # The final unit belongs to cleanup/compaction below.  Never let
+            # an inner planner callback publish 100% before that work passes.
+            EffectiveCompleted = min(Completed, EffectiveTotal - 1)
+            LastCompleted = max(LastCompleted, EffectiveCompleted)
             StageName = {
                 0: "authoritative resource graph",
                 1: "capacity-aware global guide planning",
@@ -374,8 +474,8 @@ def RoutePcbAttempt(
             ReportStatus(StageName)
             if ProgressCallback is not None:
                 ProgressCallback(
-                    CompletedRoutingPasses + Completed,
-                    CompletedRoutingPasses + Total,
+                    CompletedRoutingPasses + EffectiveCompleted,
+                    CompletedRoutingPasses + EffectiveTotal,
                 )
 
         def ReportIterationDiagnostic(Metrics: Any, FailedSignal: str | None) -> None:
@@ -424,6 +524,8 @@ def RoutePcbAttempt(
                 IterationProgressCallback=ReportIteration,
                 IterationDiagnosticCallback=ReportIterationDiagnostic,
                 Policy=Policy,
+                SkipStrictPortalReservation=False,
+                Deadline=Deadline,
             )
             return Routed
         finally:
@@ -443,24 +545,35 @@ def RoutePcbAttempt(
         else AccessLength
     )
     ReportStatus(f"compacting access length {CompactionAccessLength}")
+    if Deadline is not None:
+        Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "before"})
     Routed = CompactRoutedTrees(
         Placement,
         Routed,
         AccessLength=CompactionAccessLength,
         Resources=Resources,
+        Deadline=Deadline,
     )
+    if Deadline is not None:
+        Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "after"})
     if FrozenNetWires:
-        NetWires = {
-            Signal: set(Positions)
-            for Signal, Positions in Routed.NetWires.items()
-        }
-        NetWires.update(
-            {
-                Signal: set(Positions)
-                for Signal, Positions in FrozenNetWires.items()
-            }
+        NetWires = {}
+        for Signal, Positions in Routed.NetWires.items():
+            CheckRoutingDeadline(
+                "FrozenNetMerge",
+                {"Phase": "detailed-net", "Signal": Signal},
+            )
+            NetWires[Signal] = set(Positions)
+        for Signal, Positions in FrozenNetWires.items():
+            CheckRoutingDeadline(
+                "FrozenNetMerge",
+                {"Phase": "frozen-net", "Signal": Signal},
+            )
+            NetWires[Signal] = set(Positions)
+        Conflicts, _ConflictCounts = FindFlatRouteConflicts(
+            NetWires,
+            WorkCheck=CheckRoutingWork("FrozenNetConflictValidation"),
         )
-        Conflicts, _ConflictCounts = FindFlatRouteConflicts(NetWires)
         if Conflicts:
             raise ValueError(
                 "Frozen local NAND routes conflict with detailed routes: "
@@ -470,14 +583,24 @@ def RoutePcbAttempt(
             Signal: sorted(Positions)
             for Signal, Positions in sorted(NetWires.items())
         }
-        Routed.Wires = sorted(set().union(*NetWires.values()))
-        Routed.Supports = sorted(
-            {
-                (X, Y - 1, Z)
-                for Positions in NetWires.values()
-                for X, Y, Z in Positions
-            }
-        )
+        MergedWires: set[tuple[int, int, int]] = set()
+        MergedSupports: set[tuple[int, int, int]] = set()
+        MergedPositionCount = 0
+        for Signal, Positions in NetWires.items():
+            for X, Y, Z in Positions:
+                MergedPositionCount += 1
+                if MergedPositionCount % 256 == 0:
+                    CheckRoutingDeadline(
+                        "FrozenNetMaterialization",
+                        {
+                            "Signal": Signal,
+                            "ProcessedPositions": MergedPositionCount,
+                        },
+                    )
+                MergedWires.add((X, Y, Z))
+                MergedSupports.add((X, Y - 1, Z))
+        Routed.Wires = sorted(MergedWires)
+        Routed.Supports = sorted(MergedSupports)
         Routed.RoutingMetrics = MeasureRoutingStage(
             Routed.RoutingMetrics.Stage if Routed.RoutingMetrics else "Cleanup",
             NetWires,
@@ -494,11 +617,20 @@ def RoutePcbAttempt(
                 else ()
             ),
         )
-        FinalClaims = {
-            Signal: Resources.ResourceGraph.BuildRouteClaims(Positions)
-            for Signal, Positions in NetWires.items()
-        }
-        ClaimConflicts = FindClaimConflicts(FinalClaims)
+        FinalClaims = {}
+        for Signal, Positions in NetWires.items():
+            CheckRoutingDeadline(
+                "FrozenNetClaimRebuild",
+                {"Signal": Signal},
+            )
+            FinalClaims[Signal] = Resources.ResourceGraph.BuildRouteClaims(
+                Positions,
+                WorkCheck=CheckRoutingWork("FrozenNetClaimRebuild"),
+            )
+        ClaimConflicts = FindClaimConflicts(
+            FinalClaims,
+            WorkCheck=CheckRoutingWork("FrozenNetClaimValidation"),
+        )
         if ClaimConflicts:
             Resource = min(ClaimConflicts, key=str)
             raise ValueError(
@@ -506,8 +638,18 @@ def RoutePcbAttempt(
                 + ",".join(ClaimConflicts[Resource])
             )
         Owners = defaultdict(list)
+        OwnershipResourceCount = 0
         for Signal, Claims in FinalClaims.items():
             for Resource in Claims.ResourceIds:
+                OwnershipResourceCount += 1
+                if OwnershipResourceCount % 256 == 0:
+                    CheckRoutingDeadline(
+                        "FrozenNetOwnershipRebuild",
+                        {
+                            "Signal": Signal,
+                            "ProcessedResources": OwnershipResourceCount,
+                        },
+                    )
                 if Resource.Kind != RoutingResourceKind.Electrical:
                     Owners[Resource].append(Signal)
         if Routed.TrackAssignment is not None:
@@ -569,6 +711,12 @@ def RoutePcbAttempt(
         "BoundedEscapes": [],
         "IslandCrossings": 0,
     }
+    if Deadline is not None:
+        Deadline.RaiseIfExpired("RoutingFinalization")
+    ReportStatus("authoritative route complete")
+    if ProgressCallback is not None:
+        FinalCompleted = CompletedRoutingPasses + 1
+        ProgressCallback(FinalCompleted, FinalCompleted)
     return Routed
 
 def BuildPcbRoutingConfigurations(
@@ -586,6 +734,7 @@ def RoutePcbDesign(
         None,
     ] | None = None,
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
+    Deadline: RoutingDeadline | None = None,
 ) -> RoutedDesign:
     """Run one strict guided route and fail immediately if it is illegal."""
     Configuration = BuildPcbRoutingConfigurations(Placement)[0]
@@ -622,7 +771,29 @@ def RoutePcbDesign(
         ReportProgress()
 
     ReportProgress()
-    Resources = BuildRoutingResources(Placement.Placed)
+    if Deadline is not None:
+        Deadline.RaiseIfExpired(
+            "RoutingResourceConstruction",
+            {"Phase": "before"},
+        )
+    Resources = BuildRoutingResources(
+        Placement.Placed,
+        WorkCheck=(
+            (
+                lambda Diagnostics: Deadline.RaiseIfExpired(
+                    "RoutingResourceConstruction",
+                    Diagnostics,
+                )
+            )
+            if Deadline is not None
+            else None
+        ),
+    )
+    if Deadline is not None:
+        Deadline.RaiseIfExpired(
+            "RoutingResourceConstruction",
+            {"Phase": "after"},
+        )
     try:
         Routed = RoutePcbAttempt(
             Placement,
@@ -631,7 +802,10 @@ def RoutePcbDesign(
             ProgressCallback=RecordProgress,
             StatusCallback=RecordStatus,
             Policy=Policy,
+            Deadline=Deadline,
         )
+        if Deadline is not None:
+            Deadline.RaiseIfExpired("Routing")
     except RoutingStageError as Error:
         Stage = "failed | " + str(Error)
         ReportProgress(Failed=1)

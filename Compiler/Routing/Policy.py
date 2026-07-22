@@ -18,7 +18,9 @@ class RoutingStrategy(str, Enum):
         if isinstance(Value, cls):
             return Value
         if Value == "authoritative-only":
-            return cls.Compatibility
+            # Keep legacy alias compatibility but route it to the active
+            # organized policy to avoid accidentally invoking a retired path.
+            return cls.NewRouterFirst
         return cls(Value)
 
 
@@ -43,6 +45,7 @@ class PlacementPolicy:
     RoutingSpacingAlternatives: int = 0
     PreferWideTerminalBanks: bool = False
     TerminalBankOffsetX: int = 0
+    EnableRoutingFeedback: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,12 +63,21 @@ class NandPackingPolicy:
     GraphBeamEnabled: bool = True
     EnableStructuralReuse: bool = True
     MaximumStructuralReuseMappings: int = 4096
+    MaximumFrozenLocalNetNodes: int = 32
+    MaximumFrozenLocalTargets: int = 16
+    EnableVerticalClusterStacking: bool = True
+    MaximumClustersPerStack: int = 4
+    ClusterDeckPitch: int = 6
 
     def __post_init__(self) -> None:
         if self.MaximumStructuralReuseMappings < 1:
             raise ValueError(
                 "MaximumStructuralReuseMappings must be positive"
             )
+        if self.MaximumClustersPerStack < 1:
+            raise ValueError("MaximumClustersPerStack must be positive")
+        if self.ClusterDeckPitch < 3:
+            raise ValueError("ClusterDeckPitch must preserve support and headroom")
 
 
 @dataclass(frozen=True)
@@ -75,9 +87,30 @@ class MaterialObjectivePolicy:
     Enabled: bool = False
     MinimumComponentFunctionalShare: float = 0.60
     MaximumRoutingFunctionalShare: float = 0.40
+    # OpenROAD/VPR-style acceptance naming used by docs and diagnostics.
+    MaximumRoutingDominance: float = 0.40
+    MaximumRouteShare: float = 0.40
     MaximumRawDustFunctionalShare: float = 0.45
     MaximumFootprint: int = 600
     MaximumNonAirBlocks: int = 500
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.MinimumComponentFunctionalShare <= 1.0):
+            raise ValueError("MinimumComponentFunctionalShare must be in [0.0, 1.0]")
+        for Name, Value in (
+            ("MaximumRoutingFunctionalShare", self.MaximumRoutingFunctionalShare),
+            ("MaximumRoutingDominance", self.MaximumRoutingDominance),
+            ("MaximumRouteShare", self.MaximumRouteShare),
+            ("MaximumRawDustFunctionalShare", self.MaximumRawDustFunctionalShare),
+        ):
+            if not (0.0 <= Value <= 1.0):
+                raise ValueError(
+                    f"{Name} must be in [0.0, 1.0]"
+                )
+        if self.MaximumFootprint < 1:
+            raise ValueError("MaximumFootprint must be positive")
+        if self.MaximumNonAirBlocks < 1:
+            raise ValueError("MaximumNonAirBlocks must be positive")
 
 
 @dataclass(frozen=True)
@@ -111,6 +144,35 @@ class GlobalRoutingPolicy:
     SharedBoundaryEnvelope: int = 6
     MaximumRipupPasses: int = 4
     StagnationPassLimit: int = 2
+    EnableCapacityAwareGuides: bool = False
+
+
+@dataclass(frozen=True)
+class NegotiatedRoutingPolicy:
+    """Bounded PathFinder-style route-tree negotiation controls."""
+
+    Enabled: bool = False
+    TilePitchInTracks: int = 4
+    MaximumIterations: int = 32
+    StagnationPassLimit: int = 3
+    PresentConflictPenalty: int = 96
+    HistoryIncrement: int = 32
+    MaximumPlacementFeedbackRounds: int = 3
+    MaximumPackedAreaGrowth: float = 2.0
+
+    def __post_init__(self) -> None:
+        for Name in (
+            "TilePitchInTracks",
+            "MaximumIterations",
+            "StagnationPassLimit",
+            "PresentConflictPenalty",
+            "HistoryIncrement",
+            "MaximumPlacementFeedbackRounds",
+        ):
+            if getattr(self, Name) < 1:
+                raise ValueError(f"{Name} must be positive")
+        if self.MaximumPackedAreaGrowth < 1.0:
+            raise ValueError("MaximumPackedAreaGrowth cannot shrink the baseline")
 
 
 @dataclass(frozen=True)
@@ -131,6 +193,10 @@ class AdaptiveRoutingPolicy:
     PortalGrowthFactor: int = 2
     InitialLaneCount: int = 3
     LaneGrowthFactor: int = 2
+    MaximumPortalReservationAlternatives: int = 2
+    MaximumLaneDiversityEscalations: int = 2
+    InitialCandidateRequestsPerSignal: int = 4
+    MaximumCandidateDiversityEscalations: int = 3
     InitialCandidatesPerNet: int = 72
     CandidateGrowthFactor: int = 2
     MinimumCandidatesPerNet: int = 16
@@ -205,6 +271,7 @@ class DetailedRoutingPolicy:
     LayerPenalty: int = 0
     CandidateBendWeight: int = 0
     CandidateViaWeight: int = 0
+    RepeaterPenalty: int = 2
     StagnationPassLimit: int = 12
     StrictBaseExpansions: int = 40_000
     StrictExpansionsPerNet: int = 3_000
@@ -212,6 +279,7 @@ class DetailedRoutingPolicy:
     RepairBaseExpansions: int = 100_000
     RepairExpansionsPerNet: int = 8_000
     RepairMaximumExpansions: int = 400_000
+    MinimumCandidateExpansionLimit: int = 4_096
 
 
 @dataclass(frozen=True)
@@ -265,6 +333,9 @@ class PhysicalDesignPolicy:
         default_factory=RoutingOrganizationPolicy
     )
     GlobalRouting: GlobalRoutingPolicy = field(default_factory=GlobalRoutingPolicy)
+    NegotiatedRouting: NegotiatedRoutingPolicy = field(
+        default_factory=NegotiatedRoutingPolicy
+    )
     TrackAssignment: TrackAssignmentPolicy = field(default_factory=TrackAssignmentPolicy)
     AdaptiveRouting: AdaptiveRoutingPolicy = field(default_factory=AdaptiveRoutingPolicy)
     DetailedRouting: DetailedRoutingPolicy = field(default_factory=DetailedRoutingPolicy)
@@ -285,66 +356,112 @@ DefaultPhysicalDesignPolicy = PhysicalDesignPolicy()
 # default policy. This preserves the measured pre-rewrite route.
 CompatibilityPhysicalDesignPolicy = PhysicalDesignPolicy(
     PolicyVersion="physical-design-v1-compatibility",
+    Placement=PlacementPolicy(),
+    NandPacking=NandPackingPolicy(),
+    TrackAssignment=TrackAssignmentPolicy(
+        MaximumRouteCandidatesPerNet=1536,
+        MaximumAssignmentExpansions=100_000,
+    ),
+    AdaptiveRouting=AdaptiveRoutingPolicy(),
 )
 
 LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
-    PolicyVersion="physical-design-v6-structural-reuse-nand",
+    PolicyVersion="physical-design-v11-negotiated-route-trees",
     Placement=PlacementPolicy(
         CompactPassLimit=16,
-        RoutingSpacing=4,
+        RoutingSpacing=6,
         LocalFanoutDistance=8,
         LocalFanoutWeight=16,
         HpwlWeight=3,
         PinEscapeLength=1,
         MaximumRoutingLayers=0,
-        RoutingFeedbackIterations=2,
-        RoutingSpacingAlternatives=1,
+        RoutingFeedbackIterations=1,
+        RoutingSpacingAlternatives=2,
         PreferWideTerminalBanks=False,
         TerminalBankOffsetX=0,
+        EnableRoutingFeedback=True,
     ),
-    NandPacking=NandPackingPolicy(Enabled=True),
-    MaterialObjective=MaterialObjectivePolicy(Enabled=False),
+    NandPacking=NandPackingPolicy(
+        Enabled=True,
+        RetainedPlacementCandidates=6,
+    ),
+    MaterialObjective=MaterialObjectivePolicy(
+        Enabled=False,
+        MinimumComponentFunctionalShare=0.60,
+        MaximumRoutingFunctionalShare=0.40,
+        MaximumRoutingDominance=0.40,
+        MaximumRouteShare=0.40,
+        MaximumRawDustFunctionalShare=0.45,
+        MaximumFootprint=600,
+        MaximumNonAirBlocks=500,
+    ),
     Organization=RoutingOrganizationPolicy(Enabled=True),
     GlobalRouting=GlobalRoutingPolicy(
-        CandidateLaneCount=25,
+        CandidateLaneCount=24,
         CorridorCapacity=1,
         OverflowPenalty=12,
         ExistingGuideHintWeight=2,
         IntraClusterEnvelope=2,
         SharedBoundaryEnvelope=6,
-        MaximumRipupPasses=4,
+        MaximumRipupPasses=2,
         StagnationPassLimit=2,
+        EnableCapacityAwareGuides=True,
     ),
+    NegotiatedRouting=NegotiatedRoutingPolicy(Enabled=True),
     TrackAssignment=TrackAssignmentPolicy(
-        ReassignmentLimit=12,
+        ReassignmentLimit=20,
         ReserveRepeaterSites=True,
-        MaximumPortalsPerTerminal=16,
-        MaximumRouteCandidatesPerNet=320,
-        MaximumAssignmentExpansions=100_000,
+        MaximumPortalsPerTerminal=48,
+        MaximumRouteCandidatesPerNet=2048,
+        MaximumAssignmentExpansions=500_000,
     ),
-    AdaptiveRouting=AdaptiveRoutingPolicy(Enabled=True),
+    AdaptiveRouting=AdaptiveRoutingPolicy(
+        Enabled=True,
+        InitialPortalsPerTerminal=6,
+        PortalGrowthFactor=2,
+        InitialLaneCount=4,
+        LaneGrowthFactor=2,
+        MaximumPortalReservationAlternatives=2,
+        MaximumLaneDiversityEscalations=4,
+        InitialCandidateRequestsPerSignal=8,
+        MaximumCandidateDiversityEscalations=3,
+        InitialCandidatesPerNet=96,
+        CandidateGrowthFactor=2,
+        MinimumCandidatesPerNet=8,
+        CandidateClaimWorkQuantum=64,
+        MaximumCandidateGenerationExpansions=2_000_000,
+        InitialAssignmentExpansions=64,
+        AssignmentGrowthFactor=2,
+        BaseAssignmentExpansions=8_000,
+        AssignmentExpansionsPerNet=1_200,
+        AssignmentExpansionsPerTerminal=250,
+        MaximumAssignmentExpansions=180_000,
+        MaximumRuntimeSeconds=180.0,
+    ),
     DetailedRouting=DetailedRoutingPolicy(
-        GuideExpansion=4,
-        LengthPenalty=12,
+        GuideExpansion=3,
+        LengthPenalty=8,
         MinimumGuidePenalty=1,
         StrictGuideMultiplier=2,
-        StrictBendPenalty=12,
-        RepairBendPenalty=8,
-        StrictViaPenalty=8,
-        RepairViaPenalty=6,
+        StrictBendPenalty=10,
+        RepairBendPenalty=6,
+        StrictViaPenalty=7,
+        RepairViaPenalty=5,
         LayerPenalty=8,
-        CandidateBendWeight=12,
-        CandidateViaWeight=8,
-        StagnationPassLimit=8,
-        StrictBaseExpansions=40_000,
-        StrictExpansionsPerNet=3_000,
-        StrictMaximumExpansions=160_000,
-        RepairBaseExpansions=100_000,
-        RepairExpansionsPerNet=8_000,
-        RepairMaximumExpansions=400_000,
+        CandidateBendWeight=8,
+        CandidateViaWeight=6,
+        RepeaterPenalty=24,
+        StagnationPassLimit=6,
+        StrictBaseExpansions=25_000,
+        StrictExpansionsPerNet=1_200,
+        StrictMaximumExpansions=90_000,
+        RepairBaseExpansions=70_000,
+        RepairExpansionsPerNet=3_000,
+        RepairMaximumExpansions=160_000,
+        MinimumCandidateExpansionLimit=2_048,
     ),
-    QualityGate=QualityGatePolicy(Enabled=True),
-    QualityTarget="local-first",
+    QualityGate=QualityGatePolicy(Enabled=False),
+    QualityTarget="first-legal",
     RuntimeBudgetSeconds=120.0,
 )
 
@@ -375,6 +492,13 @@ def PolicyForRoutingStrategy(Strategy: RoutingStrategy) -> PhysicalDesignPolicy:
     if Strategy == RoutingStrategy.Compatibility:
         return CompatibilityPhysicalDesignPolicy
     return LocalFirstPhysicalDesignPolicy
+
+
+def ExecutionStrategyForRequest(Strategy: RoutingStrategy) -> RoutingStrategy:
+    """Resolve an explicit request without enabling automatic fallback."""
+    if Strategy == RoutingStrategy.Compatibility:
+        return RoutingStrategy.Compatibility
+    return RoutingStrategy.NewRouterFirst
 
 
 def BuildRoutingAttemptPolicies() -> tuple[RoutingAttemptPolicy, ...]:

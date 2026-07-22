@@ -5,14 +5,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from collections import Counter
 from math import ceil
-from typing import Any
+from typing import Any, Callable
 
 from ..Placement.Geometry import GetGateInputAccess
 from ..Placement.Rotation import RotatedCellSize
 from .ChannelPlanner import (
     BuildNetRoutingProfiles,
     CandidateLanes,
-    RasterizeChannelSegment,
 )
 from .Policy import GlobalRoutingPolicy, PhysicalDesignPolicy
 from .Technology import RedstoneRoutingTechnology
@@ -132,9 +131,19 @@ def DeriveRoutingBudget(
         Policy.GlobalRouting.CandidateLaneCount,
         Adaptive.InitialLaneCount + ceil(Demand.CongestionEstimate),
     )
+    DemandCandidates = (
+        Adaptive.InitialCandidatesPerNet
+        + Demand.MaximumFanout * 4
+        + ceil(Demand.TotalHpwl / max(1, Demand.NandCount))
+        + Demand.PinScarcityCount
+        + Demand.RoutableNetCount
+    )
     Candidates = min(
         Policy.TrackAssignment.MaximumRouteCandidatesPerNet,
-        Adaptive.InitialCandidatesPerNet,
+        max(
+            Adaptive.InitialCandidatesPerNet,
+            DemandCandidates,
+        ),
     )
     AssignmentExpansions = min(
         Policy.TrackAssignment.MaximumAssignmentExpansions,
@@ -252,9 +261,17 @@ class CoarseGuidePlan:
 @dataclass(frozen=True)
 class PlacementRoutingFeedback:
     RoutingSpacing: int
+    BoundaryOverflow: int
+    PinScarcityCount: int
     GuideOverflowPeak: int
     GuideOverflowCells: int
     PinEscapeConflictCount: int
+    LocalClaimCoverageRatio: float
+    LocalRouteTargets: int
+    LocalDirectConnectionCount: int
+    EstimatedGlobalExtensionNodes: int
+    EstimatedGlobalExtensionNets: int
+    RoutingDominanceProxy: float
     FrozenLocalNetCount: int
     PreOwnedNodeCount: int
     Hpwl: int
@@ -263,19 +280,41 @@ class PlacementRoutingFeedback:
     GateFootprint: int
 
     @property
-    def Score(self) -> tuple[int, ...]:
+    def RoutabilityWorkEstimate(self) -> int:
+        """Combine assignment size, fixed ownership, and boundary pressure."""
         return (
+            5 * self.EstimatedGlobalExtensionNets
+            + self.PreOwnedNodeCount
+            + self.EstimatedGlobalExtensionNodes
+            + 3 * self.BoundaryOverflow
+            + ceil(self.PinScarcityCount / 8)
+        )
+
+    @property
+    def Score(self) -> tuple[int, ...]:
+        # Estimate bounded routing work before applying stable physical
+        # tie-breakers. This preserves useful local routing on small designs
+        # while preventing severe boundary pressure and fixed ownership from
+        # hiding behind a deceptively small global-net count.
+        return (
+            self.RoutabilityWorkEstimate,
+            self.BoundaryOverflow,
+            self.PinScarcityCount,
             self.GuideOverflowPeak,
             self.GuideOverflowCells,
             self.PinEscapeConflictCount,
-            -self.FrozenLocalNetCount,
-            -self.PreOwnedNodeCount,
+            self.EstimatedGlobalExtensionNets,
+            self.PreOwnedNodeCount + self.EstimatedGlobalExtensionNodes,
+            -round(self.LocalClaimCoverageRatio * 10_000),
             self.WeightedLocalityCost,
             self.GateFootprint,
+            -self.FrozenLocalNetCount,
+            -self.LocalDirectConnectionCount,
         )
 
     def ToDictionary(self) -> dict[str, object]:
         Value = asdict(self)
+        Value["RoutabilityWorkEstimate"] = self.RoutabilityWorkEstimate
         Value["Score"] = list(self.Score)
         return Value
 
@@ -291,9 +330,19 @@ class LocalFirstSnapshot:
         return asdict(self)
 
 
-def _SignalEndpoints(Placed: Any) -> dict[str, tuple[Position2, ...]]:
+def _SignalEndpoints(
+    Placed: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, tuple[Position2, ...]]:
     Values: dict[str, list[Position2]] = {}
-    for Gate in Placed.PlacedGates:
+    Gates = list(Placed.PlacedGates)
+    for GateIndex, Gate in enumerate(Gates):
+        if WorkCheck is not None and GateIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "placement-feedback-endpoints",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Gates),
+            })
         if Gate.OutputPin is not None:
             for Signal in Gate.Outputs:
                 Values.setdefault(Signal, []).append(
@@ -308,12 +357,19 @@ def _SignalEndpoints(Placed: Any) -> dict[str, tuple[Position2, ...]]:
 def BuildPlacementSolution(
     Placed: Any,
     LocalFanoutDistance: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PlacementSolution:
     """Measure HPWL, locality, and pin-window overlap for a placed graph."""
-    Endpoints = _SignalEndpoints(Placed)
+    Endpoints = _SignalEndpoints(Placed, WorkCheck=WorkCheck)
     Hpwl = 0
     LocalFanoutPenalty = 0
-    for Values in Endpoints.values():
+    for SignalIndex, Values in enumerate(Endpoints.values()):
+        if WorkCheck is not None and SignalIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "placement-feedback-hpwl",
+                "CompletedSignals": SignalIndex,
+                "TotalSignals": len(Endpoints),
+            })
         if len(Values) < 2:
             continue
         Span = (
@@ -323,7 +379,14 @@ def BuildPlacementSolution(
         Hpwl += Span
         LocalFanoutPenalty += max(0, Span - LocalFanoutDistance)
     EscapeOwners: dict[Position2, set[str]] = {}
-    for Gate in Placed.PlacedGates:
+    Gates = list(Placed.PlacedGates)
+    for GateIndex, Gate in enumerate(Gates):
+        if WorkCheck is not None and GateIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "placement-feedback-pin-escape",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Gates),
+            })
         for InputIndex, Signal in enumerate(Gate.Inputs):
             Pin, Direction = GetGateInputAccess(Gate, InputIndex)
             Column = (Pin[0] + Direction[0], Pin[2] + Direction[2])
@@ -445,20 +508,58 @@ def _BuildRectilinearGuide(
     Terminals: tuple[Position2, ...],
     Axis: str,
     Lane: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> frozenset[Position2]:
+    def AddSegment(Start: Position2, End: Position2) -> None:
+        if Start[0] != End[0] and Start[1] != End[1]:
+            raise ValueError("Channel segments must be axis aligned")
+        DeltaX = 0 if Start[0] == End[0] else (1 if End[0] > Start[0] else -1)
+        DeltaZ = 0 if Start[1] == End[1] else (1 if End[1] > Start[1] else -1)
+        Position = Start
+        SegmentPositions = 1
+        Guide.add(Position)
+        while Position != End:
+            Position = (Position[0] + DeltaX, Position[1] + DeltaZ)
+            Guide.add(Position)
+            SegmentPositions += 1
+            if WorkCheck is not None and SegmentPositions % 256 == 0:
+                WorkCheck({
+                    "Phase": "capacity-guide-segment",
+                    "Axis": Axis,
+                    "Lane": Lane,
+                    "ProcessedSegmentPositions": SegmentPositions,
+                    "GuidePositionCount": len(Guide),
+                })
+
     Guide: set[Position2] = set()
     if Axis == "X":
         Minimum = min(X for X, _Z in Terminals)
         Maximum = max(X for X, _Z in Terminals)
-        Guide.update(RasterizeChannelSegment((Minimum, Lane), (Maximum, Lane)))
-        for X, Z in Terminals:
-            Guide.update(RasterizeChannelSegment((X, Z), (X, Lane)))
+        AddSegment((Minimum, Lane), (Maximum, Lane))
+        for TerminalIndex, (X, Z) in enumerate(Terminals):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "capacity-guide-terminal",
+                    "Axis": Axis,
+                    "Lane": Lane,
+                    "CompletedTerminals": TerminalIndex,
+                    "TotalTerminals": len(Terminals),
+                })
+            AddSegment((X, Z), (X, Lane))
     else:
         Minimum = min(Z for _X, Z in Terminals)
         Maximum = max(Z for _X, Z in Terminals)
-        Guide.update(RasterizeChannelSegment((Lane, Minimum), (Lane, Maximum)))
-        for X, Z in Terminals:
-            Guide.update(RasterizeChannelSegment((X, Z), (Lane, Z)))
+        AddSegment((Lane, Minimum), (Lane, Maximum))
+        for TerminalIndex, (X, Z) in enumerate(Terminals):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "capacity-guide-terminal",
+                    "Axis": Axis,
+                    "Lane": Lane,
+                    "CompletedTerminals": TerminalIndex,
+                    "TotalTerminals": len(Terminals),
+                })
+            AddSegment((X, Z), (Lane, Z))
     return frozenset(Guide)
 
 
@@ -470,6 +571,7 @@ def BuildCapacityAwareGuidePlan(
     Policy: GlobalRoutingPolicy,
     Technology: RedstoneRoutingTechnology,
     LocalFanoutDistance: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> CoarseGuidePlan:
     """Allocate deterministic coarse guides, then rip up overflow offenders."""
     if LayerCount < 1:
@@ -478,9 +580,17 @@ def BuildCapacityAwareGuidePlan(
     LocalSignals = frozenset(
         Signal
         for Signal, Profile in Profiles.items()
-        if Profile.Span <= LocalFanoutDistance and Profile.Fanout <= 2
+        if Profile.Span <= LocalFanoutDistance
     )
-    for Signal, Profile in Profiles.items():
+    ProfileItems = list(Profiles.items())
+    for ProfileIndex, (Signal, Profile) in enumerate(ProfileItems):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "capacity-guide-profile",
+                "CompletedProfiles": ProfileIndex,
+                "TotalProfiles": len(ProfileItems),
+                "Signal": Signal,
+            })
         Terminals = tuple(
             (Path[-1][0], Path[-1][2])
             for Path in (
@@ -488,28 +598,56 @@ def BuildCapacityAwareGuidePlan(
                 *Profile.TargetAccessPaths.values(),
             )
         )
-        Values = []
+        Values: list[
+            tuple[int, int, int, int, str, int, frozenset[Position2]]
+        ] = []
         XSpan = max(X for X, _Z in Terminals) - min(X for X, _Z in Terminals)
         ZSpan = max(Z for _X, Z in Terminals) - min(Z for _X, Z in Terminals)
         PreferredAxis = "X" if XSpan >= ZSpan else "Z"
         for Axis in ("X", "Z"):
-            Coordinates = sorted(
-                Z for _X, Z in Terminals
-            ) if Axis == "X" else sorted(X for X, _Z in Terminals)
+            Coordinates = (
+                sorted(Z for _X, Z in Terminals)
+                if Axis == "X"
+                else sorted(X for X, _Z in Terminals)
+            )
             Center = Coordinates[len(Coordinates) // 2]
             Anchor = MinimumZ if Axis == "X" else MinimumX
             Aligned = Anchor + (
                 (Center - Anchor + Technology.TrackPitch // 2)
                 // Technology.TrackPitch
             ) * Technology.TrackPitch
-            LaneCount = min(Policy.CandidateLaneCount, 5)
-            for Lane in CandidateLanes(Aligned, LaneCount, Technology.TrackPitch):
-                Guide = _BuildRectilinearGuide(Terminals, Axis, Lane)
-                Escape = max(0, abs(Lane - Center) - (
-                    Policy.IntraClusterEnvelope
-                    if Signal in LocalSignals
-                    else Policy.SharedBoundaryEnvelope
-                ))
+            # CandidateLaneCount is the policy ceiling; do not impose a
+            # circuit-size-specific five-lane cap here.
+            LaneCount = max(1, Policy.CandidateLaneCount)
+            Lanes = CandidateLanes(
+                Aligned,
+                LaneCount,
+                Technology.TrackPitch,
+            )
+            for LaneIndex, Lane in enumerate(Lanes):
+                if WorkCheck is not None:
+                    WorkCheck({
+                        "Phase": "capacity-guide-lane",
+                        "Signal": Signal,
+                        "Axis": Axis,
+                        "CompletedLanes": LaneIndex,
+                        "TotalLanes": len(Lanes),
+                    })
+                Guide = _BuildRectilinearGuide(
+                    Terminals,
+                    Axis,
+                    Lane,
+                    WorkCheck=WorkCheck,
+                )
+                Escape = max(
+                    0,
+                    abs(Lane - Center)
+                    - (
+                        Policy.IntraClusterEnvelope
+                        if Signal in LocalSignals
+                        else Policy.SharedBoundaryEnvelope
+                    ),
+                )
                 for Layer in range(LayerCount):
                     Values.append(
                         (
@@ -522,6 +660,10 @@ def BuildCapacityAwareGuidePlan(
                             Guide,
                         )
                     )
+        if not Values:
+            raise ValueError(
+                "bounded guide planning produced no candidates"
+            )
         Options[Signal] = sorted(Values)
 
     Selected: dict[str, tuple[int, str, int, frozenset[Position2]]] = {}
@@ -530,22 +672,45 @@ def BuildCapacityAwareGuidePlan(
 
     def SelectSignal(Signal: str) -> None:
         Best = None
-        for Escape, Length, Layer, AxisBias, Axis, Lane, Guide in Options[Signal]:
-            OverflowCost = sum(
-                max(0, Usage[(Layer, X, Z)] + 1 - Policy.CorridorCapacity)
-                for X, Z in Guide
-            )
-            ColumnOverflowCost = sum(
-                max(
+        SignalOptions = Options[Signal]
+        for OptionIndex, (
+            Escape,
+            Length,
+            Layer,
+            AxisBias,
+            Axis,
+            Lane,
+            Guide,
+        ) in enumerate(SignalOptions):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "capacity-guide-selection",
+                    "Signal": Signal,
+                    "CompletedOptions": OptionIndex,
+                    "TotalOptions": len(SignalOptions),
+                })
+            OverflowCost = 0
+            ColumnOverflowCost = 0
+            HistoryCost = 0
+            for GuidePositionIndex, (X, Z) in enumerate(Guide, start=1):
+                if WorkCheck is not None and GuidePositionIndex % 256 == 0:
+                    WorkCheck({
+                        "Phase": "capacity-guide-option-cells",
+                        "Signal": Signal,
+                        "CompletedOptions": OptionIndex,
+                        "ProcessedGuidePositions": GuidePositionIndex,
+                        "GuidePositionCount": len(Guide),
+                    })
+                OverflowCost += max(
                     0,
-                    sum(
-                        Usage[(ExistingLayer, X, Z)]
-                        for ExistingLayer in range(LayerCount)
-                    ) + 1 - 2,
+                    Usage[(Layer, X, Z)] + 1 - Policy.CorridorCapacity,
                 )
-                for X, Z in Guide
-            )
-            HistoryCost = sum(History[(Layer, X, Z)] for X, Z in Guide)
+                ColumnUsage = sum(
+                    Usage[(ExistingLayer, X, Z)]
+                    for ExistingLayer in range(LayerCount)
+                )
+                ColumnOverflowCost += max(0, ColumnUsage + 1 - 2)
+                HistoryCost += History[(Layer, X, Z)]
             Cost = (
                 (OverflowCost + ColumnOverflowCost) * Policy.OverflowPenalty,
                 Escape,
@@ -560,7 +725,15 @@ def BuildCapacityAwareGuidePlan(
         assert Best is not None
         _Cost, Layer, Axis, Lane, Guide = Best
         Selected[Signal] = (Layer, Axis, Lane, Guide)
-        Usage.update((Layer, X, Z) for X, Z in Guide)
+        for GuidePositionIndex, (X, Z) in enumerate(Guide, start=1):
+            Usage[(Layer, X, Z)] += 1
+            if WorkCheck is not None and GuidePositionIndex % 256 == 0:
+                WorkCheck({
+                    "Phase": "capacity-guide-usage",
+                    "Signal": Signal,
+                    "ProcessedGuidePositions": GuidePositionIndex,
+                    "GuidePositionCount": len(Guide),
+                })
 
     Order = sorted(
         Profiles,
@@ -570,23 +743,53 @@ def BuildCapacityAwareGuidePlan(
             Signal,
         ),
     )
-    for Signal in Order:
+    for SignalIndex, Signal in enumerate(Order):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "capacity-guide-initial-selection",
+                "CompletedSignals": SignalIndex,
+                "TotalSignals": len(Order),
+                "Signal": Signal,
+            })
         SelectSignal(Signal)
 
     Iterations = []
     PreviousOverflow = None
+
+    def BuildOverflow(Phase: str) -> dict[tuple[int, int, int], int]:
+        OverflowValue: dict[tuple[int, int, int], int] = {}
+        for UsageIndex, (Resource, Count) in enumerate(Usage.items(), start=1):
+            if WorkCheck is not None and UsageIndex % 256 == 0:
+                WorkCheck({
+                    "Phase": Phase,
+                    "ProcessedResources": UsageIndex,
+                    "UsageResourceCount": len(Usage),
+                })
+            if Count > Policy.CorridorCapacity:
+                OverflowValue[Resource] = Count - Policy.CorridorCapacity
+        return OverflowValue
+
     for PassIndex in range(Policy.MaximumRipupPasses + 1):
-        Overflow = {
-            Resource: Count - Policy.CorridorCapacity
-            for Resource, Count in Usage.items()
-            if Count > Policy.CorridorCapacity
-        }
-        Contributors = Counter(
-            Signal
-            for Signal, (Layer, _Axis, _Lane, Guide) in Selected.items()
-            for X, Z in Guide
-            if (Layer, X, Z) in Overflow
-        )
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "capacity-guide-ripup-pass",
+                "PassIndex": PassIndex,
+                "MaximumPasses": Policy.MaximumRipupPasses,
+            })
+        Overflow = BuildOverflow("capacity-guide-overflow")
+        Contributors: Counter[str] = Counter()
+        ContributorChecks = 0
+        for Signal, (Layer, _Axis, _Lane, Guide) in Selected.items():
+            for X, Z in Guide:
+                ContributorChecks += 1
+                if WorkCheck is not None and ContributorChecks % 256 == 0:
+                    WorkCheck({
+                        "Phase": "capacity-guide-contributors",
+                        "PassIndex": PassIndex,
+                        "ProcessedGuidePositions": ContributorChecks,
+                    })
+                if (Layer, X, Z) in Overflow:
+                    Contributors[Signal] += 1
         Offenders = tuple(
             Signal
             for Signal, _Count in Contributors.most_common(
@@ -607,13 +810,40 @@ def BuildCapacityAwareGuidePlan(
         if PreviousOverflow is not None and OverflowKey >= PreviousOverflow:
             break
         PreviousOverflow = OverflowKey
-        History.update(Overflow)
+        for ResourceIndex, (Resource, Count) in enumerate(
+            Overflow.items(),
+            start=1,
+        ):
+            History[Resource] += Count
+            if WorkCheck is not None and ResourceIndex % 256 == 0:
+                WorkCheck({
+                    "Phase": "capacity-guide-history",
+                    "PassIndex": PassIndex,
+                    "ProcessedResources": ResourceIndex,
+                    "OverflowResourceCount": len(Overflow),
+                })
         # Remove the whole conflict neighborhood before reselecting.  Releasing
         # one guide at a time makes the first reselected net inherit the old
         # congestion pattern and can falsely look stagnated.
-        for Signal in Offenders:
+        for OffenderIndex, Signal in enumerate(Offenders):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "capacity-guide-ripup",
+                    "PassIndex": PassIndex,
+                    "CompletedSignals": OffenderIndex,
+                    "TotalSignals": len(Offenders),
+                })
             Layer, _Axis, _Lane, Guide = Selected.pop(Signal)
-            Usage.subtract((Layer, X, Z) for X, Z in Guide)
+            for GuidePositionIndex, (X, Z) in enumerate(Guide, start=1):
+                Usage[(Layer, X, Z)] -= 1
+                if WorkCheck is not None and GuidePositionIndex % 256 == 0:
+                    WorkCheck({
+                        "Phase": "capacity-guide-ripup-cells",
+                        "PassIndex": PassIndex,
+                        "Signal": Signal,
+                        "ProcessedGuidePositions": GuidePositionIndex,
+                        "GuidePositionCount": len(Guide),
+                    })
         Usage += Counter()
         for Signal in sorted(
             Offenders,
@@ -625,11 +855,7 @@ def BuildCapacityAwareGuidePlan(
         ):
             SelectSignal(Signal)
 
-    Overflow = {
-        Resource: Count - Policy.CorridorCapacity
-        for Resource, Count in Usage.items()
-        if Count > Policy.CorridorCapacity
-    }
+    Overflow = BuildOverflow("capacity-guide-final-overflow")
     return CoarseGuidePlan(
         Guides={Signal: Value[3] for Signal, Value in Selected.items()},
         Layers={Signal: Value[0] for Signal, Value in Selected.items()},
@@ -647,13 +873,21 @@ def MeasurePlacementRoutingFeedback(
     RoutingSpacing: int,
     Policy: Any,
     Technology: RedstoneRoutingTechnology,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PlacementRoutingFeedback:
     """Score one legal placement using the same guide capacities as routing."""
+    if WorkCheck is not None:
+        WorkCheck({"Phase": "placement-feedback-start"})
     Placed = Placement.Placed
     Profiles = BuildNetRoutingProfiles(
         Placed,
         AccessLength=Policy.Placement.PinEscapeLength,
     )
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "placement-feedback-profiles",
+            "ProfileCount": len(Profiles),
+        })
     MinimumX = min(Gate.X for Gate in Placed.PlacedGates)
     MinimumZ = min(Gate.Z for Gate in Placed.PlacedGates)
     LayerCount = max(1, Placement.LayerCount)
@@ -665,10 +899,41 @@ def MeasurePlacementRoutingFeedback(
         Policy.GlobalRouting,
         Technology,
         Policy.Placement.LocalFanoutDistance,
+        WorkCheck=WorkCheck,
     )
     PlacementMetrics = BuildPlacementSolution(
         Placed,
         Policy.Placement.LocalFanoutDistance,
+        WorkCheck=WorkCheck,
+    )
+    LocalClaims = tuple(getattr(Placed, "LocalRouteClaims", ()) or ())
+    BoundaryOverflow = sum(
+        Cluster.BoundaryOverflow
+        for Cluster in getattr(Placement, "PackedClusters", ())
+    )
+    BoundaryPinScarcity = sum(
+        Cluster.PinScarcityCount
+        for Cluster in getattr(Placement, "PackedClusters", ())
+    )
+    TotalTargets = 0
+    CoveredTargets = 0
+    DirectConnections = 0
+    for ProfileIndex, Profile in enumerate(Profiles.values()):
+        if WorkCheck is not None and ProfileIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "placement-feedback-profile-metrics",
+                "CompletedProfiles": ProfileIndex,
+                "TotalProfiles": len(Profiles),
+            })
+        Unresolved = len(Profile.Targets)
+        Covered = len(Profile.Seed.ConnectedTargets) if Profile.Seed is not None else 0
+        TotalTargets += Unresolved + Covered
+        CoveredTargets += Covered
+        DirectConnections += Covered
+        if Profile.Seed is not None and Covered > 0:
+            DirectConnections += min(Unresolved, 1)
+    RoutingDominanceProxy = (
+        CoveredTargets / max(1, TotalTargets) if TotalTargets else 0.0
     )
     MaximumX = max(
         Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0] - 1
@@ -678,11 +943,31 @@ def MeasurePlacementRoutingFeedback(
         Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
         for Gate in Placed.PlacedGates
     )
+    if WorkCheck is not None:
+        WorkCheck({"Phase": "placement-feedback-complete"})
     return PlacementRoutingFeedback(
         RoutingSpacing=RoutingSpacing,
+        BoundaryOverflow=BoundaryOverflow,
+        PinScarcityCount=(
+            PlacementMetrics.PinEscapeConflictCount + BoundaryPinScarcity
+        ),
         GuideOverflowPeak=Plan.OverflowPeak,
         GuideOverflowCells=len(Plan.Overflow),
         PinEscapeConflictCount=PlacementMetrics.PinEscapeConflictCount,
+        LocalClaimCoverageRatio=(
+            CoveredTargets / max(1, TotalTargets)
+            if TotalTargets
+            else 0.0
+        ),
+        LocalRouteTargets=CoveredTargets,
+        LocalDirectConnectionCount=DirectConnections,
+        EstimatedGlobalExtensionNodes=(
+            sum(len(Profile.Targets) for Profile in Profiles.values())
+        ),
+        EstimatedGlobalExtensionNets=len(Profiles),
+        RoutingDominanceProxy=(
+            RoutingDominanceProxy
+        ),
         FrozenLocalNetCount=len(Placed.FrozenNetWires or {}),
         PreOwnedNodeCount=sum(
             len(Claim.Nodes) for Claim in (Placed.LocalRouteClaims or ())

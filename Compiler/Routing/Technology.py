@@ -25,14 +25,14 @@ class RedstoneRoutingTechnology:
 
     TechnologyVersion: str = "redstone-routing-v1"
     MaximumUnrefreshedDustLength: int = 15
-    PreferredRepeaterInterval: int = 12
+    PreferredRepeaterInterval: int = 14
     ReservedRepeaterInterval: int = 8
     TrackPitch: int = 3
     AccessLength: int = 3
-    DefaultSupportBlock: str = "minecraft:smooth_stone"
+    DefaultSupportBlock: str = "minecraft:light_gray_concrete"
     RoutingLayerPitch: int = 2
     MinimumRoutingLayerCount: int = 3
-    MaximumRoutableLayerCount: int = 6
+    MaximumRoutableLayerCount: int = 8
 
     @property
     def TrackPrimitives(self) -> tuple[TrackPrimitive, ...]:

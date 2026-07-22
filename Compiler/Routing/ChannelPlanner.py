@@ -48,13 +48,10 @@ def _CountPairClaimConflicts(
     Electrical = (First.WireCells & Second.ElectricalCells) | (
         Second.WireCells & First.ElectricalCells
     )
-    Support = (First.SupportCells & (Second.WireCells | Second.RequiredAirCells)) | (
-        Second.SupportCells & (First.WireCells | First.RequiredAirCells)
-    )
     Air = (First.RequiredAirCells & Second.WireCells) | (
         Second.RequiredAirCells & First.WireCells
     )
-    return len(Electrical) + len(Support) + len(Air)
+    return len(Electrical) + len(Air)
 
 
 @dataclass(frozen=True)
@@ -112,6 +109,38 @@ class RoutingIterationMetrics:
     BendCount: int
     ViaCount: int
     ConflictSignals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RoutingCongestionFeedback:
+    """A deterministic routing cut returned to cluster placement."""
+
+    Classification: str
+    Signals: tuple[str, ...]
+    Hotspots: tuple[Position3, ...]
+    SaturatedResources: tuple[str, ...] = ()
+    OverflowPeak: int = 0
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Classification": self.Classification,
+            "Signals": list(self.Signals),
+            "Hotspots": [list(Value) for Value in self.Hotspots],
+            "SaturatedResources": list(self.SaturatedResources),
+            "OverflowPeak": self.OverflowPeak,
+        }
+
+
+@dataclass(frozen=True)
+class NegotiatedRoutePlan:
+    """Conflict-free route trees produced before final exact validation."""
+
+    SelectedCandidates: dict[str, Any]
+    Iterations: tuple[RoutingIterationMetrics, ...]
+    ReroutedSignals: tuple[str, ...]
+    OverflowProgression: tuple[int, ...]
+    CachedNodeCount: int
+    CachedEdgeCount: int
 
 
 @dataclass(frozen=True)

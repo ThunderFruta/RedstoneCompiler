@@ -1,5 +1,31 @@
 # Organized NAND Routing Goals
 
+> **Historical goals notice (2026-07-21):** Keep the dated measurements below,
+> but do not treat them as v10 acceptance. Current gates and their verdict are
+> maintained in the [router reliability guide](RouterReliabilityGuide.md).
+
+## 2026-07-19 annotation and repeater follow-up
+
+- Final block-map construction emits one supported sign for every I/O cell;
+  signs are allocated after routing and cannot be overwritten by route material.
+- Repeater reservations are placed near the maximum safe dust interval and
+  redundant reservations are pruned against the complete directed fanout tree.
+- FullAdder retained 8/8 rows, zero conflicts, and all 5/5 I/O signs.
+- RCA4 retained 512/512 rows, zero conflicts, and all 14/14 I/O signs.
+- RCA8 retained 131072/131072 rows, zero conflicts, and all 26/26 I/O signs.
+
+The retained routes still require 2, 11, and 23 routing repeaters respectively;
+the safe minimizer did not delete them because each is necessary for at least
+one sink under the final route geometry. This is recorded as an honest unchanged
+metric rather than weakening redstone strength validation.
+
+Retained artifacts are under
+`Output/Benchmarks/2026-07-19/SignRepeaterFix/{FullAdder,Rca4Penalty,Rca8}`.
+Each was generated with `Main.py --example <example> --topmodule <module>
+--output <artifact-directory> --outputname <module> --routing-strategy
+new-router-first`. These follow-up runs are regression evidence, not Phase C
+acceptance samples, so they do not check any still-open acceptance gate below.
+
 ## Purpose
 
 This document is the acceptance checklist for the
@@ -310,6 +336,46 @@ Evidence:
 
 Evidence:
 `Output/Benchmarks/2026-07-19/ParallelSimulation`.
+
+## 2026-07-19 adaptive assignment and reset-safety follow-up
+
+- [x] Rust distinguishes exact-assignment work exhaustion from exhaustive
+  candidate incompatibility.
+- [x] Exhaustive incompatibility regenerates layers, portals, lanes, and route
+  candidates instead of replaying an identical assignment problem.
+- [x] Placement attempts consume one shared runtime budget and rank measured
+  routability before packed density.
+- [x] FullAdder and RCA4 accepted placements contain zero template-to-template
+  electrical-clearance violations.
+- [x] FullAdder retains 8/8 rows and RCA4 retains 512/512 rows after electrical
+  isolation legalization.
+- [ ] Confirm the replacement FullAdder resets after every lever on-to-off
+  transition inside Minecraft; automated steady-state simulation is not
+  sufficient evidence for this item.
+- [ ] CLA4 remains unrouted. The retained run stops at the candidate-stage
+  shared deadline after two exhaustively incompatible assignments.
+
+Evidence:
+`Output/Benchmarks/2026-07-19/StatefulResetFix` and
+`Output/Benchmarks/2026-07-19/AdaptiveClaEscalationFix/Cla4RoutabilityFirst.log`.
+
+## 2026-07-19 length-first compaction follow-up
+
+- [x] FullAdder route length improves `107 -> 102`, exact blocks improve
+  `350 -> 340`, and footprint improves `490 -> 476`.
+- [x] RCA4 route length improves `472 -> 452`, exact blocks improve
+  `1455 -> 1415`, and route support improves `716 -> 696`.
+- [x] Three FullAdder runs reproduce `length=102`, `bends=33`, `vias=24`, and
+  all 8 rows; runtime median is `2.292s` with `1.27%` maximum deviation.
+- [x] Three RCA4 runs reproduce `length=452`, `bends=136`, `vias=129`, and all
+  512 rows; runtime median is `9.177s` with `0.52%` maximum deviation.
+- [x] Both designs retain zero conflicts/unresolved claims and
+  `overflow_peak <= 1`.
+- [ ] FullAdder still misses component/routing/dust and maximum-net-share
+  gates; this checkpoint does not complete Phase C.
+- [ ] Manual Minecraft on-to-off reset verification remains open.
+
+Evidence: `Output/Benchmarks/2026-07-19/CompactionV8`.
 
 ## Current measured reference
 

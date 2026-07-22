@@ -6,6 +6,18 @@ from types import SimpleNamespace
 from Compiler.Routing.Core import (
     FindFlatRouteConflicts,
 )
+from Compiler.Routing.Actions import (
+    BuildPhysicalGraphs,
+    BuildRoutingResources,
+    MaterializeReservedRepeaters,
+    ValidatePhysicalRoutes,
+    ValidateTemplateIsolation,
+)
+from Compiler.Routing.ResourceGraph import (
+    FindClaimConflicts,
+    RoutingResourceClaims,
+    RoutingResourceGraph,
+)
 from Compiler.Routing.Pcb import BuildPcbRoutingConfigurations
 from SVDecoder.Sv import ParseSvToNetlist
 from Compiler.Placement.Pcb import PlacePcbGraph
@@ -14,6 +26,241 @@ from Compiler.Synthesis.NandTransform import ToNandOnly
 
 
 class RoutingResourceTests(unittest.TestCase):
+    def testPhysicalGraphConstructionCanBeStoppedInsideCellLoop(self) -> None:
+        Cells = {(Index, 1, 0) for Index in range(600)}
+        Observed = []
+
+        def StopDuringCells(Diagnostics):
+            Observed.append(Diagnostics)
+            if Diagnostics["Phase"] == "cells":
+                raise RuntimeError("physical graph deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "physical graph deadline expired",
+        ):
+            BuildPhysicalGraphs(
+                {"A": Cells},
+                ActualBlocks=set(),
+                Supports={(Index, 0, 0) for Index in range(600)},
+                WorkCheck=StopDuringCells,
+            )
+
+        self.assertEqual(Observed[-1]["ProcessedCells"], 256)
+
+    def testPhysicalValidationCanBeStoppedInsideConnectivityWalk(self) -> None:
+        Nodes = [(Index, 1, 0) for Index in range(600)]
+        Graph = {
+            Node: [
+                Neighbor
+                for Neighbor in (
+                    (Node[0] - 1, 1, 0),
+                    (Node[0] + 1, 1, 0),
+                )
+                if 0 <= Neighbor[0] < len(Nodes)
+            ]
+            for Node in Nodes
+        }
+        Observed = []
+
+        def StopDuringConnectivity(Diagnostics):
+            Observed.append(Diagnostics)
+            if Diagnostics["Phase"] == "connectivity":
+                raise RuntimeError("physical validation deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "physical validation deadline expired",
+        ):
+            ValidatePhysicalRoutes(
+                {"A": Graph},
+                {"A": SimpleNamespace(OutputPin=Nodes[0])},
+                {"A": [Nodes[-1]]},
+                WorkCheck=StopDuringConnectivity,
+            )
+
+        self.assertEqual(Observed[-1]["ExpandedNodes"], 256)
+
+    def testTemplateIsolationCanBeStoppedWhileExpandingKeepout(self) -> None:
+        Observed = []
+
+        def StopDuringKeepOut(Diagnostics):
+            Observed.append(Diagnostics)
+            if Diagnostics["Phase"] == "template-keepout":
+                raise RuntimeError("template isolation deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "template isolation deadline expired",
+        ):
+            ValidateTemplateIsolation(
+                {},
+                set(),
+                {(Index, 1, 0) for Index in range(600)},
+                set(),
+                {},
+                {},
+                WorkCheck=StopDuringKeepOut,
+            )
+
+        self.assertEqual(Observed[-1]["ProcessedPositions"], 256)
+
+    def testRoutingResourceConstructionCanStopInsideFrozenWireLoop(self) -> None:
+        Observed = []
+
+        def StopDuringFrozenWires(Diagnostics):
+            Observed.append(Diagnostics)
+            if Diagnostics["Phase"] == "routing-resources-frozen-position":
+                raise RuntimeError("resource construction deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "resource construction deadline expired",
+        ):
+            BuildRoutingResources(
+                SimpleNamespace(
+                    PlacedGates=[],
+                    FrozenNetWires={
+                        "A": {(Index, 1, 0) for Index in range(600)},
+                    },
+                ),
+                WorkCheck=StopDuringFrozenWires,
+            )
+
+        self.assertEqual(Observed[-1]["ProcessedPositions"], 256)
+
+    def testRouteClaimConstructionAndConflictPairsAreStoppable(self) -> None:
+        Graph = RoutingResourceGraph(
+            ActualBlocks=frozenset(),
+            ElectricalBlocks=frozenset(),
+            SolidBlocks=frozenset(),
+        )
+        ObservedClaims = []
+
+        def StopDuringClaims(Diagnostics):
+            ObservedClaims.append(Diagnostics)
+            if Diagnostics["Phase"] == "collect-wire-cells":
+                raise RuntimeError("claim rebuild deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "claim rebuild deadline expired",
+        ):
+            Graph.BuildRouteClaims(
+                ((Index, 1, 0) for Index in range(600)),
+                WorkCheck=StopDuringClaims,
+            )
+        self.assertEqual(ObservedClaims[-1]["ProcessedPositions"], 256)
+
+        Claims = {
+            f"Signal{Index}": RoutingResourceClaims(
+                WireCells=frozenset({(Index * 4, 1, 0)}),
+                ElectricalCells=frozenset({(Index * 4, 1, 0)}),
+            )
+            for Index in range(12)
+        }
+        ObservedPairs = []
+
+        def StopDuringPairs(Diagnostics):
+            ObservedPairs.append(Diagnostics)
+            if Diagnostics["Phase"] == "signal-pairs":
+                raise RuntimeError("claim conflict deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "claim conflict deadline expired",
+        ):
+            FindClaimConflicts(Claims, WorkCheck=StopDuringPairs)
+        self.assertEqual(ObservedPairs[-1]["SignalPairChecks"], 64)
+
+    def testFlatConflictRebuildCanStopInsideSignalPairs(self) -> None:
+        NetWires = {
+            f"Signal{Index}": {(Index * 4, 1, 0)}
+            for Index in range(12)
+        }
+        Observed = []
+
+        def StopDuringPairs(Diagnostics):
+            Observed.append(Diagnostics)
+            if Diagnostics["Phase"] == "signal-pairs":
+                raise RuntimeError("flat conflict deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "flat conflict deadline expired",
+        ):
+            FindFlatRouteConflicts(NetWires, WorkCheck=StopDuringPairs)
+
+        self.assertEqual(Observed[-1]["SignalPairChecks"], 64)
+
+    def testRepeaterMaterializationCanStopInsideFallbackPathSearch(self) -> None:
+        Nodes = [(Index, 1, 0) for Index in range(600)]
+        Graph = {
+            Node: [
+                Neighbor
+                for Neighbor in (
+                    (Node[0] - 1, 1, 0),
+                    (Node[0] + 1, 1, 0),
+                )
+                if 0 <= Neighbor[0] < len(Nodes)
+            ]
+            for Node in Nodes
+        }
+        Observed = []
+
+        def StopDuringFallback(Diagnostics):
+            Observed.append(Diagnostics)
+            if Diagnostics["Phase"] == "fallback-path-search":
+                raise RuntimeError("repeater deadline expired")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "repeater deadline expired",
+        ):
+            MaterializeReservedRepeaters(
+                {"A": set(Nodes)},
+                {"A": SimpleNamespace(OutputPin=Nodes[0])},
+                {"A": [Nodes[-1]]},
+                {"A": Graph},
+                {"A": SimpleNamespace(RepeaterReservations=())},
+                WorkCheck=StopDuringFallback,
+            )
+
+        self.assertEqual(Observed[-1]["ExpandedNodes"], 256)
+
+    def testFrozenRoutesAreObstaclesButNotTemplateElectricalBlocks(self) -> None:
+        FrozenPosition = (1, 1, 0)
+        Resources = BuildRoutingResources(SimpleNamespace(
+            PlacedGates=[],
+            FrozenNetWires={"A": (FrozenPosition,)},
+        ))
+
+        self.assertIn(
+            FrozenPosition,
+            Resources.StaticGeometry.ElectricalBlocks,
+        )
+        self.assertNotIn(
+            FrozenPosition,
+            Resources.StaticGeometry.TemplateElectricalBlocks,
+        )
+
+        Arguments = (
+            {"A": {(0, 1, 0), FrozenPosition}},
+            set(),
+            set(Resources.StaticGeometry.TemplateElectricalBlocks),
+            set(),
+            {"A": SimpleNamespace(OutputPin=(0, 1, 0))},
+            {"A": []},
+        )
+        ValidateTemplateIsolation(*Arguments)
+        with self.assertRaisesRegex(ValueError, "template electrical clearance"):
+            ValidateTemplateIsolation(
+                Arguments[0],
+                Arguments[1],
+                set(Resources.StaticGeometry.ElectricalBlocks),
+                *Arguments[3:],
+            )
+
     def testSupportBlocksAreNegotiatedConflictResources(self) -> None:
         ConflictCells, ConflictCounts = FindFlatRouteConflicts(
             {

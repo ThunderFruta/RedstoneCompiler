@@ -17,6 +17,7 @@ from ..Actions import BuildRoutingResources
 from ..AuthoritativePlanner import RouteAuthoritativeResources
 from ..ChannelPlanner import RoutingIterationMetrics
 from ..Models import RoutedDesign, RoutingResources
+from ..Reliability import RoutingDeadline
 from ..Policy import DefaultPhysicalDesignPolicy, PhysicalDesignPolicy
 from ..Technology import (
     DefaultRedstoneRoutingTechnology,
@@ -43,6 +44,8 @@ def RoutePcbNets(
     ] | None = None,
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
+    SkipStrictPortalReservation: bool = False,
+    Deadline: RoutingDeadline | None = None,
 ) -> RoutedDesign:
     """Plan and materialize one deterministic capacity-one Rust assignment."""
     del (
@@ -57,7 +60,19 @@ def RoutePcbNets(
     if RustRoutingContext is None:
         raise ValueError("authoritative routing requires the Rust router")
     if Resources is None:
-        Resources = BuildRoutingResources(Placed)
+        Resources = BuildRoutingResources(
+            Placed,
+            WorkCheck=(
+                (
+                    lambda Diagnostics: Deadline.RaiseIfExpired(
+                        "RoutingResourceConstruction",
+                        Diagnostics,
+                    )
+                )
+                if Deadline is not None
+                else None
+            ),
+        )
     return RouteAuthoritativeResources(
         Placed,
         Resources,
@@ -68,6 +83,8 @@ def RoutePcbNets(
         Technology,
         ProgressCallback=IterationProgressCallback,
         DiagnosticCallback=IterationDiagnosticCallback,
+        SkipStrictPortalReservation=SkipStrictPortalReservation,
+        Deadline=Deadline,
     )
 
 

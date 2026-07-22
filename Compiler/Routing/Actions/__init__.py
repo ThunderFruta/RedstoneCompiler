@@ -8,10 +8,13 @@ from .Geometry import (
     BuildRoutingResources,
     LoadRoutingTemplates,
     NeighborPositions,
+    ValidatePlacedCellElectricalIsolation,
 )
 from .Repeaters import (
     EstimateRouteMaterialCost,
     MaterializeReservedRepeaters,
+    PruneRedundantRepeaterReservations,
+    PropagateRoutePower,
     RepeaterFacing,
 )
 from .Validation import (
@@ -28,11 +31,14 @@ __all__ = [
     "BuildPhysicalGraphs",
     "BuildPlacedCellGeometry",
     "MaterializeReservedRepeaters",
+    "PruneRedundantRepeaterReservations",
+    "PropagateRoutePower",
     "BuildRoutingResources",
     "EstimateRouteMaterialCost",
     "FindFlatRouteConflicts",
     "LoadRoutingTemplates",
     "NeighborPositions",
+    "ValidatePlacedCellElectricalIsolation",
     "RepeaterFacing",
     "SimplifyNetTrees",
     "ValidatePhysicalRoutes",

@@ -1,5 +1,10 @@
 # Router/Placement Rewrite Design Document
 
+> **Historical design notice (2026-07-21):** This document preserves earlier
+> rewrite phases and measurements. The current normative contract is the
+> [router reliability design](RouterReliabilityDesignDoc.md), and the current
+> verdict is maintained in the [reliability guide](RouterReliabilityGuide.md).
+
 ## Objective
 
 Replace the current router-first, single-pass flow with a two-layer, iterative routing architecture that produces compact gate-to-gate structures and minimizes long snaking runs.
