@@ -33,7 +33,11 @@ from ..Routing.Technology import (
     DefaultRedstoneRoutingTechnology,
     RedstoneRoutingTechnology,
 )
-from .Pcb import PcbPlacement, PlacePcbGraph
+from .Pcb import (
+    FindMandatoryAccessConflictSignals,
+    PcbPlacement,
+    PlacePcbGraph,
+)
 from .Rotation import RotatedCellSize
 from .Geometry import PlacedDesign
 from ..Synthesis.Validation import ValidateNandOnlyDesign
@@ -166,7 +170,7 @@ class PlacementGenerationPlan:
 
 def BuildPlacementGenerationPlan(
     Policy: PhysicalDesignPolicy,
-    NandGateCount: int | None = None,
+    PreferPackedPlacements: bool = False,
 ) -> PlacementGenerationPlan:
     """Build a deterministic, recipe-deduplicated placement generation plan."""
     RoutingSpacing = Policy.Placement.RoutingSpacing
@@ -202,11 +206,7 @@ def BuildPlacementGenerationPlan(
             if Policy.Placement.EnableRoutingFeedback
             else RoutingSpacing
         )
-        DeferUnpackedOracle = (
-            NandGateCount is not None
-            and NandGateCount
-            > 3 * Policy.NandPacking.MaximumClusterCells
-        )
+        DeferUnpackedOracle = PreferPackedPlacements
         AddRequest(
             PrimaryRequests,
             "row-beam",
@@ -258,7 +258,10 @@ def BuildPlacementGenerationPlan(
         ):
             for Delta in range(
                 1,
-                Policy.Placement.RoutingSpacingAlternatives + 1,
+                min(
+                    Policy.Placement.RoutingFeedbackIterations,
+                    Policy.Placement.RoutingSpacingAlternatives,
+                ) + 1,
             ):
                 WiderSpacing = RoutingSpacing + Delta
                 AddRequest(
@@ -304,10 +307,7 @@ def BuildPlacementGenerationPlan(
         and Policy.Placement.RoutingFeedbackIterations > 0
     ):
         AlternativeCount = min(
-            max(
-                Policy.Placement.RoutingFeedbackIterations,
-                Policy.NandPacking.PlacementFeedbackIterations,
-            ),
+            Policy.Placement.RoutingFeedbackIterations,
             Policy.Placement.RoutingSpacingAlternatives,
         )
         for Delta in range(1, AlternativeCount + 1):
@@ -324,21 +324,18 @@ def BuildPlacementGenerationPlan(
                     Policy.NandPacking,
                 )
 
-    if (
-        Policy.NandPacking.Enabled
-        and NandGateCount is not None
-        and NandGateCount > 3 * Policy.NandPacking.MaximumClusterCells
-    ):
+    if Policy.NandPacking.Enabled and PreferPackedPlacements:
         PackedGeneratorPriority = {
             "row-beam-conflict-relocation": 0,
             "row-beam-direct-only": 1,
-            "configured-packing": 3,
-            "graph-beam-direct-only": 4,
+            "configured-packing": 2,
+            "graph-beam-direct-only": 3,
+            "unpacked": 4,
         }
         DeferredRequests.sort(
             key=lambda Request: (
-                not Request.PackingPolicy.Enabled,
-                PackedGeneratorPriority.get(Request.SourceGenerator, 2),
+                PackedGeneratorPriority.get(Request.SourceGenerator, 3),
+                Request.SourceGenerator,
             )
         )
 
@@ -356,9 +353,9 @@ def PlacementCandidateOrder(
 ) -> tuple[object, ...]:
     """Return the stable demand-first order used for placement failover."""
     return (
-        Value.FeedbackScore,
         0 if Value.Placement.PackedClusters else 1,
         0 if (Value.Placement.Placed.LocalRouteClaims or ()) else 1,
+        Value.FeedbackScore,
         abs(Value.RoutingSpacing - ConfiguredSpacing),
         Value.PlacementFingerprint,
     )
@@ -400,11 +397,31 @@ def FailureRequestsPlacementAdvance(Failure: RoutingFailure) -> bool:
     """Return whether a typed failure forbids same-candidate recovery work."""
     Diagnostics = Failure.Diagnostics or {}
     Action = str(Diagnostics.get("Action", ""))
+    ConflictGraph = Diagnostics.get("ConflictGraph", {})
     return (
         Action.startswith("advance-placement")
+        or Failure.Reason == RoutingFailureReason.NoPinAccessPattern
         or any(
             str(RepairAction).startswith("AdvancePlacement")
             for RepairAction in Failure.RepairActions
+        )
+        or (
+            isinstance(ConflictGraph, dict)
+            and ConflictGraph.get("Classification")
+            == "mandatory-boundary-capacity-cut"
+        )
+    )
+
+
+def FailureRequiresPackedAccessRepair(Failure: RoutingFailure) -> bool:
+    """Return whether a typed fixed-access cut requires local geometry repair."""
+    ConflictGraph = (Failure.Diagnostics or {}).get("ConflictGraph", {})
+    return (
+        Failure.Reason == RoutingFailureReason.NoPinAccessPattern
+        or (
+            isinstance(ConflictGraph, dict)
+            and ConflictGraph.get("Classification")
+            == "mandatory-boundary-capacity-cut"
         )
     )
 
@@ -428,10 +445,21 @@ def ExtractPlacementRelocationSignals(
             "ConflictSignals",
             "NativeConflictSignals",
             "NoCandidateSignals",
+            "CumulativeConflictSignals",
+            "CongestionCutSignals",
+            "ConflictCutSignals",
         ):
             Values = ConflictGraph.get(Key, ())
             if isinstance(Values, tuple | list):
                 Signals.update(str(Value) for Value in Values)
+        Rebalancing = ConflictGraph.get("ConflictResources", ())
+        if isinstance(Rebalancing, dict):
+            Signals.update(
+                str(Signal)
+                for SignalsForResource in Rebalancing.values()
+                if isinstance(SignalsForResource, tuple | list)
+                for Signal in SignalsForResource
+            )
         Pairwise = ConflictGraph.get("PairwiseIncompatibleEdges", ())
         if isinstance(Pairwise, tuple | list):
             Signals.update(
@@ -597,11 +625,13 @@ def _PlaceAndRoutePcbWithPolicy(
     PlacementAttemptFailures: list[dict[str, object]] = []
     LastRoutingError: Exception | None = None
     LastStructuredRoutingError: RoutingStageError | None = None
+    NeedsFeedbackPlacementGeneration = False
     GenerationPlan = BuildPlacementGenerationPlan(
         Policy,
-        NandGateCount=sum(
-            getattr(Gate, "Kind", None) == "NAND"
-            for Gate in Module.Gates
+        PreferPackedPlacements=(
+            Policy.NegotiatedRouting.Enabled
+            and Policy.NandPacking.Enabled
+            and Policy.NandPacking.DeferUnpackedOracle
         ),
     )
     if GenerationPlan.PrimaryRequests:
@@ -618,6 +648,48 @@ def _PlaceAndRoutePcbWithPolicy(
     LastRequiredRelocationSignalsUsed: frozenset[str] = frozenset()
     RelocationGenerationCount = 0
     TotalRelocationGenerationCount = 0
+    BaselinePackedGateArea: int | None = None
+    RejectedPlacementFingerprints: set[str] = set()
+    ProactiveRelocationRequested = False
+
+    def _PackedGateArea(Candidate: PcbPlacement) -> int:
+        Gates = Candidate.Placed.PlacedGates
+        if not Gates:
+            return 0
+        MinimumX = min(Gate.X for Gate in Gates)
+        MinimumZ = min(Gate.Z for Gate in Gates)
+        MaximumX = max(
+            Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0] - 1
+            for Gate in Gates
+        )
+        MaximumZ = max(
+            Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
+            for Gate in Gates
+        )
+        return (MaximumX - MinimumX + 1) * (MaximumZ - MinimumZ + 1)
+
+    def _InterClusterSignals(Candidate: PcbPlacement) -> frozenset[str]:
+        """Return signals whose endpoints span packed-cluster ownership."""
+        ClusterByGate = {
+            Name: ClusterIndex
+            for ClusterIndex, Cluster in enumerate(Candidate.Clusters)
+            for Name in Cluster
+        }
+        ProducerCluster = {
+            Signal: ClusterByGate.get(Gate.Name)
+            for Gate in Module.Gates
+            for Signal in Gate.Outputs
+        }
+        Result: set[str] = set()
+        for Gate in Module.Gates:
+            TargetCluster = ClusterByGate.get(Gate.Name)
+            if TargetCluster is None:
+                continue
+            for Signal in Gate.Inputs:
+                SourceCluster = ProducerCluster.get(Signal)
+                if SourceCluster is None or SourceCluster != TargetCluster:
+                    Result.add(Signal)
+        return frozenset(Result)
 
     def _PlacementFailureWithHistory(
         Failure: RoutingFailure,
@@ -649,6 +721,11 @@ def _PlaceAndRoutePcbWithPolicy(
         nonlocal LastRequiredRelocationSignalsUsed
         nonlocal RelocationGenerationCount
         nonlocal TotalRelocationGenerationCount
+        nonlocal BaselinePackedGateArea
+        nonlocal PlacementRelocationSignals
+        nonlocal PlacementRelocationPrioritySignals
+        nonlocal PlacementRequiredRelocationSignals
+        nonlocal ProactiveRelocationRequested
         if PlacementGenerationAttempts >= GenerationPlan.MaximumAttempts:
             return False
         PlacementGenerationAttempts += 1
@@ -676,6 +753,8 @@ def _PlaceAndRoutePcbWithPolicy(
                 TotalRelocationGenerationCount,
                 Policy.Placement.RoutingSpacingAlternatives,
             )
+            if Policy.NegotiatedRouting.Enabled:
+                RelocationSpacingLevel = 0
             if (
                 ConfiguredRoutingSpacing
                 > Policy.Placement.RoutingSpacing
@@ -685,6 +764,13 @@ def _PlaceAndRoutePcbWithPolicy(
         else:
             RelocationVariant = 0
             RelocationSpacingLevel = 0
+        # Every deferred generator evaluates the same cumulative congestion
+        # cut.  The dedicated relocation recipe is skipped separately when
+        # this set is empty; stripping feedback from later packed recipes
+        # recreates the placement that already failed.
+        EffectiveRelocationSignals = PlacementRelocationSignals
+        EffectiveRelocationPrioritySignals = PlacementRelocationPrioritySignals
+        EffectiveRequiredRelocationSignals = PlacementRequiredRelocationSignals
         CandidateSpacing = Request.RoutingSpacing + RelocationSpacingLevel
         CandidatePacking = Request.PackingPolicy
         PlacementStarted = monotonic()
@@ -804,6 +890,7 @@ def _PlaceAndRoutePcbWithPolicy(
                     Diagnostics=FailureDiagnostics,
                 )
             )
+        Fingerprint: str | None = None
         try:
             CheckPlacementGeneration({"Phase": "placement-generation-start"})
             Candidate = PlacePcbGraph(
@@ -814,16 +901,45 @@ def _PlaceAndRoutePcbWithPolicy(
                 MaximumBoundaryTerminals=Policy.Organization.MaximumClusterEntrances,
                 MaximumEntrancesPerSignal=Policy.Organization.MaximumClusterEntrancesPerSignal,
                 PackingPolicy=CandidatePacking,
-                RelocationSignals=PlacementRelocationSignals,
+                RelocationSignals=EffectiveRelocationSignals,
                 RelocationPrioritySignals=(
-                    PlacementRelocationPrioritySignals
+                    EffectiveRelocationPrioritySignals
                 ),
                 RequiredRelocationSignals=(
-                    PlacementRequiredRelocationSignals
+                    EffectiveRequiredRelocationSignals
                 ),
                 RelocationVariant=RelocationVariant,
                 WorkCheck=CheckPlacementGeneration,
             )
+            PackedGateArea = _PackedGateArea(Candidate)
+            if (
+                CandidatePacking.Enabled
+                and SourceGenerator != "row-beam-conflict-relocation"
+                and BaselinePackedGateArea is None
+            ):
+                BaselinePackedGateArea = PackedGateArea
+            MaximumPackedGateArea = (
+                int(
+                    BaselinePackedGateArea
+                    * Policy.NegotiatedRouting.MaximumPackedAreaGrowth
+                )
+                if BaselinePackedGateArea is not None
+                else None
+            )
+            if (
+                CandidatePacking.Enabled
+                and MaximumPackedGateArea is not None
+                and PackedGateArea > MaximumPackedGateArea
+            ):
+                PlacementGenerationDecisions.append({
+                    "SourceGenerator": SourceGenerator,
+                    "RoutingSpacing": CandidateSpacing,
+                    "Result": "rejected-packed-area-growth",
+                    "PackedGateArea": PackedGateArea,
+                    "BaselinePackedGateArea": BaselinePackedGateArea,
+                    "MaximumPackedGateArea": MaximumPackedGateArea,
+                })
+                return False
             RecipeDiagnostics = dict(
                 Candidate.Placed.LocalRouteDiagnostics or {}
             )
@@ -850,10 +966,80 @@ def _PlaceAndRoutePcbWithPolicy(
             CheckPlacementGeneration({
                 "Phase": "routing-resource-construction-complete",
             })
+            MandatoryConflicts = (
+                FindMandatoryAccessConflictSignals(
+                    Candidate.Placed.PlacedGates,
+                    Candidate.SignalOrder,
+                )
+                if (
+                    CandidatePacking.Enabled
+                    and CandidatePacking.EnableProactiveInterClusterRelocation
+                )
+                else {}
+            )
+            if MandatoryConflicts and SourceGenerator != "row-beam-conflict-relocation":
+                ConflictSignals = frozenset(
+                    Signal
+                    for Owners in MandatoryConflicts.values()
+                    for Signal in Owners
+                )
+                PlacementRelocationSignals |= ConflictSignals
+                PlacementRelocationPrioritySignals |= ConflictSignals
+                PlacementRequiredRelocationSignals |= ConflictSignals
+                ProactiveRelocationRequested = True
+                PlacementGenerationDecisions.append({
+                    "SourceGenerator": SourceGenerator,
+                    "RoutingSpacing": CandidateSpacing,
+                    "Result": "rejected-mandatory-access-conflict",
+                    "ConflictSignals": sorted(ConflictSignals),
+                    "ConflictResourceCount": len(MandatoryConflicts),
+                    "ElapsedSeconds": round(
+                        monotonic() - PlacementStarted, 6
+                    ),
+                })
+                return False
+            ProactiveSignals = (
+                _InterClusterSignals(Candidate)
+                if (
+                    CandidatePacking.Enabled
+                    and CandidatePacking.EnableProactiveInterClusterRelocation
+                    and SourceGenerator == "row-beam"
+                    and len(Candidate.PackedClusters) > 1
+                )
+                else frozenset()
+            )
+            if ProactiveSignals:
+                PlacementRelocationSignals |= ProactiveSignals
+                PlacementRelocationPrioritySignals |= ProactiveSignals
+                PlacementRequiredRelocationSignals |= ProactiveSignals
+                ProactiveRelocationRequested = True
+                PlacementGenerationDecisions.append({
+                    "SourceGenerator": SourceGenerator,
+                    "RoutingSpacing": CandidateSpacing,
+                    "Result": "deferred-for-inter-cluster-relocation",
+                    "SignalCount": len(ProactiveSignals),
+                    "Signals": sorted(ProactiveSignals),
+                    "ElapsedSeconds": round(
+                        monotonic() - PlacementStarted, 6
+                    ),
+                })
+                return False
             Fingerprint = BuildPlacementFingerprint(Candidate)
             CheckPlacementGeneration({
                 "Phase": "placement-fingerprint-complete",
             })
+            if Fingerprint in RejectedPlacementFingerprints:
+                PlacementGenerationDecisions.append({
+                    "SourceGenerator": SourceGenerator,
+                    "RoutingSpacing": CandidateSpacing,
+                    "Result": "rejected-placement-repeat",
+                    "PlacementFingerprint": Fingerprint,
+                    "ElapsedSeconds": round(
+                        monotonic() - PlacementStarted,
+                        6,
+                    ),
+                })
+                return False
             Existing = UniquePlacements.get(Fingerprint)
             if Existing is not None:
                 PlacementGenerationDecisions.append({
@@ -902,7 +1088,20 @@ def _PlaceAndRoutePcbWithPolicy(
                 "RoutingSpacing": CandidateSpacing,
                 "Result": "unique-placement",
                 "PlacementFingerprint": Fingerprint,
-                "RelocationSignals": sorted(PlacementRelocationSignals),
+                "RelocationSignals": sorted(EffectiveRelocationSignals),
+                "PackedGateArea": PackedGateArea,
+                "BaselinePackedGateArea": BaselinePackedGateArea,
+                "MaximumPackedGateArea": MaximumPackedGateArea,
+                "PackedClusters": [
+                    {
+                        "ClusterId": Cluster.ClusterId,
+                        "Members": list(Cluster.MemberNands),
+                        "StackId": Cluster.StackId,
+                        "StackLevel": Cluster.StackLevel,
+                        "BaseY": Cluster.BaseY,
+                    }
+                    for Cluster in Candidate.PackedClusters
+                ],
                 "PlacementGenerationBudgetSeconds": round(
                     PlacementGenerationBudgetSeconds,
                     6,
@@ -925,6 +1124,12 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
             return True
         except Exception as Error:
+            # A candidate that reached a stable fingerprint but failed a later
+            # transactional stage was never published.  Remember only its
+            # identity so another recipe cannot repeat identical bounded work
+            # and starve the next distinct retained placement.
+            if Fingerprint is not None:
+                RejectedPlacementFingerprints.add(Fingerprint)
             if isinstance(Error, RoutingStageError):
                 Failure = Error.Failure
             elif isinstance(Error, ValueError):
@@ -986,23 +1191,24 @@ def _PlaceAndRoutePcbWithPolicy(
             Request = GenerationPlan.DeferredRequests[DeferredRequestIndex]
             if Request.SourceGenerator == "row-beam-conflict-relocation":
                 DeferredRequestIndex += 1
-                return Request
-            if (
-                Request.SourceGenerator == "row-beam-direct-only"
-                and TotalRelocationGenerationCount >= 2
-            ):
-                DeferredRequestIndex += 1
-                return Request
+                if PlacementRelocationSignals:
+                    return Request
         if (
             PlacementRelocationSignals
             and TotalRelocationGenerationCount
-            < max(1, Policy.NandPacking.PlacementFeedbackIterations + 1)
+            < (
+                Policy.NegotiatedRouting.MaximumPlacementFeedbackRounds
+                if Policy.NegotiatedRouting.Enabled
+                else max(1, Policy.NandPacking.PlacementFeedbackIterations + 1)
+            )
             and (
                 PlacementRelocationSignals != LastRelocationSignalsUsed
                 or PlacementRelocationPrioritySignals
                 != LastRelocationPrioritySignalsUsed
                 or PlacementRequiredRelocationSignals
                 != LastRequiredRelocationSignalsUsed
+                or RelocationGenerationCount
+                < Policy.NegotiatedRouting.MaximumPlacementFeedbackRounds
             )
         ):
             return PlacementGenerationRequest(
@@ -1013,6 +1219,14 @@ def _PlaceAndRoutePcbWithPolicy(
                     GraphBeamEnabled=False,
                 ),
             )
+        if DeferredRequestIndex < len(GenerationPlan.DeferredRequests):
+            Request = GenerationPlan.DeferredRequests[DeferredRequestIndex]
+            if (
+                Request.SourceGenerator == "row-beam-direct-only"
+                and TotalRelocationGenerationCount >= 2
+            ):
+                DeferredRequestIndex += 1
+                return Request
         if DeferredRequestIndex >= len(GenerationPlan.DeferredRequests):
             return None
         Request = GenerationPlan.DeferredRequests[DeferredRequestIndex]
@@ -1038,6 +1252,14 @@ def _PlaceAndRoutePcbWithPolicy(
         if PlacementGenerationAttempts >= GenerationPlan.MaximumAttempts:
             break
         _TryPlacement(Request)
+
+    if ProactiveRelocationRequested:
+        for RequestIndex, Request in enumerate(GenerationPlan.DeferredRequests):
+            if Request.SourceGenerator != "row-beam-conflict-relocation":
+                continue
+            _TryPlacement(Request)
+            DeferredRequestIndex = RequestIndex + 1
+            break
 
     while not UniquePlacements:
         Request = _TakeNextDeferredRequest()
@@ -1270,42 +1492,9 @@ def _PlaceAndRoutePcbWithPolicy(
             RoutingFailureReason.TrackAssignmentConflict,
             RoutingFailureReason.DetailedSearchExhausted,
         }
-        Signals = frozenset(Failure.AffectedNets)
-        if Failure.Reason == RoutingFailureReason.TrackAssignmentConflict:
-            Diagnostics = Failure.Diagnostics or {}
-            ConflictGraph = Diagnostics.get("ConflictGraph", {})
-            Pairwise = Diagnostics.get(
-                "PairwiseIncompatible",
-                Diagnostics.get(
-                    "PairwiseIncompatibleEdges",
-                    ConflictGraph.get(
-                        "PairwiseIncompatibleEdges",
-                        Diagnostics.get("pairwise_unroutable", ()),
-                    ),
-                ),
-            )
-            Signals = frozenset(
-                Signal
-                for Pair in Pairwise
-                for Signal in Pair
-            ) | Signals
-            ConflictSignals = Diagnostics.get("ConflictSignals", ())
-            if not ConflictSignals:
-                ConflictSignals = ConflictGraph.get("NoCandidateSignals", ())
-            if isinstance(ConflictSignals, tuple | list):
-                Signals |= frozenset(ConflictSignals)
-            ZeroCompatibilityPairs = Diagnostics.get("ZeroCompatibilityPairs", ())
-            if isinstance(ZeroCompatibilityPairs, tuple | list):
-                Signals |= frozenset(
-                    Signal
-                    for Pair in ZeroCompatibilityPairs
-                    for Signal in (Pair if isinstance(Pair, tuple | list) else (Pair,))
-                )
-        if Failure.Reason == RoutingFailureReason.DetailedSearchExhausted:
-            Diagnostics = Failure.Diagnostics or {}
-            ConflictSignals = Diagnostics.get("ConflictSignals", ())
-            if isinstance(ConflictSignals, tuple | list):
-                Signals |= frozenset(ConflictSignals)
+        Signals = ExtractPlacementRelocationSignals(Failure)
+        if not Signals:
+            Signals = frozenset(Failure.AffectedNets)
         if Failure.Reason not in ReleasableReasons or not Signals:
             return None
         Original = CandidatePlacement.Placed
@@ -1462,18 +1651,106 @@ def _PlaceAndRoutePcbWithPolicy(
 
     Routed = None
     SelectedCandidate: PcbPlacementCandidate | None = None
+    RoutingPercentageSelectionEnabled = (
+        Policy.MaterialObjective.OptimizeRoutingPercentage
+        and len(Module.Gates)
+        >= Policy.MaterialObjective.MinimumRoutingPercentageSelectionNandCount
+    )
+    RoutedCandidates: list[tuple[
+        tuple[float, int, int, int, int, int, int, str],
+        PcbPlacementCandidate,
+        PcbPlacement,
+        RoutedDesign,
+        dict[str, object],
+    ]] = []
+
+    def RecordRoutedCandidate(
+        Candidate: PcbPlacementCandidate,
+        CandidatePlacement: PcbPlacement,
+        CandidateRouted: RoutedDesign,
+    ) -> None:
+        """Score legal routed placements by final volume, then route share."""
+        from SchemEncoder.Writer262 import BuildLitematicBlockMap
+
+        Composition = BuildLitematicBlockMap(CandidateRouted).Composition
+        Score = (
+            Composition.FullFootprint,
+            Composition.RoutingFunctionalShare,
+            Composition.RoutingOwnedFunctionalBlocks,
+            Composition.Footprint,
+            Composition.NonAirBlocks,
+            Composition.Width,
+            Composition.Depth,
+            Candidate.CandidateId,
+        )
+        Diagnostics: dict[str, object] = {
+            "CandidateId": Candidate.CandidateId,
+            "RoutingFunctionalShare": Composition.RoutingFunctionalShare,
+            "RoutingOwnedFunctionalBlocks": (
+                Composition.RoutingOwnedFunctionalBlocks
+            ),
+            "NonAirBlocks": Composition.NonAirBlocks,
+            "Footprint": Composition.Footprint,
+            "XYFootprint": Composition.XYFootprint,
+            "FullFootprint": Composition.FullFootprint,
+            "Width": Composition.Width,
+            "Height": Composition.Height,
+            "Depth": Composition.Depth,
+            "Score": list(Score[:-1]),
+        }
+        RoutedCandidates.append((
+            Score,
+            Candidate,
+            CandidatePlacement,
+            CandidateRouted,
+            Diagnostics,
+        ))
 
     def _PlacementCandidatesForRouting():
         nonlocal CandidateRecords, OrderedPlacements
         nonlocal LastRoutingError, LastStructuredRoutingError
+        nonlocal NeedsFeedbackPlacementGeneration
         AttemptedFingerprints: set[str] = set()
         while True:
+            if NeedsFeedbackPlacementGeneration:
+                # A typed fixed-access cut is geometry feedback. Generate its
+                # deterministic packed repair before routing an unrelated
+                # retained placement, which would consume the shared deadline
+                # and dilute the cut.
+                NeedsFeedbackPlacementGeneration = False
+                Request = _TakeNextDeferredRequest()
+                if Request is not None:
+                    try:
+                        _TryPlacement(Request)
+                    except RoutingStageError as Error:
+                        LastRoutingError = Error
+                        LastStructuredRoutingError = Error
+                        return
+                    CandidateRecords = _BuildCandidateRecords()
+                    OrderedPlacements = CandidateRecords[
+                        : max(
+                            1,
+                            Policy.NandPacking.RetainedPlacementCandidates,
+                        )
+                    ]
+                    PlacementFeedback[:] = [
+                        Candidate.ToDictionary()
+                        for Candidate in CandidateRecords
+                    ]
             Pending = [
                 Candidate
                 for Candidate in OrderedPlacements
                 if Candidate.PlacementFingerprint not in AttemptedFingerprints
             ]
             if Pending:
+                FeedbackPending = [
+                    Candidate
+                    for Candidate in Pending
+                    if Candidate.SourceGenerator
+                    == "row-beam-conflict-relocation"
+                ]
+                if FeedbackPending:
+                    Pending = FeedbackPending
                 NextCandidate = Pending[0]
                 AttemptedFingerprints.add(NextCandidate.PlacementFingerprint)
                 yield NextCandidate
@@ -1524,27 +1801,13 @@ def _PlaceAndRoutePcbWithPolicy(
             or DeferredRequestIndex < len(GenerationPlan.DeferredRequests)
         )
         RemainingRuntimeSeconds = max(0.001, Deadline.RemainingSeconds())
-        IsDeferredCandidate = CandidateRecord.SourceGenerator in {
-            Request.SourceGenerator
-            for Request in GenerationPlan.DeferredRequests
-        }
         RemainingRetainedCandidates = sum(
             Candidate.CandidateId not in AttemptedCandidateIds
             for Candidate in OrderedPlacements
         )
-        PlannedRoutingSlots = (
-            1
-            if IsDeferredCandidate
-            else max(
-                1,
-                RemainingRetainedCandidates
-                + (
-                    1
-                    if DeferredRequestIndex
-                    < len(GenerationPlan.DeferredRequests)
-                    else 0
-                ),
-            )
+        PlannedRoutingSlots = max(
+            1,
+            RemainingRetainedCandidates,
         )
         AdaptiveAttemptRuntimeSeconds = min(
             Policy.AdaptiveRouting.MaximumRuntimeSeconds,
@@ -1636,7 +1899,8 @@ def _PlaceAndRoutePcbWithPolicy(
                     "PlacementCandidate": CandidateRecord.CandidateId,
                 },
             )
-            SelectedCandidate = CandidateRecord
+            if RoutingPercentageSelectionEnabled:
+                RecordRoutedCandidate(CandidateRecord, Placement, Routed)
             PlacementAttemptFailures.append({
                 **CandidateRecord.ToDictionary(),
                 "Result": "routed",
@@ -1646,7 +1910,21 @@ def _PlaceAndRoutePcbWithPolicy(
                 ),
                 "ElapsedSeconds": round(monotonic() - AttemptStarted, 6),
             })
-            break
+            if not RoutingPercentageSelectionEnabled:
+                SelectedCandidate = CandidateRecord
+                break
+            if (
+                Deadline.RemainingSeconds()
+                < Policy.MaterialObjective
+                .MinimumRemainingRoutingPercentageSearchSeconds
+            ):
+                # A legal route is more valuable than spending the final
+                # shared-deadline slice comparing alternatives we cannot
+                # complete and validate.
+                break
+            # Keep routing bounded retained alternatives under the same
+            # absolute deadline, then publish the smallest real route share.
+            continue
         except (RoutingStageError, ValueError) as Error:
             LastRoutingError = Error
             if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
@@ -1684,17 +1962,27 @@ def _PlaceAndRoutePcbWithPolicy(
                         ),
                     }
                 )
+                # An adaptive candidate slice is not the absolute routing
+                # deadline.  Preserve the latter and advance to the next
+                # deterministic placement while publication time remains.
+                if HasRemainingPlacementAlternative and not Deadline.IsExpired():
+                    continue
                 break
             if isinstance(Error, RoutingStageError):
                 ConflictSignals = ExtractPlacementRelocationSignals(
                     Error.Failure
                 )
+                if FailureRequestsPlacementAdvance(Error.Failure):
+                    NeedsFeedbackPlacementGeneration = True
                 if ConflictSignals:
                     PlacementRelocationPrioritySignals = (
                         ConflictSignals
                         or frozenset(Error.Failure.AffectedNets)
                     )
-                    if Error.Failure.Stage == "Candidate":
+                    if (
+                        Error.Failure.Stage == "Candidate"
+                        or FailureRequiresPackedAccessRepair(Error.Failure)
+                    ):
                         PlacementRequiredRelocationSignals = frozenset((
                             *PlacementRequiredRelocationSignals,
                             *ConflictSignals,
@@ -1746,10 +2034,11 @@ def _PlaceAndRoutePcbWithPolicy(
                             )
                             if ReleaseConflictSignals:
                                 PlacementRelocationPrioritySignals = (
-                                    frozenset(
+                                    ReleaseConflictSignals
+                                    if PlacementRelocationSignals
+                                    else frozenset(
                                         ReleaseError.Failure.AffectedNets
                                     )
-                                    or ReleaseConflictSignals
                                 )
                                 PlacementRelocationSignals = frozenset((
                                     *PlacementRelocationSignals,
@@ -1794,7 +2083,12 @@ def _PlaceAndRoutePcbWithPolicy(
                     else:
                         if Released is not None:
                             Placement, Routed = Released
-                            SelectedCandidate = CandidateRecord
+                            if RoutingPercentageSelectionEnabled:
+                                RecordRoutedCandidate(
+                                    CandidateRecord,
+                                    Placement,
+                                    Routed,
+                                )
                             PlacementAttemptFailures.append(
                                 {
                                     **CandidateRecord.ToDictionary(),
@@ -1817,7 +2111,16 @@ def _PlaceAndRoutePcbWithPolicy(
                                     ),
                                 }
                             )
-                            break
+                            if not RoutingPercentageSelectionEnabled:
+                                SelectedCandidate = CandidateRecord
+                                break
+                            if (
+                                Deadline.RemainingSeconds()
+                                < Policy.MaterialObjective
+                                .MinimumRemainingRoutingPercentageSearchSeconds
+                            ):
+                                break
+                            continue
             PlacementAttemptFailures.append(
                 {
                     **CandidateRecord.ToDictionary(),
@@ -1836,6 +2139,15 @@ def _PlaceAndRoutePcbWithPolicy(
                     "ElapsedSeconds": round(monotonic() - AttemptStarted, 6),
                 }
             )
+    if RoutedCandidates:
+        (
+            _Score,
+            SelectedCandidate,
+            Placement,
+            Routed,
+            SelectedCompositionDiagnostics,
+        ) = min(RoutedCandidates, key=lambda Value: Value[0])
+        RoutingSpacing = SelectedCandidate.RoutingSpacing
     if Routed is None:
         if LastStructuredRoutingError is not None:
             BaseFailure = LastStructuredRoutingError.Failure
@@ -1873,6 +2185,21 @@ def _PlaceAndRoutePcbWithPolicy(
         SelectedCandidate.ToDictionary() if SelectedCandidate is not None else None
     )
     Routed.RoutingControlEffectiveness["SelectedRoutingSpacing"] = RoutingSpacing
+    Routed.RoutingControlEffectiveness["RoutingPercentageSelection"] = {
+        "Enabled": RoutingPercentageSelectionEnabled,
+        "Configured": Policy.MaterialObjective.OptimizeRoutingPercentage,
+        "MinimumNandCount": (
+            Policy.MaterialObjective.MinimumRoutingPercentageSelectionNandCount
+        ),
+        "NandGateCount": len(Module.Gates),
+        "CandidateCount": len(RoutedCandidates),
+        "Selected": SelectedCompositionDiagnostics if RoutedCandidates else None,
+        "Candidates": [
+            Diagnostics
+            for _Score, _Candidate, _Placement, _Routed, Diagnostics
+            in sorted(RoutedCandidates, key=lambda Value: Value[0])
+        ],
+    }
     Routed.RoutingControlEffectiveness["PlacementAttempts"] = (
         PlacementAttemptFailures
     )
@@ -1989,7 +2316,14 @@ def _PlaceAndRoutePcbWithPolicy(
     PlanningContracts["PortalReservations"] = (
         Routed.RoutingControlEffectiveness.get("PortalReservations", [])
     )
-    Deadline.RaiseIfExpired("RoutingFinalization")
+    if Deadline.IsExpired() and RoutedCandidates:
+        # A later optional comparison exhausted the shared deadline after at
+        # least one candidate had already completed routing and validation.
+        # Publish the best validated candidate instead of discarding it.
+        Routed.RoutingControlEffectiveness[
+            "RoutingPercentageSelection"]["DeadlineLimited"] = True
+    else:
+        Deadline.RaiseIfExpired("RoutingFinalization")
     Routed.RoutingControlEffectiveness["Deadline"] = Deadline.ToDictionary()
     Result = PcbResult(
         Placed=Placement.Placed,

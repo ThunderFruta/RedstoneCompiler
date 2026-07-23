@@ -46,6 +46,21 @@ class PlacementPolicy:
     PreferWideTerminalBanks: bool = False
     TerminalBankOffsetX: int = 0
     EnableRoutingFeedback: bool = False
+    # Preserve the base cell-clearance gap, but size the optional routing
+    # corridor between cluster columns/rows from the distinct nets that cross
+    # that boundary.  Disabled by default so compatibility policies retain
+    # their established geometry.
+    EnableDemandAwareInterClusterSpacing: bool = False
+    DemandAwareBoundaryTrackPitch: int = 0
+    # A relocation recipe is a geometry change, not evidence that every
+    # routing plane is necessary.  Keep the compatibility default while
+    # allowing policies to climb the layer ladder from the access-derived
+    # minimum and only spend vertical headroom after a concrete failure.
+    ForceMaximumRoutingLayersAfterPlacementRelocation: bool = False
+
+    def __post_init__(self) -> None:
+        if self.DemandAwareBoundaryTrackPitch < 0:
+            raise ValueError("DemandAwareBoundaryTrackPitch cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -59,6 +74,24 @@ class NandPackingPolicy:
     DirectConnectMaximumLength: int = 2
     MaximumLocalRouteLength: int = 40
     LocalRouteEnvelope: int = 2
+    # Placement-owned wiring is selected as one bounded resource assignment
+    # per packed cluster.  These are search limits, not circuit-specific
+    # heuristics, so the same policy applies to every NAND graph.
+    EnableJointLocalRouting: bool = True
+    MaximumLocalRouteCandidatesPerSignal: int = 16
+    MaximumLocalClusterAssignmentExpansions: int = 4096
+    MaximumLocalRepeatersPerNet: int = 2
+    # Keep I/O cells outside packed NAND fabric while allowing the shell to be
+    # tuned independently from inter-cluster routing corridors.
+    TerminalShellClearance: int = 1
+    TerminalShellLateralSearch: int = 0
+    MaximumTerminalPlacementCandidates: int = 16
+    MaximumTerminalAssignmentExpansions: int = 4096
+    RequireCompleteLocalFanoutClaims: bool = False
+    EnableProactiveInterClusterRelocation: bool = True
+    EnableLocalGeometryRepair: bool = True
+    LocalGeometryRepairColumnGap: int = 2
+    DeferUnpackedOracle: bool = True
     PlacementFeedbackIterations: int = 3
     GraphBeamEnabled: bool = True
     EnableStructuralReuse: bool = True
@@ -66,6 +99,10 @@ class NandPackingPolicy:
     MaximumFrozenLocalNetNodes: int = 32
     MaximumFrozenLocalTargets: int = 16
     EnableVerticalClusterStacking: bool = True
+    # Repeated structural clusters usually need planar separation because
+    # their pin-access geometry is identical.  Keep that conservative default
+    # unless a policy explicitly asks the placer to evaluate vertical reuse.
+    EnableRepeatedStructuralVerticalStacking: bool = False
     MaximumClustersPerStack: int = 4
     ClusterDeckPitch: int = 6
 
@@ -74,6 +111,24 @@ class NandPackingPolicy:
             raise ValueError(
                 "MaximumStructuralReuseMappings must be positive"
             )
+        if self.MaximumLocalRouteCandidatesPerSignal < 1:
+            raise ValueError("MaximumLocalRouteCandidatesPerSignal must be positive")
+        if self.MaximumLocalClusterAssignmentExpansions < 1:
+            raise ValueError(
+                "MaximumLocalClusterAssignmentExpansions must be positive"
+            )
+        if self.MaximumLocalRepeatersPerNet < 0:
+            raise ValueError("MaximumLocalRepeatersPerNet cannot be negative")
+        if self.LocalGeometryRepairColumnGap < 1:
+            raise ValueError("LocalGeometryRepairColumnGap must be positive")
+        if self.TerminalShellClearance < 1:
+            raise ValueError("TerminalShellClearance must be positive")
+        if self.TerminalShellLateralSearch < 0:
+            raise ValueError("TerminalShellLateralSearch cannot be negative")
+        if self.MaximumTerminalPlacementCandidates < 1:
+            raise ValueError("MaximumTerminalPlacementCandidates must be positive")
+        if self.MaximumTerminalAssignmentExpansions < 1:
+            raise ValueError("MaximumTerminalAssignmentExpansions must be positive")
         if self.MaximumClustersPerStack < 1:
             raise ValueError("MaximumClustersPerStack must be positive")
         if self.ClusterDeckPitch < 3:
@@ -93,6 +148,12 @@ class MaterialObjectivePolicy:
     MaximumRawDustFunctionalShare: float = 0.45
     MaximumFootprint: int = 600
     MaximumNonAirBlocks: int = 500
+    # Evaluate complete, legal routed placement candidates by their final
+    # emitted volume and routing share instead of publishing the first legal
+    # route.
+    OptimizeRoutingPercentage: bool = False
+    MinimumRemainingRoutingPercentageSearchSeconds: float = 15.0
+    MinimumRoutingPercentageSelectionNandCount: int = 16
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.MinimumComponentFunctionalShare <= 1.0):
@@ -111,6 +172,14 @@ class MaterialObjectivePolicy:
             raise ValueError("MaximumFootprint must be positive")
         if self.MaximumNonAirBlocks < 1:
             raise ValueError("MaximumNonAirBlocks must be positive")
+        if self.MinimumRemainingRoutingPercentageSearchSeconds <= 0:
+            raise ValueError(
+                "MinimumRemainingRoutingPercentageSearchSeconds must be positive"
+            )
+        if self.MinimumRoutingPercentageSelectionNandCount < 1:
+            raise ValueError(
+                "MinimumRoutingPercentageSelectionNandCount must be positive"
+            )
 
 
 @dataclass(frozen=True)
@@ -159,6 +228,14 @@ class NegotiatedRoutingPolicy:
     HistoryIncrement: int = 32
     MaximumPlacementFeedbackRounds: int = 3
     MaximumPackedAreaGrowth: float = 2.0
+    # A tree search builds its guide-cost field over the complete active sparse
+    # region before A* can reach a portal.  One hundred milliseconds is below
+    # that setup cost on multi-cluster arithmetic designs, so every otherwise
+    # legal portal alternative can expire before its search budget is used.
+    # Keep this independently bounded, but leave enough time for the
+    # configured strict expansion limit to distinguish a real repeater cut
+    # from an incomplete search.
+    MaximumRouteTreeRequestMilliseconds: int = 500
 
     def __post_init__(self) -> None:
         for Name in (
@@ -168,6 +245,7 @@ class NegotiatedRoutingPolicy:
             "PresentConflictPenalty",
             "HistoryIncrement",
             "MaximumPlacementFeedbackRounds",
+            "MaximumRouteTreeRequestMilliseconds",
         ):
             if getattr(self, Name) < 1:
                 raise ValueError(f"{Name} must be positive")
@@ -182,6 +260,10 @@ class TrackAssignmentPolicy:
     MaximumPortalsPerTerminal: int = 8
     MaximumRouteCandidatesPerNet: int = 160
     MaximumAssignmentExpansions: int = 50_000
+    # Capacity assignment is feasibility-first.  Searching the available
+    # layer ceilings in order prevents an otherwise legal solution from
+    # spending a tall routing plane merely because it was encountered first.
+    MinimizeMaximumRoutingLayer: bool = False
 
 
 @dataclass(frozen=True)
@@ -356,7 +438,9 @@ DefaultPhysicalDesignPolicy = PhysicalDesignPolicy()
 # default policy. This preserves the measured pre-rewrite route.
 CompatibilityPhysicalDesignPolicy = PhysicalDesignPolicy(
     PolicyVersion="physical-design-v1-compatibility",
-    Placement=PlacementPolicy(),
+    Placement=PlacementPolicy(
+        ForceMaximumRoutingLayersAfterPlacementRelocation=True,
+    ),
     NandPacking=NandPackingPolicy(),
     TrackAssignment=TrackAssignmentPolicy(
         MaximumRouteCandidatesPerNet=1536,
@@ -366,27 +450,33 @@ CompatibilityPhysicalDesignPolicy = PhysicalDesignPolicy(
 )
 
 LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
-    PolicyVersion="physical-design-v11-negotiated-route-trees",
+    PolicyVersion="physical-design-v15-compact-boundaries",
     Placement=PlacementPolicy(
         CompactPassLimit=16,
-        RoutingSpacing=6,
+        RoutingSpacing=5,
         LocalFanoutDistance=8,
         LocalFanoutWeight=16,
         HpwlWeight=3,
         PinEscapeLength=1,
-        MaximumRoutingLayers=0,
+        MaximumRoutingLayers=3,
         RoutingFeedbackIterations=1,
         RoutingSpacingAlternatives=2,
         PreferWideTerminalBanks=False,
         TerminalBankOffsetX=0,
         EnableRoutingFeedback=True,
+        EnableDemandAwareInterClusterSpacing=True,
+        DemandAwareBoundaryTrackPitch=2,
     ),
     NandPacking=NandPackingPolicy(
         Enabled=True,
         RetainedPlacementCandidates=6,
+        MaximumTerminalPlacementCandidates=32,
+        MaximumTerminalAssignmentExpansions=65536,
+        RequireCompleteLocalFanoutClaims=True,
+        LocalGeometryRepairColumnGap=1,
     ),
     MaterialObjective=MaterialObjectivePolicy(
-        Enabled=False,
+        Enabled=True,
         MinimumComponentFunctionalShare=0.60,
         MaximumRoutingFunctionalShare=0.40,
         MaximumRoutingDominance=0.40,
@@ -394,6 +484,11 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         MaximumRawDustFunctionalShare=0.45,
         MaximumFootprint=600,
         MaximumNonAirBlocks=500,
+        # Full rendered-candidate comparison can require several complete
+        # detailed routes.  Keep interactive compilation bounded to one
+        # authoritative route; the negotiated router still minimizes volume
+        # within that route attempt.
+        OptimizeRoutingPercentage=False,
     ),
     Organization=RoutingOrganizationPolicy(Enabled=True),
     GlobalRouting=GlobalRoutingPolicy(
@@ -414,6 +509,7 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         MaximumPortalsPerTerminal=48,
         MaximumRouteCandidatesPerNet=2048,
         MaximumAssignmentExpansions=500_000,
+        MinimizeMaximumRoutingLayer=True,
     ),
     AdaptiveRouting=AdaptiveRoutingPolicy(
         Enabled=True,

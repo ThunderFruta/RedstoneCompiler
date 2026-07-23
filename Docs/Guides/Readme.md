@@ -1,8 +1,7 @@
 # User and contributor guides
 
-Contains example-based walk-throughs for compile and export workflows.
+Contains example-based walkthroughs for compile, scale diagnostics, and export.
 
-Planned next documents:
-- FullAdder.md
-- ArithmeticRegions.md
-- MinecraftExport.md
+- [Compile FullAdder](FullAdder.md)
+- [Arithmetic routing regions](ArithmeticRegions.md)
+- [Export to Minecraft](MinecraftExport.md)

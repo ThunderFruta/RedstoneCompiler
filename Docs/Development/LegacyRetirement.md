@@ -1,5 +1,13 @@
 # Legacy Routing and Shim Retirement
 
+> **Historical scope notice (2026-07-22):** In this document, “flat
+> negotiated-routing stack” means the retired candidate/guide/pair-repair
+> implementation described below. It does not mean the active
+> [negotiated route-tree router](../Routing/NegotiatedRouteTreeRouter.md), which
+> uses persistent per-signal trees, exact Redstone claims, and incremental
+> regions. The deletion list must be re-audited against live callers before any
+> removal; this document is not deletion authorization.
+
 ## Goal
 
 Retire the obsolete flat negotiated-routing stack and the temporary repository
@@ -150,4 +158,5 @@ announced compatibility cycle.
 - Every advertised setting changes live behavior.
 - No production import references `RedstoneCompiler.*` or legacy output/cache
   roots.
-- No documentation teaches the retired negotiated-router model.
+- No documentation presents the retired flat candidate/pair-repair model as
+  the active negotiated route-tree router.

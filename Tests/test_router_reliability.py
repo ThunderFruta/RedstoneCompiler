@@ -608,6 +608,27 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertEqual(len(Candidates), 1)
         self.assertFalse(Candidates[0]["PackedNandPlacement"])
 
+    def testConflictFeedbackCarriesCumulativeCutSignals(self) -> None:
+        self.assertEqual(
+            ExtractPlacementRelocationSignals(
+                RoutingFailure(
+                    Reason=RoutingFailureReason.TrackAssignmentConflict,
+                    Stage="NegotiatedDetailedRouting",
+                    Diagnostics={
+                        "ConflictGraph": {
+                            "CumulativeConflictSignals": [
+                                "A",
+                                "B",
+                                "C",
+                            ],
+                            "CongestionCutSignals": ["D", "E"],
+                        },
+                    },
+                )
+            ),
+            frozenset({"A", "B", "C", "D", "E"}),
+        )
+
     def testAllRejectedPlacementsPreserveTypedBoundaryFailure(self) -> None:
         BoundaryFailure = RoutingFailure(
             Reason=RoutingFailureReason.NoBoundaryEscape,
@@ -1345,7 +1366,7 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertIs(Result.Routed, SuccessfulRoutes[0])
         self.assertEqual(len(set(DeadlineIdentities)), 1)
 
-    def testTypedTimeoutStopsBeforeSecondPlacementWithClockRemaining(self) -> None:
+    def testTypedAdaptiveTimeoutAdvancesWithClockRemaining(self) -> None:
         RouteOrder = []
 
         def RouteBehavior(X, SuccessfulRoute, _Options):
@@ -1359,18 +1380,14 @@ class RouterReliabilityTests(unittest.TestCase):
                 )
             return SuccessfulRoute
 
-        with self.assertRaises(RoutingStageError) as Context:
-            self.RunTwoPlacementFlow(
-                RouteBehavior=RouteBehavior,
-                RouteOrder=RouteOrder,
-            )
-
-        self.assertEqual(
-            Context.exception.Failure.Reason,
-            RoutingFailureReason.RuntimeBudgetExceeded,
+        Result, SuccessfulRoutes, DeadlineIdentities = self.RunTwoPlacementFlow(
+            RouteBehavior=RouteBehavior,
+            RouteOrder=RouteOrder,
         )
-        self.assertFalse(Context.exception.Failure.Diagnostics["Deadline"]["Expired"])
-        self.assertEqual(RouteOrder, [0])
+
+        self.assertEqual(RouteOrder, [0, 10])
+        self.assertIs(Result.Routed, SuccessfulRoutes[10])
+        self.assertEqual(len(set(DeadlineIdentities)), 1)
 
     def testTinyDeadlineStopsAfterRouteWithoutLaterWork(self) -> None:
         RouteOrder = []

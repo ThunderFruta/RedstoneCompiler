@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from ..Placement.Geometry import GetGateInputAccess
@@ -141,6 +141,7 @@ class NegotiatedRoutePlan:
     OverflowProgression: tuple[int, ...]
     CachedNodeCount: int
     CachedEdgeCount: int
+    Diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

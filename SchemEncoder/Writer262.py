@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 import gzip
 import math
@@ -12,6 +12,7 @@ import struct
 import time
 from typing import Any
 
+from Compiler.Cells.Library import CellMacros
 from Compiler.Placement.Rotation import (
     RotatedCellSize,
     TransformBlockState,
@@ -26,7 +27,7 @@ MINECRAFT_DATA_VERSION = 4903
 TRACE_PALETTE = (
     "minecraft:light_gray_concrete",
     "minecraft:yellow_concrete",
-    "minecraft:green_concrete",
+    "minecraft:lime_concrete",
     "minecraft:light_blue_concrete",
     "minecraft:red_concrete",
     "minecraft:orange_concrete",
@@ -75,7 +76,9 @@ class BlockCompositionMetrics:
     Width: int
     Height: int
     Depth: int
+    XYFootprint: int
     Footprint: int
+    FullFootprint: int
     MaterialCounts: dict[str, int]
     ProvenanceCounts: dict[str, int]
 
@@ -91,6 +94,7 @@ class LitematicBuild:
     Provenance: dict[tuple[int, int, int], BlockProvenance]
     Signs: list[tuple[tuple[int, int, int], str]]
     Composition: BlockCompositionMetrics
+    RepeaterOptimization: dict[str, Any] = field(default_factory=dict)
 
 
 def _PlaceIoSigns(
@@ -112,6 +116,16 @@ def _PlaceIoSigns(
         "minecraft:redstone_wire",
         "minecraft:repeater",
     }
+    # Capture the physical design envelope before annotations.  I/O labels
+    # are useful metadata, but they should not widen or deepen an otherwise
+    # compact routed build when a legal in-envelope position exists.
+    MinimumX = min(Position[0] for Position in Blocks)
+    MaximumX = max(Position[0] for Position in Blocks)
+    MinimumY = min(Position[1] for Position in Blocks)
+    MaximumY = max(Position[1] for Position in Blocks)
+    MinimumZ = min(Position[2] for Position in Blocks)
+    MaximumZ = max(Position[2] for Position in Blocks)
+    BaseFootprint = (MaximumX - MinimumX + 1) * (MaximumZ - MinimumZ + 1)
 
     def IsOccupiedByGate(Position: tuple[int, int, int]) -> bool:
         X, _Y, Z = Position
@@ -128,7 +142,7 @@ def _PlaceIoSigns(
         Support = Blocks.get(SupportPosition)
         return Support is None or Support["Name"] not in NonSupportingBlocks
 
-    def CandidatePositions(
+    def LocalCandidatePositions(
         Pin: tuple[int, int, int],
         PrimaryDirection: tuple[int, int, int],
     ):
@@ -152,24 +166,80 @@ def _PlaceIoSigns(
             for DeltaX, DeltaZ in Ring:
                 yield (PinX + DeltaX, PinY, PinZ + DeltaZ)
 
+    def ExteriorCandidatePositions(PinY: int):
         # The bounded local search keeps normal layouts compact. The exterior
         # search is deliberately unbounded so an annotation can never vanish
         # merely because routing filled the nearby cells.
-        MinimumX = min(Position[0] for Position in Blocks)
-        MaximumX = max(Position[0] for Position in Blocks)
-        MinimumZ = min(Position[2] for Position in Blocks)
-        MaximumZ = max(Position[2] for Position in Blocks)
         Distance = 1
         while True:
             for X in range(MinimumX - Distance, MaximumX + Distance + 1):
                 yield (X, PinY, MinimumZ - Distance)
             for X in range(MinimumX - Distance, MaximumX + Distance + 1):
                 yield (X, PinY, MaximumZ + Distance)
-            for Z in range(MinimumZ - (Distance - 1), MaximumZ + (Distance - 1) + 1):
+            for Z in range(
+                MinimumZ - (Distance - 1),
+                MaximumZ + (Distance - 1) + 1,
+            ):
                 yield (MinimumX - Distance, PinY, Z)
-            for Z in range(MinimumZ - (Distance - 1), MaximumZ + (Distance - 1) + 1):
+            for Z in range(
+                MinimumZ - (Distance - 1),
+                MaximumZ + (Distance - 1) + 1,
+            ):
                 yield (MaximumX + Distance, PinY, Z)
             Distance += 1
+
+    def FitsExistingEnvelope(Position: tuple[int, int, int]) -> bool:
+        """Return whether both a sign and its support fit the routed envelope."""
+        X, Y, Z = Position
+        return (
+            MinimumX <= X <= MaximumX
+            and MinimumY <= Y - 1 <= MaximumY
+            and MinimumY <= Y <= MaximumY
+            and MinimumZ <= Z <= MaximumZ
+        )
+
+    def ExistingDeckCandidatePositions(
+        Pin: tuple[int, int, int],
+        PrimaryDirection: tuple[int, int, int],
+    ):
+        """Yield nearby label positions on existing vertical routing decks.
+
+        A pin-level ring can be completely occupied in a dense stacked design
+        even though another already-emitted layer has a legal supported slot.
+        Restrict this fallback to the pre-annotation envelope so using a deck
+        can only avoid X/Z or height growth.
+        """
+        PinX, PinY, PinZ = Pin
+        CandidateYs = sorted(
+            (
+                Y
+                for Y in range(MinimumY + 1, MaximumY + 1)
+                if Y != PinY
+            ),
+            key=lambda Y: (abs(Y - PinY), Y),
+        )
+        for CandidateY in CandidateYs:
+            for Position in LocalCandidatePositions(
+                (PinX, CandidateY, PinZ),
+                PrimaryDirection,
+            ):
+                if FitsExistingEnvelope(Position):
+                    yield Position
+
+    def EnvelopeGrowth(
+        Position: tuple[int, int, int],
+    ) -> tuple[int, int, int]:
+        """Score annotation placement by exact physical envelope growth."""
+        X, Y, Z = Position
+        ExpandedWidth = max(MaximumX, X) - min(MinimumX, X) + 1
+        ExpandedDepth = max(MaximumZ, Z) - min(MinimumZ, Z) + 1
+        ExpandedHeight = max(MaximumY, Y) - min(MinimumY, Y - 1) + 1
+        ExpandedFootprint = ExpandedWidth * ExpandedDepth
+        return (
+            ExpandedFootprint - BaseFootprint,
+            ExpandedHeight - (MaximumY - MinimumY + 1),
+            ExpandedFootprint,
+        )
 
     for Gate in RoutedDesign.PlacedGates:
         if Gate.Kind not in ("INPUT", "OUTPUT") or not Gate.Outputs:
@@ -189,11 +259,37 @@ def _PlaceIoSigns(
             Pin = Gate.InputPins[0]
             PrimaryDirection = tuple(-Value for Value in Gate.InputDirections[0])
 
-        SignPosition = next(
-            Position
-            for Position in CandidatePositions(Pin, PrimaryDirection)
+        LocalChoices = [
+            (EnvelopeGrowth(Position), 0, 0, CandidateIndex, Position)
+            for CandidateIndex, Position in enumerate(
+                LocalCandidatePositions(Pin, PrimaryDirection)
+            )
             if CanPlace(Position)
-        )
+        ]
+        ExistingDeckChoices = [
+            (
+                EnvelopeGrowth(Position),
+                1,
+                abs(Position[1] - Pin[1]),
+                CandidateIndex,
+                Position,
+            )
+            for CandidateIndex, Position in enumerate(
+                ExistingDeckCandidatePositions(Pin, PrimaryDirection)
+            )
+            if CanPlace(Position)
+        ]
+        CandidateChoices = [*LocalChoices, *ExistingDeckChoices]
+        if CandidateChoices:
+            _Growth, _DeckPenalty, _DeckDistance, _CandidateIndex, SignPosition = min(
+                CandidateChoices
+            )
+        else:
+            SignPosition = next(
+                Position
+                for Position in ExteriorCandidatePositions(Pin[1])
+                if CanPlace(Position)
+            )
         SupportPosition = (SignPosition[0], SignPosition[1] - 1, SignPosition[2])
         if SupportPosition not in Blocks:
             Signal = SupportSignalByPosition.get(SupportPosition)
@@ -585,6 +681,33 @@ def _NormalizeTracePalette(
     )
 
 
+def TemplateRepeaterPinRoles(CellKind: str) -> dict[tuple[int, int, int], str]:
+    """Return template repeaters that bridge an externally declared macro pin.
+
+    A macro repeater on one of these positions cannot be removed by the route
+    cleanup pass: it is part of the cell's input isolation or output-driving
+    contract.  Template repeaters outside this map remain protected until a
+    macro-equivalence check is available; the audit makes that distinction
+    explicit instead of silently treating template blocks as route material.
+    """
+    Macro = CellMacros[CellKind.upper()]
+    Roles: dict[tuple[int, int, int], str] = {}
+    for Index, (Pin, Direction) in enumerate(
+        zip(Macro.InputPins, Macro.InputDirections)
+    ):
+        Roles[tuple(Pin[Axis] - Direction[Axis] for Axis in range(3))] = (
+            f"InputPin{Index}Bridge"
+        )
+    if Macro.OutputPin is not None and Macro.OutputDirection is not None:
+        Roles[
+            tuple(
+                Macro.OutputPin[Axis] - Macro.OutputDirection[Axis]
+                for Axis in range(3)
+            )
+        ] = "OutputPinBridge"
+    return Roles
+
+
 def BuildLitematicBlockMap(
     RoutedDesign: Any,
     TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
@@ -608,13 +731,34 @@ def BuildLitematicBlockMap(
         for SignalIndex, Signal in enumerate(SignalList)
     }
     SupportSignalByPosition: dict[tuple[int, int, int], str] = {}
+    TemplateRepeaterAudit: dict[str, Any] = {
+        "Scanned": 0,
+        "Removed": 0,
+        "RetainedRequired": 0,
+        "RetainedWithoutMacroEquivalenceProof": 0,
+        "Roles": {},
+    }
     for Signal in SignalList:
         for X, Y, Z in RoutedDesign.NetWires[Signal]:
             SupportSignalByPosition[(X, Y - 1, Z)] = Signal
 
     for Gate in RoutedDesign.PlacedGates:
         Template = Templates[Gate.Kind]
+        RepeaterRoles = TemplateRepeaterPinRoles(Gate.Kind)
         for (X, Y, Z), State in Template.Blocks.items():
+            if State["Name"] == "minecraft:repeater":
+                Role = RepeaterRoles.get((X, Y, Z))
+                TemplateRepeaterAudit["Scanned"] += 1
+                if Role is None:
+                    TemplateRepeaterAudit[
+                        "RetainedWithoutMacroEquivalenceProof"
+                    ] += 1
+                    Role = "InternalProtected"
+                else:
+                    TemplateRepeaterAudit["RetainedRequired"] += 1
+                TemplateRepeaterAudit["Roles"][Role] = (
+                    TemplateRepeaterAudit["Roles"].get(Role, 0) + 1
+                )
             State = PoweredCellState(
                 State,
                 Gate,
@@ -690,7 +834,7 @@ def BuildLitematicBlockMap(
 
     for Signal, Positions in RoutedDesign.NetWires.items():
         NetCells = set(Positions)
-        Power = 15 if SignalValues[Signal] else 0
+        Power = 15 if SignalValues.get(Signal, False) else 0
         for Position in NetCells:
             if Position in RoutedDesign.Repeaters:
                 continue
@@ -711,7 +855,7 @@ def BuildLitematicBlockMap(
         Blocks[Position] = {
             "Name": "minecraft:repeater",
             "Properties": {
-                "powered": str(SignalValues[Signal]).lower(),
+                "powered": str(SignalValues.get(Signal, False)).lower(),
                 "facing": Facing,
                 "locked": "false",
                 "delay": "1",
@@ -792,7 +936,9 @@ def BuildLitematicBlockMap(
         Width=Width,
         Height=Height,
         Depth=Depth,
+        XYFootprint=Width * Height,
         Footprint=Width * Depth,
+        FullFootprint=Width * Height * Depth,
         MaterialCounts=dict(sorted(Materials.items())),
         ProvenanceCounts=dict(sorted(Ownership.items())),
     )
@@ -801,6 +947,15 @@ def BuildLitematicBlockMap(
         Provenance=Provenance,
         Signs=Signs,
         Composition=Composition,
+        RepeaterOptimization={
+            "Route": dict(
+                getattr(RoutedDesign, "RepeaterOptimizationDiagnostics", {})
+            ),
+            "Templates": {
+                **TemplateRepeaterAudit,
+                "Roles": dict(sorted(TemplateRepeaterAudit["Roles"].items())),
+            },
+        },
     )
 
 

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from dataclasses import replace
-from typing import Any, Callable
+from heapq import heappop, heappush
+from typing import Any, Callable, Iterable
 
 from ..Placement.Pcb import PcbPlacement
 from ..Placement.Geometry import GetGateInputAccess
@@ -32,7 +33,10 @@ from .Failures import RoutingStageError
 from .Failures import RoutingFailure, RoutingFailureReason
 from .ResourceGraph import (
     FindClaimConflicts,
+    BuildRoutingEnvelope,
     NormalizeRoutingEdge,
+    RoutingReservation,
+    RoutingResourceId,
     RoutingResourceKind,
 )
 from .TrackAssignment import TrackAssignment
@@ -123,6 +127,38 @@ def CompactRoutedTrees(
         Signal: set(Positions)
         for Signal, Positions in Routed.NetWires.items()
     }
+
+    def BuildFootprintDiagnostics(
+        WireBySignal: dict[str, set[tuple[int, int, int]]],
+        SupportPositions: Iterable[tuple[int, int, int]],
+        RepeaterPositions: Iterable[tuple[int, int, int]],
+    ) -> dict[str, object]:
+        SupportSet = set(SupportPositions)
+        RepeaterSet = set(RepeaterPositions)
+        PerSignal = {
+            Signal: BuildRoutingEnvelope(
+                Positions,
+                (
+                    (X, Y - 1, Z)
+                    for X, Y, Z in Positions
+                    if (X, Y - 1, Z) in SupportSet
+                ),
+                (Position for Position in Positions if Position in RepeaterSet),
+            ).ToDictionary()
+            for Signal, Positions in sorted(WireBySignal.items())
+        }
+        Aggregate = BuildRoutingEnvelope(
+            (Position for Positions in WireBySignal.values() for Position in Positions),
+            SupportSet,
+            RepeaterSet,
+        ).ToDictionary()
+        return {"Aggregate": Aggregate, "PerSignal": PerSignal}
+
+    BeforeFootprint = BuildFootprintDiagnostics(
+        NetWires,
+        Routed.Supports,
+        Routed.Repeaters,
+    )
     Graphs = BuildPhysicalGraphs(
         NetWires,
         ActualBlocks,
@@ -134,10 +170,14 @@ def CompactRoutedTrees(
         CheckDeadline("prune-signal", Signal=Signal)
         Root = Producers[Signal].OutputPin
         Parents = {Root: None}
-        Pending = deque([Root])
+        BestPathCost = {Root: (0, 0, 0)}
+        IncomingDirection = {Root: None}
+        Pending = [(0, 0, 0, Root)]
         ExpandedNodes = 0
         while Pending:
-            Current = Pending.popleft()
+            Hops, VerticalTransitions, Bends, Current = heappop(Pending)
+            if BestPathCost.get(Current) != (Hops, VerticalTransitions, Bends):
+                continue
             ExpandedNodes += 1
             if ExpandedNodes % 256 == 0:
                 CheckDeadline(
@@ -145,23 +185,30 @@ def CompactRoutedTrees(
                     Signal=Signal,
                     ExpandedNodes=ExpandedNodes,
                 )
-            for Neighbor in Graph[Current]:
-                if Neighbor in Parents:
+            for Neighbor in sorted(Graph[Current]):
+                Direction = (
+                    Neighbor[0] - Current[0],
+                    Neighbor[1] - Current[1],
+                    Neighbor[2] - Current[2],
+                )
+                CandidateCost = (
+                    Hops + 1,
+                    VerticalTransitions + (Current[1] != Neighbor[1]),
+                    Bends + (
+                        IncomingDirection[Current] is not None
+                        and IncomingDirection[Current] != Direction
+                    ),
+                )
+                if CandidateCost >= BestPathCost.get(
+                    Neighbor,
+                    (float("inf"), float("inf"), float("inf")),
+                ):
                     continue
                 Parents[Neighbor] = Current
-                Pending.append(Neighbor)
+                IncomingDirection[Neighbor] = Direction
+                BestPathCost[Neighbor] = CandidateCost
+                heappush(Pending, (*CandidateCost, Neighbor))
         Required = {Root}
-        ReservedPositions = (
-            tuple(
-                Reservation.Position
-                for Reservation in Routed.TrackAssignment.Tracks.get(
-                    Signal,
-                    type("EmptyTrack", (), {"RepeaterReservations": ()})(),
-                ).RepeaterReservations
-            )
-            if Routed.TrackAssignment is not None
-            else ()
-        )
         PinAccessPositions = (
             (
                 *Routed.GlobalPlan.Profiles[Signal].SourceAccessPath,
@@ -179,7 +226,6 @@ def CompactRoutedTrees(
         )
         for Target in (
             *Targets.get(Signal, ()),
-            *ReservedPositions,
             *PinAccessPositions,
         ):
             CheckDeadline("retain-required-path", Signal=Signal)
@@ -304,6 +350,7 @@ def CompactRoutedTrees(
         },
     )
     CheckDeadline("repeater-materialization")
+    RepeaterPruningDiagnostics: dict[str, dict[str, object]] = {}
     Repeaters = MaterializeReservedRepeaters(
         NetWires,
         Producers,
@@ -311,6 +358,46 @@ def CompactRoutedTrees(
         PhysicalGraphs,
         TrackAssignmentValue.Tracks,
         WorkCheck=CheckWork("repeater-materialization"),
+        PruningDiagnostics=RepeaterPruningDiagnostics,
+    )
+    MaterializedTracks = {}
+    for Signal, Track in TrackAssignmentValue.Tracks.items():
+        ExistingReservations = {
+            Reservation.Position: Reservation
+            for Reservation in Track.RepeaterReservations
+        }
+        SignalRepeaters = {
+            Position: Facing
+            for Position, Facing in Repeaters.items()
+            if Position in NetWires[Signal]
+        }
+        MaterializedReservations = tuple(
+            ExistingReservations.get(
+                Position,
+                RoutingReservation(
+                    Signal=Signal,
+                    Resource=RoutingResourceId(
+                        RoutingResourceKind.Wire,
+                        Position,
+                    ),
+                    Position=Position,
+                    Purpose="FallbackRepeater",
+                    Facing=Facing,
+                ),
+            )
+            for Position, Facing in sorted(SignalRepeaters.items())
+        )
+        MaterializedTracks[Signal] = replace(
+            Track,
+            RepeaterSites=frozenset(
+                (Position[0], Position[2])
+                for Position in SignalRepeaters
+            ),
+            RepeaterReservations=MaterializedReservations,
+        )
+    TrackAssignmentValue = TrackAssignment(
+        Tracks=MaterializedTracks,
+        ResourceOwners=TrackAssignmentValue.ResourceOwners,
     )
     Wires = set().union(*NetWires.values()) if NetWires else set()
     PreviousMetrics = Routed.RoutingMetrics
@@ -326,6 +413,61 @@ def CompactRoutedTrees(
         else None
     )
     CheckDeadline("complete")
+    AfterFootprint = BuildFootprintDiagnostics(
+        NetWires,
+        Supports,
+        Repeaters,
+    )
+    BeforeAggregate = BeforeFootprint["Aggregate"]
+    AfterAggregate = AfterFootprint["Aggregate"]
+    RoutingFootprintDiagnostics = {
+        "BeforeCompaction": BeforeFootprint,
+        "AfterCompaction": AfterFootprint,
+        "CompactionSavings": {
+            Name: BeforeAggregate[Name] - AfterAggregate[Name]
+            for Name in (
+                "RouteBlockCount",
+                "SupportBlockCount",
+                "RepeaterCount",
+                "Footprint",
+                "Width",
+                "Depth",
+                "Height",
+            )
+        },
+    }
+    SelectedCandidates = (
+        Routed.RoutingAssignment.SelectedCandidates
+        if Routed.RoutingAssignment is not None
+        else {}
+    )
+    PerSignalShape = {
+        Signal: {
+            "TerminalAccessLength": len(AccessBySignal.get(Signal, ())),
+            "Length": Candidate.Length,
+            "Bends": Candidate.BendCount,
+            "Vias": Candidate.ViaCount,
+            "Repeaters": len(Candidate.RepeaterReservations),
+            "RouteBlockSavings": (
+                BeforeFootprint["PerSignal"].get(Signal, {})
+                .get("RouteBlockCount", 0)
+                - AfterFootprint["PerSignal"].get(Signal, {})
+                .get("RouteBlockCount", 0)
+            ),
+        }
+        for Signal, Candidate in sorted(SelectedCandidates.items())
+    }
+    RoutingFootprintDiagnostics["RouteShape"] = {
+        "Aggregate": {
+            "TerminalAccessLength": sum(
+                Value["TerminalAccessLength"]
+                for Value in PerSignalShape.values()
+            ),
+            "Bends": sum(Value["Bends"] for Value in PerSignalShape.values()),
+            "Vias": sum(Value["Vias"] for Value in PerSignalShape.values()),
+        },
+        "PerSignal": PerSignalShape,
+    }
     return RoutedDesign(
         Module=Placed.Module,
         PlacedGates=Placed.PlacedGates,
@@ -373,7 +515,11 @@ def CompactRoutedTrees(
                 for Resource in Claims.ResourceIds
             )
         ),
-        RepeaterReservationCount=Routed.RepeaterReservationCount,
+        RepeaterReservationCount=sum(
+            len(Track.RepeaterReservations)
+            for Track in TrackAssignmentValue.Tracks.values()
+        ),
+        RepeaterOptimizationDiagnostics=RepeaterPruningDiagnostics,
         ZeroResourceConflicts=Routed.ZeroResourceConflicts,
         RoutingAssignment=RoutingAssignmentValue,
         PortalCount=Routed.PortalCount,
@@ -384,6 +530,8 @@ def CompactRoutedTrees(
         RoutingStageTimings=Routed.RoutingStageTimings,
         GlobalGuideDiagnostics=Routed.GlobalGuideDiagnostics,
         RoutingControlEffectiveness=Routed.RoutingControlEffectiveness,
+        NegotiatedRoutingDiagnostics=Routed.NegotiatedRoutingDiagnostics,
+        RoutingFootprintDiagnostics=RoutingFootprintDiagnostics,
     )
 
 
@@ -467,8 +615,8 @@ def RoutePcbAttempt(
                 0: "authoritative resource graph",
                 1: "capacity-aware global guide planning",
                 2: "authoritative portal generation",
-                3: "guide-constrained route candidate generation",
-                4: "authoritative capacity-one assignment",
+                3: "negotiated route-tree construction",
+                4: "capacity-one route-tree validation",
                 5: "authoritative validation and materialization",
             }.get(Completed, "authoritative routing")
             ReportStatus(StageName)

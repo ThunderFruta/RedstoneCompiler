@@ -227,6 +227,97 @@ def PropagateRoutePower(
     return Powers
 
 
+def PruneUnneededMaterializedRepeaters(
+    Root: Position3,
+    Targets: tuple[Position3, ...],
+    Graph: dict[Position3, list[Position3]],
+    Repeaters: dict[Position3, str],
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[dict[Position3, str], dict[str, object]]:
+    """Remove final refreshers only when every sink stays electrically powered.
+
+    This deliberately runs after detailed routing and fallback insertion, not
+    while candidates are being generated.  Each trial uses the exact directed
+    power model, so branches retain a refresher whenever any downstream target
+    still needs it.  Removing repeaters can only reduce available power, which
+    means a single deterministic pass is sufficient.
+    """
+    Original = dict(Repeaters)
+    Diagnostics: dict[str, object] = {
+        "InitialCount": len(Original),
+        "RemovedPositions": [],
+        "RetainedPositions": [],
+        "PowerValidated": False,
+    }
+    if not Original:
+        Diagnostics["PowerValidated"] = True
+        return Original, Diagnostics
+    InitialPower = PropagateRoutePower(
+        Root,
+        Graph,
+        Original,
+        WorkCheck=WorkCheck,
+    )
+    if any(InitialPower.get(Target, 0) <= 0 for Target in Targets):
+        Diagnostics["RetainedPositions"] = [
+            list(Position) for Position in sorted(Original)
+        ]
+        Diagnostics["Reason"] = "initial-refresh-set-does-not-power-all-targets"
+        return Original, Diagnostics
+
+    Distances: dict[Position3, int] = {Root: 0}
+    Pending = deque((Root,))
+    ExpandedNodes = 0
+    while Pending:
+        Current = Pending.popleft()
+        ExpandedNodes += 1
+        if WorkCheck is not None and ExpandedNodes % 256 == 0:
+            WorkCheck({
+                "Phase": "repeater-pruning-distance",
+                "ExpandedNodes": ExpandedNodes,
+                "KnownDistances": len(Distances),
+            })
+        for Neighbor in sorted(Graph.get(Current, ())):
+            if Neighbor in Distances:
+                continue
+            Distances[Neighbor] = Distances[Current] + 1
+            Pending.append(Neighbor)
+
+    Retained = dict(Original)
+    Removed: list[Position3] = []
+    OrderedPositions = sorted(
+        Original,
+        key=lambda Position: (Distances.get(Position, 10**9), Position),
+    )
+    for Index, Position in enumerate(OrderedPositions, start=1):
+        if WorkCheck is not None and Index % 16 == 0:
+            WorkCheck({
+                "Phase": "repeater-pruning-trial",
+                "ProcessedRepeaters": Index,
+                "RepeaterCount": len(OrderedPositions),
+                "RemovedCount": len(Removed),
+            })
+        Trial = dict(Retained)
+        Trial.pop(Position, None)
+        Powers = PropagateRoutePower(
+            Root,
+            Graph,
+            Trial,
+            WorkCheck=WorkCheck,
+        )
+        if all(Powers.get(Target, 0) > 0 for Target in Targets):
+            Retained = Trial
+            Removed.append(Position)
+
+    Diagnostics.update({
+        "RemovedPositions": [list(Position) for Position in Removed],
+        "RetainedPositions": [list(Position) for Position in sorted(Retained)],
+        "PowerValidated": True,
+    })
+    return Retained, Diagnostics
+
+
 def PruneRedundantRepeaterReservations(
     Root: Position3,
     Targets: tuple[Position3, ...],
@@ -325,6 +416,7 @@ def MaterializeReservedRepeaters(
     Tracks: dict[str, Any],
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    PruningDiagnostics: dict[str, dict[str, object]] | None = None,
 ) -> dict[Position3, str]:
     """Materialize only the refresh resources fixed by track assignment."""
     Repeaters: dict[Position3, str] = {}
@@ -363,6 +455,8 @@ def MaterializeReservedRepeaters(
         Track = Tracks[Signal]
         Reserved = {}
         ReservedFacing = {}
+        SignalRepeaters: dict[Position3, str] = {}
+        InvalidReservations: list[dict[str, object]] = []
         for ReservationIndex, Reservation in enumerate(
             Track.RepeaterReservations,
             start=1,
@@ -377,7 +471,7 @@ def MaterializeReservedRepeaters(
                     "ProcessedReservations": ReservationIndex,
                 })
         for ReservationIndex, (Position, Reservation) in enumerate(
-            Reserved.items(),
+            tuple(Reserved.items()),
             start=1,
         ):
             if WorkCheck is not None and ReservationIndex % 64 == 0:
@@ -401,28 +495,21 @@ def MaterializeReservedRepeaters(
                 )
             ]
             if Position not in Cells or not StraightPairs:
-                raise RoutingStageError(
-                    RoutingFailure(
-                        Reason=RoutingFailureReason.NoRepeaterSite,
-                        Stage="Repeater",
-                        AffectedNets=(Signal,),
-                        Resources=(str(Reservation.Resource),),
-                        Locations=(Position,),
-                        Detail="reserved refresh resource is not a flat straight routed site",
-                    )
-                )
+                Reserved.pop(Position, None)
+                ReservedFacing.pop(Position, None)
+                InvalidReservations.append({
+                    "Position": list(Position),
+                    "Reason": "not-flat-straight-routed-site",
+                })
+                continue
             if Reservation.Facing is None:
-                raise RoutingStageError(
-                    RoutingFailure(
-                        Reason=RoutingFailureReason.NoRepeaterSite,
-                        Stage="Repeater",
-                        AffectedNets=(Signal,),
-                        Resources=(str(Reservation.Resource),),
-                        Locations=(Position,),
-                        Detail="reserved refresh resource has no ordered facing",
-                    )
-            )
-            Repeaters[Position] = Reservation.Facing
+                Reserved.pop(Position, None)
+                InvalidReservations.append({
+                    "Position": list(Position),
+                    "Reason": "missing-facing",
+                })
+                continue
+            SignalRepeaters[Position] = Reservation.Facing
 
         if Producers[Signal].OutputPin is None:
             raise RoutingStageError(
@@ -494,7 +581,7 @@ def MaterializeReservedRepeaters(
                                     Detail="reserved refresh sequence (with fallback) allows signal strength to decay to zero",
                                 )
                             )
-                    Repeaters.update(AddedRepeaters)
+                    SignalRepeaters.update(AddedRepeaters)
                 else:
                     raise RoutingStageError(
                         RoutingFailure(
@@ -503,8 +590,35 @@ def MaterializeReservedRepeaters(
                             AffectedNets=(Signal,),
                             Locations=(Target,),
                             Detail="reserved refresh sequence allows signal strength to decay to zero and no valid repeater fallback path exists",
+                            Diagnostics={
+                                "InvalidReservations": InvalidReservations,
+                                "ReservedRepeaters": [
+                                    {
+                                        "Position": list(Position),
+                                        "Facing": Facing,
+                                    }
+                                    for Position, Facing in sorted(
+                                        ReservedFacing.items()
+                                    )
+                                ],
+                                "TargetStrength": {
+                                    str(Value): BestUnrefreshedRun.get(Value, 0)
+                                    for Value in Targets[Signal]
+                                },
+                            },
                         )
                     )
+        PrunedRepeaters, Diagnostics = PruneUnneededMaterializedRepeaters(
+            Root,
+            tuple(Targets[Signal]),
+            Graph,
+            SignalRepeaters,
+            Technology,
+            WorkCheck=WorkCheck,
+        )
+        if PruningDiagnostics is not None:
+            PruningDiagnostics[Signal] = Diagnostics
+        Repeaters.update(PrunedRepeaters)
     if WorkCheck is not None:
         WorkCheck({
             "Phase": "complete",

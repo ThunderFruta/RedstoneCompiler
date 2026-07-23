@@ -14,6 +14,7 @@ from Compiler.Routing.Actions import (
     ValidateTemplateIsolation,
 )
 from Compiler.Routing.ResourceGraph import (
+    BuildRoutingEnvelope,
     FindClaimConflicts,
     RoutingResourceClaims,
     RoutingResourceGraph,
@@ -26,6 +27,18 @@ from Compiler.Synthesis.NandTransform import ToNandOnly
 
 
 class RoutingResourceTests(unittest.TestCase):
+    def testRoutingEnvelopeUsesAllAxesAndExactMaterialCounts(self) -> None:
+        Envelope = BuildRoutingEnvelope(
+            ((4, 3, 9), (7, 5, 12)),
+            ((4, 2, 9),),
+            ((7, 5, 12),),
+        )
+        self.assertEqual((Envelope.Width, Envelope.Depth, Envelope.Height), (4, 4, 4))
+        self.assertEqual(Envelope.ToDictionary()["Footprint"], 16)
+        self.assertEqual(Envelope.RouteBlockCount, 2)
+        self.assertEqual(Envelope.SupportBlockCount, 1)
+        self.assertEqual(Envelope.RepeaterCount, 1)
+
     def testPhysicalGraphConstructionCanBeStoppedInsideCellLoop(self) -> None:
         Cells = {(Index, 1, 0) for Index in range(600)}
         Observed = []
@@ -227,6 +240,57 @@ class RoutingResourceTests(unittest.TestCase):
             )
 
         self.assertEqual(Observed[-1]["ExpandedNodes"], 256)
+
+    def testMaterializedRepeaterPruningRetainsOnlyRequiredBranches(self) -> None:
+        Nodes = {
+            *((Index, 1, 0) for Index in range(29)),
+            *((10, 1, Index) for Index in range(1, 19)),
+        }
+        Graph = {
+            Node: sorted(
+                Neighbor
+                for Neighbor in Nodes
+                if sum(
+                    abs(Node[Axis] - Neighbor[Axis])
+                    for Axis in range(3)
+                ) == 1
+            )
+            for Node in Nodes
+        }
+        Root = (0, 1, 0)
+        Targets = ((28, 1, 0), (10, 1, 18))
+        Reservations = tuple(
+            SimpleNamespace(Position=Position, Facing=Facing)
+            for Position, Facing in (
+                ((8, 1, 0), "west"),
+                ((14, 1, 0), "west"),
+                ((10, 1, 4), "north"),
+                ((10, 1, 12), "north"),
+            )
+        )
+        Diagnostics = {}
+        Repeaters = MaterializeReservedRepeaters(
+            {"A": set(Nodes)},
+            {"A": SimpleNamespace(OutputPin=Root)},
+            {"A": list(Targets)},
+            {"A": Graph},
+            {"A": SimpleNamespace(RepeaterReservations=Reservations)},
+            PruningDiagnostics=Diagnostics,
+        )
+
+        self.assertEqual(
+            Repeaters,
+            {
+                (14, 1, 0): "west",
+                (10, 1, 4): "north",
+            },
+        )
+        self.assertEqual(Diagnostics["A"]["InitialCount"], 4)
+        self.assertEqual(
+            Diagnostics["A"]["RemovedPositions"],
+            [[8, 1, 0], [10, 1, 12]],
+        )
+        self.assertTrue(Diagnostics["A"]["PowerValidated"])
 
     def testFrozenRoutesAreObstaclesButNotTemplateElectricalBlocks(self) -> None:
         FrozenPosition = (1, 1, 0)

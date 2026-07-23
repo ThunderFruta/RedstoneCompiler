@@ -11,6 +11,7 @@ from Scripts.RunRouterAcceptance import (
     AcceptanceCases,
     AcceptanceCommandResult,
     AcceptanceConfiguration,
+    AcceptedPolicyVersion,
     BuildRunArtifacts,
     DefaultRoutingPublicationReserveSeconds,
     EvaluateRun,
@@ -32,9 +33,10 @@ def BuildPhysicalDesign(
     Conflicts: int = 0,
     OverflowPeak: int = 0,
     UnresolvedClaims: list[str] | None = None,
-    PolicyVersion: str = "physical-design-v10-routability-feedback",
+    PolicyVersion: str = AcceptedPolicyVersion,
     SimulationBackend: str = "native-parallel",
     ValidationMode: str = "authoritative-exact",
+    RouterReliability: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if TruthTableRows is None:
         TruthTableRows = Case.TruthTableRows
@@ -57,6 +59,7 @@ def BuildPhysicalDesign(
                 "Placement": PlacementFingerprint,
                 "ResourceGraph": "resource-graph-stable",
             },
+            **(RouterReliability or {}),
         },
         "RunSummary": {
             "RuntimeSeconds": RuntimeSeconds,
@@ -316,6 +319,137 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 "PASSED",
             )
 
+    def testEvaluatorCapturesRouterReliabilityPerformanceTelemetry(self) -> None:
+        Case = AcceptanceCases[0]
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            RunDirectory = Path(DirectoryValue) / "FullAdderRun1"
+            Artifacts = BuildRunArtifacts(RunDirectory, "FullAdderRun1")
+            WriteSuccessfulArtifacts(
+                Case,
+                Artifacts,
+                RouterReliability={
+                    "StageTimingsSeconds": {
+                        "GlobalGuidePlanning": 0.11,
+                        "ResourceGraph": 0.22,
+                        "PortalGeneration": 0.33,
+                        "RouteTree": 0.44,
+                        "CandidateGeneration": 0.55,
+                        "Assignment": 0.66,
+                        "Total": 2.21,
+                    },
+                    "NativeWork": {
+                        "Batching": {
+                            "PortalRequestCount": 120,
+                            "PortalTargetCount": 90,
+                            "RouteTreeRequestCount": 40,
+                            "PortalBatchCount": 12,
+                            "PortalCacheHit": 0.72,
+                            "RouteTreeBatchCount": 7,
+                            "CandidateDiagnostics": {
+                                "A": {"DeferredRequests": 1, "RoutedTrees": 2},
+                                "B": {"DeferredRequests": 0, "RoutedTrees": 1},
+                            },
+                        },
+                        "RequestCounts": {
+                            "PortalRequestCount": 120,
+                            "RouteTreeRequestCount": 40,
+                        },
+                        "CompletedWork": {
+                            "PortalCompletedWork": 120,
+                            "RouteTreeCompletedWork": 40,
+                        },
+                    },
+                    "Deadline": {
+                        "Expired": False,
+                        "RemainingMilliseconds": 0,
+                    },
+                },
+            )
+
+            Evaluation, _Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                DesignDigestBuilder=DigestFixture,
+            )
+
+            self.assertTrue(Evaluation["Accepted"])
+            self.assertEqual(
+                Evaluation["Perf"].get("SchemaVersion"),
+                "router-performance-v1",
+            )
+            self.assertEqual(
+                Evaluation["Perf"]["StageTimingsSeconds"],
+                {
+                    "Assignment": 0.66,
+                    "CandidateGeneration": 0.55,
+                    "GlobalGuidePlanning": 0.11,
+                    "PortalGeneration": 0.33,
+                    "ResourceGraph": 0.22,
+                    "RouteTree": 0.44,
+                    "Total": 2.21,
+                },
+            )
+            self.assertEqual(
+                Evaluation["Perf"]["NativeWork"]["Batching"],
+                {
+                    "CandidateDiagnostics": {
+                        "A": {
+                            "DeferredRequests": 1,
+                            "RoutedTrees": 2,
+                        },
+                        "B": {
+                            "DeferredRequests": 0,
+                            "RoutedTrees": 1,
+                        },
+                    },
+                    "PortalBatchCount": 12,
+                    "PortalCacheHit": 0.72,
+                    "PortalRequestCount": 120,
+                    "PortalTargetCount": 90,
+                    "RouteTreeBatchCount": 7,
+                    "RouteTreeRequestCount": 40,
+                },
+            )
+            self.assertEqual(
+                Evaluation["Perf"]["NativeWork"][
+                    "CandidateDiagnosticsSummary"
+                ],
+                {
+                    "SignalCount": 2,
+                    "SignalsWithDeferredRequests": 1,
+                },
+            )
+            self.assertEqual(
+                Evaluation["Perf"]["Deadline"],
+                {"Expired": False, "RemainingMilliseconds": 0},
+            )
+
+    def testPerfTelemetrySchemaSurvivesMissingFields(self) -> None:
+        Case = AcceptanceCases[0]
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            RunDirectory = Path(DirectoryValue) / "FullAdderRun1"
+            Artifacts = BuildRunArtifacts(RunDirectory, "FullAdderRun1")
+            WriteSuccessfulArtifacts(Case, Artifacts)
+            Evaluation, _Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                DesignDigestBuilder=DigestFixture,
+            )
+
+            self.assertTrue(Evaluation["Accepted"])
+            self.assertEqual(
+                Evaluation["Perf"].get("SchemaVersion"),
+                "router-performance-v1",
+            )
+            self.assertIsInstance(Evaluation["Perf"], dict)
+            self.assertIn("StageTimingsSeconds", Evaluation["Perf"])
+            self.assertIn("NativeWork", Evaluation["Perf"])
+            self.assertIn("Deadline", Evaluation["Perf"])
+
     def testEvaluatorRejectsEveryDisallowedSuccessShape(self) -> None:
         Case = AcceptanceCases[0]
         Scenarios = (
@@ -380,7 +514,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 {"PolicyVersion": "physical-design-v9-local-first"},
                 AcceptanceCommandResult(0, "", "", 1.0),
                 None,
-                "policy version is not physical-design-v10-routability-feedback",
+                f"policy version is not {AcceptedPolicyVersion}",
             ),
             (
                 "relaxed-simulation",
@@ -530,6 +664,62 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 for Failure in WallExceededEvaluation["Failures"]
             ))
 
+    def testAcceptanceManifestIncludesPerformanceTelemetrySchema(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+
+            def Runner(**Options):
+                Command = Options["Command"]
+                RunDirectory = Path(Command[Command.index("--output") + 1])
+                RunName = Command[Command.index("--outputname") + 1]
+                Case = next(
+                    Value for Value in AcceptanceCases
+                    if RunName.startswith(Value.Name)
+                )
+                BuildArtifacts = BuildRunArtifacts(RunDirectory, RunName)
+                WriteSuccessfulArtifacts(
+                    Case,
+                    BuildArtifacts,
+                    RouterReliability={
+                        "StageTimingsSeconds": {
+                            "GlobalGuidePlanning": 0.10,
+                            "Total": 1.10,
+                        },
+                        "NativeWork": {
+                            "Batching": {
+                                "PortalRequestCount": 8,
+                                "RouteTreeRequestCount": 4,
+                                "CandidateDiagnostics": {
+                                    "A": {"DeferredRequests": 1}
+                                },
+                            }
+                        },
+                    },
+                )
+                return AcceptanceCommandResult(0, "", "", 1.0)
+
+            Manifest = RunAcceptance(
+                self.Configuration(Root),
+                CommandRunner=Runner,
+                SourceStateProvider=lambda _Root: {
+                    "Revision": "revision",
+                    "Dirty": False,
+                },
+                DesignDigestBuilder=DigestFixture,
+                UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
+            )
+
+            for Run in Manifest["Runs"]:
+                Perf = Run["Evaluation"].get("Perf")
+                self.assertIsInstance(Perf, dict)
+                self.assertEqual(
+                    Perf.get("SchemaVersion"),
+                    "router-performance-v1",
+                )
+                self.assertIn("StageTimingsSeconds", Perf)
+                self.assertIn("NativeWork", Perf)
+                self.assertIn("Deadline", Perf)
+
     def testAcceptanceCaseRejectsInvalidDeadlineEnvelopes(self) -> None:
         BaseOptions = {
             "Name": "Fixture",
@@ -639,17 +829,17 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
             )
 
-            self.assertEqual(len(Manifest["Runs"]), 9)
+            self.assertEqual(len(Manifest["Runs"]), 1)
             self.assertEqual(Manifest["Status"], "FAILED")
             self.assertFalse(Manifest["Accepted"])
-            self.assertTrue(all(
-                Run["Evaluation"]["Process"]["ReturnCode"] == 1
-                for Run in Manifest["Runs"]
-            ))
-            self.assertTrue(all(
-                Run["Evaluation"]["Artifacts"]["RoutingFailure"]["Exists"]
-                for Run in Manifest["Runs"]
-            ))
+            self.assertEqual(
+                Manifest["Runs"][0]["Evaluation"]["Process"]["ReturnCode"],
+                1,
+            )
+            self.assertTrue(
+                Manifest["Runs"][0]["Evaluation"]["Artifacts"]
+                ["RoutingFailure"]["Exists"]
+            )
 
 
 if __name__ == "__main__":

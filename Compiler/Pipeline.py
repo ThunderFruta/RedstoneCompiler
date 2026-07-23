@@ -256,7 +256,14 @@ def BuildRoutingFingerprintEnvelope(
         and isinstance(ResourceGraph, dict)
         and ResourceGraph
     ):
-        ResourceGraphFingerprint = BuildStableFingerprint(ResourceGraph)
+        # Graph identity is topology and ownership. Stage timings are
+        # measurements, not routing state, and would make two byte-identical
+        # fixed-seed routes report different fingerprints.
+        ResourceGraphFingerprint = BuildStableFingerprint({
+            Name: Value
+            for Name, Value in ResourceGraph.items()
+            if Name != "StageTimingsSeconds"
+        })
     return {
         "Placement": Evidence.get(
             "PlacementFingerprint",
@@ -811,7 +818,9 @@ def CompileSvToLitematic(
     )
     SuccessEvidence = {
         **Routed.RoutingControlEffectiveness,
+        "NegotiatedRouting": Routed.NegotiatedRoutingDiagnostics,
         "RoutingResourceGraph": RoutingResourceGraphDocument,
+        "RepeaterOptimization": Rendered.RepeaterOptimization,
     }
     RouterReliabilityDocument = BuildSuccessRouterReliability(SuccessEvidence)
     PhysicalDesignDocument = {
@@ -831,13 +840,18 @@ def CompileSvToLitematic(
         "RouterReliability": RouterReliabilityDocument,
         "PlanningContracts": Physical.PlanningContracts,
         "GlobalGuidePlanning": Routed.GlobalGuideDiagnostics,
+        "NegotiatedRouting": Routed.NegotiatedRoutingDiagnostics,
+        "RoutingFootprint": Routed.RoutingFootprintDiagnostics,
         "RoutingControlEffectiveness": Routed.RoutingControlEffectiveness,
+        "RepeaterOptimization": Rendered.RepeaterOptimization,
         "RunSummary": {
             "RuntimeSeconds": round(RuntimeSeconds, 6),
             "Width": Composition.Width,
             "Height": Composition.Height,
             "Depth": Composition.Depth,
+            "XYFootprint": Composition.XYFootprint,
             "Footprint": Composition.Footprint,
+            "FullFootprint": Composition.FullFootprint,
             "EstimatedBlocks": Physical.EstimatedBlocks,
             "ExactNonAirBlocks": Composition.NonAirBlocks,
             "Length": Metrics.TotalLength if Metrics is not None else 0,

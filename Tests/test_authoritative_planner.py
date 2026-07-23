@@ -2,18 +2,30 @@ import unittest
 from collections import Counter
 from dataclasses import replace
 from time import monotonic, sleep
+from unittest.mock import patch
 
 from Compiler.Routing.AuthoritativePlanner import (
+    BuildNegotiatedInitialColumns,
+    BuildNegotiatedInitialTiles,
+    BuildNegotiatedFallbackGuideColumns,
+    BuildNegotiatedRouteTreeState,
     BuildRoutingConflictGraph,
     CandidatePortalShapeRank,
     CandidateRequestWindowOffset,
     ChooseRepeatedWorkTransition,
+    ExpandNegotiatedTiles,
+    FindNegotiatedBoundaryTouches,
     GrowAssignmentExpansionLimit,
+    PlanNegotiatedRouteTrees,
+    NegotiatedColumnsForTiles,
     RawPortalGeometryCache,
     RequiredRoutingLayerCountForAccess,
     ReserveBoundaryPortals,
+    ReserveNegotiatedBoundaryEscapes,
+    SelectEscalatedRoutingLayerCount,
     SelectAuthoritativeBaseClaims,
     SelectGraphAccessStarts,
+    SelectInitialRoutingLayerCount,
     ShouldGrowAssignmentBudget,
     ShouldRunShapeOptimization,
     _BuildTargetPortalBranches,
@@ -23,6 +35,7 @@ from Compiler.Routing.AuthoritativePlanner import (
 from Compiler.Routing.ChannelPlanner import NetRoutingProfile
 from Compiler.Routing.Failures import RoutingFailureReason, RoutingStageError
 from Compiler.Routing.Models import RoutingResources, RoutingStaticGeometry
+from Compiler.Routing.Policy import DefaultPhysicalDesignPolicy
 from Compiler.Routing.Reliability import RoutingDeadline
 from Compiler.Routing.ResourceGraph import (
     IndexedRoutingResourceGraph,
@@ -30,6 +43,8 @@ from Compiler.Routing.ResourceGraph import (
     NetRouteCandidate,
     PinAccessPortal,
     RoutingResourceClaims,
+    RoutingResourceId,
+    RoutingResourceKind,
     RoutingResourceGraph,
     RoutingGraphRegion,
 )
@@ -210,6 +225,75 @@ class AuthoritativePlannerTests(unittest.TestCase):
             [0, 1],
         )
 
+    def testNegotiatedReservationSelectsNetWideSelfLegalPortalTuple(self) -> None:
+        Graph = RoutingResourceGraph(
+            ActualBlocks=frozenset(),
+            ElectricalBlocks=frozenset(),
+            SolidBlocks=frozenset(),
+        )
+        Resources = RoutingResources(
+            StaticGeometry=RoutingStaticGeometry(
+                ActualBlocks=frozenset(),
+                ElectricalBlocks=frozenset(),
+            ),
+            ResourceGraph=Graph,
+        )
+        Signal = "A"
+        Root = (10, 1, 0)
+        Target = (20, 1, 0)
+
+        def Portal(Label, Terminal, Position):
+            return PinAccessPortal(
+                PortalId=Label,
+                Signal=Signal,
+                Terminal=Terminal,
+                Layer=0,
+                Path=(Position,),
+                Edges=frozenset(),
+                Claims=Graph.BuildRouteClaims((Position,)),
+                Length=0,
+                BendCount=0,
+                ViaCount=0,
+                Cost=0,
+            )
+
+        Source = Portal("source", Root, (0, 2, 0))
+        ConflictingTarget = Portal("target-conflict", Target, (0, 1, 0))
+        LegalTarget = Portal("target-legal", Target, (3, 1, 0))
+        Profile = NetRoutingProfile(
+            Signal=Signal,
+            Root=Root,
+            Targets=(Target,),
+            Span=10,
+            Fanout=1,
+            RetryCount=0,
+            Criticality=1,
+            IsTrunk=False,
+            SourceAccessPath=(Root,),
+            TargetAccessPaths={Target: (Target,)},
+        )
+
+        Reserved, Reservations = ReserveNegotiatedBoundaryEscapes(
+            {
+                (Signal, Root, 0): (Source,),
+                (Signal, Target, 0): (
+                    ConflictingTarget,
+                    LegalTarget,
+                ),
+            },
+            {Signal: Profile},
+            Resources,
+        )
+
+        self.assertEqual(
+            Reserved[(Signal, Target, 0)],
+            (LegalTarget,),
+        )
+        self.assertEqual(
+            {Reservation.PortalId for Reservation in Reservations},
+            {"source", "target-legal"},
+        )
+
     def testStackedAccessRaisesOnlyTheNecessaryRoutingLayerFloor(self) -> None:
         Technology = DefaultRedstoneRoutingTechnology
 
@@ -230,6 +314,50 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 Technology=Technology,
             ),
             Technology.MinimumRoutingLayerCount,
+        )
+
+    def testRelocatedPlacementCanClimbTheLayerLadder(self) -> None:
+        Arguments = {
+            "MinimumLayerCount": 3,
+            "EffectiveMaximumLayerCount": 8,
+            "RequiredAccessLayerCount": 3,
+            "AdaptiveLayerCount": 3,
+            "AdaptiveLayerFloor": 0,
+            "NegotiatedLayerFloor": 2,
+            "ExistingRouteLayerCount": 1,
+            "PlacementWasRelocated": True,
+        }
+        self.assertEqual(
+            SelectInitialRoutingLayerCount(
+                **Arguments,
+                ForceMaximumAfterPlacementRelocation=True,
+            ),
+            8,
+        )
+        self.assertEqual(
+            SelectInitialRoutingLayerCount(
+                **Arguments,
+                ForceMaximumAfterPlacementRelocation=False,
+            ),
+            3,
+        )
+        self.assertEqual(
+            SelectEscalatedRoutingLayerCount(
+                LayerCount=3,
+                EffectiveMaximumLayerCount=8,
+                ConflictClassification="relocated-pairwise-incompatibility",
+                ForceMaximumAfterPlacementRelocation=True,
+            ),
+            8,
+        )
+        self.assertEqual(
+            SelectEscalatedRoutingLayerCount(
+                LayerCount=3,
+                EffectiveMaximumLayerCount=8,
+                ConflictClassification="relocated-pairwise-incompatibility",
+                ForceMaximumAfterPlacementRelocation=False,
+            ),
+            4,
         )
 
     def testGreedyBoundaryPortalReservationVariantChangesPhysicalSlot(self) -> None:
@@ -697,8 +825,16 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         Branches = _BuildTargetPortalBranches((Portal,))
         RawTargetAccessBranches = [[(1, 1, 0), (2, 1, 0)]]
+        CompleteBranches = _BuildTargetPortalBranches(
+            (Portal,),
+            (((1, 1, 0), (2, 1, 0)),),
+        )
 
         self.assertEqual(Branches, [[(4, 1, 0), (3, 1, 0)]])
+        self.assertEqual(
+            CompleteBranches,
+            [[(4, 1, 0), (3, 1, 0), (2, 1, 0), (1, 1, 0)]],
+        )
         self.assertEqual(Branches[0][0], Portal.Path[-1])
         self.assertNotEqual(Branches, RawTargetAccessBranches)
 
@@ -887,6 +1023,664 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertEqual(set(Tree), {(Index, 1, 0) for Index in range(5)})
         IndependentPathBlocks = 5 + 4
         self.assertLess(len(Tree), IndependentPathBlocks)
+
+    def testRustContextAddsSparseRegionsWithoutRebuildingExistingGraph(self) -> None:
+        Context = RoutingContext(
+            (0, 3, 1, 1, 0, 0),
+            (0, 3, 0, 0),
+            [(0, 1, 0), (1, 1, 0)],
+            [((0, 1, 0), (1, 1, 0))],
+        )
+
+        Counts = Context.AddRegion(
+            [(1, 1, 0), (2, 1, 0), (3, 1, 0)],
+            [
+                ((1, 1, 0), (2, 1, 0)),
+                ((2, 1, 0), (3, 1, 0)),
+            ],
+        )
+        RepeatedCounts = Context.AddRegion(
+            [(2, 1, 0), (3, 1, 0)],
+            [((2, 1, 0), (3, 1, 0))],
+        )
+
+        self.assertEqual(Counts, (4, 3))
+        self.assertEqual(RepeatedCounts, Counts)
+
+    def testNegotiatedNodeCostMovesTreeOffPresentCongestion(self) -> None:
+        Start = (0, 1, 0)
+        Direct = (1, 1, 0)
+        Target = (2, 1, 0)
+        Detour = ((0, 1, 1), (1, 1, 1), (2, 1, 1))
+        Nodes = [Start, Direct, Target, *Detour]
+        Edges = [
+            (Start, Direct),
+            (Direct, Target),
+            (Start, Detour[0]),
+            (Detour[0], Detour[1]),
+            (Detour[1], Detour[2]),
+            (Detour[2], Target),
+        ]
+        Context = RoutingContext(
+            (0, 2, 1, 1, 0, 1),
+            (0, 2, 0, 1),
+            Nodes,
+            Edges,
+        )
+
+        Tree = Context.GenerateRouteTreeWithCostsBounded(
+            [Start],
+            [[Target]],
+            Nodes,
+            [],
+            [],
+            [(Direct, 100)],
+            1,
+            0,
+            0,
+            0,
+            1_000,
+            1_000,
+        )
+
+        self.assertIsNotNone(Tree)
+        self.assertNotIn(Direct, Tree)
+        self.assertTrue(set(Detour).issubset(Tree))
+
+    def testNegotiatedInitialRegionUsesOneFullTechnologyTileHalo(self) -> None:
+        Bounds = (0, 47, 1, 5, 0, 47)
+        TileSize = 4 * DefaultRedstoneRoutingTechnology.TrackPitch
+        Tiles = BuildNegotiatedInitialTiles({(18, 18)}, Bounds, TileSize)
+        Columns = NegotiatedColumnsForTiles(Tiles, Bounds, TileSize)
+        ExactColumns = BuildNegotiatedInitialColumns(
+            {(18, 18)}, Bounds, TileSize
+        )
+
+        self.assertEqual(TileSize, 12)
+        self.assertEqual(
+            Tiles,
+            frozenset((X, Z) for X in range(3) for Z in range(3)),
+        )
+        self.assertEqual(min(X for X, _Z in Columns), 0)
+        self.assertEqual(max(X for X, _Z in Columns), 35)
+        self.assertEqual(min(X for X, _Z in ExactColumns), 6)
+        self.assertEqual(max(X for X, _Z in ExactColumns), 30)
+        self.assertEqual(min(Z for _X, Z in ExactColumns), 6)
+        self.assertEqual(max(Z for _X, Z in ExactColumns), 30)
+
+    def testBuildNegotiatedFallbackGuideColumnsUsesProfileGeometry(self) -> None:
+        Profile = NetRoutingProfile(
+            Signal="Signal",
+            Root=(11, 1, 11),
+            Targets=((14, 1, 14),),
+            Span=3,
+            Fanout=1,
+            RetryCount=0,
+            Criticality=1,
+            IsTrunk=False,
+            SourceAccessPath=((10, 1, 10), (11, 1, 10), (11, 1, 11)),
+            TargetAccessPaths={
+                (14, 1, 14): ((14, 1, 14), (13, 1, 14), (12, 1, 14)),
+            },
+            Seed=None,
+        )
+        Columns = BuildNegotiatedFallbackGuideColumns(
+            Profile,
+            (0, 20, 1, 5, 0, 20),
+            [],
+        )
+        self.assertEqual(
+            Columns,
+            frozenset({
+                (10, 10),
+                (11, 10),
+                (11, 11),
+                (12, 14),
+                (13, 14),
+                (14, 14),
+            }),
+        )
+
+    def testNegotiatedRegionExpandsOneSideAndThenIsIdempotent(self) -> None:
+        Bounds = (0, 47, 1, 5, 0, 35)
+        TileSize = 12
+        Initial = frozenset((X, Z) for X in range(3) for Z in range(3))
+        Expanded = ExpandNegotiatedTiles(
+            Initial,
+            "MaximumX",
+            Bounds,
+            TileSize,
+        )
+        Repeated = ExpandNegotiatedTiles(
+            Expanded,
+            "MaximumX",
+            Bounds,
+            TileSize,
+        )
+
+        self.assertEqual(Expanded - Initial, {(3, 0), (3, 1), (3, 2)})
+        self.assertEqual(Repeated, Expanded)
+        Touches = FindNegotiatedBoundaryTouches(
+            {(35, 1, 18)},
+            Initial,
+            Bounds,
+            TileSize,
+        )
+        self.assertEqual(Touches, {"MaximumX": ((35, 1, 18),)})
+
+    def testNegotiatedBranchRepairRetainsOnlyCleanTargetPath(self) -> None:
+        Conflict = RoutingResourceId(
+            RoutingResourceKind.Electrical,
+            (2, 1, 0),
+        )
+        Candidate = self.BuildCandidate("Signal", "candidate", (0, 1, 0))
+        Candidate = replace(
+            Candidate,
+            TargetPaths={
+                (4, 1, 0): tuple((X, 1, 0) for X in range(5)),
+                (0, 1, 4): tuple((0, 1, Z) for Z in range(5)),
+            },
+            BranchClaims={
+                (4, 1, 0): RoutingResourceClaims(
+                    ElectricalCells=frozenset({(2, 1, 0)})
+                ),
+                (0, 1, 4): RoutingResourceClaims(
+                    ElectricalCells=frozenset({(0, 1, 2)})
+                ),
+            },
+        )
+
+        State = BuildNegotiatedRouteTreeState(Candidate, {Conflict})
+
+        self.assertEqual(State.PrunedTargets, ((4, 1, 0),))
+        self.assertEqual(State.RetainedTargets, ((0, 1, 4),))
+
+    def testNegotiatedBranchRepairPrunesOnlyTailToNearestBranchpoint(self) -> None:
+        Conflict = RoutingResourceId(
+            RoutingResourceKind.Wire,
+            (4, 1, 0),
+        )
+        Candidate = self.BuildCandidate("Signal", "candidate", (0, 1, 0))
+        Candidate = replace(
+            Candidate,
+            TargetPaths={
+                (4, 1, 4): (
+                    (0, 1, 0),
+                    (1, 1, 0),
+                    (2, 1, 0),
+                    (3, 1, 0),
+                    (4, 1, 0),
+                    (4, 1, 1),
+                    (4, 1, 2),
+                    (4, 1, 3),
+                    (4, 1, 4),
+                ),
+                (4, 1, -4): (
+                    (0, 1, 0),
+                    (1, 1, 0),
+                    (2, 1, 0),
+                    (3, 1, 0),
+                    (4, 1, 0),
+                    (4, 1, -1),
+                    (4, 1, -2),
+                    (4, 1, -3),
+                    (4, 1, -4),
+                ),
+            },
+            BranchClaims={
+                (4, 1, 4): RoutingResourceClaims(
+                    WireCells=frozenset({
+                        (0, 1, 0),
+                        (1, 1, 0),
+                        (2, 1, 0),
+                        (3, 1, 0),
+                        (4, 1, 0),
+                        (4, 1, 1),
+                        (4, 1, 2),
+                        (4, 1, 3),
+                        (4, 1, 4),
+                    })
+                ),
+                (4, 1, -4): RoutingResourceClaims(
+                    WireCells=frozenset({
+                        (0, 1, 0),
+                        (1, 1, 0),
+                        (2, 1, 0),
+                        (3, 1, 0),
+                        (4, 1, 0),
+                        (4, 1, -1),
+                        (4, 1, -2),
+                        (4, 1, -3),
+                        (4, 1, -4),
+                    })
+                ),
+            },
+        )
+
+        State = BuildNegotiatedRouteTreeState(Candidate, {Conflict})
+
+        self.assertEqual(State.PrunedTargets, ((4, 1, -4), (4, 1, 4)))
+        self.assertEqual(State.RetainedTargets, ())
+        self.assertEqual(
+            State.PrunedBranchPaths,
+            (
+                (
+                    (0, 1, 0),
+                    (1, 1, 0),
+                    (2, 1, 0),
+                    (3, 1, 0),
+                    (4, 1, 0),
+                    (4, 1, -1),
+                    (4, 1, -2),
+                    (4, 1, -3),
+                    (4, 1, -4),
+                ),
+                (
+                    (0, 1, 0),
+                    (1, 1, 0),
+                    (2, 1, 0),
+                    (3, 1, 0),
+                    (4, 1, 0),
+                    (4, 1, 1),
+                    (4, 1, 2),
+                    (4, 1, 3),
+                    (4, 1, 4),
+                ),
+            ),
+        )
+        self.assertEqual(
+            State.PrunedBranchTailPaths,
+            (
+                ((4, 1, -1), (4, 1, -2), (4, 1, -3), (4, 1, -4)),
+                ((4, 1, 1), (4, 1, 2), (4, 1, 3), (4, 1, 4)),
+            ),
+        )
+        self.assertEqual(
+            State.SharedTrunkNodes,
+            ((0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 1, 0), (4, 1, 0)),
+        )
+
+    def testPlanNegotiatedRouteTreesPreservesSeededSignalWhenNotRegenerating(self) -> None:
+        Graph = RoutingResourceGraph(
+            ActualBlocks=frozenset(),
+            ElectricalBlocks=frozenset(),
+            SolidBlocks=frozenset(),
+        )
+        Region = Graph.BuildRegion((0, 40, 1, 2, 0, 40))
+        Resources = RoutingResources(
+            StaticGeometry=RoutingStaticGeometry(
+                ActualBlocks=frozenset(),
+                ElectricalBlocks=frozenset(),
+            ),
+            ResourceGraph=Graph,
+        )
+        Context = RoutingContext(
+            (0, 40, 1, 2, 0, 40),
+            (0, 40, 0, 0),
+            sorted(Region.Nodes),
+            sorted(Region.Edges),
+        )
+        Profile = NetRoutingProfile(
+            Signal="S1",
+            Root=(1, 1, 1),
+            Targets=((6, 1, 1),),
+            Span=6,
+            Fanout=1,
+            RetryCount=0,
+            Criticality=1,
+            IsTrunk=False,
+            SourceAccessPath=((1, 1, 1),),
+            TargetAccessPaths={(6, 1, 1): ((6, 1, 1),)},
+            Seed=None,
+        )
+        SeedCandidate = self.BuildCandidate("S1", "seed", (1, 1, 1))
+        Plan = PlanNegotiatedRouteTrees(
+            Context=Context,
+            Profiles={"S1": Profile},
+            RouteRequestsBySignal={},
+            RouteMetadataBySignal={},
+            Region=Region,
+            ReservedAccess=frozenset(),
+            Resources=Resources,
+            Technology=DefaultRedstoneRoutingTechnology,
+            Policy=DefaultPhysicalDesignPolicy,
+            Deadline=RoutingDeadline(
+                StartedAt=monotonic(),
+                ExpiresAt=monotonic() + 5.0,
+            ),
+            AdaptiveExpiresAt=monotonic() + 4.0,
+            CheckRuntimeBudget=lambda _Name, _Diagnostics: None,
+            RegenerateSignals=frozenset(),
+            SeedCandidatesBySignal={"S1": (SeedCandidate,)},
+        )
+        self.assertEqual(Plan.SelectedCandidates["S1"].CandidateId, "seed")
+
+    def testPlanNegotiatedRouteTreesRegenerateForcesReplanWhenNoRequests(self) -> None:
+        Graph = RoutingResourceGraph(
+            ActualBlocks=frozenset(),
+            ElectricalBlocks=frozenset(),
+            SolidBlocks=frozenset(),
+        )
+        Region = Graph.BuildRegion((0, 40, 1, 2, 0, 40))
+        Resources = RoutingResources(
+            StaticGeometry=RoutingStaticGeometry(
+                ActualBlocks=frozenset(),
+                ElectricalBlocks=frozenset(),
+            ),
+            ResourceGraph=Graph,
+        )
+        Context = RoutingContext(
+            (0, 40, 1, 2, 0, 40),
+            (0, 40, 0, 0),
+            sorted(Region.Nodes),
+            sorted(Region.Edges),
+        )
+        Profile = NetRoutingProfile(
+            Signal="S1",
+            Root=(1, 1, 1),
+            Targets=((6, 1, 1),),
+            Span=6,
+            Fanout=1,
+            RetryCount=0,
+            Criticality=1,
+            IsTrunk=False,
+            SourceAccessPath=((1, 1, 1),),
+            TargetAccessPaths={(6, 1, 1): ((6, 1, 1),)},
+            Seed=None,
+        )
+        SeedCandidate = self.BuildCandidate("S1", "seed", (1, 1, 1))
+        with self.assertRaisesRegex(
+            RoutingStageError,
+            "no legal portal-aware route tree",
+        ) as ContextManager:
+            PlanNegotiatedRouteTrees(
+                Context=Context,
+                Profiles={"S1": Profile},
+                RouteRequestsBySignal={},
+                RouteMetadataBySignal={},
+                Region=Region,
+                ReservedAccess=frozenset(),
+                Resources=Resources,
+                Technology=DefaultRedstoneRoutingTechnology,
+                Policy=DefaultPhysicalDesignPolicy,
+                Deadline=RoutingDeadline(
+                    StartedAt=monotonic(),
+                    ExpiresAt=monotonic() + 5.0,
+                ),
+                AdaptiveExpiresAt=monotonic() + 4.0,
+                CheckRuntimeBudget=lambda _Name, _Diagnostics: None,
+                RegenerateSignals=frozenset({"S1"}),
+                SeedCandidatesBySignal={"S1": (SeedCandidate,)},
+            )
+        self.assertEqual(
+            ContextManager.exception.Failure.Reason,
+            RoutingFailureReason.NoPinAccessPattern,
+        )
+
+    def testNegotiatedPassZeroDetailedSearchUsesStableNativeBatches(self) -> None:
+        class DetailedBatchResult:
+            def __init__(self, SearchResults):
+                self.SearchResults = SearchResults
+                self.DeadlineExceeded = False
+                self.CompletedWork = len(SearchResults)
+                self.TotalWork = len(SearchResults)
+
+        class BatchContext:
+            def __init__(self, Context):
+                self.Context = Context
+                self.BatchCalls = []
+
+            def __getattr__(self, Name):
+                return getattr(self.Context, Name)
+
+            def GenerateRouteTreeDetailedBatchBounded(
+                self,
+                Requests,
+                MaximumRuntimeMilliseconds,
+            ):
+                self.BatchCalls.append((
+                    len(Requests),
+                    MaximumRuntimeMilliseconds,
+                ))
+                return DetailedBatchResult([
+                    self.Context.GenerateRouteTreeDetailedBounded(
+                        *Request,
+                        MaximumRuntimeMilliseconds,
+                    )
+                    for Request in Requests
+                ])
+
+        Graph = RoutingResourceGraph(
+            ActualBlocks=frozenset(),
+            ElectricalBlocks=frozenset(),
+            SolidBlocks=frozenset(),
+        )
+        Region = Graph.BuildRegion((0, 8, 1, 1, 0, 0))
+        Resources = RoutingResources(
+            StaticGeometry=RoutingStaticGeometry(
+                ActualBlocks=frozenset(),
+                ElectricalBlocks=frozenset(),
+            ),
+            ResourceGraph=Graph,
+        )
+        Root = (1, 1, 0)
+        Target = (6, 1, 0)
+        Profile = NetRoutingProfile(
+            Signal="S1",
+            Root=Root,
+            Targets=(Target,),
+            Span=5,
+            Fanout=1,
+            RetryCount=0,
+            Criticality=1,
+            IsTrunk=False,
+            SourceAccessPath=(Root,),
+            TargetAccessPaths={Target: (Target,)},
+            Seed=None,
+        )
+        SourcePortal = PinAccessPortal(
+            "source",
+            "S1",
+            Root,
+            0,
+            (Root,),
+            frozenset(),
+            Graph.BuildRouteClaims((Root,)),
+            0,
+            0,
+            0,
+            0,
+        )
+        TargetPortal = PinAccessPortal(
+            "target",
+            "S1",
+            Target,
+            0,
+            (Target,),
+            frozenset(),
+            Graph.BuildRouteClaims((Target,)),
+            0,
+            0,
+            0,
+            0,
+        )
+        Guide = [(X, 0) for X in range(9)]
+        Request = (
+            [Root],
+            [[Target]],
+            Guide,
+            [Root, Target],
+            [],
+            Guide,
+            1,
+            0,
+            0,
+            0,
+            # The initial global candidate budget is intentionally too small
+            # for this path. The negotiated planner must retry only this
+            # search at the strict per-net limit before declaring a cut.
+            1,
+        )
+        Metadata = (
+            SourcePortal,
+            (TargetPortal,),
+            frozenset(Guide),
+            0,
+            "X",
+            0,
+            0,
+        )
+        Context = BatchContext(RoutingContext(
+            (0, 8, 1, 1, 0, 0),
+            (0, 8, 0, 0),
+            sorted(Region.Nodes),
+            sorted(Region.Edges),
+        ))
+        with patch(
+            "Compiler.Routing.AuthoritativePlanner.GetRustRoutingThreadCount",
+            return_value=1,
+        ):
+            Plan = PlanNegotiatedRouteTrees(
+                Context=Context,
+                Profiles={"S1": Profile},
+                RouteRequestsBySignal={"S1": [Request, Request]},
+                RouteMetadataBySignal={
+                    "S1": [Metadata, (*Metadata[:-1], 1)]
+                },
+                Region=Region,
+                ReservedAccess=frozenset(),
+                Resources=Resources,
+                Technology=DefaultRedstoneRoutingTechnology,
+                Policy=DefaultPhysicalDesignPolicy,
+                Deadline=RoutingDeadline(
+                    StartedAt=monotonic(),
+                    ExpiresAt=monotonic() + 5.0,
+                ),
+                AdaptiveExpiresAt=monotonic() + 4.0,
+                CheckRuntimeBudget=lambda _Name, _Diagnostics: None,
+            )
+
+        self.assertEqual([Count for Count, _Time in Context.BatchCalls], [1, 1])
+        self.assertTrue(all(
+            Time <= DefaultPhysicalDesignPolicy.NegotiatedRouting
+            .MaximumRouteTreeRequestMilliseconds
+            for _Count, Time in Context.BatchCalls
+        ))
+        self.assertEqual(
+            Plan.Diagnostics["InitialDetailedBatch"]["CompletedWork"],
+            2,
+        )
+        self.assertEqual(
+            Plan.Diagnostics["InitialDetailedBatch"]["WorkerCount"],
+            1,
+        )
+        self.assertEqual(
+            Plan.Diagnostics["SearchExpansionEscalations"],
+            {"S1": DefaultPhysicalDesignPolicy.DetailedRouting
+             .StrictBaseExpansions},
+        )
+        self.assertTrue(any(
+            Value["MaximumExpansionCount"]
+            == DefaultPhysicalDesignPolicy.DetailedRouting.StrictBaseExpansions
+            for Value in Plan.Diagnostics["NativeSearch"]["S1"]
+        ))
+        self.assertIn("S1", Plan.SelectedCandidates)
+
+    def testDetailedNativeTreeReturnsRepeaterAwareResult(self) -> None:
+        Nodes = [(X, 1, 0) for X in range(31)]
+        Edges = list(zip(Nodes, Nodes[1:]))
+        Context = RoutingContext(
+            (0, 30, 1, 1, 0, 0),
+            (0, 30, 0, 0),
+            Nodes,
+            Edges,
+        )
+
+        Result = Context.GenerateRouteTreeDetailedBounded(
+            [Nodes[0]],
+            [[Nodes[-1]]],
+            Nodes,
+            [],
+            [],
+            [],
+            1,
+            0,
+            0,
+            0,
+            True,
+            10_000,
+            1_000,
+        )
+
+        self.assertEqual(Result.Status, "Routed")
+        self.assertEqual(len(Result.TargetPaths), 1)
+        self.assertEqual(len(Result.RepeaterReservations), 2)
+        self.assertEqual(Result.RepeaterRejectedCount, 0)
+
+    def testDetailedNativeTreeTypesImpossibleRepeaterGeometry(self) -> None:
+        Nodes = [(0, 1, 0)]
+        for Index in range(1, 20):
+            Previous = Nodes[-1]
+            Nodes.append((
+                Previous[0] + (1 if Index % 2 else 0),
+                1,
+                Previous[2] + (0 if Index % 2 else 1),
+            ))
+        Context = RoutingContext(
+            (0, 10, 1, 1, 0, 10),
+            (0, 10, 0, 10),
+            Nodes,
+            list(zip(Nodes, Nodes[1:])),
+        )
+
+        Result = Context.GenerateRouteTreeDetailedBounded(
+            [Nodes[0]],
+            [[Nodes[-1]]],
+            Nodes,
+            [],
+            [],
+            [],
+            1,
+            0,
+            0,
+            0,
+            True,
+            10_000,
+            1_000,
+        )
+
+        self.assertEqual(Result.Status, "NoPath")
+        self.assertGreater(Result.RepeaterRejectedCount, 0)
+        self.assertEqual(Result.NoPathReason, "NoRepeater")
+
+    def testDetailedNativeTreeKeepsStrengthAcrossRetainedStarts(self) -> None:
+        Nodes = [(X, 1, 0) for X in range(32)]
+        Context = RoutingContext(
+            (0, 31, 1, 1, 0, 0),
+            (0, 31, 0, 0),
+            Nodes,
+            list(zip(Nodes, Nodes[1:])),
+        )
+
+        Result = Context.GenerateRouteTreeDetailedBounded(
+            Nodes[:15],
+            [[Nodes[-1]]],
+            Nodes,
+            [],
+            [],
+            [],
+            1,
+            0,
+            0,
+            0,
+            True,
+            10_000,
+            1_000,
+        )
+
+        self.assertEqual(Result.Status, "Routed")
+        self.assertEqual(Result.TargetPaths[0][1], Nodes)
+        self.assertEqual(len(Result.RepeaterReservations), 2)
 
     def testNativeTopologyIsDeterministicAndRectilinear(self) -> None:
         First = GenerateRectilinearTopology([(4, 4), (0, 0), (4, 0)])

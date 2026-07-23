@@ -19,6 +19,7 @@ from SchemEncoder.Writer262 import (
     BuildLitematicBlockMap,
     BuildWireState,
     LoadTemplate,
+    TemplateRepeaterPinRoles,
     _PlaceIoSigns,
 )
 from Templates import LitematicTemplates
@@ -84,6 +85,102 @@ class PhysicalCellTests(unittest.TestCase):
         self.assertEqual(Provenance[Position], BlockProvenance.Annotation)
         self.assertIn((Position[0], Position[1] - 1, Position[2]), Blocks)
 
+    def testIoSignPlacementPrefersExistingPhysicalEnvelope(self) -> None:
+        Gate = SimpleNamespace(
+            Name="InputA",
+            Kind="INPUT",
+            X=0,
+            Y=1,
+            Z=0,
+            Rotation=0,
+            Outputs=["A"],
+            Inputs=[],
+            OutputPin=(1, 1, 1),
+            OutputDirection=(1, 0, 0),
+            InputPins=[],
+            InputDirections=[],
+        )
+        Blocks = {
+            (0, 0, 0): {"Name": "minecraft:smooth_stone"},
+            (1, 0, 0): {"Name": "minecraft:smooth_stone"},
+            (0, 0, 2): {"Name": "minecraft:smooth_stone"},
+            (1, 0, 2): {"Name": "minecraft:smooth_stone"},
+        }
+        Provenance = {
+            Position: BlockProvenance.RouteSupport for Position in Blocks
+        }
+        Signs = _PlaceIoSigns(
+            SimpleNamespace(PlacedGates=[Gate]),
+            Blocks,
+            Provenance,
+            {"Name": "minecraft:smooth_stone"},
+            {},
+            {"A": "minecraft:light_gray_concrete"},
+        )
+
+        self.assertEqual(Signs, [((1, 1, 0), "IN A")])
+        self.assertEqual(max(Position[0] for Position in Blocks), 1)
+        self.assertEqual(max(Position[2] for Position in Blocks), 2)
+
+    def testIoSignPlacementUsesExistingVerticalDeckBeforeExpanding(self) -> None:
+        Gate = SimpleNamespace(
+            Name="InputA",
+            Kind="INPUT",
+            X=100,
+            Y=1,
+            Z=100,
+            Rotation=0,
+            Outputs=["A"],
+            Inputs=[],
+            OutputPin=(1, 1, 1),
+            OutputDirection=(1, 0, 0),
+            InputPins=[],
+            InputDirections=[],
+        )
+        Blocks = {
+            (X, 1, Z): {"Name": "minecraft:redstone_wire"}
+            for X in range(-7, 10)
+            for Z in range(-7, 10)
+        }
+        # The primary-direction slot is occupied at the pin layer but has a
+        # valid support directly below the next existing routing deck.
+        Blocks[(2, 1, 1)] = {"Name": "minecraft:smooth_stone"}
+        Blocks[(0, 0, 0)] = {"Name": "minecraft:smooth_stone"}
+        Blocks[(0, 3, 0)] = {"Name": "minecraft:smooth_stone"}
+        Provenance = {
+            Position: BlockProvenance.RouteSupport for Position in Blocks
+        }
+        OriginalBounds = (
+            min(Position[0] for Position in Blocks),
+            max(Position[0] for Position in Blocks),
+            min(Position[1] for Position in Blocks),
+            max(Position[1] for Position in Blocks),
+            min(Position[2] for Position in Blocks),
+            max(Position[2] for Position in Blocks),
+        )
+
+        Signs = _PlaceIoSigns(
+            SimpleNamespace(PlacedGates=[Gate]),
+            Blocks,
+            Provenance,
+            {"Name": "minecraft:smooth_stone"},
+            {},
+            {"A": "minecraft:light_gray_concrete"},
+        )
+
+        self.assertEqual(Signs, [((2, 2, 1), "IN A")])
+        self.assertEqual(
+            (
+                min(Position[0] for Position in Blocks),
+                max(Position[0] for Position in Blocks),
+                min(Position[1] for Position in Blocks),
+                max(Position[1] for Position in Blocks),
+                min(Position[2] for Position in Blocks),
+                max(Position[2] for Position in Blocks),
+            ),
+            OriginalBounds,
+        )
+
     def testRepeaterPruningKeepsOnlyStrengthRequiredRefreshers(self) -> None:
         Nodes = [(X, 0, 0) for X in range(29)]
         Graph = {
@@ -105,6 +202,20 @@ class PhysicalCellTests(unittest.TestCase):
             Reservations,
         )
         self.assertEqual([Value.Position for Value in Retained], [(14, 0, 0)])
+
+    def testTemplateRepeatersAllBridgeDeclaredMacroPins(self) -> None:
+        for Name, PathValue in LitematicTemplates.items():
+            with self.subTest(Name=Name):
+                Template = LoadTemplate(PathValue)
+                Repeaters = {
+                    Position
+                    for Position, State in Template.Blocks.items()
+                    if State["Name"] == "minecraft:repeater"
+                }
+                self.assertEqual(
+                    Repeaters,
+                    set(TemplateRepeaterPinRoles(Name)),
+                )
 
     def testMacroSizesMatchTemplates(self) -> None:
         for Name, PathValue in LitematicTemplates.items():

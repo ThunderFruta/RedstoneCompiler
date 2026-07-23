@@ -3,7 +3,10 @@ use crate::AssignmentPlanning::{
     PlanAuthoritativeRoutesWithBaseAndDeadline, PlanAuthoritativeRoutesWithDeadline,
 };
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
-use crate::Generation::{GeneratePortalCandidateBatchesNative, GenerateRouteTreesNative};
+use crate::Generation::{
+    GeneratePortalCandidateBatchesNative, GenerateRouteTreeDetailedBatchNative,
+    GenerateRouteTreesNative,
+};
 use crate::Models::*;
 use crate::PathRouting::FindPath;
 use crate::{
@@ -161,6 +164,8 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_class::<PortalCandidate>()?;
     Module.add_class::<PortalCandidateBatchResult>()?;
     Module.add_class::<RouteTreeBatchResult>()?;
+    Module.add_class::<RouteTreeSearchResult>()?;
+    Module.add_class::<RouteTreeDetailedBatchResult>()?;
     Module.add_class::<RoutingAssignmentResult>()?;
     Module.add_function(wrap_pyfunction!(GetRoutingThreadCount, Module)?)?;
     Module.add_function(wrap_pyfunction!(GenerateRectilinearTopology, Module)?)?;
@@ -364,9 +369,76 @@ impl RoutingContext {
                 GuidePenalty,
                 BendPenalty,
                 ViaPenalty,
+                false,
                 MaximumExpansionCount,
                 Some(MaximumRuntimeMilliseconds as f64 / 1000.0),
             )
+        })
+    }
+
+    #[pyo3(signature=(Starts, TargetBranches, AllowedNodeValues, BlockedNodeValues, PreferredColumns, NodeCostValues, PreferredRoutingY, GuidePenalty, BendPenalty, ViaPenalty, EnforceSignalStrength, MaximumExpansionCount, MaximumRuntimeMilliseconds))]
+    fn GenerateRouteTreeDetailedBounded(
+        &self,
+        PythonValue: Python<'_>,
+        Starts: Vec<Position>,
+        TargetBranches: Vec<Vec<Position>>,
+        AllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        PreferredColumns: Vec<(i32, i32)>,
+        NodeCostValues: Vec<(Position, i32)>,
+        PreferredRoutingY: i32,
+        GuidePenalty: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        EnforceSignalStrength: bool,
+        MaximumExpansionCount: usize,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> RouteTreeSearchResult {
+        PythonValue.allow_threads(|| {
+            self.GenerateRouteTreeDetailedNative(
+                Starts,
+                TargetBranches,
+                AllowedNodeValues,
+                BlockedNodeValues,
+                PreferredColumns,
+                NodeCostValues,
+                PreferredRoutingY,
+                GuidePenalty,
+                BendPenalty,
+                ViaPenalty,
+                EnforceSignalStrength,
+                MaximumExpansionCount,
+                MaximumRuntimeMilliseconds,
+            )
+        })
+    }
+
+    /// Runs independent detailed route-tree searches against a frozen routing
+    /// context.  `MaximumRuntimeMilliseconds` is one absolute deadline for
+    /// the whole batch, not a new budget per request.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature=(Requests, MaximumRuntimeMilliseconds))]
+    fn GenerateRouteTreeDetailedBatchBounded(
+        &self,
+        PythonValue: Python<'_>,
+        Requests: Vec<(
+            Vec<Position>,
+            Vec<Vec<Position>>,
+            Vec<Position>,
+            Vec<Position>,
+            Vec<(i32, i32)>,
+            Vec<(Position, i32)>,
+            i32,
+            i32,
+            i32,
+            i32,
+            bool,
+            usize,
+        )>,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> RouteTreeDetailedBatchResult {
+        PythonValue.allow_threads(|| {
+            GenerateRouteTreeDetailedBatchNative(self, Requests, MaximumRuntimeMilliseconds)
         })
     }
 

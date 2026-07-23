@@ -10,17 +10,27 @@ from time import monotonic
 from typing import Any, Callable
 
 try:
-    from ..RustRouting import RoutingContext as RustRoutingContext
+    from ..RustRouting import (
+        GetRoutingThreadCount as GetRustRoutingThreadCount,
+        RoutingContext as RustRoutingContext,
+    )
 except ImportError:
     try:
-        from RedstoneCompiler.RustRouting import RoutingContext as RustRoutingContext
+        from RedstoneCompiler.RustRouting import (
+            GetRoutingThreadCount as GetRustRoutingThreadCount,
+            RoutingContext as RustRoutingContext,
+        )
     except Exception:
         RustRoutingContext = None
+
+        def GetRustRoutingThreadCount() -> int:
+            return 1
 
 from ..Placement.Rotation import RotatedCellSize
 from .Actions import (
     BuildPhysicalGraphs,
     MaterializeReservedRepeaters,
+    PropagateRoutePower,
     PruneRedundantRepeaterReservations,
     ValidatePhysicalRoutes,
 )
@@ -51,6 +61,7 @@ from .Policy import DefaultPhysicalDesignPolicy, PhysicalDesignPolicy
 from .ResourceGraph import (
     FindClaimConflicts,
     FindSelfClaimConflicts,
+    BuildRoutingEnvelope,
     IndexedRoutingResourceGraph,
     LocalRouteClaim,
     NetRouteCandidate,
@@ -87,6 +98,444 @@ class RepeatedWorkTransition:
     Action: str
     SkipStrictPortalReservation: bool
     Deadline: RoutingDeadline
+
+
+@dataclass
+class NegotiatedRegionState:
+    """Mutable per-signal ownership of one lazily expanded route region."""
+
+    Signal: str
+    TileSize: int
+    Bounds: tuple[int, int, int, int, int, int]
+    ActiveTiles: set[Position2]
+    ActiveColumns: set[Position2]
+    AddedNodes: set[Position3]
+    AddedEdges: set[tuple[Position3, Position3]]
+    BoundaryTouches: set[Position3]
+    ExpandedSides: list[str]
+    ExpansionEvents: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class NegotiatedRouteTreeState:
+    """Branch-level repair state retained between negotiated passes."""
+
+    Candidate: NetRouteCandidate
+    RetainedTargets: tuple[Position3, ...]
+    PrunedTargets: tuple[Position3, ...]
+    RetainedBranchPaths: tuple[tuple[Position3, ...], ...]
+    PrunedBranchPaths: tuple[tuple[Position3, ...], ...]
+    PrunedBranchTailPaths: tuple[tuple[Position3, ...], ...]
+    RetainedBranchClaims: tuple[frozenset[RoutingResourceId], ...]
+    PrunedBranchClaims: tuple[frozenset[RoutingResourceId], ...]
+    PrunedBranchTailClaims: tuple[frozenset[RoutingResourceId], ...]
+    RetainedBranchIds: tuple[Position3, ...]
+    PrunedBranchIds: tuple[Position3, ...]
+    RetainedNodes: tuple[Position3, ...]
+    PrunedNodes: tuple[Position3, ...]
+    SharedTrunkNodes: tuple[Position3, ...]
+
+
+def _NegotiatedTileForColumn(
+    Column: Position2,
+    Bounds: tuple[int, int, int, int, int, int],
+    TileSize: int,
+) -> Position2:
+    MinimumX, _MaximumX, _MinimumY, _MaximumY, MinimumZ, _MaximumZ = Bounds
+    return (
+        (Column[0] - MinimumX) // TileSize,
+        (Column[1] - MinimumZ) // TileSize,
+    )
+
+
+def _NegotiatedTileIntersectsBounds(
+    Tile: Position2,
+    Bounds: tuple[int, int, int, int, int, int],
+    TileSize: int,
+) -> bool:
+    MinimumX, MaximumX, _MinimumY, _MaximumY, MinimumZ, MaximumZ = Bounds
+    TileMinimumX = MinimumX + Tile[0] * TileSize
+    TileMinimumZ = MinimumZ + Tile[1] * TileSize
+    return (
+        TileMinimumX <= MaximumX
+        and TileMinimumX + TileSize - 1 >= MinimumX
+        and TileMinimumZ <= MaximumZ
+        and TileMinimumZ + TileSize - 1 >= MinimumZ
+    )
+
+
+def BuildNegotiatedInitialTiles(
+    GuideColumns: set[Position2] | frozenset[Position2],
+    Bounds: tuple[int, int, int, int, int, int],
+    TileSize: int,
+) -> frozenset[Position2]:
+    """Return guide tiles plus one complete negotiated tile halo."""
+    if TileSize < 1:
+        raise ValueError("Negotiated tile size must be positive")
+    GuideTiles = {
+        _NegotiatedTileForColumn(Column, Bounds, TileSize)
+        for Column in GuideColumns
+    }
+    Result = {
+        (TileX + DeltaX, TileZ + DeltaZ)
+        for TileX, TileZ in GuideTiles
+        for DeltaX in (-1, 0, 1)
+        for DeltaZ in (-1, 0, 1)
+        if _NegotiatedTileIntersectsBounds(
+            (TileX + DeltaX, TileZ + DeltaZ),
+            Bounds,
+            TileSize,
+        )
+    }
+    return frozenset(Result)
+
+
+def BuildNegotiatedInitialColumns(
+    GuideColumns: set[Position2] | frozenset[Position2],
+    Bounds: tuple[int, int, int, int, int, int],
+    HaloSize: int,
+) -> frozenset[Position2]:
+    """Return the exact clipped block-column halo around a sparse guide."""
+    if HaloSize < 1:
+        raise ValueError("Negotiated halo size must be positive")
+    MinimumX, MaximumX, _MinimumY, _MaximumY, MinimumZ, MaximumZ = Bounds
+    return frozenset(
+        (X + DeltaX, Z + DeltaZ)
+        for X, Z in GuideColumns
+        for DeltaX in range(-HaloSize, HaloSize + 1)
+        for DeltaZ in range(-HaloSize, HaloSize + 1)
+        if MinimumX <= X + DeltaX <= MaximumX
+        and MinimumZ <= Z + DeltaZ <= MaximumZ
+    )
+
+
+def BuildNegotiatedFallbackGuideColumns(
+    Profile: Any,
+    Bounds: tuple[int, int, int, int, int, int],
+    Routes: list[tuple[Any, ...]],
+) -> frozenset[Position2]:
+    """Return non-empty fallback ownership columns from required profile geometry."""
+    ProfileColumns: set[Position2] = set()
+    for Path in (
+        Profile.SourceAccessPath,
+        Profile.Root,
+        *tuple(Profile.TargetAccessPaths.values()),
+        *(
+            claim_node
+            for Claim in (Profile.Seed.LocalClaims if Profile.Seed is not None else ())
+            for claim_node in Claim.Nodes
+        ),
+    ):
+        if Path and isinstance(Path[0], tuple):
+            ProfileColumns.update((Value[0], Value[2]) for Value in Path)
+        elif Path:
+            ProfileColumns.update(((Path[0], Path[2]),))
+    for Request in Routes:
+        if len(Request) > 2:
+            ProfileColumns.update(
+                (Value[0], Value[2]) for Value in Request[0]
+            )
+    if ProfileColumns:
+        return frozenset(ProfileColumns)
+    MinimumX, _MaximumX, _MinimumY, _MaximumY, MinimumZ, _MaximumZ = Bounds
+    return frozenset({(MinimumX, MinimumZ)})
+
+
+def NegotiatedColumnsForTiles(
+    Tiles: set[Position2] | frozenset[Position2],
+    Bounds: tuple[int, int, int, int, int, int],
+    TileSize: int,
+) -> frozenset[Position2]:
+    """Materialize only physical X/Z columns owned by the selected tiles."""
+    MinimumX, MaximumX, _MinimumY, _MaximumY, MinimumZ, MaximumZ = Bounds
+    return frozenset(
+        (X, Z)
+        for TileX, TileZ in Tiles
+        for X in range(
+            max(MinimumX, MinimumX + TileX * TileSize),
+            min(MaximumX, MinimumX + (TileX + 1) * TileSize - 1) + 1,
+        )
+        for Z in range(
+            max(MinimumZ, MinimumZ + TileZ * TileSize),
+            min(MaximumZ, MinimumZ + (TileZ + 1) * TileSize - 1) + 1,
+        )
+    )
+
+
+def FindNegotiatedBoundaryTouches(
+    Nodes: set[Position3] | frozenset[Position3],
+    ActiveTiles: set[Position2] | frozenset[Position2],
+    Bounds: tuple[int, int, int, int, int, int],
+    TileSize: int,
+) -> dict[str, tuple[Position3, ...]]:
+    """Identify route nodes that touch an expandable active-region side."""
+    MinimumX, MaximumX, _MinimumY, _MaximumY, MinimumZ, MaximumZ = Bounds
+    Touches: dict[str, set[Position3]] = defaultdict(set)
+    for Node in Nodes:
+        X, _Y, Z = Node
+        TileX, TileZ = _NegotiatedTileForColumn((X, Z), Bounds, TileSize)
+        TileMinimumX = max(MinimumX, MinimumX + TileX * TileSize)
+        TileMaximumX = min(MaximumX, TileMinimumX + TileSize - 1)
+        TileMinimumZ = max(MinimumZ, MinimumZ + TileZ * TileSize)
+        TileMaximumZ = min(MaximumZ, TileMinimumZ + TileSize - 1)
+        for Side, IsTouch, Neighbor in (
+            ("MinimumX", X == TileMinimumX, (TileX - 1, TileZ)),
+            ("MaximumX", X == TileMaximumX, (TileX + 1, TileZ)),
+            ("MinimumZ", Z == TileMinimumZ, (TileX, TileZ - 1)),
+            ("MaximumZ", Z == TileMaximumZ, (TileX, TileZ + 1)),
+        ):
+            if (
+                IsTouch
+                and Neighbor not in ActiveTiles
+                and _NegotiatedTileIntersectsBounds(Neighbor, Bounds, TileSize)
+            ):
+                Touches[Side].add(Node)
+    return {
+        Side: tuple(sorted(Values))
+        for Side, Values in sorted(Touches.items())
+    }
+
+
+def ExpandNegotiatedTiles(
+    ActiveTiles: set[Position2] | frozenset[Position2],
+    Side: str,
+    Bounds: tuple[int, int, int, int, int, int],
+    TileSize: int,
+) -> frozenset[Position2]:
+    """Expand exactly one implicated side by one negotiated tile."""
+    DeltaBySide = {
+        "MinimumX": (-1, 0),
+        "MaximumX": (1, 0),
+        "MinimumZ": (0, -1),
+        "MaximumZ": (0, 1),
+    }
+    if Side not in DeltaBySide:
+        raise ValueError(f"Unknown negotiated expansion side: {Side}")
+    DeltaX, DeltaZ = DeltaBySide[Side]
+    Result = set(ActiveTiles)
+    for TileX, TileZ in sorted(ActiveTiles):
+        Neighbor = (TileX + DeltaX, TileZ + DeltaZ)
+        if (
+            Neighbor not in ActiveTiles
+            and _NegotiatedTileIntersectsBounds(Neighbor, Bounds, TileSize)
+        ):
+            Result.add(Neighbor)
+    return frozenset(Result)
+
+
+def BuildNegotiatedRouteTreeState(
+    Candidate: NetRouteCandidate,
+    ConflictResources: set[RoutingResourceId] | frozenset[RoutingResourceId],
+    Resources: RoutingResources | None = None,
+) -> NegotiatedRouteTreeState:
+    """Build branch-preserving repair state from exact conflict contributors."""
+    CandidatePaths = dict(sorted(Candidate.TargetPaths.items()))
+    EmptyClaims = RoutingResourceClaims()
+    ConflictResourceSet = set(ConflictResources)
+    if not CandidatePaths:
+        return NegotiatedRouteTreeState(
+            Candidate=Candidate,
+            RetainedTargets=(),
+            PrunedTargets=(),
+            RetainedBranchPaths=(),
+            PrunedBranchPaths=(),
+            PrunedBranchTailPaths=(),
+            RetainedBranchClaims=(),
+            PrunedBranchClaims=(),
+            PrunedBranchTailClaims=(),
+            RetainedBranchIds=(),
+            PrunedBranchIds=(),
+            RetainedNodes=(),
+            PrunedNodes=(),
+            SharedTrunkNodes=(),
+        )
+
+    Source = next(iter(CandidatePaths.values()))[0]
+    ConflictPositions = {
+        Resource.Position for Resource in ConflictResourceSet
+    }
+
+    def BranchTouchesConflict(
+        Path: tuple[Position3, ...],
+        Claims: RoutingResourceClaims,
+    ) -> bool:
+        if Claims.ResourceIds & ConflictResourceSet:
+            return True
+        if not ConflictResourceSet:
+            return False
+        for Position in Path:
+            for Conflict in ConflictPositions:
+                if (
+                    abs(Position[0] - Conflict[0])
+                    + abs(Position[1] - Conflict[1])
+                    + abs(Position[2] - Conflict[2])
+                ) <= 1:
+                    return True
+        return False
+
+    def BranchConflictIndex(
+        Path: tuple[Position3, ...],
+        Claims: RoutingResourceClaims,
+    ) -> int:
+        if not ConflictResourceSet:
+            return -1
+        ConflictIndex = -1
+        for Index, Position in enumerate(Path):
+            if not ConflictPositions:
+                break
+            for Conflict in ConflictPositions:
+                if (
+                    abs(Position[0] - Conflict[0])
+                    + abs(Position[1] - Conflict[1])
+                    + abs(Position[2] - Conflict[2])
+                ) <= 1:
+                    ConflictIndex = Index
+        if Claims.ResourceIds & ConflictResourceSet:
+            # Keep the most conservative possible span when overlap is known
+            # but no explicit route-node locality can be recovered.
+            return len(Path) - 1 if ConflictIndex < 0 else ConflictIndex
+        if ConflictIndex >= 0:
+            return ConflictIndex
+        return -1
+
+    def BranchClaimsForPath(
+        Path: tuple[Position3, ...],
+        FallbackClaims: RoutingResourceClaims,
+    ) -> frozenset[RoutingResourceId]:
+        if Resources is None or not Path:
+            return frozenset(FallbackClaims.ResourceIds)
+        return frozenset(
+            Resources.ResourceGraph.BuildRouteClaims(Path).ResourceIds
+        )
+
+    NodeNeighbors: dict[Position3, set[Position3]] = defaultdict(set)
+    for Path in CandidatePaths.values():
+        for First, Second in zip(Path, Path[1:]):
+            NodeNeighbors[First].add(Second)
+            NodeNeighbors[Second].add(First)
+
+    NodeDegree: dict[Position3, int] = {
+        Node: len(Neighbors)
+        for Node, Neighbors in NodeNeighbors.items()
+    }
+
+    def IsBranchPoint(Node: Position3) -> bool:
+        return NodeDegree.get(Node, 0) >= 3
+
+    RetainedTargetPaths: dict[Position3, tuple[Position3, ...]] = {}
+    PrunedTargetPaths: dict[Position3, tuple[Position3, ...]] = {}
+    PrunedTailPaths: dict[Position3, tuple[Position3, ...]] = {}
+    RetainedTargetClaims: dict[Position3, frozenset[RoutingResourceId]] = {}
+    PrunedTargetClaims: dict[Position3, frozenset[RoutingResourceId]] = {}
+    PrunedTailClaims: dict[Position3, frozenset[RoutingResourceId]] = {}
+    RetainedNodes: set[Position3] = set()
+    PrunedNodes: set[Position3] = set()
+    SharedNodeCounts: Counter[Position3] = Counter()
+
+    for Target, Path in CandidatePaths.items():
+        if not Path:
+            continue
+        Claims = Candidate.BranchClaims.get(Target, EmptyClaims)
+        BranchClaims = frozenset(Claims.ResourceIds)
+        if not BranchTouchesConflict(Path, Claims):
+            RetainedTargetPaths[Target] = Path
+            RetainedTargetClaims[Target] = BranchClaims
+            RetainedNodes.update(Path)
+            for Position in Path:
+                SharedNodeCounts[Position] += 1
+            continue
+        BranchpointIndex = 0
+        ConflictIndex = BranchConflictIndex(Path, Claims)
+        SearchStart = max(0, min(ConflictIndex, len(Path) - 1))
+        for Index in range(SearchStart, -1, -1):
+            if IsBranchPoint(Path[Index]):
+                BranchpointIndex = Index
+                break
+        PrunedTailPath = tuple(Path[BranchpointIndex + 1 :])
+        if not PrunedTailPath:
+            RetainedTargetPaths[Target] = Path
+            RetainedTargetClaims[Target] = BranchClaims
+            RetainedNodes.update(Path)
+            for Position in Path:
+                SharedNodeCounts[Position] += 1
+            continue
+        PrunedPath = Path
+        RetainedPath = tuple(Path[:BranchpointIndex + 1])
+        PrunedTargetPaths[Target] = PrunedPath
+        PrunedTailPaths[Target] = PrunedTailPath
+        PrunedTargetClaims[Target] = BranchClaims
+        PrunedTailClaims[Target] = (
+            BranchClaimsForPath(Path, Claims)
+            - BranchClaimsForPath(RetainedPath, EmptyClaims)
+        )
+        RetainedNodes.update(RetainedPath)
+        PrunedNodes.update(PrunedTailPath)
+        for Position in RetainedPath:
+            SharedNodeCounts[Position] += 1
+
+    if not PrunedTargetPaths:
+        RetainedTargetPaths = CandidatePaths.copy()
+        RetainedTargetClaims = {
+            TargetValue: frozenset(
+                Candidate.BranchClaims.get(TargetValue, EmptyClaims).ResourceIds
+            )
+            for TargetValue in CandidatePaths
+        }
+        RetainedNodes = set(
+            Node
+            for PathValue in CandidatePaths.values()
+            for Node in PathValue
+        )
+        for PathValue in CandidatePaths.values():
+            for Position in PathValue:
+                SharedNodeCounts[Position] += 1
+
+    RetainedTargets = tuple(sorted(RetainedTargetPaths))
+    PrunedTargets = tuple(sorted(PrunedTargetPaths))
+    SharedTrunkNodes = tuple(
+        Position
+        for Position, Count in SharedNodeCounts.items()
+        if Count > 1
+    )
+
+    return NegotiatedRouteTreeState(
+        Candidate=Candidate,
+        RetainedTargets=RetainedTargets,
+        PrunedTargets=PrunedTargets,
+        RetainedBranchPaths=tuple(
+            RetainedTargetPaths[Target]
+            for Target in RetainedTargets
+        ),
+        PrunedBranchPaths=tuple(
+            PrunedTargetPaths[Target]
+            for Target in PrunedTargets
+        ),
+        PrunedBranchTailPaths=tuple(
+            PrunedTailPaths[Target]
+            for Target in PrunedTargets
+            if Target in PrunedTailPaths
+        ),
+        RetainedBranchClaims=tuple(
+            RetainedTargetClaims[Target]
+            for Target in RetainedTargets
+            if Target in RetainedTargetClaims
+        ),
+        PrunedBranchClaims=tuple(
+            PrunedTargetClaims[Target]
+            for Target in PrunedTargets
+            if Target in PrunedTargetClaims
+        ),
+        PrunedBranchTailClaims=tuple(
+            PrunedTailClaims[Target]
+            for Target in PrunedTargets
+            if Target in PrunedTailClaims
+        ),
+        RetainedBranchIds=RetainedTargets,
+        PrunedBranchIds=PrunedTargets,
+        RetainedNodes=tuple(sorted(RetainedNodes)),
+        PrunedNodes=tuple(sorted(PrunedNodes)),
+        SharedTrunkNodes=tuple(sorted(SharedTrunkNodes)),
+    )
 
 
 def CandidateRequestWindowOffset(
@@ -455,7 +904,7 @@ def ReserveBoundaryPortals(
                 Affected = tuple(sorted({Key[0] for Key in Unassigned}))
                 raise RoutingStageError(
                     RoutingFailure(
-                        Reason=RoutingFailureReason.NoBoundaryEscape,
+                        Reason=RoutingFailureReason.BoundaryEscapeInfeasible,
                         Stage="PortalReservation",
                         AffectedNets=Affected,
                         Detail=(
@@ -471,6 +920,11 @@ def ReserveBoundaryPortals(
                                 {"Signal": Key[0], "Terminal": list(Key[1])}
                                 for Key in Unassigned[:16]
                             ],
+                            "ConflictGraph": {
+                                "Classification": "saturated-boundary-cut",
+                                "ConflictSignals": list(Affected),
+                                "RelocationSignals": list(Affected),
+                            },
                         },
                     )
                 )
@@ -511,6 +965,313 @@ def ReserveBoundaryPortals(
                 SlotIndex=0,
                 PortalId=Selected.PortalId,
                 Claims=Selected.Claims,
+            ))
+    return Filtered, tuple(Reservations)
+
+
+def ReserveNegotiatedBoundaryEscapes(
+    Portals: dict[tuple[str, Position3, int], tuple[PinAccessPortal, ...]],
+    Profiles: dict[str, Any],
+    Resources: RoutingResources,
+    ReservationVariant: int = 0,
+    MaximumExpansions: int = 50_000,
+) -> tuple[
+    dict[tuple[str, Position3, int], tuple[PinAccessPortal, ...]],
+    tuple[PortalReservation, ...],
+]:
+    """Match each net's terminals to one claim-compatible routing layer.
+
+    Reserving every terminal on every layer over-constrains boundary capacity,
+    while selecting each terminal independently can leave a net with no common
+    detailed-routing layer.  Treat a net-wide layer/portal tuple as one domain
+    value and match those values across signals with capacity-one claims.
+    """
+    if MaximumExpansions < 1:
+        raise ValueError("MaximumExpansions must be positive")
+    KeysBySignal: dict[str, list[tuple[str, Position3, int]]] = defaultdict(list)
+    for Key, Values in Portals.items():
+        if Values:
+            KeysBySignal[Key[0]].append(Key)
+    TerminalsBySignal = {
+        Signal: tuple(sorted({Key[1] for Key in Keys}))
+        for Signal, Keys in KeysBySignal.items()
+    }
+    Domains: dict[
+        str,
+        list[tuple[
+            int,
+            int,
+            tuple[tuple[Position3, PinAccessPortal], ...],
+            RoutingResourceClaims,
+        ]],
+    ] = {}
+
+    def MergeClaims(
+        Signal: str,
+        Selection: tuple[tuple[Position3, PinAccessPortal], ...],
+    ) -> RoutingResourceClaims:
+        Profile = Profiles[Signal]
+        MandatoryNodes = {
+            Position
+            for Terminal, Portal in Selection
+            for Position in (
+                *(
+                    Profile.SourceAccessPath
+                    if Terminal == Profile.Root
+                    else Profile.TargetAccessPaths[Terminal]
+                ),
+                *Portal.Path,
+            )
+        }
+        # Rebuild from the complete mandatory union. Unioning claims that were
+        # built per stem misses cross-stem stair headroom/support aliases.
+        return Resources.ResourceGraph.BuildRouteClaims(MandatoryNodes)
+    for Signal in sorted(TerminalsBySignal):
+        Terminals = TerminalsBySignal[Signal]
+        Layers = sorted({Key[2] for Key in KeysBySignal[Signal]})
+        Values = []
+        for Layer in Layers:
+            TerminalDomains = [
+                tuple(sorted(
+                    Portals.get((Signal, Terminal, Layer), ()),
+                    key=lambda Portal: (Portal.Cost, Portal.PortalId),
+                ))
+                for Terminal in Terminals
+            ]
+            if any(not Domain for Domain in TerminalDomains):
+                continue
+            VariantCount = max(len(Domain) for Domain in TerminalDomains)
+            DiagonalValues = []
+            for Variant in range(VariantCount):
+                Selection = tuple(
+                    (
+                        Terminal,
+                        Domain[(Variant + TerminalIndex) % len(Domain)],
+                    )
+                    for TerminalIndex, (Terminal, Domain) in enumerate(
+                        zip(Terminals, TerminalDomains)
+                    )
+                )
+                Claims = MergeClaims(Signal, Selection)
+                if FindSelfClaimConflicts({Signal: Claims}):
+                    continue
+                DiagonalValues.append((
+                    sum(Portal.Cost for _Terminal, Portal in Selection),
+                    Layer,
+                    Selection,
+                    Claims,
+                ))
+            if DiagonalValues:
+                Values.extend(DiagonalValues)
+                continue
+            # A portal is legal in isolation but a net owns all of its portal
+            # stems simultaneously.  Build bounded net-wide tuples and reject
+            # support/headroom aliases here, before global capacity matching.
+            # Run the product fallback only when the cheap diagonal set has no
+            # legal tuple; this keeps the common case proportional to the old
+            # reservation cost.
+            SelectionBeam: list[
+                tuple[
+                    int,
+                    tuple[tuple[Position3, PinAccessPortal], ...],
+                    RoutingResourceClaims,
+                ]
+            ] = [
+                (
+                    0,
+                    (),
+                    Resources.ResourceGraph.BuildRouteClaims(()),
+                )
+            ]
+            MaximumSelectionBeam = min(8, MaximumExpansions)
+            for Terminal, Domain in zip(Terminals, TerminalDomains):
+                NextSelections: dict[
+                    tuple[str, ...],
+                    tuple[
+                        int,
+                        tuple[tuple[Position3, PinAccessPortal], ...],
+                        RoutingResourceClaims,
+                    ],
+                ] = {}
+                for PreviousCost, PreviousSelection, _PreviousClaims in SelectionBeam:
+                    for Portal in Domain:
+                        Selection = (*PreviousSelection, (Terminal, Portal))
+                        Claims = MergeClaims(Signal, Selection)
+                        if FindSelfClaimConflicts({Signal: Claims}):
+                            continue
+                        PortalIds = tuple(
+                            Value.PortalId for _Terminal, Value in Selection
+                        )
+                        Candidate = (
+                            PreviousCost + Portal.Cost,
+                            Selection,
+                            Claims,
+                        )
+                        Existing = NextSelections.get(PortalIds)
+                        if Existing is None or Candidate[0] < Existing[0]:
+                            NextSelections[PortalIds] = Candidate
+                SelectionBeam = sorted(
+                    NextSelections.values(),
+                    key=lambda Value: (
+                        Value[0],
+                        tuple(
+                            Portal.PortalId
+                            for _Terminal, Portal in Value[1]
+                        ),
+                    ),
+                )[:MaximumSelectionBeam]
+                if not SelectionBeam:
+                    break
+            Values.extend(
+                (Cost, Layer, Selection, Claims)
+                for Cost, Selection, Claims in SelectionBeam
+                if len(Selection) == len(Terminals)
+            )
+        if not Values:
+            raise RoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.BoundaryEscapeInfeasible,
+                Stage="PortalReservation",
+                AffectedNets=(Signal,),
+                Detail="net terminals have no common legal boundary layer",
+                Diagnostics={
+                    "ConflictGraph": {
+                        "Classification": "saturated-boundary-cut",
+                        "ConflictSignals": [Signal],
+                        "RelocationSignals": [Signal],
+                    },
+                },
+            ))
+        Domains[Signal] = sorted(
+            Values,
+            key=lambda Value: (Value[0], Value[1], tuple(
+                Portal.PortalId for _Terminal, Portal in Value[2]
+            )),
+        )
+
+    SignalOrder = tuple(sorted(Domains, key=lambda Signal: (
+        len(Domains[Signal]),
+        -len(TerminalsBySignal[Signal]),
+        Signal,
+    )))
+    Selected: dict[
+        str,
+        tuple[
+            int,
+            int,
+            tuple[tuple[Position3, PinAccessPortal], ...],
+            RoutingResourceClaims,
+        ],
+    ] = {}
+    ExpansionCount = 0
+
+    def Compatible(
+        Signal: str,
+        Value: tuple[
+            int,
+            int,
+            tuple[tuple[Position3, PinAccessPortal], ...],
+            RoutingResourceClaims,
+        ],
+    ) -> tuple[bool, set[str]]:
+        Blockers: set[str] = set()
+        for OtherSignal, OtherValue in Selected.items():
+            if _ClaimsConflict(
+                Signal,
+                Value[3],
+                OtherSignal,
+                OtherValue[3],
+            ):
+                Blockers.add(OtherSignal)
+        return not Blockers, Blockers
+
+    FailedCut: set[str] = set()
+    BudgetExhausted = False
+
+    def Search(Depth: int) -> bool:
+        nonlocal ExpansionCount, BudgetExhausted
+        if Depth >= len(SignalOrder):
+            return True
+        Signal = SignalOrder[Depth]
+        Values = Domains[Signal]
+        Offset = ReservationVariant % len(Values)
+        OrderedValues = (*Values[Offset:], *Values[:Offset])
+        Cut = {Signal}
+        for Value in OrderedValues:
+            ExpansionCount += 1
+            if ExpansionCount > MaximumExpansions:
+                BudgetExhausted = True
+                FailedCut.update(Cut)
+                return False
+            IsCompatible, Blockers = Compatible(Signal, Value)
+            Cut.update(Blockers)
+            if not IsCompatible:
+                continue
+            Selected[Signal] = Value
+            ForwardFeasible = True
+            for RemainingSignal in SignalOrder[Depth + 1:]:
+                RemainingHasValue = False
+                RemainingCut = {RemainingSignal}
+                for RemainingValue in Domains[RemainingSignal]:
+                    RemainingCompatible, RemainingBlockers = Compatible(
+                        RemainingSignal,
+                        RemainingValue,
+                    )
+                    RemainingCut.update(RemainingBlockers)
+                    if RemainingCompatible:
+                        RemainingHasValue = True
+                        break
+                if not RemainingHasValue:
+                    Cut.update(RemainingCut)
+                    ForwardFeasible = False
+                    break
+            if ForwardFeasible and Search(Depth + 1):
+                return True
+            Selected.pop(Signal, None)
+            if BudgetExhausted:
+                return False
+        FailedCut.update(Cut)
+        return False
+
+    Search(0)
+
+    if len(Selected) != len(SignalOrder):
+        Affected = tuple(sorted(FailedCut or set(SignalOrder) - set(Selected)))
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.BoundaryEscapeInfeasible,
+            Stage="PortalReservation",
+            AffectedNets=Affected,
+            Detail=(
+                "no capacity-one net-layer boundary matching within "
+                f"{MaximumExpansions} deterministic expansions"
+            ),
+            Diagnostics={
+                "ExpansionCount": ExpansionCount,
+                "MaximumExpansions": MaximumExpansions,
+                "BudgetExhausted": BudgetExhausted,
+                "MatchedSignalCount": len(Selected),
+                "SignalCount": len(SignalOrder),
+                "ConflictGraph": {
+                    "Classification": "saturated-boundary-cut",
+                    "ConflictSignals": list(Affected),
+                    "RelocationSignals": list(Affected),
+                },
+            },
+        ))
+
+    Filtered = {Key: () for Key in Portals}
+    Reservations = []
+    for Signal in sorted(Selected):
+        _Cost, Layer, Selection, _Claims = Selected[Signal]
+        for SlotIndex, (Terminal, Portal) in enumerate(Selection):
+            Key = (Signal, Terminal, Layer)
+            Filtered[Key] = (Portal,)
+            Reservations.append(PortalReservation(
+                Signal=Signal,
+                Terminal=Terminal,
+                Layer=Layer,
+                SlotIndex=SlotIndex,
+                PortalId=Portal.PortalId,
+                Claims=Portal.Claims,
             ))
     return Filtered, tuple(Reservations)
 
@@ -576,6 +1337,16 @@ def BuildRoutingConflictGraph(
         for Index in sorted(set(getattr(Result, "ConflictResourceIndices", ())))
         if 0 <= Index < len(ResourcePositions)
     ]
+    HotspotPositions = {tuple(Value) for Value in Hotspots}
+    CongestionCutSignals = sorted(
+        Signal
+        for Signal, Candidates in CandidatesBySignal.items()
+        if any(
+            Resource.Position in HotspotPositions
+            for Candidate in Candidates
+            for Resource in Candidate.Claims.ResourceIds
+        )
+    )
     NativeConflictSignals = sorted({
         str(Signal)
         for Signal in getattr(Result, "ConflictSignals", ())
@@ -598,6 +1369,7 @@ def BuildRoutingConflictGraph(
             for Signal in Pair
         ),
         *NativeConflictSignals,
+        *CongestionCutSignals,
         *(
             (str(Result.FailureNet),)
             if getattr(Result, "FailureNet", None)
@@ -621,6 +1393,7 @@ def BuildRoutingConflictGraph(
         },
         "NoCandidateSignals": NoCandidateSignals,
         "NativeConflictSignals": NativeConflictSignals,
+        "CongestionCutSignals": CongestionCutSignals,
         "ConflictSignals": ConflictSignals,
         "PairwiseIncompatibleEdges": PairwiseEdges,
         "ResourceHotspots": Hotspots,
@@ -630,36 +1403,32 @@ def BuildRoutingConflictGraph(
 
 def SelectPlacementRelocationSignals(
     ConflictGraph: dict[str, object],
-    MaximumSignals: int = 3,
 ) -> list[str]:
-    """Select the smallest high-pressure net set for physical relocation."""
-    if MaximumSignals < 1:
-        return []
-    Scores: Counter[str] = Counter()
-    Edges = ConflictGraph.get("PairwiseIncompatibleEdges", ())
-    if isinstance(Edges, tuple | list):
-        for Pair in Edges:
-            if not isinstance(Pair, tuple | list) or len(Pair) != 2:
-                continue
-            Scores.update(str(Signal) for Signal in Pair)
-    if Scores:
-        return sorted(
-            Scores,
-            key=lambda Signal: (
-                -Scores[Signal],
-                0 if Signal.startswith("NandNet") else 1,
-                Signal,
-            ),
-        )[:MaximumSignals]
+    """Preserve every contributor identified by the typed congestion cut."""
+    Signals: set[str] = set()
     for Key in (
         "NativeConflictSignals",
+        "CongestionCutSignals",
         "NoCandidateSignals",
         "ConflictSignals",
     ):
         Values = ConflictGraph.get(Key, ())
-        if isinstance(Values, tuple | list) and Values:
-            return sorted({str(Value) for Value in Values})[:MaximumSignals]
-    return []
+        if isinstance(Values, tuple | list):
+            Signals.update(str(Value) for Value in Values)
+    for Key in ("PairwiseIncompatibleEdges", "StackedConflictPairs"):
+        Values = ConflictGraph.get(Key, ())
+        if not isinstance(Values, tuple | list):
+            continue
+        Signals.update(
+            str(Signal)
+            for Pair in Values
+            if isinstance(Pair, tuple | list)
+            for Signal in Pair
+        )
+    FailureNet = ConflictGraph.get("FailureNet")
+    if FailureNet:
+        Signals.add(str(FailureNet))
+    return sorted(Signals)
 
 
 def _BuildGuide(
@@ -685,11 +1454,24 @@ def _BuildGuide(
 
 def _BuildTargetPortalBranches(
     TargetPortals: tuple[PinAccessPortal, ...],
+    TargetAccessPaths: tuple[tuple[Position3, ...], ...] | None = None,
 ) -> list[list[Position3]]:
-    """Orient selected target escapes from their outer endpoint inward."""
+    """Orient complete target escapes from their outer endpoint inward."""
+    if (
+        TargetAccessPaths is not None
+        and len(TargetAccessPaths) != len(TargetPortals)
+    ):
+        raise ValueError("target portal/access branch count mismatch")
     return [
-        list(reversed(Portal.Path))
-        for Portal in TargetPortals
+        list(dict.fromkeys((
+            *reversed(Portal.Path),
+            *(
+                reversed(TargetAccessPaths[Index])
+                if TargetAccessPaths is not None
+                else ()
+            ),
+        )))
+        for Index, Portal in enumerate(TargetPortals)
     ]
 
 
@@ -729,6 +1511,56 @@ def RequiredRoutingLayerCountForAccess(
         Technology.MinimumRoutingLayerCount,
         1 + ceil(AdditionalHeight / Technology.RoutingLayerPitch),
     )
+
+
+def SelectInitialRoutingLayerCount(
+    MinimumLayerCount: int,
+    EffectiveMaximumLayerCount: int,
+    RequiredAccessLayerCount: int,
+    AdaptiveLayerCount: int,
+    AdaptiveLayerFloor: int,
+    NegotiatedLayerFloor: int,
+    ExistingRouteLayerCount: int,
+    PlacementWasRelocated: bool,
+    ForceMaximumAfterPlacementRelocation: bool,
+) -> int:
+    """Return the smallest legal initial layer budget for one route attempt.
+
+    The fixed access, retained local routes, and negotiated demand each impose
+    a lower bound.  A relocation can optionally retain the legacy behavior of
+    immediately using all vertical headroom; otherwise it is just another
+    geometry candidate and adaptive routing grows one layer at a time.
+    """
+    if MinimumLayerCount < 1 or EffectiveMaximumLayerCount < MinimumLayerCount:
+        raise ValueError("routing layer bounds must be positive and ordered")
+    InitialLayerCount = max(
+        MinimumLayerCount,
+        RequiredAccessLayerCount,
+        AdaptiveLayerCount,
+        AdaptiveLayerFloor,
+        NegotiatedLayerFloor,
+        ExistingRouteLayerCount,
+    )
+    if PlacementWasRelocated and ForceMaximumAfterPlacementRelocation:
+        InitialLayerCount = max(InitialLayerCount, EffectiveMaximumLayerCount)
+    return min(EffectiveMaximumLayerCount, InitialLayerCount)
+
+
+def SelectEscalatedRoutingLayerCount(
+    LayerCount: int,
+    EffectiveMaximumLayerCount: int,
+    ConflictClassification: str,
+    ForceMaximumAfterPlacementRelocation: bool,
+) -> int:
+    """Advance the vertical budget without skipping the adaptive ladder."""
+    if LayerCount < 1 or EffectiveMaximumLayerCount < LayerCount:
+        raise ValueError("routing layer bounds must be positive and ordered")
+    if (
+        ForceMaximumAfterPlacementRelocation
+        and ConflictClassification.startswith("relocated-")
+    ):
+        return EffectiveMaximumLayerCount
+    return min(EffectiveMaximumLayerCount, LayerCount + 1)
 
 
 def _PortalFromRust(
@@ -915,6 +1747,7 @@ def _MaterializeCandidate(
     LayerPenalty: int = 0,
     GuideDeviationPenalty: int = 0,
     RepeaterPenalty: int = 2,
+    NativeRepeaterReservations: tuple[tuple[Position3, str], ...] = (),
     RejectionCounts: Counter[str] | None = None,
 ) -> NetRouteCandidate | None:
     if RoutedTree is None:
@@ -928,10 +1761,21 @@ def _MaterializeCandidate(
         for Position in Claim.Nodes
     }
     Nodes.update(Profile.SourceAccessPath)
+    Nodes.update(SourcePortal.Path)
     for Target, Portal in zip(Profile.Targets, TargetPortals):
         Nodes.update(Profile.TargetAccessPaths[Target])
+        Nodes.update(Portal.Path)
     Claims = Resources.ResourceGraph.BuildRouteClaims(Nodes)
-    if FindSelfClaimConflicts({Signal: Claims}):
+    SelfClaimConflicts = FindSelfClaimConflicts({Signal: Claims})
+    if SelfClaimConflicts:
+        if os.environ.get("RCS_DEBUG_MATERIALIZE") == Signal:
+            print(
+                "[debug] authoritative: self-claim conflicts "
+                f"signal={Signal} conflicts="
+                f"{tuple(sorted(SelfClaimConflicts, key=str))} "
+                f"tree={tuple(RoutedTree)}",
+                flush=True,
+            )
         if RejectionCounts is not None:
             RejectionCounts["SelfClaimConflict"] += 1
         return None
@@ -1000,6 +1844,67 @@ def _MaterializeCandidate(
         if RejectionCounts is not None:
             RejectionCounts["NoRepeater"] += 1
         return None
+    # The native tree search has already proved these refresh sites while
+    # carrying signal strength in its state. Preserve them; the Python tree
+    # walk below is only a deterministic path/coverage supplement and can
+    # choose a different branch through a cyclic tree.
+    def IsFlatStraightRepeaterSite(
+        Position: Position3,
+        Facing: str,
+    ) -> bool:
+        FlatNeighbors = tuple(
+            Neighbor
+            for Neighbor in Graph.get(Position, ())
+            if Neighbor[1] == Position[1]
+        )
+        OutputDelta = {
+            "west": (1, 0),
+            "east": (-1, 0),
+            "north": (0, 1),
+            "south": (0, -1),
+        }.get(Facing)
+        if OutputDelta is None:
+            return False
+        Output = (
+            Position[0] + OutputDelta[0],
+            Position[1],
+            Position[2] + OutputDelta[1],
+        )
+        Input = (
+            Position[0] - OutputDelta[0],
+            Position[1],
+            Position[2] - OutputDelta[1],
+        )
+        return Output in FlatNeighbors and Input in FlatNeighbors
+
+    NativeReservations = {
+        Position: RoutingReservation(
+            Signal=Signal,
+            Resource=RoutingResourceId(RoutingResourceKind.Wire, Position),
+            Position=Position,
+            Purpose="Repeater",
+            Facing=Facing,
+        )
+        for Position, Facing in NativeRepeaterReservations
+        if IsFlatStraightRepeaterSite(Position, Facing)
+    }
+    EffectiveRepeaterReservations = {
+        **{Reservation.Position: Reservation for Reservation in RepeaterReservations},
+        **NativeReservations,
+    }
+    PoweredNodes = PropagateRoutePower(
+        Profile.Root,
+        Graph,
+        {
+            Position: Reservation.Facing
+            for Position, Reservation in EffectiveRepeaterReservations.items()
+            if Reservation.Facing is not None
+        },
+    )
+    if any(PoweredNodes.get(Target, 0) <= 0 for Target in Profile.Targets):
+        if RejectionCounts is not None:
+            RejectionCounts["NoRepeater"] += 1
+        return None
     Edges = frozenset(
         NormalizeRoutingEdge(Position, Neighbor)
         for Position, Neighbors in Graph.items()
@@ -1031,8 +1936,16 @@ def _MaterializeCandidate(
         + ViaCount * max(0, ViaPenalty)
         + Layer * max(0, LayerPenalty)
         + max(0, GuideDeviationPenalty)
-        + len(RepeaterReservations) * max(0, RepeaterPenalty)
+        + len(EffectiveRepeaterReservations) * max(0, RepeaterPenalty)
     )
+    TargetPaths = {
+        Target: tuple(Path)
+        for Target, Path in Paths.items()
+    }
+    BranchClaims = {
+        Target: Resources.ResourceGraph.BuildRouteClaims(Path)
+        for Target, Path in TargetPaths.items()
+    }
     return NetRouteCandidate(
         CandidateId=CandidateId,
         Signal=Signal,
@@ -1047,7 +1960,11 @@ def _MaterializeCandidate(
         Layer=Layer,
         Guide=Guide,
         RepeaterWaypoints=tuple(
-            Reservation.Position for Reservation in RepeaterReservations
+            sorted(EffectiveRepeaterReservations)
+        ),
+        RepeaterReservations=tuple(
+            EffectiveRepeaterReservations[Position]
+            for Position in sorted(EffectiveRepeaterReservations)
         ),
         MaterialCost=IncrementalMaterialCost,
         FootprintGrowth=len(Guide),
@@ -1057,6 +1974,13 @@ def _MaterializeCandidate(
         IncrementalMaterialCost=IncrementalMaterialCost,
         IncrementalLength=IncrementalLength,
         SeedNodeCount=len(SeedNodes),
+        TargetPaths=TargetPaths,
+        BranchClaims=BranchClaims,
+        Envelope=BuildRoutingEnvelope(
+            Nodes,
+            Claims.SupportCells,
+            EffectiveRepeaterReservations,
+        ),
     )
 
 
@@ -1066,28 +1990,19 @@ def PlanNegotiatedRouteTrees(
     RouteRequestsBySignal: dict[str, list[tuple[Any, ...]]],
     RouteMetadataBySignal: dict[str, list[tuple[Any, ...]]],
     Region: Any,
+    ReservedAccess: frozenset[Position3],
     Resources: RoutingResources,
     Technology: RedstoneRoutingTechnology,
     Policy: PhysicalDesignPolicy,
     Deadline: RoutingDeadline,
     AdaptiveExpiresAt: float,
     CheckRuntimeBudget: Callable[[str, dict[str, object] | None], None],
+    RegenerateSignals: frozenset[str] = frozenset(),
+    SeedCandidatesBySignal: dict[str, tuple[Any, ...]] | None = None,
 ) -> NegotiatedRoutePlan:
     """Route one tree per net and negotiate exact Redstone claim conflicts."""
     Negotiated = Policy.NegotiatedRouting
-    NodesByColumn: dict[Position2, list[Position3]] = defaultdict(list)
-    for Position in Region.Nodes:
-        NodesByColumn[(Position[0], Position[2])].append(Position)
-    for Values in NodesByColumn.values():
-        Values.sort()
-
-    Selected: dict[str, NetRouteCandidate] = {}
-    History: Counter[Position3] = Counter()
-    ReroutedSignals: set[str] = set()
-    Iterations: list[RoutingIterationMetrics] = []
-    OverflowProgression: list[int] = []
-    PreviousConflictCount: int | None = None
-    StagnationCount = 0
+    TileSize = 4 * Technology.TrackPitch
     SignalOrder = tuple(sorted(
         Profiles,
         key=lambda Signal: (
@@ -1098,12 +2013,564 @@ def PlanNegotiatedRouteTrees(
         ),
     ))
 
+    ContextNodes = set(Region.Nodes)
+    ContextEdges = set(Region.Edges)
+    RegionStates: dict[str, NegotiatedRegionState] = {}
+    for Signal in SignalOrder:
+        SignalMetadata = RouteMetadataBySignal.get(Signal, ())
+        GuideColumns = (
+            set(SignalMetadata[0][2])
+            if SignalMetadata
+            else set()
+        )
+        if not GuideColumns:
+            SignalRequests = RouteRequestsBySignal.get(Signal, ())
+            GuideColumns = (
+                {tuple(Column) for Column in SignalRequests[0][2]}
+                if SignalRequests
+                else set()
+            )
+        if not GuideColumns:
+            GuideColumns = set(
+                BuildNegotiatedFallbackGuideColumns(
+                    Profiles[Signal],
+                    Region.Bounds,
+                    list(RouteRequestsBySignal.get(Signal, ())),
+                )
+            )
+        InitialTiles = BuildNegotiatedInitialTiles(
+            GuideColumns,
+            Region.Bounds,
+            TileSize,
+        )
+        InitialColumns = BuildNegotiatedInitialColumns(
+            GuideColumns,
+            Region.Bounds,
+            TileSize,
+        )
+        RegionStates[Signal] = NegotiatedRegionState(
+            Signal=Signal,
+            TileSize=TileSize,
+            Bounds=Region.Bounds,
+            ActiveTiles=set(InitialTiles),
+            ActiveColumns=set(InitialColumns),
+            AddedNodes=set(),
+            AddedEdges=set(),
+            BoundaryTouches=set(),
+            ExpandedSides=[],
+            ExpansionEvents=[],
+        )
+
+    InitialColumns = frozenset({
+        Column
+        for State in RegionStates.values()
+        for Column in State.ActiveColumns
+    })
+    InitialRegion = Resources.ResourceGraph.BuildRegion(
+        Region.Bounds,
+        AllowedColumns=InitialColumns,
+        AllowedAccess=ReservedAccess,
+        WorkCheck=lambda Diagnostics: CheckRuntimeBudget(
+            "ResourceGraphExpansion",
+            {"Cause": "initial-one-tile-halo", **Diagnostics},
+        ),
+    )
+    InitialDeltaNodes = set(InitialRegion.Nodes) - ContextNodes
+    InitialDeltaEdges = set(InitialRegion.Edges) - ContextEdges
+    if InitialDeltaNodes or InitialDeltaEdges:
+        Context.AddRegion(
+            sorted(InitialDeltaNodes),
+            sorted(InitialDeltaEdges),
+        )
+        ContextNodes.update(InitialDeltaNodes)
+        ContextEdges.update(InitialDeltaEdges)
+    Region = InitialRegion
+
+    NodesByColumn: dict[Position2, list[Position3]] = defaultdict(list)
+    for Position in Region.Nodes:
+        NodesByColumn[(Position[0], Position[2])].append(Position)
+    for Values in NodesByColumn.values():
+        Values.sort()
+    for State in RegionStates.values():
+        OwnedColumns = State.ActiveColumns
+        State.AddedNodes.update(
+            Position
+            for Position in Region.Nodes
+            if (Position[0], Position[2]) in OwnedColumns
+        )
+        State.AddedEdges.update(
+            Edge
+            for Edge in Region.Edges
+            if Edge[0] in State.AddedNodes and Edge[1] in State.AddedNodes
+        )
+        State.ExpansionEvents.append({
+            "Cause": "initial-one-tile-halo",
+            "HaloSize": TileSize,
+            "ActiveTileCount": len(State.ActiveTiles),
+            "OwnedNodeCount": len(State.AddedNodes),
+            "OwnedEdgeCount": len(State.AddedEdges),
+            "AddedNodeCount": len(InitialDeltaNodes),
+            "AddedEdgeCount": len(InitialDeltaEdges),
+        })
+
+    Selected: dict[str, NetRouteCandidate] = {
+        Signal: Values[0]
+        for Signal, Values in (SeedCandidatesBySignal or {}).items()
+        if Values
+    }
+    RepairStates: dict[str, NegotiatedRouteTreeState] = {}
+    BranchRepairEvents: list[dict[str, object]] = []
+    CumulativeConflictSignals: set[str] = set()
+    History: Counter[Position3] = Counter()
+    ReroutedSignals: set[str] = set()
+    Iterations: list[RoutingIterationMetrics] = []
+    OverflowProgression: list[int] = []
+    PreviousConflictCount: int | None = None
+    StagnationCount = 0
+    CurrentPassIndex = 0
+    MandatoryClaimsCache: dict[tuple[str, int], RoutingResourceClaims] = {}
+    MandatoryClaimsByPortalSignature: dict[
+        tuple[str, int, tuple[int, ...]], RoutingResourceClaims
+    ] = {}
+    RejectionCountsBySignal: dict[str, Counter[str]] = defaultdict(Counter)
+    RepairBranchOutcomes: dict[str, dict[str, str]] = {}
+    MandatorySelfConflictsBySignal: dict[
+        str, set[RoutingResourceId]
+    ] = defaultdict(set)
+    SearchExpansionEscalations: dict[str, int] = {}
+    NativeSearchDiagnosticsBySignal: dict[
+        str, list[dict[str, object]]
+    ] = defaultdict(list)
+    RouteRequestDiagnostics: dict[str, dict[str, object]] = {}
+    InitialCandidateOptions: dict[str, dict[str, NetRouteCandidate]] = (
+        defaultdict(dict)
+    )
+    InitialAssignmentDiagnostics: dict[str, object] = {}
+    # Pass zero has no present-congestion costs or retained repair branches,
+    # so its detailed route-tree searches are independent once their sparse
+    # regions have been frozen.  The native batch owns only those searches;
+    # materialization, claim assignment, and every later repair pass stay
+    # serial and deterministic below.
+    InitialDetailedBatchResults: dict[tuple[str, int], Any] = {}
+    InitialDetailedBatchPreflightConflicts: dict[
+        tuple[str, int], frozenset[RoutingResourceId]
+    ] = {}
+    InitialDetailedBatchRequestIndices: dict[str, tuple[int, ...]] = {}
+    InitialDetailedBatchDiagnostics: dict[str, object] = {
+        "Enabled": False,
+        "ScheduledRequestCount": 0,
+        "RequestCount": 0,
+        "BatchCount": 0,
+        "CompletedWork": 0,
+        "DeadlineExceeded": False,
+        "WorkerCount": 1,
+        "PreflightRejectedRequestCount": 0,
+    }
+    FixedTerminalPositions = tuple(
+        Position
+        for Profile in Profiles.values()
+        for Position in (Profile.Root, *Profile.Targets)
+    )
+
+    def EnvelopeQuality(
+        Values: Iterable[NetRouteCandidate],
+    ) -> tuple[int, int, int, int, int, int, int, int, int]:
+        """Score cached legal trees without invoking another path search."""
+        Candidates = tuple(Values)
+        Envelope = BuildRoutingEnvelope(
+            (*FixedTerminalPositions, *(
+                Position
+                for Candidate in Candidates
+                for Position in Candidate.Nodes
+            )),
+            (
+                Position
+                for Candidate in Candidates
+                for Position in Candidate.Claims.SupportCells
+            ),
+            (
+                Reservation.Position
+                for Candidate in Candidates
+                for Reservation in Candidate.RepeaterReservations
+            ),
+        )
+        return (
+            Envelope.Width * Envelope.Height * Envelope.Depth,
+            Envelope.Height,
+            Envelope.Width * Envelope.Depth,
+            Envelope.Width,
+            Envelope.Depth,
+            Envelope.RouteBlockCount + Envelope.SupportBlockCount,
+            sum(Candidate.Length for Candidate in Candidates),
+            sum(Candidate.BendCount for Candidate in Candidates),
+            sum(Candidate.ViaCount for Candidate in Candidates),
+            sum(len(Candidate.RepeaterReservations) for Candidate in Candidates),
+        )
+
+    def CandidateEnvelopeQuality(
+        Candidate: NetRouteCandidate,
+    ) -> tuple[int, int, int, int, int, int]:
+        Envelope = Candidate.Envelope
+        if Envelope is None:
+            return (0, 0, 0, 0, 0, Candidate.Length)
+        return (
+            Envelope.Width * Envelope.Height * Envelope.Depth,
+            Envelope.Height,
+            Envelope.Width * Envelope.Depth,
+            Envelope.Width,
+            Envelope.Depth,
+            Envelope.RouteBlockCount + Envelope.SupportBlockCount,
+        )
+
+    def TryInitialCandidateAssignment(
+        OptimizeEnvelope: bool = False,
+    ) -> dict[str, NetRouteCandidate] | None:
+        """Select one legal member of the already bounded initial tree pool.
+
+        Pass zero materializes several portal/layer choices per signal.  A
+        greedy provisional forest may conflict even though that bounded pool
+        contains a capacity-one assignment.  Solve that exact small choice
+        before invoking negotiated rip-up; this preserves the negotiated
+        route-tree algorithm while avoiding a false placement cut.
+        """
+        def InitialCandidateOrder(
+            Candidate: NetRouteCandidate,
+        ) -> tuple[Any, ...]:
+            if not OptimizeEnvelope:
+                return (
+                    *(
+                        (Candidate.Layer,)
+                        if Policy.TrackAssignment.MinimizeMaximumRoutingLayer
+                        else ()
+                    ),
+                    Candidate.MaterialCost,
+                    Candidate.CandidateId,
+                )
+            return (
+                *(
+                    (Candidate.Layer,)
+                    if Policy.TrackAssignment.MinimizeMaximumRoutingLayer
+                    else ()
+                ),
+                *CandidateEnvelopeQuality(Candidate),
+                Candidate.Length,
+                Candidate.BendCount,
+                Candidate.ViaCount,
+                len(Candidate.RepeaterReservations),
+                Candidate.MaterialCost,
+                Candidate.CandidateId,
+            )
+
+        CandidateSets = {
+            Signal: tuple(sorted(
+                Values.values(),
+                key=InitialCandidateOrder,
+            ))
+            for Signal, Values in InitialCandidateOptions.items()
+            if Values
+        }
+        if set(CandidateSets) != set(SignalOrder):
+            InitialAssignmentDiagnostics.update({
+                "Result": "incomplete-candidate-domain",
+                "CandidateCounts": {
+                    Signal: len(Values)
+                    for Signal, Values in sorted(CandidateSets.items())
+                },
+            })
+            return None
+        ExpansionLimit = max(
+            1,
+            min(
+                Policy.AdaptiveRouting.InitialAssignmentExpansions,
+                Policy.TrackAssignment.MaximumAssignmentExpansions,
+            ),
+        )
+        ExpansionCount = 0
+        Assignment: dict[str, NetRouteCandidate] = {}
+
+        def Search(Remaining: tuple[str, ...]) -> bool:
+            nonlocal ExpansionCount
+            if not Remaining:
+                return True
+            AvailableBySignal: list[
+                tuple[str, tuple[NetRouteCandidate, ...]]
+            ] = []
+            for Signal in Remaining:
+                Available = tuple(
+                    Candidate
+                    for Candidate in CandidateSets[Signal]
+                    if all(
+                        ClaimConflictCount(Candidate.Claims, Other.Claims) == 0
+                        for Other in Assignment.values()
+                    )
+                )
+                if not Available:
+                    return False
+                AvailableBySignal.append((Signal, Available))
+            # MRV alone repeatedly chooses lexicographically first, equally
+            # sized domains.  Break that tie by the number of incompatible
+            # choices it imposes on the still-unassigned forest.  This is
+            # standard constraint propagation: it spends the fixed
+            # assignment budget on the portal/access bottleneck rather than
+            # on independent branches first.
+            Signal, Available = min(
+                AvailableBySignal,
+                key=lambda Value: (
+                    len(Value[1]),
+                    -sum(
+                        ClaimConflictCount(
+                            Candidate.Claims,
+                            OtherCandidate.Claims,
+                        )
+                        for Candidate in Value[1]
+                        for OtherSignal in Remaining
+                        if OtherSignal != Value[0]
+                        for OtherCandidate in CandidateSets[OtherSignal]
+                    ),
+                    Value[0],
+                ),
+            )
+            NextRemaining = tuple(
+                Value for Value in Remaining if Value != Signal
+            )
+            RankedAvailable = tuple(sorted(
+                Available,
+                key=lambda Candidate: (
+                    sum(
+                        ClaimConflictCount(
+                            Candidate.Claims,
+                            OtherCandidate.Claims,
+                        )
+                        for OtherSignal in NextRemaining
+                        for OtherCandidate in CandidateSets[OtherSignal]
+                    ),
+                    *(
+                        EnvelopeQuality((*Assignment.values(), Candidate))
+                        if OptimizeEnvelope
+                        else InitialCandidateOrder(Candidate)
+                    ),
+                    Candidate.CandidateId,
+                ),
+            ))
+            for Candidate in RankedAvailable:
+                ExpansionCount += 1
+                if ExpansionCount > ExpansionLimit:
+                    return False
+                Assignment[Signal] = Candidate
+                if Search(NextRemaining):
+                    return True
+                del Assignment[Signal]
+            return False
+
+        if not Search(SignalOrder):
+            InitialAssignmentDiagnostics.update({
+                "Result": "no-assignment",
+                "ExpansionCount": ExpansionCount,
+                "ExpansionLimit": ExpansionLimit,
+                "CandidateCounts": {
+                    Signal: len(Values)
+                    for Signal, Values in sorted(CandidateSets.items())
+                },
+            })
+            return None
+        InitialAssignmentDiagnostics.update({
+            "Result": "assigned",
+            "ExpansionCount": ExpansionCount,
+            "ExpansionLimit": ExpansionLimit,
+            "CandidateCounts": {
+                Signal: len(Values)
+                for Signal, Values in sorted(CandidateSets.items())
+            },
+            "SelectedEnvelope": BuildRoutingEnvelope(
+                (
+                    Position
+                    for Candidate in Assignment.values()
+                    for Position in Candidate.Nodes
+                ),
+                (
+                    Position
+                    for Candidate in Assignment.values()
+                    for Position in Candidate.Claims.SupportCells
+                ),
+                (
+                    Reservation.Position
+                    for Candidate in Assignment.values()
+                    for Reservation in Candidate.RepeaterReservations
+                ),
+            ).ToDictionary(),
+        })
+        return dict(Assignment)
+
+    def ExpandSignalRegion(
+        Signal: str,
+        Side: str,
+        Cause: str,
+        Touches: tuple[Position3, ...] = (),
+    ) -> bool:
+        State = RegionStates[Signal]
+        DeltaBySide = {
+            "MinimumX": (-1, 0),
+            "MaximumX": (1, 0),
+            "MinimumZ": (0, -1),
+            "MaximumZ": (0, 1),
+        }
+        DeltaX, DeltaZ = DeltaBySide[Side]
+        BoundaryTiles = [
+            Tile
+            for Tile in sorted(State.ActiveTiles)
+            if (
+                (Tile[0] + DeltaX, Tile[1] + DeltaZ)
+                not in State.ActiveTiles
+                and _NegotiatedTileIntersectsBounds(
+                    (Tile[0] + DeltaX, Tile[1] + DeltaZ),
+                    State.Bounds,
+                    State.TileSize,
+                )
+            )
+        ]
+        if not BoundaryTiles:
+            return False
+        AnchorTile = (
+            _NegotiatedTileForColumn(
+                (Touches[0][0], Touches[0][2]),
+                State.Bounds,
+                State.TileSize,
+            )
+            if Touches
+            else BoundaryTiles[0]
+        )
+        SelectedBoundaryTile = min(
+            BoundaryTiles,
+            key=lambda Tile: (
+                abs(Tile[0] - AnchorTile[0])
+                + abs(Tile[1] - AnchorTile[1]),
+                Tile,
+            ),
+        )
+        ExpandedTiles = frozenset({
+            *State.ActiveTiles,
+            (
+                SelectedBoundaryTile[0] + DeltaX,
+                SelectedBoundaryTile[1] + DeltaZ,
+            ),
+        })
+        if ExpandedTiles == frozenset(State.ActiveTiles):
+            return False
+        State.ActiveTiles = set(ExpandedTiles)
+        AddedTile = (
+            SelectedBoundaryTile[0] + DeltaX,
+            SelectedBoundaryTile[1] + DeltaZ,
+        )
+        State.ActiveColumns.update(NegotiatedColumnsForTiles(
+            frozenset({AddedTile}),
+            State.Bounds,
+            State.TileSize,
+        ))
+        ExpandedRegion = Resources.ResourceGraph.BuildRegion(
+            Region.Bounds,
+            AllowedColumns=frozenset(State.ActiveColumns),
+            AllowedAccess=ReservedAccess,
+            WorkCheck=lambda Diagnostics: CheckRuntimeBudget(
+                "ResourceGraphExpansion",
+                {
+                    "Signal": Signal,
+                    "Side": Side,
+                    "Cause": Cause,
+                    **Diagnostics,
+                },
+            ),
+        )
+        DeltaNodes = set(ExpandedRegion.Nodes) - ContextNodes
+        DeltaEdges = set(ExpandedRegion.Edges) - ContextEdges
+        if DeltaNodes or DeltaEdges:
+            Context.AddRegion(sorted(DeltaNodes), sorted(DeltaEdges))
+            ContextNodes.update(DeltaNodes)
+            ContextEdges.update(DeltaEdges)
+            for Position in sorted(DeltaNodes):
+                Column = (Position[0], Position[2])
+                NodesByColumn[Column].append(Position)
+            for Values in NodesByColumn.values():
+                Values.sort()
+        OwnedColumns = State.ActiveColumns
+        State.AddedNodes.update(
+            Position
+            for Position in ExpandedRegion.Nodes
+            if (Position[0], Position[2]) in OwnedColumns
+        )
+        State.AddedEdges.update(
+            Edge
+            for Edge in ExpandedRegion.Edges
+            if Edge[0] in State.AddedNodes and Edge[1] in State.AddedNodes
+        )
+        State.BoundaryTouches.update(Touches)
+        State.ExpandedSides.append(Side)
+        State.ExpansionEvents.append({
+            "Cause": Cause,
+            "Side": Side,
+            "BoundaryTouches": [list(Value) for Value in Touches],
+            "ActiveTileCount": len(State.ActiveTiles),
+            "AddedNodeCount": len(DeltaNodes),
+            "AddedEdgeCount": len(DeltaEdges),
+            "TotalNodeCount": len(ContextNodes),
+            "TotalEdgeCount": len(ContextEdges),
+        })
+        return True
+
+    def PreferredExpansionSides(
+        Signal: str,
+        Candidate: NetRouteCandidate | None = None,
+        Hotspots: tuple[Position3, ...] = (),
+    ) -> tuple[str, ...]:
+        State = RegionStates[Signal]
+        Touches = FindNegotiatedBoundaryTouches(
+            (
+                Candidate.Nodes
+                if Candidate is not None
+                else State.BoundaryTouches
+            ),
+            State.ActiveTiles,
+            State.Bounds,
+            State.TileSize,
+        )
+        if Touches:
+            return tuple(sorted(
+                Touches,
+                key=lambda Side: (-len(Touches[Side]), Side),
+            ))
+        Profile = Profiles[Signal]
+        Root = Profile.SourceAccessPath[-1]
+        Points = Hotspots or tuple(Profile.Targets)
+        if not Points:
+            return ("MaximumX", "MaximumZ", "MinimumX", "MinimumZ")
+        Point = max(
+            Points,
+            key=lambda Value: (
+                abs(Value[0] - Root[0]) + abs(Value[2] - Root[2]),
+                Value,
+            ),
+        )
+        DeltaX = Point[0] - Root[0]
+        DeltaZ = Point[2] - Root[2]
+        Primary = (
+            ("MaximumX" if DeltaX >= 0 else "MinimumX")
+            if abs(DeltaX) >= abs(DeltaZ)
+            else ("MaximumZ" if DeltaZ >= 0 else "MinimumZ")
+        )
+        Ordered = (Primary, "MaximumX", "MaximumZ", "MinimumX", "MinimumZ")
+        return tuple(dict.fromkeys(Ordered))
+
     def CandidateNodeCosts(Signal: str) -> list[tuple[Position3, int]]:
+        # Pass zero is deliberately permissive: establish a complete
+        # provisional forest before asking any net to avoid another.  Applying
+        # present congestion while this forest is still being constructed
+        # recreates one-shot routing and can starve the nets ordered last.
+        if CurrentPassIndex == 0:
+            return []
         Costs: Counter[Position3] = Counter(History)
         for OtherSignal, Candidate in Selected.items():
             if OtherSignal == Signal:
                 continue
-            Present = Negotiated.PresentConflictPenalty
+            Present = Negotiated.PresentConflictPenalty * (CurrentPassIndex + 1)
             for Position in (
                 Candidate.Claims.ElectricalCells
                 | Candidate.Claims.SupportCells
@@ -1129,9 +2596,84 @@ def PlanNegotiatedRouteTrees(
             if Cost > 0 and Position not in Required
         )
 
+    def ClaimConflictCount(
+        First: RoutingResourceClaims,
+        Second: RoutingResourceClaims,
+    ) -> int:
+        Electrical = (First.WireCells & Second.ElectricalCells) | (
+            Second.WireCells & First.ElectricalCells
+        )
+        Support = (
+            First.SupportCells & (Second.WireCells | Second.RequiredAirCells)
+        ) | (
+            Second.SupportCells & (First.WireCells | First.RequiredAirCells)
+        )
+        Air = (First.RequiredAirCells & Second.WireCells) | (
+            Second.RequiredAirCells & First.WireCells
+        )
+        return len(Electrical | Support | Air)
+
+    def RequestMandatoryClaims(
+        Signal: str,
+        RequestIndex: int,
+    ) -> RoutingResourceClaims:
+        SourcePortal, TargetPortals, _Guide, _Layer, _Axis, _Lane, _Variant = (
+            RouteMetadataBySignal[Signal][RequestIndex]
+        )
+        MandatoryNodes = {
+            *Profiles[Signal].SourceAccessPath,
+            *SourcePortal.Path,
+            *(
+                Position
+                for Target in Profiles[Signal].Targets
+                for Position in Profiles[Signal].TargetAccessPaths[Target]
+            ),
+            *(
+                Position
+                for Portal in TargetPortals
+                for Position in Portal.Path
+            ),
+        }
+        CacheKey = (Signal, RequestIndex)
+        MandatoryClaims = MandatoryClaimsCache.get(CacheKey)
+        if MandatoryClaims is None:
+            PortalSignature = (
+                Signal,
+                SourcePortal.PortalId,
+                tuple(Portal.PortalId for Portal in TargetPortals),
+            )
+            MandatoryClaims = MandatoryClaimsByPortalSignature.get(
+                PortalSignature
+            )
+            if MandatoryClaims is None:
+                MandatoryClaims = Resources.ResourceGraph.BuildRouteClaims(
+                    MandatoryNodes
+                )
+                MandatoryClaimsByPortalSignature[PortalSignature] = (
+                    MandatoryClaims
+                )
+            MandatoryClaimsCache[CacheKey] = MandatoryClaims
+        return MandatoryClaims
+
+    def RequestMandatoryConflictCount(
+        Signal: str,
+        RequestIndex: int,
+        Candidates: dict[str, NetRouteCandidate] | None = None,
+    ) -> int:
+        MandatoryClaims = RequestMandatoryClaims(Signal, RequestIndex)
+        return sum(
+            ClaimConflictCount(MandatoryClaims, Other.Claims)
+            for OtherSignal, Other in (
+                Selected if Candidates is None else Candidates
+            ).items()
+            if OtherSignal != Signal
+        )
+
     def RouteRequest(
         Signal: str,
         RequestIndex: int,
+        NodeCosts: list[tuple[Position3, int]],
+        MinimumExpansionCount: int | None = None,
     ) -> NetRouteCandidate | None:
         Requests = RouteRequestsBySignal.get(Signal, ())
         MetadataValues = RouteMetadataBySignal.get(Signal, ())
@@ -1141,7 +2683,7 @@ def PlanNegotiatedRouteTrees(
         (
             Starts,
             TargetBranches,
-            AllowedColumns,
+            _AllowedColumns,
             RequiredNodes,
             BlockedNodeValues,
             PreferredColumns,
@@ -1151,38 +2693,220 @@ def PlanNegotiatedRouteTrees(
             ViaPenalty,
             MaximumExpansionCount,
         ) = Requests[RequestIndex]
+        EffectiveMaximumExpansionCount = min(
+            Policy.DetailedRouting.StrictBaseExpansions,
+            max(MaximumExpansionCount, MinimumExpansionCount or 0),
+        )
+        RepairState = RepairStates.get(Signal)
+        if RepairState is not None and RepairState.PrunedTargets:
+            RootedStarts = list(Starts)
+            RetainedNodes = set(RepairState.RetainedNodes)
+            RetainedNodes.update(Profiles[Signal].SourceAccessPath)
+            # Keep the actual source-access root first. Sorting the retained
+            # tree made an arbitrary low-coordinate branch look like a fresh
+            # producer and silently reset its redstone strength.
+            Starts = list(dict.fromkeys((
+                *RootedStarts,
+                *sorted(RetainedNodes),
+            )))
+            TargetBranches = [
+                Branch
+                for Target, Branch in zip(
+                    RepairState.PrunedBranchIds,
+                    RepairState.PrunedBranchPaths,
+                )
+            ]
+        MandatorySelfConflicts = InitialDetailedBatchPreflightConflicts.get(
+            (Signal, RequestIndex),
+            frozenset(),
+        )
+        if not MandatorySelfConflicts:
+            MandatorySelfConflicts = FindSelfClaimConflicts({
+                Signal: RequestMandatoryClaims(Signal, RequestIndex)
+            })
+        if MandatorySelfConflicts:
+            MandatorySelfConflictsBySignal[Signal].update(
+                MandatorySelfConflicts
+            )
+            RejectionCountsBySignal[Signal][
+                "MandatorySelfClaimConflict"
+            ] += 1
+            return None
+        ActiveColumns = RegionStates[Signal].ActiveColumns
         AllowedNodes = {
             Position
-            for Column in AllowedColumns
+            for Column in ActiveColumns
             for Position in NodesByColumn.get(tuple(Column), ())
         }
         AllowedNodes.update(tuple(Position) for Position in RequiredNodes)
         CheckRuntimeBudget(
             "NegotiatedDetailedRouting",
-            {"Signal": Signal, "RequestIndex": RequestIndex},
+            {
+                "Signal": Signal,
+                "RequestIndex": RequestIndex,
+                "NegotiatedIteration": CurrentPassIndex,
+                "SelectedSignalCount": len(Selected),
+                "OverflowProgression": list(OverflowProgression),
+            },
         )
-        if not hasattr(Context, "GenerateRouteTreeWithCostsBounded"):
+        if not hasattr(Context, "GenerateRouteTreeDetailedBounded"):
             raise ValueError(
-                "negotiated routing requires the incremental Rust routing API"
+                "negotiated routing requires the diagnostic Rust routing API"
             )
-        RoutedTree = Context.GenerateRouteTreeWithCostsBounded(
-            Starts,
-            TargetBranches,
-            sorted(AllowedNodes),
-            BlockedNodeValues,
-            PreferredColumns,
-            CandidateNodeCosts(Signal),
-            PreferredRoutingY,
-            GuidePenalty,
-            BendPenalty,
-            ViaPenalty,
-            MaximumExpansionCount,
-            RemainingRoutingRuntimeMilliseconds(Deadline, AdaptiveExpiresAt),
+        SearchBlockedNodes = set(BlockedNodeValues)
+        RequiredNodeSet = set(RequiredNodes)
+        SelfClaimCutCount = 0
+        # A pass-zero result was searched against the same frozen sparse
+        # region, empty present-cost map, and no retained repair tree.  Use it
+        # once only: if self-claim repair changes the blocked set, or a region
+        # expands, the serial call below owns the changed search state.
+        BatchedSearchResult = (
+            InitialDetailedBatchResults.pop((Signal, RequestIndex), None)
+            if CurrentPassIndex == 0
+            else None
         )
+        while True:
+            if BatchedSearchResult is not None:
+                SearchResult = BatchedSearchResult
+                BatchedSearchResult = None
+            else:
+                SearchResult = Context.GenerateRouteTreeDetailedBounded(
+                    Starts,
+                    TargetBranches,
+                    sorted(AllowedNodes),
+                    sorted(SearchBlockedNodes),
+                    PreferredColumns,
+                    NodeCosts,
+                    PreferredRoutingY,
+                    GuidePenalty,
+                    BendPenalty,
+                    ViaPenalty,
+                    True,
+                    EffectiveMaximumExpansionCount,
+                    min(
+                        Negotiated.MaximumRouteTreeRequestMilliseconds,
+                        RemainingRoutingRuntimeMilliseconds(
+                            Deadline, AdaptiveExpiresAt
+                        ),
+                    ),
+                )
+            if SearchResult.Status != "Routed":
+                break
+            RoutedClaims = Resources.ResourceGraph.BuildRouteClaims(
+                SearchResult.Nodes
+            )
+            SelfClaimConflicts = FindSelfClaimConflicts({
+                Signal: RoutedClaims
+            })
+            if not SelfClaimConflicts:
+                break
+            if SelfClaimCutCount >= 3:
+                break
+            ConflictPositions = {
+                Resource.Position for Resource in SelfClaimConflicts
+            }
+            CutNodes = {
+                Node
+                for Node in SearchResult.Nodes
+                if Node not in RequiredNodeSet
+                and any(
+                    abs(Node[0] - Position[0])
+                    + abs(Node[1] - Position[1])
+                    + abs(Node[2] - Position[2])
+                    <= 1
+                    for Position in ConflictPositions
+                )
+            }
+            CutNodes -= SearchBlockedNodes
+            if not CutNodes:
+                break
+            SearchBlockedNodes.update(CutNodes)
+            SelfClaimCutCount += 1
+        FrontierNodes = tuple(SearchResult.BoundaryFrontierNodes)
+        FrontierTouches = FindNegotiatedBoundaryTouches(
+            FrontierNodes,
+            RegionStates[Signal].ActiveTiles,
+            RegionStates[Signal].Bounds,
+            RegionStates[Signal].TileSize,
+        )
+        if SearchResult.Status == "Routed":
+            RegionStates[Signal].BoundaryTouches.update(FrontierNodes)
+        RouteRequestDiagnostics[Signal] = {
+            "Status": SearchResult.Status,
+            "NoPathReason": SearchResult.NoPathReason,
+            "ExpansionCount": SearchResult.ExpansionCount,
+            "MaximumExpansionCount": EffectiveMaximumExpansionCount,
+            "BoundaryFrontierNodes": [
+                list(Value) for Value in FrontierNodes
+            ],
+            "BoundaryFrontierTouches": {
+                Side: [list(Value) for Value in Values]
+                for Side, Values in FrontierTouches.items()
+            },
+        }
+        NativeSearchDiagnosticsBySignal[Signal].append({
+            "RequestIndex": RequestIndex,
+            "Iteration": CurrentPassIndex,
+            "Status": SearchResult.Status,
+            "NoPathReason": SearchResult.NoPathReason
+            if SearchResult.Status == "NoPath"
+            else "",
+            "ExpansionCount": SearchResult.ExpansionCount,
+            "MaximumExpansionCount": EffectiveMaximumExpansionCount,
+            "BoundaryFrontierNodes": [
+                list(Value) for Value in FrontierNodes
+            ],
+            "RepeaterReservationCount": len(
+                SearchResult.RepeaterReservations
+            ),
+            "RepeaterRejectedCount": (
+                SearchResult.RepeaterRejectedCount
+            ),
+            "SelfClaimCutCount": SelfClaimCutCount,
+            "RemainingSelfClaimConflicts": [
+                str(Resource)
+                for Resource in sorted(
+                    (
+                        SelfClaimConflicts
+                        if SearchResult.Status == "Routed"
+                        else {}
+                    ),
+                    key=str,
+                )
+            ],
+        })
+        if SearchResult.RepeaterRejectedCount:
+            RejectionCountsBySignal[Signal]["NoRepeater"] += (
+                SearchResult.RepeaterRejectedCount
+            )
+        if SearchResult.Status == "BudgetExpired":
+            RejectionCountsBySignal[Signal]["NativeBudgetExpired"] += 1
+        elif SearchResult.Status == "NoPath":
+            RejectionCountsBySignal[Signal]["NoPath"] += 1
+            if SearchResult.NoPathReason == "NoRepeater":
+                RejectionCountsBySignal[Signal]["NoRepeater"] += 1
+        if RepairState is not None and RepairState.PrunedTargets:
+            for Target in RepairState.PrunedTargets:
+                RepairBranchOutcomes.setdefault(Signal, {})[
+                    str(Target)
+                ] = "Rejected"
+        RoutedTree = (
+            list(SearchResult.Nodes)
+            if SearchResult.Status == "Routed"
+            else None
+        )
+        if RoutedTree is not None and RepairState is not None:
+            # A repair search starts from the retained branch frontier.  Its
+            # result contains only the new branch segment, so preserve the
+            # clean source trunk and clean target branches when committing.
+            RoutedTree = sorted({
+                *RoutedTree,
+                *RepairState.RetainedNodes,
+            })
         SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant = (
             MetadataValues[RequestIndex]
         )
-        return _MaterializeCandidate(
+        Candidate = _MaterializeCandidate(
             Signal,
             Profiles[Signal],
             SourcePortal,
@@ -1201,11 +2925,180 @@ def PlanNegotiatedRouteTrees(
             Policy.DetailedRouting.CandidateViaWeight,
             Policy.DetailedRouting.LayerPenalty,
             RepeaterPenalty=Policy.DetailedRouting.RepeaterPenalty,
+            NativeRepeaterReservations=tuple(
+                SearchResult.RepeaterReservations
+            ),
+            RejectionCounts=RejectionCountsBySignal[Signal],
         )
+        if Candidate is not None and RepairState is not None and RepairState.PrunedTargets:
+            TargetPaths = {
+                Target
+                for Target, _Path in Candidate.TargetPaths.items()
+            }
+            for Target in RepairState.PrunedBranchIds:
+                RepairBranchOutcomes.setdefault(Signal, {})[str(Target)] = (
+                    "Committed"
+                    if Target in TargetPaths
+                    else "Lost"
+                )
+        return Candidate
+
+    def BuildPassZeroDetailedSearchRequest(
+        Signal: str,
+        RequestIndex: int,
+    ) -> tuple[Any, ...] | None:
+        """Freeze one independent initial detailed search for native batching."""
+        Requests = RouteRequestsBySignal.get(Signal, ())
+        MetadataValues = RouteMetadataBySignal.get(Signal, ())
+        RequestCount = min(len(Requests), len(MetadataValues))
+        if RequestCount == 0:
+            return None
+        RequestIndex %= RequestCount
+        (
+            Starts,
+            TargetBranches,
+            _AllowedColumns,
+            RequiredNodes,
+            BlockedNodeValues,
+            PreferredColumns,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            MaximumExpansionCount,
+        ) = Requests[RequestIndex]
+        MandatorySelfConflicts = FindSelfClaimConflicts({
+            Signal: RequestMandatoryClaims(Signal, RequestIndex)
+        })
+        if MandatorySelfConflicts:
+            InitialDetailedBatchPreflightConflicts[(Signal, RequestIndex)] = (
+                frozenset(MandatorySelfConflicts)
+            )
+            return None
+        ActiveColumns = RegionStates[Signal].ActiveColumns
+        AllowedNodes = {
+            Position
+            for Column in ActiveColumns
+            for Position in NodesByColumn.get(tuple(Column), ())
+        }
+        AllowedNodes.update(tuple(Position) for Position in RequiredNodes)
+        # Pass zero deliberately has no present/history congestion cost and
+        # no repair tree.  Keeping that snapshot explicit is what makes each
+        # native request independent and safe to schedule in parallel.
+        return (
+            list(Starts),
+            [list(Branch) for Branch in TargetBranches],
+            sorted(AllowedNodes),
+            sorted(BlockedNodeValues),
+            sorted(PreferredColumns),
+            [],
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            True,
+            min(
+                MaximumExpansionCount,
+                Policy.DetailedRouting.StrictBaseExpansions,
+            ),
+        )
+
+    def PreparePassZeroDetailedSearchBatch(
+        Signal: str,
+        RequestIndices: tuple[int, ...],
+    ) -> None:
+        """Batch one signal's already-selected initial alternatives.
+
+        The outer signal order changes capacity feedback and must remain
+        serial.  Alternatives for the *current* signal share a frozen region,
+        no present congestion, and no repair tree, so they are safe to search
+        concurrently without changing which request IDs the serial selector
+        considers.
+        """
+        if not hasattr(Context, "GenerateRouteTreeDetailedBatchBounded"):
+            return
+        InitialDetailedBatchRequestIndices[Signal] = RequestIndices
+        Scheduled = [
+            (RequestIndex, Request)
+            for RequestIndex in RequestIndices
+            if (Request := BuildPassZeroDetailedSearchRequest(
+                Signal,
+                RequestIndex,
+            )) is not None
+        ]
+        try:
+            WorkerCount = max(1, int(GetRustRoutingThreadCount()))
+        except Exception:
+            WorkerCount = 1
+        InitialDetailedBatchDiagnostics.update({
+            "Enabled": True,
+            "ScheduledRequestCount": int(
+                InitialDetailedBatchDiagnostics["ScheduledRequestCount"]
+            ) + len(RequestIndices),
+            "RequestCount": int(
+                InitialDetailedBatchDiagnostics["RequestCount"]
+            ) + len(Scheduled),
+            "WorkerCount": WorkerCount,
+            "PreflightRejectedRequestCount": len(
+                InitialDetailedBatchPreflightConflicts
+            ),
+        })
+        for StartIndex in range(0, len(Scheduled), WorkerCount):
+            Chunk = Scheduled[StartIndex:StartIndex + WorkerCount]
+            CheckRuntimeBudget(
+                "NegotiatedDetailedRouting",
+                {
+                    "Iteration": 0,
+                    "Signal": Signal,
+                    "BatchStartIndex": StartIndex,
+                    "BatchRequestCount": len(Chunk),
+                },
+            )
+            MaximumRuntimeMilliseconds = min(
+                Negotiated.MaximumRouteTreeRequestMilliseconds,
+                RemainingRoutingRuntimeMilliseconds(
+                    Deadline,
+                    AdaptiveExpiresAt,
+                ),
+            )
+            if MaximumRuntimeMilliseconds <= 0:
+                CheckRuntimeBudget(
+                    "NegotiatedDetailedRouting",
+                    {"Iteration": 0, "Signal": Signal},
+                )
+                return
+            BatchResult = Context.GenerateRouteTreeDetailedBatchBounded(
+                [Request for _Index, Request in Chunk],
+                MaximumRuntimeMilliseconds,
+            )
+            SearchResults = list(BatchResult.SearchResults)
+            if len(SearchResults) != len(Chunk):
+                raise ValueError(
+                    "detailed route-tree batch returned an unexpected result count"
+                )
+            for (RequestIndex, _Request), SearchResult in zip(
+                Chunk,
+                SearchResults,
+            ):
+                InitialDetailedBatchResults[(Signal, RequestIndex)] = (
+                    SearchResult
+                )
+            InitialDetailedBatchDiagnostics["BatchCount"] = (
+                int(InitialDetailedBatchDiagnostics["BatchCount"]) + 1
+            )
+            InitialDetailedBatchDiagnostics["CompletedWork"] = (
+                int(InitialDetailedBatchDiagnostics["CompletedWork"])
+                + int(BatchResult.CompletedWork)
+            )
+            InitialDetailedBatchDiagnostics["DeadlineExceeded"] = bool(
+                InitialDetailedBatchDiagnostics["DeadlineExceeded"]
+                or BatchResult.DeadlineExceeded
+            )
 
     ConflictSignals: tuple[str, ...] = SignalOrder
     FinalConflicts: dict[RoutingResourceId, tuple[str, ...]] = {}
     for PassIndex in range(Negotiated.MaximumIterations):
+        CurrentPassIndex = PassIndex
         CheckRuntimeBudget(
             "NegotiatedDetailedRouting",
             {"Iteration": PassIndex, "SelectedSignals": len(Selected)},
@@ -1213,55 +3106,317 @@ def PlanNegotiatedRouteTrees(
         SignalsToRoute = SignalOrder if PassIndex == 0 else ConflictSignals
         for SignalIndex, Signal in enumerate(SignalsToRoute):
             Existing = Selected.pop(Signal, None)
+            SignalNodeCosts = CandidateNodeCosts(Signal)
             Best: NetRouteCandidate | None = None
-            BestScore: tuple[int, int, str] | None = None
-            RequestCount = len(RouteRequestsBySignal.get(Signal, ()))
-            AttemptCount = min(4, RequestCount)
-            for AttemptOffset in range(AttemptCount):
-                Candidate = RouteRequest(
-                    Signal,
-                    PassIndex + SignalIndex + AttemptOffset,
-                )
-                if Candidate is None:
-                    continue
+            BestScore: tuple[Any, ...] | None = None
+
+            def ConsiderCandidate(Candidate: NetRouteCandidate) -> int:
+                """Retain the best current net tree using the normal score."""
+                nonlocal Best, BestScore
                 PairConflicts = sum(
-                    _ClaimsConflict(
-                        Signal,
-                        Candidate.Claims,
-                        OtherSignal,
-                        Other.Claims,
-                    )
-                    for OtherSignal, Other in Selected.items()
+                    ClaimConflictCount(Candidate.Claims, Other.Claims)
+                    for Other in Selected.values()
                 )
                 Score = (
                     PairConflicts,
+                    *(
+                        (Candidate.Layer,)
+                        if Policy.TrackAssignment.MinimizeMaximumRoutingLayer
+                        else ()
+                    ),
                     Candidate.MaterialCost,
                     Candidate.CandidateId,
                 )
                 if BestScore is None or Score < BestScore:
                     Best = Candidate
                     BestScore = Score
-                if PairConflicts == 0:
+                return PairConflicts
+
+            RequestCount = len(RouteRequestsBySignal.get(Signal, ()))
+            if (
+                RequestCount == 0
+                and Existing is not None
+                and Signal not in RegenerateSignals
+            ):
+                # Retained candidate geometry is still a valid legal candidate
+                # for this signal; keep it in the selection and continue instead
+                # of converting a cache-aware candidate pass into an immediate
+                # no-pin-access failure.
+                Selected[Signal] = Existing
+                continue
+            # The adaptive policy already defines the bounded initial portal
+            # domain.  Pass zero must materialize that complete configured
+            # domain for the exact capacity assignment; truncating it to four
+            # silently discards half of the legal portal/layer choices before
+            # negotiation can distinguish a real placement cut from candidate
+            # ordering.  Later repair passes stay local and retain the
+            # existing four-request window.
+            RequestWindowSize = min(
+                (
+                    Policy.AdaptiveRouting.InitialCandidateRequestsPerSignal
+                    if PassIndex == 0
+                    else 4
+                ),
+                RequestCount,
+            )
+            RankedRequestIndices = sorted(
+                range(RequestCount),
+                key=lambda RequestIndex: (
+                    RequestMandatoryConflictCount(Signal, RequestIndex),
+                    (
+                        RequestIndex
+                        - PassIndex * RequestWindowSize
+                        - SignalIndex
+                    ) % RequestCount,
+                    RequestIndex,
+                ),
+            )
+            # The first route is feasibility work, not candidate enumeration.
+            # Exhaust its already bounded portal/guide domain before declaring
+            # the net impossible. Subsequent negotiated repairs remain local.
+            # A repeated overflow is precisely when a different bounded
+            # portal/tree choice matters most.  Collapsing to one request on
+            # stagnation replays the same mandatory portal ownership and
+            # converts a candidate-ordering issue into a placement failure.
+            AttemptCount = min(RequestWindowSize, RequestCount)
+            AttemptedRequestIndices = tuple(
+                RankedRequestIndices[:AttemptCount]
+            )
+            if PassIndex == 0:
+                PreparePassZeroDetailedSearchBatch(
+                    Signal,
+                    AttemptedRequestIndices,
+                )
+            for RequestIndex in AttemptedRequestIndices:
+                Candidate = RouteRequest(
+                    Signal,
+                    RequestIndex,
+                    SignalNodeCosts,
+                )
+                if Candidate is None:
+                    continue
+                if PassIndex == 0:
+                    InitialCandidateOptions[Signal][
+                        Candidate.CandidateId
+                    ] = Candidate
+                PairConflicts = ConsiderCandidate(Candidate)
+                # Pass zero establishes the provisional forest.  It still
+                # has to compare the bounded, geometrically diverse request
+                # window; accepting request zero unconditionally turns portal
+                # ordering into physical ownership and manufactures a fixed
+                # access cut before negotiation has begun.
+                if PairConflicts == 0 and PassIndex > 0:
                     break
             if Best is None:
-                if Existing is not None:
+                # The global initial-work budget deliberately gives every
+                # portal alternative a modest share.  When an entire net's
+                # complete initial pool reaches that cap, spend the strict
+                # detailed-routing budget on *that net only* before moving
+                # placement.  RCA8 previously divided 2M expansions across
+                # 712 initial requests, capping A5 at 2,812 expansions even
+                # though no route search had established a geometric cut.
+                SearchLimitedRequestIndices = tuple(
+                    RequestIndex
+                    for RequestIndex in AttemptedRequestIndices
+                    if any(
+                        Diagnostic["RequestIndex"] == RequestIndex
+                        and Diagnostic["Iteration"] == PassIndex
+                        and Diagnostic["NoPathReason"] == "SearchLimitReached"
+                        for Diagnostic in NativeSearchDiagnosticsBySignal[Signal]
+                    )
+                )
+                if SearchLimitedRequestIndices:
+                    SearchExpansionEscalations[Signal] = (
+                        Policy.DetailedRouting.StrictBaseExpansions
+                    )
+                    for SearchLimitedRequestIndex in SearchLimitedRequestIndices:
+                        Candidate = RouteRequest(
+                            Signal,
+                            SearchLimitedRequestIndex,
+                            SignalNodeCosts,
+                            MinimumExpansionCount=(
+                                Policy.DetailedRouting.StrictBaseExpansions
+                            ),
+                        )
+                        if Candidate is None:
+                            continue
+                        if PassIndex == 0:
+                            InitialCandidateOptions[Signal][
+                                Candidate.CandidateId
+                            ] = Candidate
+                        PairConflicts = ConsiderCandidate(Candidate)
+                        if PairConflicts == 0 and PassIndex > 0:
+                            break
+                if Best is not None:
+                    Selected[Signal] = Best
+                    continue
+                Expanded = False
+                LastRequest = RouteRequestDiagnostics.get(Signal, {})
+                FailedTouches = {}
+                if isinstance(
+                    LastRequest.get("BoundaryFrontierTouches"),
+                    dict,
+                ):
+                    FailedTouches = {
+                        Key: tuple(
+                            tuple(Value) for Value in ListValue
+                        )
+                        for Key, ListValue in LastRequest[
+                            "BoundaryFrontierTouches"
+                        ].items()
+                        if isinstance(ListValue, list)
+                    }
+                if not FailedTouches:
+                    FailedTouches = FindNegotiatedBoundaryTouches(
+                        RegionStates[Signal].BoundaryTouches,
+                        RegionStates[Signal].ActiveTiles,
+                        RegionStates[Signal].Bounds,
+                        RegionStates[Signal].TileSize,
+                    )
+                FailureCause = "failed-search-frontier"
+                if LastRequest.get("NoPathReason") == "NoPathContinuation":
+                    FailureCause = "cheapest-continuation-leaves-region"
+                if any(
+                    Value for Value in FailedTouches.values()
+                ):
+                    FailureCause = "route-tree-boundary-frontier"
+                for Side in PreferredExpansionSides(Signal, Existing):
+                    if ExpandSignalRegion(
+                        Signal,
+                        Side,
+                        FailureCause,
+                        FailedTouches.get(Side, ()),
+                    ):
+                        Expanded = True
+                        break
+                if Expanded:
+                    ExpandedRequestIndices = RankedRequestIndices[
+                        AttemptCount:AttemptCount * 2
+                    ]
+                    if not ExpandedRequestIndices:
+                        ExpandedRequestIndices = RankedRequestIndices[
+                            :AttemptCount
+                        ]
+                    for ExpandedRequestIndex in ExpandedRequestIndices:
+                        Best = RouteRequest(
+                            Signal,
+                            ExpandedRequestIndex,
+                            SignalNodeCosts,
+                        )
+                        if Best is not None:
+                            break
+                if Best is not None:
+                    Selected[Signal] = Best
+                    continue
+                if Existing is not None and Signal not in RegenerateSignals:
                     Selected[Signal] = Existing
                     continue
+                FailureSignals = set(SignalsToRoute)
+                FailureSignals.update(CumulativeConflictSignals)
+                FailureSignals.add(Signal)
+                Rejections = RejectionCountsBySignal[Signal]
+                FailureReason = (
+                    RoutingFailureReason.NoPinAccessPattern
+                    if (
+                        RequestCount == 0
+                        or Rejections.get("MandatorySelfClaimConflict", 0) > 0
+                    )
+                    else (
+                        RoutingFailureReason.RepeaterAccessInfeasible
+                        if Rejections.get("NoRepeater", 0) > 0
+                        else RoutingFailureReason.GlobalCongestionUnresolved
+                    )
+                )
+                MandatoryConflicts = MandatorySelfConflictsBySignal[Signal]
                 raise RoutingStageError(RoutingFailure(
-                    Reason=RoutingFailureReason.RepeaterAccessInfeasible,
+                    Reason=FailureReason,
                     Stage="NegotiatedDetailedRouting",
-                    AffectedNets=(Signal,),
+                    AffectedNets=tuple(sorted(FailureSignals)),
+                    Locations=tuple(sorted({
+                        Resource.Position
+                        for Resource in MandatoryConflicts
+                    }))[:32],
+                    Resources=tuple(sorted(
+                        str(Resource) for Resource in MandatoryConflicts
+                    ))[:32],
+                    RepairActions=(
+                        "RelocateProducerConsumerClusters",
+                        "ExpandOffenderHalo",
+                    ),
                     Detail=(
-                        "no portal-aware route tree with legal repeater access "
-                        "was found in the negotiated sparse region"
+                        "mandatory source/target access geometry conflicts "
+                        "with its own wire, support, or headroom claims"
+                        if MandatoryConflicts
+                        else (
+                            "no legal portal-aware route tree was found in "
+                            "the bounded negotiated sparse region"
+                        )
                     ),
                     Diagnostics={
                         "RequestCount": RequestCount,
+                        "AttemptedRequestCount": AttemptCount,
                         "Iteration": PassIndex,
+                        "Rejections": dict(sorted(Rejections.items())),
+                        "InitialDetailedBatch": dict(
+                            InitialDetailedBatchDiagnostics
+                        ),
+                        "SearchExpansionEscalations": dict(
+                            sorted(SearchExpansionEscalations.items())
+                        ),
                         "CachedNodeCount": Resources.ResourceGraph.CachedNodeCount,
+                        "Region": {
+                            "HaloSize": TileSize,
+                            "ActiveTiles": [
+                                list(Value)
+                                for Value in sorted(
+                                    RegionStates[Signal].ActiveTiles
+                                )
+                            ],
+                            "BoundaryTouches": [
+                                list(Value)
+                                for Value in sorted(
+                                    RegionStates[Signal].BoundaryTouches
+                                )
+                            ],
+                            "ExpandedSides": list(
+                                RegionStates[Signal].ExpandedSides
+                            ),
+                            "ExpansionEvents": list(
+                                RegionStates[Signal].ExpansionEvents
+                            ),
+                            "NativeSearch": list(
+                                NativeSearchDiagnosticsBySignal[Signal]
+                            ),
+                        },
+                        "ConflictGraph": {
+                            "Classification": (
+                                "mandatory-access-self-conflict"
+                                if MandatoryConflicts
+                                else "sparse-region-route-cut"
+                            ),
+                            "ConflictSignals": sorted(FailureSignals),
+                            "RelocationSignals": sorted(FailureSignals),
+                            "RequestSignals": {
+                                "Signal": Signal,
+                                "RequestCount": RequestCount,
+                                "AttemptedRequestCount": AttemptCount,
+                                "FailedSignalCount": len(FailureSignals),
+                                "RequestlessSignals": sorted(
+                                    set(SignalsToRoute) | set(CumulativeConflictSignals)
+                                ),
+                            },
+                        },
                     },
                 ))
             Selected[Signal] = Best
+            BoundaryTouches = FindNegotiatedBoundaryTouches(
+                Best.Nodes,
+                RegionStates[Signal].ActiveTiles,
+                RegionStates[Signal].Bounds,
+                RegionStates[Signal].TileSize,
+            )
+            for Values in BoundaryTouches.values():
+                RegionStates[Signal].BoundaryTouches.update(Values)
             if Existing is not None and Existing.CandidateId != Best.CandidateId:
                 ReroutedSignals.add(Signal)
 
@@ -1269,11 +3424,41 @@ def PlanNegotiatedRouteTrees(
             Signal: Candidate.Claims
             for Signal, Candidate in Selected.items()
         })
+        if PassIndex == 0 and FinalConflicts:
+            InitialAssignment = TryInitialCandidateAssignment()
+            if InitialAssignment is not None:
+                EnvelopeAssignment = TryInitialCandidateAssignment(
+                    OptimizeEnvelope=True,
+                )
+                if EnvelopeAssignment is not None:
+                    BaselineQuality = EnvelopeQuality(
+                        InitialAssignment.values()
+                    )
+                    EnvelopeCandidateQuality = EnvelopeQuality(
+                        EnvelopeAssignment.values()
+                    )
+                    InitialAssignmentDiagnostics["EnvelopeSelection"] = {
+                        "Baseline": list(BaselineQuality),
+                        "Candidate": list(EnvelopeCandidateQuality),
+                        "Selected": (
+                            "envelope"
+                            if EnvelopeCandidateQuality < BaselineQuality
+                            else "baseline"
+                        ),
+                    }
+                    if EnvelopeCandidateQuality < BaselineQuality:
+                        InitialAssignment = EnvelopeAssignment
+                Selected = InitialAssignment
+                FinalConflicts = FindClaimConflicts({
+                    Signal: Candidate.Claims
+                    for Signal, Candidate in Selected.items()
+                })
         ConflictSignals = tuple(sorted({
             Signal
             for Signals in FinalConflicts.values()
             for Signal in Signals
         }))
+        CumulativeConflictSignals.update(ConflictSignals)
         ConflictCount = len(FinalConflicts)
         OverflowProgression.append(ConflictCount)
         Iterations.append(RoutingIterationMetrics(
@@ -1290,6 +3475,27 @@ def PlanNegotiatedRouteTrees(
             ConflictSignals=ConflictSignals,
         ))
         if not FinalConflicts and len(Selected) == len(Profiles):
+            if Policy.TrackAssignment.MinimizeMaximumRoutingLayer:
+                LayerOptimizedAssignment = TryInitialCandidateAssignment()
+                if LayerOptimizedAssignment is not None:
+                    LayerOptimizedConflicts = FindClaimConflicts({
+                        Signal: Candidate.Claims
+                        for Signal, Candidate in LayerOptimizedAssignment.items()
+                    })
+                    if not LayerOptimizedConflicts:
+                        Selected = LayerOptimizedAssignment
+                        InitialAssignmentDiagnostics["FinalLayerOptimization"] = {
+                            "Applied": True,
+                            "MaximumLayer": max(
+                                Candidate.Layer
+                                for Candidate in Selected.values()
+                            ),
+                        }
+                    else:
+                        InitialAssignmentDiagnostics["FinalLayerOptimization"] = {
+                            "Applied": False,
+                            "Reason": "claim-conflict",
+                        }
             return NegotiatedRoutePlan(
                 SelectedCandidates=Selected,
                 Iterations=tuple(Iterations),
@@ -1297,25 +3503,309 @@ def PlanNegotiatedRouteTrees(
                 OverflowProgression=tuple(OverflowProgression),
                 CachedNodeCount=Resources.ResourceGraph.CachedNodeCount,
                 CachedEdgeCount=Resources.ResourceGraph.CachedEdgeCount,
+                Diagnostics={
+                    "HaloSize": TileSize,
+                    "Regions": {
+                        Signal: {
+                            "ActiveTiles": [
+                                list(Value)
+                                for Value in sorted(State.ActiveTiles)
+                            ],
+                            "BoundaryTouches": [
+                                list(Value)
+                                for Value in sorted(State.BoundaryTouches)
+                            ],
+                            "ExpandedSides": list(State.ExpandedSides),
+                            "ExpansionEvents": list(State.ExpansionEvents),
+                            "OwnedNodeCount": len(State.AddedNodes),
+                            "OwnedEdgeCount": len(State.AddedEdges),
+                        }
+                        for Signal, State in sorted(RegionStates.items())
+                    },
+                    "BranchRepairs": BranchRepairEvents,
+                    "InitialAssignment": dict(InitialAssignmentDiagnostics),
+                    "InitialCandidateLayers": {
+                        Signal: sorted({Candidate.Layer for Candidate in Values.values()})
+                        for Signal, Values in sorted(InitialCandidateOptions.items())
+                    },
+                    "InitialDetailedBatch": dict(
+                        InitialDetailedBatchDiagnostics
+                    ),
+                    "SearchExpansionEscalations": dict(
+                        sorted(SearchExpansionEscalations.items())
+                    ),
+                    "CumulativeConflictSignals": sorted(
+                        CumulativeConflictSignals
+                    ),
+                    "RepeaterRejections": {
+                        Signal: dict(sorted(Values.items()))
+                        for Signal, Values in sorted(
+                            RejectionCountsBySignal.items()
+                        )
+                    },
+                    "NativeSearch": {
+                        Signal: list(Values)
+                        for Signal, Values in sorted(
+                            NativeSearchDiagnosticsBySignal.items()
+                        )
+                    },
+                },
             )
+        MandatoryClaimsBySelectedSignal: dict[
+            str, RoutingResourceClaims
+        ] = {}
+        for Signal, Candidate in Selected.items():
+            for RequestIndex, Metadata in enumerate(
+                RouteMetadataBySignal.get(Signal, ())
+            ):
+                SourcePortal, TargetPortals, *_Rest = Metadata
+                if SourcePortal.PortalId != Candidate.SourcePortalId:
+                    continue
+                if tuple(sorted(
+                    Portal.PortalId for Portal in TargetPortals
+                )) != tuple(sorted(Candidate.TargetPortalIds.values())):
+                    continue
+                MandatoryClaimsBySelectedSignal[Signal] = (
+                    RequestMandatoryClaims(Signal, RequestIndex)
+                )
+                break
+        MandatoryCutResources = {
+            Resource
+            for Resource, Signals in FinalConflicts.items()
+            if any(
+                Resource
+                in MandatoryClaimsBySelectedSignal.get(
+                    Signal,
+                    RoutingResourceClaims(),
+                ).ResourceIds
+                for Signal in Signals
+            )
+        }
+        ImmediateMandatoryPlacementCut = (
+            PassIndex == 0
+            # Several simultaneous fixed portal/access collisions cannot be
+            # repaired by negotiated wire rerouting.  Scale this trigger with
+            # the routed demand rather than requiring one conflict per net;
+            # otherwise medium arithmetic blocks spend most of their deadline
+            # rediscovering a placement cut before relocation can begin.
+            and len(MandatoryCutResources)
+            >= max(4, (len(SignalOrder) + 3) // 4)
+        )
+        if (
+            FinalConflicts
+            and MandatoryCutResources
+            and (
+                ImmediateMandatoryPlacementCut
+                or (
+                    PassIndex >= 2
+                    and PreviousConflictCount is not None
+                    and ConflictCount >= PreviousConflictCount
+                )
+            )
+        ):
+            CutSignals = tuple(sorted({
+                Signal
+                for Resource, Signals in FinalConflicts.items()
+                for Signal in Signals
+            }))
+            AffectedSignals = tuple(sorted({
+                *CutSignals,
+                *CumulativeConflictSignals,
+            }))
+            raise RoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.TrackAssignmentConflict,
+                Stage="NegotiatedDetailedRouting",
+                AffectedNets=AffectedSignals,
+                Locations=tuple(sorted({
+                    Resource.Position for Resource in MandatoryCutResources
+                }))[:32],
+                Resources=tuple(sorted(
+                    str(Resource) for Resource in MandatoryCutResources
+                ))[:32],
+                RepairActions=("RelocateAffectedClusters",),
+                Detail=(
+                    "stagnant negotiated overflow includes mandatory "
+                    "portal/access ownership and cannot be repaired only by "
+                    "region expansion"
+                ),
+                Diagnostics={
+                    "OverflowProgression": list(OverflowProgression),
+                    "MandatoryConflictResourceCount": len(
+                        MandatoryCutResources
+                    ),
+                    "MandatoryConflictClaims": {
+                        str(Resource): list(Signals)
+                        for Resource, Signals in sorted(
+                            FinalConflicts.items(),
+                            key=lambda Value: str(Value[0]),
+                        )
+                        if Resource in MandatoryCutResources
+                    },
+                    "InitialAssignment": dict(InitialAssignmentDiagnostics),
+                    "InitialDetailedBatch": dict(
+                        InitialDetailedBatchDiagnostics
+                    ),
+                    "ConflictGraph": {
+                        "Classification": "mandatory-boundary-capacity-cut",
+                        "ConflictSignals": list(AffectedSignals),
+                        "CongestionCutSignals": list(AffectedSignals),
+                        "RelocationSignals": list(AffectedSignals),
+                    },
+                },
+            ))
         for Resource, Signals in FinalConflicts.items():
             Increment = Negotiated.HistoryIncrement * max(1, len(Signals) - 1)
             History[Resource.Position] += Increment
             for Neighbor in Technology.NeighborPositions(Resource.Position):
                 History[Neighbor] += max(1, Increment // 2)
-        if PreviousConflictCount is not None and ConflictCount >= PreviousConflictCount:
+        RepairStates = {}
+        ExpandedForConflict = False
+        for Signal in ConflictSignals:
+            Candidate = Selected[Signal]
+            SignalConflictResources = {
+                Resource
+                for Resource, Signals in FinalConflicts.items()
+                if Signal in Signals
+            }
+            RepairState = BuildNegotiatedRouteTreeState(
+                Candidate,
+                SignalConflictResources,
+            )
+            if not RepairState.PrunedTargets:
+                continue
+            RepairStates[Signal] = RepairState
+            RetainedTargets = RepairState.RetainedTargets
+            PrunedTargets = RepairState.PrunedTargets
+            RetainedNodes = set(RepairState.RetainedNodes)
+            RemovedNodes = set(Candidate.Nodes) - RetainedNodes
+            RemovedEdges = {
+                Edge
+                for Edge in Candidate.Edges
+                if Edge[0] in RemovedNodes or Edge[1] in RemovedNodes
+            }
+            BranchOutcomes = {
+                str(Target): RepairBranchOutcomes.get(
+                    Signal,
+                    {},
+                ).get(
+                    str(Target),
+                    "Unknown",
+                )
+                for Target in PrunedTargets
+            }
+            BranchRepairEvents.append({
+                "Iteration": PassIndex + 1,
+                "Signal": Signal,
+                "RetainedBranches": [
+                    {
+                        "Target": list(Target),
+                        "Path": [list(Value) for Value in Path],
+                    }
+                    for Target, Path in zip(
+                        RetainedTargets,
+                        RepairState.RetainedBranchPaths,
+                    )
+                ],
+                "PrunedBranches": [
+                    {
+                        "Target": list(Target),
+                        "PrunedPath": [list(Value) for Value in Path],
+                        "Outcome": BranchOutcomes.get(
+                            str(Target),
+                            "Unknown",
+                        ),
+                    }
+                    for Target, Path in zip(
+                        PrunedTargets,
+                        RepairState.PrunedBranchPaths,
+                    )
+                ],
+                "RetainedBranchCount": len(RetainedTargets),
+                "PrunedBranchCount": len(PrunedTargets),
+                "RemovedNodeCount": len(RemovedNodes),
+                "RemovedEdgeCount": len(RemovedEdges),
+                "RemovedBranchCount": len(RepairState.PrunedBranchTailClaims),
+                "PrunedBranchClaimCounts": [
+                    len(Claims)
+                    for Claims in RepairState.PrunedBranchTailClaims
+                ],
+                "RemovedNodes": [
+                    list(Value)
+                    for Value in sorted(RemovedNodes)
+                ],
+                "ConflictResources": [
+                    str(Value) for Value in sorted(
+                        SignalConflictResources,
+                        key=str,
+                    )
+                ],
+            })
+            Touches = FindNegotiatedBoundaryTouches(
+                Candidate.Nodes,
+                RegionStates[Signal].ActiveTiles,
+                RegionStates[Signal].Bounds,
+                RegionStates[Signal].TileSize,
+            )
+            if Touches:
+                for Side in PreferredExpansionSides(Signal, Candidate):
+                    if Side not in Touches:
+                        continue
+                    ExpandedForConflict = (
+                        ExpandSignalRegion(
+                            Signal,
+                            Side,
+                            "route-tree-boundary-touch",
+                            Touches.get(Side, ()),
+                        )
+                        or ExpandedForConflict
+                    )
+                    if ExpandedForConflict:
+                        break
+        if (
+            PreviousConflictCount is not None
+            and ConflictCount >= PreviousConflictCount
+        ):
             StagnationCount += 1
         else:
             StagnationCount = 0
         PreviousConflictCount = ConflictCount
-        if StagnationCount >= Negotiated.StagnationPassLimit:
-            break
+        if StagnationCount >= Negotiated.StagnationPassLimit - 1:
+            Hotspots = tuple(sorted({
+                Resource.Position for Resource in FinalConflicts
+            }))
+            for Signal in ConflictSignals:
+                for Side in PreferredExpansionSides(
+                    Signal,
+                    Selected[Signal],
+                    Hotspots,
+                ):
+                    if ExpandSignalRegion(
+                        Signal,
+                        Side,
+                        "stagnant-overflow",
+                        Hotspots,
+                    ):
+                        ExpandedForConflict = True
+                        break
+            if ExpandedForConflict:
+                StagnationCount = 0
+                # The required one-tile delta is now retained in diagnostics.
+                # A placement whose overflow stayed flat for the complete
+                # stagnation window must proceed to the next deterministic
+                # repair pass with the same absolute deadline.
+                continue
+            else:
+                break
 
     Hotspots = tuple(sorted({Resource.Position for Resource in FinalConflicts}))
+    FinalAffectedSignals = tuple(sorted(
+        set(ConflictSignals)
+        | CumulativeConflictSignals
+    ))
     raise RoutingStageError(RoutingFailure(
         Reason=RoutingFailureReason.DetailedCongestionUnresolved,
         Stage="NegotiatedDetailedRouting",
-        AffectedNets=ConflictSignals,
+        AffectedNets=FinalAffectedSignals,
         Locations=Hotspots[:32],
         RepairActions=("RelocateAffectedClusters", "ExpandCongestedCut"),
         Detail=(
@@ -1326,13 +3816,52 @@ def PlanNegotiatedRouteTrees(
             "Algorithm": "negotiated-route-trees-v1",
             "ConflictGraph": {
                 "Classification": "detailed-congestion-cut",
-                "ConflictSignals": list(ConflictSignals),
-                "RelocationSignals": list(ConflictSignals),
+                "ConflictSignals": list(FinalAffectedSignals),
+                "RelocationSignals": list(FinalAffectedSignals),
                 "ResourceHotspots": [list(Value) for Value in Hotspots[:32]],
             },
             "OverflowProgression": OverflowProgression,
+            "ConflictResources": {
+                str(Resource): list(Signals)
+                for Resource, Signals in sorted(
+                    FinalConflicts.items(),
+                    key=lambda Value: str(Value[0]),
+                )
+            },
             "CachedNodeCount": Resources.ResourceGraph.CachedNodeCount,
             "CachedEdgeCount": Resources.ResourceGraph.CachedEdgeCount,
+            "HaloSize": TileSize,
+            "Regions": {
+                Signal: {
+                    "ActiveTiles": [
+                        list(Value) for Value in sorted(State.ActiveTiles)
+                    ],
+                    "BoundaryTouches": [
+                        list(Value) for Value in sorted(State.BoundaryTouches)
+                    ],
+                    "ExpandedSides": list(State.ExpandedSides),
+                    "ExpansionEvents": list(State.ExpansionEvents),
+                    "OwnedNodeCount": len(State.AddedNodes),
+                    "OwnedEdgeCount": len(State.AddedEdges),
+                }
+                for Signal, State in sorted(RegionStates.items())
+            },
+            "BranchRepairs": BranchRepairEvents,
+            "InitialDetailedBatch": dict(InitialDetailedBatchDiagnostics),
+            "SearchExpansionEscalations": dict(
+                sorted(SearchExpansionEscalations.items())
+            ),
+            "CumulativeConflictSignals": sorted(CumulativeConflictSignals),
+            "RepeaterRejections": {
+                Signal: dict(sorted(Values.items()))
+                for Signal, Values in sorted(RejectionCountsBySignal.items())
+            },
+            "NativeSearch": {
+                Signal: list(Values)
+                for Signal, Values in sorted(
+                    NativeSearchDiagnosticsBySignal.items()
+                )
+            },
         },
     ))
 
@@ -1418,8 +3947,6 @@ def RouteAuthoritativeResources(
             or len(PlacementRelocationDiagnostics.get("Clusters", ())) > 3
         )
     )
-    if PlacementWasRelocated:
-        SkipStrictPortalReservation = True
     StageTimings: dict[str, float] = {}
     EscalationState = (
         Policy.QualityTarget,
@@ -1657,24 +4184,33 @@ def RouteAuthoritativeResources(
         (EffectiveRoutingHeight - 2) // Technology.RoutingLayerPitch,
     )
     EffectiveMaximumLayerCount = min(MaximumLayerCount, HeightCapacity)
-    LayerCount = min(
-        EffectiveMaximumLayerCount,
-        max(
-            MinimumLayerCount,
-            RequiredAccessLayerCount,
-            (
-                AdaptiveBudget.LayerCount
-                if Policy.AdaptiveRouting.Enabled
-                else MinimumLayerCount
-            ),
-            AdaptiveLayerFloor or 0,
-            max(RouteLayers.values(), default=0) + 1,
-            (
-                EffectiveMaximumLayerCount
-                if "__PlacementRelocation__"
-                in (getattr(Placed, "LocalRouteDiagnostics", {}) or {})
-                else 0
-            ),
+    NegotiatedLayerFloor = (
+        ceil(
+            Demand.TerminalCount
+            / max(
+                1,
+                Policy.NegotiatedRouting.TilePitchInTracks
+                * Technology.TrackPitch,
+            )
+        )
+        if Policy.NegotiatedRouting.Enabled
+        else 0
+    )
+    LayerCount = SelectInitialRoutingLayerCount(
+        MinimumLayerCount=MinimumLayerCount,
+        EffectiveMaximumLayerCount=EffectiveMaximumLayerCount,
+        RequiredAccessLayerCount=RequiredAccessLayerCount,
+        AdaptiveLayerCount=(
+            AdaptiveBudget.LayerCount
+            if Policy.AdaptiveRouting.Enabled
+            else MinimumLayerCount
+        ),
+        AdaptiveLayerFloor=AdaptiveLayerFloor or 0,
+        NegotiatedLayerFloor=NegotiatedLayerFloor,
+        ExistingRouteLayerCount=max(RouteLayers.values(), default=0) + 1,
+        PlacementWasRelocated=PlacementWasRelocated,
+        ForceMaximumAfterPlacementRelocation=(
+            Policy.Placement.ForceMaximumRoutingLayersAfterPlacementRelocation
         ),
     )
     RuntimeEscalationState = replace(
@@ -2006,11 +4542,13 @@ def RouteAuthoritativeResources(
             StarvationCount=PortalStarvationCount,
         )
 
-    # Compatibility mode preserves the classic behavior: every generated boundary
-    # portal is available to the assignment solver so we do not pre-eliminate
-    # legal combinations before exact capacity-one search.
+    # Negotiated candidate construction retains the bounded portal pool so
+    # candidate-level capacity matching can choose a compatible tuple along
+    # with each complete route tree.
     UnreservedPortalMode = (
-        (not Policy.AdaptiveRouting.Enabled) or SkipStrictPortalReservation
+        Policy.NegotiatedRouting.Enabled
+        or (not Policy.AdaptiveRouting.Enabled)
+        or SkipStrictPortalReservation
     )
     PreparedCacheMatches = bool(
         PreparedPortalCache is not None
@@ -2039,13 +4577,22 @@ def RouteAuthoritativeResources(
             }
             PortalReservations = ()
         else:
-            Portals, PortalReservations = ReserveBoundaryPortals(
-                Portals,
-                ReservationVariant=ReservationVariant,
-                MaximumExpansions=AdaptiveBudget.AssignmentExpansions,
-                RequireConflictFree=False,
-                StrictTerminalThreshold=4,
-            )
+            if Policy.NegotiatedRouting.Enabled:
+                Portals, PortalReservations = ReserveNegotiatedBoundaryEscapes(
+                    Portals,
+                    Profiles,
+                    Resources,
+                    ReservationVariant=ReservationVariant,
+                    MaximumExpansions=AdaptiveBudget.AssignmentExpansions,
+                )
+            else:
+                Portals, PortalReservations = ReserveBoundaryPortals(
+                    Portals,
+                    ReservationVariant=ReservationVariant,
+                    MaximumExpansions=AdaptiveBudget.AssignmentExpansions,
+                    RequireConflictFree=False,
+                    StrictTerminalThreshold=4,
+                )
         EffectivePreparedPortalCache = PreparedPortalDomainCache(
             RawPortalCache=EffectiveRawPortalCache,
             UnreservedPortalMode=UnreservedPortalMode,
@@ -2054,6 +4601,58 @@ def RouteAuthoritativeResources(
             Reservations=PortalReservations,
         )
 
+    # Keep the unreserved multi-layer domain for detailed routing, but seed a
+    # capacity-one portal tuple into it for simultaneous-demand designs.  The
+    # previous all-or-nothing reservation mode replaced every domain with one
+    # layer and could leave a legal portal tuple without a legal sparse tree.
+    # A seed gives exact candidate assignment one globally compatible escape
+    # per net while the remaining fixed requests retain routing alternatives.
+    ReservedPortalSeedBySignal: dict[
+        str,
+        tuple[int, PinAccessPortal, tuple[PinAccessPortal, ...]],
+    ] = {}
+    if UnreservedPortalMode and len(Profiles) > 8:
+        try:
+            ReservedSeedPortals, _ReservedSeedClaims = (
+                ReserveNegotiatedBoundaryEscapes(
+                    dict(RawPortals),
+                    Profiles,
+                    Resources,
+                    ReservationVariant=ReservationVariant,
+                    MaximumExpansions=AdaptiveBudget.AssignmentExpansions,
+                )
+            )
+        except RoutingStageError as Error:
+            WorkTelemetry["PortalSeedReservation"] = {
+                "Result": "unavailable",
+                "Reason": Error.Failure.Reason.value,
+            }
+        else:
+            for Signal, Profile in Profiles.items():
+                for Layer in range(LayerCount):
+                    SourceValues = ReservedSeedPortals.get(
+                        (Signal, Profile.Root, Layer),
+                        (),
+                    )
+                    TargetValues = tuple(
+                        ReservedSeedPortals.get((Signal, Target, Layer), ())
+                        for Target in Profile.Targets
+                    )
+                    if len(SourceValues) != 1 or any(
+                        len(Values) != 1 for Values in TargetValues
+                    ):
+                        continue
+                    ReservedPortalSeedBySignal[Signal] = (
+                        Layer,
+                        SourceValues[0],
+                        tuple(Values[0] for Values in TargetValues),
+                    )
+                    break
+            WorkTelemetry["PortalSeedReservation"] = {
+                "Result": "seeded",
+                "SignalCount": len(ReservedPortalSeedBySignal),
+            }
+
     StageTimings["PortalGeneration"] = monotonic() - PortalStarted
     CheckRuntimeBudget("Portal")
     if ProgressCallback is not None:
@@ -2061,7 +4660,11 @@ def RouteAuthoritativeResources(
     CandidateStarted = monotonic()
     CandidateRequestCount = 0
     NegotiatedPlan: NegotiatedRoutePlan | None = None
-    if Policy.NegotiatedRouting.Enabled:
+    UseNegotiatedRouting = (
+        Policy.NegotiatedRouting.Enabled
+        and bool(Profiles)
+    )
+    if UseNegotiatedRouting:
         RetainedCandidateCache = None
         RetainedCandidateMetadata = None
         PriorCandidateCache = None
@@ -2163,6 +4766,14 @@ def RouteAuthoritativeResources(
             Value,
         ),
     )
+    # Candidate windows are shared capacity work.  Spread their initial portal
+    # products deterministically so nearby signals do not begin from the same
+    # shape.  The phase remains independent of placement coordinates: small
+    # designs need the established ordering to retain their legal portal mix.
+    CandidatePortalPhaseBySignal = {
+        Signal: Index
+        for Index, Signal in enumerate(CandidateSignalOrder)
+    }
     ProtectedNodesBySignal = {
         Signal: frozenset(
             {
@@ -2194,6 +4805,67 @@ def RouteAuthoritativeResources(
         )
         for Signal in Profiles
     }
+
+    def BuildSelfLegalPortalTuples(
+        Profile: Any,
+        SourcePortals: tuple[PinAccessPortal, ...],
+        TargetPortalSets: list[tuple[PinAccessPortal, ...]],
+    ) -> tuple[tuple[PinAccessPortal, ...], ...]:
+        """Enumerate a bounded, exact-claim-legal net-wide portal product."""
+        Domains = (SourcePortals, *TargetPortalSets)
+        AccessPaths = (
+            Profile.SourceAccessPath,
+            *(Profile.TargetAccessPaths[Target] for Target in Profile.Targets),
+        )
+        Beam: list[tuple[int, tuple[PinAccessPortal, ...]]] = [(0, ())]
+        for AccessPath, Domain in zip(AccessPaths, Domains):
+            Next: dict[
+                tuple[str, ...], tuple[int, tuple[PinAccessPortal, ...]]
+            ] = {}
+            for PreviousCost, PreviousPortals in Beam:
+                for Portal in Domain:
+                    CandidatePortals = (*PreviousPortals, Portal)
+                    Nodes = {
+                        Position
+                        for CandidateAccessPath, CandidatePortal in zip(
+                            AccessPaths, CandidatePortals
+                        )
+                        for Position in (
+                            *CandidateAccessPath,
+                            *CandidatePortal.Path,
+                        )
+                    }
+                    if FindSelfClaimConflicts({
+                        Profile.Signal: (
+                            Resources.ResourceGraph.BuildRouteClaims(Nodes)
+                        )
+                    }):
+                        continue
+                    PortalIds = tuple(
+                        Value.PortalId for Value in CandidatePortals
+                    )
+                    Candidate = (
+                        PreviousCost + Portal.Cost,
+                        CandidatePortals,
+                    )
+                    Existing = Next.get(PortalIds)
+                    if Existing is None or Candidate[0] < Existing[0]:
+                        Next[PortalIds] = Candidate
+            Beam = sorted(
+                Next.values(),
+                key=lambda Value: (
+                    Value[0],
+                    tuple(Portal.PortalId for Portal in Value[1]),
+                ),
+            )[:16]
+            if not Beam:
+                break
+        return tuple(
+            PortalsValue
+            for _Cost, PortalsValue in Beam
+            if len(PortalsValue) == len(Domains)
+        )
+
     RouteRequestsBySignal = {}
     RouteMetadataBySignal = {}
     DeferredRouteRequestCountsBySignal: Counter[str] = Counter()
@@ -2209,6 +4881,12 @@ def RouteAuthoritativeResources(
                 (RetainedCandidateMetadata or {}).get(Signal, {})
             )
     for Signal in CandidateSignalOrder:
+        if (
+            Signal in RegenerateSignals
+            and CandidatesBySignal.get(Signal)
+        ):
+            CandidatesBySignal.pop(Signal, None)
+            CandidateAxisLaneBySignal.pop(Signal, None)
         if CandidatesBySignal.get(Signal):
             RouteRequestsBySignal[Signal] = []
             RouteMetadataBySignal[Signal] = []
@@ -2224,6 +4902,9 @@ def RouteAuthoritativeResources(
             LayerCount,
             CandidateDiversityLevel,
         )
+        SignalPortalPhase = CandidatePortalPhaseBySignal[Signal]
+        PortalSeed = ReservedPortalSeedBySignal.get(Signal)
+        PortalSeedPending = PortalSeed is not None
         UnreservedPerLayerRequestLimit = max(
             1,
             ceil(InitialRequestLimit / LayerCount),
@@ -2240,20 +4921,23 @@ def RouteAuthoritativeResources(
             TargetPortalSets = [Portals[(Signal, Target, Layer)] for Target in Profile.Targets]
             if not SourcePortals or any(not Values for Values in TargetPortalSets):
                 continue
+            LegalPortalTuples = BuildSelfLegalPortalTuples(
+                Profile,
+                SourcePortals,
+                TargetPortalSets,
+            )
+            if not LegalPortalTuples:
+                continue
             RoutingY = Technology.RoutingY(MinimumY, Layer)
             PhysicalPortalVariantCount = min(
                 RoutePortalVariantCounts[Signal],
-                max(
-                    len(SourcePortals),
-                    *(len(Values) for Values in TargetPortalSets),
-                ),
+                len(LegalPortalTuples),
             )
             for Variant in range(PhysicalPortalVariantCount):
-                SourcePortal = SourcePortals[Variant % len(SourcePortals)]
-                BaseTargetPortals = tuple(
-                    Values[(Variant + Index) % len(Values)]
-                    for Index, Values in enumerate(TargetPortalSets)
+                SourcePortal, *BaseTargetPortalValues = (
+                    LegalPortalTuples[Variant]
                 )
+                BaseTargetPortals = tuple(BaseTargetPortalValues)
                 Terminals = tuple(
                     (Portal.Path[-1][0], Portal.Path[-1][2])
                     for Portal in (SourcePortal, *BaseTargetPortals)
@@ -2329,7 +5013,7 @@ def RouteAuthoritativeResources(
                                 Layer,
                                 PhysicalPortalVariantCount,
                                 len(LaneValues),
-                                RequestWindowOffset,
+                                RequestWindowOffset + SignalPortalPhase,
                             )
                             if UnreservedPortalMode
                             else Variant
@@ -2341,14 +5025,22 @@ def RouteAuthoritativeResources(
                         ):
                             DeferredRouteRequestCountsBySignal[Signal] += 1
                             continue
-                        PortalPhase = 1 + AxisIndex * 3 + LaneIndex
-                        TargetPortals = tuple(
-                            Values[
-                                (Variant + PortalPhase * (Index + 1))
-                                % len(Values)
+                        if (
+                            PortalSeedPending
+                            and PortalSeed is not None
+                            and Layer == PortalSeed[0]
+                        ):
+                            _SeedLayer, SourcePortal, TargetPortals = PortalSeed
+                            PortalSeedPending = False
+                        else:
+                            PortalPhase = 1 + AxisIndex * 3 + LaneIndex
+                            (
+                                SourcePortal,
+                                *TargetPortalValues,
+                            ) = LegalPortalTuples[
+                                (Variant + PortalPhase) % len(LegalPortalTuples)
                             ]
-                            for Index, Values in enumerate(TargetPortalSets)
-                        )
+                            TargetPortals = tuple(TargetPortalValues)
                         PortalNodes = {
                             Position
                             for Portal in (SourcePortal, *TargetPortals)
@@ -2409,6 +5101,16 @@ def RouteAuthoritativeResources(
                                 for Position in Portal.Path
                             }
                         )
+                        if FindSelfClaimConflicts({
+                            Signal: Resources.ResourceGraph.BuildRouteClaims(
+                                RequiredNodeSet
+                            )
+                        }):
+                            # Portal/access ownership is part of the route
+                            # request, not a post-search suggestion. Invalid
+                            # tuples must not consume the bounded detailed
+                            # search window ahead of legal combinations.
+                            continue
                         RequiredNodes = sorted(RequiredNodeSet)
                         SeedStarts = (
                             tuple(
@@ -2432,7 +5134,13 @@ def RouteAuthoritativeResources(
                                         )
                                     )
                                 ),
-                                _BuildTargetPortalBranches(TargetPortals),
+                                _BuildTargetPortalBranches(
+                                    TargetPortals,
+                                    tuple(
+                                        Profile.TargetAccessPaths[Target]
+                                        for Target in Profile.Targets
+                                    ),
+                                ),
                                 sorted(CandidateColumns),
                                 RequiredNodes,
                                 sorted(
@@ -2465,8 +5173,8 @@ def RouteAuthoritativeResources(
         OrderedRequests = sorted(
             zip(RoutePriorities, RouteRequests, RouteMetadata),
             key=lambda Value: (
-                Value[0][0],  # new portal starts before repeated shapes
-                Value[0][1],  # then layer diversity
+                Value[0][1],  # establish physical layer diversity first
+                Value[0][0],  # then new portal starts
                 Value[0][2],  # then lane diversity
                 Value[0][3],  # then axis preference
                 Value[0][4],
@@ -2501,21 +5209,52 @@ def RouteAuthoritativeResources(
         RouteMetadata = [Value[2] for Value in UniqueOrderedRequests]
         RouteRequestsBySignal[Signal] = RouteRequests
         RouteMetadataBySignal[Signal] = RouteMetadata
+        if bool(os.environ.get("RCS_DEBUG_NEGOTIATED_REQUESTS")):
+            print(
+                "[debug] authoritative: negotiated-route-requests",
+                f"signal={Signal}",
+                f"requests={len(RouteRequests)}",
+                f"metadata={len(RouteMetadata)}",
+            )
 
-    if Policy.NegotiatedRouting.Enabled:
+    if UseNegotiatedRouting:
         NegotiatedPlan = PlanNegotiatedRouteTrees(
             Context,
             Profiles,
             RouteRequestsBySignal,
             RouteMetadataBySignal,
             Region,
+            ReservedAccess,
             Resources,
             Technology,
             Policy,
             Deadline,
             AdaptiveExpiresAt,
             CheckRuntimeBudget,
+            RegenerateSignals=RegenerateSignals,
+            SeedCandidatesBySignal=CandidatesBySignal,
         )
+        MissingNegotiatedSignals = tuple(sorted(
+            set(Profiles) - set(NegotiatedPlan.SelectedCandidates)
+        ))
+        if MissingNegotiatedSignals:
+            raise RoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.TrackAssignmentConflict,
+                Stage="NegotiatedDetailedRouting",
+                AffectedNets=MissingNegotiatedSignals,
+                Detail=(
+                    "negotiated detailed routing produced no legal route tree; "
+                    "legacy candidate materialization is not a fallback"
+                ),
+                RepairActions=("RelocateAffectedClusters",),
+                Diagnostics={
+                    "MissingSignals": list(MissingNegotiatedSignals),
+                    "OverflowProgression": list(
+                        NegotiatedPlan.OverflowProgression
+                    ),
+                    **NegotiatedPlan.Diagnostics,
+                },
+            ))
         CandidatesBySignal = defaultdict(
             list,
             {
@@ -2530,6 +5269,7 @@ def RouteAuthoritativeResources(
             "ReroutedSignals": list(NegotiatedPlan.ReroutedSignals),
             "CachedNodeCount": NegotiatedPlan.CachedNodeCount,
             "CachedEdgeCount": NegotiatedPlan.CachedEdgeCount,
+            **NegotiatedPlan.Diagnostics,
         }
 
     WorkTelemetry["CandidateRequestConstructionSeconds"] = round(
@@ -2596,6 +5336,19 @@ def RouteAuthoritativeResources(
             -InitialRoutedTreeCount(Signal),
             CandidateSignalRank[Signal],
         ),
+    )
+    MaximumCandidates = (
+        min(
+            Policy.TrackAssignment.MaximumRouteCandidatesPerNet,
+            AdaptiveBudget.CandidatesPerNet
+            * Policy.AdaptiveRouting.CandidateGrowthFactor ** max(
+                0,
+                (AdaptiveLayerFloor or AdaptiveBudget.LayerCount)
+                - AdaptiveBudget.LayerCount,
+            ),
+        )
+        if Policy.AdaptiveRouting.Enabled
+        else Policy.TrackAssignment.MaximumRouteCandidatesPerNet
     )
     for Signal in CandidateMaterializationOrder:
         if CandidatesBySignal.get(Signal):
@@ -3368,8 +6121,55 @@ def RouteAuthoritativeResources(
         )
 
     AssignmentStarted = monotonic()
-    Result = PlanAssignment()
-    RaiseForNativeAssignmentDeadline(Result)
+    LayerCappedAssignmentAttempts: list[dict[str, int | bool]] = []
+    Result = None
+    if Policy.TrackAssignment.MinimizeMaximumRoutingLayer:
+        MinimumFeasibleLayer = max(
+            min(Candidate.Layer for Candidate in Values)
+            for Values in CandidatesBySignal.values()
+        )
+        MaximumCandidateLayer = max(
+            Candidate.Layer
+            for Values in CandidatesBySignal.values()
+            for Candidate in Values
+        )
+        for MaximumAssignedLayer in range(
+            MinimumFeasibleLayer,
+            MaximumCandidateLayer + 1,
+        ):
+            LayerCappedValues = EncodeCandidateValues({
+                Signal: [
+                    Candidate
+                    for Candidate in Values
+                    if Candidate.Layer <= MaximumAssignedLayer
+                ]
+                for Signal, Values in CandidatesBySignal.items()
+            })
+            # A lower ceiling which removes every candidate for one signal is
+            # not an assignment attempt; move directly to the next ceiling.
+            if not LayerCappedValues or any(
+                not any(Value[0] == Signal for Value in LayerCappedValues)
+                for Signal in CandidatesBySignal
+            ):
+                continue
+            Result = PlanAssignment(LayerCappedValues)
+            RaiseForNativeAssignmentDeadline(Result)
+            LayerCappedAssignmentAttempts.append({
+                "MaximumAssignedLayer": MaximumAssignedLayer,
+                "Success": bool(Result.Success),
+                "ExpansionCount": int(Result.ExpansionCount),
+            })
+            if Result.Success:
+                break
+            # An exhausted bounded search cannot establish that the current
+            # ceiling is infeasible.  Preserve the established unrestricted
+            # recovery path rather than rejecting a legal compact route.
+            if ShouldGrowAssignmentBudget(Result):
+                Result = None
+                break
+    if Result is None:
+        Result = PlanAssignment()
+        RaiseForNativeAssignmentDeadline(Result)
     if Policy.AdaptiveRouting.Enabled:
         while (
             not Result.Success
@@ -4052,12 +6852,16 @@ def RouteAuthoritativeResources(
             if (
                 EscalationDecision.Action == "AddRoutingLayer"
             ):
-                NextLayerCount = (
-                    EffectiveMaximumLayerCount
-                    if ConflictGraph["Classification"].startswith(
-                        "relocated-"
-                    )
-                    else LayerCount + 1
+                NextLayerCount = SelectEscalatedRoutingLayerCount(
+                    LayerCount=LayerCount,
+                    EffectiveMaximumLayerCount=EffectiveMaximumLayerCount,
+                    ConflictClassification=str(
+                        ConflictGraph["Classification"]
+                    ),
+                    ForceMaximumAfterPlacementRelocation=(
+                        Policy.Placement
+                        .ForceMaximumRoutingLayersAfterPlacementRelocation
+                    ),
                 )
                 RetainedCandidates, RetainedMetadata = (
                     RetainUnaffectedCandidateCache(
@@ -4184,7 +6988,7 @@ def RouteAuthoritativeResources(
             ),
             None,
         )
-    if CoarsePlan is not None:
+    if CoarsePlan is not None and NegotiatedPlan is None:
         if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
             print("[debug] authoritative: entering offline repair loop", flush=True)
         CongestionHistory: Counter[Position2] = Counter()
@@ -4684,12 +7488,17 @@ def RouteAuthoritativeResources(
                 )
             )
         Graph = PhysicalGraphs[Signal]
-        Reservations, Paths = _ReserveRepeaters(
+        FallbackReservations, Paths = _ReserveRepeaters(
             Signal,
             Producers[Signal].OutputPin,
             tuple(Targets[Signal]),
             Graph,
             Technology,
+        )
+        Reservations = (
+            Candidate.RepeaterReservations
+            if Candidate.RepeaterReservations
+            else FallbackReservations
         )
         for Resource in ResourceClaimsBySignal[Signal]:
             Owners[Resource].append(Signal)
@@ -4870,6 +7679,10 @@ def RouteAuthoritativeResources(
                 "LaneCount": RouteLaneCount,
                 "MaximumCandidatesPerNet": MaximumCandidates,
                 "CandidateLimitsBySignal": dict(sorted(CandidateLimitsBySignal.items())),
+                "CandidateLayersBySignal": {
+                    Signal: sorted({Candidate.Layer for Candidate in Values})
+                    for Signal, Values in sorted(CandidatesBySignal.items())
+                },
             },
             "RoutingEscalationState": RoutingEscalationState(
                 PortalMode=("unreserved" if UnreservedPortalMode else "reserved"),
@@ -4915,6 +7728,7 @@ def RouteAuthoritativeResources(
             ],
             "RustAssignmentExpansionLimit": AssignmentExpansionLimit,
             "RustAssignmentExpansions": InitialAssignmentExpansionCount,
+            "LayerCappedAssignmentAttempts": LayerCappedAssignmentAttempts,
             "LocalizedRepairPasses": len(RepairIterations),
             "LocalizedReroutedNetCount": len(ReroutedSignals),
             "LocalizedRepairOffenders": [

@@ -18,6 +18,75 @@ Position3 = tuple[int, int, int]
 RoutingEdge = tuple[Position3, Position3]
 
 
+@dataclass(frozen=True)
+class RoutingEnvelope:
+    """Exact axis-aligned bounds and material counts for routed geometry."""
+
+    MinimumX: int
+    MaximumX: int
+    MinimumY: int
+    MaximumY: int
+    MinimumZ: int
+    MaximumZ: int
+    Width: int
+    Height: int
+    Depth: int
+    RouteBlockCount: int
+    SupportBlockCount: int
+    RepeaterCount: int
+
+    def ToDictionary(self) -> dict[str, int]:
+        return {
+            "MinimumX": self.MinimumX,
+            "MaximumX": self.MaximumX,
+            "MinimumY": self.MinimumY,
+            "MaximumY": self.MaximumY,
+            "MinimumZ": self.MinimumZ,
+            "MaximumZ": self.MaximumZ,
+            "Width": self.Width,
+            "Height": self.Height,
+            "Depth": self.Depth,
+            "Footprint": self.Width * self.Depth,
+            "RouteBlockCount": self.RouteBlockCount,
+            "SupportBlockCount": self.SupportBlockCount,
+            "RepeaterCount": self.RepeaterCount,
+        }
+
+
+def BuildRoutingEnvelope(
+    RoutePositions: Iterable[Position3],
+    SupportPositions: Iterable[Position3] = (),
+    RepeaterPositions: Iterable[Position3] = (),
+) -> RoutingEnvelope:
+    """Measure emitted route geometry without performing any route search."""
+    Route = tuple(RoutePositions)
+    Supports = tuple(SupportPositions)
+    Repeaters = tuple(RepeaterPositions)
+    Positions = (*Route, *Supports, *Repeaters)
+    if not Positions:
+        return RoutingEnvelope(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    MinimumX = min(Position[0] for Position in Positions)
+    MaximumX = max(Position[0] for Position in Positions)
+    MinimumY = min(Position[1] for Position in Positions)
+    MaximumY = max(Position[1] for Position in Positions)
+    MinimumZ = min(Position[2] for Position in Positions)
+    MaximumZ = max(Position[2] for Position in Positions)
+    return RoutingEnvelope(
+        MinimumX=MinimumX,
+        MaximumX=MaximumX,
+        MinimumY=MinimumY,
+        MaximumY=MaximumY,
+        MinimumZ=MinimumZ,
+        MaximumZ=MaximumZ,
+        Width=MaximumX - MinimumX + 1,
+        Height=MaximumY - MinimumY + 1,
+        Depth=MaximumZ - MinimumZ + 1,
+        RouteBlockCount=len(Route),
+        SupportBlockCount=len(Supports),
+        RepeaterCount=len(Repeaters),
+    )
+
+
 class RoutingResourceKind(str, Enum):
     Wire = "Wire"
     Support = "Support"
@@ -107,9 +176,17 @@ class NetRouteCandidate:
     Length: int
     BendCount: int
     ViaCount: int
+    RepeaterReservations: tuple[RoutingReservation, ...] = ()
     IncrementalMaterialCost: int = 0
     IncrementalLength: int = 0
     SeedNodeCount: int = 0
+    TargetPaths: dict[Position3, tuple[Position3, ...]] = field(
+        default_factory=dict
+    )
+    BranchClaims: dict[Position3, RoutingResourceClaims] = field(
+        default_factory=dict
+    )
+    Envelope: RoutingEnvelope | None = None
 
 
 @dataclass(frozen=True)

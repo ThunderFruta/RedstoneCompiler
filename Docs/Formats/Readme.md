@@ -1,9 +1,8 @@
 # Formats docs
 
-Contains public JSON/Text artifact formats and their versioned schemas.
+Contains public JSON/text artifact formats and their validation contracts.
 
-Planned next documents:
-- NandJson.md
-- PhysicalDesignJson.md
-- TruthTable.md
-- Litematic.md
+- [NAND JSON](NandJson.md)
+- [Physical design JSON](PhysicalDesignJson.md)
+- [Truth table](TruthTable.md)
+- [Litematic](Litematic.md)

@@ -25,7 +25,12 @@ pub(crate) fn RoutingThreadPool() -> &'static ThreadPool {
             .ok()
             .and_then(|Value| Value.parse::<usize>().ok())
             .filter(|Value| *Value > 0)
-            .unwrap_or(Available);
+            // Detailed negotiated routing shares this pool with portal and
+            // legacy batch work.  A moderate default leaves CPU headroom for
+            // the Python coordinator and avoids oversubscribing the host;
+            // callers that need a different cap can still set
+            // RC_ROUTING_THREADS explicitly.
+            .unwrap_or(Available.min(16));
         ThreadPoolBuilder::new()
             .num_threads(Requested.clamp(1, Available))
             .thread_name(|Index| format!("redstone-router-{Index}"))

@@ -14,6 +14,7 @@ from .Repeaters import (
     EstimateRouteMaterialCost,
     MaterializeReservedRepeaters,
     PruneRedundantRepeaterReservations,
+    PruneUnneededMaterializedRepeaters,
     PropagateRoutePower,
     RepeaterFacing,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "BuildPlacedCellGeometry",
     "MaterializeReservedRepeaters",
     "PruneRedundantRepeaterReservations",
+    "PruneUnneededMaterializedRepeaters",
     "PropagateRoutePower",
     "BuildRoutingResources",
     "EstimateRouteMaterialCost",

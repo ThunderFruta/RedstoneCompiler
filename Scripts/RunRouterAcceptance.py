@@ -114,6 +114,101 @@ RouteMetricFields = (
     "MaximumNetLengthShare",
 )
 
+PerfBlockSchemaVersion = "router-performance-v1"
+AcceptedPolicyVersion = "physical-design-v12-demand-aware-corridors"
+
+
+def _NormalizeNumericMetrics(Value: object) -> dict[str, object]:
+    if not isinstance(Value, dict):
+        return {}
+    return {
+        str(Name): Item
+        for Name, Item in sorted(Value.items(), key=lambda Pair: str(Pair[0]))
+        if isinstance(Item, (int, float)) and not isinstance(Item, bool)
+    }
+
+
+def _NormalizeDiagnosticsSample(Value: object) -> dict[str, object]:
+    if not isinstance(Value, dict):
+        return {}
+    return {
+        str(Name): {
+            str(Key): Number
+            for Key, Number in sorted(
+                Values.items(), key=lambda Pair: str(Pair[0])
+            )
+            if isinstance(Number, (int, float)) and not isinstance(Number, bool)
+        }
+        for Name, Values in sorted(Value.items(), key=lambda Pair: str(Pair[0]))
+        if isinstance(Values, dict)
+    }
+
+
+def BuildPerfTelemetry(RouterReliability: dict[str, object] | None) -> dict[str, object]:
+    """Build a deterministic perf block for acceptance evidence persistence."""
+    if not isinstance(RouterReliability, dict):
+        return {"SchemaVersion": PerfBlockSchemaVersion}
+
+    StageTimingsSeconds = RouterReliability.get("StageTimingsSeconds", {})
+    if not isinstance(StageTimingsSeconds, dict):
+        StageTimingsSeconds = {}
+
+    NativeWork = RouterReliability.get("NativeWork", {})
+    if not isinstance(NativeWork, dict):
+        NativeWork = {}
+
+    NativeBatching = NativeWork.get("Batching", {})
+    if not isinstance(NativeBatching, dict):
+        NativeBatching = {}
+    RequestCounts = NativeWork.get("RequestCounts", {})
+    if not isinstance(RequestCounts, dict):
+        RequestCounts = {}
+    CompletedWork = NativeWork.get("CompletedWork", {})
+    if not isinstance(CompletedWork, dict):
+        CompletedWork = {}
+
+    CandidateDiagnostics = NativeBatching.get("CandidateDiagnostics", {})
+    if not isinstance(CandidateDiagnostics, dict):
+        CandidateDiagnostics = {}
+
+    Deadline = RouterReliability.get("Deadline", {})
+    if not isinstance(Deadline, dict):
+        Deadline = {}
+
+    CandidateDiagnosticsSummary = {
+        "SignalCount": len(CandidateDiagnostics),
+        "SignalsWithDeferredRequests": sum(
+            1
+            for Values in CandidateDiagnostics.values()
+            if isinstance(Values, dict) and Values.get("DeferredRequests", 0) > 0
+        ),
+    }
+
+    return {
+        "SchemaVersion": PerfBlockSchemaVersion,
+        "StageTimingsSeconds": _NormalizeNumericMetrics(StageTimingsSeconds),
+        "NativeWork": {
+            "Batching": {
+                **_NormalizeNumericMetrics(NativeBatching),
+                "CandidateDiagnostics": _NormalizeDiagnosticsSample(
+                    CandidateDiagnostics
+                ),
+            },
+            "RequestCounts": _NormalizeNumericMetrics(RequestCounts),
+            "CompletedWork": _NormalizeNumericMetrics(CompletedWork),
+            "Assignment": _NormalizeNumericMetrics(
+                NativeWork.get("Assignment", {})
+                if isinstance(NativeWork.get("Assignment"), dict)
+                else {}
+            ),
+            "CandidateDiagnosticsSummary": CandidateDiagnosticsSummary,
+        },
+        "Deadline": {
+            str(Name): Value
+            for Name, Value in sorted(Deadline.items(), key=lambda Pair: str(Pair[0]))
+        },
+    }
+
 
 @dataclass(frozen=True)
 class AcceptanceConfiguration:
@@ -438,6 +533,7 @@ def EvaluateRun(
             Failures.append(f"invalid PhysicalDesign JSON: {Error}")
 
     Evidence: dict[str, object] | None = None
+    RouterReliability: dict[str, object] = {}
     Observed: dict[str, object] = {}
     if PhysicalDocument is not None:
         Strategy = ReadNested(PhysicalDocument, "Strategy")
@@ -464,9 +560,9 @@ def EvaluateRun(
             "Policy",
             "PolicyVersion",
         )
-        if PolicyVersion != "physical-design-v10-routability-feedback":
+        if PolicyVersion != AcceptedPolicyVersion:
             Failures.append(
-                "policy version is not physical-design-v10-routability-feedback"
+                f"policy version is not {AcceptedPolicyVersion}"
             )
         if PolicySeed != ExpectedSeed:
             Failures.append(
@@ -585,6 +681,10 @@ def EvaluateRun(
                 "EmittedDesignSha256": DesignDigest,
             }
 
+    Perf = BuildPerfTelemetry(
+        RouterReliability if isinstance(RouterReliability, dict) else None
+    )
+
     ArtifactRecords = {
         Name: BuildFileRecord(PathValue)
         for Name, PathValue in Artifacts.items()
@@ -609,6 +709,7 @@ def EvaluateRun(
             "DeadlineOverrunWithinLimit": DeadlineOverrunWithinLimit,
         },
         "Observed": Observed,
+        "Perf": Perf,
         "Artifacts": ArtifactRecords,
     }
     return Result, Evidence
@@ -823,6 +924,8 @@ def RunAcceptance(
             *PlannedRuns[len(CompletedRuns):],
         ]
         WriteManifest(Configuration.ManifestPath, Manifest)
+        if not Completed["Accepted"]:
+            break
 
     Manifest["Runs"] = CompletedRuns
     Manifest["Accepted"] = (

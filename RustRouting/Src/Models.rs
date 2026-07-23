@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 pub(crate) type Position = (i32, i32, i32);
 pub(crate) type Edge = (Position, Position);
 pub(crate) type Direction = (i32, i32, i32);
-pub(crate) type SearchState = (Position, Direction);
+pub(crate) type SearchState = (Position, Direction, u8);
 pub(crate) type Position2 = (i32, i32);
 pub(crate) type RectilinearEdge = (Position2, Position2);
 
@@ -284,6 +284,63 @@ pub(crate) struct PortalCandidateBatchResult {
 pub(crate) struct RouteTreeBatchResult {
     #[pyo3(get)]
     pub(crate) RouteTrees: Vec<Option<Vec<Position>>>,
+    #[pyo3(get)]
+    pub(crate) DeadlineExceeded: bool,
+    #[pyo3(get)]
+    pub(crate) CompletedWork: usize,
+    #[pyo3(get)]
+    pub(crate) TotalWork: usize,
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub(crate) struct RouteTreeSearchResult {
+    #[pyo3(get)]
+    pub(crate) Status: String,
+    #[pyo3(get)]
+    pub(crate) NoPathReason: String,
+    #[pyo3(get)]
+    pub(crate) Nodes: Vec<Position>,
+    #[pyo3(get)]
+    pub(crate) TargetPaths: Vec<(Position, Vec<Position>)>,
+    #[pyo3(get)]
+    pub(crate) BoundaryFrontierNodes: Vec<Position>,
+    #[pyo3(get)]
+    pub(crate) RepeaterReservations: Vec<(Position, String)>,
+    #[pyo3(get)]
+    pub(crate) ExpansionCount: usize,
+    #[pyo3(get)]
+    pub(crate) RepeaterRejectedCount: usize,
+    #[pyo3(get)]
+    pub(crate) RepeaterConstraintFailureCount: usize,
+    #[pyo3(get)]
+    pub(crate) IsRouted: bool,
+    #[pyo3(get)]
+    pub(crate) IsBudgetExpired: bool,
+}
+
+/// One repeater-aware detailed route-tree request.  The batch entry point owns
+/// the runtime limit so every request in a negotiated pass observes the same
+/// absolute deadline.
+pub(crate) type DetailedRouteTreeRequest = (
+    Vec<Position>,
+    Vec<Vec<Position>>,
+    Vec<Position>,
+    Vec<Position>,
+    Vec<(i32, i32)>,
+    Vec<(Position, i32)>,
+    i32,
+    i32,
+    i32,
+    i32,
+    bool,
+    usize,
+);
+
+#[pyclass]
+pub(crate) struct RouteTreeDetailedBatchResult {
+    #[pyo3(get)]
+    pub(crate) SearchResults: Vec<RouteTreeSearchResult>,
     #[pyo3(get)]
     pub(crate) DeadlineExceeded: bool,
     #[pyo3(get)]

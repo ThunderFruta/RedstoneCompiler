@@ -53,23 +53,24 @@ redstone-compiler \
 Default and guided compiles group every generated artifact under
 `Output/<OutputName>/`.
 
-The CLI exposes only `new-router-first`. The 2026-07-21
-`physical-design-v9-openroad-style-relaxed` baseline is not accepted; the
-current recovery target is `physical-design-v10-routability-feedback`. The
-frozen compatibility implementation is an explicit internal regression oracle,
-not a production fallback, and cannot satisfy new-router acceptance. See the
-[router reliability guide](Docs/Routing/RouterReliabilityGuide.md) for the live
-verdict and reproducible commands.
+The CLI exposes only `new-router-first`. The frozen compatibility
+implementation is an explicit internal regression oracle, not a production
+fallback, and cannot satisfy new-router acceptance. The active redesign is the
+[negotiated route-tree router](Docs/Routing/Active/NegotiatedRouteTreeRouter.md), whose
+algorithmic sources are recorded in
+[router research and inspiration](Docs/Routing/Active/RouterResearchAndInspiration.md).
+See the [router reliability guide](Docs/Routing/Active/RouterReliabilityGuide.md) for
+the live verdict and reproducible commands.
 
-The current v10 checkpoint is still **NOT ACCEPTED**. The durable RRF-073
-physical matrix verifies FullAdder 5/5 with identical placement fingerprint
-`a8dc7c20513bcfc3`, ownership, route metrics, and emitted design. RCA4 and CLA4
-self-exit with typed failures inside their immutable wall ceilings but remain
-unrouted 0/2, so bounded completion does not satisfy either scale gate. The
-current evidence source is
-`Output/Acceptance/2026-07-21/RouterV10Recovery/AcceptanceManifest.json`.
-The final lightweight checkpoint passes the explicit scale-excluded Python
-suite 159/159 and the exact eight-file Rust release gate 25/25.
+The current 2026-07-22 checkpoint is still **NOT ACCEPTED**. Negotiated routing
+is implemented without circuit-name or gate-name special cases, but the latest
+RCA4 run stalls at ten electrical conflicts after overflow progression
+`[124, 10, 10, 10, 10]`; its lazy graph contains 9,792 nodes and 47,552 edges.
+Two earlier working-tree RCA4 artifacts reached zero overflow and 512/512 rows
+with 26,978 cached nodes and 141,282 edges. That comparison identifies sparse
+region growth and retained-branch repair as the present regression, not a need
+for a circuit-specific exception. CLA4 remains behind the RCA4 gate. The
+2026-07-21 RRF-073 matrix remains the last complete durable acceptance record.
 
 Each compile also writes a Graphviz `.dot` file beside the NAND JSON diagram
 and a `.PhysicalDesign.json` file beside the litematic. The latter records the
@@ -88,9 +89,9 @@ advance once to bounded unreserved portals on that same deadline; this remains
 the production new router, not compatibility routing. Frozen routes remain
 routing obstacles but are not treated as standard-cell template geometry. The
 normative behavior is in the
-[router reliability design](Docs/Routing/RouterReliabilityDesignDoc.md); its
+[router reliability design](Docs/Routing/Active/RouterReliabilityDesignDoc.md); its
 implementation status is recorded in the
-[append-only notes](Docs/Routing/RouterReliabilityImplementationNotes.md).
+[append-only notes](Docs/Routing/Active/RouterReliabilityImplementationNotes.md).
 
 Completed compiles expose `CompileResult.RoutingMetrics` and print route length,
 bends, vias, rerouted-net count, cumulative conflicts, and corridor overflow.
@@ -103,12 +104,11 @@ and the active named policy. Dense designs can take several minutes because
 each accepted route must satisfy physical connectivity, electrical isolation,
 signal-length/repeater, and truth-table checks.
 
-The current router is not accepted. The v9 FullAdder, RCA4, and CLA4 baseline
-has bounded-runtime failures. The v10 RRF-073 matrix verifies the FullAdder
-sub-gate and the 10/25/120-second process envelope, but RCA4 and CLA4 still
-produce no qualifying routed artifacts. A historical v8 FullAdder result
-remains a regression oracle but is not proof of complete v10 correctness. The
-slower RCA4 and CLA4 physical tests remain opt-in:
+The current router is not accepted. Focused FullAdder coverage passes, but the
+latest RCA4 negotiated-routing diagnostic has unresolved capacity-one
+conflicts. CLA4 must not run as an acceptance attempt until RCA4 is restored.
+Historical FullAdder and RCA4 results are regression evidence only, not proof
+of the current tree. The slower RCA4 and CLA4 physical tests remain opt-in:
 
 ```bash
 RC_RUN_SCALE_TESTS=1 python3 -m unittest Tests.test_scale_routing -v

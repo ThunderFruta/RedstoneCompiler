@@ -1,23 +1,43 @@
 # Routing docs
 
-Contains routing architecture, failure catalog, and operational diagnostics.
+Contains routing architecture, failure diagnostics, active operations, and historical design records.
 
-Current verdict: **NOT ACCEPTED**. The final RRF-073 nine-run
-`new-router-first` manifest verifies FullAdder 5/5 and keeps every process
-inside its immutable wall ceiling, but RCA4 and CLA4 both remain physically
-unrouted 0/2. The current durable source is
-`Output/Acceptance/2026-07-21/RouterV10Recovery/AcceptanceManifest.json`.
+Current verdict (2026-07-22): **NOT ACCEPTED**. The negotiated route-tree
+implementation is active, but the current RCA4 checkpoint ends with ten
+capacity-one electrical conflicts after overflow progression
+`[124, 10, 10, 10, 10]`. CLA4 is intentionally held until RCA4 returns to its
+2/2 gate. The RRF-073 nine-run manifest remains the last complete durable
+acceptance matrix, not a statement that the current working tree passes RCA4.
 
-## Canonical current documents
+## Active routing docs
 
-- [Router reliability guide](RouterReliabilityGuide.md) -- current acceptance
-  verdict, operator commands, evidence requirements, and troubleshooting.
-- [Router reliability design](RouterReliabilityDesignDoc.md) -- normative v10
-  architecture, invariants, interfaces, and acceptance contract.
-- [Router reliability implementation notes](RouterReliabilityImplementationNotes.md)
+- [Negotiated route-tree router](Active/NegotiatedRouteTreeRouter.md) -- current
+  architecture, implemented interfaces, known gaps, and acceptance sequence.
+- [Current routing failures](Active/CurrentRoutingFailures.md) -- current RCA4
+  evidence, proven observations, hypotheses, and required fix evidence.
+- [Router reliability guide](Active/RouterReliabilityGuide.md) -- current
+  acceptance verdict, operator commands, evidence requirements, and troubleshooting.
+- [Router reliability design](Active/RouterReliabilityDesignDoc.md) -- normative
+  v10 architecture, invariants, interfaces, and acceptance contract.
+- [Router reliability implementation notes](Active/RouterReliabilityImplementationNotes.md)
   -- append-only implementation and verification journal.
+- [Router research and inspiration](Active/RouterResearchAndInspiration.md) -- the
+  concrete algorithms and source projects behind the redesign.
+- [Router execution prompt](Historical/RouterExecutionPrompt.md) -- expert review
+  and solution-planning prompt.
 
-## Tools and acceptance evidence
+## Routing reference
+
+- [Resource graph](Active/ResourceGraph.md) -- claims, capacities, lazy regions,
+  and cache reuse.
+- [Hierarchical regions](Active/HierarchicalRegions.md) -- coarse tiles, detailed
+  halos, expansion triggers, and failure cuts.
+- [Track assignment](Active/TrackAssignment.md) -- the capacity-one
+  detailed-routing contract and the isolated legacy exact-assignment path.
+- [Failure catalog](Active/FailureCatalog.md) -- typed failures, required evidence,
+  and placement feedback.
+
+## Acceptance evidence and tools
 
 - [`Scripts/RunRouterAcceptance.py`](../../Scripts/RunRouterAcceptance.py) --
   canonical sequential 5+2+2 physical matrix, immutable per-circuit wall
@@ -28,13 +48,7 @@ unrouted 0/2. The current durable source is
   -- focused dry-run, sequencing, rejection-shape, determinism,
   publication-reserve, and immutable-ceiling coverage.
 - [`RustRouting/Src/`](../../RustRouting/Src/) -- the native router's exact
-  eight-file responsibility split. The approved default-feature release gate
-  currently passes 25/25 tests.
-
-The final lightweight checkpoint passes compileall, 95/95 focused routing
-tests, the 2/2 explicit terminal/transactional proof, the 14-module
-scale-excluded Python gate at 159/159 in 37.312s, Rust formatting, the 25/25
-Rust release gate, and the diff check.
+  eight-file responsibility split.
 
 Inspecting the matrix is safe and does not launch a physical compile:
 
@@ -44,29 +58,20 @@ python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
 ```
 
 The physical form of that command, without `--dry-run`, must be run only after
-the lightweight gates pass. The completed RRF-073 command uses 8/23/118-second
-router deadlines inside unchanged 10/25/120-second wall ceilings; the watchdog
-is ceiling plus two seconds for capture only. A terminal observation without
-the manifest, per-run logs, and hashed artifacts is diagnostic evidence, not
-acceptance.
+the lightweight gates pass.
 
 ## Historical design record
 
 The documents below preserve prior proposals, implementation checkpoints, and
-dated measurements. Where they conflict with the canonical reliability design,
+measured baselines. Where they conflict with the canonical reliability design,
 the canonical design controls; historical measurements remain evidence for the
 policy version that produced them.
 
-- [Router rewrite implementation plan](RouterRewriteDesignDoc.md)
-- [Open-source-informed staged router design](OpenSourceRouterPortingDesignDoc.md)
-- [Organized NAND routing design](OrganizedNandRoutingDesignDoc.md)
-- [Organized NAND routing goals](OrganizedNandRoutingGoals.md)
-- [Measured compatibility comparison](RouterRewriteComparisonDoc.md)
-- [Router service-level objectives](RouterSLO.md)
-- [RCA/CLA conflict-remediation proposal](RcaClaRoutingConflictRemediationDesign.md)
-
-Planned next documents:
-- ResourceGraph.md
-- HierarchicalRegions.md
-- TrackAssignment.md
-- FailureCatalog.md
+- [Router rewrite implementation plan](Historical/RouterRewriteDesignDoc.md)
+- [Open-source-informed staged router design](Historical/OpenSourceRouterPortingDesignDoc.md)
+- [Open-source root analysis](Historical/OpenSourceRouterRootAnalysis.md)
+- [Organized NAND routing design](Historical/OrganizedNandRoutingDesignDoc.md)
+- [Organized NAND routing goals](Historical/OrganizedNandRoutingGoals.md)
+- [Measured compatibility comparison](Historical/RouterRewriteComparisonDoc.md)
+- [Router service-level objectives](Historical/RouterSLO.md)
+- [RCA/CLA conflict-remediation proposal](Historical/RcaClaRoutingConflictRemediationDesign.md)

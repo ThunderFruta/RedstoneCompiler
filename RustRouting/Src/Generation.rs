@@ -1,14 +1,107 @@
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::Models::{
-    PortalCandidate, PortalCandidateBatchResult, Position, RouteTreeBatchResult, RoutingContext,
+    DetailedRouteTreeRequest, PortalCandidate, PortalCandidateBatchResult, Position,
+    RouteTreeBatchResult, RouteTreeDetailedBatchResult, RouteTreeSearchResult, RoutingContext,
+    SearchState,
 };
 use crate::PathRouting::{
-    BuildPortalCandidate, FindPathWithDeadline, ManhattanDistance, NormalizeEdge, BLOCKED_EDGE_COST,
+    BuildPortalCandidate, FindPathFromStatesDetailedWithDeadline, FindPathWithDeadline,
+    ManhattanDistance, NormalizeEdge, BLOCKED_EDGE_COST, MAXIMUM_UNREFRESHED_DUST_LENGTH,
 };
 use crate::RoutingThreadPool;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+
+fn DetailedRouteTreeBudgetExpiredResult() -> RouteTreeSearchResult {
+    RouteTreeSearchResult {
+        Status: "BudgetExpired".to_string(),
+        NoPathReason: "BudgetExpired".to_string(),
+        Nodes: Vec::new(),
+        TargetPaths: Vec::new(),
+        BoundaryFrontierNodes: Vec::new(),
+        RepeaterReservations: Vec::new(),
+        ExpansionCount: 0,
+        RepeaterRejectedCount: 0,
+        RepeaterConstraintFailureCount: 0,
+        IsRouted: false,
+        IsBudgetExpired: true,
+    }
+}
+
+fn BuildRootedTreeBlockages(
+    Context: &RoutingContext,
+    AllowedNodes: &HashSet<Position>,
+    BaseBlockedNodes: &HashSet<Position>,
+    Tree: &HashSet<Position>,
+    ReservedNodes: &HashSet<Position>,
+    Deadline: &RuntimeDeadline,
+) -> Option<(HashSet<Position>, HashMap<(Position, Position), i32>)> {
+    let OccupiedNodes: HashSet<_> = Tree.union(ReservedNodes).copied().collect();
+    let Supports: HashSet<_> = OccupiedNodes
+        .iter()
+        .map(|Value| (Value.0, Value.1 - 1, Value.2))
+        .collect();
+    let mut RequiredAir = HashSet::new();
+    for (Index, First) in OccupiedNodes.iter().enumerate() {
+        if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+            return None;
+        }
+        for Second in Context.Adjacency.get(First).into_iter().flatten() {
+            if !OccupiedNodes.contains(Second) || Second <= First || First.1 == Second.1 {
+                continue;
+            }
+            let Lower = if First.1 < Second.1 { *First } else { *Second };
+            RequiredAir.insert((Lower.0, Lower.1 + 1, Lower.2));
+        }
+    }
+    let mut BlockedNodes = BaseBlockedNodes.clone();
+    let LocalBlockedNodes = Supports.iter().chain(RequiredAir.iter()).copied().chain(
+        OccupiedNodes
+            .iter()
+            .chain(RequiredAir.iter())
+            .map(|Value| (Value.0, Value.1 + 1, Value.2)),
+    );
+    for (Index, Node) in LocalBlockedNodes.enumerate() {
+        if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+            return None;
+        }
+        if AllowedNodes.contains(&Node) {
+            BlockedNodes.insert(Node);
+        }
+    }
+    let mut EdgeCosts = HashMap::new();
+    for (Index, Headroom) in OccupiedNodes.iter().chain(Supports.iter()).enumerate() {
+        if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+            return None;
+        }
+        let Lower = (Headroom.0, Headroom.1 - 1, Headroom.2);
+        if !AllowedNodes.contains(&Lower) {
+            continue;
+        }
+        for Second in Context.Adjacency.get(&Lower).into_iter().flatten() {
+            if !AllowedNodes.contains(Second) || Lower.1 == Second.1 {
+                continue;
+            }
+            let EdgeLower = if Lower.1 < Second.1 { Lower } else { *Second };
+            let EdgeHeadroom = (EdgeLower.0, EdgeLower.1 + 1, EdgeLower.2);
+            if EdgeHeadroom == *Headroom {
+                EdgeCosts.insert(NormalizeEdge(Lower, *Second), BLOCKED_EDGE_COST);
+            }
+        }
+    }
+    Some((BlockedNodes, EdgeCosts))
+}
+
+fn RepeaterFacing(Current: Position, Next: Position) -> Option<String> {
+    match (Next.0 - Current.0, Next.2 - Current.2) {
+        (1, 0) => Some("west".to_string()),
+        (-1, 0) => Some("east".to_string()),
+        (0, 1) => Some("north".to_string()),
+        (0, -1) => Some("south".to_string()),
+        _ => None,
+    }
+}
 
 impl RoutingContext {
     pub(crate) fn GeneratePortalCandidatesNative(
@@ -72,6 +165,7 @@ impl RoutingContext {
                 1,
                 0,
                 MaximumExpansionCount,
+                false,
                 &Deadline,
             ) else {
                 continue;
@@ -147,6 +241,7 @@ impl RoutingContext {
             GuidePenalty,
             BendPenalty,
             ViaPenalty,
+            false,
             MaximumExpansionCount,
             MaximumRuntimeSeconds,
         )
@@ -165,6 +260,7 @@ impl RoutingContext {
         GuidePenalty: i32,
         BendPenalty: i32,
         ViaPenalty: i32,
+        EnforceSignalStrength: bool,
         MaximumExpansionCount: usize,
         MaximumRuntimeSeconds: Option<f64>,
     ) -> Option<Vec<Position>> {
@@ -300,6 +396,7 @@ impl RoutingContext {
                     ViaPenalty,
                     0,
                     MaximumExpansionCount,
+                    EnforceSignalStrength,
                     &Deadline,
                 )?;
                 if PathToStart.is_empty() {
@@ -439,6 +536,7 @@ impl RoutingContext {
                     ViaPenalty,
                     0,
                     MaximumExpansionCount,
+                    EnforceSignalStrength,
                     &Deadline,
                 )?;
                 Tree.extend(Path);
@@ -470,6 +568,413 @@ impl RoutingContext {
         let mut Result: Vec<_> = Tree.into_iter().collect();
         Result.sort_unstable();
         Some(Result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn GenerateRouteTreeDetailedNative(
+        &self,
+        Starts: Vec<Position>,
+        TargetBranches: Vec<Vec<Position>>,
+        AllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        PreferredColumns: Vec<(i32, i32)>,
+        ExternalNodeCostValues: Vec<(Position, i32)>,
+        PreferredRoutingY: i32,
+        GuidePenalty: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        EnforceSignalStrength: bool,
+        MaximumExpansionCount: usize,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> RouteTreeSearchResult {
+        let Ok(Deadline) =
+            RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds.max(1)))
+        else {
+            return DetailedRouteTreeBudgetExpiredResult();
+        };
+        self.GenerateRouteTreeDetailedWithDeadlineNative(
+            Starts,
+            TargetBranches,
+            AllowedNodeValues,
+            BlockedNodeValues,
+            PreferredColumns,
+            ExternalNodeCostValues,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            EnforceSignalStrength,
+            MaximumExpansionCount,
+            &Deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn GenerateRouteTreeDetailedWithDeadlineNative(
+        &self,
+        Starts: Vec<Position>,
+        TargetBranches: Vec<Vec<Position>>,
+        AllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        PreferredColumns: Vec<(i32, i32)>,
+        ExternalNodeCostValues: Vec<(Position, i32)>,
+        PreferredRoutingY: i32,
+        GuidePenalty: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        EnforceSignalStrength: bool,
+        MaximumExpansionCount: usize,
+        Deadline: &RuntimeDeadline,
+    ) -> RouteTreeSearchResult {
+        let Failure = |Status: &str,
+                       NoPathReason: &str,
+                       RepeaterRejectedCount: usize,
+                       RepeaterConstraintFailureCount: usize,
+                       ExpansionCount: usize| {
+            let Expired = Deadline.Check();
+            let EffectiveStatus = if Expired { "BudgetExpired" } else { Status };
+            RouteTreeSearchResult {
+                Status: EffectiveStatus.to_string(),
+                NoPathReason: NoPathReason.to_string(),
+                Nodes: Vec::new(),
+                TargetPaths: Vec::new(),
+                BoundaryFrontierNodes: Vec::new(),
+                RepeaterReservations: Vec::new(),
+                ExpansionCount,
+                RepeaterRejectedCount,
+                RepeaterConstraintFailureCount,
+                IsRouted: false,
+                IsBudgetExpired: Expired,
+            }
+        };
+        let AllowedNodes: HashSet<_> = AllowedNodeValues.into_iter().collect();
+        let mut BlockedNodes: HashSet<_> = BlockedNodeValues.into_iter().collect();
+        for Value in &AllowedNodes {
+            for Neighbor in self.Adjacency.get(Value).into_iter().flatten() {
+                if !AllowedNodes.contains(Neighbor) {
+                    BlockedNodes.insert(*Neighbor);
+                }
+            }
+        }
+        if TargetBranches.iter().any(|Branch| {
+            Branch.is_empty()
+                || Branch.windows(2).any(|Values| {
+                    !self
+                        .Adjacency
+                        .get(&Values[0])
+                        .is_some_and(|Neighbors| Neighbors.contains(&Values[1]))
+                })
+                || Branch.iter().any(|Value| BlockedNodes.contains(Value))
+        }) {
+            return Failure("NoPath", "NoPathGeometry", 0, 0, 0);
+        }
+        let mut NodeCosts: HashMap<_, _> = ExternalNodeCostValues
+            .into_iter()
+            .filter(|(_PositionValue, Cost)| *Cost > 0)
+            .collect();
+        if GuidePenalty > 0 && !PreferredColumns.is_empty() {
+            for Value in &AllowedNodes {
+                if Deadline.Check() {
+                    return Failure("NoPath", "SearchLimitReached", 0, 0, 0);
+                }
+                let Distance = PreferredColumns
+                    .iter()
+                    .map(|Column| (Value.0 - Column.0).abs() + (Value.2 - Column.1).abs())
+                    .min()
+                    .unwrap_or(0);
+                *NodeCosts.entry(*Value).or_default() += Distance * GuidePenalty;
+            }
+        }
+        let Starts: Vec<_> = Starts
+            .into_iter()
+            .filter(|Value| {
+                AllowedNodes.contains(Value)
+                    && self.Adjacency.contains_key(Value)
+                    && !BlockedNodes.contains(Value)
+            })
+            .collect();
+        let Some(Root) = Starts.first().copied() else {
+            return Failure("NoPath", "NoPathGeometry", 0, 0, 0);
+        };
+
+        let StartDirection = (0, 0, 0);
+        let RootState = (Root, StartDirection, MAXIMUM_UNREFRESHED_DUST_LENGTH);
+        let mut Tree = HashSet::from([Root]);
+        let mut StateByNode = HashMap::from([(Root, RootState)]);
+        let mut ParentByNode: HashMap<Position, Position> = HashMap::new();
+        let mut Repeaters: HashMap<Position, String> = HashMap::new();
+        let mut ExpansionCount = 0usize;
+
+        let RouteIntoTree = |Target: Position,
+                             TargetContinuation: &[Position],
+                             ReservedNodes: &HashSet<Position>,
+                             TreeValue: &HashSet<Position>,
+                             States: &HashMap<Position, SearchState>|
+         -> Option<crate::PathRouting::PathSearchResult> {
+            let (mut DynamicBlocked, EdgeCosts) = BuildRootedTreeBlockages(
+                self,
+                &AllowedNodes,
+                &BlockedNodes,
+                TreeValue,
+                ReservedNodes,
+                &Deadline,
+            )?;
+            DynamicBlocked.remove(&Target);
+            let mut StartStates: Vec<_> = States.values().copied().collect();
+            StartStates.sort_unstable();
+            FindPathFromStatesDetailedWithDeadline(
+                &self.Adjacency,
+                &StartStates,
+                Target,
+                PreferredRoutingY,
+                &DynamicBlocked,
+                &NodeCosts,
+                &EdgeCosts,
+                BendPenalty,
+                ViaPenalty,
+                0,
+                MaximumExpansionCount,
+                EnforceSignalStrength,
+                TargetContinuation,
+                0,
+                &Deadline,
+            )
+        };
+
+        // Source access and retained repair trunks are mandatory rooted tree
+        // nodes. Connect them under their actual incoming direction and
+        // remaining strength instead of granting every node fresh power.
+        for Start in Starts.into_iter().skip(1) {
+            if Tree.contains(&Start) {
+                continue;
+            }
+            let Some(Result) = RouteIntoTree(Start, &[], &HashSet::new(), &Tree, &StateByNode)
+            else {
+                return Failure(
+                    "NoPath",
+                    "NoPathGeometry",
+                    usize::from(EnforceSignalStrength),
+                    0,
+                    ExpansionCount,
+                );
+            };
+            if Result.Status != "Routed" {
+                return Failure(
+                    "NoPath",
+                    if Result.NoPathReason.is_empty() {
+                        "NoPathGeometry"
+                    } else {
+                        &Result.NoPathReason
+                    },
+                    Result.RepeaterRejectedCount,
+                    Result.RepeaterConstraintFailures,
+                    ExpansionCount + Result.ExpansionCount,
+                );
+            };
+            ExpansionCount += Result.ExpansionCount;
+            for Values in Result.StatePath.windows(2) {
+                let Previous = Values[0].0;
+                let Current = Values[1].0;
+                if Tree.insert(Current) {
+                    ParentByNode.insert(Current, Previous);
+                }
+                StateByNode.insert(Current, Values[1]);
+            }
+            for (PositionValue, Facing) in Result.RepeaterReservations {
+                Repeaters.entry(PositionValue).or_insert(Facing);
+            }
+        }
+
+        let mut TargetPaths = Vec::new();
+        let mut OrderedBranches = TargetBranches;
+        OrderedBranches.sort_by_key(|Branch| (Branch.last().copied(), Branch.len()));
+        for Branch in OrderedBranches {
+            let PortalTarget = Branch[0];
+            let ReservedNodes: HashSet<_> = Branch.iter().copied().collect();
+            if !Tree.contains(&PortalTarget) {
+                let Some(Result) =
+                    RouteIntoTree(PortalTarget, &Branch, &ReservedNodes, &Tree, &StateByNode)
+                else {
+                    return Failure(
+                        "NoPath",
+                        "NoPathGeometry",
+                        usize::from(EnforceSignalStrength),
+                        0,
+                        ExpansionCount,
+                    );
+                };
+                if Result.Status != "Routed" {
+                    return Failure(
+                        "NoPath",
+                        if Result.NoPathReason.is_empty() {
+                            "NoPathGeometry"
+                        } else {
+                            &Result.NoPathReason
+                        },
+                        Result.RepeaterRejectedCount,
+                        Result.RepeaterConstraintFailures,
+                        ExpansionCount + Result.ExpansionCount,
+                    );
+                };
+                ExpansionCount += Result.ExpansionCount;
+                for Values in Result.StatePath.windows(2) {
+                    let Previous = Values[0].0;
+                    let Current = Values[1].0;
+                    if Tree.insert(Current) {
+                        ParentByNode.insert(Current, Previous);
+                    }
+                    StateByNode.insert(Current, Values[1]);
+                }
+                for (PositionValue, Facing) in Result.RepeaterReservations {
+                    Repeaters.entry(PositionValue).or_insert(Facing);
+                }
+            }
+
+            let mut CurrentState = *StateByNode.get(&PortalTarget).unwrap();
+            for Next in Branch.into_iter().skip(1) {
+                if Tree.contains(&Next) {
+                    CurrentState = *StateByNode.get(&Next).unwrap();
+                    continue;
+                }
+                let Direction = (
+                    Next.0 - CurrentState.0 .0,
+                    Next.1 - CurrentState.0 .1,
+                    Next.2 - CurrentState.0 .2,
+                );
+                let CanPlaceRepeater = CurrentState.1 != StartDirection
+                    && CurrentState.1 == Direction
+                    && Direction.1 == 0
+                    && CurrentState.2 <= 3;
+                let RemainingStrength = if !EnforceSignalStrength {
+                    MAXIMUM_UNREFRESHED_DUST_LENGTH
+                } else if CanPlaceRepeater {
+                    let Some(Facing) = RepeaterFacing(CurrentState.0, Next) else {
+                        return Failure("NoPath", "NoPathGeometry", 1, 0, ExpansionCount);
+                    };
+                    Repeaters.entry(CurrentState.0).or_insert(Facing);
+                    MAXIMUM_UNREFRESHED_DUST_LENGTH - 1
+                } else if CurrentState.2 > 1 {
+                    CurrentState.2 - 1
+                } else {
+                    return Failure("NoPath", "NoRepeater", 1, 1, ExpansionCount);
+                };
+                let NextState = (Next, Direction, RemainingStrength);
+                ParentByNode.insert(Next, CurrentState.0);
+                Tree.insert(Next);
+                StateByNode.insert(Next, NextState);
+                CurrentState = NextState;
+            }
+
+            let Target = CurrentState.0;
+            let mut Path = vec![Target];
+            let mut Cursor = Target;
+            while Cursor != Root {
+                let Some(Previous) = ParentByNode.get(&Cursor).copied() else {
+                    return Failure("NoPath", "NoPathGeometry", 0, 0, ExpansionCount);
+                };
+                Path.push(Previous);
+                Cursor = Previous;
+            }
+            Path.reverse();
+            TargetPaths.push((Target, Path));
+        }
+        TargetPaths.sort_by_key(|Value| Value.0);
+        let mut RepeaterReservations: Vec<_> = Repeaters.into_iter().collect();
+        RepeaterReservations.sort_by_key(|Value| Value.0);
+        // Boundary diagnostics are proportional to the routed tree, not the
+        // entire sparse ownership region.  Scanning every allowed node for
+        // every net made pass zero scale as nets times region size.
+        let mut FinalNodes: Vec<_> = Tree.into_iter().collect();
+        FinalNodes.sort_unstable();
+        let BoundaryFrontierNodes = FinalNodes
+            .iter()
+            .filter(|Value| {
+                self.Adjacency
+                    .get(Value)
+                    .into_iter()
+                    .flatten()
+                    .any(|Neighbor| !AllowedNodes.contains(Neighbor))
+            })
+            .copied()
+            .collect();
+        RouteTreeSearchResult {
+            Status: "Routed".to_string(),
+            NoPathReason: String::new(),
+            Nodes: FinalNodes,
+            TargetPaths,
+            BoundaryFrontierNodes,
+            RepeaterReservations,
+            ExpansionCount,
+            RepeaterRejectedCount: 0,
+            RepeaterConstraintFailureCount: 0,
+            IsRouted: true,
+            IsBudgetExpired: false,
+        }
+    }
+}
+
+/// Generates independent repeater-aware route trees against one immutable
+/// negotiated-pass snapshot.  The shared deadline is deliberately passed into
+/// every search rather than split into per-worker budgets: a queued request
+/// cannot consume time after the pass has expired, and a completed result
+/// remains at the same input index regardless of worker scheduling.
+pub(crate) fn GenerateRouteTreeDetailedBatchNative(
+    Context: &RoutingContext,
+    Requests: Vec<DetailedRouteTreeRequest>,
+    MaximumRuntimeMilliseconds: u64,
+) -> RouteTreeDetailedBatchResult {
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .expect("u64 millisecond deadlines must be representable");
+    let TotalWork = Requests.len();
+    let SearchResults: Vec<RouteTreeSearchResult> = RoutingThreadPool().install(|| {
+        Requests
+            .into_par_iter()
+            .map(
+                |(
+                    Starts,
+                    TargetBranches,
+                    AllowedNodeValues,
+                    BlockedNodeValues,
+                    PreferredColumns,
+                    NodeCostValues,
+                    PreferredRoutingY,
+                    GuidePenalty,
+                    BendPenalty,
+                    ViaPenalty,
+                    EnforceSignalStrength,
+                    MaximumExpansionCount,
+                )| {
+                    if Deadline.Check() {
+                        return DetailedRouteTreeBudgetExpiredResult();
+                    }
+                    Context.GenerateRouteTreeDetailedWithDeadlineNative(
+                        Starts,
+                        TargetBranches,
+                        AllowedNodeValues,
+                        BlockedNodeValues,
+                        PreferredColumns,
+                        NodeCostValues,
+                        PreferredRoutingY,
+                        GuidePenalty,
+                        BendPenalty,
+                        ViaPenalty,
+                        EnforceSignalStrength,
+                        MaximumExpansionCount,
+                        &Deadline,
+                    )
+                },
+            )
+            .collect()
+    });
+    let CompletedWork = SearchResults
+        .iter()
+        .filter(|Result| !Result.IsBudgetExpired)
+        .count();
+    RouteTreeDetailedBatchResult {
+        SearchResults,
+        DeadlineExceeded: Deadline.WasExceeded(),
+        CompletedWork,
+        TotalWork,
     }
 }
 
@@ -685,6 +1190,101 @@ mod Tests {
         assert_eq!(Result.CompletedWork, 0);
         assert_eq!(Result.TotalWork, 1);
         assert_eq!(Result.RouteTrees.len(), 1);
+    }
+
+    #[test]
+    fn DetailedRouteTreeBatchPreservesRequestOrderAndTypedResults() {
+        let A = (0, 0, 0);
+        let B = (1, 0, 0);
+        let Result = GenerateRouteTreeDetailedBatchNative(
+            &LinearContext(),
+            vec![
+                (
+                    vec![A],
+                    vec![vec![B]],
+                    vec![A, B],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    128,
+                ),
+                (
+                    vec![(99, 0, 0)],
+                    vec![vec![B]],
+                    vec![A, B],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    128,
+                ),
+            ],
+            1_000,
+        );
+
+        assert_eq!(Result.TotalWork, 2);
+        assert_eq!(Result.CompletedWork, 2);
+        assert!(!Result.DeadlineExceeded);
+        assert!(Result.SearchResults[0].IsRouted);
+        assert_eq!(Result.SearchResults[1].Status, "NoPath");
+        assert_eq!(Result.SearchResults[1].NoPathReason, "NoPathGeometry");
+    }
+
+    #[test]
+    fn DetailedRouteTreeBatchReportsImmediateDeadlineForEveryRequest() {
+        let A = (0, 0, 0);
+        let B = (1, 0, 0);
+        let Result = GenerateRouteTreeDetailedBatchNative(
+            &LinearContext(),
+            vec![
+                (
+                    vec![A],
+                    vec![vec![B]],
+                    vec![A, B],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    128,
+                ),
+                (
+                    vec![A],
+                    vec![vec![B]],
+                    vec![A, B],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    128,
+                ),
+            ],
+            0,
+        );
+
+        assert!(Result.DeadlineExceeded);
+        assert_eq!(Result.CompletedWork, 0);
+        assert_eq!(Result.TotalWork, 2);
+        assert!(Result
+            .SearchResults
+            .iter()
+            .all(|SearchResult| SearchResult.IsBudgetExpired));
     }
 
     #[test]

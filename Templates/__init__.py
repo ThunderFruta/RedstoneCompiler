@@ -2,9 +2,16 @@
 
 from pathlib import Path
 
+ExternalTemplateDirectory = Path(
+    "/home/bananawewe/Documents/curseforge/minecraft/Instances/wee/schematics"
+)
+RequiredTemplateNames = ("Input.litematic", "Output.litematic", "Nand.litematic")
 TemplateDirectory = (
-    Path("/home/bananawewe/Documents/curseforge/minecraft/Instances/wee/schematics")
-    if Path("/home/bananawewe/Documents/curseforge/minecraft/Instances/wee/schematics").exists()
+    ExternalTemplateDirectory
+    if all(
+        (ExternalTemplateDirectory / Name).is_file()
+        for Name in RequiredTemplateNames
+    )
     else Path(__file__).resolve().parent
 )
 

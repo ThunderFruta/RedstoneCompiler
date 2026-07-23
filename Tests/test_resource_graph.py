@@ -8,6 +8,10 @@ from Compiler.Routing.ResourceGraph import (
     RoutingResourceKind,
     ValidateLocalRouteClaims,
 )
+from Compiler.Placement.Pcb import (
+    LocalClusterRouteCandidate,
+    SelectJointLocalClusterCandidates,
+)
 
 
 class RoutingResourceGraphTests(unittest.TestCase):
@@ -165,6 +169,51 @@ class RoutingResourceGraphTests(unittest.TestCase):
             and Resource.Position == (0, 0, 0)
             for Resource in Conflicts
         ))
+
+    def testJointClusterSelectionRejectsConflictingCandidateClaims(self) -> None:
+        Graph = self.BuildGraph()
+
+        def Claim(Signal, Nodes):
+            Ordered = tuple(Nodes)
+            return LocalRouteClaim(
+                Signal=Signal,
+                ClusterId=0,
+                Root=Ordered[0],
+                ConnectedTargets=(Ordered[-1],),
+                BoundaryNodes=(),
+                Nodes=frozenset(Ordered),
+                Edges=frozenset(
+                    NormalizeRoutingEdge(First, Second)
+                    for First, Second in zip(Ordered, Ordered[1:])
+                ),
+                Claims=Graph.BuildRouteClaims(Ordered),
+                ExactRouteSignalBlocks=len(Ordered),
+                ExactRouteSupportBlocks=len(Ordered),
+            )
+
+        First = LocalClusterRouteCandidate(
+            "cluster0:A:direct:0", Claim("A", ((0, 1, 0), (1, 1, 0)))
+        )
+        # This tree uses A's electrical clearance and must be rejected.
+        Conflicting = LocalClusterRouteCandidate(
+            "cluster0:B:direct:0", Claim("B", ((1, 1, 1), (2, 1, 1)))
+        )
+        Independent = LocalClusterRouteCandidate(
+            "cluster0:B:direct:1", Claim("B", ((4, 1, 0), (5, 1, 0)))
+        )
+
+        Selection = SelectJointLocalClusterCandidates(
+            Graph,
+            (),
+            {"A": (First,), "B": (Conflicting, Independent)},
+            64,
+        )
+
+        self.assertEqual(
+            tuple(Candidate.CandidateId for Candidate in Selection.Candidates),
+            ("cluster0:A:direct:0", "cluster0:B:direct:1"),
+        )
+        self.assertTrue(Selection.RejectionCounts)
 
 
 if __name__ == "__main__":

@@ -8,12 +8,15 @@ from Compiler.Placement.Pcb import (
     BoundaryDemandRecord,
     BuildBoundaryCapacityRecords,
     BuildConnectivityClusters,
+    BuildInterClusterBoundaryDemand,
+    BuildInterClusterGapPlan,
     BuildRelocationClusterSet,
     BuildLegalBoundaryEscapeSlots,
     BuildPinAlignedPackedCluster,
     BuildTopologicalLevels,
     EvaluateHardBoundaryFeasibility,
     HardBoundaryFeasibility,
+    InterClusterBoundaryDemand,
     OptimizeClusterSlots,
     PlacePcbGraph,
     PrioritizeRelocationClusters,
@@ -322,6 +325,117 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
         self.assertEqual(Assignment[2], (2, 0))
         self.assertEqual(ColumnCount, 3)
 
+    def testSuppressedStackMembersReceiveDistinctColumns(self) -> None:
+        Assignment, ColumnCount = RelocateClusterSlots(
+            {0: (0, 0), 1: (0, 0), 2: (0, 0)},
+            1,
+            (0, 1, 2),
+        )
+
+        self.assertEqual(
+            tuple(Assignment[Index] for Index in range(3)),
+            ((1, 0), (2, 0), (3, 0)),
+        )
+        self.assertEqual(ColumnCount, 4)
+
+    def testInterClusterGapPlanUsesDistinctCrossingSignals(self) -> None:
+        Module = self.ClusteredNetlist().Modules["ClusteredBoundaryGraph"]
+        Demand = BuildInterClusterBoundaryDemand(
+            Module,
+            (("N0",), ("N1",), ("N2",)),
+            {0: (0, 0), 1: (1, 0), 2: (2, 1)},
+        )
+
+        self.assertEqual(
+            tuple(
+                (Record.Axis, Record.BoundaryIndex, Record.Signals)
+                for Record in Demand
+            ),
+            (
+                ("X", 0, ("S0",)),
+                ("X", 1, ("S1",)),
+                ("Z", 0, ("S1",)),
+            ),
+        )
+        Plan = BuildInterClusterGapPlan(
+            Demand,
+            ColumnCount=3,
+            RowCount=2,
+            RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
+            TrackPitch=DefaultRedstoneRoutingTechnology.TrackPitch,
+            Enabled=True,
+        )
+        ExpectedSpacing = min(
+            LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
+            DefaultRedstoneRoutingTechnology.TrackPitch,
+        )
+        self.assertEqual(
+            Plan.ColumnSpacingByBoundary(),
+            {0: ExpectedSpacing, 1: ExpectedSpacing},
+        )
+        self.assertEqual(Plan.RowSpacingByBoundary(), {0: ExpectedSpacing})
+
+    def testInterClusterBoundaryDemandDeduplicatesFanoutAtOneCut(self) -> None:
+        Module = ModuleIR(
+            Name="FanoutBoundaryGraph",
+            Inputs=["Left", "Right"],
+            Outputs=["First", "Second"],
+            Gates=[
+                Gate("Source", GateKind.NAND, ["Shared"], ["Left", "Right"]),
+                Gate("FirstConsumer", GateKind.NAND, ["First"], ["Shared", "Left"]),
+                Gate("SecondConsumer", GateKind.NAND, ["Second"], ["Shared", "Right"]),
+            ],
+        )
+        Demand = BuildInterClusterBoundaryDemand(
+            Module,
+            (("Source",), ("FirstConsumer",), ("SecondConsumer",)),
+            {0: (0, 0), 1: (1, 0), 2: (1, 1)},
+        )
+
+        self.assertEqual(
+            next(
+                Record.Signals
+                for Record in Demand
+                if Record.Axis == "X" and Record.BoundaryIndex == 0
+            ),
+            ("Shared",),
+        )
+
+    def testInterClusterGapPlanCapsDemandAndPreservesUniformFallback(self) -> None:
+        # Use a direct record here to cover a multi-lane cut without tying the
+        # spacing policy to any circuit or generated signal naming scheme.
+        MultiLaneDemand = (
+            InterClusterBoundaryDemand("X", 0, ("First", "Second")),
+        )
+        Compact = BuildInterClusterGapPlan(
+            MultiLaneDemand,
+            ColumnCount=2,
+            RowCount=1,
+            RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
+            TrackPitch=DefaultRedstoneRoutingTechnology.TrackPitch,
+            Enabled=True,
+        )
+        Uniform = BuildInterClusterGapPlan(
+            MultiLaneDemand,
+            ColumnCount=2,
+            RowCount=1,
+            RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
+            TrackPitch=DefaultRedstoneRoutingTechnology.TrackPitch,
+            Enabled=False,
+        )
+        Empty = BuildInterClusterGapPlan(
+            (),
+            ColumnCount=2,
+            RowCount=1,
+            RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
+            TrackPitch=DefaultRedstoneRoutingTechnology.TrackPitch,
+            Enabled=True,
+        )
+        ExpectedSpacing = LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing
+        self.assertEqual(Compact.ColumnSpacingByBoundary(), {0: ExpectedSpacing})
+        self.assertEqual(Uniform.ColumnSpacingByBoundary(), {0: ExpectedSpacing})
+        self.assertEqual(Empty.ColumnSpacingByBoundary(), {0: 0})
+
     def testRelocationClustersAreRankedByConflictSignalCoverage(self) -> None:
         Module = self.ClusteredNetlist().Modules["ClusteredBoundaryGraph"]
         self.assertEqual(
@@ -459,15 +573,12 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
                 "row-beam-conflict-relocation",
                 "unpacked",
                 "row-beam-direct-only",
-                "unpacked-spacing-7",
-                "unpacked-spacing-8",
+                "unpacked-spacing-6",
                 "unpacked-configured-spacing",
                 "configured-packing",
                 "graph-beam-direct-only",
                 "spacing-4",
-                "spacing-5",
-                "spacing-7",
-                "spacing-8",
+                "spacing-6",
             },
         )
         for Request in Requests:

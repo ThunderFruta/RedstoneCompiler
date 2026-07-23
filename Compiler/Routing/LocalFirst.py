@@ -333,8 +333,8 @@ class LocalFirstSnapshot:
 def _SignalEndpoints(
     Placed: Any,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
-) -> dict[str, tuple[Position2, ...]]:
-    Values: dict[str, list[Position2]] = {}
+) -> dict[str, tuple[Position3, ...]]:
+    Values: dict[str, list[Position3]] = {}
     Gates = list(Placed.PlacedGates)
     for GateIndex, Gate in enumerate(Gates):
         if WorkCheck is not None and GateIndex % 32 == 0:
@@ -346,11 +346,11 @@ def _SignalEndpoints(
         if Gate.OutputPin is not None:
             for Signal in Gate.Outputs:
                 Values.setdefault(Signal, []).append(
-                    (Gate.OutputPin[0], Gate.OutputPin[2])
+                    Gate.OutputPin
                 )
         for InputIndex, Signal in enumerate(Gate.Inputs):
             Pin, _Direction = GetGateInputAccess(Gate, InputIndex)
-            Values.setdefault(Signal, []).append((Pin[0], Pin[2]))
+            Values.setdefault(Signal, []).append(Pin)
     return {Signal: tuple(Endpoints) for Signal, Endpoints in Values.items()}
 
 
@@ -374,11 +374,16 @@ def BuildPlacementSolution(
             continue
         Span = (
             max(Value[0] for Value in Values) - min(Value[0] for Value in Values)
-            + max(Value[1] for Value in Values) - min(Value[1] for Value in Values)
+            + max(Value[2] for Value in Values) - min(Value[2] for Value in Values)
         )
         Hpwl += Span
         LocalFanoutPenalty += max(0, Span - LocalFanoutDistance)
-    EscapeOwners: dict[Position2, set[str]] = {}
+    # A vertically stacked deck may legitimately share an X/Z column with a
+    # lower deck.  Pin-window ownership is an exact physical-cell property,
+    # so only the full three-dimensional escape coordinate can represent an
+    # overlap here. Detailed routing remains responsible for adjacent-cell
+    # electrical exclusions and portal capacity.
+    EscapeOwners: dict[Position3, set[str]] = {}
     Gates = list(Placed.PlacedGates)
     for GateIndex, Gate in enumerate(Gates):
         if WorkCheck is not None and GateIndex % 32 == 0:
@@ -389,8 +394,11 @@ def BuildPlacementSolution(
             })
         for InputIndex, Signal in enumerate(Gate.Inputs):
             Pin, Direction = GetGateInputAccess(Gate, InputIndex)
-            Column = (Pin[0] + Direction[0], Pin[2] + Direction[2])
-            EscapeOwners.setdefault(Column, set()).add(Signal)
+            Escape = tuple(
+                Pin[Axis] + Direction[Axis]
+                for Axis in range(3)
+            )
+            EscapeOwners.setdefault(Escape, set()).add(Signal)
     return PlacementSolution(
         GateSites={Gate.Name: (Gate.X, Gate.Z) for Gate in Placed.PlacedGates},
         Hpwl=Hpwl,
@@ -715,8 +723,8 @@ def BuildCapacityAwareGuidePlan(
                 (OverflowCost + ColumnOverflowCost) * Policy.OverflowPenalty,
                 Escape,
                 HistoryCost,
-                Length,
                 Layer,
+                Length,
                 AxisBias,
                 Lane,
             )

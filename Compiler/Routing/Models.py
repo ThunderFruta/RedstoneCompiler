@@ -42,10 +42,14 @@ class RoutedDesign:
     CandidateExpansionLimit: int = 0
     AssignmentExpansionCount: int = 0
     RoutingStageTimings: dict[str, float] = field(default_factory=dict)
+    RepeaterOptimizationDiagnostics: dict[str, object] = field(
+        default_factory=dict
+    )
     GlobalGuideDiagnostics: dict[str, object] = field(default_factory=dict)
     RoutingControlEffectiveness: dict[str, object] = field(default_factory=dict)
     FrozenNetSignals: tuple[str, ...] = ()
     NegotiatedRoutingDiagnostics: dict[str, object] = field(default_factory=dict)
+    RoutingFootprintDiagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

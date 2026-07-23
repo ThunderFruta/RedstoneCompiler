@@ -2,7 +2,6 @@
 
 Contains test strategy and execution guidance.
 
-Planned next documents:
-- TestStrategy.md
-- RunningTests.md
-- Benchmarks.md
+- [Test strategy](TestStrategy.md)
+- [Running tests](RunningTests.md)
+- [Benchmarks and acceptance gates](Benchmarks.md)

@@ -33,13 +33,126 @@ from ..Routing.Failures import (
     RoutingStageError,
 )
 from ..Routing.ResourceGraph import (
+    BuildRoutingEnvelope,
     FindClaimConflicts,
+    FindSelfClaimConflicts,
     LocalRouteClaim,
     NormalizeRoutingEdge,
     RoutingResourceClaims,
     RoutingResourceGraph,
     ValidateLocalRouteClaims,
 )
+
+
+@dataclass(frozen=True)
+class LocalClusterRouteCandidate:
+    """One legal placement-owned tree considered by the cluster optimizer."""
+
+    CandidateId: str
+    Claim: LocalRouteClaim
+
+    @property
+    def LocalizedTargetCount(self) -> int:
+        return len(set(self.Claim.ConnectedTargets))
+
+    @property
+    def FullVolume(self) -> int:
+        Envelope = BuildRoutingEnvelope(
+            self.Claim.Nodes,
+            self.Claim.Claims.SupportCells,
+            (Reservation.Position for Reservation in self.Claim.RepeaterReservations),
+        )
+        return Envelope.Width * Envelope.Height * Envelope.Depth
+
+    @property
+    def RepeaterCount(self) -> int:
+        return len(self.Claim.RepeaterReservations)
+
+    @property
+    def RouteAndSupportBlocks(self) -> int:
+        return (
+            self.Claim.ExactRouteSignalBlocks
+            + self.Claim.ExactRouteRefreshBlocks
+            + self.Claim.ExactRouteSupportBlocks
+        )
+
+
+@dataclass(frozen=True)
+class LocalClusterRoutingSelection:
+    """Result of bounded exact candidate selection for one packed cluster."""
+
+    Candidates: tuple[LocalClusterRouteCandidate, ...]
+    AssignmentExpansions: int
+    BudgetExhausted: bool
+    RejectionCounts: dict[str, int]
+
+
+def SelectJointLocalClusterCandidates(
+    ResourceGraph: RoutingResourceGraph,
+    BaseClaims: tuple[LocalRouteClaim, ...],
+    CandidatesBySignal: dict[str, tuple[LocalClusterRouteCandidate, ...]],
+    MaximumExpansions: int,
+) -> LocalClusterRoutingSelection:
+    """Select compatible local trees with deterministic volume-first tie breaks.
+
+    An omitted signal is an explicit option: it remains entirely with the
+    authoritative global router.  Every trial is checked against the same
+    resource graph used by detailed routing, including support, air and
+    electrical-clearance claims.
+    """
+    Signals = tuple(sorted(CandidatesBySignal))
+    Best: tuple[LocalClusterRouteCandidate, ...] = ()
+    BestScore: tuple[object, ...] | None = None
+    Expansions = 0
+    BudgetExhausted = False
+    Rejections: dict[str, int] = {}
+
+    def Score(Selected: tuple[LocalClusterRouteCandidate, ...]) -> tuple[object, ...]:
+        return (
+            -sum(Candidate.LocalizedTargetCount for Candidate in Selected),
+            sum(Candidate.FullVolume for Candidate in Selected),
+            sum(Candidate.RepeaterCount for Candidate in Selected),
+            sum(Candidate.RouteAndSupportBlocks for Candidate in Selected),
+            tuple(Candidate.CandidateId for Candidate in Selected),
+        )
+
+    def Search(Index: int, Selected: tuple[LocalClusterRouteCandidate, ...]) -> None:
+        nonlocal Best, BestScore, Expansions, BudgetExhausted
+        if Expansions >= MaximumExpansions:
+            BudgetExhausted = True
+            return
+        Expansions += 1
+        if Index == len(Signals):
+            CandidateScore = Score(Selected)
+            if BestScore is None or CandidateScore < BestScore:
+                Best = Selected
+                BestScore = CandidateScore
+            return
+        Signal = Signals[Index]
+        # Skip is always legal and preserves global-router authority.
+        Search(Index + 1, Selected)
+        for Candidate in CandidatesBySignal[Signal]:
+            if BudgetExhausted:
+                return
+            Trial = (*Selected, Candidate)
+            try:
+                ValidateLocalRouteClaims(
+                    ResourceGraph,
+                    (*BaseClaims, *(Item.Claim for Item in Trial)),
+                )
+            except ValueError as Error:
+                Reason = str(Error).split(":", 1)[0]
+                Rejections[Reason] = Rejections.get(Reason, 0) + 1
+                continue
+            Search(Index + 1, Trial)
+
+    Search(0, ())
+    return LocalClusterRoutingSelection(
+        Candidates=Best,
+        AssignmentExpansions=Expansions,
+        BudgetExhausted=BudgetExhausted,
+        RejectionCounts=dict(sorted(Rejections.items())),
+    )
 
 
 @dataclass(frozen=True)
@@ -61,6 +174,64 @@ class BoundaryCapacityRecord:
     LegalPortalSlots: int
     LegalCorridorLanes: int
     Overflow: int
+
+
+@dataclass(frozen=True)
+class InterClusterBoundaryDemand:
+    """Distinct signals that must cross one logical cluster boundary."""
+
+    Axis: str
+    BoundaryIndex: int
+    Signals: tuple[str, ...]
+
+    @property
+    def RequiredCorridorLanes(self) -> int:
+        """Return one independently routable lane per distinct signal."""
+        return len(self.Signals)
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Axis": self.Axis,
+            "BoundaryIndex": self.BoundaryIndex,
+            "Signals": list(self.Signals),
+            "RequiredCorridorLanes": self.RequiredCorridorLanes,
+        }
+
+
+@dataclass(frozen=True)
+class InterClusterGapPlan:
+    """Optional corridor spacing assigned to each cluster-grid boundary."""
+
+    Enabled: bool
+    RoutingSpacing: int
+    TrackPitch: int
+    ColumnExtraSpacing: tuple[tuple[int, int], ...]
+    RowExtraSpacing: tuple[tuple[int, int], ...]
+    BoundaryDemand: tuple[InterClusterBoundaryDemand, ...]
+
+    def ColumnSpacingByBoundary(self) -> dict[int, int]:
+        return dict(self.ColumnExtraSpacing)
+
+    def RowSpacingByBoundary(self) -> dict[int, int]:
+        return dict(self.RowExtraSpacing)
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Enabled": self.Enabled,
+            "RoutingSpacing": self.RoutingSpacing,
+            "TrackPitch": self.TrackPitch,
+            "ColumnExtraSpacing": {
+                str(Boundary): Spacing
+                for Boundary, Spacing in self.ColumnExtraSpacing
+            },
+            "RowExtraSpacing": {
+                str(Boundary): Spacing
+                for Boundary, Spacing in self.RowExtraSpacing
+            },
+            "BoundaryDemand": [
+                Record.ToDictionary() for Record in self.BoundaryDemand
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -1152,7 +1323,7 @@ def RelocateClusterSlots(
     RelocationClusters: Iterable[int],
     StackSuppressedClusters: frozenset[int] = frozenset(),
 ) -> tuple[dict[int, tuple[int, int]], int]:
-    """Move unresolved conflict clusters into deterministic dedicated columns."""
+    """Move a congestion cut into deterministic unoccupied placement rows."""
     Result = dict(Assignment)
     OrderedClusters = (
         tuple(sorted(RelocationClusters))
@@ -1166,13 +1337,148 @@ def RelocateClusterSlots(
     ]
     if not Pending:
         return Result, ColumnCount
+    if len(Pending) > 1:
+        ExistingSlots = tuple(Result[ClusterIndex] for ClusterIndex in Pending)
+        if len(set(ExistingSlots)) == len(ExistingSlots):
+            for Offset, ClusterIndex in enumerate(Pending):
+                Result[ClusterIndex] = ExistingSlots[(Offset + 1) % len(Pending)]
+            return Result, ColumnCount
+        # A suppressed vertical stack leaves multiple clusters in the same
+        # logical slot.  Rotating identical slots is a no-op, which would
+        # later commit physically overlapping NANDs.  Give each member a
+        # deterministic dedicated column so the suppression is real geometry
+        # rather than a bookkeeping-only placement variant.
+        NextColumn = max(
+            (Column for Column, _Row in Result.values()),
+            default=-1,
+        ) + 1
+        for Offset, ClusterIndex in enumerate(Pending):
+            Result[ClusterIndex] = (NextColumn + Offset, 0)
+        return Result, max(ColumnCount, NextColumn + len(Pending))
     NextColumn = max(
         (Column for Column, _Row in Result.values()),
         default=-1,
     ) + 1
-    for Offset, ClusterIndex in enumerate(Pending):
-        Result[ClusterIndex] = (NextColumn + Offset, 0)
-    return Result, max(ColumnCount, NextColumn + len(Pending))
+    Result[Pending[0]] = (NextColumn, 0)
+    return Result, max(ColumnCount, NextColumn + 1)
+
+
+def BuildInterClusterBoundaryDemand(
+    Module: Any,
+    Clusters: tuple[tuple[str, ...], ...],
+    Assignment: dict[int, tuple[int, int]],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[InterClusterBoundaryDemand, ...]:
+    """Derive topology-only lane demand across final cluster-grid cuts.
+
+    A signal is counted once per crossed X/Z boundary even when it has several
+    consumers beyond that cut.  This lets placement reserve one physical lane
+    for a shared routed tree instead of scaling spacing with fanout.
+    """
+    ClusterByGate = {
+        GateName: ClusterIndex
+        for ClusterIndex, Names in enumerate(Clusters)
+        for GateName in Names
+    }
+    ProducerClusterBySignal = {
+        Signal: ClusterByGate[Gate.Name]
+        for Gate in Module.Gates
+        if Gate.Name in ClusterByGate
+        for Signal in Gate.Outputs
+    }
+    SignalsByBoundary: dict[tuple[str, int], set[str]] = {}
+    for GateIndex, Gate in enumerate(Module.Gates):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "inter-cluster-boundary-demand",
+                "CompletedGates": GateIndex,
+                "TotalGates": len(Module.Gates),
+                "GateName": Gate.Name,
+            })
+        TargetCluster = ClusterByGate.get(Gate.Name)
+        if TargetCluster is None:
+            continue
+        TargetSlot = Assignment.get(TargetCluster)
+        if TargetSlot is None:
+            continue
+        for Signal in Gate.Inputs:
+            SourceCluster = ProducerClusterBySignal.get(Signal)
+            if SourceCluster is None or SourceCluster == TargetCluster:
+                continue
+            SourceSlot = Assignment.get(SourceCluster)
+            if SourceSlot is None:
+                continue
+            SourceColumn, SourceRow = SourceSlot
+            TargetColumn, TargetRow = TargetSlot
+            for BoundaryIndex in range(
+                min(SourceColumn, TargetColumn),
+                max(SourceColumn, TargetColumn),
+            ):
+                SignalsByBoundary.setdefault(("X", BoundaryIndex), set()).add(
+                    Signal
+                )
+            for BoundaryIndex in range(
+                min(SourceRow, TargetRow),
+                max(SourceRow, TargetRow),
+            ):
+                SignalsByBoundary.setdefault(("Z", BoundaryIndex), set()).add(
+                    Signal
+                )
+    return tuple(
+        InterClusterBoundaryDemand(
+            Axis=Axis,
+            BoundaryIndex=BoundaryIndex,
+            Signals=tuple(sorted(Signals)),
+        )
+        for (Axis, BoundaryIndex), Signals in sorted(SignalsByBoundary.items())
+    )
+
+
+def BuildInterClusterGapPlan(
+    BoundaryDemand: tuple[InterClusterBoundaryDemand, ...],
+    ColumnCount: int,
+    RowCount: int,
+    RoutingSpacing: int,
+    TrackPitch: int,
+    Enabled: bool,
+) -> InterClusterGapPlan:
+    """Allocate optional spacing without exceeding the configured corridor.
+
+    The fixed placement gap remains outside this plan.  When disabled every
+    boundary retains the uniform configured spacing, which exactly preserves
+    the previous coordinate construction.
+    """
+    if RoutingSpacing < 0:
+        raise ValueError("RoutingSpacing cannot be negative")
+    if TrackPitch < 1:
+        raise ValueError("TrackPitch must be positive")
+    LanesByBoundary = {
+        (Record.Axis, Record.BoundaryIndex): Record.RequiredCorridorLanes
+        for Record in BoundaryDemand
+    }
+
+    def OptionalSpacing(Axis: str, BoundaryIndex: int) -> int:
+        if not Enabled:
+            return RoutingSpacing
+        return min(
+            RoutingSpacing,
+            LanesByBoundary.get((Axis, BoundaryIndex), 0) * TrackPitch,
+        )
+
+    return InterClusterGapPlan(
+        Enabled=Enabled,
+        RoutingSpacing=RoutingSpacing,
+        TrackPitch=TrackPitch,
+        ColumnExtraSpacing=tuple(
+            (BoundaryIndex, OptionalSpacing("X", BoundaryIndex))
+            for BoundaryIndex in range(max(0, ColumnCount - 1))
+        ),
+        RowExtraSpacing=tuple(
+            (BoundaryIndex, OptionalSpacing("Z", BoundaryIndex))
+            for BoundaryIndex in range(max(0, RowCount - 1))
+        ),
+        BoundaryDemand=BoundaryDemand,
+    )
 
 
 def PlacementWireCost(Placed: PlacedDesign) -> int:
@@ -1493,6 +1799,287 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
     return False
 
 
+def BuildMandatoryAccessClaims(
+    PlacedGates: Iterable[Any],
+    Signals: Iterable[str],
+) -> dict[str, RoutingResourceClaims]:
+    """Build the fixed pin-access claims that every detailed route must own."""
+    RequiredSignals = frozenset(Signals)
+    NodesBySignal: dict[str, set[tuple[int, int, int]]] = {
+        Signal: set() for Signal in RequiredSignals
+    }
+    for Gate in PlacedGates:
+        if Gate.OutputPin is not None and Gate.OutputDirection is not None:
+            for Signal in Gate.Outputs:
+                if Signal not in RequiredSignals:
+                    continue
+                NodesBySignal[Signal].update(
+                    (
+                        Gate.OutputPin[0] + Gate.OutputDirection[0] * Offset,
+                        Gate.OutputPin[1] + Gate.OutputDirection[1] * Offset,
+                        Gate.OutputPin[2] + Gate.OutputDirection[2] * Offset,
+                    )
+                    for Offset in range(
+                        DefaultRedstoneRoutingTechnology.AccessLength
+                    )
+                )
+        for InputIndex, Signal in enumerate(Gate.Inputs):
+            if Signal not in RequiredSignals:
+                continue
+            Pin, Direction = GetGateInputAccess(Gate, InputIndex)
+            NodesBySignal[Signal].update(
+                (
+                    Pin[0] + Direction[0] * Offset,
+                    Pin[1] + Direction[1] * Offset,
+                    Pin[2] + Direction[2] * Offset,
+                )
+                for Offset in range(
+                    DefaultRedstoneRoutingTechnology.AccessLength
+                )
+            )
+    ClaimBuilder = RoutingResourceGraph(
+        ActualBlocks=frozenset(),
+        ElectricalBlocks=frozenset(),
+        SolidBlocks=frozenset(),
+    )
+    return {
+        Signal: ClaimBuilder.BuildRouteClaims(Nodes)
+        for Signal, Nodes in sorted(NodesBySignal.items())
+        if Nodes
+    }
+
+
+def CountMandatoryAccessSelfConflicts(
+    PlacedGates: Iterable[Any],
+    Signals: Iterable[str],
+) -> int:
+    """Count exact support/headroom aliases within mandatory pin accesses."""
+    return len(FindSelfClaimConflicts(
+        BuildMandatoryAccessClaims(PlacedGates, Signals)
+    ))
+
+
+def CountMandatoryAccessConflicts(
+    PlacedGates: Iterable[Any],
+    Signals: Iterable[str],
+) -> int:
+    """Count all fixed pin-access conflicts for the affected signal cut.
+
+    A packed cluster can be individually legal for every signal while two
+    different signals still claim the same electrical, support, or headroom
+    resource.  Those conflicts are immutable to detailed routing and must be
+    removed by the local placement repair before a candidate is published.
+    """
+    Claims = BuildMandatoryAccessClaims(PlacedGates, Signals)
+    return len(FindSelfClaimConflicts(Claims)) + len(FindClaimConflicts(Claims))
+
+
+def FindMandatoryAccessConflictSignals(
+    PlacedGates: Iterable[Any],
+    Signals: Iterable[str],
+) -> dict[object, tuple[str, ...]]:
+    """Return immutable cross-signal access conflicts before routing begins.
+
+    This is deliberately the same resource-claim model used by detailed
+    routing.  It lets placement advance directly to a relocation recipe when
+    no router can resolve a fixed pin-access collision.
+    """
+    Claims = BuildMandatoryAccessClaims(PlacedGates, Signals)
+    return {
+        Resource: tuple(sorted(Owners))
+        for Resource, Owners in sorted(
+            FindClaimConflicts(Claims).items(), key=lambda Value: str(Value[0])
+        )
+    }
+
+
+def RepairPackedClusterAccess(
+    Names: tuple[str, ...] | list[str],
+    InternalByName: dict[str, Any],
+    LocalPositions: dict[str, tuple[int, int]],
+    LocalRotations: dict[str, int],
+    LocalMirrors: dict[str, bool],
+    RequiredSignals: frozenset[str],
+    BeamWidth: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[dict[str, tuple[int, int]], dict[str, bool], dict[str, int]]:
+    """Repair fixed access claims inside one cluster without global spreading."""
+    ClusterSignals = frozenset(
+        Signal
+        for Name in Names
+        for Signal in (
+            *InternalByName[Name].Inputs,
+            *InternalByName[Name].Outputs,
+        )
+        if Signal in RequiredSignals
+    )
+    if not ClusterSignals:
+        return LocalPositions, LocalMirrors, {}
+
+    def BuildGates(
+        State: tuple[tuple[str, int, bool], ...],
+    ) -> list[Any]:
+        Values = {Name: (X, MirrorX) for Name, X, MirrorX in State}
+        return [
+            BuildPlacedGate(
+                InternalByName[Name],
+                Values[Name][0],
+                1,
+                LocalPositions[Name][1],
+                LocalRotations[Name],
+                Values[Name][1],
+            )
+            for Name in Names
+        ]
+
+    BaselineState = tuple(
+        (Name, LocalPositions[Name][0], LocalMirrors.get(Name, False))
+        for Name in Names
+    )
+    BaselineGates = BuildGates(BaselineState)
+    BaselineConflicts = CountMandatoryAccessConflicts(
+        BaselineGates, ClusterSignals
+    )
+    if BaselineConflicts == 0:
+        return LocalPositions, LocalMirrors, {}
+
+    BaselineMinimumX = min(Gate.X for Gate in BaselineGates)
+    BaselineMaximumX = max(
+        Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+        for Gate in BaselineGates
+    )
+    BaselineWidth = BaselineMaximumX - BaselineMinimumX
+    MaximumWidth = max(BaselineWidth, 2 * BaselineWidth)
+    SearchMinimumX = BaselineMinimumX - BaselineWidth
+    SearchMaximumX = BaselineMaximumX + BaselineWidth
+    BaselineX = {
+        Name: LocalPositions[Name][0] for Name in Names
+    }
+    EndpointNames = {
+        Name
+        for Name in Names
+        if set((
+            *InternalByName[Name].Inputs,
+            *InternalByName[Name].Outputs,
+        )) & ClusterSignals
+    }
+    SearchOrder = tuple(sorted(
+        Names,
+        key=lambda Name: (Name not in EndpointNames, LocalPositions[Name][1], Name),
+    ))
+
+    def Score(
+        State: tuple[tuple[str, int, bool], ...],
+        Gates: list[Any] | None = None,
+    ) -> tuple[int, int, int, tuple[tuple[str, int, bool], ...]]:
+        Gates = BuildGates(State) if Gates is None else Gates
+        MinimumX = min(Gate.X for Gate in Gates)
+        MaximumX = max(
+            Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+            for Gate in Gates
+        )
+        Displacement = sum(
+            abs(Gate.X - BaselineX[Gate.Name]) for Gate in Gates
+        )
+        return (
+            CountMandatoryAccessConflicts(Gates, ClusterSignals),
+            MaximumX - MinimumX,
+            Displacement,
+            State,
+        )
+
+    Beam: list[tuple[tuple[int, int, int, tuple[Any, ...]], tuple[tuple[str, int, bool], ...]]] = [
+        (Score(BaselineState, BaselineGates), BaselineState)
+    ]
+    for PassIndex in range(2):
+        for GateIndex, Name in enumerate(SearchOrder):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "packed-access-repair",
+                    "Pass": PassIndex,
+                    "GateIndex": GateIndex,
+                    "GateCount": len(SearchOrder),
+                    "BaselineConflictCount": BaselineConflicts,
+                })
+            Candidates: dict[
+                tuple[tuple[str, int, bool], ...],
+                tuple[int, int, int, tuple[Any, ...]],
+            ] = {}
+            for _PreviousScore, PreviousState in Beam:
+                Previous = {
+                    GateName: (X, MirrorX)
+                    for GateName, X, MirrorX in PreviousState
+                }
+                GateWidth = RotatedCellSize(
+                    InternalByName[Name].Kind.value,
+                    LocalRotations[Name],
+                )[0]
+                for CandidateX in range(
+                    SearchMinimumX,
+                    SearchMaximumX - GateWidth + 1,
+                ):
+                    for CandidateMirror in (False, True):
+                        Candidate = dict(Previous)
+                        Candidate[Name] = (CandidateX, CandidateMirror)
+                        State = tuple(
+                            (GateName, Candidate[GateName][0], Candidate[GateName][1])
+                            for GateName in Names
+                        )
+                        if State in Candidates:
+                            continue
+                        Gates = BuildGates(State)
+                        if any(
+                            PcbGatesConflict(First, Second)
+                            for FirstIndex, First in enumerate(Gates)
+                            for Second in Gates[FirstIndex + 1 :]
+                        ):
+                            continue
+                        MinimumX = min(Gate.X for Gate in Gates)
+                        MaximumX = max(
+                            Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+                            for Gate in Gates
+                        )
+                        if MaximumX - MinimumX > MaximumWidth:
+                            continue
+                        Candidates[State] = Score(State, Gates)
+            Beam = [
+                (CandidateScore, State)
+                for State, CandidateScore in sorted(
+                    Candidates.items(), key=lambda Value: Value[1]
+                )[:BeamWidth]
+            ]
+            if not Beam:
+                break
+        if Beam and Beam[0][0][0] == 0:
+            break
+    if not Beam or Beam[0][0][0] != 0:
+        BestConflictCount = Beam[0][0][0] if Beam else BaselineConflicts
+        raise ValueError(
+            "Could not legalize mandatory packed access claims "
+            f"within width envelope: signals={','.join(sorted(ClusterSignals))}:"
+            f"baseline={BaselineConflicts}:best={BestConflictCount}:"
+            f"maximum_width={MaximumWidth}"
+        )
+    BestScore, BestState = Beam[0]
+    Best = {Name: (X, MirrorX) for Name, X, MirrorX in BestState}
+    MinimumX = min(X for X, _MirrorX in Best.values())
+    RepairedPositions = dict(LocalPositions)
+    RepairedMirrors = dict(LocalMirrors)
+    for Name in Names:
+        RepairedPositions[Name] = (
+            Best[Name][0] - MinimumX,
+            LocalPositions[Name][1],
+        )
+        RepairedMirrors[Name] = Best[Name][1]
+    return RepairedPositions, RepairedMirrors, {
+        "BaselineConflictCount": BaselineConflicts,
+        "FinalConflictCount": BestScore[0],
+        "BaselineWidth": BaselineWidth,
+        "FinalWidth": BestScore[1],
+        "MaximumWidth": MaximumWidth,
+    }
+
+
 def BuildPinAlignedPackedCluster(
     Names: tuple[str, ...],
     InternalByName: dict[str, Any],
@@ -1587,7 +2174,13 @@ def BuildPinAlignedPackedCluster(
             (Name, State[Name].X, State[Name].Z, State[Name].Rotation, State[Name].MirrorX)
             for Name in sorted(State)
         )
-        return CrossElectricalPenalty, Hpwl, Width * Depth, max(Width, Depth), Stable
+        return (
+            CrossElectricalPenalty,
+            Hpwl,
+            Width * Depth,
+            max(Width, Depth),
+            Stable,
+        )
 
     while PlacedNames != NameSet:
         Name = ChooseNext()
@@ -1960,10 +2553,33 @@ def PlacePcbGraph(
         Clusters,
         RelocationSignals,
     )
+    RequiredRelocationClusters = BuildRelocationClusterSet(
+        Module,
+        Clusters,
+        RequiredRelocationSignals,
+    )
     BoundaryEscapeRelocationClusters = BuildRelocationClusterSet(
         Module,
         Clusters,
         RelocationPrioritySignals or RelocationSignals,
+    )
+    RankedRequiredGeometryClusters = PrioritizeRelocationClusters(
+        Module,
+        Clusters,
+        RequiredRelocationSignals,
+    )
+    LocalGeometryRepairClusters = frozenset(
+        (
+            RankedRequiredGeometryClusters[
+                RelocationVariant % len(RankedRequiredGeometryClusters)
+            ],
+        )
+        if (
+            PackedMode
+            and PackingPolicy.EnableLocalGeometryRepair
+            and RankedRequiredGeometryClusters
+        )
+        else ()
     )
     CheckWork("connectivity-clusters", ClusterCount=len(Clusters))
     Assignment, ColumnCount, _RowCount = OptimizeClusterSlots(
@@ -2000,6 +2616,7 @@ def PlacePcbGraph(
     ClusterStructuralMappings: dict[int, dict[str, str]] = {}
     ClusterStackIds: dict[int, int | None] = {}
     ClusterStackLevels: dict[int, int] = {}
+    PackedAccessRepairByCluster: dict[int, dict[str, int]] = {}
     StackSuppressedRelocationClusters: set[int] = set()
     PhysicallyRelocatedClusters: frozenset[int] = frozenset()
     SignalProducerNames = {
@@ -2355,12 +2972,59 @@ def PlacePcbGraph(
                     Row * CellPitchZ,
                 )
                 LocalRotations[Name] = 270 if Row % 2 == 0 else 90
+        if PackedMode and RequiredRelocationSignals:
+            (
+                LocalPositions,
+                LocalMirrors,
+                AccessRepairDiagnostics,
+            ) = RepairPackedClusterAccess(
+                Names,
+                InternalByName,
+                LocalPositions,
+                LocalRotations,
+                LocalMirrors,
+                RequiredRelocationSignals,
+                PackingPolicy.BeamWidth,
+                WorkCheck=WorkCheck,
+            )
+            if AccessRepairDiagnostics:
+                PackedAccessRepairByCluster[ClusterIndex] = (
+                    AccessRepairDiagnostics
+                )
+                PackedWidth = max(
+                    LocalPositions[Name][0]
+                    + RotatedCellSize(
+                        "NAND", LocalRotations[Name]
+                    )[0]
+                    for Name in Names
+                )
+                PackedDepth = max(
+                    LocalPositions[Name][1]
+                    + RotatedCellSize(
+                        "NAND", LocalRotations[Name]
+                    )[1]
+                    for Name in Names
+                )
         if (
             PackedMode
-            and len(Clusters) > 4
             and ClusterIndex in BoundaryEscapeRelocationClusters
+            and (
+                len(Clusters) > 4
+                or ClusterIndex in LocalGeometryRepairClusters
+            )
         ):
-            BoundaryEscapeGap = max(2, RoutingSpacing)
+            # A fixed-access cut inside one dense cluster needs actual
+            # corridor geometry, not another mirror of the same pin layout.
+            # Keep the single-cluster perturbation to one routing tile; the
+            # flow's existing packed-area ceiling remains the hard limit.
+            BoundaryEscapeGap = (
+                max(
+                    PackingPolicy.LocalGeometryRepairColumnGap,
+                    RoutingSpacing,
+                )
+                if len(Clusters) > 4
+                else PackingPolicy.LocalGeometryRepairColumnGap
+            )
             DistinctX = sorted({LocalPositions[Name][0] for Name in Names})
             XOffset = {
                 Value: Index * BoundaryEscapeGap
@@ -2409,6 +3073,12 @@ def PlacePcbGraph(
 
     if PackedMode and PackingPolicy.EnableVerticalClusterStacking:
         CheckWork("vertical-stacking-start")
+        # Feedback identifies every cluster participating in the cut, but it
+        # does not make every stacked cluster geometrically illegal.  Breaking
+        # the full stack for an unmodified contributor expands a local repair
+        # into a placement-wide footprint.  Only a concrete local repair is
+        # allowed to alter stack geometry below.
+        UnrepairedRequiredRelocationClusters: frozenset[int] = frozenset()
         ClusterByGate = {
             Name: ClusterIndex
             for ClusterIndex, Names in enumerate(Clusters)
@@ -2432,6 +3102,37 @@ def PlacePcbGraph(
         StackByCluster: dict[int, int] = {}
         StackMembers: dict[int, list[int]] = {}
         NextStackId = 0
+        RepeatedStructuralClusters = (
+            len(Clusters) >= 4
+            and len({
+                ClusterStructuralSignatures.get(ClusterIndex)
+                for ClusterIndex in range(len(Clusters))
+            }) == 1
+        )
+        WeakInterClusterChain = bool(InterClusterWeights) and max(
+            InterClusterWeights.values()
+        ) <= 2
+        PlanarRepeatedClusterPlacement = (
+            RepeatedStructuralClusters
+            and WeakInterClusterChain
+        )
+        if (
+            PlanarRepeatedClusterPlacement
+            and not PackingPolicy.EnableRepeatedStructuralVerticalStacking
+        ):
+            # Repeated dense clusters connected by only a small boundary cut
+            # are not stack-compatible routing resources.  A shared X/Z deck
+            # turns their independent pin escapes into mandatory electrical
+            # claims.  Make the initial placement planar so its fixed area
+            # ceiling is measured against routable geometry, not a stack that
+            # can only be repaired by exceeding that ceiling.
+            # Keep the optimizer's two-dimensional placement.  The routing
+            # defect is overlapping vertical stacks, not adjacency itself;
+            # serializing every repeated cluster into a fresh column makes
+            # the cut longer without creating a new independent escape.
+            # MaximumClusterStack below is the ownership boundary that
+            # prevents later stack merging from collapsing this grid.
+            MaximumClusterStack = 1
 
         def StackEndpoints(StackId: int) -> tuple[int, int]:
             Values = StackMembers[StackId]
@@ -2503,7 +3204,10 @@ def PlacePcbGraph(
                 CompletedEdges=EdgeIndex,
                 TotalEdges=len(OrderedInterClusterWeights),
             )
-            if Source in RelocationClusters or Target in RelocationClusters:
+            if (
+                Source in UnrepairedRequiredRelocationClusters
+                or Target in UnrepairedRequiredRelocationClusters
+            ):
                 if (
                     ClusterStructuralSignatures.get(Source)
                     == ClusterStructuralSignatures.get(Target)
@@ -2580,11 +3284,18 @@ def PlacePcbGraph(
     # still needs to change physical geometry. Move those clusters into
     # dedicated columns; merely replaying the same slot assignment would turn
     # conflict feedback into a duplicate placement.
-    RequiredRelocationPriority = PrioritizeRelocationClusters(
-        Module,
-        Clusters,
-        RequiredRelocationSignals,
+    RequiredRelocationPriority = tuple(
+        ClusterIndex
+        for ClusterIndex in PrioritizeRelocationClusters(
+            Module,
+            Clusters,
+            RequiredRelocationSignals,
+        )
+        if ClusterIndex not in PackedAccessRepairByCluster
+        and ClusterIndex not in LocalGeometryRepairClusters
     )[:1]
+    if LocalGeometryRepairClusters:
+        RequiredRelocationPriority = ()
     CurrentRelocationPriority = PrioritizeRelocationClusters(
         Module,
         Clusters,
@@ -2596,14 +3307,16 @@ def PlacePcbGraph(
         if ClusterIndex not in StackSuppressedRelocationClusters
         and ClusterIndex not in RequiredRelocationPriority
     )
-    # Relocation is cluster-level feedback, so a net conflict can touch many
-    # producer/consumer clusters.  Moving that entire transitive set turned a
-    # three-net diagnosis into a long strip of dedicated columns.  Move the
-    # highest-pressure cluster for each member of the physical conflict (up to
-    # three) and use RelocationVariant to explore the remaining ranked set.
-    MaximumOptionalRelocations = min(
-        3 if len(RelocationPrioritySignals) >= 3 else 2,
-        len(OptionalRelocationPriority),
+    # Preserve every congestion-cut contributor in feedback, but perturb one
+    # additional physical cluster per deterministic round. Moving every
+    # contributor at once tears apart a vertical stack and exceeds the fixed
+    # two-times packed-area ceiling before the router can evaluate a repair.
+    # Variants rotate through the complete ranked cut across the existing
+    # placement-feedback rounds.
+    MaximumOptionalRelocations = (
+        0
+        if LocalGeometryRepairClusters
+        else min(1, len(OptionalRelocationPriority))
     )
     OptionalRelocationClusters = (
         tuple(
@@ -2623,9 +3336,9 @@ def PlacePcbGraph(
     PhysicallyRelocatedClusters = frozenset(RelocationPriority)
     MirroredRelocationClusters = (
         frozenset(
-            RelocationPriority[
-                : min(RelocationVariant, 2, len(RelocationPriority))
-            ]
+            ClusterIndex
+            for ClusterIndex in RelocationPriority
+            if ClusterIndex not in PackedAccessRepairByCluster
         )
         if RelocationVariant > 0 and RelocationPriority
         else frozenset()
@@ -2635,7 +3348,7 @@ def PlacePcbGraph(
         ColumnCount,
         RelocationPriority,
     )
-    for ClusterIndex in PhysicallyRelocatedClusters:
+    for ClusterIndex in RequiredRelocationPriority:
         ClusterStackIds[ClusterIndex] = None
         ClusterStackLevels[ClusterIndex] = 0
     ColumnWidths = {
@@ -2660,18 +3373,47 @@ def PlacePcbGraph(
         )
         for Row in range(max((Slot[1] for Slot in Assignment.values()), default=0) + 1)
     }
+    GapPlan = BuildInterClusterGapPlan(
+        BuildInterClusterBoundaryDemand(
+            Module,
+            Clusters,
+            Assignment,
+            WorkCheck=WorkCheck,
+        ),
+        ColumnCount=ColumnCount,
+        RowCount=len(RowDepths),
+        RoutingSpacing=RoutingSpacing,
+        TrackPitch=(
+            PlacementPolicy.DemandAwareBoundaryTrackPitch
+            if (
+                PlacementPolicy is not None
+                and PlacementPolicy.DemandAwareBoundaryTrackPitch > 0
+            )
+            else DefaultRedstoneRoutingTechnology.TrackPitch
+        ),
+        Enabled=bool(
+            PlacementPolicy is not None
+            and PlacementPolicy.EnableDemandAwareInterClusterSpacing
+        ),
+    )
+    ColumnExtraSpacing = GapPlan.ColumnSpacingByBoundary()
+    RowExtraSpacing = GapPlan.RowSpacingByBoundary()
     ColumnOrigins: dict[int, int] = {}
     NextX = 0
     ColumnGap = 2 if PackedMode else 3
     RowGap = 1 if PackedMode else 2
     for Column in range(ColumnCount):
         ColumnOrigins[Column] = NextX
-        NextX += ColumnWidths[Column] + ColumnGap + RoutingSpacing
+        NextX += ColumnWidths[Column]
+        if Column + 1 < ColumnCount:
+            NextX += ColumnGap + ColumnExtraSpacing[Column]
     RowOrigins: dict[int, int] = {}
     NextZ = 0
     for Row in sorted(RowDepths):
         RowOrigins[Row] = NextZ
-        NextZ += RowDepths[Row] + RowGap + RoutingSpacing
+        NextZ += RowDepths[Row]
+        if Row + 1 < len(RowDepths):
+            NextZ += RowGap + RowExtraSpacing[Row]
     InputMargin = 0
     PlacedGates = []
     for ClusterIndex, Names in enumerate(Clusters):
@@ -2780,9 +3522,7 @@ def PlacePcbGraph(
         )
         CenterX = (InternalMinimumX + InternalMaximumX) // 2
         TerminalSpacings = (
-            (3 + RoutingSpacing, 4 + RoutingSpacing)
-            if PackedMode and RelocationSignals and len(Clusters) > 4
-            else (2, 3)
+            (2, 3)
             if PackedMode
             else
             (4 + RoutingSpacing, 3 + RoutingSpacing)
@@ -2834,9 +3574,11 @@ def PlacePcbGraph(
                 return
         raise ValueError("Could not place grouped terminal bank legally")
 
-    def PlaceLocalizedTerminals(Gates: list[Any], PortNames: list[str]) -> None:
-        """Place packed-mode I/O beside the NAND pins it actually serves."""
-        PortIndexes = {Signal: Index for Index, Signal in enumerate(PortNames)}
+    def PlaceLocalizedTerminals(
+        Gates: list[Any],
+        PortIndexes: dict[str, int],
+    ) -> list[Any] | None:
+        """Place packed-mode I/O on the exterior shell of the NAND fabric."""
         Producers = {
             Signal: Gate
             for Gate in PlacedGates
@@ -2875,7 +3617,7 @@ def PlacePcbGraph(
                 Value.Name,
             )
 
-        Planned = []
+        OptionsByGate: list[tuple[str, list[tuple[tuple[Any, ...], Any]]]] = []
         for Gate in sorted(
             Gates,
             key=TerminalOrderKey,
@@ -2886,6 +3628,21 @@ def PlacePcbGraph(
                 Targets.get(Signal, [])
                 if Gate.Kind.value == "INPUT"
                 else [Producers[Signal].OutputPin]
+            )
+            # A high-fanout terminal must not be pinned beside an arbitrary
+            # consumer.  In particular, a signal which crosses packed-cluster
+            # boundaries needs a balanced escape location: limiting candidates
+            # to a radius around every individual sink makes the terminal hug an
+            # edge and unnecessarily consumes a tall global routing layer.
+            # Keep the search bounded, but include a median anchor for every
+            # multi-target terminal so the choice generalizes to any topology.
+            TargetXs = sorted(Pin[0] for Pin in DesiredPins)
+            TargetZs = sorted(Pin[2] for Pin in DesiredPins)
+            TargetMiddle = len(DesiredPins) // 2
+            MedianAnchor = (
+                (TargetXs[(len(TargetXs) - 1) // 2] + TargetXs[TargetMiddle]) // 2,
+                DesiredPins[0][1],
+                (TargetZs[(len(TargetZs) - 1) // 2] + TargetZs[TargetMiddle]) // 2,
             )
             CandidatePinPositions = {
                 (
@@ -2906,6 +3663,45 @@ def PlacePcbGraph(
                     (0, -2),
                 )
             }
+            if len(DesiredPins) > 1:
+                CandidatePinPositions.update(
+                    (
+                        MedianAnchor[0] + DeltaX,
+                        MedianAnchor[1],
+                        MedianAnchor[2] + DeltaZ,
+                    )
+                    for DeltaX in range(-3, 4)
+                    for DeltaZ in range(-3, 4)
+                    if abs(DeltaX) + abs(DeltaZ) <= 3
+                )
+            # I/O is an external interface, not a component of the logic
+            # interior.  Keep the shell compact by assigning inputs and
+            # outputs to opposing exterior faces, aligned with the pins they
+            # serve.  This avoids four-sided horizontal sprawl while ensuring
+            # every terminal is visible and approachable at the edge of an
+            # arbitrary packed graph.
+            ShellAnchors = (*DesiredPins, MedianAnchor)
+            ShellClearance = PackingPolicy.TerminalShellClearance
+            ShellLateralSearch = PackingPolicy.TerminalShellLateralSearch
+            ShellZ = (
+                InternalMinimumZ - ShellClearance
+                if Gate.Kind.value == "INPUT"
+                else InternalMaximumZ + ShellClearance
+            )
+            for Anchor in ShellAnchors:
+                CandidatePinPositions.update(
+                    (
+                        (
+                            Anchor[0] + Delta,
+                            Anchor[1],
+                            ShellZ,
+                        )
+                        for Delta in range(
+                            -ShellLateralSearch,
+                            ShellLateralSearch + 1,
+                        )
+                    )
+                )
             Options = []
             for Rotation in (0, 90, 180, 270):
                 CheckWork(
@@ -2930,7 +3726,7 @@ def PlacePcbGraph(
                     )
                     if any(
                         PcbGatesConflict(Candidate, Existing)
-                        for Existing in (*PlacedGates, *Planned)
+                        for Existing in PlacedGates
                     ):
                         continue
                     CandidatePin = (
@@ -2943,10 +3739,25 @@ def PlacePcbGraph(
                         + abs(CandidatePin[2] - Pin[2])
                         for Pin in DesiredPins
                     )
+                    MaximumDistance = max(
+                        abs(CandidatePin[0] - Pin[0])
+                        + abs(CandidatePin[2] - Pin[2])
+                        for Pin in DesiredPins
+                    )
                     CandidateWidth, CandidateDepth = RotatedCellSize(
                         Candidate.Kind,
                         Candidate.Rotation,
                     )
+                    CandidateMaximumX = Candidate.X + CandidateWidth - 1
+                    CandidateMaximumZ = Candidate.Z + CandidateDepth - 1
+                    IsOutsideCore = (
+                        CandidateMaximumX < InternalMinimumX
+                        or Candidate.X > InternalMaximumX
+                        or CandidateMaximumZ < InternalMinimumZ
+                        or Candidate.Z > InternalMaximumZ
+                    )
+                    if not IsOutsideCore:
+                        continue
                     MinimumX = min(
                         [Existing.X for Existing in PlacedGates]
                         + [Candidate.X]
@@ -2975,35 +3786,154 @@ def PlacePcbGraph(
                     Depth = MaximumZ - MinimumZ
                     Options.append(
                         (
-                            (Distance, Width * Depth, max(Width, Depth), Candidate.X, Candidate.Z, Rotation),
+                            (
+                                MaximumDistance,
+                                Distance,
+                                Width * Depth,
+                                max(Width, Depth),
+                                Candidate.X,
+                                Candidate.Z,
+                                Rotation,
+                            ),
                             Candidate,
                         )
                     )
             if not Options:
                 return None
-            Planned.append(min(Options, key=lambda Value: Value[0])[1])
-        return Planned
+            OrderedOptions = sorted(
+                Options,
+                key=lambda Value: (
+                    Value[0][2],
+                    Value[0][3],
+                    Value[0][0],
+                    Value[0][1],
+                    Value[0][4:],
+                ),
+            )
+
+            def ExteriorFace(Option: tuple[tuple[Any, ...], Any]) -> str:
+                """Classify the shell face reached by one legal terminal cell."""
+                Candidate = Option[1]
+                Width, Depth = RotatedCellSize(
+                    Candidate.Kind,
+                    Candidate.Rotation,
+                )
+                MaximumX = Candidate.X + Width - 1
+                MaximumZ = Candidate.Z + Depth - 1
+                if MaximumZ < InternalMinimumZ:
+                    return "north"
+                if Candidate.Z > InternalMaximumZ:
+                    return "south"
+                if MaximumX < InternalMinimumX:
+                    return "west"
+                return "east"
+
+            # Keep one low-cost representative on every exterior face before
+            # truncating the bounded candidate pool.  A terminal that looks
+            # marginally worse in isolation can avoid increasing the shared
+            # X or Z envelope once neighbouring ports have already occupied a
+            # different face.  This is topology-agnostic and leaves the exact
+            # joint assignment responsible for the final choice.
+            FaceRepresentatives: list[tuple[tuple[Any, ...], Any]] = []
+            SeenFaces: set[str] = set()
+            for Option in OrderedOptions:
+                Face = ExteriorFace(Option)
+                if Face in SeenFaces:
+                    continue
+                SeenFaces.add(Face)
+                FaceRepresentatives.append(Option)
+            SelectedOptions = list(FaceRepresentatives)
+            for Option in OrderedOptions:
+                if Option in SelectedOptions:
+                    continue
+                SelectedOptions.append(Option)
+                if len(SelectedOptions) >= PackingPolicy.MaximumTerminalPlacementCandidates:
+                    break
+            OptionsByGate.append((
+                Gate.Name,
+                SelectedOptions[:PackingPolicy.MaximumTerminalPlacementCandidates],
+            ))
+
+        BestSelection: tuple[Any, ...] | None = None
+        BestScore: tuple[Any, ...] | None = None
+        AssignmentExpansions = 0
+
+        def SelectionScore(
+            Selected: tuple[tuple[tuple[Any, ...], Any], ...],
+        ) -> tuple[Any, ...]:
+            AllGates = (*PlacedGates, *(Candidate for _Key, Candidate in Selected))
+            MinimumX = min(Gate.X for Gate in AllGates)
+            MaximumX = max(
+                Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+                for Gate in AllGates
+            )
+            MinimumZ = min(Gate.Z for Gate in AllGates)
+            MaximumZ = max(
+                Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+                for Gate in AllGates
+            )
+            Width = MaximumX - MinimumX
+            Depth = MaximumZ - MinimumZ
+            return (
+                Width * Depth,
+                max(Width, Depth),
+                sum(Key[0] for Key, _Candidate in Selected),
+                sum(Key[1] for Key, _Candidate in Selected),
+                tuple(
+                    (Candidate.Name, Candidate.X, Candidate.Z, Candidate.Rotation)
+                    for _Key, Candidate in Selected
+                ),
+            )
+
+        def SearchTerminalAssignments(
+            Index: int,
+            Selected: tuple[tuple[tuple[Any, ...], Any], ...],
+        ) -> None:
+            nonlocal AssignmentExpansions, BestSelection, BestScore
+            if AssignmentExpansions >= PackingPolicy.MaximumTerminalAssignmentExpansions:
+                return
+            AssignmentExpansions += 1
+            if Index == len(OptionsByGate):
+                Score = SelectionScore(Selected)
+                if BestScore is None or Score < BestScore:
+                    BestScore = Score
+                    BestSelection = Selected
+                return
+            _GateName, Options = OptionsByGate[Index]
+            for Option in Options:
+                _Key, Candidate = Option
+                if any(
+                    PcbGatesConflict(Candidate, Existing)
+                    for _SelectedKey, Existing in Selected
+                ):
+                    continue
+                SearchTerminalAssignments(Index + 1, (*Selected, Option))
+
+        SearchTerminalAssignments(0, ())
+        if BestSelection is None:
+            return None
+        return [Candidate for _Key, Candidate in BestSelection]
 
     if PackedMode:
         # Prefer compact, cluster-aware terminals when feasible. If any localized
         # choice conflicts (including overlap with each other), fall back to
         # deterministic side banks for reliability.
         BasePlacement = list(PlacedGates)
-        UseLocalizedTerminals = not (
-            RelocationSignals and len(Clusters) > 4
-        )
-        PlannedInputs = (
-            PlaceLocalizedTerminals(InputGates, list(Module.Inputs))
+        UseLocalizedTerminals = True
+        TerminalPortIndexes = {
+            Signal: Index
+            for Index, Signal in enumerate((*Module.Inputs, *Module.Outputs))
+        }
+        PlannedTerminals = (
+            PlaceLocalizedTerminals(
+                [*InputGates, *OutputGates],
+                TerminalPortIndexes,
+            )
             if UseLocalizedTerminals
             else None
         )
-        PlannedOutputs = (
-            PlaceLocalizedTerminals(OutputGates, list(Module.Outputs))
-            if UseLocalizedTerminals
-            else None
-        )
-        if PlannedInputs is not None and PlannedOutputs is not None:
-            CandidatePlacement = BasePlacement + PlannedInputs + PlannedOutputs
+        if PlannedTerminals is not None:
+            CandidatePlacement = BasePlacement + PlannedTerminals
             try:
                 if any(
                     PcbGatesConflict(First, Second)
@@ -3016,8 +3946,8 @@ def PlacePcbGraph(
                 )
                 PlacedGates = CandidatePlacement
             except ValueError:
-                PlannedInputs = None
-        if PlannedInputs is None or PlannedOutputs is None:
+                PlannedTerminals = None
+        if PlannedTerminals is None:
             PlacedGates = BasePlacement
             PlaceTerminalBank(
                 InputGates,
@@ -3072,6 +4002,19 @@ def PlacePcbGraph(
         LocalNetTargets = {}
         LocalRouteClaims = []
         LocalRouteDiagnostics = {}
+        JointLocalCandidatesByCluster: dict[
+            int, dict[str, list[LocalClusterRouteCandidate]]
+        ] = {}
+        LocalRouteDiagnostics["__InterClusterGaps__"] = (
+            GapPlan.ToDictionary()
+        )
+        if PackedAccessRepairByCluster:
+            LocalRouteDiagnostics["__PackedAccessRepair__"] = {
+                str(ClusterIndex): Diagnostics
+                for ClusterIndex, Diagnostics in sorted(
+                    PackedAccessRepairByCluster.items()
+                )
+            }
         ActualBlocks, ElectricalBlocks, SolidBlocks = BuildPlacedCellGeometry(Placed)
         LocalResourceGraph = RoutingResourceGraph(
             ActualBlocks=frozenset(ActualBlocks),
@@ -3387,6 +4330,20 @@ def PlacePcbGraph(
             Producer = Producers.get(Signal)
             if Producer is None or not Targets:
                 continue
+            AllTargets = Targets
+            ProducerCluster = ClusterByGate.get(Producer.Name)
+            # A placement-owned tree is strictly local to its producer's
+            # packed cluster.  Remote sinks remain terminal demand for the
+            # authoritative global router and are represented only by the
+            # continuation portal below.
+            if ProducerCluster is not None:
+                Targets = [
+                    Target for Target in AllTargets
+                    if ClusterByGate.get(GateByInputPin.get(Target))
+                    == ProducerCluster
+                ]
+            if not Targets:
+                continue
             Root = Producer.OutputPin
             Paths = []
             LocalTargets = []
@@ -3471,7 +4428,6 @@ def PlacePcbGraph(
                 for Target in LocalTargets
                 if (Name := GateByInputPin.get(Target)) in ClusterByGate
             ]
-            ProducerCluster = ClusterByGate.get(Producer.Name)
             ClusterId = (
                 ProducerCluster
                 if ProducerCluster is not None
@@ -3483,7 +4439,7 @@ def PlacePcbGraph(
                 Root=Root,
                 ConnectedTargets=tuple(sorted(set(LocalTargets))),
                 BoundaryNodes=SelectBoundaryNodes(
-                    Nodes, Targets, LocalTargets
+                    Nodes, AllTargets, LocalTargets
                 ),
                 Nodes=Nodes,
                 Edges=Edges,
@@ -3497,7 +4453,7 @@ def PlacePcbGraph(
             try:
                 ValidateLocalSignalStrength(CandidateClaim)
                 ValidateLocalPhysicalConnectivity(CandidateClaim)
-                ValidateContinuationPortal(CandidateClaim, Targets)
+                ValidateContinuationPortal(CandidateClaim, AllTargets)
                 ValidateBoundaryEscapes(CandidateClaim)
                 ValidateLocalRouteClaims(LocalResourceGraph, TrialClaims)
                 if any(len(Path) - 1 > MaximumLength for Path in Paths):
@@ -3534,7 +4490,7 @@ def PlacePcbGraph(
                     Root=Root,
                     ConnectedTargets=tuple(sorted(set(LocalTargets))),
                     BoundaryNodes=SelectBoundaryNodes(
-                        Nodes, Targets, LocalTargets
+                    Nodes, AllTargets, LocalTargets
                     ),
                     Nodes=Nodes,
                     Edges=Edges,
@@ -3547,7 +4503,7 @@ def PlacePcbGraph(
                 try:
                     ValidateLocalSignalStrength(CandidateClaim)
                     ValidateLocalPhysicalConnectivity(CandidateClaim)
-                    ValidateContinuationPortal(CandidateClaim, Targets)
+                    ValidateContinuationPortal(CandidateClaim, AllTargets)
                     ValidateBoundaryEscapes(CandidateClaim)
                     ValidateLocalRouteClaims(
                         LocalResourceGraph,
@@ -3556,15 +4512,91 @@ def PlacePcbGraph(
                 except ValueError:
                     continue
             if (
+                PackingPolicy.RequireCompleteLocalFanoutClaims
+                and len(Clusters) == 1
+                and len(LocalTargets) != len(AllTargets)
+            ):
+                LocalRouteDiagnostics.setdefault(Signal, {}).update({
+                    "ReleasedForCompleteFanout": ClusterId,
+                })
+                continue
+            if (
                 len(Clusters) > 4
                 and RelocationSignals
-                and len(LocalTargets) != len(Targets)
+                and len(LocalTargets) != len(AllTargets)
             ):
                 LocalRouteDiagnostics.setdefault(Signal, {}).update({
                     "ReleasedForGlobalRelocation": ClusterId,
                 })
                 continue
-            LocalRouteClaims.append(CandidateClaim)
+            # Do not claim the tree greedily.  Keep the complete local tree
+            # and its direct-only baseline for the bounded cluster assignment
+            # below; the latter is often the compatible choice when a denser
+            # neighbouring net needs the same clearance or support resource.
+            CandidateChoices = JointLocalCandidatesByCluster.setdefault(
+                ClusterId, {}
+            ).setdefault(Signal, [])
+            CandidateChoices.append(
+                LocalClusterRouteCandidate(
+                    CandidateId=(
+                        f"cluster{ClusterId}:{Signal}:tree:"
+                        f"{len(CandidateChoices)}"
+                    ),
+                    Claim=CandidateClaim,
+                )
+            )
+            if (
+                DirectPaths
+                and (tuple(DirectTargets) != tuple(LocalTargets))
+                and len(CandidateChoices)
+                < PackingPolicy.MaximumLocalRouteCandidatesPerSignal
+            ):
+                DirectNodes = frozenset(
+                    Position for Path in DirectPaths for Position in Path
+                )
+                DirectEdges = frozenset(
+                    NormalizeRoutingEdge(First, Second)
+                    for Path in DirectPaths
+                    for First, Second in zip(Path, Path[1:])
+                )
+                DirectClaim = LocalRouteClaim(
+                    Signal=Signal,
+                    ClusterId=ClusterId,
+                    Root=Root,
+                    ConnectedTargets=tuple(sorted(set(DirectTargets))),
+                    BoundaryNodes=SelectBoundaryNodes(
+                        DirectNodes, AllTargets, DirectTargets
+                    ),
+                    Nodes=DirectNodes,
+                    Edges=DirectEdges,
+                    Claims=LocalResourceGraph.BuildRouteClaims(DirectNodes),
+                    ExactRouteSignalBlocks=len(DirectNodes),
+                    ExactRouteSupportBlocks=len({
+                        (X, Y - 1, Z) for X, Y, Z in DirectNodes
+                    } - ActualBlocks),
+                )
+                try:
+                    ValidateLocalSignalStrength(DirectClaim)
+                    ValidateLocalPhysicalConnectivity(DirectClaim)
+                    ValidateContinuationPortal(DirectClaim, AllTargets)
+                    ValidateBoundaryEscapes(DirectClaim)
+                    ValidateLocalRouteClaims(
+                        LocalResourceGraph, (DirectClaim,)
+                    )
+                except ValueError as Error:
+                    LocalRouteDiagnostics.setdefault(Signal, {}).setdefault(
+                        "DirectCandidateRejected", str(Error)
+                    )
+                else:
+                    CandidateChoices.append(
+                        LocalClusterRouteCandidate(
+                            CandidateId=(
+                                f"cluster{ClusterId}:{Signal}:direct:"
+                                f"{len(CandidateChoices)}"
+                            ),
+                            Claim=DirectClaim,
+                        )
+                    )
             LocalRouteDiagnostics.setdefault(Signal, {}).update({
                 "AcceptedTargets": len(set(LocalTargets)),
                 "AcceptedNodes": len(Nodes),
@@ -3572,12 +4604,101 @@ def PlacePcbGraph(
                     len(Path) - 1 > MaximumLength for Path in Paths
                 ),
             })
-            LocalNetBranches[Signal] = tuple(sorted(Nodes))
-            LocalNetTargets[Signal] = tuple(sorted(LocalTargets))
+        if PackingPolicy.EnableJointLocalRouting:
+            JointDiagnostics: dict[str, object] = {
+                "Enabled": True,
+                "CandidateLimitPerSignal": (
+                    PackingPolicy.MaximumLocalRouteCandidatesPerSignal
+                ),
+                "AssignmentExpansionLimit": (
+                    PackingPolicy.MaximumLocalClusterAssignmentExpansions
+                ),
+                "Clusters": {},
+            }
+            for ClusterId, CandidateMap in sorted(JointLocalCandidatesByCluster.items()):
+                BaseClaims = tuple(LocalRouteClaims)
+                LimitedCandidateMap = {
+                    Signal: tuple(Candidates[:PackingPolicy.MaximumLocalRouteCandidatesPerSignal])
+                    for Signal, Candidates in sorted(CandidateMap.items())
+                }
+                Selection = SelectJointLocalClusterCandidates(
+                    LocalResourceGraph,
+                    BaseClaims,
+                    LimitedCandidateMap,
+                    PackingPolicy.MaximumLocalClusterAssignmentExpansions,
+                )
+                SelectedClaims = tuple(
+                    Candidate.Claim for Candidate in Selection.Candidates
+                )
+                LocalRouteClaims.extend(SelectedClaims)
+                JointDiagnostics["Clusters"][str(ClusterId)] = {
+                    "AttemptedSignals": len(LimitedCandidateMap),
+                    "AttemptedCandidates": sum(
+                        len(Candidates)
+                        for Candidates in LimitedCandidateMap.values()
+                    ),
+                    "SelectedCandidates": len(Selection.Candidates),
+                    "LocalizedTargets": sum(
+                        Candidate.LocalizedTargetCount
+                        for Candidate in Selection.Candidates
+                    ),
+                    "LocalRepeaters": sum(
+                        Candidate.RepeaterCount for Candidate in Selection.Candidates
+                    ),
+                    "RouteAndSupportBlocks": sum(
+                        Candidate.RouteAndSupportBlocks
+                        for Candidate in Selection.Candidates
+                    ),
+                    "AssignmentExpansions": Selection.AssignmentExpansions,
+                    "BudgetExhausted": Selection.BudgetExhausted,
+                    "RejectionCounts": Selection.RejectionCounts,
+                }
+            FullyLocalizedSignals = {
+                Claim.Signal
+                for Claim in LocalRouteClaims
+                if set(TargetsBySignal.get(Claim.Signal, ())).issubset(
+                    Claim.ConnectedTargets
+                )
+            }
+            JointDiagnostics["Aggregate"] = {
+                "CandidateCount": sum(
+                    sum(len(Candidates) for Candidates in CandidateMap.values())
+                    for CandidateMap in JointLocalCandidatesByCluster.values()
+                ),
+                "LocalClaimCoverageBefore": 0,
+                "LocalClaimCoverageAfter": sum(
+                    len(Claim.Claims.ResourceIds) for Claim in LocalRouteClaims
+                ),
+                "SelectedClaimCount": len(LocalRouteClaims),
+                "LocalizedTargetCount": sum(
+                    len(Claim.ConnectedTargets) for Claim in LocalRouteClaims
+                ),
+                "GlobalNetCountBefore": len(TargetsBySignal),
+                "GlobalNetCountAfter": len(TargetsBySignal) - len(FullyLocalizedSignals),
+                "GlobalNetCountReduction": len(FullyLocalizedSignals),
+                "EstimatedLocalVolume": sum(
+                    LocalClusterRouteCandidate("selected", Claim).FullVolume
+                    for Claim in LocalRouteClaims
+                ),
+            }
+            LocalRouteDiagnostics["__JointLocalRouting__"] = JointDiagnostics
+        else:
+            # Compatibility mode retains the original deterministic signal
+            # ordering when a caller explicitly opts out of joint selection.
+            for CandidateMap in JointLocalCandidatesByCluster.values():
+                for Candidates in CandidateMap.values():
+                    if Candidates:
+                        LocalRouteClaims.append(Candidates[0].Claim)
+        for CandidateClaim in LocalRouteClaims:
+            Signal = CandidateClaim.Signal
+            LocalNetBranches[Signal] = tuple(sorted(CandidateClaim.Nodes))
+            LocalNetTargets[Signal] = tuple(sorted(CandidateClaim.ConnectedTargets))
             if (
-                len(LocalTargets) == len(Targets)
-                and len(Nodes) <= PackingPolicy.MaximumFrozenLocalNetNodes
-                and len(LocalTargets) <= PackingPolicy.MaximumFrozenLocalTargets
+                len(CandidateClaim.ConnectedTargets) == len(TargetsBySignal[Signal])
+                and len(CandidateClaim.Nodes)
+                <= PackingPolicy.MaximumFrozenLocalNetNodes
+                and len(CandidateClaim.ConnectedTargets)
+                <= PackingPolicy.MaximumFrozenLocalTargets
             ):
                 FrozenNetWires[Signal] = LocalNetBranches[Signal]
         Placed.FrozenNetWires = FrozenNetWires
@@ -3729,7 +4850,15 @@ def PlacePcbGraph(
             )
             for Signal in sorted(BoundarySignals)
         )
-        BoundaryPitch = DefaultRedstoneRoutingTechnology.TrackPitch
+        BoundaryPitch = (
+            PlacementPolicy.DemandAwareBoundaryTrackPitch
+            if (
+                PlacementPolicy is not None
+                and PlacementPolicy.EnableDemandAwareInterClusterSpacing
+                and PlacementPolicy.DemandAwareBoundaryTrackPitch > 0
+            )
+            else DefaultRedstoneRoutingTechnology.TrackPitch
+        )
         BoundaryLayerCapacity = (
             PlacementPolicy.MaximumRoutingLayers
             if PlacementPolicy is not None

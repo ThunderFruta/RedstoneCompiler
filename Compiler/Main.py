@@ -10,6 +10,7 @@ import shutil
 import sys
 import os
 import time
+from threading import Event, Lock, Thread
 
 if __package__:
     from .Pipeline import CompileSvToLitematic
@@ -40,10 +41,10 @@ BuiltInDefaults = {
     "PushToMinecraft": True,
     "MinecraftDirectory": str(MinecraftSchematicsDirectory),
     "PushFilePath": "Output/FullAdder/FullAdder.litematic",
-    "TraceSupportBlocks": [
+        "TraceSupportBlocks": [
         "minecraft:light_gray_concrete",
         "minecraft:yellow_concrete",
-        "minecraft:green_concrete",
+        "minecraft:lime_concrete",
         "minecraft:light_blue_concrete",
         "minecraft:red_concrete",
         "minecraft:orange_concrete",
@@ -130,7 +131,7 @@ def BuildParser() -> argparse.ArgumentParser:
         type=str,
         help=(
             "Comma-separated block IDs for per-signal route supports; "
-            "defaults to light gray, yellow, green, light blue, red, orange, magenta"
+            "defaults to light gray, yellow, lime, light blue, red, orange, magenta"
         ),
     )
     Parser.add_argument(
@@ -290,10 +291,22 @@ def PromptPath(Label: str, Default: Path | None = None) -> Path:
     while True:
         Value = input(f"{Label}{DefaultText}: ").strip()
         if Value:
-            return Path(Value).expanduser()
+            return ParsePromptPath(Value)
         if Default is not None:
             return Default
         print("A path is required.")
+
+
+def ParsePromptPath(Value: str) -> Path:
+    """Accept a pasted shell-quoted path without making quotes part of it."""
+    Normalized = Value.strip()
+    while (
+        len(Normalized) >= 2
+        and Normalized[0] == Normalized[-1]
+        and Normalized[0] in {"'", '"'}
+    ):
+        Normalized = Normalized[1:-1].strip()
+    return Path(Normalized).expanduser()
 
 
 def PushToMinecraft(
@@ -414,13 +427,38 @@ class TerminalProgressReporter:
     def __init__(self) -> None:
         self.StartTime = time.monotonic()
         self.Interactive = sys.stderr.isatty()
+        self.RefreshIntervalSeconds = 0.1
         self.LastPrintedPercent = -10
         self.LastBest: tuple[int | None, int | None] = (None, None)
         self.LastRenderKey: tuple[object, ...] | None = None
         self.LastRenderAt = 0.0
         self.HasRendered = False
+        self.LatestProgress: PcbProgress | None = None
+        self.RenderLock = Lock()
+        self.RefreshStop = Event()
+        self.RefreshThread: Thread | None = None
+        if self.Interactive:
+            self.RefreshThread = Thread(
+                target=self._RefreshLoop,
+                name="redstone-routing-progress",
+                daemon=True,
+            )
+            self.RefreshThread.start()
 
     def __call__(self, Progress: PcbProgress) -> None:
+        with self.RenderLock:
+            self.LatestProgress = Progress
+            self._Render(Progress)
+
+    def _RefreshLoop(self) -> None:
+        """Refresh elapsed time while routing is between progress callbacks."""
+        while not self.RefreshStop.wait(self.RefreshIntervalSeconds):
+            with self.RenderLock:
+                if self.LatestProgress is not None:
+                    self._Render(self.LatestProgress)
+
+    def _Render(self, Progress: PcbProgress) -> None:
+        """Render one captured progress state; caller holds RenderLock."""
         Percent = min(
             100,
             int(Progress.Completed * 100 / max(1, Progress.Total)),
@@ -457,7 +495,7 @@ class TerminalProgressReporter:
             CurrentTime = time.monotonic()
             if (
                 RenderKey == self.LastRenderKey
-                and CurrentTime - self.LastRenderAt < 1.0
+                and CurrentTime - self.LastRenderAt < self.RefreshIntervalSeconds
             ):
                 return
             TerminalWidth = max(
@@ -493,9 +531,14 @@ class TerminalProgressReporter:
 
     def Finish(self) -> None:
         """Move output following an interactive progress line to a new line."""
-        if self.Interactive and self.HasRendered:
-            print(file=sys.stderr, flush=True)
-            self.HasRendered = False
+        self.RefreshStop.set()
+        if self.RefreshThread is not None:
+            self.RefreshThread.join(timeout=self.RefreshIntervalSeconds * 2)
+            self.RefreshThread = None
+        with self.RenderLock:
+            if self.Interactive and self.HasRendered:
+                print(file=sys.stderr, flush=True)
+                self.HasRendered = False
 
 
 def BuildProgressReporter() -> TerminalProgressReporter:
@@ -613,12 +656,14 @@ def Main(Args: list[str] | None = None) -> int:
             f"overflow_peak={Metrics.CorridorOverflowPeak}"
         )
     ResultLabel = "PCB layout generated"
+    Composition = Result.BlockComposition
     print(
         f"{ResultLabel}: {Result.EstimatedBlocks} blocks, "
         f"{Result.Width}x{Result.Depth}, "
-        f"footprint {Result.Width * Result.Depth}"
+        f"xz_footprint {Composition.Footprint}, "
+        f"xy_footprint {Composition.XYFootprint}, "
+        f"full_footprint {Composition.FullFootprint}"
     )
-    Composition = Result.BlockComposition
     print(
         "Block composition: "
         f"components={Composition.ComponentOwnedFunctionalBlocks} "

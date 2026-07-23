@@ -25,6 +25,8 @@ from Compiler.Placement.Pcb import (
     PcbGatesConflict,
     PlacePcbGraph,
 )
+from Compiler.Placement.Geometry import BuildPlacedGate
+from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
 from Compiler.Routing.LocalFirst import (
     BuildCapacityAwareGuidePlan,
@@ -99,6 +101,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         Fingerprints: list[str],
         RouteSideEffect: Any,
         FeedbackSideEffect: Any = None,
+        OptimizeRoutingPercentage: bool = False,
     ) -> tuple[Any, Any, Any]:
         Module = SimpleNamespace(Gates=[SimpleNamespace(Name="Gate")])
         Netlist = SimpleNamespace(Top="Fixture", Modules={"Fixture": Module})
@@ -164,6 +167,17 @@ class LocalFirstRouterTests(unittest.TestCase):
                 Policy=replace(
                     LocalFirstPhysicalDesignPolicy,
                     RuntimeBudgetSeconds=5.0,
+                    NandPacking=replace(
+                        LocalFirstPhysicalDesignPolicy.NandPacking,
+                        EnableProactiveInterClusterRelocation=False,
+                        DeferUnpackedOracle=False,
+                    ),
+                    MaterialObjective=replace(
+                        LocalFirstPhysicalDesignPolicy.MaterialObjective,
+                        OptimizeRoutingPercentage=OptimizeRoutingPercentage,
+                        MinimumRemainingRoutingPercentageSearchSeconds=0.001,
+                        MinimumRoutingPercentageSelectionNandCount=1,
+                    ),
                 ),
                 Technology=DefaultRedstoneRoutingTechnology,
                 RequestedStrategy=RoutingStrategy.NewRouterFirst,
@@ -305,9 +319,21 @@ class LocalFirstRouterTests(unittest.TestCase):
             CompatibilityPhysicalDesignPolicy.Placement.EnableRoutingFeedback
         )
         self.assertFalse(
+            CompatibilityPhysicalDesignPolicy
+            .Placement.EnableDemandAwareInterClusterSpacing
+        )
+        self.assertFalse(
             CompatibilityPhysicalDesignPolicy.GlobalRouting.EnableCapacityAwareGuides
         )
-        self.assertEqual(LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing, 6)
+        self.assertTrue(
+            CompatibilityPhysicalDesignPolicy
+            .Placement.ForceMaximumRoutingLayersAfterPlacementRelocation
+        )
+        self.assertTrue(
+            LocalFirstPhysicalDesignPolicy
+            .Placement.EnableDemandAwareInterClusterSpacing
+        )
+        self.assertEqual(LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing, 5)
         self.assertEqual(LocalFirstPhysicalDesignPolicy.Placement.PinEscapeLength, 1)
         self.assertNotEqual(
             CompatibilityPhysicalDesignPolicy.PolicyVersion,
@@ -317,10 +343,13 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertFalse(Snapshot["QualityGate"]["Enabled"])
         self.assertEqual(Snapshot["Placement"]["RoutingFeedbackIterations"], 1)
         self.assertTrue(Snapshot["Placement"]["EnableRoutingFeedback"])
+        self.assertTrue(
+            Snapshot["Placement"]["EnableDemandAwareInterClusterSpacing"]
+        )
         self.assertTrue(Snapshot["GlobalRouting"]["EnableCapacityAwareGuides"])
         self.assertEqual(
             LocalFirstPhysicalDesignPolicy.PolicyVersion,
-            "physical-design-v10-routability-feedback",
+            "physical-design-v15-compact-boundaries",
         )
         self.assertTrue(Snapshot["NandPacking"]["Enabled"])
         self.assertTrue(Snapshot["NandPacking"]["EnableStructuralReuse"])
@@ -516,16 +545,16 @@ class LocalFirstRouterTests(unittest.TestCase):
             [
                 "row-beam-conflict-relocation",
                 "row-beam-direct-only",
-                "unpacked-spacing-7",
+                "unpacked-spacing-6",
                 "unpacked-configured-spacing",
                 "configured-packing",
                 "graph-beam-direct-only",
-                "spacing-5",
-                "spacing-7",
+                "spacing-4",
+                "spacing-6",
             ],
         )
         self.assertEqual(Plan.MaximumAttempts, 10)
-        self.assertEqual(Plan.PrimaryRequests[1].RoutingSpacing, 5)
+        self.assertEqual(Plan.PrimaryRequests[1].RoutingSpacing, 4)
         RecipeKeys = [
             (Request.RoutingSpacing, Request.PackingPolicy)
             for Request in Plan.PrimaryRequests + Plan.DeferredRequests
@@ -533,27 +562,23 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(len(RecipeKeys), len(set(RecipeKeys)) + 1)
         self.assertEqual(RecipeKeys[0], RecipeKeys[2])
 
-        LargePackedPlan = BuildPlacementGenerationPlan(
+        PackedFirstPlan = BuildPlacementGenerationPlan(
             LocalFirstPhysicalDesignPolicy,
-            NandGateCount=(
-                3
-                * LocalFirstPhysicalDesignPolicy.NandPacking.MaximumClusterCells
-                + 1
-            ),
+            PreferPackedPlacements=True,
         )
         self.assertEqual(
             [
                 Request.SourceGenerator
-                for Request in LargePackedPlan.PrimaryRequests
+                for Request in PackedFirstPlan.PrimaryRequests
             ],
             ["row-beam"],
         )
         self.assertEqual(
             [
                 Request.SourceGenerator
-                for Request in LargePackedPlan.DeferredRequests[:2]
+                for Request in PackedFirstPlan.DeferredRequests[:2]
             ],
-            ["row-beam-conflict-relocation", "unpacked"],
+            ["row-beam-conflict-relocation", "row-beam-direct-only"],
         )
 
         DirectOnlyPolicy = replace(
@@ -602,12 +627,54 @@ class LocalFirstRouterTests(unittest.TestCase):
             for Value in PackingPolicies
         ))
 
+    def testFullFootprintSelectionUsesFinalRenderedComposition(self) -> None:
+        Placements = [
+            self._BuildPlacementFlowFixture("row-beam"),
+            self._BuildPlacementFlowFixture("unpacked"),
+        ]
+        Composition = lambda Share, RouteBlocks, Footprint: SimpleNamespace(
+            RoutingFunctionalShare=Share,
+            RoutingOwnedFunctionalBlocks=RouteBlocks,
+            Footprint=Footprint,
+            NonAirBlocks=200,
+            Width=20,
+            Height=5,
+            Depth=10,
+            XYFootprint=100,
+            FullFootprint=Footprint * 5,
+        )
+        with patch(
+            "SchemEncoder.Writer262.BuildLitematicBlockMap",
+            side_effect=[
+                SimpleNamespace(Composition=Composition(0.70, 140, 200)),
+                SimpleNamespace(Composition=Composition(0.55, 150, 210)),
+            ],
+        ):
+            Result, _PlaceGraph, RouteDesign = self._RunMockedPlacementFlow(
+                Placements,
+                ["first", "second"],
+                None,
+                OptimizeRoutingPercentage=True,
+            )
+
+        Selection = Result.Routed.RoutingControlEffectiveness[
+            "RoutingPercentageSelection"
+        ]
+        self.assertEqual(RouteDesign[1].call_count, 2)
+        self.assertEqual(Selection["CandidateCount"], 2)
+        self.assertEqual(Selection["Selected"]["FullFootprint"], 1000)
+        self.assertEqual(
+            Result.Routed.RoutingControlEffectiveness[
+                "SelectedPlacementCandidate"
+            ]["PlacementFingerprint"],
+            "first",
+        )
+
     def testConfiguredGraphBeamRunsAfterEveryPrimaryPlacementFails(self) -> None:
         GraphPlacement = self._BuildPlacementFlowFixture("graph-beam")
         PlacementResults = [
             ValueError("row beam rejected"),
             ValueError("unpacked placement rejected"),
-            ValueError("conflict-relocated row beam rejected"),
             ValueError("direct-only row beam rejected"),
             ValueError("configured-spacing unpacked rejected"),
             ValueError("wider-spacing unpacked rejected"),
@@ -620,7 +687,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             None,
         )
 
-        self.assertEqual(PlaceGraph.call_count, 8)
+        self.assertEqual(PlaceGraph.call_count, 7)
         PackingPolicies = [
             Call.kwargs["PackingPolicy"] for Call in PlaceGraph.call_args_list
         ]
@@ -629,14 +696,12 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertFalse(PackingPolicies[1].Enabled)
         self.assertTrue(PackingPolicies[2].Enabled)
         self.assertFalse(PackingPolicies[2].GraphBeamEnabled)
-        self.assertTrue(PackingPolicies[3].Enabled)
-        self.assertFalse(PackingPolicies[3].GraphBeamEnabled)
+        self.assertFalse(PackingPolicies[3].Enabled)
         self.assertFalse(PackingPolicies[4].Enabled)
-        self.assertFalse(PackingPolicies[5].Enabled)
+        self.assertTrue(PackingPolicies[5].Enabled)
+        self.assertTrue(PackingPolicies[5].GraphBeamEnabled)
         self.assertTrue(PackingPolicies[6].Enabled)
         self.assertTrue(PackingPolicies[6].GraphBeamEnabled)
-        self.assertTrue(PackingPolicies[7].Enabled)
-        self.assertTrue(PackingPolicies[7].GraphBeamEnabled)
 
     def testRetainedCandidatesShareOneAbsoluteRoutingDeadline(self) -> None:
         Placements = [
@@ -777,7 +842,11 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertLessEqual(Columns * Rows, 2)
 
     def testAbsoluteMaterialGatesAreBenchmarkOnly(self) -> None:
-        self.assertFalse(LocalFirstPhysicalDesignPolicy.MaterialObjective.Enabled)
+        self.assertTrue(LocalFirstPhysicalDesignPolicy.MaterialObjective.Enabled)
+        self.assertFalse(
+            LocalFirstPhysicalDesignPolicy
+            .MaterialObjective.OptimizeRoutingPercentage
+        )
         self.assertEqual(
             RoutingAcceptanceProfiles["FullAdder"].MaximumFootprint,
             600,
@@ -817,6 +886,30 @@ class LocalFirstRouterTests(unittest.TestCase):
             )
         )
 
+    def testVerticalDeckEscapesDoNotCreatePlanarFeedbackConflicts(self) -> None:
+        Lower = BuildPlacedGate(
+            Gate("Lower", GateKind.NAND, ["LowerOut"], ["A", "A"]),
+            0,
+            1,
+            0,
+            0,
+        )
+        Upper = BuildPlacedGate(
+            Gate("Upper", GateKind.NAND, ["UpperOut"], ["B", "B"]),
+            0,
+            7,
+            0,
+            0,
+        )
+        Placement = SimpleNamespace(PlacedGates=[Lower, Upper])
+
+        Metrics = BuildPlacementSolution(
+            Placement,
+            LocalFanoutDistance=8,
+        )
+
+        self.assertEqual(Metrics.PinEscapeConflictCount, 0)
+
     def testPackedNandsRemainIndependentAndDeterministic(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
             Netlist = ToNandOnly(
@@ -831,7 +924,10 @@ class LocalFirstRouterTests(unittest.TestCase):
         Arguments = dict(
             RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
             PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
-            PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
+            PackingPolicy=replace(
+                LocalFirstPhysicalDesignPolicy.NandPacking,
+                RequireCompleteLocalFanoutClaims=False,
+            ),
         )
         First = PlacePcbGraph(Netlist, **Arguments)
         Second = PlacePcbGraph(Netlist, **Arguments)
@@ -883,10 +979,14 @@ class LocalFirstRouterTests(unittest.TestCase):
                     )
                 )
             )
+        DemandAwarePlacementPolicy = replace(
+            LocalFirstPhysicalDesignPolicy.Placement,
+            EnableDemandAwareInterClusterSpacing=True,
+        )
         Placement = PlacePcbGraph(
             Netlist,
             RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
-            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PlacementPolicy=DemandAwarePlacementPolicy,
             PackingPolicy=replace(
                 LocalFirstPhysicalDesignPolicy.NandPacking,
                 GraphBeamEnabled=False,
@@ -910,10 +1010,14 @@ class LocalFirstRouterTests(unittest.TestCase):
                     )
                 )
             )
+        DemandAwarePlacementPolicy = replace(
+            LocalFirstPhysicalDesignPolicy.Placement,
+            EnableDemandAwareInterClusterSpacing=True,
+        )
         Placement = PlacePcbGraph(
             Netlist,
             RoutingSpacing=LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
-            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PlacementPolicy=DemandAwarePlacementPolicy,
             PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
         )
         Inputs = [
@@ -922,29 +1026,69 @@ class LocalFirstRouterTests(unittest.TestCase):
             if Gate.Kind == "INPUT"
         ]
         self.assertEqual(
-            [
-                (
-                    Gate.Name,
-                    Gate.Outputs[0],
-                    Gate.X,
-                    Gate.Y,
-                    Gate.Z,
-                    Gate.Rotation,
-                )
-                for Gate in Inputs
-            ],
-            [
-                ("InputA0", "A0", 14, 1, -4, 0),
-                ("InputB0", "B0", 16, 1, -1, 0),
-                ("InputCarryIn", "CarryIn", 17, 1, 21, 90),
-                ("InputA1", "A1", 14, 7, -4, 0),
-                ("InputB1", "B1", 16, 7, -1, 0),
-                ("InputA2", "A2", 14, 13, -4, 0),
-                ("InputB2", "B2", 16, 13, -1, 0),
-                ("InputA3", "A3", 14, 19, -4, 0),
-                ("InputB3", "B3", 16, 19, -1, 0),
-            ],
+            {(Gate.Name, Gate.Outputs[0]) for Gate in Inputs},
+            {
+                ("InputA0", "A0"),
+                ("InputB0", "B0"),
+                ("InputCarryIn", "CarryIn"),
+                ("InputA1", "A1"),
+                ("InputB1", "B1"),
+                ("InputA2", "A2"),
+                ("InputB2", "B2"),
+                ("InputA3", "A3"),
+                ("InputB3", "B3"),
+            },
         )
+        InternalGates = [
+            Gate
+            for Gate in Placement.Placed.PlacedGates
+            if Gate.Kind == "NAND"
+        ]
+        CoreMinimumX = min(Gate.X for Gate in InternalGates)
+        CoreMaximumX = max(
+            Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0] - 1
+            for Gate in InternalGates
+        )
+        CoreMinimumZ = min(Gate.Z for Gate in InternalGates)
+        CoreMaximumZ = max(
+            Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
+            for Gate in InternalGates
+        )
+        for Terminal in (
+            Gate
+            for Gate in Placement.Placed.PlacedGates
+            if Gate.Kind in {"INPUT", "OUTPUT"}
+        ):
+            TerminalWidth, TerminalDepth = RotatedCellSize(
+                Terminal.Kind,
+                Terminal.Rotation,
+            )
+            self.assertTrue(
+                Terminal.X + TerminalWidth - 1 < CoreMinimumX
+                or Terminal.X > CoreMaximumX
+                or Terminal.Z + TerminalDepth - 1 < CoreMinimumZ
+                or Terminal.Z > CoreMaximumZ
+            )
+        GapPlan = Placement.Placed.LocalRouteDiagnostics[
+            "__InterClusterGaps__"
+        ]
+        self.assertTrue(GapPlan["Enabled"])
+        self.assertTrue(GapPlan["BoundaryDemand"])
+        for Demand in GapPlan["BoundaryDemand"]:
+            SpacingByBoundary = (
+                GapPlan["ColumnExtraSpacing"]
+                if Demand["Axis"] == "X"
+                else GapPlan["RowExtraSpacing"]
+            )
+            self.assertEqual(
+                SpacingByBoundary[str(Demand["BoundaryIndex"])],
+                min(
+                    LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing,
+                    Demand["RequiredCorridorLanes"]
+                    * LocalFirstPhysicalDesignPolicy
+                    .Placement.DemandAwareBoundaryTrackPitch,
+                ),
+            )
         self.assertEqual(
             Placement.Clusters[0],
             (
@@ -1163,6 +1307,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertIn('"UnresolvedClaimCount": 0', Diagnostics)
         self.assertIn('"PlanningContracts"', Diagnostics)
         self.assertIn('"BlockComposition"', Diagnostics)
+        self.assertIn('"RoutingFootprint"', Diagnostics)
         self.assertIn('"RoutingDemandEstimate"', Diagnostics)
         self.assertIn('"DerivedRoutingBudget"', Diagnostics)
         self.assertIn('"NormalizedQuality"', Diagnostics)
