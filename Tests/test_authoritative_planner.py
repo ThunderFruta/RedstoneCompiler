@@ -1,5 +1,5 @@
 import unittest
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import replace
 from time import monotonic, sleep
 from types import SimpleNamespace
@@ -8,41 +8,79 @@ from unittest.mock import patch
 from Compiler.Placement.Pcb import PlacementAssignmentConstraintSet
 from Compiler.Routing.AuthoritativePlanner import (
     BuildNegotiatedInitialColumns,
+    BeginPhysicalAssignmentArcPass,
     BuildNegotiatedInitialTiles,
     BuildNegotiatedFallbackGuideColumns,
     BuildNegotiatedOffenderHaloEscalation,
     BuildNegotiatedRouteTreeState,
     BuildOptionalPortalSeedWorkCheck,
+    BuildPinnedOrdinaryPortalReuseColumns,
     BuildRepeaterReadyPortalDomains,
     BuildCandidateStarvationClassFingerprint,
+    ClassifySiblingApertureSeamOwnershipConflicts,
+    BuildCandidateRequestGeometryIdentity,
+    BuildPhysicalCandidateRequestShapeDependencyIdentity,
     BuildCompleteMandatoryClaimCutCoverage,
     BuildInvariantRouteRequestGuidePayload,
     BuildInvariantRouteRequestNodePayload,
+    BuildForeignElectricalExclusionsBySignal,
     BuildDetachedLocalClaimObstacleNodes,
     PartitionLocalClaimSeedComponents,
+    PortalTupleFeasibilityDomainIsComplete,
     BuildBoundedPortfolioPortalSliceAdvanceFailure,
     BuildMandatoryPortalTupleSelfConflictFailure,
+    GetMandatoryPortalPairFeasibilityCertificate,
+    GetPhysicalGlobalAssignmentArcIndex,
+    IncrementalPhysicalCandidateArcIndex,
+    SelectCertifiedMandatoryPortalPairCuts,
+    SolveMandatoryPortalPairFeasibility,
     BuildRoutingConflictGraph,
     BuildClusterInterfaceAccessDomainFingerprint,
     BuildClusterInterfaceProblem,
     BuildClusterInterfaceReservationAssignmentFingerprint,
     BuildClusterLeaseSignalPatternFingerprint,
     BuildCapacityAwareGuideInputFingerprint,
+    BuildPhysicalAssemblyGuideContractFingerprint,
+    BuildFactorizedPhysicalGuideIdentity,
+    BuildCertifiedPhysicalComponentApertureDomain,
+    BuildPhysicalSignalApertureCandidateDomainIdentity,
+    BuildMinimalPhysicalRequestApertureNoGood,
+    CompletePhysicalCandidatePairDomainsHaveNoSupport,
+    PhysicalSignalLocalCandidateRequestFactorProofComplete,
+    FilterPhysicalCandidatesAgainstSiblingApertures,
+    PhysicalSignalRouteDomainContinuation,
+    SelectReplayablePhysicalSignalRouteDomainContinuation,
+    RetainCompletePhysicalSignalRouteDomainContinuations,
+    BuildPhysicalPortCorridorArcSupportIndex,
+    BuildPhysicalPortCorridorDomain,
+    BuildPhysicalPortNoGoodKeys,
+    BuildPhysicalLocalPortPairUnsupportedIndex,
+    BuildPhysicalPortApertureContractFingerprint,
+    CaptureCompletePhysicalPortCorridorDomains,
+    BuildPreparedPhysicalExteriorGuideColumnsBySignal,
+    BuildPhysicalExteriorConnectorDistanceField,
+    BuildPhysicalPortCorridorFactor,
+    BuildPhysicalGlobalPlanContinuationState,
+    BuildPhysicalGlobalPlanYieldDeadline,
+    BuildPhysicalComponentGlobalPortalId,
     BuildTelemetryRoutingStageError,
     BuildUnavoidableMandatoryClaimCutFailure,
     CandidatePortalShapeRank,
     CandidatePortalTupleIndex,
+    CandidateRequestShapeDescriptor,
     CandidateRequestWindowOffset,
     ClusterLeaseCandidateRealizabilityNogood,
     ClaimConflictPositions,
     ChooseRepeatedWorkTransition,
     CountPriorCandidateFailureFingerprint,
+    CountPriorCandidateRequestDomainFingerprint,
     CountPriorCandidateStarvationClassFingerprint,
     CountRoutedComponentGlobalNoTreeAttempts,
     CountExactLegalRetainedJointStates,
     CountJointAssignmentConstraintKinds,
     ExpandNegotiatedTiles,
     ExactAssignmentCompletionSignalOrderKey,
+    ExtendIndexedRoutingResourceGraph,
     FindAllUnavoidableMandatoryClaimCuts,
     FrozenComponentBlockedWireNodes,
     FindFirstUnavoidableCandidateDomainPairCut,
@@ -55,8 +93,30 @@ from Compiler.Routing.AuthoritativePlanner import (
     HasRepeatedExactPairCut,
     HasCoveredPairCutAfterEndpointExpansion,
     MandatoryPortalTupleSelfConflictEvidence,
+    IsPhysicalCandidateRequestDomainComplete,
+    PhysicalGlobalAssignmentDomainIsComplete,
+    PlanPhysicalGlobalAssignmentAvoidingExactNoGoods,
+    PropagatePhysicalPortCorridorArcConsistency,
+    SelectReusablePhysicalPortCorridorCandidates,
+    RetainIncompletePhysicalGlobalPlan,
+    SelectNextRetainedPhysicalGlobalPlan,
+    ShouldScheduleRetainedPhysicalGlobalPlan,
+    SelectExactNoGoodCspBranch,
+    OrderPhysicalPortOptionsByPreferences,
+    DecomposePhysicalPortLaneFactors,
+    MaterializeSupportedPhysicalPortReservation,
+    MaterializePhysicalPortFactorPair,
+    FilterPhysicalCandidatesToCurrentPortalDomain,
+    ClassifyEmptyPhysicalCandidateDomains,
+    ApplyPhysicalComponentAssemblyPortalDomains,
+    GetPersistentPhysicalComponentPortCspState,
+    FindProofQualifiedCompleteDomainNoGoodCore,
+    FindProofQualifiedUniversalNoGoodCore,
+    PropagateExactNoGoodClauses,
+    SelectBinaryExactNoGoodClauses,
     MayAdvanceStagedCandidateOnExhaustion,
     MandatoryClaimsConflict,
+    InterleavePhysicalPortSeamsByEgressClass,
     MergeSignalScopedAvoidancePositions,
     MergeSignalScopedRawPortalEntries,
     PlanNegotiatedRouteTrees,
@@ -65,9 +125,17 @@ from Compiler.Routing.AuthoritativePlanner import (
     PortalTupleConflictsWithFrozenComponentClaims,
     RawPortalProfileMatchesRequestedControls,
     RawPortalGeometryCache,
+    RawPortalGeometryReusePlan,
+    ReadRouteTreeBatchCompletionMask,
+    BuildRawPortalPlacementGeometryFingerprint,
+    BuildRawPortalResourceGeometryFingerprint,
+    BuildTranslatedPortablePortalId,
+    BuildPhysicalGlobalRouteTreeResultCacheKey,
     PreparedPortalDomainCache,
     RetainPreparedPortalDomainCache,
+    RetainPhysicalGlobalRouteTreeResults,
     RetainRawPortalGeometryCache,
+    RequiredPhysicalAssemblyRoutingLayerCount,
     RequiredRoutingLayerCountForAccess,
     ReserveBoundaryPortals,
     ReserveClusterBoundaryLeases,
@@ -75,14 +143,19 @@ from Compiler.Routing.AuthoritativePlanner import (
     RetainPartialAssignmentCandidateCache,
     RetainNegotiatedInitialCandidateOption,
     SelectEscalatedRoutingLayerCount,
+    SelectAuthoritativeRouteRequestGuide,
     SelectExactAssignmentCompletionCutWideRequests,
     SelectPendingExactAssignmentCompletionRequestIndices,
     SelectExactAssignmentCompletionRequestBatch,
     SelectExactAssignmentCompletionReserveMilliseconds,
     ShouldContinueDistinctExactCutFrontier,
     ShouldBuildCapacityAwareGlobalGuidePlan,
+    CanReuseFrozenPhysicalPortGuidePlan,
+    CompletePhysicalGlobalCandidateRequestDomains,
     SelectComponentPreparationProfiles,
     ShouldDeferUnreservedCandidateRequestShape,
+    ShouldCompletePhysicalCandidateRequestWindow,
+    LazyCandidateRouteRequest,
     ShouldRejectRoutedComponentForeignEscape,
     SelectCandidateRegenerationSignals,
     SelectCandidateRegenerationCoverSignals,
@@ -92,6 +165,9 @@ from Compiler.Routing.AuthoritativePlanner import (
     SelectAnonymousMinimumFailurePairRelocationSignals,
     BuildAnonymousCandidateDomainFingerprint,
     SelectPriorityPlacementRelocationSignals,
+    SelectPhysicalGlobalAssignmentSuffixSignals,
+    SelectPhysicalGlobalPairSupportSuffixSignals,
+    SelectOpenPhysicalGlobalCandidateDomainSignals,
     SelectCandidateDomainPairScanSliceSeconds,
     SelectConflictAvoidancePositions,
     SelectClusterLeaseOwnershipSignals,
@@ -106,6 +182,9 @@ from Compiler.Routing.AuthoritativePlanner import (
     SelectGraphAccessStarts,
     PortalPathRespectsOutwardAccess,
     SelectInitialRoutingLayerCount,
+    SelectHierarchicalRoutingMaximumLayerCount,
+    ValidatePhysicalAssemblyRoutingLayerLimit,
+    ValidatePhysicalComponentExactAttachmentPortals,
     SelectMaturePortfolioExactInitialRequestFloor,
     SelectMaturePortfolioPortalLimit,
     SelectNegotiatedExpandedRequestMinimumExpansionCount,
@@ -114,8 +193,10 @@ from Compiler.Routing.AuthoritativePlanner import (
     SelectOptionalPortalSeedSliceSeconds,
     SelectRawPortalGeometryReusePlan,
     SelectPreparedPortalDomainCache,
+    SelectPhysicalExteriorConnectorPath,
     SelectTransactionalLeasePrescreenSignals,
     TransformPlanarRoutingPosition,
+    TouchPhysicalGlobalRouteTreeResult,
     SelectJointHigherOrderConstraintSignals,
     SelectJointPairwiseConstraintSignals,
     ShouldFreezePartialAssignmentForExactCut,
@@ -149,6 +230,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     _MaterializeCandidate,
     _ReserveRepeaters,
 )
+from Compiler.Routing.Models import PhysicalGlobalPlanResumeCursor
 from Compiler.Routing.Actions import PropagateRoutePower
 from Compiler.Routing.ChannelPlanner import NetRoutingProfile
 from Compiler.Routing.Failures import (
@@ -160,8 +242,16 @@ from Compiler.Routing.Failures import (
 from Compiler.Routing.Models import (
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceStateProof,
+    PhysicalComponentPortReservation,
+    PhysicalComponentChannelReservation,
+    PhysicalPortLaneFactor,
+    PhysicalPortSeamFactor,
     RoutingResources,
     RoutingStaticGeometry,
+)
+from Compiler.Routing.ComponentPipeline import (
+    BuildPhysicalLocalPortPairSupportCertificate,
+    BuildPhysicalPortGlobalContractFingerprint,
 )
 from Compiler.Routing.Policy import (
     DefaultPhysicalDesignPolicy,
@@ -184,6 +274,72 @@ from RedstoneCompiler.RustRouting import GenerateRectilinearTopology, RoutingCon
 
 
 class AuthoritativePlannerTests(unittest.TestCase):
+    def testEmptyPhysicalCandidateDomainClassificationSeparatesProofFromIdentity(
+        self,
+    ) -> None:
+        CompleteEmpty, IdentityMismatch = (
+            ClassifyEmptyPhysicalCandidateDomains(
+                {
+                    "CompleteEmpty": (),
+                    "StaleOnly": (),
+                    "Retained": (SimpleNamespace(CandidateId="route"),),
+                },
+                {
+                    "StaleOnly": ("stale-route",),
+                    "Retained": ("unrelated-stale-route",),
+                },
+            )
+        )
+
+        self.assertEqual(CompleteEmpty, ("CompleteEmpty",))
+        self.assertEqual(IdentityMismatch, ("StaleOnly",))
+
+        CompleteEmpty, IdentityMismatch = (
+            ClassifyEmptyPhysicalCandidateDomains(
+                {"CertifiedCurrent": ()},
+                {"CertifiedCurrent": ("older-portal-route",)},
+                CertifiedCurrentEmptyDomainSignals=(
+                    "CertifiedCurrent",
+                ),
+            )
+        )
+        self.assertEqual(CompleteEmpty, ("CertifiedCurrent",))
+        self.assertEqual(IdentityMismatch, ())
+
+    def testPhysicalCandidatePortalFilterRejectsStaleRetainedIdentity(
+        self,
+    ) -> None:
+        Current = SimpleNamespace(
+            CandidateId="current",
+            SourcePortalId="source-current",
+            TargetPortalIds={(9, 1, 0): "target-current"},
+        )
+        StaleSource = SimpleNamespace(
+            CandidateId="stale-source",
+            SourcePortalId="source-old",
+            TargetPortalIds={(9, 1, 0): "target-current"},
+        )
+        StaleTarget = SimpleNamespace(
+            CandidateId="stale-target",
+            SourcePortalId="source-current",
+            TargetPortalIds={(9, 1, 0): "target-old"},
+        )
+        Portals = {
+            (0, 1, 0): (SimpleNamespace(PortalId="source-current"),),
+            (9, 1, 0): (SimpleNamespace(PortalId="target-current"),),
+        }
+
+        Filtered, Removed = FilterPhysicalCandidatesToCurrentPortalDomain(
+            {"NandNet26": (StaleSource, Current, StaleTarget)},
+            Portals,
+        )
+
+        self.assertEqual(Filtered, {"NandNet26": (Current,)})
+        self.assertEqual(
+            Removed,
+            {"NandNet26": ("stale-source", "stale-target")},
+        )
+
     def testRoutedComponentForeignEscapeUsesOneBoundedAlternateWindow(
         self,
     ) -> None:
@@ -559,6 +715,252 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         self.assertEqual(First, Second)
         self.assertIsNot(First, Second)
+
+    def testIncrementalPhysicalArcIndexComparesOnlyNewPairs(self) -> None:
+        Index = IncrementalPhysicalCandidateArcIndex()
+        A1 = SimpleNamespace(Signal="A", CandidateId="a1")
+        A2 = SimpleNamespace(Signal="A", CandidateId="a2")
+        B1 = SimpleNamespace(Signal="B", CandidateId="b1")
+        B2 = SimpleNamespace(Signal="B", CandidateId="b2")
+        Checks = []
+
+        def Compatible(First, Second):
+            Checks.append((First.CandidateId, Second.CandidateId))
+            return True
+
+        self.assertEqual(
+            Index.Extend({"A": (A1, A2), "B": (B1,)}, Compatible),
+            2,
+        )
+        self.assertEqual(
+            Index.Extend({"A": (A1, A2), "B": (B1, B2)}, Compatible),
+            2,
+        )
+        self.assertEqual(len(Checks), 4)
+        self.assertEqual(len(set(Checks)), 4)
+
+    def testPhysicalGlobalArcIndexPersistsOnlyForAssemblyPlanning(
+        self,
+    ) -> None:
+        Resources = SimpleNamespace(
+            PhysicalGlobalAssignmentArcIndex=None,
+        )
+
+        First = GetPhysicalGlobalAssignmentArcIndex(
+            Resources,
+            Persistent=True,
+        )
+        Second = GetPhysicalGlobalAssignmentArcIndex(
+            Resources,
+            Persistent=True,
+        )
+        Flat = GetPhysicalGlobalAssignmentArcIndex(
+            Resources,
+            Persistent=False,
+        )
+
+        self.assertIs(First, Second)
+        self.assertIsNot(First, Flat)
+
+    def testPhysicalAssignmentArcPassDropsStaleConflictWitnesses(
+        self,
+    ) -> None:
+        Telemetry = {
+            "EmptySignals": ["Old"],
+            "BlockerSignalsByEmptySignal": {"Old": ["Peer"]},
+            "EncodingRemovedSignal": True,
+            "CompatibilityCheckCount": 17,
+        }
+
+        BeginPhysicalAssignmentArcPass(Telemetry)
+
+        self.assertEqual(Telemetry, {"CompatibilityCheckCount": 17})
+
+    def testPersistentPhysicalArcIndexComparesNewCrossPlanPair(
+        self,
+    ) -> None:
+        Index = IncrementalPhysicalCandidateArcIndex()
+        A1 = SimpleNamespace(Signal="A", CandidateId="a1")
+        A2 = SimpleNamespace(Signal="A", CandidateId="a2")
+        B1 = SimpleNamespace(Signal="B", CandidateId="b1")
+        B2 = SimpleNamespace(Signal="B", CandidateId="b2")
+        Compared = []
+
+        def Compatible(First, Second):
+            Compared.append((First.CandidateId, Second.CandidateId))
+            return True
+
+        Index.Extend({"A": (A1,), "B": (B1,)}, Compatible)
+        Index.Extend({"A": (A2,), "B": (B2,)}, Compatible)
+        self.assertEqual(
+            Index.Extend({"A": (A1,), "B": (B2,)}, Compatible),
+            1,
+        )
+        self.assertIn(("a1", "b2"), Compared)
+
+    def testIncrementalPhysicalArcIndexPropagatesSupportClosure(
+        self,
+    ) -> None:
+        Index = IncrementalPhysicalCandidateArcIndex()
+        Candidates = {
+            "A": tuple(
+                SimpleNamespace(Signal="A", CandidateId=Value)
+                for Value in ("a1", "a2")
+            ),
+            "B": tuple(
+                SimpleNamespace(Signal="B", CandidateId=Value)
+                for Value in ("b1", "b2")
+            ),
+            "C": (
+                SimpleNamespace(Signal="C", CandidateId="c1"),
+            ),
+        }
+        CompatiblePairs = {
+            frozenset(("a1", "b1")),
+            frozenset(("a2", "b2")),
+            frozenset(("a1", "c1")),
+            frozenset(("a2", "c1")),
+            frozenset(("b1", "c1")),
+        }
+        Index.Extend(
+            Candidates,
+            lambda First, Second: frozenset((
+                First.CandidateId,
+                Second.CandidateId,
+            )) in CompatiblePairs,
+        )
+
+        Retained, PruneCount = Index.Propagate(Candidates)
+
+        self.assertEqual(
+            {
+                Signal: [Value.CandidateId for Value in Values]
+                for Signal, Values in Retained.items()
+            },
+            {"A": ["a1"], "B": ["b1"], "C": ["c1"]},
+        )
+        self.assertEqual(PruneCount, 2)
+
+    def testPhysicalRouteRequestConsumesReservedCorridor(self) -> None:
+        ReservedGuide = frozenset({
+            (0, 0),
+            (0, 4),
+            (7, 4),
+            (7, 0),
+        })
+
+        Selected = SelectAuthoritativeRouteRequestGuide(
+            ((0, 0), (7, 0)),
+            "X",
+            0,
+            ReservedPhysicalGuide=ReservedGuide,
+        )
+
+        self.assertEqual(Selected, ReservedGuide)
+        self.assertIn((0, 4), Selected)
+        self.assertNotEqual(
+            Selected,
+            frozenset((
+                (0, 0),
+                (1, 0),
+                (2, 0),
+                (3, 0),
+                (4, 0),
+                (5, 0),
+                (6, 0),
+                (7, 0),
+            )),
+        )
+
+    def testFlatRouteRequestRetainsGeneratedLane(self) -> None:
+        Selected = SelectAuthoritativeRouteRequestGuide(
+            ((0, 0), (3, 2)),
+            "X",
+            1,
+        )
+
+        self.assertEqual(
+            Selected,
+            frozenset({
+                (0, 0),
+                (0, 1),
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (3, 2),
+            }),
+        )
+
+    def testPhysicalRequestIdentityCollapsesAxisLaneAliases(self) -> None:
+        Arguments = (
+            "source",
+            ("target",),
+            frozenset({(0, 0), (1, 0)}),
+            1,
+        )
+
+        First = BuildCandidateRequestGeometryIdentity(
+            *Arguments,
+            "X",
+            3,
+            ImmutablePhysicalGuide=True,
+        )
+        Second = BuildCandidateRequestGeometryIdentity(
+            *Arguments,
+            "Z",
+            27,
+            ImmutablePhysicalGuide=True,
+        )
+
+        self.assertEqual(First, Second)
+
+    def testFlatRequestIdentityPreservesAxisLaneDiversity(self) -> None:
+        Arguments = (
+            "source",
+            ("target",),
+            frozenset({(0, 0), (1, 0)}),
+            1,
+        )
+
+        First = BuildCandidateRequestGeometryIdentity(
+            *Arguments,
+            "X",
+            3,
+            ImmutablePhysicalGuide=False,
+        )
+        Second = BuildCandidateRequestGeometryIdentity(
+            *Arguments,
+            "Z",
+            27,
+            ImmutablePhysicalGuide=False,
+        )
+
+        self.assertNotEqual(First, Second)
+
+    def testPhysicalSeamOrderAlternatesOutwardBanks(self) -> None:
+        Seams = (
+            SimpleNamespace(Name="south-0", GlobalPath=((0, 0, 0), (0, 0, -1)), Cost=0),
+            SimpleNamespace(Name="south-1", GlobalPath=((1, 0, 0), (1, 0, -1)), Cost=1),
+            SimpleNamespace(Name="south-2", GlobalPath=((2, 0, 0), (2, 0, -1)), Cost=2),
+            SimpleNamespace(Name="east-0", GlobalPath=((0, 0, 0), (1, 0, 0)), Cost=3),
+            SimpleNamespace(Name="north-0", GlobalPath=((0, 0, 0), (0, 0, 1)), Cost=4),
+        )
+
+        Ordered = InterleavePhysicalPortSeamsByEgressClass(
+            Seams,
+            BaseKey=lambda Value: (Value.Cost,),
+        )
+
+        self.assertEqual(
+            tuple(Value.Name for Value in Ordered),
+            (
+                "south-0",
+                "east-0",
+                "north-0",
+                "south-1",
+                "south-2",
+            ),
+        )
 
     def testCoordinatedPortalVariantsStayWithinExistingDemandCap(
         self,
@@ -1078,6 +1480,22 @@ class AuthoritativePlannerTests(unittest.TestCase):
             ShouldUseMatureStagedInitialCandidateScheduler(
                 **Arguments,
                 AllowPriorCandidateCache=True,
+            )
+        )
+
+    def testPhysicalAssemblyPlanningForcesSparseInitialScheduler(
+        self,
+    ) -> None:
+        self.assertTrue(
+            ShouldUseMatureStagedInitialCandidateScheduler(
+                ApplyMaturePortfolioSearchCaps=False,
+                CandidateDiversityLevel=0,
+                ReservationVariant=0,
+                LaneDiversityLevel=0,
+                SkipStrictPortalReservation=False,
+                RetainedCandidateCachePresent=False,
+                PriorCandidateCachePresent=False,
+                ForcePhysicalAssemblyPlanning=True,
             )
         )
 
@@ -2869,6 +3287,39 @@ class AuthoritativePlannerTests(unittest.TestCase):
             0,
         )
 
+    def testCandidateRequestDomainFingerprintCountsOnlyExactDomains(
+        self,
+    ) -> None:
+        History = (
+            {
+                "Stage": "CandidateGeneration",
+                "CandidateRequestDomainFingerprint": "same-domain",
+            },
+            {
+                "Stage": "CandidateGeneration",
+                "CandidateRequestDomainFingerprint": "other-domain",
+            },
+            {
+                "Stage": "TrackAssignment",
+                "CandidateRequestDomainFingerprint": "same-domain",
+            },
+        )
+
+        self.assertEqual(
+            CountPriorCandidateRequestDomainFingerprint(
+                History,
+                "same-domain",
+            ),
+            1,
+        )
+        self.assertEqual(
+            CountPriorCandidateRequestDomainFingerprint(
+                History,
+                "missing-domain",
+            ),
+            0,
+        )
+
     def testUnindexedCandidateClaimsAreIdentified(self) -> None:
         Indexed = IndexedRoutingResourceGraph(
             ResourcePositions=((0, 1, 0), (0, 0, 0)),
@@ -2888,6 +3339,101 @@ class AuthoritativePlannerTests(unittest.TestCase):
             FindUnindexedClaimPositions(Indexed, Claims),
             frozenset({(1, 1, 0), (0, 1, 1)}),
         )
+
+    def testPhysicalAssignmentIndexExtendsEveryClaimCategory(self) -> None:
+        Existing = (4, 1, 4)
+        Wire = (3, 1, 4)
+        Support = (3, 0, 4)
+        RequiredAir = (3, 2, 4)
+        Electrical = (2, 1, 4)
+        Indexed = IndexedRoutingResourceGraph(
+            ResourcePositions=(Existing,),
+            PositionIndices={Existing: 0},
+        )
+
+        Extended = ExtendIndexedRoutingResourceGraph(
+            Indexed,
+            (RoutingResourceClaims(
+                WireCells=frozenset({Wire}),
+                SupportCells=frozenset({Support}),
+                RequiredAirCells=frozenset({RequiredAir}),
+                ElectricalCells=frozenset({Electrical}),
+            ),),
+        )
+
+        Expected = tuple(sorted({
+            Existing,
+            Wire,
+            Support,
+            RequiredAir,
+            Electrical,
+        }))
+        self.assertEqual(Extended.ResourcePositions, Expected)
+        self.assertEqual(
+            Extended.PositionIndices,
+            {
+                Position: Index
+                for Index, Position in enumerate(Expected)
+            },
+        )
+
+    def testPhysicalAssignmentIndexExtensionIsClaimOrderInvariant(
+        self,
+    ) -> None:
+        Indexed = IndexedRoutingResourceGraph(
+            ResourcePositions=((9, 1, 0),),
+            PositionIndices={(9, 1, 0): 0},
+        )
+        Alpha = RoutingResourceClaims(
+            WireCells=frozenset({(2, 1, 0)}),
+            ElectricalCells=frozenset({(1, 1, 0)}),
+        )
+        Beta = RoutingResourceClaims(
+            SupportCells=frozenset({(7, 0, 0)}),
+            RequiredAirCells=frozenset({(7, 2, 0)}),
+        )
+
+        Forward = ExtendIndexedRoutingResourceGraph(
+            Indexed,
+            (Alpha, Beta),
+        )
+        Reversed = ExtendIndexedRoutingResourceGraph(
+            Indexed,
+            (Beta, Alpha),
+        )
+
+        self.assertEqual(Forward, Reversed)
+        self.assertEqual(
+            Forward.ResourcePositions,
+            tuple(sorted(Forward.ResourcePositions)),
+        )
+
+    def testPhysicalAssignmentIndexExtensionReusesCompleteIndex(
+        self,
+    ) -> None:
+        Positions = (
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, 2, 0),
+            (1, 1, 0),
+        )
+        Indexed = IndexedRoutingResourceGraph(
+            ResourcePositions=Positions,
+            PositionIndices={
+                Position: Index
+                for Index, Position in enumerate(Positions)
+            },
+        )
+        Claims = RoutingResourceClaims(
+            WireCells=frozenset({(0, 1, 0)}),
+            SupportCells=frozenset({(0, 0, 0)}),
+            RequiredAirCells=frozenset({(0, 2, 0)}),
+            ElectricalCells=frozenset({(1, 1, 0)}),
+        )
+
+        Extended = ExtendIndexedRoutingResourceGraph(Indexed, (Claims,))
+
+        self.assertIs(Extended, Indexed)
 
     def testCandidateRegenerationUsesEveryExactPairEndpoint(self) -> None:
         self.assertEqual(
@@ -3502,6 +4048,10 @@ class AuthoritativePlannerTests(unittest.TestCase):
             "regenerate-affected-candidates",
             "increase-guide-lane-diversity",
             "add-routing-layer",
+            "alternate-portal-slots",
+            "diversify-repeated-candidate-cut",
+            "try-bounded-unreserved-portals",
+            "final-bounded-unreserved-portals",
             "alternate-complete-cluster-interface-lease",
             "exclude-candidate-unrealizable-cluster-lease-template",
         ):
@@ -3510,10 +4060,6 @@ class AuthoritativePlannerTests(unittest.TestCase):
                     ShouldRetainUnaffectedCandidatesForControl(Action)
                 )
         for Action in (
-            "alternate-portal-slots",
-            "diversify-repeated-candidate-cut",
-            "try-bounded-unreserved-portals",
-            "final-bounded-unreserved-portals",
             "replace-complete-candidate-domain",
         ):
             with self.subTest(Action=Action):
@@ -4058,6 +4604,15 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertTrue(
             Failure.Diagnostics["MandatoryAccessProof"]["Complete"]
         )
+        self.assertTrue(
+            Failure.Diagnostics["MandatoryAccessProof"][
+                "PortalTupleDomainComplete"
+            ]
+        )
+        self.assertEqual(
+            Failure.Diagnostics["MandatoryAccessProof"]["ProofScope"],
+            "complete-portal-tuple-domain",
+        )
         self.assertEqual(
             Failure.Diagnostics["ConflictGraph"][
                 "PairwiseIncompatibleEdges"
@@ -4075,6 +4630,268 @@ class AuthoritativePlannerTests(unittest.TestCase):
             Constraints.PairwiseConflictEdges,
             (("A", "B"), ("B", "C")),
         )
+
+    def testPortalTupleCompletenessRejectsBoundedDiagonalSample(self) -> None:
+        self.assertFalse(PortalTupleFeasibilityDomainIsComplete((
+            {
+                "CompletePortalTupleCount": 759,
+                "EvaluatedPortalTupleCount": 13,
+            },
+            {
+                "CompletePortalTupleCount": 736,
+                "EvaluatedPortalTupleCount": 13,
+            },
+        )))
+        self.assertTrue(PortalTupleFeasibilityDomainIsComplete((
+            {
+                "CompletePortalTupleCount": 12,
+                "EvaluatedPortalTupleCount": 12,
+            },
+            {
+                "CompletePortalTupleCount": 16,
+                "EvaluatedPortalTupleCount": 16,
+            },
+        )))
+
+    def _BuildMandatoryPortalPairFixture(self, AlphaPositions):
+        class Graph:
+            @staticmethod
+            def BuildRouteClaims(Nodes):
+                Nodes = frozenset(Nodes)
+                return RoutingResourceClaims(
+                    WireCells=Nodes,
+                    ElectricalCells=Nodes,
+                )
+
+        GraphValue = Graph()
+
+        def Portal(Signal, Name, Position):
+            Claims = GraphValue.BuildRouteClaims((Position,))
+            return PinAccessPortal(
+                PortalId=f"{Signal}:{Name}",
+                Signal=Signal,
+                Terminal=Position,
+                Layer=0,
+                Path=(Position,),
+                Edges=frozenset(),
+                Claims=Claims,
+                Length=1,
+                BendCount=0,
+                ViaCount=0,
+                Cost=1,
+            )
+
+        Domains = {
+            "Alpha": ((
+                *(
+                    Portal("Alpha", str(Index), Position)
+                    for Index, Position in enumerate(AlphaPositions)
+                ),
+            ),),
+            "Beta": ((Portal("Beta", "0", (0, 1, 0)),),),
+        }
+        Fixed = {"Alpha": frozenset(), "Beta": frozenset()}
+        return GraphValue, Fixed, Domains
+
+    def testMandatoryPortalPairFactorFindsCompleteWitness(self) -> None:
+        Graph, Fixed, Domains = self._BuildMandatoryPortalPairFixture(
+            ((0, 1, 0), (2, 1, 0))
+        )
+        Certificate = SolveMandatoryPortalPairFeasibility(
+            Signals=("Alpha", "Beta"),
+            FixedAccessNodesBySignal=Fixed,
+            PortalDomainsBySignal=Domains,
+            FrozenComponentClaims=(),
+            ResourceGraph=Graph,
+            DomainFingerprint="feasible-domain",
+        )
+
+        self.assertTrue(Certificate.Complete)
+        self.assertTrue(Certificate.Feasible)
+        self.assertEqual(
+            dict(Certificate.WitnessPortalIds)["Alpha"],
+            ("Alpha:1",),
+        )
+        self.assertEqual(SelectCertifiedMandatoryPortalPairCuts((Certificate,)), ())
+
+    def testMandatoryPortalPairFactorProvesCompleteUnsat(self) -> None:
+        Graph, Fixed, Domains = self._BuildMandatoryPortalPairFixture(
+            ((0, 1, 0),)
+        )
+        Certificate = SolveMandatoryPortalPairFeasibility(
+            Signals=("Alpha", "Beta"),
+            FixedAccessNodesBySignal=Fixed,
+            PortalDomainsBySignal=Domains,
+            FrozenComponentClaims=(),
+            ResourceGraph=Graph,
+            DomainFingerprint="unsat-domain",
+        )
+
+        self.assertTrue(Certificate.Complete)
+        self.assertFalse(Certificate.Feasible)
+        self.assertTrue(Certificate.ConflictFingerprint)
+        self.assertEqual(
+            SelectCertifiedMandatoryPortalPairCuts((Certificate,))[0][0],
+            ("Alpha", "Beta"),
+        )
+
+    def testMandatoryPortalPairFactorCompletesMultiTerminalProductWithMemo(
+        self,
+    ) -> None:
+        Graph, Fixed, BaseDomains = self._BuildMandatoryPortalPairFixture(
+            ((0, 1, 0),)
+        )
+
+        def At(Portal, PortalId, Position):
+            return replace(
+                Portal,
+                PortalId=PortalId,
+                Terminal=Position,
+                Path=(Position,),
+                Claims=Graph.BuildRouteClaims((Position,)),
+            )
+
+        Alpha = BaseDomains["Alpha"][0][0]
+        Beta = BaseDomains["Beta"][0][0]
+        Domains = {
+            "Alpha": (
+                (
+                    At(Alpha, "Alpha:a0", (0, 1, 0)),
+                    At(Alpha, "Alpha:a0-alias", (0, 1, 0)),
+                ),
+                (
+                    At(Alpha, "Alpha:a1", (2, 1, 0)),
+                    At(Alpha, "Alpha:a1-alias", (2, 1, 0)),
+                ),
+            ),
+            "Beta": (
+                (
+                    At(Beta, "Beta:b0", (0, 1, 0)),
+                    At(Beta, "Beta:b0-alias", (0, 1, 0)),
+                ),
+                (
+                    At(Beta, "Beta:b1", (3, 1, 0)),
+                    At(Beta, "Beta:b1-alias", (3, 1, 0)),
+                ),
+            ),
+        }
+        Certificate = SolveMandatoryPortalPairFeasibility(
+            Signals=("Alpha", "Beta"),
+            FixedAccessNodesBySignal=Fixed,
+            PortalDomainsBySignal=Domains,
+            FrozenComponentClaims=(),
+            ResourceGraph=Graph,
+            DomainFingerprint="multi-terminal-unsat-domain",
+        )
+
+        self.assertTrue(Certificate.Complete)
+        self.assertFalse(Certificate.Feasible)
+        self.assertGreater(Certificate.MemoizedStateHitCount, 0)
+        self.assertLess(Certificate.ExpansionCount, 2 ** 4)
+        self.assertEqual(
+            SelectCertifiedMandatoryPortalPairCuts((Certificate,))[0][0],
+            ("Alpha", "Beta"),
+        )
+
+    def testIncompleteMandatoryPortalPairFactorIsNotPromoted(self) -> None:
+        Graph, Fixed, Domains = self._BuildMandatoryPortalPairFixture(
+            ((0, 1, 0),)
+        )
+        Certificate = SolveMandatoryPortalPairFeasibility(
+            Signals=("Alpha", "Beta"),
+            FixedAccessNodesBySignal=Fixed,
+            PortalDomainsBySignal=Domains,
+            FrozenComponentClaims=(),
+            ResourceGraph=Graph,
+            DomainFingerprint="incomplete-domain",
+            ShouldStop=lambda: True,
+        )
+
+        self.assertFalse(Certificate.Complete)
+        self.assertIsNone(Certificate.Feasible)
+        self.assertEqual(SelectCertifiedMandatoryPortalPairCuts((Certificate,)), ())
+
+    def testMandatoryPortalPairFactorReusesCompleteCertificate(self) -> None:
+        Graph, Fixed, Domains = self._BuildMandatoryPortalPairFixture(
+            ((0, 1, 0),)
+        )
+        Cache = {}
+        Arguments = dict(
+            Signals=("Alpha", "Beta"),
+            FixedAccessNodesBySignal=Fixed,
+            PortalDomainsBySignal=Domains,
+            FrozenComponentClaims=(),
+            ResourceGraph=Graph,
+            DomainFingerprint="cached-domain",
+        )
+        First, FirstHit = GetMandatoryPortalPairFeasibilityCertificate(
+            Cache,
+            **Arguments,
+        )
+        Second, SecondHit = GetMandatoryPortalPairFeasibilityCertificate(
+            Cache,
+            **Arguments,
+            ShouldStop=lambda: True,
+        )
+
+        self.assertFalse(FirstHit)
+        self.assertTrue(SecondHit)
+        self.assertIs(Second, First)
+
+    def testForeignElectricalExclusionProjectionMatchesNaiveUnion(
+        self,
+    ) -> None:
+        class InflatingTechnology:
+            @staticmethod
+            def BuildElectricalExclusions(Nodes):
+                return {
+                    (X + Delta, Y, Z)
+                    for X, Y, Z in Nodes
+                    for Delta in (-1, 0, 1)
+                }
+
+        Protected = {
+            "A": frozenset({(0, 1, 0), (1, 1, 0)}),
+            "B": frozenset({(1, 1, 0), (3, 1, 0)}),
+            "C": frozenset({(5, 1, 0)}),
+        }
+        Projected = BuildForeignElectricalExclusionsBySignal(
+            Protected,
+            InflatingTechnology(),
+        )
+        Naive = {
+            Signal: frozenset(
+                InflatingTechnology.BuildElectricalExclusions(set().union(*(
+                    Nodes
+                    for OtherSignal, Nodes in Protected.items()
+                    if OtherSignal != Signal
+                )))
+                - Protected[Signal]
+            )
+            for Signal in Protected
+        }
+
+        self.assertEqual(Projected, Naive)
+
+        Factored = BuildForeignElectricalExclusionsBySignal(
+            Protected,
+            InflatingTechnology(),
+            DeferredPairwiseSignals=frozenset(("A", "B")),
+        )
+        StaticCExclusions = frozenset(
+            InflatingTechnology.BuildElectricalExclusions(
+                set(Protected["C"])
+            )
+        )
+        self.assertEqual(
+            Factored["A"],
+            StaticCExclusions - Protected["A"],
+        )
+        self.assertEqual(
+            Factored["B"],
+            StaticCExclusions - Protected["B"],
+        )
+        self.assertEqual(Factored["C"], frozenset())
 
     def testMandatoryPortalFailureBatchIsOrderIndependent(self) -> None:
         First = BuildUnavoidableMandatoryClaimCutFailure((
@@ -4535,8 +5352,14 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 (self.BuildPortal(Signal, Terminal, Terminal),),
             ))
         return RawPortalGeometryCache(
-            PlacedIdentity=id(Placed),
-            ResourcesIdentity=id(Resources),
+            PlacementGeometryFingerprint=(
+                BuildRawPortalPlacementGeometryFingerprint(Placed)
+            ),
+            ResourceGeometryFingerprint=(
+                BuildRawPortalResourceGeometryFingerprint(Resources)
+            ),
+            PlacedReference=Placed,
+            ResourcesReference=Resources,
             Region=EffectiveRegion,
             LayerCount=LayerCount,
             PortalLimit=6,
@@ -4690,6 +5513,42 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 CompleteCoordinatedSignalWindow=True,
             )
         )
+
+    def testPhysicalGlobalPlanningEagerlyCompletesOnlyFixedPortWindows(
+        self,
+    ) -> None:
+        Arguments = {
+            "UseSparseCandidateBootstrap": True,
+            "SparseBootstrapRanks": (3, 4, 5),
+            "PortalShapeRank": 5,
+            "UnreservedPerLayerRequestLimit": 2,
+        }
+        self.assertTrue(
+            ShouldCompletePhysicalCandidateRequestWindow(
+                True,
+                False,
+                0,
+                0,
+                True,
+            )
+        )
+        self.assertFalse(
+            ShouldCompletePhysicalCandidateRequestWindow(
+                True,
+                False,
+                0,
+                0,
+                False,
+            )
+        )
+        self.assertFalse(
+            ShouldCompletePhysicalCandidateRequestWindow(
+                False,
+                False,
+                0,
+                0,
+            )
+        )
         self.assertFalse(
             ShouldDeferUnreservedCandidateRequestShape(
                 **{
@@ -4699,6 +5558,1677 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 CompleteCoordinatedSignalWindow=False,
             )
         )
+
+    def testLazyPhysicalCandidateRequestMaterializesExactlyOnce(self) -> None:
+        Calls = []
+        Shape = CandidateRequestShapeDescriptor(
+            SourcePortal=SimpleNamespace(PortalId="source"),
+            TargetPortals=(SimpleNamespace(PortalId="target"),),
+            Guide=frozenset({(1, 2)}),
+            Layer=1,
+            Axis="X",
+            Lane=2,
+            Variant=3,
+            PortalShapeRank=4,
+            RoutingY=5,
+            GuideExpansion=6,
+            InitiallyDeferred=True,
+            Priority=(0, 4, 0, 0, 0, "X", 2),
+        )
+
+        def BuildRequest() -> tuple[object, ...]:
+            Calls.append("materialized")
+            return ("request",)
+
+        Request = LazyCandidateRouteRequest(Shape, BuildRequest)
+        StableIdentity = str(Request)
+
+        self.assertEqual(Calls, [])
+        self.assertEqual(Request.Materialize(), ("request",))
+        self.assertEqual(Request.Materialize(), ("request",))
+        self.assertEqual(Calls, ["materialized"])
+        self.assertEqual(str(Request), StableIdentity)
+
+    def testPhysicalRequestDependencyIgnoresSearchOrderingOnly(self) -> None:
+        Source = SimpleNamespace(
+            PortalId="source",
+            Path=((0, 2, 0), (1, 2, 0)),
+        )
+        Target = SimpleNamespace(
+            PortalId="target",
+            Path=((8, 2, 0), (7, 2, 0)),
+        )
+        Base = CandidateRequestShapeDescriptor(
+            SourcePortal=Source,
+            TargetPortals=(Target,),
+            Guide=frozenset(((1, 0), (2, 0))),
+            Layer=1,
+            Axis="X",
+            Lane=2,
+            Variant=3,
+            PortalShapeRank=4,
+            RoutingY=5,
+            GuideExpansion=6,
+            InitiallyDeferred=False,
+            Priority=(0, 4, 0, 0, 0, "X", 2),
+        )
+        Reordered = replace(
+            Base,
+            Axis="Z",
+            Lane=99,
+            Variant=8,
+            PortalShapeRank=12,
+            InitiallyDeferred=True,
+            Priority=(9,),
+        )
+        ChangedPath = replace(
+            Base,
+            SourcePortal=SimpleNamespace(
+                PortalId="source",
+                Path=((0, 2, 0), (0, 2, 1)),
+            ),
+        )
+
+        self.assertEqual(
+            BuildPhysicalCandidateRequestShapeDependencyIdentity(Base),
+            BuildPhysicalCandidateRequestShapeDependencyIdentity(Reordered),
+        )
+        self.assertNotEqual(
+            BuildPhysicalCandidateRequestShapeDependencyIdentity(Base),
+            BuildPhysicalCandidateRequestShapeDependencyIdentity(ChangedPath),
+        )
+
+    def testRejectedTrailingDescriptorStillCompletesFiniteDomain(self) -> None:
+        Calls = []
+        Shape = CandidateRequestShapeDescriptor(
+            SourcePortal=SimpleNamespace(PortalId="source"),
+            TargetPortals=(SimpleNamespace(PortalId="target"),),
+            Guide=frozenset(),
+            Layer=0,
+            Axis="Z",
+            Lane=0,
+            Variant=0,
+            PortalShapeRank=7,
+            RoutingY=1,
+            GuideExpansion=1,
+            InitiallyDeferred=True,
+            Priority=(0, 7, 0, 0, 0, "Z", 0),
+        )
+
+        def RejectRequest() -> None:
+            Calls.append("rejected")
+            return None
+
+        Request = LazyCandidateRouteRequest(Shape, RejectRequest)
+        self.assertIsNone(Request.Materialize())
+        self.assertIsNone(Request.Materialize())
+        self.assertEqual(Calls, ["rejected"])
+        self.assertTrue(IsPhysicalCandidateRequestDomainComplete(0, False))
+        self.assertFalse(IsPhysicalCandidateRequestDomainComplete(1, False))
+        self.assertFalse(IsPhysicalCandidateRequestDomainComplete(0, True))
+
+    def testPhysicalGlobalAssignmentSuffixUsesNativeCutDeterministically(
+        self,
+    ) -> None:
+        Selection = SelectPhysicalGlobalAssignmentSuffixSignals(
+            ("Zulu", "Alpha", "Beta"),
+            (("Alpha", "candidate-a"),),
+            ("Zulu", "Alpha", "Unknown"),
+            {"Alpha": 4, "Beta": 9, "Zulu": 2},
+        )
+
+        self.assertEqual(Selection, ("Alpha", "Zulu"))
+
+    def testPhysicalGlobalAssignmentSuffixFallsBackToMissingSignals(
+        self,
+    ) -> None:
+        Selection = SelectPhysicalGlobalAssignmentSuffixSignals(
+            ("Zulu", "Alpha", "Beta"),
+            (("Alpha", "candidate-a"),),
+            (),
+            {"Alpha": 4, "Beta": 0, "Zulu": 2},
+        )
+
+        self.assertEqual(Selection, ("Zulu",))
+
+    def testPhysicalGlobalPairSupportClosesIncompletePartnerDomain(
+        self,
+    ) -> None:
+        def Candidate(Node):
+            Claims = SimpleNamespace(
+                WireCells=frozenset((Node,)),
+                SupportCells=frozenset(),
+                RequiredAirCells=frozenset(),
+                ElectricalCells=frozenset((Node,)),
+            )
+            return SimpleNamespace(Claims=Claims)
+
+        Candidates = {
+            "Complete": (Candidate((0, 2, 0)),),
+            "BlockedOpen": (Candidate((0, 2, 0)),),
+            "SupportedOpen": (Candidate((4, 2, 0)),),
+        }
+
+        self.assertEqual(
+            SelectPhysicalGlobalPairSupportSuffixSignals(
+                Candidates,
+                ("Complete",),
+                {
+                    "Complete": 0,
+                    "BlockedOpen": 8,
+                    "SupportedOpen": 8,
+                },
+            ),
+            ("BlockedOpen",),
+        )
+
+    def testPhysicalGlobalAssignmentCompletesOnlyAfterRelevantCursors(
+        self,
+    ) -> None:
+        Remaining = {"Conflict": 0, "Unrelated": 12}
+        self.assertTrue(
+            PhysicalGlobalAssignmentDomainIsComplete(
+                ("Conflict",),
+                Remaining,
+                AssignmentBudgetExhausted=False,
+                DeadlineExpired=False,
+            )
+        )
+        self.assertFalse(
+            PhysicalGlobalAssignmentDomainIsComplete(
+                ("Unrelated",),
+                Remaining,
+                AssignmentBudgetExhausted=False,
+                DeadlineExpired=False,
+            )
+        )
+        self.assertFalse(
+            PhysicalGlobalAssignmentDomainIsComplete(
+                ("Conflict",),
+                Remaining,
+                AssignmentBudgetExhausted=True,
+                DeadlineExpired=False,
+            )
+        )
+        self.assertFalse(
+            PhysicalGlobalAssignmentDomainIsComplete(
+                (),
+                Remaining,
+                AssignmentBudgetExhausted=False,
+                DeadlineExpired=False,
+            )
+        )
+
+    def testPhysicalGlobalProofSelectsEveryOpenCandidateDomain(
+        self,
+    ) -> None:
+        self.assertEqual(
+            SelectOpenPhysicalGlobalCandidateDomainSignals({
+                "Closed": 0,
+                "Zulu": 4,
+                "Alpha": 1,
+            }),
+            ("Alpha", "Zulu"),
+        )
+
+    def testFrozenPhysicalPortGuidesRequireCompleteCutCoverage(
+        self,
+    ) -> None:
+        Frozen = SimpleNamespace(
+            Guides={"A": frozenset(((0, 0),)), "B": frozenset(((1, 0),))},
+            Layers={"A": 0, "B": 1},
+        )
+
+        self.assertTrue(CanReuseFrozenPhysicalPortGuidePlan(
+            ("A", "B"),
+            ("A", "B", "C"),
+            Frozen,
+        ))
+        self.assertFalse(CanReuseFrozenPhysicalPortGuidePlan(
+            ("A", "C"),
+            ("A", "B", "C"),
+            Frozen,
+        ))
+
+    def testPhysicalGlobalCandidateDomainsCompleteBeforeAssignment(
+        self,
+    ) -> None:
+        Calls = []
+        Diagnostics = {
+            "A": {"DeferredRequests": 3},
+            "B": {"DeferredRequests": 0},
+        }
+
+        def ConsumeA(Count):
+            Calls.append(("A", Count))
+            Diagnostics["A"]["DeferredRequests"] = 0
+            return {"Signal": "A", "RequestCount": Count}
+
+        def ConsumeB(Count):
+            Calls.append(("B", Count))
+            return {"Signal": "B", "RequestCount": Count}
+
+        Records = CompletePhysicalGlobalCandidateRequestDomains(
+            {"A": ConsumeA, "B": ConsumeB},
+            Diagnostics,
+        )
+
+        self.assertEqual(Calls, [("A", 3)])
+        self.assertEqual(Records, ({"Signal": "A", "RequestCount": 3},))
+
+    def testExactNoGoodClauseUnitPropagatesAcrossKeyClasses(self) -> None:
+        def Option(Signal, Value):
+            return SimpleNamespace(Signal=Signal, Value=Value)
+
+        def Keys(Value):
+            return frozenset(((Value.Signal, Value.Value),))
+
+        Domains = {
+            Signal: (Option(Signal, "bad"),)
+            for Signal in ("A", "B", "C", "D", "E")
+        }
+        Domains["F"] = (
+            Option("F", "bad"),
+            Option("F", "escape"),
+        )
+        Domains["Unrelated"] = (Option("Unrelated", "only"),)
+        Clause = frozenset(
+            (Signal, "bad") for Signal in ("A", "B", "C", "D", "E", "F")
+        )
+
+        Result = PropagateExactNoGoodClauses(
+            Domains,
+            {},
+            (Clause,),
+            Keys,
+        )
+
+        self.assertIsNotNone(Result)
+        assert Result is not None
+        self.assertEqual(tuple(Value.Value for Value in Result["F"]), ("escape",))
+        self.assertEqual(len(Result["Unrelated"]), 1)
+
+    def testExactNoGoodClauseDetectsForcedContradiction(self) -> None:
+        Domains = {
+            Signal: (SimpleNamespace(Signal=Signal, Value="bad"),)
+            for Signal in ("A", "B", "C")
+        }
+        Clause = frozenset((Signal, "bad") for Signal in Domains)
+
+        self.assertIsNone(PropagateExactNoGoodClauses(
+            Domains,
+            {},
+            (Clause,),
+            lambda Value: frozenset(((Value.Signal, Value.Value),)),
+        ))
+
+    def testPhysicalGlobalAssignmentBranchesAroundExactNoGood(self) -> None:
+        Calls = []
+
+        def PlanNative(Values):
+            Calls.append(tuple((Value[0], Value[1]) for Value in Values))
+            Selected = []
+            for Signal in sorted({Value[0] for Value in Values}):
+                CandidateId = min(
+                    Value[1] for Value in Values if Value[0] == Signal
+                )
+                Selected.append((Signal, CandidateId))
+            return SimpleNamespace(
+                Success=True,
+                SelectedCandidateIds=tuple(Selected),
+                ExpansionCount=1,
+                CompletedWork=1,
+                BudgetExhausted=False,
+                DeadlineExceeded=False,
+                ConflictSignals=(),
+            )
+
+        Result = PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
+            (("A", "A0"), ("A", "A1"), ("B", "B0"), ("B", "B1")),
+            (frozenset((("A", "A0"), ("B", "B0"))),),
+            PlanNative,
+        )
+
+        self.assertEqual(
+            dict(Result.SelectedCandidateIds),
+            {"A": "A1", "B": "B0"},
+        )
+        self.assertEqual(len(Calls), 2)
+        self.assertNotIn(("A", "A0"), Calls[1])
+
+    def testRepeatedExactNoGoodCoreChangesSharedPortFirst(self) -> None:
+        Domains = {
+            "SharedA": ("A0", "A1", "A2"),
+            "SharedB": ("B0", "B1", "B2"),
+            "Varying": ("V0", "V1"),
+        }
+        Rejected = (
+            frozenset((
+                ("SharedA", "A0"),
+                ("SharedB", "B0"),
+                ("Varying", "V0"),
+            )),
+            frozenset((
+                ("SharedA", "A0"),
+                ("SharedB", "B0"),
+                ("Varying", "V1"),
+            )),
+        )
+        Signal, Options = SelectExactNoGoodCspBranch(
+            Domains,
+            {},
+            Rejected,
+            lambda Option: frozenset((
+                (
+                    "SharedA" if Option.startswith("A") else
+                    "SharedB" if Option.startswith("B") else
+                    "Varying",
+                    Option,
+                ),
+            )),
+        )
+
+        # MRV alone would revisit Varying. Repeated-clause activity changes a
+        # shared literal first, while retaining every option in the domain.
+        self.assertEqual(Signal, "SharedA")
+        self.assertEqual(Options, ("A1", "A2", "A0"))
+        self.assertEqual(set(Options), set(Domains[Signal]))
+
+    def testContradictedExactNoGoodCoreDoesNotBiasBranching(self) -> None:
+        Domains = {
+            "SharedB": ("B0", "B1", "B2"),
+            "Varying": ("V0", "V1"),
+        }
+        Rejected = tuple(
+            frozenset((
+                ("SharedA", "A0"),
+                ("SharedB", "B0"),
+                ("Varying", Value),
+            ))
+            for Value in ("V0", "V1")
+        )
+        Signal, Options = SelectExactNoGoodCspBranch(
+            Domains,
+            {"SharedA": frozenset((("SharedA", "A1"),))},
+            Rejected,
+            lambda Option: frozenset((
+                (
+                    "SharedB" if Option.startswith("B") else "Varying",
+                    Option,
+                ),
+            )),
+        )
+
+        self.assertEqual(Signal, "Varying")
+        self.assertEqual(Options, Domains[Signal])
+
+    def testSingleExactNoGoodCoreBranchesOnEscapingLiteralFirst(self) -> None:
+        Domains = {
+            "Unrelated": ("U0",),
+            "PortA": ("A0", "A1"),
+            "PortB": ("B0", "B1"),
+        }
+        Rejected = (frozenset((("PortA", "A0"), ("PortB", "B0"))),)
+
+        Signal, Options = SelectExactNoGoodCspBranch(
+            Domains,
+            {},
+            Rejected,
+            lambda Option: frozenset(((
+                {"U": "Unrelated", "A": "PortA", "B": "PortB"}[
+                    Option[0]
+                ],
+                Option,
+            ),)),
+        )
+
+        self.assertEqual(Signal, "PortA")
+        self.assertEqual(Options, ("A1", "A0"))
+
+    def testBinaryArcPassExcludesHigherOrderExactClauses(self) -> None:
+        Unary = frozenset((("A", "a0"),))
+        Binary = frozenset((("A", "a0"), ("B", "b0")))
+        HigherOrder = frozenset((
+            ("A", "a0"),
+            ("B", "b0"),
+            ("C", "c0"),
+        ))
+
+        self.assertEqual(
+            SelectBinaryExactNoGoodClauses((HigherOrder, Binary, Unary)),
+            (Binary, Unary),
+        )
+
+    def testCompleteDomainNoGoodProducesDirectProofCore(self) -> None:
+        Domains = {
+            "First": ("F0", "F1"),
+            "Second": ("S0", "S1"),
+            "Unrelated": ("U0",),
+        }
+
+        def Keys(Option):
+            Signal = {
+                "F": "First",
+                "S": "Second",
+                "U": "Unrelated",
+            }[Option[0]]
+            return frozenset((
+                (Signal, "signal-domain"),
+                (Signal, Option),
+            ))
+
+        Clause = frozenset((
+            ("First", "signal-domain"),
+            ("Second", "signal-domain"),
+        ))
+        Result = FindProofQualifiedCompleteDomainNoGoodCore(
+            Domains,
+            (Clause,),
+            Keys,
+        )
+
+        self.assertEqual(Result, (("First", "Second"), Clause))
+
+    def testSelectedOptionNoGoodIsNotACompleteDomainProof(self) -> None:
+        Domains = {"First": ("F0", "F1")}
+
+        Result = FindProofQualifiedCompleteDomainNoGoodCore(
+            Domains,
+            (frozenset((("First", "F0"),)),),
+            lambda Option: frozenset((("First", Option),)),
+        )
+
+        self.assertIsNone(Result)
+
+    def testUniversalFactorNoGoodProducesCoreWithoutOptionMaterialization(
+        self,
+    ) -> None:
+        Clause = frozenset((
+            ("First", "local-factor-domain:solver:fabric-first"),
+            ("Second", "local-factor-domain:solver:fabric-second"),
+        ))
+        Result = FindProofQualifiedUniversalNoGoodCore(
+            {
+                "First": frozenset((
+                    (
+                        "First",
+                        "local-factor-domain:solver:fabric-first",
+                    ),
+                )),
+                "Second": frozenset((
+                    (
+                        "Second",
+                        "local-factor-domain:solver:fabric-second",
+                    ),
+                )),
+            },
+            (Clause,),
+        )
+
+        self.assertEqual(Result, (("First", "Second"), Clause))
+
+    def testPhysicalPortExactPreferencePreservesDistinctOptions(self) -> None:
+        def Port(Fingerprint, LocalX, AttachmentX):
+            return PhysicalComponentPortReservation(
+                Signal="sum",
+                Direction="output",
+                OwnedTerminals=((0, 0, 0),),
+                OwnedTerminalFingerprints=("terminal",),
+                OwnedCandidateFingerprints=(),
+                FabricDomainFingerprint="fabric",
+                FabricAttachment=(0, 0, 0),
+                Attachment=(AttachmentX, 0, 0),
+                LocalPath=((0, 0, 0), (LocalX, 0, 0)),
+                GlobalPath=((AttachmentX, 0, 0), (AttachmentX + 1, 0, 0)),
+                Claims=None,
+                ReservationFingerprint=Fingerprint,
+            )
+
+        First = Port("reservation-a", 1, 4)
+        Preferred = Port("reservation-b", 2, 4)
+        OtherContract = Port("reservation-c", 3, 8)
+        Options = (OtherContract, First, Preferred)
+
+        Ordered = OrderPhysicalPortOptionsByPreferences(
+            "sum",
+            Options,
+            {},
+            {"sum": Preferred.ReservationFingerprint},
+        )
+
+        self.assertEqual(
+            tuple(Value.ReservationFingerprint for Value in Ordered),
+            ("reservation-b", "reservation-c", "reservation-a"),
+        )
+        self.assertCountEqual(Ordered, Options)
+        self.assertEqual({id(Value) for Value in Ordered}, {
+            id(Value) for Value in Options
+        })
+
+    def testPhysicalPortGlobalPreferenceOutranksExactPreference(self) -> None:
+        def Port(Fingerprint, LocalX, AttachmentX):
+            return PhysicalComponentPortReservation(
+                Signal="carry",
+                Direction="output",
+                OwnedTerminals=((0, 0, 0),),
+                OwnedTerminalFingerprints=("terminal",),
+                OwnedCandidateFingerprints=(),
+                FabricDomainFingerprint="fabric",
+                FabricAttachment=(0, 0, 0),
+                Attachment=(AttachmentX, 0, 0),
+                LocalPath=((0, 0, 0), (LocalX, 0, 0)),
+                GlobalPath=((AttachmentX, 0, 0), (AttachmentX + 1, 0, 0)),
+                Claims=None,
+                ReservationFingerprint=Fingerprint,
+            )
+
+        FirstGlobal = Port("reservation-a", 1, 4)
+        SameGlobal = Port("reservation-b", 2, 4)
+        ExactButDifferentGlobal = Port("reservation-c", 3, 8)
+
+        Ordered = OrderPhysicalPortOptionsByPreferences(
+            "carry",
+            (ExactButDifferentGlobal, SameGlobal, FirstGlobal),
+            {
+                "carry": BuildPhysicalPortGlobalContractFingerprint(
+                    FirstGlobal
+                )
+            },
+            {"carry": ExactButDifferentGlobal.ReservationFingerprint},
+        )
+
+        self.assertEqual(
+            tuple(Value.ReservationFingerprint for Value in Ordered),
+            ("reservation-b", "reservation-a", "reservation-c"),
+        )
+        self.assertEqual(
+            BuildPhysicalPortGlobalContractFingerprint(Ordered[0]),
+            BuildPhysicalPortGlobalContractFingerprint(Ordered[1]),
+        )
+
+    def testPhysicalPortDecompositionDeduplicatesSharedAperture(self) -> None:
+        def Claims(Nodes):
+            Values = frozenset(Nodes)
+            return RoutingResourceClaims(
+                WireCells=Values,
+                ElectricalCells=Values,
+            )
+
+        GlobalPath = ((4, 1, 0), (5, 1, 0))
+        Seams = tuple(
+            PhysicalPortSeamFactor(
+                FabricAttachment=(0, 1, 0),
+                Attachment=(4, 1, 0),
+                LocalPath=((0, 1, 0), (LocalX, 1, 0)),
+                GlobalPath=GlobalPath,
+                Claims=Claims(((0, 1, 0), (LocalX, 1, 0), *GlobalPath)),
+                SeamFingerprint=f"seam-{LocalX}",
+            )
+            for LocalX in (1, 2)
+        )
+        LaneFactors = {"sum": tuple(
+            PhysicalPortLaneFactor(
+                Signal="sum",
+                Direction="output",
+                Capacity=1,
+                OwnedTerminals=((0, 1, 0),),
+                Domains=(),
+                CandidateDomains=(),
+                FabricDomainFingerprint=f"fabric-{Index}",
+                Seams=(Seam,),
+                GuideCells=frozenset(((4, 0), (5, 0))),
+                ExternalTerminals=((8, 1, 0),),
+            )
+            for Index, Seam in enumerate(Seams)
+        )}
+        Channel = PhysicalComponentChannelReservation(
+            Signal="sum",
+            Layer=0,
+            GuideCells=((4, 0), (5, 0)),
+            ResourceIds=(),
+            Claims=Claims(GlobalPath),
+            ReservationFingerprint="channel-sum",
+        )
+        ResourceGraph = SimpleNamespace(
+            BuildRouteClaims=lambda Nodes: Claims(Nodes)
+        )
+
+        Local, Apertures, Supports = DecomposePhysicalPortLaneFactors(
+            LaneFactors,
+            (Channel,),
+            ResourceGraph,
+            FabricOrigin=(0, 1, 0),
+        )
+
+        self.assertEqual(len(Local[0][1]), 2)
+        self.assertEqual(len(Apertures[0][1]), 1)
+        self.assertEqual(len(Supports[0][1]), 2)
+        self.assertEqual(
+            {Value.ApertureOptionFingerprint for Value in Supports[0][1]},
+            {Apertures[0][1][0].ApertureOptionFingerprint},
+        )
+        LocalByFingerprint = {
+            Value.LocalAccessFingerprint: Value
+            for Value in Local[0][1]
+        }
+        ApertureByFingerprint = {
+            Value.ApertureOptionFingerprint: Value
+            for Value in Apertures[0][1]
+        }
+        for Support in Supports[0][1]:
+            Port = MaterializeSupportedPhysicalPortReservation(
+                LocalByFingerprint[Support.LocalAccessFingerprint],
+                ApertureByFingerprint[
+                    Support.ApertureOptionFingerprint
+                ],
+                Support,
+                ResourceGraph,
+            )
+            self.assertEqual(
+                Port.ReservationFingerprint,
+                Support.ReservationFingerprint,
+            )
+
+    def testPhysicalPortDecompositionDoesNotInventCartesianSupport(self) -> None:
+        def Claims(Nodes):
+            Values = frozenset(Nodes)
+            return RoutingResourceClaims(
+                WireCells=Values,
+                ElectricalCells=Values,
+            )
+
+        SeamSpecifications = (
+            (1, 4, "l1-a1"),
+            (2, 4, "l2-a1"),
+            (2, 8, "l2-a2"),
+        )
+        LaneFactors = {"carry": tuple(
+            PhysicalPortLaneFactor(
+                Signal="carry",
+                Direction="output",
+                Capacity=1,
+                OwnedTerminals=((0, 1, 0),),
+                Domains=(),
+                CandidateDomains=(),
+                FabricDomainFingerprint="fabric",
+                Seams=(PhysicalPortSeamFactor(
+                    FabricAttachment=(0, 1, 0),
+                    Attachment=(ApertureX, 1, 0),
+                    LocalPath=((0, 1, 0), (LocalX, 1, 0)),
+                    GlobalPath=(
+                        (ApertureX, 1, 0),
+                        (ApertureX + 1, 1, 0),
+                    ),
+                    Claims=Claims((
+                        (0, 1, 0),
+                        (LocalX, 1, 0),
+                        (ApertureX, 1, 0),
+                        (ApertureX + 1, 1, 0),
+                    )),
+                    SeamFingerprint=Name,
+                ),),
+                GuideCells=frozenset(),
+                ExternalTerminals=(),
+            )
+            for LocalX, ApertureX, Name in SeamSpecifications
+        )}
+        Channel = PhysicalComponentChannelReservation(
+            Signal="carry",
+            Layer=0,
+            GuideCells=(),
+            ResourceIds=(),
+            Claims=Claims(()),
+            ReservationFingerprint="channel-carry",
+        )
+        ResourceGraph = SimpleNamespace(
+            BuildRouteClaims=lambda Nodes: Claims(Nodes)
+        )
+
+        Local, Apertures, Supports = DecomposePhysicalPortLaneFactors(
+            LaneFactors,
+            (Channel,),
+            ResourceGraph,
+            FabricOrigin=(0, 1, 0),
+        )
+        ActualPairs = {
+            (
+                Value.LocalAccessFingerprint,
+                Value.ApertureOptionFingerprint,
+            )
+            for Value in Supports[0][1]
+        }
+
+        self.assertEqual(len(Local[0][1]), 2)
+        self.assertEqual(len(Apertures[0][1]), 2)
+        self.assertEqual(len(ActualPairs), 3)
+        self.assertLess(
+            len(ActualPairs),
+            len(Local[0][1]) * len(Apertures[0][1]),
+        )
+        LocalOne = next(
+            Value for Value in Local[0][1]
+            if Value.LocalPath[-1][0] == 1
+        )
+        ApertureTwo = next(
+            Value for Value in Apertures[0][1]
+            if Value.Attachment[0] == 8
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            MaterializePhysicalPortFactorPair(
+                LocalOne,
+                ApertureTwo,
+                Supports[0][1],
+                ResourceGraph,
+            )
+
+    def testPhysicalPortOptionOrderWithoutPreferencePreservesGeometryOrder(
+        self,
+    ) -> None:
+        def Port(Fingerprint):
+            return PhysicalComponentPortReservation(
+                Signal="sum",
+                Direction="output",
+                OwnedTerminals=((0, 0, 0),),
+                OwnedTerminalFingerprints=("terminal",),
+                OwnedCandidateFingerprints=(),
+                FabricDomainFingerprint="fabric",
+                FabricAttachment=(0, 0, 0),
+                Attachment=(4, 0, 0),
+                LocalPath=((0, 0, 0),),
+                GlobalPath=((4, 0, 0),),
+                Claims=None,
+                ReservationFingerprint=Fingerprint,
+            )
+
+        First, Second, Third = (
+            Port("reservation-a"),
+            Port("reservation-b"),
+            Port("reservation-c"),
+        )
+        Forward = OrderPhysicalPortOptionsByPreferences(
+            "sum", (Third, First, Second), {}, {}
+        )
+        Reverse = OrderPhysicalPortOptionsByPreferences(
+            "sum", (Second, Third, First), {}, {}
+        )
+
+        self.assertEqual(Forward, (Third, First, Second))
+        self.assertEqual(Reverse, (Second, Third, First))
+
+    def testPersistentPortCspStateReusesOnlyMonotonicConstraints(self) -> None:
+        Resources = SimpleNamespace(
+            RejectedPhysicalComponentPortReservationsBySignal={},
+            RejectedPhysicalComponentPortReservationSets=set(),
+            RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+            DeferredPhysicalComponentPortAssignmentFingerprints=set(),
+            PhysicalComponentPortCspStateCache={},
+            PhysicalGlobalRouteTreeResultCache={},
+        )
+        Initial, Reused = GetPersistentPhysicalComponentPortCspState(
+            Resources,
+            "solver",
+            "domain",
+        )
+        self.assertFalse(Reused)
+        Initial.FailedAssignmentStates.add(("failed-prefix",))
+
+        # Native route-tree completion and replay are downstream of physical
+        # assembly selection.  Populating that cache must not create a new
+        # port-CSP epoch or invalidate its monotonic failed-prefix state.
+        Resources.PhysicalGlobalRouteTreeResultCache["request"] = None
+        MaskIndependent, Reused = GetPersistentPhysicalComponentPortCspState(
+            Resources,
+            "solver",
+            "domain",
+        )
+        self.assertTrue(Reused)
+        self.assertIs(MaskIndependent, Initial)
+
+        Resources.RejectedPhysicalComponentPortReservationSets.add(
+            frozenset((("sum", "reservation-a"),))
+        )
+        Extended, Reused = GetPersistentPhysicalComponentPortCspState(
+            Resources,
+            "solver",
+            "domain",
+        )
+        self.assertTrue(Reused)
+        self.assertIs(Extended, Initial)
+        self.assertIn(("failed-prefix",), Extended.FailedAssignmentStates)
+
+        Resources.DeferredPhysicalComponentPortAssignmentFingerprints.add(
+            "deferred-plan"
+        )
+        Deferred, Reused = GetPersistentPhysicalComponentPortCspState(
+            Resources,
+            "solver",
+            "domain",
+        )
+        self.assertTrue(Reused)
+        Resources.DeferredPhysicalComponentPortAssignmentFingerprints.clear()
+        Restarted, Reused = GetPersistentPhysicalComponentPortCspState(
+            Resources,
+            "solver",
+            "domain",
+        )
+        self.assertFalse(Reused)
+        self.assertIsNot(Restarted, Deferred)
+        self.assertFalse(Restarted.FailedAssignmentStates)
+
+    def testPortSolverScopedNoGoodCannotMatchAnotherDomain(self) -> None:
+        Port = PhysicalComponentPortReservation(
+            Signal="sum",
+            Direction="output",
+            OwnedTerminals=((0, 0, 0),),
+            OwnedTerminalFingerprints=("terminal",),
+            OwnedCandidateFingerprints=(),
+            FabricDomainFingerprint="fabric",
+            FabricAttachment=(0, 0, 0),
+            Attachment=(4, 0, 0),
+            LocalPath=((0, 0, 0),),
+            GlobalPath=((4, 0, 0),),
+            Claims=None,
+            GlobalClaims=RoutingResourceClaims(),
+            ReservationFingerprint="reservation",
+        )
+        FirstKeys = BuildPhysicalPortNoGoodKeys(Port, "solver-a")
+        OtherKeys = BuildPhysicalPortNoGoodKeys(Port, "solver-b")
+        ScopedClause = frozenset((
+            (
+                Port.Signal,
+                BuildPhysicalPortApertureContractFingerprint(Port),
+            ),
+            (Port.Signal, "local-signal-domain:solver-a"),
+        ))
+
+        self.assertTrue(ScopedClause.issubset(FirstKeys))
+        self.assertFalse(ScopedClause.issubset(OtherKeys))
+
+    def testLocalPairSupportIndexRequiresCompleteMatchingIdentity(
+        self,
+    ) -> None:
+        Preparation = SimpleNamespace(
+            DomainFingerprint="prepared",
+            ComponentGraphFingerprint="component",
+            ResourceGraphFingerprint="resource",
+            Problem=SimpleNamespace(
+                Fabric=SimpleNamespace(FabricFingerprint="fabric"),
+            ),
+            AccessCertificate=SimpleNamespace(
+                TechnologyFingerprint="technology",
+            ),
+        )
+        CompletePreparation = SimpleNamespace(
+            **{
+                **vars(Preparation),
+                "Complete": True,
+                "LocalAccessFactorsBySignal": (
+                    ("CarryA", (
+                        SimpleNamespace(
+                            LocalContractFingerprint="local-a"
+                        ),
+                    )),
+                    ("CarryB", (
+                        SimpleNamespace(
+                            LocalContractFingerprint="local-b0"
+                        ),
+                        SimpleNamespace(
+                            LocalContractFingerprint="local-b1"
+                        ),
+                    )),
+                ),
+            },
+        )
+        Certificate = BuildPhysicalLocalPortPairSupportCertificate(
+            CompletePreparation,
+            "solver",
+            "CarryA",
+            "local-a",
+            "CarryB",
+            ("local-b0", "local-b1"),
+            frozenset((
+                ("local-a", "local-b0"),
+                ("local-a", "local-b1"),
+            )),
+            ("proof-0", "proof-1"),
+        )
+        Expected = frozenset((frozenset((
+            ("CarryA", "local-a"),
+            ("CarryB", "local-signal-domain:solver"),
+        )),))
+
+        self.assertEqual(
+            BuildPhysicalLocalPortPairUnsupportedIndex(
+                (Certificate,), CompletePreparation, "solver"
+            ),
+            Expected,
+        )
+        for Invalid in (
+            replace(Certificate, Complete=False),
+            replace(Certificate, PortSolverCacheKey="other-solver"),
+            replace(Certificate, FabricFingerprint="other-fabric"),
+            replace(Certificate, ResourceGraphFingerprint="other-resource"),
+            replace(Certificate, TechnologyFingerprint="other-technology"),
+            replace(Certificate, ComponentGraphFingerprint="other-component"),
+            replace(Certificate, PreparedDomainFingerprint="other-prepared"),
+            replace(Certificate, CertificateFingerprint="other-certificate"),
+            replace(Certificate, ProofFingerprints=()),
+            replace(
+                Certificate,
+                UnsupportedPairs=frozenset((("local-a", "local-b0"),)),
+            ),
+        ):
+            self.assertFalse(
+                BuildPhysicalLocalPortPairUnsupportedIndex(
+                    (Invalid,), CompletePreparation, "solver"
+                )
+            )
+        SubsetCertificate = BuildPhysicalLocalPortPairSupportCertificate(
+            CompletePreparation,
+            "solver",
+            "CarryA",
+            "local-a",
+            "CarryB",
+            ("local-b0",),
+            frozenset((("local-a", "local-b0"),)),
+            ("proof-subset",),
+        )
+        ForeignRowCertificate = BuildPhysicalLocalPortPairSupportCertificate(
+            CompletePreparation,
+            "solver",
+            "CarryA",
+            "local-foreign",
+            "CarryB",
+            ("local-b0", "local-b1"),
+            frozenset((
+                ("local-foreign", "local-b0"),
+                ("local-foreign", "local-b1"),
+            )),
+            ("proof-foreign",),
+        )
+        self.assertFalse(BuildPhysicalLocalPortPairUnsupportedIndex(
+            (SubsetCertificate,), CompletePreparation, "solver"
+        ))
+        self.assertFalse(BuildPhysicalLocalPortPairUnsupportedIndex(
+            (ForeignRowCertificate,), CompletePreparation, "solver"
+        ))
+
+    def testLocalPairSupportIndexCompactsLargeRowWithoutChangingRejection(
+        self,
+    ) -> None:
+        ColumnContracts = tuple(
+            f"local-column-{Index:03d}" for Index in range(144)
+        )
+        Preparation = SimpleNamespace(
+            Complete=True,
+            DomainFingerprint="prepared-large-row",
+            ComponentGraphFingerprint="component",
+            ResourceGraphFingerprint="resource",
+            Problem=SimpleNamespace(
+                Fabric=SimpleNamespace(FabricFingerprint="fabric"),
+            ),
+            AccessCertificate=SimpleNamespace(
+                TechnologyFingerprint="technology",
+            ),
+            LocalAccessFactorsBySignal=(
+                ("Row", (
+                    SimpleNamespace(
+                        LocalContractFingerprint="local-row"
+                    ),
+                )),
+                ("Column", tuple(
+                    SimpleNamespace(LocalContractFingerprint=Contract)
+                    for Contract in ColumnContracts
+                )),
+            ),
+        )
+        Certificate = BuildPhysicalLocalPortPairSupportCertificate(
+            Preparation,
+            "solver-large-row",
+            "Row",
+            "local-row",
+            "Column",
+            ColumnContracts,
+            frozenset(
+                ("local-row", Contract)
+                for Contract in ColumnContracts
+            ),
+            tuple(f"proof-{Index:03d}" for Index in range(144)),
+        )
+
+        Clauses = BuildPhysicalLocalPortPairUnsupportedIndex(
+            (Certificate,),
+            Preparation,
+            "solver-large-row",
+        )
+        ExpectedClause = frozenset((
+            ("Row", "local-row"),
+            (
+                "Column",
+                "local-signal-domain:solver-large-row",
+            ),
+        ))
+
+        self.assertEqual(Clauses, frozenset((ExpectedClause,)))
+        self.assertEqual(len(Clauses), 1)
+        for ColumnContract in ColumnContracts:
+            ExactPairKeys = frozenset((
+                ("Row", "local-row"),
+                ("Column", ColumnContract),
+                (
+                    "Column",
+                    "local-signal-domain:solver-large-row",
+                ),
+            ))
+            self.assertTrue(ExpectedClause.issubset(ExactPairKeys))
+
+        DifferentRowKeys = frozenset((
+            ("Row", "local-other-row"),
+            ("Column", ColumnContracts[0]),
+            (
+                "Column",
+                "local-signal-domain:solver-large-row",
+            ),
+        ))
+        self.assertFalse(ExpectedClause.issubset(DifferentRowKeys))
+
+    def testPhysicalPortCorridorIdentityIsTranslationNormalized(self) -> None:
+        def Port(Offset, Fingerprint):
+            return SimpleNamespace(
+                Signal="PortA",
+                Direction="output",
+                Capacity=1,
+                Attachment=(Offset, 2, 0),
+                GlobalPath=((Offset, 2, 0),),
+                ReservationFingerprint=Fingerprint,
+            )
+
+        def Candidate(Offset, CandidateId):
+            Nodes = frozenset(((Offset, 2, 0), (Offset + 1, 2, 0)))
+            return NetRouteCandidate(
+                CandidateId=CandidateId,
+                Signal="PortA",
+                SourcePortalId="source",
+                TargetPortalIds={},
+                Nodes=Nodes,
+                Edges=frozenset((((Offset, 2, 0), (Offset + 1, 2, 0)),)),
+                Claims=RoutingResourceClaims(WireCells=Nodes),
+                Layer=0,
+                Guide=frozenset(),
+                RepeaterWaypoints=(),
+                MaterialCost=2,
+                FootprintGrowth=2,
+                Length=2,
+                BendCount=0,
+                ViaCount=0,
+            )
+
+        First = BuildPhysicalPortCorridorFactor(
+            Port(0, "reservation-a"),
+            Candidate(0, "candidate-a"),
+            "request-domain",
+        )
+        Translated = BuildPhysicalPortCorridorFactor(
+            Port(10, "reservation-b"),
+            Candidate(10, "candidate-b"),
+            "request-domain",
+        )
+
+        self.assertEqual(
+            First.NormalizedIdentityFingerprint,
+            Translated.NormalizedIdentityFingerprint,
+        )
+        self.assertNotEqual(
+            First.RouteCandidateFingerprint,
+            Translated.RouteCandidateFingerprint,
+        )
+        Domain = BuildPhysicalPortCorridorDomain(
+            Port(0, "reservation-a"),
+            (Candidate(0, "candidate-b"), Candidate(0, "candidate-a")),
+            "request-domain",
+            "resource-graph",
+            "technology",
+            Complete=True,
+        )
+        self.assertEqual(len(Domain.Factors), 1)
+        self.assertEqual(Domain.Factors[0].RouteCandidateId, "candidate-a")
+        self.assertTrue(Domain.Complete)
+        SameGlobalContract = BuildPhysicalPortCorridorDomain(
+            Port(0, "reservation-local-variant"),
+            (Candidate(0, "candidate-a"),),
+            "request-domain",
+            "resource-graph",
+            "technology",
+            Complete=True,
+        )
+        self.assertEqual(
+            Domain.DomainFingerprint,
+            SameGlobalContract.DomainFingerprint,
+        )
+        self.assertNotEqual(
+            Domain.PortReservationFingerprint,
+            SameGlobalContract.PortReservationFingerprint,
+        )
+
+    def testCorridorCaptureRequiresClosedExactRequestCursor(self) -> None:
+        Port = SimpleNamespace(
+            Signal="PortA",
+            Direction="output",
+            Capacity=1,
+            Attachment=(0, 2, 0),
+            GlobalPath=((0, 2, 0),),
+            ReservationFingerprint="reservation-a",
+        )
+        Nodes = frozenset(((0, 2, 0), (1, 2, 0)))
+        Candidate = NetRouteCandidate(
+            CandidateId="candidate-a",
+            Signal="PortA",
+            SourcePortalId="source",
+            TargetPortalIds={},
+            Nodes=Nodes,
+            Edges=frozenset((((0, 2, 0), (1, 2, 0)),)),
+            Claims=RoutingResourceClaims(WireCells=Nodes),
+            Layer=0,
+            Guide=frozenset(),
+            RepeaterWaypoints=(),
+            MaterialCost=2,
+            FootprintGrowth=2,
+            Length=2,
+            BendCount=0,
+            ViaCount=0,
+        )
+        Plan = SimpleNamespace(
+            Ports=(Port,),
+            ResourceGraphFingerprint="resource-graph",
+            TechnologyFingerprint="technology",
+        )
+        Resources = SimpleNamespace(PhysicalPortCorridorDomainCache={})
+
+        self.assertEqual(
+            CaptureCompletePhysicalPortCorridorDomains(
+                Plan,
+                {"PortA": (Candidate,)},
+                {"PortA": "request-domain"},
+                {"PortA": 1},
+                Resources,
+            ),
+            (),
+        )
+        Captured = CaptureCompletePhysicalPortCorridorDomains(
+            Plan,
+            {"PortA": (Candidate,)},
+            {"PortA": "request-domain"},
+            {"PortA": 0},
+            Resources,
+        )
+        self.assertEqual(len(Captured), 1)
+        self.assertTrue(Captured[0].Complete)
+        self.assertIn(
+            Captured[0].DomainFingerprint,
+            Resources.PhysicalPortCorridorDomainCache,
+        )
+
+    def testPreparedExteriorGuideFabricUnionsEveryLegalSeam(self) -> None:
+        Preparation = SimpleNamespace(
+            Complete=True,
+            LaneFactorsBySignal=((
+                "PortA",
+                (
+                    SimpleNamespace(
+                        GuideCells=frozenset(((0, 0), (1, 0))),
+                        Seams=(SimpleNamespace(
+                            GlobalPath=((1, 2, 0), (2, 2, 0)),
+                        ),),
+                    ),
+                    SimpleNamespace(
+                        GuideCells=frozenset(((0, 1),)),
+                        Seams=(SimpleNamespace(
+                            GlobalPath=((1, 2, 1), (2, 2, 1)),
+                        ),),
+                    ),
+                ),
+            ),),
+        )
+
+        Expected = {"PortA": frozenset({
+            (0, 0), (1, 0), (2, 0),
+            (0, 1), (1, 1), (2, 1),
+        })}
+        self.assertEqual(
+            BuildPreparedPhysicalExteriorGuideColumnsBySignal(Preparation),
+            Expected,
+        )
+        ReorderedPreparation = SimpleNamespace(
+            Complete=True,
+            LaneFactorsBySignal=(
+                ("PortA", tuple(reversed(
+                    Preparation.LaneFactorsBySignal[0][1]
+                ))),
+            ),
+        )
+        self.assertEqual(
+            BuildPreparedPhysicalExteriorGuideColumnsBySignal(
+                ReorderedPreparation
+            ),
+            Expected,
+        )
+
+    def testPhysicalPortCorridorArcConsistencyUsesExactClaims(self) -> None:
+        def Port(Signal, Attachment):
+            return SimpleNamespace(
+                Signal=Signal,
+                Direction="output",
+                Capacity=1,
+                Attachment=Attachment,
+                GlobalPath=(Attachment,),
+                ReservationFingerprint=f"reservation-{Signal}",
+            )
+
+        def Candidate(Signal, CandidateId, Attachment, Extra):
+            Nodes = frozenset((Attachment, Extra))
+            return NetRouteCandidate(
+                CandidateId=CandidateId,
+                Signal=Signal,
+                SourcePortalId="source",
+                TargetPortalIds={},
+                Nodes=Nodes,
+                Edges=frozenset(((Attachment, Extra),)),
+                Claims=RoutingResourceClaims(WireCells=Nodes),
+                Layer=0,
+                Guide=frozenset(),
+                RepeaterWaypoints=(),
+                MaterialCost=2,
+                FootprintGrowth=2,
+                Length=2,
+                BendCount=0,
+                ViaCount=0,
+            )
+
+        PortA = Port("PortA", (0, 2, 0))
+        PortB = Port("PortB", (10, 2, 0))
+        Domains = {
+            "PortA": BuildPhysicalPortCorridorDomain(
+                PortA,
+                (
+                    Candidate("PortA", "a-conflict", PortA.Attachment, (5, 2, 0)),
+                    Candidate("PortA", "a-supported", PortA.Attachment, (6, 2, 0)),
+                ),
+                "request-a",
+                "resource-graph",
+                "technology",
+                Complete=True,
+            ),
+            "PortB": BuildPhysicalPortCorridorDomain(
+                PortB,
+                (Candidate("PortB", "b-only", PortB.Attachment, (5, 2, 0)),),
+                "request-b",
+                "resource-graph",
+                "technology",
+                Complete=True,
+            ),
+        }
+
+        Support = BuildPhysicalPortCorridorArcSupportIndex(Domains)
+        Propagated, CheckCount, ProofComplete = (
+            PropagatePhysicalPortCorridorArcConsistency(Domains)
+        )
+
+        self.assertTrue(Support)
+        self.assertIsNotNone(Propagated)
+        assert Propagated is not None
+        self.assertEqual(
+            [Value.RouteCandidateId for Value in Propagated["PortA"]],
+            ["a-supported"],
+        )
+        self.assertGreater(CheckCount, 0)
+        self.assertTrue(ProofComplete)
+        Incomplete = {
+            **Domains,
+            "PortB": replace(Domains["PortB"], Complete=False),
+        }
+        _Values, _Checks, IncompleteProof = (
+            PropagatePhysicalPortCorridorArcConsistency(Incomplete)
+        )
+        self.assertFalse(IncompleteProof)
+
+    def testPhysicalPortCorridorReuseRequiresCompleteExactDependencies(
+        self,
+    ) -> None:
+        def Port(ReservationFingerprint):
+            return SimpleNamespace(
+                Signal="A",
+                Direction="output",
+                Capacity=1,
+                Attachment=(0, 2, 0),
+                GlobalPath=((0, 2, 0),),
+                ReservationFingerprint=ReservationFingerprint,
+            )
+
+        Candidate = NetRouteCandidate(
+            CandidateId="candidate-a",
+            Signal="A",
+            SourcePortalId="source",
+            TargetPortalIds={},
+            Nodes=frozenset(((0, 2, 0), (1, 2, 0))),
+            Edges=frozenset((((0, 2, 0), (1, 2, 0)),)),
+            Claims=RoutingResourceClaims(
+                WireCells=frozenset(((0, 2, 0), (1, 2, 0)))
+            ),
+            Layer=0,
+            Guide=frozenset(),
+            RepeaterWaypoints=(),
+            MaterialCost=2,
+            FootprintGrowth=2,
+            Length=2,
+            BendCount=0,
+            ViaCount=0,
+        )
+        Domain = BuildPhysicalPortCorridorDomain(
+            Port("old-local"),
+            (Candidate,),
+            "request-a",
+            "graph-a",
+            "technology-a",
+            Complete=True,
+        )
+        Cache = {Domain.DomainFingerprint: Domain}
+        CurrentShapes = {"A": (SimpleNamespace(
+            Layer=0,
+            SourcePortal=SimpleNamespace(
+                PortalId="current-source",
+                Path=((0, 2, 0),),
+            ),
+            TargetPortals=(),
+        ),)}
+
+        Reused = SelectReusablePhysicalPortCorridorCandidates(
+            Cache,
+            {"A": Port("new-local")},
+            {"A": "request-a"},
+            "graph-a",
+            "technology-a",
+            CurrentShapes,
+        )
+        self.assertEqual(tuple(Reused), ("A",))
+        self.assertEqual(
+            Reused["A"][0].SourcePortalId,
+            "current-source",
+        )
+        self.assertEqual(Reused["A"][0].Nodes, Candidate.Nodes)
+        for ChangedRequests, Graph, Technology, Cached in (
+            ({"A": "request-b"}, "graph-a", "technology-a", Cache),
+            ({"A": "request-a"}, "graph-b", "technology-a", Cache),
+            ({"A": "request-a"}, "graph-a", "technology-b", Cache),
+            (
+                {"A": "request-a"},
+                "graph-a",
+                "technology-a",
+                {
+                    Domain.DomainFingerprint: replace(
+                        Domain,
+                        Complete=False,
+                    )
+                },
+            ),
+        ):
+            self.assertEqual(
+                SelectReusablePhysicalPortCorridorCandidates(
+                    Cached,
+                    {"A": Port("new-local")},
+                    ChangedRequests,
+                    Graph,
+                    Technology,
+                    CurrentShapes,
+                ),
+                {},
+            )
+
+    def testRetainedPhysicalGlobalPlanFrontierSchedulesFairly(self) -> None:
+        def Assembly(Name):
+            return SimpleNamespace(Plan=SimpleNamespace(
+                PlanFingerprint=f"plan-{Name}",
+                PortAssignmentFingerprint=f"ports-{Name}",
+                Ports=(),
+            ))
+
+        Frontier = {}
+        for Sequence, Name in enumerate(("a", "b", "c")):
+            CurrentAssembly = Assembly(Name)
+            Continuation = BuildPhysicalGlobalPlanContinuationState(
+                CurrentAssembly.Plan,
+                {"Signal": f"request-{Name}"},
+                {"Signal": 3 - Sequence},
+                (),
+                (f"aperture-{Name}",),
+                CompletedWork=Sequence + 1,
+                ResumeCursor=PhysicalGlobalPlanResumeCursor(
+                    CursorFingerprint=f"cursor-{Name}",
+                    PlanFingerprint=f"plan-{Name}",
+                    ApertureDomainFingerprint=f"aperture-{Name}",
+                    CompletedWork=Sequence + 1,
+                    State={"owner": Name},
+                ),
+            )
+            Frontier = RetainIncompletePhysicalGlobalPlan(
+                Frontier,
+                CurrentAssembly,
+                Continuation,
+                EnqueuedSequence=Sequence,
+            )
+
+        ScheduledNames = []
+        for Sequence in range(4):
+            Entry, Frontier = SelectNextRetainedPhysicalGlobalPlan(
+                Frontier,
+                ScheduleSequence=Sequence,
+            )
+            ScheduledNames.append(Entry.PlanFingerprint)
+
+        self.assertEqual(
+            ScheduledNames,
+            ["plan-a", "plan-b", "plan-c", "plan-a"],
+        )
+        self.assertFalse(any(
+            Entry.Continuation.Complete for Entry in Frontier.values()
+        ))
+
+    def testRetainedPhysicalGlobalPlansAlternateWithFreshExploration(
+        self,
+    ) -> None:
+        Frontier = {
+            "plan-a": SimpleNamespace(),
+            "plan-b": SimpleNamespace(),
+        }
+
+        self.assertTrue(ShouldScheduleRetainedPhysicalGlobalPlan(
+            Frontier,
+            PreviousPlanWasRetained=False,
+        ))
+        self.assertFalse(ShouldScheduleRetainedPhysicalGlobalPlan(
+            Frontier,
+            PreviousPlanWasRetained=True,
+        ))
+        self.assertFalse(ShouldScheduleRetainedPhysicalGlobalPlan(
+            {},
+            PreviousPlanWasRetained=False,
+        ))
+
+    def testRetainedPhysicalGlobalPlanRefreshPreservesFairnessState(self) -> None:
+        Assembly = SimpleNamespace(Plan=SimpleNamespace(
+            PlanFingerprint="plan-a",
+            PortAssignmentFingerprint="ports-a",
+            Ports=(),
+        ))
+        First = BuildPhysicalGlobalPlanContinuationState(
+            Assembly.Plan,
+            {"Signal": "request-domain"},
+            {"Signal": 4},
+            (),
+            ("aperture",),
+            CompletedWork=3,
+            ResumeCursor=PhysicalGlobalPlanResumeCursor(
+                "cursor-3", "plan-a", "aperture", 3, object(),
+            ),
+        )
+        Frontier = RetainIncompletePhysicalGlobalPlan(
+            {}, Assembly, First, EnqueuedSequence=2,
+        )
+        _Entry, Frontier = SelectNextRetainedPhysicalGlobalPlan(
+            Frontier,
+            ScheduleSequence=5,
+        )
+        Continued = BuildPhysicalGlobalPlanContinuationState(
+            Assembly.Plan,
+            {"Signal": "request-domain"},
+            {"Signal": 2},
+            (),
+            ("aperture",),
+            CompletedWork=7,
+            ResumeCursor=PhysicalGlobalPlanResumeCursor(
+                "cursor-10", "plan-a", "aperture", 10, object(),
+            ),
+        )
+        Frontier = RetainIncompletePhysicalGlobalPlan(
+            Frontier, Assembly, Continued, EnqueuedSequence=9,
+        )
+        Entry = Frontier["plan-a"]
+
+        self.assertEqual(Entry.EnqueuedSequence, 2)
+        self.assertEqual(Entry.LastScheduledSequence, 5)
+        self.assertEqual(Entry.ScheduleCount, 1)
+        self.assertEqual(Entry.AccumulatedCompletedWork, 10)
+        self.assertEqual(Entry.Continuation.RemainingRequestCounts, (
+            ("Signal", 2),
+        ))
+        Stale = BuildPhysicalGlobalPlanContinuationState(
+            Assembly.Plan,
+            {"Signal": "request-domain"},
+            {"Signal": 4},
+            (),
+            ("aperture",),
+            CompletedWork=1,
+            ResumeCursor=PhysicalGlobalPlanResumeCursor(
+                "cursor-9", "plan-a", "aperture", 9, object(),
+            ),
+        )
+        Preserved = RetainIncompletePhysicalGlobalPlan(
+            Frontier, Assembly, Stale, EnqueuedSequence=10,
+        )["plan-a"]
+        self.assertEqual(
+            Preserved.Continuation.StateFingerprint,
+            Entry.Continuation.StateFingerprint,
+        )
+        self.assertEqual(Preserved.AccumulatedCompletedWork, 10)
+        OverlappingPublication = BuildPhysicalGlobalPlanContinuationState(
+            Assembly.Plan,
+            {"Signal": "request-domain"},
+            {"Signal": 1},
+            (),
+            ("aperture",),
+            CompletedWork=9,
+            ResumeCursor=PhysicalGlobalPlanResumeCursor(
+                "cursor-12", "plan-a", "aperture", 12, object(),
+            ),
+        )
+        Advanced = RetainIncompletePhysicalGlobalPlan(
+            Frontier,
+            Assembly,
+            OverlappingPublication,
+            EnqueuedSequence=11,
+        )["plan-a"]
+        self.assertEqual(Advanced.AccumulatedCompletedWork, 12)
+        with self.assertRaises(ValueError):
+            RetainIncompletePhysicalGlobalPlan(
+                Frontier,
+                Assembly,
+                replace(Continued, Complete=True),
+                EnqueuedSequence=10,
+            )
+
+    def testPhysicalGlobalPlanYieldDeadlineReservesOtherFrontiers(self) -> None:
+        StartedAt = monotonic()
+        Shared = RoutingDeadline(
+            StartedAt=StartedAt,
+            ExpiresAt=StartedAt + 100.0,
+        )
+
+        First = BuildPhysicalGlobalPlanYieldDeadline(Shared, 0)
+        WithRetained = BuildPhysicalGlobalPlanYieldDeadline(Shared, 2)
+
+        self.assertLess(First.ExpiresAt, Shared.ExpiresAt)
+        self.assertLess(WithRetained.ExpiresAt, First.ExpiresAt)
+        self.assertGreater(First.RemainingSeconds(), 40.0)
+        self.assertGreater(WithRetained.RemainingSeconds(), 20.0)
+
+    def testPhysicalGlobalAssignmentAvoidsMultipleExactNoGoods(self) -> None:
+        def PlanNative(Values):
+            Selected = tuple(
+                (
+                    Signal,
+                    min(Value[1] for Value in Values if Value[0] == Signal),
+                )
+                for Signal in sorted({Value[0] for Value in Values})
+            )
+            return SimpleNamespace(
+                Success=True,
+                SelectedCandidateIds=Selected,
+                ExpansionCount=1,
+                CompletedWork=1,
+                BudgetExhausted=False,
+                DeadlineExceeded=False,
+                ConflictSignals=(),
+            )
+
+        Result = PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
+            (("A", "A0"), ("A", "A1"), ("B", "B0"), ("B", "B1")),
+            (
+                frozenset((("A", "A0"), ("B", "B0"))),
+                frozenset((("A", "A1"), ("B", "B0"))),
+            ),
+            PlanNative,
+        )
+
+        self.assertTrue(Result.Success)
+        self.assertEqual(
+            dict(Result.SelectedCandidateIds),
+            {"A": "A1", "B": "B1"},
+        )
+
+    def testPhysicalGlobalNoGoodBranchPreservesNativeDeadline(self) -> None:
+        Calls = 0
+
+        def PlanNative(Values):
+            nonlocal Calls
+            Calls += 1
+            if Calls == 1:
+                return SimpleNamespace(
+                    Success=True,
+                    SelectedCandidateIds=(("A", "A0"), ("B", "B0")),
+                    ExpansionCount=1,
+                    CompletedWork=1,
+                    BudgetExhausted=False,
+                    DeadlineExceeded=False,
+                    ConflictSignals=(),
+                )
+            return SimpleNamespace(
+                Success=False,
+                SelectedCandidateIds=(),
+                ExpansionCount=2,
+                CompletedWork=2,
+                BudgetExhausted=False,
+                DeadlineExceeded=True,
+                ConflictSignals=("A",),
+            )
+
+        Result = PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
+            (("A", "A0"), ("A", "A1"), ("B", "B0"), ("B", "B1")),
+            (frozenset((("A", "A0"), ("B", "B0"))),),
+            PlanNative,
+        )
+
+        self.assertTrue(Result.DeadlineExceeded)
+        self.assertFalse(Result.Success)
+        self.assertEqual(Calls, 2)
 
     def testCoordinatedReservedPortalTupleUsesTargetedWindowOffset(
         self,
@@ -6209,6 +8739,422 @@ class AuthoritativePlannerTests(unittest.TestCase):
             Technology.MinimumRoutingLayerCount,
         )
 
+    def testPhysicalAssemblyPlanningCorridorsRaiseTheLayerFloor(self) -> None:
+        Corridors = (
+            SimpleNamespace(Signal="PortA", Layer=1),
+            SimpleNamespace(
+                Signal="ForeignFeedthrough",
+                Layer=5,
+                FeedthroughComponentIds=(7,),
+            ),
+        )
+        Plan = SimpleNamespace(
+            PlanFingerprint="assembly-a",
+            Channels=(),
+            Corridors=Corridors,
+            PlanningChannels=Corridors,
+        )
+
+        self.assertEqual(
+            RequiredPhysicalAssemblyRoutingLayerCount(Plan),
+            6,
+        )
+        RequiredLayerCount = RequiredPhysicalAssemblyRoutingLayerCount(Plan)
+        ValidatePhysicalAssemblyRoutingLayerLimit(
+            Plan,
+            RequiredLayerCount=RequiredLayerCount,
+            EffectiveMaximumLayerCount=6,
+            PolicyMaximumLayerCount=8,
+            TechnologyMaximumLayerCount=8,
+        )
+        self.assertEqual(
+            SelectInitialRoutingLayerCount(
+                MinimumLayerCount=3,
+                EffectiveMaximumLayerCount=max(3, RequiredLayerCount),
+                RequiredAccessLayerCount=max(3, RequiredLayerCount),
+                AdaptiveLayerCount=3,
+                AdaptiveLayerFloor=0,
+                NegotiatedLayerFloor=0,
+                ExistingRouteLayerCount=1,
+                PlacementWasRelocated=False,
+                ForceMaximumAfterPlacementRelocation=False,
+            ),
+            RequiredLayerCount,
+        )
+
+    def testPhysicalGlobalRouteTreeCacheReusesExactRequestAcrossPlans(
+        self,
+    ) -> None:
+        FirstPlan = SimpleNamespace(PlanFingerprint="assembly-a")
+        SecondPlan = SimpleNamespace(PlanFingerprint="assembly-b")
+        Request = (
+            "PortA",
+            ((1, 2, 3),),
+            frozenset({(4, 2, 3)}),
+            ((1, 0), (2, 0)),
+        )
+
+        FirstKey = BuildPhysicalGlobalRouteTreeResultCacheKey(
+            Request,
+            "resource-graph",
+            "technology",
+        )
+        SecondKey = BuildPhysicalGlobalRouteTreeResultCacheKey(
+            Request,
+            "resource-graph",
+            "technology",
+        )
+
+        self.assertNotEqual(
+            FirstPlan.PlanFingerprint,
+            SecondPlan.PlanFingerprint,
+        )
+        self.assertEqual(FirstKey, SecondKey)
+        Cache: dict[str, object] = {}
+        FirstResult = object()
+        RetainPhysicalGlobalRouteTreeResults(
+            Cache,
+            ((FirstKey, FirstResult),),
+        )
+        self.assertIs(
+            TouchPhysicalGlobalRouteTreeResult(Cache, SecondKey),
+            FirstResult,
+        )
+
+    def testPhysicalGlobalRouteTreeCacheMissesChangedRequestGeometry(
+        self,
+    ) -> None:
+        BaseRequest = (
+            "PortA",
+            ((1, 2, 3),),
+            frozenset({(4, 2, 3)}),
+            ((1, 0), (2, 0)),
+        )
+        ChangedBlockedRequest = (
+            "PortA",
+            ((1, 2, 3),),
+            frozenset({(5, 2, 3)}),
+            ((1, 0), (2, 0)),
+        )
+
+        BaseKey = BuildPhysicalGlobalRouteTreeResultCacheKey(
+            BaseRequest,
+            "resource-graph",
+            "technology",
+        )
+
+        self.assertNotEqual(
+            BaseKey,
+            BuildPhysicalGlobalRouteTreeResultCacheKey(
+                ChangedBlockedRequest,
+                "resource-graph",
+                "technology",
+            ),
+        )
+        self.assertNotEqual(
+            BaseKey,
+            BuildPhysicalGlobalRouteTreeResultCacheKey(
+                BaseRequest,
+                "changed-resource-graph",
+                "technology",
+            ),
+        )
+
+    def testRouteTreeBatchCompletionMaskPreservesNonPrefixWork(
+        self,
+    ) -> None:
+        Batch = SimpleNamespace(
+            CompletionMask=(False, True, False, True),
+            CompletedWork=2,
+            DeadlineExceeded=True,
+        )
+
+        self.assertEqual(
+            ReadRouteTreeBatchCompletionMask(Batch, 4),
+            (False, True, False, True),
+        )
+
+    def testLegacyDeadlineBatchDoesNotInventCompletedPrefix(self) -> None:
+        LegacyBatch = SimpleNamespace(
+            CompletedWork=2,
+            DeadlineExceeded=True,
+        )
+
+        self.assertEqual(
+            ReadRouteTreeBatchCompletionMask(LegacyBatch, 4),
+            (False, False, False, False),
+        )
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            ReadRouteTreeBatchCompletionMask(
+                SimpleNamespace(
+                    CompletionMask=(True, False),
+                    CompletedWork=2,
+                    DeadlineExceeded=True,
+                ),
+                2,
+            )
+
+    def testPhysicalGlobalRouteTreeCacheRetentionIsBoundedLru(self) -> None:
+        Cache = {"a": 1, "b": 2, "c": 3}
+
+        self.assertEqual(
+            TouchPhysicalGlobalRouteTreeResult(Cache, "a"),
+            1,
+        )
+        EvictedCount = RetainPhysicalGlobalRouteTreeResults(
+            Cache,
+            (("d", 4), ("e", 5)),
+            MaximumEntries=3,
+        )
+
+        self.assertEqual(EvictedCount, 2)
+        self.assertEqual(Cache, {"a": 1, "d": 4, "e": 5})
+
+    def testPhysicalAssemblyLayerOutsidePolicyFailsTypedAndEarly(self) -> None:
+        Corridors = (SimpleNamespace(Signal="PortA", Layer=4),)
+        Plan = SimpleNamespace(
+            PlanFingerprint="assembly-b",
+            Channels=(),
+            Corridors=Corridors,
+            PlanningChannels=Corridors,
+        )
+
+        with self.assertRaises(RoutingStageError) as Context:
+            ValidatePhysicalAssemblyRoutingLayerLimit(
+                Plan,
+                RequiredLayerCount=(
+                    RequiredPhysicalAssemblyRoutingLayerCount(Plan)
+                ),
+                EffectiveMaximumLayerCount=4,
+                PolicyMaximumLayerCount=4,
+                TechnologyMaximumLayerCount=8,
+            )
+
+        Failure = Context.exception.Failure
+        self.assertEqual(
+            Failure.Reason,
+            RoutingFailureReason.ComponentChannelCapacityUnsatisfiable,
+        )
+        self.assertEqual(Failure.Stage, "PhysicalComponentGlobalPlanning")
+        self.assertEqual(Failure.AffectedNets, ("PortA",))
+        self.assertEqual(
+            Failure.Diagnostics["RequiredPhysicalAssemblyLayerCount"],
+            5,
+        )
+        self.assertTrue(
+            Failure.Diagnostics["GlobalPlanDomainComplete"]
+        )
+
+    def testExplicitInterfaceDeckExtendsOnlyTheHierarchicalMaximum(
+        self,
+    ) -> None:
+        Corridors = (SimpleNamespace(Signal="PortA", Layer=3),)
+        Plan = SimpleNamespace(
+            PlanFingerprint="assembly-deck",
+            Channels=(),
+            Corridors=Corridors,
+            PlanningChannels=Corridors,
+        )
+
+        self.assertEqual(
+            SelectHierarchicalRoutingMaximumLayerCount(
+                PolicyLayerLimit=3,
+                TechnologyMaximumLayerCount=8,
+                InterfaceDeckLayer=None,
+                Plan=None,
+            ),
+            3,
+        )
+        AuthorizedMaximum = SelectHierarchicalRoutingMaximumLayerCount(
+            PolicyLayerLimit=3,
+            TechnologyMaximumLayerCount=8,
+            InterfaceDeckLayer=3,
+            Plan=Plan,
+        )
+        self.assertEqual(AuthorizedMaximum, 4)
+        ValidatePhysicalAssemblyRoutingLayerLimit(
+            Plan,
+            RequiredLayerCount=4,
+            EffectiveMaximumLayerCount=AuthorizedMaximum,
+            PolicyMaximumLayerCount=3,
+            TechnologyMaximumLayerCount=8,
+        )
+
+        with self.assertRaises(RoutingStageError) as Context:
+            SelectHierarchicalRoutingMaximumLayerCount(
+                PolicyLayerLimit=3,
+                TechnologyMaximumLayerCount=4,
+                InterfaceDeckLayer=4,
+                Plan=SimpleNamespace(
+                    PlanFingerprint="assembly-deck",
+                    Channels=(),
+                    Corridors=(
+                        SimpleNamespace(Signal="PortA", Layer=4),
+                    ),
+                    PlanningChannels=(
+                        SimpleNamespace(Signal="PortA", Layer=4),
+                    ),
+                ),
+            )
+        Failure = Context.exception.Failure
+        self.assertEqual(
+            Failure.Reason,
+            RoutingFailureReason.ComponentChannelCapacityUnsatisfiable,
+        )
+        self.assertEqual(Failure.AffectedNets, ("PortA",))
+        self.assertEqual(
+            Failure.Diagnostics["InterfaceDeckAuthorization"],
+            "rejected-by-technology",
+        )
+
+    def testPhysicalAssemblyExactAttachmentMustBeGloballyVisible(self) -> None:
+        Attachment = (4, 3, 7)
+        GlobalPath = (Attachment, (5, 3, 7))
+        Port = SimpleNamespace(
+            Signal="PortA",
+            Attachment=Attachment,
+            GlobalPath=GlobalPath,
+            ReservationFingerprint="port-a",
+        )
+        Plan = SimpleNamespace(
+            PlanFingerprint="assembly-c",
+            Ports=(Port,),
+            Channels=(),
+            Corridors=(SimpleNamespace(Signal="PortA", Layer=1),),
+            PlanningChannels=(
+                SimpleNamespace(Signal="PortA", Layer=1),
+            ),
+        )
+        Profile = SimpleNamespace(Root=Attachment, Targets=((9, 3, 7),))
+        ExactPortal = replace(
+            self.BuildPortal("PortA", Attachment, Attachment, Layer=1),
+            PortalId=BuildPhysicalComponentGlobalPortalId(Port, 1),
+            Path=GlobalPath,
+        )
+
+        Diagnostics = ValidatePhysicalComponentExactAttachmentPortals(
+            {"PortA": Profile},
+            {("PortA", Attachment, 1): (ExactPortal,)},
+            Plan,
+            LayerCount=2,
+        )
+        self.assertTrue(
+            Diagnostics["AllDeclaredExactAttachmentsVisible"]
+        )
+
+        with self.assertRaises(RoutingStageError) as Context:
+            ValidatePhysicalComponentExactAttachmentPortals(
+                {"PortA": Profile},
+                {},
+                Plan,
+                LayerCount=2,
+            )
+        Failure = Context.exception.Failure
+        self.assertEqual(
+            Failure.Reason,
+            RoutingFailureReason.ComponentAssemblyIdentityMismatch,
+        )
+        self.assertEqual(
+            Failure.Diagnostics["VisibleExactAttachmentCount"],
+            0,
+        )
+        self.assertEqual(
+            Failure.Diagnostics["MissingExactAttachments"][0]["Problems"],
+            ["exact-portal-not-visible"],
+        )
+
+    def testPhysicalGlobalPortalIdentityFollowsOnlyGlobalSeam(self) -> None:
+        Attachment = (4, 3, 7)
+        GlobalPath = (Attachment, (5, 3, 7))
+
+        def Port(ReservationFingerprint, LocalPath, *, Path=GlobalPath):
+            return SimpleNamespace(
+                Signal="PortA",
+                Direction="output",
+                Attachment=Path[0],
+                GlobalPath=Path,
+                LocalPath=LocalPath,
+                Capacity=1,
+                ReservationFingerprint=ReservationFingerprint,
+            )
+
+        First = Port("local-reservation-a", ((2, 3, 7), Attachment))
+        LocalChanged = Port(
+            "local-reservation-b",
+            ((1, 3, 7), (2, 3, 7), Attachment),
+        )
+        GlobalChangedPath = ((4, 3, 8), (5, 3, 8))
+        GlobalChanged = Port(
+            "local-reservation-c",
+            ((2, 3, 8), GlobalChangedPath[0]),
+            Path=GlobalChangedPath,
+        )
+
+        self.assertEqual(
+            BuildPhysicalComponentGlobalPortalId(First, 1),
+            BuildPhysicalComponentGlobalPortalId(LocalChanged, 1),
+        )
+        self.assertNotEqual(
+            BuildPhysicalComponentGlobalPortalId(First, 1),
+            BuildPhysicalComponentGlobalPortalId(GlobalChanged, 1),
+        )
+
+    def testReboundCandidatePortalRemainsInCurrentGlobalDomain(self) -> None:
+        Attachment = (4, 3, 7)
+        GlobalPath = (Attachment, (5, 3, 7))
+
+        def Port(ReservationFingerprint, LocalPath):
+            return SimpleNamespace(
+                Signal="PortA",
+                Direction="output",
+                Attachment=Attachment,
+                GlobalPath=GlobalPath,
+                LocalPath=LocalPath,
+                Capacity=1,
+                ReservationFingerprint=ReservationFingerprint,
+            )
+
+        Channel = SimpleNamespace(Signal="PortA", Layer=1)
+        First = Port("local-reservation-a", ((2, 3, 7), Attachment))
+        LocalChanged = Port(
+            "local-reservation-b",
+            ((1, 3, 7), (2, 3, 7), Attachment),
+        )
+
+        def Plan(Value):
+            return SimpleNamespace(
+                Ports=(Value,),
+                PlanningChannels=(Channel,),
+            )
+
+        ResourceGraph = SimpleNamespace(
+            BuildRouteClaims=lambda Path: RoutingResourceClaims(
+                WireCells=frozenset(Path),
+            ),
+        )
+        FirstDomains = ApplyPhysicalComponentAssemblyPortalDomains(
+            {}, Plan(First), ResourceGraph,
+        )
+        NextDomains = ApplyPhysicalComponentAssemblyPortalDomains(
+            {}, Plan(LocalChanged), ResourceGraph,
+        )
+        FirstPortalId = next(iter(FirstDomains.values()))[0].PortalId
+        self.assertEqual(
+            FirstPortalId,
+            next(iter(NextDomains.values()))[0].PortalId,
+        )
+        Candidate = SimpleNamespace(
+            CandidateId="bound-global-candidate",
+            SourcePortalId=FirstPortalId,
+            TargetPortalIds={},
+        )
+        Retained, Removed = FilterPhysicalCandidatesToCurrentPortalDomain(
+            {"PortA": (Candidate,)},
+            NextDomains,
+        )
+        self.assertEqual(Retained, {"PortA": (Candidate,)})
+        self.assertEqual(Removed, {})
+
     def testRelocatedPlacementCanClimbTheLayerLadder(self) -> None:
         Arguments = {
             "MinimumLayerCount": 3,
@@ -6278,8 +9224,14 @@ class AuthoritativePlannerTests(unittest.TestCase):
         Region = object()
         Context = object()
         Cache = RawPortalGeometryCache(
-            PlacedIdentity=id(Placed),
-            ResourcesIdentity=id(Resources),
+            PlacementGeometryFingerprint=(
+                BuildRawPortalPlacementGeometryFingerprint(Placed)
+            ),
+            ResourceGeometryFingerprint=(
+                BuildRawPortalResourceGeometryFingerprint(Resources)
+            ),
+            PlacedReference=Placed,
+            ResourcesReference=Resources,
             Region=Region,
             LayerCount=3,
             PortalLimit=9,
@@ -6320,6 +9272,73 @@ class AuthoritativePlannerTests(unittest.TestCase):
         GrowingCache = replace(Cache, Region=BaseRegion)
         self.assertTrue(GrowingCache.Matches(
             Placed, Resources, ExpandedRegion, 3, 9, {"A": 9}, 3, 100
+        ))
+
+    def testRawPortalCacheOpaqueIdentityCannotAliasAnotherObject(
+        self,
+    ) -> None:
+        Placed = object()
+        Resources = object()
+        Cache = self.BuildRawPortalCache(
+            Placed,
+            Resources,
+            {"Alpha": 2},
+        )
+
+        self.assertTrue(Cache.MatchesPlacementResources(Placed, Resources))
+        self.assertFalse(Cache.MatchesPlacementResources(
+            object(),
+            Resources,
+        ))
+        self.assertFalse(Cache.MatchesPlacementResources(
+            Placed,
+            object(),
+        ))
+
+    def testRawPortalCacheMatchesEquivalentStructuralGeometry(
+        self,
+    ) -> None:
+        def BuildPlaced(X):
+            return SimpleNamespace(PlacedGates=[SimpleNamespace(
+                Name="A",
+                Kind="NAND",
+                X=X,
+                Y=0,
+                Z=0,
+                Rotation=0,
+                MirrorX=False,
+                InputPins=[(0, 0, 0), (0, 0, 1)],
+                OutputPin=(1, 0, 0),
+                InputDirections=[(-1, 0, 0), (-1, 0, 0)],
+                OutputDirection=(1, 0, 0),
+                Inputs=["I0", "I1"],
+                Outputs=["O"],
+            )])
+
+        FirstPlaced = BuildPlaced(3)
+        EquivalentPlaced = BuildPlaced(3)
+        DifferentPlaced = BuildPlaced(4)
+        FirstResources = RoutingResources(RoutingStaticGeometry(
+            frozenset({(3, 0, 0)}),
+            frozenset({(3, 0, 1)}),
+        ))
+        EquivalentResources = RoutingResources(RoutingStaticGeometry(
+            frozenset({(3, 0, 0)}),
+            frozenset({(3, 0, 1)}),
+        ))
+        Cache = self.BuildRawPortalCache(
+            FirstPlaced,
+            FirstResources,
+            {"Alpha": 2},
+        )
+
+        self.assertTrue(Cache.MatchesPlacementResources(
+            EquivalentPlaced,
+            EquivalentResources,
+        ))
+        self.assertFalse(Cache.MatchesPlacementResources(
+            DifferentPlaced,
+            EquivalentResources,
         ))
 
     def testRawPortalProfileCannotOverrideWiderRetryControls(self) -> None:
@@ -6365,8 +9384,14 @@ class AuthoritativePlannerTests(unittest.TestCase):
         Resources = object()
         GuidePlan = object()
         Cache = RawPortalGeometryCache(
-            PlacedIdentity=id(Placed),
-            ResourcesIdentity=id(Resources),
+            PlacementGeometryFingerprint=(
+                BuildRawPortalPlacementGeometryFingerprint(Placed)
+            ),
+            ResourceGeometryFingerprint=(
+                BuildRawPortalResourceGeometryFingerprint(Resources)
+            ),
+            PlacedReference=Placed,
+            ResourcesReference=Resources,
             Region=object(),
             LayerCount=3,
             PortalLimit=9,
@@ -6481,13 +9506,885 @@ class AuthoritativePlannerTests(unittest.TestCase):
             ),
         )
 
+    def testFactorizedPhysicalGuideIdentityChangesOnlyEditedSignal(
+        self,
+    ) -> None:
+        Base = SimpleNamespace(
+            Guides={"A": {(0, 0), (1, 0)}, "B": {(0, 2), (1, 2)}},
+            Layers={"A": 0, "B": 1},
+            Axes={"A": "X", "B": "X"},
+            Lanes={"A": 0, "B": 2},
+            Overflow={},
+        )
+        Changed = SimpleNamespace(
+            Guides={"A": {(0, 0), (1, 0)}, "B": {(0, 3), (1, 3)}},
+            Layers={"A": 0, "B": 1},
+            Axes={"A": "X", "B": "X"},
+            Lanes={"A": 0, "B": 3},
+            Overflow={},
+        )
+        Inputs = {"A": "input-a", "B": "input-b"}
+
+        First = BuildFactorizedPhysicalGuideIdentity(Base, Inputs)
+        Second = BuildFactorizedPhysicalGuideIdentity(Changed, Inputs)
+
+        self.assertEqual(
+            First.FactorFingerprintBySignal()["A"],
+            Second.FactorFingerprintBySignal()["A"],
+        )
+        self.assertNotEqual(
+            First.FactorFingerprintBySignal()["B"],
+            Second.FactorFingerprintBySignal()["B"],
+        )
+        self.assertNotEqual(
+            First.JointCapacityAssignmentFingerprint,
+            Second.JointCapacityAssignmentFingerprint,
+        )
+
+    def testCertifiedApertureDomainKeepsSiblingChangesLocal(self) -> None:
+        def Claims(*Nodes):
+            NodeSet = frozenset(Nodes)
+            return RoutingResourceClaims(
+                WireCells=NodeSet,
+                ElectricalCells=NodeSet,
+            )
+
+        def Port(Signal, Path, Fingerprint):
+            return SimpleNamespace(
+                Signal=Signal,
+                Direction="output",
+                Attachment=Path[0],
+                GlobalPath=tuple(Path),
+                Capacity=1,
+                ReservationFingerprint=Fingerprint,
+                Claims=Claims(*Path),
+                GlobalClaims=Claims(*Path),
+            )
+
+        def Plan(BetaPath=((4, 2, 0), (5, 2, 0))):
+            Ports = (
+                Port("Alpha", ((0, 2, 0), (1, 2, 0)), "port-a"),
+                Port("Beta", BetaPath, "port-b:" + str(BetaPath)),
+            )
+            return SimpleNamespace(
+                Ports=Ports,
+                PlanningChannels=tuple(
+                    SimpleNamespace(
+                        Signal=Value.Signal,
+                        ReservationFingerprint="channel:" + Value.Signal,
+                    )
+                    for Value in Ports
+                ),
+                GlobalKeepoutNodes=frozenset({
+                    (0, 2, 0), (1, 2, 0), (2, 2, 0), (3, 2, 0),
+                }),
+                ComponentGraphFingerprint="component",
+                ResourceGraphFingerprint="resource",
+                TechnologyFingerprint="technology",
+            )
+
+        First = BuildCertifiedPhysicalComponentApertureDomain(
+            Plan(),
+            Complete=True,
+        )
+        Second = BuildCertifiedPhysicalComponentApertureDomain(
+            Plan(((4, 2, 1), (5, 2, 1))),
+            Complete=True,
+        )
+        FirstIdentity = BuildPhysicalSignalApertureCandidateDomainIdentity(
+            First,
+            "Alpha",
+            "request-alpha",
+            ((2, 2, 0), (3, 2, 0)),
+            CoverageCursor=7,
+            Complete=False,
+        )
+        SecondIdentity = BuildPhysicalSignalApertureCandidateDomainIdentity(
+            Second,
+            "Alpha",
+            "request-alpha",
+            ((2, 2, 0), (3, 2, 0)),
+            CoverageCursor=7,
+            Complete=False,
+        )
+
+        self.assertTrue(First.Complete)
+        self.assertEqual(
+            First.StableKeepoutCoreFingerprint,
+            Second.StableKeepoutCoreFingerprint,
+        )
+        self.assertNotEqual(
+            First.DomainFingerprint,
+            Second.DomainFingerprint,
+        )
+        self.assertEqual(
+            FirstIdentity.DomainFingerprint,
+            SecondIdentity.DomainFingerprint,
+        )
+        ChangedBlockedNodes = (
+            BuildPhysicalSignalApertureCandidateDomainIdentity(
+                First,
+                "Alpha",
+                "request-alpha",
+                ((2, 2, 0),),
+                CoverageCursor=7,
+                Complete=False,
+            )
+        )
+        self.assertNotEqual(
+            FirstIdentity.DomainFingerprint,
+            ChangedBlockedNodes.DomainFingerprint,
+        )
+        AdvancedIdentity = (
+            BuildPhysicalSignalApertureCandidateDomainIdentity(
+                First,
+                "Alpha",
+                "request-alpha",
+                ((2, 2, 0), (3, 2, 0)),
+                CoverageCursor=8,
+                Complete=True,
+            )
+        )
+        self.assertEqual(
+            FirstIdentity.StableDomainFingerprint,
+            AdvancedIdentity.StableDomainFingerprint,
+        )
+        self.assertNotEqual(
+            FirstIdentity.DomainFingerprint,
+            AdvancedIdentity.DomainFingerprint,
+        )
+        self.assertNotEqual(
+            FirstIdentity.StableDomainFingerprint,
+            ChangedBlockedNodes.StableDomainFingerprint,
+        )
+
+    def testExteriorRouteDomainComposesExactApertureAndChannel(self) -> None:
+        def Claims(*Nodes):
+            NodeSet = frozenset(Nodes)
+            return RoutingResourceClaims(
+                WireCells=NodeSet,
+                ElectricalCells=NodeSet,
+            )
+
+        def Plan(PortFingerprint, ChannelFingerprint):
+            Path = ((0, 2, 0), (1, 2, 0))
+            Port = SimpleNamespace(
+                Signal="Alpha",
+                Direction="output",
+                Attachment=Path[0],
+                GlobalPath=Path,
+                Capacity=1,
+                ReservationFingerprint=PortFingerprint,
+                Claims=Claims(*Path),
+                GlobalClaims=Claims(*Path),
+            )
+            return SimpleNamespace(
+                Ports=(Port,),
+                PlanningChannels=(SimpleNamespace(
+                    Signal="Alpha",
+                    ReservationFingerprint=ChannelFingerprint,
+                ),),
+                GlobalKeepoutNodes=frozenset({
+                    (0, 2, 0), (1, 2, 0), (2, 2, 0),
+                }),
+                ComponentGraphFingerprint="component",
+                ResourceGraphFingerprint="resource",
+                TechnologyFingerprint="technology",
+            )
+
+        def Identity(PlanValue):
+            return BuildPhysicalSignalApertureCandidateDomainIdentity(
+                BuildCertifiedPhysicalComponentApertureDomain(
+                    PlanValue,
+                    Complete=True,
+                ),
+                "Alpha",
+                "authoritative-request-domain",
+                ((2, 2, 0),),
+                CoverageCursor=3,
+                Complete=False,
+            )
+
+        Base = Identity(Plan("port-a", "channel-a"))
+        ChangedPort = Identity(Plan("port-b", "channel-a"))
+        ChangedChannel = Identity(Plan("port-a", "channel-b"))
+
+        self.assertEqual(
+            Base.StableDomainFingerprint,
+            ChangedPort.StableDomainFingerprint,
+        )
+        self.assertEqual(
+            Base.StableDomainFingerprint,
+            ChangedChannel.StableDomainFingerprint,
+        )
+        self.assertEqual(
+            Base.ApertureFingerprint,
+            ChangedPort.ApertureFingerprint,
+        )
+        self.assertNotEqual(
+            Base.ChannelReservationFingerprint,
+            ChangedChannel.ChannelReservationFingerprint,
+        )
+        self.assertEqual(
+            Base.DomainFingerprint,
+            ChangedPort.DomainFingerprint,
+        )
+        self.assertNotEqual(
+            Base.DomainFingerprint,
+            ChangedChannel.DomainFingerprint,
+        )
+
+    def testExteriorRouteDomainRetainsGlobalPortContractIdentity(self) -> None:
+        def Identity(Path):
+            NodeSet = frozenset(Path)
+            Port = SimpleNamespace(
+                Signal="Alpha",
+                Direction="output",
+                Attachment=Path[0],
+                GlobalPath=tuple(Path),
+                Capacity=1,
+                ReservationFingerprint="port",
+                Claims=RoutingResourceClaims(
+                    WireCells=NodeSet,
+                    ElectricalCells=NodeSet,
+                ),
+                GlobalClaims=RoutingResourceClaims(
+                    WireCells=NodeSet,
+                    ElectricalCells=NodeSet,
+                ),
+            )
+            Plan = SimpleNamespace(
+                Ports=(Port,),
+                PlanningChannels=(SimpleNamespace(
+                    Signal="Alpha",
+                    ReservationFingerprint="channel",
+                ),),
+                GlobalKeepoutNodes=frozenset({
+                    (0, 2, 0), (1, 2, 0), (2, 2, 0),
+                }),
+                ComponentGraphFingerprint="component",
+                ResourceGraphFingerprint="resource",
+                TechnologyFingerprint="technology",
+            )
+            return BuildPhysicalSignalApertureCandidateDomainIdentity(
+                BuildCertifiedPhysicalComponentApertureDomain(
+                    Plan,
+                    Complete=True,
+                ),
+                "Alpha",
+                "authoritative-request-domain",
+                ((2, 2, 0),),
+                CoverageCursor=3,
+                Complete=False,
+            )
+
+        First = Identity(((0, 2, 0), (1, 2, 0)))
+        ChangedGlobalPath = Identity(((0, 2, 0), (0, 2, 1)))
+
+        self.assertNotEqual(
+            First.PortGlobalContractFingerprint,
+            ChangedGlobalPath.PortGlobalContractFingerprint,
+        )
+        self.assertNotEqual(
+            First.StableDomainFingerprint,
+            ChangedGlobalPath.StableDomainFingerprint,
+        )
+
+    def testCompleteApertureDomainRejectsMissingCrossingChannel(self) -> None:
+        Port = SimpleNamespace(
+            Signal="Alpha",
+            Direction="output",
+            Attachment=(0, 2, 0),
+            GlobalPath=((0, 2, 0), (1, 2, 0)),
+            Capacity=1,
+            ReservationFingerprint="port-a",
+            Claims=RoutingResourceClaims(
+                WireCells=frozenset(((0, 2, 0), (1, 2, 0))),
+            ),
+        )
+        Plan = SimpleNamespace(
+            Ports=(Port,),
+            PlanningChannels=(),
+            GlobalKeepoutNodes=frozenset(((0, 2, 0),)),
+            ComponentGraphFingerprint="component",
+            ResourceGraphFingerprint="resource",
+            TechnologyFingerprint="technology",
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing channels"):
+            BuildCertifiedPhysicalComponentApertureDomain(
+                Plan,
+                Complete=True,
+            )
+
+    def testRouteDomainContinuationRestoresExactCursorAndCandidates(
+        self,
+    ) -> None:
+        Candidate = SimpleNamespace(CandidateId="candidate-a")
+        Continuation = PhysicalSignalRouteDomainContinuation(
+            PreSiblingDomainFingerprint="stable-domain",
+            Signal="Alpha",
+            RequestDomainFingerprint="request-domain",
+            RequestDescriptorFingerprints=("shape-0", "shape-1"),
+            NextDescriptorCursor=1,
+            Candidates=(Candidate,),
+            CandidateMetadata=(("candidate-a", ("X", 3, 1, 0)),),
+            Complete=False,
+        )
+        Cache = {"stable-domain": Continuation}
+
+        Restored = SelectReplayablePhysicalSignalRouteDomainContinuation(
+            Cache,
+            "stable-domain",
+            "Alpha",
+            "request-domain",
+            ("shape-0", "shape-1"),
+        )
+
+        self.assertIs(Restored, Continuation)
+        self.assertEqual(Restored.NextDescriptorCursor, 1)
+        self.assertEqual(Restored.Candidates, (Candidate,))
+        self.assertIsNone(
+            SelectReplayablePhysicalSignalRouteDomainContinuation(
+                Cache,
+                "stable-domain",
+                "Alpha",
+                "request-domain",
+                ("shape-0", "changed-shape"),
+            )
+        )
+
+    def testPreSiblingContinuationPublishesOnlyClosedDomains(self) -> None:
+        Cache = {}
+        Identity = SimpleNamespace(
+            StableDomainFingerprint="stable-alpha"
+        )
+        Candidate = SimpleNamespace(CandidateId="candidate-a")
+
+        self.assertEqual(
+            RetainCompletePhysicalSignalRouteDomainContinuations(
+                Cache,
+                {"Alpha": Identity},
+                {"Alpha": ("shape-0", "shape-1")},
+                {"Alpha": "request-domain"},
+                {"Alpha": 1},
+                {"Alpha": (Candidate,)},
+                {"Alpha": {"candidate-a": ("X", 1, 0, 0)}},
+            ),
+            (),
+        )
+        self.assertFalse(Cache)
+
+        self.assertEqual(
+            RetainCompletePhysicalSignalRouteDomainContinuations(
+                Cache,
+                {"Alpha": Identity},
+                {"Alpha": ("shape-0", "shape-1")},
+                {"Alpha": "request-domain"},
+                {"Alpha": 0},
+                {"Alpha": (Candidate,)},
+                {"Alpha": {}},
+            ),
+            (),
+        )
+        self.assertFalse(Cache)
+
+        Retained = RetainCompletePhysicalSignalRouteDomainContinuations(
+            Cache,
+            {"Alpha": Identity},
+            {"Alpha": ("shape-0", "shape-1")},
+            {"Alpha": "request-domain"},
+            {"Alpha": 0},
+            {"Alpha": (Candidate,)},
+            {"Alpha": {"candidate-a": ("X", 1, 0, 0)}},
+        )
+        self.assertEqual(len(Retained), 1)
+        self.assertTrue(Retained[0].Complete)
+        self.assertEqual(Retained[0].NextDescriptorCursor, 2)
+        self.assertIs(Cache["stable-alpha"], Retained[0])
+
+    def testCompleteRouteDomainReplayIgnoresRequestSchedule(self) -> None:
+        Continuation = PhysicalSignalRouteDomainContinuation(
+            PreSiblingDomainFingerprint="stable-domain",
+            Signal="Alpha",
+            RequestDomainFingerprint="request-domain",
+            RequestDescriptorFingerprints=("late", "early"),
+            NextDescriptorCursor=2,
+            Candidates=(),
+            Complete=True,
+        )
+
+        Restored = SelectReplayablePhysicalSignalRouteDomainContinuation(
+            {"stable-domain": Continuation},
+            "stable-domain",
+            "Alpha",
+            "request-domain",
+            ("early", "late", "schedule-alias"),
+        )
+
+        self.assertIs(Restored, Continuation)
+        self.assertIsNone(
+            SelectReplayablePhysicalSignalRouteDomainContinuation(
+                {"stable-domain": Continuation},
+                "stable-domain",
+                "Alpha",
+                "changed-request-domain",
+                ("late", "early"),
+            )
+        )
+
+    def testExteriorDomainReusesAcrossChangedSiblingGlobalPlan(self) -> None:
+        def Claims(*Nodes):
+            NodeSet = frozenset(Nodes)
+            return RoutingResourceClaims(
+                WireCells=NodeSet,
+                ElectricalCells=NodeSet,
+            )
+
+        def Plan(BetaPath):
+            AlphaPath = ((0, 2, 0), (1, 2, 0))
+            Ports = (
+                SimpleNamespace(
+                    Signal="Alpha",
+                    Direction="output",
+                    Attachment=AlphaPath[0],
+                    GlobalPath=AlphaPath,
+                    Capacity=1,
+                    ReservationFingerprint="port-alpha",
+                    Claims=Claims(*AlphaPath),
+                    GlobalClaims=Claims(*AlphaPath),
+                ),
+                SimpleNamespace(
+                    Signal="Beta",
+                    Direction="output",
+                    Attachment=BetaPath[0],
+                    GlobalPath=tuple(BetaPath),
+                    Capacity=1,
+                    ReservationFingerprint="port-beta:" + str(BetaPath),
+                    Claims=Claims(*BetaPath),
+                    GlobalClaims=Claims(*BetaPath),
+                ),
+            )
+            return SimpleNamespace(
+                Ports=Ports,
+                PlanningChannels=tuple(
+                    SimpleNamespace(
+                        Signal=Value.Signal,
+                        ReservationFingerprint="channel:" + Value.Signal,
+                    )
+                    for Value in Ports
+                ),
+                GlobalKeepoutNodes=frozenset({
+                    (0, 2, 0), (1, 2, 0), (2, 2, 0), (3, 2, 0),
+                }),
+                ComponentGraphFingerprint="component",
+                ResourceGraphFingerprint="resource",
+                TechnologyFingerprint="technology",
+            )
+
+        def Identity(PlanValue):
+            return BuildPhysicalSignalApertureCandidateDomainIdentity(
+                BuildCertifiedPhysicalComponentApertureDomain(
+                    PlanValue,
+                    Complete=True,
+                ),
+                "Alpha",
+                "exterior-region-and-request-domain",
+                ((2, 2, 0), (3, 2, 0)),
+                CoverageCursor=0,
+                Complete=False,
+            )
+
+        FirstPlan = Plan(((4, 2, 0), (5, 2, 0)))
+        SecondPlan = Plan(((4, 2, 1), (5, 2, 1)))
+        FirstIdentity = Identity(FirstPlan)
+        SecondIdentity = Identity(SecondPlan)
+        OldSiblingOnly = SimpleNamespace(
+            CandidateId="old-sibling-only",
+            Claims=Claims((4, 2, 0)),
+        )
+        NewSiblingOnly = SimpleNamespace(
+            CandidateId="new-sibling-only",
+            Claims=Claims((4, 2, 1)),
+        )
+        Clear = SimpleNamespace(
+            CandidateId="clear",
+            Claims=Claims((8, 2, 0)),
+        )
+        Cache = {}
+        RetainCompletePhysicalSignalRouteDomainContinuations(
+            Cache,
+            {"Alpha": FirstIdentity},
+            {"Alpha": ("shape-0",)},
+            {"Alpha": "request-domain"},
+            {"Alpha": 0},
+            {"Alpha": (OldSiblingOnly, NewSiblingOnly, Clear)},
+            {"Alpha": {
+                "old-sibling-only": ("X", 0, 0, 0),
+                "new-sibling-only": ("X", 1, 0, 0),
+                "clear": ("X", 2, 0, 0),
+            }},
+        )
+
+        Restored = SelectReplayablePhysicalSignalRouteDomainContinuation(
+            Cache,
+            SecondIdentity.StableDomainFingerprint,
+            "Alpha",
+            "request-domain",
+            ("shape-0",),
+        )
+
+        self.assertIsNotNone(Restored)
+        assert Restored is not None
+        self.assertEqual(
+            FirstIdentity.StableDomainFingerprint,
+            SecondIdentity.StableDomainFingerprint,
+        )
+        CurrentBeta = next(
+            Port for Port in SecondPlan.Ports if Port.Signal == "Beta"
+        )
+        Filtered = FilterPhysicalCandidatesAgainstSiblingApertures(
+            Restored.Candidates,
+            (("Beta", CurrentBeta.GlobalClaims),),
+        )
+        self.assertEqual(
+            tuple(Value.CandidateId for Value in Filtered),
+            ("old-sibling-only", "clear"),
+        )
+
+    def testChangedExteriorRegionDependencyPreventsDomainReplay(self) -> None:
+        ApertureDomain = SimpleNamespace(
+            Complete=True,
+            Factors=(SimpleNamespace(
+                Signal="Alpha",
+                ApertureFingerprint="aperture-alpha",
+                PortGlobalContractFingerprint="global-alpha",
+                ChannelReservationFingerprint="channel-alpha",
+            ),),
+            StableKeepoutCoreFingerprint="stable-core",
+            ResourceGraphFingerprint="resource",
+            TechnologyFingerprint="technology",
+        )
+
+        def Identity(ExteriorRegionFingerprint):
+            return BuildPhysicalSignalApertureCandidateDomainIdentity(
+                ApertureDomain,
+                "Alpha",
+                ExteriorRegionFingerprint,
+                ((2, 2, 0),),
+                CoverageCursor=0,
+                Complete=False,
+            )
+
+        First = Identity("exterior-region-a")
+        ChangedRegion = Identity("exterior-region-b")
+        Continuation = PhysicalSignalRouteDomainContinuation(
+            PreSiblingDomainFingerprint=First.StableDomainFingerprint,
+            Signal="Alpha",
+            RequestDomainFingerprint="request-domain-a",
+            RequestDescriptorFingerprints=("shape-0",),
+            NextDescriptorCursor=1,
+            Candidates=(),
+            Complete=True,
+        )
+
+        self.assertNotEqual(
+            First.StableDomainFingerprint,
+            ChangedRegion.StableDomainFingerprint,
+        )
+        self.assertIsNone(
+            SelectReplayablePhysicalSignalRouteDomainContinuation(
+                {First.StableDomainFingerprint: Continuation},
+                ChangedRegion.StableDomainFingerprint,
+                "Alpha",
+                "request-domain-b",
+                ("shape-0",),
+            )
+        )
+
+    def testPriorCandidateReplayReappliesCurrentSiblingApertures(self) -> None:
+        Shared = (2, 2, 0)
+        Conflicting = SimpleNamespace(
+            CandidateId="conflicting",
+            Claims=RoutingResourceClaims(
+                WireCells=frozenset((Shared,)),
+                ElectricalCells=frozenset((Shared,)),
+            ),
+        )
+        Clear = SimpleNamespace(
+            CandidateId="clear",
+            Claims=RoutingResourceClaims(
+                WireCells=frozenset(((8, 2, 0),)),
+                ElectricalCells=frozenset(((8, 2, 0),)),
+            ),
+        )
+        SiblingClaims = RoutingResourceClaims(
+            WireCells=frozenset((Shared,)),
+            ElectricalCells=frozenset((Shared,)),
+        )
+
+        Retained = FilterPhysicalCandidatesAgainstSiblingApertures(
+            (Conflicting, Clear),
+            (("Beta", SiblingClaims),),
+        )
+
+        self.assertEqual(
+            tuple(Value.CandidateId for Value in Retained),
+            ("clear",),
+        )
+
+    def testSiblingApertureDiagnosticsSeparateLocalInteriorOwnership(
+        self,
+    ) -> None:
+        def Claims(*Nodes):
+            Values = frozenset(Nodes)
+            return RoutingResourceClaims(
+                WireCells=Values,
+                ElectricalCells=Values,
+            )
+
+        CandidateClaims = Claims((0, 0, 0), (10, 0, 0))
+        FullSiblingClaims = (
+            ("LocalOnly", Claims((0, 0, 0), (1, 0, 0))),
+            ("Global", Claims((10, 0, 0), (11, 0, 0))),
+        )
+        GlobalPathSiblingClaims = (
+            ("LocalOnly", Claims((2, 0, 0))),
+            ("Global", Claims((10, 0, 0), (11, 0, 0))),
+        )
+
+        Full, Global, LocalInteriorOnly = (
+            ClassifySiblingApertureSeamOwnershipConflicts(
+                CandidateClaims,
+                FullSiblingClaims,
+                GlobalPathSiblingClaims,
+            )
+        )
+
+        self.assertEqual(Full, ("Global", "LocalOnly"))
+        self.assertEqual(Global, ("Global",))
+        self.assertEqual(LocalInteriorOnly, ("LocalOnly",))
+
+    def testCompletePreSiblingPairNoSupportIgnoresThirdApertures(
+        self,
+    ) -> None:
+        def Candidate(Signal, CandidateId, Node):
+            return SimpleNamespace(
+                Signal=Signal,
+                CandidateId=CandidateId,
+                Claims=RoutingResourceClaims(
+                    WireCells=frozenset((Node,)),
+                    ElectricalCells=frozenset((Node,)),
+                ),
+            )
+
+        First = (Candidate("Alpha", "alpha", (1, 2, 3)),)
+        Conflicting = (Candidate("Beta", "beta", (1, 2, 3)),)
+        Supported = (Candidate("Beta", "beta-clear", (9, 2, 3)),)
+
+        self.assertTrue(
+            CompletePhysicalCandidatePairDomainsHaveNoSupport(
+                First,
+                Conflicting,
+            )
+        )
+        self.assertFalse(
+            CompletePhysicalCandidatePairDomainsHaveNoSupport(
+                First,
+                (*Conflicting, *Supported),
+            )
+        )
+
+    def testRequestApertureNoGoodMinimizesRedundantSibling(self) -> None:
+        NoGood = BuildMinimalPhysicalRequestApertureNoGood(
+            "Alpha",
+            "request-alpha",
+            (("Beta", "Gamma"), ("Beta",), ("Beta", "Gamma")),
+            {
+                "Beta": "aperture-beta",
+                "Gamma": "aperture-gamma",
+            },
+        )
+
+        self.assertEqual(NoGood, frozenset((
+            ("Alpha", "request-factor:request-alpha"),
+            ("Beta", "aperture-factor:aperture-beta"),
+        )))
+
+    def testRequestApertureNoGoodRetainsRequiredHigherOrderCut(self) -> None:
+        NoGood = BuildMinimalPhysicalRequestApertureNoGood(
+            "Alpha",
+            "request-alpha",
+            (("Beta",), ("Gamma",)),
+            {
+                "Beta": "aperture-beta",
+                "Gamma": "aperture-gamma",
+            },
+        )
+
+        self.assertEqual(NoGood, frozenset((
+            ("Alpha", "request-factor:request-alpha"),
+            ("Beta", "aperture-factor:aperture-beta"),
+            ("Gamma", "aperture-factor:aperture-gamma"),
+        )))
+        self.assertFalse(BuildMinimalPhysicalRequestApertureNoGood(
+            "Alpha",
+            "request-alpha",
+            (("Missing",),),
+            {"Beta": "aperture-beta"},
+        ))
+
+    def testSignalLocalCandidateRequestCertificateBindsExactFactors(
+        self,
+    ) -> None:
+        ApertureDomain = SimpleNamespace(
+            Complete=True,
+            CrossingSignals=("Alpha",),
+            StableKeepoutCoreFingerprint="keepout",
+            Factors=(SimpleNamespace(
+                Signal="Alpha",
+                PortGlobalContractFingerprint="global-alpha",
+                ChannelReservationFingerprint="channel-alpha",
+            ),),
+        )
+        Components = {
+            "GlobalContractFingerprint": "global-alpha",
+            "ChannelFingerprint": "channel-alpha",
+            "GuideFactorFingerprint": "",
+            "GlobalKeepoutFingerprint": "keepout",
+            "BlockedNodesFingerprint": "blocked",
+            "DescriptorDomainFingerprint": "descriptors",
+            "DescriptorCount": 2,
+        }
+
+        self.assertTrue(
+            PhysicalSignalLocalCandidateRequestFactorProofComplete(
+                "Alpha",
+                Components,
+                ("Alpha",),
+                {"Alpha": frozenset(((1, 2),))},
+                ApertureDomain,
+            )
+        )
+        self.assertFalse(
+            PhysicalSignalLocalCandidateRequestFactorProofComplete(
+                "Alpha",
+                {**Components, "ChannelFingerprint": "changed"},
+                ("Alpha",),
+                {"Alpha": frozenset(((1, 2),))},
+                ApertureDomain,
+            )
+        )
+        self.assertFalse(
+            PhysicalSignalLocalCandidateRequestFactorProofComplete(
+                "Alpha",
+                Components,
+                ("Alpha",),
+                {},
+                ApertureDomain,
+            )
+        )
+
+    def testPhysicalAssemblyGuideContractIgnoresLocalOnlyPortState(
+        self,
+    ) -> None:
+        def Port(LocalFingerprint, Attachment=(4, 2, 6)):
+            return SimpleNamespace(
+                Signal="A",
+                Direction="output",
+                Attachment=Attachment,
+                GlobalPath=(Attachment, (Attachment[0] + 1, 2, 6)),
+                Capacity=1,
+                ReservationFingerprint=LocalFingerprint,
+                LocalPath=((0, 2, 0), Attachment),
+                OwnedCandidateFingerprints=(LocalFingerprint,),
+            )
+
+        def Plan(PortValue, ChannelFingerprint="channel-a"):
+            return SimpleNamespace(
+                GlobalKeepoutFingerprint="keepout",
+                Ports=(PortValue,),
+                PlanningChannels=(SimpleNamespace(
+                    Signal="A",
+                    ReservationFingerprint=ChannelFingerprint,
+                ),),
+                PlanFingerprint=PortValue.ReservationFingerprint,
+            )
+
+        First = BuildPhysicalAssemblyGuideContractFingerprint(
+            Plan(Port("local-a"))
+        )
+        LocalOnlyChange = BuildPhysicalAssemblyGuideContractFingerprint(
+            Plan(Port("local-b"))
+        )
+        GlobalPortChange = BuildPhysicalAssemblyGuideContractFingerprint(
+            Plan(Port("local-c", Attachment=(5, 2, 6)))
+        )
+        ChannelChange = BuildPhysicalAssemblyGuideContractFingerprint(
+            Plan(Port("local-a"), ChannelFingerprint="channel-b")
+        )
+
+        self.assertEqual(First, LocalOnlyChange)
+        self.assertNotEqual(First, GlobalPortChange)
+        self.assertNotEqual(First, ChannelChange)
+
+    def testPhysicalPortCorridorDomainIdentityRejectsDependencyMismatch(
+        self,
+    ) -> None:
+        Port = SimpleNamespace(
+            Signal="A",
+            Direction="output",
+            Capacity=1,
+            Attachment=(0, 1, 0),
+            GlobalPath=((0, 1, 0),),
+            ReservationFingerprint="port-a",
+        )
+        Claims = RoutingResourceClaims(
+            WireCells=frozenset({(0, 1, 0), (1, 1, 0)}),
+            SupportCells=frozenset({(0, 0, 0), (1, 0, 0)}),
+            RequiredAirCells=frozenset(),
+            ElectricalCells=frozenset({(0, 1, 0), (1, 1, 0)}),
+        )
+        Candidate = SimpleNamespace(
+            Signal="A",
+            CandidateId="route-a",
+            Layer=0,
+            Nodes=frozenset({(0, 1, 0), (1, 1, 0)}),
+            Edges=frozenset({((0, 1, 0), (1, 1, 0))}),
+            Claims=Claims,
+            RepeaterWaypoints=(),
+        )
+
+        First = BuildPhysicalPortCorridorDomain(
+            Port, (Candidate,), "requests-a", "graph", "technology",
+            Complete=True,
+        )
+        Equivalent = BuildPhysicalPortCorridorDomain(
+            Port, (Candidate,), "requests-a", "graph", "technology",
+            Complete=True,
+        )
+        Changed = BuildPhysicalPortCorridorDomain(
+            Port, (Candidate,), "requests-b", "graph", "technology",
+            Complete=True,
+        )
+
+        self.assertEqual(First, Equivalent)
+        self.assertTrue(First.Complete)
+        self.assertEqual(len(First.Factors), 1)
+        self.assertNotEqual(
+            First.DomainFingerprint,
+            Changed.DomainFingerprint,
+        )
+
     def testReservedFilteringDoesNotMutateRawPortalCache(self) -> None:
         First = self.BuildPortal("A", (0, 1, 0), (1, 1, 0))
         Second = self.BuildPortal("A", (0, 1, 0), (2, 1, 0))
         Key = ("A", (0, 1, 0), 0)
         Cache = RawPortalGeometryCache(
-            PlacedIdentity=1,
-            ResourcesIdentity=2,
+            PlacementGeometryFingerprint="opaque-placement",
+            ResourceGeometryFingerprint="opaque-resources",
+            PlacedReference=object(),
+            ResourcesReference=object(),
             Region=object(),
             LayerCount=1,
             PortalLimit=2,
@@ -6570,6 +10467,80 @@ class AuthoritativePlannerTests(unittest.TestCase):
             frozenset({"Beta"}),
         )
 
+    def testPhysicalOrdinaryPortalReusePinsOnlySameKeepoutPaths(
+        self,
+    ) -> None:
+        Placed = object()
+        Resources = RoutingResources(
+            RoutingStaticGeometry(frozenset(), frozenset())
+        )
+        Cache = replace(
+            self.BuildRawPortalCache(
+                Placed,
+                Resources,
+                {"Ordinary": 2, "PhysicalPort": 2},
+            ),
+            PhysicalGlobalKeepoutFingerprint="keepout-a",
+        )
+        ReusePlan = RawPortalGeometryReusePlan(
+            Cache=Cache,
+            ReusedSignals=frozenset((
+                "Ordinary",
+                "PhysicalPort",
+            )),
+            GeneratedSignals=frozenset(),
+            ExactMatch=False,
+            PortableAcrossPlacement=True,
+            SignalPlanarTransforms=(
+                ("Ordinary", "Identity", (5, 0, 7)),
+                ("PhysicalPort", "Identity", (5, 0, 7)),
+            ),
+        )
+        PhysicalTerminal = next(
+            Key[1]
+            for Key, _Values in Cache.PortalEntries
+            if Key[0] == "PhysicalPort"
+        )
+
+        Columns = BuildPinnedOrdinaryPortalReuseColumns(
+            ReusePlan,
+            frozenset(((
+                "PhysicalPort",
+                (
+                    PhysicalTerminal[0] + 5,
+                    PhysicalTerminal[1],
+                    PhysicalTerminal[2] + 7,
+                ),
+            ),)),
+        )
+        OrdinaryTerminal = next(
+            Key[1]
+            for Key, _Values in Cache.PortalEntries
+            if Key[0] == "Ordinary"
+        )
+        self.assertIn(
+            (OrdinaryTerminal[0] + 5, OrdinaryTerminal[2] + 7),
+            Columns,
+        )
+        self.assertNotIn(
+            (PhysicalTerminal[0] + 5, PhysicalTerminal[2] + 7),
+            Columns,
+        )
+
+        self.assertIsNone(SelectRawPortalGeometryReusePlan(
+            (Cache,),
+            Placed=Placed,
+            Resources=Resources,
+            LayerCount=2,
+            PortalLimit=6,
+            PortalVariantCounts={"Ordinary": 2, "PhysicalPort": 2},
+            GuideExpansion=3,
+            StrictMaximumExpansions=100,
+            AccessGeometryFingerprint=("access",),
+            CoordinatedSignals=frozenset(),
+            PhysicalGlobalKeepoutFingerprint="keepout-b",
+        ))
+
     def testRawPortalPartialComponentDomainExpandsAtGlobalHandoff(
         self,
     ) -> None:
@@ -6608,7 +10579,46 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertIsNotNone(Plan)
         self.assertFalse(Plan.ExactMatch)
         self.assertEqual(Plan.ReusedSignals, frozenset({"Alpha"}))
-        self.assertEqual(Plan.GeneratedSignals, frozenset({"Beta"}))
+
+    def testRawPortalSamePlacementReusesUnchangedSignalGeometry(
+        self,
+    ) -> None:
+        Placed = object()
+        Resources = RoutingResources(
+            RoutingStaticGeometry(frozenset(), frozenset())
+        )
+        OldAlpha = ("Alpha", (0, 1, 0), (), ())
+        NewAlpha = (
+            "Alpha",
+            (0, 1, 0),
+            ((0, 1, 0), (1, 1, 0)),
+            (),
+        )
+        Beta = ("Beta", (3, 1, 0), (), ())
+        Cache = self.BuildRawPortalCache(
+            Placed,
+            Resources,
+            {"Alpha": 2, "Beta": 2},
+            AccessGeometryFingerprint=(OldAlpha, Beta),
+        )
+
+        Plan = SelectRawPortalGeometryReusePlan(
+            (Cache,),
+            Placed=Placed,
+            Resources=Resources,
+            LayerCount=2,
+            PortalLimit=6,
+            PortalVariantCounts={"Alpha": 2, "Beta": 2},
+            GuideExpansion=3,
+            StrictMaximumExpansions=100,
+            AccessGeometryFingerprint=(NewAlpha, Beta),
+            CoordinatedSignals=frozenset(),
+        )
+
+        self.assertIsNotNone(Plan)
+        self.assertEqual(Plan.ReusedSignals, frozenset(("Beta",)))
+        self.assertEqual(Plan.GeneratedSignals, frozenset(("Alpha",)))
+        self.assertTrue(Plan.PortableAcrossPlacement)
 
     def testRawPortalResourceCacheRejectsGeometryAndUnreportedDeltas(
         self,
@@ -6638,7 +10648,10 @@ class AuthoritativePlannerTests(unittest.TestCase):
             {"Placed": object()},
             {
                 "Resources": RoutingResources(
-                    RoutingStaticGeometry(frozenset(), frozenset())
+                    RoutingStaticGeometry(
+                        frozenset({(9, 0, 9)}),
+                        frozenset(),
+                    )
                 )
             },
             {"LayerCount": 3},
@@ -6730,6 +10743,28 @@ class AuthoritativePlannerTests(unittest.TestCase):
             dict(Plan.SignalTranslations),
             {"Alpha": (0, 0, 0), "Beta": (8, 0, 0)},
         )
+
+    def testTranslatedPortablePortalIdentityDoesNotRetainLineage(
+        self,
+    ) -> None:
+        Arguments = {
+            "Signal": "Alpha",
+            "Terminal": (9, 1, 0),
+            "Layer": 1,
+            "Path": ((9, 1, 0), (9, 2, 0)),
+            "Length": 2,
+            "BendCount": 0,
+            "ViaCount": 1,
+            "Cost": 7,
+        }
+
+        First = BuildTranslatedPortablePortalId(**Arguments)
+        Second = BuildTranslatedPortablePortalId(**Arguments)
+
+        self.assertEqual(First, Second)
+        self.assertEqual(First.count("translated:"), 1)
+        self.assertLess(len(First), 80)
+        self.assertNotIn("Portal:", First)
 
     def testRawPortalPortableReuseCrossesComponentVariantSignalSets(
         self,
@@ -8614,6 +12649,272 @@ class AuthoritativePlannerTests(unittest.TestCase):
 
         self.assertNotIn((13, 1, 0), Repeaters)
         self.assertTrue(all(Powers.get(Target, 0) > 0 for Target in Targets))
+
+
+class PhysicalExteriorConnectorDistanceFieldTests(unittest.TestCase):
+    class GridResourceGraph:
+        def __init__(self, ForbiddenEdges=()):
+            self.ForbiddenEdges = frozenset(ForbiddenEdges)
+
+        def BuildPrimitive(self, First, Second):
+            if (
+                First[1] != Second[1]
+                or sum(
+                    abs(First[Index] - Second[Index])
+                    for Index in range(3)
+                ) != 1
+                or (First, Second) in self.ForbiddenEdges
+            ):
+                return None
+            return object()
+
+    @staticmethod
+    def BuildField(
+        *,
+        Targets=frozenset(((4, 0, 0),)),
+        BlockedGuideCells=frozenset(),
+        EdgeIsLegal=lambda _First, _Second: True,
+        ResourceGraph=None,
+        ResourceGraphFingerprint="",
+        ForeignClaimsFingerprint="",
+    ):
+        return BuildPhysicalExteriorConnectorDistanceField(
+            ResourceGraph or (
+                PhysicalExteriorConnectorDistanceFieldTests
+                .GridResourceGraph()
+            ),
+            Targets,
+            EnvelopeMinimum=(10, 0, 10),
+            EnvelopeMaximum=(10, 0, 10),
+            BlockedGuideCells=BlockedGuideCells,
+            Margin=1,
+            Bounds=(-1, 5, -2, 2),
+            EdgeIsLegal=EdgeIsLegal,
+            ResourceGraphFingerprint=ResourceGraphFingerprint,
+            ForeignClaimsFingerprint=ForeignClaimsFingerprint,
+        )
+
+    def testOneFieldServesMultipleSeams(self):
+        Graph = self.GridResourceGraph()
+        Field = self.BuildField(ResourceGraph=Graph)
+        Results = tuple(
+            SelectPhysicalExteriorConnectorPath(
+                Field,
+                Graph,
+                Start,
+                BlockedLocalNodes=frozenset(),
+                EdgeIsLegal=lambda _First, _Second: True,
+                ValidateCandidate=lambda _Path: True,
+            )
+            for Start in ((0, 0, 0), (0, 0, 1))
+        )
+        self.assertGreater(Field.BuildExpansionCount, 0)
+        self.assertTrue(all(Result.UsedCanonicalField for Result in Results))
+        self.assertTrue(all(not Result.UsedFallback for Result in Results))
+        self.assertEqual(
+            tuple(Result.Path[-1] for Result in Results),
+            ((4, 0, 0), (4, 0, 0)),
+        )
+
+    def testFieldExcludesKeepoutAndForeignIllegalEdges(self):
+        ForbiddenEdge = frozenset(((1, 0, 0), (1, 0, -1)))
+        EdgeIsLegal = lambda First, Second: frozenset((
+            First,
+            Second,
+        )) != ForbiddenEdge
+        Graph = self.GridResourceGraph()
+        Field = self.BuildField(
+            BlockedGuideCells=frozenset(((2, 0),)),
+            EdgeIsLegal=EdgeIsLegal,
+            ResourceGraph=Graph,
+        )
+        Result = SelectPhysicalExteriorConnectorPath(
+            Field,
+            Graph,
+            (0, 0, 0),
+            BlockedLocalNodes=frozenset(),
+            EdgeIsLegal=EdgeIsLegal,
+            ValidateCandidate=lambda _Path: True,
+        )
+        self.assertTrue(Result.Path)
+        self.assertNotIn((2, 0, 0), Result.Path)
+        self.assertTrue(all(
+            frozenset((First, Second)) != ForbiddenEdge
+            for First, Second in zip(Result.Path, Result.Path[1:])
+        ))
+
+    def testFieldIdentityIsOrderAndExternalSignalNameInvariant(self):
+        Graph = self.GridResourceGraph()
+        First = self.BuildField(
+            Targets=frozenset(((4, 0, 0), (4, 0, 1))),
+            ResourceGraph=Graph,
+        )
+        Second = self.BuildField(
+            Targets=frozenset(reversed(((4, 0, 0), (4, 0, 1)))),
+            ResourceGraph=Graph,
+        )
+        FieldsBySignal = {"RenamedSignal": Second}
+        self.assertEqual(First.FieldFingerprint, Second.FieldFingerprint)
+        self.assertEqual(
+            First.FieldFingerprint,
+            FieldsBySignal["RenamedSignal"].FieldFingerprint,
+        )
+        self.assertEqual(First.NextNodeByNode, Second.NextNodeByNode)
+
+    def testFieldIdentityIncludesResourceAndForeignClaims(self):
+        Graph = self.GridResourceGraph()
+        Baseline = self.BuildField(
+            ResourceGraph=Graph,
+            ResourceGraphFingerprint="resource-a",
+            ForeignClaimsFingerprint="claims-a",
+        )
+        OtherResource = self.BuildField(
+            ResourceGraph=Graph,
+            ResourceGraphFingerprint="resource-b",
+            ForeignClaimsFingerprint="claims-a",
+        )
+        OtherClaims = self.BuildField(
+            ResourceGraph=Graph,
+            ResourceGraphFingerprint="resource-a",
+            ForeignClaimsFingerprint="claims-b",
+        )
+        self.assertNotEqual(
+            Baseline.FieldFingerprint,
+            OtherResource.FieldFingerprint,
+        )
+        self.assertNotEqual(
+            Baseline.FieldFingerprint,
+            OtherClaims.FieldFingerprint,
+        )
+
+    def testBlockedCanonicalPathUsesExactFallback(self):
+        Graph = self.GridResourceGraph()
+        Field = self.BuildField(
+            Targets=frozenset(((2, 0, 0),)),
+            ResourceGraph=Graph,
+        )
+        Result = SelectPhysicalExteriorConnectorPath(
+            Field,
+            Graph,
+            (0, 0, 0),
+            BlockedLocalNodes=frozenset(((1, 0, 0),)),
+            EdgeIsLegal=lambda _First, _Second: True,
+            ValidateCandidate=lambda _Path: True,
+        )
+        self.assertTrue(Result.UsedFallback)
+        self.assertFalse(Result.UsedCanonicalField)
+        self.assertGreater(Result.FallbackExpansionCount, 0)
+        self.assertNotIn((1, 0, 0), Result.Path)
+        self.assertEqual(Result.Path[-1], (2, 0, 0))
+
+    def testForeignClaimBlockedCanonicalEdgeUsesExactFallback(self):
+        Graph = self.GridResourceGraph()
+        Field = self.BuildField(
+            Targets=frozenset(((2, 0, 0),)),
+            ResourceGraph=Graph,
+        )
+        BlockedEdge = frozenset(((0, 0, 0), (1, 0, 0)))
+
+        Result = SelectPhysicalExteriorConnectorPath(
+            Field,
+            Graph,
+            (0, 0, 0),
+            BlockedLocalNodes=frozenset(),
+            EdgeIsLegal=lambda First, Second: frozenset((
+                First,
+                Second,
+            )) != BlockedEdge,
+            ValidateCandidate=lambda _Path: True,
+        )
+
+        self.assertTrue(Result.UsedFallback)
+        self.assertFalse(Result.UsedCanonicalField)
+        self.assertTrue(Result.Path)
+        self.assertEqual(Result.Path[-1], (2, 0, 0))
+        self.assertTrue(all(
+            frozenset((First, Second)) != BlockedEdge
+            for First, Second in zip(Result.Path, Result.Path[1:])
+        ))
+
+    def testDisconnectedStartReturnsCompleteUnreachableResult(self):
+        Graph = self.GridResourceGraph()
+        Field = self.BuildField(
+            Targets=frozenset(((4, 0, 0),)),
+            BlockedGuideCells=frozenset(
+                (1, Z) for Z in range(-2, 3)
+            ),
+            ResourceGraph=Graph,
+        )
+
+        Result = SelectPhysicalExteriorConnectorPath(
+            Field,
+            Graph,
+            (0, 0, 0),
+            BlockedLocalNodes=frozenset(),
+            EdgeIsLegal=lambda _First, _Second: True,
+            ValidateCandidate=lambda _Path: True,
+        )
+
+        self.assertEqual(Result.Path, ())
+        self.assertFalse(Result.UsedCanonicalField)
+        self.assertTrue(Result.UsedFallback)
+        self.assertGreater(Result.FallbackExpansionCount, 0)
+
+    def testSharedFieldMatchesTinyBruteBfsReachability(self):
+        Graph = self.GridResourceGraph()
+        BlockedGuideCells = frozenset(((2, 1),))
+        Field = self.BuildField(
+            Targets=frozenset(((4, 0, 0), (4, 0, 1))),
+            BlockedGuideCells=BlockedGuideCells,
+            ResourceGraph=Graph,
+        )
+
+        def BruteDistance(Start, BlockedLocalNodes):
+            MinimumX, MaximumX, MinimumZ, MaximumZ = Field.Bounds
+            Pending = deque(((Start, 0),))
+            Seen = {Start}
+            while Pending:
+                Current, Distance = Pending.popleft()
+                if Current in Field.Targets:
+                    return Distance
+                X, Y, Z = Current
+                for Neighbor in (
+                    (X - 1, Y, Z),
+                    (X + 1, Y, Z),
+                    (X, Y, Z - 1),
+                    (X, Y, Z + 1),
+                ):
+                    if (
+                        Neighbor in Seen
+                        or Neighbor in BlockedLocalNodes
+                        or not (MinimumX <= Neighbor[0] <= MaximumX)
+                        or not (MinimumZ <= Neighbor[2] <= MaximumZ)
+                        or (Neighbor[0], Neighbor[2])
+                        in Field.BlockedGuideCells
+                        or Graph.BuildPrimitive(Current, Neighbor) is None
+                    ):
+                        continue
+                    Seen.add(Neighbor)
+                    Pending.append((Neighbor, Distance + 1))
+            return None
+
+        for Start, Blocked in (
+            ((0, 0, 0), frozenset()),
+            ((0, 0, 1), frozenset(((1, 0, 1),))),
+            ((5, 0, 2), frozenset()),
+        ):
+            Result = SelectPhysicalExteriorConnectorPath(
+                Field,
+                Graph,
+                Start,
+                BlockedLocalNodes=Blocked,
+                EdgeIsLegal=lambda _First, _Second: True,
+                ValidateCandidate=lambda _Path: True,
+            )
+            ExpectedDistance = BruteDistance(Start, Blocked)
+            self.assertEqual(bool(Result.Path), ExpectedDistance is not None)
+            if Result.Path:
+                self.assertEqual(len(Result.Path) - 1, ExpectedDistance)
 
 
 class GlobalGuideStageBoundaryTests(unittest.TestCase):

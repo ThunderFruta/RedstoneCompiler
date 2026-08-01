@@ -10,12 +10,20 @@ from Compiler.Routing.ComponentRouter import (
     BuildComponentForeignTransitDomains,
     BuildComponentRoutingProblem,
     BuildComponentRoutingFabric,
+    BuildComponentFabricAdjacency,
+    BuildCompleteOpposingNetAccessRowContext,
+    BuildCompleteOpposingNetAccessContractDomain,
+    BuildOpposingNetEffectiveAccessSignature,
     BuildExactComponentPortRealizabilityContext,
     BuildExactComponentPortRealizabilityFingerprint,
     ClearStructuralPortRealizabilityCache,
     ComponentClaimsCompatibleForOwners,
     ComponentClaimsConflict,
+    EvaluateCachedCompleteOpposingNetAccessPair,
+    EvaluateCompleteOpposingNetAccessPair,
+    EvaluateCompleteOpposingNetAccessContractRow,
     EvaluateExactComponentPortRealizability,
+    FilterExternalSourcePoweredSeamCandidateDomains,
     FindCompleteComponentNetUnsatSubset,
     MaterializeRoutedComponentTemplate,
     PreserveRoutedComponentForeignEscapes,
@@ -23,9 +31,14 @@ from Compiler.Routing.ComponentRouter import (
     SelectComponentIncidentSignals,
     SolveComponentRoutingProblem,
     ValidateRoutedComponentHandoff,
+    _BuildCanonicalAccessCombinationKey,
+    _BuildNetVariant,
     _PlanTreeRepeaters,
 )
 from Compiler.Routing.ComponentPipeline import CompileClosedComponent
+from Compiler.Routing.ComponentPipeline import (
+    BuildPhysicalPortLocalContractFingerprint,
+)
 from Compiler.Routing.Models import (
     ClosedComponentInterface,
     ComponentFeedthroughContract,
@@ -39,6 +52,7 @@ from Compiler.Routing.Models import (
 )
 from Compiler.Routing.ResourceGraph import (
     PinAccessPortal,
+    RoutingResourceGraph,
     RoutingResourceClaims,
 )
 from Compiler.Routing.ChannelPlanner import NetRoutingProfile
@@ -232,6 +246,705 @@ def test_complete_net_subset_proves_monotone_capacity_unsat():
         {"First": (First,), "Second": (Second,)},
         Advance=lambda: False,
     ) is None
+
+
+def _OpposingPairProblem():
+    Base = _Problem("Current")
+    CompleteDomain = _Domain(
+        "Complete",
+        (1, 7, 0),
+        "source",
+        _Candidate(((1, 7, 0),)),
+    )
+
+    def Port(Signal, Attachment):
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            FabricAttachment=Attachment,
+            Attachment=Attachment,
+            LocalPath=(Attachment,),
+            OwnedTerminals=(Attachment,),
+            OwnedCandidateFingerprints=(),
+            OwnedAccessCandidates=(),
+            FabricDomainFingerprint="fabric-" + Signal,
+            Capacity=1,
+        )
+
+    return replace(
+        Base,
+        ComponentSignals=("Current", "Complete"),
+        OwnedTerminalDomains=(
+            *Base.OwnedTerminalDomains,
+            CompleteDomain,
+        ),
+        Interface=SimpleNamespace(PhysicalPortReservations=(
+            Port("Current", (0, 7, 0)),
+            Port("Complete", (1, 7, 0)),
+        )),
+    )
+
+
+def test_opposing_pair_oracle_has_typed_complete_and_incomplete_results():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    CurrentContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Current"]
+    )
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    BlockedVariants = (_Net("Complete", (1, 7, 0)),)
+    BlockedRowContext = BuildCompleteOpposingNetAccessRowContext(
+        Problem,
+        BlockedVariants,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+    )
+    Blocked = EvaluateCompleteOpposingNetAccessPair(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=CurrentContract,
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=BlockedVariants,
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=1.0,
+        DomainFingerprint="precomputed-pair-domain",
+        RowContext=BlockedRowContext,
+    )
+    Supported = EvaluateCompleteOpposingNetAccessPair(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=CurrentContract,
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=(_Net("Complete", (20, 7, 20)),),
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=1.0,
+    )
+    Incomplete = EvaluateCompleteOpposingNetAccessPair(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=CurrentContract,
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=(_Net("Complete", (1, 7, 0)),),
+        CompleteVariantDomainComplete=False,
+        DeadlineSeconds=1.0,
+    )
+    EmptyCompleteDomain = EvaluateCompleteOpposingNetAccessPair(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=CurrentContract,
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=(),
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=0.0,
+    )
+
+    assert (Blocked.Status, Blocked.Complete, Blocked.Feasible) == (
+        "architectural-unsatisfiable",
+        True,
+        False,
+    )
+    assert Blocked.DomainFingerprint == "precomputed-pair-domain"
+    assert Blocked.ProofFingerprint
+    assert (Supported.Status, Supported.Complete, Supported.Feasible) == (
+        "feasible",
+        True,
+        True,
+    )
+    assert Supported.SupportingCompleteVariantFingerprints
+    assert (Incomplete.Status, Incomplete.Complete, Incomplete.Feasible) == (
+        "incomplete",
+        False,
+        None,
+    )
+    assert not Incomplete.ProofFingerprint
+    assert (
+        EmptyCompleteDomain.Status,
+        EmptyCompleteDomain.Complete,
+        EmptyCompleteDomain.Feasible,
+    ) == ("architectural-unsatisfiable", True, False)
+    assert EmptyCompleteDomain.ProofFingerprint
+    assert EmptyCompleteDomain.ExpansionCount == 0
+
+
+def test_opposing_pair_oracle_rejects_mismatched_local_contract_identity():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        "local contract fingerprint mismatch",
+    ):
+        EvaluateCompleteOpposingNetAccessPair(
+            Problem,
+            CurrentSignal="Current",
+            CompleteSignal="Complete",
+            CurrentLocalContractFingerprint="stale-current-contract",
+            CompleteLocalContractFingerprint=(
+                BuildPhysicalPortLocalContractFingerprint(Ports["Complete"])
+            ),
+            CompleteVariants=(_Net("Complete", (1, 7, 0)),),
+            CompleteVariantDomainComplete=True,
+            DeadlineSeconds=1.0,
+        )
+
+
+def test_bulk_opposing_pair_oracle_matches_scalar_and_keeps_exact_identity():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    First = Ports["Current"]
+    Second = SimpleNamespace(
+        **{
+            **vars(First),
+            "LocalPath": (*First.LocalPath, (0, 7, 1)),
+        }
+    )
+    CurrentPorts = {
+        BuildPhysicalPortLocalContractFingerprint(Port): Port
+        for Port in (First, Second)
+    }
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    Variants = (
+        _Net("Complete", (1, 7, 0)),
+        _Net("Complete", (20, 7, 20)),
+    )
+    Context = BuildCompleteOpposingNetAccessRowContext(
+        Problem,
+        Variants,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+    )
+    Domains = {
+        Contract: "exact-domain:" + Contract
+        for Contract in CurrentPorts
+    }
+    ContractDomain = BuildCompleteOpposingNetAccessContractDomain(
+        Problem,
+        "Current",
+        CurrentPorts,
+    )
+
+    assert len(ContractDomain.CanonicalAccessSignatures) == 1
+    assert set(dict(
+        ContractDomain.SignatureIndexByCurrentContract
+    ).values()) == {0}
+    assert dict(ContractDomain.SignaturesByCurrentContract) == {
+        Contract: BuildOpposingNetEffectiveAccessSignature(
+            Problem,
+            "Current",
+            Port,
+        )
+        for Contract, Port in CurrentPorts.items()
+    }
+
+    Bulk = EvaluateCompleteOpposingNetAccessContractRow(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentPortsByContract=CurrentPorts,
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=Variants,
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=1.0,
+        DomainFingerprintsByCurrentContract=Domains,
+        ContractDomain=ContractDomain,
+        RowContext=Context,
+    )
+
+    assert Bulk.AccessSignatureCount == 1
+    assert Bulk.VariantScanCount <= len(Variants)
+    assert set(Bulk.Results) == set(CurrentPorts)
+    assert len({Value.DomainFingerprint for Value in Bulk.Results.values()}) == 2
+    assert len({Value.ProofFingerprint for Value in Bulk.Results.values()}) == 2
+    for Contract, Port in CurrentPorts.items():
+        ScalarProblem = replace(
+            Problem,
+            Interface=replace(
+                Problem.Interface,
+                PhysicalPortReservations=(Port, Ports["Complete"]),
+            ) if hasattr(Problem.Interface, "__dataclass_fields__") else (
+                SimpleNamespace(PhysicalPortReservations=(
+                    Port,
+                    Ports["Complete"],
+                ))
+            ),
+        )
+        Scalar = EvaluateCompleteOpposingNetAccessPair(
+            ScalarProblem,
+            CurrentSignal="Current",
+            CompleteSignal="Complete",
+            CurrentLocalContractFingerprint=Contract,
+            CompleteLocalContractFingerprint=CompleteContract,
+            CompleteVariants=Variants,
+            CompleteVariantDomainComplete=True,
+            DeadlineSeconds=1.0,
+            DomainFingerprint=Domains[Contract],
+            RowContext=Context,
+        )
+        BulkResult = Bulk.Results[Contract]
+        assert (
+            BulkResult.Status,
+            BulkResult.Complete,
+            BulkResult.Feasible,
+            BulkResult.DomainFingerprint,
+            BulkResult.ProofFingerprint,
+            BulkResult.SupportingCompleteVariantFingerprints,
+            BulkResult.ExpansionCount,
+        ) == (
+            Scalar.Status,
+            Scalar.Complete,
+            Scalar.Feasible,
+            Scalar.DomainFingerprint,
+            Scalar.ProofFingerprint,
+            Scalar.SupportingCompleteVariantFingerprints,
+            Scalar.ExpansionCount,
+        )
+
+
+def test_bulk_opposing_pair_reuses_precomputed_current_contract_domain(
+    monkeypatch,
+):
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    CurrentContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Current"]
+    )
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    Variants = (_Net("Complete", (20, 7, 20)),)
+    ContractDomain = BuildCompleteOpposingNetAccessContractDomain(
+        Problem,
+        "Current",
+        {CurrentContract: Ports["Current"]},
+    )
+    Context = BuildCompleteOpposingNetAccessRowContext(
+        Problem,
+        Variants,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+    )
+
+    monkeypatch.setattr(
+        "Compiler.Routing.ComponentRouter."
+        "BuildOpposingNetEffectiveAccessSignature",
+        lambda *_Arguments, **_Keywords: (_ for _ in ()).throw(
+            AssertionError("current access domain was recomputed")
+        ),
+    )
+    Result = EvaluateCompleteOpposingNetAccessContractRow(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentPortsByContract={CurrentContract: Ports["Current"]},
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=Variants,
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=1.0,
+        DomainFingerprintsByCurrentContract={
+            CurrentContract: "exact-domain"
+        },
+        ContractDomain=ContractDomain,
+        RowContext=Context,
+    ).Results[CurrentContract]
+
+    def UnexpectedRevalidation(*_Arguments, **_Keywords):
+        raise AssertionError("immutable access domain was revalidated")
+
+    for Name in (
+        "_OpposingNetResourceIdentityFingerprint",
+        "_OpposingRowCurrentAccessDomainFingerprint",
+        "_CanonicalOpposingNetAccessSignatureFingerprint",
+        "_BuildOpposingNetEffectiveAccessSignatureFromDomains",
+    ):
+        monkeypatch.setattr(
+            "Compiler.Routing.ComponentRouter." + Name,
+            UnexpectedRevalidation,
+        )
+    WarmResult = EvaluateCompleteOpposingNetAccessContractRow(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentPortsByContract={CurrentContract: Ports["Current"]},
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=Variants,
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=1.0,
+        DomainFingerprintsByCurrentContract={
+            CurrentContract: "exact-domain"
+        },
+        ContractDomain=ContractDomain,
+        RowContext=Context,
+    ).Results[CurrentContract]
+
+    assert Result.Complete
+    assert Result.Status in {"feasible", "architectural-unsatisfiable"}
+    assert Result.DomainFingerprint == "exact-domain"
+    assert WarmResult == Result
+
+
+def test_bulk_opposing_pair_rejects_stale_current_contract_domain():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    CurrentContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Current"]
+    )
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    ContractDomain = BuildCompleteOpposingNetAccessContractDomain(
+        Problem,
+        "Current",
+        {CurrentContract: Ports["Current"]},
+    )
+    Candidate = Problem.OwnedTerminalDomains[0].Candidates[0]
+    ChangedProblem = replace(
+        Problem,
+        OwnedTerminalDomains=(
+            replace(
+                Problem.OwnedTerminalDomains[0],
+                Candidates=(replace(
+                    Candidate,
+                    Claims=replace(
+                        Candidate.Claims,
+                        ElectricalCells=frozenset(((30, 7, 30),)),
+                    ),
+                ),),
+            ),
+            *Problem.OwnedTerminalDomains[1:],
+        ),
+    )
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        "contract domain identity mismatch",
+    ):
+        EvaluateCompleteOpposingNetAccessContractRow(
+            ChangedProblem,
+            CurrentSignal="Current",
+            CompleteSignal="Complete",
+            CurrentPortsByContract={CurrentContract: Ports["Current"]},
+            CompleteLocalContractFingerprint=CompleteContract,
+            CompleteVariants=(_Net("Complete", (20, 7, 20)),),
+            CompleteVariantDomainComplete=True,
+            DeadlineSeconds=1.0,
+            DomainFingerprintsByCurrentContract={
+                CurrentContract: "exact-domain"
+            },
+            ContractDomain=ContractDomain,
+        )
+
+
+def test_bulk_opposing_pair_rejects_corrupt_canonical_signature_index():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    CurrentContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Current"]
+    )
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    ContractDomain = BuildCompleteOpposingNetAccessContractDomain(
+        Problem,
+        "Current",
+        {CurrentContract: Ports["Current"]},
+    )
+    SignatureFingerprint, Signature = (
+        ContractDomain.CanonicalAccessSignatures[0]
+    )
+    CorruptDomain = replace(
+        ContractDomain,
+        CanonicalAccessSignatures=((
+            "0" * len(SignatureFingerprint),
+            Signature,
+        ),),
+    )
+
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        "contract domain identity mismatch",
+    ):
+        EvaluateCompleteOpposingNetAccessContractRow(
+            Problem,
+            CurrentSignal="Current",
+            CompleteSignal="Complete",
+            CurrentPortsByContract={CurrentContract: Ports["Current"]},
+            CompleteLocalContractFingerprint=CompleteContract,
+            CompleteVariants=(_Net("Complete", (20, 7, 20)),),
+            CompleteVariantDomainComplete=True,
+            DeadlineSeconds=1.0,
+            DomainFingerprintsByCurrentContract={
+                CurrentContract: "exact-domain"
+            },
+            ContractDomain=CorruptDomain,
+        )
+
+
+def test_bulk_access_signature_includes_attachment_and_every_claim_set():
+    Problem = _OpposingPairProblem()
+    CurrentPort = next(
+        Port
+        for Port in Problem.Interface.PhysicalPortReservations
+        if Port.Signal == "Current"
+    )
+    BaseCandidate = Problem.OwnedTerminalDomains[0].Candidates[0]
+    BaseSignature = BuildOpposingNetEffectiveAccessSignature(
+        Problem,
+        "Current",
+        CurrentPort,
+    )
+    ClaimFields = (
+        "WireCells",
+        "SupportCells",
+        "RequiredAirCells",
+        "ElectricalCells",
+    )
+    for Index, FieldName in enumerate(ClaimFields):
+        Claims = replace(
+            BaseCandidate.Claims,
+            **{FieldName: frozenset(((30 + Index, 7, 30),))},
+        )
+        Candidate = replace(BaseCandidate, Claims=Claims)
+        Domain = replace(
+            Problem.OwnedTerminalDomains[0],
+            Candidates=(Candidate,),
+        )
+        Changed = replace(
+            Problem,
+            OwnedTerminalDomains=(
+                Domain,
+                *Problem.OwnedTerminalDomains[1:],
+            ),
+        )
+        assert BuildOpposingNetEffectiveAccessSignature(
+            Changed,
+            "Current",
+            CurrentPort,
+        ) != BaseSignature
+    ChangedAttachment = replace(
+        BaseCandidate,
+        Attachment=(30, 7, 30),
+    )
+    ChangedProblem = replace(
+        Problem,
+        OwnedTerminalDomains=(
+            replace(
+                Problem.OwnedTerminalDomains[0],
+                Candidates=(ChangedAttachment,),
+            ),
+            *Problem.OwnedTerminalDomains[1:],
+        ),
+    )
+    assert BuildOpposingNetEffectiveAccessSignature(
+        ChangedProblem,
+        "Current",
+        CurrentPort,
+    ) != BaseSignature
+
+
+def test_bulk_opposing_pair_oracle_rejects_stale_row_context():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    CurrentContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Current"]
+    )
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    Context = BuildCompleteOpposingNetAccessRowContext(
+        Problem,
+        (_Net("Complete", (1, 7, 0)),),
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+    )
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        "row context identity mismatch",
+    ):
+        EvaluateCompleteOpposingNetAccessContractRow(
+            Problem,
+            CurrentSignal="Current",
+            CompleteSignal="Complete",
+            CurrentPortsByContract={CurrentContract: Ports["Current"]},
+            CompleteLocalContractFingerprint=CompleteContract,
+            CompleteVariants=(_Net("Complete", (20, 7, 20)),),
+            CompleteVariantDomainComplete=True,
+            DeadlineSeconds=1.0,
+            DomainFingerprintsByCurrentContract={
+                CurrentContract: "exact-domain"
+            },
+            RowContext=Context,
+        )
+
+
+def test_bulk_opposing_pair_oracle_deadline_never_certifies_unresolved_pairs():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    CurrentContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Current"]
+    )
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    Result = EvaluateCompleteOpposingNetAccessContractRow(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentPortsByContract={CurrentContract: Ports["Current"]},
+        CompleteLocalContractFingerprint=CompleteContract,
+        CompleteVariants=(_Net("Complete", (20, 7, 20)),),
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=0.0,
+        DomainFingerprintsByCurrentContract={
+            CurrentContract: "exact-domain"
+        },
+    ).Results[CurrentContract]
+
+    assert Result.Status == "incomplete"
+    assert not Result.Complete
+    assert Result.Feasible is None
+    assert not Result.ProofFingerprint
+
+
+def test_opposing_pair_oracle_identity_excludes_reserved_global_routes():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    WithGlobal = replace(
+        Problem,
+        ReservedGlobalClaimsBySignal=((
+            "Foreign",
+            _Claims((0, 7, 0), (1, 7, 0)),
+        ),),
+    )
+    Arguments = dict(
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=(
+            BuildPhysicalPortLocalContractFingerprint(Ports["Current"])
+        ),
+        CompleteLocalContractFingerprint=(
+            BuildPhysicalPortLocalContractFingerprint(Ports["Complete"])
+        ),
+        CompleteVariants=(_Net("Complete", (1, 7, 0)),),
+        CompleteVariantDomainComplete=True,
+        DeadlineSeconds=1.0,
+    )
+
+    Base = EvaluateCompleteOpposingNetAccessPair(Problem, **Arguments)
+    Relaxed = EvaluateCompleteOpposingNetAccessPair(WithGlobal, **Arguments)
+
+    assert Base.DomainFingerprint == Relaxed.DomainFingerprint
+    assert Base.ProofFingerprint == Relaxed.ProofFingerprint
+
+
+def test_cached_opposing_pair_oracle_requires_complete_portfolio_entry():
+    Problem = _OpposingPairProblem()
+    Ports = {
+        Port.Signal: Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    }
+    CurrentContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Current"]
+    )
+    CompleteContract = BuildPhysicalPortLocalContractFingerprint(
+        Ports["Complete"]
+    )
+    Missing = EvaluateCachedCompleteOpposingNetAccessPair(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=CurrentContract,
+        CompleteLocalContractFingerprint=CompleteContract,
+        VariantPortfolioCache={},
+        DeadlineSeconds=1.0,
+    )
+
+    assert Missing.Status == "incomplete"
+    assert not Missing.Complete
+    assert Missing.Feasible is None
+
+    CompleteVariant = _Net("Complete", (1, 7, 0))
+    Cached = EvaluateCachedCompleteOpposingNetAccessPair(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=CurrentContract,
+        CompleteLocalContractFingerprint=CompleteContract,
+        VariantPortfolioCache={
+            (Problem.ProblemFingerprint, "Complete"): (
+                (CompleteVariant,),
+                1,
+                {},
+                frozenset(),
+                (0, 7, 0),
+            ),
+        },
+        DeadlineSeconds=1.0,
+    )
+
+    assert Cached.Status == "architectural-unsatisfiable"
+    assert Cached.Complete
+    assert Cached.Feasible is False
+    assert Cached.ProofFingerprint
+
+    CachedEmpty = EvaluateCachedCompleteOpposingNetAccessPair(
+        Problem,
+        CurrentSignal="Current",
+        CompleteSignal="Complete",
+        CurrentLocalContractFingerprint=CurrentContract,
+        CompleteLocalContractFingerprint=CompleteContract,
+        VariantPortfolioCache={
+            (Problem.ProblemFingerprint, "Complete"): (
+                (),
+                0,
+                {},
+                frozenset(),
+                (0, 7, 0),
+            ),
+        },
+        DeadlineSeconds=0.0,
+    )
+
+    assert CachedEmpty.Status == "architectural-unsatisfiable"
+    assert CachedEmpty.Complete
+    assert CachedEmpty.Feasible is False
+    assert CachedEmpty.ProofFingerprint
+    assert CachedEmpty.Detail == (
+        "complete opposing-net variant domain is empty"
+    )
 
 
 def test_exact_port_realizability_uses_powered_local_net_primitive():
@@ -486,6 +1199,129 @@ def test_exact_port_realizability_reports_self_claim_conflict():
         "self-claim-conflict": 1,
     }
     assert not Result.Diagnostics["ImmutableConflictSignals"]
+
+
+def test_external_source_seam_filters_disconnected_and_conflicting_access():
+    LeftIsland = (
+        (0, 7, 0),
+        (1, 7, 0),
+        (2, 7, 0),
+    )
+    RightIsland = (
+        (10, 7, 0),
+        (11, 7, 0),
+    )
+    Fabric = BuildComponentRoutingFabric(
+        _Channel(LeftIsland, RightIsland)
+    )
+    ConflictMarker = LeftIsland[0]
+
+    class CandidateSensitiveResourceGraph:
+        def BuildRouteClaims(self, Nodes):
+            Nodes = frozenset(Nodes)
+            Claims = _Claims(*Nodes)
+            if ConflictMarker not in Nodes:
+                return Claims
+            return replace(
+                Claims,
+                RequiredAirCells=(
+                    Claims.RequiredAirCells
+                    | frozenset((ConflictMarker,))
+                ),
+            )
+
+    Disconnected = replace(
+        _Candidate((RightIsland[0],)),
+        CandidateFingerprint="00-disconnected",
+    )
+    ConnectedButConflicting = replace(
+        _Candidate((ConflictMarker,)),
+        CandidateFingerprint="10-connected-self-conflicting",
+    )
+    Legal = replace(
+        _Candidate((LeftIsland[1],)),
+        CandidateFingerprint="20-legal",
+    )
+    Domain = _Domain(
+        "Alpha",
+        (20, 7, 0),
+        "target",
+        Disconnected,
+        ConnectedButConflicting,
+        Legal,
+    )
+    Problem = replace(
+        _Problem(
+            Fabric=Fabric,
+            External=(("Alpha", (30, 7, 0), "source"),),
+        ),
+        OwnedTerminalDomains=(Domain,),
+        ResourceGraph=CandidateSensitiveResourceGraph(),
+    )
+    LocalPath = (LeftIsland[-1], (3, 7, 0))
+
+    assert FilterExternalSourcePoweredSeamCandidateDomains(
+        Problem,
+        "Alpha",
+        (Domain,),
+        ((Disconnected,),),
+        LocalPath,
+    ) == ((),)
+    assert FilterExternalSourcePoweredSeamCandidateDomains(
+        Problem,
+        "Alpha",
+        (Domain,),
+        ((ConnectedButConflicting,),),
+        LocalPath,
+    ) == ((),)
+    assert FilterExternalSourcePoweredSeamCandidateDomains(
+        Problem,
+        "Alpha",
+        (Domain,),
+        ((Disconnected, ConnectedButConflicting, Legal),),
+        LocalPath,
+    ) == ((Legal,),)
+
+    FabricAdjacency = BuildComponentFabricAdjacency(Fabric)
+    ParentCache = {}
+    ClaimsCache = {}
+    RepeaterCache = {}
+    RepeaterStatistics = {}
+    CachedKeywords = {
+        "FabricAdjacency": FabricAdjacency,
+        "FabricParentCache": ParentCache,
+        "RouteClaimsCache": ClaimsCache,
+        "TreeRepeaterSubproblemCache": RepeaterCache,
+        "TreeRepeaterCacheStatistics": RepeaterStatistics,
+    }
+    FirstCached = FilterExternalSourcePoweredSeamCandidateDomains(
+        Problem,
+        "Alpha",
+        (Domain,),
+        ((Legal,),),
+        LocalPath,
+        **CachedKeywords,
+    )
+    InitialRepeaterHits = RepeaterStatistics.get("HitCount", 0)
+    SecondCached = FilterExternalSourcePoweredSeamCandidateDomains(
+        Problem,
+        "Alpha",
+        (Domain,),
+        ((Legal,),),
+        LocalPath,
+        **CachedKeywords,
+    )
+
+    assert FirstCached == SecondCached == ((Legal,),)
+    assert ParentCache and ClaimsCache and RepeaterCache
+    assert RepeaterStatistics.get("HitCount", 0) > InitialRepeaterHits
+    assert FilterExternalSourcePoweredSeamCandidateDomains(
+        Problem,
+        "Alpha",
+        (Domain,),
+        ((Legal, ConnectedButConflicting, Disconnected),),
+        LocalPath,
+    ) == ((Legal,),)
 
 
 def test_exact_port_predicate_matches_single_net_local_compilation():
@@ -747,6 +1583,61 @@ def test_production_component_problem_has_closed_ownership():
     assert {
         Domain.Signal for Domain in Problem.OwnedTerminalDomains
     } == {"Alpha"}
+
+
+def test_component_problem_promotes_cluster_cut_to_explicit_port():
+    Channel = _Channel(
+        ((0, 7, 0), (1, 7, 0), (2, 7, 0)),
+    )
+    Channel.AffectedSignals = ()
+    Request = SimpleNamespace(
+        Signal="Cut",
+        SourceCluster=8,
+        TargetCluster=1,
+        SourceTerminal=(-2, 7, 0),
+        TargetTerminals=((2, 7, 0),),
+    )
+    Placed = SimpleNamespace(
+        InterClusterRoutingChannel=Channel,
+        ClusterBoundaryLeaseRequests=(Request,),
+        LocalRouteClaims=(),
+        Module=SimpleNamespace(Gates=()),
+    )
+    Profile = NetRoutingProfile(
+        Signal="Cut",
+        Root=(-2, 7, 0),
+        Targets=((2, 7, 0),),
+        Span=4,
+        Fanout=1,
+        RetryCount=0,
+        Criticality=0,
+        IsTrunk=False,
+        SourceAccessPath=((-2, 7, 0),),
+        TargetAccessPaths={(2, 7, 0): ((2, 7, 0),)},
+    )
+    Problem = BuildComponentRoutingProblem(
+        Placed=Placed,
+        Profiles={"Cut": Profile},
+        RawPortals={
+            ("Cut", (2, 7, 0), 0): (
+                _Portal(
+                    "Cut",
+                    (2, 7, 0),
+                    ((2, 7, 0),),
+                    "cut-target",
+                ),
+            ),
+        },
+        PlacementFingerprint="placement",
+        LocalTemplateFingerprint="local",
+    )
+
+    assert Problem.Interface is not None
+    assert Problem.Interface.OwnedSignals == ("Cut",)
+    assert tuple(
+        (Port.Signal, Port.Direction, Port.OwnedTerminals)
+        for Port in Problem.Interface.Ports
+    ) == (("Cut", "input", ((2, 7, 0),)),)
 
 
 def test_closed_component_rejects_undeclared_foreign_transit():
@@ -1139,7 +2030,95 @@ def test_physically_identical_access_derivations_share_one_net_variant():
         Result.Diagnostics["VariantDiagnosticsBySignal"]["Alpha"]
     )
     assert Diagnostics["AccessCombinationCount"] == 2
+    assert Diagnostics["CanonicalAccessStateCount"] == 1
+    assert Diagnostics["DuplicateCanonicalAccessStateCount"] == 1
+    assert Diagnostics["NetVariantBuildCount"] == 1
     assert Diagnostics["RoutedVariantCount"] == 1
+
+
+def test_canonical_access_state_preserves_power_and_egress_identity():
+    Problem = _Problem()
+    Domains = Problem.OwnedTerminalDomains
+    Candidates = tuple(Domain.Candidates[0] for Domain in Domains)
+    FabricSubtree = (
+        frozenset(Problem.Fabric.Nodes),
+        frozenset(Problem.Fabric.Edges),
+    )
+    Base = _BuildCanonicalAccessCombinationKey(
+        Problem,
+        "Alpha",
+        Domains,
+        Candidates,
+        (),
+        0,
+        FabricSubtree,
+    )
+    DuplicateCandidates = (
+        replace(
+            Candidates[0],
+            CandidateFingerprint="alternate-logical-identity",
+            Cost=Candidates[0].Cost + 10,
+        ),
+        Candidates[1],
+    )
+    Duplicate = _BuildCanonicalAccessCombinationKey(
+        Problem,
+        "Alpha",
+        Domains,
+        DuplicateCandidates,
+        (),
+        0,
+        FabricSubtree,
+    )
+    DifferentPowerDistance = _BuildCanonicalAccessCombinationKey(
+        replace(
+            Problem,
+            MaximumPowerDistance=Problem.MaximumPowerDistance - 1,
+        ),
+        "Alpha",
+        Domains,
+        Candidates,
+        (),
+        0,
+        FabricSubtree,
+    )
+    DifferentEgress = _BuildCanonicalAccessCombinationKey(
+        Problem,
+        "Alpha",
+        Domains,
+        Candidates,
+        ((2, 7, 0), (2, 8, 0)),
+        0,
+        FabricSubtree,
+    )
+
+    assert Duplicate == Base
+    assert DifferentPowerDistance != Base
+    assert DifferentEgress != Base
+
+
+def test_no_powered_variant_reports_complete_local_unsat_core():
+    Problem = replace(
+        _Problem(),
+        ImmutableClaims=(SimpleNamespace(
+            Signal="OutsideLocal",
+            Claims=_Claims((0, 7, 0)),
+        ),),
+    )
+
+    Result = SolveComponentRoutingProblem(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert Result.Status == "architectural-unsatisfiable"
+    assert Result.Diagnostics["LocalUnsatSignal"] == "Alpha"
+    assert Result.Diagnostics["LocalUnsatCoreSignals"] == [
+        "Alpha",
+        "OutsideLocal",
+    ]
+    assert Result.Diagnostics["LocalUnsatCoreComplete"]
+    assert Result.Diagnostics["LocalUnsatCoreFingerprint"]
 
 
 def test_tree_power_dp_places_repeaters_on_long_trunk():
@@ -1671,6 +2650,173 @@ def test_complete_net_portfolio_cache_reuses_rigid_translation_and_rename():
         Move(Position)
         for Position in First.Template.Nets[0].Nodes
     )
+
+
+def test_complete_net_portfolio_cache_does_not_cross_resource_identity():
+    PortfolioCache = {}
+    EmptyGraph = RoutingResourceGraph(
+        ActualBlocks=frozenset(),
+        ElectricalBlocks=frozenset(),
+        SolidBlocks=frozenset(),
+    )
+    First = SolveComponentRoutingProblem(
+        replace(_Problem(), ResourceGraph=EmptyGraph),
+        VariantPortfolioCache=PortfolioCache,
+        DiscoveryVariantLimit=None,
+    )
+    assert First.Feasible
+
+    ChangedGraph = RoutingResourceGraph(
+        ActualBlocks=frozenset(((100, 0, 100),)),
+        ElectricalBlocks=frozenset(),
+        SolidBlocks=frozenset(),
+    )
+    Second = SolveComponentRoutingProblem(
+        replace(
+            _Problem(),
+            ProblemFingerprint="changed-resource-identity",
+            ResourceGraph=ChangedGraph,
+        ),
+        VariantPortfolioCache=PortfolioCache,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert Second.Feasible
+    assert not Second.Diagnostics["VariantDiagnosticsBySignal"]["Alpha"][
+        "PortfolioCacheHit"
+    ]
+
+
+def test_reserved_global_claim_revalidates_cached_complete_tree():
+    PortfolioCache = {}
+    NetCache = {}
+    First = SolveComponentRoutingProblem(
+        _Problem(),
+        VariantPortfolioCache=PortfolioCache,
+        NetVariantConstructionCache=NetCache,
+        DiscoveryVariantLimit=None,
+    )
+    assert First.Feasible
+
+    Blocked = replace(
+        _Problem(),
+        ProblemFingerprint="reserved-global-blocked-problem",
+        ReservedGlobalClaimsBySignal=((
+            "ReservedPeer",
+            _Claims((1, 7, 0)),
+        ),),
+    )
+    Second = SolveComponentRoutingProblem(
+        Blocked,
+        VariantPortfolioCache=PortfolioCache,
+        NetVariantConstructionCache=NetCache,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert not Second.Feasible
+    assert "ReservedPeer" in Second.Diagnostics[
+        "VariantDiagnosticsBySignal"
+    ]["Alpha"]["ImmutableConflictSignals"]
+
+
+def test_reserved_access_conflict_cache_is_scoped_to_claim_context():
+    AccessCache = {}
+    Problem = _Problem()
+    Candidates = tuple(
+        Domain.Candidates[0]
+        for Domain in Problem.OwnedTerminalDomains
+    )
+    FirstRejections = {}
+    First = _BuildNetVariant(
+        Problem,
+        "Alpha",
+        Problem.OwnedTerminalDomains,
+        Candidates,
+        RejectionCounts=FirstRejections,
+        ImmutableAccessConflictCache=AccessCache,
+    )
+    assert First is not None
+
+    Blocked = replace(
+        _Problem(),
+        ReservedGlobalClaimsBySignal=((
+            "ReservedPeer",
+            _Claims((0, 7, 0)),
+        ),),
+    )
+    SecondRejections = {}
+    Second = _BuildNetVariant(
+        Blocked,
+        "Alpha",
+        Blocked.OwnedTerminalDomains,
+        Candidates,
+        RejectionCounts=SecondRejections,
+        ImmutableAccessConflictCache=AccessCache,
+    )
+
+    assert Second is None
+    assert SecondRejections[
+        "immutable-local-access-conflict"
+    ] > 0
+
+
+def test_reserved_blocker_provenance_separates_port_from_global_route():
+    def SolveWithPortClaims(PortClaims):
+        ReservedPort = PhysicalComponentPortReservation(
+            Signal="ReservedPeer",
+            Direction="output",
+            OwnedTerminals=((8, 7, 0),),
+            OwnedTerminalFingerprints=("reserved-terminal",),
+            OwnedCandidateFingerprints=(),
+            FabricDomainFingerprint="reserved-domain",
+            FabricAttachment=(8, 7, 0),
+            Attachment=(9, 7, 0),
+            LocalPath=((8, 7, 0), (9, 7, 0)),
+            GlobalPath=((9, 7, 0), (10, 7, 0)),
+            Claims=PortClaims,
+            Capacity=1,
+            ReservationFingerprint="reserved-port",
+        )
+        Interface = ClosedComponentInterface(
+            InterfaceFingerprint="reserved-interface",
+            ComponentId=1,
+            OwnedSignals=("Alpha", "ReservedPeer"),
+            Ports=(),
+            PhysicalPortReservations=(ReservedPort,),
+        )
+        return SolveComponentRoutingProblem(
+            replace(
+                _Problem(),
+                Interface=Interface,
+                ReservedGlobalClaimsBySignal=((
+                    "ReservedPeer",
+                    _Claims((0, 7, 0)),
+                ),),
+            ),
+            DiscoveryVariantLimit=None,
+        )
+
+    PortBlocked = SolveWithPortClaims(_Claims((0, 7, 0)))
+    RouteBlocked = SolveWithPortClaims(_Claims((9, 7, 0)))
+    PortDiagnostics = PortBlocked.Diagnostics[
+        "VariantDiagnosticsBySignal"
+    ]["Alpha"]
+    RouteDiagnostics = RouteBlocked.Diagnostics[
+        "VariantDiagnosticsBySignal"
+    ]["Alpha"]
+
+    assert PortDiagnostics[
+        "ReservedPortContractConflictSignals"
+    ] == ["ReservedPeer"]
+    assert not PortDiagnostics[
+        "ReservedGlobalRouteConflictSignals"
+    ]
+    assert RouteDiagnostics[
+        "ReservedGlobalRouteConflictSignals"
+    ] == ["ReservedPeer"]
+    assert not RouteDiagnostics[
+        "ReservedPortContractConflictSignals"
+    ]
 
 
 def test_completed_component_template_cache_reuses_translation():

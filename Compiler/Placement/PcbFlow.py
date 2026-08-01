@@ -21,7 +21,26 @@ from ..Routing.Pcb import (
 )
 from ..Routing.ComponentPipeline import (
     AssembleClosedComponentForGlobalRouting,
+    BindPhysicalComponentAssemblyGlobalChannels,
+    BindPhysicalComponentAssemblyLocalPortSupports,
+    BuildUniversalPromotedFabricPortAssignmentFailure,
+    ClassifyPhysicalComponentGlobalPlanningFailure,
     CompileClosedComponent,
+    CertifyLocalInterfaceFactorPortfolio,
+    PhysicalAssemblyGlobalRouteCanBeRebound,
+    PreparePhysicalComponentGlobalPlanningPlacement,
+    ProveGlobalRelaxedLocalUnsatisfiability,
+    RecordPhysicalComponentGlobalPlanNoGood,
+    RecordPhysicalComponentLocalCompilationNoGood,
+    SelectPhysicalAssemblyGlobalBoundaryPorts,
+    SelectPhysicalComponentExactGlobalChannelSignals,
+)
+from ..Routing.AuthoritativePlanner import (
+    BuildPhysicalGlobalPlanYieldDeadline,
+    BuildPhysicalGlobalPlanContinuationState,
+    RetainIncompletePhysicalGlobalPlan,
+    SelectNextRetainedPhysicalGlobalPlan,
+    ShouldScheduleRetainedPhysicalGlobalPlan,
 )
 from ..Routing.Models import (
     ClusterInterfaceAssignment,
@@ -33,6 +52,7 @@ from ..Routing.Models import (
     ClusterInterfaceStateProof,
     RoutedComponentTemplate,
     RoutedDesign,
+    PhysicalGlobalPlanContinuationState,
 )
 from ..Routing.Failures import (
     RoutingAssignmentCut,
@@ -107,6 +127,132 @@ class PcbResult:
     RejectedRewriteDiagnostics: dict[str, object] | None = None
 
 
+@dataclass(frozen=True)
+class PhysicalComponentPlacementFeedback:
+    """Placement guidance derived from one complete physical port proof."""
+
+    ProofFingerprint: str
+    RelocationSignals: tuple[str, ...]
+    SourcePlanFingerprint: str = ""
+    DomainFingerprint: str = ""
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "ProofFingerprint": self.ProofFingerprint,
+            "RelocationSignals": list(self.RelocationSignals),
+            "SourcePlanFingerprint": self.SourcePlanFingerprint,
+            "DomainFingerprint": self.DomainFingerprint,
+        }
+
+
+def BuildPhysicalComponentPlacementFeedback(
+    Failure: RoutingFailure,
+) -> PhysicalComponentPlacementFeedback | None:
+    """Project a complete minimal port-unsat core onto placement guidance.
+
+    This is deliberately separate from ``RoutingAssignmentCut``.  A local
+    physical port proof says which component terminals need different escape
+    geometry; it does not claim that the authoritative global assignment
+    domain produced a conflict graph.
+    """
+
+    Diagnostics = (
+        Failure.Diagnostics
+        if isinstance(Failure.Diagnostics, Mapping)
+        else {}
+    )
+    if (
+        Failure.Reason
+        != RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+        or not Diagnostics.get("PortAssignmentProofComplete", False)
+        or not Diagnostics.get("PortAssignmentUnsatCoreMinimal", False)
+    ):
+        return None
+    RelocationSignals = tuple(sorted({
+        str(Signal)
+        for Signal in Diagnostics.get(
+            "PortAssignmentUnsatCoreSignals",
+            (),
+        )
+        if str(Signal)
+    }))
+    if not RelocationSignals:
+        return None
+    SourcePlanFingerprint = str(
+        Diagnostics.get("PhysicalAssemblyPlanFingerprint", "")
+    )
+    DomainFingerprint = str(
+        Diagnostics.get("DomainFingerprint", "")
+    )
+    ProofFingerprint = str(
+        Diagnostics.get("PortAssignmentUnsatCoreFingerprint", "")
+    ) or BuildStableFingerprint((
+        "physical-component-port-unsat-core",
+        RelocationSignals,
+        SourcePlanFingerprint,
+        DomainFingerprint,
+    ))
+    return PhysicalComponentPlacementFeedback(
+        ProofFingerprint=ProofFingerprint,
+        RelocationSignals=RelocationSignals,
+        SourcePlanFingerprint=SourcePlanFingerprint,
+        DomainFingerprint=DomainFingerprint,
+    )
+
+
+def IsCompletePhysicalAssemblyUnsatisfiable(
+    FailureReason: RoutingFailureReason,
+    Diagnostics: Mapping[str, object],
+) -> bool:
+    """Return whether diagnostics contain an authoritative assembly proof.
+
+    Proof completion is a property of the search result, not of the clock at
+    the instant its caller classifies that result.  A planning deadline may
+    expire immediately after the solver produces a complete certificate; it
+    must not retroactively turn that certificate into an incomplete result.
+    """
+
+    return bool(
+        FailureReason
+        in {
+            RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+            RoutingFailureReason.ComponentChannelCapacityUnsatisfiable,
+        }
+        and (
+            Diagnostics.get("GlobalPlanDomainComplete", False)
+            or Diagnostics.get("CompleteAssignmentCutProof", False)
+            or Diagnostics.get("PortAssignmentProofComplete", False)
+        )
+    )
+
+
+def IsClusterInterfaceStateIncomplete(
+    *,
+    FailureReason: RoutingFailureReason,
+    InterfaceDeadlineExpired: bool,
+    ComponentSolveStatus: str,
+    ExplicitCompleteUnsatProof: bool,
+) -> bool:
+    """Classify incompleteness without overriding an explicit proof."""
+
+    if ExplicitCompleteUnsatProof:
+        return False
+    if ComponentSolveStatus:
+        return bool(
+            ComponentSolveStatus == "incomplete"
+            or InterfaceDeadlineExpired
+        )
+    return bool(
+        FailureReason
+        in {
+            RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            RoutingFailureReason.PhysicalComponentAssemblyIncomplete,
+            RoutingFailureReason.RuntimeBudgetExceeded,
+        }
+        or InterfaceDeadlineExpired
+    )
+
+
 def IsComponentKeepoutGlobalFailure(
     Failure: RoutingFailure,
     PhysicalAssemblyPlan: Any,
@@ -122,7 +268,9 @@ def IsComponentKeepoutGlobalFailure(
     AffectedSignals = frozenset(map(str, Failure.AffectedNets))
     PortSignals = frozenset(
         str(Port.Signal)
-        for Port in getattr(PhysicalAssemblyPlan, "Ports", ())
+        for Port in SelectPhysicalAssemblyGlobalBoundaryPorts(
+            PhysicalAssemblyPlan
+        )
     )
     Diagnostics = dict(Failure.Diagnostics or {})
     return bool(
@@ -222,12 +370,43 @@ class PcbPlacementCandidate:
         }
 
 
+def HasDistinctRetainedPhysicalEligibilityState(
+    Queue: Iterable[tuple[str, int, Any, int, int]],
+    *,
+    ComponentVariant: int,
+    PlacementFingerprint: str,
+) -> bool:
+    """Return whether a retained sibling must precede new placement work.
+
+    A complete physical port core is evidence against one placed interface,
+    not permission to synchronously regenerate geometry while another
+    interface-distinct placement for the same component variant is already
+    retained.  Keep this admission rule pure so the portfolio order is
+    deterministic and directly testable.
+    """
+
+    return any(
+        Phase == "prepare-eligibility"
+        and QueuedComponentVariant == ComponentVariant
+        and Candidate.PlacementFingerprint != PlacementFingerprint
+        for (
+            Phase,
+            _InterfaceIndex,
+            Candidate,
+            _InterfaceCutEpoch,
+            QueuedComponentVariant,
+        ) in Queue
+    )
+
+
 @dataclass(frozen=True)
 class ClusterInterfaceStageSchedule:
     """Shared deadline and immutable state order for one component solve."""
 
     StartedAt: float
+    PlanningExpiresAt: float
     ExpiresAt: float
+    LocalCompilationReserveSeconds: float
     GlobalRoutingReserveSeconds: float
     PublicationReserveSeconds: float
     StateFingerprints: tuple[str, ...]
@@ -236,11 +415,20 @@ class ClusterInterfaceStageSchedule:
     def AvailableSeconds(self) -> float:
         return max(0.0, self.ExpiresAt - self.StartedAt)
 
+    @property
+    def PlanningSeconds(self) -> float:
+        return max(0.0, self.PlanningExpiresAt - self.StartedAt)
+
     def ToDictionary(self) -> dict[str, object]:
         return {
             "StartedAt": self.StartedAt,
+            "PlanningExpiresAt": self.PlanningExpiresAt,
             "ExpiresAt": self.ExpiresAt,
             "AvailableSeconds": round(self.AvailableSeconds, 6),
+            "PlanningSeconds": round(self.PlanningSeconds, 6),
+            "LocalCompilationReserveSeconds": (
+                self.LocalCompilationReserveSeconds
+            ),
             "GlobalRoutingReserveSeconds": (
                 self.GlobalRoutingReserveSeconds
             ),
@@ -275,8 +463,15 @@ def BuildRetainedComponentPlacementSearchDomain(
 def BuildComponentAccessFeedbackPlacementScore(
     Candidate: PcbPlacementCandidate,
     Signals: Iterable[str],
-) -> tuple[int, int, int, int, int]:
-    """Rank retained placements by learned component-port escape geometry."""
+) -> tuple[int, int, int, int, int, int, int, int]:
+    """Rank retained placements by learned component-port escape geometry.
+
+    Packed placement already proves a finite set of legal boundary escapes
+    for every cluster signal.  Reuse those exact counts as a cheap estimate
+    of the port-factor preparation domain instead of selecting the next
+    retained state from terminal depth alone.  This changes only deterministic
+    portfolio order: every retained state remains in the complete queue.
+    """
     SignalSet = frozenset(map(str, Signals))
     Placement = Candidate.Placement
     GateByName = {
@@ -300,6 +495,12 @@ def BuildComponentAccessFeedbackPlacementScore(
     SeenSignals = set()
     PerimeterDepths = []
     DirectionPenalties = []
+    EscapeCandidateCountByClusterSignal = {
+        (int(Cluster.ClusterId), str(Signal)): max(0, int(Count))
+        for Cluster in Placement.PackedClusters
+        for Signal, Count in Cluster.LegalEscapeCandidateCounts
+    }
+    RequiredClusterSignals = set()
 
     def Record(
         ClusterIndex: int,
@@ -336,6 +537,8 @@ def BuildComponentAccessFeedbackPlacementScore(
         if Signal not in SignalSet:
             continue
         SeenSignals.add(Signal)
+        RequiredClusterSignals.add((int(Request.SourceCluster), Signal))
+        RequiredClusterSignals.add((int(Request.TargetCluster), Signal))
         Record(
             int(Request.SourceCluster),
             Request.SourceTerminal,
@@ -347,12 +550,53 @@ def BuildComponentAccessFeedbackPlacementScore(
                 Terminal,
                 Request.TargetBoundarySide,
             )
+    EscapeCandidateCounts = tuple(
+        EscapeCandidateCountByClusterSignal[Key]
+        for Key in sorted(RequiredClusterSignals)
+        if Key in EscapeCandidateCountByClusterSignal
+    )
     return (
         len(SignalSet - SeenSignals),
+        sum(
+            Key not in EscapeCandidateCountByClusterSignal
+            for Key in RequiredClusterSignals
+        ),
         max(DirectionPenalties, default=0),
         sum(DirectionPenalties),
+        max(EscapeCandidateCounts, default=0),
+        sum(EscapeCandidateCounts),
         max(PerimeterDepths, default=0),
         sum(PerimeterDepths),
+    )
+
+
+def SelectRetainedPhysicalPlacementForAccessCore(
+    Candidates: Iterable[PcbPlacementCandidate],
+    KnownPlacementFingerprints: Iterable[str],
+    Signals: Iterable[str],
+) -> PcbPlacementCandidate | None:
+    """Select an existing immutable placement before generating geometry."""
+    Known = frozenset(map(str, KnownPlacementFingerprints))
+    Eligible = tuple(
+        Candidate
+        for Candidate in Candidates
+        if (
+            Candidate.PlacementFingerprint not in Known
+            and Candidate.JointPlacementState is not None
+            and Candidate.TopologyDemand is not None
+        )
+    )
+    if not Eligible:
+        return None
+    return min(
+        Eligible,
+        key=lambda Candidate: (
+            BuildComponentAccessFeedbackPlacementScore(
+                Candidate,
+                Signals,
+            ),
+            Candidate.CandidateId,
+        ),
     )
 
 
@@ -370,14 +614,105 @@ def ReuseRetainedPlacementRoutingResources(
     return Created, False
 
 
+def ClassifyPhysicalGlobalPlanRetentionAdmission(
+    ApertureDiagnostics: object,
+    *,
+    Continuation: PhysicalGlobalPlanContinuationState,
+    ExistingEntry: Any = None,
+) -> dict[str, object]:
+    """Admit only certified, monotonic, actually resumable continuations."""
+    Aperture = (
+        ApertureDiagnostics
+        if isinstance(ApertureDiagnostics, dict)
+        else {}
+    )
+    ApertureFingerprint = str(Aperture.get("DomainFingerprint", ""))
+    ApertureComplete = bool(
+        ApertureFingerprint and Aperture.get("Complete", False)
+    )
+    ExistingContinuation = getattr(
+        ExistingEntry,
+        "Continuation",
+        None,
+    )
+    ExistingCertificates = frozenset(
+        str(Value)
+        for Value in getattr(
+            ExistingContinuation,
+            "CertificateFingerprints",
+            (),
+        )
+        if str(Value)
+    )
+    ResumeCursor = Continuation.ResumeCursor
+    ExistingCursor = getattr(
+        ExistingContinuation,
+        "ResumeCursor",
+        None,
+    )
+    CursorAvailable = bool(
+        ResumeCursor is not None
+        and ResumeCursor.CursorFingerprint
+        and ResumeCursor.PlanFingerprint == Continuation.PlanFingerprint
+        and ResumeCursor.ApertureDomainFingerprint == ApertureFingerprint
+        and ResumeCursor.State is not None
+    )
+    ExistingSameAperture = bool(
+        ApertureFingerprint
+        and ApertureFingerprint in ExistingCertificates
+    )
+    HasNewWork = bool(Continuation.CompletedWork > 0)
+    MonotonicProgress = bool(
+        CursorAvailable
+        and HasNewWork
+        and (
+            ExistingCursor is None
+            or (
+                ResumeCursor.ApertureDomainFingerprint
+                == ExistingCursor.ApertureDomainFingerprint
+                and ResumeCursor.CompletedWork
+                > ExistingCursor.CompletedWork
+            )
+        )
+    )
+    Admitted = bool(
+        ApertureComplete
+        and CursorAvailable
+        and MonotonicProgress
+    )
+    if not ApertureComplete:
+        Reason = "aperture-certificate-incomplete"
+    elif not CursorAvailable:
+        Reason = "resume-cursor-unavailable"
+    elif ExistingCursor is not None and not ExistingSameAperture:
+        Reason = "existing-continuation-aperture-mismatch"
+    elif not MonotonicProgress:
+        Reason = "non-monotonic-or-zero-progress"
+    else:
+        Reason = "typed-resumable-progress"
+    return {
+        "Retained": Admitted,
+        "Reason": Reason,
+        "CompletedWork": max(0, int(Continuation.CompletedWork)),
+        "ApertureDomainFingerprint": ApertureFingerprint,
+        "ApertureCertificateComplete": ApertureComplete,
+        "ResumeCursorAvailable": CursorAvailable,
+        "MonotonicProgress": MonotonicProgress,
+        "ExistingContinuationSameAperture": ExistingSameAperture,
+    }
+
+
 def BuildClusterInterfaceStageSchedule(
     Deadline: RoutingDeadline,
     StateFingerprints: Iterable[str],
     *,
+    LocalCompilationReserveSeconds: float,
     GlobalRoutingReserveSeconds: float,
     PublicationReserveSeconds: float = 2.0,
 ) -> ClusterInterfaceStageSchedule:
     """Reserve global routing while funding complete interface states."""
+    if LocalCompilationReserveSeconds < 0:
+        raise ValueError("local compilation reserve cannot be negative")
     if GlobalRoutingReserveSeconds < 0:
         raise ValueError("global routing reserve cannot be negative")
     if PublicationReserveSeconds < 0:
@@ -389,12 +724,55 @@ def BuildClusterInterfaceStageSchedule(
         - GlobalRoutingReserveSeconds
         - PublicationReserveSeconds,
     )
+    PlanningExpiresAt = max(
+        StartedAt,
+        ExpiresAt - LocalCompilationReserveSeconds,
+    )
     return ClusterInterfaceStageSchedule(
         StartedAt=StartedAt,
+        PlanningExpiresAt=PlanningExpiresAt,
         ExpiresAt=ExpiresAt,
+        LocalCompilationReserveSeconds=(
+            LocalCompilationReserveSeconds
+        ),
         GlobalRoutingReserveSeconds=GlobalRoutingReserveSeconds,
         PublicationReserveSeconds=PublicationReserveSeconds,
         StateFingerprints=tuple(StateFingerprints),
+    )
+
+
+def BuildLocalComponentCompilationAdmissionFailure(
+    Schedule: ClusterInterfaceStageSchedule,
+    *,
+    RemainingSeconds: float,
+) -> RoutingFailure:
+    """Return typed incomplete when no authoritative local solve can start."""
+    return RoutingFailure(
+        Reason=RoutingFailureReason.PhysicalComponentAssemblyIncomplete,
+        Stage="ClosedComponentCompilationIncomplete",
+        Detail=(
+            "local component compilation was not admitted before its "
+            "reserved stage deadline"
+        ),
+        RepairActions=(),
+        Diagnostics={
+            "ComponentRoutingSolve": {
+                "Status": "incomplete",
+                "Complete": False,
+                "ExpansionCount": 0,
+                "Diagnostics": {
+                    "DeadlineExceeded": True,
+                    "WorkCapReached": False,
+                    "LocalCompilationEntered": False,
+                    "RemainingSeconds": max(0.0, RemainingSeconds),
+                },
+            },
+            "DeadlineExceeded": True,
+            "WorkCapReached": False,
+            "LocalCompilationEntered": False,
+            "ExecutableLegacyRepairCascade": False,
+            "StageSchedule": Schedule.ToDictionary(),
+        },
     )
 
 
@@ -12753,6 +13131,10 @@ def _PlaceAndRoutePcbWithPolicy(
                     PlacementFingerprint,
                 ) in ComponentPlacementSearchDomain
             ),
+            LocalCompilationReserveSeconds=min(
+                5.0,
+                Policy.AdaptiveRouting.MaximumRuntimeSeconds,
+            ),
             GlobalRoutingReserveSeconds=max(
                 0.0,
                 Policy.MaterialObjective
@@ -12763,6 +13145,10 @@ def _PlaceAndRoutePcbWithPolicy(
         SharedInterfaceDeadline = RoutingDeadline(
             StartedAt=Deadline.StartedAt,
             ExpiresAt=InterfaceStageSchedule.ExpiresAt,
+        )
+        SharedInterfacePlanningDeadline = RoutingDeadline(
+            StartedAt=Deadline.StartedAt,
+            ExpiresAt=InterfaceStageSchedule.PlanningExpiresAt,
         )
         PrimaryTransforms: dict[object, object] = {}
         InterfaceCandidateQueue = [
@@ -12785,8 +13171,28 @@ def _PlaceAndRoutePcbWithPolicy(
         RoutingResourcesByRetainedPlacementFingerprint: dict[
             str, Any
         ] = {}
+        # Completed local portfolios and their construction/discovery work
+        # are keyed by translation-normalized structural identities and are
+        # revalidated against each exact component problem before reuse.
+        # Keep them for the full hierarchical interface-routing invocation so
+        # an equivalent retained placement does not rebuild the same finite
+        # local domain.  Placement-bound proof clauses and no-goods remain on
+        # each placement's RoutingResources instance.
+        ComponentVariantPortfolioCache: dict[Any, Any] = {}
+        ComponentNetVariantConstructionCache: dict[Any, Any] = {}
+        ComponentRouteClaimsConstructionCache: dict[Any, Any] = {}
+        ComponentNetVariantDiscoveryStateCache: dict[Any, Any] = {}
+        PhysicalGlobalApertureTemplateCache: dict[str, Any] = {}
         PreparedEligibilityByState: dict[
             tuple[int, str], Any
+        ] = {}
+        PhysicalComponentStageTimingsByState: dict[
+            tuple[int, str], list[dict[str, object]]
+        ] = {}
+        ProofGuidedPlacementFingerprints: set[str] = set()
+        ProofGuidedPlacementGenerationCount = 0
+        PendingProofGuidedPlacementByComponentVariant: dict[
+            int, tuple[RoutingFailure, PcbPlacementCandidate]
         ] = {}
 
         def ReorderRemainingPlacementsForAccessCore(
@@ -12819,7 +13225,301 @@ def _PlaceAndRoutePcbWithPolicy(
                     ),
                 )
             ]
-        while InterfaceCandidateQueue:
+
+        def EnqueueProofGuidedPhysicalPlacement(
+            Failure: RoutingFailure,
+            SourceCandidate: PcbPlacementCandidate,
+            ComponentVariant: int,
+        ) -> bool:
+            """Turn one complete global-plan cut into a new placement state."""
+            nonlocal CurrentPlacementAssignmentCut
+            nonlocal PlacementAssignmentConstraints
+            nonlocal PlacementRelocationSignals
+            nonlocal PlacementRelocationPrioritySignals
+            nonlocal PlacementRequiredRelocationSignals
+            nonlocal PendingTopologyCutEpoch
+            nonlocal NeedsFeedbackPlacementGeneration
+            nonlocal NeedsCurrentStructuredCutRegeneration
+            nonlocal JointPortfolioPrimaryCandidateId
+            nonlocal ProofGuidedPlacementGenerationCount
+            nonlocal LastRoutingError
+            nonlocal LastStructuredRoutingError
+            if ProofGuidedPlacementGenerationCount >= (
+                MaximumRetainedComponentSelections
+            ):
+                return False
+            Diagnostics = (
+                Failure.Diagnostics
+                if isinstance(Failure.Diagnostics, dict)
+                else {}
+            )
+            CompleteGlobalAssignmentCut = bool(
+                Diagnostics.get("GlobalPlanDomainComplete", False)
+                and Diagnostics.get(
+                    "CompleteAssignmentCutProof",
+                    False,
+                )
+            )
+            PhysicalPlacementFeedback = (
+                BuildPhysicalComponentPlacementFeedback(Failure)
+            )
+            if (
+                not CompleteGlobalAssignmentCut
+                and PhysicalPlacementFeedback is None
+            ):
+                return False
+            AssignmentCut = (
+                RoutingAssignmentCut.FromFailure(
+                    Failure,
+                    SourceCandidateId=SourceCandidate.CandidateId,
+                    MandatoryAccessOwnershipFingerprint=(
+                        SourceCandidate.TopologyDemand
+                        .MandatoryAccessOwnershipFingerprint
+                        if SourceCandidate.TopologyDemand is not None
+                        else ""
+                    ),
+                )
+                if CompleteGlobalAssignmentCut
+                else None
+            )
+            if CompleteGlobalAssignmentCut and AssignmentCut is None:
+                return False
+            RelocationSignals = frozenset(
+                (
+                    AssignmentCut.PriorityRelocationSignals
+                    or AssignmentCut.RelocationSignals
+                    or AssignmentCut.ConflictSignals
+                    or AssignmentCut.NoCandidateSignals
+                )
+                if AssignmentCut is not None
+                else PhysicalPlacementFeedback.RelocationSignals
+            )
+            if not RelocationSignals:
+                return False
+            if HasDistinctRetainedPhysicalEligibilityState(
+                InterfaceCandidateQueue,
+                ComponentVariant=ComponentVariant,
+                PlacementFingerprint=SourceCandidate.PlacementFingerprint,
+            ):
+                PendingProofGuidedPlacementByComponentVariant[
+                    ComponentVariant
+                ] = (Failure, SourceCandidate)
+                PlacementGenerationDecisions.append({
+                    "Result": (
+                        "physical-global-proof-guided-placement-deferred-"
+                        "for-retained-state"
+                    ),
+                    "SourceCandidateId": SourceCandidate.CandidateId,
+                    "ComponentVariant": ComponentVariant,
+                    "RelocationSignals": sorted(RelocationSignals),
+                    "ExecutableLegacyRepairCascade": False,
+                })
+                return True
+            KnownFingerprints = {
+                Candidate.PlacementFingerprint
+                for Candidate in RawInterfaceCandidates
+            } | ProofGuidedPlacementFingerprints
+            RetainedCandidate = SelectRetainedPhysicalPlacementForAccessCore(
+                OrderedPlacements,
+                KnownFingerprints,
+                RelocationSignals,
+            )
+            if RetainedCandidate is not None:
+                ProofGuidedPlacementFingerprints.add(
+                    RetainedCandidate.PlacementFingerprint
+                )
+                ProofGuidedPlacementGenerationCount += 1
+                InterfaceCandidateQueue.insert(0, (
+                    "prepare-eligibility",
+                    len(RawInterfaceCandidates)
+                    + ProofGuidedPlacementGenerationCount,
+                    RetainedCandidate,
+                    0,
+                    ComponentVariant,
+                ))
+                PlacementGenerationDecisions.append({
+                    "Result": (
+                        "physical-global-proof-guided-retained-placement"
+                    ),
+                    "SourceCandidateId": SourceCandidate.CandidateId,
+                    "ProofKind": (
+                        "global-assignment-cut"
+                        if AssignmentCut is not None
+                        else "physical-port-unsat-core"
+                    ),
+                    "RelocationSignals": sorted(RelocationSignals),
+                    "PlacementFingerprint": (
+                        RetainedCandidate.PlacementFingerprint
+                    ),
+                    "GeneratedNewGeometry": False,
+                    "ExecutableLegacyRepairCascade": False,
+                })
+                return True
+            if AssignmentCut is not None:
+                CurrentPlacementAssignmentCut = AssignmentCut
+                PlacementAssignmentCutHistory.append(AssignmentCut)
+                PlacementAssignmentConstraints = (
+                    PlacementAssignmentConstraints.WithCut(AssignmentCut)
+                )
+                PendingTopologyCutEpoch = BuildTopologyCutEpochIdentity(
+                    AssignmentCut,
+                    PlacementAssignmentConstraints,
+                )
+            else:
+                # The physical core is placement guidance, not a global cut.
+                # Keep accumulated generic legality constraints, but do not
+                # attach an unrelated legacy cut identity to the new state.
+                CurrentPlacementAssignmentCut = None
+                PendingTopologyCutEpoch = None
+            PlacementRelocationSignals = RelocationSignals
+            PlacementRelocationPrioritySignals = RelocationSignals
+            PlacementRequiredRelocationSignals = RelocationSignals
+            NeedsFeedbackPlacementGeneration = True
+            NeedsCurrentStructuredCutRegeneration = (
+                AssignmentCut is not None
+            )
+            JointPortfolioPrimaryCandidateId = None
+            PendingJointPlacementStates.clear()
+            KnownFingerprints = {
+                Candidate.PlacementFingerprint
+                for Candidate in RawInterfaceCandidates
+            } | ProofGuidedPlacementFingerprints
+            Request = _TakeNextDeferredRequest(
+                PreferRelocation=True,
+                RequireExactCutBeforeBroad=(AssignmentCut is not None),
+            )
+            GeneratedUniquePlacement = False
+            if Request is not None:
+                try:
+                    GeneratedUniquePlacement = _TryPlacement(
+                        Request,
+                        MaterializeRoutingResources=False,
+                    )
+                except RoutingStageError as Error:
+                    LastRoutingError = Error
+                    LastStructuredRoutingError = Error
+                    return False
+            while True:
+                Candidate = next(
+                    (
+                        Value
+                        for Value in _BuildCandidateRecords()
+                        if Value.PlacementFingerprint
+                        not in KnownFingerprints
+                    ),
+                    None,
+                )
+                if Candidate is not None:
+                    ProofGuidedPlacementFingerprints.add(
+                        Candidate.PlacementFingerprint
+                    )
+                    ProofGuidedPlacementGenerationCount += 1
+                    InterfaceCandidateQueue.insert(0, (
+                        "prepare-eligibility",
+                        len(InterfaceCandidates)
+                        + ProofGuidedPlacementGenerationCount,
+                        Candidate,
+                        0,
+                        ComponentVariant,
+                    ))
+                    PlacementGenerationDecisions.append({
+                        "Result": "physical-global-proof-guided-placement",
+                        "SourceCandidateId": SourceCandidate.CandidateId,
+                        "SourcePlanFingerprint": Diagnostics.get(
+                            "PhysicalAssemblyPlanFingerprint",
+                            "",
+                        ),
+                        "ProofKind": (
+                            "global-assignment-cut"
+                            if AssignmentCut is not None
+                            else "physical-port-unsat-core"
+                        ),
+                        "ProofFingerprint": (
+                            AssignmentCut.ConflictFingerprint
+                            if AssignmentCut is not None
+                            else PhysicalPlacementFeedback.ProofFingerprint
+                        ),
+                        "RelocationSignals": sorted(RelocationSignals),
+                        "PlacementFingerprint": (
+                            Candidate.PlacementFingerprint
+                        ),
+                        "LivePlacementStateBound": 6,
+                        "PendingImmutablePlacementStateCount": len(
+                            PendingJointPlacementStates
+                        ),
+                        "IncrementalPlacementMaterialization": True,
+                        "ExecutableLegacyRepairCascade": False,
+                    })
+                    return True
+                if not PendingJointPlacementStates:
+                    return False
+                JointState = PendingJointPlacementStates.pop(0)
+                try:
+                    GeneratedUniquePlacement = _TryPlacement(
+                        JointState.Request,
+                        JointPlacementCandidateIndex=(
+                            JointState.CandidateIndex
+                        ),
+                        FixedRelocationVariant=(
+                            JointState.RelocationVariant
+                        ),
+                        FixedCandidateSpacing=JointState.RoutingSpacing,
+                        FixedRelocationSignals=(
+                            JointState.RelocationSignals
+                        ),
+                        FixedRelocationPrioritySignals=(
+                            JointState.RelocationPrioritySignals
+                        ),
+                        FixedRequiredRelocationSignals=(
+                            JointState.RequiredRelocationSignals
+                        ),
+                        FixedAssignmentCut=JointState.AssignmentCut,
+                        FixedAssignmentConstraints=(
+                            JointState.AssignmentConstraints
+                        ),
+                        FixedCoordinatedCandidateDiversificationSignals=(
+                            JointState
+                            .CoordinatedCandidateDiversificationSignals
+                        ),
+                        FixedTopologyCutFrontier=(
+                            JointState.TopologyCutFrontier
+                        ),
+                        MaterializeRoutingResources=False,
+                    )
+                except RoutingStageError as Error:
+                    LastRoutingError = Error
+                    LastStructuredRoutingError = Error
+                    return False
+        while (
+            InterfaceCandidateQueue
+            or PendingProofGuidedPlacementByComponentVariant
+        ):
+            for PendingComponentVariant in sorted(tuple(
+                PendingProofGuidedPlacementByComponentVariant
+            )):
+                PendingFailure, PendingSourceCandidate = (
+                    PendingProofGuidedPlacementByComponentVariant[
+                        PendingComponentVariant
+                    ]
+                )
+                if HasDistinctRetainedPhysicalEligibilityState(
+                    InterfaceCandidateQueue,
+                    ComponentVariant=PendingComponentVariant,
+                    PlacementFingerprint=(
+                        PendingSourceCandidate.PlacementFingerprint
+                    ),
+                ):
+                    continue
+                del PendingProofGuidedPlacementByComponentVariant[
+                    PendingComponentVariant
+                ]
+                EnqueueProofGuidedPhysicalPlacement(
+                    PendingFailure,
+                    PendingSourceCandidate,
+                    PendingComponentVariant,
+                )
+            if not InterfaceCandidateQueue:
+                break
             (
                 InterfaceWorkPhase,
                 InterfaceIndex,
@@ -12835,7 +13535,51 @@ def _PlaceAndRoutePcbWithPolicy(
                 ComponentVariantForState,
                 RetainedPlacementFingerprint,
             )
-            InterfaceDeadline = SharedInterfaceDeadline
+            PhysicalComponentStageTimings = (
+                PhysicalComponentStageTimingsByState.setdefault(
+                    EligibilityStateKey,
+                    [],
+                )
+            )
+
+            def RecordPhysicalComponentStageTiming(
+                Stage: str,
+                StartedAt: float,
+                *,
+                Result: str,
+                PlanFingerprint: str = "",
+            ) -> None:
+                PhysicalComponentStageTimings.append({
+                    "Stage": Stage,
+                    "AttemptIndex": sum(
+                        Entry.get("Stage") == Stage
+                        for Entry in PhysicalComponentStageTimings
+                    ),
+                    "Result": Result,
+                    "DurationSeconds": round(
+                        monotonic() - StartedAt,
+                        6,
+                    ),
+                    "ElapsedSinceRoutingStartSeconds": round(
+                        monotonic() - Deadline.StartedAt,
+                        6,
+                    ),
+                    "PhysicalAssemblyPlanFingerprint": PlanFingerprint,
+                })
+
+            # Once a complete physical core has selected a retained sibling,
+            # its envelope and factor preparation are authoritative execution
+            # work, not speculative portfolio planning.  Admit that state to
+            # the shared execution deadline while preserving the publication
+            # reserve and the single production ceiling.
+            InterfaceDeadline = (
+                SharedInterfaceDeadline
+                if (
+                    InterfaceWorkPhase == "prepare-eligibility"
+                    and ActiveComponentCutSignals
+                )
+                else SharedInterfacePlanningDeadline
+            )
             StateRealizabilityNogoods: list[
                 ClusterInterfaceRealizabilityNogood
             ] = []
@@ -13079,6 +13823,12 @@ def _PlaceAndRoutePcbWithPolicy(
                 RoutingResourcesByFingerprint[
                     InterfaceCandidate.PlacementFingerprint
                 ] = InterfaceResources
+                # Successful exterior-aperture witnesses are normalized and
+                # revalidated, so one component-pipeline invocation can reuse
+                # them across retained rigidly equivalent placements.
+                InterfaceResources.PhysicalGlobalApertureTemplateCache = (
+                    PhysicalGlobalApertureTemplateCache
+                )
                 # Physical plans, rejection sets, and routed templates are
                 # component-specific. Only immutable placement geometry and
                 # raw whole-design portal/guide preparation survive when the
@@ -13167,9 +13917,17 @@ def _PlaceAndRoutePcbWithPolicy(
                     ChannelFingerprint=ChannelFingerprint,
                     InterClusterChannel=Channel,
                 )
-                InterfaceRemainingSeconds = max(
-                    0.001,
-                    InterfaceDeadline.RemainingSeconds(),
+                if InterfaceDeadline.IsExpired():
+                    raise RoutingStageError(
+                        BuildLocalComponentCompilationAdmissionFailure(
+                            InterfaceStageSchedule,
+                            RemainingSeconds=(
+                                SharedInterfaceDeadline.RemainingSeconds()
+                            ),
+                        )
+                    )
+                InterfaceRemainingSeconds = (
+                    InterfaceDeadline.RemainingSeconds()
                 )
                 InterfacePolicy = replace(
                     Policy,
@@ -13197,9 +13955,31 @@ def _PlaceAndRoutePcbWithPolicy(
                     .RejectedPhysicalComponentPortReservationSets
                     .clear()
                 )
+                (
+                    InterfaceResources
+                    .ForbiddenPhysicalComponentGlobalCandidateSets
+                    .clear()
+                )
+                (
+                    InterfaceResources
+                    .RejectedPhysicalComponentAssemblyPlanFingerprints
+                    .clear()
+                )
+                (
+                    InterfaceResources
+                    .PreferredPhysicalComponentGlobalContractsBySignal
+                    .clear()
+                )
+                (
+                    InterfaceResources
+                    .PreferredPhysicalComponentPortReservationsBySignal
+                    .clear()
+                )
+                InterfaceResources.PhysicalComponentPortCspStateCache.clear()
                 if InterfaceWorkPhase == "prepare-eligibility":
-                    PreparedEligibility = (
-                        PreparePhysicalComponentEligibility(
+                    EligibilityPreparationStartedAt = monotonic()
+                    try:
+                        PreparedEligibility = PreparePhysicalComponentEligibility(
                             MaterializedInterfacePlacement,
                             Resources=InterfaceResources,
                             Policy=InterfacePolicy,
@@ -13209,6 +13989,21 @@ def _PlaceAndRoutePcbWithPolicy(
                             ),
                             LocalRouteFingerprint=LocalRouteFingerprint,
                         )
+                    except Exception:
+                        RecordPhysicalComponentStageTiming(
+                            "PhysicalEligibilityPreparation",
+                            EligibilityPreparationStartedAt,
+                            Result="failed",
+                        )
+                        raise
+                    RecordPhysicalComponentStageTiming(
+                        "PhysicalEligibilityPreparation",
+                        EligibilityPreparationStartedAt,
+                        Result=(
+                            "complete"
+                            if PreparedEligibility.Complete
+                            else "incomplete"
+                        ),
                     )
                     if not PreparedEligibility.Complete:
                         raise RoutingStageError(RoutingFailure(
@@ -13278,15 +14073,79 @@ def _PlaceAndRoutePcbWithPolicy(
                         ),
                         "Complete": True,
                         "Feasible": True,
+                        "PreparationStageTimings": dict(
+                            PreparedEligibility.PreparationStageTimings
+                        ),
+                        "PhysicalConnectorDiagnostics": {
+                            "SearchCount": (
+                                PreparedEligibility
+                                .GlobalConnectorSearchCount
+                            ),
+                            "PortableCacheHitCount": (
+                                PreparedEligibility
+                                .GlobalConnectorPortableCacheHitCount
+                            ),
+                            "PortableCacheValidationRejectCount": (
+                                PreparedEligibility
+                                .GlobalConnectorPortableCacheValidationRejectCount
+                            ),
+                            "PortableCacheStoreCount": (
+                                PreparedEligibility
+                                .GlobalConnectorPortableCacheStoreCount
+                            ),
+                            "ExpansionCount": (
+                                PreparedEligibility
+                                .GlobalConnectorExpansionCount
+                            ),
+                            "GuideFieldBuildCount": (
+                                PreparedEligibility
+                                .GlobalGuideFieldBuildCount
+                            ),
+                            "GuideFieldExpansionCount": (
+                                PreparedEligibility
+                                .GlobalGuideFieldExpansionCount
+                            ),
+                            "GuideFieldHitCount": (
+                                PreparedEligibility
+                                .GlobalGuideFieldHitCount
+                            ),
+                            "GuideFieldCanonicalPathCount": (
+                                PreparedEligibility
+                                .GlobalGuideFieldCanonicalPathCount
+                            ),
+                            "GuideFieldFallbackCount": (
+                                PreparedEligibility
+                                .GlobalGuideFieldFallbackCount
+                            ),
+                            "LaneFactorExpansionCount": (
+                                PreparedEligibility
+                                .LaneFactorExpansionCount
+                            ),
+                            "AccessFactorExpansionCount": (
+                                PreparedEligibility
+                                .AccessFactorExpansionCount
+                            ),
+                            "SeamFactorExpansionCount": (
+                                PreparedEligibility
+                                .SeamFactorExpansionCount
+                            ),
+                        },
+                        "PhysicalComponentStageTimings": list(
+                            PhysicalComponentStageTimings
+                        ),
                     })
-                    InterfaceCandidateQueue.append((
+                    # A complete physical domain belongs to this retained
+                    # placement. Exhaust its global port/channel plans before
+                    # spending the shared deadline preparing another
+                    # placement; only a complete-domain failure may advance
+                    # the placement frontier.
+                    InterfaceCandidateQueue.insert(0, (
                         "solve-prepared-eligibility",
                         InterfaceIndex,
                         RetainedBaseInterfaceCandidate,
                         InterfaceCutEpoch,
                         ComponentVariantForState,
                     ))
-                    ReorderRemainingPlacementsForAccessCore("")
                     continue
                 PreparedEligibility = PreparedEligibilityByState.get(
                     EligibilityStateKey
@@ -13296,12 +14155,25 @@ def _PlaceAndRoutePcbWithPolicy(
                         "physical component solve was scheduled without "
                         "a complete eligibility domain"
                     )
-                PreparedAssembly = (
-                    SolvePreparedPhysicalComponentEligibility(
+                EligibilitySolveStartedAt = monotonic()
+                try:
+                    PreparedAssembly = SolvePreparedPhysicalComponentEligibility(
                         PreparedEligibility,
                         Resources=InterfaceResources,
                         Deadline=InterfaceDeadline,
                     )
+                except Exception:
+                    RecordPhysicalComponentStageTiming(
+                        "PhysicalEligibilitySolve",
+                        EligibilitySolveStartedAt,
+                        Result="failed",
+                    )
+                    raise
+                RecordPhysicalComponentStageTiming(
+                    "PhysicalEligibilitySolve",
+                    EligibilitySolveStartedAt,
+                    Result="complete",
+                    PlanFingerprint=PreparedAssembly.Plan.PlanFingerprint,
                 )
                 PhysicalAssemblyPlan = PreparedAssembly.Plan
                 ComponentProblem = PreparedAssembly.Problem
@@ -13309,6 +14181,614 @@ def _PlaceAndRoutePcbWithPolicy(
                     MaterializedInterfacePlacement
                 )
                 ComponentBaseCandidate = InterfaceCandidate
+
+                def ReplanPhysicalAssemblyWithTiming(
+                    RequiredGlobalBoundaryPorts: tuple[Any, ...] | None = None,
+                ) -> Any:
+                    ReplanStartedAt = monotonic()
+                    try:
+                        Result = ReplanPhysicalComponentAssembly(
+                            ComponentBasePlacement,
+                            Resources=InterfaceResources,
+                            Deadline=InterfaceDeadline,
+                            RequiredGlobalBoundaryPorts=(
+                                RequiredGlobalBoundaryPorts
+                            ),
+                        )
+                    except Exception:
+                        RecordPhysicalComponentStageTiming(
+                            "PhysicalAssemblyReplan",
+                            ReplanStartedAt,
+                            Result="failed",
+                        )
+                        raise
+                    RecordPhysicalComponentStageTiming(
+                        "PhysicalAssemblyReplan",
+                        ReplanStartedAt,
+                        Result="complete",
+                        PlanFingerprint=Result.Plan.PlanFingerprint,
+                    )
+                    return Result
+
+                SuccessfulGlobalPlanWasRetained = False
+
+                def ReserveAuthoritativeGlobalChannels(
+                    Assembly: Any,
+                ) -> tuple[Any, RoutedDesign | None]:
+                    nonlocal SuccessfulGlobalPlanWasRetained
+                    def FindDiagnosticValues(
+                        Value: Any,
+                        Key: str,
+                    ) -> list[Any]:
+                        Result = []
+                        if isinstance(Value, dict):
+                            if Key in Value:
+                                Result.append(Value[Key])
+                            for Nested in Value.values():
+                                Result.extend(FindDiagnosticValues(Nested, Key))
+                        elif isinstance(Value, (list, tuple)):
+                            for Nested in Value:
+                                Result.extend(FindDiagnosticValues(Nested, Key))
+                        return Result
+
+                    def RebuildFrontierDeferrals() -> None:
+                        (
+                            InterfaceResources
+                            .DeferredPhysicalComponentPortAssignmentFingerprints
+                        ) = {
+                            Entry.Assembly.Plan.PortAssignmentFingerprint
+                            for Entry in (
+                                InterfaceResources
+                                .RetainedPhysicalGlobalPlanFrontier.values()
+                            )
+                        }
+
+                    def RetainIncompleteGlobalPlan(
+                        CurrentAssembly: Any,
+                        Failure: RoutingFailure,
+                    ) -> dict[str, object]:
+                        Diagnostics = dict(Failure.Diagnostics or {})
+                        DependencyValues = FindDiagnosticValues(
+                            Diagnostics,
+                            (
+                                "PhysicalGlobalCandidateRequestDependency"
+                                "Fingerprints"
+                            ),
+                        )
+                        RequestDependencies = next((
+                            Value for Value in reversed(DependencyValues)
+                            if isinstance(Value, dict)
+                        ), {})
+                        RemainingValues = FindDiagnosticValues(
+                            Diagnostics,
+                            "RemainingRequestCounts",
+                        )
+                        RemainingCounts = next((
+                            Value for Value in reversed(RemainingValues)
+                            if isinstance(Value, dict)
+                        ), {})
+                        CompletedWorkValues = FindDiagnosticValues(
+                            Diagnostics,
+                            "RouteTreeCompletedWork",
+                        )
+                        CompletedWork = max(
+                            (
+                                int(Value)
+                                for Value in CompletedWorkValues
+                                if isinstance(Value, (int, float))
+                            ),
+                            default=0,
+                        )
+                        ApertureValues = FindDiagnosticValues(
+                            Diagnostics,
+                            "CertifiedPhysicalComponentApertureDomain",
+                        )
+                        ApertureDiagnostics = next((
+                            Value for Value in reversed(ApertureValues)
+                            if isinstance(Value, dict)
+                        ), {})
+                        PortsBySignal = {
+                            Port.Signal: Port
+                            for Port in (
+                                SelectPhysicalAssemblyGlobalBoundaryPorts(
+                                    CurrentAssembly.Plan
+                                )
+                            )
+                        }
+                        CorridorBySignal = {}
+                        for Domain in (
+                            InterfaceResources
+                            .PhysicalPortCorridorDomainCache.values()
+                        ):
+                            Port = PortsBySignal.get(Domain.Signal)
+                            if (
+                                Port is None
+                                or Domain.PortReservationFingerprint
+                                != Port.ReservationFingerprint
+                            ):
+                                continue
+                            ExpectedDependency = RequestDependencies.get(
+                                Domain.Signal
+                            )
+                            if (
+                                ExpectedDependency
+                                and Domain.RequestDependencyFingerprint
+                                != ExpectedDependency
+                            ):
+                                continue
+                            CorridorBySignal[Domain.Signal] = Domain
+                        CertificateFingerprints = tuple(sorted({
+                            str(Value)
+                            for Key in (
+                                "CertificateFingerprint",
+                                "AccessCertificateFingerprint",
+                            )
+                            for Value in FindDiagnosticValues(Diagnostics, Key)
+                            if isinstance(Value, str) and Value
+                        } | {
+                            str(ApertureDiagnostics.get(
+                                "DomainFingerprint",
+                                "",
+                            ))
+                        }))
+                        Continuation = (
+                            BuildPhysicalGlobalPlanContinuationState(
+                                CurrentAssembly.Plan,
+                                RequestDependencies,
+                                RemainingCounts,
+                                CorridorBySignal.values(),
+                                CertificateFingerprints,
+                                CompletedWork=CompletedWork,
+                                ResumeCursor=None,
+                            )
+                        )
+                        ExistingEntry = (
+                            InterfaceResources
+                            .RetainedPhysicalGlobalPlanFrontier
+                            .get(CurrentAssembly.Plan.PlanFingerprint)
+                        )
+                        RetentionAdmission = (
+                            ClassifyPhysicalGlobalPlanRetentionAdmission(
+                                ApertureDiagnostics,
+                                Continuation=Continuation,
+                                ExistingEntry=ExistingEntry,
+                            )
+                        )
+                        if not RetentionAdmission["Retained"]:
+                            return RetentionAdmission
+                        Sequence = int(
+                            InterfaceResources
+                            .PhysicalGlobalPlanFrontierScheduleSequence
+                        )
+                        (
+                            InterfaceResources
+                            .RetainedPhysicalGlobalPlanFrontier
+                        ) = RetainIncompletePhysicalGlobalPlan(
+                            InterfaceResources
+                            .RetainedPhysicalGlobalPlanFrontier,
+                            CurrentAssembly,
+                            Continuation,
+                            EnqueuedSequence=Sequence,
+                        )
+                        (
+                            InterfaceResources
+                            .PhysicalGlobalPlanFrontierScheduleSequence
+                        ) = Sequence + 1
+                        RebuildFrontierDeferrals()
+                        return {
+                            **RetentionAdmission,
+                            "RetainedGlobalPlanFrontierSize": len(
+                                InterfaceResources
+                                .RetainedPhysicalGlobalPlanFrontier
+                            ),
+                        }
+
+                    PreviousGlobalPlanWasRetained = False
+
+                    def SelectRetainedAssembly(
+                        *,
+                        ClearDeferredAssignments: bool,
+                    ) -> Any:
+                        nonlocal PreviousGlobalPlanWasRetained
+                        Frontier = (
+                            InterfaceResources
+                            .RetainedPhysicalGlobalPlanFrontier
+                        )
+                        if not Frontier:
+                            raise ValueError(
+                                "retained physical global-plan frontier "
+                                "is empty"
+                            )
+                        if ClearDeferredAssignments:
+                            (
+                                InterfaceResources
+                                .DeferredPhysicalComponentPortAssignmentFingerprints
+                            ).clear()
+                        Sequence = int(
+                            InterfaceResources
+                            .PhysicalGlobalPlanFrontierScheduleSequence
+                        )
+                        Entry, UpdatedFrontier = (
+                            SelectNextRetainedPhysicalGlobalPlan(
+                                Frontier,
+                                ScheduleSequence=Sequence,
+                            )
+                        )
+                        (
+                            InterfaceResources
+                            .RetainedPhysicalGlobalPlanFrontier
+                        ) = UpdatedFrontier
+                        (
+                            InterfaceResources
+                            .PhysicalGlobalPlanFrontierScheduleSequence
+                        ) = Sequence + 1
+                        PreviousGlobalPlanWasRetained = True
+                        return Entry.Assembly
+
+                    def SelectFreshOrRetainedAssembly() -> Any:
+                        nonlocal PreviousGlobalPlanWasRetained
+                        Frontier = (
+                            InterfaceResources
+                            .RetainedPhysicalGlobalPlanFrontier
+                        )
+                        if ShouldScheduleRetainedPhysicalGlobalPlan(
+                            Frontier,
+                            PreviousPlanWasRetained=(
+                                PreviousGlobalPlanWasRetained
+                            ),
+                        ):
+                            return SelectRetainedAssembly(
+                                ClearDeferredAssignments=False,
+                            )
+                        try:
+                            Assembly = ReplanPhysicalAssemblyWithTiming()
+                            PreviousGlobalPlanWasRetained = False
+                            return Assembly
+                        except RoutingStageError as Error:
+                            Diagnostics = dict(
+                                Error.Failure.Diagnostics or {}
+                            )
+                            if not Diagnostics.get(
+                                "DeferredPortAssignmentDomainExhausted",
+                                False,
+                            ):
+                                raise
+                            Frontier = (
+                                InterfaceResources
+                                .RetainedPhysicalGlobalPlanFrontier
+                            )
+                            if not Frontier:
+                                raise
+                            return SelectRetainedAssembly(
+                                ClearDeferredAssignments=True,
+                            )
+
+                    CurrentAssembly = Assembly
+                    while True:
+                        (
+                            InterfaceResources
+                            .FrozenPhysicalComponentAssemblyPlan
+                        ) = CurrentAssembly.Plan
+                        (
+                            InterfaceResources
+                            .PreparedComponentRoutingProblem
+                        ) = CurrentAssembly.Problem
+                        # The selected seam paths supersede the old logical
+                        # component-lease portal cache. Keep portable raw
+                        # portal geometry, but require a fresh complete global
+                        # domain for every distinct assembly plan.
+                        InterfaceResources.FrozenPreparedPortalDomainCache = None
+                        InterfaceResources.FrozenInterfaceGlobalCandidateCache = {}
+                        InterfaceResources.FrozenInterfaceGlobalCandidateMetadata = {}
+                        InterfaceResources.FrozenInterfaceGlobalCandidatePlacementIdentity = None
+                        GlobalPlanningAttemptStartedAt = monotonic()
+                        GlobalPlanningAttemptResult = "failed"
+                        GlobalPlanningAttemptRecorded = False
+                        GlobalPlanningAttemptPlanFingerprint = (
+                            CurrentAssembly.Plan.PlanFingerprint
+                        )
+                        try:
+                            ExactGlobalSignals = (
+                                SelectPhysicalComponentExactGlobalChannelSignals(
+                                    CurrentAssembly.Plan
+                                )
+                            )
+                            InterfaceResources.PreparingPhysicalComponentGlobalChannels = True
+                            InterfaceResources.PhysicalComponentExactGlobalChannelSignals = (
+                                ExactGlobalSignals
+                            )
+                            GlobalPlanningPlacement = replace(
+                                ComponentBasePlacement,
+                                Placed=(
+                                    PreparePhysicalComponentGlobalPlanningPlacement(
+                                        ComponentBasePlacement.Placed,
+                                        CurrentAssembly.Problem,
+                                        CurrentAssembly.Plan,
+                                    )
+                                ),
+                            )
+                            if InterfaceDeadline.IsExpired():
+                                raise RoutingStageError(
+                                    BuildLocalComponentCompilationAdmissionFailure(
+                                        InterfaceStageSchedule,
+                                        RemainingSeconds=(
+                                            SharedInterfaceDeadline
+                                            .RemainingSeconds()
+                                        ),
+                                    )
+                                )
+                            GlobalPlanningDeadline = (
+                                BuildPhysicalGlobalPlanYieldDeadline(
+                                    InterfaceDeadline,
+                                    len(
+                                        InterfaceResources
+                                        .RetainedPhysicalGlobalPlanFrontier
+                                    ),
+                                )
+                            )
+                            GlobalPlanningSeconds = (
+                                GlobalPlanningDeadline.RemainingSeconds()
+                            )
+                            GlobalPlanningPolicy = replace(
+                                Policy,
+                                RuntimeBudgetSeconds=GlobalPlanningSeconds,
+                                AdaptiveRouting=replace(
+                                    Policy.AdaptiveRouting,
+                                    MaximumRuntimeSeconds=min(
+                                        Policy.AdaptiveRouting
+                                        .MaximumRuntimeSeconds,
+                                        GlobalPlanningSeconds,
+                                    ),
+                                ),
+                            )
+                            GlobalChannelDesign = RoutePcbDesign(
+                                GlobalPlanningPlacement,
+                                Policy=GlobalPlanningPolicy,
+                                Deadline=GlobalPlanningDeadline,
+                                Resources=InterfaceResources,
+                            )
+                            BoundAssembly = (
+                                BindPhysicalComponentAssemblyGlobalChannels(
+                                    CurrentAssembly,
+                                    GlobalChannelDesign,
+                                    InterfaceResources.ResourceGraph,
+                                )
+                            )
+                            BoundAssembly = (
+                                BindPhysicalComponentAssemblyLocalPortSupports(
+                                    BoundAssembly,
+                                )
+                            )
+                            GlobalPlanningAttemptResult = "reserved"
+                        except RoutingStageError as GlobalPlanningError:
+                            ClassifiedFailure = (
+                                ClassifyPhysicalComponentGlobalPlanningFailure(
+                                    GlobalPlanningError.Failure,
+                                    CurrentAssembly.Plan,
+                                    DeadlineExpired=(
+                                        InterfaceDeadline.IsExpired()
+                                    ),
+                                )
+                            )
+                            if (
+                                ClassifiedFailure.Reason
+                                == RoutingFailureReason
+                                .ComponentChannelCapacityUnsatisfiable
+                                and not InterfaceDeadline.IsExpired()
+                                and ClassifiedFailure.Diagnostics.get(
+                                    "AssemblyPlanReassignmentAllowed",
+                                    True,
+                                )
+                            ):
+                                GlobalPlanningAttemptResult = (
+                                    "complete-plan-rejected"
+                                )
+                                (
+                                    InterfaceResources
+                                    .RetainedPhysicalGlobalPlanFrontier
+                                    .pop(
+                                        CurrentAssembly.Plan.PlanFingerprint,
+                                        None,
+                                    )
+                                )
+                                RebuildFrontierDeferrals()
+                                NoGoodDiagnostics = (
+                                    RecordPhysicalComponentGlobalPlanNoGood(
+                                        ClassifiedFailure,
+                                        CurrentAssembly.Plan,
+                                        InterfaceResources,
+                                    )
+                                )
+                                StateAttemptDiagnostics.append({
+                                    "Result": (
+                                        "global-planning-reject-physical-plan"
+                                    ),
+                                    "GlobalPlanSource": (
+                                        "retained"
+                                        if PreviousGlobalPlanWasRetained
+                                        else "fresh"
+                                    ),
+                                    "PhysicalAssemblyPlanFingerprint": (
+                                        CurrentAssembly.Plan.PlanFingerprint
+                                    ),
+                                    "RejectedPortAssignmentFingerprint": (
+                                        CurrentAssembly.Plan
+                                        .PortAssignmentFingerprint
+                                    ),
+                                    **NoGoodDiagnostics,
+                                    "UnderlyingFailure": (
+                                        ClassifiedFailure.ToDictionary()
+                                    ),
+                                    "LocalCompilationEntered": False,
+                                    "LocalTemplateReopened": False,
+                                    "ImplicitForeignTransitDomainCount": 0,
+                                })
+                                RecordPhysicalComponentStageTiming(
+                                    "AuthoritativeGlobalReserve",
+                                    GlobalPlanningAttemptStartedAt,
+                                    Result=GlobalPlanningAttemptResult,
+                                    PlanFingerprint=(
+                                        GlobalPlanningAttemptPlanFingerprint
+                                    ),
+                                )
+                                GlobalPlanningAttemptRecorded = True
+                                CurrentAssembly = (
+                                    SelectFreshOrRetainedAssembly()
+                                )
+                                continue
+                            if ClassifiedFailure.Reason == (
+                                RoutingFailureReason
+                                .PhysicalComponentAssemblyIncomplete
+                            ):
+                                RetentionDiagnostics = (
+                                    RetainIncompleteGlobalPlan(
+                                        CurrentAssembly,
+                                        ClassifiedFailure,
+                                    )
+                                )
+                                GlobalPlanningAttemptResult = (
+                                    "incomplete-plan-retained"
+                                    if RetentionDiagnostics["Retained"]
+                                    else "incomplete-plan-not-retained"
+                                )
+                                StateAttemptDiagnostics.append({
+                                    "Result": (
+                                        "global-planning-retain-plan"
+                                        if RetentionDiagnostics["Retained"]
+                                        else (
+                                            "global-planning-incomplete-"
+                                            "plan-not-retained"
+                                        )
+                                    ),
+                                    "GlobalPlanSource": (
+                                        "retained"
+                                        if PreviousGlobalPlanWasRetained
+                                        else "fresh"
+                                    ),
+                                    "PhysicalAssemblyPlanFingerprint": (
+                                        CurrentAssembly.Plan.PlanFingerprint
+                                    ),
+                                    "PortAssignmentFingerprint": (
+                                        CurrentAssembly.Plan
+                                        .PortAssignmentFingerprint
+                                    ),
+                                    "RetainedGlobalPlanFrontierSize": len(
+                                        InterfaceResources
+                                        .RetainedPhysicalGlobalPlanFrontier
+                                    ),
+                                    "CursorResumeAvailable": False,
+                                    "CompleteAssignmentCutProof": False,
+                                    "NoGoodRecorded": False,
+                                    "RetentionAdmission": (
+                                        RetentionDiagnostics
+                                    ),
+                                    "UnderlyingFailure": (
+                                        ClassifiedFailure.ToDictionary()
+                                    ),
+                                    "ImplicitForeignTransitDomainCount": 0,
+                                })
+                                if InterfaceDeadline.IsExpired():
+                                    raise RoutingStageError(
+                                        ClassifiedFailure
+                                    ) from GlobalPlanningError
+                                if not RetentionDiagnostics["Retained"]:
+                                    raise RoutingStageError(replace(
+                                        ClassifiedFailure,
+                                        Diagnostics={
+                                            **dict(
+                                                ClassifiedFailure.Diagnostics
+                                                or {}
+                                            ),
+                                            "RetentionAdmission": (
+                                                RetentionDiagnostics
+                                            ),
+                                            "RetainedGlobalPlanFrontierSize": (
+                                                len(
+                                                    InterfaceResources
+                                                    .RetainedPhysicalGlobalPlanFrontier
+                                                )
+                                            ),
+                                        },
+                                    )) from GlobalPlanningError
+                                # Close this global-reserve timing interval
+                                # before selecting or compiling the next
+                                # assembly plan.  Selection is physical-plan
+                                # work and must never be charged to the
+                                # preceding authoritative reserve attempt.
+                                RecordPhysicalComponentStageTiming(
+                                    "AuthoritativeGlobalReserve",
+                                    GlobalPlanningAttemptStartedAt,
+                                    Result=GlobalPlanningAttemptResult,
+                                    PlanFingerprint=(
+                                        GlobalPlanningAttemptPlanFingerprint
+                                    ),
+                                )
+                                GlobalPlanningAttemptRecorded = True
+                                CurrentAssembly = (
+                                    SelectFreshOrRetainedAssembly()
+                                )
+                                continue
+                            raise RoutingStageError(
+                                ClassifiedFailure
+                            ) from GlobalPlanningError
+                        finally:
+                            if not GlobalPlanningAttemptRecorded:
+                                RecordPhysicalComponentStageTiming(
+                                    "AuthoritativeGlobalReserve",
+                                    GlobalPlanningAttemptStartedAt,
+                                    Result=GlobalPlanningAttemptResult,
+                                    PlanFingerprint=(
+                                        GlobalPlanningAttemptPlanFingerprint
+                                    ),
+                                )
+                            InterfaceResources.PreparingPhysicalComponentGlobalChannels = False
+                            InterfaceResources.PhysicalComponentExactGlobalChannelSignals = frozenset()
+                        # Binding replaces guide metadata with the exact
+                        # reserved corridor contract. Every later stage must
+                        # see this bound problem/plan, never the pre-reserve
+                        # assembly.
+                        InterfaceResources.PreparedPhysicalComponentAssembly = (
+                            BoundAssembly
+                        )
+                        InterfaceResources.PreparedComponentRoutingProblem = (
+                            BoundAssembly.Problem
+                        )
+                        InterfaceResources.FrozenPhysicalComponentAssemblyPlan = (
+                            BoundAssembly.Plan
+                        )
+                        (
+                            InterfaceResources
+                            .RetainedPhysicalGlobalPlanFrontier
+                            .pop(BoundAssembly.Plan.PlanFingerprint, None)
+                        )
+                        RebuildFrontierDeferrals()
+                        SuccessfulGlobalPlanWasRetained = (
+                            PreviousGlobalPlanWasRetained
+                        )
+                        return BoundAssembly, GlobalChannelDesign
+
+                PreparedAssembly, GlobalChannelDesign = (
+                    ReserveAuthoritativeGlobalChannels(
+                        PreparedAssembly
+                    )
+                )
+                PhysicalAssemblyPlan = PreparedAssembly.Plan
+                ComponentProblem = PreparedAssembly.Problem
+                StateAttemptDiagnostics.append({
+                    "Result": "authoritative-global-channels-reserved",
+                    "GlobalPlanSource": (
+                        "retained"
+                        if SuccessfulGlobalPlanWasRetained
+                        else "fresh"
+                    ),
+                    "PhysicalAssemblyPlanFingerprint": (
+                        PhysicalAssemblyPlan.PlanFingerprint
+                    ),
+                    "ExactChannelCount": len(
+                        PhysicalAssemblyPlan.Channels
+                    ),
+                    "ImplicitForeignTransitDomainCount": 0,
+                })
                 while True:
                     # A failed post-handoff feedback solve belongs to the
                     # component proof for this state, not to the preceding
@@ -13319,23 +14799,66 @@ def _PlaceAndRoutePcbWithPolicy(
                     RoutedComponentHandoffEntered = False
                     ComponentSolve = None
                     ComponentTemplate = None
-                    ActiveComponentDeadline = InterfaceDeadline
-                    ComponentSolve = CompileClosedComponent(
-                        ComponentProblem,
-                        AssemblyPlan=PhysicalAssemblyPlan,
-                        DeadlineSeconds=max(
-                            0.001,
-                            ActiveComponentDeadline.RemainingSeconds(),
-                        ),
-                        WorkCheck=lambda Diagnostics:
-                        ActiveComponentDeadline.RaiseIfExpired(
-                            "ComponentRoutingSolve",
-                            {
-                                "CandidateId": (
-                                    ComponentBaseCandidate.CandidateId
+                    ActiveComponentDeadline = SharedInterfaceDeadline
+                    ActiveComponentRemainingSeconds = (
+                        ActiveComponentDeadline.RemainingSeconds()
+                    )
+                    if ActiveComponentRemainingSeconds <= 0:
+                        raise RoutingStageError(
+                            BuildLocalComponentCompilationAdmissionFailure(
+                                InterfaceStageSchedule,
+                                RemainingSeconds=(
+                                    ActiveComponentRemainingSeconds
                                 ),
-                                **Diagnostics,
-                            },
+                            )
+                        )
+                    LocalCompilationStartedAt = monotonic()
+                    try:
+                        ComponentSolve = CompileClosedComponent(
+                            ComponentProblem,
+                            AssemblyPlan=PhysicalAssemblyPlan,
+                            DeadlineSeconds=(
+                                ActiveComponentRemainingSeconds
+                            ),
+                            WorkCheck=lambda Diagnostics:
+                            ActiveComponentDeadline.RaiseIfExpired(
+                                "ComponentRoutingSolve",
+                                {
+                                    "CandidateId": (
+                                        ComponentBaseCandidate.CandidateId
+                                    ),
+                                    **Diagnostics,
+                                },
+                            ),
+                            VariantPortfolioCache=(
+                                ComponentVariantPortfolioCache
+                            ),
+                            NetVariantConstructionCache=(
+                                ComponentNetVariantConstructionCache
+                            ),
+                            RouteClaimsConstructionCache=(
+                                ComponentRouteClaimsConstructionCache
+                            ),
+                            NetVariantDiscoveryStateCache=(
+                                ComponentNetVariantDiscoveryStateCache
+                            ),
+                        )
+                    except Exception:
+                        RecordPhysicalComponentStageTiming(
+                            "BoundLocalCompilation",
+                            LocalCompilationStartedAt,
+                            Result="failed",
+                            PlanFingerprint=(
+                                PhysicalAssemblyPlan.PlanFingerprint
+                            ),
+                        )
+                        raise
+                    RecordPhysicalComponentStageTiming(
+                        "BoundLocalCompilation",
+                        LocalCompilationStartedAt,
+                        Result=str(ComponentSolve.Status),
+                        PlanFingerprint=(
+                            PhysicalAssemblyPlan.PlanFingerprint
                         ),
                     )
                     if not ComponentSolve.Feasible:
@@ -13344,17 +14867,257 @@ def _PlaceAndRoutePcbWithPolicy(
                         )
                         if (
                             not Incomplete
+                            and InterfaceDeadline.IsExpired()
                             and not ActiveComponentDeadline.IsExpired()
                         ):
-                            RejectedPortAssignmentFingerprint = (
-                                PhysicalAssemblyPlan
-                                .PortAssignmentFingerprint
+                            raise RoutingStageError(
+                                BuildLocalComponentCompilationAdmissionFailure(
+                                    InterfaceStageSchedule,
+                                    RemainingSeconds=(
+                                        ActiveComponentDeadline
+                                        .RemainingSeconds()
+                                    ),
+                                )
                             )
-                            (
-                                InterfaceResources
-                                .RejectedPhysicalComponentPortAssignmentFingerprints
-                                .add(RejectedPortAssignmentFingerprint)
+                        if (
+                            not Incomplete
+                            and not ActiveComponentDeadline.IsExpired()
+                            and ComponentSolve.Diagnostics.get(
+                                "LocalUnsatCoreComplete",
+                                False,
                             )
+                        ):
+                            # Local factor certification is part of the
+                            # authoritative component proof, not speculative
+                            # global planning.  It may use the component stage
+                            # reserve, but an incomplete portfolio must stop
+                            # before reopening the global port/channel CSP.
+                            FeedbackProofDeadline = ActiveComponentDeadline
+                            FeedbackProofRemainingSeconds = (
+                                FeedbackProofDeadline.RemainingSeconds()
+                            )
+                            if FeedbackProofRemainingSeconds <= 0:
+                                raise RoutingStageError(
+                                    BuildLocalComponentCompilationAdmissionFailure(
+                                        InterfaceStageSchedule,
+                                        RemainingSeconds=(
+                                            ActiveComponentDeadline
+                                            .RemainingSeconds()
+                                        ),
+                                    )
+                                )
+                            RelaxedProofStartedAt = monotonic()
+                            try:
+                                RelaxedProofDiagnostics = ProveGlobalRelaxedLocalUnsatisfiability(
+                                    ComponentProblem,
+                                    DeadlineSeconds=(
+                                        FeedbackProofRemainingSeconds
+                                    ),
+                                    WorkCheck=lambda Diagnostics:
+                                    FeedbackProofDeadline.RaiseIfExpired(
+                                        "GlobalRelaxedComponentRoutingSolve",
+                                        {
+                                            "CandidateId": (
+                                                ComponentBaseCandidate
+                                                .CandidateId
+                                            ),
+                                            **Diagnostics,
+                                        },
+                                    ),
+                                    VariantPortfolioCache=(
+                                        ComponentVariantPortfolioCache
+                                    ),
+                                    NetVariantConstructionCache=(
+                                        ComponentNetVariantConstructionCache
+                                    ),
+                                    RouteClaimsConstructionCache=(
+                                        ComponentRouteClaimsConstructionCache
+                                    ),
+                                    NetVariantDiscoveryStateCache=(
+                                        ComponentNetVariantDiscoveryStateCache
+                                    ),
+                                )
+                            except Exception:
+                                RecordPhysicalComponentStageTiming(
+                                    "GlobalRelaxedLocalProof",
+                                    RelaxedProofStartedAt,
+                                    Result="failed",
+                                    PlanFingerprint=(
+                                        PhysicalAssemblyPlan.PlanFingerprint
+                                    ),
+                                )
+                                raise
+                            RecordPhysicalComponentStageTiming(
+                                "GlobalRelaxedLocalProof",
+                                RelaxedProofStartedAt,
+                                Result=str(
+                                    RelaxedProofDiagnostics.get(
+                                        "GlobalRelaxedLocalProofStatus",
+                                        "complete",
+                                    )
+                                ),
+                                PlanFingerprint=(
+                                    PhysicalAssemblyPlan.PlanFingerprint
+                                ),
+                            )
+                            ComponentSolve = replace(
+                                ComponentSolve,
+                                Diagnostics={
+                                    **ComponentSolve.Diagnostics,
+                                    **RelaxedProofDiagnostics,
+                                },
+                            )
+                            LocalNoGoodDiagnostics = (
+                                RecordPhysicalComponentLocalCompilationNoGood(
+                                    ComponentSolve,
+                                    PhysicalAssemblyPlan,
+                                    GlobalChannelDesign,
+                                    InterfaceResources,
+                                    Problem=ComponentProblem,
+                                )
+                            )
+                            PortfolioDiagnostics = None
+                            if (
+                                RelaxedProofDiagnostics.get(
+                                    "GlobalRelaxedLocalProofComplete",
+                                    False,
+                                )
+                                and RelaxedProofDiagnostics.get(
+                                    "GlobalRelaxedLocalCoreComplete",
+                                    False,
+                                )
+                                and RelaxedProofDiagnostics.get(
+                                    "GlobalRelaxedLocalUnsatCoreKind",
+                                    "",
+                                )
+                                == "complete-opposing-net-access-pair"
+                            ):
+                                PortfolioStartedAt = monotonic()
+                                try:
+                                    PortfolioDiagnostics = (
+                                        CertifyLocalInterfaceFactorPortfolio(
+                                            ComponentProblem,
+                                            PhysicalAssemblyPlan,
+                                            str(RelaxedProofDiagnostics.get(
+                                                "GlobalRelaxedLocalCurrentSignal",
+                                                "",
+                                            )),
+                                            str(RelaxedProofDiagnostics.get(
+                                                "GlobalRelaxedLocalCompleteSignal",
+                                                "",
+                                            )),
+                                            InterfaceResources,
+                                            DeadlineSeconds=(
+                                                FeedbackProofDeadline
+                                                .RemainingSeconds()
+                                            ),
+                                            WorkCheck=lambda Diagnostics:
+                                            FeedbackProofDeadline.RaiseIfExpired(
+                                                "LocalInterfaceFactorPortfolioCertification",
+                                                {
+                                                    "CandidateId": (
+                                                        ComponentBaseCandidate
+                                                        .CandidateId
+                                                    ),
+                                                    **Diagnostics,
+                                                },
+                                            ),
+                                            VariantPortfolioCache=(
+                                                ComponentVariantPortfolioCache
+                                            ),
+                                            NetVariantConstructionCache=(
+                                                ComponentNetVariantConstructionCache
+                                            ),
+                                            RouteClaimsConstructionCache=(
+                                                ComponentRouteClaimsConstructionCache
+                                            ),
+                                            NetVariantDiscoveryStateCache=(
+                                                ComponentNetVariantDiscoveryStateCache
+                                            ),
+                                        )
+                                    )
+                                finally:
+                                    RecordPhysicalComponentStageTiming(
+                                        "LocalInterfaceFactorPortfolioCertification",
+                                        PortfolioStartedAt,
+                                        Result=(
+                                            "complete"
+                                            if PortfolioDiagnostics
+                                            and PortfolioDiagnostics.get(
+                                                "Complete", False
+                                            )
+                                            else "incomplete"
+                                        ),
+                                        PlanFingerprint=(
+                                            PhysicalAssemblyPlan.PlanFingerprint
+                                        ),
+                                    )
+                                if (
+                                    PortfolioDiagnostics is not None
+                                    and not PortfolioDiagnostics.get(
+                                        "Complete", False
+                                    )
+                                    and PortfolioDiagnostics.get(
+                                        "FeasibleWitness"
+                                    ) is None
+                                ):
+                                    raise RoutingStageError(RoutingFailure(
+                                        Reason=(
+                                            RoutingFailureReason
+                                            .PhysicalComponentAssemblyIncomplete
+                                        ),
+                                        Stage=(
+                                            "LocalInterfaceFactorPortfolio"
+                                            "CertificationIncomplete"
+                                        ),
+                                        AffectedNets=tuple(sorted(filter(
+                                            None,
+                                            (
+                                                str(PortfolioDiagnostics.get(
+                                                    "CurrentSignal", ""
+                                                )),
+                                                str(PortfolioDiagnostics.get(
+                                                    "CompleteSignal", ""
+                                                )),
+                                            ),
+                                        ))),
+                                        Detail=(
+                                            "the complete local interface "
+                                            "factor domain was not certified; "
+                                            "partial proof-qualified clauses "
+                                            "were retained without reopening "
+                                            "global assembly planning"
+                                        ),
+                                        RepairActions=(),
+                                        Diagnostics={
+                                            "LocalInterfaceFactorPortfolio": (
+                                                PortfolioDiagnostics
+                                            ),
+                                            "PhysicalAssemblyPlanFingerprint": (
+                                                PhysicalAssemblyPlan
+                                                .PlanFingerprint
+                                            ),
+                                            "PartialProofStateRetained": True,
+                                            "GlobalReplanEntered": False,
+                                            "LocalTemplateReopened": False,
+                                            "BroadFallbackAllowed": False,
+                                            "ExecutableLegacyRepairCascade": (
+                                                False
+                                            ),
+                                            "ImplicitForeignTransitDomainCount": 0,
+                                        },
+                                    ))
+                                UniversalFabricFailure = (
+                                    BuildUniversalPromotedFabricPortAssignmentFailure(
+                                        PhysicalAssemblyPlan,
+                                        InterfaceResources,
+                                        PortfolioDiagnostics,
+                                    )
+                                )
+                                if UniversalFabricFailure is not None:
+                                    raise RoutingStageError(
+                                        UniversalFabricFailure
+                                    )
                             StateAttemptDiagnostics.append({
                                 "Result": (
                                     "local-unsat-reject-complete-assembly-plan"
@@ -13362,21 +15125,111 @@ def _PlaceAndRoutePcbWithPolicy(
                                 "PhysicalAssemblyPlanFingerprint": (
                                     PhysicalAssemblyPlan.PlanFingerprint
                                 ),
-                                "RejectedPortAssignmentFingerprint": (
-                                    RejectedPortAssignmentFingerprint
-                                ),
                                 "LocalSolveDetail": ComponentSolve.Detail,
                                 "LocalTemplateReopened": False,
-                                "PerSignalReservationFeedbackUsed": False,
+                                "PerSignalReservationFeedbackUsed": bool(
+                                    LocalNoGoodDiagnostics.get(
+                                        "NoGoodReservationKeys"
+                                    )
+                                ),
+                                **LocalNoGoodDiagnostics,
+                                "LocalInterfaceFactorPortfolio": (
+                                    PortfolioDiagnostics
+                                ),
                                 "ImplicitForeignTransitDomainCount": 0,
                             })
-                            PreparedAssembly = (
-                                ReplanPhysicalComponentAssembly(
-                                    ComponentBasePlacement,
-                                    Resources=InterfaceResources,
-                                    Deadline=InterfaceDeadline,
+                            try:
+                                PreparedAssembly = (
+                                    ReplanPhysicalAssemblyWithTiming(
+                                        SelectPhysicalAssemblyGlobalBoundaryPorts(
+                                            PhysicalAssemblyPlan
+                                        )
+                                    )
                                 )
-                            )
+                            except RoutingStageError as Error:
+                                if Error.Failure.Reason not in {
+                                    RoutingFailureReason
+                                    .ComponentPortAssignmentUnsatisfiable,
+                                    RoutingFailureReason
+                                    .ComponentLocalCompilationUnsatisfiable,
+                                }:
+                                    raise
+                                StateAttemptDiagnostics.append({
+                                    "Result": (
+                                        "fixed-global-boundary-local-support-"
+                                        "exhausted"
+                                    ),
+                                    "PhysicalAssemblyPlanFingerprint": (
+                                        PhysicalAssemblyPlan.PlanFingerprint
+                                    ),
+                                    "UnderlyingFailure": (
+                                        Error.Failure.ToDictionary()
+                                    ),
+                                    "AdvanceWithinRetainedPlacement": True,
+                                    "ImplicitForeignTransitDomainCount": 0,
+                                })
+                                PreparedAssembly = (
+                                    ReplanPhysicalAssemblyWithTiming()
+                                )
+                            if PhysicalAssemblyGlobalRouteCanBeRebound(
+                                PhysicalAssemblyPlan,
+                                PreparedAssembly.Plan,
+                            ):
+                                GlobalRebindStartedAt = monotonic()
+                                PreparedAssembly = (
+                                    BindPhysicalComponentAssemblyGlobalChannels(
+                                        PreparedAssembly,
+                                        GlobalChannelDesign,
+                                        InterfaceResources.ResourceGraph,
+                                    )
+                                )
+                                PreparedAssembly = (
+                                    BindPhysicalComponentAssemblyLocalPortSupports(
+                                        PreparedAssembly,
+                                    )
+                                )
+                                RecordPhysicalComponentStageTiming(
+                                    "AuthoritativeGlobalReserve",
+                                    GlobalRebindStartedAt,
+                                    Result=(
+                                        "rebound-identical-global-contract"
+                                    ),
+                                    PlanFingerprint=(
+                                        PreparedAssembly.Plan.PlanFingerprint
+                                    ),
+                                )
+                                StateAttemptDiagnostics.append({
+                                    "Result": (
+                                        "authoritative-global-contract-rebound"
+                                    ),
+                                    "PhysicalAssemblyPlanFingerprint": (
+                                        PreparedAssembly.Plan.PlanFingerprint
+                                    ),
+                                    "PreviousPhysicalAssemblyPlanFingerprint": (
+                                        PhysicalAssemblyPlan.PlanFingerprint
+                                    ),
+                                    "LocalTemplateReopened": False,
+                                    "ImplicitForeignTransitDomainCount": 0,
+                                })
+                                (
+                                    InterfaceResources
+                                    .PreparedPhysicalComponentAssembly
+                                ) = PreparedAssembly
+                                (
+                                    InterfaceResources
+                                    .PreparedComponentRoutingProblem
+                                ) = PreparedAssembly.Problem
+                                (
+                                    InterfaceResources
+                                    .FrozenPhysicalComponentAssemblyPlan
+                                ) = PreparedAssembly.Plan
+                            else:
+                                (
+                                    PreparedAssembly,
+                                    GlobalChannelDesign,
+                                ) = ReserveAuthoritativeGlobalChannels(
+                                    PreparedAssembly
+                                )
                             PhysicalAssemblyPlan = PreparedAssembly.Plan
                             ComponentProblem = PreparedAssembly.Problem
                             continue
@@ -13454,6 +15307,28 @@ def _PlaceAndRoutePcbWithPolicy(
                     InterfaceResources.FrozenPhysicalComponentAssemblyPlan = (
                         PhysicalAssemblyPlan
                     )
+                    if (
+                        GlobalChannelDesign is not None
+                        and GlobalChannelDesign.RoutingAssignment is not None
+                    ):
+                        SelectedGlobalCandidates = (
+                            GlobalChannelDesign
+                            .RoutingAssignment
+                            .SelectedCandidates
+                        )
+                        InterfaceResources.FrozenInterfaceGlobalCandidateCache = {
+                            Signal: (Candidate,)
+                            for Signal, Candidate in (
+                                SelectedGlobalCandidates.items()
+                            )
+                        }
+                        InterfaceResources.FrozenInterfaceGlobalCandidateMetadata = {
+                            Signal: {}
+                            for Signal in SelectedGlobalCandidates
+                        }
+                        InterfaceResources.FrozenInterfaceGlobalCandidatePlacementIdentity = id(
+                            RoutedComponentPlaced
+                        )
                     HandoffDiagnostics = (
                         ComponentAssembly.HandoffDiagnostics
                     )
@@ -13568,11 +15443,13 @@ def _PlaceAndRoutePcbWithPolicy(
                                 None
                             )
                             PreparedAssembly = (
-                                ReplanPhysicalComponentAssembly(
-                                    ComponentBasePlacement,
-                                    Resources=InterfaceResources,
-                                    Deadline=InterfaceDeadline,
-                                )
+                                ReplanPhysicalAssemblyWithTiming()
+                            )
+                            (
+                                PreparedAssembly,
+                                GlobalChannelDesign,
+                            ) = ReserveAuthoritativeGlobalChannels(
+                                PreparedAssembly
                             )
                             PhysicalAssemblyPlan = PreparedAssembly.Plan
                             ComponentProblem = PreparedAssembly.Problem
@@ -13708,6 +15585,9 @@ def _PlaceAndRoutePcbWithPolicy(
                             .ExportedPortFingerprint
                         ),
                     },
+                    "PhysicalComponentStageTimings": list(
+                        PhysicalComponentStageTimings
+                    ),
                 })
                 CapturePortableRawPortalGeometryCaches(
                     InterfaceResources
@@ -13715,654 +15595,7 @@ def _PlaceAndRoutePcbWithPolicy(
                 # A routed component is a complete physical state, so the
                 # first feasible ranked state deterministically ends the
                 # shared component-stage search.
-                break
-                while True:
-                    try:
-                        Assignment = PrepareClusterInterfaceAssignment(
-                            MaterializedInterfacePlacement,
-                            Resources=InterfaceResources,
-                            Policy=InterfacePolicy,
-                            Deadline=InterfaceDeadline,
-                            RealizabilityNogoods=tuple(
-                                StateRealizabilityNogoods
-                            ),
-                            StateFingerprint=(
-                                InterfaceCandidate
-                                .PlacementFingerprint
-                            ),
-                            LocalRouteFingerprint=(
-                                LocalRouteFingerprint
-                            ),
-                            ForbiddenAssignmentFingerprints=(
-                                frozenset(
-                                    StateAssignmentFingerprints
-                                )
-                            ),
-                            FrozenPatternFingerprints=(
-                                StateFrozenPatternFingerprints
-                            ),
-                            FrozenReservations=(
-                                StateFrozenReservations
-                            ),
-                            RequireCompleteDomain=True,
-                        )
-                        if (
-                            Assignment.AssignmentFingerprint
-                            in StateAssignmentFingerprints
-                        ):
-                            raise RoutingStageError(RoutingFailure(
-                                Reason=(
-                                    RoutingFailureReason
-                                    .ClusterInterfaceUnsatisfiable
-                                ),
-                                Stage=(
-                                    "ClusterInterfaceUnsatisfiable"
-                                ),
-                                Detail=(
-                                    "the exact interface re-solve "
-                                    "repeated a complete assignment"
-                                ),
-                                Diagnostics={
-                                    "RepeatedAssignmentFingerprint": (
-                                        Assignment
-                                        .AssignmentFingerprint
-                                    ),
-                                    "RouteTreeRealizabilityAttempted": (
-                                        False
-                                    ),
-                                },
-                            ))
-                        StateAssignmentFingerprints.extend(
-                            Fingerprint
-                            for Fingerprint in (
-                                Assignment.AssignmentFingerprint,
-                                Assignment
-                                .OwnershipAssignmentFingerprint,
-                            )
-                            if (
-                                Fingerprint
-                                and Fingerprint
-                                not in StateAssignmentFingerprints
-                            )
-                        )
-                        try:
-                            ForeignAccessDiagnostics = (
-                                ValidateClusterInterfaceForeignAccess(
-                                    MaterializedInterfacePlacement,
-                                    Resources=InterfaceResources,
-                                    Assignment=Assignment,
-                                    Policy=InterfacePolicy,
-                                    Deadline=InterfaceDeadline,
-                                )
-                            )
-                        except RoutingStageError as AccessError:
-                            if (
-                                AccessError.Failure.Stage
-                                != "ClusterInterfaceForeignAccessStarved"
-                            ):
-                                raise
-                            AccessDiagnostics = dict(
-                                AccessError.Failure.Diagnostics or {}
-                            )
-                            ForeignAccessValidation = dict(
-                                AccessDiagnostics.get(
-                                    "ForeignAccessValidation",
-                                    {},
-                                )
-                            )
-                            BlockingPatterns = {
-                                (str(Signal), str(Fingerprint))
-                                for EmptyDomain in (
-                                    ForeignAccessValidation.get(
-                                        "EmptyTerminalDomains",
-                                        (),
-                                    )
-                                )
-                                if isinstance(EmptyDomain, dict)
-                                for Signal, Fingerprint in dict(
-                                    EmptyDomain.get(
-                                        "BlockingInterfacePatternFingerprints",
-                                        {},
-                                    )
-                                ).items()
-                                if Fingerprint
-                            }
-                            StateAttemptDiagnostics.append({
-                                "Result": "foreign-access-no-good",
-                                "Failure": {
-                                    "Reason": (
-                                        AccessError
-                                        .Failure.Reason.value
-                                    ),
-                                    "Stage": (
-                                        AccessError.Failure.Stage
-                                    ),
-                                    "AffectedNets": list(
-                                        AccessError
-                                        .Failure.AffectedNets
-                                    ),
-                                    "Detail": (
-                                        AccessError.Failure.Detail
-                                    ),
-                                },
-                                "RejectedAssignmentFingerprint": (
-                                    Assignment
-                                    .AssignmentFingerprint
-                                ),
-                                "ForeignAccessValidation": (
-                                    ForeignAccessValidation
-                                ),
-                                "RouteTreeRealizabilityAttempted": False,
-                            })
-                            if not BlockingPatterns:
-                                raise RoutingStageError(replace(
-                                    AccessError.Failure,
-                                    Reason=(
-                                        RoutingFailureReason
-                                        .ClusterInterfaceSolveIncomplete
-                                    ),
-                                    Stage=(
-                                        "ClusterInterfaceSolveIncomplete"
-                                    ),
-                                    Detail=(
-                                        "foreign terminal starvation did "
-                                        "not identify an exact blocking "
-                                        "component access assignment"
-                                    ),
-                                    Diagnostics={
-                                        **AccessDiagnostics,
-                                        "BlockingInterfacePatterns": [
-                                            list(Value)
-                                            for Value in sorted(
-                                                BlockingPatterns
-                                            )
-                                        ],
-                                    },
-                                )) from AccessError
-                            continue
-                        StateAttemptDiagnostics.append({
-                            "Result": "foreign-access-validated",
-                            "AssignmentFingerprint": (
-                                Assignment.AssignmentFingerprint
-                            ),
-                            **ForeignAccessDiagnostics,
-                        })
-                        ValidatedForeignAccess = dict(
-                            ForeignAccessDiagnostics.get(
-                                "ForeignAccessValidation",
-                                {},
-                            )
-                        )
-                        InterfaceResources.FrozenClusterInterfaceAssignment = (
-                            Assignment
-                        )
-                        try:
-                            PreRoutedDesign = RoutePcbDesign(
-                                MaterializedInterfacePlacement,
-                                Policy=InterfacePolicy,
-                                Deadline=InterfaceDeadline,
-                                Resources=InterfaceResources,
-                            )
-                        except RoutingStageError as GlobalError:
-                            GlobalDiagnostics = dict(
-                                GlobalError.Failure.Diagnostics or {}
-                            )
-                            ConflictGraph = dict(
-                                GlobalDiagnostics.get(
-                                    "ConflictGraph",
-                                    {},
-                                )
-                            )
-                            ComponentSignals = frozenset(
-                                str(Signal)
-                                for Signal in getattr(
-                                    Channel,
-                                    "AffectedSignals",
-                                    (),
-                                )
-                            )
-                            CrossingComponentSignals = {
-                                str(First)
-                                for Edge in ConflictGraph.get(
-                                    "PairwiseIncompatibleEdges",
-                                    (),
-                                )
-                                if (
-                                    isinstance(Edge, list | tuple)
-                                    and len(Edge) == 2
-                                )
-                                for First, Second in (Edge,)
-                                if (
-                                    (str(First) in ComponentSignals)
-                                    != (str(Second) in ComponentSignals)
-                                )
-                                and str(First) in ComponentSignals
-                            } | {
-                                str(Second)
-                                for Edge in ConflictGraph.get(
-                                    "PairwiseIncompatibleEdges",
-                                    (),
-                                )
-                                if (
-                                    isinstance(Edge, list | tuple)
-                                    and len(Edge) == 2
-                                )
-                                for First, Second in (Edge,)
-                                if (
-                                    (str(First) in ComponentSignals)
-                                    != (str(Second) in ComponentSignals)
-                                )
-                                and str(Second) in ComponentSignals
-                            }
-                            PatternFingerprints = dict(
-                                ValidatedForeignAccess.get(
-                                    "InterfacePatternFingerprints",
-                                    {},
-                                )
-                            )
-                            if (
-                                not CrossingComponentSignals
-                                and GlobalError.Failure.Stage
-                                == "ClusterBoundaryLease"
-                            ):
-                                CrossingComponentSignals = {
-                                    str(Signal)
-                                    for Signal
-                                    in GlobalError.Failure.AffectedNets
-                                    if str(Signal) in ComponentSignals
-                                }
-                            RepairableSignals = tuple(sorted(
-                                Signal
-                                for Signal in CrossingComponentSignals
-                                if PatternFingerprints.get(Signal)
-                            ))
-                            StateAttemptDiagnostics.append({
-                                "Result": (
-                                    "ordinary-global-interface-no-good"
-                                    if RepairableSignals
-                                    else "ordinary-global-terminal"
-                                ),
-                                "Failure": {
-                                    "Reason": (
-                                        GlobalError.Failure.Reason.value
-                                    ),
-                                    "Stage": GlobalError.Failure.Stage,
-                                    "AffectedNets": list(
-                                        GlobalError
-                                        .Failure.AffectedNets
-                                    ),
-                                    "Detail": (
-                                        GlobalError.Failure.Detail
-                                    ),
-                                },
-                                "CrossingComponentSignals": list(
-                                    RepairableSignals
-                                ),
-                                "RouteTreeRealizabilityAttempted": True,
-                            })
-                            if (
-                                not RepairableSignals
-                                or InterfaceDeadline.IsExpired()
-                            ):
-                                raise
-                            continue
-                        PreRoutedClusterInterfaceDesignsByPlacementFingerprint[
-                            InterfaceCandidate.PlacementFingerprint
-                        ] = PreRoutedDesign
-                        break
-                    except RoutingStageError as StateError:
-                        StateDiagnostics = dict(
-                            StateError.Failure.Diagnostics or {}
-                        )
-                        RejectedAssignment = StateDiagnostics.get(
-                            "RejectedInterfaceAssignment"
-                        )
-                        RequiresNogood = bool(
-                            StateDiagnostics.get(
-                                "ExactInterfaceRealizabilityNogoodRequired",
-                                False,
-                            )
-                        )
-                        PatternFingerprint = str(
-                            StateDiagnostics.get(
-                                "CurrentLeasePatternFingerprint",
-                                "",
-                            )
-                        )
-                        SelectedPatternFingerprints = dict(
-                            StateDiagnostics.get(
-                                "SelectedClusterInterfacePatternFingerprints",
-                                {},
-                            )
-                        )
-                        FailureSignal = (
-                            StateError.Failure.AffectedNets[0]
-                            if StateError.Failure.AffectedNets
-                            else ""
-                        )
-                        SignalPatternFingerprint = str(
-                            SelectedPatternFingerprints.get(
-                                FailureSignal,
-                                PatternFingerprint,
-                            )
-                            or PatternFingerprint
-                        )
-                        FailureFingerprint = str(
-                            StateDiagnostics.get(
-                                "CandidateFailureFingerprint",
-                                "",
-                            )
-                        )
-                        RejectedFingerprint = (
-                            str(
-                                RejectedAssignment.get(
-                                    "AssignmentFingerprint",
-                                    "",
-                                )
-                            )
-                            if isinstance(
-                                RejectedAssignment,
-                                dict,
-                            )
-                            else ""
-                        )
-                        RejectedProblem = (
-                            RejectedAssignment.get("Problem", {})
-                            if isinstance(
-                                RejectedAssignment,
-                                dict,
-                            )
-                            else {}
-                        )
-                        ComponentFingerprint = str(
-                            RejectedProblem.get(
-                                "ComponentFingerprint",
-                                "",
-                            )
-                        )
-                        DomainFingerprint = str(
-                            StateDiagnostics.get(
-                                "AuthoritativeAccessDomainFingerprint",
-                                ComponentFingerprint,
-                            )
-                            or ComponentFingerprint
-                        )
-                        CanAddNogood = bool(
-                            RequiresNogood
-                            and SignalPatternFingerprint
-                            and FailureFingerprint
-                            and RejectedFingerprint
-                            and RejectedFingerprint
-                            not in StateAssignmentFingerprints
-                            and not InterfaceDeadline.IsExpired()
-                        )
-                        StateAttemptDiagnostics.append({
-                            "Result": (
-                                "realizability-no-good"
-                                if CanAddNogood
-                                else "terminal"
-                            ),
-                            "Failure": {
-                                "Reason": (
-                                    StateError.Failure.Reason.value
-                                ),
-                                "Stage": StateError.Failure.Stage,
-                                "AffectedNets": list(
-                                    StateError.Failure.AffectedNets
-                                ),
-                                "Detail": StateError.Failure.Detail,
-                                "CurrentLeasePatternFingerprint": (
-                                    PatternFingerprint
-                                ),
-                                "RejectedSignalPatternFingerprint": (
-                                    SignalPatternFingerprint
-                                ),
-                                "CandidateFailureFingerprint": (
-                                    FailureFingerprint
-                                ),
-                            },
-                            "RejectedAssignmentFingerprint": (
-                                RejectedFingerprint
-                            ),
-                            "RouteTreeRealizabilityAttempted": bool(
-                                StateDiagnostics.get(
-                                    "RouteTreeRealizabilityAttempted",
-                                    True,
-                                )
-                            ),
-                        })
-                        if not CanAddNogood:
-                            raise
-                        PatternSearch = StateDiagnostics.get(
-                            "ClusterInterfacePatternSearch",
-                            {},
-                        )
-                        ConflictEdges = (
-                            PatternSearch.get("ConflictEdges", ())
-                            if isinstance(PatternSearch, dict)
-                            else ()
-                        )
-                        StateActiveComponentSignals.add(
-                            FailureSignal
-                        )
-                        ComponentChanged = True
-                        while ComponentChanged:
-                            ComponentChanged = False
-                            for Edge in ConflictEdges:
-                                if (
-                                    not isinstance(Edge, list | tuple)
-                                    or len(Edge) != 2
-                                ):
-                                    continue
-                                FirstSignal, SecondSignal = map(
-                                    str,
-                                    Edge,
-                                )
-                                if (
-                                    FirstSignal
-                                    in StateActiveComponentSignals
-                                    and SecondSignal
-                                    not in StateActiveComponentSignals
-                                ):
-                                    StateActiveComponentSignals.add(
-                                        SecondSignal
-                                    )
-                                    ComponentChanged = True
-                                elif (
-                                    SecondSignal
-                                    in StateActiveComponentSignals
-                                    and FirstSignal
-                                    not in StateActiveComponentSignals
-                                ):
-                                    StateActiveComponentSignals.add(
-                                        FirstSignal
-                                    )
-                                    ComponentChanged = True
-                        StateFrozenPatternFingerprints = {
-                            str(Signal): str(Fingerprint)
-                            for Signal, Fingerprint
-                            in SelectedPatternFingerprints.items()
-                            if (
-                                str(Signal)
-                                not in StateActiveComponentSignals
-                            )
-                        }
-                        PreparedReservations = (
-                            InterfaceResources
-                            .PreparedPortalDomainCaches[-1]
-                            .Reservations
-                            if InterfaceResources
-                            .PreparedPortalDomainCaches
-                            else ()
-                        )
-                        StateFrozenReservations = tuple(
-                            Reservation
-                            for Reservation in PreparedReservations
-                            if (
-                                Reservation.Signal
-                                not in StateActiveComponentSignals
-                            )
-                        )
-                        ComponentFingerprint = (
-                            BuildStableFingerprint(tuple(sorted(
-                                SelectedPatternFingerprints.get(
-                                    Signal,
-                                    "",
-                                )
-                                for Signal
-                                in StateActiveComponentSignals
-                            )))
-                            if SelectedPatternFingerprints
-                            else ComponentFingerprint
-                        )
-                        StateAssignmentFingerprints.append(
-                            RejectedFingerprint
-                        )
-                        StateRealizabilityNogoods.append(
-                            ClusterInterfaceRealizabilityNogood(
-                                PlacementStateFingerprint=(
-                                    InterfaceCandidate
-                                    .PlacementFingerprint
-                                ),
-                                ComponentFingerprint=(
-                                    ComponentFingerprint
-                                ),
-                                Signal=(
-                                    FailureSignal
-                                ),
-                                TerminalPatternFingerprint=(
-                                    SignalPatternFingerprint
-                                ),
-                                CandidateDomainFingerprint=(
-                                    DomainFingerprint
-                                ),
-                                RouteFailureFingerprint=(
-                                    FailureFingerprint
-                                ),
-                                RejectedAssignmentFingerprint=(
-                                    RejectedFingerprint
-                                ),
-                            )
-                        )
-                CapturePortableRawPortalGeometryCaches(
-                    InterfaceResources
-                )
-                PlacementState = (
-                    InterfacePlacementStatesByFingerprint[
-                        InterfaceCandidate.PlacementFingerprint
-                    ]
-                )
-                Assignment = replace(
-                    Assignment,
-                    Problem=replace(
-                        Assignment.Problem,
-                        PlacementVariantFingerprint=(
-                            InterfaceCandidate.PlacementFingerprint
-                        ),
-                        PlacementStates=(PlacementState,),
-                        PolicyFingerprint=BuildStableFingerprint(
-                            InterfacePolicy.ToDictionary()
-                        ),
-                        LocalRouteFingerprint=LocalRouteFingerprint,
-                        ChannelFingerprint=ChannelFingerprint,
-                        InterClusterChannel=Channel,
-                    ),
-                )
-                Objective = (
-                    0,
-                    ChangedClusterCount,
-                    sum(
-                        DomainSize == 1
-                        for DomainSize
-                        in Assignment.Problem.TerminalDomainSizes
-                    ),
-                    (
-                        Demand.PeakBoundaryDemand
-                        if Demand is not None
-                        else 0
-                    ),
-                    (
-                        Demand.AccessCandidateScarcity
-                        if Demand is not None
-                        else 0
-                    ),
-                    (
-                        len(Channel.InsertedBoundaryStrips)
-                        if Channel is not None
-                        else 0
-                    ),
-                    (
-                        Demand.GateFootprint
-                        if Demand is not None
-                        else 0
-                    ),
-                    Demand.Hpwl if Demand is not None else 0,
-                    Assignment.AssignmentFingerprint,
-                )
-                Assignment = replace(
-                    Assignment,
-                    Objective=Objective,
-                )
-                InterfaceResources.FrozenClusterInterfaceAssignment = (
-                    Assignment
-                )
-                FrozenClusterInterfaceAssignmentsByPlacementFingerprint[
-                    InterfaceCandidate.PlacementFingerprint
-                ] = Assignment
-                FrozenPreparedPortalDomainCachesByPlacementFingerprint[
-                    InterfaceCandidate.PlacementFingerprint
-                ] = InterfaceResources.FrozenPreparedPortalDomainCache
-                InterfaceFeasibleCandidates.append((
-                    Objective,
-                    InterfaceCandidate,
-                    Assignment,
-                ))
-                InterfaceStateProofs.append(
-                    ClusterInterfaceStateProof(
-                        PlacementStateFingerprint=(
-                            InterfaceCandidate.PlacementFingerprint
-                        ),
-                        Status="feasible",
-                        ChannelFingerprint=ChannelFingerprint,
-                        TransformFingerprint=TransformFingerprint,
-                        AssignmentFingerprints=tuple(
-                            StateAssignmentFingerprints
-                        ),
-                        RealizabilityNogoods=tuple(
-                            StateRealizabilityNogoods
-                        ),
-                        DomainFingerprint=(
-                            Assignment.Problem.ComponentFingerprint
-                        ),
-                        DomainComplete=(
-                            Assignment.Problem.DomainComplete
-                        ),
-                        OwnershipComplete=True,
-                        RealizabilityComplete=True,
-                        Exhaustive=False,
-                    )
-                )
-                InterfaceAttemptDiagnostics.append({
-                    "CandidateId": InterfaceCandidate.CandidateId,
-                    "PlacementFingerprint": (
-                        InterfaceCandidate.PlacementFingerprint
-                    ),
-                    "Result": "feasible",
-                    "Objective": list(Objective),
-                    "Transforms": Transforms,
-                    "InterfaceAssignment": Assignment.ToDictionary(),
-                    "RealizabilityAttempts": (
-                        StateAttemptDiagnostics
-                    ),
-                    "RealizabilityNogoods": [
-                        Nogood.ToDictionary()
-                        for Nogood in StateRealizabilityNogoods
-                    ],
-                })
-                # The shared component-stage budget is sequential, not a
-                # best-of-six tournament.  The first complete feasible state
-                # is deterministic under the ranked state order and must hand
-                # its reserved global-routing time back immediately.
+                InterfaceSolveIncompleteError = None
                 break
             except RoutingStageError as Error:
                 CaptureResources = RoutingResourcesByFingerprint.get(
@@ -14454,6 +15687,9 @@ def _PlaceAndRoutePcbWithPolicy(
                         "ComponentCutEpochAttempts": (
                             StateAttemptDiagnostics
                         ),
+                        "PhysicalComponentStageTimings": list(
+                            PhysicalComponentStageTimings
+                        ),
                     })
                     continue
                 FailureDiagnostics = dict(
@@ -14506,15 +15742,11 @@ def _PlaceAndRoutePcbWithPolicy(
                     and FailureDiagnostics.get("Complete", False)
                     and not FailureDiagnostics.get("Feasible", True)
                 )
-                CompletePhysicalAssemblyUnsat = bool(
-                    Error.Failure.Reason
-                    in {
-                        RoutingFailureReason
-                        .ComponentPortAssignmentUnsatisfiable,
-                        RoutingFailureReason
-                        .ComponentChannelCapacityUnsatisfiable,
-                    }
-                    and not InterfaceDeadline.IsExpired()
+                CompletePhysicalAssemblyUnsat = (
+                    IsCompletePhysicalAssemblyUnsatisfiable(
+                        Error.Failure.Reason,
+                        FailureDiagnostics,
+                    )
                 )
                 DomainComplete = bool(
                     RejectedProblem.get("DomainComplete", False)
@@ -14540,22 +15772,16 @@ def _PlaceAndRoutePcbWithPolicy(
                             False,
                         )
                     )
-                StateIncomplete = bool(
-                    Error.Failure.Reason
-                    in {
-                        RoutingFailureReason
-                        .ClusterInterfaceSolveIncomplete,
-                        RoutingFailureReason
-                        .PhysicalComponentAssemblyIncomplete,
-                        RoutingFailureReason.RuntimeBudgetExceeded,
-                    }
-                    or InterfaceDeadline.IsExpired()
+                StateIncomplete = IsClusterInterfaceStateIncomplete(
+                    FailureReason=Error.Failure.Reason,
+                    InterfaceDeadlineExpired=(
+                        InterfaceDeadline.IsExpired()
+                    ),
+                    ComponentSolveStatus=ComponentSolveStatus,
+                    ExplicitCompleteUnsatProof=(
+                        CompletePhysicalAssemblyUnsat
+                    ),
                 )
-                if ComponentSolveStatus:
-                    StateIncomplete = (
-                        ComponentSolveStatus == "incomplete"
-                        or InterfaceDeadline.IsExpired()
-                    )
                 OwnershipCoreFingerprint = str(
                     FailureDiagnostics.get(
                         "AuthoritativeCutAccessDomainFingerprint",
@@ -14764,6 +15990,9 @@ def _PlaceAndRoutePcbWithPolicy(
                     "RealizabilityAttempts": (
                         StateAttemptDiagnostics
                     ),
+                    "PhysicalComponentStageTimings": list(
+                        PhysicalComponentStageTimings
+                    ),
                     "RealizabilityNogoods": [
                         Nogood.ToDictionary()
                         for Nogood in StateRealizabilityNogoods
@@ -14803,18 +16032,24 @@ def _PlaceAndRoutePcbWithPolicy(
                         or CompleteEmptyPortSignals
                         or tuple(map(str, Error.Failure.AffectedNets))
                     )
-                    if (
-                        ComponentAccessCoreSignals
-                        and Error.Failure.Reason
-                        != RoutingFailureReason
-                        .ComponentChannelCapacityUnsatisfiable
-                        and not InterfaceDeadline.IsExpired()
-                    ):
+                    if ComponentAccessCoreSignals:
+                        # Complete global channel cuts are placement evidence
+                        # too.  Feed their affected signals into the retained
+                        # placement ordering instead of spending the next
+                        # state on an equivalent geometry with the same
+                        # mandatory-access conflict.  This changes only the
+                        # global placement frontier; it does not reopen a
+                        # port plan or invoke the legacy signal retry cascade.
                         ActiveComponentCutSignals.update(
                             ComponentAccessCoreSignals
                         )
                         ReorderRemainingPlacementsForAccessCore(
                             RetainedPlacementFingerprint
+                        )
+                        EnqueueProofGuidedPhysicalPlacement(
+                            Error.Failure,
+                            RetainedBaseInterfaceCandidate,
+                            ComponentVariantForState,
                         )
                         InterfaceAttemptDiagnostics.append({
                             "CandidateId": (
@@ -14886,6 +16121,11 @@ def _PlaceAndRoutePcbWithPolicy(
                             },
                         )
                     )
+                    # An incomplete physical-global domain is not evidence
+                    # against this placement.  Only a complete unsat proof
+                    # may advance the retained-placement scheduler; otherwise
+                    # continuing would silently turn the placement queue into
+                    # another speculative retry portfolio.
                     break
         LatestInterfaceProofByPlacement: dict[
             str, ClusterInterfaceStateProof

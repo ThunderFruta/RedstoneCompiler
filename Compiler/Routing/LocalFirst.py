@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from collections import Counter
 from math import ceil
 from typing import Any, Callable
@@ -14,6 +14,7 @@ from .ChannelPlanner import (
     CandidateLanes,
 )
 from .Policy import GlobalRoutingPolicy, PhysicalDesignPolicy
+from .Reliability import BuildStableFingerprint
 from .Technology import RedstoneRoutingTechnology
 
 Position2 = tuple[int, int]
@@ -237,6 +238,11 @@ class CoarseGuidePlan:
     Overflow: dict[tuple[int, int, int], int]
     LocalSignals: frozenset[str]
     Iterations: tuple[GuidePlanningIteration, ...]
+    LocalInputFingerprintsBySignal: dict[str, str] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
     @property
     def OverflowPeak(self) -> int:
@@ -256,6 +262,44 @@ class CoarseGuidePlan:
             "LocalSignals": sorted(self.LocalSignals),
             "Iterations": [asdict(Value) for Value in self.Iterations],
         }
+
+
+CapacityAwareGuideOption = tuple[
+    int,
+    int,
+    int,
+    int,
+    str,
+    int,
+    frozenset[Position2],
+]
+
+
+@dataclass(frozen=True)
+class CapacityAwareGuideOptionDomain:
+    """Deterministic signal-local choices before shared capacity assignment."""
+
+    Signal: str
+    LocalInputFingerprint: str
+    Options: tuple[CapacityAwareGuideOption, ...]
+
+    @property
+    def OptionFingerprints(self) -> tuple[str, ...]:
+        return tuple(
+            BuildStableFingerprint((
+                "capacity-aware-guide-option-v1",
+                self.LocalInputFingerprint,
+                Escape,
+                Length,
+                Layer,
+                AxisBias,
+                Axis,
+                Lane,
+                tuple(sorted(Guide)),
+            ))
+            for Escape, Length, Layer, AxisBias, Axis, Lane, Guide
+            in self.Options
+        )
 
 
 @dataclass(frozen=True)
@@ -516,9 +560,11 @@ def _BuildRectilinearGuide(
     Terminals: tuple[Position2, ...],
     Axis: str,
     Lane: int,
+    ObstacleBounds: tuple[int, int, int, int] | None = None,
+    ObstacleCells: frozenset[Position2] = frozenset(),
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> frozenset[Position2]:
-    def AddSegment(Start: Position2, End: Position2) -> None:
+    def AddRawSegment(Start: Position2, End: Position2) -> None:
         if Start[0] != End[0] and Start[1] != End[1]:
             raise ValueError("Channel segments must be axis aligned")
         DeltaX = 0 if Start[0] == End[0] else (1 if End[0] > Start[0] else -1)
@@ -538,6 +584,71 @@ def _BuildRectilinearGuide(
                     "ProcessedSegmentPositions": SegmentPositions,
                     "GuidePositionCount": len(Guide),
                 })
+
+    def AddSegment(Start: Position2, End: Position2) -> None:
+        EffectiveObstacleBounds = ObstacleBounds
+        if ObstacleCells:
+            SegmentObstacleCells = tuple(
+                Position
+                for Position in ObstacleCells
+                if (
+                    Start[0] == End[0] == Position[0]
+                    and min(Start[1], End[1])
+                    <= Position[1]
+                    <= max(Start[1], End[1])
+                )
+                or (
+                    Start[1] == End[1] == Position[1]
+                    and min(Start[0], End[0])
+                    <= Position[0]
+                    <= max(Start[0], End[0])
+                )
+            )
+            EffectiveObstacleBounds = (
+                (
+                    min(Value[0] for Value in ObstacleCells),
+                    max(Value[0] for Value in ObstacleCells),
+                    min(Value[1] for Value in ObstacleCells),
+                    max(Value[1] for Value in ObstacleCells),
+                )
+                if SegmentObstacleCells
+                else None
+            )
+        if EffectiveObstacleBounds is None:
+            AddRawSegment(Start, End)
+            return
+        MinimumX, MaximumX, MinimumZ, MaximumZ = (
+            EffectiveObstacleBounds
+        )
+        if (
+            Start[1] == End[1]
+            and MinimumZ <= Start[1] <= MaximumZ
+            and min(Start[0], End[0]) <= MaximumX
+            and max(Start[0], End[0]) >= MinimumX
+        ):
+            DetourZ = min(
+                (MinimumZ - 1, MaximumZ + 1),
+                key=lambda Value: (abs(Value - Start[1]), Value),
+            )
+            AddRawSegment(Start, (Start[0], DetourZ))
+            AddRawSegment((Start[0], DetourZ), (End[0], DetourZ))
+            AddRawSegment((End[0], DetourZ), End)
+            return
+        if (
+            Start[0] == End[0]
+            and MinimumX <= Start[0] <= MaximumX
+            and min(Start[1], End[1]) <= MaximumZ
+            and max(Start[1], End[1]) >= MinimumZ
+        ):
+            DetourX = min(
+                (MinimumX - 1, MaximumX + 1),
+                key=lambda Value: (abs(Value - Start[0]), Value),
+            )
+            AddRawSegment(Start, (DetourX, Start[1]))
+            AddRawSegment((DetourX, Start[1]), (DetourX, End[1]))
+            AddRawSegment((DetourX, End[1]), End)
+            return
+        AddRawSegment(Start, End)
 
     Guide: set[Position2] = set()
     if Axis == "X":
@@ -571,7 +682,7 @@ def _BuildRectilinearGuide(
     return frozenset(Guide)
 
 
-def BuildCapacityAwareGuidePlan(
+def BuildCapacityAwareGuideOptionDomains(
     Profiles: dict[str, Any],
     LayerCount: int,
     MinimumX: int,
@@ -580,25 +691,25 @@ def BuildCapacityAwareGuidePlan(
     Technology: RedstoneRoutingTechnology,
     LocalFanoutDistance: int,
     ComponentObstacleBounds: tuple[int, int, int, int] | None = None,
-    ComponentOwnedSignals: frozenset[str] = frozenset(),
-    ReservedGuideResourcesBySignal: dict[
-        str, frozenset[tuple[int, int, int]]
+    ComponentObstacleCellsByLayer: dict[
+        int, frozenset[Position2]
     ] | None = None,
-    SeedPlan: CoarseGuidePlan | None = None,
+    ComponentObstacleExemptCellsBySignal: dict[
+        str, dict[int, frozenset[Position2]]
+    ] | None = None,
+    ComponentOwnedSignals: frozenset[str] = frozenset(),
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
-) -> CoarseGuidePlan:
-    """Allocate deterministic coarse guides, then rip up overflow offenders."""
+) -> dict[str, CapacityAwareGuideOptionDomain]:
+    """Build independent deterministic guide choices for every signal."""
     if LayerCount < 1:
         raise ValueError("LayerCount must be positive")
-    ReservedGuideResourcesBySignal = dict(
-        ReservedGuideResourcesBySignal or {}
+    ComponentObstacleCellsByLayer = dict(
+        ComponentObstacleCellsByLayer or {}
     )
-    ReservedGuideResources = frozenset(
-        Resource
-        for Resources in ReservedGuideResourcesBySignal.values()
-        for Resource in Resources
+    ComponentObstacleExemptCellsBySignal = dict(
+        ComponentObstacleExemptCellsBySignal or {}
     )
-    Options: dict[str, list[tuple[int, int, int, int, str, int, frozenset[Position2]]]] = {}
+    Domains: dict[str, CapacityAwareGuideOptionDomain] = {}
     LocalSignals = frozenset(
         Signal
         for Signal, Profile in Profiles.items()
@@ -655,12 +766,6 @@ def BuildCapacityAwareGuidePlan(
                         "CompletedLanes": LaneIndex,
                         "TotalLanes": len(Lanes),
                     })
-                Guide = _BuildRectilinearGuide(
-                    Terminals,
-                    Axis,
-                    Lane,
-                    WorkCheck=WorkCheck,
-                )
                 Escape = max(
                     0,
                     abs(Lane - Center)
@@ -671,6 +776,35 @@ def BuildCapacityAwareGuidePlan(
                     ),
                 )
                 for Layer in range(LayerCount):
+                    ExactObstacleCells = (
+                        ComponentObstacleCellsByLayer.get(
+                            Layer,
+                            frozenset(),
+                        )
+                        - ComponentObstacleExemptCellsBySignal.get(
+                            Signal,
+                            {},
+                        ).get(Layer, frozenset())
+                    )
+                    Guide = _BuildRectilinearGuide(
+                        Terminals,
+                        Axis,
+                        Lane,
+                        ObstacleBounds=(
+                            ComponentObstacleBounds
+                            if (
+                                Signal not in ComponentOwnedSignals
+                                and not ComponentObstacleCellsByLayer
+                            )
+                            else None
+                        ),
+                        ObstacleCells=(
+                            ExactObstacleCells
+                            if Signal not in ComponentOwnedSignals
+                            else frozenset()
+                        ),
+                        WorkCheck=WorkCheck,
+                    )
                     Values.append(
                         (
                             Escape,
@@ -686,12 +820,98 @@ def BuildCapacityAwareGuidePlan(
             raise ValueError(
                 "bounded guide planning produced no candidates"
             )
-        Options[Signal] = sorted(Values)
+        SortedValues = tuple(sorted(Values))
+        LocalInputFingerprint = BuildStableFingerprint((
+            "capacity-aware-signal-guide-input-v1",
+            LayerCount,
+            MinimumX,
+            MinimumZ,
+            Policy.CandidateLaneCount,
+            Policy.IntraClusterEnvelope,
+            Policy.SharedBoundaryEnvelope,
+            Technology.TrackPitch,
+            tuple(sorted(Terminals)),
+            Signal in LocalSignals,
+            ComponentObstacleBounds,
+            tuple(
+                (Layer, tuple(sorted(Cells)))
+                for Layer, Cells
+                in sorted(ComponentObstacleCellsByLayer.items())
+            ),
+            tuple(
+                (Layer, tuple(sorted(Cells)))
+                for Layer, Cells in sorted(
+                    ComponentObstacleExemptCellsBySignal.get(
+                        Signal,
+                        {},
+                    ).items()
+                )
+            ),
+            Signal in ComponentOwnedSignals,
+        ))
+        Domains[Signal] = CapacityAwareGuideOptionDomain(
+            Signal=Signal,
+            LocalInputFingerprint=LocalInputFingerprint,
+            Options=SortedValues,
+        )
+    return Domains
+
+
+def AssignCapacityAwareGuideOptionDomains(
+    Profiles: dict[str, Any],
+    OptionDomains: dict[str, CapacityAwareGuideOptionDomain],
+    LayerCount: int,
+    Policy: GlobalRoutingPolicy,
+    LocalFanoutDistance: int,
+    ComponentObstacleBounds: tuple[int, int, int, int] | None = None,
+    ComponentObstacleCellsByLayer: dict[
+        int, frozenset[Position2]
+    ] | None = None,
+    ComponentObstacleExemptCellsBySignal: dict[
+        str, dict[int, frozenset[Position2]]
+    ] | None = None,
+    ComponentOwnedSignals: frozenset[str] = frozenset(),
+    ReservedGuideResourcesBySignal: dict[
+        str, frozenset[tuple[int, int, int]]
+    ] | None = None,
+    SeedPlan: CoarseGuidePlan | None = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> CoarseGuidePlan:
+    """Jointly select signal-local options under shared corridor capacity."""
+    if set(OptionDomains) != set(Profiles):
+        raise ValueError("guide option domains must match profile signals")
+    if any(
+        Domain.Signal != Signal or not Domain.Options
+        for Signal, Domain in OptionDomains.items()
+    ):
+        raise ValueError("guide option domains must be nonempty and keyed by signal")
+    ReservedGuideResourcesBySignal = dict(
+        ReservedGuideResourcesBySignal or {}
+    )
+    ComponentObstacleCellsByLayer = dict(
+        ComponentObstacleCellsByLayer or {}
+    )
+    ComponentObstacleExemptCellsBySignal = dict(
+        ComponentObstacleExemptCellsBySignal or {}
+    )
+    ReservedGuideResources = frozenset(
+        Resource
+        for Resources in ReservedGuideResourcesBySignal.values()
+        for Resource in Resources
+    )
+    Options = {
+        Signal: list(Domain.Options)
+        for Signal, Domain in OptionDomains.items()
+    }
+    LocalSignals = frozenset(
+        Signal
+        for Signal, Profile in Profiles.items()
+        if Profile.Span <= LocalFanoutDistance
+    )
 
     Selected: dict[str, tuple[int, str, int, frozenset[Position2]]] = {}
     Usage: Counter[tuple[int, int, int]] = Counter()
     History: Counter[tuple[int, int, int]] = Counter()
-
     def SelectSignal(Signal: str) -> None:
         Best = None
         SignalOptions = Options[Signal]
@@ -736,19 +956,36 @@ def BuildCapacityAwareGuidePlan(
                 ColumnOverflowCost += max(0, ColumnUsage + 1 - 2)
                 HistoryCost += History[(Layer, X, Z)]
                 if (
-                    ComponentObstacleBounds is not None
+                    (
+                        ComponentObstacleBounds is not None
+                        or ComponentObstacleCellsByLayer
+                    )
                     and Signal not in ComponentOwnedSignals
                 ):
-                    (
-                        ComponentMinimumX,
-                        ComponentMaximumX,
-                        ComponentMinimumZ,
-                        ComponentMaximumZ,
-                    ) = ComponentObstacleBounds
-                    ComponentInteriorCost += bool(
-                        ComponentMinimumX <= X <= ComponentMaximumX
-                        and ComponentMinimumZ <= Z <= ComponentMaximumZ
-                    )
+                    if ComponentObstacleCellsByLayer:
+                        ComponentInteriorCost += (
+                            (X, Z)
+                            in ComponentObstacleCellsByLayer.get(
+                                Layer,
+                                frozenset(),
+                            )
+                            - ComponentObstacleExemptCellsBySignal.get(
+                                Signal,
+                                {},
+                            ).get(Layer, frozenset())
+                        )
+                    else:
+                        assert ComponentObstacleBounds is not None
+                        (
+                            ComponentMinimumX,
+                            ComponentMaximumX,
+                            ComponentMinimumZ,
+                            ComponentMaximumZ,
+                        ) = ComponentObstacleBounds
+                        ComponentInteriorCost += bool(
+                            ComponentMinimumX <= X <= ComponentMaximumX
+                            and ComponentMinimumZ <= Z <= ComponentMaximumZ
+                        )
                 if (Layer, X, Z) in ReservedGuideResources:
                     ReservedPortConflictCost += sum(
                         Signal != Owner
@@ -831,15 +1068,33 @@ def BuildCapacityAwareGuidePlan(
                 ) in Options[Signal]
             )
             CandidateAvoidsComponent = bool(
-                ComponentObstacleBounds is None
+                (
+                    ComponentObstacleBounds is None
+                    and not ComponentObstacleCellsByLayer
+                )
                 or Signal in ComponentOwnedSignals
                 or not any(
-                    ComponentObstacleBounds[0]
-                    <= X
-                    <= ComponentObstacleBounds[1]
-                    and ComponentObstacleBounds[2]
-                    <= Z
-                    <= ComponentObstacleBounds[3]
+                    (
+                        (X, Z)
+                        in ComponentObstacleCellsByLayer.get(
+                            Candidate[0],
+                            frozenset(),
+                        )
+                        - ComponentObstacleExemptCellsBySignal.get(
+                            Signal,
+                            {},
+                        ).get(Candidate[0], frozenset())
+                    )
+                    if ComponentObstacleCellsByLayer
+                    else (
+                        ComponentObstacleBounds is not None
+                        and ComponentObstacleBounds[0]
+                        <= X
+                        <= ComponentObstacleBounds[1]
+                        and ComponentObstacleBounds[2]
+                        <= Z
+                        <= ComponentObstacleBounds[3]
+                    )
                     for X, Z in Candidate[3]
                 )
             )
@@ -988,6 +1243,67 @@ def BuildCapacityAwareGuidePlan(
         Overflow=Overflow,
         LocalSignals=LocalSignals,
         Iterations=tuple(Iterations),
+        LocalInputFingerprintsBySignal={
+            Signal: Domain.LocalInputFingerprint
+            for Signal, Domain in OptionDomains.items()
+        },
+    )
+
+
+def BuildCapacityAwareGuidePlan(
+    Profiles: dict[str, Any],
+    LayerCount: int,
+    MinimumX: int,
+    MinimumZ: int,
+    Policy: GlobalRoutingPolicy,
+    Technology: RedstoneRoutingTechnology,
+    LocalFanoutDistance: int,
+    ComponentObstacleBounds: tuple[int, int, int, int] | None = None,
+    ComponentObstacleCellsByLayer: dict[
+        int, frozenset[Position2]
+    ] | None = None,
+    ComponentObstacleExemptCellsBySignal: dict[
+        str, dict[int, frozenset[Position2]]
+    ] | None = None,
+    ComponentOwnedSignals: frozenset[str] = frozenset(),
+    ReservedGuideResourcesBySignal: dict[
+        str, frozenset[tuple[int, int, int]]
+    ] | None = None,
+    SeedPlan: CoarseGuidePlan | None = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> CoarseGuidePlan:
+    """Build signal-local options, then perform authoritative assignment."""
+    OptionDomains = BuildCapacityAwareGuideOptionDomains(
+        Profiles,
+        LayerCount,
+        MinimumX,
+        MinimumZ,
+        Policy,
+        Technology,
+        LocalFanoutDistance,
+        ComponentObstacleBounds=ComponentObstacleBounds,
+        ComponentObstacleCellsByLayer=ComponentObstacleCellsByLayer,
+        ComponentObstacleExemptCellsBySignal=(
+            ComponentObstacleExemptCellsBySignal
+        ),
+        ComponentOwnedSignals=ComponentOwnedSignals,
+        WorkCheck=WorkCheck,
+    )
+    return AssignCapacityAwareGuideOptionDomains(
+        Profiles,
+        OptionDomains,
+        LayerCount,
+        Policy,
+        LocalFanoutDistance,
+        ComponentObstacleBounds=ComponentObstacleBounds,
+        ComponentObstacleCellsByLayer=ComponentObstacleCellsByLayer,
+        ComponentObstacleExemptCellsBySignal=(
+            ComponentObstacleExemptCellsBySignal
+        ),
+        ComponentOwnedSignals=ComponentOwnedSignals,
+        ReservedGuideResourcesBySignal=ReservedGuideResourcesBySignal,
+        SeedPlan=SeedPlan,
+        WorkCheck=WorkCheck,
     )
 
 

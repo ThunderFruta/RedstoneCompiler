@@ -135,7 +135,12 @@ def ValidatePhysicalRoutes(
                     "CompletedSignals": SignalIndex - 1,
                     "ExpandedNodes": ExpandedNodes,
                 })
-            for Neighbor in Graph[Cell]:
+            # A projected physical-component port can be the logical root of
+            # an otherwise empty or disconnected candidate.  Treat that as a
+            # connectivity failure with the signal identity preserved; a raw
+            # graph lookup here used to escape as an untyped Position3
+            # KeyError and hid the failed assembly-plan stage.
+            for Neighbor in Graph.get(Cell, ()):
                 if Neighbor not in Seen:
                     Seen.add(Neighbor)
                     Queue.append(Neighbor)

@@ -1119,12 +1119,17 @@ pub(crate) fn GenerateRouteTreesNative(
         .iter()
         .filter(|(_RouteTree, Completed)| *Completed)
         .count();
+    let CompletionMask = WorkResults
+        .iter()
+        .map(|(_RouteTree, Completed)| *Completed)
+        .collect();
     let RouteTrees = WorkResults
         .into_iter()
         .map(|(Value, _Completed)| Value)
         .collect();
     Ok(RouteTreeBatchResult {
         RouteTrees,
+        CompletionMask,
         DeadlineExceeded: Deadline.WasExceeded(),
         CompletedWork,
         TotalWork,
@@ -1189,6 +1194,7 @@ mod Tests {
         assert_eq!(Result.CompletedWork, 0);
         assert_eq!(Result.TotalWork, 1);
         assert_eq!(Result.RouteTrees.len(), 1);
+        assert_eq!(Result.CompletionMask, vec![false]);
     }
 
     #[test]
@@ -1367,6 +1373,7 @@ mod Tests {
 
         assert_eq!(Result.RouteTrees[0], Some(vec![A, C, D]));
         assert_eq!(Result.RouteTrees[1], None);
+        assert_eq!(Result.CompletionMask, vec![true, true]);
         assert_eq!(Result.CompletedWork, 2);
         assert!(!Result.DeadlineExceeded);
     }

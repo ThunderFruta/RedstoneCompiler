@@ -258,13 +258,25 @@ def CompactRoutedTrees(
             and Signal in Routed.GlobalPlan.Profiles
             else ()
         )
-        for Target in (
-            *Targets.get(Signal, ()),
+        RequiredTargets = tuple(Targets.get(Signal, ()))
+        for TargetIndex, Target in enumerate((
+            *RequiredTargets,
             *PinAccessPositions,
-        ):
+        )):
             CheckDeadline("retain-required-path", Signal=Signal)
             if Target not in Parents:
-                raise ValueError(f"PCB route compaction disconnected net {Signal}")
+                TargetKind = (
+                    "logical-target"
+                    if TargetIndex < len(RequiredTargets)
+                    else "profile-access"
+                )
+                raise ValueError(
+                    "PCB route compaction disconnected net "
+                    f"{Signal}: {TargetKind}={Target}, root={Root}, "
+                    f"target-in-graph={Target in Graph}, "
+                    f"root-in-graph={Root in Graph}, "
+                    f"reachable={len(Parents)}, graph={len(Graph)}"
+                )
             Current = Target
             while Current is not None:
                 Required.add(Current)
@@ -788,6 +800,15 @@ def RoutePcbAttempt(
                 "no factor domain"
             )
         return Routed
+    if Resources.PreparingPhysicalComponentGlobalChannels:
+        if not isinstance(Routed, RoutedDesign):
+            raise RuntimeError(
+                "physical global channel preparation returned no routed design"
+            )
+        # This is an immutable corridor contract, not a completed whole-design
+        # route. Compaction and whole-design materialization belong to the
+        # authoritative detailed-routing pass after local template handoff.
+        return Routed
     LocalNetBranches = Placement.Placed.LocalNetBranches or {}
     CompactionAccessLength = (
         max(AccessLength, 3)
@@ -1265,6 +1286,8 @@ def SolvePreparedPhysicalComponentEligibility(
     *,
     Resources: Any,
     Deadline: RoutingDeadline,
+    DeferLocalCompositeSelection: bool = True,
+    RequiredBoundaryPorts: tuple[Any, ...] | None = None,
 ) -> PreparedPhysicalComponentAssembly:
     """Solve one identity-validated eligibility domain without rebuilding it."""
     from .AuthoritativePlanner import (
@@ -1275,6 +1298,8 @@ def SolvePreparedPhysicalComponentEligibility(
         Assembly = SolvePreparedPhysicalComponentPortFactorDomain(
             Preparation,
             Resources,
+            DeferLocalCompositeSelection=DeferLocalCompositeSelection,
+            RequiredBoundaryPorts=RequiredBoundaryPorts,
             WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
                 "PhysicalComponentAssembly",
                 Diagnostics,
@@ -1459,6 +1484,7 @@ def ReplanPhysicalComponentAssembly(
     *,
     Resources: Any,
     Deadline: RoutingDeadline,
+    RequiredGlobalBoundaryPorts: tuple[Any, ...] | None = None,
 ) -> PreparedPhysicalComponentAssembly:
     """Select the next physical plan from the frozen authoritative domain."""
     Preparation = Resources.PreparedPhysicalComponentPortFactorDomain
@@ -1472,6 +1498,10 @@ def ReplanPhysicalComponentAssembly(
             Preparation,
             Resources=Resources,
             Deadline=Deadline,
+            DeferLocalCompositeSelection=(
+                RequiredGlobalBoundaryPorts is None
+            ),
+            RequiredBoundaryPorts=RequiredGlobalBoundaryPorts,
         )
     except RoutingStageError as Error:
         Classified = ClassifyPhysicalComponentAssemblyFailure(
@@ -1533,6 +1563,7 @@ def RoutePcbDesign(
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
     Deadline: RoutingDeadline | None = None,
     Resources: Any | None = None,
+    RequireCompleteClusterInterfaceDomain: bool = False,
 ) -> RoutedDesign:
     """Run one strict guided route and fail immediately if it is illegal."""
     Configuration = BuildPcbRoutingConfigurations(Placement)[0]
@@ -1681,6 +1712,9 @@ def RoutePcbDesign(
                     StatusCallback=RecordStatus,
                     Policy=VariantPolicy,
                     Deadline=VariantDeadline,
+                    RequireCompleteClusterInterfaceDomain=(
+                        RequireCompleteClusterInterfaceDomain
+                    ),
                     PreparePortalGeometryOnly=(
                         LeaseStateCount > 1 and LeaseVariant == 0
                     ),

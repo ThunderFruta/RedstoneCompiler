@@ -28,7 +28,9 @@ from Compiler.Placement.Geometry import BuildPlacedGate
 from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
 from Compiler.Routing.LocalFirst import (
+    AssignCapacityAwareGuideOptionDomains,
     BuildCapacityAwareGuidePlan,
+    BuildCapacityAwareGuideOptionDomains,
     BuildPlacementSolution,
     BuildRipupPlan,
     DeriveRoutingBudget,
@@ -356,6 +358,114 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertLessEqual(First.OverflowPeak, 1)
         self.assertEqual(set(First.Guides), set(Profiles))
 
+    def testFactorizedGuideAssignmentPreservesPlanIdentity(self) -> None:
+        def Profile(Source, Target):
+            return SimpleNamespace(
+                SourceAccessPath=(Source,),
+                TargetAccessPaths={Target: (Target,)},
+                Span=abs(Target[0] - Source[0]) + abs(Target[2] - Source[2]),
+                Fanout=1,
+                Criticality=1,
+            )
+
+        Profiles = {
+            "A": Profile((0, 2, 0), (8, 2, 8)),
+            "B": Profile((0, 2, 8), (8, 2, 0)),
+        }
+        Policy = GlobalRoutingPolicy(MaximumRipupPasses=2)
+        Domains = BuildCapacityAwareGuideOptionDomains(
+            Profiles,
+            2,
+            0,
+            0,
+            Policy,
+            DefaultRedstoneRoutingTechnology,
+            8,
+        )
+        Factorized = AssignCapacityAwareGuideOptionDomains(
+            Profiles,
+            Domains,
+            2,
+            Policy,
+            8,
+        )
+        ExistingEntryPoint = BuildCapacityAwareGuidePlan(
+            Profiles,
+            2,
+            0,
+            0,
+            Policy,
+            DefaultRedstoneRoutingTechnology,
+            8,
+        )
+
+        self.assertEqual(
+            ExistingEntryPoint.ToDictionary(),
+            Factorized.ToDictionary(),
+        )
+
+    def testGuideDomainInputsInvalidateOnlyChangedSignal(self) -> None:
+        def Profile(Source, Target):
+            return SimpleNamespace(
+                SourceAccessPath=(Source,),
+                TargetAccessPaths={Target: (Target,)},
+                Span=abs(Target[0] - Source[0]) + abs(Target[2] - Source[2]),
+                Fanout=1,
+                Criticality=1,
+            )
+
+        Policy = GlobalRoutingPolicy(MaximumRipupPasses=2)
+        OriginalProfiles = {
+            "A": Profile((0, 2, 0), (8, 2, 8)),
+            "B": Profile((0, 2, 8), (8, 2, 0)),
+        }
+        EditedProfiles = {
+            **OriginalProfiles,
+            "A": Profile((1, 2, 0), (8, 2, 8)),
+        }
+        Original = BuildCapacityAwareGuideOptionDomains(
+            OriginalProfiles,
+            2,
+            0,
+            0,
+            Policy,
+            DefaultRedstoneRoutingTechnology,
+            8,
+        )
+        Edited = BuildCapacityAwareGuideOptionDomains(
+            EditedProfiles,
+            2,
+            0,
+            0,
+            Policy,
+            DefaultRedstoneRoutingTechnology,
+            8,
+        )
+
+        self.assertNotEqual(
+            Original["A"].LocalInputFingerprint,
+            Edited["A"].LocalInputFingerprint,
+        )
+        self.assertEqual(
+            Original["B"].LocalInputFingerprint,
+            Edited["B"].LocalInputFingerprint,
+        )
+        OriginalPlan = AssignCapacityAwareGuideOptionDomains(
+            OriginalProfiles,
+            Original,
+            2,
+            Policy,
+            8,
+        )
+        EditedPlan = AssignCapacityAwareGuideOptionDomains(
+            EditedProfiles,
+            Edited,
+            2,
+            Policy,
+            8,
+        )
+        self.assertEqual(set(OriginalPlan.Guides), set(EditedPlan.Guides))
+
     def testCapacityAwareGuidePlanReusesValidPlacementSeed(self) -> None:
         def Profile(Source, Target):
             return SimpleNamespace(
@@ -442,7 +552,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         )
         Plan = BuildCapacityAwareGuidePlan(
             {"Global": Profile},
-            2,
+            1,
             0,
             0,
             GlobalRoutingPolicy(CandidateLaneCount=5),
@@ -455,6 +565,76 @@ class LocalFirstRouterTests(unittest.TestCase):
             5 <= X <= 15 and -1 <= Z <= 1
             for X, Z in Plan.Guides["Global"]
         ))
+
+    def testCapacityGuideUsesLayerExactComponentKeepout(self) -> None:
+        Profile = SimpleNamespace(
+            SourceAccessPath=((0, 2, 0),),
+            TargetAccessPaths={(20, 2, 0): ((20, 2, 0),)},
+            Span=20,
+            Fanout=1,
+            Criticality=1,
+        )
+        BlockedCells = frozenset((
+            (X, 0) for X in range(5, 16)
+        ))
+
+        BlockedPlan = BuildCapacityAwareGuidePlan(
+            {"Global": Profile},
+            1,
+            0,
+            0,
+            GlobalRoutingPolicy(CandidateLaneCount=1),
+            DefaultRedstoneRoutingTechnology,
+            8,
+            ComponentObstacleCellsByLayer={0: BlockedCells},
+        )
+        OtherLayerPlan = BuildCapacityAwareGuidePlan(
+            {"Global": Profile},
+            1,
+            0,
+            0,
+            GlobalRoutingPolicy(CandidateLaneCount=1),
+            DefaultRedstoneRoutingTechnology,
+            8,
+            ComponentObstacleCellsByLayer={1: BlockedCells},
+        )
+
+        self.assertFalse(
+            BlockedCells & BlockedPlan.Guides["Global"]
+        )
+        self.assertTrue(
+            BlockedCells <= OtherLayerPlan.Guides["Global"]
+        )
+
+    def testCapacityGuideExemptsOnlyDeclaredSignalPassage(self) -> None:
+        Profile = SimpleNamespace(
+            SourceAccessPath=((0, 2, 0),),
+            TargetAccessPaths={(20, 2, 0): ((20, 2, 0),)},
+            Span=20,
+            Fanout=1,
+            Criticality=1,
+        )
+        BlockedCells = frozenset((
+            (X, 0) for X in range(5, 16)
+        ))
+
+        Plan = BuildCapacityAwareGuidePlan(
+            {"PortSignal": Profile},
+            1,
+            0,
+            0,
+            GlobalRoutingPolicy(CandidateLaneCount=1),
+            DefaultRedstoneRoutingTechnology,
+            8,
+            ComponentObstacleCellsByLayer={0: BlockedCells},
+            ComponentObstacleExemptCellsBySignal={
+                "PortSignal": {0: BlockedCells},
+            },
+        )
+
+        self.assertTrue(
+            BlockedCells <= Plan.Guides["PortSignal"]
+        )
 
     def testCapacityGuideConstructionCanStopInsideLongSegment(self) -> None:
         Profile = SimpleNamespace(

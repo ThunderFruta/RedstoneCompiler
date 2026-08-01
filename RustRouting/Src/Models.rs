@@ -293,6 +293,8 @@ pub(crate) struct RouteTreeBatchResult {
     #[pyo3(get)]
     pub(crate) RouteTrees: Vec<Option<Vec<Position>>>,
     #[pyo3(get)]
+    pub(crate) CompletionMask: Vec<bool>,
+    #[pyo3(get)]
     pub(crate) DeadlineExceeded: bool,
     #[pyo3(get)]
     pub(crate) CompletedWork: usize,

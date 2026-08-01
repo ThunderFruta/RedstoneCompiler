@@ -694,6 +694,9 @@ class ComponentFeedthroughContract:
     Signal: str
     EndpointPairs: tuple[tuple[Position3, Position3], ...]
     Capacity: int = 1
+    ReservedPathNodes: tuple[Position3, ...] = ()
+    Claims: Any = None
+    ReservationFingerprint: str = ""
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -706,6 +709,10 @@ class ComponentFeedthroughContract:
                 for Entry, Exit in self.EndpointPairs
             ],
             "Capacity": self.Capacity,
+            "ReservedPathNodes": [
+                list(Value) for Value in self.ReservedPathNodes
+            ],
+            "ReservationFingerprint": self.ReservationFingerprint,
         }
 
 
@@ -746,6 +753,8 @@ class PhysicalComponentPortReservation:
     LocalPath: tuple[Position3, ...]
     GlobalPath: tuple[Position3, ...]
     Claims: Any
+    LocalClaims: Any = None
+    GlobalClaims: Any = None
     OwnedAccessCandidates: tuple[
         ComponentTerminalAccessCandidate, ...
     ] = ()
@@ -770,6 +779,11 @@ class PhysicalComponentPortReservation:
             "Attachment": list(self.Attachment),
             "LocalPath": [list(Value) for Value in self.LocalPath],
             "GlobalPath": [list(Value) for Value in self.GlobalPath],
+            "SeamOwnership": {
+                "LocalNodeCount": len(self.LocalPath),
+                "GlobalNodeCount": len(self.GlobalPath),
+                "SharedAttachment": list(self.Attachment),
+            },
             "OwnedAccessCandidates": [
                 {
                     "CandidateFingerprint": Value.CandidateFingerprint,
@@ -786,8 +800,96 @@ class PhysicalComponentPortReservation:
 
 
 @dataclass(frozen=True)
+class PhysicalComponentBoundaryPortReservation:
+    """Globally owned boundary reservation selected before local support.
+
+    This contract deliberately excludes component-local paths, fabric
+    attachments, and owned-access candidates.  It is therefore safe to use as
+    the authoritative input to a later, separately selected local support.
+    """
+
+    Signal: str
+    Direction: str
+    Attachment: Position3
+    GlobalPath: tuple[Position3, ...]
+    GlobalClaims: Any
+    Capacity: int = 1
+    ChannelContractFingerprint: str = ""
+    GlobalContractFingerprint: str = ""
+    ApertureContractFingerprint: str = ""
+    ReservationFingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if self.Capacity <= 0:
+            raise ValueError("boundary port capacity must be positive")
+        if self.GlobalPath and self.GlobalPath[0] != self.Attachment:
+            raise ValueError(
+                "boundary port global path must start at its attachment"
+            )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "Direction": self.Direction,
+            "Attachment": list(self.Attachment),
+            "GlobalPath": [list(Value) for Value in self.GlobalPath],
+            "GlobalClaimCount": len(getattr(
+                self.GlobalClaims,
+                "ResourceIds",
+                (),
+            )),
+            "Capacity": self.Capacity,
+            "ChannelContractFingerprint": (
+                self.ChannelContractFingerprint
+            ),
+            "GlobalContractFingerprint": (
+                self.GlobalContractFingerprint
+            ),
+            "ApertureContractFingerprint": (
+                self.ApertureContractFingerprint
+            ),
+            "ReservationFingerprint": self.ReservationFingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalComponentSelectedLocalPortSupport:
+    """Identity-only reference to local support for one boundary reservation."""
+
+    Signal: str
+    BoundaryReservationFingerprint: str
+    LocalContractFingerprint: str
+    LocalAccessFingerprint: str
+    SupportFingerprint: str
+
+    def __post_init__(self) -> None:
+        RequiredValues = (
+            self.Signal,
+            self.BoundaryReservationFingerprint,
+            self.LocalContractFingerprint,
+            self.LocalAccessFingerprint,
+            self.SupportFingerprint,
+        )
+        if any(not Value for Value in RequiredValues):
+            raise ValueError(
+                "selected local port support identities must be nonempty"
+            )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "BoundaryReservationFingerprint": (
+                self.BoundaryReservationFingerprint
+            ),
+            "LocalContractFingerprint": self.LocalContractFingerprint,
+            "LocalAccessFingerprint": self.LocalAccessFingerprint,
+            "SupportFingerprint": self.SupportFingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class PhysicalComponentChannelReservation:
-    """Capacity-owned global corridor associated with one component port."""
+    """One selected exact global route owned by an assembly plan."""
 
     Signal: str
     Layer: int
@@ -797,6 +899,12 @@ class PhysicalComponentChannelReservation:
     Capacity: int = 1
     FeedthroughComponentIds: tuple[int, ...] = ()
     ReservationFingerprint: str = ""
+    # A guide is only a search preference.  Once authoritative detailed
+    # routing has selected a candidate, these nodes and identities are the
+    # immutable physical channel contract consumed by local compilation.
+    ReservedPathNodes: tuple[Position3, ...] = ()
+    RouteCandidateId: str = ""
+    RouteCandidateFingerprint: str = ""
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -814,6 +922,13 @@ class PhysicalComponentChannelReservation:
                 self.FeedthroughComponentIds
             ),
             "ReservationFingerprint": self.ReservationFingerprint,
+            "ReservedPathNodes": [
+                list(Value) for Value in self.ReservedPathNodes
+            ],
+            "RouteCandidateId": self.RouteCandidateId,
+            "RouteCandidateFingerprint": (
+                self.RouteCandidateFingerprint
+            ),
         }
 
 
@@ -834,20 +949,52 @@ class PhysicalComponentAssemblyPlan:
     KeepoutClaims: Any
     Ports: tuple[PhysicalComponentPortReservation, ...]
     Channels: tuple[PhysicalComponentChannelReservation, ...]
+    # Non-exclusive guide/capacity domains used by global planning.  Unlike
+    # Channels, these have no selected candidate and confer no resource
+    # ownership on the local compiler.
+    Corridors: tuple[PhysicalComponentChannelReservation, ...] = ()
+    # One immutable, layer-exact obstacle domain shared by coarse guide
+    # planning, detailed candidate generation, and assembly validation.  These
+    # are routable wire nodes whose claims conflict with the closed component;
+    # consumers must not inflate them into an all-layer X/Z prism.
+    GlobalKeepoutNodes: tuple[Position3, ...] = ()
+    GlobalKeepoutFingerprint: str = ""
     Feedthroughs: tuple[ComponentFeedthroughContract, ...] = ()
     StageOrder: tuple[str, ...] = (
-        "PhysicalComponentAssemblyPlanning",
+        "PhysicalBoundaryPlanning",
+        "AuthoritativeGlobalReserve",
+        "LocalSupportBinding",
         "ClosedComponentCompilation",
         "AuthoritativeDetailedRouting",
     )
     Complete: bool = True
     AccessCertificateFingerprint: str = ""
+    LocalAccessDomainFingerprint: str = ""
+    # Authoritative port-first representation.  ``Ports`` remains available
+    # while transitional planner and local-compiler callers are migrated.
+    GlobalBoundaryPorts: tuple[
+        PhysicalComponentBoundaryPortReservation, ...
+    ] = ()
+    SelectedLocalPortSupports: tuple[
+        PhysicalComponentSelectedLocalPortSupport, ...
+    ] = ()
 
     @property
     def DeclaredFeedthroughSignals(self) -> frozenset[str]:
         return frozenset(
             Value.Signal for Value in self.Feedthroughs
         )
+
+    @property
+    def PlanningChannels(
+        self,
+    ) -> tuple[PhysicalComponentChannelReservation, ...]:
+        """Return exact channels plus unbound corridor domains by signal."""
+        ExactSignals = frozenset(Value.Signal for Value in self.Channels)
+        return tuple((*self.Channels, *(
+            Value for Value in self.Corridors
+            if Value.Signal not in ExactSignals
+        )))
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -869,14 +1016,33 @@ class PhysicalComponentAssemblyPlan:
             "EnvelopeMinimum": list(self.EnvelopeMinimum),
             "EnvelopeMaximum": list(self.EnvelopeMaximum),
             "Ports": [Value.ToDictionary() for Value in self.Ports],
+            "GlobalBoundaryPorts": [
+                Value.ToDictionary() for Value in self.GlobalBoundaryPorts
+            ],
+            "SelectedLocalPortSupports": [
+                Value.ToDictionary()
+                for Value in self.SelectedLocalPortSupports
+            ],
             "Channels": [
                 Value.ToDictionary() for Value in self.Channels
             ],
+            "Corridors": [
+                Value.ToDictionary() for Value in self.Corridors
+            ],
+            "GlobalKeepoutNodes": [
+                list(Value) for Value in self.GlobalKeepoutNodes
+            ],
+            "GlobalKeepoutFingerprint": (
+                self.GlobalKeepoutFingerprint
+            ),
             "Feedthroughs": [
                 Value.ToDictionary() for Value in self.Feedthroughs
             ],
             "AccessCertificateFingerprint": (
                 self.AccessCertificateFingerprint
+            ),
+            "LocalAccessDomainFingerprint": (
+                self.LocalAccessDomainFingerprint
             ),
             "StageOrder": list(self.StageOrder),
             "Complete": self.Complete,
@@ -1164,6 +1330,107 @@ class PreparedPhysicalComponentAssembly:
         compare=False,
         repr=False,
     )
+    PortFactorDomain: PreparedPhysicalComponentPortFactorDomain | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True)
+class PhysicalGlobalPlanResumeCursor:
+    """Opaque, identity-bound cursor emitted by authoritative global routing."""
+
+    CursorFingerprint: str
+    PlanFingerprint: str
+    ApertureDomainFingerprint: str
+    CompletedWork: int
+    State: Any = field(default=None, compare=False, repr=False)
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "CursorFingerprint": self.CursorFingerprint,
+            "PlanFingerprint": self.PlanFingerprint,
+            "ApertureDomainFingerprint": (
+                self.ApertureDomainFingerprint
+            ),
+            "CompletedWork": self.CompletedWork,
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalGlobalPlanContinuationState:
+    """Retained exact-channel frontier for one incomplete assembly plan."""
+
+    StateFingerprint: str
+    PlanFingerprint: str
+    RequestDependencyFingerprints: tuple[tuple[str, str], ...]
+    RemainingRequestCounts: tuple[tuple[str, int], ...]
+    CorridorDomainFingerprints: tuple[tuple[str, str], ...]
+    CertificateFingerprints: tuple[str, ...]
+    CompletedWork: int
+    Complete: bool = False
+    ResumeCursor: PhysicalGlobalPlanResumeCursor | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "StateFingerprint": self.StateFingerprint,
+            "PlanFingerprint": self.PlanFingerprint,
+            "RequestDependencyFingerprints": dict(
+                self.RequestDependencyFingerprints
+            ),
+            "RemainingRequestCounts": dict(self.RemainingRequestCounts),
+            "CorridorDomainFingerprints": dict(
+                self.CorridorDomainFingerprints
+            ),
+            "CertificateFingerprints": list(
+                self.CertificateFingerprints
+            ),
+            "CompletedWork": self.CompletedWork,
+            "Complete": self.Complete,
+            "ResumeCursor": (
+                self.ResumeCursor.ToDictionary()
+                if self.ResumeCursor is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class RetainedPhysicalGlobalPlanFrontierEntry:
+    """One fairly scheduled, proof-neutral incomplete physical plan."""
+
+    Assembly: PreparedPhysicalComponentAssembly = field(
+        compare=False,
+        repr=False,
+    )
+    Continuation: PhysicalGlobalPlanContinuationState
+    EnqueuedSequence: int
+    LastScheduledSequence: int = -1
+    ScheduleCount: int = 0
+    AccumulatedCompletedWork: int = 0
+
+    @property
+    def PlanFingerprint(self) -> str:
+        return self.Assembly.Plan.PlanFingerprint
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "PlanFingerprint": self.PlanFingerprint,
+            "PortAssignmentFingerprint": (
+                self.Assembly.Plan.PortAssignmentFingerprint
+            ),
+            "Continuation": self.Continuation.ToDictionary(),
+            "EnqueuedSequence": self.EnqueuedSequence,
+            "LastScheduledSequence": self.LastScheduledSequence,
+            "ScheduleCount": self.ScheduleCount,
+            "AccumulatedCompletedWork": self.AccumulatedCompletedWork,
+            "Rejected": False,
+        }
 
 
 class PhysicalComponentAssemblyPrepared(RuntimeError):
@@ -1256,6 +1523,386 @@ class PhysicalPortLaneFactor:
 
 
 @dataclass(frozen=True)
+class PhysicalPortLocalAccessFactor:
+    """One local-only component access choice, independent of its aperture."""
+
+    Signal: str
+    Direction: str
+    Capacity: int
+    OwnedTerminals: tuple[Position3, ...]
+    OwnedTerminalFingerprints: tuple[str, ...]
+    OwnedAccessCandidates: tuple[
+        ComponentTerminalAccessCandidate, ...
+    ]
+    FabricDomainFingerprint: str
+    FabricAttachment: Position3
+    LocalPath: tuple[Position3, ...]
+    LocalClaims: RoutingResourceClaims
+    OwnedCandidateFingerprints: tuple[str, ...]
+    LocalContractFingerprint: str
+    LocalAccessFingerprint: str
+
+
+@dataclass(frozen=True)
+class PhysicalPortApertureOptionFactor:
+    """One globally owned physical aperture, independent of local access."""
+
+    Signal: str
+    Direction: str
+    Capacity: int
+    Attachment: Position3
+    GlobalPath: tuple[Position3, ...]
+    GlobalClaims: RoutingResourceClaims
+    ChannelContractFingerprint: str
+    GlobalContractFingerprint: str
+    ApertureContractFingerprint: str
+    ApertureOptionFingerprint: str
+
+
+@dataclass(frozen=True)
+class PhysicalGlobalAperturePathTemplate:
+    """One positive exterior path reusable under a rigid planar transform.
+
+    The canonical contract carries every physical dependency used to build
+    the witness.  A consumer still has to materialize and validate the path
+    against its current resource graph; this object is never a negative
+    reachability proof.
+    """
+
+    ContractFingerprint: str
+    CanonicalContract: tuple[object, ...]
+    CanonicalPath: tuple[Position3, ...]
+    SourcePlacementFingerprint: str = ""
+
+
+@dataclass(frozen=True)
+class PhysicalPortLocalApertureSupport:
+    """An exact certified edge between local access and global aperture."""
+
+    Signal: str
+    LocalAccessFingerprint: str
+    ApertureOptionFingerprint: str
+    SourceSeamFingerprint: str
+    ReservationFingerprint: str
+    SupportFingerprint: str
+
+
+@dataclass(frozen=True)
+class PhysicalPortCorridorFactor:
+    """One exact authoritative global route tied to one port option.
+
+    Unlike a coarse guide, this factor owns the candidate's exact claims.
+    ``RequestDependencyFingerprint`` identifies every input on which the
+    authoritative candidate request depended; consumers may not reuse the
+    factor under a different request domain.
+    """
+
+    Signal: str
+    PortReservationFingerprint: str
+    PortGlobalContractFingerprint: str
+    RequestDependencyFingerprint: str
+    RouteCandidateId: str
+    RouteCandidateFingerprint: str
+    NormalizedIdentityFingerprint: str
+    Layer: int
+    Nodes: frozenset[Position3]
+    Claims: RoutingResourceClaims
+    Candidate: Any = field(default=None, compare=False, repr=False)
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "PortReservationFingerprint": (
+                self.PortReservationFingerprint
+            ),
+            "PortGlobalContractFingerprint": (
+                self.PortGlobalContractFingerprint
+            ),
+            "RequestDependencyFingerprint": (
+                self.RequestDependencyFingerprint
+            ),
+            "RouteCandidateId": self.RouteCandidateId,
+            "RouteCandidateFingerprint": self.RouteCandidateFingerprint,
+            "NormalizedIdentityFingerprint": (
+                self.NormalizedIdentityFingerprint
+            ),
+            "Layer": self.Layer,
+            "Nodes": [list(Value) for Value in sorted(self.Nodes)],
+            "ClaimCount": len(self.Claims.ResourceIds),
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalPortCorridorDomain:
+    """Finite exact corridor domain for one physical port reservation."""
+
+    DomainFingerprint: str
+    Signal: str
+    PortReservationFingerprint: str
+    PortGlobalContractFingerprint: str
+    RequestDependencyFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    Factors: tuple[PhysicalPortCorridorFactor, ...]
+    Complete: bool
+    # Non-empty only after an external proof establishes that factors from
+    # domains carrying the same value are portable across their original
+    # request dependencies. Ordinary captured plan domains leave this empty.
+    PortableRequestFamilyFingerprint: str = ""
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "DomainFingerprint": self.DomainFingerprint,
+            "Signal": self.Signal,
+            "PortReservationFingerprint": (
+                self.PortReservationFingerprint
+            ),
+            "PortGlobalContractFingerprint": (
+                self.PortGlobalContractFingerprint
+            ),
+            "RequestDependencyFingerprint": (
+                self.RequestDependencyFingerprint
+            ),
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "Factors": [Value.ToDictionary() for Value in self.Factors],
+            "Complete": self.Complete,
+            "PortableRequestFamilyFingerprint": (
+                self.PortableRequestFamilyFingerprint
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalComponentApertureFactor:
+    """One selected immutable component crossing in an assembly contract."""
+
+    Signal: str
+    PortReservationFingerprint: str
+    PortGlobalContractFingerprint: str
+    ChannelReservationFingerprint: str
+    PassageNodes: frozenset[Position3]
+    ClaimsFingerprint: str
+    ApertureFingerprint: str
+
+
+@dataclass(frozen=True)
+class CertifiedPhysicalComponentApertureDomain:
+    """Complete selected apertures over one stable component keepout core."""
+
+    DomainFingerprint: str
+    ComponentDomainFingerprint: str
+    StableKeepoutCoreFingerprint: str
+    StableKeepoutCoreNodes: frozenset[Position3]
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    CrossingSignals: tuple[str, ...]
+    Factors: tuple[PhysicalComponentApertureFactor, ...]
+    Complete: bool
+
+
+@dataclass
+class PhysicalComponentPortCspState:
+    """Persistent monotonic search state for one prepared port domain."""
+
+    DomainFingerprint: str
+    RejectedReservationsBySignal: frozenset[tuple[str, str]] = frozenset()
+    RejectedReservationSets: frozenset[
+        frozenset[tuple[str, str]]
+    ] = frozenset()
+    RejectedAssignmentFingerprints: frozenset[str] = frozenset()
+    DeferredAssignmentFingerprints: frozenset[str] = frozenset()
+    FailedAssignmentStates: set[Any] = field(default_factory=set)
+    FailedApertureRestrictionStates: set[Any] = field(
+        default_factory=set
+    )
+    OptionDomainPropagationCache: dict[Any, Any] = field(
+        default_factory=dict
+    )
+    LatestOptionDomainsByState: dict[Any, Any] = field(
+        default_factory=dict
+    )
+    PortClaimCompatibilityCache: dict[Any, bool] = field(
+        default_factory=dict
+    )
+    PortContractClaimsCache: dict[Any, Any] = field(
+        default_factory=dict
+    )
+    PortNoGoodKeyCache: dict[Any, Any] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(frozen=True)
+class PhysicalLocalPortPairSupportCertificate:
+    """One complete proof-derived row of the local port support relation.
+
+    The row fixes ``RowContract`` and covers every contract in
+    ``ColumnContracts``.  Consumers may prune ``UnsupportedPairs`` only when
+    all preparation and fabric identities match and ``Complete`` is true.
+    """
+
+    CertificateFingerprint: str
+    PreparedDomainFingerprint: str
+    PortSolverCacheKey: str
+    ComponentGraphFingerprint: str
+    FabricFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    RowSignal: str
+    RowContract: str
+    ColumnSignal: str
+    ColumnContracts: tuple[str, ...]
+    UnsupportedPairs: frozenset[tuple[str, str]]
+    ProofFingerprints: tuple[str, ...]
+    Complete: bool
+
+
+@dataclass(frozen=True)
+class PhysicalComponentLocalFactorProjection:
+    """Cheap normalized local-access domain for one retained placement.
+
+    Signal identifiers and absolute coordinates are intentionally absent from
+    every identity.  The resource and technology fingerprints remain strict
+    because a local impossibility proof is not portable across a different
+    routing technology or resource graph.
+    """
+
+    ProjectionFingerprint: str
+    ComponentTopologyFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    InterfaceContractFingerprint: str
+    LocalFactorDomainFingerprint: str
+    SignalFactorIdentities: tuple[tuple[str, tuple[str, ...]], ...]
+    Complete: bool
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": (
+                "physical-component-local-factor-projection-v1"
+            ),
+            "ProjectionFingerprint": self.ProjectionFingerprint,
+            "ComponentTopologyFingerprint": (
+                self.ComponentTopologyFingerprint
+            ),
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "InterfaceContractFingerprint": (
+                self.InterfaceContractFingerprint
+            ),
+            "LocalFactorDomainFingerprint": (
+                self.LocalFactorDomainFingerprint
+            ),
+            "SignalFactorIdentities": [
+                {
+                    "SignalIdentity": SignalIdentity,
+                    "FactorIdentities": list(FactorIdentities),
+                }
+                for SignalIdentity, FactorIdentities
+                in self.SignalFactorIdentities
+            ],
+            "Complete": self.Complete,
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalComponentLocalFactorUnsatCertificate:
+    """Complete local-factor UNSAT proof detached from signal names."""
+
+    CertificateFingerprint: str
+    ProjectionFingerprint: str
+    ComponentTopologyFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    InterfaceContractFingerprint: str
+    LocalFactorDomainFingerprint: str
+    CoreSignalFactorIdentities: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    ProofFingerprint: str
+    ProofKind: str
+    Complete: bool
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": (
+                "physical-component-local-factor-unsat-certificate-v1"
+            ),
+            "CertificateFingerprint": self.CertificateFingerprint,
+            "ProjectionFingerprint": self.ProjectionFingerprint,
+            "ComponentTopologyFingerprint": (
+                self.ComponentTopologyFingerprint
+            ),
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "InterfaceContractFingerprint": (
+                self.InterfaceContractFingerprint
+            ),
+            "LocalFactorDomainFingerprint": (
+                self.LocalFactorDomainFingerprint
+            ),
+            "CoreSignalFactorIdentities": [
+                {
+                    "SignalIdentity": SignalIdentity,
+                    "FactorIdentities": list(FactorIdentities),
+                }
+                for SignalIdentity, FactorIdentities
+                in self.CoreSignalFactorIdentities
+            ],
+            "ProofFingerprint": self.ProofFingerprint,
+            "ProofKind": self.ProofKind,
+            "Complete": self.Complete,
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalComponentLocalFactorProjectionComparison:
+    """Deterministic proof-to-placement comparison before global planning."""
+
+    ComparisonFingerprint: str
+    IdentityCompatible: bool
+    ExactDomainMatch: bool
+    CoreFactorMatchCount: int
+    CoreFactorCount: int
+    CanPrune: bool
+    RejectionReason: str = ""
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": (
+                "physical-component-local-factor-comparison-v1"
+            ),
+            "ComparisonFingerprint": self.ComparisonFingerprint,
+            "IdentityCompatible": self.IdentityCompatible,
+            "ExactDomainMatch": self.ExactDomainMatch,
+            "CoreFactorMatchCount": self.CoreFactorMatchCount,
+            "CoreFactorCount": self.CoreFactorCount,
+            "CanPrune": self.CanPrune,
+            "RejectionReason": self.RejectionReason,
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalSignalApertureCandidateDomainIdentity:
+    """Signal-local route domain over a stable core, before sibling filtering."""
+
+    DomainFingerprint: str
+    StableDomainFingerprint: str
+    Signal: str
+    ApertureFingerprint: str
+    PortGlobalContractFingerprint: str
+    ChannelReservationFingerprint: str
+    RequestDependencyFingerprint: str
+    StableKeepoutCoreFingerprint: str
+    BlockedNodesFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    CoverageCursor: int
+    Complete: bool
+
+
+@dataclass(frozen=True)
 class PreparedPhysicalComponentPortFactorDomain:
     """Complete pre-assignment physical port factor-domain boundary."""
 
@@ -1282,13 +1929,44 @@ class PreparedPhysicalComponentPortFactorDomain:
     ComponentEnvelopeMaximum: Position3
     FabricAdjacency: tuple[tuple[Position3, tuple[Position3, ...]], ...]
     ComponentKeepoutNodes: frozenset[Position3]
+    ComponentKeepoutGuideCellsByLayer: tuple[
+        tuple[int, frozenset[Position2]], ...
+    ]
     LaneFactorExpansionCount: int
     AccessFactorExpansionCount: int
     SeamFactorExpansionCount: int
     GlobalConnectorSearchCount: int
+    GlobalConnectorCacheHitCount: int
     GlobalConnectorExpansionCount: int
+    GlobalGuideFieldBuildCount: int
+    GlobalGuideFieldExpansionCount: int
+    GlobalGuideFieldHitCount: int
+    GlobalGuideFieldCanonicalPathCount: int
+    GlobalGuideFieldFallbackCount: int
+    GlobalConnectorPortableCacheHitCount: int
+    GlobalConnectorPortableCacheValidationRejectCount: int
+    GlobalConnectorPortableCacheStoreCount: int
     Complete: bool
     Feasible: bool
+    PreparationStageTimings: tuple[tuple[str, float], ...] = ()
+    LocalAccessFactorsBySignal: tuple[
+        tuple[str, tuple[PhysicalPortLocalAccessFactor, ...]], ...
+    ] = ()
+    ApertureFactorsBySignal: tuple[
+        tuple[str, tuple[PhysicalPortApertureOptionFactor, ...]], ...
+    ] = ()
+    LocalApertureSupportBySignal: tuple[
+        tuple[str, tuple[PhysicalPortLocalApertureSupport, ...]], ...
+    ] = ()
+    # Complete global-only candidate reservations.  This additive field lets
+    # assembly planning publish its authoritative boundary choices without
+    # coupling them back to component-local access witnesses.
+    BoundaryPortReservationsBySignal: tuple[
+        tuple[
+            str,
+            tuple[PhysicalComponentBoundaryPortReservation, ...],
+        ], ...
+    ] = ()
 
 
 @dataclass
@@ -1300,6 +1978,11 @@ class RoutingResources:
     )
     RawPortalGeometryCaches: tuple[Any, ...] = field(
         default_factory=tuple,
+        compare=False,
+        repr=False,
+    )
+    PhysicalGlobalApertureTemplateCache: dict[str, Any] = field(
+        default_factory=dict,
         compare=False,
         repr=False,
     )
@@ -1392,7 +2075,176 @@ class RoutingResources:
         compare=False,
         repr=False,
     )
+    PhysicalGlobalRouteTreeResultCache: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalGlobalAssignmentArcCompatibilityCache: dict[
+        tuple[str, str], bool
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalGlobalAssignmentArcIndex: Any = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    PhysicalGlobalMandatoryPortalPairCertificateCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentPortOptionDomainCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentFactorPortOptionDomainCache: dict[
+        tuple[str, str], Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentPortOptionArcSupportCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentPortLaneArcSupportCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentPortCspStateCache: dict[
+        str, PhysicalComponentPortCspState
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentBoundaryAssignmentIteratorCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentBoundaryTraversalPrioritySignals: tuple[str, ...] = (
+        field(
+            default_factory=tuple,
+            compare=False,
+            repr=False,
+        )
+    )
+    PhysicalComponentBoundaryTraversalEpoch: int = field(
+        default=0,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentBoundaryTraversalCursor: int = field(
+        default=0,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentLocalInterfaceFactorProofCache: dict[
+        tuple[str, str, str, str], Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentLocalPortfolioContextCache: dict[
+        tuple[str, str, str], Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalLocalPortPairSupportCertificateCache: dict[
+        str, PhysicalLocalPortPairSupportCertificate
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalPortCorridorDomainCache: dict[
+        str, PhysicalPortCorridorDomain
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalSignalRouteDomainContinuationCache: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentApertureDomainCache: dict[
+        str, CertifiedPhysicalComponentApertureDomain
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PreferredPhysicalComponentGlobalContractsBySignal: dict[
+        str, str
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PreferredPhysicalComponentPortReservationsBySignal: dict[
+        str, str
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    RetainedPhysicalGlobalPlanFrontier: dict[
+        str, RetainedPhysicalGlobalPlanFrontierEntry
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    DeferredPhysicalComponentPortAssignmentFingerprints: set[str] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    PhysicalGlobalPlanFrontierScheduleSequence: int = field(
+        default=0,
+        compare=False,
+        repr=False,
+    )
+    PreparingPhysicalComponentGlobalChannels: bool = field(
+        default=False,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentExactGlobalChannelSignals: frozenset[str] = field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
     RejectedPhysicalComponentPortAssignmentFingerprints: set[str] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    RejectedPhysicalComponentBoundaryAssignmentFingerprints: set[str] = field(
         default_factory=set,
         compare=False,
         repr=False,
@@ -1407,6 +2259,25 @@ class RoutingResources:
     RejectedPhysicalComponentPortReservationSets: set[
         frozenset[tuple[str, str]]
     ] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    ForbiddenPhysicalComponentGlobalCandidateSets: set[
+        frozenset[tuple[str, str]]
+    ] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    RejectedPhysicalGlobalRequestApertureFactorSets: set[
+        frozenset[tuple[str, str]]
+    ] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    RejectedPhysicalComponentAssemblyPlanFingerprints: set[str] = field(
         default_factory=set,
         compare=False,
         repr=False,

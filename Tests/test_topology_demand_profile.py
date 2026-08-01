@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
 from Compiler.Placement.Geometry import PlacedDesign
@@ -30,7 +31,9 @@ from Compiler.Placement.PcbFlow import (
     BuildMandatoryAccessPortfolioExpectedCandidateIndices,
     BuildMandatoryAccessPortfolioRecipeIdentity,
     BuildClusterInterfaceUnsatProof,
+    BuildComponentAccessFeedbackPlacementScore,
     BuildClusterInterfaceStageSchedule,
+    BuildLocalComponentCompilationAdmissionFailure,
     BuildPendingJointPlacementPortfolioIdentity,
     BuildPendingJointPlacementPortfolioFingerprint,
     BuildPendingJointPlacementStateKey,
@@ -48,6 +51,8 @@ from Compiler.Placement.PcbFlow import (
     HasActiveMaterializedJointPlacementCandidate,
     HasCurrentMaterializedJointPlacementCandidate,
     HasCurrentPendingJointPlacementState,
+    HasDistinctRetainedPhysicalEligibilityState,
+    SelectRetainedPhysicalPlacementForAccessCore,
     MandatoryAccessPortfolioEvidence,
     MandatoryAccessPortfolioEvaluation,
     MandatoryAccessPortfolioIdentity,
@@ -333,6 +338,184 @@ def BuildOwnedPairCapacityCut(
 
 
 class TopologyDemandProfileTests(unittest.TestCase):
+    def testPhysicalAccessFeedbackRanksExactEscapeDomainBeforeDepth(
+        self,
+    ) -> None:
+        def Candidate(
+            Fingerprint: str,
+            EscapeCount: int,
+            SourceX: int,
+        ):
+            Request = SimpleNamespace(
+                Signal="CutSignal",
+                SourceCluster=0,
+                TargetCluster=1,
+                SourceTerminal=(SourceX, 1, 1),
+                TargetTerminals=((20, 1, 1),),
+                SourceBoundarySide="west",
+                TargetBoundarySide="east",
+            )
+            Placement = SimpleNamespace(
+                Placed=SimpleNamespace(
+                    PlacedGates=(
+                        SimpleNamespace(Name="Left", X=0, Z=0),
+                        SimpleNamespace(Name="Right", X=20, Z=0),
+                    ),
+                    ClusterBoundaryLeaseRequests=(Request,),
+                ),
+                Clusters=(("Left",), ("Right",)),
+                ClusterBoundaryLeaseRequests=(Request,),
+                PackedClusters=(
+                    SimpleNamespace(
+                        ClusterId=0,
+                        LegalEscapeCandidateCounts=((
+                            "CutSignal", EscapeCount,
+                        ),),
+                    ),
+                    SimpleNamespace(
+                        ClusterId=1,
+                        LegalEscapeCandidateCounts=((
+                            "CutSignal", EscapeCount,
+                        ),),
+                    ),
+                ),
+            )
+            return SimpleNamespace(
+                PlacementFingerprint=Fingerprint,
+                CandidateId="Placement-" + Fingerprint,
+                JointPlacementState=object(),
+                TopologyDemand=object(),
+                Placement=Placement,
+            )
+
+        CompactDomain = Candidate("compact", 2, 1)
+        BroadDomain = Candidate("broad", 9, 0)
+        self.assertLess(
+            BuildComponentAccessFeedbackPlacementScore(
+                CompactDomain,
+                ("CutSignal",),
+            ),
+            BuildComponentAccessFeedbackPlacementScore(
+                BroadDomain,
+                ("CutSignal",),
+            ),
+        )
+        self.assertEqual(
+            SelectRetainedPhysicalPlacementForAccessCore(
+                (BroadDomain, CompactDomain),
+                (),
+                ("CutSignal",),
+            ).PlacementFingerprint,
+            "compact",
+        )
+
+    def testPhysicalAccessFeedbackScoreIsRenameAndOrderInvariant(
+        self,
+    ) -> None:
+        def Build(Signals: tuple[str, str], Reverse: bool):
+            Requests = [
+                SimpleNamespace(
+                    Signal=Signal,
+                    SourceCluster=0,
+                    TargetCluster=1,
+                    SourceTerminal=(0, 1, Index),
+                    TargetTerminals=((10, 1, Index),),
+                    SourceBoundarySide="west",
+                    TargetBoundarySide="east",
+                )
+                for Index, Signal in enumerate(Signals)
+            ]
+            Counts = [(Signal, Index + 2) for Index, Signal in enumerate(Signals)]
+            if Reverse:
+                Requests.reverse()
+                Counts.reverse()
+            return SimpleNamespace(Placement=SimpleNamespace(
+                Placed=SimpleNamespace(
+                    PlacedGates=(
+                        SimpleNamespace(Name="Left", X=0, Z=0),
+                        SimpleNamespace(Name="Right", X=10, Z=0),
+                    ),
+                    ClusterBoundaryLeaseRequests=tuple(Requests),
+                ),
+                Clusters=(("Left",), ("Right",)),
+                ClusterBoundaryLeaseRequests=tuple(Requests),
+                PackedClusters=tuple(
+                    SimpleNamespace(
+                        ClusterId=ClusterId,
+                        LegalEscapeCandidateCounts=tuple(Counts),
+                    )
+                    for ClusterId in (0, 1)
+                ),
+            ))
+
+        self.assertEqual(
+            BuildComponentAccessFeedbackPlacementScore(
+                Build(("Alpha", "Beta"), False),
+                ("Alpha", "Beta"),
+            ),
+            BuildComponentAccessFeedbackPlacementScore(
+                Build(("Renamed0", "Renamed1"), True),
+                ("Renamed1", "Renamed0"),
+            ),
+        )
+
+    def testPhysicalProofConsumesRetainedPlacementBeforeGeneration(
+        self,
+    ) -> None:
+        def Candidate(Fingerprint: str):
+            return SimpleNamespace(
+                PlacementFingerprint=Fingerprint,
+                CandidateId="Placement-" + Fingerprint,
+                JointPlacementState=object(),
+                TopologyDemand=object(),
+            )
+
+        Candidates = tuple(map(Candidate, ("known", "wide", "best")))
+        with patch(
+            "Compiler.Placement.PcbFlow."
+            "BuildComponentAccessFeedbackPlacementScore",
+            side_effect=lambda CandidateValue, _Signals: {
+                "known": (0,),
+                "best": (1,),
+                "wide": (2,),
+            }[CandidateValue.PlacementFingerprint],
+        ):
+            Selected = SelectRetainedPhysicalPlacementForAccessCore(
+                Candidates,
+                ("known",),
+                ("NandNet28", "NandNet29"),
+            )
+
+        self.assertIsNotNone(Selected)
+        self.assertEqual(Selected.PlacementFingerprint, "best")
+
+    def testPhysicalProofGuidedPlacementWaitsForRetainedSibling(
+        self,
+    ) -> None:
+        First = SimpleNamespace(PlacementFingerprint="first")
+        Second = SimpleNamespace(PlacementFingerprint="second")
+        Queue = [
+            ("solve-prepared-eligibility", 0, First, 0, 0),
+            ("prepare-eligibility", 1, Second, 0, 0),
+            ("prepare-eligibility", 2, First, 0, 1),
+        ]
+
+        self.assertTrue(HasDistinctRetainedPhysicalEligibilityState(
+            Queue,
+            ComponentVariant=0,
+            PlacementFingerprint="first",
+        ))
+        self.assertFalse(HasDistinctRetainedPhysicalEligibilityState(
+            Queue,
+            ComponentVariant=1,
+            PlacementFingerprint="first",
+        ))
+        self.assertFalse(HasDistinctRetainedPhysicalEligibilityState(
+            Queue[:1],
+            ComponentVariant=0,
+            PlacementFingerprint="first",
+        ))
+
     def testAuthoritativeCutAccessDomainFingerprintSurvivesScheduler(
         self,
     ) -> None:
@@ -3307,6 +3490,7 @@ class TopologyDemandProfileTests(unittest.TestCase):
         Schedule = BuildClusterInterfaceStageSchedule(
             Deadline,
             ("state-b", "state-a"),
+            LocalCompilationReserveSeconds=5.0,
             GlobalRoutingReserveSeconds=15.0,
             PublicationReserveSeconds=2.0,
         )
@@ -3318,10 +3502,48 @@ class TopologyDemandProfileTests(unittest.TestCase):
             Schedule.ExpiresAt,
             Deadline.ExpiresAt - 17.0 + 0.001,
         )
+        self.assertLessEqual(
+            Schedule.PlanningExpiresAt,
+            Deadline.ExpiresAt - 22.0 + 0.001,
+        )
+        self.assertEqual(Schedule.LocalCompilationReserveSeconds, 5.0)
+        self.assertEqual(
+            Schedule.ToDictionary()["LocalCompilationReserveSeconds"],
+            5.0,
+        )
         self.assertEqual(
             Schedule.ToDictionary()["Scheduling"],
             "sequential-shared-budget",
         )
+
+    def testLocalCompilationAdmissionFailureReportsZeroSolverWork(self) -> None:
+        Deadline = RoutingDeadline.Start(30.0)
+        Schedule = BuildClusterInterfaceStageSchedule(
+            Deadline,
+            ("state",),
+            LocalCompilationReserveSeconds=5.0,
+            GlobalRoutingReserveSeconds=4.0,
+            PublicationReserveSeconds=2.0,
+        )
+
+        Failure = BuildLocalComponentCompilationAdmissionFailure(
+            Schedule,
+            RemainingSeconds=-0.25,
+        )
+
+        self.assertEqual(
+            Failure.Reason,
+            RoutingFailureReason.PhysicalComponentAssemblyIncomplete,
+        )
+        self.assertEqual(
+            Failure.Stage,
+            "ClosedComponentCompilationIncomplete",
+        )
+        Solve = Failure.Diagnostics["ComponentRoutingSolve"]
+        self.assertEqual(Solve["ExpansionCount"], 0)
+        self.assertTrue(Solve["Diagnostics"]["DeadlineExceeded"])
+        self.assertFalse(Solve["Diagnostics"]["WorkCapReached"])
+        self.assertFalse(Solve["Diagnostics"]["LocalCompilationEntered"])
 
     def test_interface_portfolio_retains_topology_not_orientation_labels(self):
         def Candidate(
