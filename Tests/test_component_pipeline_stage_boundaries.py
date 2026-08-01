@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from Compiler.Placement.PcbFlow import (
+    BuildPhysicalGlobalPlanResumeCursorFromDiagnostics,
     BuildPhysicalComponentPlacementFeedback,
     ClassifyPhysicalGlobalPlanRetentionAdmission,
     IsClusterInterfaceStateIncomplete,
@@ -13,6 +14,7 @@ from Compiler.Placement.PcbFlow import (
 )
 import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
 from Compiler.Routing.ComponentPipeline import (
+    BuildPhysicalComponentAssemblyChoiceFingerprint,
     BuildPhysicalAssemblyGlobalReuseFingerprint,
     BuildPhysicalGlobalPlanCutFamilyFingerprint,
     BuildPhysicalGlobalPlanDependencyFingerprint,
@@ -22,6 +24,7 @@ from Compiler.Routing.ComponentPipeline import (
     ClassifyPhysicalComponentGlobalPlanningFailure,
     RecordPhysicalComponentGlobalPlanNoGood,
     PhysicalAssemblyGlobalRouteCanBeRebound,
+    SelectContractIndependentOwnedSignalFrontierUnsatCore,
     SelectPhysicalComponentGlobalContractRecommendation,
     SelectPhysicalComponentExactGlobalChannelSignals,
 )
@@ -149,7 +152,21 @@ def test_local_compilation_requires_explicit_admission_without_floor():
     assert "max(" not in Invocation
 
 
-def test_physical_planning_promotes_proof_guided_retained_execution():
+def test_admitted_local_compilation_is_not_reclassified_by_planning_clock():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Compile = Source.index("ComponentSolve = CompileClosedComponent(")
+    Result = Source.index("if not ComponentSolve.Feasible:", Compile)
+    LocalProof = Source.index(
+        "ProveGlobalRelaxedLocalUnsatisfiability(",
+        Result,
+    )
+    Classification = Source[Result:LocalProof]
+
+    assert "InterfaceDeadline.IsExpired()" not in Classification
+    assert "not ActiveComponentDeadline.IsExpired()" in Classification
+
+
+def test_physical_planning_uses_planning_clock_until_bound_handoff():
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
     Schedule = Source.index("BuildClusterInterfaceStageSchedule(")
     PlanningDeadline = Source.index(
@@ -157,7 +174,7 @@ def test_physical_planning_promotes_proof_guided_retained_execution():
         Schedule,
     )
     StateDeadline = Source.index(
-        "InterfaceDeadline = (",
+        "InterfaceDeadline = SharedInterfacePlanningDeadline",
         PlanningDeadline,
     )
     Admission = Source.index(
@@ -171,10 +188,110 @@ def test_physical_planning_promotes_proof_guided_retained_execution():
 
     assert Schedule < PlanningDeadline < StateDeadline < Admission < Preparation
     Selection = Source[StateDeadline:Admission]
-    assert 'InterfaceWorkPhase == "prepare-eligibility"' in Selection
-    assert "and ActiveComponentCutSignals" in Selection
-    assert "SharedInterfaceDeadline" in Selection
-    assert "SharedInterfacePlanningDeadline" in Selection
+    assert "InterfaceDeadline = SharedInterfacePlanningDeadline" in Selection
+    assert "SharedInterfaceDeadline" not in Selection
+
+
+def test_stage_specific_incomplete_failures_preserve_handoff_identity():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Compile = Source.index("ComponentSolve = CompileClosedComponent(")
+    BeforeCompile = Source[:Compile]
+    AfterCompile = Source[Compile:]
+
+    assert BeforeCompile.count(
+        "BuildPhysicalAssemblyPlanningIncompleteFailure("
+    ) == 2
+    assert BeforeCompile.count(
+        "BuildLocalComponentCompilationAdmissionFailure("
+    ) == 1
+    assert "BuildClosedComponentExecutionIncompleteFailure(" not in (
+        BeforeCompile
+    )
+    assert "BuildClosedComponentExecutionIncompleteFailure(" in AfterCompile
+    assert "PhysicalAssemblyPlan.PlanFingerprint" in AfterCompile
+
+
+def test_unbound_owned_frontier_core_requires_complete_independence():
+    Problem = SimpleNamespace(
+        Interface=SimpleNamespace(PhysicalPortReservations=()),
+        ReservedGlobalClaimsBySignal={},
+    )
+    SignalProof = {
+        "Complete": True,
+        "EmptyPhase": "owned-terminal-frontier",
+        "OwnedSignalDomainContractIndependent": True,
+        "CertifiedRejectedCandidateCount": 0,
+    }
+    Result = SimpleNamespace(
+        Status="architectural-unsatisfiable",
+        Template=None,
+        Diagnostics={
+            "LocalUnsatCoreComplete": True,
+            "LocalUnsatCoreKind": (
+                "tree-frontier-empty-owned-signal-domain"
+            ),
+            "LocalUnsatCoreSignals": ["NandLike"],
+            "LocalUnsatCoreProjectionFingerprint": "projection",
+            "SignalDiagnostics": {"NandLike": SignalProof},
+        },
+    )
+
+    assert SelectContractIndependentOwnedSignalFrontierUnsatCore(
+        Problem,
+        Result,
+    ) == ("NandLike",)
+    Incomplete = SimpleNamespace(
+        **{**Result.__dict__, "Status": "incomplete"}
+    )
+    assert SelectContractIndependentOwnedSignalFrontierUnsatCore(
+        Problem,
+        Incomplete,
+    ) == ()
+    Dependent = SimpleNamespace(
+        **{
+            **Result.__dict__,
+            "Diagnostics": {
+                **Result.Diagnostics,
+                "SignalDiagnostics": {
+                    "NandLike": {
+                        **SignalProof,
+                        "OwnedSignalDomainContractIndependent": False,
+                    }
+                },
+            },
+        }
+    )
+    assert SelectContractIndependentOwnedSignalFrontierUnsatCore(
+        Problem,
+        Dependent,
+    ) == ()
+    BoundProblem = SimpleNamespace(
+        Interface=SimpleNamespace(
+            PhysicalPortReservations=(SimpleNamespace(),),
+        ),
+        ReservedGlobalClaimsBySignal={},
+    )
+    assert SelectContractIndependentOwnedSignalFrontierUnsatCore(
+        BoundProblem,
+        Result,
+    ) == ()
+
+
+def test_unbound_frontier_callback_precedes_port_factor_preparation():
+    Source = inspect.getsource(
+        AuthoritativePlanner.RouteAuthoritativeResources
+    )
+    Access = Source.index("if not PreparedAccessCertificate.Feasible:")
+    Callback = Source.index(
+        "UnboundOwnedSignalFrontierProofCallback(",
+        Access,
+    )
+    Factors = Source.index(
+        "Preparation = PreparePhysicalComponentPortFactorDomain(",
+        Callback,
+    )
+
+    assert Access < Callback < Factors
 
 
 @pytest.mark.parametrize(
@@ -450,7 +567,7 @@ def test_incomplete_global_plan_is_retained_without_recording_a_no_good():
 
     assert Incomplete < Retain < Defer < Replan
     assert '"NoGoodRecorded": False' in Reservation[Retain:Replan]
-    assert '"CursorResumeAvailable": False' in Reservation[Retain:Replan]
+    assert '"CursorResumeAvailable": bool(' in Reservation[Retain:Replan]
     assert "RecordPhysicalComponentGlobalPlanNoGood(" not in (
         Reservation[Incomplete:Replan]
     )
@@ -579,6 +696,490 @@ def test_frontier_retention_requires_complete_aperture_and_progress():
     assert Positive["Reason"] == "typed-resumable-progress"
 
 
+def test_candidate_stage_portal_progress_builds_resumable_cursor():
+    Cursor, CompletedWork = (
+        BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+            "plan-a",
+            "aperture-a",
+            {
+                "UnderlyingFailure": {
+                    "Diagnostics": {
+                        "PortalCompletedWork": 28,
+                        "PortalRequestCount": 40,
+                        "PortalCacheMode": "partial-signal",
+                        "RawPortalResourceCacheSelected": True,
+                    },
+                },
+            },
+        )
+    )
+
+    assert CompletedWork == 28
+    assert Cursor is not None
+    assert Cursor.PlanFingerprint == "plan-a"
+    assert Cursor.ApertureDomainFingerprint == "aperture-a"
+    assert Cursor.CompletedWork == 28
+
+
+def test_uncached_portal_failure_does_not_build_resume_cursor():
+    Cursor, CompletedWork = (
+        BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+            "plan-a",
+            "aperture-a",
+            {
+                "PortalCompletedWork": 28,
+                "PortalRequestCount": 40,
+                "PortalCacheMode": "disabled",
+                "RawPortalResourceCacheSelected": False,
+            },
+        )
+    )
+
+    assert CompletedWork == 28
+    assert Cursor is None
+
+
+def _DescriptorProgressDiagnostics(
+    Completed,
+    *,
+    PreSibling="pre-sibling-a",
+    RequestDomain="request-a",
+    Universe="universe-a",
+    DescriptorCount=3,
+    StoredRouteResults=0,
+):
+    return {
+        "PhysicalSignalRouteDomainDescriptorProgress": {
+            "SignalA": {
+                "PreSiblingDomainFingerprint": PreSibling,
+                "RequestDomainFingerprint": RequestDomain,
+                "DescriptorUniverseFingerprint": Universe,
+                "DescriptorCount": DescriptorCount,
+                "CompletedDescriptorCount": len(Completed),
+                "CompletedDescriptorFingerprints": list(Completed),
+            },
+        },
+        "PhysicalGlobalRouteTreeResultCache": {
+            "StoredResultCount": StoredRouteResults,
+            "StoredResultCountAfterDeadlineRetention": (
+                StoredRouteResults
+            ),
+        },
+        "RouteTreeCompletedWork": StoredRouteResults,
+    }
+
+
+def _DescriptorContinuation(Completed, **DiagnosticOverrides):
+    Cursor, CompletedWork = (
+        BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+            "plan-a",
+            "aperture-a",
+            _DescriptorProgressDiagnostics(
+                Completed,
+                **DiagnosticOverrides,
+            ),
+        )
+    )
+    assert Cursor is not None
+    Plan = SimpleNamespace(PlanFingerprint="plan-a", Ports=())
+    return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+        Plan,
+        {"SignalA": "request-a"},
+        {"SignalA": 3 - len(Completed)},
+        (),
+        ("aperture-a",),
+        CompletedWork=CompletedWork,
+        ResumeCursor=Cursor,
+    )
+
+
+def test_descriptor_retention_admits_only_a_strict_completed_set_superset():
+    First = _DescriptorContinuation(("descriptor-0",))
+    Existing = SimpleNamespace(Continuation=First)
+    StrictSuperset = _DescriptorContinuation((
+        "descriptor-0",
+        "descriptor-2",
+    ))
+
+    Admission = ClassifyPhysicalGlobalPlanRetentionAdmission(
+        {"DomainFingerprint": "aperture-a", "Complete": True},
+        Continuation=StrictSuperset,
+        ExistingEntry=Existing,
+    )
+
+    assert Admission["Retained"] is True
+    assert Admission["DescriptorCompletedSetSuperset"] is True
+    assert Admission["DescriptorStrictAddition"] is True
+
+
+def test_descriptor_retention_keeps_full_two_signal_universe_across_rollover():
+    def Continuation(AlphaCompleted, BetaCompleted):
+        Diagnostics = {
+            "PhysicalSignalRouteDomainDescriptorProgress": {
+                "Alpha": {
+                    "PreSiblingDomainFingerprint": "pre-alpha",
+                    "RequestDomainFingerprint": "request-alpha",
+                    "DescriptorUniverseFingerprint": "universe-alpha",
+                    "DescriptorCount": 2,
+                    "CompletedDescriptorCount": len(AlphaCompleted),
+                    "CompletedDescriptorFingerprints": list(
+                        AlphaCompleted
+                    ),
+                },
+                "Beta": {
+                    "PreSiblingDomainFingerprint": "pre-beta",
+                    "RequestDomainFingerprint": "request-beta",
+                    "DescriptorUniverseFingerprint": "universe-beta",
+                    "DescriptorCount": 2,
+                    "CompletedDescriptorCount": len(BetaCompleted),
+                    "CompletedDescriptorFingerprints": list(
+                        BetaCompleted
+                    ),
+                },
+            },
+        }
+        Cursor, CompletedWork = (
+            BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+                "plan-a",
+                "aperture-a",
+                Diagnostics,
+            )
+        )
+        assert Cursor is not None
+        return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+            SimpleNamespace(PlanFingerprint="plan-a", Ports=()),
+            {
+                "Alpha": "request-alpha",
+                "Beta": "request-beta",
+            },
+            {
+                "Alpha": 2 - len(AlphaCompleted),
+                "Beta": 2 - len(BetaCompleted),
+            },
+            (),
+            ("aperture-a",),
+            CompletedWork=CompletedWork,
+            ResumeCursor=Cursor,
+        )
+
+    First = Continuation(("alpha-0",), ())
+    Second = Continuation(("alpha-0",), ("beta-1",))
+    assert (
+        First.ResumeCursor.State.UniverseIdentities
+        == Second.ResumeCursor.State.UniverseIdentities
+    )
+
+    Admission = ClassifyPhysicalGlobalPlanRetentionAdmission(
+        {"DomainFingerprint": "aperture-a", "Complete": True},
+        Continuation=Second,
+        ExistingEntry=SimpleNamespace(Continuation=First),
+    )
+
+    assert Admission["Retained"] is True
+    assert Admission["DescriptorCompletedSetSuperset"] is True
+    assert Admission["DescriptorStrictAddition"] is True
+
+
+def test_portable_conversion_publishes_exact_full_universe_before_retry():
+    Cache = {}
+    PortableCandidate = SimpleNamespace(
+        CandidateId="portable-alpha",
+        Payload="translated",
+    )
+    Alpha, _Advanced = (
+        AuthoritativePlanner
+        .RetainPhysicalSignalRouteDomainDescriptorProgress(
+            Cache,
+            PreSiblingDomainFingerprint="pre-alpha",
+            Signal="Alpha",
+            RequestDomainFingerprint="request-alpha",
+            RequestDescriptorFingerprints=("alpha-0", "alpha-1"),
+            CompletedDescriptorFingerprints=("alpha-0", "alpha-1"),
+            Candidates=(PortableCandidate,),
+            CandidateMetadata={
+                "portable-alpha": ("X", 0, 0, 2),
+            },
+        )
+    )
+    Beta, _Advanced = (
+        AuthoritativePlanner
+        .RetainPhysicalSignalRouteDomainDescriptorProgress(
+            Cache,
+            PreSiblingDomainFingerprint="pre-beta",
+            Signal="Beta",
+            RequestDomainFingerprint="request-beta",
+            RequestDescriptorFingerprints=("beta-0", "beta-1"),
+            CompletedDescriptorFingerprints=(),
+            Candidates=(),
+            CandidateMetadata={},
+        )
+    )
+    FirstDiagnostics = {
+        "PhysicalSignalRouteDomainDescriptorProgress": {
+            "Alpha": {
+                **Alpha.ToProgressDictionary(),
+                "PortableReplayProvenance": True,
+            },
+            "Beta": Beta.ToProgressDictionary(),
+        },
+    }
+
+    ReplayedAlpha = (
+        AuthoritativePlanner
+        .SelectReplayablePhysicalSignalRouteDomainContinuation(
+            Cache,
+            "pre-alpha",
+            "Alpha",
+            "request-alpha",
+            ("alpha-0", "alpha-1"),
+        )
+    )
+    assert ReplayedAlpha is Alpha
+    BetaAdvanced, StrictlyAdvanced = (
+        AuthoritativePlanner
+        .RetainPhysicalSignalRouteDomainDescriptorProgress(
+            Cache,
+            PreSiblingDomainFingerprint="pre-beta",
+            Signal="Beta",
+            RequestDomainFingerprint="request-beta",
+            RequestDescriptorFingerprints=("beta-0", "beta-1"),
+            CompletedDescriptorFingerprints=("beta-1",),
+            Candidates=(),
+            CandidateMetadata={},
+        )
+    )
+    assert StrictlyAdvanced
+    SecondDiagnostics = {
+        "PhysicalSignalRouteDomainDescriptorProgress": {
+            "Alpha": {
+                **ReplayedAlpha.ToProgressDictionary(),
+                "PortableReplayProvenance": False,
+            },
+            "Beta": BetaAdvanced.ToProgressDictionary(),
+        },
+    }
+
+    def Continuation(Diagnostics):
+        Cursor, CompletedWork = (
+            BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+                "plan-a",
+                "aperture-a",
+                Diagnostics,
+            )
+        )
+        assert Cursor is not None
+        return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+            SimpleNamespace(PlanFingerprint="plan-a", Ports=()),
+            {
+                "Alpha": "request-alpha",
+                "Beta": "request-beta",
+            },
+            {
+                "Alpha": 0,
+                "Beta": (
+                    2
+                    - len(BetaAdvanced.CompletedDescriptorFingerprints)
+                    if Diagnostics is SecondDiagnostics
+                    else 2
+                ),
+            },
+            (),
+            ("aperture-a",),
+            CompletedWork=CompletedWork,
+            ResumeCursor=Cursor,
+        )
+
+    First = Continuation(FirstDiagnostics)
+    Second = Continuation(SecondDiagnostics)
+    assert (
+        First.ResumeCursor.State.UniverseIdentities
+        == Second.ResumeCursor.State.UniverseIdentities
+    )
+    Admission = ClassifyPhysicalGlobalPlanRetentionAdmission(
+        {"DomainFingerprint": "aperture-a", "Complete": True},
+        Continuation=Second,
+        ExistingEntry=SimpleNamespace(Continuation=First),
+    )
+    assert Admission["Retained"] is True
+    assert Admission["DescriptorStrictAddition"] is True
+
+
+def test_descriptor_retention_rejects_equal_cardinality_different_sets():
+    First = _DescriptorContinuation(("descriptor-0",))
+    Existing = SimpleNamespace(Continuation=First)
+    DifferentSet = _DescriptorContinuation(("descriptor-1",))
+
+    Admission = ClassifyPhysicalGlobalPlanRetentionAdmission(
+        {"DomainFingerprint": "aperture-a", "Complete": True},
+        Continuation=DifferentSet,
+        ExistingEntry=Existing,
+    )
+
+    assert Admission["Retained"] is False
+    assert Admission["Reason"] == "descriptor-completion-is-not-a-superset"
+
+
+@pytest.mark.parametrize(
+    "ChangedIdentity",
+    (
+        {"PreSibling": "pre-sibling-b"},
+        {"RequestDomain": "request-b"},
+        {"Universe": "universe-b"},
+        {"DescriptorCount": 4},
+    ),
+)
+def test_descriptor_retention_rejects_universe_or_identity_mismatch(
+    ChangedIdentity,
+):
+    First = _DescriptorContinuation(("descriptor-0",))
+    Existing = SimpleNamespace(Continuation=First)
+    Changed = _DescriptorContinuation(
+        ("descriptor-0", "descriptor-1"),
+        **ChangedIdentity,
+    )
+
+    Admission = ClassifyPhysicalGlobalPlanRetentionAdmission(
+        {"DomainFingerprint": "aperture-a", "Complete": True},
+        Continuation=Changed,
+        ExistingEntry=Existing,
+    )
+
+    assert Admission["Retained"] is False
+    assert Admission["Reason"] == (
+        "descriptor-universe-or-identity-mismatch"
+    )
+
+
+def test_raw_route_lru_growth_is_not_descriptor_progress():
+    Cursor, CompletedWork = (
+        BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+            "plan-a",
+            "aperture-a",
+            {
+                "RouteTreeCompletedWork": 23,
+                "PhysicalComponentGlobalCandidateContinuations": [{
+                    "Signal": "SignalA",
+                    "ExecutedRequestCount": 23,
+                    "RemainingRequestCount": 40,
+                    "MaterializedCandidateCount": 2,
+                }],
+                "PhysicalGlobalRouteTreeResultCache": {
+                    "DescriptorCount": 63,
+                    "StoredResultCount": 23,
+                    "StoredResultCountAfterDeadlineRetention": 23,
+                },
+            },
+        )
+    )
+
+    assert Cursor is None
+    assert CompletedWork == 0
+
+
+def test_descriptor_progress_ignores_raw_route_lru_growth():
+    FirstCursor, FirstWork = (
+        BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+            "plan-a",
+            "aperture-a",
+            _DescriptorProgressDiagnostics(
+                ("descriptor-0",),
+                StoredRouteResults=1,
+            ),
+        )
+    )
+    GrownCursor, GrownWork = (
+        BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+            "plan-a",
+            "aperture-a",
+            _DescriptorProgressDiagnostics(
+                ("descriptor-0",),
+                StoredRouteResults=99,
+            ),
+        )
+    )
+
+    assert FirstCursor is not None and GrownCursor is not None
+    assert FirstWork == GrownWork == 1
+    assert FirstCursor.CursorFingerprint == GrownCursor.CursorFingerprint
+
+
+def test_descriptor_retention_two_signal_rollover_requires_zero_seeded_universe():
+    def Diagnostics(*, IncludeSignalB, CompletedB=()):
+        Progress = {
+            "SignalA": {
+                "PreSiblingDomainFingerprint": "pre-sibling-a",
+                "RequestDomainFingerprint": "request-a",
+                "DescriptorUniverseFingerprint": "universe-a",
+                "DescriptorCount": 2,
+                "CompletedDescriptorCount": 1,
+                "CompletedDescriptorFingerprints": ["a-0"],
+            },
+        }
+        if IncludeSignalB:
+            Progress["SignalB"] = {
+                "PreSiblingDomainFingerprint": "pre-sibling-b",
+                "RequestDomainFingerprint": "request-b",
+                "DescriptorUniverseFingerprint": "universe-b",
+                "DescriptorCount": 2,
+                "CompletedDescriptorCount": len(CompletedB),
+                "CompletedDescriptorFingerprints": list(CompletedB),
+            }
+        return {
+            "PhysicalSignalRouteDomainDescriptorProgress": Progress,
+        }
+
+    def Continuation(DiagnosticsValue):
+        Cursor, CompletedWork = (
+            BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+                "plan-a",
+                "aperture-a",
+                DiagnosticsValue,
+            )
+        )
+        assert Cursor is not None
+        return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+            SimpleNamespace(PlanFingerprint="plan-a", Ports=()),
+            {"SignalA": "request-a", "SignalB": "request-b"},
+            {"SignalA": 1, "SignalB": 1},
+            (),
+            ("aperture-a",),
+            CompletedWork=CompletedWork,
+            ResumeCursor=Cursor,
+        )
+
+    ZeroSeededFirst = Continuation(Diagnostics(
+        IncludeSignalB=True,
+    ))
+    Second = Continuation(Diagnostics(
+        IncludeSignalB=True,
+        CompletedB=("b-1",),
+    ))
+    Aperture = {"DomainFingerprint": "aperture-a", "Complete": True}
+
+    Admitted = ClassifyPhysicalGlobalPlanRetentionAdmission(
+        Aperture,
+        Continuation=Second,
+        ExistingEntry=SimpleNamespace(Continuation=ZeroSeededFirst),
+    )
+
+    assert Admitted["Retained"] is True
+    assert Admitted["DescriptorStrictAddition"] is True
+
+    OmittedSignalFirst = Continuation(Diagnostics(
+        IncludeSignalB=False,
+    ))
+    Rejected = ClassifyPhysicalGlobalPlanRetentionAdmission(
+        Aperture,
+        Continuation=Second,
+        ExistingEntry=SimpleNamespace(Continuation=OmittedSignalFirst),
+    )
+
+    assert Rejected["Retained"] is False
+    assert Rejected["Reason"] == (
+        "descriptor-universe-or-identity-mismatch"
+    )
+
+
 def test_retained_plan_resume_preserves_aperture_and_fairness_state():
     Plan = SimpleNamespace(
         PlanFingerprint="plan-a",
@@ -656,7 +1257,7 @@ def test_retained_plan_resume_preserves_aperture_and_fairness_state():
     assert Entry.AccumulatedCompletedWork == 8
     assert Entry.Continuation.RemainingRequestCounts == (("Signal", 2),)
     assert "aperture-a" in Entry.Continuation.CertificateFingerprints
-    assert not AuthoritativePlanner.ShouldScheduleRetainedPhysicalGlobalPlan(
+    assert AuthoritativePlanner.ShouldScheduleRetainedPhysicalGlobalPlan(
         Frontier,
         PreviousPlanWasRetained=True,
     )
@@ -782,6 +1383,263 @@ def test_single_port_global_proof_records_only_targeted_reservation_no_good():
     ]
     assert Diagnostics["BoundaryTraversalEpoch"] == 1
     assert Resources.PhysicalComponentBoundaryAssignmentIteratorCache == {}
+    assert Diagnostics["MinimumDeltaReplanPivotSignal"] == "PortA"
+    assert Diagnostics["MinimumDeltaRetainedGlobalContracts"] == {
+        "PortB": BuildPhysicalPortGlobalContractFingerprint(Plan.Ports[1]),
+    }
+    assert (
+        Resources.PreferredPhysicalComponentGlobalContractsBySignal
+        == Diagnostics["MinimumDeltaRetainedGlobalContracts"]
+    )
+
+
+def test_feedthrough_global_proof_records_consumable_exact_assembly_choice():
+    Port = SimpleNamespace(
+        Signal="PortA",
+        Direction="input",
+        Attachment=(0, 2, 0),
+        GlobalPath=((0, 2, 0), (0, 2, -1)),
+        Capacity=1,
+        ReservationFingerprint="reservation-a",
+        GlobalClaims=SimpleNamespace(
+            ResourceIds=frozenset(("wire:port-a",)),
+        ),
+    )
+    Feedthrough = SimpleNamespace(
+        Signal="Foreign",
+        ReservationFingerprint="feedthrough-reservation",
+        EndpointDomainFingerprint="feedthrough-domain",
+        EndpointCandidateFingerprint="feedthrough-candidate",
+    )
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        PortAssignmentFingerprint="whole-assignment",
+        PlacementFingerprint="placement",
+        ComponentGraphFingerprint="component-graph",
+        ResourceGraphFingerprint="resource-graph",
+        TechnologyFingerprint="technology",
+        InterfaceFingerprint="interface",
+        Ports=(Port,),
+        Feedthroughs=(Feedthrough,),
+        AssemblyChoiceFingerprint="",
+    )
+    Failure = ClassifyPhysicalComponentGlobalPlanningFailure(
+        RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="PhysicalComponentGlobalAssignmentDomain",
+            AffectedNets=("PortA",),
+            Diagnostics={
+                "GlobalPlanDomainComplete": True,
+                "CompleteAssignmentCutProof": True,
+            },
+        ),
+        Plan,
+        DeadlineExpired=False,
+    )
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        RejectedPhysicalComponentAssemblyChoiceFingerprints=set(),
+        PhysicalComponentBoundaryAssignmentIteratorCache={},
+    )
+
+    Diagnostics = RecordPhysicalComponentGlobalPlanNoGood(
+        Failure,
+        Plan,
+        Resources,
+    )
+
+    ChoiceFingerprint = BuildPhysicalComponentAssemblyChoiceFingerprint(
+        Plan
+    )
+    assert Diagnostics["NoGoodScope"] == (
+        "exact-assembly-port-feedthrough-choice"
+    )
+    assert Diagnostics["RejectedAssemblyChoiceFingerprint"] == (
+        ChoiceFingerprint
+    )
+    assert Resources.RejectedPhysicalComponentAssemblyChoiceFingerprints == {
+        ChoiceFingerprint
+    }
+    assert not Resources.RejectedPhysicalComponentPortReservationSets
+    assert not Resources.RejectedPhysicalComponentPortReservationsBySignal
+    assert Diagnostics["NoGoodReservationKeys"] == []
+
+
+def test_feedthrough_independence_proof_allows_port_only_global_no_good():
+    Port = SimpleNamespace(
+        Signal="PortA",
+        ReservationFingerprint="reservation-a",
+        GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+    )
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        PortAssignmentFingerprint="whole-assignment",
+        Ports=(Port,),
+        Feedthroughs=(SimpleNamespace(
+            Signal="Foreign",
+            ReservationFingerprint="feedthrough-reservation",
+        ),),
+    )
+    Failure = ClassifyPhysicalComponentGlobalPlanningFailure(
+        RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="PhysicalComponentGlobalAssignmentDomain",
+            AffectedNets=("PortA",),
+            Diagnostics={
+                "GlobalPlanDomainComplete": True,
+                "CompleteAssignmentCutProof": True,
+                "AssemblyPlanFeedthroughIndependentProofComplete": True,
+            },
+        ),
+        Plan,
+        DeadlineExpired=False,
+    )
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        RejectedPhysicalComponentAssemblyChoiceFingerprints=set(),
+        PhysicalComponentBoundaryAssignmentIteratorCache={},
+    )
+
+    Diagnostics = RecordPhysicalComponentGlobalPlanNoGood(
+        Failure,
+        Plan,
+        Resources,
+    )
+
+    assert Diagnostics["NoGoodScope"] == (
+        "single-port-aperture-reservation"
+    )
+    assert not Resources.RejectedPhysicalComponentAssemblyChoiceFingerprints
+    assert Resources.RejectedPhysicalComponentPortReservationsBySignal
+
+
+def test_generated_empty_portal_domain_needs_exact_assembly_certificate():
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        ResourceGraphFingerprint="resource-graph",
+        TechnologyFingerprint="technology",
+        PlacementFingerprint="placement",
+        InterfaceFingerprint="interface",
+        Ports=(SimpleNamespace(
+            Signal="CarryLike",
+            Direction="input",
+            Attachment=(0, 2, 0),
+            GlobalPath=((0, 2, 0),),
+            Capacity=1,
+            GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+        ),),
+    )
+    GeneratedOnly = AuthoritativePlanner.BuildMandatoryPortalTupleSelfConflictFailure((
+        AuthoritativePlanner.MandatoryPortalTupleSelfConflictEvidence(
+            Signal="CarryLike",
+            CompletePortalTupleCount=16,
+            EvaluatedPortalTupleCount=16,
+            TerminalPortalDomainCounts=(1, 4, 4),
+            ConflictResources=(),
+        ),
+    ))
+
+    Classified = ClassifyPhysicalComponentGlobalPlanningFailure(
+        GeneratedOnly,
+        Plan,
+        DeadlineExpired=False,
+    )
+
+    assert Classified.Reason == (
+        RoutingFailureReason.PhysicalComponentAssemblyIncomplete
+    )
+    assert Classified.Diagnostics["GlobalPlanDomainComplete"] is False
+
+
+def test_certified_empty_portal_domain_is_complete_exact_plan_unsat():
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        PortAssignmentFingerprint="whole-assignment",
+        ResourceGraphFingerprint="resource-graph",
+        TechnologyFingerprint="technology",
+        PlacementFingerprint="placement",
+        InterfaceFingerprint="interface",
+        Ports=(SimpleNamespace(
+            Signal="CarryLike",
+            Direction="input",
+            Attachment=(0, 2, 0),
+            GlobalPath=((0, 2, 0),),
+            Capacity=1,
+            GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+        ), SimpleNamespace(
+            Signal="UnrelatedSibling",
+            Direction="input",
+            Attachment=(4, 2, 0),
+            GlobalPath=((4, 2, 0),),
+            Capacity=1,
+            GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+        )),
+    )
+    Certified = AuthoritativePlanner.BuildMandatoryPortalTupleSelfConflictFailure((
+        AuthoritativePlanner.MandatoryPortalTupleSelfConflictEvidence(
+            Signal="CarryLike",
+            CompletePortalTupleCount=64,
+            EvaluatedPortalTupleCount=64,
+            TerminalPortalDomainCounts=(1, 4, 4),
+            ConflictResources=(),
+            PortalDomainCertificateFingerprint="portal-certificate",
+            PhysicalAssemblyPlanFingerprint="physical-plan",
+            ResourceGraphFingerprint="resource-graph",
+            TechnologyFingerprint="technology",
+            PlacementFingerprint="placement",
+            InterfaceFingerprint="interface",
+            SeamFingerprint="seam",
+            PortalRequestDomainFingerprint="request-domain",
+            ExactAttachmentValidationFingerprint="attachment-validation",
+        ),
+    ))
+
+    Classified = ClassifyPhysicalComponentGlobalPlanningFailure(
+        Certified,
+        Plan,
+        DeadlineExpired=False,
+    )
+
+    assert Classified.Reason == (
+        RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+    )
+    assert Classified.Diagnostics["GlobalPlanDomainComplete"] is True
+    assert Classified.Diagnostics["CompleteAssignmentCutProof"] is True
+    assert Classified.Diagnostics["AssemblyPlanDependencySignals"] == [
+        "CarryLike"
+    ]
+    assert Classified.Diagnostics["AssemblyPlanDependentPortSignals"] == [
+        "CarryLike"
+    ]
+    assert Classified.Diagnostics[
+        "IndependentEmptyCandidateDomainSignals"
+    ] == ["CarryLike"]
+
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        RejectedPhysicalComponentAssemblyChoiceFingerprints=set(),
+        PhysicalComponentBoundaryAssignmentIteratorCache={},
+    )
+    NoGood = RecordPhysicalComponentGlobalPlanNoGood(
+        Classified,
+        Plan,
+        Resources,
+    )
+
+    assert NoGood["NoGoodScope"] == (
+        "independent-empty-global-route-domain"
+    )
+    assert NoGood["NoGoodConstraintArity"] == 1
+    assert set(
+        Resources.RejectedPhysicalComponentPortReservationsBySignal
+    ) == {"CarryLike"}
+    assert not Resources.RejectedPhysicalComponentPortReservationSets
 
 
 def test_joint_port_global_proof_records_only_targeted_reservation_tuple():
@@ -1018,6 +1876,20 @@ def test_request_aperture_proof_retains_global_determinants_and_scope():
     assert any(
         Fingerprint.startswith("local-signal-domain:")
         for _Signal, Fingerprint in NoGood
+    )
+    ExpectedRetainedContracts = {
+        Port.Signal: BuildPhysicalPortGlobalContractFingerprint(Port)
+        for Port in Ports
+        if Port.Signal != "Blocker"
+    }
+    assert Diagnostics["MinimumDeltaReplanPivotSignal"] == "Blocker"
+    assert Diagnostics["BoundaryTraversalFocusSignal"] == "Blocker"
+    assert Diagnostics["MinimumDeltaRetainedGlobalContracts"] == (
+        ExpectedRetainedContracts
+    )
+    assert (
+        Resources.PreferredPhysicalComponentGlobalContractsBySignal
+        == ExpectedRetainedContracts
     )
 
 

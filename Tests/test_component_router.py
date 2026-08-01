@@ -2105,6 +2105,91 @@ def test_tree_frontier_dp_matches_legacy_capacity_unsat():
     assert Dynamic.Diagnostics["CompleteTreesMaterialized"] == 0
 
 
+def _OwnedFrontierEmptyProblem(*, RestrictedByPort: bool):
+    Left = ((0, 7, 0), (1, 7, 0))
+    Right = ((10, 7, 0), (11, 7, 0))
+    Fabric = BuildComponentRoutingFabric(_Channel(Left, Right))
+    SourceLeft = replace(
+        _Candidate((Left[0],)),
+        CandidateFingerprint="source-left",
+    )
+    SourceRight = replace(
+        _Candidate((Right[0],)),
+        CandidateFingerprint="source-right",
+    )
+    TargetLeft = replace(
+        _Candidate((Left[-1],)),
+        CandidateFingerprint="target-left",
+    )
+    SourceCandidates = (
+        (SourceLeft, SourceRight)
+        if RestrictedByPort
+        else (SourceRight,)
+    )
+    CertifiedCandidates = (
+        ("source-right", "target-left")
+        if RestrictedByPort
+        else ()
+    )
+    Port = SimpleNamespace(
+        Signal="Alpha",
+        Direction="output",
+        FabricDomainFingerprint="fabric-alpha",
+        FabricAttachment=Right[0],
+        Attachment=Right[0],
+        LocalPath=(Right[0],),
+        OwnedTerminals=(Left[0], Left[-1]),
+        OwnedTerminalFingerprints=(),
+        OwnedCandidateFingerprints=CertifiedCandidates,
+        OwnedAccessCandidates=(),
+        Capacity=1,
+    )
+    return replace(
+        _Problem(),
+        Fabric=Fabric,
+        OwnedTerminalDomains=(
+            _Domain("Alpha", Left[0], "source", *SourceCandidates),
+            _Domain("Alpha", Left[-1], "target", TargetLeft),
+        ),
+        Interface=SimpleNamespace(
+            Complete=True,
+            DeclaredFeedthroughSignals=frozenset(),
+            PhysicalPortReservations=(Port,),
+        ),
+    )
+
+
+def test_tree_frontier_restricted_candidate_failure_is_not_port_independent():
+    Result = SolveComponentRoutingProblemDynamic(
+        _OwnedFrontierEmptyProblem(RestrictedByPort=True)
+    )
+
+    assert Result.Status == "architectural-unsatisfiable"
+    assert Result.Diagnostics["LocalUnsatCoreKind"] == (
+        "tree-frontier-empty-signal"
+    )
+    Signal = Result.Diagnostics["SignalDiagnostics"]["Alpha"]
+    assert Signal["EmptyPhase"] == "owned-terminal-frontier"
+    assert Signal["CertifiedRejectedCandidateCount"] == 1
+    assert Signal["OwnedSignalDomainContractIndependent"] is False
+
+
+def test_tree_frontier_unfiltered_empty_domain_is_port_independent():
+    Result = SolveComponentRoutingProblemDynamic(
+        _OwnedFrontierEmptyProblem(RestrictedByPort=False)
+    )
+
+    assert Result.Status == "architectural-unsatisfiable"
+    assert Result.Diagnostics["LocalUnsatCoreKind"] == (
+        "tree-frontier-empty-owned-signal-domain"
+    )
+    assert Result.Diagnostics["LocalUnsatCoreProjectionFingerprint"]
+    Signal = Result.Diagnostics["SignalDiagnostics"]["Alpha"]
+    assert Signal["EmptyPhase"] == "owned-terminal-frontier"
+    assert Signal["CertifiedRejectedCandidateCount"] == 0
+    assert Signal["OwnedSignalDomainContractIndependent"] is True
+
+
 def test_tree_frontier_dp_is_deterministic_and_typed_incomplete():
     First = SolveComponentRoutingProblemDynamic(_Problem())
     Second = SolveComponentRoutingProblemDynamic(_Problem())

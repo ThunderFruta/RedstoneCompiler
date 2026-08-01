@@ -112,10 +112,24 @@ def test_assembly_plan_additively_serializes_port_first_contracts():
     assert Serialized["SelectedLocalPortSupports"][0][
         "BoundaryReservationFingerprint"
     ] == "reservation"
+    assert Serialized["ExteriorFabricSetFingerprint"] == ""
+    assert Serialized["ExteriorRegionFingerprint"] == ""
+    assert Serialized["ExteriorCapacityLedgerFingerprint"] == ""
     PreparedField = PreparedPhysicalComponentPortFactorDomain.__dataclass_fields__[
         "BoundaryPortReservationsBySignal"
     ]
     assert PreparedField.default == ()
+    for FieldName in (
+        "ExteriorFabricSetFingerprint",
+        "ExteriorRegionFingerprint",
+        "ExteriorCapacityLedgerFingerprint",
+    ):
+        assert (
+            PreparedPhysicalComponentPortFactorDomain.__dataclass_fields__[
+                FieldName
+            ].default
+            == ""
+        )
 
 
 def test_global_planning_identity_ignores_transitional_local_port_state():

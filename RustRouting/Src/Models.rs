@@ -281,6 +281,8 @@ pub(crate) struct PortalCandidateBatchResult {
     #[pyo3(get)]
     pub(crate) Candidates: Vec<Vec<PortalCandidate>>,
     #[pyo3(get)]
+    pub(crate) CompletionMask: Vec<bool>,
+    #[pyo3(get)]
     pub(crate) DeadlineExceeded: bool,
     #[pyo3(get)]
     pub(crate) CompletedWork: usize,

@@ -1030,12 +1030,17 @@ pub(crate) fn GeneratePortalCandidateBatchesNative(
         .iter()
         .filter(|(_Candidates, Completed)| *Completed)
         .count();
+    let CompletionMask = WorkResults
+        .iter()
+        .map(|(_Candidates, Completed)| *Completed)
+        .collect();
     let Candidates = WorkResults
         .into_iter()
         .map(|(Values, _Completed)| Values)
         .collect();
     Ok(PortalCandidateBatchResult {
         Candidates,
+        CompletionMask,
         DeadlineExceeded: Deadline.WasExceeded(),
         CompletedWork,
         TotalWork,
@@ -1168,6 +1173,11 @@ mod Tests {
         assert_eq!(Result.CompletedWork, 0);
         assert_eq!(Result.TotalWork, 1);
         assert_eq!(Result.Candidates.len(), 1);
+        assert_eq!(Result.CompletionMask, vec![false]);
+        assert_eq!(
+            Result.CompletionMask.iter().filter(|Value| **Value).count(),
+            Result.CompletedWork,
+        );
     }
 
     #[test]

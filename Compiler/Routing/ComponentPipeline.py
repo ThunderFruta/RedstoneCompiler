@@ -350,6 +350,85 @@ def ValidatePhysicalBoundaryPortHandoff(
             )
 
 
+def ValidatePhysicalExteriorFabricHandoff(
+    Plan: PhysicalComponentAssemblyPlan,
+    Preparation: PreparedPhysicalComponentPortFactorDomain,
+    *,
+    CurrentResourceGraphFingerprint: str = "",
+) -> None:
+    """Require one exact exterior-routing identity across the stage seam.
+
+    Older fixtures carry three empty defaults and remain valid. Once either
+    side publishes any exterior identity, both sides must publish the complete
+    fabric-set, detailed-region, and joint-capacity-ledger triple and match it
+    exactly.
+    """
+    FieldNames = (
+        "ExteriorFabricSetFingerprint",
+        "ExteriorRegionFingerprint",
+        "ExteriorCapacityLedgerFingerprint",
+    )
+    PlanIdentity = tuple(
+        str(getattr(Plan, FieldName, "")) for FieldName in FieldNames
+    )
+    PreparationIdentity = tuple(
+        str(getattr(Preparation, FieldName, ""))
+        for FieldName in FieldNames
+    )
+    PlanResourceFingerprint = str(getattr(
+        Plan,
+        "ResourceGraphFingerprint",
+        "",
+    ))
+    PreparationResourceFingerprint = str(getattr(
+        Preparation,
+        "ResourceGraphFingerprint",
+        "",
+    ))
+    ResourceIdentities = (
+        PlanResourceFingerprint,
+        PreparationResourceFingerprint,
+        str(CurrentResourceGraphFingerprint),
+    )
+    if not any((*PlanIdentity, *PreparationIdentity, *ResourceIdentities)):
+        return
+    if any((*PlanIdentity, *PreparationIdentity)) and (
+        not all(PlanIdentity) or not all(PreparationIdentity)
+    ):
+        raise ValueError(
+            "physical exterior fabric handoff requires the complete "
+            "fabric-set, region, and capacity-ledger identity triple"
+        )
+    Mismatches = tuple(
+        FieldName
+        for FieldName, PlanValue, PreparationValue in zip(
+            FieldNames,
+            PlanIdentity,
+            PreparationIdentity,
+        )
+        if PlanValue != PreparationValue
+    )
+    if Mismatches:
+        raise ValueError(
+            "physical exterior fabric handoff identity mismatch: "
+            + ", ".join(Mismatches)
+        )
+    if any(ResourceIdentities) and (
+        not PlanResourceFingerprint
+        or not PreparationResourceFingerprint
+        or PlanResourceFingerprint != PreparationResourceFingerprint
+        or (
+            CurrentResourceGraphFingerprint
+            and str(CurrentResourceGraphFingerprint)
+            != PreparationResourceFingerprint
+        )
+    ):
+        raise ValueError(
+            "physical exterior fabric handoff resource-graph identity "
+            "mismatch"
+        )
+
+
 def _ValidatePhysicalProblemContract(
     Problem: ComponentRoutingProblem,
     Plan: PhysicalComponentAssemblyPlan,
@@ -450,12 +529,17 @@ def _ValidatePhysicalProblemContract(
             raise ValueError(
                 "physical port seam ownership is malformed"
             )
-        if (
+        PathOwnershipOverlap = (
             frozenset(Port.LocalPath[1:])
             & frozenset(Port.GlobalPath[1:])
-        ):
+        )
+        if PathOwnershipOverlap:
             raise ValueError(
-                "local and global port paths overlap beyond the seam"
+                "local and global port paths overlap beyond the seam: "
+                f"signal={Port.Signal}, "
+                f"overlap={tuple(sorted(PathOwnershipOverlap))}, "
+                f"local_path={tuple(Port.LocalPath)}, "
+                f"global_path={tuple(Port.GlobalPath)}"
             )
         SeamClaims = Problem.ResourceGraph.BuildRouteClaims(frozenset((
             *Port.LocalPath,
@@ -775,6 +859,43 @@ def BuildPhysicalPortApertureContractFingerprint(
     return "aperture-contract-v2:" + _Fingerprint((
         BuildPhysicalPortGlobalContractFingerprint(Port),
         ClaimsIdentity,
+    ))
+
+
+def BuildPhysicalComponentAssemblyChoiceFingerprint(
+    Plan: PhysicalComponentAssemblyPlan,
+) -> str:
+    """Identify one exact port plus explicit-feedthrough assembly choice."""
+    return "assembly-choice-v1:" + BuildStableFingerprint((
+        str(getattr(Plan, "PlacementFingerprint", "")),
+        str(getattr(Plan, "ComponentGraphFingerprint", "")),
+        str(getattr(Plan, "ResourceGraphFingerprint", "")),
+        str(getattr(Plan, "TechnologyFingerprint", "")),
+        tuple(sorted(
+            (
+                Port.Signal,
+                Port.ReservationFingerprint,
+                BuildPhysicalPortApertureContractFingerprint(Port),
+            )
+            for Port in Plan.Ports
+        )),
+        tuple(sorted(
+            (
+                Feedthrough.Signal,
+                Feedthrough.ReservationFingerprint,
+                str(getattr(
+                    Feedthrough,
+                    "EndpointDomainFingerprint",
+                    "",
+                )),
+                str(getattr(
+                    Feedthrough,
+                    "EndpointCandidateFingerprint",
+                    "",
+                )),
+            )
+            for Feedthrough in getattr(Plan, "Feedthroughs", ())
+        )),
     ))
 
 
@@ -1362,6 +1483,7 @@ def BindPhysicalComponentAssemblyLocalPortSupports(
             "physical port factor domain"
         )
     Plan = Assembly.Plan
+    ValidatePhysicalExteriorFabricHandoff(Plan, FactorDomain)
     if not Plan.Channels:
         raise ValueError(
             "local port supports cannot be selected before authoritative "
@@ -1602,6 +1724,36 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
         if isinstance(MandatoryProof, dict)
         else ""
     )
+    MandatorySignalProofs = tuple(
+        MandatoryProof.get("SignalProofs", ())
+        if isinstance(MandatoryProof, dict)
+        else ()
+    )
+    NetWidePortalProofIdentityMatches = bool(
+        MandatoryProofKind
+        != "generated-net-wide-portal-tuple-domain-exhausted"
+        or (
+            MandatorySignalProofs
+            and all(
+                isinstance(Value, dict)
+                and Value.get("PortalDomainCertificateFingerprint")
+                and Value.get("PhysicalAssemblyPlanFingerprint")
+                == Plan.PlanFingerprint
+                and Value.get("ResourceGraphFingerprint")
+                == Plan.ResourceGraphFingerprint
+                and Value.get("TechnologyFingerprint")
+                == Plan.TechnologyFingerprint
+                and Value.get("PlacementFingerprint")
+                == Plan.PlacementFingerprint
+                and Value.get("InterfaceFingerprint")
+                == Plan.InterfaceFingerprint
+                and Value.get("SeamFingerprint")
+                and Value.get("PortalRequestDomainFingerprint")
+                and Value.get("ExactAttachmentValidationFingerprint")
+                for Value in MandatorySignalProofs
+            )
+        )
+    )
     AmbiguousFixedPortalProof = bool(
         MandatoryProofKind == "generated-fixed-portal-domain-exhausted"
         and not (
@@ -1613,6 +1765,7 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
     CompleteCapacityProof = bool(
         not DeadlineExpired
         and not AmbiguousFixedPortalProof
+        and NetWidePortalProofIdentityMatches
         and (
             Diagnostics.get("GlobalPlanDomainComplete", False)
             or
@@ -1843,6 +1996,13 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
                     False,
                 )
             ),
+            "AssemblyPlanFeedthroughIndependentProofComplete": bool(
+                CompleteCapacityProof
+                and Diagnostics.get(
+                    "AssemblyPlanFeedthroughIndependentProofComplete",
+                    False,
+                )
+            ),
             "RequestApertureFactorProofComplete": (
                 RequestApertureFactorProofComplete
             ),
@@ -1859,22 +2019,30 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
 def AdvancePhysicalComponentBoundaryTraversal(
     Resources: Any,
     Signals: Iterable[str],
+    *,
+    FocusSignal: str = "",
 ) -> dict[str, object]:
     """Rotate a proof-neutral CSP branch hint and invalidate stale stacks."""
     OrderedSignals = tuple(sorted(frozenset(map(str, Signals))))
     if OrderedSignals:
+        RequestedFocusSignal = str(FocusSignal)
         TraversalCursor = int(getattr(
             Resources,
             "PhysicalComponentBoundaryTraversalCursor",
             0,
         )) % len(OrderedSignals)
-        FocusSignal = OrderedSignals[TraversalCursor]
+        FocusSignal = (
+            RequestedFocusSignal
+            if RequestedFocusSignal in OrderedSignals
+            else OrderedSignals[TraversalCursor]
+        )
         PrioritySignals = tuple(
             Signal for Signal in OrderedSignals if Signal != FocusSignal
         ) + (FocusSignal,)
-        Resources.PhysicalComponentBoundaryTraversalCursor = (
-            TraversalCursor + 1
-        ) % len(OrderedSignals)
+        if not RequestedFocusSignal:
+            Resources.PhysicalComponentBoundaryTraversalCursor = (
+                TraversalCursor + 1
+            ) % len(OrderedSignals)
     else:
         FocusSignal = ""
         PrioritySignals = ()
@@ -1910,11 +2078,9 @@ def RecordPhysicalComponentGlobalPlanNoGood(
     """Record the smallest port contract justified by a complete cut.
 
     Global planning happens before local compilation, so its complete proof
-    may reject the physical seam choices on which that proof depends.  A
-    single implicated port rejects only that reservation.  A joint proof
-    rejects only the implicated reservation tuple.  Unrelated ports remain
-    eligible and a proof with no physical-port dependency records no port
-    no-good at all.
+    may reject only physical choices on which that proof depends.  Explicit
+    feedthroughs remain part of the exact assembly identity unless the proof
+    independently certifies that they cannot affect the cut.
     """
     Diagnostics = dict(Failure.Diagnostics or {})
     if not bool(
@@ -1927,6 +2093,14 @@ def RecordPhysicalComponentGlobalPlanNoGood(
     DependencySignals = frozenset(str(Signal) for Signal in (
         Diagnostics.get("AssemblyPlanDependentPortSignals", ()) or ()
     ))
+    Feedthroughs = tuple(getattr(Plan, "Feedthroughs", ()))
+    FeedthroughIndependenceProved = bool(Diagnostics.get(
+        "AssemblyPlanFeedthroughIndependentProofComplete",
+        False,
+    ))
+    RequiresExactAssemblyChoice = bool(
+        Feedthroughs and not FeedthroughIndependenceProved
+    )
     DependencyPorts = tuple(
         Port for Port in Plan.Ports if Port.Signal in DependencySignals
     )
@@ -2058,7 +2232,41 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         else frozenset()
     )
     Scope = "none"
-    if IndependentEmptyDomainSignals:
+    RejectedAssemblyChoiceFingerprint = ""
+    if RequiresExactAssemblyChoice:
+        ComputedAssemblyChoiceFingerprint = (
+            BuildPhysicalComponentAssemblyChoiceFingerprint(Plan)
+        )
+        DeclaredAssemblyChoiceFingerprint = str(getattr(
+            Plan,
+            "AssemblyChoiceFingerprint",
+            "",
+        ))
+        if (
+            DeclaredAssemblyChoiceFingerprint
+            and DeclaredAssemblyChoiceFingerprint
+            != ComputedAssemblyChoiceFingerprint
+        ):
+            raise ValueError(
+                "physical assembly choice fingerprint identity mismatch"
+            )
+        RejectedAssemblyChoiceFingerprint = (
+            DeclaredAssemblyChoiceFingerprint
+            or ComputedAssemblyChoiceFingerprint
+        )
+        RejectedChoices = getattr(
+            Resources,
+            "RejectedPhysicalComponentAssemblyChoiceFingerprints",
+            None,
+        )
+        if RejectedChoices is None:
+            RejectedChoices = set()
+            Resources.RejectedPhysicalComponentAssemblyChoiceFingerprints = (
+                RejectedChoices
+            )
+        RejectedChoices.add(RejectedAssemblyChoiceFingerprint)
+        Scope = "exact-assembly-port-feedthrough-choice"
+    elif IndependentEmptyDomainSignals:
         for Signal, ReservationFingerprint in ReservationKeys:
             (
                 Resources
@@ -2136,12 +2344,84 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         if Recommendation is not None
         else {}
     )
+    MinimumDeltaPivotSignal = ""
+    MinimumDeltaTraversalFocusSignal = ""
+    MinimumDeltaRetainedContracts: dict[str, str] = {}
+    if (
+        not RecommendedContracts
+        and Scope in {
+            "exact-assembly-port-aperture-set",
+            "request-aperture-factor-port-set",
+        }
+    ):
+        # A complete higher-order cut rejects the exact tuple, not each of
+        # its literals.  Preserve every non-pivot global contract as a soft
+        # preference so the next CSP solution changes the smallest useful
+        # part of the assembly and can reuse completed exterior domains.
+        # Universal conflict hubs are the strongest deterministic pivot;
+        # otherwise use the reported failure net or the first dependency.
+        RequestAperturePivotSignals = tuple(sorted(
+            Signal
+            for Signal, Fingerprint in RequestApertureFactorNoGood
+            if Fingerprint.startswith("aperture-factor:")
+            and Signal in DependencySignals
+        ))
+        UniversalConflictHubs = (
+            ConflictGraph.get("UniversalConflictHubs", {})
+            if isinstance(ConflictGraph, dict)
+            else {}
+        )
+        HubSignals = tuple(sorted(
+            (
+                str(Signal),
+                int(
+                    Details.get("PairDegree", 0)
+                    if isinstance(Details, dict)
+                    else 0
+                ),
+            )
+            for Signal, Details in (
+                UniversalConflictHubs.items()
+                if isinstance(UniversalConflictHubs, dict)
+                else ()
+            )
+            if str(Signal) in DependencySignals
+        ))
+        if RequestAperturePivotSignals:
+            MinimumDeltaPivotSignal = RequestAperturePivotSignals[0]
+            MinimumDeltaTraversalFocusSignal = MinimumDeltaPivotSignal
+        elif HubSignals:
+            MinimumDeltaPivotSignal = max(
+                HubSignals,
+                key=lambda Value: (Value[1], Value[0]),
+            )[0]
+            MinimumDeltaTraversalFocusSignal = MinimumDeltaPivotSignal
+        else:
+            ReportedFailureNet = str(
+                ConflictGraph.get("FailureNet", "")
+                if isinstance(ConflictGraph, dict)
+                else ""
+            )
+            MinimumDeltaPivotSignal = (
+                ReportedFailureNet
+                if ReportedFailureNet in DependencySignals
+                else min(DependencySignals)
+                if DependencySignals
+                else ""
+            )
+        MinimumDeltaRetainedContracts = {
+            Port.Signal: BuildPhysicalPortGlobalContractFingerprint(Port)
+            for Port in Plan.Ports
+            if Port.Signal != MinimumDeltaPivotSignal
+        }
+        RecommendedContracts = dict(MinimumDeltaRetainedContracts)
     Resources.PreferredPhysicalComponentGlobalContractsBySignal = (
         RecommendedContracts
     )
     TraversalDiagnostics = AdvancePhysicalComponentBoundaryTraversal(
         Resources,
         DependencySignals,
+        FocusSignal=MinimumDeltaTraversalFocusSignal,
     )
     return {
         "NoGoodScope": Scope,
@@ -2149,15 +2429,21 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         "NoGoodReservationKeys": [
             [Signal, ReservationFingerprint]
             for Signal, ReservationFingerprint in sorted(
-                RejectedRequestApertureSet
+                ()
+                if RequiresExactAssemblyChoice
+                else RejectedRequestApertureSet
                 if RequestApertureProofComplete
                 else ReservationKeys
             )
         ],
-        "NoGoodConstraintArity": len(
-            RejectedRequestApertureSet
-            if RequestApertureProofComplete
-            else ReservationKeys
+        "NoGoodConstraintArity": (
+            1
+            if RequiresExactAssemblyChoice
+            else len(
+                RejectedRequestApertureSet
+                if RequestApertureProofComplete
+                else ReservationKeys
+            )
         ),
         "AssemblyPortCount": len(tuple(Plan.Ports)),
         "NoGoodReservationSets": [
@@ -2173,6 +2459,10 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         "CachedCorridorContractRecommendationComplete": bool(
             Recommendation is not None
         ),
+        "MinimumDeltaReplanPivotSignal": MinimumDeltaPivotSignal,
+        "MinimumDeltaRetainedGlobalContracts": dict(sorted(
+            MinimumDeltaRetainedContracts.items()
+        )),
         **TraversalDiagnostics,
         "RejectedPortAssignmentFingerprint": (
             Plan.PortAssignmentFingerprint
@@ -2188,6 +2478,12 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         ),
         "PairwisePortReservationNoGoodProofComplete": (
             PairwiseProofComplete
+        ),
+        "RejectedAssemblyChoiceFingerprint": (
+            RejectedAssemblyChoiceFingerprint
+        ),
+        "AssemblyPlanFeedthroughIndependentProofComplete": (
+            FeedthroughIndependenceProved
         ),
     }
 
@@ -2945,6 +3241,161 @@ def ProveGlobalRelaxedLocalUnsatisfiability(
             RelaxedSolve.ExpansionCount
         ),
     }
+
+
+def ProveClosedComponentOwnedSignalFrontiers(
+    Problem: ComponentRoutingProblem,
+    *,
+    DeadlineSeconds: float | None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    RouteClaimsConstructionCache: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ] | None = None,
+) -> ComponentRoutingSolveResult:
+    """Certify per-signal local frontier existence before global routing.
+
+    This eligibility proof stops before the net-capacity CSP and before any
+    routed component template is materialized.  It may therefore reject a
+    placement whose owned signal domain is structurally empty without
+    violating the port-first global-before-local compilation boundary.
+    """
+    Result = SolveComponentRoutingProblem(
+        Problem,
+        DeadlineSeconds=DeadlineSeconds,
+        WorkCheck=WorkCheck,
+        RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+        StopAfterOwnedSignalFrontierProof=True,
+    )
+    if Result.Template is not None:
+        raise ValueError(
+            "owned-signal frontier eligibility materialized a template"
+        )
+    return Result
+
+
+def ProveClosedComponentSymbolicCapacityEligibility(
+    Problem: ComponentRoutingProblem,
+    *,
+    DeadlineSeconds: float | None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    RouteClaimsConstructionCache: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ] | None = None,
+) -> ComponentRoutingSolveResult:
+    """Solve the exact local capacity CSP without materializing a template."""
+    Result = SolveComponentRoutingProblem(
+        Problem,
+        DeadlineSeconds=DeadlineSeconds,
+        WorkCheck=WorkCheck,
+        RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+        StopAfterSymbolicCapacityProof=True,
+    )
+    if Result.Template is not None:
+        raise ValueError(
+            "symbolic capacity eligibility materialized a template"
+        )
+    return Result
+
+
+def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
+    Proof: ComponentRoutingSolveResult,
+    Plan: PhysicalComponentAssemblyPlan,
+    Resources: Any,
+) -> dict[str, object]:
+    """Reject one exact port tuple disproven before global reservation."""
+    Diagnostics = dict(Proof.Diagnostics or {})
+    if (
+        Proof.Status != "architectural-unsatisfiable"
+        or not Diagnostics.get("SymbolicCapacityProofComplete", False)
+    ):
+        raise ValueError(
+            "symbolic capacity no-good requires a complete local proof"
+        )
+    Resources.RejectedPhysicalComponentPortAssignmentFingerprints.add(
+        Plan.PortAssignmentFingerprint
+    )
+    Resources.RejectedPhysicalComponentAssemblyPlanFingerprints.add(
+        Plan.PlanFingerprint
+    )
+    Resources.PreferredPhysicalComponentGlobalContractsBySignal = {
+        Port.Signal: BuildPhysicalPortGlobalContractFingerprint(Port)
+        for Port in Plan.Ports
+    }
+    TraversalDiagnostics = AdvancePhysicalComponentBoundaryTraversal(
+        Resources,
+        (),
+    )
+    return {
+        "NoGoodScope": "pre-global-symbolic-capacity-port-assignment",
+        "RejectedPortAssignmentFingerprint": (
+            Plan.PortAssignmentFingerprint
+        ),
+        "RejectedPhysicalAssemblyPlanFingerprint": Plan.PlanFingerprint,
+        "SymbolicCapacityProofComplete": True,
+        "SymbolicCapacityProofFingerprint": Proof.ProofFingerprint,
+        "LocalCompilationEntered": False,
+        "GlobalPlanningEntered": False,
+        "PreferredRetainedGlobalContracts": dict(sorted(
+            Resources.PreferredPhysicalComponentGlobalContractsBySignal.items()
+        )),
+        **TraversalDiagnostics,
+        "ImplicitForeignTransitDomainCount": 0,
+    }
+
+
+def SelectContractIndependentOwnedSignalFrontierUnsatCore(
+    Problem: ComponentRoutingProblem,
+    Result: ComponentRoutingSolveResult,
+) -> tuple[str, ...]:
+    """Select only an unbound, port-independent owned-frontier proof.
+
+    This is deliberately one-way: a feasible unbound frontier does not prove
+    that any later fixed port contract is feasible.  It only lets placement
+    eligibility reject a terminal-domain contradiction that binding cannot
+    repair.
+    """
+    Interface = getattr(Problem, "Interface", None)
+    if (
+        tuple(getattr(Interface, "PhysicalPortReservations", ()))
+        or bool(getattr(Problem, "ReservedGlobalClaimsBySignal", {}))
+        or Result.Template is not None
+        or Result.Status != "architectural-unsatisfiable"
+    ):
+        return ()
+    Diagnostics = dict(Result.Diagnostics or {})
+    CoreSignals = tuple(sorted(map(str, (
+        Diagnostics.get("LocalUnsatCoreSignals", ()) or ()
+    ))))
+    SignalDiagnostics = Diagnostics.get("SignalDiagnostics", {})
+    if (
+        not CoreSignals
+        or not Diagnostics.get("LocalUnsatCoreComplete", False)
+        or Diagnostics.get("LocalUnsatCoreKind", "")
+        != "tree-frontier-empty-owned-signal-domain"
+        or not Diagnostics.get(
+            "LocalUnsatCoreProjectionFingerprint",
+            "",
+        )
+        or not isinstance(SignalDiagnostics, dict)
+    ):
+        return ()
+    for Signal in CoreSignals:
+        SignalProof = SignalDiagnostics.get(Signal, {})
+        if not isinstance(SignalProof, dict) or not (
+            SignalProof.get("Complete", False)
+            and SignalProof.get("EmptyPhase", "")
+            == "owned-terminal-frontier"
+            and SignalProof.get(
+                "OwnedSignalDomainContractIndependent",
+                False,
+            )
+            and int(SignalProof.get(
+                "CertifiedRejectedCandidateCount",
+                -1,
+            )) == 0
+        ):
+            return ()
+    return CoreSignals
 
 
 def PromoteCoveredLocalContractNoGoods(

@@ -18,6 +18,7 @@ from ..AuthoritativePlanner import RouteAuthoritativeResources
 from ..ChannelPlanner import RoutingIterationMetrics
 from ..Models import (
     ClusterInterfaceRealizabilityNogood,
+    ComponentRoutingProblem,
     RoutedDesign,
     RoutingResources,
 )
@@ -56,6 +57,9 @@ def RoutePcbNets(
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
     PreparePhysicalComponentPortFactorDomainOnly: bool = False,
+    UnboundOwnedSignalFrontierProofCallback: Callable[
+        [ComponentRoutingProblem], None
+    ] | None = None,
     RequireCompleteClusterInterfaceDomain: bool = False,
     ClusterInterfaceRealizabilityNogoods: tuple[
         ClusterInterfaceRealizabilityNogood, ...
@@ -130,6 +134,9 @@ def RoutePcbNets(
         ),
         PreparePhysicalComponentPortFactorDomainOnly=(
             PreparePhysicalComponentPortFactorDomainOnly
+        ),
+        UnboundOwnedSignalFrontierProofCallback=(
+            UnboundOwnedSignalFrontierProofCallback
         ),
         RequireCompleteClusterInterfaceDomain=(
             RequireCompleteClusterInterfaceDomain

@@ -8410,6 +8410,8 @@ def SolveComponentRoutingProblemDynamic(
     RouteClaimsConstructionCache: dict[
         frozenset[Position3], RoutingResourceClaims
     ] | None = None,
+    StopAfterOwnedSignalFrontierProof: bool = False,
+    StopAfterSymbolicCapacityProof: bool = False,
 ) -> ComponentRoutingSolveResult:
     """Solve a complete tree fabric through canonical frontier states.
 
@@ -9120,9 +9122,40 @@ def SolveComponentRoutingProblemDynamic(
                         Signal,
                         CoreKind,
                     )),
+                    "SymbolicCapacityProofComplete": bool(
+                        StopAfterSymbolicCapacityProof
+                    ),
+                    "SymbolicCapacityFeasible": False,
                 },
             )
         NetStatesBySignal[Signal] = States
+
+    if StopAfterOwnedSignalFrontierProof:
+        ProofFingerprint = _StableFingerprint((
+            Problem.ProblemFingerprint,
+            "owned-signal-frontier-feasible",
+            tuple(
+                (Signal, len(States))
+                for Signal, States in sorted(NetStatesBySignal.items())
+            ),
+        ))
+        return ComponentRoutingSolveResult(
+            Status="frontier-feasible",
+            ProofFingerprint=ProofFingerprint,
+            ExpansionCount=ExpansionCount,
+            Detail=(
+                "every owned component signal has a powered frontier state"
+            ),
+            Diagnostics={
+                **FinishDiagnostics(),
+                "OwnedSignalFrontierProofComplete": True,
+                "OwnedSignalFrontierFeasible": True,
+                "OwnedSignalFrontierStateCounts": {
+                    Signal: len(States)
+                    for Signal, States in sorted(NetStatesBySignal.items())
+                },
+            },
+        )
 
     # Solve symbolic net states and passive interface witnesses in one exact
     # capacity CSP.  Only the selected symbolic nets are materialized below.
@@ -9225,7 +9258,11 @@ def SolveComponentRoutingProblemDynamic(
             )),
             ExpansionCount=ExpansionCount,
             Detail="a complete symbolic capacity domain is empty",
-            Diagnostics=FinishDiagnostics(),
+            Diagnostics={
+                **FinishDiagnostics(),
+                "SymbolicCapacityProofComplete": True,
+                "SymbolicCapacityFeasible": False,
+            },
         )
 
     Selected: dict[tuple[str, str], Any] = {}
@@ -9365,7 +9402,31 @@ def SolveComponentRoutingProblemDynamic(
                 if HitLimit
                 else "complete symbolic component state space exhausted"
             ),
-            Diagnostics=FinishDiagnostics(),
+            Diagnostics={
+                **FinishDiagnostics(),
+                "SymbolicCapacityProofComplete": not HitLimit,
+                "SymbolicCapacityFeasible": False,
+            },
+        )
+
+    if StopAfterSymbolicCapacityProof:
+        ProofFingerprint = _StableFingerprint((
+            Problem.ProblemFingerprint,
+            "symbolic-capacity-feasible",
+            SolverDiagnostics.get("SelectedAssignmentFingerprint", ""),
+        ))
+        return ComponentRoutingSolveResult(
+            Status="capacity-feasible",
+            ProofFingerprint=ProofFingerprint,
+            ExpansionCount=ExpansionCount,
+            Detail=(
+                "the closed component symbolic capacity CSP is feasible"
+            ),
+            Diagnostics={
+                **FinishDiagnostics(),
+                "SymbolicCapacityProofComplete": True,
+                "SymbolicCapacityFeasible": True,
+            },
         )
 
     Nets = tuple(sorted(
@@ -9529,6 +9590,8 @@ def SolveComponentRoutingProblem(
     StaticPortfolioContextsBySignal: dict[
         str, CompleteComponentNetPortfolioStaticContext
     ] | None = None,
+    StopAfterOwnedSignalFrontierProof: bool = False,
+    StopAfterSymbolicCapacityProof: bool = False,
 ) -> ComponentRoutingSolveResult:
     """Dispatch physical tree fabrics to DP and retain the legacy oracle."""
     UseDynamicSolver = bool(
@@ -9559,6 +9622,12 @@ def SolveComponentRoutingProblem(
             ),
             RequiredForeignTransitSignals=RequiredForeignTransitSignals,
             RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+            StopAfterOwnedSignalFrontierProof=(
+                StopAfterOwnedSignalFrontierProof
+            ),
+            StopAfterSymbolicCapacityProof=(
+                StopAfterSymbolicCapacityProof
+            ),
         )
     return _SolveComponentRoutingProblemLegacy(
         Problem,

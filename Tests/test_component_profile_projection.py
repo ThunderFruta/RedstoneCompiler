@@ -105,6 +105,7 @@ def test_internal_only_component_profile_disappears_before_global_routing():
     Problem = _Problem(
         ("Internal",),
         {"Internal": (Root, *Targets)},
+        Plan,
     )
 
     Result = ApplyPhysicalComponentAssemblyGlobalProfiles(
@@ -133,6 +134,7 @@ def test_covered_producer_root_uses_exact_reserved_global_port_path():
     Problem = _Problem(
         ("Exported",),
         {"Exported": (CoveredRoot,)},
+        Plan,
     )
 
     Result = ApplyPhysicalComponentAssemblyGlobalProfiles(
@@ -171,6 +173,7 @@ def test_covered_sink_targets_collapse_to_one_exact_reserved_attachment():
     Problem = _Problem(
         ("Imported",),
         {"Imported": CoveredTargets},
+        Plan,
     )
 
     Result = ApplyPhysicalComponentAssemblyGlobalProfiles(
@@ -195,7 +198,7 @@ def test_outside_profile_is_preserved_without_rebuilding_access_contract():
     Target = (-10, 1, -4)
     Outside = _Profile("Outside", Root, (Target,))
     Plan = _Plan()
-    Problem = _Problem(("Internal",), {"Internal": ()})
+    Problem = _Problem(("Internal",), {"Internal": ()}, Plan)
 
     Result = ApplyPhysicalComponentAssemblyGlobalProfiles(
         {"Outside": Outside},
@@ -237,6 +240,7 @@ def test_profile_projection_is_signal_rename_and_input_order_invariant():
             _Problem(
                 (ComponentSignal,),
                 {ComponentSignal: (CoveredRoot,)},
+                Plan,
             ),
             Plan,
         )

@@ -22,6 +22,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     BuildExplicitPhysicalComponentFeedthrough,
     BuildPhysicalExteriorApertureFabric,
     BuildPhysicalGlobalApertureSearchKey,
+    BuildPhysicalPortNoGoodKeys,
     BuildPortablePhysicalGlobalApertureContract,
     BuildPhysicalComponentAssemblyPlan,
     ExpandPhysicalComponentGuideChannels,
@@ -59,6 +60,7 @@ from Compiler.Routing.ComponentPipeline import (
     PromoteCoveredLocalContractNoGoods,
     RecordPhysicalComponentLocalCompilationNoGood,
     ValidatePhysicalBoundaryPortHandoff,
+    ValidatePhysicalExteriorFabricHandoff,
 )
 from Compiler.Routing.ComponentAccess import (
     BuildComponentCutAccessFeasibilityCertificate,
@@ -290,6 +292,28 @@ def test_persistent_boundary_iteration_observes_new_global_clause():
         ("Alpha", Baseline[1][0].ApertureContractFingerprint),
     )))
     assert next(Frontier) == Baseline[2]
+
+
+def test_persistent_boundary_iteration_restarts_after_new_unary_cut():
+    Alpha = tuple(_BoundaryPort("Alpha", X) for X in (0, 10))
+    Beta = tuple(_BoundaryPort("Beta", X) for X in (100, 110, 120))
+    RejectedBySignal = {}
+    Frontier = iter(IterPhysicalBoundaryPortAssignments(
+        {"Alpha": Alpha, "Beta": Beta},
+        RejectedGlobalApertureFingerprintsBySignal=RejectedBySignal,
+    ))
+
+    First = next(Frontier)
+    FirstBySignal = {Value.Signal: Value for Value in First}
+    RejectedBySignal["Alpha"] = {
+        FirstBySignal["Alpha"].ApertureContractFingerprint,
+    }
+    Second = next(Frontier)
+    SecondBySignal = {Value.Signal: Value for Value in Second}
+
+    assert SecondBySignal["Alpha"].ApertureContractFingerprint not in (
+        RejectedBySignal["Alpha"]
+    )
 
 
 def _BoundaryAttachmentIndexSequence(Assignments):
@@ -831,6 +855,18 @@ def test_explicit_physical_feedthrough_freezes_one_declared_fabric_lane():
         Contract.ReservedPathNodes
     )
     assert Contract.ReservationFingerprint
+    assert Contract.EndpointDomainFingerprint
+    assert Contract.EndpointCandidateFingerprint
+    assert Contract.EndpointCandidateCount == 1
+    assert Contract.EndpointPrescreenRetainedCandidateCount == 1
+    assert Contract.EndpointPrescreenRejectedCandidateCount == 0
+    Serialized = Contract.ToDictionary()
+    assert Serialized["EndpointDomainFingerprint"] == (
+        Contract.EndpointDomainFingerprint
+    )
+    assert Serialized["EndpointCandidateFingerprint"] == (
+        Contract.EndpointCandidateFingerprint
+    )
     assert Guide == frozenset((X, 0) for X in range(-4, 5))
 
 
@@ -870,6 +906,8 @@ def test_prepared_feedthrough_endpoint_domain_preserves_relative_geometry():
 
     assert First.Complete is True
     assert len(First.Candidates) == 2
+    assert First.ToDictionary()["CandidateCount"] == 2
+    assert First.ToDictionary()["Complete"] is True
     # A physical assembly domain remains placement-specific so parallel
     # translated lanes are not merged.  Their normalized geometry is still
     # identical for completed-template cache identity.
@@ -1157,6 +1195,13 @@ def test_exterior_aperture_fabric_is_rename_and_order_invariant():
         RenamedAndReordered.SignalGuideIngressGeometry
     )
     assert First.AllowedNodes == RenamedAndReordered.AllowedNodes
+    assert First.GuideIdentityFingerprint == (
+        RenamedAndReordered.GuideIdentityFingerprint
+    )
+    assert First.SignalBindingFingerprint != (
+        RenamedAndReordered.SignalBindingFingerprint
+    )
+    assert not First.Complete
 
 
 def test_exterior_aperture_fabric_enforces_closed_ownership():
@@ -1184,6 +1229,115 @@ def test_exterior_aperture_fabric_enforces_closed_ownership():
     assert not Fabric.AllowsNode((3, 1, 1))
     assert (1, 1) not in Fabric.AllowedColumns
     assert (3, 1) not in Fabric.AllowedColumns
+
+
+def test_complete_exterior_fabric_retains_every_exterior_region_edge():
+    RegionNodes = frozenset((
+        (-1, 1, 1),
+        (-1, 1, 2),
+        (-1, 1, 3),
+        (0, 1, 3),
+        (1, 1, 3),
+        (2, 1, 3),
+        (3, 1, 3),
+        (4, 1, 3),
+        (4, 1, 2),
+        (4, 1, 1),
+        # Interior Region nodes remain locally owned.
+        (1, 1, 1),
+    ))
+    RegionPath = (
+        (-1, 1, 1),
+        (-1, 1, 2),
+        (-1, 1, 3),
+        (0, 1, 3),
+        (1, 1, 3),
+        (2, 1, 3),
+        (3, 1, 3),
+        (4, 1, 3),
+        (4, 1, 2),
+        (4, 1, 1),
+    )
+    RegionEdges = tuple(zip(RegionPath, RegionPath[1:]))
+
+    Fabric = BuildPhysicalExteriorApertureFabric(
+        EnvelopeMinimum=(0, 0, 0),
+        EnvelopeMaximum=(2, 2, 2),
+        CompleteCoarseGuideCellsBySignal={"Port": ((4, 1),)},
+        DeclaredPortalIngressNodesBySignal={
+            "Port": ((-1, 1, 1),),
+        },
+        Technology=DefaultRedstoneRoutingTechnology,
+        MinimumPlacementY=0,
+        Layer=0,
+        RegionNodes=reversed(sorted(RegionNodes)),
+        RegionEdges=reversed(RegionEdges),
+        RegionFingerprint="region",
+        ResourceGraphFingerprint="resource-graph",
+        Complete=True,
+    )
+    Reordered = BuildPhysicalExteriorApertureFabric(
+        EnvelopeMinimum=(0, 0, 0),
+        EnvelopeMaximum=(2, 2, 2),
+        CompleteCoarseGuideCellsBySignal={"Port": ((4, 1),)},
+        DeclaredPortalIngressNodesBySignal={
+            "Port": ((-1, 1, 1),),
+        },
+        Technology=DefaultRedstoneRoutingTechnology,
+        MinimumPlacementY=0,
+        Layer=0,
+        RegionNodes=sorted(RegionNodes),
+        RegionEdges=RegionEdges,
+        RegionFingerprint="region",
+        ResourceGraphFingerprint="resource-graph",
+        Complete=True,
+    )
+
+    assert Fabric.Complete
+    assert Fabric == Reordered
+    assert Fabric.RegionFingerprint == "region"
+    assert Fabric.ResourceGraphFingerprint == "resource-graph"
+    assert (1, 1, 1) not in Fabric.AllowedNodes
+    # These intermediate nodes are neither a guide nor an ingress.  The
+    # explicit Region, rather than a ring/guide intersection, owns them.
+    assert (1, 1, 3) in Fabric.AllowedNodes
+    assert all(
+        Fabric.AllowsEdge(First, Second)
+        for First, Second in RegionEdges
+    )
+    assert Fabric.Neighbors((-1, 1, 1)) == ((-1, 1, 2),)
+
+
+def test_exterior_fabric_identity_includes_edges_and_rejects_bad_adjacency():
+    Arguments = dict(
+        EnvelopeMinimum=(0, 0, 0),
+        EnvelopeMaximum=(0, 0, 0),
+        CompleteCoarseGuideCellsBySignal={"Port": ((2, 0),)},
+        DeclaredPortalIngressNodesBySignal={
+            "Port": ((-1, 1, 0),),
+        },
+        Technology=DefaultRedstoneRoutingTechnology,
+        MinimumPlacementY=0,
+        Layer=0,
+        RegionNodes=((-1, 1, 0), (1, 1, 0), (2, 1, 0)),
+        RegionFingerprint="region",
+        ResourceGraphFingerprint="resource",
+        Complete=True,
+    )
+    Disconnected = BuildPhysicalExteriorApertureFabric(
+        RegionEdges=(),
+        **Arguments,
+    )
+    Connected = BuildPhysicalExteriorApertureFabric(
+        RegionEdges=(((1, 1, 0), (2, 1, 0)),),
+        **Arguments,
+    )
+
+    assert Disconnected.FabricFingerprint != Connected.FabricFingerprint
+    assert not Disconnected.AllowsEdge((1, 1, 0), (2, 1, 0))
+    assert Connected.AllowsEdge((2, 1, 0), (1, 1, 0))
+    with pytest.raises(ValueError, match="adjacency differs"):
+        replace(Connected, Adjacency=())
 
 
 def test_portable_global_aperture_contract_reuses_rigid_planar_geometry():
@@ -2537,6 +2691,78 @@ def test_promoted_local_factor_no_good_prunes_prepared_replan_before_seams():
     assert Diagnostics["SeamFactorExpansionCount"] == 0
     assert Diagnostics["PortOptionGenerationCounts"] == {}
     assert Diagnostics["PortOptionMaterializationComplete"] is False
+
+
+def test_promoted_signal_domain_prunes_distinct_local_contracts():
+    Problem = _Problem()
+    Placed = _Placed(Problem)
+    Resources = RoutingResources(
+        StaticGeometry=SimpleNamespace(),
+        ResourceGraph=Problem.ResourceGraph,
+    )
+    Preparation = PreparePhysicalComponentPortFactorDomain(
+        Placed,
+        Problem,
+        _Guide(Problem),
+        Resources,
+        AccessCertificate=_AccessCertificate(
+            Problem,
+            Placed,
+            Resources,
+        ),
+    )
+    Options = MaterializePreparedPhysicalPortOptionDomains(
+        Preparation,
+        Resources,
+        ("Alpha",),
+    )["Alpha"]
+    assert len(Options) >= 2
+    First, Second = Options[:2]
+    assert BuildPhysicalPortLocalContractFingerprint(First) != (
+        BuildPhysicalPortLocalContractFingerprint(Second)
+    )
+
+    PortSolverCacheKey = (
+        ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+            Preparation.DomainFingerprint,
+        )
+    )
+    SignalDomainKey = (
+        "Alpha",
+        "local-signal-domain:" + PortSolverCacheKey,
+    )
+    PromotedClause = frozenset((SignalDomainKey,))
+    assert PromotedClause <= BuildPhysicalPortNoGoodKeys(
+        First,
+        PortSolverCacheKey,
+    )
+    assert PromotedClause <= BuildPhysicalPortNoGoodKeys(
+        Second,
+        PortSolverCacheKey,
+    )
+    Resources.RejectedPhysicalComponentPortReservationSets.add(
+        PromotedClause
+    )
+
+    with pytest.raises(RoutingStageError) as Raised:
+        SolvePreparedPhysicalComponentPortFactorDomain(
+            Preparation,
+            Resources,
+        )
+
+    Failure = Raised.value.Failure
+    assert Failure.Reason == (
+        RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+    )
+    assert Failure.Diagnostics["PortAssignmentUnsatCoreDirectReuse"] is True
+    assert Failure.Diagnostics["PortAssignmentUnsatCoreProofBasis"] == (
+        "complete-factor-domain-no-good"
+    )
+    assert Failure.Diagnostics["PortAssignmentUnsatCoreNoGoodKeys"] == [
+        list(SignalDomainKey)
+    ]
+    assert Failure.Diagnostics["PortOptionMaterializationComplete"] is False
+    assert Failure.Diagnostics["SeamFactorExpansionCount"] == 0
 
 
 def test_proof_neutral_port_assignment_deferral_selects_a_distinct_plan(
@@ -3969,6 +4195,113 @@ def test_physical_plan_publishes_global_only_boundary_port_contract():
         == TranslatedBoundary.ReservationFingerprint
     )
     assert Original.Plan.SelectedLocalPortSupports == ()
+
+
+def test_exterior_fabric_handoff_accepts_legacy_empty_and_exact_identity():
+    Assembly = _Assembly(_Problem())
+    Preparation = Assembly.PortFactorDomain
+    assert Preparation is not None
+
+    ValidatePhysicalExteriorFabricHandoff(Assembly.Plan, Preparation)
+    Identity = {
+        "ExteriorFabricSetFingerprint": "exterior-fabric-set",
+        "ExteriorRegionFingerprint": "exterior-region",
+        "ExteriorCapacityLedgerFingerprint": "capacity-ledger",
+    }
+    ValidatePhysicalExteriorFabricHandoff(
+        replace(Assembly.Plan, **Identity),
+        replace(Preparation, **Identity),
+        CurrentResourceGraphFingerprint=(
+            Preparation.ResourceGraphFingerprint
+        ),
+    )
+
+
+def test_exterior_fabric_handoff_binds_preparation_plan_and_current_resource():
+    Assembly = _Assembly(_Problem())
+    Preparation = Assembly.PortFactorDomain
+    assert Preparation is not None
+    ResourceFingerprint = Preparation.ResourceGraphFingerprint
+
+    ValidatePhysicalExteriorFabricHandoff(
+        Assembly.Plan,
+        Preparation,
+        CurrentResourceGraphFingerprint=ResourceFingerprint,
+    )
+    for ChangedPlan, ChangedPreparation, CurrentFingerprint in (
+        (
+            replace(
+                Assembly.Plan,
+                ResourceGraphFingerprint="changed-plan-resource",
+            ),
+            Preparation,
+            ResourceFingerprint,
+        ),
+        (
+            Assembly.Plan,
+            replace(
+                Preparation,
+                ResourceGraphFingerprint="changed-preparation-resource",
+            ),
+            ResourceFingerprint,
+        ),
+        (
+            Assembly.Plan,
+            Preparation,
+            "changed-current-resource",
+        ),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="resource-graph identity mismatch",
+        ):
+            ValidatePhysicalExteriorFabricHandoff(
+                ChangedPlan,
+                ChangedPreparation,
+                CurrentResourceGraphFingerprint=CurrentFingerprint,
+            )
+
+
+@pytest.mark.parametrize(
+    "FieldName",
+    (
+        "ExteriorFabricSetFingerprint",
+        "ExteriorRegionFingerprint",
+        "ExteriorCapacityLedgerFingerprint",
+    ),
+)
+def test_exterior_fabric_handoff_rejects_each_identity_mismatch(FieldName):
+    Assembly = _Assembly(_Problem())
+    Preparation = Assembly.PortFactorDomain
+    assert Preparation is not None
+    Identity = {
+        "ExteriorFabricSetFingerprint": "exterior-fabric-set",
+        "ExteriorRegionFingerprint": "exterior-region",
+        "ExteriorCapacityLedgerFingerprint": "capacity-ledger",
+    }
+    ChangedIdentity = {**Identity, FieldName: "changed-identity"}
+
+    with pytest.raises(ValueError, match=FieldName):
+        ValidatePhysicalExteriorFabricHandoff(
+            replace(Assembly.Plan, **Identity),
+            replace(Preparation, **ChangedIdentity),
+        )
+
+
+def test_local_support_handoff_rejects_partial_exterior_identity_first():
+    Assembly = _Assembly(_Problem())
+    Preparation = Assembly.PortFactorDomain
+    assert Preparation is not None
+    ChangedPlan = replace(
+        Assembly.Plan,
+        ExteriorFabricSetFingerprint="exterior-fabric-set",
+    )
+
+    with pytest.raises(ValueError, match="complete.*identity triple"):
+        BindPhysicalComponentAssemblyLocalPortSupports(
+            replace(Assembly, Plan=ChangedPlan),
+            Preparation,
+        )
 
 
 def _ProblemWithPhysicalPlan(Assembly, Plan):

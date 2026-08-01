@@ -14,6 +14,7 @@ from .ResourceGraph import (
     RoutingResourceClaims,
 )
 
+Position2 = tuple[int, int]
 Position3 = tuple[int, int, int]
 
 
@@ -697,6 +698,11 @@ class ComponentFeedthroughContract:
     ReservedPathNodes: tuple[Position3, ...] = ()
     Claims: Any = None
     ReservationFingerprint: str = ""
+    EndpointDomainFingerprint: str = ""
+    EndpointCandidateFingerprint: str = ""
+    EndpointCandidateCount: int = 0
+    EndpointPrescreenRetainedCandidateCount: int = 0
+    EndpointPrescreenRejectedCandidateCount: int = 0
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -713,6 +719,17 @@ class ComponentFeedthroughContract:
                 list(Value) for Value in self.ReservedPathNodes
             ],
             "ReservationFingerprint": self.ReservationFingerprint,
+            "EndpointDomainFingerprint": self.EndpointDomainFingerprint,
+            "EndpointCandidateFingerprint": (
+                self.EndpointCandidateFingerprint
+            ),
+            "EndpointCandidateCount": self.EndpointCandidateCount,
+            "EndpointPrescreenRetainedCandidateCount": (
+                self.EndpointPrescreenRetainedCandidateCount
+            ),
+            "EndpointPrescreenRejectedCandidateCount": (
+                self.EndpointPrescreenRejectedCandidateCount
+            ),
         }
 
 
@@ -727,6 +744,17 @@ class PhysicalComponentFeedthroughEndpointCandidate:
     ReservedPathNodes: tuple[Position3, ...]
     Claims: RoutingResourceClaims
 
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "CandidateFingerprint": self.CandidateFingerprint,
+            "Layer": self.Layer,
+            "Entry": list(self.Entry),
+            "Exit": list(self.Exit),
+            "ReservedPathNodes": [
+                list(Value) for Value in self.ReservedPathNodes
+            ],
+        }
+
 
 @dataclass(frozen=True)
 class PreparedPhysicalComponentFeedthroughEndpointDomain:
@@ -739,6 +767,20 @@ class PreparedPhysicalComponentFeedthroughEndpointDomain:
     ResourceGraphFingerprint: str
     Candidates: tuple[PhysicalComponentFeedthroughEndpointCandidate, ...]
     Complete: bool
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "DomainFingerprint": self.DomainFingerprint,
+            "Signal": self.Signal,
+            "Layer": self.Layer,
+            "FabricFingerprint": self.FabricFingerprint,
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "CandidateCount": len(self.Candidates),
+            "Complete": self.Complete,
+            "CandidateFingerprints": [
+                Value.CandidateFingerprint for Value in self.Candidates
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -878,6 +920,120 @@ class PhysicalComponentBoundaryPortReservation:
 
 
 @dataclass(frozen=True)
+class PhysicalExteriorApertureFabric:
+    """Complete finite exterior graph reserved before local compilation.
+
+    ``FabricFingerprint`` is structural and deliberately excludes signal
+    names. ``SignalBindingFingerprint`` separately identifies the exact
+    signal-to-guide/ingress relation used by an assembly plan.
+    """
+
+    EnvelopeMinimum: Position3
+    EnvelopeMaximum: Position3
+    Layer: int
+    RoutingY: int
+    ExteriorPerimeterColumns: frozenset[Position2]
+    SignalGuideIngressGeometry: tuple[
+        tuple[tuple[Position2, ...], tuple[Position3, ...]], ...
+    ]
+    SignalGuideIngressBindings: tuple[
+        tuple[str, tuple[Position2, ...], tuple[Position3, ...]], ...
+    ]
+    DeclaredPortalIngressNodes: frozenset[Position3]
+    KeepoutColumns: frozenset[Position2]
+    KeepoutNodes: frozenset[Position3]
+    AllowedColumns: frozenset[Position2]
+    AllowedNodes: frozenset[Position3]
+    AllowedEdges: frozenset[tuple[Position3, Position3]]
+    Adjacency: tuple[tuple[Position3, tuple[Position3, ...]], ...]
+    Complete: bool
+    RegionFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    GuideIdentityFingerprint: str
+    SignalBindingFingerprint: str
+    FabricFingerprint: str
+
+    def __post_init__(self) -> None:
+        if any(
+            self.EnvelopeMinimum[Index] > self.EnvelopeMaximum[Index]
+            for Index in range(3)
+        ):
+            raise ValueError("exterior fabric envelope is inverted")
+        if any(
+            First >= Second
+            for First, Second in self.AllowedEdges
+        ):
+            raise ValueError("exterior fabric edges must be normalized")
+        if any(
+            First not in self.AllowedNodes
+            or Second not in self.AllowedNodes
+            for First, Second in self.AllowedEdges
+        ):
+            raise ValueError("exterior fabric edge escapes allowed nodes")
+        ExpectedAdjacency: dict[Position3, set[Position3]] = {
+            Node: set() for Node in self.AllowedNodes
+        }
+        for First, Second in self.AllowedEdges:
+            ExpectedAdjacency[First].add(Second)
+            ExpectedAdjacency[Second].add(First)
+        CanonicalAdjacency = tuple(
+            (Node, tuple(sorted(Neighbors)))
+            for Node, Neighbors in sorted(ExpectedAdjacency.items())
+        )
+        if self.Adjacency != CanonicalAdjacency:
+            raise ValueError("exterior fabric adjacency differs from edges")
+        if not self.DeclaredPortalIngressNodes <= self.AllowedNodes:
+            raise ValueError("exterior fabric omits a declared ingress")
+        if self.Complete and not all((
+            self.RegionFingerprint,
+            self.ResourceGraphFingerprint,
+            self.TechnologyFingerprint,
+            self.GuideIdentityFingerprint,
+            self.SignalBindingFingerprint,
+            self.FabricFingerprint,
+        )):
+            raise ValueError(
+                "complete exterior fabric requires every graph identity"
+            )
+
+    def AllowsNode(self, Node: Position3) -> bool:
+        return tuple(Node) in self.AllowedNodes
+
+    def AllowsEdge(self, First: Position3, Second: Position3) -> bool:
+        Edge = (tuple(First), tuple(Second))
+        if Edge[1] < Edge[0]:
+            Edge = (Edge[1], Edge[0])
+        return Edge in self.AllowedEdges
+
+    def Neighbors(self, Node: Position3) -> tuple[Position3, ...]:
+        return dict(self.Adjacency).get(tuple(Node), ())
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": "physical-exterior-aperture-fabric-v2",
+            "EnvelopeMinimum": list(self.EnvelopeMinimum),
+            "EnvelopeMaximum": list(self.EnvelopeMaximum),
+            "Layer": self.Layer,
+            "RoutingY": self.RoutingY,
+            "AllowedColumnCount": len(self.AllowedColumns),
+            "AllowedNodeCount": len(self.AllowedNodes),
+            "AllowedEdgeCount": len(self.AllowedEdges),
+            "DeclaredPortalIngressNodes": [
+                list(Value)
+                for Value in sorted(self.DeclaredPortalIngressNodes)
+            ],
+            "Complete": self.Complete,
+            "RegionFingerprint": self.RegionFingerprint,
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "GuideIdentityFingerprint": self.GuideIdentityFingerprint,
+            "SignalBindingFingerprint": self.SignalBindingFingerprint,
+            "FabricFingerprint": self.FabricFingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class PhysicalComponentSelectedLocalPortSupport:
     """Identity-only reference to local support for one boundary reservation."""
 
@@ -985,6 +1141,7 @@ class PhysicalComponentAssemblyPlan:
     GlobalKeepoutNodes: tuple[Position3, ...] = ()
     GlobalKeepoutFingerprint: str = ""
     Feedthroughs: tuple[ComponentFeedthroughContract, ...] = ()
+    AssemblyChoiceFingerprint: str = ""
     StageOrder: tuple[str, ...] = (
         "PhysicalBoundaryPlanning",
         "AuthoritativeGlobalReserve",
@@ -995,6 +1152,13 @@ class PhysicalComponentAssemblyPlan:
     Complete: bool = True
     AccessCertificateFingerprint: str = ""
     LocalAccessDomainFingerprint: str = ""
+    # Exact exterior-routing identities carried across preparation, global
+    # reservation, and the local-compilation handoff.  Empty values preserve
+    # compatibility for fixtures created before this additive contract.
+    ExteriorFabricSetFingerprint: str = ""
+    ExteriorRegionFingerprint: str = ""
+    ExteriorCapacityLedgerFingerprint: str = ""
+    ExteriorFabrics: tuple[PhysicalExteriorApertureFabric, ...] = ()
     # Authoritative port-first representation.  ``Ports`` remains available
     # while transitional planner and local-compiler callers are migrated.
     GlobalBoundaryPorts: tuple[
@@ -1063,12 +1227,23 @@ class PhysicalComponentAssemblyPlan:
             "Feedthroughs": [
                 Value.ToDictionary() for Value in self.Feedthroughs
             ],
+            "AssemblyChoiceFingerprint": self.AssemblyChoiceFingerprint,
             "AccessCertificateFingerprint": (
                 self.AccessCertificateFingerprint
             ),
             "LocalAccessDomainFingerprint": (
                 self.LocalAccessDomainFingerprint
             ),
+            "ExteriorFabricSetFingerprint": (
+                self.ExteriorFabricSetFingerprint
+            ),
+            "ExteriorRegionFingerprint": self.ExteriorRegionFingerprint,
+            "ExteriorCapacityLedgerFingerprint": (
+                self.ExteriorCapacityLedgerFingerprint
+            ),
+            "ExteriorFabrics": [
+                Value.ToDictionary() for Value in self.ExteriorFabrics
+            ],
             "StageOrder": list(self.StageOrder),
             "Complete": self.Complete,
             "ImplicitForeignTransitDomainCount": 0,
@@ -1363,6 +1538,75 @@ class PreparedPhysicalComponentAssembly:
 
 
 @dataclass(frozen=True)
+class PhysicalSignalRouteDomainDescriptorProgressState:
+    """Exact completed-descriptor set for one physical exterior signal."""
+
+    Signal: str
+    PreSiblingDomainFingerprint: str
+    RequestDomainFingerprint: str
+    DescriptorUniverseFingerprint: str
+    DescriptorCount: int
+    CompletedDescriptorFingerprints: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.Signal
+            or not self.PreSiblingDomainFingerprint
+            or not self.RequestDomainFingerprint
+            or not self.DescriptorUniverseFingerprint
+            or self.DescriptorCount < 1
+        ):
+            raise ValueError(
+                "physical descriptor progress identity is incomplete"
+            )
+        if len(self.CompletedDescriptorFingerprints) > self.DescriptorCount:
+            raise ValueError(
+                "physical descriptor progress exceeds its universe"
+            )
+
+    @property
+    def UniverseIdentity(self) -> tuple[object, ...]:
+        return (
+            self.Signal,
+            self.PreSiblingDomainFingerprint,
+            self.RequestDomainFingerprint,
+            self.DescriptorUniverseFingerprint,
+            self.DescriptorCount,
+        )
+
+
+@dataclass(frozen=True)
+class PhysicalGlobalPlanDescriptorProgressState:
+    """Identity-closed descriptor progress emitted by global planning."""
+
+    PlanFingerprint: str
+    ApertureDomainFingerprint: str
+    Signals: tuple[PhysicalSignalRouteDomainDescriptorProgressState, ...]
+
+    def __post_init__(self) -> None:
+        if not self.PlanFingerprint or not self.ApertureDomainFingerprint:
+            raise ValueError(
+                "physical descriptor resume state is unidentified"
+            )
+        SignalNames = tuple(Value.Signal for Value in self.Signals)
+        if not SignalNames or len(set(SignalNames)) != len(SignalNames):
+            raise ValueError(
+                "physical descriptor resume signals must be unique"
+            )
+
+    @property
+    def CompletedDescriptorCount(self) -> int:
+        return sum(
+            len(Value.CompletedDescriptorFingerprints)
+            for Value in self.Signals
+        )
+
+    @property
+    def UniverseIdentities(self) -> tuple[tuple[object, ...], ...]:
+        return tuple(Value.UniverseIdentity for Value in self.Signals)
+
+
+@dataclass(frozen=True)
 class PhysicalGlobalPlanResumeCursor:
     """Opaque, identity-bound cursor emitted by authoritative global routing."""
 
@@ -1582,6 +1826,57 @@ class PhysicalPortApertureOptionFactor:
     GlobalContractFingerprint: str
     ApertureContractFingerprint: str
     ApertureOptionFingerprint: str
+
+
+@dataclass(frozen=True)
+class PhysicalPortExteriorFixedClaimCertificate:
+    """Complete unary proof for claims shared by every exterior route.
+
+    Portal alternatives may add geometry, but they can never remove the
+    projected whole-design access paths or the selected component aperture.
+    A conflict in this monotone fixed core therefore rejects the aperture
+    before a whole physical assembly plan is materialized.
+    """
+
+    CertificateFingerprint: str
+    Signal: str
+    ApertureOptionFingerprint: str
+    ApertureContractFingerprint: str
+    PlacementFingerprint: str
+    InterfaceFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    FixedClaimsFingerprint: str
+    FrozenClaimsFingerprint: str
+    Complete: bool
+    Feasible: bool
+    SelfConflictResources: tuple[str, ...] = ()
+    FrozenConflictSignals: tuple[str, ...] = ()
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": (
+                "physical-port-exterior-fixed-claim-certificate-v1"
+            ),
+            "CertificateFingerprint": self.CertificateFingerprint,
+            "Signal": self.Signal,
+            "ApertureOptionFingerprint": (
+                self.ApertureOptionFingerprint
+            ),
+            "ApertureContractFingerprint": (
+                self.ApertureContractFingerprint
+            ),
+            "PlacementFingerprint": self.PlacementFingerprint,
+            "InterfaceFingerprint": self.InterfaceFingerprint,
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "FixedClaimsFingerprint": self.FixedClaimsFingerprint,
+            "FrozenClaimsFingerprint": self.FrozenClaimsFingerprint,
+            "Complete": self.Complete,
+            "Feasible": self.Feasible,
+            "SelfConflictResources": list(self.SelfConflictResources),
+            "FrozenConflictSignals": list(self.FrozenConflictSignals),
+        }
 
 
 @dataclass(frozen=True)
@@ -2011,6 +2306,9 @@ class PreparedPhysicalComponentPortFactorDomain:
     LocalApertureSupportBySignal: tuple[
         tuple[str, tuple[PhysicalPortLocalApertureSupport, ...]], ...
     ] = ()
+    ExteriorFixedClaimCertificates: tuple[
+        PhysicalPortExteriorFixedClaimCertificate, ...
+    ] = ()
     # Complete global-only candidate reservations.  This additive field lets
     # assembly planning publish its authoritative boundary choices without
     # coupling them back to component-local access witnesses.
@@ -2023,6 +2321,12 @@ class PreparedPhysicalComponentPortFactorDomain:
     FeedthroughEndpointDomains: tuple[
         PreparedPhysicalComponentFeedthroughEndpointDomain, ...
     ] = ()
+    # Authoritative exterior fabric, detailed region, and joint capacity
+    # ledger identities.  These remain optional only for legacy preparations.
+    ExteriorFabricSetFingerprint: str = ""
+    ExteriorRegionFingerprint: str = ""
+    ExteriorCapacityLedgerFingerprint: str = ""
+    ExteriorFabrics: tuple[PhysicalExteriorApertureFabric, ...] = ()
 
 
 @dataclass
@@ -2334,6 +2638,11 @@ class RoutingResources:
         repr=False,
     )
     RejectedPhysicalComponentAssemblyPlanFingerprints: set[str] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    RejectedPhysicalComponentAssemblyChoiceFingerprints: set[str] = field(
         default_factory=set,
         compare=False,
         repr=False,

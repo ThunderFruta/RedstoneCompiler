@@ -29,9 +29,13 @@ from ..Routing.ComponentPipeline import (
     CertifyLocalInterfaceFactorPortfolio,
     PhysicalAssemblyGlobalRouteCanBeRebound,
     PreparePhysicalComponentGlobalPlanningPlacement,
+    ProveClosedComponentOwnedSignalFrontiers,
+    ProveClosedComponentSymbolicCapacityEligibility,
     ProveGlobalRelaxedLocalUnsatisfiability,
     RecordPhysicalComponentGlobalPlanNoGood,
     RecordPhysicalComponentLocalCompilationNoGood,
+    RecordPhysicalComponentSymbolicCapacityEligibilityNoGood,
+    SelectContractIndependentOwnedSignalFrontierUnsatCore,
     SelectPhysicalAssemblyGlobalBoundaryPorts,
     SelectPhysicalComponentExactGlobalChannelSignals,
 )
@@ -52,7 +56,10 @@ from ..Routing.Models import (
     ClusterInterfaceStateProof,
     RoutedComponentTemplate,
     RoutedDesign,
+    PhysicalGlobalPlanDescriptorProgressState,
+    PhysicalGlobalPlanResumeCursor,
     PhysicalGlobalPlanContinuationState,
+    PhysicalSignalRouteDomainDescriptorProgressState,
 )
 from ..Routing.Failures import (
     RoutingAssignmentCut,
@@ -614,6 +621,192 @@ def ReuseRetainedPlacementRoutingResources(
     return Created, False
 
 
+def FindPhysicalGlobalDiagnosticValues(
+    Value: Any,
+    Key: str,
+) -> list[Any]:
+    """Collect one diagnostic field through nested routed-stage failures."""
+    Result = []
+    if isinstance(Value, dict):
+        if Key in Value:
+            Result.append(Value[Key])
+        for Nested in Value.values():
+            Result.extend(FindPhysicalGlobalDiagnosticValues(Nested, Key))
+    elif isinstance(Value, (list, tuple)):
+        for Nested in Value:
+            Result.extend(FindPhysicalGlobalDiagnosticValues(Nested, Key))
+    return Result
+
+
+def BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+    PlanFingerprint: str,
+    ApertureDomainFingerprint: str,
+    Diagnostics: Mapping[str, Any],
+) -> tuple[PhysicalGlobalPlanResumeCursor | None, int]:
+    """Build a typed cursor from exact same-plan portal or route progress."""
+    def MaximumInteger(Key: str) -> int:
+        return max(
+            (
+                int(Value)
+                for Value in FindPhysicalGlobalDiagnosticValues(
+                    Diagnostics,
+                    Key,
+                )
+                if isinstance(Value, (int, float))
+            ),
+            default=0,
+        )
+
+    PortalCompletedWork = MaximumInteger("PortalCompletedWork")
+    PortalRequestCount = MaximumInteger("PortalRequestCount")
+    DescriptorProgressValues = FindPhysicalGlobalDiagnosticValues(
+        Diagnostics,
+        "PhysicalSignalRouteDomainDescriptorProgress",
+    )
+    DescriptorProgressBySignal = next((
+        Value
+        for Value in reversed(DescriptorProgressValues)
+        if isinstance(Value, dict) and Value
+    ), {})
+    if DescriptorProgressBySignal:
+        if not PlanFingerprint or not ApertureDomainFingerprint:
+            return None, 0
+        SignalStates = []
+        try:
+            for Signal, RawState in sorted(
+                DescriptorProgressBySignal.items()
+            ):
+                if not isinstance(RawState, Mapping):
+                    raise ValueError(
+                        "physical descriptor progress record is malformed"
+                    )
+                RawCompleted = RawState.get(
+                    "CompletedDescriptorFingerprints",
+                    (),
+                )
+                if not isinstance(RawCompleted, (list, tuple, set, frozenset)):
+                    raise ValueError(
+                        "physical descriptor completion set is malformed"
+                    )
+                Completed = frozenset(str(Value) for Value in RawCompleted)
+                if any(not Value for Value in Completed):
+                    raise ValueError(
+                        "physical descriptor completion is unidentified"
+                    )
+                DeclaredCompletedCount = int(RawState.get(
+                    "CompletedDescriptorCount",
+                    len(Completed),
+                ))
+                if DeclaredCompletedCount != len(Completed):
+                    raise ValueError(
+                        "physical descriptor completion count disagrees"
+                    )
+                SignalStates.append(
+                    PhysicalSignalRouteDomainDescriptorProgressState(
+                        Signal=str(Signal),
+                        PreSiblingDomainFingerprint=str(RawState.get(
+                            "PreSiblingDomainFingerprint",
+                            "",
+                        )),
+                        RequestDomainFingerprint=str(RawState.get(
+                            "RequestDomainFingerprint",
+                            "",
+                        )),
+                        DescriptorUniverseFingerprint=str(RawState.get(
+                            "DescriptorUniverseFingerprint",
+                            "",
+                        )),
+                        DescriptorCount=int(RawState.get(
+                            "DescriptorCount",
+                            0,
+                        )),
+                        CompletedDescriptorFingerprints=Completed,
+                    )
+                )
+        except (TypeError, ValueError):
+            return None, 0
+        DescriptorState = PhysicalGlobalPlanDescriptorProgressState(
+            PlanFingerprint=str(PlanFingerprint),
+            ApertureDomainFingerprint=str(ApertureDomainFingerprint),
+            Signals=tuple(SignalStates),
+        )
+        CompletedWork = DescriptorState.CompletedDescriptorCount
+        if CompletedWork <= 0:
+            return None, 0
+        return PhysicalGlobalPlanResumeCursor(
+            CursorFingerprint=BuildStableFingerprint((
+                "physical-global-descriptor-resume-cursor-v1",
+                DescriptorState.PlanFingerprint,
+                DescriptorState.ApertureDomainFingerprint,
+                tuple(
+                    (
+                        Value.UniverseIdentity,
+                        tuple(sorted(
+                            Value.CompletedDescriptorFingerprints
+                        )),
+                    )
+                    for Value in DescriptorState.Signals
+                ),
+            )),
+            PlanFingerprint=str(PlanFingerprint),
+            ApertureDomainFingerprint=str(ApertureDomainFingerprint),
+            CompletedWork=CompletedWork,
+            State=DescriptorState,
+        ), CompletedWork
+
+    PortalCacheModes = tuple(
+        str(Value)
+        for Value in FindPhysicalGlobalDiagnosticValues(
+            Diagnostics,
+            "PortalCacheMode",
+        )
+        if str(Value)
+    )
+    RawPortalCacheSelections = tuple(
+        bool(Value)
+        for Value in FindPhysicalGlobalDiagnosticValues(
+            Diagnostics,
+            "RawPortalResourceCacheSelected",
+        )
+    )
+    PortalProgressAvailable = bool(
+        PortalCompletedWork > 0
+        and PortalRequestCount > 0
+        and (
+            any(Value in {"partial-signal", "complete"}
+                for Value in PortalCacheModes)
+            or any(RawPortalCacheSelections)
+        )
+    )
+    CompletedWork = PortalCompletedWork
+    if (
+        not PlanFingerprint
+        or not ApertureDomainFingerprint
+        or CompletedWork <= 0
+        or not PortalProgressAvailable
+    ):
+        return None, CompletedWork
+    ResumeState = (
+        "physical-global-portal-resume-v1",
+        PortalCompletedWork,
+        PortalRequestCount,
+        tuple(sorted(PortalCacheModes)),
+        bool(any(RawPortalCacheSelections)),
+    )
+    return PhysicalGlobalPlanResumeCursor(
+        CursorFingerprint=BuildStableFingerprint((
+            "physical-global-resume-cursor-v2",
+            PlanFingerprint,
+            ApertureDomainFingerprint,
+            ResumeState,
+        )),
+        PlanFingerprint=PlanFingerprint,
+        ApertureDomainFingerprint=ApertureDomainFingerprint,
+        CompletedWork=CompletedWork,
+        State=ResumeState,
+    ), CompletedWork
+
+
 def ClassifyPhysicalGlobalPlanRetentionAdmission(
     ApertureDiagnostics: object,
     *,
@@ -657,24 +850,103 @@ def ClassifyPhysicalGlobalPlanRetentionAdmission(
         and ResumeCursor.ApertureDomainFingerprint == ApertureFingerprint
         and ResumeCursor.State is not None
     )
+    DescriptorState = (
+        ResumeCursor.State
+        if (
+            ResumeCursor is not None
+            and isinstance(
+                ResumeCursor.State,
+                PhysicalGlobalPlanDescriptorProgressState,
+            )
+        )
+        else None
+    )
+    ExistingDescriptorState = (
+        ExistingCursor.State
+        if (
+            ExistingCursor is not None
+            and isinstance(
+                ExistingCursor.State,
+                PhysicalGlobalPlanDescriptorProgressState,
+            )
+        )
+        else None
+    )
     ExistingSameAperture = bool(
         ApertureFingerprint
         and ApertureFingerprint in ExistingCertificates
     )
-    HasNewWork = bool(Continuation.CompletedWork > 0)
-    MonotonicProgress = bool(
-        CursorAvailable
-        and HasNewWork
-        and (
-            ExistingCursor is None
-            or (
-                ResumeCursor.ApertureDomainFingerprint
-                == ExistingCursor.ApertureDomainFingerprint
-                and ResumeCursor.CompletedWork
-                > ExistingCursor.CompletedWork
+    DescriptorIdentityMatch = True
+    DescriptorCompletedSetSuperset = True
+    DescriptorStrictAddition = True
+    if DescriptorState is not None:
+        DescriptorIdentityMatch = bool(
+            DescriptorState.PlanFingerprint
+            == Continuation.PlanFingerprint
+            and DescriptorState.ApertureDomainFingerprint
+            == ApertureFingerprint
+        )
+        if ExistingCursor is not None:
+            DescriptorIdentityMatch = bool(
+                DescriptorIdentityMatch
+                and ExistingDescriptorState is not None
+                and DescriptorState.UniverseIdentities
+                == ExistingDescriptorState.UniverseIdentities
+            )
+            if DescriptorIdentityMatch:
+                PriorBySignal = {
+                    Value.Signal: Value.CompletedDescriptorFingerprints
+                    for Value in ExistingDescriptorState.Signals
+                }
+                CurrentBySignal = {
+                    Value.Signal: Value.CompletedDescriptorFingerprints
+                    for Value in DescriptorState.Signals
+                }
+                DescriptorCompletedSetSuperset = all(
+                    CurrentBySignal[Signal] >= PriorCompleted
+                    for Signal, PriorCompleted in PriorBySignal.items()
+                )
+                DescriptorStrictAddition = bool(
+                    DescriptorCompletedSetSuperset
+                    and any(
+                        CurrentBySignal[Signal] > PriorCompleted
+                        for Signal, PriorCompleted in PriorBySignal.items()
+                    )
+                )
+            else:
+                DescriptorCompletedSetSuperset = False
+                DescriptorStrictAddition = False
+        else:
+            DescriptorStrictAddition = bool(
+                DescriptorState.CompletedDescriptorCount > 0
+            )
+        MonotonicProgress = bool(
+            CursorAvailable
+            and DescriptorIdentityMatch
+            and DescriptorCompletedSetSuperset
+            and DescriptorStrictAddition
+        )
+    elif ExistingDescriptorState is not None:
+        # Never replace exact descriptor proof state with a scalar/portal
+        # cursor, even when its reported work count is larger.
+        DescriptorIdentityMatch = False
+        DescriptorCompletedSetSuperset = False
+        DescriptorStrictAddition = False
+        MonotonicProgress = False
+    else:
+        MonotonicProgress = bool(
+            CursorAvailable
+            and Continuation.CompletedWork > 0
+            and (
+                ExistingCursor is None
+                or (
+                    ResumeCursor.ApertureDomainFingerprint
+                    == ExistingCursor.ApertureDomainFingerprint
+                    and ResumeCursor.CompletedWork
+                    > ExistingCursor.CompletedWork
+                )
             )
         )
-    )
     Admitted = bool(
         ApertureComplete
         and CursorAvailable
@@ -686,6 +958,12 @@ def ClassifyPhysicalGlobalPlanRetentionAdmission(
         Reason = "resume-cursor-unavailable"
     elif ExistingCursor is not None and not ExistingSameAperture:
         Reason = "existing-continuation-aperture-mismatch"
+    elif not DescriptorIdentityMatch:
+        Reason = "descriptor-universe-or-identity-mismatch"
+    elif not DescriptorCompletedSetSuperset:
+        Reason = "descriptor-completion-is-not-a-superset"
+    elif not DescriptorStrictAddition:
+        Reason = "descriptor-completion-has-no-strict-addition"
     elif not MonotonicProgress:
         Reason = "non-monotonic-or-zero-progress"
     else:
@@ -698,6 +976,12 @@ def ClassifyPhysicalGlobalPlanRetentionAdmission(
         "ApertureCertificateComplete": ApertureComplete,
         "ResumeCursorAvailable": CursorAvailable,
         "MonotonicProgress": MonotonicProgress,
+        "DescriptorProgress": DescriptorState is not None,
+        "DescriptorIdentityMatch": DescriptorIdentityMatch,
+        "DescriptorCompletedSetSuperset": (
+            DescriptorCompletedSetSuperset
+        ),
+        "DescriptorStrictAddition": DescriptorStrictAddition,
         "ExistingContinuationSameAperture": ExistingSameAperture,
     }
 
@@ -770,6 +1054,74 @@ def BuildLocalComponentCompilationAdmissionFailure(
             "DeadlineExceeded": True,
             "WorkCapReached": False,
             "LocalCompilationEntered": False,
+            "ExecutableLegacyRepairCascade": False,
+            "StageSchedule": Schedule.ToDictionary(),
+        },
+    )
+
+
+def BuildPhysicalAssemblyPlanningIncompleteFailure(
+    Schedule: ClusterInterfaceStageSchedule,
+    *,
+    RemainingSeconds: float,
+    GlobalPlanningEntered: bool,
+) -> RoutingFailure:
+    """Return typed incomplete before an immutable plan reaches handoff."""
+    return RoutingFailure(
+        Reason=RoutingFailureReason.PhysicalComponentAssemblyIncomplete,
+        Stage="PhysicalAssemblyPlanningIncomplete",
+        Detail=(
+            "physical component planning did not produce a bound assembly "
+            "plan before its planning deadline"
+        ),
+        RepairActions=(),
+        Diagnostics={
+            "DeadlineExceeded": True,
+            "WorkCapReached": False,
+            "GlobalPlanningEntered": GlobalPlanningEntered,
+            "LocalCompilationEntered": False,
+            "RemainingSeconds": max(0.0, RemainingSeconds),
+            "ExecutableLegacyRepairCascade": False,
+            "StageSchedule": Schedule.ToDictionary(),
+        },
+    )
+
+
+def BuildClosedComponentExecutionIncompleteFailure(
+    Schedule: ClusterInterfaceStageSchedule,
+    ComponentSolve: Any,
+    *,
+    PhysicalAssemblyPlanFingerprint: str,
+    RemainingSeconds: float,
+) -> RoutingFailure:
+    """Return typed incomplete after local compilation was admitted."""
+    return RoutingFailure(
+        Reason=RoutingFailureReason.PhysicalComponentAssemblyIncomplete,
+        Stage="ClosedComponentCompilationIncomplete",
+        Detail=(
+            "the admitted closed-component proof did not complete before "
+            "its execution deadline"
+        ),
+        RepairActions=(),
+        Diagnostics={
+            "ComponentRoutingSolve": {
+                "Status": "incomplete",
+                "UnderlyingStatus": str(ComponentSolve.Status),
+                "ProofFingerprint": str(
+                    ComponentSolve.ProofFingerprint
+                ),
+                "ExpansionCount": int(ComponentSolve.ExpansionCount),
+                "Complete": False,
+                "Diagnostics": dict(ComponentSolve.Diagnostics),
+            },
+            "PhysicalAssemblyPlanFingerprint": (
+                PhysicalAssemblyPlanFingerprint
+            ),
+            "DeadlineExceeded": True,
+            "WorkCapReached": False,
+            "GlobalPlanningEntered": True,
+            "LocalCompilationEntered": True,
+            "RemainingSeconds": max(0.0, RemainingSeconds),
             "ExecutableLegacyRepairCascade": False,
             "StageSchedule": Schedule.ToDictionary(),
         },
@@ -13567,19 +13919,10 @@ def _PlaceAndRoutePcbWithPolicy(
                     "PhysicalAssemblyPlanFingerprint": PlanFingerprint,
                 })
 
-            # Once a complete physical core has selected a retained sibling,
-            # its envelope and factor preparation are authoritative execution
-            # work, not speculative portfolio planning.  Admit that state to
-            # the shared execution deadline while preserving the publication
-            # reserve and the single production ceiling.
-            InterfaceDeadline = (
-                SharedInterfaceDeadline
-                if (
-                    InterfaceWorkPhase == "prepare-eligibility"
-                    and ActiveComponentCutSignals
-                )
-                else SharedInterfacePlanningDeadline
-            )
+            # Every stage before an immutable global assembly is bound remains
+            # planning work.  The local execution reserve becomes available
+            # only at the explicit post-bind handoff below.
+            InterfaceDeadline = SharedInterfacePlanningDeadline
             StateRealizabilityNogoods: list[
                 ClusterInterfaceRealizabilityNogood
             ] = []
@@ -13919,11 +14262,12 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
                 if InterfaceDeadline.IsExpired():
                     raise RoutingStageError(
-                        BuildLocalComponentCompilationAdmissionFailure(
+                        BuildPhysicalAssemblyPlanningIncompleteFailure(
                             InterfaceStageSchedule,
                             RemainingSeconds=(
-                                SharedInterfaceDeadline.RemainingSeconds()
+                                InterfaceDeadline.RemainingSeconds()
                             ),
+                            GlobalPlanningEntered=False,
                         )
                     )
                 InterfaceRemainingSeconds = (
@@ -13977,6 +14321,74 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
                 InterfaceResources.PhysicalComponentPortCspStateCache.clear()
                 if InterfaceWorkPhase == "prepare-eligibility":
+                    def ProveUnboundOwnedSignalFrontier(
+                        UnboundProblem: Any,
+                    ) -> None:
+                        FrontierProofStartedAt = monotonic()
+                        FrontierProof = (
+                            ProveClosedComponentOwnedSignalFrontiers(
+                                UnboundProblem,
+                                DeadlineSeconds=(
+                                    InterfaceDeadline.RemainingSeconds()
+                                ),
+                                WorkCheck=lambda Diagnostics: (
+                                    InterfaceDeadline.RaiseIfExpired(
+                                        "PhysicalUnboundOwnedSignalFrontier"
+                                        "Eligibility",
+                                        Diagnostics,
+                                    )
+                                ),
+                                RouteClaimsConstructionCache=(
+                                    ComponentRouteClaimsConstructionCache
+                                ),
+                            )
+                        )
+                        CoreSignals = (
+                            SelectContractIndependentOwnedSignalFrontierUnsatCore(
+                                UnboundProblem,
+                                FrontierProof,
+                            )
+                        )
+                        RecordPhysicalComponentStageTiming(
+                            "PhysicalUnboundOwnedSignalFrontierEligibility",
+                            FrontierProofStartedAt,
+                            Result=(
+                                "contract-independent-unsatisfiable"
+                                if CoreSignals
+                                else FrontierProof.Status
+                            ),
+                        )
+                        if not CoreSignals:
+                            return
+                        FrontierDiagnostics = dict(
+                            FrontierProof.Diagnostics or {}
+                        )
+                        raise RoutingStageError(RoutingFailure(
+                            Reason=(
+                                RoutingFailureReason
+                                .ComponentPortAssignmentUnsatisfiable
+                            ),
+                            Stage="PhysicalComponentLocalEligibility",
+                            AffectedNets=CoreSignals,
+                            Detail=(
+                                "the unbound placed component has a "
+                                "port-independent empty owned-signal "
+                                "frontier"
+                            ),
+                            RepairActions=(),
+                            Diagnostics={
+                                **FrontierDiagnostics,
+                                "OwnedSignalFrontierProofComplete": True,
+                                "PortAssignmentProofComplete": True,
+                                "PhysicalPortFactorPreparationEntered": (
+                                    False
+                                ),
+                                "GlobalPlanningEntered": False,
+                                "LocalCompilationEntered": False,
+                                "ImplicitForeignTransitDomainCount": 0,
+                            },
+                        ))
+
                     EligibilityPreparationStartedAt = monotonic()
                     try:
                         PreparedEligibility = PreparePhysicalComponentEligibility(
@@ -13988,6 +14400,9 @@ def _PlaceAndRoutePcbWithPolicy(
                                 InterfaceCandidate.PlacementFingerprint
                             ),
                             LocalRouteFingerprint=LocalRouteFingerprint,
+                            UnboundOwnedSignalFrontierProofCallback=(
+                                ProveUnboundOwnedSignalFrontier
+                            ),
                         )
                     except Exception:
                         RecordPhysicalComponentStageTiming(
@@ -14175,12 +14590,138 @@ def _PlaceAndRoutePcbWithPolicy(
                     Result="complete",
                     PlanFingerprint=PreparedAssembly.Plan.PlanFingerprint,
                 )
-                PhysicalAssemblyPlan = PreparedAssembly.Plan
-                ComponentProblem = PreparedAssembly.Problem
                 ComponentBasePlacement = (
                     MaterializedInterfacePlacement
                 )
                 ComponentBaseCandidate = InterfaceCandidate
+                while True:
+                    CapacityProofStartedAt = monotonic()
+                    CapacityProof = (
+                        ProveClosedComponentSymbolicCapacityEligibility(
+                            PreparedAssembly.Problem,
+                            DeadlineSeconds=(
+                                InterfaceDeadline.RemainingSeconds()
+                            ),
+                            WorkCheck=lambda Diagnostics:
+                            InterfaceDeadline.RaiseIfExpired(
+                                "PhysicalSymbolicCapacityEligibility",
+                                Diagnostics,
+                            ),
+                            RouteClaimsConstructionCache=(
+                                ComponentRouteClaimsConstructionCache
+                            ),
+                        )
+                    )
+                    RecordPhysicalComponentStageTiming(
+                        "PhysicalSymbolicCapacityEligibility",
+                        CapacityProofStartedAt,
+                        Result=CapacityProof.Status,
+                        PlanFingerprint=(
+                            PreparedAssembly.Plan.PlanFingerprint
+                        ),
+                    )
+                    CapacityDiagnostics = dict(
+                        CapacityProof.Diagnostics or {}
+                    )
+                    if (
+                        CapacityProof.Status
+                        == "architectural-unsatisfiable"
+                        and CapacityDiagnostics.get(
+                            "LocalUnsatCoreComplete",
+                            False,
+                        )
+                        and CapacityDiagnostics.get(
+                            "LocalUnsatCoreKind",
+                            "",
+                        ) == "tree-frontier-empty-owned-signal-domain"
+                    ):
+                        raise RoutingStageError(RoutingFailure(
+                            Reason=(
+                                RoutingFailureReason
+                                .ComponentPortAssignmentUnsatisfiable
+                            ),
+                            Stage="PhysicalComponentLocalEligibility",
+                            AffectedNets=tuple(CapacityDiagnostics.get(
+                                "LocalUnsatCoreSignals",
+                                (),
+                            )),
+                            Detail=(
+                                "the placed component has an empty owned-"
+                                "signal frontier before global channel "
+                                "reservation"
+                            ),
+                            Diagnostics={
+                                **CapacityDiagnostics,
+                                "OwnedSignalFrontierProofComplete": True,
+                                "PortAssignmentProofComplete": True,
+                                "ComponentFabricConstructionComplete": True,
+                                "OwnershipSearchComplete": True,
+                                "PortAssignmentUnsatCoreSignals": list(
+                                    CapacityDiagnostics.get(
+                                        "LocalUnsatCoreSignals",
+                                        (),
+                                    )
+                                ),
+                                "PortAssignmentUnsatCoreFingerprint": str(
+                                    CapacityDiagnostics.get(
+                                        "LocalUnsatCoreFingerprint",
+                                        CapacityProof.ProofFingerprint,
+                                    )
+                                ),
+                                "LocalCompilationEntered": False,
+                                "GlobalPlanningEntered": False,
+                                "ImplicitForeignTransitDomainCount": 0,
+                            },
+                        ))
+                    if not (
+                        CapacityProof.Status
+                        == "architectural-unsatisfiable"
+                        and CapacityDiagnostics.get(
+                            "SymbolicCapacityProofComplete",
+                            False,
+                        )
+                    ):
+                        break
+                    EligibilityNoGood = (
+                        RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
+                            CapacityProof,
+                            PreparedAssembly.Plan,
+                            InterfaceResources,
+                        )
+                    )
+                    StateAttemptDiagnostics.append({
+                        "Result": (
+                            "pre-global-symbolic-capacity-reject-physical-plan"
+                        ),
+                        "PhysicalAssemblyPlanFingerprint": (
+                            PreparedAssembly.Plan.PlanFingerprint
+                        ),
+                        **EligibilityNoGood,
+                    })
+                    ReplanStartedAt = monotonic()
+                    try:
+                        PreparedAssembly = ReplanPhysicalComponentAssembly(
+                            ComponentBasePlacement,
+                            Resources=InterfaceResources,
+                            Deadline=InterfaceDeadline,
+                        )
+                    except Exception:
+                        RecordPhysicalComponentStageTiming(
+                            "PhysicalAssemblyReplan",
+                            ReplanStartedAt,
+                            Result="failed",
+                        )
+                        raise
+                    RecordPhysicalComponentStageTiming(
+                        "PhysicalAssemblyReplan",
+                        ReplanStartedAt,
+                        Result="complete",
+                        PlanFingerprint=(
+                            PreparedAssembly.Plan.PlanFingerprint
+                        ),
+                    )
+                PhysicalAssemblyPlan = PreparedAssembly.Plan
+                ComponentProblem = PreparedAssembly.Problem
 
                 def ReplanPhysicalAssemblyWithTiming(
                     RequiredGlobalBoundaryPorts: tuple[Any, ...] | None = None,
@@ -14216,21 +14757,6 @@ def _PlaceAndRoutePcbWithPolicy(
                     Assembly: Any,
                 ) -> tuple[Any, RoutedDesign | None]:
                     nonlocal SuccessfulGlobalPlanWasRetained
-                    def FindDiagnosticValues(
-                        Value: Any,
-                        Key: str,
-                    ) -> list[Any]:
-                        Result = []
-                        if isinstance(Value, dict):
-                            if Key in Value:
-                                Result.append(Value[Key])
-                            for Nested in Value.values():
-                                Result.extend(FindDiagnosticValues(Nested, Key))
-                        elif isinstance(Value, (list, tuple)):
-                            for Nested in Value:
-                                Result.extend(FindDiagnosticValues(Nested, Key))
-                        return Result
-
                     def RebuildFrontierDeferrals() -> None:
                         (
                             InterfaceResources
@@ -14248,7 +14774,7 @@ def _PlaceAndRoutePcbWithPolicy(
                         Failure: RoutingFailure,
                     ) -> dict[str, object]:
                         Diagnostics = dict(Failure.Diagnostics or {})
-                        DependencyValues = FindDiagnosticValues(
+                        DependencyValues = FindPhysicalGlobalDiagnosticValues(
                             Diagnostics,
                             (
                                 "PhysicalGlobalCandidateRequestDependency"
@@ -14259,7 +14785,7 @@ def _PlaceAndRoutePcbWithPolicy(
                             Value for Value in reversed(DependencyValues)
                             if isinstance(Value, dict)
                         ), {})
-                        RemainingValues = FindDiagnosticValues(
+                        RemainingValues = FindPhysicalGlobalDiagnosticValues(
                             Diagnostics,
                             "RemainingRequestCounts",
                         )
@@ -14267,19 +14793,35 @@ def _PlaceAndRoutePcbWithPolicy(
                             Value for Value in reversed(RemainingValues)
                             if isinstance(Value, dict)
                         ), {})
-                        CompletedWorkValues = FindDiagnosticValues(
+                        CandidateContinuationValues = (
+                            FindPhysicalGlobalDiagnosticValues(
                             Diagnostics,
-                            "RouteTreeCompletedWork",
+                            "PhysicalComponentGlobalCandidateContinuations",
+                            )
                         )
-                        CompletedWork = max(
-                            (
-                                int(Value)
-                                for Value in CompletedWorkValues
-                                if isinstance(Value, (int, float))
-                            ),
-                            default=0,
-                        )
-                        ApertureValues = FindDiagnosticValues(
+                        CandidateContinuationRecords = next((
+                            Value
+                            for Value in reversed(
+                                CandidateContinuationValues
+                            )
+                            if isinstance(Value, list) and Value
+                        ), [])
+                        if not RemainingCounts:
+                            RemainingCounts = {
+                                str(Value.get("Signal", "")): max(
+                                    0,
+                                    int(Value.get(
+                                        "RemainingRequestCount",
+                                        0,
+                                    )),
+                                )
+                                for Value in CandidateContinuationRecords
+                                if (
+                                    isinstance(Value, dict)
+                                    and str(Value.get("Signal", ""))
+                                )
+                            }
+                        ApertureValues = FindPhysicalGlobalDiagnosticValues(
                             Diagnostics,
                             "CertifiedPhysicalComponentApertureDomain",
                         )
@@ -14323,7 +14865,10 @@ def _PlaceAndRoutePcbWithPolicy(
                                 "CertificateFingerprint",
                                 "AccessCertificateFingerprint",
                             )
-                            for Value in FindDiagnosticValues(Diagnostics, Key)
+                            for Value in FindPhysicalGlobalDiagnosticValues(
+                                Diagnostics,
+                                Key,
+                            )
                             if isinstance(Value, str) and Value
                         } | {
                             str(ApertureDiagnostics.get(
@@ -14331,6 +14876,19 @@ def _PlaceAndRoutePcbWithPolicy(
                                 "",
                             ))
                         }))
+                        ApertureFingerprint = str(
+                            ApertureDiagnostics.get(
+                                "DomainFingerprint",
+                                "",
+                            )
+                        )
+                        ResumeCursor, CompletedWork = (
+                            BuildPhysicalGlobalPlanResumeCursorFromDiagnostics(
+                                CurrentAssembly.Plan.PlanFingerprint,
+                                ApertureFingerprint,
+                                Diagnostics,
+                            )
+                        )
                         Continuation = (
                             BuildPhysicalGlobalPlanContinuationState(
                                 CurrentAssembly.Plan,
@@ -14339,7 +14897,7 @@ def _PlaceAndRoutePcbWithPolicy(
                                 CorridorBySignal.values(),
                                 CertificateFingerprints,
                                 CompletedWork=CompletedWork,
-                                ResumeCursor=None,
+                                ResumeCursor=ResumeCursor,
                             )
                         )
                         ExistingEntry = (
@@ -14509,12 +15067,13 @@ def _PlaceAndRoutePcbWithPolicy(
                             )
                             if InterfaceDeadline.IsExpired():
                                 raise RoutingStageError(
-                                    BuildLocalComponentCompilationAdmissionFailure(
+                                    BuildPhysicalAssemblyPlanningIncompleteFailure(
                                         InterfaceStageSchedule,
                                         RemainingSeconds=(
-                                            SharedInterfaceDeadline
+                                            InterfaceDeadline
                                             .RemainingSeconds()
                                         ),
+                                        GlobalPlanningEntered=True,
                                     )
                                 )
                             GlobalPlanningDeadline = (
@@ -14523,6 +15082,9 @@ def _PlaceAndRoutePcbWithPolicy(
                                     len(
                                         InterfaceResources
                                         .RetainedPhysicalGlobalPlanFrontier
+                                    ),
+                                    CurrentPlanWasRetained=(
+                                        PreviousGlobalPlanWasRetained
                                     ),
                                 )
                             )
@@ -14676,7 +15238,12 @@ def _PlaceAndRoutePcbWithPolicy(
                                         InterfaceResources
                                         .RetainedPhysicalGlobalPlanFrontier
                                     ),
-                                    "CursorResumeAvailable": False,
+                                    "CursorResumeAvailable": bool(
+                                        RetentionDiagnostics.get(
+                                            "CursorResumeAvailable",
+                                            False,
+                                        )
+                                    ),
                                     "CompleteAssignmentCutProof": False,
                                     "NoGoodRecorded": False,
                                     "RetentionAdmission": (
@@ -14865,20 +15432,14 @@ def _PlaceAndRoutePcbWithPolicy(
                         Incomplete = (
                             ComponentSolve.Status == "incomplete"
                         )
-                        if (
-                            not Incomplete
-                            and InterfaceDeadline.IsExpired()
-                            and not ActiveComponentDeadline.IsExpired()
-                        ):
-                            raise RoutingStageError(
-                                BuildLocalComponentCompilationAdmissionFailure(
-                                    InterfaceStageSchedule,
-                                    RemainingSeconds=(
-                                        ActiveComponentDeadline
-                                        .RemainingSeconds()
-                                    ),
-                                )
-                            )
+                        # Crossing the immutable global-plan handoff promotes
+                        # this state from planning into execution.  The local
+                        # compiler was admitted above against
+                        # ActiveComponentDeadline, so expiry of the earlier
+                        # planning clock cannot retroactively turn a complete
+                        # local result into a zero-work admission failure.
+                        # From this point onward only the execution deadline
+                        # may classify local proof work as incomplete.
                         if (
                             not Incomplete
                             and not ActiveComponentDeadline.IsExpired()
@@ -14898,8 +15459,13 @@ def _PlaceAndRoutePcbWithPolicy(
                             )
                             if FeedbackProofRemainingSeconds <= 0:
                                 raise RoutingStageError(
-                                    BuildLocalComponentCompilationAdmissionFailure(
+                                    BuildClosedComponentExecutionIncompleteFailure(
                                         InterfaceStageSchedule,
+                                        ComponentSolve,
+                                        PhysicalAssemblyPlanFingerprint=(
+                                            PhysicalAssemblyPlan
+                                            .PlanFingerprint
+                                        ),
                                         RemainingSeconds=(
                                             ActiveComponentDeadline
                                             .RemainingSeconds()

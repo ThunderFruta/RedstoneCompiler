@@ -595,6 +595,9 @@ def RoutePcbAttempt(
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
     PreparePhysicalComponentPortFactorDomainOnly: bool = False,
+    UnboundOwnedSignalFrontierProofCallback: Callable[
+        [ComponentRoutingProblem], None
+    ] | None = None,
     RequireCompleteClusterInterfaceDomain: bool = False,
     ClusterInterfaceRealizabilityNogoods: tuple[
         ClusterInterfaceRealizabilityNogood, ...
@@ -755,6 +758,9 @@ def RoutePcbAttempt(
                 ),
                 PreparePhysicalComponentPortFactorDomainOnly=(
                     PreparePhysicalComponentPortFactorDomainOnly
+                ),
+                UnboundOwnedSignalFrontierProofCallback=(
+                    UnboundOwnedSignalFrontierProofCallback
                 ),
                 RequireCompleteClusterInterfaceDomain=(
                     RequireCompleteClusterInterfaceDomain
@@ -1242,6 +1248,9 @@ def PreparePhysicalComponentEligibility(
     LocalRouteFingerprint: str = "",
     ProgressCallback: Callable[[int, int], None] | None = None,
     StatusCallback: Callable[[str], None] | None = None,
+    UnboundOwnedSignalFrontierProofCallback: Callable[
+        [ComponentRoutingProblem], None
+    ] | None = None,
 ) -> PreparedPhysicalComponentPortFactorDomain:
     """Freeze the complete physical port domain before assignment search."""
     Resources.PreparedPhysicalComponentPortFactorDomain = None
@@ -1265,6 +1274,9 @@ def PreparePhysicalComponentEligibility(
         Deadline=Deadline,
         PreparePhysicalComponentAssemblyOnly=True,
         PreparePhysicalComponentPortFactorDomainOnly=True,
+        UnboundOwnedSignalFrontierProofCallback=(
+            UnboundOwnedSignalFrontierProofCallback
+        ),
         RequireCompleteClusterInterfaceDomain=True,
         ClusterInterfaceStateFingerprint=StateFingerprint,
         ClusterInterfaceLocalRouteFingerprint=LocalRouteFingerprint,

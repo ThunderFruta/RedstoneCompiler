@@ -8,6 +8,9 @@ from unittest.mock import patch
 from Compiler.Placement.Pcb import PlacementAssignmentConstraintSet
 from Compiler.Routing.AuthoritativePlanner import (
     BuildNegotiatedInitialColumns,
+    BuildConfiguredPortalRequestDomainFingerprint,
+    BuildExactPhysicalPortalCertificateIdentityConditions,
+    BuildPhysicalExteriorResourceGraphFingerprint,
     BeginPhysicalAssignmentArcPass,
     BuildNegotiatedInitialTiles,
     BuildNegotiatedFallbackGuideColumns,
@@ -27,6 +30,14 @@ from Compiler.Routing.AuthoritativePlanner import (
     BuildDetachedLocalClaimObstacleNodes,
     PartitionLocalClaimSeedComponents,
     PortalTupleFeasibilityDomainIsComplete,
+    PortalTupleEmptyProofDomainIsComplete,
+    ReadPortalBatchCandidatesAndCompletionMask,
+    SelectCompletedPortalBatchEntries,
+    MergePartialRawPortalBatchWork,
+    MergePhysicalSignalRouteDomainDescriptorProgress,
+    RetainPhysicalSignalRouteDomainDescriptorProgress,
+    SelectPendingPhysicalRouteDescriptorRows,
+    SelectMatchingPartialPortalReplaySignals,
     BuildBoundedPortfolioPortalSliceAdvanceFailure,
     BuildMandatoryPortalTupleSelfConflictFailure,
     GetMandatoryPortalPairFeasibilityCertificate,
@@ -49,6 +60,13 @@ from Compiler.Routing.AuthoritativePlanner import (
     PhysicalSignalLocalCandidateRequestFactorProofComplete,
     FilterPhysicalCandidatesAgainstSiblingApertures,
     PhysicalSignalRouteDomainContinuation,
+    PhysicalSignalRouteDomainIsCertifiedEmpty,
+    BuildPortablePhysicalSignalRouteDomainIdentity,
+    PreparePortablePhysicalSignalRouteDomain,
+    SelectPreparedPortablePhysicalSignalRouteDomainContinuation,
+    RetainCompletePortablePhysicalSignalRouteDomains,
+    SelectPortablePhysicalSignalRouteDomainContinuation,
+    RetainPortablePhysicalSignalRouteDomainContinuation,
     SelectReplayablePhysicalSignalRouteDomainContinuation,
     RetainCompletePhysicalSignalRouteDomainContinuations,
     BuildPhysicalPortCorridorArcSupportIndex,
@@ -83,6 +101,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     ExtendIndexedRoutingResourceGraph,
     FindAllUnavoidableMandatoryClaimCuts,
     FrozenComponentBlockedWireNodes,
+    ImmutableRoutingClaimsBlockedWireNodes,
     FindFirstUnavoidableCandidateDomainPairCut,
     FindPriorCandidateDomainPairExpansion,
     FindUnindexedClaimPositions,
@@ -95,6 +114,8 @@ from Compiler.Routing.AuthoritativePlanner import (
     MandatoryPortalTupleSelfConflictEvidence,
     IsPhysicalCandidateRequestDomainComplete,
     PhysicalGlobalAssignmentDomainIsComplete,
+    PhysicalPortPathsOwnExclusiveSeam,
+    ConflictClassificationSupportsPhysicalPortPairNoGoods,
     PlanPhysicalGlobalAssignmentAvoidingExactNoGoods,
     PropagatePhysicalPortCorridorArcConsistency,
     SelectReusablePhysicalPortCorridorCandidates,
@@ -152,7 +173,6 @@ from Compiler.Routing.AuthoritativePlanner import (
     ShouldContinueDistinctExactCutFrontier,
     ShouldBuildCapacityAwareGlobalGuidePlan,
     CanReuseFrozenPhysicalPortGuidePlan,
-    CompletePhysicalGlobalCandidateRequestDomains,
     SelectComponentPreparationProfiles,
     ShouldDeferUnreservedCandidateRequestShape,
     ShouldCompletePhysicalCandidateRequestWindow,
@@ -197,6 +217,9 @@ from Compiler.Routing.AuthoritativePlanner import (
     SelectPhysicalExteriorConnectorPath,
     SelectTransactionalLeasePrescreenSignals,
     TransformPlanarRoutingPosition,
+    TransformPortableCompletePortalDomainKeys,
+    SelectPortablePortalProofReusableSignals,
+    PartitionExpectedGenericPortalDomainKeys,
     TouchPhysicalGlobalRouteTreeResult,
     SelectJointHigherOrderConstraintSignals,
     SelectJointPairwiseConstraintSignals,
@@ -445,6 +468,24 @@ class AuthoritativePlannerTests(unittest.TestCase):
             ),
             frozenset(),
         )
+        self.assertEqual(
+            ImmutableRoutingClaimsBlockedWireNodes((Claim.Claims,)),
+            Obstacles,
+        )
+
+    def testPhysicalPortPathsShareOnlyTheirDeclaredAttachment(self) -> None:
+        self.assertTrue(PhysicalPortPathsOwnExclusiveSeam(
+            ((0, 2, 0), (1, 2, 0), (2, 2, 0)),
+            ((2, 2, 0), (3, 2, 0), (4, 2, 0)),
+        ))
+        self.assertFalse(PhysicalPortPathsOwnExclusiveSeam(
+            ((0, 2, 0), (3, 2, 0), (2, 2, 0)),
+            ((2, 2, 0), (3, 2, 0), (4, 2, 0)),
+        ))
+        self.assertFalse(PhysicalPortPathsOwnExclusiveSeam(
+            ((0, 2, 0), (1, 2, 0)),
+            ((2, 2, 0), (3, 2, 0)),
+        ))
 
     def testRoutedComponentNoTreeEvidenceRequiresCompletedWindows(
         self,
@@ -4677,6 +4718,552 @@ class AuthoritativePlannerTests(unittest.TestCase):
             },
         )))
 
+    def testPortalTupleCompletenessRequiresEveryEligibleLayer(self) -> None:
+        CompleteLayer = {
+            "Layer": 0,
+            "CompletePortalTupleCount": 16,
+            "EvaluatedPortalTupleCount": 16,
+            "PortalTupleDomainComplete": True,
+        }
+        self.assertFalse(PortalTupleFeasibilityDomainIsComplete(
+            (CompleteLayer,),
+            ExpectedLayers=range(2),
+        ))
+        self.assertTrue(PortalTupleFeasibilityDomainIsComplete(
+            (
+                CompleteLayer,
+                {**CompleteLayer, "Layer": 1},
+            ),
+            ExpectedLayers=range(2),
+        ))
+
+    def testRetainedPortalWitnessCapIsNotACompleteCutDomain(self) -> None:
+        TruncatedWitnessLayer = {
+            "Layer": 0,
+            "CompletePortalTupleCount": 64,
+            "EvaluatedPortalTupleCount": 64,
+            "PortalTupleDomainComplete": False,
+            "PortalTupleExhaustiveSearchComplete": True,
+            "PortalTupleEmptyProofComplete": False,
+            "RetainedLegalWitnessDomainComplete": False,
+            "DiscoveredLegalPortalTupleCount": 24,
+            "LegalPortalTupleCount": 16,
+        }
+        self.assertFalse(PortalTupleFeasibilityDomainIsComplete(
+            (TruncatedWitnessLayer,),
+            ExpectedLayers=(0,),
+        ))
+        self.assertFalse(PortalTupleEmptyProofDomainIsComplete(
+            (TruncatedWitnessLayer,),
+            ExpectedLayers=(0,),
+        ))
+
+    def testPortalBatchCompletionMaskRequiresCandidateAlignment(self) -> None:
+        with self.assertRaises(ValueError):
+            ReadPortalBatchCandidatesAndCompletionMask(
+                SimpleNamespace(
+                    Candidates=((),),
+                    CompletedWork=1,
+                    DeadlineExceeded=False,
+                    CompletionMask=(True, False),
+                ),
+                2,
+            )
+        Candidates, CompletionMask = (
+            ReadPortalBatchCandidatesAndCompletionMask(
+                SimpleNamespace(
+                    Candidates=((), ()),
+                    CompletedWork=2,
+                    DeadlineExceeded=False,
+                    CompletionMask=(True, True),
+                ),
+                2,
+            )
+        )
+        self.assertEqual(len(Candidates), 2)
+        self.assertEqual(CompletionMask, (True, True))
+
+        with self.assertRaises(ValueError):
+            ReadPortalBatchCandidatesAndCompletionMask(
+                SimpleNamespace(
+                    Candidates=((), ()),
+                    CompletedWork=1,
+                    TotalWork=3,
+                    DeadlineExceeded=True,
+                    CompletionMask=(False, True),
+                ),
+                2,
+            )
+
+    def testNonPrefixPortalCompletionPublishesAndReplaysExactKeys(
+        self,
+    ) -> None:
+        Metadata = tuple(
+            ("SignalA", (Index, 0, 0), 0)
+            for Index in range(4)
+        )
+        Results = ("zero", "one", "two", "three")
+        self.assertEqual(
+            SelectMatchingPartialPortalReplaySignals(
+                ("SignalA", "ChangedSignal"),
+                {
+                    "SignalA": "same-domain",
+                    "ChangedSignal": "new-domain",
+                },
+                {
+                    "SignalA": "same-domain",
+                    "ChangedSignal": "old-domain",
+                },
+                False,
+            ),
+            frozenset(("SignalA",)),
+        )
+        self.assertEqual(
+            SelectMatchingPartialPortalReplaySignals(
+                ("SignalA",),
+                {"SignalA": "same-domain"},
+                {"SignalA": "same-domain"},
+                True,
+            ),
+            frozenset(),
+        )
+        CompletedEntries = SelectCompletedPortalBatchEntries(
+            Metadata,
+            Results,
+            (False, True, False, True),
+        )
+        self.assertEqual(
+            CompletedEntries,
+            (
+                (Metadata[1], "one"),
+                (Metadata[3], "three"),
+            ),
+        )
+
+        CachedKey = ("SignalA", (-1, 0, 0), 0)
+        PublishedEntries, PublishedKeys = MergePartialRawPortalBatchWork(
+            ((CachedKey, ()),),
+            tuple((Key, ()) for Key, _Value in CompletedEntries),
+            (CachedKey,),
+            tuple(Key for Key, _Value in CompletedEntries),
+            ("SignalA",),
+            True,
+        )
+        self.assertEqual(
+            {Key for Key, _Values in PublishedEntries},
+            {CachedKey, Metadata[1], Metadata[3]},
+        )
+        self.assertEqual(
+            set(PublishedKeys),
+            {CachedKey, Metadata[1], Metadata[3]},
+        )
+
+        ReplayEntries, ReplayKeys = MergePartialRawPortalBatchWork(
+            PublishedEntries,
+            ((Metadata[2], ()),),
+            PublishedKeys,
+            (Metadata[2],),
+            ("SignalA",),
+            True,
+        )
+        self.assertEqual(
+            {Key for Key, _Values in ReplayEntries},
+            {CachedKey, Metadata[1], Metadata[2], Metadata[3]},
+        )
+        self.assertEqual(
+            set(ReplayKeys),
+            {CachedKey, Metadata[1], Metadata[2], Metadata[3]},
+        )
+
+    def testDescriptorProgressDeadlineReplayExceedsLruAndFinishesTwoSlices(
+        self,
+    ) -> None:
+        Descriptors = tuple(f"descriptor-{Index:04d}" for Index in range(700))
+        FirstSlice = frozenset(Descriptors[::2])
+        SecondSlice = frozenset(Descriptors[1::2])
+        CandidateA = SimpleNamespace(CandidateId="candidate-a", Payload="a")
+        CandidateB = SimpleNamespace(CandidateId="candidate-b", Payload="b")
+
+        ProgressCache = {}
+        First, FirstAdvanced = (
+            RetainPhysicalSignalRouteDomainDescriptorProgress(
+                ProgressCache,
+                PreSiblingDomainFingerprint="stable-domain",
+                Signal="Alpha",
+                RequestDomainFingerprint="request-domain",
+                RequestDescriptorFingerprints=Descriptors,
+                CompletedDescriptorFingerprints=FirstSlice,
+                Candidates=(CandidateA,),
+                CandidateMetadata={"candidate-a": ("X", 1, 0, 3)},
+            )
+        )
+        self.assertTrue(FirstAdvanced)
+        self.assertFalse(First.Complete)
+        self.assertEqual(
+            First.RemainingDescriptorFingerprints,
+            SecondSlice,
+        )
+
+        RawLru = {}
+        RetainPhysicalGlobalRouteTreeResults(
+            RawLru,
+            ((Descriptor, None) for Descriptor in Descriptors),
+        )
+        self.assertEqual(len(RawLru), 512)
+        self.assertGreater(
+            len(First.CompletedDescriptorFingerprints),
+            len(RawLru) // 2,
+        )
+
+        Replayed = SelectReplayablePhysicalSignalRouteDomainContinuation(
+            ProgressCache,
+            "stable-domain",
+            "Alpha",
+            "request-domain",
+            Descriptors,
+        )
+        self.assertIs(Replayed, First)
+
+        ReorderedRows = SelectPendingPhysicalRouteDescriptorRows(
+            tuple(reversed(Descriptors)),
+            tuple(reversed(Descriptors)),
+            tuple(reversed(Descriptors)),
+            First.CompletedDescriptorFingerprints,
+        )
+        self.assertEqual(
+            tuple(Row[2] for Row in ReorderedRows),
+            tuple(reversed(Descriptors[1::2])),
+        )
+        self.assertFalse(
+            First.CompletedDescriptorFingerprints
+            & frozenset(Row[2] for Row in ReorderedRows)
+        )
+
+        Second, SecondAdvanced = (
+            RetainPhysicalSignalRouteDomainDescriptorProgress(
+                ProgressCache,
+                PreSiblingDomainFingerprint="stable-domain",
+                Signal="Alpha",
+                RequestDomainFingerprint="request-domain",
+                RequestDescriptorFingerprints=Descriptors,
+                CompletedDescriptorFingerprints=SecondSlice,
+                Candidates=(CandidateA, CandidateB),
+                CandidateMetadata={
+                    "candidate-a": ("X", 1, 0, 3),
+                    "candidate-b": ("Z", 2, 1, 4),
+                },
+            )
+        )
+        self.assertTrue(SecondAdvanced)
+        self.assertTrue(Second.Complete)
+        self.assertEqual(
+            Second.CompletedDescriptorFingerprints,
+            frozenset(Descriptors),
+        )
+        self.assertFalse(Second.RemainingDescriptorFingerprints)
+        self.assertEqual(
+            tuple(Value.CandidateId for Value in Second.Candidates),
+            ("candidate-a", "candidate-b"),
+        )
+        self.assertEqual(len(Second.CandidateMetadata), 2)
+        Summary = Second.ToProgressDictionary()
+        self.assertEqual(Summary["DescriptorCount"], 700)
+        self.assertEqual(Summary["CompletedDescriptorCount"], 700)
+        self.assertEqual(Summary["RemainingDescriptorCount"], 0)
+        self.assertEqual(Summary["SemanticCandidateCount"], 2)
+        self.assertTrue(Summary["CandidateMetadataClosed"])
+        self.assertTrue(Summary["ProgressFingerprint"])
+        self.assertFalse(Summary["RawResultCacheAuthoritative"])
+        with self.assertRaises(ValueError):
+            RetainPhysicalSignalRouteDomainDescriptorProgress(
+                ProgressCache,
+                PreSiblingDomainFingerprint="stable-domain",
+                Signal="Alpha",
+                RequestDomainFingerprint="request-domain",
+                RequestDescriptorFingerprints=Descriptors,
+                CompletedDescriptorFingerprints=(),
+                Candidates=(SimpleNamespace(
+                    CandidateId="candidate-a",
+                    Payload="changed",
+                ),),
+                CandidateMetadata={
+                    "candidate-a": ("X", 1, 0, 3),
+                },
+            )
+
+    def testExactPortalCertificateIdentityReportsEachStrictMismatch(
+        self,
+    ) -> None:
+        Fabric = SimpleNamespace(
+            Complete=True,
+            ResourceGraphFingerprint="region-resource",
+            RegionFingerprint="region",
+        )
+        Plan = SimpleNamespace(
+            PlanFingerprint="plan",
+            PlacementFingerprint="placement",
+            ComponentGraphFingerprint="component",
+            ResourceGraphFingerprint="region-resource",
+            TechnologyFingerprint="technology",
+            InterfaceFingerprint="interface",
+            ExteriorRegionFingerprint="region",
+            ExteriorFabricSetFingerprint="fabric-set",
+            ExteriorFabrics=(Fabric,),
+        )
+        Problem = SimpleNamespace(
+            PhysicalAssemblyPlan=Plan,
+            PlacementFingerprint="placement",
+            Interface=SimpleNamespace(
+                InterfaceFingerprint="interface",
+                PhysicalAssemblyPlanFingerprint="plan",
+            ),
+        )
+        Preparation = SimpleNamespace(
+            PlacementFingerprint="placement",
+            ComponentGraphFingerprint="component",
+            ResourceGraphFingerprint="region-resource",
+            ExteriorRegionFingerprint="region",
+            ExteriorFabricSetFingerprint="fabric-set",
+            ExteriorFabrics=(Fabric,),
+        )
+
+        Baseline = BuildExactPhysicalPortalCertificateIdentityConditions(
+            Plan,
+            Problem,
+            Preparation,
+            "region-resource",
+            "region",
+            "technology",
+        )
+        self.assertTrue(all(Baseline.values()), Baseline)
+
+        Cases = (
+            (
+                "ProblemPlanIdentityMatch",
+                Plan,
+                SimpleNamespace(
+                    PhysicalAssemblyPlan=SimpleNamespace(
+                        PlanFingerprint="other-plan"
+                    ),
+                    PlacementFingerprint="placement",
+                    Interface=Problem.Interface,
+                ),
+                Preparation,
+                "region-resource",
+                "region",
+                "technology",
+            ),
+            (
+                "PlacementIdentityMatch",
+                Plan,
+                Problem,
+                SimpleNamespace(
+                    **{
+                        **vars(Preparation),
+                        "PlacementFingerprint": "other-placement",
+                    }
+                ),
+                "region-resource",
+                "region",
+                "technology",
+            ),
+            (
+                "ResourceGraphCurrentIdentityMatch",
+                Plan,
+                Problem,
+                Preparation,
+                "other-resource",
+                "region",
+                "technology",
+            ),
+            (
+                "ExteriorFabricPreparationIdentityMatch",
+                Plan,
+                Problem,
+                SimpleNamespace(
+                    **{
+                        **vars(Preparation),
+                        "ExteriorFabricSetFingerprint": (
+                            "other-fabric-set"
+                        ),
+                    }
+                ),
+                "region-resource",
+                "region",
+                "technology",
+            ),
+            (
+                "ResourceGraphPreparationIdentityMatch",
+                Plan,
+                Problem,
+                SimpleNamespace(
+                    **{
+                        **vars(Preparation),
+                        "ResourceGraphFingerprint": "other-resource",
+                    }
+                ),
+                "region-resource",
+                "region",
+                "technology",
+            ),
+            (
+                "ExteriorRegionCurrentIdentityMatch",
+                Plan,
+                Problem,
+                Preparation,
+                "region-resource",
+                "other-region",
+                "technology",
+            ),
+            (
+                "TechnologyIdentityMatch",
+                Plan,
+                Problem,
+                Preparation,
+                "region-resource",
+                "region",
+                "other-technology",
+            ),
+            (
+                "InterfaceIdentityMatch",
+                Plan,
+                SimpleNamespace(
+                    PhysicalAssemblyPlan=Plan,
+                    PlacementFingerprint="placement",
+                    Interface=SimpleNamespace(
+                        InterfaceFingerprint="other-interface",
+                        PhysicalAssemblyPlanFingerprint="plan",
+                    ),
+                ),
+                Preparation,
+                "region-resource",
+                "region",
+                "technology",
+            ),
+        )
+        for ExpectedMismatch, *Arguments in Cases:
+            with self.subTest(ExpectedMismatch=ExpectedMismatch):
+                Conditions = (
+                    BuildExactPhysicalPortalCertificateIdentityConditions(
+                        *Arguments
+                    )
+                )
+                self.assertFalse(Conditions[ExpectedMismatch])
+                self.assertFalse(all(Conditions.values()))
+
+    def testConfiguredPortalRequestDomainBindsEverySearchInput(self) -> None:
+        BaseArguments = (
+            "SignalA",
+            4,
+            1000,
+            "guide-input",
+            (0, 20, -4, 16),
+        )
+        FirstRecord = (
+            ((1, 2, 3), 0, ((1, 2, 3),), ((4, 2, 3),), "allowed-a", 2, 4, 1000),
+        )
+        Baseline = BuildConfiguredPortalRequestDomainFingerprint(
+            *BaseArguments,
+            FirstRecord,
+        )
+        self.assertNotEqual(
+            Baseline,
+            BuildConfiguredPortalRequestDomainFingerprint(
+                *BaseArguments,
+                (
+                    ((1, 2, 3), 0, ((1, 2, 3),), ((5, 2, 3),), "allowed-a", 2, 4, 1000),
+                ),
+            ),
+        )
+        self.assertNotEqual(
+            Baseline,
+            BuildConfiguredPortalRequestDomainFingerprint(
+                "SignalA",
+                4,
+                1001,
+                "guide-input",
+                (0, 20, -4, 16),
+                FirstRecord,
+            ),
+        )
+
+    def testExteriorResourceFingerprintUsesAuthoritativeRegionIdentity(
+        self,
+    ) -> None:
+        Graph = SimpleNamespace(
+            GraphVersion="resource-graph-v1",
+            # These whole-graph attributes intentionally disagree with the
+            # authoritative region and must not affect this identity.
+            Nodes=tuple(range(99)),
+            Edges=tuple(range(101)),
+        )
+        Region = SimpleNamespace(
+            Bounds=(0, 20, 1, 8, -4, 16),
+            Nodes=((0, 2, 0), (1, 2, 0)),
+            Edges=(((0, 2, 0), (1, 2, 0)),),
+        )
+        Baseline = BuildPhysicalExteriorResourceGraphFingerprint(
+            Graph,
+            "authoritative-region-a",
+            Region,
+        )
+        SameRegionDifferentWholeGraph = (
+            BuildPhysicalExteriorResourceGraphFingerprint(
+                SimpleNamespace(
+                    **{
+                        **vars(Graph),
+                        "Nodes": (),
+                        "Edges": (),
+                    }
+                ),
+                "authoritative-region-a",
+                Region,
+            )
+        )
+
+        self.assertEqual(Baseline, SameRegionDifferentWholeGraph)
+        for ChangedFingerprint, ChangedRegion in (
+            ("authoritative-region-b", Region),
+            (
+                "authoritative-region-a",
+                SimpleNamespace(
+                    **{
+                        **vars(Region),
+                        "Bounds": (0, 21, 1, 8, -4, 16),
+                    }
+                ),
+            ),
+            (
+                "authoritative-region-a",
+                SimpleNamespace(
+                    **{
+                        **vars(Region),
+                        "Nodes": (*Region.Nodes, (2, 2, 0)),
+                    }
+                ),
+            ),
+            (
+                "authoritative-region-a",
+                SimpleNamespace(
+                    **{
+                        **vars(Region),
+                        "Edges": (
+                            *Region.Edges,
+                            ((1, 2, 0), (2, 2, 0)),
+                        ),
+                    }
+                ),
+            ),
+        ):
+            self.assertNotEqual(
+                Baseline,
+                BuildPhysicalExteriorResourceGraphFingerprint(
+                    Graph,
+                    ChangedFingerprint,
+                    ChangedRegion,
+                ),
+            )
+
     def _BuildMandatoryPortalPairFixture(self, AlphaPositions):
         class Graph:
             @staticmethod
@@ -5783,6 +6370,23 @@ class AuthoritativePlannerTests(unittest.TestCase):
             )
         )
 
+    def testMultiPairConflictRetainsExactBinaryPortProofs(self) -> None:
+        self.assertTrue(
+            ConflictClassificationSupportsPhysicalPortPairNoGoods(
+                "pairwise-incompatibility"
+            )
+        )
+        self.assertTrue(
+            ConflictClassificationSupportsPhysicalPortPairNoGoods(
+                "multi-pair-placement-conflict"
+            )
+        )
+        self.assertFalse(
+            ConflictClassificationSupportsPhysicalPortPairNoGoods(
+                "higher-order-placement-conflict"
+            )
+        )
+
     def testPhysicalGlobalProofSelectsEveryOpenCandidateDomain(
         self,
     ) -> None:
@@ -5813,32 +6417,6 @@ class AuthoritativePlannerTests(unittest.TestCase):
             ("A", "B", "C"),
             Frozen,
         ))
-
-    def testPhysicalGlobalCandidateDomainsCompleteBeforeAssignment(
-        self,
-    ) -> None:
-        Calls = []
-        Diagnostics = {
-            "A": {"DeferredRequests": 3},
-            "B": {"DeferredRequests": 0},
-        }
-
-        def ConsumeA(Count):
-            Calls.append(("A", Count))
-            Diagnostics["A"]["DeferredRequests"] = 0
-            return {"Signal": "A", "RequestCount": Count}
-
-        def ConsumeB(Count):
-            Calls.append(("B", Count))
-            return {"Signal": "B", "RequestCount": Count}
-
-        Records = CompletePhysicalGlobalCandidateRequestDomains(
-            {"A": ConsumeA, "B": ConsumeB},
-            Diagnostics,
-        )
-
-        self.assertEqual(Calls, [("A", 3)])
-        self.assertEqual(Records, ({"Signal": "A", "RequestCount": 3},))
 
     def testExactNoGoodClauseUnitPropagatesAcrossKeyClasses(self) -> None:
         def Option(Signal, Value):
@@ -7075,7 +7653,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             Entry.Continuation.Complete for Entry in Frontier.values()
         ))
 
-    def testRetainedPhysicalGlobalPlansAlternateWithFreshExploration(
+    def testRetainedPhysicalGlobalPlansFinishBeforeFreshExploration(
         self,
     ) -> None:
         Frontier = {
@@ -7087,7 +7665,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             Frontier,
             PreviousPlanWasRetained=False,
         ))
-        self.assertFalse(ShouldScheduleRetainedPhysicalGlobalPlan(
+        self.assertTrue(ShouldScheduleRetainedPhysicalGlobalPlan(
             Frontier,
             PreviousPlanWasRetained=True,
         ))
@@ -7188,7 +7766,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 EnqueuedSequence=10,
             )
 
-    def testPhysicalGlobalPlanYieldDeadlineReservesOtherFrontiers(self) -> None:
+    def testPhysicalGlobalPlanYieldDeadlineServesAdmittedFrontiers(self) -> None:
         StartedAt = monotonic()
         Shared = RoutingDeadline(
             StartedAt=StartedAt,
@@ -7197,11 +7775,27 @@ class AuthoritativePlannerTests(unittest.TestCase):
 
         First = BuildPhysicalGlobalPlanYieldDeadline(Shared, 0)
         WithRetained = BuildPhysicalGlobalPlanYieldDeadline(Shared, 2)
+        SelectedRetained = BuildPhysicalGlobalPlanYieldDeadline(
+            Shared,
+            1,
+            CurrentPlanWasRetained=True,
+        )
 
-        self.assertLess(First.ExpiresAt, Shared.ExpiresAt)
+        self.assertAlmostEqual(First.ExpiresAt, Shared.ExpiresAt, delta=0.05)
         self.assertLess(WithRetained.ExpiresAt, First.ExpiresAt)
-        self.assertGreater(First.RemainingSeconds(), 40.0)
+        self.assertAlmostEqual(
+            SelectedRetained.ExpiresAt,
+            Shared.ExpiresAt,
+            delta=0.05,
+        )
+        self.assertGreater(First.RemainingSeconds(), 90.0)
         self.assertGreater(WithRetained.RemainingSeconds(), 20.0)
+        with self.assertRaises(ValueError):
+            BuildPhysicalGlobalPlanYieldDeadline(
+                Shared,
+                0,
+                CurrentPlanWasRetained=True,
+            )
 
     def testPhysicalGlobalAssignmentAvoidsMultipleExactNoGoods(self) -> None:
         def PlanNative(Values):
@@ -9122,6 +9716,9 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertTrue(
             Diagnostics["AllDeclaredExactAttachmentsVisible"]
         )
+        self.assertTrue(
+            Diagnostics["ExactAttachmentValidationFingerprint"]
+        )
 
         with self.assertRaises(RoutingStageError) as Context:
             ValidatePhysicalComponentExactAttachmentPortals(
@@ -9970,6 +10567,16 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         self.assertFalse(Cache)
 
+        RetainPhysicalSignalRouteDomainDescriptorProgress(
+            Cache,
+            PreSiblingDomainFingerprint="stable-alpha",
+            Signal="Alpha",
+            RequestDomainFingerprint="request-domain",
+            RequestDescriptorFingerprints=("shape-0", "shape-1"),
+            CompletedDescriptorFingerprints=("shape-0", "shape-1"),
+            Candidates=(Candidate,),
+            CandidateMetadata={"candidate-a": ("X", 1, 0, 0)},
+        )
         Retained = RetainCompletePhysicalSignalRouteDomainContinuations(
             Cache,
             {"Alpha": Identity},
@@ -9984,7 +10591,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertEqual(Retained[0].NextDescriptorCursor, 2)
         self.assertIs(Cache["stable-alpha"], Retained[0])
 
-    def testCompleteRouteDomainReplayIgnoresRequestSchedule(self) -> None:
+    def testCompleteRouteDomainReplayBindsOrderedDescriptorUniverse(self) -> None:
         Continuation = PhysicalSignalRouteDomainContinuation(
             PreSiblingDomainFingerprint="stable-domain",
             Signal="Alpha",
@@ -9992,6 +10599,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             RequestDescriptorFingerprints=("late", "early"),
             NextDescriptorCursor=2,
             Candidates=(),
+            CompletedDescriptorFingerprints=frozenset(("late", "early")),
             Complete=True,
         )
 
@@ -10003,7 +10611,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             ("early", "late", "schedule-alias"),
         )
 
-        self.assertIs(Restored, Continuation)
+        self.assertIsNone(Restored)
         self.assertIsNone(
             SelectReplayablePhysicalSignalRouteDomainContinuation(
                 {"stable-domain": Continuation},
@@ -10011,6 +10619,446 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 "Alpha",
                 "changed-request-domain",
                 ("late", "early"),
+            )
+        )
+
+    def testCompleteEmptyRouteDomainIsAnExactReplayProof(self) -> None:
+        Empty = PhysicalSignalRouteDomainContinuation(
+            PreSiblingDomainFingerprint="stable-domain",
+            Signal="Alpha",
+            RequestDomainFingerprint="request-domain",
+            RequestDescriptorFingerprints=("shape-0", "shape-1"),
+            NextDescriptorCursor=2,
+            Candidates=(),
+            CompletedDescriptorFingerprints=frozenset((
+                "shape-0",
+                "shape-1",
+            )),
+            Complete=True,
+        )
+
+        self.assertTrue(PhysicalSignalRouteDomainIsCertifiedEmpty(
+            Empty,
+            Signal="Alpha",
+            PreSiblingDomainFingerprint="stable-domain",
+            RequestDomainFingerprint="request-domain",
+        ))
+        self.assertFalse(PhysicalSignalRouteDomainIsCertifiedEmpty(
+            replace(
+                Empty,
+                Candidates=(SimpleNamespace(CandidateId="candidate"),),
+                CandidateMetadata=(("candidate", ()),),
+            ),
+            Signal="Alpha",
+            PreSiblingDomainFingerprint="stable-domain",
+            RequestDomainFingerprint="request-domain",
+        ))
+        self.assertFalse(PhysicalSignalRouteDomainIsCertifiedEmpty(
+            Empty,
+            Signal="Alpha",
+            PreSiblingDomainFingerprint="different-domain",
+            RequestDomainFingerprint="request-domain",
+        ))
+
+    def testPortableStructuralBucketDefersFullCanonicalization(
+        self,
+    ) -> None:
+        Source = PinAccessPortal(
+            PortalId="source-a",
+            Signal="Alpha",
+            Terminal=(0, 2, 0),
+            Layer=0,
+            Path=((0, 2, 0), (1, 2, 0)),
+            Edges=frozenset(),
+            Claims=RoutingResourceClaims(),
+            Length=2,
+            BendCount=0,
+            ViaCount=0,
+            Cost=2,
+        )
+        Target = replace(
+            Source,
+            PortalId="target-a",
+            Terminal=(4, 2, 0),
+            Path=((4, 2, 0), (3, 2, 0)),
+        )
+        Descriptor = CandidateRequestShapeDescriptor(
+            SourcePortal=Source,
+            TargetPortals=(Target,),
+            Guide=frozenset(((1, 0), (2, 0))),
+            Layer=0,
+            Axis="X",
+            Lane=0,
+            Variant=0,
+            PortalShapeRank=0,
+            RoutingY=2,
+            GuideExpansion=2,
+            InitiallyDeferred=False,
+            Priority=(),
+        )
+        Plan = SimpleNamespace(
+            Ports=(SimpleNamespace(
+                Signal="Alpha",
+                Direction="output",
+                Attachment=(0, 2, 0),
+                Capacity=1,
+            ),),
+            GlobalBoundaryPorts=(),
+            PlanningChannels=(SimpleNamespace(
+                Signal="Alpha",
+                Layer=0,
+                Capacity=1,
+                FeedthroughComponentIds=(),
+            ),),
+            ComponentGraphFingerprint="component-a",
+            TechnologyFingerprint="technology-a",
+        )
+        Preparation = PreparePortablePhysicalSignalRouteDomain(
+            Plan,
+            "Alpha",
+            (Descriptor,),
+            ((0, 2, 0),),
+            ((8, 2, 0),),
+            ((1, 2, 0),),
+            (),
+        )
+        Cache = {}
+        Canonicalizer = (
+            "Compiler.Routing.AuthoritativePlanner."
+            "BuildPortablePhysicalSignalRouteDomainIdentity"
+        )
+        with patch(Canonicalizer, wraps=(
+            BuildPortablePhysicalSignalRouteDomainIdentity
+        )) as BuildFull:
+            Restored, Reason = (
+                SelectPreparedPortablePhysicalSignalRouteDomainContinuation(
+                    Cache,
+                    Preparation,
+                )
+            )
+            self.assertIsNone(Restored)
+            self.assertEqual(Reason, "structural-bucket-miss")
+            BuildFull.assert_not_called()
+
+            self.assertEqual(
+                RetainCompletePortablePhysicalSignalRouteDomains(
+                    Cache,
+                    {"Alpha": Preparation},
+                    {"Alpha": 1},
+                    {"Alpha": ()},
+                    {"Alpha": {}},
+                ),
+                (),
+            )
+            BuildFull.assert_not_called()
+
+            Published = RetainCompletePortablePhysicalSignalRouteDomains(
+                Cache,
+                {"Alpha": Preparation},
+                {"Alpha": 0},
+                {"Alpha": ()},
+                {"Alpha": {}},
+            )
+            self.assertEqual(len(Published), 1)
+            self.assertEqual(BuildFull.call_count, 1)
+
+            Restored, Reason = (
+                SelectPreparedPortablePhysicalSignalRouteDomainContinuation(
+                    Cache,
+                    Preparation,
+                )
+            )
+            self.assertIsNotNone(Restored)
+            self.assertEqual(Reason, "hit")
+            self.assertEqual(BuildFull.call_count, 2)
+
+            Bucket = next(
+                Value for Key, Value in Cache.items()
+                if Key.startswith("portable-route-domain-bucket:")
+            )
+            FullKey = next(iter(Bucket))
+            OriginalEntry = Bucket[FullKey]
+            OriginalPortalId, OriginalGeometry = (
+                OriginalEntry.PortalGeometryById[0]
+            )
+            Bucket[FullKey] = replace(
+                OriginalEntry,
+                PortalGeometryById=((
+                    OriginalPortalId,
+                    (
+                        OriginalGeometry[0],
+                        (99, 99, 99),
+                        OriginalGeometry[2],
+                    ),
+                ),),
+            )
+            Restored, Reason = (
+                SelectPreparedPortablePhysicalSignalRouteDomainContinuation(
+                    Cache,
+                    Preparation,
+                )
+            )
+            self.assertIsNone(Restored)
+            self.assertEqual(Reason, "portal-rebind-mismatch")
+            Bucket[FullKey] = OriginalEntry
+
+            ChangedGeometry = replace(
+                Preparation,
+                BlockedNodes=((9, 2, 0),),
+            )
+            Restored, Reason = (
+                SelectPreparedPortablePhysicalSignalRouteDomainContinuation(
+                    Cache,
+                    ChangedGeometry,
+                )
+            )
+            self.assertIsNone(Restored)
+            self.assertEqual(Reason, "full-identity-mismatch")
+            self.assertEqual(BuildFull.call_count, 4)
+
+    def testPortableCompleteRouteDomainRebindsTranslatedPortalIds(
+        self,
+    ) -> None:
+        def BuildFixture(Transform="Identity", Translation=(0, 0, 0)):
+            def Position(Value):
+                return TransformPlanarRoutingPosition(
+                    Value, Transform, Translation
+                )
+
+            SourcePath = tuple(map(Position, ((0, 2, 0), (1, 2, 0))))
+            TargetPath = tuple(map(Position, ((4, 2, 0), (3, 2, 0))))
+            Source = PinAccessPortal(
+                PortalId="source:" + str(Translation) + Transform,
+                Signal="Alpha",
+                Terminal=SourcePath[0],
+                Layer=0,
+                Path=SourcePath,
+                Edges=frozenset(),
+                Claims=RoutingResourceClaims(
+                    WireCells=frozenset(SourcePath)
+                ),
+                Length=2,
+                BendCount=0,
+                ViaCount=0,
+                Cost=2,
+            )
+            Target = replace(
+                Source,
+                PortalId="target:" + str(Translation) + Transform,
+                Terminal=TargetPath[0],
+                Path=TargetPath,
+                Claims=RoutingResourceClaims(
+                    WireCells=frozenset(TargetPath)
+                ),
+            )
+            Descriptor = CandidateRequestShapeDescriptor(
+                SourcePortal=Source,
+                TargetPortals=(Target,),
+                Guide=frozenset(
+                    (Value[0], Value[2])
+                    for Value in map(Position, ((1, 2, 0), (2, 2, 0)))
+                ),
+                Layer=0,
+                Axis="X",
+                Lane=0,
+                Variant=0,
+                PortalShapeRank=0,
+                RoutingY=Position((0, 2, 0))[1],
+                GuideExpansion=2,
+                InitiallyDeferred=False,
+                Priority=(),
+            )
+            Port = SimpleNamespace(
+                Signal="Alpha",
+                Direction="output",
+                Attachment=Source.Terminal,
+                GlobalPath=Source.Path,
+                Capacity=1,
+            )
+            Channel = SimpleNamespace(
+                Signal="Alpha",
+                Layer=0,
+                Capacity=1,
+                FeedthroughComponentIds=(),
+            )
+            Plan = SimpleNamespace(
+                Ports=(Port,),
+                GlobalBoundaryPorts=(),
+                PlanningChannels=(Channel,),
+                ComponentGraphFingerprint="component-a",
+                TechnologyFingerprint="technology-a",
+            )
+            Identity = BuildPortablePhysicalSignalRouteDomainIdentity(
+                Plan,
+                "Alpha",
+                (Descriptor,),
+                SourcePath,
+                tuple(map(Position, ((7, 2, 1),))),
+                (SourcePath[-1],),
+                (),
+            )
+            Nodes = frozenset(map(Position, (
+                (0, 2, 0), (1, 2, 0), (2, 2, 0),
+                (3, 2, 0), (4, 2, 0),
+            )))
+            Candidate = NetRouteCandidate(
+                CandidateId="candidate:" + str(Translation) + Transform,
+                Signal="Alpha",
+                SourcePortalId=Source.PortalId,
+                TargetPortalIds={Target.Terminal: Target.PortalId},
+                Nodes=Nodes,
+                Edges=frozenset(
+                    (First, Second)
+                    for First, Second in zip(
+                        sorted(Nodes), sorted(Nodes)[1:]
+                    )
+                ),
+                Claims=RoutingResourceClaims(WireCells=Nodes),
+                Layer=0,
+                Guide=Descriptor.Guide,
+                RepeaterWaypoints=(),
+                MaterialCost=5,
+                FootprintGrowth=5,
+                Length=5,
+                BendCount=0,
+                ViaCount=0,
+            )
+            return Plan, Identity, Source, Target, Candidate
+
+        _OldPlan, OldIdentity, _OldSource, _OldTarget, Candidate = (
+            BuildFixture()
+        )
+        Cache = {}
+        Retained = RetainPortablePhysicalSignalRouteDomainContinuation(
+            Cache,
+            OldIdentity[0],
+            OldIdentity[1],
+            "Alpha",
+            OldIdentity[2],
+            OldIdentity[3],
+            OldIdentity[4],
+            (Candidate,),
+            {Candidate.CandidateId: ("X", 0, 0, 0)},
+            Complete=True,
+        )
+        self.assertIsNotNone(Retained)
+
+        _NewPlan, NewIdentity, NewSource, NewTarget, _NewCandidate = (
+            BuildFixture("Rotate90", (20, 0, 10))
+        )
+        self.assertEqual(OldIdentity[0], NewIdentity[0])
+        Restored = SelectPortablePhysicalSignalRouteDomainContinuation(
+            Cache,
+            NewIdentity[0],
+            NewIdentity[1],
+            "Alpha",
+            NewIdentity[2],
+            NewIdentity[3],
+            NewIdentity[4],
+        )
+
+        self.assertIsNotNone(Restored)
+        assert Restored is not None
+        self.assertEqual(
+            Restored.Candidates[0].SourcePortalId,
+            NewSource.PortalId,
+        )
+        self.assertEqual(
+            set(Restored.Candidates[0].TargetPortalIds.values()),
+            {NewTarget.PortalId},
+        )
+        self.assertIn(NewSource.Terminal, Restored.Candidates[0].Nodes)
+        self.assertEqual(
+            dict(Restored.CandidateMetadata)[
+                Restored.Candidates[0].CandidateId
+            ][:2],
+            ("Z", 20),
+        )
+        ConflictingNode = next(iter(
+            Restored.Candidates[0].Claims.WireCells
+        ))
+        CurrentSiblingClaims = RoutingResourceClaims(
+            WireCells=frozenset((ConflictingNode,)),
+            ElectricalCells=frozenset((ConflictingNode,)),
+        )
+        self.assertEqual(
+            FilterPhysicalCandidatesAgainstSiblingApertures(
+                Restored.Candidates,
+                (("CurrentSibling", CurrentSiblingClaims),),
+            ),
+            (),
+        )
+
+        _MirrorPlan, MirrorIdentity, _MirrorSource, _MirrorTarget, _ = (
+            BuildFixture("MirrorX", (30, 0, 5))
+        )
+        Mirrored = SelectPortablePhysicalSignalRouteDomainContinuation(
+            Cache,
+            MirrorIdentity[0],
+            MirrorIdentity[1],
+            "Alpha",
+            MirrorIdentity[2],
+            MirrorIdentity[3],
+            MirrorIdentity[4],
+        )
+        self.assertIsNotNone(Mirrored)
+        assert Mirrored is not None
+        self.assertEqual(
+            dict(Mirrored.CandidateMetadata)[
+                Mirrored.Candidates[0].CandidateId
+            ][:2],
+            ("X", 5),
+        )
+
+    def testPortableRouteDomainRejectsIdentityMismatchAndOpenDomain(
+        self,
+    ) -> None:
+        Candidate = SimpleNamespace(CandidateId="candidate-a")
+        Cache = {}
+        self.assertIsNone(
+            RetainPortablePhysicalSignalRouteDomainContinuation(
+                Cache,
+                "portable-a",
+                "identity-a",
+                "Alpha",
+                (0, 2, 0),
+                "Identity",
+                (("portal-a", (0, (0, 0, 0), ((0, 0, 0),))),),
+                (Candidate,),
+                {"candidate-a": ("X", 0, 0, 0)},
+                Complete=False,
+            )
+        )
+        self.assertFalse(Cache)
+
+        # A complete entry is still unusable under a different structural or
+        # technology identity, even if its portable geometry key is supplied.
+        from Compiler.Routing.AuthoritativePlanner import (
+            PortablePhysicalSignalRouteDomainContinuation,
+        )
+        Cache["portable-route-domain:portable-a"] = (
+            PortablePhysicalSignalRouteDomainContinuation(
+            PortableDomainFingerprint="portable-a",
+            IdentityFingerprint="identity-a",
+            Signal="Alpha",
+            Attachment=(0, 2, 0),
+            CanonicalTransform="Identity",
+            PortalGeometryById=(
+                ("portal-a", (0, (0, 0, 0), ((0, 0, 0),))),
+            ),
+            Candidates=(),
+                CandidateMetadata=(),
+            )
+        )
+        self.assertIsNone(
+            SelectPortablePhysicalSignalRouteDomainContinuation(
+                Cache,
+                "portable-a",
+                "changed-technology-or-graph",
+                "Alpha",
+                (5, 2, 0),
+                "Identity",
+                (("portal-b", (0, (0, 0, 0), ((0, 0, 0),))),),
             )
         )
 
@@ -10092,7 +11140,38 @@ class AuthoritativePlannerTests(unittest.TestCase):
             CandidateId="clear",
             Claims=Claims((8, 2, 0)),
         )
-        Cache = {}
+        Cache = {
+            FirstIdentity.StableDomainFingerprint: (
+                MergePhysicalSignalRouteDomainDescriptorProgress(
+                    None,
+                    PreSiblingDomainFingerprint=(
+                        FirstIdentity.StableDomainFingerprint
+                    ),
+                    Signal="Alpha",
+                    RequestDomainFingerprint="request-domain",
+                    RequestDescriptorFingerprints=("shape-0",),
+                    CompletedDescriptorFingerprints=("shape-0",),
+                    Candidates=(),
+                    CandidateMetadata={},
+                )
+            )
+        }
+        RetainPhysicalSignalRouteDomainDescriptorProgress(
+            Cache,
+            PreSiblingDomainFingerprint=(
+                FirstIdentity.StableDomainFingerprint
+            ),
+            Signal="Alpha",
+            RequestDomainFingerprint="request-domain",
+            RequestDescriptorFingerprints=("shape-0",),
+            CompletedDescriptorFingerprints=("shape-0",),
+            Candidates=(OldSiblingOnly, NewSiblingOnly, Clear),
+            CandidateMetadata={
+                "old-sibling-only": ("X", 0, 0, 0),
+                "new-sibling-only": ("X", 1, 0, 0),
+                "clear": ("X", 2, 0, 0),
+            },
+        )
         RetainCompletePhysicalSignalRouteDomainContinuations(
             Cache,
             {"Alpha": FirstIdentity},
@@ -10130,7 +11209,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         self.assertEqual(
             tuple(Value.CandidateId for Value in Filtered),
-            ("old-sibling-only", "clear"),
+            ("clear", "old-sibling-only"),
         )
 
     def testChangedExteriorRegionDependencyPreventsDomainReplay(self) -> None:
@@ -10166,6 +11245,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             RequestDescriptorFingerprints=("shape-0",),
             NextDescriptorCursor=1,
             Candidates=(),
+            CompletedDescriptorFingerprints=frozenset(("shape-0",)),
             Complete=True,
         )
 
@@ -10213,6 +11293,64 @@ class AuthoritativePlannerTests(unittest.TestCase):
             tuple(Value.CandidateId for Value in Retained),
             ("clear",),
         )
+
+    def testReplayedSiblingProjectionRetainsApertureProofWitnesses(
+        self,
+    ) -> None:
+        FirstShared = (2, 2, 0)
+        SecondShared = (3, 2, 0)
+
+        def Claims(*Nodes):
+            Values = frozenset(Nodes)
+            return RoutingResourceClaims(
+                WireCells=Values,
+                ElectricalCells=Values,
+            )
+
+        Candidates = (
+            SimpleNamespace(
+                CandidateId="first",
+                Claims=Claims(FirstShared),
+            ),
+            SimpleNamespace(
+                CandidateId="second",
+                Claims=Claims(SecondShared),
+            ),
+        )
+        SiblingClaims = Claims(FirstShared, SecondShared)
+        ConflictSets = []
+
+        def Classify(CandidateClaims):
+            Conflicts = (
+                ("Beta",)
+                if CandidateClaims.WireCells & SiblingClaims.WireCells
+                else ()
+            )
+            if Conflicts:
+                ConflictSets.append(frozenset(Conflicts))
+            return Conflicts
+
+        Retained = FilterPhysicalCandidatesAgainstSiblingApertures(
+            Candidates,
+            (("Beta", SiblingClaims),),
+            ConflictClassifier=Classify,
+        )
+        NoGood = BuildMinimalPhysicalRequestApertureNoGood(
+            "Alpha",
+            "request-domain",
+            ConflictSets,
+            {"Beta": "beta-aperture"},
+        )
+
+        self.assertEqual(Retained, ())
+        self.assertEqual(
+            ConflictSets,
+            [frozenset(("Beta",)), frozenset(("Beta",))],
+        )
+        self.assertEqual(NoGood, frozenset((
+            ("Alpha", "request-factor:request-domain"),
+            ("Beta", "aperture-factor:beta-aperture"),
+        )))
 
     def testSiblingApertureDiagnosticsSeparateLocalInteriorOwnership(
         self,
@@ -10975,6 +12113,120 @@ class AuthoritativePlannerTests(unittest.TestCase):
             Plan.SignalPlanarTransforms,
             (("Alpha", "Rotate90", Translation),),
         )
+
+    def testPortablePortalCompletenessTransformsOnlyClosedSourceKeys(
+        self,
+    ) -> None:
+        Translation = (20, 0, 10)
+        ClosedSource = ("Alpha", (1, 2, 3), 0)
+        OpenSource = ("Alpha", (4, 2, 3), 0)
+        ExactSource = ("Alpha", (7, 2, 3), 0)
+        OrdinarySource = ("Beta", (2, 2, 8), 0)
+
+        def TransformKey(Key):
+            return (
+                Key[0],
+                TransformPlanarRoutingPosition(
+                    Key[1], "Rotate90", Translation
+                ),
+                Key[2],
+            )
+
+        ClosedCurrent = TransformKey(ClosedSource)
+        OpenCurrent = TransformKey(OpenSource)
+        ExactCurrent = TransformKey(ExactSource)
+        OrdinaryCurrent = TransformKey(OrdinarySource)
+        Result = TransformPortableCompletePortalDomainKeys(
+            (ClosedSource, ExactSource, OrdinarySource),
+            {
+                "Alpha": ("Rotate90", Translation),
+                "Beta": ("Rotate90", Translation),
+            },
+            (
+                ClosedCurrent,
+                OpenCurrent,
+                ExactCurrent,
+                OrdinaryCurrent,
+            ),
+            frozenset(((ExactCurrent[0], ExactCurrent[1]),)),
+            frozenset(("Alpha",)),
+        )
+
+        self.assertEqual(Result, frozenset((OrdinaryCurrent,)))
+        self.assertNotIn(ClosedCurrent, Result)
+        self.assertNotIn(OpenCurrent, Result)
+        self.assertNotIn(ExactCurrent, Result)
+
+    def testPortableExactPlanSignalRebuildsChangedRequestProof(
+        self,
+    ) -> None:
+        Reusable = SelectPortablePortalProofReusableSignals(
+            ("ExactSignal", "OrdinarySignal"),
+            ("ExactSignal",),
+        )
+        self.assertEqual(Reusable, frozenset(("OrdinarySignal",)))
+
+        Arguments = (
+            "ExactSignal",
+            4,
+            1000,
+            "guide-input",
+            (0, 20, -4, 16),
+        )
+        SamePortalGeometryOldObstacle = ((
+            (1, 2, 3),
+            0,
+            ((1, 2, 3),),
+            ((4, 2, 3),),
+            "allowed-obstacle-domain-a",
+            2,
+            4,
+            1000,
+        ),)
+        SamePortalGeometryNewObstacle = ((
+            (1, 2, 3),
+            0,
+            ((1, 2, 3),),
+            ((4, 2, 3),),
+            "allowed-obstacle-domain-b",
+            2,
+            4,
+            1000,
+        ),)
+        OldFingerprint = BuildConfiguredPortalRequestDomainFingerprint(
+            *Arguments,
+            SamePortalGeometryOldObstacle,
+        )
+        NewFingerprint = BuildConfiguredPortalRequestDomainFingerprint(
+            *Arguments,
+            SamePortalGeometryNewObstacle,
+        )
+
+        self.assertNotEqual(OldFingerprint, NewFingerprint)
+        self.assertNotIn("ExactSignal", Reusable)
+
+    def testExactPortalCompletenessSchedulesOnlyMissingSignals(
+        self,
+    ) -> None:
+        AlphaKeys = frozenset((
+            ("Alpha", (0, 2, 0), 0),
+            ("Alpha", (0, 2, 0), 1),
+        ))
+        BetaKeys = frozenset((
+            ("Beta", (4, 2, 0), 0),
+            ("Beta", (4, 2, 0), 1),
+        ))
+        Missing, ReusedSignals, GeneratedSignals = (
+            PartitionExpectedGenericPortalDomainKeys(
+                (*AlphaKeys, *BetaKeys),
+                (*AlphaKeys, next(iter(BetaKeys))),
+            )
+        )
+
+        self.assertEqual(len(Missing), 1)
+        self.assertEqual({Key[0] for Key in Missing}, {"Beta"})
+        self.assertEqual(ReusedSignals, frozenset(("Alpha",)))
+        self.assertEqual(GeneratedSignals, frozenset(("Beta",)))
 
     def testSignalScopedPortalMergeEqualsCompleteRegeneration(
         self,
