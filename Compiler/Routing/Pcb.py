@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import replace
 from heapq import heappop, heappush
+import os
+from time import monotonic
+import traceback
 from typing import Any, Callable, Iterable
 
 from ..Placement.Pcb import PcbPlacement
@@ -27,7 +30,17 @@ from .Actions import (
     ValidateTemplateIsolation,
 )
 from .ChannelPlanner import MeasureRoutingStage
-from .Models import RoutedDesign
+from .Models import (
+    ClusterInterfaceAssignment,
+    ClusterInterfaceAssignmentPrepared,
+    ClusterInterfaceRealizabilityNogood,
+    ComponentRoutingProblem,
+    ComponentRoutingProblemPrepared,
+    PhysicalComponentAssemblyPrepared,
+    PreparedPhysicalComponentPortFactorDomain,
+    PreparedPhysicalComponentAssembly,
+    RoutedDesign,
+)
 from .Reliability import RoutingDeadline
 from .Failures import RoutingStageError
 from .Failures import RoutingFailure, RoutingFailureReason
@@ -47,6 +60,27 @@ from .Policy import (
     RoutingAttemptPolicy,
 )
 from .Workers.DetailedRouting import RoutePcbNets
+
+
+def ClusterBoundaryLeaseStateSliceSeconds(
+    LeaseStateCount: int,
+    LeaseVariant: int,
+) -> float | None:
+    """Bound proof-state time so a repaired geometry retains route time."""
+    if LeaseStateCount <= 1:
+        return None
+    # Raw portal/guide preparation is immutable and measured separately. The
+    # two ownership proofs only need enough time to reach an authoritative
+    # capacity-one result; the remaining shared deadline belongs to the
+    # cut-scoped repair that those proofs authorize.
+    return 8.0 if LeaseVariant == 0 else 2.5
+
+
+def ClusterBoundaryLeaseEndgameReserveSeconds(
+    LeaseStateCount: int,
+) -> float:
+    """Keep time for the paired repair's placement and first route attempt."""
+    return 12.0 if LeaseStateCount > 1 else 0.0
 
 def CompactRoutedTrees(
     Placement: PcbPlacement,
@@ -543,6 +577,25 @@ def RoutePcbAttempt(
     StatusCallback: Callable[[str], None] | None = None,
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
     Deadline: RoutingDeadline | None = None,
+    PreparePortalGeometryOnly: bool = False,
+    ValidateClusterInterfaceForeignAccessOnly: bool = False,
+    PrepareClusterInterfaceAssignmentOnly: bool = False,
+    PrepareComponentRoutingProblemOnly: bool = False,
+    PreparePhysicalComponentAssemblyOnly: bool = False,
+    PreparePhysicalComponentPortFactorDomainOnly: bool = False,
+    RequireCompleteClusterInterfaceDomain: bool = False,
+    ClusterInterfaceRealizabilityNogoods: tuple[
+        ClusterInterfaceRealizabilityNogood, ...
+    ] = (),
+    ClusterInterfaceStateFingerprint: str = "",
+    ClusterInterfaceLocalRouteFingerprint: str = "",
+    ForbiddenClusterInterfaceAssignmentFingerprints: (
+        frozenset[str]
+    ) = frozenset(),
+    ClusterInterfaceFrozenPatternFingerprints: (
+        dict[str, str] | None
+    ) = None,
+    ClusterInterfaceFrozenReservations: tuple[Any, ...] = (),
 ) -> RoutedDesign:
     """Run the single authoritative routing configuration."""
     def CheckRoutingDeadline(
@@ -565,6 +618,7 @@ def RoutePcbAttempt(
     DetourAllowance = Configuration.MaximumDetourAllowance
     Iterations = Configuration.MaximumIterations
     OrderMode = Configuration.OrderMode
+    LeaseReservationVariant = Placement.ClusterBoundaryLeaseVariant
     if Resources is None:
         Resources = BuildRoutingResources(
             Placement.Placed,
@@ -673,6 +727,44 @@ def RoutePcbAttempt(
                 IterationDiagnosticCallback=ReportIterationDiagnostic,
                 Policy=Policy,
                 SkipStrictPortalReservation=False,
+                ReservationVariant=LeaseReservationVariant,
+                PreparePortalGeometryOnly=PreparePortalGeometryOnly,
+                ValidateClusterInterfaceForeignAccessOnly=(
+                    ValidateClusterInterfaceForeignAccessOnly
+                ),
+                PrepareClusterInterfaceAssignmentOnly=(
+                    PrepareClusterInterfaceAssignmentOnly
+                ),
+                PrepareComponentRoutingProblemOnly=(
+                    PrepareComponentRoutingProblemOnly
+                ),
+                PreparePhysicalComponentAssemblyOnly=(
+                    PreparePhysicalComponentAssemblyOnly
+                ),
+                PreparePhysicalComponentPortFactorDomainOnly=(
+                    PreparePhysicalComponentPortFactorDomainOnly
+                ),
+                RequireCompleteClusterInterfaceDomain=(
+                    RequireCompleteClusterInterfaceDomain
+                ),
+                ClusterInterfaceRealizabilityNogoods=(
+                    ClusterInterfaceRealizabilityNogoods
+                ),
+                ClusterInterfaceStateFingerprint=(
+                    ClusterInterfaceStateFingerprint
+                ),
+                ClusterInterfaceLocalRouteFingerprint=(
+                    ClusterInterfaceLocalRouteFingerprint
+                ),
+                ForbiddenClusterInterfaceAssignmentFingerprints=(
+                    ForbiddenClusterInterfaceAssignmentFingerprints
+                ),
+                ClusterInterfaceFrozenPatternFingerprints=(
+                    ClusterInterfaceFrozenPatternFingerprints
+                ),
+                ClusterInterfaceFrozenReservations=(
+                    ClusterInterfaceFrozenReservations
+                ),
                 Deadline=Deadline,
             )
             return Routed
@@ -686,6 +778,16 @@ def RoutePcbAttempt(
         Resources,
         AccessLength,
     )
+    if PreparePhysicalComponentPortFactorDomainOnly:
+        if not isinstance(
+            Routed,
+            PreparedPhysicalComponentPortFactorDomain,
+        ):
+            raise RuntimeError(
+                "physical component eligibility preparation returned "
+                "no factor domain"
+            )
+        return Routed
     LocalNetBranches = Placement.Placed.LocalNetBranches or {}
     CompactionAccessLength = (
         max(AccessLength, 3)
@@ -875,6 +977,553 @@ def BuildPcbRoutingConfigurations(
     return BuildRoutingAttemptPolicies()
 
 
+def ClusterBoundaryLeaseStateCount(Placement: PcbPlacement) -> int:
+    """Select the bounded lease portfolio for one placed geometry.
+
+    A dense original placement needs multiple ownership states to establish
+    whether its access conflict is structural.  Once a complete assignment
+    cut has already produced a new exact joint placement, replaying that
+    proof portfolio would divide the new geometry's first route attempt into
+    three tiny slices.  The repaired geometry instead receives one
+    authoritative state; any new cut returns to placement for the next
+    access-distinct geometry.
+
+    A routed component has already discharged the dense interface proof and
+    frozen its physical claims.  Its handoff is therefore an ordinary global
+    route over the remaining nets, not another dense lease portfolio.
+    """
+    if getattr(
+        Placement.Placed,
+        "RoutedComponentTemplates",
+        (),
+    ):
+        return 1
+    LeaseTerminalCount = sum(
+        1 + len(Request.TargetTerminals)
+        for Request in getattr(
+            Placement.Placed,
+            "ClusterBoundaryLeaseRequests",
+            (),
+        )
+    )
+    JointDiagnostics = (
+        getattr(Placement.Placed, "LocalRouteDiagnostics", {}) or {}
+    ).get("__JointClusterPlacement__", {})
+    SerializedConstraints = (
+        JointDiagnostics.get("ActiveAssignmentConstraints", {})
+        if isinstance(JointDiagnostics, dict)
+        else {}
+    )
+    HasStructuredJointRepair = bool(
+        isinstance(SerializedConstraints, dict)
+        and (
+            SerializedConstraints.get("PairwiseConflictEdges")
+            or SerializedConstraints.get("HigherOrderSignalSets")
+        )
+    )
+    return 1 if HasStructuredJointRepair else (
+        3 if LeaseTerminalCount >= 16 else 1
+    )
+
+
+def PrepareClusterInterfaceAssignment(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+    RealizabilityNogoods: tuple[
+        ClusterInterfaceRealizabilityNogood, ...
+    ] = (),
+    StateFingerprint: str = "",
+    LocalRouteFingerprint: str = "",
+    ForbiddenAssignmentFingerprints: frozenset[str] = frozenset(),
+    FrozenPatternFingerprints: dict[str, str] | None = None,
+    FrozenReservations: tuple[Any, ...] = (),
+    ProgressCallback: Callable[[int, int], None] | None = None,
+    StatusCallback: Callable[[str], None] | None = None,
+    RequireCompleteDomain: bool = True,
+) -> ClusterInterfaceAssignment:
+    """Prove boundary ownership and bounded access-tree realizability."""
+    Resources.PreparedClusterInterfaceAssignment = None
+    Resources.FrozenClusterInterfaceAssignment = None
+    Resources.FrozenPreparedPortalDomainCache = None
+    if RealizabilityNogoods or ForbiddenAssignmentFingerprints:
+        # The geometry cache remains valid, but a prepared ownership cache
+        # contains the exact access pattern that the new no-good or complete
+        # ownership-combination exclusion rejects.
+        Resources.PreparedPortalDomainCaches = ()
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            replace(Placement, ClusterBoundaryLeaseVariant=0),
+            Configuration,
+            Resources=Resources,
+            ProgressCallback=ProgressCallback,
+            StatusCallback=StatusCallback,
+            Policy=Policy,
+            Deadline=Deadline,
+            PrepareClusterInterfaceAssignmentOnly=True,
+            RequireCompleteClusterInterfaceDomain=(
+                RequireCompleteDomain
+            ),
+            ClusterInterfaceRealizabilityNogoods=(
+                RealizabilityNogoods
+            ),
+            ClusterInterfaceStateFingerprint=StateFingerprint,
+            ClusterInterfaceLocalRouteFingerprint=(
+                LocalRouteFingerprint
+            ),
+            ForbiddenClusterInterfaceAssignmentFingerprints=(
+                ForbiddenAssignmentFingerprints
+            ),
+            ClusterInterfaceFrozenPatternFingerprints=(
+                FrozenPatternFingerprints
+            ),
+            ClusterInterfaceFrozenReservations=FrozenReservations,
+        )
+    except ClusterInterfaceAssignmentPrepared as Prepared:
+        if not Resources.PreparedPortalDomainCaches:
+            raise RuntimeError(
+                "cluster interface assignment was prepared without its "
+                "immutable portal-domain cache"
+            )
+        Resources.FrozenPreparedPortalDomainCache = (
+            Resources.PreparedPortalDomainCaches[-1]
+        )
+        return Prepared.Assignment
+    except RoutingStageError as Error:
+        Diagnostics = dict(Error.Failure.Diagnostics or {})
+        RejectedAssignment = (
+            Resources.PreparedClusterInterfaceAssignment
+        )
+        if (
+            RejectedAssignment is not None
+            and "RejectedInterfaceAssignment" not in Diagnostics
+        ):
+            Diagnostics["RejectedInterfaceAssignment"] = (
+                RejectedAssignment.ToDictionary()
+            )
+        PatternSearch = Diagnostics.get(
+            "ClusterInterfacePatternSearch",
+            {},
+        )
+        Incomplete = bool(
+            Diagnostics.get("BudgetExhausted", False)
+            or Diagnostics.get("BoundedPortalSlice", False)
+            or (
+                isinstance(PatternSearch, dict)
+                and PatternSearch.get("BudgetExhausted", False)
+            )
+            or Deadline.IsExpired()
+        )
+        DomainComplete = bool(
+            RequireCompleteDomain
+            and not Incomplete
+        )
+        raise RoutingStageError(replace(
+            Error.Failure,
+            Reason=(
+                RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                if Incomplete
+                else RoutingFailureReason.ClusterInterfaceUnsatisfiable
+            ),
+            Stage=(
+                "ClusterInterfaceSolveIncomplete"
+                if Incomplete
+                else "ClusterInterfaceUnsatisfiable"
+            ),
+            RepairActions=(),
+            Diagnostics={
+                **Diagnostics,
+                "ClusterInterfaceDomainComplete": DomainComplete,
+                "ClusterInterfacePreparationClassification": {
+                    "RequireCompleteDomain": RequireCompleteDomain,
+                    "DeadlineExpired": Deadline.IsExpired(),
+                    "BudgetExhausted": bool(
+                        Diagnostics.get("BudgetExhausted", False)
+                    ),
+                    "BoundedPortalSlice": bool(
+                        Diagnostics.get("BoundedPortalSlice", False)
+                    ),
+                    "PatternSearchBudgetExhausted": bool(
+                        isinstance(PatternSearch, dict)
+                        and PatternSearch.get(
+                            "BudgetExhausted",
+                            False,
+                        )
+                    ),
+                },
+                "InterfaceSolve": {
+                    "Complete": not Incomplete,
+                    "DomainComplete": DomainComplete,
+                    "ExecutableRepairAllowed": False,
+                },
+            },
+        )) from Error
+    raise RuntimeError(
+        "cluster interface preparation returned without an assignment"
+    )
+
+
+def PrepareComponentRoutingProblem(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+    StateFingerprint: str = "",
+    LocalRouteFingerprint: str = "",
+    ProgressCallback: Callable[[int, int], None] | None = None,
+    StatusCallback: Callable[[str], None] | None = None,
+) -> ComponentRoutingProblem:
+    """Prepare complete finite component domains without route ownership."""
+    Resources.PreparedComponentRoutingProblem = None
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            replace(Placement, ClusterBoundaryLeaseVariant=0),
+            Configuration,
+            Resources=Resources,
+            ProgressCallback=ProgressCallback,
+            StatusCallback=StatusCallback,
+            Policy=Policy,
+            Deadline=Deadline,
+            PrepareComponentRoutingProblemOnly=True,
+            RequireCompleteClusterInterfaceDomain=True,
+            ClusterInterfaceStateFingerprint=StateFingerprint,
+            ClusterInterfaceLocalRouteFingerprint=(
+                LocalRouteFingerprint
+            ),
+        )
+    except ComponentRoutingProblemPrepared as Prepared:
+        if Resources.PreparedComponentRoutingProblem is not Prepared.Problem:
+            raise RuntimeError(
+                "component problem preparation lost its typed result"
+            )
+        return Prepared.Problem
+    raise RuntimeError(
+        "component problem preparation returned a routed design"
+    )
+
+
+def PreparePhysicalComponentEligibility(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+    StateFingerprint: str = "",
+    LocalRouteFingerprint: str = "",
+    ProgressCallback: Callable[[int, int], None] | None = None,
+    StatusCallback: Callable[[str], None] | None = None,
+) -> PreparedPhysicalComponentPortFactorDomain:
+    """Freeze the complete physical port domain before assignment search."""
+    Resources.PreparedPhysicalComponentPortFactorDomain = None
+    Resources.PreparedPhysicalComponentAssembly = None
+    Resources.PreparedPhysicalComponentUnboundProblem = None
+    Resources.PreparedComponentRoutingProblem = None
+    Resources.PreparedClusterInterfaceAssignment = None
+    Resources.FrozenClusterInterfaceAssignment = None
+    Resources.FrozenPhysicalComponentAssemblyPlan = None
+    Resources.FrozenPhysicalComponentGlobalGuidePlan = None
+    Resources.FrozenPreparedPortalDomainCache = None
+    Resources.PreparedPortalDomainCaches = ()
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    Prepared = RoutePcbAttempt(
+        replace(Placement, ClusterBoundaryLeaseVariant=0),
+        Configuration,
+        Resources=Resources,
+        ProgressCallback=ProgressCallback,
+        StatusCallback=StatusCallback,
+        Policy=Policy,
+        Deadline=Deadline,
+        PreparePhysicalComponentAssemblyOnly=True,
+        PreparePhysicalComponentPortFactorDomainOnly=True,
+        RequireCompleteClusterInterfaceDomain=True,
+        ClusterInterfaceStateFingerprint=StateFingerprint,
+        ClusterInterfaceLocalRouteFingerprint=LocalRouteFingerprint,
+    )
+    if not isinstance(Prepared, PreparedPhysicalComponentPortFactorDomain):
+        raise RuntimeError(
+            "physical component eligibility lost its typed factor domain"
+        )
+    if Resources.PreparedPhysicalComponentPortFactorDomain is not Prepared:
+        raise RuntimeError(
+            "physical component eligibility resource identity mismatch"
+        )
+    Resources.PreparedPhysicalComponentUnboundProblem = Prepared.Problem
+    Resources.PreparedComponentAccessCertificate = (
+        Prepared.AccessCertificate
+    )
+    Resources.FrozenPhysicalComponentGlobalGuidePlan = Prepared.CoarsePlan
+    return Prepared
+
+
+def SolvePreparedPhysicalComponentEligibility(
+    Preparation: PreparedPhysicalComponentPortFactorDomain,
+    *,
+    Resources: Any,
+    Deadline: RoutingDeadline,
+) -> PreparedPhysicalComponentAssembly:
+    """Solve one identity-validated eligibility domain without rebuilding it."""
+    from .AuthoritativePlanner import (
+        SolvePreparedPhysicalComponentPortFactorDomain,
+    )
+
+    try:
+        Assembly = SolvePreparedPhysicalComponentPortFactorDomain(
+            Preparation,
+            Resources,
+            WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                "PhysicalComponentAssembly",
+                Diagnostics,
+            ),
+        )
+    except RoutingStageError as Error:
+        Diagnostics = {
+            **dict(Error.Failure.Diagnostics or {}),
+            "DomainFingerprint": Preparation.DomainFingerprint,
+            "PreparedFactorDomainReused": True,
+        }
+        Classified = ClassifyPhysicalComponentAssemblyFailure(
+            RoutingStageError(replace(
+                Error.Failure,
+                Diagnostics=Diagnostics,
+            )),
+            Operation="solve-prepared-eligibility",
+            Resources=Resources,
+        )
+        raise Classified from Error
+    Resources.PreparedComponentRoutingProblem = Assembly.Problem
+    Resources.PreparedPhysicalComponentAssembly = Assembly
+    Resources.FrozenPhysicalComponentAssemblyPlan = Assembly.Plan
+    Resources.FrozenPhysicalComponentGlobalGuidePlan = (
+        Assembly.GlobalGuidePlan
+    )
+    return Assembly
+
+
+def PreparePhysicalComponentAssembly(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+    StateFingerprint: str = "",
+    LocalRouteFingerprint: str = "",
+    ProgressCallback: Callable[[int, int], None] | None = None,
+    StatusCallback: Callable[[str], None] | None = None,
+) -> PreparedPhysicalComponentAssembly:
+    """Prepare authoritative global ports and corridors before local solve."""
+    Resources.PreparedPhysicalComponentAssembly = None
+    Resources.PreparedPhysicalComponentUnboundProblem = None
+    Resources.PreparedComponentRoutingProblem = None
+    Resources.PreparedClusterInterfaceAssignment = None
+    Resources.FrozenClusterInterfaceAssignment = None
+    Resources.FrozenPhysicalComponentAssemblyPlan = None
+    Resources.FrozenPhysicalComponentGlobalGuidePlan = None
+    # The prior cluster-interface cache intentionally contains only the
+    # component slice and has no whole-design guide. Port-first preparation
+    # must rebuild the complete authoritative domain.
+    Resources.FrozenPreparedPortalDomainCache = None
+    Resources.PreparedPortalDomainCaches = ()
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            replace(Placement, ClusterBoundaryLeaseVariant=0),
+            Configuration,
+            Resources=Resources,
+            ProgressCallback=ProgressCallback,
+            StatusCallback=StatusCallback,
+            Policy=Policy,
+            Deadline=Deadline,
+            PreparePhysicalComponentAssemblyOnly=True,
+            RequireCompleteClusterInterfaceDomain=True,
+            ClusterInterfaceStateFingerprint=StateFingerprint,
+            ClusterInterfaceLocalRouteFingerprint=(
+                LocalRouteFingerprint
+            ),
+        )
+    except PhysicalComponentAssemblyPrepared as Prepared:
+        if (
+            Resources.PreparedPhysicalComponentAssembly
+            is not Prepared.Assembly
+        ):
+            raise RuntimeError(
+                "physical component assembly lost its typed result"
+            )
+        Resources.FrozenPhysicalComponentAssemblyPlan = (
+            Prepared.Assembly.Plan
+        )
+        return Prepared.Assembly
+    except RoutingStageError as Error:
+        Classified = ClassifyPhysicalComponentAssemblyFailure(
+            Error,
+            Operation="prepare",
+            Resources=Resources,
+        )
+        if Classified is Error:
+            raise
+        raise Classified from Error
+    raise RuntimeError(
+        "physical component assembly preparation returned a routed design"
+    )
+
+
+def ClassifyPhysicalComponentAssemblyFailure(
+    Error: RoutingStageError,
+    *,
+    Operation: str,
+    Resources: Any | None = None,
+) -> RoutingStageError:
+    """Preserve physical-plan incompleteness across the router adapter."""
+    if Error.Failure.Reason not in {
+        RoutingFailureReason.RuntimeBudgetExceeded,
+        RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+        RoutingFailureReason.PhysicalComponentAssemblyIncomplete,
+    }:
+        return Error
+    Diagnostics = dict(Error.Failure.Diagnostics or {})
+    FactorStage = str(
+        Diagnostics.get("Stage", Error.Failure.Stage)
+    )
+    FactorDiagnostics = {
+        Key: Diagnostics[Key]
+        for Key in (
+            "AssignedPortCount",
+            "PortCount",
+            "AssignedTerminalCount",
+            "TerminalCount",
+            "ExpansionCount",
+            "FactorExpansionCount",
+            "PortAssignmentExpansionCount",
+            "DomainFingerprint",
+            "PreparedFactorDomainReused",
+        )
+        if Key in Diagnostics
+    }
+    RejectedSignalReservations = {
+        str(Signal): sorted(map(str, Fingerprints))
+        for Signal, Fingerprints in sorted(
+            getattr(
+                Resources,
+                "RejectedPhysicalComponentPortReservationsBySignal",
+                {},
+            ).items()
+        )
+        if Fingerprints
+    }
+    FactorDiagnostics.update({
+        "RejectedSignalReservationFingerprintsBySignal": (
+            RejectedSignalReservations
+        ),
+        "RejectedSignalReservationCount": sum(
+            len(Fingerprints)
+            for Fingerprints in RejectedSignalReservations.values()
+        ),
+        "RejectedPortAssignmentFingerprints": sorted(map(
+            str,
+            getattr(
+                Resources,
+                "RejectedPhysicalComponentPortAssignmentFingerprints",
+                (),
+            ),
+        )),
+    })
+    return RoutingStageError(replace(
+        Error.Failure,
+        Reason=(
+            RoutingFailureReason
+            .PhysicalComponentAssemblyIncomplete
+        ),
+        Stage="PhysicalComponentAssemblyIncomplete",
+        RepairActions=(),
+        Diagnostics={
+            **Diagnostics,
+            "PhysicalComponentAssemblyClassification": {
+                "Operation": Operation,
+                "ActiveFactorStage": FactorStage,
+                "Complete": False,
+                "FactorDiagnostics": FactorDiagnostics,
+                "ExecutableRetryAllowed": False,
+                "FlatFallbackAllowed": False,
+                "SignalLevelFallbackAllowed": False,
+            },
+        },
+    ))
+
+
+def ReplanPhysicalComponentAssembly(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Deadline: RoutingDeadline,
+) -> PreparedPhysicalComponentAssembly:
+    """Select the next physical plan from the frozen authoritative domain."""
+    Preparation = Resources.PreparedPhysicalComponentPortFactorDomain
+    if Preparation is None:
+        raise RuntimeError(
+            "physical component replanning requires a frozen complete "
+            "port factor domain"
+        )
+    try:
+        Assembly = SolvePreparedPhysicalComponentEligibility(
+            Preparation,
+            Resources=Resources,
+            Deadline=Deadline,
+        )
+    except RoutingStageError as Error:
+        Classified = ClassifyPhysicalComponentAssemblyFailure(
+            Error,
+            Operation="replan",
+            Resources=Resources,
+        )
+        if Classified is Error:
+            raise
+        raise Classified from Error
+    Resources.PreparedComponentRoutingProblem = Assembly.Problem
+    Resources.PreparedPhysicalComponentAssembly = Assembly
+    Resources.FrozenPhysicalComponentAssemblyPlan = Assembly.Plan
+    return Assembly
+
+
+def ValidateClusterInterfaceForeignAccess(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Assignment: ClusterInterfaceAssignment,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+) -> dict[str, object]:
+    """Verify the frozen component leaves every global terminal escapable."""
+    if Resources.FrozenPreparedPortalDomainCache is None:
+        raise RuntimeError(
+            "foreign-access validation requires a frozen portal-domain cache"
+        )
+    Resources.FrozenClusterInterfaceAssignment = Assignment
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            replace(Placement, ClusterBoundaryLeaseVariant=0),
+            Configuration,
+            Resources=Resources,
+            Policy=Policy,
+            Deadline=Deadline,
+            ValidateClusterInterfaceForeignAccessOnly=True,
+        )
+    except RoutingStageError as Error:
+        if (
+            Error.Failure.Stage
+            == "ClusterInterfaceForeignAccessValidated"
+        ):
+            return dict(Error.Failure.Diagnostics or {})
+        raise
+    raise RuntimeError(
+        "foreign-access validation returned without a typed result"
+    )
+
+
 def RoutePcbDesign(
     Placement: PcbPlacement,
     ProgressCallback: Callable[
@@ -883,6 +1532,7 @@ def RoutePcbDesign(
     ] | None = None,
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
     Deadline: RoutingDeadline | None = None,
+    Resources: Any | None = None,
 ) -> RoutedDesign:
     """Run one strict guided route and fail immediately if it is illegal."""
     Configuration = BuildPcbRoutingConfigurations(Placement)[0]
@@ -924,34 +1574,205 @@ def RoutePcbDesign(
             "RoutingResourceConstruction",
             {"Phase": "before"},
         )
-    Resources = BuildRoutingResources(
-        Placement.Placed,
-        WorkCheck=(
-            (
-                lambda Diagnostics: Deadline.RaiseIfExpired(
-                    "RoutingResourceConstruction",
-                    Diagnostics,
+    if Resources is None:
+        Resources = BuildRoutingResources(
+            Placement.Placed,
+            WorkCheck=(
+                (
+                    lambda Diagnostics: Deadline.RaiseIfExpired(
+                        "RoutingResourceConstruction",
+                        Diagnostics,
+                    )
                 )
-            )
-            if Deadline is not None
-            else None
-        ),
-    )
+                if Deadline is not None
+                else None
+            ),
+        )
     if Deadline is not None:
         Deadline.RaiseIfExpired(
             "RoutingResourceConstruction",
             {"Phase": "after"},
         )
+    # Dense interfaces receive a bounded whole-state portfolio. The first
+    # state pays immutable portal/guide setup; later states reuse it through
+    # RoutingResources.RawPortalGeometryCaches and split the remainder.
+    LeaseStateCount = (
+        1
+        if Resources.FrozenClusterInterfaceAssignment is not None
+        else ClusterBoundaryLeaseStateCount(Placement)
+    )
+    LeaseFailures: list[RoutingStageError] = []
+    LeaseAttemptDiagnostics: list[dict[str, object]] = []
+    Routed = None
     try:
-        Routed = RoutePcbAttempt(
-            Placement,
-            Configuration,
-            Resources=Resources,
-            ProgressCallback=RecordProgress,
-            StatusCallback=RecordStatus,
-            Policy=Policy,
-            Deadline=Deadline,
-        )
+        for LeaseVariant in range(LeaseStateCount):
+            VariantPlacement = replace(
+                Placement,
+                ClusterBoundaryLeaseVariant=LeaseVariant,
+            )
+            VariantDeadline = Deadline
+            if Deadline is not None and LeaseStateCount > 1:
+                RemainingStates = LeaseStateCount - LeaseVariant
+                SliceFraction = (
+                    0.55
+                    if LeaseVariant == 0
+                    # The first cached follow-up proves one ownership state
+                    # quickly. Keep the larger remainder for the final
+                    # access-distinct state, which must still materialize its
+                    # own exact lease and candidate assignment.
+                    else 0.35
+                    if RemainingStates > 1
+                    else 1.0
+                )
+                VariantDeadline = RoutingDeadline(
+                    StartedAt=Deadline.StartedAt,
+                    ExpiresAt=min(
+                        Deadline.ExpiresAt,
+                        monotonic() + min(
+                            max(
+                                0.001,
+                                Deadline.RemainingSeconds()
+                                - ClusterBoundaryLeaseEndgameReserveSeconds(
+                                    LeaseStateCount,
+                                ),
+                            ) * SliceFraction,
+                            ClusterBoundaryLeaseStateSliceSeconds(
+                                LeaseStateCount,
+                                LeaseVariant,
+                            ) or Deadline.RemainingSeconds(),
+                        ),
+                    ),
+                )
+            try:
+                VariantPlacement.Placed.LocalRouteDiagnostics = {
+                    **(VariantPlacement.Placed.LocalRouteDiagnostics or {}),
+                    "__ClusterBoundaryLeaseScheduler__": {
+                        "Variant": LeaseVariant,
+                        "StateCount": LeaseStateCount,
+                        "EndgameReserveSeconds": (
+                            ClusterBoundaryLeaseEndgameReserveSeconds(
+                                LeaseStateCount,
+                            )
+                        ),
+                    },
+                }
+                VariantPolicy = Policy
+                if VariantDeadline is not None and LeaseStateCount > 1:
+                    VariantSeconds = VariantDeadline.RemainingSeconds()
+                    VariantPolicy = replace(
+                        Policy,
+                        RuntimeBudgetSeconds=min(
+                            Policy.RuntimeBudgetSeconds,
+                            VariantSeconds,
+                        ),
+                        AdaptiveRouting=replace(
+                            Policy.AdaptiveRouting,
+                            MaximumRuntimeSeconds=min(
+                                Policy.AdaptiveRouting.MaximumRuntimeSeconds,
+                                VariantSeconds,
+                            ),
+                        ),
+                    )
+                Routed = RoutePcbAttempt(
+                    VariantPlacement,
+                    Configuration,
+                    Resources=Resources,
+                    ProgressCallback=RecordProgress,
+                    StatusCallback=RecordStatus,
+                    Policy=VariantPolicy,
+                    Deadline=VariantDeadline,
+                    PreparePortalGeometryOnly=(
+                        LeaseStateCount > 1 and LeaseVariant == 0
+                    ),
+                )
+                break
+            except RoutingStageError as Error:
+                if Error.Failure.Stage == "PortalGeometryPreparation":
+                    LeaseAttemptDiagnostics.append({
+                        "Variant": LeaseVariant,
+                        "StateCount": LeaseStateCount,
+                        "Status": "portal-geometry-prepared",
+                        **dict(Error.Failure.Diagnostics or {}),
+                    })
+                    continue
+                LeaseFailures.append(Error)
+                FailureDiagnostics = dict(Error.Failure.Diagnostics or {})
+                PatternSearchDiagnostics = dict(
+                    FailureDiagnostics.get(
+                        "ClusterInterfacePatternSearch",
+                        {},
+                    )
+                )
+                FailedAccessDomainFingerprint = str(
+                    FailureDiagnostics.get(
+                        "AuthoritativeCutAccessDomainFingerprint",
+                        PatternSearchDiagnostics.get(
+                            "AuthoritativeCutAccessDomainFingerprint",
+                            "",
+                        ),
+                    )
+                )
+                LeaseAttemptDiagnostics.append({
+                    "Variant": LeaseVariant,
+                    "StateCount": LeaseStateCount,
+                    "FailureReason": Error.Failure.Reason.value,
+                    "FailureStage": Error.Failure.Stage,
+                    "AffectedNets": list(Error.Failure.AffectedNets),
+                    "RawPortalCacheHit": bool(
+                        FailureDiagnostics.get("PortalCacheHit", False)
+                    ),
+                    "GlobalGuidePlanCacheHit": bool(
+                        FailureDiagnostics.get(
+                            "GlobalGuidePlanCacheHit",
+                            False,
+                        )
+                    ),
+                    "OwnershipFingerprint": str(
+                        Resources.ClusterBoundaryLeaseOwnershipFingerprints.get(
+                            LeaseVariant,
+                            dict(
+                                FailureDiagnostics.get(
+                                    "ClusterBoundaryLeases",
+                                    {},
+                                )
+                            ).get(
+                                "OwnershipFingerprint",
+                                FailedAccessDomainFingerprint,
+                            ),
+                        )
+                    ),
+                    "AuthoritativeAccessDomainFingerprint": str(
+                        FailureDiagnostics.get(
+                            "AuthoritativeAccessDomainFingerprint",
+                            PatternSearchDiagnostics.get(
+                                "AuthoritativeAccessDomainFingerprint",
+                                "",
+                            ),
+                        )
+                    ),
+                    "AuthoritativeCutAccessDomainFingerprint": (
+                        FailedAccessDomainFingerprint
+                    ),
+                    "Deadline": (
+                        VariantDeadline.ToDictionary()
+                        if VariantDeadline is not None
+                        else None
+                    ),
+                })
+                if Deadline is None or Deadline.IsExpired():
+                    break
+        if Routed is None:
+            LastFailure = LeaseFailures[-1].Failure
+            raise RoutingStageError(replace(
+                LastFailure,
+                Diagnostics={
+                    **dict(LastFailure.Diagnostics or {}),
+                    "ClusterBoundaryLeaseScheduler": {
+                        "StateCount": LeaseStateCount,
+                        "Attempts": LeaseAttemptDiagnostics,
+                    },
+                },
+            ))
         if Deadline is not None:
             Deadline.RaiseIfExpired("Routing")
     except RoutingStageError as Error:
@@ -961,6 +1782,8 @@ def RoutePcbDesign(
     except Exception as Error:
         Stage = "failed | " + str(Error).split("; cells:", 1)[0]
         ReportProgress(Failed=1)
+        if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
+            traceback.print_exc()
         raise ValueError(f"PCB authoritative router failed: {Error}") from Error
 
     Completed = Total

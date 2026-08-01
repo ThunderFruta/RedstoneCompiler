@@ -5,15 +5,15 @@ from Compiler.Cells.Library import CellMacros
 from Compiler.Ir.Models import Gate, GateKind
 from Compiler.Placement.Geometry import BuildPlacedGate
 from Compiler.Placement.Pcb import PcbGatesConflict
-from Compiler.Routing.Core import (
+from Compiler.Routing.Actions import (
     AreConnected,
     BuildElectricalExclusions,
     BuildPhysicalGraphs,
     NeighborPositions,
-    RustRoutingContext,
 )
 from Compiler.Routing.Actions.Repeaters import PruneRedundantRepeaterReservations
 from Compiler.Routing.Actions.Geometry import ValidatePlacedCellElectricalIsolation
+from Compiler.Routing.Workers.DetailedRouting import RustRoutingContext
 from SchemEncoder.Writer262 import (
     BlockProvenance,
     BuildLitematicBlockMap,

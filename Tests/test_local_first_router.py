@@ -3,7 +3,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 from contextlib import redirect_stderr
 from io import StringIO
-import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -39,7 +38,6 @@ from Compiler.Routing.ChannelPlanner import BuildNetRoutingProfiles
 from Compiler.Routing.Actions.Geometry import ValidatePlacedCellElectricalIsolation
 from Compiler.Routing.Policy import (
     AdaptiveRoutingPolicy,
-    CompatibilityPhysicalDesignPolicy,
     GlobalRoutingPolicy,
     LocalFirstPhysicalDesignPolicy,
     NandPackingPolicy,
@@ -128,6 +126,10 @@ class LocalFirstRouterTests(unittest.TestCase):
                 side_effect=Fingerprints,
             ),
             patch(
+                "Compiler.Placement.PcbFlow.BuildPlacementRetentionFingerprint",
+                side_effect=Fingerprints,
+            ),
+            patch(
                 "Compiler.Placement.PcbFlow.MeasurePlacementRoutingFeedback",
                 side_effect=FeedbackSideEffect,
                 return_value=self._BuildPlacementFeedbackFixture(),
@@ -180,25 +182,10 @@ class LocalFirstRouterTests(unittest.TestCase):
                     ),
                 ),
                 Technology=DefaultRedstoneRoutingTechnology,
-                RequestedStrategy=RoutingStrategy.NewRouterFirst,
-                UsedStrategy=RoutingStrategy.NewRouterFirst,
+                RequestedStrategy=RoutingStrategy.Default,
+                UsedStrategy=RoutingStrategy.Default,
             )
         return Result, PlaceGraph, (StartDeadline, RouteDesign)
-
-    def testCompatibilityRegressionFixtureMatchesFrozenPolicy(self) -> None:
-        Fixture = json.loads(
-            Path("Tests/Fixtures/FullAdderCompatibility.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(
-            Fixture["PolicyVersion"],
-            CompatibilityPhysicalDesignPolicy.PolicyVersion,
-        )
-        self.assertEqual(Fixture["GateKinds"], {"INPUT": 3, "NAND": 9, "OUTPUT": 2})
-        self.assertEqual(Fixture["RunSummary"]["Conflicts"], 0)
-        self.assertEqual(Fixture["FinalValidation"]["UnresolvedClaimCount"], 0)
-        self.assertEqual(len(Fixture["TruthTableOutputs"]), 8)
 
     def testNandOnlyValidationRejectsNonNandLogic(self) -> None:
         Module = ModuleIR(
@@ -219,20 +206,20 @@ class LocalFirstRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"missing=\['N0'\]"):
             ValidateNandOnlyDesign(SimpleNamespace(PlacedGates=[]), Reference)
 
-    def testCliAliasesAndRoutingStrategiesParse(self) -> None:
+    def testCliAliasesAndDefaultRoutingStrategyParse(self) -> None:
         Parsed = BuildParser().parse_args(
             [
                 "--example", "Examples/FullAdder.sv",
                 "--topmodule", "FullAdder",
                 "--output", "Output/Test",
                 "--outputname", "Test",
-                "--routing-strategy", "new-router-first",
+                "--routing-strategy", "default",
             ]
         )
         self.assertEqual(Parsed.input, Path("Examples/FullAdder.sv"))
         self.assertEqual(Parsed.top, "FullAdder")
         self.assertEqual(Parsed.outputname, "Test")
-        self.assertEqual(Parsed.routing_strategy, "new-router-first")
+        self.assertEqual(Parsed.routing_strategy, "default")
         self.assertIsNone(Parsed.routing_deadline_seconds)
         self.assertEqual(
             BuildParser().parse_args([
@@ -240,25 +227,25 @@ class LocalFirstRouterTests(unittest.TestCase):
             ]).routing_deadline_seconds,
             2.5,
         )
-        self.assertEqual(
-            BuildParser().parse_args(
-                ["--routing-strategy", "compatibility"]
-            ).routing_strategy,
+        for RemovedStrategy in (
             "compatibility",
-        )
-        self.assertEqual(
-            BuildParser().parse_args(
-                ["--routing-strategy", "hybrid"]
-            ).routing_strategy,
             "hybrid",
-        )
-        self.assertEqual(
-            RoutingStrategy.Parse("authoritative-only"),
-            RoutingStrategy.NewRouterFirst,
-        )
+            "authoritative-only",
+        ):
+            with (
+                self.subTest(RemovedStrategy=RemovedStrategy),
+                redirect_stderr(StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                BuildParser().parse_args([
+                    "--routing-strategy",
+                    RemovedStrategy,
+                ])
+            with self.assertRaises(ValueError):
+                RoutingStrategy.Parse(RemovedStrategy)
         self.assertEqual(
             BuildParser().parse_args([]).routing_strategy,
-            "new-router-first",
+            "default",
         )
         for InvalidDeadline in ("0", "-1", "nan", "inf"):
             with (
@@ -295,7 +282,7 @@ class LocalFirstRouterTests(unittest.TestCase):
                     "--output",
                     str(Directory / "Failed.litematic"),
                     "--routing-strategy",
-                    "new-router-first",
+                    "default",
                     "--routing-deadline-seconds",
                     "3.5",
                 ])
@@ -307,38 +294,13 @@ class LocalFirstRouterTests(unittest.TestCase):
             3.5,
         )
 
-    def testCompatibilityPolicyIsFrozenBesideLocalFirstPolicy(self) -> None:
-        self.assertEqual(CompatibilityPhysicalDesignPolicy.Placement.RoutingSpacing, 6)
-        self.assertEqual(
-            CompatibilityPhysicalDesignPolicy.NandPacking.MaximumLocalRouteLength,
-            40,
-        )
-        self.assertFalse(CompatibilityPhysicalDesignPolicy.Organization.Enabled)
-        self.assertFalse(CompatibilityPhysicalDesignPolicy.AdaptiveRouting.Enabled)
-        self.assertFalse(
-            CompatibilityPhysicalDesignPolicy.Placement.EnableRoutingFeedback
-        )
-        self.assertFalse(
-            CompatibilityPhysicalDesignPolicy
-            .Placement.EnableDemandAwareInterClusterSpacing
-        )
-        self.assertFalse(
-            CompatibilityPhysicalDesignPolicy.GlobalRouting.EnableCapacityAwareGuides
-        )
-        self.assertTrue(
-            CompatibilityPhysicalDesignPolicy
-            .Placement.ForceMaximumRoutingLayersAfterPlacementRelocation
-        )
+    def testDefaultPolicyEnablesAuthoritativeRoutingFeatures(self) -> None:
         self.assertTrue(
             LocalFirstPhysicalDesignPolicy
             .Placement.EnableDemandAwareInterClusterSpacing
         )
         self.assertEqual(LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing, 5)
         self.assertEqual(LocalFirstPhysicalDesignPolicy.Placement.PinEscapeLength, 1)
-        self.assertNotEqual(
-            CompatibilityPhysicalDesignPolicy.PolicyVersion,
-            LocalFirstPhysicalDesignPolicy.PolicyVersion,
-        )
         Snapshot = LocalFirstPhysicalDesignPolicy.ToDictionary()
         self.assertFalse(Snapshot["QualityGate"]["Enabled"])
         self.assertEqual(Snapshot["Placement"]["RoutingFeedbackIterations"], 1)
@@ -349,7 +311,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertTrue(Snapshot["GlobalRouting"]["EnableCapacityAwareGuides"])
         self.assertEqual(
             LocalFirstPhysicalDesignPolicy.PolicyVersion,
-            "physical-design-v15-compact-boundaries",
+            "physical-design-v16-reconvergent-access",
         )
         self.assertTrue(Snapshot["NandPacking"]["Enabled"])
         self.assertTrue(Snapshot["NandPacking"]["EnableStructuralReuse"])
@@ -394,6 +356,51 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertLessEqual(First.OverflowPeak, 1)
         self.assertEqual(set(First.Guides), set(Profiles))
 
+    def testCapacityAwareGuidePlanReusesValidPlacementSeed(self) -> None:
+        def Profile(Source, Target):
+            return SimpleNamespace(
+                SourceAccessPath=(Source,),
+                TargetAccessPaths={Target: (Target,)},
+                Span=(
+                    abs(Target[0] - Source[0])
+                    + abs(Target[2] - Source[2])
+                ),
+                Fanout=1,
+                Criticality=1,
+            )
+
+        Profiles = {
+            "A": Profile((0, 2, 0), (8, 2, 8)),
+            "B": Profile((0, 2, 8), (8, 2, 0)),
+        }
+        Arguments = (
+            Profiles,
+            2,
+            0,
+            0,
+            GlobalRoutingPolicy(MaximumRipupPasses=2),
+            DefaultRedstoneRoutingTechnology,
+            8,
+        )
+        Seed = BuildCapacityAwareGuidePlan(*Arguments)
+        Events = []
+
+        Reused = BuildCapacityAwareGuidePlan(
+            *Arguments,
+            SeedPlan=Seed,
+            WorkCheck=Events.append,
+        )
+
+        self.assertEqual(Seed.ToDictionary(), Reused.ToDictionary())
+        self.assertEqual(
+            {
+                Event["Signal"]
+                for Event in Events
+                if Event["Phase"] == "capacity-guide-seed-reuse"
+            },
+            set(Profiles),
+        )
+
     def testCapacityAwareGuidePlanningPublishesStoppableInnerWork(self) -> None:
         Profile = SimpleNamespace(
             SourceAccessPath=((0, 2, 0),),
@@ -424,6 +431,30 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertIn("capacity-guide-profile", Phases)
         self.assertIn("capacity-guide-lane", Phases)
         self.assertEqual(Phases[-1], "capacity-guide-selection")
+
+    def testCapacityGuideTreatsComponentInteriorAsObstacle(self) -> None:
+        Profile = SimpleNamespace(
+            SourceAccessPath=((0, 2, 0),),
+            TargetAccessPaths={(20, 2, 0): ((20, 2, 0),)},
+            Span=20,
+            Fanout=1,
+            Criticality=1,
+        )
+        Plan = BuildCapacityAwareGuidePlan(
+            {"Global": Profile},
+            2,
+            0,
+            0,
+            GlobalRoutingPolicy(CandidateLaneCount=5),
+            DefaultRedstoneRoutingTechnology,
+            8,
+            ComponentObstacleBounds=(5, 15, -1, 1),
+        )
+
+        self.assertFalse(any(
+            5 <= X <= 15 and -1 <= Z <= 1
+            for X, Z in Plan.Guides["Global"]
+        ))
 
     def testCapacityGuideConstructionCanStopInsideLongSegment(self) -> None:
         Profile = SimpleNamespace(
@@ -555,12 +586,25 @@ class LocalFirstRouterTests(unittest.TestCase):
         )
         self.assertEqual(Plan.MaximumAttempts, 10)
         self.assertEqual(Plan.PrimaryRequests[1].RoutingSpacing, 4)
-        RecipeKeys = [
+        NonRelocationRecipeKeys = [
             (Request.RoutingSpacing, Request.PackingPolicy)
             for Request in Plan.PrimaryRequests + Plan.DeferredRequests
+            if Request.SourceGenerator != "row-beam-conflict-relocation"
         ]
-        self.assertEqual(len(RecipeKeys), len(set(RecipeKeys)) + 1)
-        self.assertEqual(RecipeKeys[0], RecipeKeys[2])
+        self.assertEqual(
+            len(NonRelocationRecipeKeys),
+            len(set(NonRelocationRecipeKeys)),
+        )
+        self.assertEqual(
+            (
+                Plan.DeferredRequests[0].RoutingSpacing,
+                Plan.DeferredRequests[0].PackingPolicy,
+            ),
+            (
+                Plan.PrimaryRequests[0].RoutingSpacing,
+                Plan.PrimaryRequests[0].PackingPolicy,
+            ),
+        )
 
         PackedFirstPlan = BuildPlacementGenerationPlan(
             LocalFirstPhysicalDesignPolicy,
@@ -576,9 +620,14 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(
             [
                 Request.SourceGenerator
-                for Request in PackedFirstPlan.DeferredRequests[:2]
+                for Request in PackedFirstPlan.DeferredRequests[:4]
             ],
-            ["row-beam-conflict-relocation", "row-beam-direct-only"],
+            [
+                "row-beam-conflict-relocation",
+                "row-beam-direct-only",
+                "unpacked",
+                "unpacked-configured-spacing",
+            ],
         )
 
         DirectOnlyPolicy = replace(
@@ -703,7 +752,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertTrue(PackingPolicies[6].Enabled)
         self.assertTrue(PackingPolicies[6].GraphBeamEnabled)
 
-    def testRetainedCandidatesShareOneAbsoluteRoutingDeadline(self) -> None:
+    def testRetainedCandidatesUseSlicesOfOneAbsoluteRoutingDeadline(self) -> None:
         Placements = [
             self._BuildPlacementFlowFixture("first"),
             self._BuildPlacementFlowFixture("second"),
@@ -733,9 +782,9 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(RouteDesign.call_count, 2)
         FirstDeadline = RouteDesign.call_args_list[0].kwargs["Deadline"]
         SecondDeadline = RouteDesign.call_args_list[1].kwargs["Deadline"]
-        self.assertIs(FirstDeadline, SecondDeadline)
+        self.assertIsNot(FirstDeadline, SecondDeadline)
         self.assertEqual(FirstDeadline.StartedAt, SecondDeadline.StartedAt)
-        self.assertEqual(FirstDeadline.ExpiresAt, SecondDeadline.ExpiresAt)
+        self.assertLess(FirstDeadline.ExpiresAt, SecondDeadline.ExpiresAt)
         FirstPolicy = RouteDesign.call_args_list[0].kwargs["Policy"]
         self.assertLessEqual(
             FirstPolicy.AdaptiveRouting.MaximumRuntimeSeconds,
@@ -750,6 +799,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         ) -> SimpleNamespace:
             return SimpleNamespace(
                 FeedbackScore=Score,
+                JointExactScore=(),
                 Placement=SimpleNamespace(
                     PackedClusters=(1,),
                     Placed=SimpleNamespace(LocalRouteClaims=(1,)),
@@ -853,6 +903,12 @@ class LocalFirstRouterTests(unittest.TestCase):
         )
         self.assertIsNone(
             RoutingAcceptanceProfiles["RippleCarryAdder4"].MaximumFootprint
+        )
+        self.assertEqual(
+            RoutingAcceptanceProfiles[
+                "RippleCarryAdder8"
+            ].MaximumRuntimeSeconds,
+            30.0,
         )
 
     def testRepeatedNandStructureIsDetectedWithoutCircuitNames(self) -> None:
@@ -1205,46 +1261,27 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(First.Signals, ("A", "B"))
         self.assertTrue(Second.Stagnated)
 
-    def testHybridFallsThroughToNewRouterPolicy(self) -> None:
+    def testRemovedHybridStrategyIsRejectedBeforeRouting(self) -> None:
         with patch(
             "Compiler.Placement.PcbFlow._PlaceAndRoutePcbWithPolicy",
-            side_effect=ValueError("forced local failure"),
         ) as Execute:
-            with self.assertRaisesRegex(ValueError, "forced local failure"):
+            with self.assertRaises(ValueError):
                 PlaceAndRoutePcb(
                     SimpleNamespace(),
-                    Strategy=RoutingStrategy.Hybrid,
+                    Strategy="hybrid",
                 )
-        self.assertEqual(Execute.call_count, 1)
-        self.assertEqual(
-            Execute.call_args.kwargs["UsedStrategy"],
-            RoutingStrategy.NewRouterFirst,
-        )
+        Execute.assert_not_called()
 
-    def testExplicitCompatibilityUsesFrozenOracleWithoutFallback(self) -> None:
-        Expected = object()
+    def testRemovedCompatibilityStrategyIsRejectedBeforeRouting(self) -> None:
         with patch(
             "Compiler.Placement.PcbFlow._PlaceAndRoutePcbWithPolicy",
-            return_value=Expected,
         ) as Execute:
-            Result = PlaceAndRoutePcb(
-                SimpleNamespace(),
-                Strategy=RoutingStrategy.Compatibility,
-            )
-
-        self.assertIs(Result, Expected)
-        self.assertEqual(
-            Execute.call_args.kwargs["Policy"],
-            CompatibilityPhysicalDesignPolicy,
-        )
-        self.assertEqual(
-            Execute.call_args.kwargs["RequestedStrategy"],
-            RoutingStrategy.Compatibility,
-        )
-        self.assertEqual(
-            Execute.call_args.kwargs["UsedStrategy"],
-            RoutingStrategy.Compatibility,
-        )
+            with self.assertRaises(ValueError):
+                PlaceAndRoutePcb(
+                    SimpleNamespace(),
+                    Strategy="compatibility",
+                )
+        Execute.assert_not_called()
 
     def testCliDeadlineOverridesEffectivePolicyWithoutMutatingCanonicalPolicy(
         self,
@@ -1256,7 +1293,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         ) as Execute:
             Result = PlaceAndRoutePcb(
                 SimpleNamespace(),
-                Strategy=RoutingStrategy.NewRouterFirst,
+                Strategy=RoutingStrategy.Default,
                 RoutingDeadlineSeconds=4.25,
             )
 
@@ -1285,7 +1322,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "forced local failure"):
                 PlaceAndRoutePcb(
                     SimpleNamespace(),
-                    Strategy=RoutingStrategy.NewRouterFirst,
+                    Strategy=RoutingStrategy.Default,
                 )
         self.assertEqual(Execute.call_count, 1)
 
@@ -1298,12 +1335,12 @@ class LocalFirstRouterTests(unittest.TestCase):
                 OutputPath=Root / "FullAdder.litematic",
                 DiagramPath=Root / "FullAdder.Nand.json",
                 Workdir=Root / "Frontend",
-                RoutingStrategyValue=RoutingStrategy.NewRouterFirst,
+                RoutingStrategyValue=RoutingStrategy.Default,
             )
             Diagnostics = Result.PhysicalDesignPath.read_text(encoding="utf-8")
             EmittedBlockCount = len(LoadTemplate(Result.OutputPath).Blocks)
         self.assertTrue(Result.TruthTablePassed)
-        self.assertEqual(Result.UsedStrategy, "new-router-first")
+        self.assertEqual(Result.UsedStrategy, "default")
         self.assertIn('"UnresolvedClaimCount": 0', Diagnostics)
         self.assertIn('"PlanningContracts"', Diagnostics)
         self.assertIn('"BlockComposition"', Diagnostics)

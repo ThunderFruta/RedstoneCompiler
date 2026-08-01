@@ -43,6 +43,13 @@ class PlacedDesign:
     LocalNetTargets: dict[str, tuple[tuple[int, int, int], ...]] | None = None
     LocalRouteClaims: tuple[Any, ...] = ()
     LocalRouteDiagnostics: dict[str, Any] | None = None
+    ClusterBoundaryLeaseRequests: tuple[Any, ...] = ()
+    CompleteClusterInterfaceAccess: bool = False
+    InterClusterRoutingChannel: Any | None = None
+    RoutedComponentTemplates: tuple[Any, ...] = ()
+    RoutedComponentRoutingChannels: tuple[Any, ...] = ()
+    PackedClusters: tuple[Any, ...] = ()
+    ComponentGraph: Any | None = None
 
 
 def ValidatePlacedGateContract(Gate: PlacedGate) -> None:

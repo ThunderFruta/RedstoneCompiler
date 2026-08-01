@@ -84,6 +84,44 @@ def _JsonDiagnosticDefault(Value: object) -> object:
     return str(Value)
 
 
+def _JsonDiagnosticValue(Value: object) -> object:
+    """Recursively make diagnostic mapping keys JSON-compatible."""
+    if isinstance(Value, dict):
+        return {
+            (
+                Key
+                if isinstance(Key, (str, int, float, bool)) or Key is None
+                else str(Key)
+            ): _JsonDiagnosticValue(Item)
+            for Key, Item in Value.items()
+        }
+    if isinstance(Value, (list, tuple, set, frozenset)):
+        return [_JsonDiagnosticValue(Item) for Item in Value]
+    return Value
+
+
+RoutingFailureArtifactAggregateDiagnosticKeys = frozenset({
+    "PlacementAttempts",
+    "EscalationHistory",
+    "AdaptiveEscalationHistory",
+})
+
+
+def BuildRoutingFailureArtifactSnapshot(
+    Failure: RoutingFailure,
+) -> dict[str, object]:
+    """Return one failure without duplicating top-level aggregate evidence."""
+    Snapshot = Failure.ToDictionary()
+    Diagnostics = Snapshot.get("Diagnostics")
+    if isinstance(Diagnostics, dict):
+        Snapshot["Diagnostics"] = {
+            Key: Value
+            for Key, Value in Diagnostics.items()
+            if Key not in RoutingFailureArtifactAggregateDiagnosticKeys
+        }
+    return Snapshot
+
+
 def ReadSourceState() -> dict[str, object]:
     """Read the current revision and dirty marker without mutating the tree."""
     RepositoryRoot = Path(__file__).resolve().parent.parent
@@ -502,7 +540,7 @@ def WriteRoutingFailureArtifact(
     FailurePath = OutputPath.with_suffix(".RoutingFailure.json")
     FailurePath.write_text(
         json.dumps(
-            {
+            _JsonDiagnosticValue({
                 "SchemaVersion": "routing-failure-v1",
                 "Policy": (
                     EffectivePolicy or PolicyForRoutingStrategy(UsedStrategy)
@@ -517,7 +555,7 @@ def WriteRoutingFailureArtifact(
                 "Reproduction": Reproduction,
                 "OutputIdentity": Reproduction["Output"],
                 "Technology": asdict(Technology),
-                "Failure": Failure.ToDictionary(),
+                "Failure": BuildRoutingFailureArtifactSnapshot(Failure),
                 "Affected": {
                     "Nets": list(Failure.AffectedNets),
                     "Resources": list(Failure.Resources),
@@ -548,9 +586,9 @@ def WriteRoutingFailureArtifact(
                 ),
                 "Deadline": Diagnostics.get("Deadline", {}),
                 "RuntimeSeconds": round(monotonic() - StartedAt, 6),
-            },
-            indent=2,
+            }),
             sort_keys=True,
+            separators=(",", ":"),
             default=_JsonDiagnosticDefault,
         ) + "\n",
         encoding="utf-8",
@@ -579,7 +617,7 @@ def CompileSvToLitematic(
     TopModule: str | None = None,
     Workdir: Path = Path("Cache/Frontend"),
     ProgressCallback: Callable[[PcbProgress], None] | None = None,
-    RoutingStrategyValue: RoutingStrategy | str = RoutingStrategy.NewRouterFirst,
+    RoutingStrategyValue: RoutingStrategy | str = RoutingStrategy.Default,
     RoutingDeadlineSeconds: float | None = None,
     TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
 ) -> CompileResult:

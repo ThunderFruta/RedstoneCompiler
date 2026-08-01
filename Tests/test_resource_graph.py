@@ -1,7 +1,9 @@
 import unittest
 
+from Compiler.Placement.Geometry import PlacedGate
 from Compiler.Routing.ResourceGraph import (
     FindClaimConflicts,
+    FindClaimConflictsByResourceIndex,
     LocalRouteClaim,
     NormalizeRoutingEdge,
     RoutingResourceGraph,
@@ -9,7 +11,9 @@ from Compiler.Routing.ResourceGraph import (
     ValidateLocalRouteClaims,
 )
 from Compiler.Placement.Pcb import (
+    FindMandatoryAccessConflictSignals,
     LocalClusterRouteCandidate,
+    MeasureMandatoryAccessConflictProfile,
     SelectJointLocalClusterCandidates,
 )
 
@@ -21,6 +25,91 @@ class RoutingResourceGraphTests(unittest.TestCase):
             ElectricalBlocks=frozenset(Electrical),
             SolidBlocks=frozenset(Solid),
         )
+
+    def BuildMandatoryOutput(
+        self,
+        Name,
+        Signal,
+        Pin,
+    ):
+        return PlacedGate(
+            Name=Name,
+            Kind="NAND",
+            X=Pin[0],
+            Y=Pin[1],
+            Z=Pin[2],
+            Outputs=[Signal],
+            Inputs=[],
+            Attrs={},
+            InputPins=[],
+            OutputPin=Pin,
+            Rotation=0,
+            MirrorX=False,
+            InputDirections=[],
+            OutputDirection=(1, 0, 0),
+        )
+
+    def testMandatoryAccessProfileIsRenameAndTranslationIndependent(self) -> None:
+        First = (
+            self.BuildMandatoryOutput("First", "Alpha", (0, 1, 0)),
+            self.BuildMandatoryOutput("Second", "Beta", (0, 1, 0)),
+        )
+        RenamedTranslated = (
+            self.BuildMandatoryOutput("RenamedSecond", "Y", (11, 4, 7)),
+            self.BuildMandatoryOutput("RenamedFirst", "X", (11, 4, 7)),
+        )
+
+        Baseline = MeasureMandatoryAccessConflictProfile(
+            First,
+            ("Alpha", "Beta"),
+        )
+        Candidate = MeasureMandatoryAccessConflictProfile(
+            RenamedTranslated,
+            ("X", "Y"),
+        )
+
+        self.assertTrue(Baseline.HasConflicts)
+        self.assertEqual(
+            Baseline.OwnershipFingerprint,
+            Candidate.OwnershipFingerprint,
+        )
+        self.assertEqual(
+            Baseline.ConflictFingerprint,
+            Candidate.ConflictFingerprint,
+        )
+        self.assertEqual(
+            FindMandatoryAccessConflictSignals(
+                First,
+                ("Alpha", "Beta"),
+            ),
+            dict(Baseline.CrossConflicts),
+        )
+        self.assertEqual(
+            Baseline.ToDictionary()["ExactConflictCount"],
+            Baseline.ExactConflictCount,
+        )
+
+    def testMandatoryAccessOwnershipFingerprintChangesWithTopology(self) -> None:
+        Shared = MeasureMandatoryAccessConflictProfile(
+            (
+                self.BuildMandatoryOutput("First", "Alpha", (0, 1, 0)),
+                self.BuildMandatoryOutput("Second", "Beta", (0, 1, 0)),
+            ),
+            ("Alpha", "Beta"),
+        )
+        Separated = MeasureMandatoryAccessConflictProfile(
+            (
+                self.BuildMandatoryOutput("First", "Alpha", (0, 1, 0)),
+                self.BuildMandatoryOutput("Second", "Beta", (20, 1, 0)),
+            ),
+            ("Alpha", "Beta"),
+        )
+
+        self.assertNotEqual(
+            Shared.OwnershipFingerprint,
+            Separated.OwnershipFingerprint,
+        )
+        self.assertFalse(Separated.HasConflicts)
 
     def testLocalClaimsMergeForOneSignalAndRejectForeignAdjacency(self) -> None:
         Graph = self.BuildGraph()
@@ -157,6 +246,15 @@ class RoutingResourceGraphTests(unittest.TestCase):
             any(Resource.Kind == RoutingResourceKind.Electrical for Resource in Conflicts)
         )
 
+    def testRouteClaimsReuseTheExactPositionSet(self) -> None:
+        Graph = self.BuildGraph()
+        Positions = frozenset({(0, 1, 0), (1, 1, 0)})
+
+        First = Graph.BuildRouteClaims(Positions)
+        Second = Graph.BuildRouteClaims(Positions)
+
+        self.assertIs(First, Second)
+
     def testForeignSupportCannotOccupyAnotherSignalsWire(self) -> None:
         Graph = self.BuildGraph()
         Upper = Graph.BuildRouteClaims({(0, 1, 0)})
@@ -169,6 +267,35 @@ class RoutingResourceGraphTests(unittest.TestCase):
             and Resource.Position == (0, 0, 0)
             for Resource in Conflicts
         ))
+
+    def testIndexedClaimConflictsMatchPairwiseConflicts(self) -> None:
+        Graph = self.BuildGraph()
+        Claims = {
+            "A": Graph.BuildRouteClaims({
+                (0, 1, 0),
+                (1, 1, 0),
+                (2, 2, 0),
+            }),
+            "B": Graph.BuildRouteClaims({
+                (1, 1, 1),
+                (2, 1, 1),
+                (2, 2, 1),
+            }),
+            "C": Graph.BuildRouteClaims({
+                (0, 0, 0),
+                (1, 0, 0),
+                (3, 1, 1),
+            }),
+            "D": Graph.BuildRouteClaims({
+                (4, 1, 0),
+                (4, 2, 0),
+            }),
+        }
+
+        self.assertEqual(
+            FindClaimConflictsByResourceIndex(Claims),
+            FindClaimConflicts(Claims),
+        )
 
     def testJointClusterSelectionRejectsConflictingCandidateClaims(self) -> None:
         Graph = self.BuildGraph()

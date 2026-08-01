@@ -786,8 +786,7 @@ impl RoutingContext {
         }
 
         let mut TargetPaths = Vec::new();
-        let mut OrderedBranches = TargetBranches;
-        OrderedBranches.sort_by_key(|Branch| (Branch.last().copied(), Branch.len()));
+        let OrderedBranches = TargetBranches;
         for Branch in OrderedBranches {
             let PortalTarget = Branch[0];
             let ReservedNodes: HashSet<_> = Branch.iter().copied().collect();
@@ -844,7 +843,7 @@ impl RoutingContext {
                 let CanPlaceRepeater = CurrentState.1 != StartDirection
                     && CurrentState.1 == Direction
                     && Direction.1 == 0
-                    && CurrentState.2 <= 3;
+                    && CurrentState.2 <= crate::PathRouting::REPEATER_TURN_HEADROOM;
                 let RemainingStrength = if !EnforceSignalStrength {
                     MAXIMUM_UNREFRESHED_DUST_LENGTH
                 } else if CanPlaceRepeater {

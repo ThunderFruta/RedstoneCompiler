@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "me.autobot.maceswap.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "MixinMultiPlayerGameMode_MaceSwap",
+    "MixinPlayerCombatInvoker",
+    "MixinLivingEntityCombatInvoker",
+    "MixinClientLevel_MaceParticleFilter"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

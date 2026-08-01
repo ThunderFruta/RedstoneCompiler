@@ -34,7 +34,7 @@ class ScaleRoutingTests(unittest.TestCase):
             Optimized = OptimizeLogic(Netlist)
             Physical = PlaceAndRoutePcb(
                 ToNandOnly(Optimized),
-                Strategy=RoutingStrategy.NewRouterFirst,
+                Strategy=RoutingStrategy.Default,
             )
             Report = SimulateRoutedTruthTable(
                 Physical.Routed,

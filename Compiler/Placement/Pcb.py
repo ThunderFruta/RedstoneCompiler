@@ -2,32 +2,46 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from collections import deque
 from functools import lru_cache
 from hashlib import sha256
-from itertools import permutations
+from itertools import combinations, permutations, product
 from math import ceil, sqrt
 from statistics import median
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
-from .Rotation import RotatedCellSize
+from ..Ir.ComponentGraph import BuildComponentGraph
+from .Rotation import (
+    NormalizeRotation,
+    RotatedCellSize,
+    TransformDirection,
+    TransformLocalPosition,
+)
 from .Geometry import (
     BuildPlacedGate,
     GateAccessPositions,
     GetGateInputAccess,
+    PlacedGate,
     PlacedDesign,
     RectanglesOverlap,
 )
 from ..Routing.Technology import DefaultRedstoneRoutingTechnology
+from ..Routing.Models import (
+    InterClusterChannelLane,
+    InterClusterRoutingChannel,
+)
 from ..Routing.Policy import ClusteringPolicy, NandPackingPolicy, PlacementPolicy
 from ..Routing.Actions.Geometry import BuildPlacedCellGeometry
+from ..Routing.Actions.Geometry import ValidatePlacedCellElectricalIsolation
 from ..Routing.Actions.Validation import (
     BuildPhysicalGraphs,
     ValidatePhysicalRoutes,
     ValidateTemplateIsolation,
 )
 from ..Routing.Failures import (
+    RoutingAssignmentCut,
     RoutingFailure,
     RoutingFailureReason,
     RoutingStageError,
@@ -35,13 +49,762 @@ from ..Routing.Failures import (
 from ..Routing.ResourceGraph import (
     BuildRoutingEnvelope,
     FindClaimConflicts,
+    FindClaimConflictsByResourceIndex,
     FindSelfClaimConflicts,
     LocalRouteClaim,
     NormalizeRoutingEdge,
     RoutingResourceClaims,
     RoutingResourceGraph,
+    RoutingResourceId,
+    RoutingReservation,
     ValidateLocalRouteClaims,
 )
+
+
+# A joint portfolio materializes several retained states of the same completed
+# local cluster layouts.  Retain the expensive slot/orientation beam result
+# within one compiler process; final gate commit, local routing, and exact
+# candidate screening still run independently for every state.
+_JointPlacementSearchCache: dict[
+    tuple[object, ...],
+    dict[str, object],
+] = {}
+_JointPlacementExactScreenCache: dict[
+    tuple[object, ...],
+    "ExactJointPlacementScreen",
+] = {}
+_ExactStatePlacementGeometryCache: dict[
+    tuple[object, ...],
+    tuple["ExactStatePlacedGateGeometry", ...],
+] = {}
+_PackedClusterBaseLayoutCache: dict[
+    tuple[object, ...],
+    tuple[
+        str,
+        int | None,
+        dict[str, str],
+        dict[str, tuple[int, int]],
+        dict[str, int],
+        dict[str, bool],
+        int,
+        int,
+    ],
+] = {}
+_PlacementTopologyCache: dict[
+    tuple[object, ...],
+    tuple[
+        tuple[tuple[str, int], ...],
+        tuple[tuple[str, ...], ...],
+    ],
+] = {}
+_ClusterLocalRouteTemplateCache: dict[
+    tuple[object, ...],
+    "ClusterLocalRouteTemplateCacheEntry",
+] = {}
+
+
+@dataclass(frozen=True)
+class ExactStatePlacedGateGeometry:
+    """Immutable exact-state gate geometry reconstructed from the module."""
+
+    Name: str
+    X: int
+    Y: int
+    Z: int
+    Rotation: int
+    MirrorX: bool
+
+    @classmethod
+    def FromPlacedGate(
+        cls,
+        Gate: PlacedGate,
+    ) -> "ExactStatePlacedGateGeometry":
+        return cls(
+            Name=Gate.Name,
+            X=Gate.X,
+            Y=Gate.Y,
+            Z=Gate.Z,
+            Rotation=Gate.Rotation,
+            MirrorX=Gate.MirrorX,
+        )
+
+    def BuildPlacedGate(
+        self,
+        ModuleGate: Any,
+    ) -> PlacedGate:
+        """Return a fresh mutable placed gate for one cache consumer."""
+        return BuildPlacedGate(
+            ModuleGate,
+            self.X,
+            self.Y,
+            self.Z,
+            self.Rotation,
+            self.MirrorX,
+        )
+
+
+@dataclass(frozen=True)
+class ExactJointPlacementScreen:
+    """Transactional retained-state diagnostics plus reusable core geometry."""
+
+    RetainedStates: tuple[dict[str, object], ...]
+    CoreGeometryByCandidate: tuple[
+        tuple[int, tuple[ExactStatePlacedGateGeometry, ...]],
+        ...,
+    ]
+    MandatoryProfileByCandidate: tuple[
+        tuple[int, "MandatoryAccessConflictProfile"],
+        ...,
+    ] = ()
+
+    def CoreGeometry(
+        self,
+        CandidateIndex: int,
+    ) -> tuple[ExactStatePlacedGateGeometry, ...] | None:
+        """Return one retained state's immutable NAND-only geometry."""
+        return next(
+            (
+                Geometry
+                for Index, Geometry in self.CoreGeometryByCandidate
+                if Index == CandidateIndex
+            ),
+            None,
+        )
+
+    def MandatoryProfile(
+        self,
+        CandidateIndex: int,
+    ) -> "MandatoryAccessConflictProfile | None":
+        """Return the cached NAND-only mandatory-access screen."""
+        return next(
+            (
+                Profile
+                for Index, Profile in self.MandatoryProfileByCandidate
+                if Index == CandidateIndex
+            ),
+            None,
+        )
+
+
+@dataclass(frozen=True)
+class PlacementConstraintObservation:
+    """Name-bearing diagnostic evidence for one heuristic interface cut."""
+
+    Signals: tuple[str, ...]
+    ObservationCount: int = 1
+    ObservationFingerprints: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        CanonicalSignals = tuple(sorted(set(map(str, self.Signals))))
+        if len(CanonicalSignals) < 2:
+            raise ValueError(
+                "PlacementConstraintObservation requires two signals"
+            )
+        if self.ObservationCount < 1:
+            raise ValueError("ObservationCount must be positive")
+        object.__setattr__(self, "Signals", CanonicalSignals)
+        object.__setattr__(
+            self,
+            "ObservationFingerprints",
+            tuple(sorted(set(map(str, self.ObservationFingerprints)))),
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signals": list(self.Signals),
+            "ObservationCount": self.ObservationCount,
+            "ObservationFingerprints": list(
+                self.ObservationFingerprints
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PlacementAssignmentConstraintSet:
+    """Canonical placement-scoring constraints learned from exact cuts."""
+
+    PairwiseConflictEdges: tuple[tuple[str, str], ...] = ()
+    HigherOrderSignalSets: tuple[tuple[str, ...], ...] = ()
+    ObservedInterfaceConflictEdges: tuple[tuple[str, str], ...] = ()
+    HigherOrderSignalEvidence: tuple[
+        PlacementConstraintObservation, ...
+    ] = ()
+    ObservedInterfaceConflictEvidence: tuple[
+        PlacementConstraintObservation, ...
+    ] = ()
+    ActiveHigherOrderSignalSets: tuple[tuple[str, ...], ...] = ()
+    ActiveObservedInterfaceConflictEdges: tuple[
+        tuple[str, str], ...
+    ] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "PairwiseConflictEdges",
+            tuple(sorted({
+                tuple(sorted((str(First), str(Second))))
+                for First, Second in self.PairwiseConflictEdges
+                if str(First) != str(Second)
+            })),
+        )
+        object.__setattr__(
+            self,
+            "HigherOrderSignalSets",
+            tuple(sorted({
+                tuple(sorted({str(Signal) for Signal in Signals}))
+                for Signals in self.HigherOrderSignalSets
+                if len(set(map(str, Signals))) >= 2
+            })),
+        )
+        object.__setattr__(
+            self,
+            "ObservedInterfaceConflictEdges",
+            tuple(sorted({
+                tuple(sorted((str(First), str(Second))))
+                for First, Second in self.ObservedInterfaceConflictEdges
+                if str(First) != str(Second)
+            })),
+        )
+        object.__setattr__(
+            self,
+            "HigherOrderSignalEvidence",
+            tuple(sorted(
+                {
+                    Observation.Signals: Observation
+                    for Observation in self.HigherOrderSignalEvidence
+                }.values(),
+                key=lambda Observation: Observation.Signals,
+            )),
+        )
+        object.__setattr__(
+            self,
+            "ObservedInterfaceConflictEvidence",
+            tuple(sorted(
+                {
+                    Observation.Signals: Observation
+                    for Observation
+                    in self.ObservedInterfaceConflictEvidence
+                }.values(),
+                key=lambda Observation: Observation.Signals,
+            )),
+        )
+        object.__setattr__(
+            self,
+            "ActiveHigherOrderSignalSets",
+            tuple(sorted({
+                tuple(sorted(set(map(str, Signals))))
+                for Signals in self.ActiveHigherOrderSignalSets
+                if len(set(map(str, Signals))) >= 2
+            })),
+        )
+        object.__setattr__(
+            self,
+            "ActiveObservedInterfaceConflictEdges",
+            tuple(sorted({
+                tuple(sorted((str(First), str(Second))))
+                for First, Second
+                in self.ActiveObservedInterfaceConflictEdges
+                if str(First) != str(Second)
+            })),
+        )
+
+    @property
+    def Fingerprint(self) -> str:
+        return sha256(repr((
+            self.PairwiseConflictEdges,
+            self.HigherOrderSignalSets,
+            self.ObservedInterfaceConflictEdges,
+            tuple(
+                (
+                    Observation.Signals,
+                    Observation.ObservationCount,
+                )
+                for Observation in self.HigherOrderSignalEvidence
+            ),
+            tuple(
+                (
+                    Observation.Signals,
+                    Observation.ObservationCount,
+                )
+                for Observation
+                in self.ObservedInterfaceConflictEvidence
+            ),
+        )).encode("utf-8")).hexdigest()
+
+    @property
+    def HasActivePlacementConstraints(self) -> bool:
+        """Return whether hard or recurrent evidence changes placement."""
+        return bool(
+            self.PairwiseConflictEdges
+            or self.ActiveHigherOrderSignalSets
+            or self.ActiveObservedInterfaceConflictEdges
+        )
+
+    def WithCut(
+        self,
+        AssignmentCut: RoutingAssignmentCut | None,
+    ) -> "PlacementAssignmentConstraintSet":
+        """Return this immutable set plus one exact cut's placement demands."""
+        if AssignmentCut is None:
+            return self
+        PairwiseEdges = BuildEffectiveAssignmentCutPairwiseEdges(
+            AssignmentCut
+        )
+        CurrentObservedEdges = tuple(sorted({
+            tuple(sorted(map(str, Edge)))
+            for Edge in AssignmentCut.ConflictGraph.get(
+                "ObservedPatternConflictEdges",
+                (),
+            )
+            if (
+                isinstance(Edge, tuple | list)
+                and len(Edge) == 2
+                and str(Edge[0]) != str(Edge[1])
+            )
+        }))
+        CurrentHigherOrderSignalSets: tuple[tuple[str, ...], ...] = ()
+        if AssignmentCut.Classification.value in {
+            "saturated-boundary-cut",
+            "higher-order-placement-conflict",
+            "larger-matching-failure",
+            "multi-pair-placement-conflict",
+            "relocated-higher-order-conflict",
+            "relocated-larger-matching-failure",
+            "relocated-multi-pair-conflict",
+            "relocated-pairwise-incompatibility",
+        }:
+            Signals = (
+                AssignmentCut.PriorityRelocationSignals
+                or AssignmentCut.RelocationSignals
+                or AssignmentCut.ConflictSignals
+            )
+            if len(Signals) >= 2:
+                CurrentHigherOrderSignalSets = (
+                    tuple(sorted(set(map(str, Signals)))),
+                )
+
+        ObservationFingerprint = sha256(repr((
+            AssignmentCut.Classification.value,
+            AssignmentCut.ConflictFingerprint,
+            AssignmentCut.MandatoryAccessOwnershipFingerprint,
+            AssignmentCut.SourceCandidateId,
+            AssignmentCut.ConflictGraphJson,
+        )).encode("utf-8")).hexdigest()
+
+        def UpdateEvidence(
+            Existing: tuple[PlacementConstraintObservation, ...],
+            ExistingActive: tuple[tuple[str, ...], ...],
+            Current: tuple[tuple[str, ...], ...],
+        ) -> tuple[PlacementConstraintObservation, ...]:
+            EvidenceBySignals = {
+                Observation.Signals: Observation
+                for Observation in Existing
+            }
+            for Signals in ExistingActive:
+                Canonical = tuple(sorted(set(map(str, Signals))))
+                if len(Canonical) < 2 or Canonical in EvidenceBySignals:
+                    continue
+                EvidenceBySignals[Canonical] = (
+                    PlacementConstraintObservation(
+                        Signals=Canonical,
+                        ObservationCount=1,
+                        ObservationFingerprints=(),
+                    )
+                )
+            for Signals in Current:
+                Prior = EvidenceBySignals.get(Signals)
+                PriorFingerprints = (
+                    Prior.ObservationFingerprints
+                    if Prior is not None
+                    else ()
+                )
+                IsNewObservation = (
+                    ObservationFingerprint not in PriorFingerprints
+                )
+                EvidenceBySignals[Signals] = (
+                    PlacementConstraintObservation(
+                        Signals=Signals,
+                        ObservationCount=(
+                            1
+                            if Prior is None
+                            else (
+                                Prior.ObservationCount + 1
+                                if IsNewObservation
+                                else Prior.ObservationCount
+                            )
+                        ),
+                        ObservationFingerprints=(
+                            *PriorFingerprints,
+                            ObservationFingerprint,
+                        ),
+                    )
+                )
+            return tuple(sorted(
+                EvidenceBySignals.values(),
+                key=lambda Observation: Observation.Signals,
+            ))
+
+        HigherOrderEvidence = UpdateEvidence(
+            self.HigherOrderSignalEvidence,
+            self.HigherOrderSignalSets,
+            CurrentHigherOrderSignalSets,
+        )
+        if CurrentHigherOrderSignalSets:
+            # Exact higher-order cores can change by one peripheral signal
+            # after each access-distinct relocation while retaining the same
+            # congested interface nucleus.  Learn one bounded recurrent
+            # intersection from distinct authoritative observations instead
+            # of requiring the complete name-bearing set to repeat exactly.
+            # Three signals are required so an overlap remains a hyperedge,
+            # never an inferred capacity-one pair.
+            OverlapCandidates: list[
+                tuple[
+                    int,
+                    int,
+                    tuple[str, ...],
+                    tuple[str, ...],
+                ]
+            ] = []
+            for CurrentSignals in CurrentHigherOrderSignalSets:
+                CurrentSet = frozenset(CurrentSignals)
+                for Prior in self.HigherOrderSignalEvidence:
+                    SupportingFingerprints = tuple(sorted({
+                        *Prior.ObservationFingerprints,
+                        ObservationFingerprint,
+                    }))
+                    if len(SupportingFingerprints) < 2:
+                        continue
+                    Overlap = tuple(sorted(
+                        CurrentSet.intersection(Prior.Signals)
+                    ))
+                    if len(Overlap) < 3:
+                        continue
+                    OverlapCandidates.append((
+                        -len(SupportingFingerprints),
+                        -len(Overlap),
+                        Overlap,
+                        SupportingFingerprints,
+                    ))
+            if OverlapCandidates:
+                (
+                    _NegativeSupport,
+                    _NegativeSize,
+                    RecurrentOverlap,
+                    SupportingFingerprints,
+                ) = min(OverlapCandidates)
+                EvidenceBySignals = {
+                    Observation.Signals: Observation
+                    for Observation in HigherOrderEvidence
+                }
+                PriorOverlap = EvidenceBySignals.get(
+                    RecurrentOverlap
+                )
+                CombinedFingerprints = tuple(sorted({
+                    *(
+                        PriorOverlap.ObservationFingerprints
+                        if PriorOverlap is not None
+                        else ()
+                    ),
+                    *SupportingFingerprints,
+                }))
+                EvidenceBySignals[RecurrentOverlap] = (
+                    PlacementConstraintObservation(
+                        Signals=RecurrentOverlap,
+                        ObservationCount=max(
+                            (
+                                PriorOverlap.ObservationCount
+                                if PriorOverlap is not None
+                                else 0
+                            ),
+                            len(CombinedFingerprints),
+                        ),
+                        ObservationFingerprints=CombinedFingerprints,
+                    )
+                )
+                HigherOrderEvidence = tuple(sorted(
+                    EvidenceBySignals.values(),
+                    key=lambda Observation: Observation.Signals,
+                ))
+        ObservedInterfaceEvidence = UpdateEvidence(
+            self.ObservedInterfaceConflictEvidence,
+            self.ObservedInterfaceConflictEdges,
+            CurrentObservedEdges,
+        )
+        def RecurrentWorkingSet(
+            Evidence: tuple[PlacementConstraintObservation, ...],
+        ) -> tuple[tuple[str, ...], ...]:
+            return tuple(sorted({
+                Observation.Signals
+                for Observation in Evidence
+                if Observation.ObservationCount >= 2
+            }))
+
+        ActiveHigherOrderSignalSets = RecurrentWorkingSet(
+            HigherOrderEvidence,
+        )
+        ActiveObservedInterfaceConflictEdges = RecurrentWorkingSet(
+            ObservedInterfaceEvidence,
+        )
+        return PlacementAssignmentConstraintSet(
+            PairwiseConflictEdges=(
+                *self.PairwiseConflictEdges,
+                *PairwiseEdges,
+            ),
+            HigherOrderSignalSets=(
+                *self.HigherOrderSignalSets,
+                *CurrentHigherOrderSignalSets,
+            ),
+            ObservedInterfaceConflictEdges=(
+                *self.ObservedInterfaceConflictEdges,
+                *CurrentObservedEdges,
+            ),
+            HigherOrderSignalEvidence=HigherOrderEvidence,
+            ObservedInterfaceConflictEvidence=(
+                ObservedInterfaceEvidence
+            ),
+            ActiveHigherOrderSignalSets=(
+                ActiveHigherOrderSignalSets
+            ),
+            ActiveObservedInterfaceConflictEdges=(
+                ActiveObservedInterfaceConflictEdges
+            ),
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Fingerprint": self.Fingerprint,
+            "PairwiseConflictEdges": [
+                list(Edge) for Edge in self.PairwiseConflictEdges
+            ],
+            "HigherOrderSignalSets": [
+                list(Signals) for Signals in self.HigherOrderSignalSets
+            ],
+            "ObservedInterfaceConflictEdges": [
+                list(Edge)
+                for Edge in self.ObservedInterfaceConflictEdges
+            ],
+            "HigherOrderSignalEvidence": [
+                Observation.ToDictionary()
+                for Observation in self.HigherOrderSignalEvidence
+            ],
+            "ObservedInterfaceConflictEvidence": [
+                Observation.ToDictionary()
+                for Observation
+                in self.ObservedInterfaceConflictEvidence
+            ],
+            "ActiveHigherOrderSignalSets": [
+                list(Signals)
+                for Signals in self.ActiveHigherOrderSignalSets
+            ],
+            "ActiveObservedInterfaceConflictEdges": [
+                list(Edge)
+                for Edge in self.ActiveObservedInterfaceConflictEdges
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class PlacementConstraintWorkingSet:
+    """Recurrent constraints that can interact with the current cut."""
+
+    PairwiseConflictEdges: tuple[tuple[str, str], ...] = ()
+    HigherOrderSignalSets: tuple[tuple[str, ...], ...] = ()
+    ObservedInterfaceConflictEdges: tuple[tuple[str, str], ...] = ()
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "PairwiseConflictEdges": [
+                list(Edge) for Edge in self.PairwiseConflictEdges
+            ],
+            "HigherOrderSignalSets": [
+                list(Signals) for Signals in self.HigherOrderSignalSets
+            ],
+            "ObservedInterfaceConflictEdges": [
+                list(Edge) for Edge in self.ObservedInterfaceConflictEdges
+            ],
+        }
+
+
+def SelectPlacementConstraintWorkingSet(
+    AssignmentCut: RoutingAssignmentCut | None,
+    Constraints: PlacementAssignmentConstraintSet,
+    FrontierAssignmentCuts: Iterable[RoutingAssignmentCut] = (),
+    *,
+    ExpandConnectedComponent: bool = False,
+) -> PlacementConstraintWorkingSet:
+    """Select bounded recurrent pressure for a cut-scoped move.
+
+    Exact pair constraints remain globally hard elsewhere. Recurrent heuristic
+    constraints enter this working set only when they share a signal with the
+    current authoritative cut or its explicitly bounded frontier. A cut-scoped
+    move can therefore avoid reopening the immediately preceding interface
+    without turning every historical observation into a design-wide search.
+    """
+    BoundedCompleteProofSignals = (
+        frozenset(AssignmentCut.PriorityRelocationSignals)
+        if (
+            AssignmentCut is not None
+            and AssignmentCut.CompleteAssignmentCutProof
+            and AssignmentCut.PriorityRelocationSignals
+        )
+        else frozenset()
+    )
+    ActiveCuts = tuple(
+        Cut
+        for Cut in (
+            *((AssignmentCut,) if AssignmentCut is not None else ()),
+            *(
+                ()
+                if BoundedCompleteProofSignals
+                else FrontierAssignmentCuts
+            ),
+        )
+        if Cut is not None
+    )
+    CurrentSignals = (
+        BoundedCompleteProofSignals
+        or frozenset(
+            Signal
+            for Cut in ActiveCuts
+            for Signal in (
+                *Cut.ConflictSignals,
+                *Cut.RelocationSignals,
+                *Cut.PriorityRelocationSignals,
+                *Cut.NoCandidateSignals,
+                *(
+                    Signal
+                    for Edge in Cut.PairwiseConflictEdges
+                    for Signal in Edge
+                ),
+            )
+        )
+    )
+    if not CurrentSignals:
+        return PlacementConstraintWorkingSet(
+            PairwiseConflictEdges=Constraints.PairwiseConflictEdges,
+            HigherOrderSignalSets=(
+                Constraints.ActiveHigherOrderSignalSets
+            ),
+            ObservedInterfaceConflictEdges=(
+                Constraints.ActiveObservedInterfaceConflictEdges
+            ),
+        )
+    WorkingSignals = set(CurrentSignals)
+    if ExpandConnectedComponent and not BoundedCompleteProofSignals:
+        ConstraintSignalSets = (
+            *Constraints.PairwiseConflictEdges,
+            *Constraints.ActiveHigherOrderSignalSets,
+            *Constraints.ActiveObservedInterfaceConflictEdges,
+        )
+        Changed = True
+        while Changed:
+            Changed = False
+            for Signals in ConstraintSignalSets:
+                SignalSet = set(map(str, Signals))
+                if (
+                    WorkingSignals.intersection(SignalSet)
+                    and not SignalSet.issubset(WorkingSignals)
+                ):
+                    WorkingSignals.update(SignalSet)
+                    Changed = True
+    return PlacementConstraintWorkingSet(
+        PairwiseConflictEdges=tuple(
+            Edge
+            for Edge in Constraints.PairwiseConflictEdges
+            if (
+                set(Edge).issubset(WorkingSignals)
+                if BoundedCompleteProofSignals
+                else WorkingSignals.intersection(Edge)
+            )
+        ),
+        HigherOrderSignalSets=tuple(
+            Signals
+            for Signals in Constraints.ActiveHigherOrderSignalSets
+            if (
+                set(Signals).issubset(WorkingSignals)
+                if BoundedCompleteProofSignals
+                else WorkingSignals.intersection(Signals)
+            )
+        ),
+        ObservedInterfaceConflictEdges=tuple(
+            Edge
+            for Edge in Constraints.ActiveObservedInterfaceConflictEdges
+            if (
+                set(Edge).issubset(WorkingSignals)
+                if BoundedCompleteProofSignals
+                else WorkingSignals.intersection(Edge)
+            )
+        ),
+    )
+
+
+def BuildAssignmentCutHigherOrderSignalSet(
+    AssignmentCut: RoutingAssignmentCut | None,
+) -> tuple[str, ...]:
+    """Project one non-pair authoritative cut into a stable signal set."""
+    if AssignmentCut is None:
+        return ()
+    PairwiseEdges = BuildEffectiveAssignmentCutPairwiseEdges(AssignmentCut)
+    Signals = tuple(sorted(set(map(str, (
+        AssignmentCut.PriorityRelocationSignals
+        or AssignmentCut.RelocationSignals
+        or AssignmentCut.ConflictSignals
+    )))))
+    return Signals if not PairwiseEdges and len(Signals) >= 2 else ()
+
+
+def BuildJointPlacementSearchCacheKey(
+    Module: Any,
+    Clusters: list[list[str]] | tuple[tuple[str, ...], ...],
+    BaseAssignment: dict[int, tuple[int, int]],
+    BeamWidth: int,
+    PassLimit: int,
+    RetainedCandidateCount: int,
+    AssignmentCut: RoutingAssignmentCut | None = None,
+    AssignmentConstraints: PlacementAssignmentConstraintSet = (
+        PlacementAssignmentConstraintSet()
+    ),
+    EnableClusterInterfacePlacementFeasibility: bool = False,
+    FocusedOptimizationClusters: frozenset[int] | None = None,
+    FrontierAssignmentCuts: Iterable[RoutingAssignmentCut] = (),
+) -> tuple[object, ...]:
+    """Build the immutable joint-search identity, including exact cut work."""
+    AssignmentCutKey = (
+        (
+            AssignmentCut.ConflictFingerprint,
+            AssignmentCut.EffectiveWorkFingerprint,
+            AssignmentCut.MandatoryAccessOwnershipFingerprint,
+            AssignmentCut.AuthoritativeAccessDomainFingerprint,
+            sha256(
+                AssignmentCut.ConflictGraphJson.encode("utf-8")
+            ).hexdigest()[:16],
+        )
+        if AssignmentCut is not None
+        else ("", "", "", "", "")
+    )
+    return (
+        id(Module),
+        tuple(tuple(Names) for Names in Clusters),
+        tuple(sorted(BaseAssignment.items())),
+        BeamWidth,
+        PassLimit,
+        RetainedCandidateCount,
+        EnableClusterInterfacePlacementFeasibility,
+        (
+            tuple(sorted(FocusedOptimizationClusters))
+            if FocusedOptimizationClusters
+            else ()
+        ),
+        tuple(
+            (
+                Cut.ConflictFingerprint,
+                Cut.EffectiveWorkFingerprint,
+            )
+            for Cut in FrontierAssignmentCuts
+        ),
+        AssignmentCutKey,
+        AssignmentConstraints.Fingerprint,
+    )
 
 
 @dataclass(frozen=True)
@@ -199,6 +962,882 @@ class InterClusterBoundaryDemand:
 
 
 @dataclass(frozen=True)
+class ClusterBoundaryBundle:
+    """One logical producer/consumer cluster interface contract."""
+
+    SourceCluster: int
+    TargetCluster: int
+    Signals: tuple[str, ...]
+    FanoutEndpoints: int
+
+    @property
+    def RequiredCorridorLanes(self) -> int:
+        """Reserve one lane for each distinct crossing signal."""
+        return len(self.Signals)
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SourceCluster": self.SourceCluster,
+            "TargetCluster": self.TargetCluster,
+            "Signals": list(self.Signals),
+            "FanoutEndpoints": self.FanoutEndpoints,
+            "RequiredCorridorLanes": self.RequiredCorridorLanes,
+        }
+
+
+@dataclass(frozen=True)
+class CutDrivenClusterRefinementProfile:
+    """Bounded structural cohesion applied only to reported exact-cut nets."""
+
+    Signals: tuple[str, ...]
+    EdgeWeight: int
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SignalCount": len(self.Signals),
+            "EdgeWeight": self.EdgeWeight,
+            "StructuralFingerprint": sha256(repr((
+                len(self.Signals),
+                self.EdgeWeight,
+            )).encode("utf-8")).hexdigest(),
+        }
+
+
+@dataclass(frozen=True)
+class ClusterBoundaryContractScore:
+    """Topology-only capacity score for a tentative cluster-slot assignment."""
+
+    PeakBoundaryDemand: int
+    TotalBoundaryDemand: int
+    OverflowLanes: int
+
+    def ToDictionary(self) -> dict[str, int]:
+        return {
+            "PeakBoundaryDemand": self.PeakBoundaryDemand,
+            "TotalBoundaryDemand": self.TotalBoundaryDemand,
+            "OverflowLanes": self.OverflowLanes,
+        }
+
+
+@dataclass(frozen=True)
+class ClusterInterfacePlacementPattern:
+    """Topology-only boundary-bank ownership for one tentative placement."""
+
+    SignalBanks: tuple[
+        tuple[str, tuple[tuple[int, int, str, str, int, bool], ...]],
+        ...,
+    ]
+    OwnershipFingerprint: str
+
+    def BanksBySignal(
+        self,
+    ) -> dict[str, frozenset[tuple[int, int, str]]]:
+        """Return physical slot-side banks while omitting diagnostic traits."""
+        return {
+            Signal: frozenset(
+                (Column, Row, Side)
+                for Column, Row, Side, _Role, _Rotation, _MirrorX in Banks
+            )
+            for Signal, Banks in self.SignalBanks
+        }
+
+
+@dataclass(frozen=True)
+class ClusterInterfaceTopology:
+    """Immutable signal-to-cluster interface model reused by a placement beam."""
+
+    SignalEndpoints: tuple[
+        tuple[str, int | None, tuple[int, ...], bool],
+        ...,
+    ]
+
+
+def BuildClusterInterfaceTopology(
+    Module: Any,
+    Clusters: tuple[tuple[str, ...], ...],
+    Signals: Iterable[str] | None = None,
+) -> ClusterInterfaceTopology:
+    """Build endpoint topology for selected signals or every interface."""
+    SelectedSignals = (
+        frozenset(map(str, Signals))
+        if Signals is not None
+        else None
+    )
+    ClusterByGate = {
+        GateName: ClusterIndex
+        for ClusterIndex, Names in enumerate(Clusters)
+        for GateName in Names
+    }
+    ProducerBySignal = {
+        Signal: Gate
+        for Gate in Module.Gates
+        for Signal in Gate.Outputs
+        if SelectedSignals is None or Signal in SelectedSignals
+    }
+    ConsumersBySignal: dict[str, list[Any]] = {}
+    for Gate in Module.Gates:
+        for Signal in Gate.Inputs:
+            if SelectedSignals is not None and Signal not in SelectedSignals:
+                continue
+            ConsumersBySignal.setdefault(Signal, []).append(Gate)
+    SignalNames = tuple(sorted({
+        *ProducerBySignal,
+        *ConsumersBySignal,
+    }))
+    return ClusterInterfaceTopology(SignalEndpoints=tuple(
+        (
+            Signal,
+            (
+                ClusterByGate.get(ProducerBySignal[Signal].Name)
+                if Signal in ProducerBySignal
+                else None
+            ),
+            tuple(sorted({
+                ClusterByGate[Consumer.Name]
+                for Consumer in ConsumersBySignal.get(Signal, ())
+                if Consumer.Name in ClusterByGate
+            })),
+            any(
+                (
+                    Consumer.Kind.value
+                    if hasattr(Consumer.Kind, "value")
+                    else str(Consumer.Kind)
+                ) == "OUTPUT"
+                for Consumer in ConsumersBySignal.get(Signal, ())
+            ),
+        )
+        for Signal in SignalNames
+    ))
+
+
+@dataclass(frozen=True)
+class ClusterInterfacePlacementScore:
+    """Exact-cut score derived from tentative cluster boundary ownership."""
+
+    PairBankConflicts: int
+    HigherOrderBankPressure: int
+    HigherOrderPeakBankDemand: int
+    HigherOrderBankExcessDemand: int
+    HigherOrderOverloadedBankCount: int
+    FacingMismatches: int
+    Pattern: ClusterInterfacePlacementPattern
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "PairBankConflicts": self.PairBankConflicts,
+            "HigherOrderBankPressure": self.HigherOrderBankPressure,
+            "HigherOrderPeakBankDemand": (
+                self.HigherOrderPeakBankDemand
+            ),
+            "HigherOrderBankExcessDemand": (
+                self.HigherOrderBankExcessDemand
+            ),
+            "HigherOrderOverloadedBankCount": (
+                self.HigherOrderOverloadedBankCount
+            ),
+            "FacingMismatches": self.FacingMismatches,
+            "SignalCount": len(self.Pattern.SignalBanks),
+            "OwnershipFingerprint": self.Pattern.OwnershipFingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class HigherOrderPhysicalBankDemandScore:
+    """Aggregate capacity pressure for reported higher-order interface cuts."""
+
+    CollisionPairs: int = 0
+    PeakDemand: int = 0
+    ExcessDemand: int = 0
+    OverloadedBankCount: int = 0
+
+
+def ClusterBoundaryCorridorKey(
+    Bank: tuple[int, int, str],
+) -> tuple[int, int, str]:
+    """Return the shared grid boundary reached through one cluster-side bank."""
+    Column, Row, Side = Bank
+    if Side == "East":
+        return Column, Row, "Vertical"
+    if Side == "West":
+        return Column - 1, Row, "Vertical"
+    if Side == "South":
+        return Column, Row, "Horizontal"
+    if Side == "North":
+        return Column, Row - 1, "Horizontal"
+    raise ValueError(f"Unknown cluster boundary side: {Side}")
+
+
+def ScoreHigherOrderPhysicalBankDemand(
+    PhysicalBanksBySignal: dict[
+        str,
+        frozenset[tuple[int, int, str]],
+    ],
+    HigherOrderConflictSets: Iterable[Iterable[str]],
+) -> HigherOrderPhysicalBankDemandScore:
+    """Measure total cut concentration on topology-derived physical banks.
+
+    A maximum-only score cannot distinguish one shared bank from several
+    simultaneously shared banks.  Sum pair collisions so concentration grows
+    quadratically, then retain peak/excess/overloaded-bank diagnostics for
+    deterministic lexicographic placement ranking.
+    """
+    CollisionPairs = 0
+    PeakDemand = 0
+    ExcessDemand = 0
+    OverloadedBankCount = 0
+    CanonicalConflictSets = tuple(sorted({
+        tuple(sorted(set(map(str, Signals))))
+        for Signals in HigherOrderConflictSets
+        if len(set(map(str, Signals))) >= 3
+    }))
+    for Signals in CanonicalConflictSets:
+        CandidateBanks = {
+            Bank
+            for Signal in Signals
+            for Bank in PhysicalBanksBySignal.get(
+                Signal,
+                frozenset(),
+            )
+        }
+        for Bank in CandidateBanks:
+            Demand = sum(
+                Bank
+                in PhysicalBanksBySignal.get(
+                    Signal,
+                    frozenset(),
+                )
+                for Signal in Signals
+            )
+            PeakDemand = max(PeakDemand, Demand)
+            if Demand <= 1:
+                continue
+            CollisionPairs += Demand * (Demand - 1) // 2
+            ExcessDemand += Demand - 1
+            OverloadedBankCount += 1
+    return HigherOrderPhysicalBankDemandScore(
+        CollisionPairs=CollisionPairs,
+        PeakDemand=PeakDemand,
+        ExcessDemand=ExcessDemand,
+        OverloadedBankCount=OverloadedBankCount,
+    )
+
+
+def ScoreClusterInterfaceFacingMismatches(
+    Topology: ClusterInterfaceTopology,
+    Assignment: Mapping[int, tuple[int, int]],
+    Variants: Mapping[int, ClusterLayoutVariant],
+) -> int:
+    """Count all interface pins that face away from their destination bank.
+
+    This is the hot-path component of cluster-interface scoring.  It avoids
+    constructing signal ownership sets and fingerprints for every beam state;
+    the complete pattern is still built for the retained diagnostic states.
+    """
+    def BoundarySide(
+        FromSlot: tuple[int, int],
+        ToSlot: tuple[int, int],
+    ) -> str:
+        DeltaColumn = ToSlot[0] - FromSlot[0]
+        DeltaRow = ToSlot[1] - FromSlot[1]
+        if abs(DeltaColumn) >= abs(DeltaRow):
+            return "East" if DeltaColumn >= 0 else "West"
+        return "South" if DeltaRow >= 0 else "North"
+
+    def OppositeBoundarySide(Side: str) -> str:
+        return {
+            "East": "West",
+            "West": "East",
+            "North": "South",
+            "South": "North",
+        }[Side]
+
+    Directions = {
+        "East": (1, 0, 0),
+        "West": (-1, 0, 0),
+        "North": (0, 0, -1),
+        "South": (0, 0, 1),
+    }
+    Mismatches = 0
+
+    def AddInterface(
+        ClusterIndex: int,
+        Side: str,
+        Role: str,
+    ) -> None:
+        nonlocal Mismatches
+        Variant = Variants[ClusterIndex]
+        PinDirection = TransformDirection(
+            (0, 0, 1) if Role == "Source" else (0, 0, -1),
+            Variant.Rotation,
+            Variant.MirrorX,
+        )
+        BoundaryDirection = Directions[Side]
+        if (
+            PinDirection[0] * BoundaryDirection[0]
+            + PinDirection[2] * BoundaryDirection[2]
+            <= 0
+        ):
+            Mismatches += 1
+
+    for (
+        _Signal,
+        SourceCluster,
+        TargetClusters,
+        HasExternalTarget,
+    ) in Topology.SignalEndpoints:
+        if SourceCluster is not None:
+            for TargetCluster in TargetClusters:
+                if TargetCluster == SourceCluster:
+                    continue
+                SourceSide = BoundarySide(
+                    Assignment[SourceCluster],
+                    Assignment[TargetCluster],
+                )
+                AddInterface(SourceCluster, SourceSide, "Source")
+                AddInterface(
+                    TargetCluster,
+                    OppositeBoundarySide(SourceSide),
+                    "Target",
+                )
+            if HasExternalTarget:
+                AddInterface(SourceCluster, "East", "Source")
+        else:
+            for TargetCluster in TargetClusters:
+                AddInterface(TargetCluster, "West", "Target")
+    return Mismatches
+
+
+def ScoreClusterInterfacePlacement(
+    Module: Any,
+    Clusters: tuple[tuple[str, ...], ...],
+    Assignment: dict[int, tuple[int, int]],
+    Variants: dict[int, ClusterLayoutVariant],
+    PairwiseConflictEdges: Iterable[tuple[str, str]] = (),
+    HigherOrderConflictSets: Iterable[Iterable[str]] = (),
+    Topology: ClusterInterfaceTopology | None = None,
+) -> ClusterInterfacePlacementScore:
+    """Score cut-signal ownership of topology-derived cluster pin banks.
+
+    This is deliberately a placement model rather than a portal generator.
+    It proves whether a reported capacity-one pair is still being presented
+    to the same cluster boundary bank.  The authoritative router remains the
+    sole judge of concrete portal and electrical legality.
+    """
+    PairwiseConflictEdges = tuple({
+        tuple(sorted((str(First), str(Second))))
+        for First, Second in PairwiseConflictEdges
+        if str(First) != str(Second)
+    })
+    HigherOrderConflictSets = tuple(sorted({
+        tuple(sorted(set(map(str, Signals))))
+        for Signals in HigherOrderConflictSets
+        if len(set(map(str, Signals))) >= 3
+    }))
+    if Topology is None:
+        Topology = BuildClusterInterfaceTopology(
+            Module,
+            Clusters,
+            ({
+                Signal
+                for Edge in PairwiseConflictEdges
+                for Signal in Edge
+            } | {
+                Signal
+                for Signals in HigherOrderConflictSets
+                for Signal in Signals
+            }) or None,
+        )
+
+    def BoundarySide(
+        FromSlot: tuple[int, int],
+        ToSlot: tuple[int, int],
+    ) -> str:
+        DeltaColumn = ToSlot[0] - FromSlot[0]
+        DeltaRow = ToSlot[1] - FromSlot[1]
+        if abs(DeltaColumn) >= abs(DeltaRow):
+            return "East" if DeltaColumn >= 0 else "West"
+        return "South" if DeltaRow >= 0 else "North"
+
+    def OppositeBoundarySide(Side: str) -> str:
+        return {
+            "East": "West",
+            "West": "East",
+            "North": "South",
+            "South": "North",
+        }[Side]
+
+    def DirectionForSide(Side: str) -> tuple[int, int, int]:
+        return {
+            "East": (1, 0, 0),
+            "West": (-1, 0, 0),
+            "North": (0, 0, -1),
+            "South": (0, 0, 1),
+        }[Side]
+
+    BanksBySignal: dict[
+        str,
+        set[tuple[int, int, str, str, int, bool]],
+    ] = {}
+    FacingMismatches = 0
+    for (
+        Signal,
+        SourceCluster,
+        TargetClusters,
+        HasExternalTarget,
+    ) in Topology.SignalEndpoints:
+        HasExternalSource = SourceCluster is None
+        Banks = BanksBySignal.setdefault(Signal, set())
+
+        def AddBank(
+            ClusterIndex: int,
+            Side: str,
+            Role: str,
+        ) -> None:
+            nonlocal FacingMismatches
+            Slot = Assignment[ClusterIndex]
+            Variant = Variants[ClusterIndex]
+            Banks.add((
+                Slot[0],
+                Slot[1],
+                Side,
+                Role,
+                Variant.Rotation,
+                Variant.MirrorX,
+            ))
+            PinDirection = TransformDirection(
+                (0, 0, 1) if Role == "Source" else (0, 0, -1),
+                Variant.Rotation,
+                Variant.MirrorX,
+            )
+            BoundaryDirection = DirectionForSide(Side)
+            if (
+                PinDirection[0] * BoundaryDirection[0]
+                + PinDirection[2] * BoundaryDirection[2]
+                <= 0
+            ):
+                FacingMismatches += 1
+
+        if SourceCluster is not None:
+            for TargetCluster in TargetClusters:
+                if TargetCluster == SourceCluster:
+                    continue
+                SourceSide = BoundarySide(
+                    Assignment[SourceCluster],
+                    Assignment[TargetCluster],
+                )
+                AddBank(SourceCluster, SourceSide, "Source")
+                AddBank(
+                    TargetCluster,
+                    OppositeBoundarySide(SourceSide),
+                    "Target",
+                )
+            if HasExternalTarget:
+                AddBank(SourceCluster, "East", "Source")
+        elif HasExternalSource:
+            for TargetCluster in TargetClusters:
+                AddBank(TargetCluster, "West", "Target")
+
+    SignalBanks = tuple(
+        (Signal, tuple(sorted(Banks)))
+        for Signal, Banks in sorted(BanksBySignal.items())
+        if Banks
+    )
+    # Names select the cut endpoints, but never enter the topology identity.
+    # Slot coordinates plus rigid transforms make renamed/reordered modules
+    # produce the same ownership fingerprint.
+    StructuralOwnership = tuple(sorted(
+        Banks for _Signal, Banks in SignalBanks
+    ))
+    Pattern = ClusterInterfacePlacementPattern(
+        SignalBanks=SignalBanks,
+        OwnershipFingerprint=sha256(
+            repr(StructuralOwnership).encode("utf-8")
+        ).hexdigest(),
+    )
+    OwnershipBanksBySignal = Pattern.BanksBySignal()
+    # Role and transform describe ownership identity, but the physical side of
+    # one occupied cluster slot is the shared capacity resource.  Collapse
+    # source/target roles before scoring so opposite endpoint roles cannot
+    # hide competition for the same pin bank.
+    PhysicalBanksBySignal = {
+        Signal: frozenset(
+            (Bank[0], Bank[1], Bank[2])
+            for Bank in Banks
+        )
+        for Signal, Banks in OwnershipBanksBySignal.items()
+    }
+    # Facing banks of adjacent clusters feed the same capacity-one boundary
+    # corridor.  Score that shared resource rather than treating the two sides
+    # as independent merely because their owner slots differ.
+    BoundaryCorridorsBySignal = {
+        Signal: frozenset(
+            ClusterBoundaryCorridorKey(Bank)
+            for Bank in Banks
+        )
+        for Signal, Banks in PhysicalBanksBySignal.items()
+    }
+    PairBankConflicts = sum(
+        bool(
+            BoundaryCorridorsBySignal.get(str(First), frozenset())
+            .intersection(
+                BoundaryCorridorsBySignal.get(str(Second), frozenset())
+            )
+        )
+        for First, Second in PairwiseConflictEdges
+    )
+    HigherOrderDemand = ScoreHigherOrderPhysicalBankDemand(
+        BoundaryCorridorsBySignal,
+        HigherOrderConflictSets,
+    )
+    return ClusterInterfacePlacementScore(
+        PairBankConflicts=PairBankConflicts,
+        HigherOrderBankPressure=HigherOrderDemand.CollisionPairs,
+        HigherOrderPeakBankDemand=HigherOrderDemand.PeakDemand,
+        HigherOrderBankExcessDemand=HigherOrderDemand.ExcessDemand,
+        HigherOrderOverloadedBankCount=(
+            HigherOrderDemand.OverloadedBankCount
+        ),
+        FacingMismatches=FacingMismatches,
+        Pattern=Pattern,
+    )
+
+
+@dataclass(frozen=True)
+class ClusterBoundaryLeaseRequest:
+    """One packed interface signal requiring an owned pin-access portal."""
+
+    SourceCluster: int
+    TargetCluster: int
+    Signal: str
+    SourceBoundarySide: str
+    TargetBoundarySide: str
+    SourceTerminal: tuple[int, int, int] | None = None
+    TargetTerminals: tuple[tuple[int, int, int], ...] = ()
+    CompletePinAccess: bool = False
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SourceCluster": self.SourceCluster,
+            "TargetCluster": self.TargetCluster,
+            "Signal": self.Signal,
+            "SourceBoundarySide": self.SourceBoundarySide,
+            "TargetBoundarySide": self.TargetBoundarySide,
+            "SourceTerminal": (
+                list(self.SourceTerminal)
+                if self.SourceTerminal is not None
+                else None
+            ),
+            "TargetTerminals": [list(Value) for Value in self.TargetTerminals],
+            "LeaseExtent": (
+                "complete-pin-access-to-routing-track"
+                if self.CompletePinAccess
+                else "first-segment"
+            ),
+        }
+
+
+def BuildClusterBoundaryBundles(
+    Module: Any,
+    Clusters: tuple[tuple[str, ...], ...],
+) -> tuple[ClusterBoundaryBundle, ...]:
+    """Build name-independent logical interfaces before physical placement."""
+    ClusterByGate = {
+        GateName: ClusterIndex
+        for ClusterIndex, Names in enumerate(Clusters)
+        for GateName in Names
+    }
+    ProducerClusterBySignal = {
+        Signal: ClusterByGate[Gate.Name]
+        for Gate in Module.Gates
+        if Gate.Name in ClusterByGate
+        for Signal in Gate.Outputs
+    }
+    SignalsByInterface: dict[tuple[int, int], set[str]] = {}
+    EndpointsByInterface: dict[tuple[int, int], int] = {}
+    for Gate in Module.Gates:
+        TargetCluster = ClusterByGate.get(Gate.Name)
+        if TargetCluster is None:
+            continue
+        for Signal in Gate.Inputs:
+            SourceCluster = ProducerClusterBySignal.get(Signal)
+            if SourceCluster is None or SourceCluster == TargetCluster:
+                continue
+            Interface = SourceCluster, TargetCluster
+            SignalsByInterface.setdefault(Interface, set()).add(Signal)
+            EndpointsByInterface[Interface] = (
+                EndpointsByInterface.get(Interface, 0) + 1
+            )
+    return tuple(
+        ClusterBoundaryBundle(
+            SourceCluster=Source,
+            TargetCluster=Target,
+            Signals=tuple(sorted(Signals)),
+            FanoutEndpoints=EndpointsByInterface[(Source, Target)],
+        )
+        for (Source, Target), Signals in sorted(SignalsByInterface.items())
+    )
+
+
+def BuildClusterBoundaryLeaseRequests(
+    Bundles: tuple[ClusterBoundaryBundle, ...],
+    Assignment: dict[int, tuple[int, int]],
+    Module: Any | None = None,
+    Clusters: tuple[tuple[str, ...], ...] = (),
+    PlacedGates: Iterable[PlacedGate] = (),
+    IncludePrimaryTerminals: bool = False,
+) -> tuple[ClusterBoundaryLeaseRequest, ...]:
+    """Materialize deterministic packed-boundary lease demand from slots.
+
+    The router resolves the actual portal and its first segment against the
+    authoritative resource graph.  Placement owns the invariant that every
+    inter-cluster signal has one directional request, independent of names or
+    synthesis order.
+    """
+    def BoundarySide(
+        FromSlot: tuple[int, int],
+        ToSlot: tuple[int, int],
+    ) -> str:
+        DeltaColumn = ToSlot[0] - FromSlot[0]
+        DeltaRow = ToSlot[1] - FromSlot[1]
+        if abs(DeltaColumn) >= abs(DeltaRow):
+            return "East" if DeltaColumn >= 0 else "West"
+        return "South" if DeltaRow >= 0 else "North"
+
+    def PhysicalBoundarySide(
+        FromTerminal: tuple[int, int, int],
+        ToTerminals: Iterable[tuple[int, int, int]],
+    ) -> str:
+        Values = tuple(ToTerminals)
+        if not Values:
+            return "East"
+        ToX = sum(Value[0] for Value in Values) / len(Values)
+        ToZ = sum(Value[2] for Value in Values) / len(Values)
+        DeltaX = ToX - FromTerminal[0]
+        DeltaZ = ToZ - FromTerminal[2]
+        if abs(DeltaX) >= abs(DeltaZ):
+            return "East" if DeltaX >= 0 else "West"
+        return "South" if DeltaZ >= 0 else "North"
+
+    def OppositeBoundarySide(Side: str) -> str:
+        return {
+            "East": "West",
+            "West": "East",
+            "North": "South",
+            "South": "North",
+        }[Side]
+
+    GateByName = {Gate.Name: Gate for Gate in PlacedGates}
+    ClusterByGate = {
+        GateName: ClusterIndex
+        for ClusterIndex, Names in enumerate(Clusters)
+        for GateName in Names
+    }
+    ProducerBySignal = {
+        Signal: Gate
+        for Gate in (Module.Gates if Module is not None else ())
+        for Signal in Gate.Outputs
+    }
+    ConsumersBySignal: dict[str, list[Any]] = {}
+    for Gate in (Module.Gates if Module is not None else ()):
+        for Signal in Gate.Inputs:
+            ConsumersBySignal.setdefault(Signal, []).append(Gate)
+
+    def SignalTerminals(
+        Signal: str,
+        SourceCluster: int,
+        TargetCluster: int,
+    ) -> tuple[tuple[int, int, int] | None, tuple[tuple[int, int, int], ...]]:
+        # Gate identity is used only to carry placement geometry across the
+        # stage boundary.  Selection remains entirely physical and topology
+        # driven; names never participate in routing policy.
+        SourceGate = ProducerBySignal.get(Signal)
+        SourcePlaced = (
+            GateByName.get(SourceGate.Name) if SourceGate is not None else None
+        )
+        SourceTerminal = (
+            SourcePlaced.OutputPin
+            if SourcePlaced is not None else None
+        )
+        Targets = []
+        for Consumer in ConsumersBySignal.get(Signal, ()):
+            TargetPlaced = GateByName.get(Consumer.Name)
+            if (
+                TargetPlaced is None
+                or ClusterByGate.get(Consumer.Name) != TargetCluster
+            ):
+                continue
+            Targets.extend(
+                TargetPlaced.InputPins[Index]
+                for Index, InputSignal in enumerate(TargetPlaced.Inputs)
+                if InputSignal == Signal
+            )
+        return SourceTerminal, tuple(sorted(set(Targets)))
+
+    Requests: list[ClusterBoundaryLeaseRequest] = []
+    for Bundle in Bundles:
+        SourceSlot = Assignment.get(Bundle.SourceCluster)
+        TargetSlot = Assignment.get(Bundle.TargetCluster)
+        if SourceSlot is None or TargetSlot is None:
+            continue
+        SourceSide = BoundarySide(SourceSlot, TargetSlot)
+        TargetSide = BoundarySide(TargetSlot, SourceSlot)
+        for Signal in Bundle.Signals:
+            SourceTerminal, TargetTerminals = SignalTerminals(
+                Signal,
+                Bundle.SourceCluster,
+                Bundle.TargetCluster,
+            )
+            Requests.append(ClusterBoundaryLeaseRequest(
+                SourceCluster=Bundle.SourceCluster,
+                TargetCluster=Bundle.TargetCluster,
+                Signal=Signal,
+                SourceBoundarySide=SourceSide,
+                TargetBoundarySide=TargetSide,
+                SourceTerminal=SourceTerminal,
+                TargetTerminals=TargetTerminals,
+                CompletePinAccess=IncludePrimaryTerminals,
+            ))
+
+    # Primary terminals are cluster interfaces too.  Omitting them allowed a
+    # capacity-legal cluster-to-cluster lease pattern to collide later with an
+    # input/output pin bank during complete portal assignment.
+    if Module is not None and IncludePrimaryTerminals:
+        for Gate in Module.Gates:
+            GateKind = (
+                Gate.Kind.value
+                if hasattr(Gate.Kind, "value")
+                else str(Gate.Kind)
+            )
+            PlacedGate = GateByName.get(Gate.Name)
+            if PlacedGate is None:
+                continue
+            if GateKind == "INPUT" and PlacedGate.OutputPin is not None:
+                for Signal in Gate.Outputs:
+                    TargetsByCluster: dict[
+                        int, list[tuple[int, int, int]]
+                    ] = {}
+                    for Consumer in ConsumersBySignal.get(Signal, ()):
+                        TargetCluster = ClusterByGate.get(Consumer.Name)
+                        TargetPlaced = GateByName.get(Consumer.Name)
+                        if TargetCluster is None or TargetPlaced is None:
+                            continue
+                        TargetsByCluster.setdefault(
+                            TargetCluster,
+                            [],
+                        ).extend(
+                            TargetPlaced.InputPins[Index]
+                            for Index, InputSignal
+                            in enumerate(TargetPlaced.Inputs)
+                            if InputSignal == Signal
+                        )
+                    for TargetCluster, TargetTerminals in sorted(
+                        TargetsByCluster.items()
+                    ):
+                        SourceSide = PhysicalBoundarySide(
+                            PlacedGate.OutputPin,
+                            TargetTerminals,
+                        )
+                        Requests.append(ClusterBoundaryLeaseRequest(
+                            SourceCluster=-1,
+                            TargetCluster=TargetCluster,
+                            Signal=Signal,
+                            SourceBoundarySide=SourceSide,
+                            TargetBoundarySide=OppositeBoundarySide(
+                                SourceSide
+                            ),
+                            SourceTerminal=PlacedGate.OutputPin,
+                            TargetTerminals=tuple(sorted(set(
+                                TargetTerminals
+                            ))),
+                            CompletePinAccess=True,
+                        ))
+            elif GateKind == "OUTPUT":
+                for InputIndex, Signal in enumerate(Gate.Inputs):
+                    SourceGate = ProducerBySignal.get(Signal)
+                    SourceCluster = (
+                        ClusterByGate.get(SourceGate.Name)
+                        if SourceGate is not None
+                        else None
+                    )
+                    SourcePlaced = (
+                        GateByName.get(SourceGate.Name)
+                        if SourceGate is not None
+                        else None
+                    )
+                    if (
+                        SourceCluster is None
+                        or SourcePlaced is None
+                        or SourcePlaced.OutputPin is None
+                        or InputIndex >= len(PlacedGate.InputPins)
+                    ):
+                        continue
+                    TargetTerminal = PlacedGate.InputPins[InputIndex]
+                    SourceSide = PhysicalBoundarySide(
+                        SourcePlaced.OutputPin,
+                        (TargetTerminal,),
+                    )
+                    Requests.append(ClusterBoundaryLeaseRequest(
+                        SourceCluster=SourceCluster,
+                        TargetCluster=-1,
+                        Signal=Signal,
+                        SourceBoundarySide=SourceSide,
+                        TargetBoundarySide=OppositeBoundarySide(SourceSide),
+                        SourceTerminal=SourcePlaced.OutputPin,
+                        TargetTerminals=(TargetTerminal,),
+                        CompletePinAccess=True,
+                    ))
+    return tuple(sorted(
+        Requests,
+        key=lambda Value: (
+            Value.SourceCluster,
+            Value.TargetCluster,
+            Value.Signal,
+        ),
+    ))
+
+
+def ScoreClusterBoundaryContracts(
+    Bundles: tuple[ClusterBoundaryBundle, ...],
+    Assignment: dict[int, tuple[int, int]],
+    BoundaryCapacity: int,
+) -> ClusterBoundaryContractScore:
+    """Score whether all logical bundles fit the tentative grid cuts."""
+    if BoundaryCapacity < 1:
+        raise ValueError("BoundaryCapacity must be positive")
+    SignalsByBoundary: dict[tuple[str, int], set[str]] = {}
+    for Bundle in Bundles:
+        SourceSlot = Assignment.get(Bundle.SourceCluster)
+        TargetSlot = Assignment.get(Bundle.TargetCluster)
+        if SourceSlot is None or TargetSlot is None:
+            continue
+        SourceColumn, SourceRow = SourceSlot
+        TargetColumn, TargetRow = TargetSlot
+        for Boundary in range(
+            min(SourceColumn, TargetColumn),
+            max(SourceColumn, TargetColumn),
+        ):
+            SignalsByBoundary.setdefault(("X", Boundary), set()).update(
+                Bundle.Signals
+            )
+        for Boundary in range(
+            min(SourceRow, TargetRow),
+            max(SourceRow, TargetRow),
+        ):
+            SignalsByBoundary.setdefault(("Z", Boundary), set()).update(
+                Bundle.Signals
+            )
+    Demands = [len(Signals) for Signals in SignalsByBoundary.values()]
+    return ClusterBoundaryContractScore(
+        PeakBoundaryDemand=max(Demands, default=0),
+        TotalBoundaryDemand=sum(Demands),
+        OverflowLanes=sum(
+            max(0, Demand - BoundaryCapacity)
+            for Demand in Demands
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class InterClusterGapPlan:
     """Optional corridor spacing assigned to each cluster-grid boundary."""
 
@@ -252,6 +1891,23 @@ class HardBoundaryFeasibility:
     @property
     def IsFeasible(self) -> bool:
         return not self.RejectionReasons
+
+    @property
+    def LegalEscapeCandidateCounts(self) -> tuple[tuple[str, int], ...]:
+        """Expose exact per-signal escape scarcity without mutable slot sets."""
+        return tuple(
+            (Signal, len(Slots))
+            for Signal, Slots in self.LegalEscapeSlotsBySignal
+        )
+
+    @property
+    def SingleCandidateBoundarySignals(self) -> tuple[str, ...]:
+        """Return signals whose boundary access has exactly one legal choice."""
+        return tuple(
+            Signal
+            for Signal, Count in self.LegalEscapeCandidateCounts
+            if Count == 1
+        )
 
 
 def EvaluateHardBoundaryFeasibility(
@@ -555,6 +2211,9 @@ def BuildLegalBoundaryEscapeSlots(
     ResourceGraph: RoutingResourceGraph,
     FixedAccessClaimsBySignal: dict[str, RoutingResourceClaims],
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    CandidateClaimsBySignal: (
+        dict[str, list["BoundaryEscapeCandidate"]] | None
+    ) = None,
 ) -> dict[str, set[tuple[int, int, int]]]:
     """Enumerate exact one-primitive exits from immutable terminal access."""
     Result: dict[str, set[tuple[int, int, int]]] = {}
@@ -602,8 +2261,246 @@ def BuildLegalBoundaryEscapeSlots(
                 ):
                     continue
                 LegalSlots.add(Neighbor)
+                if CandidateClaimsBySignal is not None:
+                    CandidateClaimsBySignal.setdefault(
+                        Signal,
+                        [],
+                    ).append(BoundaryEscapeCandidate(
+                        Signal=Signal,
+                        Anchor=Anchor,
+                        Entrance=Neighbor,
+                        Claims=CandidateClaims,
+                    ))
         Result[Signal] = LegalSlots
     return Result
+
+
+@dataclass(frozen=True)
+class BoundaryEscapeCandidate:
+    """One exact first primitive from a fixed packed pin-access envelope."""
+
+    Signal: str
+    Anchor: tuple[int, int, int]
+    Entrance: tuple[int, int, int]
+    Claims: RoutingResourceClaims
+
+    @property
+    def StructuralKey(self) -> tuple[object, ...]:
+        """Identify physical ownership without depending on a signal name."""
+        return (
+            self.Anchor,
+            self.Entrance,
+            tuple(sorted(map(str, self.Claims.ResourceIds))),
+        )
+
+
+@dataclass(frozen=True)
+class CutBoundaryEscapeFeasibility:
+    """Exact necessary-condition proof for one higher-order placement cut."""
+
+    Verdict: str
+    VariableCount: int
+    SignalCount: int
+    DomainCounts: tuple[tuple[int, str, int], ...]
+    Assignment: tuple[
+        tuple[int, str, tuple[int, int, int], tuple[int, int, int]],
+        ...,
+    ]
+    ExpansionCount: int
+    MaximumExpansions: int
+    MaximumAssignedVariables: int
+    ConflictSignals: tuple[str, ...]
+    StructuralFingerprint: str
+
+    @property
+    def IsInfeasible(self) -> bool:
+        return self.Verdict == "infeasible"
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Verdict": self.Verdict,
+            "VariableCount": self.VariableCount,
+            "SignalCount": self.SignalCount,
+            "DomainCounts": [
+                {
+                    "ClusterId": ClusterId,
+                    "Signal": Signal,
+                    "CandidateCount": CandidateCount,
+                }
+                for ClusterId, Signal, CandidateCount in self.DomainCounts
+            ],
+            "Assignment": [
+                {
+                    "ClusterId": ClusterId,
+                    "Signal": Signal,
+                    "Anchor": list(Anchor),
+                    "Entrance": list(Entrance),
+                }
+                for ClusterId, Signal, Anchor, Entrance in self.Assignment
+            ],
+            "ExpansionCount": self.ExpansionCount,
+            "MaximumExpansions": self.MaximumExpansions,
+            "MaximumAssignedVariables": self.MaximumAssignedVariables,
+            "Deficit": max(
+                0,
+                self.VariableCount - self.MaximumAssignedVariables,
+            ),
+            "ConflictSignals": list(self.ConflictSignals),
+            "StructuralFingerprint": self.StructuralFingerprint,
+        }
+
+
+def EvaluateCutBoundaryEscapeFeasibility(
+    Domains: Mapping[
+        tuple[int, str],
+        Iterable[BoundaryEscapeCandidate],
+    ],
+    CutSignals: Iterable[str],
+    MaximumExpansions: int = 4_096,
+) -> CutBoundaryEscapeFeasibility:
+    """Prove a cut's fixed first escapes are jointly capacity-one legal.
+
+    This is a conservative placement prescreen, not a substitute for portal
+    generation.  Every retained domain contains all exact one-primitive
+    escapes found around the committed local geometry.  An exhaustive failed
+    search is therefore a hard placement result; an exhausted search budget
+    remains unknown and is left to the authoritative router.
+    """
+    if MaximumExpansions < 1:
+        raise ValueError("MaximumExpansions must be positive")
+    SelectedSignals = frozenset(map(str, CutSignals))
+    NormalizedDomains = {
+        (int(ClusterId), str(Signal)): tuple(sorted(
+            {
+                Candidate.StructuralKey: Candidate
+                for Candidate in Candidates
+                if str(Signal) in SelectedSignals
+                and Candidate.Signal == str(Signal)
+            }.values(),
+            key=lambda Candidate: Candidate.StructuralKey,
+        ))
+        for (ClusterId, Signal), Candidates in Domains.items()
+        if str(Signal) in SelectedSignals
+    }
+    Variables = tuple(sorted(
+        NormalizedDomains,
+        key=lambda Key: (
+            len(NormalizedDomains[Key]),
+            Key[0],
+            Key[1],
+        ),
+    ))
+    DomainCounts = tuple(
+        (ClusterId, Signal, len(NormalizedDomains[(ClusterId, Signal)]))
+        for ClusterId, Signal in sorted(NormalizedDomains)
+    )
+
+    def ClaimsConflict(
+        First: RoutingResourceClaims,
+        Second: RoutingResourceClaims,
+    ) -> bool:
+        return bool(
+            (First.WireCells & Second.ElectricalCells)
+            or (Second.WireCells & First.ElectricalCells)
+            or (
+                First.SupportCells
+                & (Second.WireCells | Second.RequiredAirCells)
+            )
+            or (
+                Second.SupportCells
+                & (First.WireCells | First.RequiredAirCells)
+            )
+            or (First.RequiredAirCells & Second.WireCells)
+            or (Second.RequiredAirCells & First.WireCells)
+        )
+
+    Selected: dict[tuple[int, str], BoundaryEscapeCandidate] = {}
+    BestAssignment: tuple[
+        tuple[int, str, tuple[int, int, int], tuple[int, int, int]],
+        ...,
+    ] = ()
+    ExpansionCount = 0
+    BudgetExhausted = False
+
+    def RecordBest() -> None:
+        nonlocal BestAssignment
+        Candidate = tuple(sorted(
+            (
+                ClusterId,
+                Signal,
+                Choice.Anchor,
+                Choice.Entrance,
+            )
+            for (ClusterId, Signal), Choice in Selected.items()
+        ))
+        if len(Candidate) > len(BestAssignment):
+            BestAssignment = Candidate
+
+    def Search(Index: int) -> bool:
+        nonlocal ExpansionCount, BudgetExhausted
+        RecordBest()
+        if Index == len(Variables):
+            return True
+        if ExpansionCount >= MaximumExpansions:
+            BudgetExhausted = True
+            return False
+        Variable = Variables[Index]
+        Signal = Variable[1]
+        for Candidate in NormalizedDomains[Variable]:
+            ExpansionCount += 1
+            if ExpansionCount > MaximumExpansions:
+                BudgetExhausted = True
+                return False
+            if any(
+                OtherSignal != Signal
+                and ClaimsConflict(Candidate.Claims, Other.Claims)
+                for (_OtherCluster, OtherSignal), Other
+                in Selected.items()
+            ):
+                continue
+            Selected[Variable] = Candidate
+            if Search(Index + 1):
+                return True
+            del Selected[Variable]
+        return False
+
+    Complete = Search(0)
+    Verdict = (
+        "feasible"
+        if Complete
+        else "budget-exhausted"
+        if BudgetExhausted
+        else "infeasible"
+    )
+    # Signal identifiers are diagnostics.  The fingerprint represents only
+    # physical domain structure so renamed/reordered equivalent cuts agree.
+    StructuralDomains = tuple(sorted(
+        tuple(
+            Candidate.StructuralKey
+            for Candidate in NormalizedDomains[Variable]
+        )
+        for Variable in Variables
+    ))
+    return CutBoundaryEscapeFeasibility(
+        Verdict=Verdict,
+        VariableCount=len(Variables),
+        SignalCount=len({
+            Signal for _ClusterId, Signal in Variables
+        }),
+        DomainCounts=DomainCounts,
+        Assignment=BestAssignment,
+        ExpansionCount=ExpansionCount,
+        MaximumExpansions=MaximumExpansions,
+        MaximumAssignedVariables=len(BestAssignment),
+        ConflictSignals=(
+            tuple(sorted(SelectedSignals))
+            if Verdict == "infeasible"
+            else ()
+        ),
+        StructuralFingerprint=sha256(
+            repr(StructuralDomains).encode("utf-8")
+        ).hexdigest(),
+    )
 
 
 @dataclass(frozen=True)
@@ -634,6 +2531,38 @@ class PackedNandCluster:
     BoundaryCapacityRecords: tuple[BoundaryCapacityRecord, ...] = ()
     BoundaryOverflow: int = 0
     PinScarcityCount: int = 0
+    LegalEscapeCandidateCounts: tuple[tuple[str, int], ...] = ()
+    OrientationRotation: int = 0
+    OrientationMirrorX: bool = False
+
+    @property
+    def SingleCandidateBoundarySignals(self) -> tuple[str, ...]:
+        """Return boundary signals with only one exact legal escape slot."""
+        return tuple(
+            Signal
+            for Signal, Count in self.LegalEscapeCandidateCounts
+            if Count == 1
+        )
+
+
+@dataclass(frozen=True)
+class ClusterLayoutVariant:
+    """One exact rigid transform of a packed-cluster layout."""
+
+    Rotation: int
+    MirrorX: bool
+    Positions: dict[str, tuple[int, int]]
+    Rotations: dict[str, int]
+    Mirrors: dict[str, bool]
+    Width: int
+    Depth: int
+    ActualGeometry: dict[str, frozenset[tuple[int, int, int]]]
+    ElectricalGeometry: dict[str, frozenset[tuple[int, int, int]]]
+    RejectionReason: str | None = None
+
+    @property
+    def IsLegal(self) -> bool:
+        return self.RejectionReason is None
 
 
 @dataclass(frozen=True)
@@ -656,6 +2585,94 @@ class PackedNandClusterCandidate:
 
 
 @dataclass(frozen=True)
+class ClusterLocalRouteTemplate:
+    """Immutable cluster-relative local routing retained across cut epochs."""
+
+    ClusterId: int
+    StructuralSignature: str
+    Rotation: int
+    MirrorX: bool
+    Origin: tuple[int, int, int]
+    LocalClaimFingerprint: str
+    BoundaryTerminalFingerprint: str
+    ClaimCount: int
+    BoundaryTerminalCount: int
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "ClusterId": self.ClusterId,
+            "StructuralSignature": self.StructuralSignature,
+            "Rotation": self.Rotation,
+            "MirrorX": self.MirrorX,
+            "Origin": list(self.Origin),
+            "LocalClaimFingerprint": self.LocalClaimFingerprint,
+            "BoundaryTerminalFingerprint": self.BoundaryTerminalFingerprint,
+            "ClaimCount": self.ClaimCount,
+            "BoundaryTerminalCount": self.BoundaryTerminalCount,
+        }
+
+
+@dataclass(frozen=True)
+class ClusterLocalRouteTemplateCacheEntry:
+    """One immutable, translation-safe internal cluster route template."""
+
+    CacheKey: tuple[object, ...]
+    Origin: tuple[int, int, int]
+    Claims: tuple[LocalRouteClaim, ...]
+    LocalClaimFingerprint: str
+
+
+def TranslateClusterLocalRouteClaim(
+    Claim: LocalRouteClaim,
+    Delta: tuple[int, int, int],
+) -> LocalRouteClaim:
+    """Translate an immutable internal claim without changing its topology."""
+    def Translate(Position: tuple[int, int, int]) -> tuple[int, int, int]:
+        return tuple(
+            Position[Index] + Delta[Index]
+            for Index in range(3)
+        )
+
+    def TranslateClaims(Claims: RoutingResourceClaims) -> RoutingResourceClaims:
+        return RoutingResourceClaims(
+            WireCells=frozenset(map(Translate, Claims.WireCells)),
+            SupportCells=frozenset(map(Translate, Claims.SupportCells)),
+            RequiredAirCells=frozenset(map(Translate, Claims.RequiredAirCells)),
+            ElectricalCells=frozenset(map(Translate, Claims.ElectricalCells)),
+        )
+
+    return LocalRouteClaim(
+        Signal=Claim.Signal,
+        ClusterId=Claim.ClusterId,
+        Root=Translate(Claim.Root),
+        ConnectedTargets=tuple(map(Translate, Claim.ConnectedTargets)),
+        BoundaryNodes=tuple(map(Translate, Claim.BoundaryNodes)),
+        Nodes=frozenset(map(Translate, Claim.Nodes)),
+        Edges=frozenset(
+            NormalizeRoutingEdge(Translate(First), Translate(Second))
+            for First, Second in Claim.Edges
+        ),
+        Claims=TranslateClaims(Claim.Claims),
+        RepeaterReservations=tuple(
+            RoutingReservation(
+                Signal=Reservation.Signal,
+                Resource=RoutingResourceId(
+                    Reservation.Resource.Kind,
+                    Translate(Reservation.Resource.Position),
+                ),
+                Position=Translate(Reservation.Position),
+                Purpose=Reservation.Purpose,
+                Facing=Reservation.Facing,
+            )
+            for Reservation in Claim.RepeaterReservations
+        ),
+        ExactRouteSignalBlocks=Claim.ExactRouteSignalBlocks,
+        ExactRouteRefreshBlocks=Claim.ExactRouteRefreshBlocks,
+        ExactRouteSupportBlocks=Claim.ExactRouteSupportBlocks,
+    )
+
+
+@dataclass(frozen=True)
 class PcbPlacement:
     """Weighted placement plus global routing metadata."""
 
@@ -664,6 +2681,1650 @@ class PcbPlacement:
     SignalOrder: tuple[str, ...]
     LayerCount: int
     PackedClusters: tuple[PackedNandCluster, ...] = ()
+    ClusterBoundaryLeaseRequests: tuple[ClusterBoundaryLeaseRequest, ...] = ()
+    ClusterLocalRouteTemplates: tuple[ClusterLocalRouteTemplate, ...] = ()
+    ClusterBoundaryLeaseVariant: int = 0
+    CompleteClusterInterfaceAccess: bool = False
+    MandatoryAccessPreScreenProfile: (
+        "MandatoryAccessConflictProfile | None"
+    ) = None
+    InterClusterRoutingChannel: InterClusterRoutingChannel | None = None
+    ComponentGraph: Any | None = None
+
+
+def BuildPhysicalClusterBoundaryLeaseRequests(
+    Source: PcbPlacement,
+) -> tuple[ClusterBoundaryLeaseRequest, ...]:
+    """Materialize explicit interfaces from committed physical clusters."""
+    Existing = tuple(Source.ClusterBoundaryLeaseRequests)
+    GateByName = {
+        Gate.Name: Gate for Gate in Source.Placed.PlacedGates
+    }
+    PhysicalOrigins = {
+        ClusterIndex: (
+            min(GateByName[Name].X for Name in Names if Name in GateByName),
+            min(GateByName[Name].Z for Name in Names if Name in GateByName),
+        )
+        for ClusterIndex, Names in enumerate(Source.Clusters)
+        if any(Name in GateByName for Name in Names)
+    }
+    Generated = BuildClusterBoundaryLeaseRequests(
+        BuildClusterBoundaryBundles(
+            Source.Placed.Module,
+            Source.Clusters,
+        ),
+        PhysicalOrigins,
+        Module=Source.Placed.Module,
+        Clusters=Source.Clusters,
+        PlacedGates=Source.Placed.PlacedGates,
+        IncludePrimaryTerminals=True,
+    )
+    RequestsByIdentity = {
+        (
+            str(Value.Signal),
+            int(Value.SourceCluster),
+            int(Value.TargetCluster),
+            Value.SourceTerminal,
+            tuple(Value.TargetTerminals),
+        ): Value
+        for Value in (*Existing, *Generated)
+    }
+    return tuple(
+        RequestsByIdentity[Key]
+        for Key in sorted(
+            RequestsByIdentity,
+            key=repr,
+        )
+    )
+
+
+def BuildBoundedInterClusterRoutingChannel(
+    Source: PcbPlacement,
+    *,
+    TrackPitch: int | None = None,
+    MaximumAffectedClusters: int = 3,
+    MaximumBoundaryStrips: int = 2,
+    RoutingLayerCount: int = 3,
+    ForcedAffectedClusters: tuple[int, ...] | None = None,
+    ForcedRoot: int | None = None,
+    ForcedAxisPattern: tuple[str, ...] | None = None,
+) -> PcbPlacement:
+    """Insert one bounded physical channel through the densest interface.
+
+    This is an architectural placement transform, not router feedback.  It
+    shifts only a connected component of at most three packed clusters,
+    translates their immutable local claims, and exposes ordinary
+    capacity-one lane cells on the existing routing layers.
+    """
+    TrackPitch = (
+        DefaultRedstoneRoutingTechnology.TrackPitch
+        if TrackPitch is None
+        else int(TrackPitch)
+    )
+    if TrackPitch < 1:
+        raise ValueError("inter-cluster channel pitch must be positive")
+    if MaximumAffectedClusters < 2 or MaximumAffectedClusters > 3:
+        raise ValueError("inter-cluster channel supports two or three clusters")
+    if MaximumBoundaryStrips < 1 or MaximumBoundaryStrips > 2:
+        raise ValueError("inter-cluster channel supports one or two strips")
+    if RoutingLayerCount < 1:
+        raise ValueError("inter-cluster channel requires routing layers")
+    if Source.InterClusterRoutingChannel is not None:
+        return Source
+
+    GateByName = {
+        Gate.Name: Gate for Gate in Source.Placed.PlacedGates
+    }
+    ClusterGates = {
+        ClusterIndex: tuple(
+            GateByName[Name]
+            for Name in Names
+            if Name in GateByName
+        )
+        for ClusterIndex, Names in enumerate(Source.Clusters)
+    }
+    ClusterGates = {
+        ClusterIndex: Gates
+        for ClusterIndex, Gates in ClusterGates.items()
+        if Gates
+    }
+    AllBoundaryRequests = (
+        BuildPhysicalClusterBoundaryLeaseRequests(Source)
+    )
+    BoundaryRequests = tuple(
+        Request
+        for Request in AllBoundaryRequests
+        if (
+            Request.SourceCluster in ClusterGates
+            and Request.TargetCluster in ClusterGates
+            and Request.SourceCluster != Request.TargetCluster
+        )
+    )
+    if not BoundaryRequests:
+        raise ValueError(
+            "dense interface has no inter-cluster boundary requests"
+        )
+
+    EdgeDemand: dict[tuple[int, int], int] = {}
+    for Request in BoundaryRequests:
+        Edge = tuple(sorted((
+            int(Request.SourceCluster),
+            int(Request.TargetCluster),
+        )))
+        EdgeDemand[Edge] = EdgeDemand.get(Edge, 0) + (
+            1 + len(Request.TargetTerminals)
+        )
+    LogicalComponentGraph = (
+        Source.ComponentGraph or Source.Placed.ComponentGraph
+    )
+    LogicalComponentByGate = (
+        dict(LogicalComponentGraph.GateToComponent)
+        if (
+            LogicalComponentGraph is not None
+            and LogicalComponentGraph.Hierarchical
+        )
+        else {}
+    )
+    LogicalClustersByComponent: dict[int, set[int]] = {}
+    MixedLogicalClusters: set[int] = set()
+    LogicalComponentByCluster: dict[int, int] = {}
+    for ClusterIndex, Gates in ClusterGates.items():
+        ComponentIds = {
+            LogicalComponentByGate[Gate.Name]
+            for Gate in Gates
+            if Gate.Name in LogicalComponentByGate
+        }
+        if len(ComponentIds) != 1:
+            MixedLogicalClusters.add(ClusterIndex)
+            continue
+        ComponentId = next(iter(ComponentIds))
+        LogicalComponentByCluster[ClusterIndex] = ComponentId
+        LogicalClustersByComponent.setdefault(
+            ComponentId, set()
+        ).add(ClusterIndex)
+    AlignedLogicalComponents = {
+        frozenset(ClusterIndexes): ComponentId
+        for ComponentId, ClusterIndexes
+        in LogicalClustersByComponent.items()
+        if (
+            2 <= len(ClusterIndexes) <= MaximumAffectedClusters
+            and not (ClusterIndexes & MixedLogicalClusters)
+        )
+    }
+    def LogicalComponentForClusterSet(
+        ClusterSet: frozenset[int],
+    ) -> int | None:
+        ComponentIds = {
+            LogicalComponentByCluster[Cluster]
+            for Cluster in ClusterSet
+            if Cluster in LogicalComponentByCluster
+        }
+        return (
+            next(iter(ComponentIds))
+            if (
+                len(ComponentIds) == 1
+                and ClusterSet
+                == frozenset(LogicalClustersByComponent.get(
+                    next(iter(ComponentIds)),
+                    (),
+                ))
+                and frozenset(
+                    Gate.Name
+                    for Cluster in ClusterSet
+                    for Gate in ClusterGates[Cluster]
+                    if Gate.Name in LogicalComponentByGate
+                )
+                == LogicalGateNamesByComponent.get(
+                    next(iter(ComponentIds)),
+                    frozenset(),
+                )
+                and len(ComponentIds) == len({
+                    LogicalComponentByCluster.get(Cluster)
+                    for Cluster in ClusterSet
+                })
+                and not (ClusterSet & MixedLogicalClusters)
+            )
+            else None
+        )
+    LogicalComponentBenefits = {
+        Value.ComponentId: (
+            len(Value.BoundarySignals),
+            -Value.QualifyingReconvergentCutCount,
+            -len(Value.GateNames),
+        )
+        for Value in getattr(
+            LogicalComponentGraph,
+            "Components",
+            (),
+        )
+    }
+    LogicalGateNamesByComponent = {
+        Value.ComponentId: frozenset(Value.GateNames)
+        for Value in getattr(
+            LogicalComponentGraph,
+            "Components",
+            (),
+        )
+    }
+    CandidateComponents: list[
+        tuple[tuple[object, ...], tuple[int, ...]]
+    ] = []
+    ClusterIndexes = tuple(sorted(ClusterGates))
+    for ComponentSize in range(
+        min(MaximumAffectedClusters, len(ClusterIndexes)),
+        1,
+        -1,
+    ):
+        for Component in combinations(ClusterIndexes, ComponentSize):
+            ComponentSet = frozenset(Component)
+            ComponentEdges = tuple(
+                Edge
+                for Edge in EdgeDemand
+                if set(Edge) <= ComponentSet
+            )
+            if len(ComponentEdges) < ComponentSize - 1:
+                continue
+            Visited = {Component[0]}
+            while True:
+                Expanded = {
+                    Value
+                    for Edge in ComponentEdges
+                    if set(Edge) & Visited
+                    for Value in Edge
+                }
+                if Expanded <= Visited:
+                    break
+                Visited.update(Expanded)
+            if Visited != set(Component):
+                continue
+            if (
+                LogicalComponentGraph is not None
+                and LogicalComponentGraph.Hierarchical
+                and LogicalComponentForClusterSet(ComponentSet) is None
+            ):
+                continue
+            StructuralSignatures = tuple(sorted(
+                (
+                    Source.PackedClusters[Index].StructuralSignature
+                    if Index < len(Source.PackedClusters)
+                    else str(len(Source.Clusters[Index]))
+                )
+                for Index in Component
+            ))
+            CandidateComponents.append((
+                (
+                    0
+                    if LogicalComponentForClusterSet(ComponentSet)
+                    is not None
+                    else 1,
+                    LogicalComponentBenefits.get(
+                        LogicalComponentForClusterSet(ComponentSet),
+                        (1 << 30, 0, 0),
+                    ),
+                    -sum(EdgeDemand[Edge] for Edge in ComponentEdges),
+                    -ComponentSize,
+                    StructuralSignatures,
+                    Component,
+                ),
+                Component,
+            ))
+    if not CandidateComponents:
+        raise ValueError(
+            "no connected two-or-three-cluster channel component"
+        )
+    RankedComponents = tuple(sorted(CandidateComponents))
+    if ForcedAffectedClusters is None:
+        _ComponentScore, AffectedClusters = RankedComponents[0]
+    else:
+        ForcedClusterSet = frozenset(map(int, ForcedAffectedClusters))
+        ForcedMatches = tuple(
+            Value
+            for Value in RankedComponents
+            if frozenset(Value[1]) == ForcedClusterSet
+        )
+        if not ForcedMatches:
+            raise ValueError(
+                "forced channel component is not a legal connected component"
+            )
+        _ComponentScore, AffectedClusters = ForcedMatches[0]
+    AffectedSet = frozenset(AffectedClusters)
+    ComponentId = LogicalComponentForClusterSet(AffectedSet)
+    TopologyComponent = (
+        next(
+            (
+                Value
+                for Value in LogicalComponentGraph.Components
+                if Value.ComponentId == ComponentId
+            ),
+            None,
+        )
+        if (
+            LogicalComponentGraph is not None
+            and ComponentId is not None
+        )
+        else None
+    )
+
+    def Envelope(
+        Gates: Iterable[PlacedGate],
+    ) -> tuple[int, int, int, int]:
+        Values = tuple(Gates)
+        return (
+            min(Gate.X for Gate in Values),
+            min(Gate.Z for Gate in Values),
+            max(
+                Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+                for Gate in Values
+            ),
+            max(
+                Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+                for Gate in Values
+            ),
+        )
+
+    Envelopes = {
+        Cluster: Envelope(ClusterGates[Cluster])
+        for Cluster in AffectedClusters
+    }
+    Centers = {
+        Cluster: (
+            (Bounds[0] + Bounds[2]) // 2,
+            (Bounds[1] + Bounds[3]) // 2,
+        )
+        for Cluster, Bounds in Envelopes.items()
+    }
+    ComponentEdges = tuple(
+        Edge
+        for Edge in EdgeDemand
+        if set(Edge) <= AffectedSet
+    )
+    RankedEdges = sorted(
+        ComponentEdges,
+        key=lambda Edge: (
+            -EdgeDemand[Edge],
+            abs(Centers[Edge[0]][0] - Centers[Edge[1]][0])
+            + abs(Centers[Edge[0]][1] - Centers[Edge[1]][1]),
+            Edge,
+        ),
+    )
+    Parents = {Cluster: Cluster for Cluster in AffectedClusters}
+
+    def Find(Value: int) -> int:
+        while Parents[Value] != Value:
+            Parents[Value] = Parents[Parents[Value]]
+            Value = Parents[Value]
+        return Value
+
+    TreeEdges: list[tuple[int, int]] = []
+    for First, Second in RankedEdges:
+        FirstRoot = Find(First)
+        SecondRoot = Find(Second)
+        if FirstRoot == SecondRoot:
+            continue
+        Parents[max(FirstRoot, SecondRoot)] = min(FirstRoot, SecondRoot)
+        TreeEdges.append((First, Second))
+        if len(TreeEdges) == len(AffectedClusters) - 1:
+            break
+    if len(TreeEdges) != len(AffectedClusters) - 1:
+        raise ValueError("channel component spanning tree is incomplete")
+    TreeEdges = TreeEdges[:MaximumBoundaryStrips]
+
+    Adjacency: dict[int, list[int]] = {
+        Cluster: [] for Cluster in AffectedClusters
+    }
+    for First, Second in TreeEdges:
+        Adjacency[First].append(Second)
+        Adjacency[Second].append(First)
+    RankedRoots = tuple(sorted(
+        AffectedClusters,
+        key=lambda Cluster: (
+            Source.PackedClusters[Cluster].StructuralSignature
+            if Cluster < len(Source.PackedClusters)
+            else "",
+            Centers[Cluster],
+            Cluster,
+        ),
+    ))
+    if ForcedRoot is None:
+        RootFailures = []
+        PreferredAxes = tuple(
+            (
+                "X"
+                if abs(
+                    Centers[Edge[0]][0] - Centers[Edge[1]][0]
+                ) >= abs(
+                    Centers[Edge[0]][1] - Centers[Edge[1]][1]
+                )
+                else "Z"
+            )
+            for Edge in TreeEdges
+        )
+        AxisPatterns = tuple(sorted(
+            product(("X", "Z"), repeat=len(TreeEdges)),
+            key=lambda Pattern: (
+                sum(
+                    Axis != PreferredAxes[Index]
+                    for Index, Axis in enumerate(Pattern)
+                ),
+                Pattern,
+            ),
+        ))
+        for RootCandidate in RankedRoots:
+            for AxisPattern in AxisPatterns:
+                try:
+                    return BuildBoundedInterClusterRoutingChannel(
+                        Source,
+                        TrackPitch=TrackPitch,
+                        MaximumAffectedClusters=MaximumAffectedClusters,
+                        MaximumBoundaryStrips=MaximumBoundaryStrips,
+                        RoutingLayerCount=RoutingLayerCount,
+                        ForcedAffectedClusters=tuple(AffectedClusters),
+                        ForcedRoot=RootCandidate,
+                        ForcedAxisPattern=tuple(AxisPattern),
+                    )
+                except ValueError as Error:
+                    RootFailures.append(
+                        "root-"
+                        f"{RankedRoots.index(RootCandidate)}"
+                        f"-axes-{''.join(AxisPattern)}:{Error}"
+                    )
+        raise ValueError(
+            "no legal bounded channel root: "
+            + "; ".join(RootFailures)
+        )
+    if ForcedRoot not in AffectedSet:
+        raise ValueError("forced channel root is outside the component")
+    if (
+        ForcedAxisPattern is None
+        or len(ForcedAxisPattern) != len(TreeEdges)
+        or any(Axis not in {"X", "Z"} for Axis in ForcedAxisPattern)
+    ):
+        raise ValueError("forced channel axis pattern is invalid")
+    Root = ForcedRoot
+    AxisByEdge = {
+        tuple(sorted(Edge)): ForcedAxisPattern[Index]
+        for Index, Edge in enumerate(TreeEdges)
+    }
+    ClusterTranslations: dict[int, tuple[int, int, int]] = {
+        Root: (0, 0, 0)
+    }
+    StripSeeds: list[tuple[str, int, int, int]] = []
+    Queue = deque([(Root, -1)])
+    while Queue:
+        Parent, GrandParent = Queue.popleft()
+        for Child in sorted(Adjacency[Parent]):
+            if Child == GrandParent:
+                continue
+            DeltaX = Centers[Child][0] - Centers[Parent][0]
+            DeltaZ = Centers[Child][1] - Centers[Parent][1]
+            Axis = AxisByEdge[tuple(sorted((Parent, Child)))]
+            Direction = (
+                1
+                if (DeltaX if Axis == "X" else DeltaZ) >= 0
+                else -1
+            )
+            ParentDelta = ClusterTranslations[Parent]
+            Shift = (
+                Direction * TrackPitch,
+                0,
+                0,
+            ) if Axis == "X" else (
+                0,
+                0,
+                Direction * TrackPitch,
+            )
+            ClusterTranslations[Child] = tuple(
+                ParentDelta[Index] + Shift[Index]
+                for Index in range(3)
+            )
+            if any(
+                abs(ClusterTranslations[Child][Index]) > TrackPitch
+                for Index in (0, 2)
+            ):
+                raise ValueError(
+                    "inter-cluster channel exceeds per-axis growth bound"
+                )
+            Bounds = Envelopes[Child]
+            if Axis == "X":
+                Coordinate = (
+                    Bounds[0] + ParentDelta[0] + TrackPitch // 2
+                    if Direction > 0
+                    else Bounds[2] + ParentDelta[0]
+                    - TrackPitch + TrackPitch // 2
+                )
+            else:
+                Coordinate = (
+                    Bounds[1] + ParentDelta[2] + TrackPitch // 2
+                    if Direction > 0
+                    else Bounds[3] + ParentDelta[2]
+                    - TrackPitch + TrackPitch // 2
+                )
+            StripSeeds.append((Axis, Coordinate, Parent, Child))
+            Queue.append((Child, Parent))
+
+    ModuleGateByName = {
+        Gate.Name: Gate for Gate in Source.Placed.Module.Gates
+    }
+    ClusterByGate = {
+        Name: ClusterIndex
+        for ClusterIndex, Names in enumerate(Source.Clusters)
+        for Name in Names
+    }
+
+    def TranslatePosition(
+        Position: tuple[int, int, int],
+        Delta: tuple[int, int, int],
+    ) -> tuple[int, int, int]:
+        return tuple(
+            int(Position[Index]) + int(Delta[Index])
+            for Index in range(3)
+        )
+
+    CandidateGates = []
+    for Gate in Source.Placed.PlacedGates:
+        Cluster = ClusterByGate.get(Gate.Name)
+        Delta = ClusterTranslations.get(Cluster, (0, 0, 0))
+        if Delta == (0, 0, 0) or Gate.Name not in ModuleGateByName:
+            CandidateGates.append(Gate)
+            continue
+        CandidateGates.append(BuildPlacedGate(
+            ModuleGateByName[Gate.Name],
+            Gate.X + Delta[0],
+            Gate.Y + Delta[1],
+            Gate.Z + Delta[2],
+            Gate.Rotation,
+            Gate.MirrorX,
+        ))
+    CandidatePlacedForValidation = PlacedDesign(
+        Module=Source.Placed.Module,
+        PlacedGates=CandidateGates,
+    )
+    Occupied, _Electrical, _Solid = BuildPlacedCellGeometry(
+        CandidatePlacedForValidation
+    )
+    ValidatePlacedCellElectricalIsolation(
+        CandidatePlacedForValidation
+    )
+
+    def InterfaceStripExtent(
+        Axis: str,
+        FirstCluster: int,
+        SecondCluster: int,
+    ) -> tuple[int, int]:
+        PerpendicularCoordinates = []
+        Edge = frozenset((FirstCluster, SecondCluster))
+        for Request in BoundaryRequests:
+            if frozenset((
+                Request.SourceCluster,
+                Request.TargetCluster,
+            )) != Edge:
+                continue
+            Terminals = (
+                *((Request.SourceTerminal,)
+                  if Request.SourceTerminal is not None else ()),
+                *Request.TargetTerminals,
+            )
+            for Terminal in Terminals:
+                Cluster = (
+                    Request.SourceCluster
+                    if Terminal == Request.SourceTerminal
+                    else Request.TargetCluster
+                )
+                Delta = ClusterTranslations.get(
+                    Cluster,
+                    (0, 0, 0),
+                )
+                PerpendicularCoordinates.append(
+                    Terminal[2] + Delta[2]
+                    if Axis == "X"
+                    else Terminal[0] + Delta[0]
+                )
+        if not PerpendicularCoordinates:
+            PerpendicularCoordinates.extend((
+                Centers[FirstCluster][1]
+                if Axis == "X"
+                else Centers[FirstCluster][0],
+                Centers[SecondCluster][1]
+                if Axis == "X"
+                else Centers[SecondCluster][0],
+            ))
+        Margin = TrackPitch // 2
+        return (
+            min(PerpendicularCoordinates) - Margin,
+            max(PerpendicularCoordinates) + Margin,
+        )
+
+    InsertedBoundaryStrips = tuple(
+        (
+            Axis,
+            Coordinate,
+            *InterfaceStripExtent(Axis, First, Second),
+        )
+        for Axis, Coordinate, First, Second in StripSeeds
+    )
+    LaneRecords = []
+    for Axis, Coordinate, Minimum, Maximum in InsertedBoundaryStrips:
+        Direction = "Z" if Axis == "X" else "X"
+        for Layer in range(min(
+            RoutingLayerCount,
+            max(1, Source.LayerCount),
+        )):
+            RoutingY = DefaultRedstoneRoutingTechnology.RoutingY(
+                0,
+                Layer,
+            )
+            Cells = tuple(
+                (
+                    (Coordinate, RoutingY, Offset)
+                    if Axis == "X"
+                    else (Offset, RoutingY, Coordinate)
+                )
+                for Offset in range(Minimum, Maximum + 1)
+            )
+            if any(Cell in Occupied for Cell in Cells):
+                raise ValueError(
+                    "inter-cluster channel lane overlaps placed geometry"
+                )
+            IngressNodes = tuple(
+                Cells[Index]
+                for Index in range(0, len(Cells), TrackPitch)
+            )
+            PhysicalClaims = RoutingResourceClaims(
+                WireCells=frozenset(Cells),
+                SupportCells=frozenset(
+                    (X, Y - 1, Z) for X, Y, Z in Cells
+                ),
+                RequiredAirCells=frozenset(),
+                ElectricalCells=frozenset(
+                    DefaultRedstoneRoutingTechnology
+                    .BuildElectricalExclusions(set(Cells))
+                ),
+            )
+            ClaimsFingerprint = sha256(repr((
+                Layer,
+                Direction,
+                tuple(sorted(PhysicalClaims.ResourceIds, key=repr)),
+            )).encode("utf-8")).hexdigest()[:16]
+            LaneRecords.append(InterClusterChannelLane(
+                Layer=Layer,
+                Direction=Direction,
+                Cells=Cells,
+                IngressNodes=IngressNodes,
+                PhysicalClaims=PhysicalClaims,
+                ClaimsFingerprint=ClaimsFingerprint,
+            ))
+
+    CandidateAffectedSignals = {
+        Request.Signal
+        for Request in AllBoundaryRequests
+        if (
+            Request.SourceCluster in AffectedSet
+            or Request.TargetCluster in AffectedSet
+        )
+    }
+    if TopologyComponent is not None:
+        ClosedSignals = frozenset((
+            *TopologyComponent.InternalSignals,
+            *TopologyComponent.BoundarySignals,
+        ))
+        CandidateAffectedSignals.intersection_update(ClosedSignals)
+    AffectedSignals = tuple(sorted(CandidateAffectedSignals))
+    MinimumX = min(
+        (Cell[0] for Lane in LaneRecords for Cell in Lane.Cells),
+        default=0,
+    )
+    MinimumZ = min(
+        (Cell[2] for Lane in LaneRecords for Cell in Lane.Cells),
+        default=0,
+    )
+    StructuralClusters = tuple(sorted(
+        Source.PackedClusters[Cluster].StructuralSignature
+        if Cluster < len(Source.PackedClusters)
+        else str(len(Source.Clusters[Cluster]))
+        for Cluster in AffectedClusters
+    ))
+    ChannelFingerprint = sha256(repr((
+        StructuralClusters,
+        tuple(
+            (
+                Axis,
+                Coordinate - (MinimumX if Axis == "X" else MinimumZ),
+                Minimum - (MinimumZ if Axis == "X" else MinimumX),
+                Maximum - (MinimumZ if Axis == "X" else MinimumX),
+            )
+            for Axis, Coordinate, Minimum, Maximum
+            in InsertedBoundaryStrips
+        ),
+        tuple(
+            (
+                Lane.Layer,
+                Lane.Direction,
+                tuple(
+                    (
+                        Cell[0] - MinimumX,
+                        Cell[1],
+                        Cell[2] - MinimumZ,
+                    )
+                    for Cell in Lane.Cells
+                ),
+            )
+            for Lane in LaneRecords
+        ),
+    )).encode("utf-8")).hexdigest()[:16]
+    Channel = InterClusterRoutingChannel(
+        ChannelFingerprint=ChannelFingerprint,
+        AffectedClusters=tuple(sorted(AffectedClusters)),
+        AffectedSignals=AffectedSignals,
+        InsertedBoundaryStrips=InsertedBoundaryStrips,
+        ClusterTranslations=tuple(sorted(
+            ClusterTranslations.items()
+        )),
+        Lanes=tuple(LaneRecords),
+        TrackPitch=TrackPitch,
+        MaximumAffectedClusters=MaximumAffectedClusters,
+        MaximumBoundaryStrips=MaximumBoundaryStrips,
+        ComponentId=ComponentId,
+        InterfaceFingerprint=(
+            TopologyComponent.StructuralFingerprint
+            if TopologyComponent is not None
+            else ""
+        ),
+        DeclaredFeedthroughSignals=(),
+    )
+
+    CandidateClaims = tuple(
+        TranslateClusterLocalRouteClaim(
+            Claim,
+            ClusterTranslations.get(Claim.ClusterId, (0, 0, 0)),
+        )
+        for Claim in Source.Placed.LocalRouteClaims or ()
+    )
+    CandidateLeaseRequests = tuple(
+        replace(
+            Request,
+            SourceTerminal=(
+                TranslatePosition(
+                    Request.SourceTerminal,
+                    ClusterTranslations.get(
+                        Request.SourceCluster,
+                        (0, 0, 0),
+                    ),
+                )
+                if Request.SourceTerminal is not None
+                else None
+            ),
+            TargetTerminals=tuple(
+                TranslatePosition(
+                    Terminal,
+                    ClusterTranslations.get(
+                        Request.TargetCluster,
+                        (0, 0, 0),
+                    ),
+                )
+                for Terminal in Request.TargetTerminals
+            ),
+        )
+        for Request in AllBoundaryRequests
+    )
+    Diagnostics = dict(Source.Placed.LocalRouteDiagnostics or {})
+    DeferredDiagnostics = Diagnostics.get(
+        "__DeferredLocalRouting__",
+        {},
+    )
+    if isinstance(DeferredDiagnostics, dict):
+        Diagnostics["__DeferredLocalRouting__"] = {
+            **DeferredDiagnostics,
+            "ScoringOnly": False,
+            "Channelized": True,
+        }
+    Diagnostics["__InterClusterRoutingChannel__"] = (
+        Channel.ToDictionary()
+    )
+    CandidatePlaced = PlacedDesign(
+        Module=Source.Placed.Module,
+        PlacedGates=CandidateGates,
+        RouteGuides=None,
+        RouteLayers=None,
+        FrozenNetWires=None,
+        LocalNetBranches=None,
+        LocalNetTargets=None,
+        LocalRouteClaims=CandidateClaims,
+        LocalRouteDiagnostics=Diagnostics,
+        ClusterBoundaryLeaseRequests=CandidateLeaseRequests,
+        CompleteClusterInterfaceAccess=True,
+        InterClusterRoutingChannel=Channel,
+        PackedClusters=Source.PackedClusters,
+        ComponentGraph=LogicalComponentGraph,
+    )
+    return replace(
+        Source,
+        Placed=CandidatePlaced,
+        PackedClusters=tuple(
+            replace(
+                Cluster,
+                BoundaryTerminals=tuple(
+                    TranslatePosition(
+                        Terminal,
+                        ClusterTranslations.get(
+                            Cluster.ClusterId,
+                            (0, 0, 0),
+                        ),
+                    )
+                    for Terminal in Cluster.BoundaryTerminals
+                ),
+            )
+            for Cluster in Source.PackedClusters
+        ),
+        ClusterBoundaryLeaseRequests=CandidateLeaseRequests,
+        ClusterLocalRouteTemplates=tuple(
+            replace(
+                Template,
+                Origin=TranslatePosition(
+                    Template.Origin,
+                    ClusterTranslations.get(
+                        Template.ClusterId,
+                        (0, 0, 0),
+                    ),
+                ),
+            )
+            for Template in Source.ClusterLocalRouteTemplates
+        ),
+        CompleteClusterInterfaceAccess=True,
+        MandatoryAccessPreScreenProfile=None,
+        InterClusterRoutingChannel=Channel,
+        ComponentGraph=LogicalComponentGraph,
+    )
+
+
+def BuildBoundedInterClusterRoutingDeck(
+    Source: PcbPlacement,
+    *,
+    TrackPitch: int | None = None,
+    MaximumAffectedClusters: int = 3,
+    MaximumDeckLanes: int = 2,
+    InterfaceDeckLayer: int = 3,
+    ComponentVariant: int = 0,
+    PreferredSignals: Iterable[str] = (),
+    ForcedAffectedClusters: tuple[int, ...] | None = None,
+) -> PcbPlacement:
+    """Add one component-owned routing deck above the compact three layers."""
+    TrackPitch = (
+        DefaultRedstoneRoutingTechnology.TrackPitch
+        if TrackPitch is None
+        else int(TrackPitch)
+    )
+    if TrackPitch < 1:
+        raise ValueError("interface deck pitch must be positive")
+    if MaximumAffectedClusters not in {2, 3}:
+        raise ValueError("interface deck supports two or three clusters")
+    if not 1 <= MaximumDeckLanes <= 12:
+        raise ValueError("interface deck supports one through twelve lanes")
+    if InterfaceDeckLayer != 3:
+        raise ValueError(
+            "the bounded interface deck must follow three compact layers"
+        )
+    if ComponentVariant < 0:
+        raise ValueError("component variant cannot be negative")
+    PreferredSignalSet = frozenset(
+        str(Signal) for Signal in PreferredSignals
+    )
+
+    GateByName = {
+        Gate.Name: Gate for Gate in Source.Placed.PlacedGates
+    }
+    ClusterGates = {
+        ClusterIndex: tuple(
+            GateByName[Name]
+            for Name in Names
+            if Name in GateByName
+        )
+        for ClusterIndex, Names in enumerate(Source.Clusters)
+    }
+    ClusterGates = {
+        ClusterIndex: Gates
+        for ClusterIndex, Gates in ClusterGates.items()
+        if Gates
+    }
+    AllBoundaryRequests = (
+        BuildPhysicalClusterBoundaryLeaseRequests(Source)
+    )
+    BoundaryRequests = tuple(
+        Request
+        for Request in AllBoundaryRequests
+        if (
+            Request.SourceCluster in ClusterGates
+            and Request.TargetCluster in ClusterGates
+            and Request.SourceCluster != Request.TargetCluster
+        )
+    )
+    EdgeDemand: dict[tuple[int, int], int] = {}
+    for Request in BoundaryRequests:
+        Edge = tuple(sorted((
+            int(Request.SourceCluster),
+            int(Request.TargetCluster),
+        )))
+        EdgeDemand[Edge] = EdgeDemand.get(Edge, 0) + (
+            1 + len(Request.TargetTerminals)
+        )
+    LogicalComponentGraph = (
+        Source.ComponentGraph or Source.Placed.ComponentGraph
+    )
+    LogicalComponentByGate = (
+        dict(LogicalComponentGraph.GateToComponent)
+        if (
+            LogicalComponentGraph is not None
+            and LogicalComponentGraph.Hierarchical
+        )
+        else {}
+    )
+    LogicalClustersByComponent: dict[int, set[int]] = {}
+    LogicalComponentByCluster: dict[int, int] = {}
+    for ClusterIndex, Gates in ClusterGates.items():
+        ComponentIds = {
+            LogicalComponentByGate[Gate.Name]
+            for Gate in Gates
+            if Gate.Name in LogicalComponentByGate
+        }
+        if len(ComponentIds) == 1:
+            ComponentId = next(iter(ComponentIds))
+            LogicalComponentByCluster[ClusterIndex] = ComponentId
+            LogicalClustersByComponent.setdefault(
+                ComponentId,
+                set(),
+            ).add(ClusterIndex)
+    AlignedLogicalComponents = {
+        frozenset(ClusterIndexes): ComponentId
+        for ComponentId, ClusterIndexes
+        in LogicalClustersByComponent.items()
+        if 2 <= len(ClusterIndexes) <= MaximumAffectedClusters
+    }
+    def LogicalComponentForClusterSet(
+        ClusterSet: frozenset[int],
+    ) -> int | None:
+        ComponentIds = {
+            LogicalComponentByCluster[Cluster]
+            for Cluster in ClusterSet
+            if Cluster in LogicalComponentByCluster
+        }
+        return (
+            next(iter(ComponentIds))
+            if (
+                len(ComponentIds) == 1
+                and ClusterSet
+                == frozenset(LogicalClustersByComponent.get(
+                    next(iter(ComponentIds)),
+                    (),
+                ))
+                and frozenset(
+                    Gate.Name
+                    for Cluster in ClusterSet
+                    for Gate in ClusterGates[Cluster]
+                    if Gate.Name in LogicalComponentByGate
+                )
+                == LogicalGateNamesByComponent.get(
+                    next(iter(ComponentIds)),
+                    frozenset(),
+                )
+                and all(
+                    Cluster in LogicalComponentByCluster
+                    for Cluster in ClusterSet
+                )
+            )
+            else None
+        )
+    LogicalComponentBenefits = {
+        Value.ComponentId: (
+            len(Value.BoundarySignals),
+            -Value.QualifyingReconvergentCutCount,
+            -len(Value.GateNames),
+        )
+        for Value in getattr(
+            LogicalComponentGraph,
+            "Components",
+            (),
+        )
+    }
+    LogicalGateNamesByComponent = {
+        Value.ComponentId: frozenset(Value.GateNames)
+        for Value in getattr(
+            LogicalComponentGraph,
+            "Components",
+            (),
+        )
+    }
+    CandidateComponents = []
+    ClusterIndexes = tuple(sorted(ClusterGates))
+    for ComponentSize in range(
+        min(MaximumAffectedClusters, len(ClusterIndexes)),
+        1,
+        -1,
+    ):
+        for Component in combinations(ClusterIndexes, ComponentSize):
+            ComponentSet = frozenset(Component)
+            Edges = tuple(
+                Edge for Edge in EdgeDemand
+                if set(Edge) <= ComponentSet
+            )
+            if len(Edges) < ComponentSize - 1:
+                continue
+            Visited = {Component[0]}
+            while True:
+                Expanded = {
+                    Value
+                    for Edge in Edges
+                    if set(Edge) & Visited
+                    for Value in Edge
+                }
+                if Expanded <= Visited:
+                    break
+                Visited.update(Expanded)
+            if Visited != set(Component):
+                continue
+            if (
+                LogicalComponentGraph is not None
+                and LogicalComponentGraph.Hierarchical
+                and LogicalComponentForClusterSet(ComponentSet) is None
+            ):
+                continue
+            Signatures = tuple(sorted(
+                Source.PackedClusters[Index].StructuralSignature
+                if Index < len(Source.PackedClusters)
+                else str(len(Source.Clusters[Index]))
+                for Index in Component
+            ))
+            CrossingOwnedTerminalDemand = 0
+            CrossingSignals = set()
+            IncidentSignals = set()
+            InternallyOwnedSignals = set()
+            InternallyOwnedTerminalDemand = 0
+            PreferredCoveredSignals = set()
+            PreferredOwnedTerminalCoverage = 0
+            PreferredFullyOwnedRequestCount = 0
+            ComponentGates = tuple(
+                Gate
+                for Cluster in ComponentSet
+                for Gate in ClusterGates[Cluster]
+            )
+            ComponentMinimumX = min(Gate.X for Gate in ComponentGates)
+            ComponentMaximumX = max(Gate.X for Gate in ComponentGates)
+            ComponentMinimumZ = min(Gate.Z for Gate in ComponentGates)
+            ComponentMaximumZ = max(Gate.Z for Gate in ComponentGates)
+            PerimeterDepths = []
+            DirectedPerimeterPenalties = []
+
+            def RecordPerimeterDepth(
+                Terminal: tuple[int, int, int] | None,
+                Side: str,
+            ) -> None:
+                if Terminal is None:
+                    return
+                X, _Y, Z = Terminal
+                SideDepths = {
+                    "west": abs(X - ComponentMinimumX),
+                    "east": abs(ComponentMaximumX - X),
+                    "north": abs(Z - ComponentMinimumZ),
+                    "south": abs(ComponentMaximumZ - Z),
+                }
+                MinimumDepth = min(SideDepths.values())
+                DirectedDepth = SideDepths.get(
+                    str(Side).lower(),
+                    MinimumDepth,
+                )
+                PerimeterDepths.append(MinimumDepth)
+                DirectedPerimeterPenalties.append(
+                    max(0, DirectedDepth - MinimumDepth)
+                )
+
+            for Request in AllBoundaryRequests:
+                SourceSelected = (
+                    int(Request.SourceCluster) in ComponentSet
+                )
+                TargetSelected = (
+                    int(Request.TargetCluster) in ComponentSet
+                )
+                if not (SourceSelected or TargetSelected):
+                    continue
+                IncidentSignals.add(str(Request.Signal))
+                if str(Request.Signal) in PreferredSignalSet:
+                    PreferredCoveredSignals.add(
+                        str(Request.Signal)
+                    )
+                    PreferredOwnedTerminalCoverage += (
+                        int(
+                            SourceSelected
+                            and Request.SourceTerminal is not None
+                        )
+                        + (
+                            len(Request.TargetTerminals)
+                            if TargetSelected
+                            else 0
+                        )
+                    )
+                    PreferredFullyOwnedRequestCount += int(
+                        SourceSelected and TargetSelected
+                    )
+                if SourceSelected and TargetSelected:
+                    InternallyOwnedSignals.add(str(Request.Signal))
+                    InternallyOwnedTerminalDemand += (
+                        int(Request.SourceTerminal is not None)
+                        + len(Request.TargetTerminals)
+                    )
+                if SourceSelected == TargetSelected:
+                    continue
+                CrossingSignals.add(str(Request.Signal))
+                if SourceSelected:
+                    RecordPerimeterDepth(
+                        Request.SourceTerminal,
+                        Request.SourceBoundarySide,
+                    )
+                else:
+                    for Terminal in Request.TargetTerminals:
+                        RecordPerimeterDepth(
+                            Terminal,
+                            Request.TargetBoundarySide,
+                        )
+                CrossingOwnedTerminalDemand += (
+                    int(Request.SourceTerminal is not None)
+                    if SourceSelected
+                    else len(Request.TargetTerminals)
+                )
+            PeakInternalDemand = max(
+                (EdgeDemand[Edge] for Edge in Edges),
+                default=0,
+            )
+            TotalInternalDemand = sum(
+                EdgeDemand[Edge] for Edge in Edges
+            )
+            PeakInternalSignalCount = max(
+                (
+                    len({
+                        str(Request.Signal)
+                        for Request in AllBoundaryRequests
+                        if frozenset((
+                            int(Request.SourceCluster),
+                            int(Request.TargetCluster),
+                        )) == frozenset(Edge)
+                    })
+                    for Edge in Edges
+                ),
+                default=0,
+            )
+            if PreferredSignalSet:
+                # A learned global cut identifies work that must move inside
+                # the routed component.  First maximize exact ownership of
+                # that cut; only then prefer the least-demanding residual
+                # interface.  Reversing these priorities can select a quiet
+                # component that owns one cut terminal and exports the
+                # original high-fanout net back to the global router.
+                Score = (
+                    -len(PreferredCoveredSignals),
+                    -PreferredFullyOwnedRequestCount,
+                    -PreferredOwnedTerminalCoverage,
+                    0
+                    if LogicalComponentForClusterSet(ComponentSet)
+                    is not None
+                    else 1,
+                    len(CrossingSignals),
+                    CrossingOwnedTerminalDemand,
+                    max(DirectedPerimeterPenalties, default=0),
+                    sum(DirectedPerimeterPenalties),
+                    max(PerimeterDepths, default=0),
+                    sum(PerimeterDepths),
+                    LogicalComponentBenefits.get(
+                        LogicalComponentForClusterSet(ComponentSet),
+                        (1 << 30, 0, 0),
+                    ),
+                    PeakInternalDemand,
+                    TotalInternalDemand,
+                    len(IncidentSignals),
+                    PeakInternalSignalCount,
+                    -len(InternallyOwnedSignals),
+                    -InternallyOwnedTerminalDemand,
+                    -ComponentSize,
+                    Signatures,
+                    Component,
+                )
+            else:
+                Score = (
+                    0,
+                    0,
+                    0,
+                    0
+                    if LogicalComponentForClusterSet(ComponentSet)
+                    is not None
+                    else 1,
+                    len(CrossingSignals),
+                    CrossingOwnedTerminalDemand,
+                    max(DirectedPerimeterPenalties, default=0),
+                    sum(DirectedPerimeterPenalties),
+                    max(PerimeterDepths, default=0),
+                    sum(PerimeterDepths),
+                    LogicalComponentBenefits.get(
+                        LogicalComponentForClusterSet(ComponentSet),
+                        (1 << 30, 0, 0),
+                    ),
+                    len(IncidentSignals),
+                    PeakInternalSignalCount,
+                    PeakInternalDemand,
+                    TotalInternalDemand,
+                    -len(InternallyOwnedSignals),
+                    -InternallyOwnedTerminalDemand,
+                    -ComponentSize,
+                    Signatures,
+                    Component,
+                )
+            CandidateComponents.append((
+                Score,
+                Component,
+                (
+                    len(CrossingSignals),
+                    CrossingOwnedTerminalDemand,
+                    max(DirectedPerimeterPenalties, default=0),
+                    sum(DirectedPerimeterPenalties),
+                    max(PerimeterDepths, default=0),
+                    sum(PerimeterDepths),
+                ),
+            ))
+    if not CandidateComponents:
+        raise ValueError(
+            "no connected two-or-three-cluster interface deck component"
+        )
+    RankedComponents = tuple(sorted(CandidateComponents))
+    if len(ClusterIndexes) <= MaximumAffectedClusters:
+        WholePlacementComponents = tuple(
+            Value
+            for Value in RankedComponents
+            if frozenset(Value[1]) == frozenset(ClusterIndexes)
+        )
+        if WholePlacementComponents:
+            RankedComponents = WholePlacementComponents
+    if ForcedAffectedClusters is None:
+        (
+            _Score,
+            AffectedClusters,
+            SelectedPerimeterAccessScore,
+        ) = RankedComponents[ComponentVariant % len(RankedComponents)]
+    else:
+        ForcedClusterSet = frozenset(map(int, ForcedAffectedClusters))
+        ForcedMatches = tuple(
+            Value
+            for Value in RankedComponents
+            if frozenset(Value[1]) == ForcedClusterSet
+        )
+        if not ForcedMatches:
+            raise ValueError(
+                "forced deck component is not a legal connected component"
+            )
+        (
+            _Score,
+            AffectedClusters,
+            SelectedPerimeterAccessScore,
+        ) = ForcedMatches[0]
+    AffectedSet = frozenset(AffectedClusters)
+    ComponentId = LogicalComponentForClusterSet(AffectedSet)
+    TopologyComponent = (
+        next(
+            (
+                Value
+                for Value in LogicalComponentGraph.Components
+                if Value.ComponentId == ComponentId
+            ),
+            None,
+        )
+        if (
+            LogicalComponentGraph is not None
+            and ComponentId is not None
+        )
+        else None
+    )
+
+    def Center(Cluster: int) -> tuple[int, int]:
+        Gates = ClusterGates[Cluster]
+        return (
+            sum(Gate.X for Gate in Gates) // len(Gates),
+            sum(Gate.Z for Gate in Gates) // len(Gates),
+        )
+
+    Centers = {
+        Cluster: Center(Cluster)
+        for Cluster in AffectedClusters
+    }
+    RankedEdges = sorted(
+        (
+            Edge for Edge in EdgeDemand
+            if set(Edge) <= AffectedSet
+        ),
+        key=lambda Edge: (
+            -EdgeDemand[Edge],
+            abs(Centers[Edge[0]][0] - Centers[Edge[1]][0])
+            + abs(Centers[Edge[0]][1] - Centers[Edge[1]][1]),
+            Edge,
+        ),
+    )
+    Parents = {Cluster: Cluster for Cluster in AffectedClusters}
+
+    def Find(Value: int) -> int:
+        while Parents[Value] != Value:
+            Parents[Value] = Parents[Parents[Value]]
+            Value = Parents[Value]
+        return Value
+
+    TreeEdges = []
+    for First, Second in RankedEdges:
+        FirstRoot, SecondRoot = Find(First), Find(Second)
+        if FirstRoot == SecondRoot:
+            continue
+        Parents[max(FirstRoot, SecondRoot)] = min(
+            FirstRoot,
+            SecondRoot,
+        )
+        TreeEdges.append((First, Second))
+        if len(TreeEdges) == len(AffectedClusters) - 1:
+            break
+    if len(TreeEdges) != len(AffectedClusters) - 1:
+        raise ValueError("interface deck spanning tree is incomplete")
+    TreeEdges = TreeEdges[:MaximumDeckLanes]
+
+    PlacementBaseY = min(
+        Gate.Y for Gate in Source.Placed.PlacedGates
+    )
+    RoutingY = DefaultRedstoneRoutingTechnology.RoutingY(
+        PlacementBaseY,
+        InterfaceDeckLayer,
+    )
+    Occupied, _Electrical, _Solid = BuildPlacedCellGeometry(Source.Placed)
+
+    def BuildTreeLane(
+        DeltaX: int,
+        DeltaZ: int,
+        XFirst: bool,
+    ) -> tuple[tuple[tuple[int, int, int], ...], ...] | None:
+        def InclusiveRange(Start: int, End: int) -> range:
+            return range(
+                Start,
+                End + (1 if End >= Start else -1),
+                1 if End >= Start else -1,
+            )
+
+        EdgePaths = []
+        for First, Second in TreeEdges:
+            FirstX, FirstZ = Centers[First]
+            SecondX, SecondZ = Centers[Second]
+            StartX, StartZ = FirstX + DeltaX, FirstZ + DeltaZ
+            EndX, EndZ = SecondX + DeltaX, SecondZ + DeltaZ
+            if XFirst:
+                Cells = tuple((
+                    *((X, RoutingY, StartZ)
+                      for X in InclusiveRange(StartX, EndX)),
+                    *((EndX, RoutingY, Z)
+                      for Z in tuple(InclusiveRange(StartZ, EndZ))[1:]),
+                ))
+            else:
+                Cells = tuple((
+                    *((StartX, RoutingY, Z)
+                      for Z in InclusiveRange(StartZ, EndZ)),
+                    *((X, RoutingY, EndZ)
+                      for X in tuple(InclusiveRange(StartX, EndX))[1:]),
+                ))
+            if not Cells or any(
+                Position in Occupied
+                for X, Y, Z in Cells
+                for Position in (
+                    (X, Y, Z),
+                    (X, Y - 1, Z),
+                )
+            ):
+                return None
+            EdgePaths.append(Cells)
+        return tuple(EdgePaths)
+
+    LaneCandidates = []
+    LaneOffsets = (
+        (0, 0),
+        *(
+            Value
+            for Distance in range(1, 7)
+            for Value in (
+                (-Distance * TrackPitch, 0),
+                (Distance * TrackPitch, 0),
+                (0, -Distance * TrackPitch),
+                (0, Distance * TrackPitch),
+            )
+        ),
+    )
+    for DeltaX, DeltaZ in LaneOffsets:
+        for XFirst in (True, False):
+            EdgePaths = BuildTreeLane(
+                DeltaX,
+                DeltaZ,
+                XFirst,
+            )
+            if EdgePaths is None:
+                continue
+            Cells = frozenset(
+                Position
+                for Path in EdgePaths
+                for Position in Path
+            )
+            LaneCandidates.append((
+                (
+                    abs(DeltaX) + abs(DeltaZ),
+                    DeltaX,
+                    DeltaZ,
+                    not XFirst,
+                ),
+                EdgePaths,
+                Cells,
+            ))
+    def LanesAreSeparated(
+        First: tuple[object, ...],
+        Second: tuple[object, ...],
+    ) -> bool:
+        return not any(
+            abs(FirstCell[0] - SecondCell[0])
+            + abs(FirstCell[2] - SecondCell[2])
+            < TrackPitch
+            for FirstCell in First[2]
+            for SecondCell in Second[2]
+        )
+
+    SelectedTreeLaneValues = []
+    for Candidate in sorted(
+        LaneCandidates,
+        key=lambda Value: Value[0],
+    ):
+        if all(
+            LanesAreSeparated(Candidate, Existing)
+            for Existing in SelectedTreeLaneValues
+        ):
+            SelectedTreeLaneValues.append(Candidate)
+            if len(SelectedTreeLaneValues) >= MaximumDeckLanes:
+                break
+    SelectedTreeLanes = tuple(SelectedTreeLaneValues)
+    if not SelectedTreeLanes:
+        raise ValueError(
+            "no electrically separated component-tree deck lane"
+        )
+
+    LaneRecords = []
+    for ParallelLaneIndex, LaneCandidate in enumerate(
+        SelectedTreeLanes[:MaximumDeckLanes]
+    ):
+        _LaneScore, EdgePaths, _LaneCells = LaneCandidate
+        for EdgeIndex, Cells in enumerate(EdgePaths):
+            First, Second = TreeEdges[EdgeIndex]
+            IngressNodes = tuple(dict.fromkeys((
+                Cells[0],
+                Cells[-1],
+                *Cells[::TrackPitch],
+            )))
+            PhysicalClaims = RoutingResourceClaims(
+                WireCells=frozenset(Cells),
+                SupportCells=frozenset(
+                    (X, Y - 1, Z) for X, Y, Z in Cells
+                ),
+                RequiredAirCells=frozenset(),
+                ElectricalCells=frozenset(
+                    DefaultRedstoneRoutingTechnology
+                    .BuildElectricalExclusions(set(Cells))
+                ),
+            )
+            ClaimsFingerprint = sha256(repr((
+                InterfaceDeckLayer,
+                tuple(sorted(
+                    PhysicalClaims.ResourceIds,
+                    key=repr,
+                )),
+            )).encode("utf-8")).hexdigest()[:16]
+            LaneRecords.append(InterClusterChannelLane(
+                Layer=InterfaceDeckLayer,
+                Direction=f"XZ-Lane{ParallelLaneIndex}",
+                Cells=Cells,
+                IngressNodes=IngressNodes,
+                PhysicalClaims=PhysicalClaims,
+                ClaimsFingerprint=ClaimsFingerprint,
+            ))
+
+    MinimumX = min(Cell[0] for Lane in LaneRecords for Cell in Lane.Cells)
+    MinimumZ = min(Cell[2] for Lane in LaneRecords for Cell in Lane.Cells)
+    StructuralClusters = tuple(sorted(
+        Source.PackedClusters[Cluster].StructuralSignature
+        if Cluster < len(Source.PackedClusters)
+        else str(len(Source.Clusters[Cluster]))
+        for Cluster in AffectedClusters
+    ))
+    ChannelFingerprint = sha256(repr((
+        "parallel-tree-cluster-interface-deck-v1",
+        StructuralClusters,
+        InterfaceDeckLayer,
+        tuple(
+            (
+                Lane.Layer,
+                tuple(
+                    (
+                        Cell[0] - MinimumX,
+                        Cell[1] - PlacementBaseY,
+                        Cell[2] - MinimumZ,
+                    )
+                    for Cell in Lane.Cells
+                ),
+            )
+            for Lane in LaneRecords
+        ),
+    )).encode("utf-8")).hexdigest()[:16]
+    CandidateAffectedSignals = {
+        Request.Signal
+        for Request in AllBoundaryRequests
+        if (
+            (
+                Request.SourceCluster in AffectedSet
+                and Request.TargetCluster in AffectedSet
+            )
+            or (
+                str(Request.Signal) in PreferredSignalSet
+                and (
+                    Request.SourceCluster in AffectedSet
+                    or Request.TargetCluster in AffectedSet
+                )
+            )
+        )
+    }
+    if TopologyComponent is not None:
+        CandidateAffectedSignals.intersection_update(frozenset((
+            *TopologyComponent.InternalSignals,
+            *TopologyComponent.BoundarySignals,
+        )))
+    AffectedSignals = tuple(sorted(CandidateAffectedSignals))
+    Deck = InterClusterRoutingChannel(
+        ChannelFingerprint=ChannelFingerprint,
+        AffectedClusters=tuple(sorted(AffectedClusters)),
+        AffectedSignals=AffectedSignals,
+        InsertedBoundaryStrips=(),
+        ClusterTranslations=tuple(
+            (Cluster, (0, 0, 0))
+            for Cluster in sorted(AffectedClusters)
+        ),
+        Lanes=tuple(LaneRecords),
+        PhysicalModel="parallel-tree-cluster-interface-deck-v1",
+        InterfaceDeckLayer=InterfaceDeckLayer,
+        TrackPitch=TrackPitch,
+        MaximumAffectedClusters=MaximumAffectedClusters,
+        MaximumBoundaryStrips=0,
+        ComponentId=ComponentId,
+        InterfaceFingerprint=(
+            TopologyComponent.StructuralFingerprint
+            if TopologyComponent is not None
+            else ""
+        ),
+        DeclaredFeedthroughSignals=(),
+    )
+    Diagnostics = dict(Source.Placed.LocalRouteDiagnostics or {})
+    DeferredDiagnostics = Diagnostics.get(
+        "__DeferredLocalRouting__",
+        {},
+    )
+    if isinstance(DeferredDiagnostics, dict):
+        Diagnostics["__DeferredLocalRouting__"] = {
+            **DeferredDiagnostics,
+            "ScoringOnly": False,
+            "InterfaceDeck": True,
+        }
+    Diagnostics["__InterClusterRoutingChannel__"] = Deck.ToDictionary()
+    Diagnostics["__InterClusterRoutingDeckSelection__"] = {
+        "PreferredSignals": sorted(PreferredSignalSet),
+        "SelectedPreferredSignalCount": -_Score[0],
+        "SelectedPeakInternalEdgeDemand": max(
+            (
+                EdgeDemand[Edge]
+                for Edge in EdgeDemand
+                if set(Edge) <= AffectedSet
+            ),
+            default=0,
+        ),
+        "SelectedTotalInternalEdgeDemand": sum(
+            EdgeDemand[Edge]
+            for Edge in EdgeDemand
+            if set(Edge) <= AffectedSet
+        ),
+        "SelectedPreferredFullyOwnedRequestCount": (
+            -_Score[1] if PreferredSignalSet else 0
+        ),
+        "SelectedPreferredOwnedTerminalCoverage": (
+            -_Score[2] if PreferredSignalSet else 0
+        ),
+        "SelectedClusterCount": len(AffectedClusters),
+        "SelectedPerimeterAccessScore": list(
+            SelectedPerimeterAccessScore[2:]
+        ),
+        "SelectedBoundaryInterfaceSignalCount": (
+            SelectedPerimeterAccessScore[0]
+        ),
+        "SelectedBoundaryInterfaceTerminalDemand": (
+            SelectedPerimeterAccessScore[1]
+        ),
+        "ComponentVariant": ComponentVariant,
+    }
+    CandidatePlaced = replace(
+        Source.Placed,
+        RouteGuides=None,
+        RouteLayers=None,
+        FrozenNetWires=None,
+        LocalNetBranches=None,
+        LocalNetTargets=None,
+        LocalRouteDiagnostics=Diagnostics,
+        ClusterBoundaryLeaseRequests=AllBoundaryRequests,
+        CompleteClusterInterfaceAccess=True,
+        InterClusterRoutingChannel=Deck,
+        PackedClusters=Source.PackedClusters,
+    )
+    return replace(
+        Source,
+        Placed=CandidatePlaced,
+        ClusterBoundaryLeaseRequests=AllBoundaryRequests,
+        CompleteClusterInterfaceAccess=True,
+        MandatoryAccessPreScreenProfile=None,
+        InterClusterRoutingChannel=Deck,
+    )
 
 
 def BuildTopologicalLevels(
@@ -734,6 +4395,8 @@ def BuildConnectivityClusters(
     MaximumClusterSize: int = 32,
     Policy: ClusteringPolicy | None = None,
     MaximumBoundaryTerminals: int | None = None,
+    RefinementProfile: CutDrivenClusterRefinementProfile | None = None,
+    LogicalComponentByGate: Mapping[str, int] | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[tuple[str, ...], ...]:
     """Agglomerate strongly connected NAND gates without circuit recognition."""
@@ -743,6 +4406,9 @@ def BuildConnectivityClusters(
     if not Internal:
         return ()
     InternalNames = {Gate.Name for Gate in Internal}
+    LogicalComponentByGate = dict(
+        LogicalComponentByGate or {}
+    )
     Producers = {
         Signal: Gate.Name
         for Gate in Module.Gates
@@ -761,7 +4427,18 @@ def BuildConnectivityClusters(
             if Producer not in InternalNames or Producer == Gate.Name:
                 continue
             Key = frozenset((Producer, Gate.Name))
-            EdgeWeights[Key] = EdgeWeights.get(Key, 0) + 1
+            EdgeWeights[Key] = (
+                EdgeWeights.get(Key, 0)
+                + 1
+                + (
+                    RefinementProfile.EdgeWeight
+                    if (
+                        RefinementProfile is not None
+                        and Signal in RefinementProfile.Signals
+                    )
+                    else 0
+                )
+            )
     Levels = BuildTopologicalLevels(Module, WorkCheck=WorkCheck)
     BoundaryEvaluationCount = 0
 
@@ -813,6 +4490,12 @@ def BuildConnectivityClusters(
                 First = Clusters[FirstId]
                 Second = Clusters[SecondId]
                 if len(First) + len(Second) > MaximumClusterSize:
+                    continue
+                if LogicalComponentByGate and len({
+                    LogicalComponentByGate[Name]
+                    for Name in (*First, *Second)
+                    if Name in LogicalComponentByGate
+                }) > 1:
                     continue
                 CrossWeight = sum(
                     Weight
@@ -1079,10 +4762,246 @@ def FindIsomorphicNandClusterMapping(
     }
 
 
+def ComposeCellTransform(
+    CellRotation: int,
+    CellMirrorX: bool,
+    ClusterRotation: int,
+    ClusterMirrorX: bool,
+) -> tuple[int, bool]:
+    """Compose a cell transform with one enclosing cluster transform."""
+    TargetX = TransformDirection(
+        TransformDirection((1, 0, 0), CellRotation, CellMirrorX),
+        ClusterRotation,
+        ClusterMirrorX,
+    )
+    TargetZ = TransformDirection(
+        TransformDirection((0, 0, 1), CellRotation, CellMirrorX),
+        ClusterRotation,
+        ClusterMirrorX,
+    )
+    for Rotation in (0, 90, 180, 270):
+        for MirrorX in (False, True):
+            if (
+                TransformDirection((1, 0, 0), Rotation, MirrorX) == TargetX
+                and TransformDirection((0, 0, 1), Rotation, MirrorX) == TargetZ
+            ):
+                return Rotation, MirrorX
+    raise ValueError("Could not compose packed-cell transforms")
+
+
+def TransformPackedClusterLayout(
+    Names: tuple[str, ...],
+    LocalPositions: dict[str, tuple[int, int]],
+    LocalRotations: dict[str, int],
+    LocalMirrors: dict[str, bool],
+    Rotation: int,
+    MirrorX: bool,
+    GatesByName: dict[str, Any] | None = None,
+) -> ClusterLayoutVariant:
+    """Rigidly transform a local layout using exact template geometry.
+
+    A NAND's placement origin is not a rigid physical anchor: its template
+    extends beyond the nominal footprint through pins, electrical exclusions,
+    and directional supports.  When logical gates are available, derive each
+    transformed origin by matching the transformed actual/electrical template
+    sets to a composed target template.  This prevents a nominally mirrored
+    rectangle from committing as an electrically overlapping NAND placement.
+    """
+    Rotation = NormalizeRotation(Rotation)
+    BaseWidth = max(
+        LocalPositions[Name][0]
+        + RotatedCellSize("NAND", LocalRotations[Name])[0]
+        for Name in Names
+    )
+    BaseDepth = max(
+        LocalPositions[Name][1]
+        + RotatedCellSize("NAND", LocalRotations[Name])[1]
+        for Name in Names
+    )
+    Positions: dict[str, tuple[int, int]] = {}
+    Rotations: dict[str, int] = {}
+    Mirrors: dict[str, bool] = {}
+    ActualGeometry: dict[str, frozenset[tuple[int, int, int]]] = {}
+    ElectricalGeometry: dict[str, frozenset[tuple[int, int, int]]] = {}
+
+    def TransformPosition(
+        Position: tuple[int, int, int],
+    ) -> tuple[int, int, int]:
+        return TransformLocalPosition(
+            Position,
+            (BaseWidth, BaseDepth),
+            Rotation,
+            MirrorX,
+        )
+
+    def TranslateGeometry(
+        Geometry: frozenset[tuple[int, int, int]],
+        DeltaX: int,
+        DeltaZ: int,
+    ) -> frozenset[tuple[int, int, int]]:
+        return frozenset(
+            (X + DeltaX, Y, Z + DeltaZ)
+            for X, Y, Z in Geometry
+        )
+
+    for Name in Names:
+        X, Z = LocalPositions[Name]
+        Width, Depth = RotatedCellSize("NAND", LocalRotations[Name])
+        Rotations[Name], Mirrors[Name] = ComposeCellTransform(
+            LocalRotations[Name],
+            LocalMirrors.get(Name, False),
+            Rotation,
+            MirrorX,
+        )
+        if GatesByName is None:
+            Corners = (
+                TransformPosition((X, 0, Z)),
+                TransformPosition((X + Width - 1, 0, Z)),
+                TransformPosition((X, 0, Z + Depth - 1)),
+                TransformPosition((X + Width - 1, 0, Z + Depth - 1)),
+            )
+            Positions[Name] = (
+                min(Value[0] for Value in Corners),
+                min(Value[2] for Value in Corners),
+            )
+            continue
+        SourceActual, SourceElectrical = _PhysicalGateGeometry(
+            "NAND",
+            X,
+            1,
+            Z,
+            LocalRotations[Name],
+            LocalMirrors.get(Name, False),
+        )
+        TransformedActual = frozenset(
+            TransformPosition(Position) for Position in SourceActual
+        )
+        TransformedElectrical = frozenset(
+            TransformPosition(Position) for Position in SourceElectrical
+        )
+        TargetActual, TargetElectrical = _PhysicalGateGeometry(
+            "NAND",
+            0,
+            1,
+            0,
+            Rotations[Name],
+            Mirrors[Name],
+        )
+        SourceAnchor = min(TransformedActual)
+        Match = next(
+            (
+                (SourceAnchor[0] - TargetAnchor[0], SourceAnchor[2] - TargetAnchor[2])
+                for TargetAnchor in sorted(TargetActual)
+                if TranslateGeometry(
+                    TargetActual,
+                    SourceAnchor[0] - TargetAnchor[0],
+                    SourceAnchor[2] - TargetAnchor[2],
+                ) == TransformedActual
+                and TranslateGeometry(
+                    TargetElectrical,
+                    SourceAnchor[0] - TargetAnchor[0],
+                    SourceAnchor[2] - TargetAnchor[2],
+                ) == TransformedElectrical
+            ),
+            None,
+        )
+        if Match is None:
+            return ClusterLayoutVariant(
+                Rotation=Rotation,
+                MirrorX=MirrorX,
+                Positions={},
+                Rotations={},
+                Mirrors={},
+                Width=0,
+                Depth=0,
+                ActualGeometry={},
+                ElectricalGeometry={},
+                RejectionReason=(
+                    f"TemplateTransformMismatch:Member={Name}:"
+                    f"Rotation={Rotation}:MirrorX={MirrorX}"
+                ),
+            )
+        Positions[Name] = Match
+        ActualGeometry[Name] = TransformedActual
+        ElectricalGeometry[Name] = TransformedElectrical
+    MinimumX = min(Value[0] for Value in Positions.values())
+    MinimumZ = min(Value[1] for Value in Positions.values())
+    Positions = {
+        Name: (X - MinimumX, Z - MinimumZ)
+        for Name, (X, Z) in Positions.items()
+    }
+    ActualGeometry = {
+        Name: TranslateGeometry(Geometry, -MinimumX, -MinimumZ)
+        for Name, Geometry in ActualGeometry.items()
+    }
+    ElectricalGeometry = {
+        Name: TranslateGeometry(Geometry, -MinimumX, -MinimumZ)
+        for Name, Geometry in ElectricalGeometry.items()
+    }
+    Width = max(
+        Positions[Name][0] + RotatedCellSize("NAND", Rotations[Name])[0]
+        for Name in Names
+    )
+    Depth = max(
+        Positions[Name][1] + RotatedCellSize("NAND", Rotations[Name])[1]
+        for Name in Names
+    )
+    if GatesByName is not None:
+        CandidateGates = [
+            BuildPlacedGate(
+                GatesByName[Name],
+                Positions[Name][0],
+                1,
+                Positions[Name][1],
+                Rotations[Name],
+                Mirrors[Name],
+            )
+            for Name in Names
+        ]
+        Conflict = next(
+            (
+                (First.Name, Second.Name)
+                for Index, First in enumerate(CandidateGates)
+                for Second in CandidateGates[Index + 1 :]
+                if PcbGatesConflict(First, Second)
+            ),
+            None,
+        )
+        if Conflict is not None:
+            return ClusterLayoutVariant(
+                Rotation=Rotation,
+                MirrorX=MirrorX,
+                Positions=Positions,
+                Rotations=Rotations,
+                Mirrors=Mirrors,
+                Width=Width,
+                Depth=Depth,
+                ActualGeometry=ActualGeometry,
+                ElectricalGeometry=ElectricalGeometry,
+                RejectionReason=(
+                    "TemplateConflict:Members="
+                    f"{Conflict[0]},{Conflict[1]}:Rotation={Rotation}:"
+                    f"MirrorX={MirrorX}"
+                ),
+            )
+    return ClusterLayoutVariant(
+        Rotation=Rotation,
+        MirrorX=MirrorX,
+        Positions=Positions,
+        Rotations=Rotations,
+        Mirrors=Mirrors,
+        Width=Width,
+        Depth=Depth,
+        ActualGeometry=ActualGeometry,
+        ElectricalGeometry=ElectricalGeometry,
+    )
+
+
 def OptimizeClusterSlots(
     Module: Any,
     Clusters: tuple[tuple[str, ...], ...],
     Levels: dict[str, int],
+    LogicalComponentByGate: Mapping[str, int] | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[dict[int, tuple[int, int]], int, int]:
     """Place clusters on a compact grid using weighted net length."""
@@ -1099,6 +5018,9 @@ def OptimizeClusterSlots(
         for Gate in Module.Gates
         for Signal in Gate.Outputs
     }
+    LogicalComponentByGate = dict(
+        LogicalComponentByGate or {}
+    )
     DirectedWeights: dict[tuple[int, int], int] = {}
     InputWeights = {Index: 0 for Index in range(Count)}
     OutputWeights = {Index: 0 for Index in range(Count)}
@@ -1121,7 +5043,21 @@ def OptimizeClusterSlots(
                 and SourceCluster != TargetCluster
             ):
                 Key = SourceCluster, TargetCluster
-                DirectedWeights[Key] = DirectedWeights.get(Key, 0) + 1
+                SharedComponentWeight = (
+                    16
+                    if (
+                        LogicalComponentByGate
+                        and LogicalComponentByGate.get(Producer.Name)
+                        == LogicalComponentByGate.get(Gate.Name)
+                        and Producer.Name in LogicalComponentByGate
+                        and Gate.Name in LogicalComponentByGate
+                    )
+                    else 1
+                )
+                DirectedWeights[Key] = (
+                    DirectedWeights.get(Key, 0)
+                    + SharedComponentWeight
+                )
             elif SourceCluster is not None and Gate.Kind.value == "OUTPUT":
                 OutputWeights[SourceCluster] += 1
 
@@ -1254,6 +5190,1309 @@ def OptimizeClusterSlots(
     return Assignment, Columns, Rows
 
 
+def BuildEffectiveAssignmentCutPairwiseEdges(
+    AssignmentCut: RoutingAssignmentCut | None,
+) -> tuple[tuple[str, str], ...]:
+    """Preserve an explicit assignment edge or infer one exact two-net cut."""
+    if AssignmentCut is None:
+        return ()
+    if AssignmentCut.PairwiseConflictEdges:
+        return AssignmentCut.PairwiseConflictEdges
+    if (
+        AssignmentCut.Classification.value
+        in {
+            "mandatory-boundary-capacity-cut",
+            "portal-coverage-pair-conflict",
+        }
+        and len(AssignmentCut.PriorityRelocationSignals) == 2
+    ):
+        return (
+            tuple(sorted(AssignmentCut.PriorityRelocationSignals)),
+        )
+    return ()
+
+
+def RequiresStructuredAssignmentCutRelocation(
+    AssignmentCut: RoutingAssignmentCut | None,
+) -> bool:
+    """Return whether a complete cut should use footprint-neutral joint repair."""
+    return (
+        AssignmentCut is not None
+        and AssignmentCut.Classification.value
+        in {
+            "saturated-boundary-cut",
+            "higher-order-placement-conflict",
+            "larger-matching-failure",
+            "multi-pair-placement-conflict",
+            "mandatory-boundary-capacity-cut",
+            "portal-coverage-pair-conflict",
+            "relocated-higher-order-conflict",
+            "relocated-larger-matching-failure",
+            "relocated-multi-pair-conflict",
+            "relocated-pairwise-incompatibility",
+        }
+    )
+
+
+def BuildEffectiveStructuredRelocationFocus(
+    AssignmentCut: RoutingAssignmentCut | None,
+    AssignmentConstraints: PlacementAssignmentConstraintSet,
+    RelocationPrioritySignals: frozenset[str],
+    RequiredRelocationSignals: frozenset[str],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Resolve the latest exact repair focus without reviving stale cuts.
+
+    Pairwise assignment constraints remain cumulative placement evidence, but
+    a caller-provided priority/required set names the latest exact geometry
+    repair.  Re-unioning every historical pair endpoint here makes a newly
+    promoted mandatory-access conflict compete with older cuts and can move
+    clusters unrelated to the resource collision.  Only derive a focus when
+    the caller did not provide one.
+    """
+    PairwiseSignals = frozenset(
+        Signal
+        for Edge in (
+            *BuildEffectiveAssignmentCutPairwiseEdges(AssignmentCut),
+            *AssignmentConstraints.PairwiseConflictEdges,
+        )
+        for Signal in Edge
+    )
+    CutPrioritySignals = (
+        frozenset(AssignmentCut.PriorityRelocationSignals)
+        if AssignmentCut is not None
+        else frozenset()
+    )
+    DerivedFocus = CutPrioritySignals or PairwiseSignals
+    EffectivePrioritySignals = (
+        RelocationPrioritySignals or DerivedFocus
+    )
+    EffectiveRequiredSignals = RequiredRelocationSignals
+    if (
+        not EffectiveRequiredSignals
+        and RequiresStructuredAssignmentCutRelocation(AssignmentCut)
+    ):
+        EffectiveRequiredSignals = DerivedFocus
+    return EffectivePrioritySignals, EffectiveRequiredSignals
+
+
+def ShouldExpandBoundaryEscapeGeometry(
+    *,
+    PackedMode: bool,
+    ClusterIndex: int,
+    BoundaryEscapeRelocationClusters: frozenset[int],
+    PackedAccessRepairClusters: frozenset[int],
+    RequiredRelocationSignals: frozenset[str],
+    RelocationVariant: int,
+    RelocationPrioritySignalCount: int,
+    LocalGeometryRepairClusters: frozenset[int],
+    StructuredAssignmentCutRelocation: bool,
+) -> bool:
+    """Gate the broad boundary shell behind exhausted non-structured repair."""
+    return (
+        PackedMode
+        and ClusterIndex in BoundaryEscapeRelocationClusters
+        and ClusterIndex not in PackedAccessRepairClusters
+        and (
+            not RequiredRelocationSignals
+            or RelocationVariant >= 12
+        )
+        and (
+            RelocationPrioritySignalCount > 1
+            or ClusterIndex in LocalGeometryRepairClusters
+        )
+        and not StructuredAssignmentCutRelocation
+    )
+
+
+def ShouldReleasePartialLocalTreeBeforeSearch(
+    *,
+    ClusterCount: int,
+    HasRelocationSignals: bool,
+    LocalTargetCount: int,
+    TotalTargetCount: int,
+) -> bool:
+    """Skip a local tree whose final feedback policy must release it."""
+    return (
+        ClusterCount > 4
+        and HasRelocationSignals
+        and LocalTargetCount != TotalTargetCount
+    )
+
+
+def SelectFocusedCutEpochClusters(
+    RankedRelocationClusters: Iterable[int],
+    Enabled: bool,
+    MaximumClusters: int = 2,
+) -> frozenset[int]:
+    """Select a bounded cluster-local ECO focus from structural cut ranking."""
+    if not Enabled or MaximumClusters <= 0:
+        return frozenset()
+    return frozenset(
+        int(ClusterIndex)
+        for ClusterIndex in tuple(RankedRelocationClusters)[
+            :MaximumClusters
+        ]
+    )
+
+
+def SelectFocusedTopologyFrontierClusters(
+    CurrentRankedClusters: Iterable[int],
+    PreviousRankedClusters: Iterable[int],
+    Enabled: bool,
+    MaximumClusters: int = 3,
+) -> frozenset[int]:
+    """Retain current-cut clusters plus one bounded prior-cut representative."""
+    if not Enabled or MaximumClusters <= 0:
+        return frozenset()
+    Selected: list[int] = []
+    for ClusterIndex in CurrentRankedClusters:
+        Normalized = int(ClusterIndex)
+        if Normalized not in Selected:
+            Selected.append(Normalized)
+        if len(Selected) >= min(2, MaximumClusters):
+            break
+    if len(Selected) < MaximumClusters:
+        for ClusterIndex in PreviousRankedClusters:
+            Normalized = int(ClusterIndex)
+            if Normalized not in Selected:
+                Selected.append(Normalized)
+                break
+    return frozenset(Selected[:MaximumClusters])
+
+
+def SelectFocusedConstraintComponentClusters(
+    CurrentFocusedClusters: Iterable[int],
+    RankedConstraintClusters: Iterable[int],
+    Enabled: bool,
+    MaximumClusters: int = 6,
+) -> frozenset[int]:
+    """Extend one cut ECO across its bounded recurrent cluster component."""
+    if not Enabled or MaximumClusters <= 0:
+        return frozenset(map(int, CurrentFocusedClusters))
+    Selected: list[int] = []
+    for Values in (CurrentFocusedClusters, RankedConstraintClusters):
+        for ClusterIndex in Values:
+            Normalized = int(ClusterIndex)
+            if Normalized not in Selected:
+                Selected.append(Normalized)
+            if len(Selected) >= MaximumClusters:
+                return frozenset(Selected)
+    return frozenset(Selected)
+
+
+def SelectInternalPinBankGeometrySignals(
+    *,
+    Enabled: bool,
+    RepairSignals: Iterable[str],
+    CoordinatedCandidateDiversificationSignals: Iterable[str],
+) -> frozenset[str]:
+    """Keep physical ECO focus narrower than cumulative routing diversity."""
+    if not Enabled:
+        return frozenset()
+    ExactRepairSignals = frozenset(map(str, RepairSignals))
+    if ExactRepairSignals:
+        return ExactRepairSignals
+    return frozenset(map(
+        str,
+        CoordinatedCandidateDiversificationSignals,
+    ))
+
+
+def BuildJointPortfolioBaseRelocationControls(
+    *,
+    RelocationVariant: int,
+    JointPlacementCandidateIndex: int,
+    RequiresStructuredJointRelocation: bool,
+    PreservePortfolioBaseAssignment: bool,
+) -> tuple[int, bool]:
+    """Keep one retained portfolio on one immutable base slot assignment."""
+    CandidateOffset = (
+        JointPlacementCandidateIndex
+        if (
+            RequiresStructuredJointRelocation
+            and not PreservePortfolioBaseAssignment
+        )
+        else 0
+    )
+    return (
+        max(0, RelocationVariant - 1) + CandidateOffset,
+        bool(
+            RequiresStructuredJointRelocation
+            and JointPlacementCandidateIndex > 0
+            and not PreservePortfolioBaseAssignment
+        ),
+    )
+
+
+def OptimizeJointClusterPlacement(
+    Module: Any,
+    Clusters: tuple[tuple[str, ...], ...],
+    Levels: dict[str, int],
+    VariantsByCluster: dict[int, tuple[ClusterLayoutVariant, ...]],
+    BeamWidth: int,
+    PassLimit: int,
+    RetainedCandidates: int = 1,
+    CandidateIndex: int = 0,
+    InitialAssignment: dict[int, tuple[int, int]] | None = None,
+    FixedSlotClusters: frozenset[int] = frozenset(),
+    AssignmentCut: RoutingAssignmentCut | None = None,
+    AssignmentConstraints: PlacementAssignmentConstraintSet = (
+        PlacementAssignmentConstraintSet()
+    ),
+    BoundaryContractCapacity: int = 0,
+    EnableClusterInterfacePlacementFeasibility: bool = False,
+    FocusedOptimizationClusters: frozenset[int] | None = None,
+    FrontierAssignmentCuts: tuple[RoutingAssignmentCut, ...] = (),
+    LogicalComponentByGate: Mapping[str, int] | None = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[
+    dict[int, tuple[int, int]],
+    dict[int, ClusterLayoutVariant],
+    dict[str, object],
+]:
+    """Jointly optimize packed-cluster grid slots and rigid transforms."""
+    Assignment, Columns, Rows = OptimizeClusterSlots(
+        Module,
+        Clusters,
+        Levels,
+        LogicalComponentByGate=LogicalComponentByGate,
+        WorkCheck=WorkCheck,
+    )
+    if InitialAssignment is not None:
+        Assignment = dict(InitialAssignment)
+        Columns = max((Slot[0] for Slot in Assignment.values()), default=-1) + 1
+        Rows = max((Slot[1] for Slot in Assignment.values()), default=-1) + 1
+    Count = len(Clusters)
+    if Count == 0:
+        return Assignment, {}, {"Enabled": True, "CandidateCount": 0}
+    BoundaryBundles = BuildClusterBoundaryBundles(Module, Clusters)
+    ClusterByGate = {
+        GateName: ClusterIndex
+        for ClusterIndex, Names in enumerate(Clusters)
+        for GateName in Names
+    }
+    Producers = {
+        Signal: Gate
+        for Gate in Module.Gates
+        for Signal in Gate.Outputs
+    }
+    LogicalComponentByGate = dict(
+        LogicalComponentByGate or {}
+    )
+    DirectedWeights: dict[tuple[int, int], int] = {}
+    InputWeights = {Index: 0 for Index in range(Count)}
+    OutputWeights = {Index: 0 for Index in range(Count)}
+    for Gate in Module.Gates:
+        Target = ClusterByGate.get(Gate.Name)
+        for Signal in Gate.Inputs:
+            Source = ClusterByGate.get(Producers[Signal].Name)
+            if Source is None and Target is not None:
+                InputWeights[Target] += 1
+            elif Source is not None and Target is not None and Source != Target:
+                DirectedWeights[Source, Target] = (
+                    DirectedWeights.get((Source, Target), 0)
+                    + (
+                        16
+                        if (
+                            LogicalComponentByGate
+                            and LogicalComponentByGate.get(
+                                Producers[Signal].Name
+                            )
+                            == LogicalComponentByGate.get(Gate.Name)
+                            and Producers[Signal].Name
+                            in LogicalComponentByGate
+                            and Gate.Name in LogicalComponentByGate
+                        )
+                        else 1
+                    )
+                )
+            elif Source is not None and Gate.Kind.value == "OUTPUT":
+                OutputWeights[Source] += 1
+    ActiveConstraintWorkingSet = SelectPlacementConstraintWorkingSet(
+        AssignmentCut,
+        AssignmentConstraints,
+        FrontierAssignmentCuts,
+        ExpandConnectedComponent=bool(FocusedOptimizationClusters),
+    )
+    BoundedCompleteProofSignals = (
+        frozenset(AssignmentCut.PriorityRelocationSignals)
+        if (
+            AssignmentCut is not None
+            and AssignmentCut.CompleteAssignmentCutProof
+            and AssignmentCut.PriorityRelocationSignals
+        )
+        else frozenset()
+    )
+    CurrentCutPairwiseEdges = tuple(
+        Edge
+        for Edge in BuildEffectiveAssignmentCutPairwiseEdges(
+            AssignmentCut
+        )
+        if (
+            not BoundedCompleteProofSignals
+            or set(Edge).issubset(BoundedCompleteProofSignals)
+        )
+    )
+    FrontierPairwiseEdges = () if BoundedCompleteProofSignals else tuple(
+        Edge
+        for Cut in FrontierAssignmentCuts
+        for Edge in BuildEffectiveAssignmentCutPairwiseEdges(Cut)
+    )
+    EffectivePairwiseConflictEdges = tuple(sorted({
+        *CurrentCutPairwiseEdges,
+        *FrontierPairwiseEdges,
+        *ActiveConstraintWorkingSet.PairwiseConflictEdges,
+    }))
+    EffectiveObservedInterfaceConflictEdges = tuple(sorted(
+        ActiveConstraintWorkingSet.ObservedInterfaceConflictEdges
+    ))
+    CurrentCutHigherOrderSignals = (
+        BuildAssignmentCutHigherOrderSignalSet(AssignmentCut)
+    )
+    FrontierHigherOrderSignalSets = () if BoundedCompleteProofSignals else tuple(
+        Signals
+        for Cut in FrontierAssignmentCuts
+        if (
+            Signals := BuildAssignmentCutHigherOrderSignalSet(Cut)
+        )
+    )
+    EffectiveHigherOrderConflictSets = tuple(sorted({
+        *ActiveConstraintWorkingSet.HigherOrderSignalSets,
+        *FrontierHigherOrderSignalSets,
+        *((CurrentCutHigherOrderSignals,)
+          if CurrentCutHigherOrderSignals else ()),
+    }))
+    InterfaceConstraintSignals = {
+        Signal
+        for Edge in EffectivePairwiseConflictEdges
+        for Signal in Edge
+    } | {
+        Signal
+        for Edge in EffectiveObservedInterfaceConflictEdges
+        for Signal in Edge
+    } | {
+        Signal
+        for Signals in EffectiveHigherOrderConflictSets
+        for Signal in Signals
+    }
+    FocusedConstraintComponentClusters = (
+        SelectFocusedConstraintComponentClusters(
+            FocusedOptimizationClusters or (),
+            PrioritizeRelocationClusters(
+                Module,
+                Clusters,
+                frozenset(InterfaceConstraintSignals),
+            ),
+            Enabled=bool(FocusedOptimizationClusters),
+        )
+    )
+    ClusterInterfaceTopologyModel = (
+        BuildClusterInterfaceTopology(
+            Module,
+            Clusters,
+            None,
+        )
+        if EnableClusterInterfacePlacementFeasibility
+        else None
+    )
+    CutClusterInterfaceTopologyModel = (
+        BuildClusterInterfaceTopology(
+            Module,
+            Clusters,
+            InterfaceConstraintSignals,
+        )
+        if (
+            EnableClusterInterfacePlacementFeasibility
+            and InterfaceConstraintSignals
+        )
+        else None
+    )
+    ObservedClusterInterfaceTopologyModel = (
+        BuildClusterInterfaceTopology(
+            Module,
+            Clusters,
+            {
+                Signal
+                for Edge in EffectiveObservedInterfaceConflictEdges
+                for Signal in Edge
+            },
+        )
+        if (
+            EnableClusterInterfacePlacementFeasibility
+            and EffectiveObservedInterfaceConflictEdges
+        )
+        else None
+    )
+    ExactPairClusterEdges: set[tuple[int, int]] = set()
+    if EffectivePairwiseConflictEdges:
+        for FirstSignal, SecondSignal in EffectivePairwiseConflictEdges:
+            # A capacity-one signal pair proves one competing access
+            # interface, not that every producer/consumer endpoint of the
+            # two fanout nets must be mutually separated.  Project each
+            # signal to its deterministic topology-ranked interface cluster
+            # and keep one distinct representative pair.  The former cross
+            # product over-constrained high-fanout reconvergent cuts until no
+            # exact-legal orientation remained.
+            FirstClusters = PrioritizeRelocationClusters(
+                Module,
+                Clusters,
+                frozenset((FirstSignal,)),
+            )
+            SecondClusters = PrioritizeRelocationClusters(
+                Module,
+                Clusters,
+                frozenset((SecondSignal,)),
+            )
+            RepresentativePair = next(
+                (
+                    tuple(sorted((FirstCluster, SecondCluster)))
+                    for FirstCluster in FirstClusters
+                    for SecondCluster in SecondClusters
+                    if FirstCluster != SecondCluster
+                ),
+                None,
+            )
+            if RepresentativePair is not None:
+                ExactPairClusterEdges.add(RepresentativePair)
+    HigherOrderProjectedClusterEdges: set[tuple[int, int]] = set()
+    HigherOrderRepresentativeClusters: set[int] = set()
+    for Signals in EffectiveHigherOrderConflictSets:
+        for Signal in Signals:
+            RankedSignalClusters = PrioritizeRelocationClusters(
+                Module,
+                Clusters,
+                frozenset((Signal,)),
+            )
+            if RankedSignalClusters:
+                HigherOrderRepresentativeClusters.add(
+                    RankedSignalClusters[0]
+                )
+        RankedClusters = PrioritizeRelocationClusters(
+            Module,
+            Clusters,
+            frozenset(Signals),
+        )
+        if len(RankedClusters) >= 2:
+            HigherOrderProjectedClusterEdges.add(
+                tuple(sorted(RankedClusters[:2]))
+            )
+    HigherOrderProjectedClusterEdges.difference_update(
+        ExactPairClusterEdges
+    )
+    ExactPairClusterEdgesTuple = tuple(sorted(ExactPairClusterEdges))
+    HigherOrderProjectedClusterEdgesTuple = tuple(
+        sorted(HigherOrderProjectedClusterEdges)
+    )
+    CutPairClusterEdges = tuple(sorted({
+        *ExactPairClusterEdges,
+        *HigherOrderProjectedClusterEdges,
+    }))
+    ExactPairClusters = frozenset(
+        ClusterIndex
+        for Edge in ExactPairClusterEdgesTuple
+        for ClusterIndex in Edge
+    )
+    EffectiveFixedSlotClusters = (
+        FixedSlotClusters - ExactPairClusters
+    )
+    CutPairSignals = frozenset(
+        Signal
+        for Edge in EffectivePairwiseConflictEdges
+        for Signal in Edge
+    )
+    ConstraintSignals = frozenset(
+        Signal
+        for Signals in EffectiveHigherOrderConflictSets
+        for Signal in Signals
+    )
+    CurrentCutSignals = (
+        BoundedCompleteProofSignals
+        or frozenset((
+            *(
+                AssignmentCut.PriorityRelocationSignals
+                if AssignmentCut is not None
+                else ()
+            ),
+            *(
+                AssignmentCut.RelocationSignals
+                if AssignmentCut is not None
+                else ()
+            ),
+            *(
+                AssignmentCut.ConflictSignals
+                if AssignmentCut is not None
+                else ()
+            ),
+            *(
+                AssignmentCut.NoCandidateSignals
+                if AssignmentCut is not None
+                else ()
+            ),
+        ))
+    )
+    CurrentPairSignals = frozenset(
+        Signal
+        for Edge in CurrentCutPairwiseEdges
+        for Signal in Edge
+    )
+    ResidualCurrentCutSignals = (
+        CurrentCutSignals
+        - CurrentPairSignals
+        - frozenset(CurrentCutHigherOrderSignals)
+    )
+    StructuredCutClusters = (
+        frozenset((
+            *ExactPairClusters,
+            *HigherOrderRepresentativeClusters,
+            *BuildRelocationClusterSet(
+                Module,
+                Clusters,
+                ResidualCurrentCutSignals,
+            ),
+        ))
+        if (
+            AssignmentCut is not None
+            or AssignmentConstraints.HasActivePlacementConstraints
+        )
+        else frozenset()
+    )
+    JointOptimizationClusterIndices = (
+        tuple(sorted(
+            ClusterIndex
+            for ClusterIndex in FocusedConstraintComponentClusters
+            if 0 <= ClusterIndex < Count
+        ))
+        if FocusedConstraintComponentClusters
+        else (
+            tuple(sorted(StructuredCutClusters))
+            if StructuredCutClusters
+            else tuple(range(Count))
+        )
+    )
+    if not JointOptimizationClusterIndices:
+        JointOptimizationClusterIndices = tuple(range(Count))
+    HasStructuredCut = (
+        AssignmentCut is not None
+        or AssignmentConstraints.HasActivePlacementConstraints
+    )
+    EffectivePassLimit = (
+        min(PassLimit, 2)
+        if HasStructuredCut
+        else (
+            min(PassLimit, 4)
+            if EnableClusterInterfacePlacementFeasibility
+            else PassLimit
+        )
+    )
+    InitialSlots = tuple(Assignment[Index] for Index in range(Count))
+    InitialOrientations = tuple(0 for _ in range(Count))
+    Slots = tuple(
+        (Column, Row)
+        for Column in range(Columns)
+        for Row in range(Rows)
+    )
+    VariantWidths = {
+        Index: tuple(Variant.Width for Variant in Variants)
+        for Index, Variants in VariantsByCluster.items()
+    }
+    VariantDepths = {
+        Index: tuple(Variant.Depth for Variant in Variants)
+        for Index, Variants in VariantsByCluster.items()
+    }
+    SourceFaces = {
+        Index: tuple(
+            TransformDirection(
+                (0, 0, 1),
+                Variant.Rotation,
+                Variant.MirrorX,
+            )
+            for Variant in Variants
+        )
+        for Index, Variants in VariantsByCluster.items()
+    }
+    TargetFaces = {
+        Index: tuple(
+            TransformDirection(
+                (0, 0, -1),
+                Variant.Rotation,
+                Variant.MirrorX,
+            )
+            for Variant in Variants
+        )
+        for Index, Variants in VariantsByCluster.items()
+    }
+
+    def Centers(
+        SlotsByCluster: tuple[tuple[int, int], ...],
+        Orientations: tuple[int, ...],
+    ) -> dict[int, tuple[float, float]]:
+        ColumnWidths = [1] * Columns
+        RowDepths = [1] * Rows
+        for Index, (Column, Row) in enumerate(SlotsByCluster):
+            ColumnWidths[Column] = max(
+                ColumnWidths[Column],
+                VariantWidths[Index][Orientations[Index]],
+            )
+            RowDepths[Row] = max(
+                RowDepths[Row],
+                VariantDepths[Index][Orientations[Index]],
+            )
+        ColumnOrigins: dict[int, int] = {}
+        NextX = 0
+        for Column in range(Columns):
+            ColumnOrigins[Column] = NextX
+            NextX += ColumnWidths[Column] + 2
+        RowOrigins: dict[int, int] = {}
+        NextZ = 0
+        for Row in range(Rows):
+            RowOrigins[Row] = NextZ
+            NextZ += RowDepths[Row] + 1
+        return {
+            Index: (
+                ColumnOrigins[Slot[0]]
+                + VariantWidths[Index][Orientations[Index]] / 2,
+                RowOrigins[Slot[1]]
+                + VariantDepths[Index][Orientations[Index]] / 2,
+            )
+            for Index, Slot in enumerate(SlotsByCluster)
+        }
+
+    def Score(
+        SlotsByCluster: tuple[tuple[int, int], ...],
+        Orientations: tuple[int, ...],
+    ) -> tuple[object, ...]:
+        StateAssignment = {
+            ClusterIndex: Slot
+            for ClusterIndex, Slot in enumerate(SlotsByCluster)
+        }
+        StateVariants = {
+            ClusterIndex: VariantsByCluster[ClusterIndex][
+                Orientations[ClusterIndex]
+            ]
+            for ClusterIndex in range(Count)
+        }
+        CenterByCluster = Centers(SlotsByCluster, Orientations)
+        BoundaryContract = (
+            ScoreClusterBoundaryContracts(
+                BoundaryBundles,
+                StateAssignment,
+                BoundaryContractCapacity,
+            )
+            if BoundaryContractCapacity > 0
+            else ClusterBoundaryContractScore(0, 0, 0)
+        )
+        Cost = 0
+        for (Source, Target), Weight in DirectedWeights.items():
+            SourceX, SourceZ = CenterByCluster[Source]
+            TargetX, TargetZ = CenterByCluster[Target]
+            DeltaX = TargetX - SourceX
+            DeltaZ = TargetZ - SourceZ
+            Cost += Weight * int(10 * (abs(DeltaX) + abs(DeltaZ)))
+            if DeltaX < 0:
+                Cost += Weight * 4
+            Direction = (
+                (1 if DeltaX >= 0 else -1, 0, 0)
+                if abs(DeltaX) >= abs(DeltaZ)
+                else (0, 0, 1 if DeltaZ >= 0 else -1)
+            )
+            SourceFace = SourceFaces[Source][Orientations[Source]]
+            TargetFace = TargetFaces[Target][Orientations[Target]]
+            if SourceFace[0] * Direction[0] + SourceFace[2] * Direction[2] <= 0:
+                Cost += Weight * 8
+            if TargetFace[0] * Direction[0] + TargetFace[2] * Direction[2] >= 0:
+                Cost += Weight * 8
+        MaximumCenterX = max(
+            Value[0] for Value in CenterByCluster.values()
+        )
+        Cost += sum(
+            InputWeights[Index] * int(CenterByCluster[Index][0]) * 5
+            + OutputWeights[Index]
+            * int(MaximumCenterX - CenterByCluster[Index][0])
+            * 5
+            for Index in range(Count)
+        )
+        ExactPairAdjacencyViolations = 0
+        # A proven capacity-one pair is stronger evidence than the projected
+        # leading edge of a higher-order cut.  Order the bounded beam by exact
+        # pair separation first, while retaining the original placement cost
+        # as the public SearchScore/SelectedScore.
+        for FirstCluster, SecondCluster in ExactPairClusterEdgesTuple:
+            FirstSlot = SlotsByCluster[FirstCluster]
+            SecondSlot = SlotsByCluster[SecondCluster]
+            SlotDistance = (
+                abs(FirstSlot[0] - SecondSlot[0])
+                + abs(FirstSlot[1] - SecondSlot[1])
+            )
+            if SlotDistance <= 1:
+                ExactPairAdjacencyViolations += 1
+                Cost += 200
+            elif (
+                FirstSlot[0] == SecondSlot[0]
+                or FirstSlot[1] == SecondSlot[1]
+            ):
+                Cost += 40
+        # Higher-order projections remain a soft distance hint: they summarize
+        # one reported cut, but are not themselves proven pair incompatibility.
+        # Keep them out of the lexicographic exact-pair objective.
+        for FirstCluster, SecondCluster in (
+            HigherOrderProjectedClusterEdgesTuple
+        ):
+            FirstSlot = SlotsByCluster[FirstCluster]
+            SecondSlot = SlotsByCluster[SecondCluster]
+            SlotDistance = (
+                abs(FirstSlot[0] - SecondSlot[0])
+                + abs(FirstSlot[1] - SecondSlot[1])
+            )
+            if SlotDistance <= 1:
+                Cost += 200
+            elif (
+                FirstSlot[0] == SecondSlot[0]
+                or FirstSlot[1] == SecondSlot[1]
+            ):
+                Cost += 40
+        InterfaceScore = (
+            ScoreClusterInterfacePlacement(
+                Module,
+                Clusters,
+                StateAssignment,
+                StateVariants,
+                EffectivePairwiseConflictEdges,
+                EffectiveHigherOrderConflictSets,
+                Topology=CutClusterInterfaceTopologyModel,
+            )
+            if CutClusterInterfaceTopologyModel is not None
+            else None
+        )
+        ObservedInterfaceBankConflicts = (
+            ScoreClusterInterfacePlacement(
+                Module,
+                Clusters,
+                StateAssignment,
+                StateVariants,
+                EffectiveObservedInterfaceConflictEdges,
+                Topology=ObservedClusterInterfaceTopologyModel,
+            ).PairBankConflicts
+            if ObservedClusterInterfaceTopologyModel is not None
+            else 0
+        )
+        AllInterfaceFacingMismatches = (
+            ScoreClusterInterfaceFacingMismatches(
+                ClusterInterfaceTopologyModel,
+                StateAssignment,
+                StateVariants,
+            )
+            if ClusterInterfaceTopologyModel is not None
+            else 0
+        )
+        return (
+            (
+                (
+                    InterfaceScore.PairBankConflicts
+                    if InterfaceScore is not None
+                    else 0
+                ),
+                (
+                    InterfaceScore.HigherOrderBankPressure
+                    if InterfaceScore is not None
+                    else 0
+                ),
+                (
+                    InterfaceScore.HigherOrderPeakBankDemand
+                    if InterfaceScore is not None
+                    else 0
+                ),
+                (
+                    InterfaceScore.HigherOrderBankExcessDemand
+                    if InterfaceScore is not None
+                    else 0
+                ),
+                (
+                    InterfaceScore.HigherOrderOverloadedBankCount
+                    if InterfaceScore is not None
+                    else 0
+                ),
+                ExactPairAdjacencyViolations,
+                AllInterfaceFacingMismatches,
+                ObservedInterfaceBankConflicts,
+            ),
+            BoundaryContract.OverflowLanes,
+            BoundaryContract.PeakBoundaryDemand,
+            Cost,
+            SlotsByCluster,
+            Orientations,
+        )
+
+    Beam = [(Score(InitialSlots, InitialOrientations), InitialSlots, InitialOrientations)]
+
+    def SelectDiverseBeam(
+        OrderedStates: list[
+            tuple[tuple[object, ...], tuple[tuple[int, int], ...], tuple[int, ...]]
+        ],
+        Limit: int = BeamWidth,
+    ) -> list[
+        tuple[tuple[object, ...], tuple[tuple[int, int], ...], tuple[int, ...]]
+    ]:
+        """Keep score-competitive orientation representatives at every pass.
+
+        A plain score prefix makes a chain of identical clusters retain only
+        changes to its final members: changing an early member temporarily
+        increases directed-distance cost and is pruned before the beam can
+        discover its access benefit.  Reserve one best representative for
+        every cluster whose rigid transform differs from the primary state,
+        then fill the remaining beam by maximum transform separation.
+        """
+        if not OrderedStates:
+            return []
+        Retained = [OrderedStates[0]]
+        Pending = list(OrderedStates[1:])
+        PrimaryOrientations = Retained[0][2]
+        DiversityClusterIndices = JointOptimizationClusterIndices
+        DiversityScanCount = 0
+
+        def FindRepresentativeIndex(
+            Predicate: Callable[
+                [tuple[
+                    tuple[object, ...],
+                    tuple[tuple[int, int], ...],
+                    tuple[int, ...],
+                ]],
+                bool,
+            ],
+            ScanPhase: str,
+        ) -> int | None:
+            nonlocal DiversityScanCount
+            for Index, State in enumerate(Pending):
+                DiversityScanCount += 1
+                if (
+                    WorkCheck is not None
+                    and DiversityScanCount % 512 == 0
+                ):
+                    WorkCheck({
+                        "Phase": "joint-cluster-placement-diversity",
+                        "ScanPhase": ScanPhase,
+                        "ScannedStates": DiversityScanCount,
+                        "PendingStates": len(Pending),
+                    })
+                if Predicate(State):
+                    return Index
+            return None
+
+        for ClusterIndex in DiversityClusterIndices:
+            RepresentativeIndex = FindRepresentativeIndex(
+                lambda State, CurrentCluster=ClusterIndex: (
+                    State[2][CurrentCluster]
+                    != PrimaryOrientations[CurrentCluster]
+                ),
+                "orientation",
+            )
+            if RepresentativeIndex is not None:
+                Retained.append(Pending.pop(RepresentativeIndex))
+        # A slot permutation is a real placement alternative even when every
+        # cluster keeps the same local template.  Keep a representative that
+        # changes each cluster's slot as well, preferring one that also has a
+        # new rigid-transform vector so the retained portfolio never spends a
+        # candidate on a duplicate orientation state.
+        for ClusterIndex in DiversityClusterIndices:
+            ExistingTransforms = {
+                Existing[2] for Existing in Retained
+            }
+            RepresentativeIndex = FindRepresentativeIndex(
+                lambda State, CurrentCluster=ClusterIndex: (
+                    State[1][CurrentCluster] != InitialSlots[CurrentCluster]
+                    and State[2] not in ExistingTransforms
+                ),
+                "slot",
+            )
+            if RepresentativeIndex is not None:
+                Retained.append(Pending.pop(RepresentativeIndex))
+        # The frontier can contain tens of thousands of states.  The anchor
+        # representatives above are the required diversity guarantee; fill
+        # the remainder in already-sorted score order rather than repeatedly
+        # scanning the complete frontier for a maximum-Hamming-distance tie.
+        # That quadratic selection consumed the entire shared RCA8 deadline
+        # during placement before a single exact routing candidate ran.
+        Retained.extend(Pending[:max(0, Limit - len(Retained))])
+        return Retained
+
+    CandidateCount = 1
+    CandidateEvaluationCount = 0
+    for PassIndex in range(EffectivePassLimit):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "joint-cluster-placement",
+                "PassIndex": PassIndex,
+                "BeamStates": len(Beam),
+                "ClusterCount": Count,
+            })
+        Candidates: dict[
+            tuple[tuple[tuple[int, int], ...], tuple[int, ...]],
+            tuple[object, ...],
+        ] = {}
+        for _Score, PreviousSlots, PreviousOrientations in Beam:
+            Candidates[PreviousSlots, PreviousOrientations] = _Score
+            OccupantBySlot = {
+                Slot: Index
+                for Index, Slot in enumerate(PreviousSlots)
+            }
+            for ClusterIndex in JointOptimizationClusterIndices:
+                CandidateSlotsForCluster = (
+                    (PreviousSlots[ClusterIndex],)
+                    if ClusterIndex in EffectiveFixedSlotClusters
+                    else Slots
+                )
+                for Slot in CandidateSlotsForCluster:
+                    Occupant = OccupantBySlot.get(Slot)
+                    if (
+                        Occupant is not None
+                        and Occupant != ClusterIndex
+                        and Occupant in EffectiveFixedSlotClusters
+                    ):
+                        continue
+                    for OrientationIndex in range(len(VariantsByCluster[ClusterIndex])):
+                        CandidateSlots = list(PreviousSlots)
+                        CandidateSlots[ClusterIndex] = Slot
+                        if Occupant is not None and Occupant != ClusterIndex:
+                            CandidateSlots[Occupant] = PreviousSlots[ClusterIndex]
+                        CandidateOrientations = list(PreviousOrientations)
+                        CandidateOrientations[ClusterIndex] = OrientationIndex
+                        Key = tuple(CandidateSlots), tuple(CandidateOrientations)
+                        if Key not in Candidates:
+                            CandidateEvaluationCount += 1
+                            if (
+                                WorkCheck is not None
+                                and CandidateEvaluationCount % 256 == 0
+                            ):
+                                WorkCheck({
+                                    "Phase": (
+                                        "joint-cluster-placement-candidate"
+                                    ),
+                                    "PassIndex": PassIndex,
+                                    "EvaluatedCandidates": (
+                                        CandidateEvaluationCount
+                                    ),
+                                    "CurrentFrontier": len(Candidates),
+                                })
+                            Candidates[Key] = Score(*Key)
+        CandidateCount += len(Candidates)
+        Ordered = sorted(
+            (ScoreValue, SlotsValue, OrientationValue)
+            for (SlotsValue, OrientationValue), ScoreValue in Candidates.items()
+        )
+        NextBeam = SelectDiverseBeam(Ordered)
+        if [(Value[1], Value[2]) for Value in NextBeam] == [
+            (Value[1], Value[2]) for Value in Beam
+        ]:
+            Beam = NextBeam
+            break
+        Beam = NextBeam
+    if CandidateIndex < 0:
+        raise ValueError("Joint placement candidate index cannot be negative")
+    if RetainedCandidates < 1:
+        raise ValueError("Joint placement must retain at least one candidate")
+
+    # The beam is intentionally retained rather than collapsing to one
+    # center-score winner.  Final placement materializes every retained state
+    # and measures exact access/escape legality before the router receives it.
+    # Prefer states that differ in the actual boundary-bank ownership pattern.
+    # Rotation labels and slot distance are only tie-breakers: they are not
+    # useful diversity when the same terminals still contend for the same
+    # capacity-one interface.
+    OrderedBeam = sorted(Beam)
+    InterfaceFeasibleBeam = [
+        State for State in OrderedBeam
+        if State[0][0][0] == 0
+    ]
+    InterfaceRejectedStateCount = 0
+    if (
+        EnableClusterInterfacePlacementFeasibility
+        and EffectivePairwiseConflictEdges
+        and InterfaceFeasibleBeam
+    ):
+        InterfaceRejectedStateCount = (
+            len(OrderedBeam) - len(InterfaceFeasibleBeam)
+        )
+        OrderedBeam = InterfaceFeasibleBeam
+    RetainedBeam = [OrderedBeam[0]]
+    PendingBeam = list(OrderedBeam[1:])
+    SearchRetentionLimit = min(
+        len(OrderedBeam),
+        (
+            RetainedCandidates * 2
+            if EnableClusterInterfacePlacementFeasibility
+            else RetainedCandidates
+        ),
+    )
+
+    def JointStateDistance(
+        First: tuple[
+            tuple[object, ...], tuple[tuple[int, int], ...], tuple[int, ...]
+        ],
+        Second: tuple[
+            tuple[object, ...], tuple[tuple[int, int], ...], tuple[int, ...]
+        ],
+    ) -> int:
+        DiversityClusterIndices = JointOptimizationClusterIndices
+        return sum(
+            First[1][ClusterIndex] != Second[1][ClusterIndex]
+            for ClusterIndex in DiversityClusterIndices
+        ) + sum(
+            First[2][ClusterIndex] != Second[2][ClusterIndex]
+            for ClusterIndex in DiversityClusterIndices
+        )
+
+    def InterfaceOwnershipFingerprint(
+        State: tuple[
+            tuple[object, ...], tuple[tuple[int, int], ...], tuple[int, ...]
+        ],
+    ) -> str:
+        if ClusterInterfaceTopologyModel is None:
+            return ""
+        _Score, StateSlots, StateOrientations = State
+        return ScoreClusterInterfacePlacement(
+            Module,
+            Clusters,
+            {
+                ClusterIndex: StateSlots[ClusterIndex]
+                for ClusterIndex in range(Count)
+            },
+            {
+                ClusterIndex: VariantsByCluster[ClusterIndex][
+                    StateOrientations[ClusterIndex]
+                ]
+                for ClusterIndex in range(Count)
+            },
+            EffectivePairwiseConflictEdges,
+            EffectiveHigherOrderConflictSets,
+            Topology=ClusterInterfaceTopologyModel,
+        ).Pattern.OwnershipFingerprint
+
+    while (
+        PendingBeam
+        and len(RetainedBeam) < SearchRetentionLimit
+    ):
+        ExistingOwnershipFingerprints = {
+            InterfaceOwnershipFingerprint(State)
+            for State in RetainedBeam
+        }
+        DistinctInterfaceIndices = []
+        for Index, State in enumerate(PendingBeam):
+            if WorkCheck is not None and Index % 512 == 0:
+                WorkCheck({
+                    "Phase": "joint-cluster-placement-retained-scan",
+                    "ScannedStates": Index,
+                    "PendingStates": len(PendingBeam),
+                    "RetainedStates": len(RetainedBeam),
+                })
+            if (
+                InterfaceOwnershipFingerprint(State)
+                not in ExistingOwnershipFingerprints
+            ):
+                DistinctInterfaceIndices.append(Index)
+        CandidateIndices = (
+            DistinctInterfaceIndices
+            if DistinctInterfaceIndices
+            else list(range(len(PendingBeam)))
+        )
+        BestIndex = CandidateIndices[0]
+        BestKey: tuple[object, ...] | None = None
+        for ScanIndex, Index in enumerate(CandidateIndices, start=1):
+            if WorkCheck is not None and ScanIndex % 512 == 0:
+                WorkCheck({
+                    "Phase": "joint-cluster-placement-retained-rank",
+                    "ScannedStates": ScanIndex,
+                    "CandidateStates": len(CandidateIndices),
+                    "RetainedStates": len(RetainedBeam),
+                })
+            CandidateKey = (
+                -min(
+                    JointStateDistance(PendingBeam[Index], Existing)
+                    for Existing in RetainedBeam
+                ),
+                PendingBeam[Index][0],
+                PendingBeam[Index][1],
+                PendingBeam[Index][2],
+            )
+            if BestKey is None or CandidateKey < BestKey:
+                BestKey = CandidateKey
+                BestIndex = Index
+        RetainedBeam.append(PendingBeam.pop(BestIndex))
+    if CandidateIndex >= len(RetainedBeam):
+        raise ValueError(
+            "Joint placement candidate index exceeds retained state count "
+            f"({CandidateIndex} >= {len(RetainedBeam)})"
+        )
+    BestScore, BestSlots, BestOrientations = RetainedBeam[CandidateIndex]
+    BestAssignment = {
+        Index: BestSlots[Index] for Index in range(Count)
+    }
+    BestVariants = {
+        Index: VariantsByCluster[Index][BestOrientations[Index]]
+        for Index in range(Count)
+    }
+    return BestAssignment, BestVariants, {
+        "Enabled": True,
+        "BeamWidth": BeamWidth,
+        "PassLimit": PassLimit,
+        "EffectivePassLimit": EffectivePassLimit,
+        "StructuredCutClusters": sorted(StructuredCutClusters),
+        "FocusedOptimizationClusters": (
+            sorted(FocusedOptimizationClusters)
+            if FocusedOptimizationClusters
+            else []
+        ),
+        "JointOptimizationClusters": list(
+            JointOptimizationClusterIndices
+        ),
+        "RequestedFixedSlotClusters": sorted(FixedSlotClusters),
+        "FixedSlotClusters": sorted(EffectiveFixedSlotClusters),
+        "CandidateCount": CandidateCount,
+        "SearchRetentionLimit": SearchRetentionLimit,
+        "PublishedRetentionLimit": RetainedCandidates,
+        "CutPairClusterEdges": [
+            list(Edge) for Edge in CutPairClusterEdges
+        ],
+        "ExactPairClusterEdges": [
+            list(Edge) for Edge in ExactPairClusterEdgesTuple
+        ],
+        "HigherOrderProjectedClusterEdges": [
+            list(Edge) for Edge in HigherOrderProjectedClusterEdgesTuple
+        ],
+        "AssignmentConstraints": AssignmentConstraints.ToDictionary(),
+        "ActiveConstraintWorkingSet": (
+            ActiveConstraintWorkingSet.ToDictionary()
+        ),
+        "EffectivePairwiseConflictEdges": [
+            list(Edge) for Edge in EffectivePairwiseConflictEdges
+        ],
+        "EffectiveObservedInterfaceConflictEdges": [
+            list(Edge)
+            for Edge in EffectiveObservedInterfaceConflictEdges
+        ],
+        "EffectiveHigherOrderConflictSets": [
+            list(Signals)
+            for Signals in EffectiveHigherOrderConflictSets
+        ],
+        "ClusterInterfacePlacementFeasibility": {
+            "Enabled": EnableClusterInterfacePlacementFeasibility,
+            "ExactPairCount": len(EffectivePairwiseConflictEdges),
+            "FeasibleStateCount": len(InterfaceFeasibleBeam),
+            "RejectedStateCount": InterfaceRejectedStateCount,
+            "AppliedAsHardFilter": bool(
+                EnableClusterInterfacePlacementFeasibility
+                and EffectivePairwiseConflictEdges
+                and InterfaceFeasibleBeam
+            ),
+        },
+        "SelectedCandidateIndex": CandidateIndex,
+        "SelectedScore": BestScore[3],
+        "SelectedInterfacePairBankConflicts": BestScore[0][0],
+        "SelectedHigherOrderBankPressure": BestScore[0][1],
+        "SelectedHigherOrderPeakBankDemand": BestScore[0][2],
+        "SelectedHigherOrderBankExcessDemand": BestScore[0][3],
+        "SelectedHigherOrderOverloadedBankCount": BestScore[0][4],
+        "SelectedExactPairAdjacencyViolations": BestScore[0][5],
+        "SelectedInterfaceFacingMismatches": BestScore[0][6],
+        "SelectedObservedInterfaceBankConflicts": BestScore[0][7],
+        "SelectedClusterInterfacePlacement": (
+            ScoreClusterInterfacePlacement(
+                Module,
+                Clusters,
+                BestAssignment,
+                BestVariants,
+                EffectivePairwiseConflictEdges,
+                EffectiveHigherOrderConflictSets,
+                Topology=ClusterInterfaceTopologyModel,
+            ).ToDictionary()
+            if ClusterInterfaceTopologyModel is not None
+            else None
+        ),
+        "SelectedBoundaryContract": ScoreClusterBoundaryContracts(
+            BoundaryBundles,
+            BestAssignment,
+            BoundaryContractCapacity,
+        ).ToDictionary()
+        if BoundaryContractCapacity > 0
+        else None,
+        "SelectedTransforms": {
+            str(Index): {
+                "Rotation": BestVariants[Index].Rotation,
+                "MirrorX": BestVariants[Index].MirrorX,
+            }
+            for Index in range(Count)
+        },
+        "RetainedStates": [
+            {
+                "CandidateIndex": Index,
+                "SearchScore": StateScore[3],
+                "InterfaceOwnershipFingerprint": (
+                    InterfaceOwnershipFingerprint((
+                        StateScore,
+                        StateSlots,
+                        StateOrientations,
+                    ))
+                ),
+                "InterfacePairBankConflicts": StateScore[0][0],
+                "HigherOrderBankPressure": StateScore[0][1],
+                "HigherOrderPeakBankDemand": StateScore[0][2],
+                "HigherOrderBankExcessDemand": StateScore[0][3],
+                "HigherOrderOverloadedBankCount": StateScore[0][4],
+                "ExactPairAdjacencyViolations": StateScore[0][5],
+                "InterfaceFacingMismatches": StateScore[0][6],
+                "ObservedInterfaceBankConflicts": StateScore[0][7],
+                "ClusterInterfacePlacement": (
+                    ScoreClusterInterfacePlacement(
+                        Module,
+                        Clusters,
+                        {
+                            ClusterIndex: StateSlots[ClusterIndex]
+                            for ClusterIndex in range(Count)
+                        },
+                        {
+                            ClusterIndex: VariantsByCluster[ClusterIndex][
+                                StateOrientations[ClusterIndex]
+                            ]
+                            for ClusterIndex in range(Count)
+                        },
+                        EffectivePairwiseConflictEdges,
+                        EffectiveHigherOrderConflictSets,
+                        Topology=ClusterInterfaceTopologyModel,
+                    ).ToDictionary()
+                    if ClusterInterfaceTopologyModel is not None
+                    else None
+                ),
+                "BoundaryContract": ScoreClusterBoundaryContracts(
+                    BoundaryBundles,
+                    {
+                        ClusterIndex: StateSlots[ClusterIndex]
+                        for ClusterIndex in range(Count)
+                    },
+                    BoundaryContractCapacity,
+                ).ToDictionary()
+                if BoundaryContractCapacity > 0
+                else None,
+                "Slots": {
+                    str(ClusterIndex): list(StateSlots[ClusterIndex])
+                    for ClusterIndex in range(Count)
+                },
+                "Transforms": {
+                    str(ClusterIndex): {
+                        "Rotation": VariantsByCluster[ClusterIndex][
+                            StateOrientations[ClusterIndex]
+                        ].Rotation,
+                        "MirrorX": VariantsByCluster[ClusterIndex][
+                            StateOrientations[ClusterIndex]
+                        ].MirrorX,
+                    }
+                    for ClusterIndex in range(Count)
+                },
+            }
+            for Index, (StateScore, StateSlots, StateOrientations) in enumerate(
+                RetainedBeam
+            )
+        ],
+    }
+
+
 def BuildRelocationClusterSet(
     Module: Any,
     Clusters: tuple[tuple[str, ...], ...],
@@ -1322,6 +6561,9 @@ def RelocateClusterSlots(
     ColumnCount: int,
     RelocationClusters: Iterable[int],
     StackSuppressedClusters: frozenset[int] = frozenset(),
+    RelocationOffset: int = 0,
+    RotateExactPortfolioSlots: bool = False,
+    ForceDedicatedColumns: bool = False,
 ) -> tuple[dict[int, tuple[int, int]], int]:
     """Move a congestion cut into deterministic unoccupied placement rows."""
     Result = dict(Assignment)
@@ -1337,11 +6579,52 @@ def RelocateClusterSlots(
     ]
     if not Pending:
         return Result, ColumnCount
+    if ForceDedicatedColumns:
+        # A complete multi-pair access cut can remain infeasible while its
+        # owners merely trade the same compact slots.  Give only the reported
+        # clusters independent columns; this is a bounded cut-local geometry
+        # repair, not a global spacing or routing-limit increase.
+        NextColumn = max(
+            (Column for Column, _Row in Result.values()),
+            default=-1,
+        ) + 1 + RelocationOffset
+        for Offset, ClusterIndex in enumerate(Pending):
+            Result[ClusterIndex] = (NextColumn + Offset, 0)
+        return Result, max(ColumnCount, NextColumn + len(Pending))
     if len(Pending) > 1:
         ExistingSlots = tuple(Result[ClusterIndex] for ClusterIndex in Pending)
         if len(set(ExistingSlots)) == len(ExistingSlots):
+            if len(Pending) % 2 == 0:
+                if RotateExactPortfolioSlots and RelocationOffset:
+                    # A retained structured portfolio must vary slot
+                    # ownership as well as orientation. Keep the established
+                    # adjacent-pair swap at offset zero, but rotate all
+                    # measured owners for later exact states.
+                    Shift = RelocationOffset % len(Pending)
+                    for Offset, ClusterIndex in enumerate(Pending):
+                        Result[ClusterIndex] = ExistingSlots[
+                            (Offset + Shift) % len(Pending)
+                        ]
+                    return Result, ColumnCount
+                # Compose independent exact-cut repairs without replacing the
+                # strongest pair geometry.  Each adjacent ranked pair swaps
+                # its established slots, so four selected owners express two
+                # measured repairs with no footprint growth.
+                for Offset in range(0, len(Pending), 2):
+                    First = Pending[Offset]
+                    Second = Pending[Offset + 1]
+                    Result[First] = ExistingSlots[Offset + 1]
+                    Result[Second] = ExistingSlots[Offset]
+                return Result, ColumnCount
+            # Keep a multi-cluster feedback repair within the established
+            # footprint.  RelocationOffset already chooses which ranked
+            # clusters participate; using it to move only Pending[0] into a
+            # distant column silently discarded the remaining exact cut.
+            Shift = 1 + RelocationOffset % (len(Pending) - 1)
             for Offset, ClusterIndex in enumerate(Pending):
-                Result[ClusterIndex] = ExistingSlots[(Offset + 1) % len(Pending)]
+                Result[ClusterIndex] = ExistingSlots[
+                    (Offset + Shift) % len(Pending)
+                ]
             return Result, ColumnCount
         # A suppressed vertical stack leaves multiple clusters in the same
         # logical slot.  Rotating identical slots is a no-op, which would
@@ -1351,14 +6634,14 @@ def RelocateClusterSlots(
         NextColumn = max(
             (Column for Column, _Row in Result.values()),
             default=-1,
-        ) + 1
+        ) + 1 + RelocationOffset
         for Offset, ClusterIndex in enumerate(Pending):
             Result[ClusterIndex] = (NextColumn + Offset, 0)
         return Result, max(ColumnCount, NextColumn + len(Pending))
     NextColumn = max(
         (Column for Column, _Row in Result.values()),
         default=-1,
-    ) + 1
+    ) + 1 + RelocationOffset
     Result[Pending[0]] = (NextColumn, 0)
     return Result, max(ColumnCount, NextColumn + 1)
 
@@ -1799,16 +7082,278 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class MandatoryAccessConflictProfile:
+    """Immutable, routing-grade ownership and conflict summary for pin access."""
+
+    OwnershipFingerprint: str
+    ConflictFingerprint: str
+    OwnershipRecords: tuple[
+        tuple[str, tuple[RoutingResourceId, ...]], ...
+    ]
+    CrossConflicts: tuple[
+        tuple[RoutingResourceId, tuple[str, ...]], ...
+    ]
+    SelfConflicts: tuple[
+        tuple[RoutingResourceId, tuple[str, ...]], ...
+    ]
+
+    @property
+    def SignalCount(self) -> int:
+        return len(self.OwnershipRecords)
+
+    @property
+    def ClaimCount(self) -> int:
+        return sum(
+            len(Resources) for _Signal, Resources in self.OwnershipRecords
+        )
+
+    @property
+    def CrossConflictCount(self) -> int:
+        return len(self.CrossConflicts)
+
+    @property
+    def SelfConflictCount(self) -> int:
+        return len(self.SelfConflicts)
+
+    @property
+    def ExactConflictCount(self) -> int:
+        """Preserve the existing self-plus-cross mandatory conflict metric."""
+        return self.CrossConflictCount + self.SelfConflictCount
+
+    @property
+    def ConflictResourceCount(self) -> int:
+        return len({
+            Resource
+            for Resource, _Owners in (
+                *self.CrossConflicts,
+                *self.SelfConflicts,
+            )
+        })
+
+    @property
+    def ConflictSignals(self) -> tuple[str, ...]:
+        return tuple(sorted({
+            Signal
+            for _Resource, Owners in (
+                *self.CrossConflicts,
+                *self.SelfConflicts,
+            )
+            for Signal in Owners
+        }))
+
+    @property
+    def HasConflicts(self) -> bool:
+        return self.ExactConflictCount > 0
+
+    def ToDictionary(self) -> dict[str, object]:
+        def ConflictRecords(
+            Values: tuple[
+                tuple[RoutingResourceId, tuple[str, ...]], ...
+            ],
+        ) -> list[dict[str, object]]:
+            return [
+                {
+                    "Resource": str(Resource),
+                    "Kind": Resource.Kind.value,
+                    "Position": list(Resource.Position),
+                    "Owners": list(Owners),
+                }
+                for Resource, Owners in Values
+            ]
+
+        return {
+            "OwnershipFingerprint": self.OwnershipFingerprint,
+            "ConflictFingerprint": self.ConflictFingerprint,
+            "SignalCount": self.SignalCount,
+            "ClaimCount": self.ClaimCount,
+            "ClaimCountsBySignal": {
+                Signal: len(Resources)
+                for Signal, Resources in self.OwnershipRecords
+            },
+            "CrossConflictCount": self.CrossConflictCount,
+            "SelfConflictCount": self.SelfConflictCount,
+            "ExactConflictCount": self.ExactConflictCount,
+            "ConflictResourceCount": self.ConflictResourceCount,
+            "ConflictSignals": list(self.ConflictSignals),
+            "HasConflicts": self.HasConflicts,
+            "CrossConflicts": ConflictRecords(self.CrossConflicts),
+            "SelfConflicts": ConflictRecords(self.SelfConflicts),
+        }
+
+
+def OrderExactStatesForMandatoryAccessCommit(
+    States: Iterable[dict[str, object]],
+    ProfilesBySearchCandidate: Mapping[
+        int,
+        MandatoryAccessConflictProfile,
+    ],
+) -> tuple[dict[str, object], ...]:
+    """Promote the first exact zero-conflict state without losing identity.
+
+    The joint beam's candidate index is a search-order identity.  A topology
+    cut epoch additionally needs a commit order whose first state is known to
+    have realizable mandatory pin access.  Preserve both identities so cached
+    geometry and failure evidence remain attributable to the state that
+    produced them.
+    """
+    CopiedStates = [deepcopy(State) for State in States]
+    LegalStates = [
+        State for State in CopiedStates
+        if bool(State.get("ExactLegal"))
+    ]
+    RejectedStates = [
+        State for State in CopiedStates
+        if not bool(State.get("ExactLegal"))
+    ]
+    FirstZeroConflictState = next(
+        (
+            State
+            for State in LegalStates
+            if (
+                int(State["CandidateIndex"])
+                in ProfilesBySearchCandidate
+                and not ProfilesBySearchCandidate[
+                    int(State["CandidateIndex"])
+                ].HasConflicts
+            )
+        ),
+        None,
+    )
+    if FirstZeroConflictState is not None:
+        LegalStates = [
+            FirstZeroConflictState,
+            *(
+                State for State in LegalStates
+                if State is not FirstZeroConflictState
+            ),
+        ]
+    OrderedStates = [*LegalStates, *RejectedStates]
+    for CommitCandidateIndex, State in enumerate(OrderedStates):
+        SearchCandidateIndex = int(State["CandidateIndex"])
+        State["SearchCandidateIndex"] = SearchCandidateIndex
+        State["CandidateIndex"] = CommitCandidateIndex
+        Profile = ProfilesBySearchCandidate.get(SearchCandidateIndex)
+        State["ExactMandatoryAccessScreened"] = Profile is not None
+        if Profile is not None:
+            State["ExactMandatoryAccessConflictResources"] = (
+                Profile.ConflictResourceCount
+            )
+            State["ExactMandatoryAccessConflictSignals"] = list(
+                Profile.ConflictSignals
+            )
+            State["ExactMandatoryAccessOwnershipFingerprint"] = (
+                Profile.OwnershipFingerprint
+            )
+            State["ExactMandatoryAccessConflictFingerprint"] = (
+                Profile.ConflictFingerprint
+            )
+    return tuple(OrderedStates)
+
+
+def SelectExactInterfaceCommitStates(
+    States: Iterable[dict[str, object]],
+    ProfilesBySearchCandidate: Mapping[
+        int,
+        MandatoryAccessConflictProfile,
+    ],
+    MaximumStates: int,
+) -> tuple[
+    tuple[dict[str, object], ...],
+    tuple[dict[str, object], ...],
+]:
+    """Commit up to the bound using exact legality and interface diversity."""
+    if MaximumStates <= 0:
+        raise ValueError("exact interface commit bound must be positive")
+    Selected: list[dict[str, object]] = []
+    Attrition: list[dict[str, object]] = []
+    SeenOwnership: set[str] = set()
+    for State in States:
+        SearchCandidateIndex = int(State["CandidateIndex"])
+        Profile = ProfilesBySearchCandidate.get(SearchCandidateIndex)
+        Pattern = State.get("ClusterInterfacePlacement", {})
+        OwnershipFingerprint = (
+            str(Pattern.get("OwnershipFingerprint", ""))
+            if isinstance(Pattern, dict)
+            else ""
+        )
+        if not bool(State.get("ExactLegal")):
+            Attrition.append({
+                "SearchCandidateIndex": SearchCandidateIndex,
+                "Classification": (
+                    "geometric-overlap-illegal-placement"
+                ),
+                "InterfaceOwnershipFingerprint": OwnershipFingerprint,
+            })
+            continue
+        if Profile is None or Profile.HasConflicts:
+            Attrition.append({
+                "SearchCandidateIndex": SearchCandidateIndex,
+                "Classification": "mandatory-access-unsat",
+                "InterfaceOwnershipFingerprint": OwnershipFingerprint,
+                "MandatoryAccessOwnershipFingerprint": (
+                    Profile.OwnershipFingerprint
+                    if Profile is not None
+                    else ""
+                ),
+                "MandatoryAccessConflictFingerprint": (
+                    Profile.ConflictFingerprint
+                    if Profile is not None
+                    else ""
+                ),
+            })
+            continue
+        if OwnershipFingerprint in SeenOwnership:
+            Attrition.append({
+                "SearchCandidateIndex": SearchCandidateIndex,
+                "Classification": "duplicate-access-topology",
+                "InterfaceOwnershipFingerprint": OwnershipFingerprint,
+            })
+            continue
+        if len(Selected) >= MaximumStates:
+            Attrition.append({
+                "SearchCandidateIndex": SearchCandidateIndex,
+                "Classification": "pruned-by-scoring-budget",
+                "InterfaceOwnershipFingerprint": OwnershipFingerprint,
+            })
+            continue
+        SeenOwnership.add(OwnershipFingerprint)
+        Selected.append(deepcopy(State))
+    for CommitCandidateIndex, State in enumerate(Selected):
+        State["SearchCandidateIndex"] = int(State["CandidateIndex"])
+        State["CandidateIndex"] = CommitCandidateIndex
+    return tuple(Selected), tuple(Attrition)
+
+
 def BuildMandatoryAccessClaims(
     PlacedGates: Iterable[Any],
     Signals: Iterable[str],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, RoutingResourceClaims]:
     """Build the fixed pin-access claims that every detailed route must own."""
+    Gates = (
+        PlacedGates
+        if isinstance(PlacedGates, (list, tuple))
+        else tuple(PlacedGates)
+    )
     RequiredSignals = frozenset(Signals)
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "mandatory-access-claims-start",
+            "GateCount": len(Gates),
+            "SignalCount": len(RequiredSignals),
+        })
     NodesBySignal: dict[str, set[tuple[int, int, int]]] = {
         Signal: set() for Signal in RequiredSignals
     }
-    for Gate in PlacedGates:
+    for GateIndex, Gate in enumerate(Gates, start=1):
+        if WorkCheck is not None and GateIndex % 32 == 0:
+            WorkCheck({
+                "Phase": "mandatory-access-claims-gates",
+                "ProcessedGates": GateIndex,
+                "GateCount": len(Gates),
+                "SignalCount": len(RequiredSignals),
+            })
         if Gate.OutputPin is not None and Gate.OutputDirection is not None:
             for Signal in Gate.Outputs:
                 if Signal not in RequiredSignals:
@@ -1842,26 +7387,210 @@ def BuildMandatoryAccessClaims(
         ElectricalBlocks=frozenset(),
         SolidBlocks=frozenset(),
     )
-    return {
-        Signal: ClaimBuilder.BuildRouteClaims(Nodes)
+    Claims: dict[str, RoutingResourceClaims] = {}
+    NonEmptySignals = tuple(
+        (Signal, Nodes)
         for Signal, Nodes in sorted(NodesBySignal.items())
         if Nodes
+    )
+    for SignalIndex, (Signal, Nodes) in enumerate(
+        NonEmptySignals,
+        start=1,
+    ):
+        if WorkCheck is not None and (
+            SignalIndex == 1 or SignalIndex % 16 == 0
+        ):
+            WorkCheck({
+                "Phase": "mandatory-access-claims-signals",
+                "Signal": Signal,
+                "ProcessedSignals": SignalIndex - 1,
+                "SignalCount": len(NonEmptySignals),
+            })
+        if WorkCheck is None:
+            Claims[Signal] = ClaimBuilder.BuildRouteClaims(Nodes)
+            continue
+
+        def CheckRouteClaims(
+            Diagnostics: dict[str, object],
+            *,
+            CurrentSignal: str = Signal,
+        ) -> None:
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "mandatory-access-route-claims",
+                    "Signal": CurrentSignal,
+                    "ClaimPhase": Diagnostics.get("Phase"),
+                    **{
+                        Key: Value
+                        for Key, Value in Diagnostics.items()
+                        if Key != "Phase"
+                    },
+                })
+
+        Claims[Signal] = ClaimBuilder.BuildRouteClaims(
+            Nodes,
+            WorkCheck=CheckRouteClaims,
+        )
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "mandatory-access-claims-complete",
+            "GateCount": len(Gates),
+            "SignalCount": len(Claims),
+            "ClaimCount": sum(
+                len(Claim.ResourceIds) for Claim in Claims.values()
+            ),
+        })
+    return Claims
+
+
+def MeasureMandatoryAccessConflictProfile(
+    PlacedGates: Iterable[Any],
+    Signals: Iterable[str],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> MandatoryAccessConflictProfile:
+    """Measure fixed access ownership with rename-independent fingerprints."""
+    Claims = BuildMandatoryAccessClaims(
+        PlacedGates,
+        Signals,
+        WorkCheck=WorkCheck,
+    )
+    OwnershipRecords = tuple(
+        (
+            Signal,
+            tuple(sorted(Claim.ResourceIds, key=str)),
+        )
+        for Signal, Claim in sorted(Claims.items())
+    )
+    AllResources = tuple(
+        Resource
+        for _Signal, Resources in OwnershipRecords
+        for Resource in Resources
+    )
+    MinimumX = min(
+        (Resource.Position[0] for Resource in AllResources),
+        default=0,
+    )
+    MinimumY = min(
+        (Resource.Position[1] for Resource in AllResources),
+        default=0,
+    )
+    MinimumZ = min(
+        (Resource.Position[2] for Resource in AllResources),
+        default=0,
+    )
+
+    def NormalizeResource(
+        Resource: RoutingResourceId,
+    ) -> tuple[str, int, int, int]:
+        X, Y, Z = Resource.Position
+        return (
+            Resource.Kind.value,
+            X - MinimumX,
+            Y - MinimumY,
+            Z - MinimumZ,
+        )
+
+    NormalizedOwnershipBySignal = {
+        Signal: tuple(sorted(
+            NormalizeResource(Resource) for Resource in Resources
+        ))
+        for Signal, Resources in OwnershipRecords
     }
+
+    def StableFingerprint(Value: object) -> str:
+        return sha256(repr(Value).encode("utf-8")).hexdigest()
+
+    OwnershipFingerprint = StableFingerprint(tuple(sorted(
+        NormalizedOwnershipBySignal.values()
+    )))
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "mandatory-access-conflicts-start",
+            "SignalCount": len(Claims),
+        })
+
+    def CheckCrossConflicts(Diagnostics: dict[str, object]) -> None:
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "mandatory-access-cross-conflicts",
+                "ConflictPhase": Diagnostics.get("Phase"),
+                **{
+                    Key: Value
+                    for Key, Value in Diagnostics.items()
+                    if Key != "Phase"
+                },
+            })
+
+    CrossConflictMap = FindClaimConflictsByResourceIndex(
+        Claims,
+        WorkCheck=CheckCrossConflicts if WorkCheck is not None else None,
+    )
+    SelfConflictMap = FindSelfClaimConflicts(Claims)
+    CrossConflicts = tuple(sorted(
+        (
+            (Resource, tuple(sorted(Owners)))
+            for Resource, Owners in CrossConflictMap.items()
+        ),
+        key=lambda Value: str(Value[0]),
+    ))
+    SelfConflicts = tuple(sorted(
+        (
+            (Resource, tuple(sorted(Owners)))
+            for Resource, Owners in SelfConflictMap.items()
+        ),
+        key=lambda Value: str(Value[0]),
+    ))
+    AnonymousConflictRecords = tuple(sorted(
+        (
+            ConflictKind,
+            NormalizeResource(Resource),
+            tuple(sorted(
+                StableFingerprint(
+                    NormalizedOwnershipBySignal.get(Owner, ())
+                )
+                for Owner in Owners
+            )),
+        )
+        for ConflictKind, Conflicts in (
+            ("Cross", CrossConflicts),
+            ("Self", SelfConflicts),
+        )
+        for Resource, Owners in Conflicts
+    ))
+    Result = MandatoryAccessConflictProfile(
+        OwnershipFingerprint=OwnershipFingerprint,
+        ConflictFingerprint=StableFingerprint(AnonymousConflictRecords),
+        OwnershipRecords=OwnershipRecords,
+        CrossConflicts=CrossConflicts,
+        SelfConflicts=SelfConflicts,
+    )
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "mandatory-access-conflicts-complete",
+            "SignalCount": Result.SignalCount,
+            "ClaimCount": Result.ClaimCount,
+            "ExactConflictCount": Result.ExactConflictCount,
+        })
+    return Result
 
 
 def CountMandatoryAccessSelfConflicts(
     PlacedGates: Iterable[Any],
     Signals: Iterable[str],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> int:
     """Count exact support/headroom aliases within mandatory pin accesses."""
-    return len(FindSelfClaimConflicts(
-        BuildMandatoryAccessClaims(PlacedGates, Signals)
-    ))
+    return len(FindSelfClaimConflicts(BuildMandatoryAccessClaims(
+        PlacedGates,
+        Signals,
+        WorkCheck=WorkCheck,
+    )))
 
 
 def CountMandatoryAccessConflicts(
     PlacedGates: Iterable[Any],
     Signals: Iterable[str],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> int:
     """Count all fixed pin-access conflicts for the affected signal cut.
 
@@ -1870,13 +7599,82 @@ def CountMandatoryAccessConflicts(
     resource.  Those conflicts are immutable to detailed routing and must be
     removed by the local placement repair before a candidate is published.
     """
-    Claims = BuildMandatoryAccessClaims(PlacedGates, Signals)
-    return len(FindSelfClaimConflicts(Claims)) + len(FindClaimConflicts(Claims))
+    Claims = BuildMandatoryAccessClaims(
+        PlacedGates,
+        Signals,
+        WorkCheck=WorkCheck,
+    )
+
+    def CheckConflicts(Diagnostics: dict[str, object]) -> None:
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "mandatory-access-cross-conflicts",
+                "ConflictPhase": Diagnostics.get("Phase"),
+                **{
+                    Key: Value
+                    for Key, Value in Diagnostics.items()
+                    if Key != "Phase"
+                },
+            })
+
+    return (
+        len(FindSelfClaimConflicts(Claims))
+        + len(FindClaimConflicts(
+            Claims,
+            WorkCheck=CheckConflicts if WorkCheck is not None else None,
+        ))
+    )
+
+
+def CountPackedAccessEscapeConflicts(
+    PlacedGates: Iterable[Any],
+    RepairSignals: Iterable[str],
+) -> int:
+    """Count pin pairs too close to expose independent routing portals.
+
+    Exact mandatory claims cover the fixed access cells themselves, but two
+    otherwise legal pins separated by less than one routing track can still
+    leave no pair of electrically independent first portals.  Restrict this
+    stronger placement metric to pairs involving the current typed repair cut
+    so ordinary compact clusters retain their established geometry.
+    """
+    Gates = tuple(PlacedGates)
+    Required = frozenset(RepairSignals)
+    PinOwners: list[tuple[tuple[int, int, int], str, str]] = []
+    for Gate in Gates:
+        if Gate.OutputPin is not None:
+            PinOwners.extend(
+                (Gate.OutputPin, Signal, Gate.Name)
+                for Signal in Gate.Outputs
+            )
+        PinOwners.extend(
+            (Pin, Signal, Gate.Name)
+            for Pin, Signal in zip(Gate.InputPins, Gate.Inputs)
+        )
+    NearConflicts = sum(
+        1
+        for Index, (FirstPin, FirstSignal, FirstGate) in enumerate(PinOwners)
+        for SecondPin, SecondSignal, SecondGate in PinOwners[Index + 1 :]
+        if FirstGate != SecondGate
+        and FirstSignal != SecondSignal
+        and (
+            FirstSignal in Required
+            or SecondSignal in Required
+        )
+        and abs(FirstPin[1] - SecondPin[1]) <= 1
+        and (
+            abs(FirstPin[0] - SecondPin[0])
+            + abs(FirstPin[2] - SecondPin[2])
+            < DefaultRedstoneRoutingTechnology.TrackPitch
+        )
+    )
+    return CountMandatoryAccessConflicts(Gates, Required) + NearConflicts
 
 
 def FindMandatoryAccessConflictSignals(
     PlacedGates: Iterable[Any],
     Signals: Iterable[str],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[object, tuple[str, ...]]:
     """Return immutable cross-signal access conflicts before routing begins.
 
@@ -1884,12 +7682,13 @@ def FindMandatoryAccessConflictSignals(
     routing.  It lets placement advance directly to a relocation recipe when
     no router can resolve a fixed pin-access collision.
     """
-    Claims = BuildMandatoryAccessClaims(PlacedGates, Signals)
     return {
-        Resource: tuple(sorted(Owners))
-        for Resource, Owners in sorted(
-            FindClaimConflicts(Claims).items(), key=lambda Value: str(Value[0])
-        )
+        Resource: Owners
+        for Resource, Owners in MeasureMandatoryAccessConflictProfile(
+            PlacedGates,
+            Signals,
+            WorkCheck=WorkCheck,
+        ).CrossConflicts
     }
 
 
@@ -1901,8 +7700,15 @@ def RepairPackedClusterAccess(
     LocalMirrors: dict[str, bool],
     RequiredSignals: frozenset[str],
     BeamWidth: int,
+    IncludeNearPortalConflicts: bool = False,
+    NormalizeOrigin: bool = True,
+    RequireAccessDistinctGeometry: bool = False,
+    AccessDistinctVariant: int = 0,
+    PriorityTerminalPositions: frozenset[
+        tuple[int, int, int]
+    ] = frozenset(),
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
-) -> tuple[dict[str, tuple[int, int]], dict[str, bool], dict[str, int]]:
+    ) -> tuple[dict[str, tuple[int, int]], dict[str, bool], dict[str, int]]:
     """Repair fixed access claims inside one cluster without global spreading."""
     ClusterSignals = frozenset(
         Signal
@@ -1917,30 +7723,43 @@ def RepairPackedClusterAccess(
         return LocalPositions, LocalMirrors, {}
 
     def BuildGates(
-        State: tuple[tuple[str, int, bool], ...],
+        State: tuple[tuple[str, int, int, bool], ...],
     ) -> list[Any]:
-        Values = {Name: (X, MirrorX) for Name, X, MirrorX in State}
+        Values = {
+            Name: (X, Z, MirrorX)
+            for Name, X, Z, MirrorX in State
+        }
         return [
             BuildPlacedGate(
                 InternalByName[Name],
                 Values[Name][0],
                 1,
-                LocalPositions[Name][1],
-                LocalRotations[Name],
                 Values[Name][1],
+                LocalRotations[Name],
+                Values[Name][2],
             )
             for Name in Names
         ]
 
     BaselineState = tuple(
-        (Name, LocalPositions[Name][0], LocalMirrors.get(Name, False))
+        (
+            Name,
+            LocalPositions[Name][0],
+            LocalPositions[Name][1],
+            LocalMirrors.get(Name, False),
+        )
         for Name in Names
     )
     BaselineGates = BuildGates(BaselineState)
-    BaselineConflicts = CountMandatoryAccessConflicts(
+    BaselineMandatoryConflicts = CountMandatoryAccessConflicts(
         BaselineGates, ClusterSignals
     )
-    if BaselineConflicts == 0:
+    BaselineConflicts = (
+        CountPackedAccessEscapeConflicts(BaselineGates, ClusterSignals)
+        if IncludeNearPortalConflicts
+        else BaselineMandatoryConflicts
+    )
+    if BaselineConflicts == 0 and not RequireAccessDistinctGeometry:
         return LocalPositions, LocalMirrors, {}
 
     BaselineMinimumX = min(Gate.X for Gate in BaselineGates)
@@ -1952,8 +7771,17 @@ def RepairPackedClusterAccess(
     MaximumWidth = max(BaselineWidth, 2 * BaselineWidth)
     SearchMinimumX = BaselineMinimumX - BaselineWidth
     SearchMaximumX = BaselineMaximumX + BaselineWidth
-    BaselineX = {
-        Name: LocalPositions[Name][0] for Name in Names
+    BaselineMinimumZ = min(Gate.Z for Gate in BaselineGates)
+    BaselineMaximumZ = max(
+        Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+        for Gate in BaselineGates
+    )
+    BaselineDepth = BaselineMaximumZ - BaselineMinimumZ
+    MaximumDepth = max(BaselineDepth, 2 * BaselineDepth)
+    SearchMinimumZ = BaselineMinimumZ - BaselineDepth
+    SearchMaximumZ = BaselineMaximumZ + BaselineDepth
+    BaselinePosition = {
+        Name: LocalPositions[Name] for Name in Names
     }
     EndpointNames = {
         Name
@@ -1963,34 +7791,105 @@ def RepairPackedClusterAccess(
             *InternalByName[Name].Outputs,
         )) & ClusterSignals
     }
+    PriorityEndpointNames = frozenset(
+        Gate.Name
+        for Gate in BaselineGates
+        if (
+            (
+                Gate.OutputPin is not None
+                and Gate.OutputPin in PriorityTerminalPositions
+                and bool(set(Gate.Outputs) & ClusterSignals)
+            )
+            or any(
+                Pin in PriorityTerminalPositions
+                and Signal in ClusterSignals
+                for Signal, Pin in zip(
+                    Gate.Inputs,
+                    Gate.InputPins,
+                )
+            )
+        )
+    )
     SearchOrder = tuple(sorted(
-        Names,
-        key=lambda Name: (Name not in EndpointNames, LocalPositions[Name][1], Name),
+        EndpointNames,
+        key=lambda Name: (
+            Name not in PriorityEndpointNames,
+            LocalPositions[Name][1],
+            Name,
+        ),
     ))
 
     def Score(
-        State: tuple[tuple[str, int, bool], ...],
+        State: tuple[tuple[str, int, int, bool], ...],
         Gates: list[Any] | None = None,
-    ) -> tuple[int, int, int, tuple[tuple[str, int, bool], ...]]:
+    ) -> tuple[object, ...]:
         Gates = BuildGates(State) if Gates is None else Gates
         MinimumX = min(Gate.X for Gate in Gates)
         MaximumX = max(
             Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
             for Gate in Gates
         )
+        MinimumZ = min(Gate.Z for Gate in Gates)
+        MaximumZ = max(
+            Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+            for Gate in Gates
+        )
+        Width = MaximumX - MinimumX
+        Depth = MaximumZ - MinimumZ
         Displacement = sum(
-            abs(Gate.X - BaselineX[Gate.Name]) for Gate in Gates
+            abs(Gate.X - BaselinePosition[Gate.Name][0])
+            + abs(Gate.Z - BaselinePosition[Gate.Name][1])
+            for Gate in Gates
+        )
+        ConflictCount = (
+            CountPackedAccessEscapeConflicts(Gates, ClusterSignals)
+            if IncludeNearPortalConflicts
+            else CountMandatoryAccessConflicts(Gates, ClusterSignals)
+        )
+        StateByName = {
+            Name: (X, Z, MirrorX)
+            for Name, X, Z, MirrorX in State
+        }
+        PriorityEndpointUnchangedCount = sum(
+            StateByName[Name]
+            == (
+                BaselinePosition[Name][0],
+                BaselinePosition[Name][1],
+                LocalMirrors.get(Name, False),
+            )
+            for Name in PriorityEndpointNames
+        )
+        GeometryChangePenalty = (
+            PriorityEndpointUnchangedCount
+            if PriorityEndpointNames
+            else int(
+                RequireAccessDistinctGeometry
+                and State == BaselineState
+            )
         )
         return (
-            CountMandatoryAccessConflicts(Gates, ClusterSignals),
-            MaximumX - MinimumX,
-            Displacement,
-            State,
+            (
+                ConflictCount,
+                GeometryChangePenalty,
+                Width * Depth,
+                max(Width, Depth),
+                Displacement,
+                State,
+            )
+            if IncludeNearPortalConflicts
+            else (
+                ConflictCount,
+                GeometryChangePenalty,
+                Width,
+                Displacement,
+                State,
+            )
         )
 
-    Beam: list[tuple[tuple[int, int, int, tuple[Any, ...]], tuple[tuple[str, int, bool], ...]]] = [
+    Beam: list[tuple[tuple[object, ...], tuple[tuple[str, int, int, bool], ...]]] = [
         (Score(BaselineState, BaselineGates), BaselineState)
     ]
+    CandidateEvaluationCount = 0
     for PassIndex in range(2):
         for GateIndex, Name in enumerate(SearchOrder):
             if WorkCheck is not None:
@@ -2002,31 +7901,102 @@ def RepairPackedClusterAccess(
                     "BaselineConflictCount": BaselineConflicts,
                 })
             Candidates: dict[
-                tuple[tuple[str, int, bool], ...],
-                tuple[int, int, int, tuple[Any, ...]],
+                tuple[tuple[str, int, int, bool], ...],
+                tuple[object, ...],
             ] = {}
             for _PreviousScore, PreviousState in Beam:
                 Previous = {
-                    GateName: (X, MirrorX)
-                    for GateName, X, MirrorX in PreviousState
+                    GateName: (X, Z, MirrorX)
+                    for GateName, X, Z, MirrorX in PreviousState
                 }
                 GateWidth = RotatedCellSize(
                     InternalByName[Name].Kind.value,
                     LocalRotations[Name],
                 )[0]
-                for CandidateX in range(
-                    SearchMinimumX,
-                    SearchMaximumX - GateWidth + 1,
+                GateDepth = RotatedCellSize(
+                    InternalByName[Name].Kind.value,
+                    LocalRotations[Name],
+                )[1]
+                CandidateXValues = sorted(
+                    range(
+                        SearchMinimumX,
+                        SearchMaximumX - GateWidth + 1,
+                    ),
+                    key=lambda CandidateX: (
+                        abs(
+                            CandidateX
+                            - BaselinePosition[Name][0]
+                        ),
+                        CandidateX,
+                    ),
+                )[:33]
+                CandidatePositions = [
+                    (CandidateX, BaselinePosition[Name][1])
+                    for CandidateX in CandidateXValues
+                ]
+                if IncludeNearPortalConflicts:
+                    CandidateZValues = sorted(
+                        range(
+                            SearchMinimumZ,
+                            SearchMaximumZ - GateDepth + 1,
+                        ),
+                        key=lambda CandidateZ: (
+                            abs(
+                                CandidateZ
+                                - BaselinePosition[Name][1]
+                            ),
+                            CandidateZ,
+                        ),
+                    )[:33]
+                    CandidatePositions.extend(
+                        (BaselinePosition[Name][0], CandidateZ)
+                        for CandidateZ in CandidateZValues
+                    )
+                    CandidatePositions.extend(
+                        (
+                            BaselinePosition[Name][0] + DeltaX,
+                            BaselinePosition[Name][1] + DeltaZ,
+                        )
+                        for DeltaX in range(-6, 7)
+                        for DeltaZ in range(-6, 7)
+                        if abs(DeltaX) + abs(DeltaZ) <= 6
+                    )
+                for CandidateX, CandidateZ in dict.fromkeys(
+                    CandidatePositions
                 ):
                     for CandidateMirror in (False, True):
                         Candidate = dict(Previous)
-                        Candidate[Name] = (CandidateX, CandidateMirror)
+                        Candidate[Name] = (
+                            CandidateX,
+                            CandidateZ,
+                            CandidateMirror,
+                        )
                         State = tuple(
-                            (GateName, Candidate[GateName][0], Candidate[GateName][1])
+                            (
+                                GateName,
+                                Candidate[GateName][0],
+                                Candidate[GateName][1],
+                                Candidate[GateName][2],
+                            )
                             for GateName in Names
                         )
                         if State in Candidates:
                             continue
+                        CandidateEvaluationCount += 1
+                        if (
+                            WorkCheck is not None
+                            and CandidateEvaluationCount % 128 == 0
+                        ):
+                            WorkCheck({
+                                "Phase": "packed-access-repair-candidate",
+                                "Pass": PassIndex,
+                                "GateIndex": GateIndex,
+                                "GateCount": len(SearchOrder),
+                                "EvaluatedCandidates": (
+                                    CandidateEvaluationCount
+                                ),
+                                "CurrentFrontier": len(Candidates),
+                            })
                         Gates = BuildGates(State)
                         if any(
                             PcbGatesConflict(First, Second)
@@ -2039,7 +8009,16 @@ def RepairPackedClusterAccess(
                             Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
                             for Gate in Gates
                         )
-                        if MaximumX - MinimumX > MaximumWidth:
+                        MinimumZ = min(Gate.Z for Gate in Gates)
+                        MaximumZ = max(
+                            Gate.Z
+                            + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+                            for Gate in Gates
+                        )
+                        if (
+                            MaximumX - MinimumX > MaximumWidth
+                            or MaximumZ - MinimumZ > MaximumDepth
+                        ):
                             continue
                         Candidates[State] = Score(State, Gates)
             Beam = [
@@ -2050,34 +8029,827 @@ def RepairPackedClusterAccess(
             ]
             if not Beam:
                 break
-        if Beam and Beam[0][0][0] == 0:
+            if (
+                Beam[0][0][0] == 0
+                and Beam[0][0][1] == 0
+                and (
+                    not RequireAccessDistinctGeometry
+                    or Beam[0][1] != BaselineState
+                )
+            ):
+                break
+        if (
+            Beam
+            and Beam[0][0][0] == 0
+            and Beam[0][0][1] == 0
+            and (
+                not RequireAccessDistinctGeometry
+                or Beam[0][1] != BaselineState
+            )
+        ):
             break
-    if not Beam or Beam[0][0][0] != 0:
-        BestConflictCount = Beam[0][0][0] if Beam else BaselineConflicts
+    ExactLegalChangedBeam = [
+        (CandidateScore, State)
+        for CandidateScore, State in Beam
+        if CandidateScore[0] == 0
+        and CandidateScore[1] == 0
+        and (
+            not RequireAccessDistinctGeometry
+            or State != BaselineState
+        )
+    ]
+    SelectedBeam = (
+        ExactLegalChangedBeam[
+            AccessDistinctVariant % len(ExactLegalChangedBeam)
+        ]
+        if ExactLegalChangedBeam
+        else (Beam[0] if Beam else None)
+    )
+    BestMandatoryConflicts = (
+        CountMandatoryAccessConflicts(
+            BuildGates(SelectedBeam[1]),
+            ClusterSignals,
+        )
+        if SelectedBeam is not None
+        else BaselineMandatoryConflicts
+    )
+    if SelectedBeam is None or BestMandatoryConflicts != 0:
+        BestConflictCount = (
+            SelectedBeam[0][0]
+            if SelectedBeam is not None
+            else BaselineConflicts
+        )
         raise ValueError(
             "Could not legalize mandatory packed access claims "
             f"within width envelope: signals={','.join(sorted(ClusterSignals))}:"
             f"baseline={BaselineConflicts}:best={BestConflictCount}:"
             f"maximum_width={MaximumWidth}"
         )
-    BestScore, BestState = Beam[0]
-    Best = {Name: (X, MirrorX) for Name, X, MirrorX in BestState}
-    MinimumX = min(X for X, _MirrorX in Best.values())
+    BestScore, BestState = SelectedBeam
+    Best = {
+        Name: (X, Z, MirrorX)
+        for Name, X, Z, MirrorX in BestState
+    }
+    MinimumX = (
+        min(X for X, _Z, _MirrorX in Best.values())
+        if NormalizeOrigin
+        else 0
+    )
+    MinimumZ = (
+        min(Z for _X, Z, _MirrorX in Best.values())
+        if NormalizeOrigin
+        else 0
+    )
     RepairedPositions = dict(LocalPositions)
     RepairedMirrors = dict(LocalMirrors)
     for Name in Names:
         RepairedPositions[Name] = (
             Best[Name][0] - MinimumX,
-            LocalPositions[Name][1],
+            Best[Name][1] - MinimumZ,
         )
-        RepairedMirrors[Name] = Best[Name][1]
+        RepairedMirrors[Name] = Best[Name][2]
+    BestGates = BuildGates(BestState)
+    FinalWidth = (
+        max(
+            Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+            for Gate in BestGates
+        )
+        - min(Gate.X for Gate in BestGates)
+    )
+    FinalDepth = (
+        max(
+            Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+            for Gate in BestGates
+        )
+        - min(Gate.Z for Gate in BestGates)
+    )
     return RepairedPositions, RepairedMirrors, {
         "BaselineConflictCount": BaselineConflicts,
         "FinalConflictCount": BestScore[0],
+        "BaselineMandatoryConflictCount": BaselineMandatoryConflicts,
+        "FinalMandatoryConflictCount": BestMandatoryConflicts,
         "BaselineWidth": BaselineWidth,
-        "FinalWidth": BestScore[1],
+        "FinalWidth": FinalWidth,
         "MaximumWidth": MaximumWidth,
+        "BaselineDepth": BaselineDepth,
+        "FinalDepth": FinalDepth,
+        "MaximumDepth": MaximumDepth,
+        "NormalizedOrigin": NormalizeOrigin,
+        "AccessDistinctVariant": AccessDistinctVariant,
+        "AccessDistinctVariantCount": len(ExactLegalChangedBeam),
+        "PriorityEndpointNames": sorted(PriorityEndpointNames),
+        "PriorityTerminalPositions": [
+            list(Position)
+            for Position in sorted(PriorityTerminalPositions)
+        ],
     }
+
+
+@dataclass(frozen=True)
+class TransactionalClusterEndpointRepairResult:
+    """One committed cluster-local ECO or a diagnostic rejection."""
+
+    Placement: PcbPlacement | None
+    Diagnostics: dict[str, object]
+
+    @property
+    def Accepted(self) -> bool:
+        return self.Placement is not None
+
+
+def RankTransactionalRepairClusterSelections(
+    EligibleClusterSignals: Iterable[
+        tuple[int, tuple[str, ...], frozenset[str]]
+    ],
+    RepairClusterCount: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Rank bounded cluster combinations by reported-cut coverage."""
+    Eligible = tuple(EligibleClusterSignals)
+    if not Eligible:
+        return ()
+    EffectiveCount = min(
+        max(1, RepairClusterCount),
+        len(Eligible),
+    )
+
+    def SelectionKey(
+        Selection: tuple[int, ...],
+    ) -> tuple[object, ...]:
+        SignalSets = tuple(
+            Eligible[Ordinal][2]
+            for Ordinal in Selection
+        )
+        CoveredSignals = frozenset(
+            Signal
+            for Signals in SignalSets
+            for Signal in Signals
+        )
+        return (
+            -len(CoveredSignals),
+            -sum(len(Signals) for Signals in SignalSets),
+            -min(len(Signals) for Signals in SignalSets),
+            tuple(Eligible[Ordinal][0] for Ordinal in Selection),
+        )
+
+    return tuple(sorted(
+        combinations(range(len(Eligible)), EffectiveCount),
+        key=SelectionKey,
+    ))
+
+
+def SelectTransactionalRepairClusterSelections(
+    EligibleClusterSignals: Iterable[
+        tuple[int, tuple[str, ...], frozenset[str]]
+    ],
+    RepairClusterCount: int,
+    RepairSignals: frozenset[str],
+) -> tuple[tuple[int, ...], ...]:
+    """Keep complete-cut cluster selections when the bound admits them."""
+    Eligible = tuple(EligibleClusterSignals)
+    # A small exact capacity cut may span three owners even when the normal
+    # coordinated repair starts at two.  Escalate only when every two-owner
+    # combination omits a reported endpoint; this remains a structural,
+    # bounded ownership decision rather than a benchmark rule.
+    MaximumClusterCount = min(3, len(Eligible))
+    Ranked: tuple[tuple[int, ...], ...] = ()
+    Complete: tuple[tuple[int, ...], ...] = ()
+    for CandidateCount in range(
+        min(max(1, RepairClusterCount), MaximumClusterCount),
+        MaximumClusterCount + 1,
+    ):
+        Ranked = RankTransactionalRepairClusterSelections(
+            Eligible,
+            CandidateCount,
+        )
+        Complete = tuple(
+            Selection
+            for Selection in Ranked
+            if RepairSignals <= frozenset(
+                Signal
+                for Ordinal in Selection
+                for Signal in Eligible[Ordinal][2]
+            )
+        )
+        if Complete:
+            return Complete
+    # Some cuts include top-level terminals with no packed-cluster owner. In
+    # that case retain the ordinary maximum-coverage ranking; otherwise a
+    # state that omits a reported cut signal cannot be a coordinated repair
+    # and only consumes one of the fixed geometry variants.
+    return Ranked
+
+
+def BuildTransactionalClusterEndpointRepair(
+    Source: PcbPlacement,
+    RepairSignals: frozenset[str],
+    BeamWidth: int = 16,
+    RepairVariant: int = 0,
+    RepairClusterCount: int = 1,
+    RepairTerminalPositions: frozenset[
+        tuple[int, int, int]
+    ] = frozenset(),
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> TransactionalClusterEndpointRepairResult:
+    """Repair endpoint access without reopening clustering or global slots.
+
+    This is a physical-design ECO transaction.  It may translate or mirror
+    only NAND gates touching the reported signals inside their current
+    clusters.  Every unrelated gate, the global XZ envelope, and unaffected
+    local routes remain immutable.  Claims incident to a moved gate are
+    deliberately released so authoritative routing regenerates them against
+    the new pin geometry.
+    """
+    Signals = frozenset(map(str, RepairSignals))
+    Diagnostics: dict[str, object] = {
+        "Enabled": True,
+        "Signals": sorted(Signals),
+        "Accepted": False,
+        "RepairVariant": RepairVariant,
+    }
+    if not Signals or not Source.Clusters:
+        Diagnostics["Reason"] = "missing-signals-or-clusters"
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+
+    Module = Source.Placed.Module
+    ModuleGateByName = {
+        Gate.Name: Gate
+        for Gate in Module.Gates
+    }
+    SourceGateByName = {
+        Gate.Name: Gate
+        for Gate in Source.Placed.PlacedGates
+    }
+    InternalByName = {
+        Name: ModuleGateByName[Name]
+        for Names in Source.Clusters
+        for Name in Names
+        if (
+            Name in ModuleGateByName
+            and str(getattr(
+                ModuleGateByName[Name].Kind,
+                "value",
+                ModuleGateByName[Name].Kind,
+            )) == "NAND"
+        )
+    }
+    if not InternalByName:
+        Diagnostics["Reason"] = "no-packed-nand-clusters"
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+
+    def GateGeometry(Gate: PlacedGate) -> tuple[object, ...]:
+        return (
+            Gate.X,
+            Gate.Y,
+            Gate.Z,
+            Gate.Rotation,
+            bool(Gate.MirrorX),
+        )
+
+    def GateEnvelope(
+        Gates: Iterable[PlacedGate],
+    ) -> tuple[int, int, int, int]:
+        Values = tuple(Gates)
+        return (
+            min(Gate.X for Gate in Values),
+            min(Gate.Z for Gate in Values),
+            max(
+                Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+                for Gate in Values
+            ),
+            max(
+                Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+                for Gate in Values
+            ),
+        )
+
+    SourceEnvelope = GateEnvelope(Source.Placed.PlacedGates)
+    EligibleClusterSignals = tuple(
+        (
+            ClusterIndex,
+            tuple(
+                Name
+                for Name in Names
+                if Name in InternalByName and Name in SourceGateByName
+            ),
+            frozenset(
+                Signal
+                for Name in Names
+                if Name in InternalByName
+                for Signal in (
+                    *InternalByName[Name].Inputs,
+                    *InternalByName[Name].Outputs,
+                )
+                if Signal in Signals
+            ),
+        )
+        for ClusterIndex, Names in enumerate(Source.Clusters)
+        if any(
+            Signal in Signals
+            for Name in Names
+            if Name in InternalByName
+            for Signal in (
+                *InternalByName[Name].Inputs,
+                *InternalByName[Name].Outputs,
+            )
+        )
+    )
+    if not EligibleClusterSignals:
+        Diagnostics["Reason"] = "repair-signals-have-no-cluster-endpoints"
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+    EffectiveRepairClusterCount = min(
+        max(1, RepairClusterCount),
+        len(EligibleClusterSignals),
+    )
+    ClusterSelections = SelectTransactionalRepairClusterSelections(
+        EligibleClusterSignals,
+        EffectiveRepairClusterCount,
+        Signals,
+    )
+    EffectiveRepairClusterCount = len(ClusterSelections[0])
+    PriorityTerminalOwnerClusters = frozenset(
+        ClusterIndex
+        for ClusterIndex, Names in enumerate(Source.Clusters)
+        if any(
+            (
+                Gate.OutputPin in RepairTerminalPositions
+                and bool(set(Gate.Outputs) & Signals)
+            )
+            or any(
+                Pin in RepairTerminalPositions
+                and Signal in Signals
+                for Signal, Pin in zip(
+                    Gate.Inputs,
+                    Gate.InputPins,
+                )
+            )
+            for Name in Names
+            for Gate in (SourceGateByName.get(Name),)
+            if Gate is not None
+        )
+    )
+    PriorityOwnerSelections = tuple(
+        Selection
+        for Selection in ClusterSelections
+        if PriorityTerminalOwnerClusters <= frozenset(
+            EligibleClusterSignals[Ordinal][0]
+            for Ordinal in Selection
+        )
+    )
+    if PriorityOwnerSelections:
+        ClusterSelections = PriorityOwnerSelections
+    SelectedClusterOrdinals = ClusterSelections[
+        RepairVariant % len(ClusterSelections)
+    ]
+    SelectedClusterIndices = frozenset(
+        EligibleClusterSignals[Ordinal][0]
+        for Ordinal in SelectedClusterOrdinals
+    )
+    ClusterRepairVariant = RepairVariant // len(ClusterSelections)
+    Diagnostics.update({
+        "EligibleClusterCount": len(EligibleClusterSignals),
+        "RequestedRepairClusterCount": RepairClusterCount,
+        "RepairClusterCount": EffectiveRepairClusterCount,
+        "SelectedClusterIndices": sorted(SelectedClusterIndices),
+        "SelectedClusterIndex": (
+            next(iter(SelectedClusterIndices))
+            if len(SelectedClusterIndices) == 1
+            else None
+        ),
+        "ClusterRepairVariant": ClusterRepairVariant,
+        "SelectedCutSignalCoverage": len(frozenset(
+            Signal
+            for Ordinal in SelectedClusterOrdinals
+            for Signal in EligibleClusterSignals[Ordinal][2]
+        )),
+        "PriorityTerminalOwnerClusters": sorted(
+            PriorityTerminalOwnerClusters
+        ),
+        "PriorityTerminalOwnerCoverageApplied": bool(
+            PriorityOwnerSelections
+        ),
+    })
+
+    RepairedGateByName = dict(SourceGateByName)
+    RepairedRotationByName = {
+        Name: Gate.Rotation
+        for Name, Gate in SourceGateByName.items()
+    }
+    RepairByCluster: dict[str, dict[str, object]] = {}
+    TouchedClusters: set[int] = set()
+    for ClusterIndex, ClusterNames, ClusterSignals in (
+        EligibleClusterSignals
+    ):
+        if ClusterIndex not in SelectedClusterIndices:
+            continue
+        TouchedClusters.add(ClusterIndex)
+        LocalPositions = {
+            Name: (
+                SourceGateByName[Name].X,
+                SourceGateByName[Name].Z,
+            )
+            for Name in ClusterNames
+        }
+        LocalRotations = {
+            Name: SourceGateByName[Name].Rotation
+            for Name in ClusterNames
+        }
+        LocalMirrors = {
+            Name: bool(SourceGateByName[Name].MirrorX)
+            for Name in ClusterNames
+        }
+        try:
+            (
+                RepairedPositions,
+                RepairedMirrors,
+                ClusterDiagnostics,
+            ) = RepairPackedClusterAccess(
+                ClusterNames,
+                InternalByName,
+                LocalPositions,
+                LocalRotations,
+                LocalMirrors,
+                ClusterSignals,
+                BeamWidth,
+                IncludeNearPortalConflicts=True,
+                NormalizeOrigin=False,
+                RequireAccessDistinctGeometry=True,
+                AccessDistinctVariant=ClusterRepairVariant,
+                PriorityTerminalPositions=RepairTerminalPositions,
+                WorkCheck=WorkCheck,
+            )
+        except ValueError as Error:
+            Diagnostics.update({
+                "Reason": "cluster-local-search-rejected",
+                "RejectedCluster": ClusterIndex,
+                "Validation": str(Error),
+            })
+            return TransactionalClusterEndpointRepairResult(
+                None,
+                Diagnostics,
+            )
+        PriorityEndpointNames = tuple(sorted(
+            Name
+            for Name in ClusterNames
+            for Gate in (SourceGateByName[Name],)
+            if (
+                (
+                    Gate.OutputPin in RepairTerminalPositions
+                    and bool(set(Gate.Outputs) & Signals)
+                )
+                or any(
+                    Pin in RepairTerminalPositions
+                    and Signal in Signals
+                    for Signal, Pin in zip(
+                        Gate.Inputs,
+                        Gate.InputPins,
+                    )
+                )
+            )
+        ))
+        if PriorityEndpointNames:
+            # Translation and mirroring preserve a macro's relative pin-bank
+            # geometry. A witnessed same-macro access collision needs one
+            # bounded rigid orientation alternative instead.
+            RotationDelta = (90, 180, 270)[
+                ClusterRepairVariant % 3
+            ]
+            CandidateRotations = {
+                Name: (
+                    (LocalRotations[Name] + RotationDelta) % 360
+                    if Name in PriorityEndpointNames
+                    else LocalRotations[Name]
+                )
+                for Name in ClusterNames
+            }
+            CandidateClusterGates = [
+                BuildPlacedGate(
+                    InternalByName[Name],
+                    RepairedPositions[Name][0],
+                    SourceGateByName[Name].Y,
+                    RepairedPositions[Name][1],
+                    CandidateRotations[Name],
+                    RepairedMirrors[Name],
+                )
+                for Name in ClusterNames
+            ]
+            if (
+                not any(
+                    PcbGatesConflict(First, Second)
+                    for GateIndex, First in enumerate(CandidateClusterGates)
+                    for Second in CandidateClusterGates[GateIndex + 1 :]
+                )
+                and CountMandatoryAccessConflicts(
+                    CandidateClusterGates,
+                    ClusterSignals,
+                ) == 0
+            ):
+                for Name in PriorityEndpointNames:
+                    RepairedRotationByName[Name] = (
+                        CandidateRotations[Name]
+                    )
+                ClusterDiagnostics["PriorityEndpointRotationDelta"] = (
+                    RotationDelta
+                )
+                ClusterDiagnostics["PriorityEndpointRotationNames"] = (
+                    list(PriorityEndpointNames)
+                )
+            else:
+                ClusterDiagnostics["PriorityEndpointRotationRejected"] = (
+                    True
+                )
+        RepairByCluster[str(ClusterIndex)] = {
+            **ClusterDiagnostics,
+            "Signals": sorted(ClusterSignals),
+            "PortfolioRepairVariant": RepairVariant,
+            "ClusterRepairVariant": ClusterRepairVariant,
+        }
+        for Name in ClusterNames:
+            SourceGate = SourceGateByName[Name]
+            RepairedGateByName[Name] = BuildPlacedGate(
+                InternalByName[Name],
+                RepairedPositions[Name][0],
+                SourceGate.Y,
+                RepairedPositions[Name][1],
+                RepairedRotationByName[Name],
+                RepairedMirrors[Name],
+            )
+
+    CandidateGates = [
+        RepairedGateByName.get(Gate.Name, Gate)
+        for Gate in Source.Placed.PlacedGates
+    ]
+    ChangedGateNames = frozenset(
+        Name
+        for Name, SourceGate in SourceGateByName.items()
+        if (
+            Name in RepairedGateByName
+            and GateGeometry(RepairedGateByName[Name])
+            != GateGeometry(SourceGate)
+        )
+    )
+    if not ChangedGateNames:
+        Diagnostics.update({
+            "Reason": "no-endpoint-geometry-change",
+            "Clusters": RepairByCluster,
+        })
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+
+    AllowedGateNames = frozenset(
+        Name
+        for Name in InternalByName
+        if set((
+            *InternalByName[Name].Inputs,
+            *InternalByName[Name].Outputs,
+        )) & Signals
+    )
+    UnexpectedChanges = ChangedGateNames - AllowedGateNames
+    if UnexpectedChanges:
+        Diagnostics.update({
+            "Reason": "unrelated-gate-geometry-changed",
+            "UnexpectedChangedGateCount": len(UnexpectedChanges),
+        })
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+
+    CandidateEnvelope = GateEnvelope(CandidateGates)
+    if (
+        CandidateEnvelope[0] < SourceEnvelope[0]
+        or CandidateEnvelope[1] < SourceEnvelope[1]
+        or CandidateEnvelope[2] > SourceEnvelope[2]
+        or CandidateEnvelope[3] > SourceEnvelope[3]
+    ):
+        Diagnostics.update({
+            "Reason": "global-envelope-growth",
+            "SourceEnvelope": list(SourceEnvelope),
+            "CandidateEnvelope": list(CandidateEnvelope),
+        })
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+
+    CandidatePlacedForValidation = PlacedDesign(
+        Module=Module,
+        PlacedGates=CandidateGates,
+    )
+    try:
+        if any(
+            PcbGatesConflict(First, Second)
+            for GateIndex, First in enumerate(CandidateGates)
+            for Second in CandidateGates[GateIndex + 1 :]
+        ):
+            raise ValueError("repaired gate geometry overlaps")
+        BuildPlacedCellGeometry(CandidatePlacedForValidation)
+    except ValueError as Error:
+        Diagnostics.update({
+            "Reason": "exact-electrical-validation-rejected",
+            "Validation": str(Error),
+        })
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+
+    SourceProfile = (
+        Source.MandatoryAccessPreScreenProfile
+        or MeasureMandatoryAccessConflictProfile(
+            Source.Placed.PlacedGates,
+            Source.SignalOrder,
+            WorkCheck=WorkCheck,
+        )
+    )
+    CandidateProfile = MeasureMandatoryAccessConflictProfile(
+        CandidateGates,
+        Source.SignalOrder,
+        WorkCheck=WorkCheck,
+    )
+    CandidateConflictCount = (
+        len(CandidateProfile.CrossConflicts)
+        + len(CandidateProfile.SelfConflicts)
+    )
+    if CandidateConflictCount:
+        Diagnostics.update({
+            "Reason": "mandatory-access-conflict",
+            "MandatoryAccessConflictResourceCount": CandidateConflictCount,
+        })
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+    if (
+        CandidateProfile.OwnershipFingerprint
+        == SourceProfile.OwnershipFingerprint
+    ):
+        Diagnostics.update({
+            "Reason": "unchanged-mandatory-access-ownership",
+            "MandatoryAccessOwnershipFingerprint": (
+                CandidateProfile.OwnershipFingerprint
+            ),
+        })
+        return TransactionalClusterEndpointRepairResult(None, Diagnostics)
+
+    InvalidatedSignals = frozenset(
+        Signal
+        for Name in ChangedGateNames
+        for Signal in (
+            *ModuleGateByName[Name].Inputs,
+            *ModuleGateByName[Name].Outputs,
+        )
+    )
+
+    def RetainUnchangedSignalEntries(
+        Values: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if Values is None:
+            return None
+        return {
+            Signal: Value
+            for Signal, Value in Values.items()
+            if Signal not in InvalidatedSignals
+        }
+
+    ClusterByGate = {
+        Name: ClusterIndex
+        for ClusterIndex, Names in enumerate(Source.Clusters)
+        for Name in Names
+    }
+    CandidateGateByName = {
+        Gate.Name: Gate for Gate in CandidateGates
+    }
+    ProducerBySignal = {
+        Signal: Gate
+        for Gate in Module.Gates
+        for Signal in Gate.Outputs
+    }
+    ConsumersBySignal: dict[str, list[Any]] = {}
+    for Gate in Module.Gates:
+        for Signal in Gate.Inputs:
+            ConsumersBySignal.setdefault(Signal, []).append(Gate)
+
+    def RefreshLease(
+        Request: ClusterBoundaryLeaseRequest,
+    ) -> ClusterBoundaryLeaseRequest:
+        Producer = ProducerBySignal.get(Request.Signal)
+        ProducerPlaced = (
+            CandidateGateByName.get(Producer.Name)
+            if Producer is not None
+            else None
+        )
+        SourceTerminal = (
+            ProducerPlaced.OutputPin
+            if ProducerPlaced is not None
+            else Request.SourceTerminal
+        )
+        TargetTerminals = tuple(sorted({
+            TargetPlaced.InputPins[InputIndex]
+            for Consumer in ConsumersBySignal.get(Request.Signal, ())
+            if (
+                (
+                    Request.TargetCluster < 0
+                    and Consumer.Name not in ClusterByGate
+                )
+                or ClusterByGate.get(Consumer.Name)
+                == Request.TargetCluster
+            )
+            if (TargetPlaced := CandidateGateByName.get(Consumer.Name))
+            is not None
+            for InputIndex, InputSignal in enumerate(Consumer.Inputs)
+            if InputSignal == Request.Signal
+        }))
+        return replace(
+            Request,
+            SourceTerminal=SourceTerminal,
+            TargetTerminals=TargetTerminals,
+        )
+
+    SourceDiagnostics = dict(
+        Source.Placed.LocalRouteDiagnostics or {}
+    )
+    Diagnostics.update({
+        "Accepted": True,
+        "Reason": "access-distinct-local-eco",
+        "Clusters": RepairByCluster,
+        "TouchedClusterCount": len(TouchedClusters),
+        "ChangedGateCount": len(ChangedGateNames),
+        "InvalidatedSignals": sorted(InvalidatedSignals),
+        "SourceEnvelope": list(SourceEnvelope),
+        "CandidateEnvelope": list(CandidateEnvelope),
+        "SourceMandatoryAccessOwnershipFingerprint": (
+            SourceProfile.OwnershipFingerprint
+        ),
+        "CandidateMandatoryAccessOwnershipFingerprint": (
+            CandidateProfile.OwnershipFingerprint
+        ),
+        "PreservedLocalClaimCount": sum(
+            Claim.Signal not in InvalidatedSignals
+            for Claim in Source.Placed.LocalRouteClaims or ()
+        ),
+        "InvalidatedLocalClaimCount": sum(
+            Claim.Signal in InvalidatedSignals
+            for Claim in Source.Placed.LocalRouteClaims or ()
+        ),
+    })
+    SourceDiagnostics["__TransactionalClusterEndpointRepair__"] = (
+        Diagnostics
+    )
+    CandidateLeaseRequests = tuple(
+        RefreshLease(Request)
+        for Request in Source.ClusterBoundaryLeaseRequests
+    )
+    CandidatePlaced = PlacedDesign(
+        Module=Module,
+        PlacedGates=CandidateGates,
+        RouteGuides=RetainUnchangedSignalEntries(
+            Source.Placed.RouteGuides
+        ),
+        RouteLayers=RetainUnchangedSignalEntries(
+            Source.Placed.RouteLayers
+        ),
+        FrozenNetWires=RetainUnchangedSignalEntries(
+            Source.Placed.FrozenNetWires
+        ),
+        LocalNetBranches=RetainUnchangedSignalEntries(
+            Source.Placed.LocalNetBranches
+        ),
+        LocalNetTargets=RetainUnchangedSignalEntries(
+            Source.Placed.LocalNetTargets
+        ),
+        LocalRouteClaims=tuple(
+            Claim
+            for Claim in Source.Placed.LocalRouteClaims or ()
+            if Claim.Signal not in InvalidatedSignals
+        ),
+        LocalRouteDiagnostics=SourceDiagnostics,
+        ClusterBoundaryLeaseRequests=CandidateLeaseRequests,
+        CompleteClusterInterfaceAccess=(
+            Source.CompleteClusterInterfaceAccess
+        ),
+    )
+    return TransactionalClusterEndpointRepairResult(
+        PcbPlacement(
+            Placed=CandidatePlaced,
+            Clusters=Source.Clusters,
+            SignalOrder=Source.SignalOrder,
+            LayerCount=Source.LayerCount,
+            PackedClusters=Source.PackedClusters,
+            ClusterBoundaryLeaseRequests=CandidateLeaseRequests,
+            ClusterLocalRouteTemplates=tuple(
+                Template
+                for Template in Source.ClusterLocalRouteTemplates
+                if Template.ClusterId not in TouchedClusters
+            ),
+            ClusterBoundaryLeaseVariant=(
+                Source.ClusterBoundaryLeaseVariant
+            ),
+            CompleteClusterInterfaceAccess=(
+                Source.CompleteClusterInterfaceAccess
+            ),
+            MandatoryAccessPreScreenProfile=CandidateProfile,
+        ),
+        Diagnostics,
+    )
+
+
+def ShouldIncludeNearPortalPackedAccessRepair(
+    *,
+    RelocationVariant: int,
+    EnableInternalPinBankGeometryRepair: bool,
+) -> bool:
+    """Enable the stronger local search for typed internal pin-bank work."""
+    return (
+        RelocationVariant >= 12
+        or EnableInternalPinBankGeometryRepair
+    )
 
 
 def BuildPinAlignedPackedCluster(
@@ -2456,10 +9228,21 @@ def AddPcbRoutingGuides(
         for Gate in Placed.PlacedGates
         for Signal in Gate.Inputs
     }
+    # A capped three-layer guide plane is sufficient for small circuits, but
+    # cannot assign disjoint portal ownership for the 64+ signal arithmetic
+    # region. Let only that scale use the technology's full routing ladder.
+    EffectiveMaximumLayerCount = (
+        DefaultRedstoneRoutingTechnology.MaximumRoutableLayerCount
+        if (
+            MaximumLayerCount > 0
+            and len(Signals) >= 64
+        )
+        else MaximumLayerCount
+    )
     LayerCount = min(
         (
-            MaximumLayerCount
-            if MaximumLayerCount > 0
+            EffectiveMaximumLayerCount
+            if EffectiveMaximumLayerCount > 0
             else DefaultRedstoneRoutingTechnology.MaximumRoutableLayerCount
         ),
         max(
@@ -2498,6 +9281,22 @@ def PlacePcbGraph(
     RelocationPrioritySignals: frozenset[str] = frozenset(),
     RequiredRelocationSignals: frozenset[str] = frozenset(),
     RelocationVariant: int = 0,
+    JointPlacementCandidateIndex: int = 0,
+    AssignmentCut: RoutingAssignmentCut | None = None,
+    AssignmentConstraints: PlacementAssignmentConstraintSet = (
+        PlacementAssignmentConstraintSet()
+    ),
+    CoordinatedCandidateDiversificationSignals: frozenset[str] = frozenset(),
+    EnableClusterLocalRouteReuse: bool = False,
+    EnableClusterBoundaryLeases: bool = False,
+    EnableClusterInterfacePlacementFeasibility: bool = False,
+    CutDrivenClusterRefinementSignals: frozenset[str] | None = None,
+    EnableInternalPinBankGeometryRepair: bool = False,
+    InternalPinBankGeometryRepairSignals: frozenset[str] = frozenset(),
+    FocusedCutEpochPlacement: bool = False,
+    TopologyCutFrontier: tuple[RoutingAssignmentCut, ...] = (),
+    MandatoryAccessPreScreenOnly: bool = False,
+    PlacementScoringOnly: bool = False,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PcbPlacement:
     """Cluster, optimize, legalize, and guide a generic NAND graph."""
@@ -2509,9 +9308,26 @@ def PlacePcbGraph(
     if RoutingSpacing < 0:
         raise ValueError("RoutingSpacing cannot be negative")
     Module = Netlist.Modules[Netlist.Top]
-    Levels = BuildTopologicalLevels(Module, WorkCheck=WorkCheck)
+    ModuleLayoutFingerprint = tuple(
+        (
+            Gate.Name,
+            (
+                Gate.Kind.value
+                if hasattr(Gate.Kind, "value")
+                else str(Gate.Kind)
+            ),
+            tuple(Gate.Inputs),
+            tuple(Gate.Outputs),
+        )
+        for Gate in Module.Gates
+    )
     PackedMode = bool(PackingPolicy is not None and PackingPolicy.Enabled)
     NandCount = sum(Gate.Kind.value == "NAND" for Gate in Module.Gates)
+    TerminalPlacementPolicy = (
+        PackingPolicy
+        if PackingPolicy is not None
+        else NandPackingPolicy()
+    )
     AdaptiveClusterSize = (
         min(
             PackingPolicy.MaximumClusterCells,
@@ -2539,14 +9355,172 @@ def PlacePcbGraph(
                 - PackingPolicy.MaximumClusterCells // 8,
             ),
         )
-    Clusters = BuildConnectivityClusters(
+    LogicalComponentGraph = BuildComponentGraph(
         Module,
-        MaximumClusterSize=AdaptiveClusterSize,
-        Policy=ClusterPolicy if PackedMode else None,
-        MaximumBoundaryTerminals=(
-            MaximumBoundaryTerminals if PackedMode else None
+        MaximumComponentGates=max(4, AdaptiveClusterSize + 4),
+    )
+    LogicalComponentByGate = (
+        dict(LogicalComponentGraph.GateToComponent)
+        if LogicalComponentGraph.Hierarchical
+        else {}
+    )
+    ClusterRefinementSignals = tuple(sorted(
+        CutDrivenClusterRefinementSignals
+        if CutDrivenClusterRefinementSignals is not None
+        else {
+            Signal
+            for Edge in BuildEffectiveAssignmentCutPairwiseEdges(
+                AssignmentCut
+            )
+            for Signal in Edge
+        }
+    ))
+    ClusterRefinementProfile = (
+        CutDrivenClusterRefinementProfile(
+            Signals=ClusterRefinementSignals,
+            EdgeWeight=max(4, AdaptiveClusterSize),
+        )
+        if (
+            EnableClusterInterfacePlacementFeasibility
+            and ClusterRefinementSignals
+        )
+        else None
+    )
+    PlacementTopologyCacheKey = (
+        ModuleLayoutFingerprint,
+        PackedMode,
+        AdaptiveClusterSize,
+        repr(ClusterPolicy if PackedMode else None),
+        MaximumBoundaryTerminals if PackedMode else None,
+        (
+            ClusterRefinementProfile.Signals
+            if ClusterRefinementProfile is not None
+            else ()
         ),
-        WorkCheck=WorkCheck,
+        (
+            ClusterRefinementProfile.EdgeWeight
+            if ClusterRefinementProfile is not None
+            else 0
+        ),
+        LogicalComponentGraph.StructuralFingerprint,
+    )
+    CachedPlacementTopology = _PlacementTopologyCache.get(
+        PlacementTopologyCacheKey
+    )
+    if CachedPlacementTopology is None:
+        Levels = BuildTopologicalLevels(Module, WorkCheck=WorkCheck)
+        Clusters = BuildConnectivityClusters(
+            Module,
+            MaximumClusterSize=AdaptiveClusterSize,
+            Policy=ClusterPolicy if PackedMode else None,
+            MaximumBoundaryTerminals=(
+                MaximumBoundaryTerminals if PackedMode else None
+            ),
+            RefinementProfile=ClusterRefinementProfile,
+            LogicalComponentByGate=LogicalComponentByGate,
+            WorkCheck=WorkCheck,
+        )
+        # Publish only after both topology passes complete. A deadline cannot
+        # leak a partial cluster decomposition into a later retained state.
+        _PlacementTopologyCache[PlacementTopologyCacheKey] = (
+            tuple(sorted(Levels.items())),
+            tuple(tuple(Names) for Names in Clusters),
+        )
+    else:
+        CachedLevels, CachedClusters = CachedPlacementTopology
+        Levels = dict(CachedLevels)
+        Clusters = tuple(tuple(Names) for Names in CachedClusters)
+        CheckWork(
+            "placement-topology-cache-hit",
+            GateCount=len(Module.Gates),
+            ClusterCount=len(Clusters),
+        )
+    ActiveConstraintWorkingSet = SelectPlacementConstraintWorkingSet(
+        AssignmentCut,
+        AssignmentConstraints,
+        TopologyCutFrontier,
+        ExpandConnectedComponent=FocusedCutEpochPlacement,
+    )
+    EffectivePairwiseConflictEdges = tuple(sorted({
+        *BuildEffectiveAssignmentCutPairwiseEdges(AssignmentCut),
+        *(
+            Edge
+            for Cut in TopologyCutFrontier
+            for Edge in BuildEffectiveAssignmentCutPairwiseEdges(Cut)
+        ),
+        *ActiveConstraintWorkingSet.PairwiseConflictEdges,
+    }))
+    StructuredPairwiseSignals = frozenset(
+        Signal
+        for Edge in EffectivePairwiseConflictEdges
+        for Signal in Edge
+    )
+    FrontierHigherOrderSignalSets = tuple(
+        Signals
+        for Cut in TopologyCutFrontier
+        if (
+            Signals := BuildAssignmentCutHigherOrderSignalSet(Cut)
+        )
+    )
+    StructuredConstraintSignals = frozenset(
+        Signal
+        for Signals in (
+            *ActiveConstraintWorkingSet.HigherOrderSignalSets,
+            *FrontierHigherOrderSignalSets,
+        )
+        for Signal in Signals
+    ) | frozenset(
+        Signal
+        for Edge in ActiveConstraintWorkingSet.ObservedInterfaceConflictEdges
+        for Signal in Edge
+    )
+    RequiresStructuredJointRelocation = (
+        RequiresStructuredAssignmentCutRelocation(AssignmentCut)
+    )
+    if AssignmentCut is not None:
+        RelocationSignals = frozenset((
+            *RelocationSignals,
+            *AssignmentCut.RelocationSignals,
+            *AssignmentCut.ConflictSignals,
+            *AssignmentCut.NoCandidateSignals,
+            *StructuredPairwiseSignals,
+            *StructuredConstraintSignals,
+        ))
+    # A repeated candidate-starvation cut across access-distinct ownership
+    # states proves that changing portal domains alone cannot make progress.
+    # The scheduler supplies this flag only for that bounded repair epoch.
+    # Include exactly the reported endpoints in the physical relocation focus
+    # so a fresh state has a genuinely different pin-bank topology.
+    InternalPinBankGeometrySignals = (
+        SelectInternalPinBankGeometrySignals(
+            Enabled=EnableInternalPinBankGeometryRepair,
+            RepairSignals=InternalPinBankGeometryRepairSignals,
+            CoordinatedCandidateDiversificationSignals=(
+                CoordinatedCandidateDiversificationSignals
+            ),
+        )
+    )
+    if InternalPinBankGeometrySignals:
+        RelocationSignals = frozenset((
+            *RelocationSignals,
+            *InternalPinBankGeometrySignals,
+        ))
+        RelocationPrioritySignals = frozenset((
+            *RelocationPrioritySignals,
+            *InternalPinBankGeometrySignals,
+        ))
+        RequiredRelocationSignals = frozenset((
+            *RequiredRelocationSignals,
+            *InternalPinBankGeometrySignals,
+        ))
+    (
+        RelocationPrioritySignals,
+        RequiredRelocationSignals,
+    ) = BuildEffectiveStructuredRelocationFocus(
+        AssignmentCut,
+        AssignmentConstraints,
+        RelocationPrioritySignals,
+        RequiredRelocationSignals,
     )
     RelocationClusters = BuildRelocationClusterSet(
         Module,
@@ -2566,29 +9540,35 @@ def PlacePcbGraph(
     RankedRequiredGeometryClusters = PrioritizeRelocationClusters(
         Module,
         Clusters,
-        RequiredRelocationSignals,
+        RelocationPrioritySignals or RequiredRelocationSignals,
     )
     LocalGeometryRepairClusters = frozenset(
         (
             RankedRequiredGeometryClusters[
-                RelocationVariant % len(RankedRequiredGeometryClusters)
+                min(RelocationVariant, 1)
+                % len(RankedRequiredGeometryClusters)
             ],
         )
         if (
             PackedMode
             and PackingPolicy.EnableLocalGeometryRepair
+            and not RequiresStructuredJointRelocation
             and RankedRequiredGeometryClusters
         )
         else ()
     )
     CheckWork("connectivity-clusters", ClusterCount=len(Clusters))
+    CheckWork("cluster-slots", ClusterCount=len(Clusters))
+    # Establish the topology-only seed before optional vertical-stack planning.
+    # The joint orientation search below replaces it with the scored final
+    # placement after all local cluster layouts are known.
     Assignment, ColumnCount, _RowCount = OptimizeClusterSlots(
         Module,
         Clusters,
         Levels,
+        LogicalComponentByGate=LogicalComponentByGate,
         WorkCheck=WorkCheck,
     )
-    CheckWork("cluster-slots", ClusterCount=len(Clusters))
     InternalByName = {
         Gate.Name: Gate
         for Gate in Module.Gates
@@ -2616,6 +9596,8 @@ def PlacePcbGraph(
     ClusterStructuralMappings: dict[int, dict[str, str]] = {}
     ClusterStackIds: dict[int, int | None] = {}
     ClusterStackLevels: dict[int, int] = {}
+    SelectedClusterVariants: dict[int, ClusterLayoutVariant] = {}
+    JointPlacementDiagnostics: dict[str, object] = {}
     PackedAccessRepairByCluster: dict[int, dict[str, int]] = {}
     StackSuppressedRelocationClusters: set[int] = set()
     PhysicallyRelocatedClusters: frozenset[int] = frozenset()
@@ -2631,8 +9613,57 @@ def PlacePcbGraph(
             TotalClusters=len(Clusters),
         )
         ClusterNames = set(Names)
+        CutDrivenRefinementCluster = bool(
+            ClusterRefinementProfile is not None
+            and any(
+                Signal in ClusterRefinementProfile.Signals
+                for Name in Names
+                for Signal in (
+                    *InternalByName[Name].Inputs,
+                    *InternalByName[Name].Outputs,
+                )
+            )
+        )
         ReuseAccepted = False
-        if PackedMode:
+        BaseLayoutCacheKey = (
+            ModuleLayoutFingerprint,
+            tuple(Names),
+            RoutingSpacing,
+            PackingPolicy.BeamWidth if PackedMode else 0,
+            PackingPolicy.GraphBeamEnabled if PackedMode else False,
+            PackingPolicy.EnableStructuralReuse if PackedMode else False,
+            (
+                PackingPolicy.MaximumStructuralReuseMappings
+                if PackedMode
+                else 0
+            ),
+        )
+        CachedBaseLayout = (
+            _PackedClusterBaseLayoutCache.get(BaseLayoutCacheKey)
+            if PackedMode
+            else None
+        )
+        if CachedBaseLayout is not None:
+            (
+                StructuralSignature,
+                ReuseSource,
+                StructuralMapping,
+                CachedPositions,
+                CachedRotations,
+                CachedMirrors,
+                CachedWidth,
+                CachedDepth,
+            ) = CachedBaseLayout
+            ClusterStructuralSignatures[ClusterIndex] = StructuralSignature
+            ClusterReuseSources[ClusterIndex] = ReuseSource
+            if StructuralMapping:
+                ClusterStructuralMappings[ClusterIndex] = dict(
+                    StructuralMapping
+                )
+            LocalPositions.update(CachedPositions)
+            LocalRotations.update(CachedRotations)
+            LocalMirrors.update(CachedMirrors)
+        elif PackedMode:
             StructuralSignature = AnalyzeNandClusterStructure(
                 Module,
                 Names,
@@ -2738,7 +9769,12 @@ def PlacePcbGraph(
             Names,
             key=lambda Name: (LocalLevels[Name], Name),
         )
-        if PackedMode and ReuseAccepted:
+        if PackedMode and CachedBaseLayout is not None:
+            FoldColumns = 1
+            FoldRows = 1
+            PackedWidth = CachedWidth
+            PackedDepth = CachedDepth
+        elif PackedMode and ReuseAccepted:
             FoldColumns = 1
             FoldRows = 1
             PackedWidth = max(
@@ -2758,6 +9794,16 @@ def PlacePcbGraph(
             FoldRows = max(NamesByLevel) + 1
             PackedXByName: dict[str, int] = {}
             PackedMirrorByName: dict[str, bool] = {}
+            RefinedClusterFallback: tuple[
+                dict[str, tuple[int, int]],
+                dict[str, int],
+                dict[str, bool],
+            ] | None = None
+            ClusterRowPitchZ = (
+                CellPitchZ + 1
+                if ClusterRefinementProfile is not None
+                else CellPitchZ
+            )
             for Row in range(FoldRows):
                 CheckWork(
                     "row-beam",
@@ -2798,7 +9844,9 @@ def PlacePcbGraph(
                         (
                             InputIndex,
                             PackedXByName[Producer] + 1,
-                            LocalLevels[Producer] * CellPitchZ + NandDepth,
+                            LocalLevels[Producer]
+                            * ClusterRowPitchZ
+                            + NandDepth,
                         )
                         for InputIndex, Signal in enumerate(InternalByName[Name].Inputs)
                         if (Producer := SignalProducerNames.get(Signal))
@@ -2815,6 +9863,20 @@ def PlacePcbGraph(
                         for Value in tuple(CandidateXs)
                         for Shift in (-10, -5, 5, 10)
                     )
+                    if CutDrivenRefinementCluster:
+                        # A cut-cohesive cluster can place several formerly
+                        # separate interface consumers on one topological
+                        # level.  Give that row one deterministic pin-bank
+                        # lane per member instead of failing before the graph
+                        # packer can materialize the refined topology.
+                        RowCenter = int(median(ParentOutputs or [0]))
+                        CandidateXs.update(
+                            RowCenter + Lane * (NandWidth + 1)
+                            for Lane in range(
+                                -len(RowNames),
+                                len(RowNames) + 1,
+                            )
+                        )
                     NextBeam = []
                     for PreviousKey, Assigned in RowBeam:
                         for CandidateX in sorted(CandidateXs):
@@ -2828,7 +9890,8 @@ def PlacePcbGraph(
                                     InternalByName[ExistingName],
                                     ExistingX,
                                     1,
-                                    LocalLevels[ExistingName] * CellPitchZ,
+                                    LocalLevels[ExistingName]
+                                    * ClusterRowPitchZ,
                                     PackedRotation,
                                     PackedMirrorByName[ExistingName],
                                 )
@@ -2839,7 +9902,7 @@ def PlacePcbGraph(
                                     InternalByName[ExistingName],
                                     ExistingX,
                                     1,
-                                    Row * CellPitchZ,
+                                    Row * ClusterRowPitchZ,
                                     PackedRotation,
                                     ExistingMirror,
                                 )
@@ -2854,7 +9917,7 @@ def PlacePcbGraph(
                                     InternalByName[Name],
                                     CandidateX,
                                     1,
-                                    Row * CellPitchZ,
+                                    Row * ClusterRowPitchZ,
                                     PackedRotation,
                                     MirrorX,
                                 )
@@ -2872,7 +9935,7 @@ def PlacePcbGraph(
                                     abs(OutputX - Pins[InputIndex])
                                     for InputIndex, OutputX, _OutputZ in ParentItems
                                 )
-                                InputZ = Row * CellPitchZ - 1
+                                InputZ = Row * ClusterRowPitchZ - 1
                                 CrossPenalty = sum(
                                     1
                                     for InputIndex, OutputX, OutputZ in ParentItems
@@ -2911,6 +9974,17 @@ def PlacePcbGraph(
                     NextBeam.sort(key=lambda Value: Value[0])
                     RowBeam = NextBeam[: PackingPolicy.BeamWidth]
                 if not RowBeam:
+                    if CutDrivenRefinementCluster:
+                        RefinedClusterFallback = (
+                            BuildPinAlignedPackedCluster(
+                                Names,
+                                InternalByName,
+                                PackingPolicy.BeamWidth,
+                                WorkCheck=WorkCheck,
+                            )
+                        )
+                        if RefinedClusterFallback is not None:
+                            break
                     raise ValueError(
                         f"Could not pack NAND cluster row {ClusterIndex}:{Row}"
                     )
@@ -2922,23 +9996,27 @@ def PlacePcbGraph(
                     Name: MirrorX
                     for Name, (_X, MirrorX) in RowBeam[0][1].items()
                 })
-            MinimumPackedX = min(PackedXByName.values())
-            for Name in OrderedNames:
-                LocalPositions[Name] = (
-                    PackedXByName[Name] - MinimumPackedX,
-                    LocalLevels[Name] * CellPitchZ,
-                )
-                LocalRotations[Name] = PackedRotation
-                LocalMirrors[Name] = PackedMirrorByName[Name]
+            if RefinedClusterFallback is None:
+                MinimumPackedX = min(PackedXByName.values())
+                for Name in OrderedNames:
+                    LocalPositions[Name] = (
+                        PackedXByName[Name] - MinimumPackedX,
+                        LocalLevels[Name] * ClusterRowPitchZ,
+                    )
+                    LocalRotations[Name] = PackedRotation
+                    LocalMirrors[Name] = PackedMirrorByName[Name]
             BeamPacked = (
-                BuildPinAlignedPackedCluster(
-                    Names,
-                    InternalByName,
-                    PackingPolicy.BeamWidth,
-                    WorkCheck=WorkCheck,
+                RefinedClusterFallback
+                or (
+                    BuildPinAlignedPackedCluster(
+                        Names,
+                        InternalByName,
+                        PackingPolicy.BeamWidth,
+                        WorkCheck=WorkCheck,
+                    )
+                    if PackingPolicy.GraphBeamEnabled
+                    else None
                 )
-                if PackingPolicy.GraphBeamEnabled
-                else None
             )
             if BeamPacked is not None:
                 BeamPositions, BeamRotations, BeamMirrors = BeamPacked
@@ -2972,6 +10050,26 @@ def PlacePcbGraph(
                     Row * CellPitchZ,
                 )
                 LocalRotations[Name] = 270 if Row % 2 == 0 else 90
+        if PackedMode and CachedBaseLayout is None:
+            _PackedClusterBaseLayoutCache[BaseLayoutCacheKey] = (
+                ClusterStructuralSignatures[ClusterIndex],
+                ClusterReuseSources.get(ClusterIndex),
+                dict(ClusterStructuralMappings.get(ClusterIndex, {})),
+                {
+                    Name: LocalPositions[Name]
+                    for Name in Names
+                },
+                {
+                    Name: LocalRotations[Name]
+                    for Name in Names
+                },
+                {
+                    Name: LocalMirrors.get(Name, False)
+                    for Name in Names
+                },
+                PackedWidth,
+                PackedDepth,
+            )
         if PackedMode and RequiredRelocationSignals:
             (
                 LocalPositions,
@@ -2984,7 +10082,15 @@ def PlacePcbGraph(
                 LocalRotations,
                 LocalMirrors,
                 RequiredRelocationSignals,
-                PackingPolicy.BeamWidth,
+                min(PackingPolicy.BeamWidth, 16),
+                IncludeNearPortalConflicts=(
+                    ShouldIncludeNearPortalPackedAccessRepair(
+                        RelocationVariant=RelocationVariant,
+                        EnableInternalPinBankGeometryRepair=(
+                            EnableInternalPinBankGeometryRepair
+                        ),
+                    )
+                ),
                 WorkCheck=WorkCheck,
             )
             if AccessRepairDiagnostics:
@@ -3005,13 +10111,31 @@ def PlacePcbGraph(
                     )[1]
                     for Name in Names
                 )
-        if (
-            PackedMode
-            and ClusterIndex in BoundaryEscapeRelocationClusters
-            and (
-                len(Clusters) > 4
-                or ClusterIndex in LocalGeometryRepairClusters
-            )
+        # The first mandatory-access repair is deliberately local. A signal
+        # can touch several clusters even when its immutable collision is
+        # wholly inside one cluster; spreading every touched cluster turns a
+        # pin repair into a placement-wide footprint expansion. Variant 12
+        # and a typed internal pin-bank epoch use the stronger near-portal
+        # repair; other structured cuts remain in the footprint-neutral joint
+        # slot/orientation search.
+        if ShouldExpandBoundaryEscapeGeometry(
+            PackedMode=PackedMode,
+            ClusterIndex=ClusterIndex,
+            BoundaryEscapeRelocationClusters=(
+                BoundaryEscapeRelocationClusters
+            ),
+            PackedAccessRepairClusters=frozenset(
+                PackedAccessRepairByCluster
+            ),
+            RequiredRelocationSignals=RequiredRelocationSignals,
+            RelocationVariant=RelocationVariant,
+            RelocationPrioritySignalCount=len(
+                RelocationPrioritySignals
+            ),
+            LocalGeometryRepairClusters=LocalGeometryRepairClusters,
+            StructuredAssignmentCutRelocation=(
+                RequiresStructuredJointRelocation
+            ),
         ):
             # A fixed-access cut inside one dense cluster needs actual
             # corridor geometry, not another mirror of the same pin layout.
@@ -3025,17 +10149,34 @@ def PlacePcbGraph(
                 if len(Clusters) > 4
                 else PackingPolicy.LocalGeometryRepairColumnGap
             )
-            DistinctX = sorted({LocalPositions[Name][0] for Name in Names})
-            XOffset = {
-                Value: Index * BoundaryEscapeGap
-                for Index, Value in enumerate(DistinctX)
-            }
-            for Name in Names:
-                LocalX, LocalZ = LocalPositions[Name]
-                LocalPositions[Name] = (
-                    LocalX + XOffset[LocalX],
-                    LocalZ,
-                )
+            if RelocationVariant % 2:
+                DistinctZ = sorted({
+                    LocalPositions[Name][1] for Name in Names
+                })
+                ZOffset = {
+                    Value: Index * BoundaryEscapeGap
+                    for Index, Value in enumerate(DistinctZ)
+                }
+                for Name in Names:
+                    LocalX, LocalZ = LocalPositions[Name]
+                    LocalPositions[Name] = (
+                        LocalX,
+                        LocalZ + ZOffset[LocalZ],
+                    )
+            else:
+                DistinctX = sorted({
+                    LocalPositions[Name][0] for Name in Names
+                })
+                XOffset = {
+                    Value: Index * BoundaryEscapeGap
+                    for Index, Value in enumerate(DistinctX)
+                }
+                for Name in Names:
+                    LocalX, LocalZ = LocalPositions[Name]
+                    LocalPositions[Name] = (
+                        LocalX + XOffset[LocalX],
+                        LocalZ,
+                    )
             PackedWidth = max(
                 LocalPositions[Name][0]
                 + RotatedCellSize("NAND", LocalRotations[Name])[0]
@@ -3254,6 +10395,9 @@ def PlacePcbGraph(
             Endpoint = Source if SourceStack is not None else Target
             if len(StackMembers[ActiveStack]) >= MaximumClusterStack:
                 continue
+            FirstEndpoint, LastEndpoint = StackEndpoints(ActiveStack)
+            if Endpoint not in (FirstEndpoint, LastEndpoint):
+                continue
             AddCluster(ActiveStack, Endpoint, Candidate)
 
         for ClusterIndex in range(len(Clusters)):
@@ -3284,7 +10428,7 @@ def PlacePcbGraph(
     # still needs to change physical geometry. Move those clusters into
     # dedicated columns; merely replaying the same slot assignment would turn
     # conflict feedback into a duplicate placement.
-    RequiredRelocationPriority = tuple(
+    RankedRequiredRelocationClusters = tuple(
         ClusterIndex
         for ClusterIndex in PrioritizeRelocationClusters(
             Module,
@@ -3293,7 +10437,24 @@ def PlacePcbGraph(
         )
         if ClusterIndex not in PackedAccessRepairByCluster
         and ClusterIndex not in LocalGeometryRepairClusters
-    )[:1]
+    )
+    RequiredRelocationLimit = (
+        (
+            min(6, len(RankedRequiredRelocationClusters))
+        )
+        if (
+            RequiresStructuredJointRelocation
+            and len(RequiredRelocationSignals) > 2
+        )
+        else (
+            2
+            if RequiresStructuredJointRelocation
+            else 1
+        )
+    )
+    RequiredRelocationPriority = RankedRequiredRelocationClusters[
+        :RequiredRelocationLimit
+    ]
     if LocalGeometryRepairClusters:
         RequiredRelocationPriority = ()
     CurrentRelocationPriority = PrioritizeRelocationClusters(
@@ -3301,22 +10462,67 @@ def PlacePcbGraph(
         Clusters,
         RelocationPrioritySignals or RelocationSignals,
     )
+    PreviousFrontierSignals = frozenset(
+        Signal
+        for Cut in TopologyCutFrontier[1:]
+        for Signal in (
+            *Cut.ConflictSignals,
+            *Cut.RelocationSignals,
+            *Cut.PriorityRelocationSignals,
+            *Cut.NoCandidateSignals,
+            *(
+                Signal
+                for Edge in Cut.PairwiseConflictEdges
+                for Signal in Edge
+            ),
+        )
+    )
+    PreviousFrontierPriority = PrioritizeRelocationClusters(
+        Module,
+        Clusters,
+        PreviousFrontierSignals,
+    )
+    FocusedCutEpochClusters = SelectFocusedTopologyFrontierClusters(
+        CurrentRelocationPriority,
+        PreviousFrontierPriority,
+        FocusedCutEpochPlacement,
+    )
+    FocusedInternalPinBankClusters = SelectFocusedCutEpochClusters(
+        PrioritizeRelocationClusters(
+            Module,
+            Clusters,
+            InternalPinBankGeometrySignals,
+        ),
+        bool(InternalPinBankGeometrySignals),
+    )
+    FocusedJointOptimizationClusters = (
+        FocusedInternalPinBankClusters
+        or FocusedCutEpochClusters
+    )
     OptionalRelocationPriority = tuple(
         ClusterIndex
         for ClusterIndex in CurrentRelocationPriority
         if ClusterIndex not in StackSuppressedRelocationClusters
         and ClusterIndex not in RequiredRelocationPriority
     )
+    if not OptionalRelocationPriority:
+        OptionalRelocationPriority = tuple(
+            ClusterIndex
+            for ClusterIndex in CurrentRelocationPriority
+            if ClusterIndex not in RequiredRelocationPriority
+        )[:1]
     # Preserve every congestion-cut contributor in feedback, but perturb one
-    # additional physical cluster per deterministic round. Moving every
-    # contributor at once tears apart a vertical stack and exceeds the fixed
-    # two-times packed-area ceiling before the router can evaluate a repair.
-    # Variants rotate through the complete ranked cut across the existing
-    # placement-feedback rounds.
+    # bounded pair set per deterministic round.  Swapping disjoint ranked
+    # pairs changes every measured cut without expanding the packed
+    # footprint.  Variants rotate through the complete ranked cut across the
+    # existing placement-feedback rounds.
     MaximumOptionalRelocations = (
-        0
-        if LocalGeometryRepairClusters
-        else min(1, len(OptionalRelocationPriority))
+        min(2, len(OptionalRelocationPriority))
+        if (
+            RelocationVariant > 2
+            and len(RelocationPrioritySignals) > 2
+        )
+        else 0
     )
     OptionalRelocationClusters = (
         tuple(
@@ -3334,7 +10540,298 @@ def PlacePcbGraph(
         *OptionalRelocationClusters,
     )
     PhysicallyRelocatedClusters = frozenset(RelocationPriority)
-    MirroredRelocationClusters = (
+    (
+        JointPortfolioRelocationOffset,
+        RotateExactPortfolioSlots,
+    ) = BuildJointPortfolioBaseRelocationControls(
+        RelocationVariant=RelocationVariant,
+        JointPlacementCandidateIndex=JointPlacementCandidateIndex,
+        RequiresStructuredJointRelocation=(
+            RequiresStructuredJointRelocation
+        ),
+        PreservePortfolioBaseAssignment=FocusedCutEpochPlacement,
+    )
+    BaseAssignment, ColumnCount = RelocateClusterSlots(
+        Assignment,
+        ColumnCount,
+        RelocationPriority,
+        RelocationOffset=JointPortfolioRelocationOffset,
+        RotateExactPortfolioSlots=RotateExactPortfolioSlots,
+        ForceDedicatedColumns=(
+            RequiresStructuredJointRelocation
+            and len(RequiredRelocationSignals) > 2
+            and (
+                RelocationVariant > 0
+                or JointPlacementCandidateIndex > 0
+            )
+        ),
+    )
+    AllVariantsByCluster = {
+        ClusterIndex: tuple(
+            TransformPackedClusterLayout(
+                Names,
+                LocalPositions,
+                LocalRotations,
+                LocalMirrors,
+                Rotation,
+                MirrorX,
+                GatesByName=InternalByName,
+            )
+            for Rotation, MirrorX in (
+                (0, False),
+                (0, True),
+                (90, False),
+                (90, True),
+                (180, False),
+                (180, True),
+                (270, False),
+                (270, True),
+            )
+        )
+        for ClusterIndex, Names in enumerate(Clusters)
+    }
+    JointVariantDiagnostics = {
+        str(ClusterIndex): [
+            {
+                "Rotation": Variant.Rotation,
+                "MirrorX": Variant.MirrorX,
+                "Legal": Variant.IsLegal,
+                "RejectionReason": Variant.RejectionReason,
+            }
+            for Variant in Variants
+        ]
+        for ClusterIndex, Variants in AllVariantsByCluster.items()
+    }
+    VariantsByCluster = {
+        ClusterIndex: tuple(
+            Variant for Variant in Variants if Variant.IsLegal
+        )
+        for ClusterIndex, Variants in AllVariantsByCluster.items()
+    }
+    MissingLegalVariants = [
+        ClusterIndex
+        for ClusterIndex, Variants in VariantsByCluster.items()
+        if not Variants
+    ]
+    if MissingLegalVariants:
+        raise ValueError(
+            "No exact-legal rigid transform for packed NAND cluster(s): "
+            + ",".join(str(Value) for Value in MissingLegalVariants)
+        )
+    if PackedMode and PackingPolicy.EnableJointClusterOrientation:
+        JointCacheKey = BuildJointPlacementSearchCacheKey(
+            Module,
+            Clusters,
+            BaseAssignment,
+            PackingPolicy.JointPlacementBeamWidth,
+            PackingPolicy.JointPlacementPassLimit,
+            PackingPolicy.RetainedJointPlacementCandidates,
+            AssignmentCut,
+            AssignmentConstraints,
+            EnableClusterInterfacePlacementFeasibility,
+            FocusedJointOptimizationClusters,
+            TopologyCutFrontier,
+        )
+        CachedJointSearch = _JointPlacementSearchCache.get(JointCacheKey)
+        CachedState = (
+            next(
+                (
+                    State
+                    for State in CachedJointSearch["RetainedStates"]
+                    if int(State["CandidateIndex"])
+                    == JointPlacementCandidateIndex
+                ),
+                None,
+            )
+            if CachedJointSearch is not None
+            else None
+        )
+        if CachedState is None:
+            (
+                Assignment,
+                SelectedClusterVariants,
+                JointPlacementDiagnostics,
+            ) = OptimizeJointClusterPlacement(
+                Module,
+                Clusters,
+                Levels,
+                VariantsByCluster,
+                PackingPolicy.JointPlacementBeamWidth,
+                PackingPolicy.JointPlacementPassLimit,
+                PackingPolicy.RetainedJointPlacementCandidates,
+                JointPlacementCandidateIndex,
+                InitialAssignment=BaseAssignment,
+                FixedSlotClusters=frozenset(
+                    RequiredRelocationPriority
+                ),
+                AssignmentCut=AssignmentCut,
+                AssignmentConstraints=AssignmentConstraints,
+                BoundaryContractCapacity=(
+                    max(1, MaximumBoundaryTerminals or len(Clusters))
+                    if RequiresStructuredJointRelocation
+                    else 0
+                ),
+                EnableClusterInterfacePlacementFeasibility=(
+                    EnableClusterInterfacePlacementFeasibility
+                ),
+                FocusedOptimizationClusters=(
+                    FocusedJointOptimizationClusters
+                    if FocusedJointOptimizationClusters
+                    else None
+                ),
+                FrontierAssignmentCuts=TopologyCutFrontier,
+                LogicalComponentByGate=LogicalComponentByGate,
+                WorkCheck=WorkCheck,
+            )
+            _JointPlacementSearchCache[JointCacheKey] = deepcopy(
+                JointPlacementDiagnostics
+            )
+        else:
+            Assignment = {
+                int(ClusterIndex): tuple(Slot)
+                for ClusterIndex, Slot in dict(CachedState["Slots"]).items()
+            }
+            SelectedClusterVariants = {
+                ClusterIndex: next(
+                    Variant
+                    for Variant in VariantsByCluster[ClusterIndex]
+                    if (
+                        Variant.Rotation,
+                        Variant.MirrorX,
+                    ) == (
+                        int(
+                            dict(CachedState["Transforms"])[
+                                str(ClusterIndex)
+                            ]["Rotation"]
+                        ),
+                        bool(
+                            dict(CachedState["Transforms"])[
+                                str(ClusterIndex)
+                            ]["MirrorX"]
+                        ),
+                    )
+                )
+                for ClusterIndex in range(len(Clusters))
+            }
+            JointPlacementDiagnostics = deepcopy(CachedJointSearch)
+            JointPlacementDiagnostics["SearchCacheHit"] = True
+            JointPlacementDiagnostics["SelectedCandidateIndex"] = (
+                JointPlacementCandidateIndex
+            )
+            JointPlacementDiagnostics["SelectedTransforms"] = deepcopy(
+                CachedState["Transforms"]
+            )
+            JointPlacementDiagnostics["SelectedScore"] = CachedState.get(
+                "SearchScore",
+                JointPlacementDiagnostics.get("SelectedScore"),
+            )
+            JointPlacementDiagnostics[
+                "SelectedExactPairAdjacencyViolations"
+            ] = CachedState.get(
+                "ExactPairAdjacencyViolations",
+                JointPlacementDiagnostics.get(
+                    "SelectedExactPairAdjacencyViolations",
+                    0,
+                ),
+            )
+            JointPlacementDiagnostics[
+                "SelectedInterfacePairBankConflicts"
+            ] = CachedState.get(
+                "InterfacePairBankConflicts",
+                JointPlacementDiagnostics.get(
+                    "SelectedInterfacePairBankConflicts",
+                    0,
+                ),
+            )
+            JointPlacementDiagnostics[
+                "SelectedHigherOrderBankPressure"
+            ] = CachedState.get(
+                "HigherOrderBankPressure",
+                JointPlacementDiagnostics.get(
+                    "SelectedHigherOrderBankPressure",
+                    0,
+                ),
+            )
+            for MetricName in (
+                "HigherOrderPeakBankDemand",
+                "HigherOrderBankExcessDemand",
+                "HigherOrderOverloadedBankCount",
+            ):
+                JointPlacementDiagnostics[
+                    f"Selected{MetricName}"
+                ] = CachedState.get(
+                    MetricName,
+                    JointPlacementDiagnostics.get(
+                        f"Selected{MetricName}",
+                        0,
+                    ),
+                )
+            JointPlacementDiagnostics[
+                "SelectedObservedInterfaceBankConflicts"
+            ] = CachedState.get(
+                "ObservedInterfaceBankConflicts",
+                JointPlacementDiagnostics.get(
+                    "SelectedObservedInterfaceBankConflicts",
+                    0,
+                ),
+            )
+            JointPlacementDiagnostics[
+                "SelectedInterfaceFacingMismatches"
+            ] = CachedState.get(
+                "InterfaceFacingMismatches",
+                JointPlacementDiagnostics.get(
+                    "SelectedInterfaceFacingMismatches",
+                    0,
+                ),
+            )
+            JointPlacementDiagnostics[
+                "SelectedClusterInterfacePlacement"
+            ] = deepcopy(CachedState.get(
+                "ClusterInterfacePlacement",
+                JointPlacementDiagnostics.get(
+                    "SelectedClusterInterfacePlacement"
+                ),
+            ))
+        JointPlacementDiagnostics["ClusterTransformVariants"] = (
+            JointVariantDiagnostics
+        )
+        JointPlacementDiagnostics["AssignmentCut"] = (
+            AssignmentCut.ToDictionary()
+            if AssignmentCut is not None
+            else None
+        )
+        JointPlacementDiagnostics["AssignmentConstraints"] = (
+            AssignmentConstraints.ToDictionary()
+        )
+        JointPlacementDiagnostics["TopologyCutFrontier"] = [
+            {
+                "AssignmentCutFingerprint": Cut.ConflictFingerprint,
+                "AssignmentCutWorkFingerprint": Cut.EffectiveWorkFingerprint,
+            }
+            for Cut in TopologyCutFrontier
+        ]
+        JointPlacementDiagnostics["FocusedOptimizationClusters"] = sorted(
+            FocusedJointOptimizationClusters
+        )
+        ColumnCount = max(
+            (Column for Column, _Row in Assignment.values()),
+            default=-1,
+        ) + 1
+        for ClusterIndex, Variant in SelectedClusterVariants.items():
+            LocalPositions.update(Variant.Positions)
+            LocalRotations.update(Variant.Rotations)
+            LocalMirrors.update(Variant.Mirrors)
+            ClusterSizes[ClusterIndex] = (Variant.Width, Variant.Depth)
+        # A feedback rerun is a new joint placement search. Do not mutate the
+        # committed layout with an independent post-placement mirror.
+        MirroredRelocationClusters = frozenset()
+    else:
+        Assignment = BaseAssignment
+        SelectedClusterVariants = {
+            ClusterIndex: Variants[0]
+            for ClusterIndex, Variants in VariantsByCluster.items()
+        }
+        MirroredRelocationClusters = (
         frozenset(
             ClusterIndex
             for ClusterIndex in RelocationPriority
@@ -3342,11 +10839,6 @@ def PlacePcbGraph(
         )
         if RelocationVariant > 0 and RelocationPriority
         else frozenset()
-    )
-    Assignment, ColumnCount = RelocateClusterSlots(
-        Assignment,
-        ColumnCount,
-        RelocationPriority,
     )
     for ClusterIndex in RequiredRelocationPriority:
         ClusterStackIds[ClusterIndex] = None
@@ -3414,74 +10906,941 @@ def PlacePcbGraph(
         NextZ += RowDepths[Row]
         if Row + 1 < len(RowDepths):
             NextZ += RowGap + RowExtraSpacing[Row]
-    InputMargin = 0
-    PlacedGates = []
-    for ClusterIndex, Names in enumerate(Clusters):
-        CheckWork(
-            "placement-commit",
-            CompletedClusters=ClusterIndex,
-            TotalClusters=len(Clusters),
+    ExactStatePlacementCacheKey: tuple[object, ...] | None = None
+    ExactStatePlacementCacheFingerprint = ""
+    CachedExactStateGeometry: tuple[
+        ExactStatePlacedGateGeometry, ...
+    ] | None = None
+    CachedExactStateCoreGeometry: tuple[
+        ExactStatePlacedGateGeometry, ...
+    ] | None = None
+    SelectedExactMandatoryAccessProfile: (
+        MandatoryAccessConflictProfile | None
+    ) = None
+    if PackedMode and PackingPolicy.EnableJointClusterOrientation:
+        # The beam's local template test is necessary but not sufficient: two
+        # exact variants can still contend for an electrical/access resource
+        # after their selected slots are materialized.  Screen every retained
+        # joint state with the same placed-gate conflict predicate used by the
+        # final commit.  Cache the completed six-state screen transactionally,
+        # but retain both legal and rejected states for failure diagnostics.
+        VariantByTransform = {
+            ClusterIndex: {
+                (Variant.Rotation, Variant.MirrorX): Variant
+                for Variant in Variants
+            }
+            for ClusterIndex, Variants in VariantsByCluster.items()
+        }
+        ExactScreenTrackPitch = (
+            PlacementPolicy.DemandAwareBoundaryTrackPitch
+            if (
+                PlacementPolicy is not None
+                and PlacementPolicy.DemandAwareBoundaryTrackPitch > 0
+            )
+            else DefaultRedstoneRoutingTechnology.TrackPitch
         )
-        SlotX, SlotZ = Assignment[ClusterIndex]
-        BaseX = InputMargin + ColumnOrigins[SlotX]
-        BaseZ = RowOrigins[SlotZ]
-        BaseY = 1 + (
-            ClusterStackLevels[ClusterIndex] * PackingPolicy.ClusterDeckPitch
-            if PackedMode
-            else 0
+        ExactScreenDemandSpacing = bool(
+            PlacementPolicy is not None
+            and PlacementPolicy.EnableDemandAwareInterClusterSpacing
         )
-        CandidateClusterGates = []
-        for Name in Names:
-            LocalX, LocalZ = LocalPositions[Name]
-            Rotation = LocalRotations[Name]
-            MirrorX = LocalMirrors.get(Name, False)
-            if ClusterIndex in MirroredRelocationClusters:
-                GateWidth = RotatedCellSize(
-                    InternalByName[Name].Kind.value,
-                    Rotation,
-                )[0]
-                LocalX = ClusterSizes[ClusterIndex][0] - LocalX - GateWidth
-                MirrorX = not MirrorX
-            CandidateClusterGates.append(
-                BuildPlacedGate(
-                    InternalByName[Name],
-                    BaseX + LocalX,
-                    BaseY,
-                    BaseZ + LocalZ,
-                    Rotation,
-                    MirrorX,
+        RawRetainedStates = tuple(
+            deepcopy(State)
+            for State in JointPlacementDiagnostics.get("RetainedStates", ())
+        )
+        ExactScreenCacheKey = (
+            ModuleLayoutFingerprint,
+            tuple(tuple(Names) for Names in Clusters),
+            RoutingSpacing,
+            ColumnGap,
+            RowGap,
+            PackingPolicy.ClusterDeckPitch,
+            ExactScreenTrackPitch,
+            ExactScreenDemandSpacing,
+            tuple(sorted(ClusterStackLevels.items())),
+            tuple(
+                (
+                    ClusterIndex,
+                    tuple(
+                        (
+                            Variant.Rotation,
+                            Variant.MirrorX,
+                            Variant.Width,
+                            Variant.Depth,
+                            tuple(sorted(Variant.Positions.items())),
+                            tuple(sorted(Variant.Rotations.items())),
+                            tuple(sorted(Variant.Mirrors.items())),
+                        )
+                        for Variant in Variants
+                    ),
+                )
+                for ClusterIndex, Variants in sorted(
+                    VariantsByCluster.items()
+                )
+            ),
+            tuple(
+                (
+                    int(State["CandidateIndex"]),
+                    State.get("SearchScore"),
+                    tuple(sorted(
+                        (
+                            int(ClusterIndex),
+                            tuple(Slot),
+                        )
+                        for ClusterIndex, Slot in dict(
+                            State["Slots"]
+                        ).items()
+                    )),
+                    tuple(sorted(
+                        (
+                            int(ClusterIndex),
+                            int(Transform["Rotation"]),
+                            bool(Transform["MirrorX"]),
+                        )
+                        for ClusterIndex, Transform in dict(
+                            State["Transforms"]
+                        ).items()
+                    )),
+                )
+                for State in RawRetainedStates
+            ),
+        )
+
+        def FindExactStateConflict(
+            State: dict[str, object],
+            StateOrdinal: int,
+            StateCount: int,
+        ) -> tuple[
+            dict[int, ClusterLayoutVariant],
+            tuple[Any, Any] | None,
+            dict[str, dict[int, int]],
+            dict[int, tuple[int, int]],
+            tuple[dict[str, object], ...],
+            tuple[ExactStatePlacedGateGeometry, ...],
+        ]:
+            StateSlots = {
+                int(Index): tuple(Slot)
+                for Index, Slot in dict(State["Slots"]).items()
+            }
+            StateVariants = {
+                ClusterIndex: VariantByTransform[ClusterIndex][(
+                    int(dict(State["Transforms"])[str(ClusterIndex)]["Rotation"]),
+                    bool(dict(State["Transforms"])[str(ClusterIndex)]["MirrorX"]),
+                )]
+                for ClusterIndex in range(len(Clusters))
+            }
+
+            def BuildStateGeometry() -> tuple[
+                int,
+                int,
+                dict[int, int],
+                dict[int, int],
+                dict[int, int],
+                dict[int, int],
+            ]:
+                StateColumnCount = max(
+                    (Slot[0] for Slot in StateSlots.values()),
+                    default=-1,
+                ) + 1
+                StateRowCount = max(
+                    (Slot[1] for Slot in StateSlots.values()),
+                    default=-1,
+                ) + 1
+                StateColumnWidths = {
+                    Column: max(
+                        (
+                            StateVariants[Index].Width
+                            for Index, Slot in StateSlots.items()
+                            if Slot[0] == Column
+                        ),
+                        default=1,
+                    )
+                    for Column in range(StateColumnCount)
+                }
+                StateRowDepths = {
+                    Row: max(
+                        (
+                            StateVariants[Index].Depth
+                            for Index, Slot in StateSlots.items()
+                            if Slot[1] == Row
+                        ),
+                        default=1,
+                    )
+                    for Row in range(StateRowCount)
+                }
+                StateGapPlan = BuildInterClusterGapPlan(
+                    BuildInterClusterBoundaryDemand(
+                        Module,
+                        Clusters,
+                        StateSlots,
+                        WorkCheck=WorkCheck,
+                    ),
+                    ColumnCount=StateColumnCount,
+                    RowCount=StateRowCount,
+                    RoutingSpacing=RoutingSpacing,
+                    TrackPitch=ExactScreenTrackPitch,
+                    Enabled=ExactScreenDemandSpacing,
+                )
+                return (
+                    StateColumnCount,
+                    StateRowCount,
+                    StateColumnWidths,
+                    StateRowDepths,
+                    StateGapPlan.ColumnSpacingByBoundary(),
+                    StateGapPlan.RowSpacingByBoundary(),
+                )
+
+            (
+                StateColumnCount,
+                StateRowCount,
+                StateColumnWidths,
+                StateRowDepths,
+                StateColumnExtra,
+                StateRowExtra,
+            ) = BuildStateGeometry()
+
+            def BuildStateGates() -> list[tuple[int, Any]]:
+                StateColumnOrigins: dict[int, int] = {}
+                NextStateX = 0
+                for Column in range(StateColumnCount):
+                    StateColumnOrigins[Column] = NextStateX
+                    NextStateX += StateColumnWidths[Column]
+                    if Column + 1 < StateColumnCount:
+                        NextStateX += ColumnGap + StateColumnExtra[Column]
+                StateRowOrigins: dict[int, int] = {}
+                NextStateZ = 0
+                for Row in range(StateRowCount):
+                    StateRowOrigins[Row] = NextStateZ
+                    NextStateZ += StateRowDepths[Row]
+                    if Row + 1 < StateRowCount:
+                        NextStateZ += RowGap + StateRowExtra[Row]
+                StateGates: list[tuple[int, Any]] = []
+                for ClusterIndex, Names in enumerate(Clusters):
+                    SlotX, SlotZ = StateSlots[ClusterIndex]
+                    Variant = StateVariants[ClusterIndex]
+                    for Name in Names:
+                        LocalX, LocalZ = Variant.Positions[Name]
+                        StateGates.append((ClusterIndex, BuildPlacedGate(
+                            InternalByName[Name],
+                            StateColumnOrigins[SlotX] + LocalX,
+                            1 + ClusterStackLevels[ClusterIndex]
+                            * PackingPolicy.ClusterDeckPitch,
+                            StateRowOrigins[SlotZ] + LocalZ,
+                            Variant.Rotations[Name],
+                            Variant.Mirrors[Name],
+                        )))
+                return StateGates
+
+            # Add only the boundary clearance required by a concrete conflict.
+            # This is part of the candidate's joint slot/orientation state;
+            # it never changes a NAND's template geometry or rotates it after
+            # placement.  A hard bound keeps pre-screening deterministic.
+            PairChecks = 0
+            LastConflict: tuple[int, Any, int, Any] | None = None
+            ExactSlotRepairs: list[dict[str, object]] = []
+            for Attempt in range(32):
+                CheckWork(
+                    "joint-exact-screen-clearance",
+                    CandidateIndex=State["CandidateIndex"],
+                    CandidateOrdinal=StateOrdinal,
+                    CandidateCount=StateCount,
+                    Attempt=Attempt,
+                    PairChecks=PairChecks,
+                )
+                StateGates = BuildStateGates()
+                Conflict = None
+                for GateIndex, (FirstCluster, First) in enumerate(StateGates):
+                    for SecondCluster, Second in StateGates[GateIndex + 1 :]:
+                        if FirstCluster == SecondCluster:
+                            continue
+                        PairChecks += 1
+                        if PairChecks % 128 == 0:
+                            CheckWork(
+                                "joint-exact-screen-pairs",
+                                CandidateIndex=State["CandidateIndex"],
+                                CandidateOrdinal=StateOrdinal,
+                                CandidateCount=StateCount,
+                                Attempt=Attempt,
+                                PairChecks=PairChecks,
+                            )
+                        if PcbGatesConflict(First, Second):
+                            Conflict = (
+                                FirstCluster,
+                                First,
+                                SecondCluster,
+                                Second,
+                            )
+                            break
+                    if Conflict is not None:
+                        break
+                if Conflict is None:
+                    return (
+                        StateVariants,
+                        None,
+                        {
+                            "Columns": dict(StateColumnExtra),
+                            "Rows": dict(StateRowExtra),
+                        },
+                        dict(StateSlots),
+                        tuple(ExactSlotRepairs),
+                        tuple(
+                            ExactStatePlacedGateGeometry.FromPlacedGate(Gate)
+                            for _ClusterIndex, Gate in StateGates
+                        ),
+                    )
+                LastConflict = Conflict
+                FirstCluster, First, SecondCluster, Second = Conflict
+                FirstSlot = StateSlots[FirstCluster]
+                SecondSlot = StateSlots[SecondCluster]
+                if FirstSlot[0] != SecondSlot[0]:
+                    StateColumnExtra[min(FirstSlot[0], SecondSlot[0])] += 1
+                    continue
+                if FirstSlot[1] != SecondSlot[1]:
+                    StateRowExtra[min(FirstSlot[1], SecondSlot[1])] += 1
+                    continue
+                # The retained beam state can stack two clusters in one slot
+                # even though their final NAND templates contend on the same
+                # deck.  Diversify only that exact conflicting pair by moving
+                # one cluster into a bounded dedicated column.  This preserves
+                # every transform and leaves unrelated cluster slots intact.
+                RelocatedCluster = max(FirstCluster, SecondCluster)
+                PreviousSlot = StateSlots[RelocatedCluster]
+                NewSlot = (
+                    max(
+                        (Slot[0] for Slot in StateSlots.values()),
+                        default=-1,
+                    ) + 1,
+                    PreviousSlot[1],
+                )
+                StateSlots[RelocatedCluster] = NewSlot
+                ExactSlotRepairs.append({
+                    "Attempt": Attempt,
+                    "RelocatedCluster": RelocatedCluster,
+                    "FromSlot": list(PreviousSlot),
+                    "ToSlot": list(NewSlot),
+                    "ConflictClusters": sorted(
+                        (FirstCluster, SecondCluster)
+                    ),
+                    "ConflictMembers": [First.Name, Second.Name],
+                })
+                (
+                    StateColumnCount,
+                    StateRowCount,
+                    StateColumnWidths,
+                    StateRowDepths,
+                    StateColumnExtra,
+                    StateRowExtra,
+                ) = BuildStateGeometry()
+                continue
+            if LastConflict is None:
+                raise AssertionError(
+                    "Exact joint screen exhausted without a conflict record"
+                )
+            _FirstCluster, First, _SecondCluster, Second = LastConflict
+            return (
+                StateVariants,
+                (First, Second),
+                {
+                    "Columns": dict(StateColumnExtra),
+                    "Rows": dict(StateRowExtra),
+                },
+                dict(StateSlots),
+                tuple(ExactSlotRepairs),
+                (),
+            )
+
+        CachedExactScreen = _JointPlacementExactScreenCache.get(
+            ExactScreenCacheKey
+        )
+        ExactScreenCacheHit = CachedExactScreen is not None
+        if CachedExactScreen is None:
+            ScreenedRetainedStates: list[dict[str, object]] = []
+            CoreGeometryByCandidate: list[
+                tuple[int, tuple[ExactStatePlacedGateGeometry, ...]]
+            ] = []
+            for StateOrdinal, State in enumerate(
+                RawRetainedStates,
+                start=1,
+            ):
+                CheckWork(
+                    "joint-exact-screen-state",
+                    CandidateIndex=State["CandidateIndex"],
+                    CandidateOrdinal=StateOrdinal,
+                    CandidateCount=len(RawRetainedStates),
+                )
+                (
+                    _StateVariants,
+                    Conflict,
+                    ExactSpacing,
+                    ExactSlots,
+                    ExactSlotRepairs,
+                    ExactCoreGeometry,
+                ) = (
+                    FindExactStateConflict(
+                        State,
+                        StateOrdinal,
+                        len(RawRetainedStates),
+                    )
+                )
+                if Conflict is None:
+                    CoreGeometryByCandidate.append((
+                        int(State["CandidateIndex"]),
+                        ExactCoreGeometry,
+                    ))
+                    ScreenedRetainedStates.append({
+                        **State,
+                        "Slots": ExactSlots,
+                        "ExactLegal": True,
+                        "ExactSpacing": ExactSpacing,
+                        "ExactSlotRepairs": ExactSlotRepairs,
+                    })
+                    continue
+                First, Second = Conflict
+                Rejection = {
+                    "CandidateIndex": State["CandidateIndex"],
+                    "Reason": "PcbGatesConflict",
+                    "Members": [First.Name, Second.Name],
+                    "Resource": [First.X, First.Y, First.Z],
+                    "Transforms": State["Transforms"],
+                    "Slots": ExactSlots,
+                    "ExactSlotRepairs": ExactSlotRepairs,
+                }
+                ScreenedRetainedStates.append({
+                    **State,
+                    "Slots": ExactSlots,
+                    "ExactLegal": False,
+                    "ExactSpacing": ExactSpacing,
+                    "ExactSlotRepairs": ExactSlotRepairs,
+                    "ExactRejection": Rejection,
+                })
+            # Publish only after every retained state completed. A deadline or
+            # other exception cannot leak a partial exact-screen cache entry.
+            CachedExactScreen = ExactJointPlacementScreen(
+                RetainedStates=tuple(deepcopy(ScreenedRetainedStates)),
+                CoreGeometryByCandidate=tuple(
+                    sorted(CoreGeometryByCandidate)
+                ),
+            )
+            _JointPlacementExactScreenCache[
+                ExactScreenCacheKey
+            ] = CachedExactScreen
+        else:
+            ScreenedRetainedStates = list(
+                deepcopy(CachedExactScreen.RetainedStates)
+            )
+            CheckWork(
+                "joint-exact-screen-cache-hit",
+                CandidateCount=len(ScreenedRetainedStates),
+            )
+        if (
+            MandatoryAccessPreScreenOnly
+            and not CachedExactScreen.MandatoryProfileByCandidate
+        ):
+            ModuleGateByNameForMandatoryScreen = {
+                Gate.Name: Gate for Gate in Module.Gates
+            }
+            MandatoryScreenSignalOrder = tuple(sorted({
+                *Module.Inputs,
+                *Module.Outputs,
+                *(
+                    Signal
+                    for Gate in Module.Gates
+                    for Signal in (*Gate.Inputs, *Gate.Outputs)
+                ),
+            }))
+            ProfilesBySearchCandidate: dict[
+                int,
+                MandatoryAccessConflictProfile,
+            ] = {}
+            for State in ScreenedRetainedStates:
+                if not bool(State.get("ExactLegal")):
+                    continue
+                SearchCandidateIndex = int(State["CandidateIndex"])
+                ExactCoreGeometry = CachedExactScreen.CoreGeometry(
+                    SearchCandidateIndex
+                )
+                if ExactCoreGeometry is None:
+                    continue
+                CheckWork(
+                    "joint-exact-mandatory-access-screen",
+                    CandidateIndex=SearchCandidateIndex,
+                    ScreenedCandidateCount=len(
+                        ProfilesBySearchCandidate
+                    ),
+                )
+
+                def CheckMandatoryAccessScreen(
+                    Diagnostics: dict[str, object],
+                ) -> None:
+                    CheckWork(
+                        str(Diagnostics.get(
+                            "Phase",
+                            "joint-exact-mandatory-access-profile",
+                        )),
+                        **{
+                            Key: Value
+                            for Key, Value in Diagnostics.items()
+                            if Key != "Phase"
+                        },
+                    )
+
+                Profile = MeasureMandatoryAccessConflictProfile(
+                    (
+                        Geometry.BuildPlacedGate(
+                            ModuleGateByNameForMandatoryScreen[Geometry.Name]
+                        )
+                        for Geometry in ExactCoreGeometry
+                    ),
+                    MandatoryScreenSignalOrder,
+                    WorkCheck=CheckMandatoryAccessScreen,
+                )
+                ProfilesBySearchCandidate[
+                    SearchCandidateIndex
+                ] = Profile
+                if (
+                    not EnableClusterInterfacePlacementFeasibility
+                    and not Profile.HasConflicts
+                ):
+                    break
+            if EnableClusterInterfacePlacementFeasibility:
+                (
+                    OrderedRetainedStates,
+                    InterfacePortfolioAttrition,
+                ) = SelectExactInterfaceCommitStates(
+                    ScreenedRetainedStates,
+                    ProfilesBySearchCandidate,
+                    min(
+                        len(ScreenedRetainedStates),
+                        PackingPolicy.RetainedJointPlacementCandidates * 2,
+                    ),
+                )
+            else:
+                OrderedRetainedStates = (
+                    OrderExactStatesForMandatoryAccessCommit(
+                        ScreenedRetainedStates,
+                        ProfilesBySearchCandidate,
+                    )
+                )
+                InterfacePortfolioAttrition = ()
+            OrderedCoreGeometryByCandidate = tuple(
+                (
+                    int(State["CandidateIndex"]),
+                    Geometry,
+                )
+                for State in OrderedRetainedStates
+                if (
+                    Geometry := CachedExactScreen.CoreGeometry(
+                        int(State["SearchCandidateIndex"])
+                    )
+                ) is not None
+            )
+            OrderedMandatoryProfilesByCandidate = tuple(
+                (
+                    int(State["CandidateIndex"]),
+                    ProfilesBySearchCandidate[
+                        int(State["SearchCandidateIndex"])
+                    ],
+                )
+                for State in OrderedRetainedStates
+                if int(State["SearchCandidateIndex"])
+                in ProfilesBySearchCandidate
+            )
+            CachedExactScreen = ExactJointPlacementScreen(
+                RetainedStates=tuple(deepcopy(OrderedRetainedStates)),
+                CoreGeometryByCandidate=(
+                    OrderedCoreGeometryByCandidate
+                ),
+                MandatoryProfileByCandidate=(
+                    OrderedMandatoryProfilesByCandidate
+                ),
+            )
+            _JointPlacementExactScreenCache[
+                ExactScreenCacheKey
+            ] = CachedExactScreen
+            ScreenedRetainedStates = list(
+                deepcopy(CachedExactScreen.RetainedStates)
+            )
+            JointPlacementDiagnostics[
+                "InterfacePortfolioAttrition"
+            ] = list(InterfacePortfolioAttrition)
+            CheckWork(
+                "joint-exact-mandatory-access-order-complete",
+                ScreenedCandidateCount=len(
+                    ProfilesBySearchCandidate
+                ),
+                PromotedSearchCandidateIndex=(
+                    int(ScreenedRetainedStates[0].get(
+                        "SearchCandidateIndex",
+                        ScreenedRetainedStates[0]["CandidateIndex"],
+                    ))
+                    if ScreenedRetainedStates
+                    else -1
+                ),
+            )
+        ExactLegalRetainedStates = [
+            State
+            for State in ScreenedRetainedStates
+            if bool(State.get("ExactLegal"))
+        ]
+        ExactRejections = [
+            deepcopy(State["ExactRejection"])
+            for State in ScreenedRetainedStates
+            if not bool(State.get("ExactLegal"))
+            and "ExactRejection" in State
+        ]
+        JointPlacementDiagnostics["RetainedStates"] = (
+            ScreenedRetainedStates
+        )
+        JointPlacementDiagnostics["ExactLegalRetainedStates"] = (
+            ExactLegalRetainedStates
+        )
+        JointPlacementDiagnostics["ExactCandidateRejections"] = (
+            ExactRejections
+        )
+        JointPlacementDiagnostics["ExactScreenCacheHit"] = (
+            ExactScreenCacheHit
+        )
+        ExactScreenFingerprint = sha256(
+            repr(ExactScreenCacheKey).encode("utf-8")
+        ).hexdigest()
+        JointPlacementDiagnostics["ExactScreenFingerprint"] = (
+            ExactScreenFingerprint
+        )
+        SelectedExactState = next(
+            (
+                State for State in ScreenedRetainedStates
+                if int(State["CandidateIndex"])
+                == JointPlacementCandidateIndex
+            ),
+            None,
+        )
+        if (
+            SelectedExactState is not None
+            and bool(SelectedExactState.get("ExactLegal"))
+        ):
+            SelectedExactMandatoryAccessProfile = (
+                CachedExactScreen.MandatoryProfile(
+                    JointPlacementCandidateIndex
                 )
             )
-        if PackedMode and (
-            any(
-                PcbGatesConflict(Candidate, Existing)
-                for Candidate in CandidateClusterGates
-                for Existing in PlacedGates
+            CachedExactStateCoreGeometry = (
+                CachedExactScreen.CoreGeometry(
+                    JointPlacementCandidateIndex
+                )
             )
-            or any(
-                PcbGatesConflict(First, Second)
-                for Index, First in enumerate(CandidateClusterGates)
-                for Second in CandidateClusterGates[Index + 1 :]
+            JointPlacementDiagnostics[
+                "SelectedSearchCandidateIndex"
+            ] = int(SelectedExactState.get(
+                "SearchCandidateIndex",
+                JointPlacementCandidateIndex,
+            ))
+            JointPlacementDiagnostics["SelectedScore"] = (
+                SelectedExactState.get(
+                    "SearchScore",
+                    JointPlacementDiagnostics.get("SelectedScore"),
+                )
             )
+            JointPlacementDiagnostics["SelectedTransforms"] = deepcopy(
+                SelectedExactState.get("Transforms", {})
+            )
+            SelectedExactStateFingerprint = sha256(
+                repr((
+                    JointPlacementCandidateIndex,
+                    SelectedExactState,
+                )).encode("utf-8")
+            ).hexdigest()
+            ExactStatePlacementCacheKey = (
+                ExactScreenFingerprint,
+                JointPlacementCandidateIndex,
+                SelectedExactStateFingerprint,
+                repr(PlacementPolicy),
+                repr(PackingPolicy),
+                bool(MandatoryAccessPreScreenOnly),
+                RelocationVariant,
+                tuple(sorted(RelocationSignals)),
+                tuple(sorted(RelocationPrioritySignals)),
+                tuple(sorted(RequiredRelocationSignals)),
+                tuple(sorted(
+                    CoordinatedCandidateDiversificationSignals
+                )),
+                (
+                    (
+                        AssignmentCut.ConflictFingerprint,
+                        AssignmentCut.EffectiveWorkFingerprint,
+                    )
+                    if AssignmentCut is not None
+                    else ("", "")
+                ),
+                AssignmentConstraints.Fingerprint,
+            )
+            ExactStatePlacementCacheFingerprint = sha256(
+                repr(ExactStatePlacementCacheKey).encode("utf-8")
+            ).hexdigest()
+            CachedExactStateGeometry = (
+                _ExactStatePlacementGeometryCache.get(
+                    ExactStatePlacementCacheKey
+                )
+            )
+            JointPlacementDiagnostics[
+                "ExactStatePlacementCache"
+            ] = {
+                "Key": ExactStatePlacementCacheFingerprint,
+                "Hit": CachedExactStateGeometry is not None,
+                "CandidateIndex": JointPlacementCandidateIndex,
+                "StateFingerprint": SelectedExactStateFingerprint,
+                "CachedGateCount": (
+                    len(CachedExactStateGeometry)
+                    if CachedExactStateGeometry is not None
+                    else 0
+                ),
+                "CoreGeometryAvailable": (
+                    CachedExactStateCoreGeometry is not None
+                ),
+                "CoreGeometryCacheHit": (
+                    ExactScreenCacheHit
+                    and CachedExactStateCoreGeometry is not None
+                ),
+                "CoreGateCount": (
+                    len(CachedExactStateCoreGeometry)
+                    if CachedExactStateCoreGeometry is not None
+                    else 0
+                ),
+            }
+            Assignment = {
+                int(ClusterIndex): tuple(Slot)
+                for ClusterIndex, Slot in dict(
+                    SelectedExactState["Slots"]
+                ).items()
+            }
+            SelectedTransforms = dict(
+                SelectedExactState["Transforms"]
+            )
+            SelectedClusterVariants = {
+                ClusterIndex: VariantByTransform[ClusterIndex][(
+                    int(
+                        SelectedTransforms[str(ClusterIndex)][
+                            "Rotation"
+                        ]
+                    ),
+                    bool(
+                        SelectedTransforms[str(ClusterIndex)][
+                            "MirrorX"
+                        ]
+                    ),
+                )]
+                for ClusterIndex in range(len(Clusters))
+            }
+            for ClusterIndex, Variant in (
+                SelectedClusterVariants.items()
+            ):
+                LocalPositions.update(Variant.Positions)
+                LocalRotations.update(Variant.Rotations)
+                LocalMirrors.update(Variant.Mirrors)
+                ClusterSizes[ClusterIndex] = (
+                    Variant.Width,
+                    Variant.Depth,
+                )
+            ColumnCount = max(
+                (Column for Column, _Row in Assignment.values()),
+                default=-1,
+            ) + 1
+            RowCount = max(
+                (Row for _Column, Row in Assignment.values()),
+                default=-1,
+            ) + 1
+            ColumnWidths = {
+                Column: max(
+                    (
+                        ClusterSizes[Index][0]
+                        for Index, Slot in Assignment.items()
+                        if Slot[0] == Column
+                    ),
+                    default=1,
+                )
+                for Column in range(ColumnCount)
+            }
+            RowDepths = {
+                Row: max(
+                    (
+                        ClusterSizes[Index][1]
+                        for Index, Slot in Assignment.items()
+                        if Slot[1] == Row
+                    ),
+                    default=1,
+                )
+                for Row in range(RowCount)
+            }
+            SelectedExactSpacing = dict(SelectedExactState["ExactSpacing"])
+            ColumnExtraSpacing = dict(SelectedExactSpacing["Columns"])
+            RowExtraSpacing = dict(SelectedExactSpacing["Rows"])
+            GapPlan = InterClusterGapPlan(
+                Enabled=ExactScreenDemandSpacing,
+                RoutingSpacing=RoutingSpacing,
+                TrackPitch=ExactScreenTrackPitch,
+                ColumnExtraSpacing=tuple(sorted(
+                    ColumnExtraSpacing.items()
+                )),
+                RowExtraSpacing=tuple(sorted(
+                    RowExtraSpacing.items()
+                )),
+                BoundaryDemand=BuildInterClusterBoundaryDemand(
+                    Module,
+                    Clusters,
+                    Assignment,
+                    WorkCheck=WorkCheck,
+                ),
+            )
+            JointPlacementDiagnostics["SelectedSlots"] = {
+                str(ClusterIndex): list(Slot)
+                for ClusterIndex, Slot in sorted(Assignment.items())
+            }
+            JointPlacementDiagnostics["SelectedExactSlotRepairs"] = (
+                deepcopy(
+                    SelectedExactState.get(
+                        "ExactSlotRepairs",
+                        (),
+                    )
+                )
+            )
+            ColumnOrigins = {}
+            NextX = 0
+            for Column in range(ColumnCount):
+                ColumnOrigins[Column] = NextX
+                NextX += ColumnWidths[Column]
+                if Column + 1 < ColumnCount:
+                    NextX += ColumnGap + ColumnExtraSpacing[Column]
+            RowOrigins = {}
+            NextZ = 0
+            for Row in sorted(RowDepths):
+                RowOrigins[Row] = NextZ
+                NextZ += RowDepths[Row]
+                if Row + 1 < len(RowDepths):
+                    NextZ += RowGap + RowExtraSpacing[Row]
+        if (
+            SelectedExactState is None
+            or not bool(SelectedExactState.get("ExactLegal"))
         ):
-            raise ValueError(
-                f"Packed NAND cluster {ClusterIndex} conflicts at placement commit"
+            Rejection = (
+                SelectedExactState.get(
+                    "ExactRejection",
+                    {"Reason": "not retained"},
+                )
+                if SelectedExactState is not None
+                else {"Reason": "not retained"}
             )
-        PlacedGates.extend(CandidateClusterGates)
+            raise ValueError(
+                "Exact joint placement candidate rejected: "
+                f"{Rejection}"
+            )
+    InputMargin = 0
+    ModuleGateByName = {
+        Gate.Name: Gate for Gate in Module.Gates
+    }
+    if CachedExactStateGeometry is not None:
+        CheckWork(
+            "exact-state-placement-cache-hit",
+            CandidateIndex=JointPlacementCandidateIndex,
+            CachedGateCount=len(CachedExactStateGeometry),
+        )
+    elif CachedExactStateCoreGeometry is not None:
+        CheckWork(
+            "exact-state-core-geometry-reused",
+            CandidateIndex=JointPlacementCandidateIndex,
+            CachedGateCount=len(CachedExactStateCoreGeometry),
+            ExactScreenCacheHit=ExactScreenCacheHit,
+        )
+    SelectedPlacedGateGeometry = (
+        CachedExactStateGeometry
+        if CachedExactStateGeometry is not None
+        else CachedExactStateCoreGeometry
+    )
+    PlacedGates = (
+        [
+            Geometry.BuildPlacedGate(
+                ModuleGateByName[Geometry.Name]
+            )
+            for Geometry in SelectedPlacedGateGeometry
+        ]
+        if SelectedPlacedGateGeometry is not None
+        else []
+    )
+    if SelectedPlacedGateGeometry is None:
+        for ClusterIndex, Names in enumerate(Clusters):
+            CheckWork(
+                "placement-commit",
+                CompletedClusters=ClusterIndex,
+                TotalClusters=len(Clusters),
+            )
+            SlotX, SlotZ = Assignment[ClusterIndex]
+            BaseX = InputMargin + ColumnOrigins[SlotX]
+            BaseZ = RowOrigins[SlotZ]
+            BaseY = 1 + (
+                ClusterStackLevels[ClusterIndex]
+                * PackingPolicy.ClusterDeckPitch
+                if PackedMode
+                else 0
+            )
+            CandidateClusterGates = []
+            for Name in Names:
+                LocalX, LocalZ = LocalPositions[Name]
+                Rotation = LocalRotations[Name]
+                MirrorX = LocalMirrors.get(Name, False)
+                if ClusterIndex in MirroredRelocationClusters:
+                    GateWidth = RotatedCellSize(
+                        InternalByName[Name].Kind.value,
+                        Rotation,
+                    )[0]
+                    LocalX = (
+                        ClusterSizes[ClusterIndex][0]
+                        - LocalX
+                        - GateWidth
+                    )
+                    MirrorX = not MirrorX
+                CandidateClusterGates.append(
+                    BuildPlacedGate(
+                        InternalByName[Name],
+                        BaseX + LocalX,
+                        BaseY,
+                        BaseZ + LocalZ,
+                        Rotation,
+                        MirrorX,
+                    )
+                )
+            if PackedMode and (
+                any(
+                    PcbGatesConflict(Candidate, Existing)
+                    for Candidate in CandidateClusterGates
+                    for Existing in PlacedGates
+                )
+                or any(
+                    PcbGatesConflict(First, Second)
+                    for Index, First in enumerate(
+                        CandidateClusterGates
+                    )
+                    for Second in CandidateClusterGates[Index + 1 :]
+                )
+            ):
+                raise ValueError(
+                    "Packed NAND cluster "
+                    f"{ClusterIndex} conflicts at placement commit"
+                )
+            PlacedGates.extend(CandidateClusterGates)
 
     InputGates = [Gate for Gate in Module.Gates if Gate.Kind.value == "INPUT"]
     OutputGates = [Gate for Gate in Module.Gates if Gate.Kind.value == "OUTPUT"]
 
-    if PackedMode:
-        ClusterByGate = {
+    ClusterByGate = (
+        {
             Name: ClusterIndex
             for ClusterIndex, Names in enumerate(Clusters)
             for Name in Names
         }
-        TerminalConsumers: dict[str, list[Any]] = {}
-        for ModuleGate in Module.Gates:
-            for Signal in ModuleGate.Inputs:
-                TerminalConsumers.setdefault(Signal, []).append(ModuleGate)
+        if PackedMode
+        else {}
+    )
+    TerminalConsumers: dict[str, list[Any]] = {}
+    for ModuleGate in Module.Gates:
+        for Signal in ModuleGate.Inputs:
+            TerminalConsumers.setdefault(Signal, []).append(ModuleGate)
 
     InternalMinimumX = min(Gate.X for Gate in PlacedGates)
     InternalMaximumX = max(
@@ -3493,14 +11852,14 @@ def PlacePcbGraph(
         Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
         for Gate in PlacedGates
     )
-
     def PlaceTerminalBank(
         Gates: list[Any],
         BankZ: int,
         OutwardStep: int,
         PortNames: list[str],
+        LocalizeByInternalPins: bool = False,
     ) -> None:
-        """Place terminals in their declared SystemVerilog port order."""
+        """Place a legal terminal bank, optionally ordered by internal pins."""
         PortIndexes = {
             Signal: Index
             for Index, Signal in enumerate(PortNames)
@@ -3513,23 +11872,77 @@ def PlacePcbGraph(
                 else Gate.Inputs[0]
             )
 
+        InternalPinsBySignal: dict[str, list[tuple[int, int, int]]] = {}
+        InternalOutputsBySignal: dict[str, tuple[int, int, int]] = {}
+        if LocalizeByInternalPins:
+            for Existing in PlacedGates:
+                for InputIndex, Signal in enumerate(Existing.Inputs):
+                    InternalPinsBySignal.setdefault(Signal, []).append(
+                        Existing.InputPins[InputIndex]
+                    )
+                if Existing.OutputPin is not None:
+                    for Signal in Existing.Outputs:
+                        InternalOutputsBySignal[Signal] = Existing.OutputPin
+
+        def TerminalAnchorX(Gate: Any) -> int:
+            Signal = TerminalSignal(Gate)
+            Pins = (
+                InternalPinsBySignal.get(Signal, ())
+                if Gate.Kind.value == "INPUT"
+                else (
+                    (InternalOutputsBySignal[Signal],)
+                    if Signal in InternalOutputsBySignal
+                    else ()
+                )
+            )
+            if not Pins:
+                return PortIndexes[Signal]
+            Values = sorted(Pin[0] for Pin in Pins)
+            return Values[(len(Values) - 1) // 2]
+
         Ordered = sorted(
             Gates,
             key=lambda Gate: (
+                (
+                    TerminalAnchorX(Gate)
+                    if LocalizeByInternalPins
+                    else PortIndexes[TerminalSignal(Gate)]
+                ),
                 PortIndexes[TerminalSignal(Gate)],
                 Gate.Name,
             ),
         )
-        CenterX = (InternalMinimumX + InternalMaximumX) // 2
-        TerminalSpacings = (
-            (2, 3)
-            if PackedMode
-            else
-            (4 + RoutingSpacing, 3 + RoutingSpacing)
-            if PlacementPolicy is not None
-            and PlacementPolicy.PreferWideTerminalBanks
-            else (3 + RoutingSpacing, 4 + RoutingSpacing)
-        )
+        if LocalizeByInternalPins and Ordered:
+            AnchorXs = [TerminalAnchorX(Gate) for Gate in Ordered]
+            CenterX = (min(AnchorXs) + max(AnchorXs)) // 2
+            LocalizedSpacing = max(
+                3 + RoutingSpacing,
+                ceil(
+                    (max(AnchorXs) - min(AnchorXs))
+                    / max(1, len(Ordered) - 1)
+                ),
+            )
+            TerminalSpacings = (
+                LocalizedSpacing,
+                LocalizedSpacing + 1,
+            )
+        else:
+            CenterX = (InternalMinimumX + InternalMaximumX) // 2
+            TerminalSpacings = (
+                (4 + RoutingSpacing, 3 + RoutingSpacing)
+                if (
+                    PackedMode
+                    and PlacementPolicy is not None
+                    and PlacementPolicy.PreferWideTerminalBanks
+                )
+                else (2, 3)
+                if PackedMode
+                else
+                (4 + RoutingSpacing, 3 + RoutingSpacing)
+                if PlacementPolicy is not None
+                and PlacementPolicy.PreferWideTerminalBanks
+                else (3 + RoutingSpacing, 4 + RoutingSpacing)
+            )
         for Spacing in TerminalSpacings:
             CheckWork("terminal-bank-spacing", Spacing=Spacing)
             BankWidth = max(1, 1 + Spacing * (len(Ordered) - 1))
@@ -3579,6 +11992,16 @@ def PlacePcbGraph(
         PortIndexes: dict[str, int],
     ) -> list[Any] | None:
         """Place packed-mode I/O on the exterior shell of the NAND fabric."""
+        PlacedMinimumX = min(Gate.X for Gate in PlacedGates)
+        PlacedMaximumX = max(
+            Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
+            for Gate in PlacedGates
+        )
+        PlacedMinimumZ = min(Gate.Z for Gate in PlacedGates)
+        PlacedMaximumZ = max(
+            Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
+            for Gate in PlacedGates
+        )
         Producers = {
             Signal: Gate
             for Gate in PlacedGates
@@ -3590,12 +12013,20 @@ def PlacePcbGraph(
             for InputIndex, Signal in enumerate(Existing.Inputs):
                 Targets.setdefault(Signal, []).append(Existing.InputPins[InputIndex])
 
+        def TerminalKind(Gate: Any) -> str:
+            Kind = getattr(Gate, "Kind", "")
+            return str(getattr(Kind, "value", Kind))
+
         def TerminalSignal(Gate: Any) -> str:
-            return Gate.Outputs[0] if Gate.Kind.value == "INPUT" else Gate.Inputs[0]
+            return (
+                Gate.Outputs[0]
+                if TerminalKind(Gate) == "INPUT"
+                else Gate.Inputs[0]
+            )
 
         def TerminalCluster(Gate: Any) -> int | None:
             Signal = TerminalSignal(Gate)
-            if Gate.Kind.value == "INPUT":
+            if TerminalKind(Gate) == "INPUT":
                 CandidateClusters = {
                     ClusterByGate[Consumer.Name]
                     for Consumer in TerminalConsumers.get(Signal, ())
@@ -3617,6 +12048,71 @@ def PlacePcbGraph(
                 Value.Name,
             )
 
+        PreCutInternalSignalsByTerminal: dict[
+            str, frozenset[str]
+        ] = {}
+        for First, Second in AssignmentConstraints.PairwiseConflictEdges:
+            FirstSignal = str(First)
+            SecondSignal = str(Second)
+            if (
+                FirstSignal in PortIndexes
+                and SecondSignal not in PortIndexes
+                and FirstSignal != SecondSignal
+            ):
+                PreCutInternalSignalsByTerminal[FirstSignal] = frozenset({
+                    *PreCutInternalSignalsByTerminal.get(
+                        FirstSignal,
+                        frozenset(),
+                    ),
+                    SecondSignal,
+                })
+            if (
+                SecondSignal in PortIndexes
+                and FirstSignal not in PortIndexes
+                and FirstSignal != SecondSignal
+            ):
+                PreCutInternalSignalsByTerminal[SecondSignal] = frozenset({
+                    *PreCutInternalSignalsByTerminal.get(
+                        SecondSignal,
+                        frozenset(),
+                    ),
+                    FirstSignal,
+                })
+        PreInternalPinsBySignal: dict[
+            str, set[tuple[int, int, int]]
+        ] = {}
+        for Existing in PlacedGates:
+            if Existing.OutputPin is not None:
+                for Signal in Existing.Outputs:
+                    PreInternalPinsBySignal.setdefault(
+                        str(Signal),
+                        set(),
+                    ).add(Existing.OutputPin)
+            for InputIndex, Signal in enumerate(Existing.Inputs):
+                PreInternalPinsBySignal.setdefault(
+                    str(Signal),
+                    set(),
+                ).add(Existing.InputPins[InputIndex])
+        PreCutTerminalPinSpacing = (
+            3 + RoutingSpacing
+            if (
+                TerminalPlacementPolicy.EnableJointClusterOrientation
+                and PreCutInternalSignalsByTerminal
+            )
+            else 0
+        )
+
+        TypedTerminalPlacementPressure = (
+            TerminalPlacementPolicy.EnableJointClusterOrientation
+            or (
+                PlacementPolicy is not None
+                and PlacementPolicy.PreferWideTerminalBanks
+            )
+        )
+        PreferTerminalRoutingCost = (
+            TypedTerminalPlacementPressure
+            and len(RelocationPrioritySignals) >= 3
+        )
         OptionsByGate: list[tuple[str, list[tuple[tuple[Any, ...], Any]]]] = []
         for Gate in sorted(
             Gates,
@@ -3626,7 +12122,7 @@ def PlacePcbGraph(
             Signal = TerminalSignal(Gate)
             DesiredPins = (
                 Targets.get(Signal, [])
-                if Gate.Kind.value == "INPUT"
+                if TerminalKind(Gate) == "INPUT"
                 else [Producers[Signal].OutputPin]
             )
             # A high-fanout terminal must not be pinned beside an arbitrary
@@ -3681,11 +12177,20 @@ def PlacePcbGraph(
             # every terminal is visible and approachable at the edge of an
             # arbitrary packed graph.
             ShellAnchors = (*DesiredPins, MedianAnchor)
-            ShellClearance = PackingPolicy.TerminalShellClearance
-            ShellLateralSearch = PackingPolicy.TerminalShellLateralSearch
+            ShellClearance = (
+                TerminalPlacementPolicy.TerminalShellClearance
+            )
+            ShellLateralSearch = (
+                TerminalPlacementPolicy.TerminalShellLateralSearch
+                + (
+                    PreCutTerminalPinSpacing
+                    if Signal in PreCutInternalSignalsByTerminal
+                    else 0
+                )
+            )
             ShellZ = (
                 InternalMinimumZ - ShellClearance
-                if Gate.Kind.value == "INPUT"
+                if TerminalKind(Gate) == "INPUT"
                 else InternalMaximumZ + ShellClearance
             )
             for Anchor in ShellAnchors:
@@ -3712,7 +12217,7 @@ def PlacePcbGraph(
                 Origin = BuildPlacedGate(Gate, 0, 1, 0, Rotation, False)
                 LocalPin = (
                     Origin.OutputPin
-                    if Gate.Kind.value == "INPUT"
+                    if TerminalKind(Gate) == "INPUT"
                     else Origin.InputPins[0]
                 )
                 for PinPosition in sorted(CandidatePinPositions):
@@ -3731,9 +12236,27 @@ def PlacePcbGraph(
                         continue
                     CandidatePin = (
                         Candidate.OutputPin
-                        if Gate.Kind.value == "INPUT"
+                        if TerminalKind(Gate) == "INPUT"
                         else Candidate.InputPins[0]
                     )
+                    if (
+                        PreCutTerminalPinSpacing > 0
+                        and any(
+                            abs(CandidatePin[0] - InternalPin[0])
+                            + abs(CandidatePin[2] - InternalPin[2])
+                            < PreCutTerminalPinSpacing
+                            for InternalSignal
+                            in PreCutInternalSignalsByTerminal.get(
+                                Signal,
+                                frozenset(),
+                            )
+                            for InternalPin in PreInternalPinsBySignal.get(
+                                InternalSignal,
+                                set(),
+                            )
+                        )
+                    ):
+                        continue
                     Distance = sum(
                         abs(CandidatePin[0] - Pin[0])
                         + abs(CandidatePin[2] - Pin[2])
@@ -3758,29 +12281,15 @@ def PlacePcbGraph(
                     )
                     if not IsOutsideCore:
                         continue
-                    MinimumX = min(
-                        [Existing.X for Existing in PlacedGates]
-                        + [Candidate.X]
-                    )
+                    MinimumX = min(PlacedMinimumX, Candidate.X)
                     MaximumX = max(
-                        [
-                            Existing.X
-                            + RotatedCellSize(Existing.Kind, Existing.Rotation)[0]
-                            for Existing in PlacedGates
-                        ]
-                        + [Candidate.X + CandidateWidth]
+                        PlacedMaximumX,
+                        Candidate.X + CandidateWidth,
                     )
-                    MinimumZ = min(
-                        [Existing.Z for Existing in PlacedGates]
-                        + [Candidate.Z]
-                    )
+                    MinimumZ = min(PlacedMinimumZ, Candidate.Z)
                     MaximumZ = max(
-                        [
-                            Existing.Z
-                            + RotatedCellSize(Existing.Kind, Existing.Rotation)[1]
-                            for Existing in PlacedGates
-                        ]
-                        + [Candidate.Z + CandidateDepth]
+                        PlacedMaximumZ,
+                        Candidate.Z + CandidateDepth,
                     )
                     Width = MaximumX - MinimumX
                     Depth = MaximumZ - MinimumZ
@@ -3803,10 +12312,20 @@ def PlacePcbGraph(
             OrderedOptions = sorted(
                 Options,
                 key=lambda Value: (
-                    Value[0][2],
-                    Value[0][3],
-                    Value[0][0],
-                    Value[0][1],
+                    (
+                        Value[0][0],
+                        Value[0][1],
+                        Value[0][2],
+                        Value[0][3],
+                    )
+                    if PreferTerminalRoutingCost
+                    else (
+                        Value[0][2],
+                        Value[0][3],
+                        Value[0][0],
+                        Value[0][1],
+                    )
+                ) + (
                     Value[0][4:],
                 ),
             )
@@ -3847,52 +12366,278 @@ def PlacePcbGraph(
                 if Option in SelectedOptions:
                     continue
                 SelectedOptions.append(Option)
-                if len(SelectedOptions) >= PackingPolicy.MaximumTerminalPlacementCandidates:
+                if (
+                    len(SelectedOptions)
+                    >= TerminalPlacementPolicy.MaximumTerminalPlacementCandidates
+                ):
                     break
             OptionsByGate.append((
                 Gate.Name,
-                SelectedOptions[:PackingPolicy.MaximumTerminalPlacementCandidates],
+                SelectedOptions[
+                    :TerminalPlacementPolicy.MaximumTerminalPlacementCandidates
+                ],
             ))
 
         BestSelection: tuple[Any, ...] | None = None
         BestScore: tuple[Any, ...] | None = None
         AssignmentExpansions = 0
+        StopAfterFirstLegalTerminalAssignment = (
+            TypedTerminalPlacementPressure
+            and RelocationVariant >= 2
+        )
+        TerminalAssignmentExpansionLimit = (
+            min(
+                TerminalPlacementPolicy.MaximumTerminalAssignmentExpansions,
+                4_096,
+            )
+            if StopAfterFirstLegalTerminalAssignment
+            else TerminalPlacementPolicy.MaximumTerminalAssignmentExpansions
+        )
+        MinimumTerminalPinSpacing = (
+            3 + RoutingSpacing
+            if (
+                TypedTerminalPlacementPressure
+            )
+            else 0
+        )
+        CutScopedTerminalPinPairs = frozenset(
+            tuple(sorted((str(First), str(Second))))
+            for First, Second in AssignmentConstraints.PairwiseConflictEdges
+            if str(First) in PortIndexes
+            and str(Second) in PortIndexes
+            and str(First) != str(Second)
+        )
+        CutScopedInternalSignalsByTerminal: dict[
+            str, frozenset[str]
+        ] = {}
+        for First, Second in AssignmentConstraints.PairwiseConflictEdges:
+            FirstSignal = str(First)
+            SecondSignal = str(Second)
+            if (
+                FirstSignal in PortIndexes
+                and SecondSignal not in PortIndexes
+                and FirstSignal != SecondSignal
+            ):
+                CutScopedInternalSignalsByTerminal[FirstSignal] = (
+                    frozenset({
+                        *CutScopedInternalSignalsByTerminal.get(
+                            FirstSignal,
+                            frozenset(),
+                        ),
+                        SecondSignal,
+                    })
+                )
+            if (
+                SecondSignal in PortIndexes
+                and FirstSignal not in PortIndexes
+                and FirstSignal != SecondSignal
+            ):
+                CutScopedInternalSignalsByTerminal[SecondSignal] = (
+                    frozenset({
+                        *CutScopedInternalSignalsByTerminal.get(
+                            SecondSignal,
+                            frozenset(),
+                        ),
+                        FirstSignal,
+                    })
+                )
+        InternalPinsBySignal: dict[
+            str, frozenset[tuple[int, int, int]]
+        ] = {}
+        MutableInternalPinsBySignal: dict[
+            str, set[tuple[int, int, int]]
+        ] = {}
+        for Existing in PlacedGates:
+            if Existing.OutputPin is not None:
+                for Signal in Existing.Outputs:
+                    MutableInternalPinsBySignal.setdefault(
+                        str(Signal),
+                        set(),
+                    ).add(Existing.OutputPin)
+            for InputIndex, Signal in enumerate(Existing.Inputs):
+                MutableInternalPinsBySignal.setdefault(
+                    str(Signal),
+                    set(),
+                ).add(Existing.InputPins[InputIndex])
+        InternalPinsBySignal = {
+            Signal: frozenset(Pins)
+            for Signal, Pins in MutableInternalPinsBySignal.items()
+        }
+        CutScopedTerminalPinSpacing = (
+            3 + RoutingSpacing
+            if (
+                TerminalPlacementPolicy.EnableJointClusterOrientation
+                and (
+                    CutScopedTerminalPinPairs
+                    or CutScopedInternalSignalsByTerminal
+                )
+            )
+            else 0
+        )
+
+        def TerminalConnectionPin(Candidate: Any) -> tuple[int, int, int]:
+            return (
+                Candidate.OutputPin
+                if getattr(Candidate.Kind, "value", Candidate.Kind) == "INPUT"
+                else Candidate.InputPins[0]
+            )
+
+        TerminalCandidates = tuple(
+            Candidate
+            for _GateName, Options in OptionsByGate
+            for _Key, Candidate in Options
+        )
+        TerminalPinByIdentity = {
+            id(Candidate): TerminalConnectionPin(Candidate)
+            for Candidate in TerminalCandidates
+        }
+        TerminalBoundsByIdentity = {
+            id(Candidate): (
+                Candidate.X,
+                Candidate.X
+                + RotatedCellSize(Candidate.Kind, Candidate.Rotation)[0],
+                Candidate.Z,
+                Candidate.Z
+                + RotatedCellSize(Candidate.Kind, Candidate.Rotation)[1],
+            )
+            for Candidate in TerminalCandidates
+        }
+        TerminalConflictCache: dict[tuple[int, int], bool] = {}
+        MinimumRemainingRoutingCosts: list[tuple[int, int]] = [
+            (0, 0)
+            for _ in range(len(OptionsByGate) + 1)
+        ]
+        for OptionIndex in range(len(OptionsByGate) - 1, -1, -1):
+            _GateName, Options = OptionsByGate[OptionIndex]
+            RemainingMaximumDistance, RemainingTotalDistance = (
+                MinimumRemainingRoutingCosts[OptionIndex + 1]
+            )
+            MinimumRemainingRoutingCosts[OptionIndex] = (
+                RemainingMaximumDistance
+                + min(Key[0] for Key, _Candidate in Options),
+                RemainingTotalDistance
+                + min(Key[1] for Key, _Candidate in Options),
+            )
+
+        def TerminalCandidatesConflict(First: Any, Second: Any) -> bool:
+            FirstIdentity = id(First)
+            SecondIdentity = id(Second)
+            Key = (
+                (FirstIdentity, SecondIdentity)
+                if FirstIdentity < SecondIdentity
+                else (SecondIdentity, FirstIdentity)
+            )
+            Conflict = TerminalConflictCache.get(Key)
+            if Conflict is None:
+                Conflict = PcbGatesConflict(First, Second)
+                TerminalConflictCache[Key] = Conflict
+            return Conflict
 
         def SelectionScore(
             Selected: tuple[tuple[tuple[Any, ...], Any], ...],
         ) -> tuple[Any, ...]:
-            AllGates = (*PlacedGates, *(Candidate for _Key, Candidate in Selected))
-            MinimumX = min(Gate.X for Gate in AllGates)
-            MaximumX = max(
-                Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
-                for Gate in AllGates
+            SelectedBounds = tuple(
+                TerminalBoundsByIdentity[id(Candidate)]
+                for _Key, Candidate in Selected
             )
-            MinimumZ = min(Gate.Z for Gate in AllGates)
-            MaximumZ = max(
-                Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
-                for Gate in AllGates
-            )
+            MinimumX = min((
+                PlacedMinimumX,
+                *(Bounds[0] for Bounds in SelectedBounds),
+            ))
+            MaximumX = max((
+                PlacedMaximumX,
+                *(Bounds[1] for Bounds in SelectedBounds),
+            ))
+            MinimumZ = min((
+                PlacedMinimumZ,
+                *(Bounds[2] for Bounds in SelectedBounds),
+            ))
+            MaximumZ = max((
+                PlacedMaximumZ,
+                *(Bounds[3] for Bounds in SelectedBounds),
+            ))
             Width = MaximumX - MinimumX
             Depth = MaximumZ - MinimumZ
-            return (
-                Width * Depth,
-                max(Width, Depth),
+            AreaScore = (Width * Depth, max(Width, Depth))
+            RoutingScore = (
                 sum(Key[0] for Key, _Candidate in Selected),
                 sum(Key[1] for Key, _Candidate in Selected),
+            )
+            return (
+                (
+                    (*RoutingScore, *AreaScore)
+                    if PreferTerminalRoutingCost
+                    else (*AreaScore, *RoutingScore)
+                )
+                + (
                 tuple(
                     (Candidate.Name, Candidate.X, Candidate.Z, Candidate.Rotation)
                     for _Key, Candidate in Selected
                 ),
+                )
             )
+
+        def SelectionLowerBound(
+            Index: int,
+            Selected: tuple[tuple[tuple[Any, ...], Any], ...],
+        ) -> tuple[int, int, int, int]:
+            """Return a monotone prefix bound for exact terminal assignment."""
+            SelectedBounds = tuple(
+                TerminalBoundsByIdentity[id(Candidate)]
+                for _Key, Candidate in Selected
+            )
+            MinimumX = min((
+                PlacedMinimumX,
+                *(Bounds[0] for Bounds in SelectedBounds),
+            ))
+            MaximumX = max((
+                PlacedMaximumX,
+                *(Bounds[1] for Bounds in SelectedBounds),
+            ))
+            MinimumZ = min((
+                PlacedMinimumZ,
+                *(Bounds[2] for Bounds in SelectedBounds),
+            ))
+            MaximumZ = max((
+                PlacedMaximumZ,
+                *(Bounds[3] for Bounds in SelectedBounds),
+            ))
+            Width = MaximumX - MinimumX
+            Depth = MaximumZ - MinimumZ
+            AreaScore = (Width * Depth, max(Width, Depth))
+            RemainingMaximumDistance, RemainingTotalDistance = (
+                MinimumRemainingRoutingCosts[Index]
+            )
+            RoutingScore = (
+                sum(Key[0] for Key, _Candidate in Selected)
+                + RemainingMaximumDistance,
+                sum(Key[1] for Key, _Candidate in Selected)
+                + RemainingTotalDistance,
+            )
+            return (
+                (*RoutingScore, *AreaScore)
+                if PreferTerminalRoutingCost
+                else (*AreaScore, *RoutingScore)
+            )
+
+        PrunedAssignmentExpansions = 0
 
         def SearchTerminalAssignments(
             Index: int,
             Selected: tuple[tuple[tuple[Any, ...], Any], ...],
         ) -> None:
             nonlocal AssignmentExpansions, BestSelection, BestScore
-            if AssignmentExpansions >= PackingPolicy.MaximumTerminalAssignmentExpansions:
+            nonlocal PrunedAssignmentExpansions
+            if AssignmentExpansions >= TerminalAssignmentExpansionLimit:
                 return
             AssignmentExpansions += 1
+            if (
+                BestScore is not None
+                and SelectionLowerBound(Index, Selected)
+                > BestScore[:4]
+            ):
+                PrunedAssignmentExpansions += 1
+                return
             if Index == len(OptionsByGate):
                 Score = SelectionScore(Selected)
                 if BestScore is None or Score < BestScore:
@@ -3903,76 +12648,237 @@ def PlacePcbGraph(
             for Option in Options:
                 _Key, Candidate = Option
                 if any(
-                    PcbGatesConflict(Candidate, Existing)
+                    TerminalCandidatesConflict(Candidate, Existing)
                     for _SelectedKey, Existing in Selected
                 ):
                     continue
+                CandidatePin = TerminalPinByIdentity[id(Candidate)]
+                if (
+                    MinimumTerminalPinSpacing > 0
+                    and any(
+                        abs(CandidatePin[0] - SelectedPin[0])
+                        + abs(CandidatePin[2] - SelectedPin[2])
+                        < MinimumTerminalPinSpacing
+                        for SelectedPin in (
+                            TerminalPinByIdentity[id(Existing)]
+                            for _SelectedKey, Existing in Selected
+                        )
+                    )
+                ):
+                    continue
+                CandidateSignal = TerminalSignal(Candidate)
+                if (
+                    CutScopedTerminalPinSpacing > 0
+                    and any(
+                        abs(CandidatePin[0] - InternalPin[0])
+                        + abs(CandidatePin[2] - InternalPin[2])
+                        < CutScopedTerminalPinSpacing
+                        for InternalSignal
+                        in CutScopedInternalSignalsByTerminal.get(
+                            CandidateSignal,
+                            frozenset(),
+                        )
+                        for InternalPin in InternalPinsBySignal.get(
+                            InternalSignal,
+                            frozenset(),
+                        )
+                    )
+                ):
+                    continue
+                if (
+                    CutScopedTerminalPinSpacing > 0
+                    and any(
+                        tuple(sorted((
+                            CandidateSignal,
+                            TerminalSignal(Existing),
+                        ))) in CutScopedTerminalPinPairs
+                        and (
+                            abs(
+                                CandidatePin[0]
+                                - TerminalPinByIdentity[id(Existing)][0]
+                            )
+                            + abs(
+                                CandidatePin[2]
+                                - TerminalPinByIdentity[id(Existing)][2]
+                            )
+                            < CutScopedTerminalPinSpacing
+                        )
+                        for _SelectedKey, Existing in Selected
+                    )
+                ):
+                    continue
                 SearchTerminalAssignments(Index + 1, (*Selected, Option))
+                if (
+                    StopAfterFirstLegalTerminalAssignment
+                    and BestSelection is not None
+                ):
+                    return
 
         SearchTerminalAssignments(0, ())
+        CheckWork(
+            "localized-terminal-search-complete",
+            AssignmentExpansions=AssignmentExpansions,
+            StopAfterFirstLegalTerminalAssignment=(
+                StopAfterFirstLegalTerminalAssignment
+            ),
+            NandCount=NandCount,
+            RelocationVariant=RelocationVariant,
+            PrunedAssignmentExpansions=PrunedAssignmentExpansions,
+        )
         if BestSelection is None:
             return None
         return [Candidate for _Key, Candidate in BestSelection]
 
-    if PackedMode:
-        # Prefer compact, cluster-aware terminals when feasible. If any localized
-        # choice conflicts (including overlap with each other), fall back to
-        # deterministic side banks for reliability.
-        BasePlacement = list(PlacedGates)
-        UseLocalizedTerminals = True
-        TerminalPortIndexes = {
-            Signal: Index
-            for Index, Signal in enumerate((*Module.Inputs, *Module.Outputs))
+    if MandatoryAccessPreScreenOnly:
+        if (
+            ExactStatePlacementCacheKey is not None
+            and CachedExactStateGeometry is None
+        ):
+            CachedExactStateGeometry = tuple(
+                ExactStatePlacedGateGeometry.FromPlacedGate(Gate)
+                for Gate in PlacedGates
+            )
+            _ExactStatePlacementGeometryCache[
+                ExactStatePlacementCacheKey
+            ] = CachedExactStateGeometry
+            JointPlacementDiagnostics[
+                "ExactStatePlacementCache"
+            ]["CachedGateCount"] = len(CachedExactStateGeometry)
+        SignalOrder = tuple(sorted({
+            *Module.Inputs,
+            *Module.Outputs,
+            *(
+                Signal
+                for Gate in Module.Gates
+                for Signal in (*Gate.Inputs, *Gate.Outputs)
+            ),
+        }))
+        PreScreenDiagnostics: dict[str, object] = {
+            "__InterClusterGaps__": GapPlan.ToDictionary(),
+            "__MandatoryAccessPreScreen__": {
+                "Enabled": True,
+                "TerminalsIncluded": False,
+                "JointPlacementCandidateIndex": (
+                    JointPlacementCandidateIndex
+                ),
+                "PlacedGateCount": len(PlacedGates),
+                "SignalCount": len(SignalOrder),
+            },
         }
-        PlannedTerminals = (
-            PlaceLocalizedTerminals(
-                [*InputGates, *OutputGates],
-                TerminalPortIndexes,
+        if JointPlacementDiagnostics:
+            PreScreenDiagnostics["__JointClusterPlacement__"] = deepcopy(
+                JointPlacementDiagnostics
             )
-            if UseLocalizedTerminals
-            else None
-        )
-        if PlannedTerminals is not None:
-            CandidatePlacement = BasePlacement + PlannedTerminals
-            try:
-                if any(
-                    PcbGatesConflict(First, Second)
-                    for Index, First in enumerate(CandidatePlacement)
-                    for Second in CandidatePlacement[Index + 1 :]
-                ):
-                    raise ValueError("localized terminal placement conflicts")
-                _ = BuildPlacedCellGeometry(
-                    PlacedDesign(Module=Module, PlacedGates=CandidatePlacement)
+        if PackedAccessRepairByCluster:
+            PreScreenDiagnostics["__PackedAccessRepair__"] = {
+                str(ClusterIndex): deepcopy(Diagnostics)
+                for ClusterIndex, Diagnostics in sorted(
+                    PackedAccessRepairByCluster.items()
                 )
-                PlacedGates = CandidatePlacement
-            except ValueError:
-                PlannedTerminals = None
-        if PlannedTerminals is None:
-            PlacedGates = BasePlacement
-            PlaceTerminalBank(
-                InputGates,
-                InternalMinimumZ - 4,
-                -1,
-                list(Module.Inputs),
+            }
+        return PcbPlacement(
+            Placed=PlacedDesign(
+                Module=Module,
+                PlacedGates=list(PlacedGates),
+                LocalRouteDiagnostics=PreScreenDiagnostics,
+            ),
+            Clusters=Clusters,
+            SignalOrder=SignalOrder,
+            LayerCount=(
+                PlacementPolicy.MaximumRoutingLayers
+                if PlacementPolicy is not None
+                else 0
+            ),
+            MandatoryAccessPreScreenProfile=(
+                SelectedExactMandatoryAccessProfile
+            ),
+        )
+
+    # Prefer compact terminals localized to their producer/consumer geometry
+    # in both packed and unpacked placements. If any localized choice
+    # conflicts, retain the deterministic side banks as a reliability fallback.
+    BasePlacement = list(PlacedGates)
+    TerminalPortIndexes = {
+        Signal: Index
+        for Index, Signal in enumerate((*Module.Inputs, *Module.Outputs))
+    }
+    PlannedTerminals = (
+        PlaceLocalizedTerminals(
+            [*InputGates, *OutputGates],
+            TerminalPortIndexes,
+        )
+        if (
+            PackingPolicy is not None
+            and CachedExactStateGeometry is None
+        )
+        else None
+    )
+    if PlannedTerminals is not None:
+        CandidatePlacement = BasePlacement + PlannedTerminals
+        try:
+            if any(
+                PcbGatesConflict(First, Second)
+                for Index, First in enumerate(CandidatePlacement)
+                for Second in CandidatePlacement[Index + 1 :]
+            ):
+                raise ValueError("localized terminal placement conflicts")
+            _ = BuildPlacedCellGeometry(
+                PlacedDesign(Module=Module, PlacedGates=CandidatePlacement)
             )
-            PlaceTerminalBank(
-                OutputGates,
-                InternalMaximumZ + 2,
-                1,
-                list(Module.Outputs),
-            )
-    else:
+            PlacedGates = CandidatePlacement
+        except ValueError:
+            PlannedTerminals = None
+    PlacedGates = BasePlacement + (PlannedTerminals or [])
+    PlannedTerminalNames = {
+        Gate.Name for Gate in (PlannedTerminals or [])
+    }
+    RemainingInputGates = [
+        Gate for Gate in InputGates
+        if (
+            CachedExactStateGeometry is None
+            and Gate.Name not in PlannedTerminalNames
+        )
+    ]
+    RemainingOutputGates = [
+        Gate for Gate in OutputGates
+        if (
+            CachedExactStateGeometry is None
+            and Gate.Name not in PlannedTerminalNames
+        )
+    ]
+    if RemainingInputGates:
+        RemainingInputSignals = {
+            Gate.Outputs[0] for Gate in RemainingInputGates
+        }
         PlaceTerminalBank(
-            InputGates,
+            RemainingInputGates,
             InternalMinimumZ - 4,
             -1,
-            list(Module.Inputs),
+            [
+                Signal
+                for Signal in Module.Inputs
+                if Signal in RemainingInputSignals
+            ],
+            LocalizeByInternalPins=(
+                not PackedMode and PackingPolicy is not None
+            ),
         )
+    if RemainingOutputGates:
+        RemainingOutputSignals = {
+            Gate.Inputs[0] for Gate in RemainingOutputGates
+        }
         PlaceTerminalBank(
-            OutputGates,
+            RemainingOutputGates,
             InternalMaximumZ + 2,
             1,
-            list(Module.Outputs),
+            [
+                Signal
+                for Signal in Module.Outputs
+                if Signal in RemainingOutputSignals
+            ],
+            LocalizeByInternalPins=(
+                not PackedMode and PackingPolicy is not None
+            ),
         )
 
     if PackedMode and any(
@@ -3981,6 +12887,20 @@ def PlacePcbGraph(
         for Second in PlacedGates[Index + 1 :]
     ):
         raise ValueError("Packed placement conflicts at final commit")
+    if (
+        ExactStatePlacementCacheKey is not None
+        and CachedExactStateGeometry is None
+    ):
+        CachedExactStateGeometry = tuple(
+            ExactStatePlacedGateGeometry.FromPlacedGate(Gate)
+            for Gate in PlacedGates
+        )
+        _ExactStatePlacementGeometryCache[
+            ExactStatePlacementCacheKey
+        ] = CachedExactStateGeometry
+        JointPlacementDiagnostics[
+            "ExactStatePlacementCache"
+        ]["CachedGateCount"] = len(CachedExactStateGeometry)
     CheckWork("terminal-placement-complete", GateCount=len(PlacedGates))
     Placed = PlacedDesign(Module=Module, PlacedGates=PlacedGates)
     if PackedMode:
@@ -4008,6 +12928,16 @@ def PlacePcbGraph(
         LocalRouteDiagnostics["__InterClusterGaps__"] = (
             GapPlan.ToDictionary()
         )
+        if ClusterRefinementProfile is not None:
+            LocalRouteDiagnostics["__CutDrivenClusterRefinement__"] = {
+                **ClusterRefinementProfile.ToDictionary(),
+                "Signals": list(ClusterRefinementProfile.Signals),
+                "ClusterCount": len(Clusters),
+            }
+        if JointPlacementDiagnostics:
+            LocalRouteDiagnostics["__JointClusterPlacement__"] = (
+                JointPlacementDiagnostics
+            )
         if PackedAccessRepairByCluster:
             LocalRouteDiagnostics["__PackedAccessRepair__"] = {
                 str(ClusterIndex): Diagnostics
@@ -4311,17 +13241,136 @@ def PlacePcbGraph(
             raise ValueError(
                 f"Partial local route has no legal continuation portal: {Candidate.Signal}"
             )
-        for Signal, Targets in sorted(
-            TargetsBySignal.items(),
-            key=lambda Value: (
-                0
-                if Producers.get(Value[0]) is not None
-                and Producers[Value[0]].Kind == "NAND"
-                else 1,
-                -len(set(Value[1])),
-                Value[0],
-            ),
-        ):
+
+        ClusterOrigins = {
+            ClusterIndex: (
+                min(
+                    Gate.X for Gate in PlacedGates
+                    if Gate.Name in ClusterNames
+                ),
+                min(
+                    Gate.Y for Gate in PlacedGates
+                    if Gate.Name in ClusterNames
+                ),
+                min(
+                    Gate.Z for Gate in PlacedGates
+                    if Gate.Name in ClusterNames
+                ),
+            )
+            for ClusterIndex, ClusterNames in enumerate(Clusters)
+        }
+
+        def BuildClusterLocalRouteTemplateCacheKey(
+            ClusterIndex: int,
+        ) -> tuple[object, ...]:
+            """Identify reusable internal routing independently of the slot."""
+            Variant = SelectedClusterVariants[ClusterIndex]
+            return (
+                ClusterStructuralSignatures.get(ClusterIndex, ""),
+                tuple(sorted(Clusters[ClusterIndex])),
+                Variant.Rotation,
+                Variant.MirrorX,
+                repr(PackingPolicy),
+            )
+
+        ReusedLocalRouteSignals: set[str] = set()
+        TemplateReuseDiagnostics: dict[str, object] = {
+            "Enabled": EnableClusterLocalRouteReuse,
+            "Clusters": {},
+        }
+        if EnableClusterLocalRouteReuse and not PlacementScoringOnly:
+            for ClusterIndex, ClusterNames in enumerate(Clusters):
+                CacheKey = BuildClusterLocalRouteTemplateCacheKey(ClusterIndex)
+                Template = _ClusterLocalRouteTemplateCache.get(CacheKey)
+                ClusterDiagnostic: dict[str, object] = {
+                    "CacheKey": sha256(repr(CacheKey).encode("utf-8")).hexdigest(),
+                }
+                TemplateReuseDiagnostics["Clusters"][str(ClusterIndex)] = (
+                    ClusterDiagnostic
+                )
+                if Template is None:
+                    ClusterDiagnostic.update({"Cache": "miss"})
+                    continue
+                Delta = tuple(
+                    ClusterOrigins[ClusterIndex][Axis] - Template.Origin[Axis]
+                    for Axis in range(3)
+                )
+                TranslatedClaims = tuple(
+                    TranslateClusterLocalRouteClaim(Claim, Delta)
+                    for Claim in Template.Claims
+                )
+                try:
+                    if not TranslatedClaims:
+                        raise ValueError("template has no internal claims")
+                    for Claim in TranslatedClaims:
+                        Producer = Producers.get(Claim.Signal)
+                        if (
+                            Claim.ClusterId != ClusterIndex
+                            or Producer is None
+                            or Producer.OutputPin != Claim.Root
+                            or any(
+                                ClusterByGate.get(GateByInputPin.get(Target))
+                                != ClusterIndex
+                                for Target in Claim.ConnectedTargets
+                            )
+                        ):
+                            raise ValueError("instantiated local topology differs")
+                        ValidateLocalSignalStrength(Claim)
+                        ValidateLocalPhysicalConnectivity(Claim)
+                        ValidateContinuationPortal(
+                            Claim,
+                            TargetsBySignal.get(Claim.Signal, []),
+                        )
+                        ValidateBoundaryEscapes(Claim)
+                    ValidateLocalRouteClaims(
+                        LocalResourceGraph,
+                        (*LocalRouteClaims, *TranslatedClaims),
+                    )
+                except ValueError as Error:
+                    ClusterDiagnostic.update({
+                        "Cache": "rejected",
+                        "Validation": str(Error),
+                    })
+                    continue
+                LocalRouteClaims.extend(TranslatedClaims)
+                ReusedLocalRouteSignals.update(
+                    Claim.Signal for Claim in TranslatedClaims
+                )
+                ClusterDiagnostic.update({
+                    "Cache": "hit",
+                    "Delta": list(Delta),
+                    "ReusedLocalClaimCount": len(TranslatedClaims),
+                    "RegeneratedBoundarySignals": sorted({
+                        Claim.Signal
+                        for Claim in TranslatedClaims
+                        if not set(TargetsBySignal.get(Claim.Signal, ())).issubset(
+                            Claim.ConnectedTargets
+                        )
+                    }),
+                    "Validation": "accepted",
+                })
+        if EnableClusterLocalRouteReuse:
+            LocalRouteDiagnostics["__ClusterLocalRouteTemplates__"] = (
+                TemplateReuseDiagnostics
+            )
+        LocalRouteSignals = (
+            ()
+            if PlacementScoringOnly
+            else sorted(
+                TargetsBySignal.items(),
+                key=lambda Value: (
+                    0
+                    if Producers.get(Value[0]) is not None
+                    and Producers[Value[0]].Kind == "NAND"
+                    else 1,
+                    -len(set(Value[1])),
+                    Value[0],
+                ),
+            )
+        )
+        for Signal, Targets in LocalRouteSignals:
+            if Signal in ReusedLocalRouteSignals:
+                continue
             CheckWork(
                 "local-route-signal",
                 Signal=Signal,
@@ -4343,6 +13392,26 @@ def PlacePcbGraph(
                     == ProducerCluster
                 ]
             if not Targets:
+                continue
+            if ShouldReleasePartialLocalTreeBeforeSearch(
+                ClusterCount=len(Clusters),
+                HasRelocationSignals=bool(RelocationSignals),
+                LocalTargetCount=len(Targets),
+                TotalTargetCount=len(AllTargets),
+            ):
+                # Feedback placements deliberately release every partial
+                # inter-cluster tree to the global router below. Searching
+                # and validating a local branch cannot change that verdict,
+                # so avoid repeating bounded BFS work for every retained
+                # slot/orientation state.
+                LocalRouteDiagnostics.setdefault(Signal, {}).update({
+                    "ReleasedForGlobalRelocation": (
+                        ProducerCluster
+                        if ProducerCluster is not None
+                        else -1
+                    ),
+                    "ReleasedBeforeLocalSearch": True,
+                })
                 continue
             Root = Producer.OutputPin
             Paths = []
@@ -4604,7 +13673,16 @@ def PlacePcbGraph(
                     len(Path) - 1 > MaximumLength for Path in Paths
                 ),
             })
-        if PackingPolicy.EnableJointLocalRouting:
+        if PlacementScoringOnly:
+            LocalRouteDiagnostics["__DeferredLocalRouting__"] = {
+                "Enabled": True,
+                "ScoringOnly": True,
+                "TerminalsIncluded": True,
+                "FixedPinAccessClaimsIncluded": True,
+                "LocalRouteCandidateSearchDeferred": True,
+                "LocalRoutePathSearchDeferred": True,
+            }
+        elif PackingPolicy.EnableJointLocalRouting:
             JointDiagnostics: dict[str, object] = {
                 "Enabled": True,
                 "CandidateLimitPerSignal": (
@@ -4705,7 +13783,7 @@ def PlacePcbGraph(
         Placed.LocalNetBranches = LocalNetBranches
         Placed.LocalNetTargets = LocalNetTargets
         Placed.LocalRouteClaims = tuple(LocalRouteClaims)
-        if RelocationSignals:
+        if RelocationSignals or AssignmentCut is not None:
             LocalRouteDiagnostics["__PlacementRelocation__"] = {
                 "Signals": sorted(RelocationSignals),
                 "PrioritySignals": sorted(RelocationPrioritySignals),
@@ -4713,6 +13791,26 @@ def PlacePcbGraph(
                 "Variant": RelocationVariant,
                 "Clusters": sorted(PhysicallyRelocatedClusters),
                 "MirroredClusters": sorted(MirroredRelocationClusters),
+                "AssignmentCut": (
+                    AssignmentCut.ToDictionary()
+                    if AssignmentCut is not None
+                    else None
+                ),
+                "ActivePlacementConstraints": (
+                    AssignmentConstraints.ToDictionary()
+                ),
+                "CoordinatedCandidateDiversificationSignals": sorted(
+                    CoordinatedCandidateDiversificationSignals
+                ),
+                "CoordinatedCandidateDiversityLevel": (
+                    1
+                    if CoordinatedCandidateDiversificationSignals
+                    else 0
+                ),
+                "InternalPinBankGeometryRepair": {
+                    "Enabled": EnableInternalPinBankGeometryRepair,
+                    "Signals": sorted(InternalPinBankGeometrySignals),
+                },
             }
         Placed.LocalRouteDiagnostics = LocalRouteDiagnostics
     if RoutingSpacing == 0:
@@ -4748,6 +13846,15 @@ def PlacePcbGraph(
     ClaimsByCluster: dict[int, list[LocalRouteClaim]] = {}
     for Claim in Placed.LocalRouteClaims:
         ClaimsByCluster.setdefault(Claim.ClusterId, []).append(Claim)
+    CutBoundaryEscapeSignals = (
+        frozenset(BuildAssignmentCutHigherOrderSignalSet(AssignmentCut))
+        if EnableClusterInterfacePlacementFeasibility
+        else frozenset()
+    )
+    CutBoundaryEscapeDomains: dict[
+        tuple[int, str],
+        tuple[BoundaryEscapeCandidate, ...],
+    ] = {}
     for ClusterIndex, Names in enumerate(Clusters):
         CheckWork(
             "boundary-capacity",
@@ -4876,6 +13983,7 @@ def PlacePcbGraph(
             * BoundaryLayerCapacity,
         }
         LegalPortalSlotsBySide = dict(GeometricCapacity)
+        LegalEscapeCandidateCounts: tuple[tuple[str, int], ...] = ()
         if PackedMode:
             AccessPositionsBySignal = {
                 Signal: set(
@@ -4883,24 +13991,34 @@ def PlacePcbGraph(
                 )
                 for Signal in BoundarySignals
             }
-            for Claim in ClaimsByCluster.get(ClusterIndex, ()):
-                if Claim.Signal not in BoundarySignals:
-                    continue
-                AccessPositionsBySignal.setdefault(
-                    Claim.Signal,
-                    set(),
-                ).update(Claim.BoundaryNodes)
+            BoundaryEscapeCandidatesBySignal: dict[
+                str, list[BoundaryEscapeCandidate]
+            ] = {}
             LegalEscapeSlotsBySignal = BuildLegalBoundaryEscapeSlots(
                 BoundarySignals,
                 AccessPositionsBySignal,
                 LocalResourceGraph,
                 AccessClaimsBySignal,
                 WorkCheck=WorkCheck,
+                CandidateClaimsBySignal=(
+                    BoundaryEscapeCandidatesBySignal
+                    if CutBoundaryEscapeSignals
+                    else None
+                ),
             )
+            for Signal in sorted(
+                CutBoundaryEscapeSignals.intersection(BoundarySignals)
+            ):
+                CutBoundaryEscapeDomains[(ClusterIndex, Signal)] = tuple(
+                    BoundaryEscapeCandidatesBySignal.get(Signal, ())
+                )
             HardBoundary = EvaluateHardBoundaryFeasibility(
                 ClusterIndex,
                 BoundaryDemandRecords,
                 LegalEscapeSlotsBySignal,
+            )
+            LegalEscapeCandidateCounts = (
+                HardBoundary.LegalEscapeCandidateCounts
             )
             ValidateHardBoundaryFeasibility(HardBoundary)
             SlotsBySide = {
@@ -5012,13 +14130,144 @@ def PlacePcbGraph(
                 BoundaryCapacityRecords=BoundaryCapacityRecords,
                 BoundaryOverflow=BoundaryOverflow,
                 PinScarcityCount=PinScarcityCount,
+                LegalEscapeCandidateCounts=LegalEscapeCandidateCounts,
+                OrientationRotation=SelectedClusterVariants[ClusterIndex].Rotation,
+                OrientationMirrorX=SelectedClusterVariants[ClusterIndex].MirrorX,
             )
         )
+    if CutBoundaryEscapeSignals:
+        CutBoundaryEscapeFeasibility = (
+            EvaluateCutBoundaryEscapeFeasibility(
+                CutBoundaryEscapeDomains,
+                CutBoundaryEscapeSignals,
+            )
+        )
+        Guided.Placed.LocalRouteDiagnostics.setdefault(
+            "__CutBoundaryEscapeFeasibility__",
+            CutBoundaryEscapeFeasibility.ToDictionary(),
+        )
+    if Guided.Placed.LocalRouteDiagnostics is None:
+        Guided.Placed.LocalRouteDiagnostics = {}
+    Guided.Placed.LocalRouteDiagnostics["__ComponentGraph__"] = (
+        LogicalComponentGraph.ToDictionary()
+    )
     CheckWork("complete", ClusterCount=len(Clusters))
+    BoundaryLeaseRequests = (
+        BuildClusterBoundaryLeaseRequests(
+            BuildClusterBoundaryBundles(Module, Clusters),
+            Assignment,
+            Module=Module,
+            Clusters=Clusters,
+            PlacedGates=Guided.Placed.PlacedGates,
+            IncludePrimaryTerminals=(
+                EnableClusterInterfacePlacementFeasibility
+            ),
+        )
+        if PackedMode and EnableClusterBoundaryLeases
+        else ()
+    )
+    ClusterLocalRouteTemplates = tuple(
+        ClusterLocalRouteTemplate(
+            ClusterId=Cluster.ClusterId,
+            StructuralSignature=Cluster.StructuralSignature,
+            Rotation=Cluster.OrientationRotation,
+            MirrorX=Cluster.OrientationMirrorX,
+            Origin=(
+                min(
+                    Gate.X for Gate in Guided.Placed.PlacedGates
+                    if Gate.Name in Cluster.MemberNands
+                ),
+                Cluster.BaseY,
+                min(
+                    Gate.Z for Gate in Guided.Placed.PlacedGates
+                    if Gate.Name in Cluster.MemberNands
+                ),
+            ),
+            LocalClaimFingerprint=sha256(repr(tuple(sorted(
+                (
+                    Claim.Signal,
+                    Claim.Root,
+                    Claim.ConnectedTargets,
+                    Claim.BoundaryNodes,
+                    tuple(sorted(Claim.Nodes)),
+                    tuple(sorted(Claim.Edges)),
+                )
+                for Claim in Guided.Placed.LocalRouteClaims
+                if Claim.ClusterId == Cluster.ClusterId
+            ))).encode("utf-8")).hexdigest(),
+            BoundaryTerminalFingerprint=sha256(repr(
+                Cluster.BoundaryTerminals
+            ).encode("utf-8")).hexdigest(),
+            ClaimCount=sum(
+                Claim.ClusterId == Cluster.ClusterId
+                for Claim in Guided.Placed.LocalRouteClaims
+            ),
+            BoundaryTerminalCount=len(Cluster.BoundaryTerminals),
+        )
+        for Cluster in PackedClusters
+    ) if PackedMode else ()
+    if PackedMode and not PlacementScoringOnly:
+        for ClusterIndex, Cluster in enumerate(PackedClusters):
+            Claims = tuple(
+                Claim
+                for Claim in Guided.Placed.LocalRouteClaims
+                if Claim.ClusterId == ClusterIndex
+                and all(
+                    ClusterByGate.get(GateByInputPin.get(Target)) == ClusterIndex
+                    for Target in Claim.ConnectedTargets
+                )
+            )
+            if not Claims:
+                continue
+            CacheKey = BuildClusterLocalRouteTemplateCacheKey(ClusterIndex)
+            LocalClaimFingerprint = sha256(repr(tuple(sorted(
+                (
+                    Claim.Signal,
+                    Claim.Root,
+                    Claim.ConnectedTargets,
+                    Claim.BoundaryNodes,
+                    tuple(sorted(Claim.Nodes)),
+                    tuple(sorted(Claim.Edges)),
+                )
+                for Claim in Claims
+            ))).encode("utf-8")).hexdigest()
+            _ClusterLocalRouteTemplateCache[CacheKey] = (
+                ClusterLocalRouteTemplateCacheEntry(
+                    CacheKey=CacheKey,
+                    Origin=ClusterOrigins[ClusterIndex],
+                    Claims=Claims,
+                    LocalClaimFingerprint=LocalClaimFingerprint,
+                )
+            )
+        if EnableClusterLocalRouteReuse:
+            Guided.Placed.LocalRouteDiagnostics.setdefault(
+                "__ClusterLocalRouteTemplates__", {}
+            )["CacheEntryCount"] = len(_ClusterLocalRouteTemplateCache)
     return PcbPlacement(
-        Placed=Guided.Placed,
+        Placed=PlacedDesign(
+            Module=Guided.Placed.Module,
+            PlacedGates=Guided.Placed.PlacedGates,
+            RouteGuides=Guided.Placed.RouteGuides,
+            RouteLayers=Guided.Placed.RouteLayers,
+            FrozenNetWires=Guided.Placed.FrozenNetWires,
+            LocalNetBranches=Guided.Placed.LocalNetBranches,
+            LocalNetTargets=Guided.Placed.LocalNetTargets,
+            LocalRouteClaims=Guided.Placed.LocalRouteClaims,
+            LocalRouteDiagnostics=Guided.Placed.LocalRouteDiagnostics,
+            ClusterBoundaryLeaseRequests=BoundaryLeaseRequests,
+            CompleteClusterInterfaceAccess=(
+                EnableClusterInterfacePlacementFeasibility
+            ),
+            ComponentGraph=LogicalComponentGraph,
+        ),
         Clusters=Clusters,
         SignalOrder=Guided.SignalOrder,
         LayerCount=Guided.LayerCount,
         PackedClusters=tuple(PackedClusters) if PackedMode else (),
+        ClusterBoundaryLeaseRequests=BoundaryLeaseRequests,
+        ClusterLocalRouteTemplates=ClusterLocalRouteTemplates,
+        CompleteClusterInterfaceAccess=(
+            EnableClusterInterfacePlacementFeasibility
+        ),
+        ComponentGraph=LogicalComponentGraph,
     )

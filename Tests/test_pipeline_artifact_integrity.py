@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from Compiler.Pipeline import (
+    BuildRoutingFailureArtifactSnapshot,
     BuildSuccessRouterReliability,
     ClearStaleSuccessArtifacts,
     CompileSvToLitematic,
@@ -23,6 +24,27 @@ from Compiler.Routing.Policy import RoutingStrategy
 
 
 class PipelineArtifactIntegrityTests(unittest.TestCase):
+    def testFailureArtifactSnapshotDoesNotDuplicateAggregateEvidence(
+        self,
+    ) -> None:
+        Failure = RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="TrackAssignment",
+            Diagnostics={
+                "ConflictGraph": {"ConflictSignals": ["A", "B"]},
+                "PlacementAttempts": [{"CandidateId": "Placement-001"}],
+                "EscalationHistory": [{"Action": "retry"}],
+                "AdaptiveEscalationHistory": [{"Action": "legacy-retry"}],
+            },
+        )
+
+        Snapshot = BuildRoutingFailureArtifactSnapshot(Failure)
+
+        self.assertEqual(
+            Snapshot["Diagnostics"],
+            {"ConflictGraph": {"ConflictSignals": ["A", "B"]}},
+        )
+
     def testFailureAndSuccessReliabilityUseParallelEvidence(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Directory = Path(DirectoryValue)
@@ -72,7 +94,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
             )
             FailurePath = WriteRoutingFailureArtifact(
                 OutputPath=OutputPath,
-                RequestedStrategy=RoutingStrategy.NewRouterFirst,
+                RequestedStrategy=RoutingStrategy.Default,
                 Failure=Failure,
                 StartedAt=monotonic(),
                 InputPath=InputPath,
@@ -145,15 +167,15 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
             FailureDocument["NativeWork"],
         )
 
-    def testCompatibilityFailureArtifactNamesFrozenExplicitOracle(self) -> None:
+    def testDefaultFailureArtifactNamesAuthoritativePolicy(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
-            OutputPath = Path(DirectoryValue) / "Compatibility.litematic"
+            OutputPath = Path(DirectoryValue) / "Default.litematic"
             FailurePath = WriteRoutingFailureArtifact(
                 OutputPath=OutputPath,
-                RequestedStrategy=RoutingStrategy.Compatibility,
+                RequestedStrategy=RoutingStrategy.Default,
                 Failure=RoutingFailure(
                     Reason=RoutingFailureReason.DetailedSearchExhausted,
-                    Stage="CompatibilityOracle",
+                    Stage="AuthoritativeRouter",
                     Detail="controlled failure",
                 ),
                 StartedAt=monotonic(),
@@ -161,13 +183,13 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
             Document = json.loads(FailurePath.read_text(encoding="utf-8"))
 
         self.assertEqual(Document["Strategy"], {
-            "Requested": "compatibility",
-            "Used": "compatibility",
+            "Requested": "default",
+            "Used": "default",
             "FallbackUsed": False,
         })
         self.assertEqual(
             Document["Policy"]["PolicyVersion"],
-            "physical-design-v1-compatibility",
+            "physical-design-v16-reconvergent-access",
         )
 
     def testTypedRoutingFailureEscapesAndLeavesOnlyFailureArtifact(self) -> None:

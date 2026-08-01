@@ -147,6 +147,8 @@ class PortalReservation:
     SlotIndex: int
     PortalId: str
     Claims: RoutingResourceClaims
+    Purpose: str = "boundary-portal"
+    FirstSegment: tuple[Position3, ...] = ()
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -156,6 +158,8 @@ class PortalReservation:
             "SlotIndex": self.SlotIndex,
             "PortalId": self.PortalId,
             "ClaimCount": len(self.Claims.ResourceIds),
+            "Purpose": self.Purpose,
+            "FirstSegment": [list(Value) for Value in self.FirstSegment],
         }
 
 
@@ -300,6 +304,13 @@ class RoutingResourceGraph:
             frozenset[Position2] | None,
             frozenset[Position3],
         ]
+    ] = field(default_factory=list, repr=False)
+    _RouteClaimsCache: dict[
+        frozenset[Position3],
+        RoutingResourceClaims,
+    ] = field(default_factory=dict, repr=False)
+    _RouteClaimsCacheOrder: list[
+        frozenset[Position3],
     ] = field(default_factory=list, repr=False)
 
     @cached_property
@@ -547,15 +558,22 @@ class RoutingResourceGraph:
         Positions: Iterable[Position3],
         WorkCheck: Callable[[dict[str, object]], None] | None = None,
     ) -> RoutingResourceClaims:
-        WireCells: set[Position3] = set()
-        for PositionIndex, Position in enumerate(Positions, start=1):
-            WireCells.add(Position)
-            if WorkCheck is not None and PositionIndex % 256 == 0:
-                WorkCheck({
-                    "Phase": "collect-wire-cells",
-                    "ProcessedPositions": PositionIndex,
-                    "WireCellCount": len(WireCells),
-                })
+        if WorkCheck is None:
+            WireCells = frozenset(Positions)
+            Cached = self._RouteClaimsCache.get(WireCells)
+            if Cached is not None:
+                return Cached
+        else:
+            CollectedWireCells: set[Position3] = set()
+            for PositionIndex, Position in enumerate(Positions, start=1):
+                CollectedWireCells.add(Position)
+                if PositionIndex % 256 == 0:
+                    WorkCheck({
+                        "Phase": "collect-wire-cells",
+                        "ProcessedPositions": PositionIndex,
+                        "WireCellCount": len(CollectedWireCells),
+                    })
+            WireCells = frozenset(CollectedWireCells)
         SupportCells: set[Position3] = set()
         RequiredAirCells: set[Position3] = set()
         ElectricalCells = set(WireCells)
@@ -575,12 +593,20 @@ class RoutingResourceGraph:
                 Primitive = self.BuildPrimitive(First, Second)
                 if Primitive is not None:
                     RequiredAirCells.update(Primitive.Claims.RequiredAirCells)
-        return RoutingResourceClaims(
-            WireCells=frozenset(WireCells),
+        Result = RoutingResourceClaims(
+            WireCells=WireCells,
             SupportCells=frozenset(SupportCells),
             RequiredAirCells=frozenset(RequiredAirCells),
             ElectricalCells=frozenset(ElectricalCells),
         )
+        if WorkCheck is None:
+            self._RouteClaimsCache[WireCells] = Result
+            self._RouteClaimsCacheOrder.append(WireCells)
+            while len(self._RouteClaimsCacheOrder) > 4_096:
+                Evicted = self._RouteClaimsCacheOrder.pop(0)
+                if Evicted != WireCells:
+                    self._RouteClaimsCache.pop(Evicted, None)
+        return Result
 
     def BuildIndexedGraph(
         self,
@@ -673,6 +699,135 @@ def FindClaimConflicts(
             "Phase": "complete",
             "SignalPairChecks": SignalPairChecks,
             "ConflictResourceChecks": ConflictResourceChecks,
+            "ConflictCount": len(Result),
+        })
+    return Result
+
+
+def FindClaimConflictsByResourceIndex(
+    ClaimsBySignal: dict[str, RoutingResourceClaims],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> dict[RoutingResourceId, tuple[str, ...]]:
+    """Find the same cross-signal conflicts by indexing resource ownership.
+
+    Mandatory-access profiling compares many small signal claim sets.  The
+    pairwise implementation above is useful when callers need pair-progress
+    telemetry, but repeatedly intersecting four sets for every signal pair is
+    avoidable when the complete ownership map is already available.
+    """
+    Signals = sorted(ClaimsBySignal)
+    if WorkCheck is not None:
+        WorkCheck({"Phase": "start", "SignalCount": len(Signals)})
+
+    OwnersByKind: dict[
+        str,
+        dict[Position3, set[str]],
+    ] = {
+        "Wire": {},
+        "Support": {},
+        "Air": {},
+        "Electrical": {},
+    }
+    IndexedResourceCount = 0
+    for SignalIndex, Signal in enumerate(Signals, start=1):
+        Claims = ClaimsBySignal[Signal]
+        for Kind, Positions in (
+            ("Wire", Claims.WireCells),
+            ("Support", Claims.SupportCells),
+            ("Air", Claims.RequiredAirCells),
+            ("Electrical", Claims.ElectricalCells),
+        ):
+            OwnersByPosition = OwnersByKind[Kind]
+            for Position in Positions:
+                OwnersByPosition.setdefault(Position, set()).add(Signal)
+                IndexedResourceCount += 1
+                if (
+                    WorkCheck is not None
+                    and IndexedResourceCount % 256 == 0
+                ):
+                    WorkCheck({
+                        "Phase": "resource-index",
+                        "ProcessedSignals": SignalIndex - 1,
+                        "SignalCount": len(Signals),
+                        "IndexedResourceCount": IndexedResourceCount,
+                    })
+
+    Conflicts: dict[RoutingResourceId, set[str]] = {}
+    ConflictPairChecks = 0
+
+    def AddIndexedConflicts(
+        Kind: RoutingResourceKind,
+        FirstOwnersByPosition: dict[Position3, set[str]],
+        SecondOwnersByPosition: dict[Position3, set[str]],
+    ) -> None:
+        nonlocal ConflictPairChecks
+        SharedPositions = (
+            FirstOwnersByPosition.keys()
+            & SecondOwnersByPosition.keys()
+        )
+        for PositionIndex, Position in enumerate(
+            SharedPositions,
+            start=1,
+        ):
+            FirstOwners = FirstOwnersByPosition[Position]
+            SecondOwners = SecondOwnersByPosition[Position]
+            ConflictPairs = {
+                tuple(sorted((FirstSignal, SecondSignal)))
+                for FirstSignal in FirstOwners
+                for SecondSignal in SecondOwners
+                if FirstSignal != SecondSignal
+            }
+            if not ConflictPairs:
+                continue
+            ConflictPairChecks += len(ConflictPairs)
+            Conflicts.setdefault(
+                RoutingResourceId(Kind, Position),
+                set(),
+            ).update(
+                Signal
+                for Pair in ConflictPairs
+                for Signal in Pair
+            )
+            if WorkCheck is not None and PositionIndex % 256 == 0:
+                WorkCheck({
+                    "Phase": "indexed-conflict-resources",
+                    "Kind": Kind.value,
+                    "ProcessedPositions": PositionIndex,
+                    "SharedPositionCount": len(SharedPositions),
+                    "ConflictPairChecks": ConflictPairChecks,
+                })
+
+    AddIndexedConflicts(
+        RoutingResourceKind.Electrical,
+        OwnersByKind["Wire"],
+        OwnersByKind["Electrical"],
+    )
+    WireOrAirOwners = {
+        Position: set(Owners)
+        for Position, Owners in OwnersByKind["Wire"].items()
+    }
+    for Position, Owners in OwnersByKind["Air"].items():
+        WireOrAirOwners.setdefault(Position, set()).update(Owners)
+    AddIndexedConflicts(
+        RoutingResourceKind.Support,
+        OwnersByKind["Support"],
+        WireOrAirOwners,
+    )
+    AddIndexedConflicts(
+        RoutingResourceKind.Air,
+        OwnersByKind["Air"],
+        OwnersByKind["Wire"],
+    )
+
+    Result = {
+        Resource: tuple(sorted(Owners))
+        for Resource, Owners in Conflicts.items()
+    }
+    if WorkCheck is not None:
+        WorkCheck({
+            "Phase": "complete",
+            "IndexedResourceCount": IndexedResourceCount,
+            "ConflictPairChecks": ConflictPairChecks,
             "ConflictCount": len(Result),
         })
     return Result

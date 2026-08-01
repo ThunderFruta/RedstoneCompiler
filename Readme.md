@@ -62,15 +62,16 @@ algorithmic sources are recorded in
 See the [router reliability guide](Docs/Routing/Active/RouterReliabilityGuide.md) for
 the live verdict and reproducible commands.
 
-The current 2026-07-22 checkpoint is still **NOT ACCEPTED**. Negotiated routing
-is implemented without circuit-name or gate-name special cases, but the latest
-RCA4 run stalls at ten electrical conflicts after overflow progression
-`[124, 10, 10, 10, 10]`; its lazy graph contains 9,792 nodes and 47,552 edges.
-Two earlier working-tree RCA4 artifacts reached zero overflow and 512/512 rows
-with 26,978 cached nodes and 141,282 edges. That comparison identifies sparse
-region growth and retained-branch repair as the present regression, not a need
-for a circuit-specific exception. CLA4 remains behind the RCA4 gate. The
-2026-07-21 RRF-073 matrix remains the last complete durable acceptance record.
+The latest working-tree checkpoint (2026-07-23) is still **NOT ACCEPTED**. Negotiated
+routing is implemented without circuit-name or gate-name special cases, but the latest
+RCA4 diagnostic is from `RRF-078`, which still stalls on unresolved detailed routing
+conflicts; the prior 2026-07-22 RRF-076/RRF-077 artifacts used overflow progression
+`[124, 10, 10, 10, 10]` and 9,792 graph nodes / 47,552 edges before early routing exit.
+Two earlier working-tree RCA4 artifacts reached zero overflow and 512/512 rows with
+26,978 cached nodes and 141,282 edges. That comparison identifies sparse-region growth
+and retained-branch repair as the present regression, not a need for a circuit-specific
+exception. CLA4 remains gated behind RCA4. The 2026-07-21 RRF-073 matrix remains the last
+complete durable acceptance record.
 
 Each compile also writes a Graphviz `.dot` file beside the NAND JSON diagram
 and a `.PhysicalDesign.json` file beside the litematic. The latter records the

@@ -4,10 +4,13 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
 
-const MAXIMUM_EXPANSIONS: usize = 1_000_000;
+const MAXIMUM_EXPANSIONS: usize = 2_000_000;
 const HEURISTIC_WEIGHT: i32 = 4;
 pub(crate) const MAXIMUM_UNREFRESHED_DUST_LENGTH: u8 = 15;
 const REPEATER_SEARCH_PENALTY: i32 = 24;
+// Preserve the proven three-unit refresh window so straight routes place the
+// minimum required repeaters while retaining room for a legal final refresh.
+pub(crate) const REPEATER_TURN_HEADROOM: u8 = 3;
 pub(crate) const BLOCKED_EDGE_COST: i32 = 1_000_000_000;
 
 pub(crate) fn NormalizeEdge(First: Position, Second: Position) -> Edge {
@@ -243,13 +246,7 @@ pub(crate) fn FindPathDetailedWithDeadline(
         }
     };
     if Deadline.Check() {
-        return Some(Failure(
-            "BudgetExpired",
-            "BudgetExpired",
-            0,
-            0,
-            0,
-        ));
+        return Some(Failure("BudgetExpired", "BudgetExpired", 0, 0, 0));
     }
     let StartDirection = (0, 0, 0);
     let StartStates: Vec<_> = Starts
@@ -299,7 +296,7 @@ fn CanTraverseTargetContinuation(
             && CurrentState.1 == Direction
             && Direction.1 == 0
             && CurrentState.0 .1 == Next.1
-            && CurrentState.2 <= 3;
+            && CurrentState.2 <= REPEATER_TURN_HEADROOM;
         let RemainingStrength = if !EnforceSignalStrength {
             MAXIMUM_UNREFRESHED_DUST_LENGTH
         } else if CanPlaceRepeater {
@@ -570,14 +567,14 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
                 && Item.IncomingDirection == OutgoingDirection
                 && Item.IncomingDirection.1 == 0
                 && Current.1 == Neighbor.1
-                && Item.RemainingStrength <= 3;
+                && Item.RemainingStrength <= REPEATER_TURN_HEADROOM;
             let mut StrengthOptions = Vec::with_capacity(2);
             if !RequiresStrengthState {
                 StrengthOptions.push((MAXIMUM_UNREFRESHED_DUST_LENGTH, 0));
             } else if CanPlaceRepeater {
                 // Commit the first legal site in the final three strength
-                // units. Keeping both dust and repeater successors multiplied
-                // otherwise identical A* states without improving legality.
+                // units; retaining both successors multiplies equivalent A*
+                // states without improving straight-route legality.
                 StrengthOptions
                     .push((MAXIMUM_UNREFRESHED_DUST_LENGTH - 1, REPEATER_SEARCH_PENALTY));
             } else if Item.RemainingStrength > 1 {

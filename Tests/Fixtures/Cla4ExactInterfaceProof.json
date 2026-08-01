@@ -1,0 +1,60 @@
+{
+  "SchemaVersion": "cla4-exact-interface-proof-v1",
+  "Circuit": "CarryLookaheadAdder4",
+  "AcceptedOutcomes": [
+    "completed-artifact",
+    "exact-proof"
+  ],
+  "ExactProof": {
+    "ProofFingerprint": "3f11c5e51405355b",
+    "AttemptedStateCount": 3,
+    "BroadFallbackAllowed": false,
+    "ExecutableRepairAllowed": false,
+    "StateProofs": [
+      {
+        "PlacementStateFingerprint": "5967a0b69b0a5bc1",
+        "Status": "ownership-unsatisfiable",
+        "TransformFingerprint": "f1c7097c0ef3705e",
+        "OwnershipUnsatCoreFingerprint": "64ce2411339c7145",
+        "AssignmentFingerprints": [
+          "4d32d40683343545",
+          "cab7df80b07b6c7d",
+          "f94f8524d998e233",
+          "c9443ce381f5ae75"
+        ]
+      },
+      {
+        "PlacementStateFingerprint": "23d8d00fabd5683c",
+        "Status": "realizability-unsatisfiable",
+        "TransformFingerprint": "4399a7fd2b056f71",
+        "OwnershipUnsatCoreFingerprint": "",
+        "AssignmentFingerprints": [
+          "d171421364b03063",
+          "e21be3df165ef702",
+          "46fb7a32b2300a96",
+          "0be7d08a2211dd9a"
+        ]
+      },
+      {
+        "PlacementStateFingerprint": "18ccd85af2c75808",
+        "Status": "realizability-unsatisfiable",
+        "TransformFingerprint": "8ee8a661bb3f07d6",
+        "OwnershipUnsatCoreFingerprint": "",
+        "AssignmentFingerprints": [
+          "407827350b34a3b6",
+          "724e19c1f4e2daf1",
+          "14b644da819d9fa9",
+          "74cf3676548153cc"
+        ]
+      }
+    ]
+  },
+  "ForbiddenExecutableResults": [
+    "transactional-endpoint-repair",
+    "coordinated-candidate-diversification",
+    "topology-cut-epoch-created",
+    "pin-bank-diversification",
+    "broad-placement-fallback",
+    "unpacked-placement-fallback"
+  ]
+}

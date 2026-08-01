@@ -2,7 +2,7 @@
 
 Status: active working-tree failure record
 
-Evidence date: 2026-07-22
+Evidence date: 2026-07-23
 
 This page describes what fails in the current negotiated-router checkpoint.
 It deliberately separates observed artifact facts from likely causes. Dated
@@ -28,6 +28,9 @@ RCA4 passes 2/2 with 512/512 rows and zero final conflicts.
 ## RRF-076 implementation checkpoint
 
 Primary current evidence:
+`/tmp/rca-request-100ms/RippleCarryAdder4.RoutingFailure.json` (RRF-078).
+Earlier current-tree checkpoints remain for continuity:
+`/tmp/rrf077-final-rca/RippleCarryAdder4.RoutingFailure.json`,
 `/tmp/rrf076-final2-rca4/RippleCarryAdder4.RoutingFailure.json`.
 
 The requested scheduling, dynamic-region, branch-state, native diagnostic,

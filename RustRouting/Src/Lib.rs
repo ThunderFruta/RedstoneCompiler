@@ -315,7 +315,9 @@ mod Tests {
     fn MrvAssignmentSelectsAZeroConflictAlternative() {
         let Candidate = |Id: &str, Wire: usize, Electrical: &[usize]| AssignmentCandidate {
             CandidateId: Id.to_string(),
-            Claims: ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
+            Claims: std::sync::Arc::new(
+                ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
+            ),
             MaterialCost: 1,
             FootprintGrowth: 1,
             Length: 1,
@@ -351,6 +353,8 @@ mod Tests {
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
+            &mut Vec::new(),
+            &mut false,
         ));
         assert!(!BudgetExhausted);
         assert!(Selected.contains(&("B".to_string(), "B1".to_string())));
@@ -360,7 +364,7 @@ mod Tests {
     fn AssignmentBudgetHardFails() {
         let Candidate = AssignmentCandidate {
             CandidateId: "A0".to_string(),
-            Claims: ClaimMask::FromIndices(4, &[0], &[], &[], &[0]).unwrap(),
+            Claims: std::sync::Arc::new(ClaimMask::FromIndices(4, &[0], &[], &[], &[0]).unwrap()),
             MaterialCost: 1,
             FootprintGrowth: 1,
             Length: 1,
@@ -387,6 +391,8 @@ mod Tests {
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
+            &mut Vec::new(),
+            &mut false,
         ));
         assert!(BudgetExhausted);
         assert_eq!(Failure, Some("A".to_string()));
@@ -396,7 +402,9 @@ mod Tests {
     fn ExhaustiveAssignmentFailureIsNotABudgetFailure() {
         let Candidate = |Id: &str| AssignmentCandidate {
             CandidateId: Id.to_string(),
-            Claims: ClaimMask::FromIndices(4, &[1], &[], &[], &[0, 1, 2]).unwrap(),
+            Claims: std::sync::Arc::new(
+                ClaimMask::FromIndices(4, &[1], &[], &[], &[0, 1, 2]).unwrap(),
+            ),
             MaterialCost: 1,
             FootprintGrowth: 1,
             Length: 1,
@@ -426,6 +434,8 @@ mod Tests {
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
+            &mut Vec::new(),
+            &mut false,
         ));
         assert!(!BudgetExhausted);
         assert_eq!(Expansions, 1);
@@ -438,7 +448,9 @@ mod Tests {
     fn AssignmentRespectsPreOwnedBaseClaims() {
         let Candidate = |Id: &str, Wire: usize, Electrical: &[usize]| AssignmentCandidate {
             CandidateId: Id.to_string(),
-            Claims: ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
+            Claims: std::sync::Arc::new(
+                ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
+            ),
             MaterialCost: 1,
             FootprintGrowth: 1,
             Length: 1,
@@ -472,6 +484,8 @@ mod Tests {
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
+            &mut Vec::new(),
+            &mut false,
         ));
         assert!(!BudgetExhausted);
         assert_eq!(
@@ -484,7 +498,9 @@ mod Tests {
     fn AssignmentMergesSameSignalBaseClaims() {
         let Candidate = AssignmentCandidate {
             CandidateId: "extension".to_string(),
-            Claims: ClaimMask::FromIndices(16, &[3], &[], &[], &[2, 3, 4]).unwrap(),
+            Claims: std::sync::Arc::new(
+                ClaimMask::FromIndices(16, &[3], &[], &[], &[2, 3, 4]).unwrap(),
+            ),
             MaterialCost: 1,
             FootprintGrowth: 1,
             Length: 1,
@@ -512,6 +528,8 @@ mod Tests {
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
+            &mut Vec::new(),
+            &mut false,
         ));
         assert!(!BudgetExhausted);
         assert_eq!(

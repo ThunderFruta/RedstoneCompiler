@@ -1,7 +1,799 @@
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::Models::{AssignmentCandidate, ClaimMask};
+use crate::RoutingThreadPool;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+
+type CandidateDomain = Vec<u64>;
+type CandidateCompatibility = Vec<Vec<Vec<CandidateDomain>>>;
+
+fn DomainWordCount(CandidateCount: usize) -> usize {
+    CandidateCount.div_ceil(64)
+}
+
+fn SetDomainBit(Domain: &mut CandidateDomain, CandidateIndex: usize) {
+    Domain[CandidateIndex / 64] |= 1u64 << (CandidateIndex % 64);
+}
+
+fn ClearDomainBit(Domain: &mut CandidateDomain, CandidateIndex: usize) {
+    Domain[CandidateIndex / 64] &= !(1u64 << (CandidateIndex % 64));
+}
+
+fn DomainContains(Domain: &CandidateDomain, CandidateIndex: usize) -> bool {
+    Domain[CandidateIndex / 64] & (1u64 << (CandidateIndex % 64)) != 0
+}
+
+fn DomainCount(Domain: &CandidateDomain) -> usize {
+    Domain.iter().map(|Value| Value.count_ones() as usize).sum()
+}
+
+fn DomainIsEmpty(Domain: &CandidateDomain) -> bool {
+    Domain.iter().all(|Value| *Value == 0)
+}
+
+fn IntersectDomain(Domain: &mut CandidateDomain, Mask: &CandidateDomain) {
+    for (Value, Allowed) in Domain.iter_mut().zip(Mask) {
+        *Value &= *Allowed;
+    }
+}
+
+fn IntersectionCount(First: &CandidateDomain, Second: &CandidateDomain) -> usize {
+    First
+        .iter()
+        .zip(Second)
+        .map(|(FirstWord, SecondWord)| (FirstWord & SecondWord).count_ones() as usize)
+        .sum()
+}
+
+fn EnforceArcConsistency(
+    SignalNames: &[String],
+    Compatibility: &CandidateCompatibility,
+    Domains: &mut [CandidateDomain],
+    Assigned: &[bool],
+    Deadline: &RuntimeDeadline,
+    FailureNet: &mut Option<String>,
+) -> bool {
+    let mut PropagationSteps = 0usize;
+    loop {
+        let mut Changed = false;
+        for FirstSignalIndex in 0..SignalNames.len() {
+            if Assigned[FirstSignalIndex] {
+                continue;
+            }
+            let CandidateCount = Compatibility[FirstSignalIndex].len();
+            for FirstCandidateIndex in 0..CandidateCount {
+                if !DomainContains(&Domains[FirstSignalIndex], FirstCandidateIndex) {
+                    continue;
+                }
+                for SecondSignalIndex in 0..SignalNames.len() {
+                    if Assigned[SecondSignalIndex] || SecondSignalIndex == FirstSignalIndex {
+                        continue;
+                    }
+                    PropagationSteps += 1;
+                    if PropagationSteps % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                        *FailureNet = Some(SignalNames[FirstSignalIndex].clone());
+                        return false;
+                    }
+                    if IntersectionCount(
+                        &Domains[SecondSignalIndex],
+                        &Compatibility[FirstSignalIndex][FirstCandidateIndex][SecondSignalIndex],
+                    ) == 0
+                    {
+                        ClearDomainBit(&mut Domains[FirstSignalIndex], FirstCandidateIndex);
+                        Changed = true;
+                        break;
+                    }
+                }
+            }
+            if DomainIsEmpty(&Domains[FirstSignalIndex]) {
+                *FailureNet = Some(SignalNames[FirstSignalIndex].clone());
+                return false;
+            }
+        }
+        if !Changed {
+            return !Deadline.Check();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn RecordIndexedDeadEnd(
+    Groups: &BTreeMap<String, Vec<AssignmentCandidate>>,
+    SignalNames: &[String],
+    Domains: &[CandidateDomain],
+    Selection: &[Option<usize>],
+    CurrentSignalIndex: usize,
+    CurrentCandidateIndex: usize,
+    FailingSignalIndex: usize,
+    FailureDepth: &mut usize,
+    FailureNet: &mut Option<String>,
+    ConflictSignals: &mut Vec<String>,
+    ConflictResources: &mut Vec<usize>,
+    Deadline: &RuntimeDeadline,
+) {
+    let Depth = Selection.iter().filter(|Value| Value.is_some()).count() + 1;
+    if Depth <= *FailureDepth || Deadline.Check() {
+        return;
+    }
+    *FailureDepth = Depth;
+    *FailureNet = Some(SignalNames[FailingSignalIndex].clone());
+    ConflictSignals.clear();
+    for (SignalIndex, CandidateIndex) in Selection.iter().enumerate() {
+        if CandidateIndex.is_some() {
+            ConflictSignals.push(SignalNames[SignalIndex].clone());
+        }
+    }
+    ConflictSignals.push(SignalNames[CurrentSignalIndex].clone());
+    ConflictSignals.push(SignalNames[FailingSignalIndex].clone());
+    ConflictSignals.sort();
+    ConflictSignals.dedup();
+
+    ConflictResources.clear();
+    let Candidate = &Groups[&SignalNames[CurrentSignalIndex]][CurrentCandidateIndex];
+    for OtherCandidateIndex in 0..Groups[&SignalNames[FailingSignalIndex]].len() {
+        if !DomainContains(&Domains[FailingSignalIndex], OtherCandidateIndex) {
+            continue;
+        }
+        let Some(Indices) = Candidate.Claims.ConflictIndicesWithDeadline(
+            &Groups[&SignalNames[FailingSignalIndex]][OtherCandidateIndex].Claims,
+            Deadline,
+        ) else {
+            return;
+        };
+        ConflictResources.extend(Indices);
+    }
+    ConflictResources.sort_unstable();
+    ConflictResources.dedup();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn AssignIndexedCandidateDomains(
+    Groups: &BTreeMap<String, Vec<AssignmentCandidate>>,
+    SignalNames: &[String],
+    Compatibility: &CandidateCompatibility,
+    Domains: &[CandidateDomain],
+    Assigned: &mut [bool],
+    Selection: &mut [Option<usize>],
+    BestSelection: &mut Vec<Option<usize>>,
+    ExpansionCount: &mut usize,
+    MaximumExpansionCount: usize,
+    BudgetExhausted: &mut bool,
+    Deadline: &RuntimeDeadline,
+    FailureDepth: &mut usize,
+    FailureNet: &mut Option<String>,
+    ConflictSignals: &mut Vec<String>,
+    ConflictResources: &mut Vec<usize>,
+) -> bool {
+    if *BudgetExhausted || Deadline.Check() {
+        return false;
+    }
+    let SelectionDepth = Selection.iter().filter(|Value| Value.is_some()).count();
+    if SelectionDepth > BestSelection.iter().filter(|Value| Value.is_some()).count() {
+        *BestSelection = Selection.to_vec();
+    }
+    if SelectionDepth == SignalNames.len() {
+        return true;
+    }
+
+    let mut SelectedSignal = None;
+    for SignalIndex in 0..SignalNames.len() {
+        if Assigned[SignalIndex] {
+            continue;
+        }
+        let Count = DomainCount(&Domains[SignalIndex]);
+        if Count == 0 {
+            *FailureNet = Some(SignalNames[SignalIndex].clone());
+            return false;
+        }
+        if SelectedSignal.is_none_or(|(BestIndex, BestCount)| {
+            (Count, &SignalNames[SignalIndex]) < (BestCount, &SignalNames[BestIndex])
+        }) {
+            SelectedSignal = Some((SignalIndex, Count));
+        }
+    }
+    let SignalIndex = SelectedSignal.unwrap().0;
+    let CandidateCount = Groups[&SignalNames[SignalIndex]].len();
+    let mut CandidateIndices = (0..CandidateCount)
+        .filter(|CandidateIndex| DomainContains(&Domains[SignalIndex], *CandidateIndex))
+        .map(|CandidateIndex| {
+            let CompatibleCounts = (0..SignalNames.len())
+                .filter(|OtherSignalIndex| {
+                    !Assigned[*OtherSignalIndex] && *OtherSignalIndex != SignalIndex
+                })
+                .map(|OtherSignalIndex| {
+                    IntersectionCount(
+                        &Domains[OtherSignalIndex],
+                        &Compatibility[SignalIndex][CandidateIndex][OtherSignalIndex],
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                CandidateIndex,
+                CompatibleCounts.iter().copied().min().unwrap_or(0),
+                CompatibleCounts.iter().sum::<usize>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    CandidateIndices.sort_by(
+        |(FirstIndex, FirstMinimum, FirstTotal), (SecondIndex, SecondMinimum, SecondTotal)| {
+            (
+                std::cmp::Reverse(*FirstMinimum),
+                std::cmp::Reverse(*FirstTotal),
+                *FirstIndex,
+            )
+                .cmp(&(
+                    std::cmp::Reverse(*SecondMinimum),
+                    std::cmp::Reverse(*SecondTotal),
+                    *SecondIndex,
+                ))
+        },
+    );
+    for (CandidateIndex, _MinimumCompatible, _TotalCompatible) in CandidateIndices {
+        if Deadline.Check() {
+            *FailureNet = Some(SignalNames[SignalIndex].clone());
+            return false;
+        }
+        *ExpansionCount += 1;
+        if *ExpansionCount > MaximumExpansionCount {
+            *BudgetExhausted = true;
+            *FailureNet = Some(SignalNames[SignalIndex].clone());
+            return false;
+        }
+
+        let mut NextDomains = Domains.to_vec();
+        let mut Consistent = true;
+        for OtherSignalIndex in 0..SignalNames.len() {
+            if Assigned[OtherSignalIndex] || OtherSignalIndex == SignalIndex {
+                continue;
+            }
+            IntersectDomain(
+                &mut NextDomains[OtherSignalIndex],
+                &Compatibility[SignalIndex][CandidateIndex][OtherSignalIndex],
+            );
+            if DomainIsEmpty(&NextDomains[OtherSignalIndex]) {
+                let mut FailureSelection = Selection.to_vec();
+                FailureSelection[SignalIndex] = Some(CandidateIndex);
+                if FailureSelection
+                    .iter()
+                    .filter(|Value| Value.is_some())
+                    .count()
+                    > BestSelection.iter().filter(|Value| Value.is_some()).count()
+                {
+                    *BestSelection = FailureSelection;
+                }
+                RecordIndexedDeadEnd(
+                    Groups,
+                    SignalNames,
+                    Domains,
+                    Selection,
+                    SignalIndex,
+                    CandidateIndex,
+                    OtherSignalIndex,
+                    FailureDepth,
+                    FailureNet,
+                    ConflictSignals,
+                    ConflictResources,
+                    Deadline,
+                );
+                Consistent = false;
+                break;
+            }
+        }
+        if !Consistent {
+            continue;
+        }
+        Assigned[SignalIndex] = true;
+        Selection[SignalIndex] = Some(CandidateIndex);
+        let ShouldPropagate = Selection.iter().filter(|Value| Value.is_some()).count() >= 2;
+        if ShouldPropagate
+            && !EnforceArcConsistency(
+                SignalNames,
+                Compatibility,
+                &mut NextDomains,
+                Assigned,
+                Deadline,
+                FailureNet,
+            )
+        {
+            ConflictSignals.clear();
+            for (SelectedSignalIndex, SelectedCandidateIndex) in Selection.iter().enumerate() {
+                if SelectedCandidateIndex.is_some() {
+                    ConflictSignals.push(SignalNames[SelectedSignalIndex].clone());
+                }
+            }
+            if let Some(FailingSignal) = FailureNet.as_ref() {
+                ConflictSignals.push(FailingSignal.clone());
+            }
+            ConflictSignals.sort();
+            ConflictSignals.dedup();
+            let mut FailureSelection = Selection.to_vec();
+            if FailureSelection
+                .iter()
+                .filter(|Value| Value.is_some())
+                .count()
+                > BestSelection.iter().filter(|Value| Value.is_some()).count()
+            {
+                *BestSelection = std::mem::take(&mut FailureSelection);
+            }
+            Assigned[SignalIndex] = false;
+            Selection[SignalIndex] = None;
+            if Deadline.WasExceeded() {
+                return false;
+            }
+            continue;
+        }
+        if AssignIndexedCandidateDomains(
+            Groups,
+            SignalNames,
+            Compatibility,
+            &NextDomains,
+            Assigned,
+            Selection,
+            BestSelection,
+            ExpansionCount,
+            MaximumExpansionCount,
+            BudgetExhausted,
+            Deadline,
+            FailureDepth,
+            FailureNet,
+            ConflictSignals,
+            ConflictResources,
+        ) {
+            return true;
+        }
+        Assigned[SignalIndex] = false;
+        Selection[SignalIndex] = None;
+        if *BudgetExhausted || Deadline.WasExceeded() {
+            return false;
+        }
+    }
+    false
+}
+
+fn BuildGreedyMaximalIndexedSelection(
+    SignalNames: &[String],
+    Compatibility: &CandidateCompatibility,
+    Domains: &[CandidateDomain],
+    Deadline: &RuntimeDeadline,
+    Seed: Option<(usize, usize)>,
+) -> Vec<Option<usize>> {
+    let mut RemainingDomains = Domains.to_vec();
+    let mut Completed = vec![false; SignalNames.len()];
+    let mut Selection = vec![None; SignalNames.len()];
+    if let Some((SignalIndex, CandidateIndex)) = Seed {
+        if SignalIndex >= SignalNames.len()
+            || CandidateIndex >= Compatibility[SignalIndex].len()
+            || !DomainContains(&RemainingDomains[SignalIndex], CandidateIndex)
+        {
+            return Selection;
+        }
+        Completed[SignalIndex] = true;
+        Selection[SignalIndex] = Some(CandidateIndex);
+        for OtherSignalIndex in 0..SignalNames.len() {
+            if OtherSignalIndex == SignalIndex {
+                continue;
+            }
+            IntersectDomain(
+                &mut RemainingDomains[OtherSignalIndex],
+                &Compatibility[SignalIndex][CandidateIndex][OtherSignalIndex],
+            );
+        }
+    }
+    while Completed.iter().any(|Value| !*Value) {
+        if Deadline.Check() {
+            break;
+        }
+        let Some(SignalIndex) = (0..SignalNames.len())
+            .filter(|Index| !Completed[*Index])
+            .min_by_key(|Index| (DomainCount(&RemainingDomains[*Index]), &SignalNames[*Index]))
+        else {
+            break;
+        };
+        Completed[SignalIndex] = true;
+        if DomainIsEmpty(&RemainingDomains[SignalIndex]) {
+            continue;
+        }
+        let CandidateCount = Compatibility[SignalIndex].len();
+        let SelectedCandidateIndex = (0..CandidateCount)
+            .filter(|CandidateIndex| {
+                DomainContains(&RemainingDomains[SignalIndex], *CandidateIndex)
+            })
+            .map(|CandidateIndex| {
+                let CompatibleCounts = (0..SignalNames.len())
+                    .filter(|OtherSignalIndex| {
+                        !Completed[*OtherSignalIndex] && *OtherSignalIndex != SignalIndex
+                    })
+                    .map(|OtherSignalIndex| {
+                        IntersectionCount(
+                            &RemainingDomains[OtherSignalIndex],
+                            &Compatibility[SignalIndex][CandidateIndex][OtherSignalIndex],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    CandidateIndex,
+                    CompatibleCounts.iter().copied().min().unwrap_or(0),
+                    CompatibleCounts.iter().sum::<usize>(),
+                )
+            })
+            .max_by_key(|(CandidateIndex, MinimumCompatible, TotalCompatible)| {
+                (
+                    *MinimumCompatible,
+                    *TotalCompatible,
+                    std::cmp::Reverse(*CandidateIndex),
+                )
+            })
+            .map(|Value| Value.0);
+        let Some(CandidateIndex) = SelectedCandidateIndex else {
+            continue;
+        };
+        Selection[SignalIndex] = Some(CandidateIndex);
+        for OtherSignalIndex in 0..SignalNames.len() {
+            if Completed[OtherSignalIndex] {
+                continue;
+            }
+            IntersectDomain(
+                &mut RemainingDomains[OtherSignalIndex],
+                &Compatibility[SignalIndex][CandidateIndex][OtherSignalIndex],
+            );
+        }
+    }
+    Selection
+}
+
+#[allow(clippy::too_many_arguments)]
+fn SearchMaximumPartialIndexedSelection(
+    SignalNames: &[String],
+    Compatibility: &CandidateCompatibility,
+    Domains: &[CandidateDomain],
+    Completed: &mut [bool],
+    Selection: &mut [Option<usize>],
+    BestSelection: &mut Vec<Option<usize>>,
+    ExpansionCount: &mut usize,
+    MaximumExpansionCount: usize,
+    Deadline: &RuntimeDeadline,
+) {
+    if *ExpansionCount >= MaximumExpansionCount || Deadline.Check() {
+        return;
+    }
+    let SelectionCount = Selection.iter().filter(|Value| Value.is_some()).count();
+    let BestCount = BestSelection.iter().filter(|Value| Value.is_some()).count();
+    if SelectionCount > BestCount {
+        *BestSelection = Selection.to_vec();
+    }
+    let RemainingCount = Completed.iter().filter(|Value| !**Value).count();
+    if RemainingCount == 0 || SelectionCount + RemainingCount <= BestCount {
+        return;
+    }
+    let Some(SignalIndex) = (0..SignalNames.len())
+        .filter(|Index| !Completed[*Index])
+        .min_by_key(|Index| (DomainCount(&Domains[*Index]), &SignalNames[*Index]))
+    else {
+        return;
+    };
+    Completed[SignalIndex] = true;
+    let CandidateCount = Compatibility[SignalIndex].len();
+    let mut CandidateIndices = (0..CandidateCount)
+        .filter(|CandidateIndex| DomainContains(&Domains[SignalIndex], *CandidateIndex))
+        .map(|CandidateIndex| {
+            let CompatibleCounts = (0..SignalNames.len())
+                .filter(|OtherSignalIndex| !Completed[*OtherSignalIndex])
+                .map(|OtherSignalIndex| {
+                    IntersectionCount(
+                        &Domains[OtherSignalIndex],
+                        &Compatibility[SignalIndex][CandidateIndex][OtherSignalIndex],
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                CandidateIndex,
+                CompatibleCounts.iter().copied().min().unwrap_or(0),
+                CompatibleCounts.iter().sum::<usize>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    CandidateIndices.sort_by(
+        |(FirstIndex, FirstMinimum, FirstTotal), (SecondIndex, SecondMinimum, SecondTotal)| {
+            (
+                std::cmp::Reverse(*FirstMinimum),
+                std::cmp::Reverse(*FirstTotal),
+                *FirstIndex,
+            )
+                .cmp(&(
+                    std::cmp::Reverse(*SecondMinimum),
+                    std::cmp::Reverse(*SecondTotal),
+                    *SecondIndex,
+                ))
+        },
+    );
+    for (CandidateIndex, _MinimumCompatible, _TotalCompatible) in CandidateIndices {
+        if *ExpansionCount >= MaximumExpansionCount || Deadline.Check() {
+            break;
+        }
+        *ExpansionCount += 1;
+        let mut NextDomains = Domains.to_vec();
+        for OtherSignalIndex in 0..SignalNames.len() {
+            if Completed[OtherSignalIndex] {
+                continue;
+            }
+            IntersectDomain(
+                &mut NextDomains[OtherSignalIndex],
+                &Compatibility[SignalIndex][CandidateIndex][OtherSignalIndex],
+            );
+        }
+        Selection[SignalIndex] = Some(CandidateIndex);
+        SearchMaximumPartialIndexedSelection(
+            SignalNames,
+            Compatibility,
+            &NextDomains,
+            Completed,
+            Selection,
+            BestSelection,
+            ExpansionCount,
+            MaximumExpansionCount,
+            Deadline,
+        );
+        Selection[SignalIndex] = None;
+    }
+    SearchMaximumPartialIndexedSelection(
+        SignalNames,
+        Compatibility,
+        Domains,
+        Completed,
+        Selection,
+        BestSelection,
+        ExpansionCount,
+        MaximumExpansionCount,
+        Deadline,
+    );
+    Completed[SignalIndex] = false;
+}
+
+fn BuildMaximumPartialIndexedSelection(
+    SignalNames: &[String],
+    Compatibility: &CandidateCompatibility,
+    Domains: &[CandidateDomain],
+    InitialBestSelection: Vec<Option<usize>>,
+    MaximumExpansionCount: usize,
+    Deadline: &RuntimeDeadline,
+) -> Vec<Option<usize>> {
+    let mut Completed = vec![false; SignalNames.len()];
+    let mut Selection = vec![None; SignalNames.len()];
+    let mut BestSelection = InitialBestSelection;
+    let mut ExpansionCount = 0usize;
+    SearchMaximumPartialIndexedSelection(
+        SignalNames,
+        Compatibility,
+        Domains,
+        &mut Completed,
+        &mut Selection,
+        &mut BestSelection,
+        &mut ExpansionCount,
+        MaximumExpansionCount,
+        Deadline,
+    );
+    BestSelection
+}
+
+fn TryAssignIndexedCandidates(
+    Groups: &BTreeMap<String, Vec<AssignmentCandidate>>,
+    Domains: &BTreeMap<String, Vec<usize>>,
+    Selected: &mut Vec<(String, String)>,
+    ExpansionCount: &mut usize,
+    MaximumExpansionCount: usize,
+    BudgetExhausted: &mut bool,
+    Deadline: &RuntimeDeadline,
+    FailureNet: &mut Option<String>,
+    ConflictSignals: &mut Vec<String>,
+    ConflictResources: &mut Vec<usize>,
+    PairwiseIncompatibleSignals: &mut Vec<(String, String)>,
+    PairwiseCompatibilityComplete: &mut bool,
+) -> Option<bool> {
+    const MAXIMUM_COMPATIBILITY_WORDS: usize = 16_000_000;
+    let SignalNames = Domains.keys().cloned().collect::<Vec<_>>();
+    let DomainWordCounts = SignalNames
+        .iter()
+        .map(|Signal| DomainWordCount(Groups[Signal].len()))
+        .collect::<Vec<_>>();
+    let WordsPerCandidate = DomainWordCounts.iter().sum::<usize>();
+    let TotalCandidateCount = SignalNames
+        .iter()
+        .map(|Signal| Groups[Signal].len())
+        .sum::<usize>();
+    if TotalCandidateCount
+        .checked_mul(WordsPerCandidate)
+        .is_none_or(|Value| Value > MAXIMUM_COMPATIBILITY_WORDS)
+    {
+        return None;
+    }
+
+    let mut IndexedDomains = SignalNames
+        .iter()
+        .enumerate()
+        .map(|(SignalIndex, _Signal)| vec![0u64; DomainWordCounts[SignalIndex]])
+        .collect::<Vec<_>>();
+    for (SignalIndex, Signal) in SignalNames.iter().enumerate() {
+        for CandidateIndex in &Domains[Signal] {
+            SetDomainBit(&mut IndexedDomains[SignalIndex], *CandidateIndex);
+        }
+    }
+    let mut Compatibility = SignalNames
+        .iter()
+        .map(|Signal| {
+            (0..Groups[Signal].len())
+                .map(|_| {
+                    DomainWordCounts
+                        .iter()
+                        .map(|WordCount| vec![0u64; *WordCount])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<CandidateCompatibility>();
+    let SignalPairs = (0..SignalNames.len())
+        .flat_map(|FirstSignalIndex| {
+            ((FirstSignalIndex + 1)..SignalNames.len())
+                .map(move |SecondSignalIndex| (FirstSignalIndex, SecondSignalIndex))
+        })
+        .collect::<Vec<_>>();
+    let PairCompatibility = RoutingThreadPool().install(|| {
+        SignalPairs
+            .into_par_iter()
+            .map(|(FirstSignalIndex, SecondSignalIndex)| {
+                let mut CompatiblePairs = Vec::new();
+                let mut PairCount = 0usize;
+                for FirstCandidateIndex in &Domains[&SignalNames[FirstSignalIndex]] {
+                    for SecondCandidateIndex in &Domains[&SignalNames[SecondSignalIndex]] {
+                        PairCount += 1;
+                        if PairCount % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                            return (FirstSignalIndex, SecondSignalIndex, None);
+                        }
+                        let First = &Groups[&SignalNames[FirstSignalIndex]][*FirstCandidateIndex];
+                        let Second =
+                            &Groups[&SignalNames[SecondSignalIndex]][*SecondCandidateIndex];
+                        if !First.Claims.Conflicts(&Second.Claims) {
+                            CompatiblePairs.push((*FirstCandidateIndex, *SecondCandidateIndex));
+                        }
+                    }
+                }
+                (FirstSignalIndex, SecondSignalIndex, Some(CompatiblePairs))
+            })
+            .collect::<Vec<_>>()
+    });
+    if Deadline.Check()
+        || PairCompatibility
+            .iter()
+            .any(|(_First, _Second, Values)| Values.is_none())
+    {
+        return Some(false);
+    }
+    PairwiseIncompatibleSignals.clear();
+    for (FirstSignalIndex, SecondSignalIndex, CompatiblePairs) in PairCompatibility {
+        let CompatiblePairs =
+            CompatiblePairs.expect("deadline-free compatibility partition must be complete");
+        if CompatiblePairs.is_empty() {
+            PairwiseIncompatibleSignals.push((
+                SignalNames[FirstSignalIndex].clone(),
+                SignalNames[SecondSignalIndex].clone(),
+            ));
+        }
+        for (FirstCandidateIndex, SecondCandidateIndex) in CompatiblePairs {
+            SetDomainBit(
+                &mut Compatibility[FirstSignalIndex][FirstCandidateIndex][SecondSignalIndex],
+                SecondCandidateIndex,
+            );
+            SetDomainBit(
+                &mut Compatibility[SecondSignalIndex][SecondCandidateIndex][FirstSignalIndex],
+                FirstCandidateIndex,
+            );
+        }
+    }
+    *PairwiseCompatibilityComplete = true;
+    if Deadline.Check() {
+        return Some(false);
+    }
+
+    let mut Assigned = vec![false; SignalNames.len()];
+    let mut Selection = vec![None; SignalNames.len()];
+    let mut BestSelection = Selection.clone();
+    let mut FailureDepth = 0usize;
+    let mut Success = AssignIndexedCandidateDomains(
+        Groups,
+        &SignalNames,
+        &Compatibility,
+        &IndexedDomains,
+        &mut Assigned,
+        &mut Selection,
+        &mut BestSelection,
+        ExpansionCount,
+        MaximumExpansionCount,
+        BudgetExhausted,
+        Deadline,
+        &mut FailureDepth,
+        FailureNet,
+        ConflictSignals,
+        ConflictResources,
+    );
+    if !Success && !*BudgetExhausted && !Deadline.WasExceeded() {
+        let mut GreedySelection = BuildGreedyMaximalIndexedSelection(
+            &SignalNames,
+            &Compatibility,
+            &IndexedDomains,
+            Deadline,
+            None,
+        );
+        const MAXIMUM_GREEDY_SEEDS: usize = 2_048;
+        let mut SeedCount = 0usize;
+        'Signals: for SignalIndex in 0..SignalNames.len() {
+            for CandidateIndex in 0..Compatibility[SignalIndex].len() {
+                if !DomainContains(&IndexedDomains[SignalIndex], CandidateIndex) {
+                    continue;
+                }
+                if SeedCount >= MAXIMUM_GREEDY_SEEDS || Deadline.Check() {
+                    break 'Signals;
+                }
+                SeedCount += 1;
+                let SeededSelection = BuildGreedyMaximalIndexedSelection(
+                    &SignalNames,
+                    &Compatibility,
+                    &IndexedDomains,
+                    Deadline,
+                    Some((SignalIndex, CandidateIndex)),
+                );
+                if SeededSelection
+                    .iter()
+                    .filter(|Value| Value.is_some())
+                    .count()
+                    > GreedySelection
+                        .iter()
+                        .filter(|Value| Value.is_some())
+                        .count()
+                {
+                    GreedySelection = SeededSelection;
+                }
+            }
+        }
+        if GreedySelection
+            .iter()
+            .filter(|Value| Value.is_some())
+            .count()
+            > BestSelection.iter().filter(|Value| Value.is_some()).count()
+        {
+            BestSelection = GreedySelection;
+        }
+        if BestSelection.iter().filter(|Value| Value.is_some()).count() * 10
+            >= SignalNames.len() * 7
+        {
+            const MAXIMUM_PARTIAL_EXPANSIONS: usize = 20_000;
+            BestSelection = BuildMaximumPartialIndexedSelection(
+                &SignalNames,
+                &Compatibility,
+                &IndexedDomains,
+                BestSelection,
+                MAXIMUM_PARTIAL_EXPANSIONS,
+                Deadline,
+            );
+            if BestSelection.iter().filter(|Value| Value.is_some()).count() == SignalNames.len() {
+                Selection = BestSelection.clone();
+                Success = true;
+            }
+        }
+    }
+    let EffectiveSelection = if Success { &Selection } else { &BestSelection };
+    Selected.clear();
+    for (SignalIndex, CandidateIndex) in EffectiveSelection.iter().enumerate() {
+        if let Some(CandidateIndex) = CandidateIndex {
+            Selected.push((
+                SignalNames[SignalIndex].clone(),
+                Groups[&SignalNames[SignalIndex]][*CandidateIndex]
+                    .CandidateId
+                    .clone(),
+            ));
+        }
+    }
+    Some(Success)
+}
 
 pub(crate) fn CandidateOrder(Value: &AssignmentCandidate) -> (i32, i32, i32, i32, i32, &str) {
     (
@@ -118,6 +910,8 @@ pub(crate) fn AssignCandidates(
     FailureNet: &mut Option<String>,
     ConflictSignals: &mut Vec<String>,
     ConflictResources: &mut Vec<usize>,
+    PairwiseIncompatibleSignals: &mut Vec<(String, String)>,
+    PairwiseCompatibilityComplete: &mut bool,
 ) -> bool {
     if Deadline.Check() {
         *FailureNet = Remaining.first().cloned();
@@ -169,6 +963,22 @@ pub(crate) fn AssignCandidates(
             Compatible.push(Index);
         }
         Domains.insert(Signal.clone(), Compatible);
+    }
+    if let Some(Result) = TryAssignIndexedCandidates(
+        Groups,
+        &Domains,
+        Selected,
+        ExpansionCount,
+        MaximumExpansionCount,
+        BudgetExhausted,
+        Deadline,
+        FailureNet,
+        ConflictSignals,
+        ConflictResources,
+        PairwiseIncompatibleSignals,
+        PairwiseCompatibilityComplete,
+    ) {
+        return Result;
     }
     AssignCandidateDomains(
         Groups,
@@ -252,6 +1062,8 @@ fn AssignCandidateDomains(
         }
         return false;
     }
+    let SelectionDepth = Selected.len();
+    let mut FailureSelection = Vec::new();
     for CandidateIndex in &Domains[&Signal] {
         if Deadline.Check() {
             *FailureNet = Some(Signal.clone());
@@ -304,6 +1116,8 @@ fn AssignCandidateDomains(
                     *FailureNet = Some(OtherSignal.clone());
                     return false;
                 }
+                FailureSelection = Selected.clone();
+                FailureSelection.push((Signal.clone(), Candidate.CandidateId.clone()));
                 for OtherIndex in OtherDomain {
                     if Deadline.Check() {
                         *FailureNet = Some(OtherSignal.clone());
@@ -366,10 +1180,20 @@ fn AssignCandidateDomains(
         ) {
             return true;
         }
-        Selected.pop();
+        let RecursiveFailureSelection = Selected.clone();
+        Selected.truncate(SelectionDepth);
+        if RecursiveFailureSelection.len() > FailureSelection.len() {
+            FailureSelection = RecursiveFailureSelection;
+        }
         if *BudgetExhausted || Deadline.WasExceeded() {
+            if !FailureSelection.is_empty() {
+                *Selected = FailureSelection;
+            }
             return false;
         }
+    }
+    if !FailureSelection.is_empty() {
+        *Selected = FailureSelection;
     }
     false
 }
@@ -381,7 +1205,7 @@ mod Tests {
     fn Candidate(CandidateId: &str, MaterialCost: i32) -> AssignmentCandidate {
         AssignmentCandidate {
             CandidateId: CandidateId.to_string(),
-            Claims: ClaimMask::default(),
+            Claims: std::sync::Arc::new(ClaimMask::default()),
             MaterialCost,
             FootprintGrowth: 1,
             Length: 1,
@@ -416,5 +1240,49 @@ mod Tests {
 
         assert!(!SortCandidatesWithDeadline(&mut Values, &Deadline));
         assert!(Deadline.WasExceeded());
+    }
+
+    #[test]
+    fn GreedyMaximalSelectionKeepsCompatibleSubset() {
+        let SignalNames = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let mut Compatibility = (0..3)
+            .map(|_| vec![(0..3).map(|_| vec![0u64; 1]).collect::<Vec<_>>()])
+            .collect::<CandidateCompatibility>();
+        for SignalIndex in 0..3 {
+            SetDomainBit(&mut Compatibility[SignalIndex][0][SignalIndex], 0);
+        }
+        SetDomainBit(&mut Compatibility[0][0][1], 0);
+        SetDomainBit(&mut Compatibility[1][0][0], 0);
+        SetDomainBit(&mut Compatibility[0][0][2], 0);
+        SetDomainBit(&mut Compatibility[2][0][0], 0);
+        let Domains = vec![vec![1u64], vec![1u64], vec![1u64]];
+        let Deadline = RuntimeDeadline::FromMilliseconds(Some(1_000)).unwrap();
+
+        let Selected = BuildGreedyMaximalIndexedSelection(
+            &SignalNames,
+            &Compatibility,
+            &Domains,
+            &Deadline,
+            None,
+        );
+
+        assert_eq!(Selected.iter().filter(|Value| Value.is_some()).count(), 2,);
+        assert!(Selected[0].is_some());
+
+        let MaximumSelected = BuildMaximumPartialIndexedSelection(
+            &SignalNames,
+            &Compatibility,
+            &Domains,
+            Selected,
+            1_000,
+            &Deadline,
+        );
+        assert_eq!(
+            MaximumSelected
+                .iter()
+                .filter(|Value| Value.is_some())
+                .count(),
+            2,
+        );
     }
 }

@@ -1,6 +1,7 @@
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use pyo3::prelude::*;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 pub(crate) type Position = (i32, i32, i32);
 pub(crate) type Edge = (Position, Position);
@@ -80,9 +81,17 @@ impl ClaimMask {
         (!Deadline.Check()).then(Self::default)
     }
 
-    #[cfg(test)]
     fn Intersects(First: &[usize], Second: &[usize]) -> bool {
-        Self::IntersectsWithDeadline(First, Second, &RuntimeDeadline::Unlimited()) == Some(true)
+        let mut FirstIndex = 0usize;
+        let mut SecondIndex = 0usize;
+        while FirstIndex < First.len() && SecondIndex < Second.len() {
+            match First[FirstIndex].cmp(&Second[SecondIndex]) {
+                std::cmp::Ordering::Less => FirstIndex += 1,
+                std::cmp::Ordering::Greater => SecondIndex += 1,
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
     }
 
     fn IntersectsWithDeadline(
@@ -113,7 +122,6 @@ impl ClaimMask {
         Some(false)
     }
 
-    #[cfg(test)]
     pub(crate) fn Conflicts(&self, Other: &Self) -> bool {
         Self::Intersects(&self.Wire, &Other.Electrical)
             || Self::Intersects(&Other.Wire, &self.Electrical)
@@ -352,7 +360,7 @@ pub(crate) struct RouteTreeDetailedBatchResult {
 #[derive(Clone)]
 pub(crate) struct AssignmentCandidate {
     pub(crate) CandidateId: String,
-    pub(crate) Claims: ClaimMask,
+    pub(crate) Claims: Arc<ClaimMask>,
     pub(crate) MaterialCost: i32,
     pub(crate) FootprintGrowth: i32,
     pub(crate) Length: i32,
@@ -380,6 +388,10 @@ pub(crate) struct RoutingAssignmentResult {
     pub(crate) ConflictSignals: Vec<String>,
     #[pyo3(get)]
     pub(crate) ConflictResourceIndices: Vec<usize>,
+    #[pyo3(get)]
+    pub(crate) PairwiseIncompatibleSignals: Vec<(String, String)>,
+    #[pyo3(get)]
+    pub(crate) PairwiseCompatibilityComplete: bool,
 }
 
 #[pyclass]

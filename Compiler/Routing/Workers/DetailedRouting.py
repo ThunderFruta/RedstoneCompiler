@@ -1,8 +1,8 @@
-"""Authoritative detailed-routing worker and compatibility entrypoint."""
+"""Authoritative detailed-routing entrypoint."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
 from typing import Any, Callable
 
 try:
@@ -16,7 +16,11 @@ except ImportError:
 from ..Actions import BuildRoutingResources
 from ..AuthoritativePlanner import RouteAuthoritativeResources
 from ..ChannelPlanner import RoutingIterationMetrics
-from ..Models import RoutedDesign, RoutingResources
+from ..Models import (
+    ClusterInterfaceRealizabilityNogood,
+    RoutedDesign,
+    RoutingResources,
+)
 from ..Reliability import RoutingDeadline
 from ..Policy import DefaultPhysicalDesignPolicy, PhysicalDesignPolicy
 from ..Technology import (
@@ -45,6 +49,26 @@ def RoutePcbNets(
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
     SkipStrictPortalReservation: bool = False,
+    ReservationVariant: int = 0,
+    PreparePortalGeometryOnly: bool = False,
+    ValidateClusterInterfaceForeignAccessOnly: bool = False,
+    PrepareClusterInterfaceAssignmentOnly: bool = False,
+    PrepareComponentRoutingProblemOnly: bool = False,
+    PreparePhysicalComponentAssemblyOnly: bool = False,
+    PreparePhysicalComponentPortFactorDomainOnly: bool = False,
+    RequireCompleteClusterInterfaceDomain: bool = False,
+    ClusterInterfaceRealizabilityNogoods: tuple[
+        ClusterInterfaceRealizabilityNogood, ...
+    ] = (),
+    ClusterInterfaceStateFingerprint: str = "",
+    ClusterInterfaceLocalRouteFingerprint: str = "",
+    ForbiddenClusterInterfaceAssignmentFingerprints: (
+        frozenset[str]
+    ) = frozenset(),
+    ClusterInterfaceFrozenPatternFingerprints: (
+        dict[str, str] | None
+    ) = None,
+    ClusterInterfaceFrozenReservations: tuple[Any, ...] = (),
     Deadline: RoutingDeadline | None = None,
 ) -> RoutedDesign:
     """Plan and materialize one deterministic capacity-one Rust assignment."""
@@ -73,6 +97,12 @@ def RoutePcbNets(
                 else None
             ),
         )
+    if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")) and Deadline is not None:
+        print(
+            "[debug] authoritative: detailed-routing deadline "
+            f"remaining={Deadline.RemainingSeconds():.3f}s",
+            flush=True,
+        )
     return RouteAuthoritativeResources(
         Placed,
         Resources,
@@ -84,21 +114,43 @@ def RoutePcbNets(
         ProgressCallback=IterationProgressCallback,
         DiagnosticCallback=IterationDiagnosticCallback,
         SkipStrictPortalReservation=SkipStrictPortalReservation,
+        ReservationVariant=ReservationVariant,
+        PreparePortalGeometryOnly=PreparePortalGeometryOnly,
+        ValidateClusterInterfaceForeignAccessOnly=(
+            ValidateClusterInterfaceForeignAccessOnly
+        ),
+        PrepareClusterInterfaceAssignmentOnly=(
+            PrepareClusterInterfaceAssignmentOnly
+        ),
+        PrepareComponentRoutingProblemOnly=(
+            PrepareComponentRoutingProblemOnly
+        ),
+        PreparePhysicalComponentAssemblyOnly=(
+            PreparePhysicalComponentAssemblyOnly
+        ),
+        PreparePhysicalComponentPortFactorDomainOnly=(
+            PreparePhysicalComponentPortFactorDomainOnly
+        ),
+        RequireCompleteClusterInterfaceDomain=(
+            RequireCompleteClusterInterfaceDomain
+        ),
+        ClusterInterfaceRealizabilityNogoods=(
+            ClusterInterfaceRealizabilityNogoods
+        ),
+        ClusterInterfaceStateFingerprint=(
+            ClusterInterfaceStateFingerprint
+        ),
+        ClusterInterfaceLocalRouteFingerprint=(
+            ClusterInterfaceLocalRouteFingerprint
+        ),
+        ForbiddenClusterInterfaceAssignmentFingerprints=(
+            ForbiddenClusterInterfaceAssignmentFingerprints
+        ),
+        ClusterInterfaceFrozenPatternFingerprints=(
+            ClusterInterfaceFrozenPatternFingerprints
+        ),
+        ClusterInterfaceFrozenReservations=(
+            ClusterInterfaceFrozenReservations
+        ),
         Deadline=Deadline,
     )
-
-
-@dataclass(frozen=True)
-class DetailedRoutingWorker:
-    """Own one authoritative detailed-routing run."""
-
-    Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy
-    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology
-
-    def Run(self, Placed: Any, **Options: Any) -> RoutedDesign:
-        return RoutePcbNets(
-            Placed,
-            Policy=self.Policy,
-            Technology=self.Technology,
-            **Options,
-        )

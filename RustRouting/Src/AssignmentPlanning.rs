@@ -2,9 +2,19 @@ use crate::Assignment::{AssignCandidates, SortCandidatesWithDeadline};
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::Models::{AssignmentCandidate, ClaimMask, ClaimMaskBuildError, RoutingAssignmentResult};
 use pyo3::prelude::*;
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
 const MAXIMUM_EXPANSIONS: usize = 1_000_000;
+const MAXIMUM_CACHED_CLAIM_MASKS: usize = 100_000;
+
+thread_local! {
+    static ASSIGNMENT_CLAIM_MASK_CACHE:
+        RefCell<HashMap<(String, u64), Arc<ClaimMask>>> =
+        RefCell::new(HashMap::new());
+}
 
 pub(crate) type AssignmentCandidateValue = (
     String,
@@ -32,6 +42,8 @@ pub(crate) fn DeadlineExceededAssignmentResult(CompletedWork: usize) -> RoutingA
         FailureNet: None,
         ConflictSignals: Vec::new(),
         ConflictResourceIndices: Vec::new(),
+        PairwiseIncompatibleSignals: Vec::new(),
+        PairwiseCompatibilityComplete: false,
     }
 }
 
@@ -61,21 +73,42 @@ fn BuildCandidateGroups(
         if CandidateIndex % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
             return Ok(None);
         }
-        let Claims = match ClaimMask::FromIndicesWithDeadline(
-            ResourceCount,
-            &Wire,
-            &Support,
-            &Air,
-            &Electrical,
-            Deadline,
-        ) {
-            Ok(Value) => Value,
-            Err(ClaimMaskBuildError::DeadlineExceeded) => return Ok(None),
-            Err(ClaimMaskBuildError::IndexOutOfRange) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "candidate references a resource outside the indexed graph",
-                ));
-            }
+        let mut FingerprintState = DefaultHasher::new();
+        ResourceCount.hash(&mut FingerprintState);
+        Wire.hash(&mut FingerprintState);
+        Support.hash(&mut FingerprintState);
+        Air.hash(&mut FingerprintState);
+        Electrical.hash(&mut FingerprintState);
+        let CacheKey = (CandidateId.clone(), FingerprintState.finish());
+        let CachedClaims = ASSIGNMENT_CLAIM_MASK_CACHE
+            .with(|CacheCell| CacheCell.borrow().get(&CacheKey).cloned());
+        let Claims = if let Some(Value) = CachedClaims {
+            Value
+        } else {
+            let Value = match ClaimMask::FromIndicesWithDeadline(
+                ResourceCount,
+                &Wire,
+                &Support,
+                &Air,
+                &Electrical,
+                Deadline,
+            ) {
+                Ok(Value) => Arc::new(Value),
+                Err(ClaimMaskBuildError::DeadlineExceeded) => return Ok(None),
+                Err(ClaimMaskBuildError::IndexOutOfRange) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "candidate references a resource outside the indexed graph",
+                    ));
+                }
+            };
+            ASSIGNMENT_CLAIM_MASK_CACHE.with(|CacheCell| {
+                let mut Cache = CacheCell.borrow_mut();
+                if Cache.len() > MAXIMUM_CACHED_CLAIM_MASKS {
+                    Cache.clear();
+                }
+                Cache.insert(CacheKey, Arc::clone(&Value));
+            });
+            Value
         };
         Groups.entry(Signal).or_default().push(AssignmentCandidate {
             CandidateId,
@@ -193,6 +226,8 @@ pub(crate) fn PlanAuthoritativeRoutesWithDeadline(
     let mut BudgetExhausted = false;
     let mut ConflictSignals = Vec::new();
     let mut ConflictResources = Vec::new();
+    let mut PairwiseIncompatibleSignals = Vec::new();
+    let mut PairwiseCompatibilityComplete = false;
     let Success = AssignCandidates(
         &Groups,
         &Remaining,
@@ -206,6 +241,8 @@ pub(crate) fn PlanAuthoritativeRoutesWithDeadline(
         &mut FailureNet,
         &mut ConflictSignals,
         &mut ConflictResources,
+        &mut PairwiseIncompatibleSignals,
+        &mut PairwiseCompatibilityComplete,
     );
     if Deadline.WasExceeded() {
         return Ok(DeadlineExceededAssignmentResult(ExpansionCount));
@@ -215,7 +252,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithDeadline(
     };
     Ok(RoutingAssignmentResult {
         Success,
-        SelectedCandidateIds: if Success { Selected } else { Vec::new() },
+        SelectedCandidateIds: Selected,
         ExpansionCount,
         BudgetExhausted,
         DeadlineExceeded: Deadline.WasExceeded(),
@@ -223,6 +260,8 @@ pub(crate) fn PlanAuthoritativeRoutesWithDeadline(
         FailureNet,
         ConflictSignals: if Success { Vec::new() } else { ConflictSignals },
         ConflictResourceIndices: ConflictResources,
+        PairwiseIncompatibleSignals,
+        PairwiseCompatibilityComplete,
     })
 }
 
@@ -330,6 +369,8 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
                     FailureNet: Some(Signal.clone()),
                     ConflictSignals: vec![Signal.clone(), OtherSignal.clone()],
                     ConflictResourceIndices,
+                    PairwiseIncompatibleSignals: Vec::new(),
+                    PairwiseCompatibilityComplete: false,
                 });
             }
         }
@@ -359,6 +400,8 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
     let mut BudgetExhausted = false;
     let mut ConflictSignals = Vec::new();
     let mut ConflictResources = Vec::new();
+    let mut PairwiseIncompatibleSignals = Vec::new();
+    let mut PairwiseCompatibilityComplete = false;
     let Success = AssignCandidates(
         &Groups,
         &Remaining,
@@ -372,6 +415,8 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
         &mut FailureNet,
         &mut ConflictSignals,
         &mut ConflictResources,
+        &mut PairwiseIncompatibleSignals,
+        &mut PairwiseCompatibilityComplete,
     );
     if Deadline.WasExceeded() {
         return Ok(DeadlineExceededAssignmentResult(ExpansionCount));
@@ -381,7 +426,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
     };
     Ok(RoutingAssignmentResult {
         Success,
-        SelectedCandidateIds: if Success { Selected } else { Vec::new() },
+        SelectedCandidateIds: Selected,
         ExpansionCount,
         BudgetExhausted,
         DeadlineExceeded: Deadline.WasExceeded(),
@@ -389,6 +434,8 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
         FailureNet,
         ConflictSignals: if Success { Vec::new() } else { ConflictSignals },
         ConflictResourceIndices: ConflictResources,
+        PairwiseIncompatibleSignals,
+        PairwiseCompatibilityComplete,
     })
 }
 
@@ -487,6 +534,14 @@ mod Tests {
             First.ConflictSignals,
             vec!["A".to_string(), "B".to_string(), "C".to_string()]
         );
+        assert_eq!(
+            First.SelectedCandidateIds,
+            vec![
+                ("A".to_string(), "A0".to_string()),
+                ("B".to_string(), "B0".to_string()),
+            ]
+        );
+        assert_eq!(First.SelectedCandidateIds, Second.SelectedCandidateIds);
         assert_eq!(First.ConflictSignals, Second.ConflictSignals);
         assert_eq!(
             First.ConflictResourceIndices,

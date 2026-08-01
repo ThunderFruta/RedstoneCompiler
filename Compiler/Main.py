@@ -99,10 +99,9 @@ def BuildParser() -> argparse.ArgumentParser:
     Parser.add_argument(
         "--routing-strategy",
         choices=tuple(Value.value for Value in RoutingStrategy),
-        default=RoutingStrategy.NewRouterFirst.value,
+        default=RoutingStrategy.Default.value,
         help=(
-            "Router selection; compatibility is an explicit regression oracle "
-            "and hybrid never falls back automatically"
+            "Routing strategy selection. Only `default` is available."
         ),
     )
     Parser.add_argument(

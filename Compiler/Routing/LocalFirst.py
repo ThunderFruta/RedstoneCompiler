@@ -579,11 +579,25 @@ def BuildCapacityAwareGuidePlan(
     Policy: GlobalRoutingPolicy,
     Technology: RedstoneRoutingTechnology,
     LocalFanoutDistance: int,
+    ComponentObstacleBounds: tuple[int, int, int, int] | None = None,
+    ComponentOwnedSignals: frozenset[str] = frozenset(),
+    ReservedGuideResourcesBySignal: dict[
+        str, frozenset[tuple[int, int, int]]
+    ] | None = None,
+    SeedPlan: CoarseGuidePlan | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> CoarseGuidePlan:
     """Allocate deterministic coarse guides, then rip up overflow offenders."""
     if LayerCount < 1:
         raise ValueError("LayerCount must be positive")
+    ReservedGuideResourcesBySignal = dict(
+        ReservedGuideResourcesBySignal or {}
+    )
+    ReservedGuideResources = frozenset(
+        Resource
+        for Resources in ReservedGuideResourcesBySignal.values()
+        for Resource in Resources
+    )
     Options: dict[str, list[tuple[int, int, int, int, str, int, frozenset[Position2]]]] = {}
     LocalSignals = frozenset(
         Signal
@@ -700,6 +714,8 @@ def BuildCapacityAwareGuidePlan(
             OverflowCost = 0
             ColumnOverflowCost = 0
             HistoryCost = 0
+            ComponentInteriorCost = 0
+            ReservedPortConflictCost = 0
             for GuidePositionIndex, (X, Z) in enumerate(Guide, start=1):
                 if WorkCheck is not None and GuidePositionIndex % 256 == 0:
                     WorkCheck({
@@ -719,7 +735,30 @@ def BuildCapacityAwareGuidePlan(
                 )
                 ColumnOverflowCost += max(0, ColumnUsage + 1 - 2)
                 HistoryCost += History[(Layer, X, Z)]
+                if (
+                    ComponentObstacleBounds is not None
+                    and Signal not in ComponentOwnedSignals
+                ):
+                    (
+                        ComponentMinimumX,
+                        ComponentMaximumX,
+                        ComponentMinimumZ,
+                        ComponentMaximumZ,
+                    ) = ComponentObstacleBounds
+                    ComponentInteriorCost += bool(
+                        ComponentMinimumX <= X <= ComponentMaximumX
+                        and ComponentMinimumZ <= Z <= ComponentMaximumZ
+                    )
+                if (Layer, X, Z) in ReservedGuideResources:
+                    ReservedPortConflictCost += sum(
+                        Signal != Owner
+                        and (Layer, X, Z) in Resources
+                        for Owner, Resources
+                        in ReservedGuideResourcesBySignal.items()
+                    )
             Cost = (
+                ReservedPortConflictCost,
+                ComponentInteriorCost,
                 (OverflowCost + ColumnOverflowCost) * Policy.OverflowPenalty,
                 Escape,
                 HistoryCost,
@@ -751,6 +790,7 @@ def BuildCapacityAwareGuidePlan(
             Signal,
         ),
     )
+    SeededSignals: set[str] = set()
     for SignalIndex, Signal in enumerate(Order):
         if WorkCheck is not None:
             WorkCheck({
@@ -759,7 +799,82 @@ def BuildCapacityAwareGuidePlan(
                 "TotalSignals": len(Order),
                 "Signal": Signal,
             })
-        SelectSignal(Signal)
+        SeedSelection = None
+        if (
+            SeedPlan is not None
+            and Signal in SeedPlan.Guides
+            and Signal in SeedPlan.Layers
+            and Signal in SeedPlan.Axes
+            and Signal in SeedPlan.Lanes
+        ):
+            Candidate = (
+                int(SeedPlan.Layers[Signal]),
+                str(SeedPlan.Axes[Signal]),
+                int(SeedPlan.Lanes[Signal]),
+                frozenset(SeedPlan.Guides[Signal]),
+            )
+            CandidateMatchesCurrentDomain = any(
+                (
+                    int(Layer),
+                    str(Axis),
+                    int(Lane),
+                    Guide,
+                ) == Candidate
+                for (
+                    _Escape,
+                    _Length,
+                    Layer,
+                    _AxisBias,
+                    Axis,
+                    Lane,
+                    Guide,
+                ) in Options[Signal]
+            )
+            CandidateAvoidsComponent = bool(
+                ComponentObstacleBounds is None
+                or Signal in ComponentOwnedSignals
+                or not any(
+                    ComponentObstacleBounds[0]
+                    <= X
+                    <= ComponentObstacleBounds[1]
+                    and ComponentObstacleBounds[2]
+                    <= Z
+                    <= ComponentObstacleBounds[3]
+                    for X, Z in Candidate[3]
+                )
+            )
+            CandidateAvoidsReservations = not any(
+                (Candidate[0], X, Z) in ReservedGuideResources
+                and any(
+                    Signal != Owner
+                    and (Candidate[0], X, Z) in Resources
+                    for Owner, Resources
+                    in ReservedGuideResourcesBySignal.items()
+                )
+                for X, Z in Candidate[3]
+            )
+            if (
+                CandidateMatchesCurrentDomain
+                and CandidateAvoidsComponent
+                and CandidateAvoidsReservations
+            ):
+                SeedSelection = Candidate
+        if SeedSelection is None:
+            SelectSignal(Signal)
+            continue
+        Layer, Axis, Lane, Guide = SeedSelection
+        Selected[Signal] = (Layer, Axis, Lane, Guide)
+        SeededSignals.add(Signal)
+        for X, Z in Guide:
+            Usage[(Layer, X, Z)] += 1
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "capacity-guide-seed-reuse",
+                "Signal": Signal,
+                "SeededSignalCount": len(SeededSignals),
+                "CompletedSignals": SignalIndex + 1,
+                "TotalSignals": len(Order),
+            })
 
     Iterations = []
     PreviousOverflow = None

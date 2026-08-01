@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "shieldbutton",
+  "version": "1.0.0",
+  "name": "Shield Button",
+  "description": "Standalone shield-button helper for 26.2.",
+  "authors": ["bananawewe"],
+  "license": "CC0-1.0",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "me.autobot.shieldbutton.client.MaceSwapClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.6",
+    "minecraft": "~26.2",
+    "fabric-api": "*",
+    "java": ">=21"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}

@@ -2,12 +2,14 @@
 
 Contains routing architecture, failure diagnostics, active operations, and historical design records.
 
-Current verdict (2026-07-22): **NOT ACCEPTED**. The negotiated route-tree
-implementation is active, but the current RCA4 checkpoint ends with ten
+Current verdict (2026-07-23): **NOT ACCEPTED**. The negotiated route-tree
+implementation is active, but the current RCA4 checkpoint is still unresolved in
+diagnostic RRF-078; earlier focused RCA4 evidence still includes ten
 capacity-one electrical conflicts after overflow progression
-`[124, 10, 10, 10, 10]`. CLA4 is intentionally held until RCA4 returns to its
-2/2 gate. The RRF-073 nine-run manifest remains the last complete durable
-acceptance matrix, not a statement that the current working tree passes RCA4.
+`[124, 10, 10, 10, 10]`. CLA4 remains intentionally gated behind RCA4
+passing its 2/2 acceptance requirement. The RRF-073 nine-run manifest remains the
+last complete durable acceptance matrix, not a statement that the current working
+tree passes RCA4.
 
 ## Active routing docs
 

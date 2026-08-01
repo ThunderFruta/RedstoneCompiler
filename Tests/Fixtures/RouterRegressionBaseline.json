@@ -1,0 +1,1753 @@
+{
+  "CapturedAtUtc": "2026-07-25T22:14:52.829556+00:00",
+  "Cases": {
+    "FullAdder": {
+      "AccuracyAndDeterminismPassed": true,
+      "CandidateFingerprint": "9357edd54e291168",
+      "Deterministic": true,
+      "Dimensions": {
+        "Depth": 32,
+        "Height": 4,
+        "Width": 17
+      },
+      "EffectiveWorkFingerprint": null,
+      "EmittedDesignSha256": "8408211bb6cbce2a9a24a082f8c20b1fcedad861556ef13cff93949ab16c61b7",
+      "Failures": [],
+      "FootprintMetrics": {
+        "Depth": 32,
+        "ExactNonAirBlocks": 348,
+        "Footprint": 544,
+        "FullFootprint": 2176,
+        "Height": 4,
+        "Width": 17
+      },
+      "LitematicComposition": {
+        "Depth": 32,
+        "ExactNonAirBlocks": 348,
+        "Footprint": 544,
+        "FullFootprint": 2176,
+        "Height": 4,
+        "Width": 17
+      },
+      "MeasuredRunCount": 5,
+      "OwnershipCounts": {
+        "Air": 17,
+        "Electrical": 1014,
+        "Support": 106,
+        "Wire": 106
+      },
+      "PlacementFingerprint": "174808fc119c07dd",
+      "Promotable": true,
+      "ResourceGraphFingerprint": "b1c32b14d62028ae",
+      "Requirements": {
+        "ExamplePath": "Examples/FullAdder.sv",
+        "MaximumOverflowPeak": 1,
+        "Name": "FullAdder",
+        "PublicationReserveSeconds": 2.0,
+        "RequiredRuns": 5,
+        "RoutingDeadlineSeconds": 8.0,
+        "RuntimeCeilingSeconds": 10.0,
+        "TopModule": "FullAdder",
+        "TruthTableRows": 8
+      },
+      "RouteMetrics": {
+        "AccessOverflowCells": 0,
+        "AccessOverflowPeak": 0,
+        "Bends": 25,
+        "Conflicts": 0,
+        "Length": 106,
+        "MaximumNetLengthShare": 0.216981,
+        "OverflowPeak": 1,
+        "PerNetLength": {
+          "A": 10,
+          "B": 12,
+          "CarryIn": 12,
+          "CarryOut": 6,
+          "NandNet0": 23,
+          "NandNet1": 4,
+          "NandNet2": 4,
+          "NandNet3": 18,
+          "NandNet4": 3,
+          "NandNet5": 4,
+          "Propagate": 9,
+          "Sum": 1
+        },
+        "ReroutedNets": 0,
+        "RoutingPasses": 1,
+        "Vias": 17
+      },
+      "RunNames": [
+        "FullAdderRun1",
+        "FullAdderRun2",
+        "FullAdderRun3",
+        "FullAdderRun4",
+        "FullAdderRun5"
+      ],
+      "Runtime": {
+        "MaximumSpreadFraction": 0.011535488,
+        "MaximumSpreadFractionConservative": 0.011536480924024536,
+        "MedianSeconds": 1.012701,
+        "RecordedPrecisionSeconds": 0.000001,
+        "ReferenceMedianLowerBoundSeconds": 1.0127005,
+        "ReferenceMedianUpperBoundSeconds": 1.0127015000000001,
+        "SamplesSeconds": [
+          1.00899,
+          1.009763,
+          1.024383,
+          1.012701,
+          1.014647
+        ],
+        "Stable": true,
+        "StableConservative": true
+      },
+      "SimulationBackend": "native-parallel",
+      "StableArtifactSha256": {
+        "EmittedDesignSemantic": "8408211bb6cbce2a9a24a082f8c20b1fcedad861556ef13cff93949ab16c61b7",
+        "TruthTable": "6dd7dad5adb9e7758e99c8151fd236adb613b5b50ed3b99a4feae16bd474acb9"
+      },
+      "TruthTableArithmeticSha256": "2ac95308cc8e1566382817333b1995734fcd61ae6890c189767935cec96bbd12",
+      "TruthTableSimulationSha256": "2ac95308cc8e1566382817333b1995734fcd61ae6890c189767935cec96bbd12"
+    },
+    "RippleCarryAdder4": {
+      "AccuracyAndDeterminismPassed": true,
+      "CandidateFingerprint": "e53724add20c8894",
+      "Deterministic": true,
+      "Dimensions": {
+        "Depth": 33,
+        "Height": 7,
+        "Width": 79
+      },
+      "EffectiveWorkFingerprint": null,
+      "EmittedDesignSha256": "667b18f26a2e6dfa3a9650a717134e2847566650c4f9fa4be163b643636c48ba",
+      "Failures": [],
+      "FootprintMetrics": {
+        "Depth": 33,
+        "ExactNonAirBlocks": 1625,
+        "Footprint": 2607,
+        "FullFootprint": 18249,
+        "Height": 7,
+        "Width": 79
+      },
+      "LitematicComposition": {
+        "Depth": 33,
+        "ExactNonAirBlocks": 1625,
+        "Footprint": 2607,
+        "FullFootprint": 18249,
+        "Height": 7,
+        "Width": 79
+      },
+      "MeasuredRunCount": 3,
+      "OwnershipCounts": {
+        "Air": 161,
+        "Electrical": 5231,
+        "Support": 557,
+        "Wire": 557
+      },
+      "PlacementFingerprint": "599645c54753b819",
+      "Promotable": true,
+      "ResourceGraphFingerprint": "a6c26d7525f8214c",
+      "Requirements": {
+        "ExamplePath": "Examples/RippleCarryAdder4.sv",
+        "MaximumOverflowPeak": 1,
+        "Name": "RippleCarryAdder4",
+        "PublicationReserveSeconds": 2.0,
+        "RequiredRuns": 3,
+        "RoutingDeadlineSeconds": 23.0,
+        "RuntimeCeilingSeconds": 25.0,
+        "TopModule": "RippleCarryAdder4",
+        "TruthTableRows": 512
+      },
+      "RouteMetrics": {
+        "AccessOverflowCells": 14,
+        "AccessOverflowPeak": 1,
+        "Bends": 177,
+        "Conflicts": 0,
+        "Length": 557,
+        "MaximumNetLengthShare": 0.084381,
+        "OverflowPeak": 1,
+        "PerNetLength": {
+          "A0": 12,
+          "A1": 10,
+          "A2": 10,
+          "A3": 10,
+          "B0": 15,
+          "B1": 14,
+          "B2": 14,
+          "B3": 14,
+          "Carry0": 24,
+          "Carry1": 23,
+          "Carry2": 29,
+          "CarryIn": 24,
+          "CarryOut": 6,
+          "NandNet0": 47,
+          "NandNet1": 6,
+          "NandNet10": 3,
+          "NandNet11": 4,
+          "NandNet12": 38,
+          "NandNet13": 4,
+          "NandNet14": 4,
+          "NandNet15": 21,
+          "NandNet16": 3,
+          "NandNet17": 4,
+          "NandNet18": 33,
+          "NandNet19": 4,
+          "NandNet2": 5,
+          "NandNet20": 4,
+          "NandNet21": 21,
+          "NandNet22": 3,
+          "NandNet23": 4,
+          "NandNet3": 27,
+          "NandNet4": 4,
+          "NandNet5": 5,
+          "NandNet6": 33,
+          "NandNet7": 4,
+          "NandNet8": 4,
+          "NandNet9": 25,
+          "Propagate0": 11,
+          "Propagate1": 9,
+          "Propagate2": 9,
+          "Propagate3": 9,
+          "Sum0": 1,
+          "Sum1": 1,
+          "Sum2": 1,
+          "Sum3": 1
+        },
+        "ReroutedNets": 0,
+        "RoutingPasses": 1,
+        "Vias": 161
+      },
+      "RunNames": [
+        "RippleCarryAdder4Run1",
+        "RippleCarryAdder4Run2",
+        "RippleCarryAdder4Run3"
+      ],
+      "Runtime": {
+        "MaximumSpreadFraction": 0.007807888,
+        "MaximumSpreadFractionConservative": 0.007807973142783922,
+        "MedianSeconds": 11.79333,
+        "RecordedPrecisionSeconds": 0.000001,
+        "ReferenceMedianLowerBoundSeconds": 11.793329499999999,
+        "ReferenceMedianUpperBoundSeconds": 11.7933305,
+        "SamplesSeconds": [
+          11.79333,
+          11.885411,
+          11.793319
+        ],
+        "Stable": true,
+        "StableConservative": true
+      },
+      "SimulationBackend": "native-parallel",
+      "StableArtifactSha256": {
+        "EmittedDesignSemantic": "667b18f26a2e6dfa3a9650a717134e2847566650c4f9fa4be163b643636c48ba",
+        "TruthTable": "d48e3a9a4bc98f8e3e6742e9096a189fe214a1498f394b8b2b308752f2142d13"
+      },
+      "TruthTableArithmeticSha256": "2432227f6d42a9b034409f23f0e8471e9b254a528160c3642d8ff53715bf4ff5",
+      "TruthTableSimulationSha256": "2432227f6d42a9b034409f23f0e8471e9b254a528160c3642d8ff53715bf4ff5"
+    },
+    "RippleCarryAdder8": {
+      "AccuracyAndDeterminismPassed": true,
+      "CandidateFingerprint": "1d54eba02ba979d8",
+      "Deterministic": true,
+      "Dimensions": {
+        "Depth": 32,
+        "Height": 5,
+        "Width": 150
+      },
+      "EffectiveWorkFingerprint": null,
+      "EmittedDesignSha256": "47d1a1d9ed12e19bc6f52af953747cd6337c4ddbda9cbcf87c6437e21fb2883b",
+      "Failures": [],
+      "FootprintMetrics": {
+        "Depth": 32,
+        "ExactNonAirBlocks": 2923,
+        "Footprint": 4800,
+        "FullFootprint": 24000,
+        "Height": 5,
+        "Width": 150
+      },
+      "LitematicComposition": {
+        "Depth": 32,
+        "ExactNonAirBlocks": 2923,
+        "Footprint": 4800,
+        "FullFootprint": 24000,
+        "Height": 5,
+        "Width": 150
+      },
+      "MeasuredRunCount": 3,
+      "OwnershipCounts": {
+        "Air": 157,
+        "Electrical": 8946,
+        "Support": 956,
+        "Wire": 956
+      },
+      "PlacementFingerprint": "c4b6e11d8ca9d704",
+      "Promotable": true,
+      "ResourceGraphFingerprint": "fbc5c71025b1ba84",
+      "Requirements": {
+        "ExamplePath": "Examples/RippleCarryAdder8.sv",
+        "MaximumOverflowPeak": 1,
+        "Name": "RippleCarryAdder8",
+        "PublicationReserveSeconds": 2.0,
+        "RequiredRuns": 3,
+        "RoutingDeadlineSeconds": 28.0,
+        "RuntimeCeilingSeconds": 30.0,
+        "TopModule": "RippleCarryAdder8",
+        "TruthTableRows": 131072
+      },
+      "RouteMetrics": {
+        "AccessOverflowCells": 4,
+        "AccessOverflowPeak": 1,
+        "Bends": 221,
+        "Conflicts": 0,
+        "Length": 956,
+        "MaximumNetLengthShare": 0.030335,
+        "OverflowPeak": 1,
+        "PerNetLength": {
+          "A0": 15,
+          "A1": 10,
+          "A2": 10,
+          "A3": 10,
+          "A4": 10,
+          "A5": 10,
+          "A6": 10,
+          "A7": 10,
+          "B0": 12,
+          "B1": 12,
+          "B2": 12,
+          "B3": 12,
+          "B4": 12,
+          "B5": 12,
+          "B6": 12,
+          "B7": 12,
+          "Carry0": 22,
+          "Carry1": 26,
+          "Carry2": 29,
+          "Carry3": 29,
+          "Carry4": 24,
+          "Carry5": 29,
+          "Carry6": 29,
+          "CarryIn": 12,
+          "CarryOut": 6,
+          "NandNet0": 23,
+          "NandNet1": 4,
+          "NandNet10": 3,
+          "NandNet11": 4,
+          "NandNet12": 26,
+          "NandNet13": 4,
+          "NandNet14": 4,
+          "NandNet15": 20,
+          "NandNet16": 3,
+          "NandNet17": 4,
+          "NandNet18": 26,
+          "NandNet19": 4,
+          "NandNet2": 4,
+          "NandNet20": 4,
+          "NandNet21": 20,
+          "NandNet22": 3,
+          "NandNet23": 4,
+          "NandNet24": 25,
+          "NandNet25": 4,
+          "NandNet26": 4,
+          "NandNet27": 20,
+          "NandNet28": 3,
+          "NandNet29": 4,
+          "NandNet3": 29,
+          "NandNet30": 26,
+          "NandNet31": 4,
+          "NandNet32": 4,
+          "NandNet33": 19,
+          "NandNet34": 3,
+          "NandNet35": 4,
+          "NandNet36": 23,
+          "NandNet37": 4,
+          "NandNet38": 4,
+          "NandNet39": 20,
+          "NandNet4": 3,
+          "NandNet40": 3,
+          "NandNet41": 4,
+          "NandNet42": 23,
+          "NandNet43": 4,
+          "NandNet44": 4,
+          "NandNet45": 20,
+          "NandNet46": 3,
+          "NandNet47": 4,
+          "NandNet5": 4,
+          "NandNet6": 23,
+          "NandNet7": 4,
+          "NandNet8": 4,
+          "NandNet9": 20,
+          "Propagate0": 9,
+          "Propagate1": 9,
+          "Propagate2": 9,
+          "Propagate3": 9,
+          "Propagate4": 9,
+          "Propagate5": 9,
+          "Propagate6": 9,
+          "Propagate7": 9,
+          "Sum0": 7,
+          "Sum1": 1,
+          "Sum2": 1,
+          "Sum3": 1,
+          "Sum4": 1,
+          "Sum5": 1,
+          "Sum6": 1,
+          "Sum7": 1
+        },
+        "ReroutedNets": 0,
+        "RoutingPasses": 1,
+        "Vias": 157
+      },
+      "RunNames": [
+        "RippleCarryAdder8Run1",
+        "RippleCarryAdder8Run2",
+        "RippleCarryAdder8Run3"
+      ],
+      "Runtime": {
+        "MaximumSpreadFraction": 0.011797492,
+        "MaximumSpreadFractionConservative": 0.01179758615466536,
+        "MedianSeconds": 10.71821,
+        "RecordedPrecisionSeconds": 0.000001,
+        "ReferenceMedianLowerBoundSeconds": 10.718209499999999,
+        "ReferenceMedianUpperBoundSeconds": 10.7182105,
+        "SamplesSeconds": [
+          10.71821,
+          10.708907,
+          10.844658
+        ],
+        "Stable": true,
+        "StableConservative": true
+      },
+      "SimulationBackend": "native-parallel",
+      "StableArtifactSha256": {
+        "EmittedDesignSemantic": "47d1a1d9ed12e19bc6f52af953747cd6337c4ddbda9cbcf87c6437e21fb2883b",
+        "TruthTable": "d5786e1eb2472727f3ecab3df360db97e801250ae15436235179482188a97e14"
+      },
+      "TruthTableArithmeticSha256": "6bf3f999868950799e2ce167870e8453e4bb9d0a80b5a2f4fab776a1eaf30b16",
+      "TruthTableSimulationSha256": "6bf3f999868950799e2ce167870e8453e4bb9d0a80b5a2f4fab776a1eaf30b16"
+    }
+  },
+  "Compatibility": {
+    "BenchmarkInputs": {
+      "CarryLookaheadAdder4": {
+        "Exists": true,
+        "Path": "Examples/CarryLookaheadAdder4.sv",
+        "Sha256": "03316289d9e954cb3f98fe05ff301d7d0a7378d6ee3205853411af17a542bf06",
+        "SizeBytes": 3053
+      },
+      "FullAdder": {
+        "Exists": true,
+        "Path": "Examples/FullAdder.sv",
+        "Sha256": "0c1695433b3d7b628fcba493e06088948328f032c24cc510c695df426b02d7ab",
+        "SizeBytes": 403
+      },
+      "RippleCarryAdder4": {
+        "Exists": true,
+        "Path": "Examples/RippleCarryAdder4.sv",
+        "Sha256": "e44b4b1afadc0e9228081c2702d36863006932f9aa4f430d5e0aafbd5c5bdadc",
+        "SizeBytes": 1118
+      },
+      "RippleCarryAdder8": {
+        "Exists": true,
+        "Path": "Examples/RippleCarryAdder8.sv",
+        "Sha256": "92e1b54ff75b9947b2dc9ea148fc2d9fd398efcb5726ed4c6fa7e1803224bdc8",
+        "SizeBytes": 2170
+      }
+    },
+    "BenchmarkProfile": {
+      "CanonicalArithmeticDigests": {
+        "CarryLookaheadAdder4": "2432227f6d42a9b034409f23f0e8471e9b254a528160c3642d8ff53715bf4ff5",
+        "FullAdder": "2ac95308cc8e1566382817333b1995734fcd61ae6890c189767935cec96bbd12",
+        "RippleCarryAdder4": "2432227f6d42a9b034409f23f0e8471e9b254a528160c3642d8ff53715bf4ff5",
+        "RippleCarryAdder8": "6bf3f999868950799e2ce167870e8453e4bb9d0a80b5a2f4fab776a1eaf30b16"
+      },
+      "Cases": {
+        "CarryLookaheadAdder4": {
+          "ExamplePath": "Examples/CarryLookaheadAdder4.sv",
+          "MaximumOverflowPeak": 1,
+          "Name": "CarryLookaheadAdder4",
+          "PublicationReserveSeconds": 2.0,
+          "RequiredRuns": 2,
+          "RoutingDeadlineSeconds": 118.0,
+          "RuntimeCeilingSeconds": 120.0,
+          "TopModule": "CarryLookaheadAdder4",
+          "TruthTableRows": 512
+        },
+        "FullAdder": {
+          "ExamplePath": "Examples/FullAdder.sv",
+          "MaximumOverflowPeak": 1,
+          "Name": "FullAdder",
+          "PublicationReserveSeconds": 2.0,
+          "RequiredRuns": 5,
+          "RoutingDeadlineSeconds": 8.0,
+          "RuntimeCeilingSeconds": 10.0,
+          "TopModule": "FullAdder",
+          "TruthTableRows": 8
+        },
+        "RippleCarryAdder4": {
+          "ExamplePath": "Examples/RippleCarryAdder4.sv",
+          "MaximumOverflowPeak": 1,
+          "Name": "RippleCarryAdder4",
+          "PublicationReserveSeconds": 2.0,
+          "RequiredRuns": 3,
+          "RoutingDeadlineSeconds": 23.0,
+          "RuntimeCeilingSeconds": 25.0,
+          "TopModule": "RippleCarryAdder4",
+          "TruthTableRows": 512
+        },
+        "RippleCarryAdder8": {
+          "ExamplePath": "Examples/RippleCarryAdder8.sv",
+          "MaximumOverflowPeak": 1,
+          "Name": "RippleCarryAdder8",
+          "PublicationReserveSeconds": 2.0,
+          "RequiredRuns": 3,
+          "RoutingDeadlineSeconds": 28.0,
+          "RuntimeCeilingSeconds": 30.0,
+          "TopModule": "RippleCarryAdder8",
+          "TruthTableRows": 131072
+        }
+      },
+      "PolicySeed": 0,
+      "RegressionCircuits": [
+        "FullAdder",
+        "RippleCarryAdder4",
+        "RippleCarryAdder8"
+      ],
+      "RoutingStrategy": "default",
+      "RoutingThreads": 16,
+      "SchemaVersion": "router-regression-profile-v1",
+      "Warmup": {
+        "Circuit": "FullAdder",
+        "Count": 1,
+        "MeasurementIncluded": false
+      }
+    },
+    "CpuProfile": {
+      "Architecture": "x86_64",
+      "LogicalCpuCount": 32,
+      "Model": "x86_64"
+    },
+    "Platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+    "PolicySeed": 0,
+    "PythonBasePrefix": "/usr",
+    "PythonExecutable": "/mnt/Projects/RedstoneCompiler/.venv/bin/python",
+    "PythonImplementation": "CPython",
+    "PythonPrefix": "/mnt/Projects/RedstoneCompiler/.venv",
+    "PythonProfileSource": "configured-child",
+    "PythonVersion": "3.12.3",
+    "RequestedPythonExecutable": "/mnt/Projects/RedstoneCompiler/.venv/bin/python",
+    "RoutingEnvironment": {
+      "PYTHONHASHSEED": "0",
+      "RC_ROUTING_THREADS": "16"
+    },
+    "RoutingThreads": 16
+  },
+  "Environment": {
+    "CpuProfile": {
+      "Architecture": "x86_64",
+      "LogicalCpuCount": 32,
+      "Model": "x86_64"
+    },
+    "Platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+    "PolicySeed": 0,
+    "ProfileSource": "configured-child",
+    "PythonBasePrefix": "/usr",
+    "PythonExecutable": "/mnt/Projects/RedstoneCompiler/.venv/bin/python",
+    "PythonImplementation": "CPython",
+    "PythonPrefix": "/mnt/Projects/RedstoneCompiler/.venv",
+    "PythonVersion": "3.12.3",
+    "RequestedPythonExecutable": "/mnt/Projects/RedstoneCompiler/.venv/bin/python",
+    "RoutingEnvironment": {
+      "PYTHONHASHSEED": "0",
+      "RC_ROUTING_THREADS": "16"
+    },
+    "RoutingThreads": 16,
+    "WorkingDirectory": "/mnt/Projects/RedstoneCompiler"
+  },
+  "Promotable": true,
+  "RecordedRuntimeEvidence": {
+    "SourceManifestPath": "Output/Regression/2026-07-25/RouterRegression/BaselineCapture/AcceptanceManifest.json",
+    "SourceManifestSha256": "7719e40ff7836672ce7ef084395bb4b361520d27867bd0366d8e0771c6549fad",
+    "WallRuntimeRecordedPrecisionSeconds": 0.000001
+  },
+  "ProvenanceChecks": [
+    {
+      "Phase": "after-regression-capture",
+      "SourceProvenance": {
+        "BenchmarkInputs": {
+          "CarryLookaheadAdder4": {
+            "Exists": true,
+            "Path": "Examples/CarryLookaheadAdder4.sv",
+            "Sha256": "03316289d9e954cb3f98fe05ff301d7d0a7378d6ee3205853411af17a542bf06",
+            "SizeBytes": 3053
+          },
+          "FullAdder": {
+            "Exists": true,
+            "Path": "Examples/FullAdder.sv",
+            "Sha256": "0c1695433b3d7b628fcba493e06088948328f032c24cc510c695df426b02d7ab",
+            "SizeBytes": 403
+          },
+          "RippleCarryAdder4": {
+            "Exists": true,
+            "Path": "Examples/RippleCarryAdder4.sv",
+            "Sha256": "e44b4b1afadc0e9228081c2702d36863006932f9aa4f430d5e0aafbd5c5bdadc",
+            "SizeBytes": 1118
+          },
+          "RippleCarryAdder8": {
+            "Exists": true,
+            "Path": "Examples/RippleCarryAdder8.sv",
+            "Sha256": "92e1b54ff75b9947b2dc9ea148fc2d9fd398efcb5726ed4c6fa7e1803224bdc8",
+            "SizeBytes": 2170
+          }
+        },
+        "ExpectedPolicyVersion": "physical-design-v15-compact-boundaries",
+        "Git": {
+          "Dirty": true,
+          "Revision": "8dd349dfd8b79ded9ee64146d62ecd239d557490"
+        },
+        "NativeExtension": {
+          "Exists": true,
+          "Loaded": true,
+          "Module": "RedstoneCompiler.RustRouting",
+          "Path": "RedstoneCompiler/RustRouting.cpython-312-x86_64-linux-gnu.so",
+          "Sha256": "edd461f4d269a2cc0df11c50ca27fe27342f96cb3bb33add4c246a5e7c8a7181",
+          "SizeBytes": 1822440,
+          "WithinRepository": true
+        },
+        "Policy": {
+          "PolicyVersion": "physical-design-v15-compact-boundaries",
+          "Seed": 0,
+          "Sha256": "9495b081b87db81f110eb3968f29a32ce6b8430ee98ea7fe9a8f2b72f88d8d83",
+          "Snapshot": {
+            "AdaptiveRouting": {
+              "AssignmentExpansionsPerNet": 1200,
+              "AssignmentExpansionsPerTerminal": 250,
+              "AssignmentGrowthFactor": 2,
+              "BaseAssignmentExpansions": 8000,
+              "CandidateClaimWorkQuantum": 64,
+              "CandidateGrowthFactor": 2,
+              "Enabled": true,
+              "InitialAssignmentExpansions": 64,
+              "InitialCandidateRequestsPerSignal": 4,
+              "InitialCandidatesPerNet": 96,
+              "InitialLaneCount": 4,
+              "InitialPortalsPerTerminal": 6,
+              "LaneGrowthFactor": 2,
+              "MaximumAssignmentExpansions": 180000,
+              "MaximumCandidateDiversityEscalations": 12,
+              "MaximumCandidateGenerationExpansions": 2000000,
+              "MaximumLaneDiversityEscalations": 4,
+              "MaximumPortalReservationAlternatives": 2,
+              "MaximumRuntimeSeconds": 360.0,
+              "MinimumCandidatesPerNet": 8,
+              "PortalGrowthFactor": 2
+            },
+            "Clustering": {
+              "BalanceWeight": 4,
+              "CohesiveCellScale": 3.0,
+              "CutWeight": 8,
+              "MinimumCohesiveCells": 9
+            },
+            "DetailedRouting": {
+              "CandidateBendWeight": 8,
+              "CandidateViaWeight": 6,
+              "GuideExpansion": 3,
+              "LayerPenalty": 8,
+              "LengthPenalty": 8,
+              "MinimumCandidateExpansionLimit": 2048,
+              "MinimumGuidePenalty": 1,
+              "RepairBaseExpansions": 70000,
+              "RepairBendPenalty": 6,
+              "RepairExpansionsPerNet": 3000,
+              "RepairMaximumExpansions": 160000,
+              "RepairViaPenalty": 5,
+              "RepeaterPenalty": 24,
+              "StagnationPassLimit": 6,
+              "StrictBaseExpansions": 90000,
+              "StrictBendPenalty": 10,
+              "StrictExpansionsPerNet": 1200,
+              "StrictGuideMultiplier": 2,
+              "StrictMaximumExpansions": 90000,
+              "StrictViaPenalty": 7
+            },
+            "GlobalRouting": {
+              "CandidateLaneCount": 24,
+              "CorridorCapacity": 1,
+              "EnableCapacityAwareGuides": true,
+              "ExistingGuideHintWeight": 2,
+              "IntraClusterEnvelope": 2,
+              "MaximumRipupPasses": 2,
+              "OverflowPenalty": 12,
+              "SharedBoundaryEnvelope": 6,
+              "StagnationPassLimit": 2
+            },
+            "MaterialObjective": {
+              "Enabled": true,
+              "MaximumFootprint": 600,
+              "MaximumNonAirBlocks": 500,
+              "MaximumRawDustFunctionalShare": 0.45,
+              "MaximumRouteShare": 0.4,
+              "MaximumRoutingDominance": 0.4,
+              "MaximumRoutingFunctionalShare": 0.4,
+              "MinimumComponentFunctionalShare": 0.6,
+              "MinimumRemainingRoutingPercentageSearchSeconds": 15.0,
+              "MinimumRoutingPercentageSelectionNandCount": 16,
+              "OptimizeRoutingPercentage": false
+            },
+            "NandPacking": {
+              "BeamWidth": 64,
+              "ClusterDeckPitch": 6,
+              "DeferUnpackedOracle": true,
+              "DirectConnectMaximumLength": 2,
+              "EnableJointClusterOrientation": true,
+              "EnableJointLocalRouting": true,
+              "EnableLocalGeometryRepair": true,
+              "EnableProactiveInterClusterRelocation": true,
+              "EnableRepeatedStructuralVerticalStacking": false,
+              "EnableStructuralReuse": true,
+              "EnableVerticalClusterStacking": true,
+              "Enabled": true,
+              "GraphBeamEnabled": true,
+              "JointPlacementBeamWidth": 64,
+              "JointPlacementPassLimit": 12,
+              "LocalGeometryRepairColumnGap": 1,
+              "LocalRouteEnvelope": 2,
+              "MaximumClusterCells": 16,
+              "MaximumClustersPerStack": 4,
+              "MaximumFrozenLocalNetNodes": 32,
+              "MaximumFrozenLocalTargets": 16,
+              "MaximumLocalClusterAssignmentExpansions": 4096,
+              "MaximumLocalRepeatersPerNet": 2,
+              "MaximumLocalRouteCandidatesPerSignal": 16,
+              "MaximumLocalRouteLength": 40,
+              "MaximumStructuralReuseMappings": 4096,
+              "MaximumTerminalAssignmentExpansions": 65536,
+              "MaximumTerminalPlacementCandidates": 32,
+              "PlacementFeedbackIterations": 3,
+              "RequireCompleteLocalFanoutClaims": true,
+              "RetainedJointPlacementCandidates": 6,
+              "RetainedPlacementCandidates": 6,
+              "TerminalShellClearance": 1,
+              "TerminalShellLateralSearch": 0
+            },
+            "NegotiatedRouting": {
+              "Enabled": true,
+              "HistoryIncrement": 32,
+              "MaximumIterations": 32,
+              "MaximumPackedAreaGrowth": 4.0,
+              "MaximumPlacementFeedbackRounds": 1,
+              "MaximumRouteTreeRequestMilliseconds": 500,
+              "PresentConflictPenalty": 96,
+              "StagnationPassLimit": 3,
+              "TilePitchInTracks": 4
+            },
+            "Organization": {
+              "AllowForeignIslandTraversal": false,
+              "AllowSameSignalMerge": true,
+              "BoundaryCorridorPitch": 3,
+              "BoundaryCorridorWidth": 2,
+              "BridgeLayers": [
+                2
+              ],
+              "ClusterKeepInMargin": 1,
+              "ComponentLayer": -1,
+              "Enabled": true,
+              "MaximumBoundedEscapeDistance": 4,
+              "MaximumClusterEntrances": 16,
+              "MaximumClusterEntrancesPerSignal": 2,
+              "MaximumLocalBranchDistance": 2,
+              "PreferredXLayer": 0,
+              "PreferredZLayer": 1,
+              "SteinerTopologyMode": "native"
+            },
+            "Placement": {
+              "CompactPassLimit": 16,
+              "DemandAwareBoundaryTrackPitch": 2,
+              "EnableDemandAwareInterClusterSpacing": true,
+              "EnableRoutingFeedback": true,
+              "ForceMaximumRoutingLayersAfterPlacementRelocation": false,
+              "HpwlWeight": 3,
+              "LocalFanoutDistance": 8,
+              "LocalFanoutWeight": 16,
+              "MaximumRoutingLayers": 3,
+              "PinEscapeLength": 1,
+              "PreferWideTerminalBanks": false,
+              "RoutingFeedbackIterations": 1,
+              "RoutingSpacing": 5,
+              "RoutingSpacingAlternatives": 2,
+              "TerminalBankOffsetX": 0
+            },
+            "PolicyVersion": "physical-design-v15-compact-boundaries",
+            "QualityGate": {
+              "Enabled": false,
+              "MaximumAverageBendsPerNet": 5.5,
+              "MaximumAverageViasPerNet": 7.34,
+              "MaximumCorridorOverflowPeak": 1,
+              "MaximumNetLengthShare": 0.2
+            },
+            "QualityTarget": "first-legal",
+            "Repair": {
+              "HistoryIncrement": 16,
+              "MaximumConflictNeighborhoodDepth": 6
+            },
+            "RuntimeBudgetSeconds": 120.0,
+            "Seed": 0,
+            "TrackAssignment": {
+              "MaximumAssignmentExpansions": 500000,
+              "MaximumPortalsPerTerminal": 48,
+              "MaximumRouteCandidatesPerNet": 2048,
+              "MinimizeMaximumRoutingLayer": true,
+              "ReassignmentLimit": 20,
+              "ReserveRepeaterSites": true
+            }
+          }
+        },
+        "SchemaVersion": "router-source-provenance-v1",
+        "SourceContent": {
+          "AggregateSha256": "b0b4959b6d985c844be87c97d4f6ebae6373675178a6f222cf09d9556e094df0",
+          "FileCount": 58,
+          "Files": [
+            {
+              "Exists": true,
+              "Path": "Compiler/Cells/Library.py",
+              "Sha256": "fc8353e104a8c1e334b470388139bae76150a065f40bb43362ebd4b2ef93f09b",
+              "SizeBytes": 3048
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Cells/Nand.py",
+              "Sha256": "a2e2920807dee85b723b678ebffa18b5d4554f650fb5eea0cde86a2178097c1a",
+              "SizeBytes": 459
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Cells/__init__.py",
+              "Sha256": "5b6516737cc5509ca3b23a151a824b18095bcdbc04a03b1e3f793456c1920b1a",
+              "SizeBytes": 194
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Ir/Models.py",
+              "Sha256": "5b5f31786aede75b5aa6ed5e231961a7326b945d5b66925c1628040c33df1224",
+              "SizeBytes": 1448
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Ir/__init__.py",
+              "Sha256": "146bdc46366979891f5384c30096eae1884efbadab93108c9b066e1e368ebcd9",
+              "SizeBytes": 186
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Main.py",
+              "Sha256": "f7b75fe352f9483792ab1320f2fc4bc64f4f9ce258c5859a320444628dbcf2ad",
+              "SizeBytes": 24668
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Pipeline.py",
+              "Sha256": "110d7edfa0669e712a2ce8c72444e1032d944b7f3233e6be67de6755e90dc329",
+              "SizeBytes": 35148
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Placement/Geometry.py",
+              "Sha256": "848cc071bbbaf5fd2adde449325b9a43e66caaaace99f1ef7c4012d557d5a321",
+              "SizeBytes": 6046
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Placement/Pcb.py",
+              "Sha256": "0086ff2a730d578f9c4e5b731219a7d7b2155d0ea844b7e4e375c944225df8af",
+              "SizeBytes": 256184
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Placement/PcbFlow.py",
+              "Sha256": "7cc55648159bf0cadc6da4c2e325fc23a7cf16fee3ad08c021ef51802f7c9e96",
+              "SizeBytes": 145140
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Placement/Rotation.py",
+              "Sha256": "334d8b00ce679cc277f04830f960ff00d027d1399963db8754673710e9c57fb2",
+              "SizeBytes": 5967
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Placement/__init__.py",
+              "Sha256": "4fa118a0e32f8ffd628dcce414b84de7b3678e2f7ff0a4fd74ffd553d5b79a87",
+              "SizeBytes": 43
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Actions/ConflictRepair.py",
+              "Sha256": "74da5d93661f10d16d75c88f452b7c59202beebbe4889b38b1488dd9c37bd19c",
+              "SizeBytes": 6265
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Actions/Geometry.py",
+              "Sha256": "9807f09d2cc076975db64af032c7bae9e66068f3955c246f3b758fa7e5f0988f",
+              "SizeBytes": 8285
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Actions/Repeaters.py",
+              "Sha256": "b2f026d887276dde56ec0bc94725f86f464c420d4507abfd9716a063df436bbf",
+              "SizeBytes": 24876
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Actions/Validation.py",
+              "Sha256": "8ed855ef374d4d308fa991765c371a57237fe9d845ae0eefa694562b8dfc2468",
+              "SizeBytes": 11192
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Actions/__init__.py",
+              "Sha256": "20773bff00fcfbf2c65a8f894fa129607c0c0186acc6303094b80bd22386d990",
+              "SizeBytes": 1303
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/AuthoritativePlanner.py",
+              "Sha256": "d03c728d11dba3f284773400c15f4fd71adbe87735decfae1edcaf3c4e71ab52",
+              "SizeBytes": 499145
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/ChannelPlanner.py",
+              "Sha256": "b86b6a0dcf1e6f8072baf1966017a7db3cdebe55a9b9f02db215c81062f1dec6",
+              "SizeBytes": 26367
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Core.py",
+              "Sha256": "25b8eabd2b489be43b9efa21584074ae5c12f73756b790a69773d658d7741798",
+              "SizeBytes": 1392
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Failures.py",
+              "Sha256": "4e071bbdf66bc45199def72789d30acf401c0dfb8b9076d79302f1a867afe9fd",
+              "SizeBytes": 2768
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/LocalFirst.py",
+              "Sha256": "e0872e1f63c29e9c08b228d34e8298dc4b45ba000f0b884ea489a5628affd584",
+              "SizeBytes": 37152
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Models.py",
+              "Sha256": "0b49ec6e73ad413bac682991c273a9e141548be1dbfc1421d717d6b37a5c68a4",
+              "SizeBytes": 3096
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Pcb.py",
+              "Sha256": "034f7836fbb0a7d216a03487159720dec4b2287c7b60a4a9aaa8d29b95b88428",
+              "SizeBytes": 35660
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Policy.py",
+              "Sha256": "c968b7b8b1414f2b8a52b2105b69110dc72e59b0c31bc3bc262e6350058988ae",
+              "SizeBytes": 23355
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Reliability.py",
+              "Sha256": "929974c361ad28b4b999e05bfef24b75c60172acb7bc79a82ce4a3eefa1ce574",
+              "SizeBytes": 19057
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/ResourceGraph.py",
+              "Sha256": "e60fc92096b9ddfb626e26783537a68deba097517fb6ccbd2ff9b58e50e6ec2a",
+              "SizeBytes": 27933
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Technology.py",
+              "Sha256": "0be4a144b931cccc16e2b9699fd1a3ec59ba46b102482398d27376acbe70b134",
+              "SizeBytes": 3041
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/TrackAssignment.py",
+              "Sha256": "bebb6da2668d0a4a5447940620cd73185b7d0beffff41e6ea5e7c7b2024eabdb",
+              "SizeBytes": 9338
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Workers/DetailedRouting.py",
+              "Sha256": "3d80e0bd45c0462d33ed89143a36a3d825efedc30b23c075451cdc6e56ef3928",
+              "SizeBytes": 3648
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Workers/PinAccess.py",
+              "Sha256": "b6c93d6a108443540799e6d9c3b110aa4c8a4a0f450ef0acfd269baaf1e6c1d9",
+              "SizeBytes": 7423
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/Workers/__init__.py",
+              "Sha256": "b7a38bfbfd330b22a380d63fd1727ba82d4d8d9d2784626100c31a096948f4c2",
+              "SizeBytes": 297
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Routing/__init__.py",
+              "Sha256": "c7a1079cac362f12cc206092e54121f6b2a921f83a17776659256a39cdc5fc19",
+              "SizeBytes": 27
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Simulation/Redstone.py",
+              "Sha256": "357cd01affae003c89132971abb53329b2b2bfc5c35996de2ebfb6eef808230c",
+              "SizeBytes": 15977
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Simulation/__init__.py",
+              "Sha256": "3c8a5ded89056844eff482fa3c7267b0ad1c423f845759fa187aaf72fdb0bb9b",
+              "SizeBytes": 272
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Synthesis/Diagram.py",
+              "Sha256": "7919e88b9e8e2eb87293bb9d59710b94ddfca214eefcc9a5b07ff3d48667e5be",
+              "SizeBytes": 1586
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Synthesis/LogicOptimization.py",
+              "Sha256": "0c6e5630832fd0daf990c104fc9115fa43c85b1b237b9ee484c9960bb2d1d8a0",
+              "SizeBytes": 14018
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Synthesis/NandTransform.py",
+              "Sha256": "22e5e2705fa60d5d0312f2d2625911b2e9050b9d371c4fb417c125ad4f345291",
+              "SizeBytes": 4980
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Synthesis/Validation.py",
+              "Sha256": "7aee57a069dbbaac637b078bc94e9f79044f5e7054725f42984f08f43a77ff8b",
+              "SizeBytes": 2342
+            },
+            {
+              "Exists": true,
+              "Path": "Compiler/Synthesis/__init__.py",
+              "Sha256": "13d8b52778307476d9387e11f97b0d984f3311d1737fad3843ccb78b75018449",
+              "SizeBytes": 236
+            },
+            {
+              "Exists": true,
+              "Path": "Main.py",
+              "Sha256": "581524de06747a1924efbdd876c4ccc765cf5d75fb41aab7fdadf6cd872f7125",
+              "SizeBytes": 124
+            },
+            {
+              "Exists": true,
+              "Path": "RedstoneCompiler/__init__.py",
+              "Sha256": "8e73262467e75657e442db3a2ff906b9a8d476526ff92c3c5e48e019d170b068",
+              "SizeBytes": 104
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Cargo.lock",
+              "Sha256": "1a01915b4612bcc6fb091834890e2ccf1e477ba15b8eb9173ea743c27fff301c",
+              "SizeBytes": 6092
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Cargo.toml",
+              "Sha256": "910cf112526df03ec69088a34f338b352e1300771f4bd936142270dd94c6a4f2",
+              "SizeBytes": 283
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/Assignment.rs",
+              "Sha256": "8bf904c077f3523f83f4ed3f905df663ed1663c7a2162c14e01269f073de0570",
+              "SizeBytes": 45737
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/AssignmentPlanning.rs",
+              "Sha256": "6d49b46765e57ab2376543c003bbffbd4b17843f5b63d089e3f93e7c303a196b",
+              "SizeBytes": 21156
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/Bindings.rs",
+              "Sha256": "b9e840bd657ff35c4222a40b7d4d9564244e7ade949ddbe466f59aef14bc184b",
+              "SizeBytes": 23584
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/Deadline.rs",
+              "Sha256": "4a053d31f9defdd3b9187b0fce7cdb91373f07b7d08f4eb68c1cd77b06b21843",
+              "SizeBytes": 2941
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/Generation.rs",
+              "Sha256": "8bec79b38903b5b4ce5d036b8ad8f8672b4b3092826a4b05e43e7b9af63c1e75",
+              "SizeBytes": 50475
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/Lib.rs",
+              "Sha256": "bc7e58dadd70b43b987b65dc3ccbba4fb1e3b0c715ca26ba5c17d99fd8fadf1a",
+              "SizeBytes": 18733
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/Models.rs",
+              "Sha256": "53d5de7a264689941e4b5f33cae54061fe8f8dea24532c89f91b9f735af5cecb",
+              "SizeBytes": 13868
+            },
+            {
+              "Exists": true,
+              "Path": "RustRouting/Src/PathRouting.rs",
+              "Sha256": "acd080960a40ee515419d3caf8b64385e09e7de7e0588ffa366bb76819fd1697",
+              "SizeBytes": 22533
+            },
+            {
+              "Exists": true,
+              "Path": "SVDecoder/Sv.py",
+              "Sha256": "739b8894c6b058b3df79fd9f3065d5895eaaad20ef49a11c22aa76be2a100e2a",
+              "SizeBytes": 8105
+            },
+            {
+              "Exists": true,
+              "Path": "SVDecoder/__init__.py",
+              "Sha256": "9961a09746bba003b53861fbd674d215679147332d379e10b9e19ca5a9eb1ccd",
+              "SizeBytes": 60
+            },
+            {
+              "Exists": true,
+              "Path": "SchemEncoder/Writer262.py",
+              "Sha256": "6e7311c82f3522eea246f98aad9bc4e8a3419e8c6fb5f47cbe81a31e24d4a6c9",
+              "SizeBytes": 38542
+            },
+            {
+              "Exists": true,
+              "Path": "SchemEncoder/__init__.py",
+              "Sha256": "790424f25a5731ece219d6f35bec3db1804263f7fce53c1ff8e4d18c49b020f5",
+              "SizeBytes": 40
+            },
+            {
+              "Exists": true,
+              "Path": "Scripts/RunRouterAcceptance.py",
+              "Sha256": "d5221a61a35f16e136cd7b01731a2b833cc4bd6dde9e2b8ab7ff4ef7d98893fe",
+              "SizeBytes": 89201
+            },
+            {
+              "Exists": true,
+              "Path": "pyproject.toml",
+              "Sha256": "007841f5444149eda9dabb57714dbe59216edfe1ff1391640b86ce24b5d17f8b",
+              "SizeBytes": 486
+            }
+          ]
+        }
+      },
+      "SourceState": {
+        "Dirty": true,
+        "Revision": "8dd349dfd8b79ded9ee64146d62ecd239d557490"
+      },
+      "Stable": true
+    }
+  ],
+  "SchemaVersion": "router-regression-baseline-v1",
+  "SourceProvenance": {
+    "BenchmarkInputs": {
+      "CarryLookaheadAdder4": {
+        "Exists": true,
+        "Path": "Examples/CarryLookaheadAdder4.sv",
+        "Sha256": "03316289d9e954cb3f98fe05ff301d7d0a7378d6ee3205853411af17a542bf06",
+        "SizeBytes": 3053
+      },
+      "FullAdder": {
+        "Exists": true,
+        "Path": "Examples/FullAdder.sv",
+        "Sha256": "0c1695433b3d7b628fcba493e06088948328f032c24cc510c695df426b02d7ab",
+        "SizeBytes": 403
+      },
+      "RippleCarryAdder4": {
+        "Exists": true,
+        "Path": "Examples/RippleCarryAdder4.sv",
+        "Sha256": "e44b4b1afadc0e9228081c2702d36863006932f9aa4f430d5e0aafbd5c5bdadc",
+        "SizeBytes": 1118
+      },
+      "RippleCarryAdder8": {
+        "Exists": true,
+        "Path": "Examples/RippleCarryAdder8.sv",
+        "Sha256": "92e1b54ff75b9947b2dc9ea148fc2d9fd398efcb5726ed4c6fa7e1803224bdc8",
+        "SizeBytes": 2170
+      }
+    },
+    "ExpectedPolicyVersion": "physical-design-v15-compact-boundaries",
+    "Git": {
+      "Dirty": true,
+      "Revision": "8dd349dfd8b79ded9ee64146d62ecd239d557490"
+    },
+    "NativeExtension": {
+      "Exists": true,
+      "Loaded": true,
+      "Module": "RedstoneCompiler.RustRouting",
+      "Path": "RedstoneCompiler/RustRouting.cpython-312-x86_64-linux-gnu.so",
+      "Sha256": "edd461f4d269a2cc0df11c50ca27fe27342f96cb3bb33add4c246a5e7c8a7181",
+      "SizeBytes": 1822440,
+      "WithinRepository": true
+    },
+    "Policy": {
+      "PolicyVersion": "physical-design-v15-compact-boundaries",
+      "Seed": 0,
+      "Sha256": "9495b081b87db81f110eb3968f29a32ce6b8430ee98ea7fe9a8f2b72f88d8d83",
+      "Snapshot": {
+        "AdaptiveRouting": {
+          "AssignmentExpansionsPerNet": 1200,
+          "AssignmentExpansionsPerTerminal": 250,
+          "AssignmentGrowthFactor": 2,
+          "BaseAssignmentExpansions": 8000,
+          "CandidateClaimWorkQuantum": 64,
+          "CandidateGrowthFactor": 2,
+          "Enabled": true,
+          "InitialAssignmentExpansions": 64,
+          "InitialCandidateRequestsPerSignal": 4,
+          "InitialCandidatesPerNet": 96,
+          "InitialLaneCount": 4,
+          "InitialPortalsPerTerminal": 6,
+          "LaneGrowthFactor": 2,
+          "MaximumAssignmentExpansions": 180000,
+          "MaximumCandidateDiversityEscalations": 12,
+          "MaximumCandidateGenerationExpansions": 2000000,
+          "MaximumLaneDiversityEscalations": 4,
+          "MaximumPortalReservationAlternatives": 2,
+          "MaximumRuntimeSeconds": 360.0,
+          "MinimumCandidatesPerNet": 8,
+          "PortalGrowthFactor": 2
+        },
+        "Clustering": {
+          "BalanceWeight": 4,
+          "CohesiveCellScale": 3.0,
+          "CutWeight": 8,
+          "MinimumCohesiveCells": 9
+        },
+        "DetailedRouting": {
+          "CandidateBendWeight": 8,
+          "CandidateViaWeight": 6,
+          "GuideExpansion": 3,
+          "LayerPenalty": 8,
+          "LengthPenalty": 8,
+          "MinimumCandidateExpansionLimit": 2048,
+          "MinimumGuidePenalty": 1,
+          "RepairBaseExpansions": 70000,
+          "RepairBendPenalty": 6,
+          "RepairExpansionsPerNet": 3000,
+          "RepairMaximumExpansions": 160000,
+          "RepairViaPenalty": 5,
+          "RepeaterPenalty": 24,
+          "StagnationPassLimit": 6,
+          "StrictBaseExpansions": 90000,
+          "StrictBendPenalty": 10,
+          "StrictExpansionsPerNet": 1200,
+          "StrictGuideMultiplier": 2,
+          "StrictMaximumExpansions": 90000,
+          "StrictViaPenalty": 7
+        },
+        "GlobalRouting": {
+          "CandidateLaneCount": 24,
+          "CorridorCapacity": 1,
+          "EnableCapacityAwareGuides": true,
+          "ExistingGuideHintWeight": 2,
+          "IntraClusterEnvelope": 2,
+          "MaximumRipupPasses": 2,
+          "OverflowPenalty": 12,
+          "SharedBoundaryEnvelope": 6,
+          "StagnationPassLimit": 2
+        },
+        "MaterialObjective": {
+          "Enabled": true,
+          "MaximumFootprint": 600,
+          "MaximumNonAirBlocks": 500,
+          "MaximumRawDustFunctionalShare": 0.45,
+          "MaximumRouteShare": 0.4,
+          "MaximumRoutingDominance": 0.4,
+          "MaximumRoutingFunctionalShare": 0.4,
+          "MinimumComponentFunctionalShare": 0.6,
+          "MinimumRemainingRoutingPercentageSearchSeconds": 15.0,
+          "MinimumRoutingPercentageSelectionNandCount": 16,
+          "OptimizeRoutingPercentage": false
+        },
+        "NandPacking": {
+          "BeamWidth": 64,
+          "ClusterDeckPitch": 6,
+          "DeferUnpackedOracle": true,
+          "DirectConnectMaximumLength": 2,
+          "EnableJointClusterOrientation": true,
+          "EnableJointLocalRouting": true,
+          "EnableLocalGeometryRepair": true,
+          "EnableProactiveInterClusterRelocation": true,
+          "EnableRepeatedStructuralVerticalStacking": false,
+          "EnableStructuralReuse": true,
+          "EnableVerticalClusterStacking": true,
+          "Enabled": true,
+          "GraphBeamEnabled": true,
+          "JointPlacementBeamWidth": 64,
+          "JointPlacementPassLimit": 12,
+          "LocalGeometryRepairColumnGap": 1,
+          "LocalRouteEnvelope": 2,
+          "MaximumClusterCells": 16,
+          "MaximumClustersPerStack": 4,
+          "MaximumFrozenLocalNetNodes": 32,
+          "MaximumFrozenLocalTargets": 16,
+          "MaximumLocalClusterAssignmentExpansions": 4096,
+          "MaximumLocalRepeatersPerNet": 2,
+          "MaximumLocalRouteCandidatesPerSignal": 16,
+          "MaximumLocalRouteLength": 40,
+          "MaximumStructuralReuseMappings": 4096,
+          "MaximumTerminalAssignmentExpansions": 65536,
+          "MaximumTerminalPlacementCandidates": 32,
+          "PlacementFeedbackIterations": 3,
+          "RequireCompleteLocalFanoutClaims": true,
+          "RetainedJointPlacementCandidates": 6,
+          "RetainedPlacementCandidates": 6,
+          "TerminalShellClearance": 1,
+          "TerminalShellLateralSearch": 0
+        },
+        "NegotiatedRouting": {
+          "Enabled": true,
+          "HistoryIncrement": 32,
+          "MaximumIterations": 32,
+          "MaximumPackedAreaGrowth": 4.0,
+          "MaximumPlacementFeedbackRounds": 1,
+          "MaximumRouteTreeRequestMilliseconds": 500,
+          "PresentConflictPenalty": 96,
+          "StagnationPassLimit": 3,
+          "TilePitchInTracks": 4
+        },
+        "Organization": {
+          "AllowForeignIslandTraversal": false,
+          "AllowSameSignalMerge": true,
+          "BoundaryCorridorPitch": 3,
+          "BoundaryCorridorWidth": 2,
+          "BridgeLayers": [
+            2
+          ],
+          "ClusterKeepInMargin": 1,
+          "ComponentLayer": -1,
+          "Enabled": true,
+          "MaximumBoundedEscapeDistance": 4,
+          "MaximumClusterEntrances": 16,
+          "MaximumClusterEntrancesPerSignal": 2,
+          "MaximumLocalBranchDistance": 2,
+          "PreferredXLayer": 0,
+          "PreferredZLayer": 1,
+          "SteinerTopologyMode": "native"
+        },
+        "Placement": {
+          "CompactPassLimit": 16,
+          "DemandAwareBoundaryTrackPitch": 2,
+          "EnableDemandAwareInterClusterSpacing": true,
+          "EnableRoutingFeedback": true,
+          "ForceMaximumRoutingLayersAfterPlacementRelocation": false,
+          "HpwlWeight": 3,
+          "LocalFanoutDistance": 8,
+          "LocalFanoutWeight": 16,
+          "MaximumRoutingLayers": 3,
+          "PinEscapeLength": 1,
+          "PreferWideTerminalBanks": false,
+          "RoutingFeedbackIterations": 1,
+          "RoutingSpacing": 5,
+          "RoutingSpacingAlternatives": 2,
+          "TerminalBankOffsetX": 0
+        },
+        "PolicyVersion": "physical-design-v15-compact-boundaries",
+        "QualityGate": {
+          "Enabled": false,
+          "MaximumAverageBendsPerNet": 5.5,
+          "MaximumAverageViasPerNet": 7.34,
+          "MaximumCorridorOverflowPeak": 1,
+          "MaximumNetLengthShare": 0.2
+        },
+        "QualityTarget": "first-legal",
+        "Repair": {
+          "HistoryIncrement": 16,
+          "MaximumConflictNeighborhoodDepth": 6
+        },
+        "RuntimeBudgetSeconds": 120.0,
+        "Seed": 0,
+        "TrackAssignment": {
+          "MaximumAssignmentExpansions": 500000,
+          "MaximumPortalsPerTerminal": 48,
+          "MaximumRouteCandidatesPerNet": 2048,
+          "MinimizeMaximumRoutingLayer": true,
+          "ReassignmentLimit": 20,
+          "ReserveRepeaterSites": true
+        }
+      }
+    },
+    "SchemaVersion": "router-source-provenance-v1",
+    "SourceContent": {
+      "AggregateSha256": "b0b4959b6d985c844be87c97d4f6ebae6373675178a6f222cf09d9556e094df0",
+      "FileCount": 58,
+      "Files": [
+        {
+          "Exists": true,
+          "Path": "Compiler/Cells/Library.py",
+          "Sha256": "fc8353e104a8c1e334b470388139bae76150a065f40bb43362ebd4b2ef93f09b",
+          "SizeBytes": 3048
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Cells/Nand.py",
+          "Sha256": "a2e2920807dee85b723b678ebffa18b5d4554f650fb5eea0cde86a2178097c1a",
+          "SizeBytes": 459
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Cells/__init__.py",
+          "Sha256": "5b6516737cc5509ca3b23a151a824b18095bcdbc04a03b1e3f793456c1920b1a",
+          "SizeBytes": 194
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Ir/Models.py",
+          "Sha256": "5b5f31786aede75b5aa6ed5e231961a7326b945d5b66925c1628040c33df1224",
+          "SizeBytes": 1448
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Ir/__init__.py",
+          "Sha256": "146bdc46366979891f5384c30096eae1884efbadab93108c9b066e1e368ebcd9",
+          "SizeBytes": 186
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Main.py",
+          "Sha256": "f7b75fe352f9483792ab1320f2fc4bc64f4f9ce258c5859a320444628dbcf2ad",
+          "SizeBytes": 24668
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Pipeline.py",
+          "Sha256": "110d7edfa0669e712a2ce8c72444e1032d944b7f3233e6be67de6755e90dc329",
+          "SizeBytes": 35148
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Placement/Geometry.py",
+          "Sha256": "848cc071bbbaf5fd2adde449325b9a43e66caaaace99f1ef7c4012d557d5a321",
+          "SizeBytes": 6046
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Placement/Pcb.py",
+          "Sha256": "0086ff2a730d578f9c4e5b731219a7d7b2155d0ea844b7e4e375c944225df8af",
+          "SizeBytes": 256184
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Placement/PcbFlow.py",
+          "Sha256": "7cc55648159bf0cadc6da4c2e325fc23a7cf16fee3ad08c021ef51802f7c9e96",
+          "SizeBytes": 145140
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Placement/Rotation.py",
+          "Sha256": "334d8b00ce679cc277f04830f960ff00d027d1399963db8754673710e9c57fb2",
+          "SizeBytes": 5967
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Placement/__init__.py",
+          "Sha256": "4fa118a0e32f8ffd628dcce414b84de7b3678e2f7ff0a4fd74ffd553d5b79a87",
+          "SizeBytes": 43
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Actions/ConflictRepair.py",
+          "Sha256": "74da5d93661f10d16d75c88f452b7c59202beebbe4889b38b1488dd9c37bd19c",
+          "SizeBytes": 6265
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Actions/Geometry.py",
+          "Sha256": "9807f09d2cc076975db64af032c7bae9e66068f3955c246f3b758fa7e5f0988f",
+          "SizeBytes": 8285
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Actions/Repeaters.py",
+          "Sha256": "b2f026d887276dde56ec0bc94725f86f464c420d4507abfd9716a063df436bbf",
+          "SizeBytes": 24876
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Actions/Validation.py",
+          "Sha256": "8ed855ef374d4d308fa991765c371a57237fe9d845ae0eefa694562b8dfc2468",
+          "SizeBytes": 11192
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Actions/__init__.py",
+          "Sha256": "20773bff00fcfbf2c65a8f894fa129607c0c0186acc6303094b80bd22386d990",
+          "SizeBytes": 1303
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/AuthoritativePlanner.py",
+          "Sha256": "d03c728d11dba3f284773400c15f4fd71adbe87735decfae1edcaf3c4e71ab52",
+          "SizeBytes": 499145
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/ChannelPlanner.py",
+          "Sha256": "b86b6a0dcf1e6f8072baf1966017a7db3cdebe55a9b9f02db215c81062f1dec6",
+          "SizeBytes": 26367
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Core.py",
+          "Sha256": "25b8eabd2b489be43b9efa21584074ae5c12f73756b790a69773d658d7741798",
+          "SizeBytes": 1392
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Failures.py",
+          "Sha256": "4e071bbdf66bc45199def72789d30acf401c0dfb8b9076d79302f1a867afe9fd",
+          "SizeBytes": 2768
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/LocalFirst.py",
+          "Sha256": "e0872e1f63c29e9c08b228d34e8298dc4b45ba000f0b884ea489a5628affd584",
+          "SizeBytes": 37152
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Models.py",
+          "Sha256": "0b49ec6e73ad413bac682991c273a9e141548be1dbfc1421d717d6b37a5c68a4",
+          "SizeBytes": 3096
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Pcb.py",
+          "Sha256": "034f7836fbb0a7d216a03487159720dec4b2287c7b60a4a9aaa8d29b95b88428",
+          "SizeBytes": 35660
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Policy.py",
+          "Sha256": "c968b7b8b1414f2b8a52b2105b69110dc72e59b0c31bc3bc262e6350058988ae",
+          "SizeBytes": 23355
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Reliability.py",
+          "Sha256": "929974c361ad28b4b999e05bfef24b75c60172acb7bc79a82ce4a3eefa1ce574",
+          "SizeBytes": 19057
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/ResourceGraph.py",
+          "Sha256": "e60fc92096b9ddfb626e26783537a68deba097517fb6ccbd2ff9b58e50e6ec2a",
+          "SizeBytes": 27933
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Technology.py",
+          "Sha256": "0be4a144b931cccc16e2b9699fd1a3ec59ba46b102482398d27376acbe70b134",
+          "SizeBytes": 3041
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/TrackAssignment.py",
+          "Sha256": "bebb6da2668d0a4a5447940620cd73185b7d0beffff41e6ea5e7c7b2024eabdb",
+          "SizeBytes": 9338
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Workers/DetailedRouting.py",
+          "Sha256": "3d80e0bd45c0462d33ed89143a36a3d825efedc30b23c075451cdc6e56ef3928",
+          "SizeBytes": 3648
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Workers/PinAccess.py",
+          "Sha256": "b6c93d6a108443540799e6d9c3b110aa4c8a4a0f450ef0acfd269baaf1e6c1d9",
+          "SizeBytes": 7423
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/Workers/__init__.py",
+          "Sha256": "b7a38bfbfd330b22a380d63fd1727ba82d4d8d9d2784626100c31a096948f4c2",
+          "SizeBytes": 297
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Routing/__init__.py",
+          "Sha256": "c7a1079cac362f12cc206092e54121f6b2a921f83a17776659256a39cdc5fc19",
+          "SizeBytes": 27
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Simulation/Redstone.py",
+          "Sha256": "357cd01affae003c89132971abb53329b2b2bfc5c35996de2ebfb6eef808230c",
+          "SizeBytes": 15977
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Simulation/__init__.py",
+          "Sha256": "3c8a5ded89056844eff482fa3c7267b0ad1c423f845759fa187aaf72fdb0bb9b",
+          "SizeBytes": 272
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Synthesis/Diagram.py",
+          "Sha256": "7919e88b9e8e2eb87293bb9d59710b94ddfca214eefcc9a5b07ff3d48667e5be",
+          "SizeBytes": 1586
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Synthesis/LogicOptimization.py",
+          "Sha256": "0c6e5630832fd0daf990c104fc9115fa43c85b1b237b9ee484c9960bb2d1d8a0",
+          "SizeBytes": 14018
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Synthesis/NandTransform.py",
+          "Sha256": "22e5e2705fa60d5d0312f2d2625911b2e9050b9d371c4fb417c125ad4f345291",
+          "SizeBytes": 4980
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Synthesis/Validation.py",
+          "Sha256": "7aee57a069dbbaac637b078bc94e9f79044f5e7054725f42984f08f43a77ff8b",
+          "SizeBytes": 2342
+        },
+        {
+          "Exists": true,
+          "Path": "Compiler/Synthesis/__init__.py",
+          "Sha256": "13d8b52778307476d9387e11f97b0d984f3311d1737fad3843ccb78b75018449",
+          "SizeBytes": 236
+        },
+        {
+          "Exists": true,
+          "Path": "Main.py",
+          "Sha256": "581524de06747a1924efbdd876c4ccc765cf5d75fb41aab7fdadf6cd872f7125",
+          "SizeBytes": 124
+        },
+        {
+          "Exists": true,
+          "Path": "RedstoneCompiler/__init__.py",
+          "Sha256": "8e73262467e75657e442db3a2ff906b9a8d476526ff92c3c5e48e019d170b068",
+          "SizeBytes": 104
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Cargo.lock",
+          "Sha256": "1a01915b4612bcc6fb091834890e2ccf1e477ba15b8eb9173ea743c27fff301c",
+          "SizeBytes": 6092
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Cargo.toml",
+          "Sha256": "910cf112526df03ec69088a34f338b352e1300771f4bd936142270dd94c6a4f2",
+          "SizeBytes": 283
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/Assignment.rs",
+          "Sha256": "8bf904c077f3523f83f4ed3f905df663ed1663c7a2162c14e01269f073de0570",
+          "SizeBytes": 45737
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/AssignmentPlanning.rs",
+          "Sha256": "6d49b46765e57ab2376543c003bbffbd4b17843f5b63d089e3f93e7c303a196b",
+          "SizeBytes": 21156
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/Bindings.rs",
+          "Sha256": "b9e840bd657ff35c4222a40b7d4d9564244e7ade949ddbe466f59aef14bc184b",
+          "SizeBytes": 23584
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/Deadline.rs",
+          "Sha256": "4a053d31f9defdd3b9187b0fce7cdb91373f07b7d08f4eb68c1cd77b06b21843",
+          "SizeBytes": 2941
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/Generation.rs",
+          "Sha256": "8bec79b38903b5b4ce5d036b8ad8f8672b4b3092826a4b05e43e7b9af63c1e75",
+          "SizeBytes": 50475
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/Lib.rs",
+          "Sha256": "bc7e58dadd70b43b987b65dc3ccbba4fb1e3b0c715ca26ba5c17d99fd8fadf1a",
+          "SizeBytes": 18733
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/Models.rs",
+          "Sha256": "53d5de7a264689941e4b5f33cae54061fe8f8dea24532c89f91b9f735af5cecb",
+          "SizeBytes": 13868
+        },
+        {
+          "Exists": true,
+          "Path": "RustRouting/Src/PathRouting.rs",
+          "Sha256": "acd080960a40ee515419d3caf8b64385e09e7de7e0588ffa366bb76819fd1697",
+          "SizeBytes": 22533
+        },
+        {
+          "Exists": true,
+          "Path": "SVDecoder/Sv.py",
+          "Sha256": "739b8894c6b058b3df79fd9f3065d5895eaaad20ef49a11c22aa76be2a100e2a",
+          "SizeBytes": 8105
+        },
+        {
+          "Exists": true,
+          "Path": "SVDecoder/__init__.py",
+          "Sha256": "9961a09746bba003b53861fbd674d215679147332d379e10b9e19ca5a9eb1ccd",
+          "SizeBytes": 60
+        },
+        {
+          "Exists": true,
+          "Path": "SchemEncoder/Writer262.py",
+          "Sha256": "6e7311c82f3522eea246f98aad9bc4e8a3419e8c6fb5f47cbe81a31e24d4a6c9",
+          "SizeBytes": 38542
+        },
+        {
+          "Exists": true,
+          "Path": "SchemEncoder/__init__.py",
+          "Sha256": "790424f25a5731ece219d6f35bec3db1804263f7fce53c1ff8e4d18c49b020f5",
+          "SizeBytes": 40
+        },
+        {
+          "Exists": true,
+          "Path": "Scripts/RunRouterAcceptance.py",
+          "Sha256": "d5221a61a35f16e136cd7b01731a2b833cc4bd6dde9e2b8ab7ff4ef7d98893fe",
+          "SizeBytes": 89201
+        },
+        {
+          "Exists": true,
+          "Path": "pyproject.toml",
+          "Sha256": "007841f5444149eda9dabb57714dbe59216edfe1ff1391640b86ce24b5d17f8b",
+          "SizeBytes": 486
+        }
+      ]
+    }
+  },
+  "WarmupsPassed": true
+}

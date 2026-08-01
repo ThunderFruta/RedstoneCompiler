@@ -9,18 +9,12 @@ from enum import Enum
 class RoutingStrategy(str, Enum):
     """User-visible physical-routing strategy."""
 
-    Compatibility = "compatibility"
-    Hybrid = "hybrid"
-    NewRouterFirst = "new-router-first"
+    Default = "default"
 
     @classmethod
     def Parse(cls, Value: str | "RoutingStrategy") -> "RoutingStrategy":
         if isinstance(Value, cls):
             return Value
-        if Value == "authoritative-only":
-            # Keep legacy alias compatibility but route it to the active
-            # organized policy to avoid accidentally invoking a retired path.
-            return cls.NewRouterFirst
         return cls(Value)
 
 
@@ -48,14 +42,14 @@ class PlacementPolicy:
     EnableRoutingFeedback: bool = False
     # Preserve the base cell-clearance gap, but size the optional routing
     # corridor between cluster columns/rows from the distinct nets that cross
-    # that boundary.  Disabled by default so compatibility policies retain
+    # that boundary.
     # their established geometry.
     EnableDemandAwareInterClusterSpacing: bool = False
     DemandAwareBoundaryTrackPitch: int = 0
     # A relocation recipe is a geometry change, not evidence that every
-    # routing plane is necessary.  Keep the compatibility default while
-    # allowing policies to climb the layer ladder from the access-derived
-    # minimum and only spend vertical headroom after a concrete failure.
+    # routing plane is necessary.  Allow policies to climb the layer ladder from
+    # the access-derived minimum and only spend vertical headroom after a
+    # concrete failure.
     ForceMaximumRoutingLayersAfterPlacementRelocation: bool = False
 
     def __post_init__(self) -> None:
@@ -94,6 +88,13 @@ class NandPackingPolicy:
     DeferUnpackedOracle: bool = True
     PlacementFeedbackIterations: int = 3
     GraphBeamEnabled: bool = True
+    # Choose each packed cluster's rigid world transform together with its
+    # grid slot.  Per-NAND graph-beam orientation remains local to the
+    # cluster; this search decides how that legal layout meets its neighbours.
+    EnableJointClusterOrientation: bool = True
+    JointPlacementBeamWidth: int = 64
+    JointPlacementPassLimit: int = 12
+    RetainedJointPlacementCandidates: int = 6
     EnableStructuralReuse: bool = True
     MaximumStructuralReuseMappings: int = 4096
     MaximumFrozenLocalNetNodes: int = 32
@@ -107,6 +108,12 @@ class NandPackingPolicy:
     ClusterDeckPitch: int = 6
 
     def __post_init__(self) -> None:
+        if self.JointPlacementBeamWidth < 1:
+            raise ValueError("JointPlacementBeamWidth must be positive")
+        if self.JointPlacementPassLimit < 1:
+            raise ValueError("JointPlacementPassLimit must be positive")
+        if self.RetainedJointPlacementCandidates < 1:
+            raise ValueError("RetainedJointPlacementCandidates must be positive")
         if self.MaximumStructuralReuseMappings < 1:
             raise ValueError(
                 "MaximumStructuralReuseMappings must be positive"
@@ -434,23 +441,8 @@ class PhysicalDesignPolicy:
 
 DefaultPhysicalDesignPolicy = PhysicalDesignPolicy()
 
-# Compatibility is deliberately a frozen value, not an alias to the evolving
-# default policy. This preserves the measured pre-rewrite route.
-CompatibilityPhysicalDesignPolicy = PhysicalDesignPolicy(
-    PolicyVersion="physical-design-v1-compatibility",
-    Placement=PlacementPolicy(
-        ForceMaximumRoutingLayersAfterPlacementRelocation=True,
-    ),
-    NandPacking=NandPackingPolicy(),
-    TrackAssignment=TrackAssignmentPolicy(
-        MaximumRouteCandidatesPerNet=1536,
-        MaximumAssignmentExpansions=100_000,
-    ),
-    AdaptiveRouting=AdaptiveRoutingPolicy(),
-)
-
 LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
-    PolicyVersion="physical-design-v15-compact-boundaries",
+    PolicyVersion="physical-design-v16-reconvergent-access",
     Placement=PlacementPolicy(
         CompactPassLimit=16,
         RoutingSpacing=5,
@@ -472,6 +464,7 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         RetainedPlacementCandidates=6,
         MaximumTerminalPlacementCandidates=32,
         MaximumTerminalAssignmentExpansions=65536,
+        TerminalShellLateralSearch=0,
         RequireCompleteLocalFanoutClaims=True,
         LocalGeometryRepairColumnGap=1,
     ),
@@ -502,7 +495,16 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         StagnationPassLimit=2,
         EnableCapacityAwareGuides=True,
     ),
-    NegotiatedRouting=NegotiatedRoutingPolicy(Enabled=True),
+    NegotiatedRouting=NegotiatedRoutingPolicy(
+        Enabled=True,
+        MaximumPlacementFeedbackRounds=1,
+        MaximumPackedAreaGrowth=4.0,
+        # Retained-domain assignment distinguishes a changing tree set from a
+        # real plateau before placement feedback.  RCA4 otherwise repeats the
+        # same overflow through its complete acceptance deadline, so keep the
+        # bounded three-pass stagnation window.
+        StagnationPassLimit=3,
+    ),
     TrackAssignment=TrackAssignmentPolicy(
         ReassignmentLimit=20,
         ReserveRepeaterSites=True,
@@ -519,8 +521,8 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         LaneGrowthFactor=2,
         MaximumPortalReservationAlternatives=2,
         MaximumLaneDiversityEscalations=4,
-        InitialCandidateRequestsPerSignal=8,
-        MaximumCandidateDiversityEscalations=3,
+        InitialCandidateRequestsPerSignal=4,
+        MaximumCandidateDiversityEscalations=12,
         InitialCandidatesPerNet=96,
         CandidateGrowthFactor=2,
         MinimumCandidatesPerNet=8,
@@ -532,7 +534,7 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         AssignmentExpansionsPerNet=1_200,
         AssignmentExpansionsPerTerminal=250,
         MaximumAssignmentExpansions=180_000,
-        MaximumRuntimeSeconds=180.0,
+        MaximumRuntimeSeconds=360.0,
     ),
     DetailedRouting=DetailedRoutingPolicy(
         GuideExpansion=3,
@@ -548,7 +550,11 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         CandidateViaWeight=6,
         RepeaterPenalty=24,
         StagnationPassLimit=6,
-        StrictBaseExpansions=25_000,
+        # Initial adaptive batches are intentionally small.  If every portal
+        # request for a large net exhausts that batch, the authoritative
+        # planner retries only that net at this strict budget; 90k is needed
+        # to reach a legal repeater refresh site in the RCA8 sparse region.
+        StrictBaseExpansions=90_000,
         StrictExpansionsPerNet=1_200,
         StrictMaximumExpansions=90_000,
         RepairBaseExpansions=70_000,
@@ -576,6 +582,10 @@ RoutingAcceptanceProfiles = {
         Name="RippleCarryAdder4",
         MaximumRuntimeSeconds=25.0,
     ),
+    "RippleCarryAdder8": RoutingAcceptanceProfile(
+        Name="RippleCarryAdder8",
+        MaximumRuntimeSeconds=30.0,
+    ),
     "CarryLookaheadAdder4": RoutingAcceptanceProfile(
         Name="CarryLookaheadAdder4",
         MaximumRuntimeSeconds=120.0,
@@ -585,16 +595,12 @@ RoutingAcceptanceProfiles = {
 
 def PolicyForRoutingStrategy(Strategy: RoutingStrategy) -> PhysicalDesignPolicy:
     """Resolve the immutable policy attached to one routing implementation."""
-    if Strategy == RoutingStrategy.Compatibility:
-        return CompatibilityPhysicalDesignPolicy
     return LocalFirstPhysicalDesignPolicy
 
 
 def ExecutionStrategyForRequest(Strategy: RoutingStrategy) -> RoutingStrategy:
     """Resolve an explicit request without enabling automatic fallback."""
-    if Strategy == RoutingStrategy.Compatibility:
-        return RoutingStrategy.Compatibility
-    return RoutingStrategy.NewRouterFirst
+    return RoutingStrategy.Default
 
 
 def BuildRoutingAttemptPolicies() -> tuple[RoutingAttemptPolicy, ...]:

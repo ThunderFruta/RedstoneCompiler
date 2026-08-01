@@ -197,7 +197,6 @@ def BuildRoutingDeadlineDiagnostics(
 ) -> dict[str, object]:
     """Build the complete diagnostic payload for every deadline exit."""
     Diagnostics = dict(WorkTelemetry)
-    Diagnostics.update(AdditionalDiagnostics or {})
     Diagnostics.update({
         "EscalationHistory": tuple(EscalationHistory),
         "RoutingEscalationState": EscalationState.ToDictionary(),
@@ -207,6 +206,11 @@ def BuildRoutingDeadlineDiagnostics(
         },
         "Deadline": Deadline.ToDictionary(),
     })
+    # A typed failure can carry a terminal snapshot that is newer than the
+    # enclosing planner closure.  Apply it last so a just-appended escalation
+    # entry, state transition, or deadline observation is not replaced by the
+    # stale defaults captured before the failure was constructed.
+    Diagnostics.update(AdditionalDiagnostics or {})
     return Diagnostics
 
 
@@ -248,6 +252,22 @@ def ChooseRoutingEscalationAction(
     MaximumEffectiveRoutingLayers: int,
 ) -> RoutingEscalationDecision:
     """Choose the only legal next control change for a routing failure."""
+    if Classification == "mandatory-boundary-capacity-cut":
+        return RoutingEscalationDecision(
+            Action="AdvancePlacement",
+            Reason=(
+                "every fixed portal/access alternative conflicts; packed "
+                "local geometry must change"
+            ),
+        )
+    if Classification == "portal-coverage-pair-conflict":
+        return RoutingEscalationDecision(
+            Action="RegenerateAffectedCandidates",
+            Reason=(
+                "the complete portal domain contains a compatible access "
+                "pair that the retained route candidates did not materialize"
+            ),
+        )
     if Classification in {
         "higher-order-placement-conflict",
         "stacked-placement-conflict",
@@ -266,6 +286,17 @@ def ChooseRoutingEscalationAction(
                 Reason=(
                     "the relocated placement has physical routing-layer "
                     "capacity available before another cluster move"
+                ),
+            )
+        if (
+            State.CandidateDiversityLevel + 1
+            < MaximumCandidateDiversityLevels
+        ):
+            return RoutingEscalationDecision(
+                Action="RegenerateAffectedCandidates",
+                Reason=(
+                    "the fully layered relocated placement has one unused "
+                    "affected-net candidate-domain expansion"
                 ),
             )
         return RoutingEscalationDecision(
@@ -370,19 +401,22 @@ def ChooseRoutingEscalationAction(
             ),
         )
     if Classification == "relocated-multi-pair-conflict":
-        if State.LaneDiversityLevel + 1 < MaximumLaneDiversityLevels:
+        if (
+            State.CandidateDiversityLevel + 1
+            < MaximumCandidateDiversityLevels
+        ):
             return RoutingEscalationDecision(
-                Action="IncreaseLaneDiversity",
+                Action="RegenerateAffectedCandidates",
                 Reason=(
-                    "independent relocated pairs have unused guide-lane "
-                    "shapes before another cluster move"
+                    "the fully layered relocated exact cut has one unused "
+                    "affected-net candidate-domain expansion"
                 ),
             )
         return RoutingEscalationDecision(
             Action="AdvancePlacement",
             Reason=(
-                "the complete fully layered candidate pool still contains "
-                "independent conflicts; relocate their clusters"
+                "the complete fully layered candidate pool contains "
+                "independent exact conflicts; relocate their clusters"
             ),
         )
     if (

@@ -1,11 +1,10 @@
-"""Routing-stage workers that orchestrate reusable actions."""
+"""Routing-stage worker entrypoints."""
 
-from .DetailedRouting import DetailedRoutingWorker, RoutePcbNets
+from .DetailedRouting import RoutePcbNets
 from .PinAccess import AnalyzePinAccess, PinAccessWorker
 
 __all__ = [
     "AnalyzePinAccess",
-    "DetailedRoutingWorker",
     "PinAccessWorker",
     "RoutePcbNets",
 ]

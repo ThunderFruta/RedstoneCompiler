@@ -3,12 +3,10 @@ from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 
-from Compiler.Routing.Core import (
-    FindFlatRouteConflicts,
-)
 from Compiler.Routing.Actions import (
     BuildPhysicalGraphs,
     BuildRoutingResources,
+    FindFlatRouteConflicts,
     MaterializeReservedRepeaters,
     ValidatePhysicalRoutes,
     ValidateTemplateIsolation,
