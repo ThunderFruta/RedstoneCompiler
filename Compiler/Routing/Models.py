@@ -717,6 +717,31 @@ class ComponentFeedthroughContract:
 
 
 @dataclass(frozen=True)
+class PhysicalComponentFeedthroughEndpointCandidate:
+    """One layer-exact interior passage before exterior seam binding."""
+
+    CandidateFingerprint: str
+    Layer: int
+    Entry: Position3
+    Exit: Position3
+    ReservedPathNodes: tuple[Position3, ...]
+    Claims: RoutingResourceClaims
+
+
+@dataclass(frozen=True)
+class PreparedPhysicalComponentFeedthroughEndpointDomain:
+    """Complete port-independent endpoint/path domain for one feedthrough."""
+
+    DomainFingerprint: str
+    Signal: str
+    Layer: int
+    FabricFingerprint: str
+    ResourceGraphFingerprint: str
+    Candidates: tuple[PhysicalComponentFeedthroughEndpointCandidate, ...]
+    Complete: bool
+
+
+@dataclass(frozen=True)
 class ComponentInterfacePort:
     """One owned logical net exported through a closed physical boundary."""
 
@@ -1734,6 +1759,21 @@ class PhysicalComponentPortCspState:
 
 
 @dataclass(frozen=True)
+class PhysicalLocalPortPairProofRecord:
+    """One exact complete local pair-support UNSAT proof."""
+
+    CurrentSignal: str
+    CurrentContract: str
+    CompleteSignal: str
+    CompleteContract: str
+    ProofDomainFingerprint: str
+    ProofFingerprint: str
+    Status: str
+    Complete: bool
+    Feasible: bool | None
+
+
+@dataclass(frozen=True)
 class PhysicalLocalPortPairSupportCertificate:
     """One complete proof-derived row of the local port support relation.
 
@@ -1753,9 +1793,22 @@ class PhysicalLocalPortPairSupportCertificate:
     RowContract: str
     ColumnSignal: str
     ColumnContracts: tuple[str, ...]
-    UnsupportedPairs: frozenset[tuple[str, str]]
-    ProofFingerprints: tuple[str, ...]
+    LocalProofContextFingerprint: str
+    PairProofRecords: tuple[PhysicalLocalPortPairProofRecord, ...]
     Complete: bool
+
+    @property
+    def UnsupportedPairs(self) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            (self.RowContract, Value.CurrentContract)
+            for Value in self.PairProofRecords
+        )
+
+    @property
+    def ProofFingerprints(self) -> tuple[str, ...]:
+        return tuple(sorted({
+            Value.ProofFingerprint for Value in self.PairProofRecords
+        }))
 
 
 @dataclass(frozen=True)
@@ -1966,6 +2019,9 @@ class PreparedPhysicalComponentPortFactorDomain:
             str,
             tuple[PhysicalComponentBoundaryPortReservation, ...],
         ], ...
+    ] = ()
+    FeedthroughEndpointDomains: tuple[
+        PreparedPhysicalComponentFeedthroughEndpointDomain, ...
     ] = ()
 
 

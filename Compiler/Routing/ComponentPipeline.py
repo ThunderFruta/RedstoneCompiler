@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from time import monotonic
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
 from .ComponentRouter import (
@@ -33,6 +34,7 @@ from .Models import (
     PhysicalComponentLocalFactorProjection,
     PhysicalComponentLocalFactorProjectionComparison,
     PhysicalComponentLocalFactorUnsatCertificate,
+    PhysicalLocalPortPairProofRecord,
     PhysicalLocalPortPairSupportCertificate,
     PhysicalComponentPortReservation,
     PhysicalComponentSelectedLocalPortSupport,
@@ -586,9 +588,20 @@ def _ValidatePhysicalTemplate(
         if (
             len(Nets) > Contract.Capacity
             or any(
-                not any(
-                    Entry in Net.Nodes and Exit in Net.Nodes
-                    for Entry, Exit in Contract.EndpointPairs
+                (
+                    not any(
+                        Entry in Net.Nodes and Exit in Net.Nodes
+                        for Entry, Exit in Contract.EndpointPairs
+                    )
+                    or (
+                        Contract.ReservedPathNodes
+                        and Net.Nodes
+                        != frozenset(Contract.ReservedPathNodes)
+                    )
+                    or (
+                        Contract.Claims is not None
+                        and Net.Claims != Contract.Claims
+                    )
                 )
                 for Net in Nets
             )
@@ -1521,6 +1534,14 @@ def SelectPhysicalComponentExactGlobalChannelSignals(
         Port.Signal
         for Port in SelectPhysicalAssemblyGlobalBoundaryPorts(Plan)
     }
+    ExactSignals.update(getattr(
+        Plan,
+        "DeclaredFeedthroughSignals",
+        frozenset(
+            Value.Signal
+            for Value in getattr(Plan, "Feedthroughs", ())
+        ),
+    ))
     ExactSignals.update(
         Channel.Signal
         for Channel in Channels
@@ -2339,6 +2360,95 @@ def BuildGlobalRelaxedLocalProofDomainFingerprint(
     ))
 
 
+def BuildPhysicalLocalPairProofContextFingerprint(
+    Problem: ComponentRoutingProblem,
+    Preparation: PreparedPhysicalComponentPortFactorDomain,
+) -> str:
+    """Bind pair-support proofs to the complete global-independent context.
+
+    Exact global channels and selected ports are intentionally removed.  All
+    component-local geometry, immutable obstacles, declared feedthroughs, and
+    finite terminal domains remain in the relaxed-domain identity.  Comparing
+    the bound problem with the preparation problem prevents a post-planning
+    mutation from being laundered into a reusable pre-assignment certificate.
+    """
+    if (
+        Preparation is None
+        or not Preparation.Complete
+        or not Preparation.Feasible
+        or not Preparation.DomainFingerprint
+    ):
+        raise ValueError(
+            "local pair proof context requires a complete feasible preparation"
+        )
+
+    def CanonicalFingerprint(Value: ComponentRoutingProblem) -> str:
+        Interface = Value.Interface
+        if (
+            Interface is None
+            or not bool(getattr(Interface, "Complete", True))
+            or not Value.DomainComplete
+            or not bool(getattr(Value.Fabric, "Complete", True))
+            or any(
+                not bool(getattr(Domain, "Complete", True))
+                for Domain in Value.OwnedTerminalDomains
+            )
+        ):
+            raise ValueError("local pair proof input domain is incomplete")
+        Feedthroughs = tuple(getattr(Interface, "Feedthroughs", ()))
+        DeclaredFeedthroughSignals = frozenset(
+            Value.Signal for Value in Feedthroughs
+        )
+        ForeignTransitSignals = frozenset(
+            Domain.Signal for Domain in Value.ForeignTransitDomains
+        )
+        if not ForeignTransitSignals.issubset(DeclaredFeedthroughSignals):
+            raise ValueError(
+                "local pair proof contains undeclared foreign transit"
+            )
+        CanonicalInterface = replace(
+            Interface,
+            PhysicalPortReservations=(),
+        )
+        CanonicalProblem = replace(
+            Value,
+            Interface=CanonicalInterface,
+            PhysicalAssemblyPlan=SimpleNamespace(
+                Ports=(),
+                Feedthroughs=Feedthroughs,
+            ),
+            ReservedGlobalClaimsBySignal=(),
+        )
+        return BuildGlobalRelaxedLocalProofDomainFingerprint(
+            CanonicalProblem
+        )
+
+    PreparedContext = CanonicalFingerprint(Preparation.Problem)
+    CurrentContext = CanonicalFingerprint(Problem)
+    if PreparedContext != CurrentContext:
+        raise ValueError(
+            "local pair proof context differs from its prepared domain"
+        )
+    AccessCertificate = Preparation.AccessCertificate
+    if (
+        not bool(getattr(AccessCertificate, "Complete", False))
+        or not bool(getattr(AccessCertificate, "Feasible", False))
+        or not getattr(AccessCertificate, "CertificateFingerprint", "")
+    ):
+        raise ValueError(
+            "local pair proof requires a complete feasible access certificate"
+        )
+    return _Fingerprint((
+        "physical-local-pair-proof-context-v1",
+        Preparation.DomainFingerprint,
+        Preparation.PlacementFingerprint,
+        Preparation.ComponentGraphFingerprint,
+        Preparation.ResourceGraphFingerprint,
+        Preparation.AccessCertificateFingerprint,
+        PreparedContext,
+    ))
+
+
 def _BuildPhysicalComponentLocalFactorProjectionParts(
     Problem: ComponentRoutingProblem,
     LocalFactorsBySignal: Any,
@@ -2819,6 +2929,12 @@ def ProveGlobalRelaxedLocalUnsatisfiability(
         "GlobalRelaxedLocalUnsatCoreKind": str(
             RelaxedDiagnostics.get("LocalUnsatCoreKind", "")
         ),
+        "LocalUnsatCoreProjectionFingerprint": str(
+            RelaxedDiagnostics.get(
+                "LocalUnsatCoreProjectionFingerprint",
+                "",
+            )
+        ),
         "GlobalRelaxedLocalCurrentSignal": str(
             RelaxedDiagnostics.get("LocalUnsatCoreCurrentSignal", "")
         ),
@@ -3058,12 +3174,18 @@ def BuildPhysicalLocalPortPairSupportCertificate(
     RowContract: str,
     ColumnSignal: str,
     ColumnContracts: tuple[str, ...],
-    UnsupportedPairs: frozenset[tuple[str, str]],
-    ProofFingerprints: tuple[str, ...],
+    LocalProofContextFingerprint: str,
+    PairProofRecords: tuple[PhysicalLocalPortPairProofRecord, ...],
 ) -> PhysicalLocalPortPairSupportCertificate:
     """Freeze one completely disproven local-support row for port AC-3."""
-    if Preparation is None or not bool(getattr(Preparation, "Complete", False)):
-        raise ValueError("local pair support requires complete preparation")
+    if (
+        Preparation is None
+        or not bool(getattr(Preparation, "Complete", False))
+        or not bool(getattr(Preparation, "Feasible", False))
+    ):
+        raise ValueError(
+            "local pair support requires complete feasible preparation"
+        )
     PreparedDomainFingerprint = str(getattr(
         Preparation,
         "DomainFingerprint",
@@ -3093,17 +3215,45 @@ def BuildPhysicalLocalPortPairSupportCertificate(
     ColumnContracts = tuple(sorted({
         str(Value) for Value in ColumnContracts if str(Value)
     }))
-    UnsupportedPairs = frozenset(
-        (str(First), str(Second))
-        for First, Second in UnsupportedPairs
-    )
-    ExpectedPairs = frozenset(
-        (RowContract, ColumnContract)
+    LocalProofContextFingerprint = str(LocalProofContextFingerprint)
+    if any(
+        not isinstance(Value, PhysicalLocalPortPairProofRecord)
+        for Value in PairProofRecords
+    ):
+        raise ValueError("local pair support row is incomplete")
+    PairProofRecords = tuple(sorted(
+        PairProofRecords,
+        key=lambda Value: (
+            Value.CurrentContract,
+            Value.ProofDomainFingerprint,
+            Value.ProofFingerprint,
+        ),
+    ))
+    ExpectedRecordKeys = frozenset(
+        (ColumnContract, RowContract)
         for ColumnContract in ColumnContracts
     )
-    ProofFingerprints = tuple(sorted({
-        str(Value) for Value in ProofFingerprints if str(Value)
-    }))
+    ActualRecordKeys = frozenset(
+        (Value.CurrentContract, Value.CompleteContract)
+        for Value in PairProofRecords
+    )
+    RecordsAreExact = bool(
+        len(PairProofRecords) == len(ColumnContracts)
+        and ActualRecordKeys == ExpectedRecordKeys
+        and all(
+            isinstance(Value, PhysicalLocalPortPairProofRecord)
+            and Value.CurrentSignal == ColumnSignal
+            and Value.CompleteSignal == RowSignal
+            and Value.CompleteContract == RowContract
+            and Value.CurrentContract in ColumnContracts
+            and Value.ProofDomainFingerprint
+            and Value.ProofFingerprint
+            and Value.Status == "architectural-unsatisfiable"
+            and Value.Complete
+            and Value.Feasible is False
+            for Value in PairProofRecords
+        )
+    )
     if (
         not PreparedDomainFingerprint
         or not PortSolverCacheKey
@@ -3116,8 +3266,8 @@ def BuildPhysicalLocalPortPairSupportCertificate(
         or not ColumnSignal
         or RowSignal == ColumnSignal
         or not ColumnContracts
-        or UnsupportedPairs != ExpectedPairs
-        or not ProofFingerprints
+        or not LocalProofContextFingerprint
+        or not RecordsAreExact
     ):
         raise ValueError("local pair support row is incomplete")
     CertificateFingerprint = _Fingerprint((
@@ -3132,8 +3282,8 @@ def BuildPhysicalLocalPortPairSupportCertificate(
         RowContract,
         ColumnSignal,
         ColumnContracts,
-        tuple(sorted(UnsupportedPairs)),
-        ProofFingerprints,
+        LocalProofContextFingerprint,
+        PairProofRecords,
     ))
     return PhysicalLocalPortPairSupportCertificate(
         CertificateFingerprint=CertificateFingerprint,
@@ -3147,8 +3297,8 @@ def BuildPhysicalLocalPortPairSupportCertificate(
         RowContract=RowContract,
         ColumnSignal=ColumnSignal,
         ColumnContracts=ColumnContracts,
-        UnsupportedPairs=UnsupportedPairs,
-        ProofFingerprints=ProofFingerprints,
+        LocalProofContextFingerprint=LocalProofContextFingerprint,
+        PairProofRecords=PairProofRecords,
         Complete=True,
     )
 
@@ -3166,6 +3316,20 @@ def ValidatePhysicalLocalPortPairSupportCertificate(
         )
         or not Certificate.Complete
         or Certificate.PortSolverCacheKey != PortSolverCacheKey
+    ):
+        return False
+    try:
+        ExpectedProofContextFingerprint = (
+            BuildPhysicalLocalPairProofContextFingerprint(
+                Preparation.Problem,
+                Preparation,
+            )
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (
+        Certificate.LocalProofContextFingerprint
+        != ExpectedProofContextFingerprint
     ):
         return False
     LocalFactorsBySignal = dict(getattr(
@@ -3196,8 +3360,8 @@ def ValidatePhysicalLocalPortPairSupportCertificate(
             Certificate.RowContract,
             Certificate.ColumnSignal,
             Certificate.ColumnContracts,
-            Certificate.UnsupportedPairs,
-            Certificate.ProofFingerprints,
+            Certificate.LocalProofContextFingerprint,
+            Certificate.PairProofRecords,
         )
     except (AttributeError, TypeError, ValueError):
         return False
@@ -3212,6 +3376,7 @@ def CertifyDirectionalLocalContractPortfolio(
     *,
     BuildProofDomainFingerprint: Callable[[Any, Any], str],
     EvaluatePair: Callable[[Any, Any, str], dict[str, object]],
+    LocalProofContextFingerprint: str,
     MaximumCompletedRows: int | None = None,
 ) -> dict[str, object]:
     """Certify exact local-contract pairs before resolving factor clauses.
@@ -3237,6 +3402,7 @@ def CertifyDirectionalLocalContractPortfolio(
         or not CompleteSignal
         or CurrentSignal == CompleteSignal
         or not DomainFingerprint
+        or not LocalProofContextFingerprint
     ):
         return {
             "Complete": False,
@@ -3376,7 +3542,7 @@ def CertifyDirectionalLocalContractPortfolio(
             PreviouslyCoveredPairCount += len(CurrentOptions)
             continue
         CompleteContractCovered = True
-        RowProofFingerprints = set()
+        RowProofRecords = []
         for CurrentContract, CurrentOption in sorted(CurrentOptions.items()):
             ExactNoGood = ExactPairNoGood(
                 CurrentContract,
@@ -3384,10 +3550,6 @@ def CertifyDirectionalLocalContractPortfolio(
             )
             if PairCovered(ExactNoGood):
                 PreviouslyCoveredPairCount += 1
-                RowProofFingerprints.add(_Fingerprint((
-                    "proof-qualified-local-pair-no-good-v1",
-                    tuple(sorted(ExactNoGood)),
-                )))
                 continue
             ProofDomainFingerprint = str(BuildProofDomainFingerprint(
                 CurrentOption,
@@ -3432,6 +3594,10 @@ def CertifyDirectionalLocalContractPortfolio(
                 == frozenset((CurrentSignal, CompleteSignal))
                 and Proof.get("GlobalRelaxedLocalDomainFingerprint", "")
                 == ProofDomainFingerprint
+                and bool(Proof.get(
+                    "GlobalRelaxedLocalProofFingerprint",
+                    "",
+                ))
             )
             if Certified:
                 # Only complete proof-qualified UNSAT results may populate
@@ -3440,10 +3606,21 @@ def CertifyDirectionalLocalContractPortfolio(
                 ProofCache[CacheKey] = Proof
                 RejectedSets.add(ExactNoGood)
                 CertifiedPairCount += 1
-                RowProofFingerprints.add(str(
-                    Proof.get("GlobalRelaxedLocalProofFingerprint", "")
-                    or ProofDomainFingerprint
-                ))
+                RowProofRecords.append(
+                    PhysicalLocalPortPairProofRecord(
+                        CurrentSignal=CurrentSignal,
+                        CurrentContract=CurrentContract,
+                        CompleteSignal=CompleteSignal,
+                        CompleteContract=CompleteContract,
+                        ProofDomainFingerprint=ProofDomainFingerprint,
+                        ProofFingerprint=str(Proof[
+                            "GlobalRelaxedLocalProofFingerprint"
+                        ]),
+                        Status="architectural-unsatisfiable",
+                        Complete=True,
+                        Feasible=False,
+                    )
+                )
             else:
                 CompleteContractCovered = False
                 if (
@@ -3471,7 +3648,10 @@ def CertifyDirectionalLocalContractPortfolio(
             break
         if CompleteContractCovered:
             CompletedRowCount += 1
-            if bool(getattr(Preparation, "Complete", False)):
+            if (
+                bool(getattr(Preparation, "Complete", False))
+                and len(RowProofRecords) == len(CurrentOptions)
+            ):
                 Certificate = BuildPhysicalLocalPortPairSupportCertificate(
                     Preparation,
                     PortSolverCacheKey,
@@ -3479,11 +3659,8 @@ def CertifyDirectionalLocalContractPortfolio(
                     CompleteContract,
                     CurrentSignal,
                     tuple(sorted(CurrentOptions)),
-                    frozenset(
-                        (CompleteContract, CurrentContract)
-                        for CurrentContract in CurrentOptions
-                    ),
-                    tuple(sorted(RowProofFingerprints)),
+                    LocalProofContextFingerprint,
+                    tuple(RowProofRecords),
                 )
                 SupportCertificateCache[
                     Certificate.CertificateFingerprint
@@ -3692,6 +3869,22 @@ def CertifyLocalInterfaceFactorPortfolio(
         "DomainFingerprint",
         "",
     ))
+    LocalProofContextFingerprint = ""
+    if (
+        isinstance(
+            Preparation,
+            PreparedPhysicalComponentPortFactorDomain,
+        )
+        and isinstance(Preparation.Problem, ComponentRoutingProblem)
+        and Preparation.Complete
+        and Preparation.Feasible
+    ):
+        LocalProofContextFingerprint = (
+            BuildPhysicalLocalPairProofContextFingerprint(
+                Problem,
+                Preparation,
+            )
+        )
     PortSolverCacheKey = (
         BuildPhysicalComponentPortSolverCacheKey(
             PreparedDomainFingerprint
@@ -4096,6 +4289,9 @@ def CertifyLocalInterfaceFactorPortfolio(
             Resources,
             BuildProofDomainFingerprint=ProofDomain,
             EvaluatePair=Evaluate,
+            LocalProofContextFingerprint=(
+                LocalProofContextFingerprint
+            ),
             MaximumCompletedRows=None,
         )
         CertificationPasses.append({
@@ -4346,6 +4542,7 @@ def RecordPhysicalComponentLocalCompilationNoGood(
     )
     CertifiedCoreKinds = frozenset((
         "complete-opposing-net-access-pair",
+        "tree-frontier-empty-owned-signal-domain",
     ))
     if GlobalRelaxedProofComplete:
         if not RelaxedProofFingerprint or not RelaxedDomainFingerprint:
@@ -4385,20 +4582,52 @@ def RecordPhysicalComponentLocalCompilationNoGood(
             and RelaxedCoreSignals
             and RelaxedCoreSignals <= PortsBySignal.keys()
         ):
-            CoreReservationKeys = frozenset(
-                (
-                    Signal,
-                    BuildPhysicalPortLocalContractFingerprint(
-                        PortsBySignal[Signal]
-                    ),
-                )
-                for Signal in RelaxedCoreSignals
+            PreparedPortDomain = getattr(
+                Resources,
+                "PreparedPhysicalComponentPortFactorDomain",
+                None,
             )
+            OwnedSignalFamilyProof = bool(
+                RelaxedCoreKind
+                == "tree-frontier-empty-owned-signal-domain"
+                and len(RelaxedCoreSignals) == 1
+                and Diagnostics.get(
+                    "LocalUnsatCoreProjectionFingerprint",
+                    "",
+                )
+                and PreparedPortDomain is not None
+                and bool(getattr(PreparedPortDomain, "Complete", False))
+                and bool(getattr(PreparedPortDomain, "Feasible", False))
+                and getattr(PreparedPortDomain, "DomainFingerprint", "")
+            )
+            if OwnedSignalFamilyProof:
+                PortSolverCacheKey = (
+                    BuildPhysicalComponentPortSolverCacheKey(str(
+                        PreparedPortDomain.DomainFingerprint
+                    ))
+                )
+                CoreReservationKeys = frozenset(
+                    (
+                        Signal,
+                        "local-signal-domain:" + PortSolverCacheKey,
+                    )
+                    for Signal in RelaxedCoreSignals
+                )
+            else:
+                CoreReservationKeys = frozenset(
+                    (
+                        Signal,
+                        BuildPhysicalPortLocalContractFingerprint(
+                            PortsBySignal[Signal]
+                        ),
+                    )
+                    for Signal in RelaxedCoreSignals
+                )
             Resources.RejectedPhysicalComponentPortReservationSets.add(
                 CoreReservationKeys
             )
             DirectionalLocalFactorNoGoods = ()
-            if RelaxedCoreSignals == frozenset((
+            if not OwnedSignalFamilyProof and RelaxedCoreSignals == frozenset((
                 RelaxedCurrentSignal,
                 RelaxedCompleteSignal,
             )):
@@ -4413,12 +4642,20 @@ def RecordPhysicalComponentLocalCompilationNoGood(
                 Resources.RejectedPhysicalComponentPortReservationSets.update(
                     DirectionalLocalFactorNoGoods
                 )
-            PromotedFabricNoGoods = PromoteCoveredLocalContractNoGoods(
-                Plan,
-                RelaxedCoreSignals,
-                Resources,
+            PromotedFabricNoGoods = (
+                ()
+                if OwnedSignalFamilyProof
+                else PromoteCoveredLocalContractNoGoods(
+                    Plan,
+                    RelaxedCoreSignals,
+                    Resources,
+                )
             )
-            Scope = "global-relaxed-local-port-core"
+            Scope = (
+                "global-relaxed-owned-signal-domain"
+                if OwnedSignalFamilyProof
+                else "global-relaxed-local-port-core"
+            )
         else:
             Resources.RejectedPhysicalComponentPortAssignmentFingerprints.add(
                 Plan.PortAssignmentFingerprint

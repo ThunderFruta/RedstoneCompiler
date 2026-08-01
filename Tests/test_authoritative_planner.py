@@ -109,6 +109,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     FilterPhysicalCandidatesToCurrentPortalDomain,
     ClassifyEmptyPhysicalCandidateDomains,
     ApplyPhysicalComponentAssemblyPortalDomains,
+    SelectGenericPortalTerminalPaths,
     GetPersistentPhysicalComponentPortCspState,
     FindProofQualifiedCompleteDomainNoGoodCore,
     FindProofQualifiedUniversalNoGoodCore,
@@ -244,6 +245,7 @@ from Compiler.Routing.Models import (
     ClusterInterfaceStateProof,
     PhysicalComponentPortReservation,
     PhysicalComponentChannelReservation,
+    PhysicalLocalPortPairProofRecord,
     PhysicalPortLaneFactor,
     PhysicalPortSeamFactor,
     RoutingResources,
@@ -271,6 +273,28 @@ from Compiler.Routing.ResourceGraph import (
 )
 from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
 from RedstoneCompiler.RustRouting import GenerateRectilinearTopology, RoutingContext
+
+
+def _LocalPairProofRecords(
+    CurrentSignal,
+    CurrentContracts,
+    CompleteSignal,
+    CompleteContract,
+):
+    return tuple(
+        PhysicalLocalPortPairProofRecord(
+            CurrentSignal=CurrentSignal,
+            CurrentContract=CurrentContract,
+            CompleteSignal=CompleteSignal,
+            CompleteContract=CompleteContract,
+            ProofDomainFingerprint="domain:" + CurrentContract,
+            ProofFingerprint="proof:" + CurrentContract,
+            Status="architectural-unsatisfiable",
+            Complete=True,
+            Feasible=False,
+        )
+        for CurrentContract in CurrentContracts
+    )
 
 
 class AuthoritativePlannerTests(unittest.TestCase):
@@ -6444,8 +6468,14 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertTrue(ScopedClause.issubset(FirstKeys))
         self.assertFalse(ScopedClause.issubset(OtherKeys))
 
+    @patch(
+        "Compiler.Routing.ComponentPipeline."
+        "BuildPhysicalLocalPairProofContextFingerprint",
+        return_value="local-proof-context",
+    )
     def testLocalPairSupportIndexRequiresCompleteMatchingIdentity(
         self,
+        _ProofContext,
     ) -> None:
         Preparation = SimpleNamespace(
             DomainFingerprint="prepared",
@@ -6462,6 +6492,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             **{
                 **vars(Preparation),
                 "Complete": True,
+                "Feasible": True,
                 "LocalAccessFactorsBySignal": (
                     ("CarryA", (
                         SimpleNamespace(
@@ -6486,11 +6517,13 @@ class AuthoritativePlannerTests(unittest.TestCase):
             "local-a",
             "CarryB",
             ("local-b0", "local-b1"),
-            frozenset((
-                ("local-a", "local-b0"),
-                ("local-a", "local-b1"),
-            )),
-            ("proof-0", "proof-1"),
+            "local-proof-context",
+            _LocalPairProofRecords(
+                "CarryB",
+                ("local-b0", "local-b1"),
+                "CarryA",
+                "local-a",
+            ),
         )
         Expected = frozenset((frozenset((
             ("CarryA", "local-a"),
@@ -6512,10 +6545,10 @@ class AuthoritativePlannerTests(unittest.TestCase):
             replace(Certificate, ComponentGraphFingerprint="other-component"),
             replace(Certificate, PreparedDomainFingerprint="other-prepared"),
             replace(Certificate, CertificateFingerprint="other-certificate"),
-            replace(Certificate, ProofFingerprints=()),
+            replace(Certificate, PairProofRecords=()),
             replace(
                 Certificate,
-                UnsupportedPairs=frozenset((("local-a", "local-b0"),)),
+                PairProofRecords=Certificate.PairProofRecords[:1],
             ),
         ):
             self.assertFalse(
@@ -6530,8 +6563,10 @@ class AuthoritativePlannerTests(unittest.TestCase):
             "local-a",
             "CarryB",
             ("local-b0",),
-            frozenset((("local-a", "local-b0"),)),
-            ("proof-subset",),
+            "local-proof-context",
+            _LocalPairProofRecords(
+                "CarryB", ("local-b0",), "CarryA", "local-a"
+            ),
         )
         ForeignRowCertificate = BuildPhysicalLocalPortPairSupportCertificate(
             CompletePreparation,
@@ -6540,11 +6575,13 @@ class AuthoritativePlannerTests(unittest.TestCase):
             "local-foreign",
             "CarryB",
             ("local-b0", "local-b1"),
-            frozenset((
-                ("local-foreign", "local-b0"),
-                ("local-foreign", "local-b1"),
-            )),
-            ("proof-foreign",),
+            "local-proof-context",
+            _LocalPairProofRecords(
+                "CarryB",
+                ("local-b0", "local-b1"),
+                "CarryA",
+                "local-foreign",
+            ),
         )
         self.assertFalse(BuildPhysicalLocalPortPairUnsupportedIndex(
             (SubsetCertificate,), CompletePreparation, "solver"
@@ -6553,14 +6590,21 @@ class AuthoritativePlannerTests(unittest.TestCase):
             (ForeignRowCertificate,), CompletePreparation, "solver"
         ))
 
+    @patch(
+        "Compiler.Routing.ComponentPipeline."
+        "BuildPhysicalLocalPairProofContextFingerprint",
+        return_value="local-proof-context",
+    )
     def testLocalPairSupportIndexCompactsLargeRowWithoutChangingRejection(
         self,
+        _ProofContext,
     ) -> None:
         ColumnContracts = tuple(
             f"local-column-{Index:03d}" for Index in range(144)
         )
         Preparation = SimpleNamespace(
             Complete=True,
+            Feasible=True,
             DomainFingerprint="prepared-large-row",
             ComponentGraphFingerprint="component",
             ResourceGraphFingerprint="resource",
@@ -6589,11 +6633,10 @@ class AuthoritativePlannerTests(unittest.TestCase):
             "local-row",
             "Column",
             ColumnContracts,
-            frozenset(
-                ("local-row", Contract)
-                for Contract in ColumnContracts
+            "local-proof-context",
+            _LocalPairProofRecords(
+                "Column", ColumnContracts, "Row", "local-row"
             ),
-            tuple(f"proof-{Index:03d}" for Index in range(144)),
         )
 
         Clauses = BuildPhysicalLocalPortPairUnsupportedIndex(
@@ -8972,6 +9015,15 @@ class AuthoritativePlannerTests(unittest.TestCase):
             Plan=Plan,
         )
         self.assertEqual(AuthorizedMaximum, 4)
+        self.assertEqual(
+            SelectHierarchicalRoutingMaximumLayerCount(
+                PolicyLayerLimit=3,
+                TechnologyMaximumLayerCount=8,
+                InterfaceDeckLayer=None,
+                Plan=Plan,
+            ),
+            4,
+        )
         ValidatePhysicalAssemblyRoutingLayerLimit(
             Plan,
             RequiredLayerCount=4,
@@ -9005,6 +9057,35 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertEqual(
             Failure.Diagnostics["InterfaceDeckAuthorization"],
             "rejected-by-technology",
+        )
+
+    def testExactPhysicalAttachmentSkipsGenericPortalPreparation(
+        self,
+    ) -> None:
+        Profile = SimpleNamespace(
+            Signal="PortA",
+            Root=(0, 7, 0),
+            SourceAccessPath=((0, 7, 0), (1, 7, 0)),
+            Targets=((8, 7, 0),),
+            TargetAccessPaths={
+                (8, 7, 0): ((8, 7, 0), (7, 7, 0)),
+            },
+        )
+        Plan = SimpleNamespace(Ports=(SimpleNamespace(
+            Signal="PortA",
+            Attachment=(0, 7, 0),
+        ),))
+
+        self.assertEqual(
+            SelectGenericPortalTerminalPaths(Profile, Plan),
+            (((8, 7, 0), ((8, 7, 0), (7, 7, 0))),),
+        )
+        self.assertEqual(
+            SelectGenericPortalTerminalPaths(Profile, None),
+            (
+                ((0, 7, 0), ((0, 7, 0), (1, 7, 0))),
+                ((8, 7, 0), ((8, 7, 0), (7, 7, 0))),
+            ),
         )
 
     def testPhysicalAssemblyExactAttachmentMustBeGloballyVisible(self) -> None:

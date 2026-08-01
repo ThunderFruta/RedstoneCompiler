@@ -1,4 +1,7 @@
 from dataclasses import replace
+import json
+from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 import unittest
 
@@ -30,10 +33,12 @@ from Compiler.Routing.ComponentRouter import (
     PruneDominatedComponentAccessCandidates,
     SelectComponentIncidentSignals,
     SolveComponentRoutingProblem,
+    SolveComponentRoutingProblemDynamic,
     ValidateRoutedComponentHandoff,
     _BuildCanonicalAccessCombinationKey,
     _BuildNetVariant,
     _PlanTreeRepeaters,
+    _SolveComponentRoutingProblemLegacy,
 )
 from Compiler.Routing.ComponentPipeline import CompileClosedComponent
 from Compiler.Routing.ComponentPipeline import (
@@ -44,13 +49,16 @@ from Compiler.Routing.Models import (
     ComponentFeedthroughContract,
     ComponentForeignTransitDomain,
     ComponentInterfacePort,
+    ComponentRoutingFabric,
     ComponentRoutingProblem,
     ComponentTerminalAccessCandidate,
     ComponentTerminalAccessDomain,
+    PhysicalComponentAssemblyPlan,
     PhysicalComponentPortReservation,
     RoutedComponentNet,
 )
 from Compiler.Routing.ResourceGraph import (
+    LocalRouteClaim,
     PinAccessPortal,
     RoutingResourceGraph,
     RoutingResourceClaims,
@@ -1738,6 +1746,55 @@ def test_declared_feedthrough_compiles_only_its_exact_endpoints():
     )
 
 
+def test_declared_physical_feedthrough_compiles_only_reserved_path():
+    Fabric = BuildComponentRoutingFabric(_Channel(
+        tuple((X, 7, 0) for X in range(5)),
+        tuple((X, 7, 1) for X in range(5)),
+    ))
+    Problem = _Problem(Fabric=Fabric)
+    ReservedPath = tuple((X, 7, 1) for X in range(5))
+    Contract = ComponentFeedthroughContract(
+        Signal="Foreign",
+        EndpointPairs=((ReservedPath[0], ReservedPath[-1]),),
+        Capacity=1,
+        ReservedPathNodes=ReservedPath,
+        ReservationFingerprint="physical-feedthrough",
+    )
+
+    (Domain,) = BuildDeclaredComponentFeedthroughDomains(
+        Problem,
+        (Contract,),
+    )
+
+    assert Domain.Complete
+    assert len(Domain.Candidates) == 1
+    assert Domain.Candidates[0].Nodes == frozenset(ReservedPath)
+
+
+def test_declared_physical_feedthrough_rejects_reserved_path_drift():
+    Fabric = BuildComponentRoutingFabric(_Channel(
+        tuple((X, 7, 0) for X in range(5)),
+    ))
+    Problem = _Problem(Fabric=Fabric)
+    Contract = ComponentFeedthroughContract(
+        Signal="Foreign",
+        EndpointPairs=(((0, 7, 0), (4, 7, 0)),),
+        ReservedPathNodes=((0, 7, 0), (2, 7, 0), (4, 7, 0)),
+        ReservationFingerprint="disconnected-feedthrough",
+    )
+
+    (Domain,) = BuildDeclaredComponentFeedthroughDomains(
+        Problem,
+        (Contract,),
+    )
+
+    assert Domain.Complete
+    assert not Domain.Candidates
+    assert Domain.Diagnostics["RejectionCounts"] == {
+        "invalid-declared-endpoints": 1,
+    }
+
+
 def test_foreign_transit_competes_for_capacity_and_freezes_as_seed():
     Fabric = BuildComponentRoutingFabric(_Channel(
         tuple((X, 7, 0) for X in range(7)),
@@ -1996,6 +2053,308 @@ def test_unique_subtree_conflict_fixture_is_exhaustive():
     assert Bounded.Diagnostics["CapacityEmptyDomainWitnesses"]
     Result = SolveComponentRoutingProblem(Conflicting)
     assert Result.Exhaustive
+
+
+def test_tree_frontier_dp_matches_legacy_feasible_template():
+    Problem = _Problem()
+    Legacy = _SolveComponentRoutingProblemLegacy(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+    Dynamic = SolveComponentRoutingProblemDynamic(Problem)
+
+    assert Legacy.Feasible and Dynamic.Feasible
+    assert Legacy.Template is not None and Dynamic.Template is not None
+    assert (
+        Legacy.Template.RoutedTemplateFingerprint
+        == Dynamic.Template.RoutedTemplateFingerprint
+    )
+    assert Dynamic.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"
+    assert Dynamic.Diagnostics["CompleteTreesMaterialized"] == 0
+    assert Dynamic.Diagnostics["SelectedTreesMaterialized"] == 1
+
+
+def test_tree_frontier_dp_matches_legacy_capacity_unsat():
+    Base = _Problem()
+    Conflicting = replace(
+        Base,
+        ComponentSignals=("Alpha", "Beta"),
+        OwnedTerminalDomains=(
+            *Base.OwnedTerminalDomains,
+            _Domain(
+                "Beta",
+                (0, 7, 0),
+                "source",
+                _Candidate(((0, 7, 0),)),
+            ),
+            _Domain(
+                "Beta",
+                (2, 7, 0),
+                "target",
+                _Candidate(((2, 7, 0),)),
+            ),
+        ),
+    )
+    Legacy = _SolveComponentRoutingProblemLegacy(
+        Conflicting,
+        DiscoveryVariantLimit=None,
+    )
+    Dynamic = SolveComponentRoutingProblemDynamic(Conflicting)
+
+    assert Legacy.Exhaustive and Dynamic.Exhaustive
+    assert Dynamic.Diagnostics["CompleteTreesMaterialized"] == 0
+
+
+def test_tree_frontier_dp_is_deterministic_and_typed_incomplete():
+    First = SolveComponentRoutingProblemDynamic(_Problem())
+    Second = SolveComponentRoutingProblemDynamic(_Problem())
+    Incomplete = SolveComponentRoutingProblemDynamic(
+        replace(_Problem(), MaximumWork=0)
+    )
+
+    assert First.Template is not None and Second.Template is not None
+    assert (
+        First.Template.RoutedTemplateFingerprint
+        == Second.Template.RoutedTemplateFingerprint
+    )
+    assert First.Diagnostics["PeakFrontierStateCount"] == 1
+    assert Incomplete.Status == "incomplete"
+    assert Incomplete.Diagnostics["CompleteTreesMaterialized"] == 0
+
+
+def _LoadCla4TreeDpFixture():
+    Data = json.loads(
+        (
+            Path(__file__).parent
+            / "Fixtures"
+            / "Cla4ComponentTreeDpProblem.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    def Position(Value):
+        return tuple(map(int, Value))
+
+    def Claims(Value):
+        return RoutingResourceClaims(
+            WireCells=frozenset(map(Position, Value["WireCells"])),
+            SupportCells=frozenset(map(
+                Position,
+                Value["SupportCells"],
+            )),
+            RequiredAirCells=frozenset(map(
+                Position,
+                Value["RequiredAirCells"],
+            )),
+            ElectricalCells=frozenset(map(
+                Position,
+                Value["ElectricalCells"],
+            )),
+        )
+
+    def LocalClaim(Value):
+        return LocalRouteClaim(
+            Signal=Value["Signal"],
+            ClusterId=int(Value["ClusterId"]),
+            Root=Position(Value["Root"]),
+            ConnectedTargets=tuple(map(
+                Position,
+                Value["ConnectedTargets"],
+            )),
+            BoundaryNodes=tuple(map(
+                Position,
+                Value["BoundaryNodes"],
+            )),
+            Nodes=frozenset(map(Position, Value["Nodes"])),
+            Edges=frozenset(
+                tuple(sorted((Position(First), Position(Second))))
+                for First, Second in Value["Edges"]
+            ),
+            Claims=Claims(Value["Claims"]),
+        )
+
+    FabricValue = Data["Fabric"]
+    Fabric = ComponentRoutingFabric(
+        FabricFingerprint=FabricValue["FabricFingerprint"],
+        Nodes=tuple(map(Position, FabricValue["Nodes"])),
+        Edges=tuple(
+            tuple(sorted((Position(First), Position(Second))))
+            for First, Second in FabricValue["Edges"]
+        ),
+        IngressNodes=tuple(map(
+            Position,
+            FabricValue["IngressNodes"],
+        )),
+        TopologyKind=FabricValue["TopologyKind"],
+        Complete=bool(FabricValue["Complete"]),
+        IncompleteReason=FabricValue["IncompleteReason"],
+    )
+    Domains = tuple(
+        ComponentTerminalAccessDomain(
+            Signal=Value["Signal"],
+            Terminal=Position(Value["Terminal"]),
+            TerminalRole=Value["TerminalRole"],
+            TerminalFingerprint=Value["TerminalFingerprint"],
+            Candidates=tuple(
+                ComponentTerminalAccessCandidate(
+                    CandidateFingerprint=(
+                        Candidate["CandidateFingerprint"]
+                    ),
+                    Attachment=Position(Candidate["Attachment"]),
+                    Path=tuple(map(Position, Candidate["Path"])),
+                    Claims=Claims(Candidate["Claims"]),
+                    Layer=int(Candidate["Layer"]),
+                    Cost=int(Candidate["Cost"]),
+                )
+                for Candidate in Value["Candidates"]
+            ),
+            Complete=bool(Value["Complete"]),
+        )
+        for Value in Data["OwnedTerminalDomains"]
+    )
+    InterfaceValue = Data["Interface"]
+    PhysicalPorts = tuple(
+        PhysicalComponentPortReservation(
+            Signal=Value["Signal"],
+            Direction=Value["Direction"],
+            OwnedTerminals=tuple(map(
+                Position,
+                Value["OwnedTerminals"],
+            )),
+            OwnedTerminalFingerprints=tuple(
+                Value["OwnedTerminalFingerprints"]
+            ),
+            OwnedCandidateFingerprints=tuple(
+                Value["OwnedCandidateFingerprints"]
+            ),
+            FabricDomainFingerprint=(
+                Value["FabricDomainFingerprint"]
+            ),
+            FabricAttachment=Position(Value["FabricAttachment"]),
+            Attachment=Position(Value["Attachment"]),
+            LocalPath=tuple(map(Position, Value["LocalPath"])),
+            GlobalPath=tuple(map(Position, Value["GlobalPath"])),
+            Claims=Claims(Value["Claims"]),
+            Capacity=int(Value["Capacity"]),
+            ReservationFingerprint=Value["ReservationFingerprint"],
+        )
+        for Value in InterfaceValue["PhysicalPortReservations"]
+    )
+    Interface = ClosedComponentInterface(
+        InterfaceFingerprint=InterfaceValue["InterfaceFingerprint"],
+        ComponentId=InterfaceValue["ComponentId"],
+        OwnedSignals=tuple(InterfaceValue["OwnedSignals"]),
+        Ports=tuple(
+            ComponentInterfacePort(
+                Signal=Value["Signal"],
+                Direction=Value["Direction"],
+                OwnedTerminals=tuple(map(
+                    Position,
+                    Value["OwnedTerminals"],
+                )),
+                ExternalTerminalCount=int(
+                    Value["ExternalTerminalCount"]
+                ),
+                Capacity=int(Value["Capacity"]),
+            )
+            for Value in InterfaceValue["Ports"]
+        ),
+        PhysicalPortReservations=PhysicalPorts,
+        PhysicalAssemblyPlanFingerprint="cla4-tree-dp-fixture-plan",
+        Complete=bool(InterfaceValue["Complete"]),
+    )
+    ResourceValue = Data["ResourceGraph"]
+    ResourceGraph = RoutingResourceGraph(
+        ActualBlocks=frozenset(map(
+            Position,
+            ResourceValue["ActualBlocks"],
+        )),
+        ElectricalBlocks=frozenset(map(
+            Position,
+            ResourceValue["ElectricalBlocks"],
+        )),
+        SolidBlocks=frozenset(map(
+            Position,
+            ResourceValue["SolidBlocks"],
+        )),
+        GraphVersion=ResourceValue["GraphVersion"],
+    )
+    Plan = PhysicalComponentAssemblyPlan(
+        PlanFingerprint="cla4-tree-dp-fixture-plan",
+        PortAssignmentFingerprint="cla4-tree-dp-fixture-ports",
+        PlacementFingerprint=Data["PlacementFingerprint"],
+        ComponentGraphFingerprint="cla4-tree-dp-fixture-component",
+        ResourceGraphFingerprint="cla4-tree-dp-fixture-resource",
+        TechnologyFingerprint="cla4-tree-dp-fixture-technology",
+        InterfaceFingerprint=Interface.InterfaceFingerprint,
+        ComponentId=Interface.ComponentId,
+        EnvelopeMinimum=min(Fabric.Nodes),
+        EnvelopeMaximum=max(Fabric.Nodes),
+        KeepoutClaims=RoutingResourceClaims(),
+        Ports=PhysicalPorts,
+        Channels=(),
+    )
+    Problem = ComponentRoutingProblem(
+        ProblemFingerprint=Data["ProblemFingerprint"],
+        PlacementFingerprint=Data["PlacementFingerprint"],
+        LocalTemplateFingerprint=Data["LocalTemplateFingerprint"],
+        SelectedClusters=tuple(map(int, Data["SelectedClusters"])),
+        ComponentSignals=tuple(Data["ComponentSignals"]),
+        LocalClaims=tuple(map(LocalClaim, Data["LocalClaims"])),
+        Fabric=Fabric,
+        OwnedTerminalDomains=Domains,
+        ExternalContinuationTerminals=tuple(
+            (Signal, Position(Terminal), Role)
+            for Signal, Terminal, Role
+            in Data["ExternalContinuationTerminals"]
+        ),
+        ForeignEscapeDomains=(),
+        MaximumPowerDistance=int(Data["MaximumPowerDistance"]),
+        DomainComplete=bool(Data["DomainComplete"]),
+        ResourceGraph=ResourceGraph,
+        MaximumWork=int(Data["MaximumWork"]),
+        ImmutableClaims=tuple(map(
+            LocalClaim,
+            Data["ImmutableClaims"],
+        )),
+        Interface=Interface,
+        PhysicalAssemblyPlan=Plan,
+        ReservedGlobalClaimsBySignal=tuple(
+            (Signal, Claims(Value))
+            for Signal, Value
+            in Data["ReservedGlobalClaimsBySignal"]
+        ),
+    )
+    return Data, Problem
+
+
+def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
+    Data, Problem = _LoadCla4TreeDpFixture()
+    Started = monotonic()
+    First = SolveComponentRoutingProblemDynamic(
+        Problem,
+        DeadlineSeconds=30.0,
+    )
+    RuntimeSeconds = monotonic() - Started
+    Second = SolveComponentRoutingProblemDynamic(
+        Problem,
+        DeadlineSeconds=30.0,
+    )
+    Dispatched = SolveComponentRoutingProblem(
+        Problem,
+        DeadlineSeconds=30.0,
+    )
+
+    assert First.Status == Data["ExpectedStatus"]
+    assert Second.Status == First.Status
+    assert Dispatched.Status == First.Status
+    assert Second.ProofFingerprint == First.ProofFingerprint
+    assert Dispatched.ProofFingerprint == First.ProofFingerprint
+    assert RuntimeSeconds < 30.0
+    assert First.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"
+    assert Dispatched.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"
+    assert First.Diagnostics["CompleteTreesMaterialized"] == 0
+    assert First.Diagnostics["ComponentSignalCount"] == 7
+    assert First.Diagnostics["OwnedTerminalDomainCount"] == 9
 
 
 def test_physically_identical_access_derivations_share_one_net_variant():

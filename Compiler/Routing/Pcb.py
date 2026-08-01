@@ -800,7 +800,11 @@ def RoutePcbAttempt(
                 "no factor domain"
             )
         return Routed
-    if Resources.PreparingPhysicalComponentGlobalChannels:
+    if bool(getattr(
+        Resources,
+        "PreparingPhysicalComponentGlobalChannels",
+        False,
+    )):
         if not isinstance(Routed, RoutedDesign):
             raise RuntimeError(
                 "physical global channel preparation returned no routed design"

@@ -55,6 +55,7 @@ from .Models import (
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceTerminalDomain,
     ComponentRoutingProblemPrepared,
+    ComponentFeedthroughContract,
     ComponentCutAccessFeasibilityCertificate,
     PhysicalComponentAssemblyPlan,
     PhysicalComponentApertureFactor,
@@ -63,6 +64,7 @@ from .Models import (
     PhysicalComponentChannelReservation,
     PhysicalComponentPortReservation,
     PhysicalComponentPortCspState,
+    PhysicalComponentFeedthroughEndpointCandidate,
     PhysicalLocalPortPairSupportCertificate,
     PhysicalPortCorridorDomain,
     PhysicalPortCorridorFactor,
@@ -76,6 +78,7 @@ from .Models import (
     PhysicalPortSeamFactor,
     PhysicalSignalApertureCandidateDomainIdentity,
     PreparedPhysicalComponentPortFactorDomain,
+    PreparedPhysicalComponentFeedthroughEndpointDomain,
     PreparedPhysicalComponentAssembly,
     RetainedPhysicalGlobalPlanFrontierEntry,
     RoutedDesign,
@@ -103,6 +106,7 @@ from .ComponentRouter import (
     BuildComponentEgressPaths,
     BuildComponentFabricAdjacency,
     BuildComponentRoutingProblem,
+    BuildDeclaredComponentFeedthroughDomains,
     ComponentClaimsConflict,
     FilterExternalSourcePoweredSeamCandidateDomains,
     PreserveRoutedComponentForeignEscapes,
@@ -11656,11 +11660,27 @@ def SelectHierarchicalRoutingMaximumLayerCount(
         if PolicyLayerLimit > 0
         else TechnologyMaximumLayerCount
     )
-    if InterfaceDeckLayer is None:
+    PlanRequiredLayerCount = (
+        RequiredPhysicalAssemblyRoutingLayerCount(Plan)
+        if Plan is not None
+        else 0
+    )
+    PlanDeckLayer = (
+        PlanRequiredLayerCount - 1
+        if PlanRequiredLayerCount > PolicyMaximumLayerCount
+        else None
+    )
+    DeclaredDeckLayers = tuple(
+        Layer
+        for Layer in (InterfaceDeckLayer, PlanDeckLayer)
+        if Layer is not None
+    )
+    if not DeclaredDeckLayers:
         return PolicyMaximumLayerCount
-    RequiredDeckLayerCount = int(InterfaceDeckLayer) + 1
+    EffectiveInterfaceDeckLayer = max(map(int, DeclaredDeckLayers))
+    RequiredDeckLayerCount = EffectiveInterfaceDeckLayer + 1
     if (
-        int(InterfaceDeckLayer) < 0
+        EffectiveInterfaceDeckLayer < 0
         or RequiredDeckLayerCount > TechnologyMaximumLayerCount
     ):
         raise RoutingStageError(RoutingFailure(
@@ -11681,7 +11701,7 @@ def SelectHierarchicalRoutingMaximumLayerCount(
                     "PlanFingerprint",
                     "",
                 )),
-                "InterfaceDeckLayer": int(InterfaceDeckLayer),
+                "InterfaceDeckLayer": EffectiveInterfaceDeckLayer,
                 "RequiredInterfaceDeckLayerCount": (
                     RequiredDeckLayerCount
                 ),
@@ -11834,6 +11854,36 @@ def BuildPhysicalComponentGlobalPortalId(
     return (
         f"physical-global:{Port.Signal}:L{int(Layer)}:"
         f"{BuildPhysicalPortGlobalContractFingerprint(Port)}"
+    )
+
+
+def SelectGenericPortalTerminalPaths(
+    Profile: Any,
+    Plan: PhysicalComponentAssemblyPlan | None,
+) -> tuple[tuple[Position3, tuple[Position3, ...]], ...]:
+    """Return only terminals still owned by generic portal preparation.
+
+    A fixed physical assembly already owns the global side of each declared
+    component seam.  Generating generic portals for those attachments and
+    replacing them later both wastes work and briefly gives two stages
+    authority over the same endpoint.  External terminals remain generic;
+    exact attachments are injected from ``Port.GlobalPath``.
+    """
+    ExactAttachments = frozenset(
+        Port.Attachment
+        for Port in getattr(Plan, "Ports", ())
+        if str(Port.Signal) == str(Profile.Signal)
+    )
+    return tuple(
+        (Terminal, tuple(Path))
+        for Terminal, Path in (
+            (Profile.Root, Profile.SourceAccessPath),
+            *((
+                Target,
+                Profile.TargetAccessPaths[Target],
+            ) for Target in Profile.Targets),
+        )
+        if Terminal not in ExactAttachments
     )
 
 
@@ -16880,6 +16930,520 @@ def BuildComponentKeepoutGuideCellsByLayer(
     return Result
 
 
+def PreparePhysicalComponentFeedthroughEndpointDomain(
+    Signal: str,
+    Layer: int,
+    *,
+    FabricNodes: frozenset[tuple[int, int, int]],
+    FabricEdges: frozenset[
+        tuple[tuple[int, int, int], tuple[int, int, int]]
+    ],
+    FabricIngressNodes: frozenset[tuple[int, int, int]],
+    FabricFingerprint: str,
+    ResourceGraph: Any,
+    MinimumPlacementY: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> PreparedPhysicalComponentFeedthroughEndpointDomain:
+    """Enumerate the complete port-independent interior passage domain.
+
+    A boundary assignment may block a candidate later, but it may not cause
+    the component fabric to be searched again.  On the component fabric used
+    by this pipeline every connected ingress pair has one deterministic path;
+    retaining every such path makes an empty post-port domain authoritative.
+    """
+    RoutingY = ResourceGraph.Technology.RoutingY(
+        MinimumPlacementY,
+        int(Layer),
+    )
+    LayerNodes = frozenset(
+        Node for Node in FabricNodes if int(Node[1]) == int(RoutingY)
+    )
+    CandidateNodes = frozenset(
+        Node for Node in FabricIngressNodes if Node in LayerNodes
+    )
+    LayerAdjacency: dict[
+        tuple[int, int, int], set[tuple[int, int, int]]
+    ] = defaultdict(set)
+    for First, Second in FabricEdges:
+        if First not in LayerNodes or Second not in LayerNodes:
+            continue
+        if ResourceGraph.BuildPrimitive(First, Second) is None:
+            continue
+        LayerAdjacency[First].add(Second)
+        LayerAdjacency[Second].add(First)
+    # One retained path per ingress pair is complete only on a forest.  The
+    # production component fabric is a parallel tree; explicitly reject an
+    # unexpected cyclic backend instead of mistaking one BFS witness for the
+    # complete claim-distinct path domain.
+    RemainingLayerNodes = set(LayerNodes)
+    LayerFabricIsForest = True
+    while RemainingLayerNodes:
+        Start = min(RemainingLayerNodes)
+        Pending = [Start]
+        Reached = {Start}
+        RemainingLayerNodes.remove(Start)
+        DegreeSum = 0
+        while Pending:
+            Current = Pending.pop()
+            Neighbors = LayerAdjacency.get(Current, set())
+            DegreeSum += len(Neighbors)
+            for Neighbor in Neighbors:
+                if Neighbor in Reached:
+                    continue
+                Reached.add(Neighbor)
+                RemainingLayerNodes.discard(Neighbor)
+                Pending.append(Neighbor)
+        if DegreeSum // 2 != max(0, len(Reached) - 1):
+            LayerFabricIsForest = False
+            break
+    CandidatesByFingerprint = {}
+    SearchCount = 0
+    for Entry in sorted(CandidateNodes):
+        Pending = deque((Entry,))
+        Previous: dict[
+            tuple[int, int, int], tuple[int, int, int] | None
+        ] = {Entry: None}
+        while Pending:
+            Current = Pending.popleft()
+            SearchCount += 1
+            if WorkCheck is not None and SearchCount % 1024 == 0:
+                WorkCheck({
+                    "Stage": "physical-component-feedthrough-domain",
+                    "Signal": Signal,
+                    "VisitedNodeCount": SearchCount,
+                })
+            for Neighbor in sorted(LayerAdjacency.get(Current, ())):
+                if Neighbor in Previous:
+                    continue
+                Previous[Neighbor] = Current
+                Pending.append(Neighbor)
+        for Exit in sorted(CandidateNodes):
+            if Exit <= Entry or Exit not in Previous:
+                continue
+            Path = [Exit]
+            while Previous[Path[-1]] is not None:
+                Parent = Previous[Path[-1]]
+                assert Parent is not None
+                Path.append(Parent)
+            Path.reverse()
+            Forward = tuple(Path)
+            Reverse = tuple(reversed(Path))
+            ReservedPathNodes = min(Forward, Reverse)
+            # This is the complete candidate domain for one fixed placement,
+            # so translated lanes remain distinct physical choices.  Relative
+            # topology is a template-cache identity, not a license to merge
+            # absolute endpoint reservations before port claims are applied.
+            CandidateFingerprint = BuildStableFingerprint((
+                "physical-component-feedthrough-endpoint-candidate-v2",
+                int(Layer),
+                ReservedPathNodes,
+            ))
+            CandidatesByFingerprint.setdefault(
+                CandidateFingerprint,
+                PhysicalComponentFeedthroughEndpointCandidate(
+                    CandidateFingerprint=CandidateFingerprint,
+                    Layer=int(Layer),
+                    Entry=ReservedPathNodes[0],
+                    Exit=ReservedPathNodes[-1],
+                    ReservedPathNodes=ReservedPathNodes,
+                    Claims=ResourceGraph.BuildRouteClaims(
+                        ReservedPathNodes
+                    ),
+                ),
+            )
+    Candidates = tuple(
+        CandidatesByFingerprint[Fingerprint]
+        for Fingerprint in sorted(CandidatesByFingerprint)
+    )
+    ResourceGraphFingerprint = BuildStableFingerprint((
+        getattr(ResourceGraph, "GraphVersion", ""),
+        len(getattr(ResourceGraph, "Nodes", ())),
+        len(getattr(ResourceGraph, "Edges", ())),
+    ))
+    DomainFingerprint = BuildStableFingerprint((
+        "physical-component-feedthrough-endpoint-domain-v1",
+        int(Layer),
+        str(FabricFingerprint),
+        ResourceGraphFingerprint,
+        tuple(Value.CandidateFingerprint for Value in Candidates),
+    ))
+    return PreparedPhysicalComponentFeedthroughEndpointDomain(
+        DomainFingerprint=DomainFingerprint,
+        Signal=str(Signal),
+        Layer=int(Layer),
+        FabricFingerprint=str(FabricFingerprint),
+        ResourceGraphFingerprint=ResourceGraphFingerprint,
+        Candidates=Candidates,
+        Complete=LayerFabricIsForest,
+    )
+
+
+def BuildExplicitPhysicalComponentFeedthrough(
+    Signal: str,
+    Layer: int,
+    Guide: frozenset[tuple[int, int]],
+    *,
+    ComponentKeepoutGuideCells: frozenset[tuple[int, int]],
+    ReservedPortAccessGuideCells: frozenset[tuple[int, int]],
+    FabricNodes: frozenset[tuple[int, int, int]],
+    FabricEdges: frozenset[
+        tuple[tuple[int, int, int], tuple[int, int, int]]
+    ],
+    FabricIngressNodes: frozenset[tuple[int, int, int]],
+    ResourceGraph: Any,
+    MinimumPlacementY: int,
+    PreparedEndpointDomain: (
+        PreparedPhysicalComponentFeedthroughEndpointDomain | None
+    ) = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[ComponentFeedthroughContract, frozenset[tuple[int, int]]]:
+    """Reserve one exact capacity-one lane through a closed component.
+
+    Ordinary global nets are first required to route around the component.
+    This constructor is used only after that complete exterior search proves
+    the guide's required exterior pieces cannot be joined.  It chooses two
+    physical fabric boundary nodes on the signal's authoritative layer,
+    freezes the shortest deterministic fabric path between them, and joins
+    only those declared passage cells back to the exterior guide.  No foreign
+    component domain is inferred from incidental overlap.
+    """
+    OutsideGuide = frozenset(
+        Value
+        for Value in Guide
+        if (
+            Value not in ComponentKeepoutGuideCells
+            and Value not in ReservedPortAccessGuideCells
+        )
+    )
+
+    def Components(
+        Nodes: frozenset[tuple[int, int]],
+    ) -> tuple[frozenset[tuple[int, int]], ...]:
+        Remaining = set(Nodes)
+        Result = []
+        while Remaining:
+            Start = min(Remaining)
+            Pending = deque((Start,))
+            Reached = {Start}
+            Remaining.remove(Start)
+            while Pending:
+                X, Z = Pending.popleft()
+                for Neighbor in (
+                    (X - 1, Z),
+                    (X + 1, Z),
+                    (X, Z - 1),
+                    (X, Z + 1),
+                ):
+                    if Neighbor not in Remaining:
+                        continue
+                    Remaining.remove(Neighbor)
+                    Reached.add(Neighbor)
+                    Pending.append(Neighbor)
+            Result.append(frozenset(Reached))
+        return tuple(sorted(Result, key=lambda Value: tuple(sorted(Value))))
+
+    ExteriorComponents = Components(OutsideGuide)
+    if len(ExteriorComponents) != 2:
+        raise RoutingStageError(RoutingFailure(
+            Reason=(
+                RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+            ),
+            Stage="PhysicalComponentAssemblyPlanning",
+            AffectedNets=(Signal,),
+            Detail=(
+                "an explicit capacity-one component feedthrough requires "
+                "exactly two exterior guide components"
+            ),
+            Diagnostics={
+                "Signal": Signal,
+                "ExteriorGuideComponentCount": len(ExteriorComponents),
+                "DeclaredFeedthroughCapacity": 1,
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
+    RoutingY = ResourceGraph.Technology.RoutingY(
+        MinimumPlacementY,
+        int(Layer),
+    )
+    LayerNodes = frozenset(
+        Node for Node in FabricNodes if int(Node[1]) == int(RoutingY)
+    )
+    EndpointDomain = PreparedEndpointDomain
+    if EndpointDomain is None:
+        EndpointDomain = PreparePhysicalComponentFeedthroughEndpointDomain(
+            Signal,
+            Layer,
+            FabricNodes=FabricNodes,
+            FabricEdges=FabricEdges,
+            FabricIngressNodes=FabricIngressNodes,
+            FabricFingerprint=BuildStableFingerprint((
+                tuple(sorted(FabricNodes)),
+                tuple(sorted(FabricEdges)),
+            )),
+            ResourceGraph=ResourceGraph,
+            MinimumPlacementY=MinimumPlacementY,
+            WorkCheck=WorkCheck,
+        )
+    CurrentResourceGraphFingerprint = BuildStableFingerprint((
+        getattr(ResourceGraph, "GraphVersion", ""),
+        len(getattr(ResourceGraph, "Nodes", ())),
+        len(getattr(ResourceGraph, "Edges", ())),
+    ))
+    if not EndpointDomain.Complete:
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.PhysicalComponentAssemblyIncomplete,
+            Stage="PhysicalComponentAssemblyPlanning",
+            AffectedNets=(Signal,),
+            Detail=(
+                "the feedthrough endpoint domain requires claim-distinct "
+                "path enumeration for a cyclic component fabric"
+            ),
+            Diagnostics={
+                "Signal": Signal,
+                "FeedthroughEndpointDomainFingerprint": (
+                    EndpointDomain.DomainFingerprint
+                ),
+                "FeedthroughEndpointDomainComplete": False,
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
+    if (
+        EndpointDomain.Signal != str(Signal)
+        or EndpointDomain.Layer != int(Layer)
+        or EndpointDomain.ResourceGraphFingerprint
+        != CurrentResourceGraphFingerprint
+    ):
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ComponentAssemblyIdentityMismatch,
+            Stage="PhysicalComponentAssemblyPlanning",
+            AffectedNets=(Signal,),
+            Detail=(
+                "the prepared feedthrough endpoint domain identity does "
+                "not match the fixed physical assembly"
+            ),
+            Diagnostics={
+                "Signal": Signal,
+                "FeedthroughEndpointDomainFingerprint": (
+                    EndpointDomain.DomainFingerprint
+                ),
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
+    EndpointCandidates = tuple(
+        Candidate
+        for Candidate in EndpointDomain.Candidates
+        if not any(
+            (Node[0], Node[2]) in ReservedPortAccessGuideCells
+            for Node in Candidate.ReservedPathNodes
+        )
+    )
+    EndpointPrescreenRejectedCandidateCount = (
+        len(EndpointDomain.Candidates) - len(EndpointCandidates)
+    )
+    CandidateNodes = frozenset(
+        Node
+        for Candidate in EndpointCandidates
+        for Node in (Candidate.Entry, Candidate.Exit)
+    )
+
+    def DistanceToComponent(
+        Node: tuple[int, int, int],
+        Component: frozenset[tuple[int, int]],
+    ) -> int:
+        return min(
+            abs(Node[0] - X) + abs(Node[2] - Z)
+            for X, Z in Component
+        )
+
+    def JoinExterior(
+        Component: frozenset[tuple[int, int]],
+        Target: tuple[int, int],
+    ) -> tuple[tuple[int, int], ...]:
+        """Find the exact exterior stem for one candidate fabric endpoint."""
+        Pending = deque(sorted(Component))
+        Previous: dict[
+            tuple[int, int], tuple[int, int] | None
+        ] = {Value: None for Value in Component}
+        Reached = Target if Target in Previous else None
+        # The search box is a finite exact domain for this fixed physical
+        # contract.  Include every obstacle extent; bounding only the guide
+        # and selected lane could incorrectly hide the route around a port
+        # access halo that extends beyond both.
+        # The exterior seam owns exactly one attachment, not the entire
+        # interior feedthrough path.
+        AllowedInterior = frozenset((Target,))
+        SearchExtent = frozenset((
+            *OutsideGuide,
+            *AllowedInterior,
+            *ComponentKeepoutGuideCells,
+            *ReservedPortAccessGuideCells,
+        ))
+        MinimumX = min(Value[0] for Value in SearchExtent) - 2
+        MaximumX = max(Value[0] for Value in SearchExtent) + 2
+        MinimumZ = min(Value[1] for Value in SearchExtent) - 2
+        MaximumZ = max(Value[1] for Value in SearchExtent) + 2
+        while Pending and Reached is None:
+            Current = Pending.popleft()
+            X, Z = Current
+            for Neighbor in (
+                (X - 1, Z),
+                (X + 1, Z),
+                (X, Z - 1),
+                (X, Z + 1),
+            ):
+                if (
+                    Neighbor in Previous
+                    or not (
+                        MinimumX <= Neighbor[0] <= MaximumX
+                        and MinimumZ <= Neighbor[1] <= MaximumZ
+                    )
+                    or Neighbor in ReservedPortAccessGuideCells
+                    or (
+                        Neighbor in ComponentKeepoutGuideCells
+                        and Neighbor not in AllowedInterior
+                    )
+                ):
+                    continue
+                Previous[Neighbor] = Current
+                if Neighbor == Target:
+                    Reached = Neighbor
+                    break
+                Pending.append(Neighbor)
+        if Reached is None:
+            return ()
+        Path = [Reached]
+        while Previous[Path[-1]] is not None:
+            Parent = Previous[Path[-1]]
+            assert Parent is not None
+            Path.append(Parent)
+        return tuple(reversed(Path))
+
+    Best: tuple[
+        tuple[object, ...],
+        tuple[tuple[int, int, int], ...],
+        tuple[tuple[int, int], ...],
+        tuple[tuple[int, int], ...],
+    ] | None = None
+    SearchCount = 0
+    FabricPathCandidateCount = 2 * len(EndpointCandidates)
+    ExteriorJoinRejectedCandidateCount = 0
+    FirstComponent, SecondComponent = ExteriorComponents
+    FirstExteriorJoins = {
+        Node: JoinExterior(FirstComponent, (Node[0], Node[2]))
+        for Node in sorted(CandidateNodes)
+    }
+    SecondExteriorJoins = {
+        Node: JoinExterior(SecondComponent, (Node[0], Node[2]))
+        for Node in sorted(CandidateNodes)
+    }
+    for EndpointCandidate in EndpointCandidates:
+        Path = list(EndpointCandidate.ReservedPathNodes)
+        for Entry, Exit, OrientedPath in (
+            (Path[0], Path[-1], tuple(Path)),
+            (Path[-1], Path[0], tuple(reversed(Path))),
+        ):
+            ForwardScore = (
+                DistanceToComponent(Entry, FirstComponent)
+                + DistanceToComponent(Exit, SecondComponent),
+                len(OrientedPath),
+                Entry,
+                Exit,
+            )
+            if FirstExteriorJoins[Entry] and SecondExteriorJoins[Exit]:
+                Candidate = (
+                    ForwardScore,
+                    OrientedPath,
+                    FirstExteriorJoins[Entry],
+                    SecondExteriorJoins[Exit],
+                )
+                if Best is None or Candidate < Best:
+                    Best = Candidate
+            else:
+                ExteriorJoinRejectedCandidateCount += 1
+    if Best is None:
+        HasFabricPaths = FabricPathCandidateCount > 0
+        raise RoutingStageError(RoutingFailure(
+            Reason=(
+                RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+            ),
+            Stage="PhysicalComponentAssemblyPlanning",
+            AffectedNets=(Signal,),
+            Detail=(
+                (
+                    "the complete explicit feedthrough endpoint domain "
+                    "cannot reach both exterior guide components without "
+                    "crossing a port claim"
+                )
+                if HasFabricPaths
+                else (
+                    "the component fabric has no layer-exact path for an "
+                    "explicit foreign feedthrough"
+                )
+            ),
+            Diagnostics={
+                "Signal": Signal,
+                "Layer": int(Layer),
+                "RoutingY": int(RoutingY),
+                "FabricLayerNodeCount": len(LayerNodes),
+                "FabricBoundaryNodeCount": len(CandidateNodes),
+                "FabricPathCandidateCount": FabricPathCandidateCount,
+                "ExteriorJoinRejectedCandidateCount": (
+                    ExteriorJoinRejectedCandidateCount
+                ),
+                "FeedthroughEndpointDomainFingerprint": (
+                    EndpointDomain.DomainFingerprint
+                ),
+                "FeedthroughEndpointCandidateCount": len(
+                    EndpointDomain.Candidates
+                ),
+                "FeedthroughEndpointPrescreenRejectedCandidateCount": (
+                    EndpointPrescreenRejectedCandidateCount
+                ),
+                "FeedthroughEndpointPrescreenComplete": True,
+                "FeedthroughCandidateDomainComplete": True,
+                "ComponentFabricConstructionComplete": True,
+                "OwnershipSearchComplete": True,
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
+    ReservedPathNodes = Best[1]
+    ReservedGuideCells = frozenset(
+        (Node[0], Node[2]) for Node in ReservedPathNodes
+    )
+
+    FirstJoin = Best[2]
+    SecondJoin = Best[3]
+    Claims = ResourceGraph.BuildRouteClaims(ReservedPathNodes)
+    ReservationFingerprint = BuildStableFingerprint((
+        "physical-component-feedthrough-v1",
+        int(Layer),
+        tuple(
+            (
+                Node[0] - ReservedPathNodes[0][0],
+                Node[1] - ReservedPathNodes[0][1],
+                Node[2] - ReservedPathNodes[0][2],
+            )
+            for Node in ReservedPathNodes
+        ),
+        tuple(sorted(map(str, Claims.ResourceIds))),
+    ))
+    Contract = ComponentFeedthroughContract(
+        Signal=Signal,
+        EndpointPairs=((ReservedPathNodes[0], ReservedPathNodes[-1]),),
+        Capacity=1,
+        ReservedPathNodes=ReservedPathNodes,
+        Claims=Claims,
+        ReservationFingerprint=ReservationFingerprint,
+    )
+    UpdatedGuide = frozenset((
+        *OutsideGuide,
+        *FirstJoin,
+        *ReservedGuideCells,
+        *SecondJoin,
+    ))
+    return Contract, UpdatedGuide
+
+
 def BuildComponentKeepoutAvoidingGlobalGuides(
     CoarsePlan: Any,
     *,
@@ -16894,6 +17458,7 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
     ComponentKeepoutGuideCellsByLayer: (
         Mapping[int, frozenset[tuple[int, int]]] | None
     ) = None,
+    DeclaredFeedthroughSignals: frozenset[str] = frozenset(),
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[Any, tuple[str, ...]]:
     """Reserve connected exterior corridors for ordinary global nets."""
@@ -17017,6 +17582,8 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
             })
         if Signal in ComponentPortSignals:
             continue
+        if Signal in DeclaredFeedthroughSignals:
+            continue
         Guide = frozenset(Guides[Signal])
         Layer = int(Layers.get(Signal, 0))
         ComponentKeepoutHaloCells = ComponentKeepoutHaloForLayer(Layer)
@@ -17077,25 +17644,53 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
             (Value[1] for Value in ReservedPortAccessHaloCells),
             default=EnvelopeMaximum[2],
         )
+        # The authoritative obstacle is the projected physical keepout, not
+        # merely the logical component envelope used to seed it.  Electrical
+        # exclusions can extend beyond that envelope; bounding the exterior
+        # search only from the logical box can therefore place the obstacle
+        # directly on the search boundary and falsely prove that two exterior
+        # guide components cannot be joined.  Include the exact layer-owned
+        # keepout extent so the global router always has the declared margin
+        # in which to route around a closed component.
+        KeepoutMinimumX = min(
+            (Value[0] for Value in ComponentKeepoutHaloCells),
+            default=EnvelopeMinimum[0],
+        )
+        KeepoutMaximumX = max(
+            (Value[0] for Value in ComponentKeepoutHaloCells),
+            default=EnvelopeMaximum[0],
+        )
+        KeepoutMinimumZ = min(
+            (Value[1] for Value in ComponentKeepoutHaloCells),
+            default=EnvelopeMinimum[2],
+        )
+        KeepoutMaximumZ = max(
+            (Value[1] for Value in ComponentKeepoutHaloCells),
+            default=EnvelopeMaximum[2],
+        )
         MinimumX = min(
             min(Value[0] for Value in OutsideGuide),
             EnvelopeMinimum[0] - Margin,
             ReservedMinimumX - Margin,
+            KeepoutMinimumX - Margin,
         ) - 1
         MaximumX = max(
             max(Value[0] for Value in OutsideGuide),
             EnvelopeMaximum[0] + Margin,
             ReservedMaximumX + Margin,
+            KeepoutMaximumX + Margin,
         ) + 1
         MinimumZ = min(
             min(Value[1] for Value in OutsideGuide),
             EnvelopeMinimum[2] - Margin,
             ReservedMinimumZ - Margin,
+            KeepoutMinimumZ - Margin,
         ) - 1
         MaximumZ = max(
             max(Value[1] for Value in OutsideGuide),
             EnvelopeMaximum[2] + Margin,
             ReservedMaximumZ + Margin,
+            KeepoutMaximumZ + Margin,
         ) + 1
         GuideComponents = Components(OutsideGuide)
         SourcePath = tuple(getattr(
@@ -18398,6 +18993,120 @@ PhysicalGlobalAperturePlanarTransforms = (
 MaximumPhysicalGlobalApertureTemplateCacheEntries = 2048
 
 
+@dataclass(frozen=True)
+class PreparedPhysicalGlobalApertureTransform:
+    """Signal-static geometry for one exact planar aperture transform."""
+
+    Transform: str
+    Direction: Position3
+    Targets: tuple[Position3, ...]
+    EnvelopeCorners: tuple[Position3, ...]
+    BlockedGuideCells: tuple[Position2, ...]
+    ForeignWireCells: tuple[Position3, ...]
+    ForeignSupportCells: tuple[Position3, ...]
+    ForeignRequiredAirCells: tuple[Position3, ...]
+    ForeignElectricalCells: tuple[Position3, ...]
+
+
+@dataclass(frozen=True)
+class PreparedPhysicalGlobalApertureStaticContract:
+    """Pre-transformed aperture geometry shared by all attachments."""
+
+    Layer: int
+    TechnologyVersion: str
+    TrackPitch: int
+    TechnologyIdentity: str
+    Transforms: tuple[PreparedPhysicalGlobalApertureTransform, ...]
+
+
+def PreparePhysicalGlobalApertureStaticContract(
+    Direction: Position3,
+    Layer: int,
+    Targets: frozenset[Position3],
+    EnvelopeMinimum: Position3,
+    EnvelopeMaximum: Position3,
+    BlockedGuideCells: frozenset[Position2],
+    ForeignClaims: RoutingResourceClaims | None,
+    Technology: object,
+) -> PreparedPhysicalGlobalApertureStaticContract:
+    """Transform and sort signal-static aperture geometry exactly once."""
+    ForeignClaims = ForeignClaims or RoutingResourceClaims()
+    EnvelopeCorners = tuple(
+        (X, Y, Z)
+        for X in (EnvelopeMinimum[0], EnvelopeMaximum[0])
+        for Y in (EnvelopeMinimum[1], EnvelopeMaximum[1])
+        for Z in (EnvelopeMinimum[2], EnvelopeMaximum[2])
+    )
+
+    def TransformPositions(
+        Positions: Iterable[Position3],
+        Transform: str,
+    ) -> tuple[Position3, ...]:
+        return tuple(sorted(
+            TransformPlanarRoutingPosition(Position, Transform)
+            for Position in Positions
+        ))
+
+    return PreparedPhysicalGlobalApertureStaticContract(
+        Layer=int(Layer),
+        TechnologyVersion=str(getattr(
+            Technology,
+            "TechnologyVersion",
+            "",
+        )),
+        TrackPitch=int(getattr(
+            Technology,
+            "TrackPitch",
+            DefaultRedstoneRoutingTechnology.TrackPitch,
+        )),
+        TechnologyIdentity=repr(Technology),
+        Transforms=tuple(
+            PreparedPhysicalGlobalApertureTransform(
+                Transform=Transform,
+                Direction=TransformPlanarRoutingPosition(
+                    tuple(map(int, Direction)),
+                    Transform,
+                ),
+                Targets=TransformPositions(Targets, Transform),
+                EnvelopeCorners=TransformPositions(
+                    EnvelopeCorners,
+                    Transform,
+                ),
+                BlockedGuideCells=tuple(sorted(
+                    (
+                        Transformed[0],
+                        Transformed[2],
+                    )
+                    for Transformed in (
+                        TransformPlanarRoutingPosition(
+                            (int(X), 0, int(Z)),
+                            Transform,
+                        )
+                        for X, Z in BlockedGuideCells
+                    )
+                )),
+                ForeignWireCells=TransformPositions(
+                    ForeignClaims.WireCells,
+                    Transform,
+                ),
+                ForeignSupportCells=TransformPositions(
+                    ForeignClaims.SupportCells,
+                    Transform,
+                ),
+                ForeignRequiredAirCells=TransformPositions(
+                    ForeignClaims.RequiredAirCells,
+                    Transform,
+                ),
+                ForeignElectricalCells=TransformPositions(
+                    ForeignClaims.ElectricalCells,
+                    Transform,
+                ),
+            )
+            for Transform in PhysicalGlobalAperturePlanarTransforms
+        ),
+    )
+
+
 def InvertPlanarRoutingTransform(Transform: str) -> str:
     """Return the inverse of one supported planar routing transform."""
     Inverse = {
@@ -18425,31 +19134,59 @@ def BuildPortablePhysicalGlobalApertureContract(
     BlockedGuideCells: frozenset[Position2],
     ForeignClaims: RoutingResourceClaims | None,
     Technology: object,
+    PreparedStaticContract: (
+        PreparedPhysicalGlobalApertureStaticContract | None
+    ) = None,
 ) -> tuple[str, tuple[object, ...], str]:
     """Canonicalize the complete exterior-aperture dependency contract."""
-
-    def Relative(Position: Position3) -> Position3:
-        return tuple(
-            int(Position[Index]) - int(Attachment[Index])
-            for Index in range(3)
+    Prepared = (
+        PreparedStaticContract
+        or PreparePhysicalGlobalApertureStaticContract(
+            Direction,
+            Layer,
+            Targets,
+            EnvelopeMinimum,
+            EnvelopeMaximum,
+            BlockedGuideCells,
+            ForeignClaims,
+            Technology,
         )
-
-    RelativeEnvelopeCorners = tuple(
-        Relative((X, Y, Z))
-        for X in (EnvelopeMinimum[0], EnvelopeMaximum[0])
-        for Y in (EnvelopeMinimum[1], EnvelopeMaximum[1])
-        for Z in (EnvelopeMinimum[2], EnvelopeMaximum[2])
     )
-    ForeignClaims = ForeignClaims or RoutingResourceClaims()
+    # Direction is the first transform-varying field in the serialized
+    # contract.  Any transform whose direction does not have the minimum
+    # representation cannot become canonical, regardless of the much larger
+    # target/claim geometry that follows it.  Restricting to the tied
+    # direction class preserves the exact fingerprint while avoiding six of
+    # eight large relative-contract materializations for cardinal seams.
+    MinimumDirectionRepresentation = min(
+        repr(Value.Direction) for Value in Prepared.Transforms
+    )
+    EligibleTransforms = tuple(
+        Value
+        for Value in Prepared.Transforms
+        if repr(Value.Direction) == MinimumDirectionRepresentation
+    )
     Candidates = []
-    for Transform in PhysicalGlobalAperturePlanarTransforms:
-        TransformPosition = lambda Position: TransformPlanarRoutingPosition(
-            Position,
+    for PreparedTransform in EligibleTransforms:
+        Transform = PreparedTransform.Transform
+        TransformedAttachment = TransformPlanarRoutingPosition(
+            tuple(map(int, Attachment)),
             Transform,
         )
+        TransformedBlockedAttachment = TransformPlanarRoutingPosition(
+            (int(Attachment[0]), 0, int(Attachment[2])),
+            Transform,
+        )
+
+        def RelativeTransformed(Position: Position3) -> Position3:
+            return tuple(
+                int(Position[Index]) - int(TransformedAttachment[Index])
+                for Index in range(3)
+            )
+
         TransformedEnvelopeCorners = tuple(
-            TransformPosition(Position)
-            for Position in RelativeEnvelopeCorners
+            RelativeTransformed(Position)
+            for Position in PreparedTransform.EnvelopeCorners
         )
         TransformedEnvelopeMinimum = tuple(
             min(Position[Index] for Position in TransformedEnvelopeCorners)
@@ -18460,87 +19197,44 @@ def BuildPortablePhysicalGlobalApertureContract(
             for Index in range(3)
         )
 
-        def TransformClaims(
-            Positions: Iterable[Position3],
-        ) -> tuple[Position3, ...]:
-            return tuple(sorted(
-                TransformPosition(Relative(Position))
-                for Position in Positions
-            ))
-
         Contract = (
             "physical-global-aperture-template-v1",
-            TransformPosition(tuple(map(int, Direction))),
-            int(Layer),
-            tuple(sorted(
-                TransformPosition(Relative(Position))
-                for Position in Targets
-            )),
+            PreparedTransform.Direction,
+            Prepared.Layer,
+            tuple(
+                RelativeTransformed(Position)
+                for Position in PreparedTransform.Targets
+            ),
             TransformedEnvelopeMinimum,
             TransformedEnvelopeMaximum,
-            tuple(sorted(
+            tuple(
                 (
-                    TransformPosition((
-                        int(X) - int(Attachment[0]),
-                        0,
-                        int(Z) - int(Attachment[2]),
-                    ))[0],
-                    TransformPosition((
-                        int(X) - int(Attachment[0]),
-                        0,
-                        int(Z) - int(Attachment[2]),
-                    ))[2],
+                    int(X) - int(TransformedBlockedAttachment[0]),
+                    int(Z) - int(TransformedBlockedAttachment[2]),
                 )
-                for X, Z in BlockedGuideCells
-            )),
-            TransformClaims(ForeignClaims.WireCells),
-            TransformClaims(ForeignClaims.SupportCells),
-            TransformClaims(ForeignClaims.RequiredAirCells),
-            TransformClaims(ForeignClaims.ElectricalCells),
-            str(getattr(Technology, "TechnologyVersion", "")),
-            int(getattr(
-                Technology,
-                "TrackPitch",
-                DefaultRedstoneRoutingTechnology.TrackPitch,
-            )),
-            repr(Technology),
+                for X, Z in PreparedTransform.BlockedGuideCells
+            ),
+            tuple(
+                RelativeTransformed(Position)
+                for Position in PreparedTransform.ForeignWireCells
+            ),
+            tuple(
+                RelativeTransformed(Position)
+                for Position in PreparedTransform.ForeignSupportCells
+            ),
+            tuple(
+                RelativeTransformed(Position)
+                for Position in PreparedTransform.ForeignRequiredAirCells
+            ),
+            tuple(
+                RelativeTransformed(Position)
+                for Position in PreparedTransform.ForeignElectricalCells
+            ),
+            Prepared.TechnologyVersion,
+            Prepared.TrackPitch,
+            Prepared.TechnologyIdentity,
         )
         Candidates.append((Contract, Transform))
-    CanonicalContract, CanonicalTransform = min(
-        Candidates,
-        key=lambda Value: repr(Value[0]),
-    )
-    return (
-        BuildStableFingerprint(CanonicalContract),
-        CanonicalContract,
-        CanonicalTransform,
-    )
-
-
-def BuildPortablePhysicalGlobalApertureWitnessFamilyContract(
-    Direction: Position3,
-    Layer: int,
-    Technology: object,
-) -> tuple[str, tuple[object, ...], str]:
-    """Canonicalize the reusable direction/layer witness family."""
-    Candidates = tuple(
-        (
-            (
-                "physical-global-aperture-positive-witness-family-v1",
-                TransformPlanarRoutingPosition(Direction, Transform),
-                int(Layer),
-                str(getattr(Technology, "TechnologyVersion", "")),
-                int(getattr(
-                    Technology,
-                    "TrackPitch",
-                    DefaultRedstoneRoutingTechnology.TrackPitch,
-                )),
-                repr(Technology),
-            ),
-            Transform,
-        )
-        for Transform in PhysicalGlobalAperturePlanarTransforms
-    )
     CanonicalContract, CanonicalTransform = min(
         Candidates,
         key=lambda Value: repr(Value[0]),
@@ -19348,6 +20042,8 @@ def PreparePhysicalComponentPortFactorDomain(
     }
     AlignedGuideLayers = dict(CoarsePlan.Layers)
     CertifiedGuideLayerReassignmentsBySignal = {}
+    CertifiedPolicyLayerEmptySignals = []
+    CertifiedCandidateLayersBySignal = {}
     for Port in sorted(
         Problem.Interface.Ports,
         key=lambda Value: Value.Signal,
@@ -19355,10 +20051,17 @@ def PreparePhysicalComponentPortFactorDomain(
         Domain = CertifiedPortDomainBySignal.get(Port.Signal)
         if Domain is None or not Domain.Complete:
             continue
-        AvailableLayers = tuple(sorted({
+        CertifiedLayers = tuple(sorted({
             int(Candidate.Layer) for Candidate in Domain.Candidates
         }))
+        CertifiedCandidateLayersBySignal[Port.Signal] = CertifiedLayers
+        AvailableLayers = tuple(
+            Layer
+            for Layer in CertifiedLayers
+            if 0 <= Layer < EffectiveLayerCount
+        )
         if not AvailableLayers:
+            CertifiedPolicyLayerEmptySignals.append(Port.Signal)
             continue
         PreferredLayer = int(AlignedGuideLayers.get(Port.Signal, 0))
         SelectedLayer = min(
@@ -19376,6 +20079,37 @@ def PreparePhysicalComponentPortFactorDomain(
             "AssignedLayer": SelectedLayer,
             "CertifiedLayers": list(AvailableLayers),
         }
+    if CertifiedPolicyLayerEmptySignals:
+        raise RoutingStageError(RoutingFailure(
+            Reason=(
+                RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+            ),
+            Stage="PhysicalComponentEligibility",
+            AffectedNets=tuple(sorted(CertifiedPolicyLayerEmptySignals)),
+            Detail=(
+                "the complete certified perimeter domain requires a layer "
+                "outside the authoritative routing policy"
+            ),
+            Diagnostics={
+                "Complete": True,
+                "EffectiveLayerCount": EffectiveLayerCount,
+                "EmptyPortSignals": sorted(
+                    CertifiedPolicyLayerEmptySignals
+                ),
+                "CertifiedCandidateLayersBySignal": {
+                    Signal: list(CertifiedCandidateLayersBySignal[Signal])
+                    for Signal in sorted(
+                        CertifiedPolicyLayerEmptySignals
+                    )
+                },
+                "AccessCertificateFingerprint": (
+                    AccessCertificate.CertificateFingerprint
+                ),
+                "ComponentFabricConstructionComplete": True,
+                "OwnershipSearchComplete": True,
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
     if AlignedGuideLayers != CoarsePlan.Layers:
         CoarsePlan = replace(CoarsePlan, Layers=AlignedGuideLayers)
 
@@ -19403,21 +20137,160 @@ def PreparePhysicalComponentPortFactorDomain(
             WorkCheck=WorkCheck,
         )
     )
-    (
-        CoarsePlan,
-        KeepoutDetouredGlobalSignals,
-    ) = BuildComponentKeepoutAvoidingGlobalGuides(
-        CoarsePlan,
-        ComponentPortSignals=ComponentPortSignals,
-        EnvelopeMinimum=PreliminaryEnvelopeMinimum,
-        EnvelopeMaximum=PreliminaryEnvelopeMaximum,
-        TrackPitch=PortBankTrackPitch,
-        ReservedPortGuideCells=frozenset(),
-        ComponentKeepoutGuideCellsByLayer=(
-            ComponentKeepoutGuideCellsByLayer
-        ),
-        WorkCheck=WorkCheck,
-    )
+    ExplicitFeedthroughsBySignal = {
+        Value.Signal: Value for Value in Problem.Interface.Feedthroughs
+    }
+    FeedthroughEndpointDomainsBySignal: dict[
+        str, PreparedPhysicalComponentFeedthroughEndpointDomain
+    ] = {}
+    KeepoutDetouredGlobalSignals: tuple[str, ...] = ()
+    while True:
+        try:
+            (
+                CoarsePlan,
+                KeepoutDetouredGlobalSignals,
+            ) = BuildComponentKeepoutAvoidingGlobalGuides(
+                CoarsePlan,
+                ComponentPortSignals=ComponentPortSignals,
+                EnvelopeMinimum=PreliminaryEnvelopeMinimum,
+                EnvelopeMaximum=PreliminaryEnvelopeMaximum,
+                TrackPitch=PortBankTrackPitch,
+                ReservedPortGuideCells=frozenset(),
+                ComponentKeepoutGuideCellsByLayer=(
+                    ComponentKeepoutGuideCellsByLayer
+                ),
+                DeclaredFeedthroughSignals=frozenset(
+                    ExplicitFeedthroughsBySignal
+                ),
+                WorkCheck=WorkCheck,
+            )
+            break
+        except RoutingStageError as Error:
+            Failure = Error.Failure
+            Signal = str(Failure.Diagnostics.get("Signal", ""))
+            if (
+                Failure.Reason
+                != RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+                or Failure.Diagnostics.get(
+                    "ExteriorGuideComponentCount"
+                ) != 2
+                or not Signal
+                or Signal in ExplicitFeedthroughsBySignal
+            ):
+                raise
+            Layer = int(CoarsePlan.Layers.get(Signal, 0))
+            KeepoutCore = ComponentKeepoutGuideCellsByLayer.get(
+                Layer,
+                frozenset(),
+            )
+            KeepoutHalo = frozenset(
+                (X + DeltaX, Z + DeltaZ)
+                for X, Z in KeepoutCore
+                for DeltaX, DeltaZ in (
+                    (0, 0),
+                    (-1, 0),
+                    (1, 0),
+                    (0, -1),
+                    (0, 1),
+                )
+            )
+            EndpointDomain = (
+                PreparePhysicalComponentFeedthroughEndpointDomain(
+                    Signal,
+                    Layer,
+                    FabricNodes=frozenset(Problem.Fabric.Nodes),
+                    FabricEdges=frozenset(Problem.Fabric.Edges),
+                    FabricIngressNodes=frozenset(
+                        Problem.Fabric.IngressNodes
+                    ),
+                    FabricFingerprint=Problem.Fabric.FabricFingerprint,
+                    ResourceGraph=ResourceGraph,
+                    MinimumPlacementY=MinimumPlacementY,
+                    WorkCheck=WorkCheck,
+                )
+            )
+            FeedthroughEndpointDomainsBySignal[Signal] = EndpointDomain
+            Contract, UpdatedGuide = (
+                BuildExplicitPhysicalComponentFeedthrough(
+                    Signal,
+                    Layer,
+                    frozenset(CoarsePlan.Guides.get(Signal, ())),
+                    ComponentKeepoutGuideCells=KeepoutHalo,
+                    ReservedPortAccessGuideCells=frozenset(),
+                    FabricNodes=frozenset(Problem.Fabric.Nodes),
+                    FabricEdges=frozenset(Problem.Fabric.Edges),
+                    FabricIngressNodes=frozenset(
+                        Problem.Fabric.IngressNodes
+                    ),
+                    ResourceGraph=ResourceGraph,
+                    MinimumPlacementY=MinimumPlacementY,
+                    PreparedEndpointDomain=EndpointDomain,
+                    WorkCheck=WorkCheck,
+                )
+            )
+            ExplicitFeedthroughsBySignal[Signal] = Contract
+            Guides = dict(CoarsePlan.Guides)
+            Guides[Signal] = UpdatedGuide
+            PlanFields = getattr(CoarsePlan, "__dataclass_fields__", {})
+            Changes: dict[str, object] = {"Guides": Guides}
+            if "Usage" in PlanFields:
+                Changes["Usage"] = dict(Counter(
+                    (
+                        int(CoarsePlan.Layers.get(GuideSignal, 0)),
+                        X,
+                        Z,
+                    )
+                    for GuideSignal, Cells in Guides.items()
+                    for X, Z in Cells
+                ))
+            if "Overflow" in PlanFields:
+                Usage = Changes.get("Usage", {})
+                Changes["Overflow"] = {
+                    Position: Count - 1
+                    for Position, Count in Usage.items()
+                    if Count > 1
+                }
+            if "CorridorUsage" in PlanFields:
+                Changes["CorridorUsage"] = dict(Counter(
+                    Position
+                    for Cells in Guides.values()
+                    for Position in Cells
+                ))
+            CoarsePlan = replace(CoarsePlan, **Changes)
+    if tuple(ExplicitFeedthroughsBySignal.values()) != (
+        Problem.Interface.Feedthroughs
+    ):
+        Feedthroughs = tuple(
+            ExplicitFeedthroughsBySignal[Signal]
+            for Signal in sorted(ExplicitFeedthroughsBySignal)
+        )
+        Interface = replace(
+            Problem.Interface,
+            Feedthroughs=Feedthroughs,
+        )
+        FeedthroughProblem = replace(Problem, Interface=Interface)
+        ForeignTransitDomains = BuildDeclaredComponentFeedthroughDomains(
+            FeedthroughProblem,
+            Feedthroughs,
+        )
+        Problem = replace(
+            FeedthroughProblem,
+            ProblemFingerprint=BuildStableFingerprint((
+                Problem.ProblemFingerprint,
+                tuple(
+                    Value.ReservationFingerprint
+                    for Value in Feedthroughs
+                ),
+            )),
+            ForeignTransitDomains=ForeignTransitDomains,
+            DomainComplete=bool(
+                Problem.DomainComplete
+                and all(
+                    Domain.Complete and Domain.Candidates
+                    for Domain in ForeignTransitDomains
+                )
+            ),
+        )
     GraphChannelsBySignal = {
         str(Value.Signal): Value
         for Value in getattr(ComponentGraph, "Channels", ())
@@ -19481,16 +20354,28 @@ def PreparePhysicalComponentPortFactorDomain(
                 },
             ))
         LogicalChannel = GraphChannelsBySignal.get(Signal)
+        DeclaredFeedthroughComponentIds = (
+            (
+                (int(Problem.Interface.ComponentId),)
+                if Problem.Interface.ComponentId is not None
+                else ()
+            )
+            if Signal in Problem.Interface.DeclaredFeedthroughSignals
+            else ()
+        )
         ChannelIdentity = (
             Signal,
             Layer,
             GuideCells,
             tuple(map(str, ResourceIds)),
-            tuple(getattr(
-                LogicalChannel,
-                "FeedthroughComponentIds",
-                (),
-            )),
+            tuple(sorted({
+                *getattr(
+                    LogicalChannel,
+                    "FeedthroughComponentIds",
+                    (),
+                ),
+                *DeclaredFeedthroughComponentIds,
+            }, key=str)),
         )
         ChannelReservations.append(
             PhysicalComponentChannelReservation(
@@ -19500,11 +20385,14 @@ def PreparePhysicalComponentPortFactorDomain(
                 ResourceIds=tuple(map(str, ResourceIds)),
                 Claims=CorridorClaims,
                 Capacity=(Port.Capacity if Port is not None else 1),
-                FeedthroughComponentIds=tuple(getattr(
-                    LogicalChannel,
-                    "FeedthroughComponentIds",
-                    (),
-                )),
+                FeedthroughComponentIds=tuple(sorted({
+                    *getattr(
+                        LogicalChannel,
+                        "FeedthroughComponentIds",
+                        (),
+                    ),
+                    *DeclaredFeedthroughComponentIds,
+                }, key=str)),
                 ReservationFingerprint=BuildStableFingerprint(
                     ChannelIdentity
                 ),
@@ -19601,6 +20489,8 @@ def PreparePhysicalComponentPortFactorDomain(
     GlobalGuideFieldHitCount = 0
     GlobalGuideFieldCanonicalPathCount = 0
     GlobalGuideFieldFallbackCount = 0
+    GlobalApertureTargetContextBuildCount = 0
+    GlobalApertureStaticContractBuildCount = 0
     GlobalConnectorCache: dict[
         tuple[
             str,
@@ -19621,6 +20511,21 @@ def PreparePhysicalComponentPortFactorDomain(
     ] = {}
     GlobalConnectorForeignEdgeLegalityCache: dict[
         tuple[str, str, Position3, Position3], bool
+    ] = {}
+    GlobalApertureTargetsCache: dict[
+        tuple[str, int, int, frozenset[Position2]],
+        frozenset[Position3],
+    ] = {}
+    GlobalApertureStaticContractCache: dict[
+        tuple[
+            str,
+            Position3,
+            int,
+            int,
+            frozenset[Position2],
+            str,
+        ],
+        PreparedPhysicalGlobalApertureStaticContract,
     ] = {}
     LaneFactorDiagnosticsBySignal: dict[str, dict[str, object]] = {}
     ResourceGraphFingerprint = BuildStableFingerprint((
@@ -19648,6 +20553,8 @@ def PreparePhysicalComponentPortFactorDomain(
         nonlocal GlobalGuideFieldHitCount
         nonlocal GlobalGuideFieldCanonicalPathCount
         nonlocal GlobalGuideFieldFallbackCount
+        nonlocal GlobalApertureTargetContextBuildCount
+        nonlocal GlobalApertureStaticContractBuildCount
         if not GuideCells:
             return ()
         ForeignClaimsFingerprint = BuildStableFingerprint(tuple(
@@ -19676,18 +20583,28 @@ def PreparePhysicalComponentPortFactorDomain(
         if CacheKey in GlobalConnectorCache:
             GlobalConnectorCacheHitCount += 1
             return GlobalConnectorCache[CacheKey]
-        Targets = frozenset(
-            (X, SeamAttachment[1], Z)
-            for X, Z in GuideCells
-            if not (
-                ComponentEnvelopeMinimum[0]
-                <= X
-                <= ComponentEnvelopeMaximum[0]
-                and ComponentEnvelopeMinimum[2]
-                <= Z
-                <= ComponentEnvelopeMaximum[2]
-            )
+        TargetContextKey = (
+            Signal,
+            int(Layer),
+            int(SeamAttachment[1]),
+            GuideCells,
         )
+        Targets = GlobalApertureTargetsCache.get(TargetContextKey)
+        if Targets is None:
+            GlobalApertureTargetContextBuildCount += 1
+            Targets = frozenset(
+                (X, SeamAttachment[1], Z)
+                for X, Z in GuideCells
+                if not (
+                    ComponentEnvelopeMinimum[0]
+                    <= X
+                    <= ComponentEnvelopeMaximum[0]
+                    and ComponentEnvelopeMinimum[2]
+                    <= Z
+                    <= ComponentEnvelopeMaximum[2]
+                )
+            )
+            GlobalApertureTargetsCache[TargetContextKey] = Targets
         if not Targets:
             return ()
         HasForeignCorridorClaims = bool(ForeignCorridorClaims)
@@ -19816,6 +20733,34 @@ def PreparePhysicalComponentPortFactorDomain(
                 and ConnectorClaimsAreLegal(PortablePath)
             )
 
+        StaticContractKey = (
+            Signal,
+            tuple(Direction),
+            int(Layer),
+            int(SeamAttachment[1]),
+            GuideCells,
+            ForeignClaimsFingerprint,
+        )
+        PreparedStaticContract = (
+            GlobalApertureStaticContractCache.get(StaticContractKey)
+        )
+        if PreparedStaticContract is None:
+            GlobalApertureStaticContractBuildCount += 1
+            PreparedStaticContract = (
+                PreparePhysicalGlobalApertureStaticContract(
+                    Direction,
+                    Layer,
+                    Targets,
+                    ComponentEnvelopeMinimum,
+                    ComponentEnvelopeMaximum,
+                    BlockedGuideCells,
+                    ForeignClaims,
+                    ResourceGraph.Technology,
+                )
+            )
+            GlobalApertureStaticContractCache[
+                StaticContractKey
+            ] = PreparedStaticContract
         (
             PortableContractFingerprint,
             PortableCanonicalContract,
@@ -19830,6 +20775,7 @@ def PreparePhysicalComponentPortFactorDomain(
             BlockedGuideCells,
             ForeignClaims,
             ResourceGraph.Technology,
+            PreparedStaticContract=PreparedStaticContract,
         )
         PortableTemplate = (
             Resources.PhysicalGlobalApertureTemplateCache.get(
@@ -19855,45 +20801,6 @@ def PreparePhysicalComponentPortFactorDomain(
                 return PortablePath
             GlobalConnectorPortableCacheValidationRejectCount += 1
 
-        (
-            PortableFamilyFingerprint,
-            PortableFamilyContract,
-            PortableFamilyTransform,
-        ) = BuildPortablePhysicalGlobalApertureWitnessFamilyContract(
-            Direction,
-            Layer,
-            ResourceGraph.Technology,
-        )
-        PortableFamily = (
-            Resources.PhysicalGlobalApertureTemplateCache.get(
-                PortableFamilyFingerprint,
-                (),
-            )
-        )
-        if isinstance(PortableFamily, tuple):
-            for FamilyTemplate in reversed(PortableFamily):
-                if not (
-                    isinstance(
-                        FamilyTemplate,
-                        PhysicalGlobalAperturePathTemplate,
-                    )
-                    and FamilyTemplate.CanonicalContract
-                    == PortableFamilyContract
-                    and FamilyTemplate.SourcePlacementFingerprint
-                    != Problem.PlacementFingerprint
-                ):
-                    continue
-                PortablePath = MaterializePhysicalGlobalAperturePath(
-                    FamilyTemplate.CanonicalPath,
-                    SeamAttachment,
-                    PortableFamilyTransform,
-                )
-                if PortablePathIsValid(PortablePath):
-                    GlobalConnectorPortableCacheHitCount += 1
-                    GlobalConnectorCache[CacheKey] = PortablePath
-                    return PortablePath
-                GlobalConnectorPortableCacheValidationRejectCount += 1
-
         def RetainPortablePath(
             Path: tuple[Position3, ...],
         ) -> None:
@@ -19913,55 +20820,13 @@ def PreparePhysicalComponentPortFactorDomain(
                     ),
                 ),
             )
-            FamilyTemplate = PhysicalGlobalAperturePathTemplate(
-                ContractFingerprint=PortableFamilyFingerprint,
-                CanonicalContract=PortableFamilyContract,
-                CanonicalPath=NormalizePhysicalGlobalAperturePath(
-                    Path,
-                    SeamAttachment,
-                    PortableFamilyTransform,
-                ),
-                SourcePlacementFingerprint=Problem.PlacementFingerprint,
-            )
-            ExistingFamily = (
-                Resources.PhysicalGlobalApertureTemplateCache.get(
-                    PortableFamilyFingerprint,
-                    (),
-                )
-            )
-            ExistingFamily = (
-                ExistingFamily
-                if isinstance(ExistingFamily, tuple)
-                else ()
-            )
-            FamilyByPath = {
-                Value.CanonicalPath: Value
-                for Value in ExistingFamily
-                if isinstance(
-                    Value,
-                    PhysicalGlobalAperturePathTemplate,
-                )
-            }
-            FamilyByPath[FamilyTemplate.CanonicalPath] = FamilyTemplate
-            Resources.PhysicalGlobalApertureTemplateCache.pop(
-                PortableFamilyFingerprint,
-                None,
-            )
-            Resources.PhysicalGlobalApertureTemplateCache[
-                PortableFamilyFingerprint
-            ] = tuple(FamilyByPath.values())[-16:]
-            while len(
-                Resources.PhysicalGlobalApertureTemplateCache
-            ) > MaximumPhysicalGlobalApertureTemplateCacheEntries:
-                del Resources.PhysicalGlobalApertureTemplateCache[
-                    next(iter(
-                        Resources.PhysicalGlobalApertureTemplateCache
-                    ))
-                ]
             GlobalConnectorPortableCacheStoreCount += 1
 
         GlobalConnectorSearchCount += 1
-        if WorkCheck is not None:
+        if WorkCheck is not None and (
+            GlobalConnectorSearchCount == 1
+            or GlobalConnectorSearchCount % 64 == 0
+        ):
             WorkCheck({
                 "Stage": "physical-port-global-connector",
                 "Signal": Signal,
@@ -19987,6 +20852,12 @@ def PreparePhysicalComponentPortFactorDomain(
                 ),
                 "GuideFieldFallbackCount": (
                     GlobalGuideFieldFallbackCount
+                ),
+                "ApertureTargetContextBuildCount": (
+                    GlobalApertureTargetContextBuildCount
+                ),
+                "ApertureStaticContractBuildCount": (
+                    GlobalApertureStaticContractBuildCount
                 ),
                 "GuideCellCount": len(GuideCells),
             })
@@ -20218,6 +21089,8 @@ def PreparePhysicalComponentPortFactorDomain(
             "ForeignCorridorConflictResources": [],
             "ForeignCorridorConflictSamples": [],
             "CertifiedLaneFactorCount": 0,
+            "CertifiedCandidateDomainProjectionBuildCount": 0,
+            "CertifiedCandidateDomainProjectionHitCount": 0,
             "CommonFabricComponentCount": 0,
             "FabricIngressNodeCount": 0,
             "EgressPathCount": 0,
@@ -20290,6 +21163,27 @@ def PreparePhysicalComponentPortFactorDomain(
                 for Domain in Domains
                 for Candidate in Domain.Candidates
             }
+            CandidateDomainsByFabricComponentIndex = {
+                ComponentIndex: tuple(
+                    DeduplicateCertifiedAccessCandidates(
+                        Candidate
+                        for Candidate in Domain.Candidates
+                        if FabricComponentByNode.get(
+                            Candidate.Attachment
+                        ) == ComponentIndex
+                    )
+                    for Domain in Domains
+                )
+                for ComponentIndex in sorted({
+                    FabricComponentByNode[Candidate.Attachment]
+                    for Domain in Domains
+                    for Candidate in Domain.Candidates
+                    if Candidate.Attachment in FabricComponentByNode
+                })
+            }
+            SignalLaneDiagnostics[
+                "CertifiedCandidateDomainProjectionBuildCount"
+            ] = len(CandidateDomainsByFabricComponentIndex)
             for CertifiedCandidate in CertifiedDomain.Candidates:
                 CandidateLayerCounts = SignalLaneDiagnostics[
                     "CertifiedCandidateLayerCounts"
@@ -20348,19 +21242,23 @@ def PreparePhysicalComponentPortFactorDomain(
                             CertifiedCandidate.FabricAttachment
                         )
                     )
-                    SelectedCandidateDomains = tuple(
-                        DeduplicateCertifiedAccessCandidates(
-                            Candidate
-                            for Candidate in Domain.Candidates
-                            if FabricComponentByNode.get(
-                                Candidate.Attachment
-                            ) == CertifiedComponentIndex
+                    SelectedCandidateDomains = (
+                        CandidateDomainsByFabricComponentIndex.get(
+                            CertifiedComponentIndex,
+                            (),
                         )
-                        for Domain in Domains
                     )
-                    if any(
-                        not Values
-                        for Values in SelectedCandidateDomains
+                    SignalLaneDiagnostics[
+                        "CertifiedCandidateDomainProjectionHitCount"
+                    ] = int(SignalLaneDiagnostics[
+                        "CertifiedCandidateDomainProjectionHitCount"
+                    ]) + 1
+                    if (
+                        len(SelectedCandidateDomains) != len(Domains)
+                        or any(
+                            not Values
+                            for Values in SelectedCandidateDomains
+                        )
                     ):
                         SignalLaneDiagnostics[
                             "CertifiedIncompleteCandidateDomainMappingCount"
@@ -21051,6 +21949,13 @@ def PreparePhysicalComponentPortFactorDomain(
             Value.ReservationFingerprint
             for Value in ChannelReservations
         ),
+        tuple(
+            Domain.DomainFingerprint
+            for Domain in (
+                FeedthroughEndpointDomainsBySignal[Signal]
+                for Signal in sorted(FeedthroughEndpointDomainsBySignal)
+            )
+        ),
         FactorDomainIdentity,
         tuple(
             (
@@ -21141,13 +22046,26 @@ def PreparePhysicalComponentPortFactorDomain(
             GlobalGuideFieldCanonicalPathCount
         ),
         GlobalGuideFieldFallbackCount=GlobalGuideFieldFallbackCount,
-        Complete=True,
-        Feasible=not EmptySignals,
+        Complete=all(
+            Domain.Complete
+            for Domain in FeedthroughEndpointDomainsBySignal.values()
+        ),
+        Feasible=bool(
+            not EmptySignals
+            and all(
+                Domain.Candidates
+                for Domain in FeedthroughEndpointDomainsBySignal.values()
+            )
+        ),
         LocalAccessFactorsBySignal=LocalAccessFactorsBySignal,
         ApertureFactorsBySignal=ApertureFactorsBySignal,
         LocalApertureSupportBySignal=LocalApertureSupportBySignal,
         BoundaryPortReservationsBySignal=(
             BoundaryPortReservationsBySignal
+        ),
+        FeedthroughEndpointDomains=tuple(
+            FeedthroughEndpointDomainsBySignal[Signal]
+            for Signal in sorted(FeedthroughEndpointDomainsBySignal)
         ),
     )
     Resources.PreparedPhysicalComponentPortFactorDomain = Preparation
@@ -21231,6 +22149,10 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         tuple(
             Value.ReservationFingerprint
             for Value in Preparation.ChannelReservations
+        ),
+        tuple(
+            Domain.DomainFingerprint
+            for Domain in Preparation.FeedthroughEndpointDomains
         ),
         CurrentFactorDomainIdentity,
         tuple(
@@ -23559,7 +24481,12 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         Any,
         tuple[PhysicalComponentPortReservation, ...],
         tuple[PhysicalComponentChannelReservation, ...],
+        ComponentRoutingProblem,
     ]:
+        # Candidate-specific feedthrough contracts belong to one immutable
+        # port/channel plan.  A rejected plan must not leak them into the next
+        # boundary assignment.
+        CandidateProblem = Problem
         if WorkCheck is not None:
             WorkCheck({
                 "Stage": "physical-port-plan-selected",
@@ -23675,36 +24602,218 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         KeepoutGuideCellsByLayer = dict(
             Preparation.ComponentKeepoutGuideCellsByLayer
         )
-        CandidateCoarsePlan, _PortAwareDetouredSignals = (
-            BuildComponentKeepoutAvoidingGlobalGuides(
-                CandidateCoarsePlan,
-                ComponentPortSignals=PortSignals,
-                EnvelopeMinimum=(
-                    Preparation.ComponentEnvelopeMinimum
-                ),
-                EnvelopeMaximum=(
-                    Preparation.ComponentEnvelopeMaximum
-                ),
-                TrackPitch=int(getattr(
-                    ResourceGraph.Technology,
-                    "TrackPitch",
-                    DefaultRedstoneRoutingTechnology.TrackPitch,
-                )),
-                ReservedPortGuideCells=frozenset(
-                    (Position[0], Position[2])
-                    for Port in Ports
-                    # Global guide ownership ends at the declared attachment.
-                    # LocalPath and its claims are component-interior state;
-                    # leaking them into the guide solve makes unrelated local
-                    # variants alter the external request-factor domain.
-                    for Position in Port.GlobalPath
-                ),
-                ComponentKeepoutGuideCellsByLayer=(
-                    KeepoutGuideCellsByLayer
-                ),
-                WorkCheck=WorkCheck,
-            )
+        ReservedPortGuideCells = frozenset(
+            (Position[0], Position[2])
+            for Port in Ports
+            # Global guide ownership ends at the declared attachment.
+            # LocalPath and its claims are component-interior state;
+            # leaking them into the guide solve makes unrelated local
+            # variants alter the external request-factor domain.
+            for Position in Port.GlobalPath
         )
+        PortClearance = max(1, int(getattr(
+            ResourceGraph.Technology,
+            "TrackPitch",
+            DefaultRedstoneRoutingTechnology.TrackPitch,
+        )))
+        ReservedPortAccessGuideCells = frozenset(
+            (X + DeltaX, Z + DeltaZ)
+            for X, Z in ReservedPortGuideCells
+            for DeltaX in range(-PortClearance, PortClearance + 1)
+            for DeltaZ in range(-PortClearance, PortClearance + 1)
+            if abs(DeltaX) + abs(DeltaZ) <= PortClearance
+        )
+        PreparedFeedthroughDomainsBySignal = {
+            Domain.Signal: Domain
+            for Domain in Preparation.FeedthroughEndpointDomains
+        }
+        if PreparedFeedthroughDomainsBySignal:
+            # Preparation proves the complete interior endpoint/path domain,
+            # but its no-port representative is not an assembly choice. Drop
+            # those provisional contracts and select them jointly with this
+            # boundary assignment below.
+            RetainedFeedthroughs = tuple(
+                Value
+                for Value in CandidateProblem.Interface.Feedthroughs
+                if Value.Signal not in PreparedFeedthroughDomainsBySignal
+            )
+            CandidateProblem = replace(
+                CandidateProblem,
+                Interface=replace(
+                    CandidateProblem.Interface,
+                    Feedthroughs=RetainedFeedthroughs,
+                ),
+                ForeignTransitDomains=tuple(
+                    Domain
+                    for Domain in CandidateProblem.ForeignTransitDomains
+                    if Domain.Signal
+                    not in PreparedFeedthroughDomainsBySignal
+                ),
+            )
+            for Signal, EndpointDomain in sorted(
+                PreparedFeedthroughDomainsBySignal.items()
+            ):
+                RetainedEndpointCandidates = tuple(
+                    Candidate
+                    for Candidate in EndpointDomain.Candidates
+                    if not any(
+                        (Node[0], Node[2])
+                        in ReservedPortAccessGuideCells
+                        for Node in Candidate.ReservedPathNodes
+                    )
+                )
+                if RetainedEndpointCandidates:
+                    continue
+                raise RoutingStageError(RoutingFailure(
+                    Reason=(
+                        RoutingFailureReason
+                        .ComponentChannelCapacityUnsatisfiable
+                    ),
+                    Stage="PhysicalComponentAssemblyPlanning",
+                    AffectedNets=(Signal,),
+                    Detail=(
+                        "the selected physical ports block every candidate "
+                        "in the complete feedthrough endpoint domain"
+                    ),
+                    Diagnostics={
+                        "Signal": Signal,
+                        "FeedthroughEndpointDomainFingerprint": (
+                            EndpointDomain.DomainFingerprint
+                        ),
+                        "FeedthroughEndpointCandidateCount": len(
+                            EndpointDomain.Candidates
+                        ),
+                        "FeedthroughEndpointPrescreenRejectedCandidateCount": (
+                            len(EndpointDomain.Candidates)
+                        ),
+                        "FeedthroughEndpointPrescreenComplete": True,
+                        "ComponentFabricConstructionComplete": True,
+                        "OwnershipSearchComplete": True,
+                        "ImplicitForeignTransitDomainCount": 0,
+                    },
+                ))
+        while True:
+            try:
+                CandidateCoarsePlan, _PortAwareDetouredSignals = (
+                    BuildComponentKeepoutAvoidingGlobalGuides(
+                        CandidateCoarsePlan,
+                        ComponentPortSignals=PortSignals,
+                        EnvelopeMinimum=(
+                            Preparation.ComponentEnvelopeMinimum
+                        ),
+                        EnvelopeMaximum=(
+                            Preparation.ComponentEnvelopeMaximum
+                        ),
+                        TrackPitch=PortClearance,
+                        ReservedPortGuideCells=ReservedPortGuideCells,
+                        ComponentKeepoutGuideCellsByLayer=(
+                            KeepoutGuideCellsByLayer
+                        ),
+                        DeclaredFeedthroughSignals=(
+                            CandidateProblem.Interface
+                            .DeclaredFeedthroughSignals
+                        ),
+                        WorkCheck=WorkCheck,
+                    )
+                )
+                break
+            except RoutingStageError as Error:
+                Failure = Error.Failure
+                Signal = str(Failure.Diagnostics.get("Signal", ""))
+                if (
+                    Failure.Reason != (
+                        RoutingFailureReason
+                        .ComponentChannelCapacityUnsatisfiable
+                    )
+                    or Failure.Diagnostics.get(
+                        "ExteriorGuideComponentCount"
+                    ) != 2
+                    or not Signal
+                    or Signal in (
+                        CandidateProblem.Interface
+                        .DeclaredFeedthroughSignals
+                    )
+                ):
+                    raise
+                Layer = int(CandidateCoarsePlan.Layers.get(Signal, 0))
+                KeepoutCore = KeepoutGuideCellsByLayer.get(
+                    Layer,
+                    frozenset(),
+                )
+                KeepoutHalo = frozenset(
+                    (X + DeltaX, Z + DeltaZ)
+                    for X, Z in KeepoutCore
+                    for DeltaX, DeltaZ in (
+                        (0, 0),
+                        (-1, 0),
+                        (1, 0),
+                        (0, -1),
+                        (0, 1),
+                    )
+                )
+                Contract, UpdatedGuide = (
+                    BuildExplicitPhysicalComponentFeedthrough(
+                        Signal,
+                        Layer,
+                        frozenset(
+                            CandidateCoarsePlan.Guides.get(Signal, ())
+                        ),
+                        ComponentKeepoutGuideCells=KeepoutHalo,
+                        ReservedPortAccessGuideCells=(
+                            ReservedPortAccessGuideCells
+                        ),
+                        FabricNodes=frozenset(CandidateProblem.Fabric.Nodes),
+                        FabricEdges=frozenset(CandidateProblem.Fabric.Edges),
+                        FabricIngressNodes=frozenset(
+                            CandidateProblem.Fabric.IngressNodes
+                        ),
+                        ResourceGraph=ResourceGraph,
+                        MinimumPlacementY=Preparation.MinimumPlacementY,
+                        PreparedEndpointDomain=(
+                            PreparedFeedthroughDomainsBySignal.get(Signal)
+                        ),
+                        WorkCheck=WorkCheck,
+                    )
+                )
+                Feedthroughs = tuple(sorted(
+                    (*CandidateProblem.Interface.Feedthroughs, Contract),
+                    key=lambda Value: Value.Signal,
+                ))
+                Interface = replace(
+                    CandidateProblem.Interface,
+                    Feedthroughs=Feedthroughs,
+                )
+                FeedthroughProblem = replace(
+                    CandidateProblem,
+                    Interface=Interface,
+                )
+                ForeignTransitDomains = (
+                    BuildDeclaredComponentFeedthroughDomains(
+                        FeedthroughProblem,
+                        Feedthroughs,
+                    )
+                )
+                CandidateProblem = replace(
+                    FeedthroughProblem,
+                    ProblemFingerprint=BuildStableFingerprint((
+                        CandidateProblem.ProblemFingerprint,
+                        Contract.ReservationFingerprint,
+                    )),
+                    ForeignTransitDomains=ForeignTransitDomains,
+                    DomainComplete=bool(
+                        Problem.DomainComplete
+                        and all(
+                            Domain.Complete and Domain.Candidates
+                            for Domain in ForeignTransitDomains
+                        )
+                    ),
+                )
+                Guides = dict(CandidateCoarsePlan.Guides)
+                Guides[Signal] = UpdatedGuide
+                CandidateCoarsePlan = replace(
+                    CandidateCoarsePlan,
+                    Guides=Guides,
+                )
         CandidateChannels = []
         for Channel in Preparation.ChannelReservations:
             Layer = int(CandidateCoarsePlan.Layers.get(
@@ -23760,7 +24869,12 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         # corridors have been reassembled around those immutable claims.
         # RoutePcbDesign chooses the complete capacity-compatible candidates;
         # only that exact assignment is frozen by the handoff binder.
-        return CandidateCoarsePlan, Ports, CandidateChannels
+        return (
+            CandidateCoarsePlan,
+            Ports,
+            CandidateChannels,
+            CandidateProblem,
+        )
 
     ChannelPlanRejectionCount = 0
     while True:
@@ -23770,9 +24884,15 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             key=lambda Value: Value.Signal,
         ))
         try:
-            CoarsePlan, SelectedPorts, ChannelReservations = (
+            (
+                CoarsePlan,
+                SelectedPorts,
+                ChannelReservations,
+                CandidateProblem,
+            ) = (
                 FinalizePortFirstGlobalChannels(SelectedPorts)
             )
+            Problem = CandidateProblem
             break
         except RoutingStageError as Error:
             if Error.Failure.Reason != (
@@ -23808,7 +24928,56 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             SelectedPorts = None
             ActiveApertureContractRestrictionsBySignal = {}
             if not SelectNextGloballyPlannedBoundary():
-                raise Error
+                CutSignals = tuple(sorted({
+                    *OrderedSignals,
+                    *Error.Failure.AffectedNets,
+                }))
+                Diagnostics = dict(Error.Failure.Diagnostics or {})
+                CutFingerprint = BuildStableFingerprint((
+                    "physical-feedthrough-port-domain-cut-v1",
+                    CutSignals,
+                    tuple(sorted(
+                        RejectedBoundaryAssignmentFingerprints
+                    )),
+                    tuple(sorted(
+                        Resources
+                        .RejectedPhysicalComponentPortAssignmentFingerprints
+                    )),
+                ))
+                raise RoutingStageError(replace(
+                    Error.Failure,
+                    AffectedNets=CutSignals,
+                    Detail=(
+                        "the complete physical port and feedthrough channel "
+                        "domain is capacity-unsatisfiable"
+                    ),
+                    Diagnostics={
+                        **Diagnostics,
+                        "GlobalPlanDomainComplete": True,
+                        "CompleteAssignmentCutProof": True,
+                        "PortAssignmentProofComplete": True,
+                        "ComponentFabricConstructionComplete": True,
+                        "OwnershipSearchComplete": True,
+                        "ChannelPlanRejectionCount": (
+                            ChannelPlanRejectionCount
+                        ),
+                        "PortAssignmentUnsatCoreSignals": list(CutSignals),
+                        "PortAssignmentUnsatCoreFingerprint": (
+                            CutFingerprint
+                        ),
+                        "ConflictFingerprint": CutFingerprint,
+                        "ConflictGraph": {
+                            "Classification": (
+                                "physical-feedthrough-capacity-cut"
+                            ),
+                            "ConflictSignals": list(CutSignals),
+                            "RelocationSignals": list(CutSignals),
+                            "PriorityRelocationSignals": list(CutSignals),
+                            "CompleteAssignmentCutProof": True,
+                        },
+                        "ImplicitForeignTransitDomainCount": 0,
+                    },
+                )) from Error
 
     KeepoutNodes = ComponentKeepoutNodes
     KeepoutClaims = ResourceGraph.BuildRouteClaims(KeepoutNodes)
@@ -26663,12 +27832,9 @@ def RouteAuthoritativeResources(
             if Signal in ReusedPortalSignals:
                 continue
             Profile = Profiles[Signal]
-            TerminalPaths = (
-                (Profile.Root, Profile.SourceAccessPath),
-                *(
-                    (Target, Profile.TargetAccessPaths[Target])
-                    for Target in Profile.Targets
-                ),
+            TerminalPaths = SelectGenericPortalTerminalPaths(
+                Profile,
+                PhysicalAssemblyPlan,
             )
             for TerminalIndex, (Terminal, AccessPath) in enumerate(
                 TerminalPaths
@@ -27717,13 +28883,15 @@ def RouteAuthoritativeResources(
             Problem,
             CoarsePlan,
             Resources,
+            # LayerCount already passed through
+            # SelectHierarchicalRoutingMaximumLayerCount above.  That stage
+            # is the single authority which may admit the explicitly
+            # declared interface deck above the flat-placement policy cap.
+            # Reapplying MaximumRoutingLayers here made the access
+            # certificate and the physical assembly reason about different
+            # resource graphs (four layers versus three for CLA4).
             LayerCount=min(
                 LayerCount,
-                (
-                    Policy.Placement.MaximumRoutingLayers
-                    if Policy.Placement.MaximumRoutingLayers > 0
-                    else Technology.MaximumRoutableLayerCount
-                ),
                 Technology.MaximumRoutableLayerCount,
             ),
             AccessCertificate=PreparedAccessCertificate,

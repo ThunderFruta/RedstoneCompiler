@@ -19,6 +19,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     BuildPhysicalBoundaryPortAssignmentFingerprint,
     BuildComponentKeepoutAvoidingGlobalGuides,
     BuildComponentKeepoutGuideCellsByLayer,
+    BuildExplicitPhysicalComponentFeedthrough,
     BuildPhysicalExteriorApertureFabric,
     BuildPhysicalGlobalApertureSearchKey,
     BuildPortablePhysicalGlobalApertureContract,
@@ -27,6 +28,8 @@ from Compiler.Routing.AuthoritativePlanner import (
     FindSignalClaimConflicts,
     IterPhysicalBoundaryPortAssignments,
     PropagateLaneFactorArcConsistency,
+    PreparePhysicalGlobalApertureStaticContract,
+    PreparePhysicalComponentFeedthroughEndpointDomain,
     PreparePhysicalComponentPortFactorDomain,
     MaterializePhysicalGlobalAperturePath,
     NormalizePhysicalGlobalAperturePath,
@@ -45,6 +48,7 @@ from Compiler.Routing.ComponentPipeline import (
     BuildUniversalPromotedFabricPortAssignmentFailure,
     BuildDirectionalLocalFactorNoGoods,
     BuildPhysicalLocalPortPairSupportCertificate,
+    BuildPhysicalLocalPairProofContextFingerprint,
     CertifyDirectionalLocalContractPortfolio,
     BuildPhysicalPortGlobalContractFingerprint,
     BuildPhysicalPortApertureContractFingerprint,
@@ -75,6 +79,7 @@ from Compiler.Routing.Failures import (
 )
 from Compiler.Routing.Models import (
     ClosedComponentInterface,
+    ComponentFeedthroughContract,
     ComponentInterfacePort,
     ComponentRoutingProblem,
     ComponentRoutingSolveResult,
@@ -83,6 +88,7 @@ from Compiler.Routing.Models import (
     PhysicalComponentChannelReservation,
     PhysicalComponentBoundaryPortReservation,
     PhysicalGlobalAperturePathTemplate,
+    PhysicalLocalPortPairProofRecord,
     RoutingResources,
 )
 from Compiler.Routing.ResourceGraph import (
@@ -751,12 +757,301 @@ def test_global_guide_detours_around_exterior_port_access_halo():
     )
 
 
+def test_global_guide_detour_bounds_include_projected_keepout_extent():
+    Guide = frozenset((X, 0) for X in range(-8, 9))
+    Plan = CoarseGuidePlan(
+        Guides={"Foreign": Guide},
+        Layers={"Foreign": 0},
+        Axes={"Foreign": "X"},
+        Lanes={"Foreign": 0},
+        Usage={},
+        Overflow={},
+        LocalSignals=frozenset(),
+        Iterations=(),
+    )
+    # Model electrical keepout projection extending beyond the logical
+    # component envelope on both sides of the guide.  The exterior router
+    # must bound its search from this physical claim, not from the smaller
+    # logical envelope.
+    ProjectedKeepout = frozenset(
+        (X, Z)
+        for X in range(-2, 3)
+        for Z in range(-5, 6)
+    )
+
+    Result, Detoured = BuildComponentKeepoutAvoidingGlobalGuides(
+        Plan,
+        ComponentPortSignals=frozenset(),
+        EnvelopeMinimum=(-1, 0, -1),
+        EnvelopeMaximum=(1, 8, 1),
+        TrackPitch=1,
+        ComponentKeepoutGuideCells=ProjectedKeepout,
+    )
+
+    assert Detoured == ("Foreign",)
+    assert not Result.Guides["Foreign"] & ProjectedKeepout
+    assert any(abs(Z) > 6 for _X, Z in Result.Guides["Foreign"])
+
+
+def test_explicit_physical_feedthrough_freezes_one_declared_fabric_lane():
+    FabricNodes = frozenset(
+        (X, 1, 0) for X in range(-1, 2)
+    )
+    FabricEdges = frozenset(
+        (
+            ((X, 1, 0), (X + 1, 1, 0))
+            for X in range(-1, 1)
+        )
+    )
+
+    Contract, Guide = BuildExplicitPhysicalComponentFeedthrough(
+        "Foreign",
+        0,
+        frozenset((X, 0) for X in range(-4, 5)),
+        ComponentKeepoutGuideCells=frozenset(
+            (X, 0) for X in range(-1, 2)
+        ),
+        ReservedPortAccessGuideCells=frozenset(),
+        FabricNodes=FabricNodes,
+        FabricEdges=FabricEdges,
+        FabricIngressNodes=frozenset(((-1, 1, 0), (1, 1, 0))),
+        ResourceGraph=_ResourceGraph(),
+        MinimumPlacementY=0,
+    )
+
+    assert Contract.Signal == "Foreign"
+    assert Contract.Capacity == 1
+    assert Contract.EndpointPairs == (((-1, 1, 0), (1, 1, 0)),)
+    assert Contract.ReservedPathNodes == (
+        (-1, 1, 0),
+        (0, 1, 0),
+        (1, 1, 0),
+    )
+    assert Contract.Claims == _ResourceGraph().BuildRouteClaims(
+        Contract.ReservedPathNodes
+    )
+    assert Contract.ReservationFingerprint
+    assert Guide == frozenset((X, 0) for X in range(-4, 5))
+
+
+def test_prepared_feedthrough_endpoint_domain_preserves_relative_geometry():
+    def Build(DeltaX: int, DeltaZ: int):
+        Nodes = frozenset(
+            (X + DeltaX, 1, Z + DeltaZ)
+            for Z in (0, 3)
+            for X in range(-1, 2)
+        )
+        Edges = frozenset(
+            (
+                (X + DeltaX, 1, Z + DeltaZ),
+                (X + 1 + DeltaX, 1, Z + DeltaZ),
+            )
+            for Z in (0, 3)
+            for X in range(-1, 1)
+        )
+        Ingress = frozenset(
+            (X + DeltaX, 1, Z + DeltaZ)
+            for Z in (0, 3)
+            for X in (-1, 1)
+        )
+        return PreparePhysicalComponentFeedthroughEndpointDomain(
+            "Foreign",
+            0,
+            FabricNodes=Nodes,
+            FabricEdges=Edges,
+            FabricIngressNodes=Ingress,
+            FabricFingerprint="relative-fabric",
+            ResourceGraph=_ResourceGraph(),
+            MinimumPlacementY=0,
+        )
+
+    First = Build(0, 0)
+    Second = Build(20, -7)
+
+    assert First.Complete is True
+    assert len(First.Candidates) == 2
+    # A physical assembly domain remains placement-specific so parallel
+    # translated lanes are not merged.  Their normalized geometry is still
+    # identical for completed-template cache identity.
+    assert First.DomainFingerprint != Second.DomainFingerprint
+    Normalize = lambda Candidate: tuple(
+        (
+            Node[0] - Candidate.ReservedPathNodes[0][0],
+            Node[1] - Candidate.ReservedPathNodes[0][1],
+            Node[2] - Candidate.ReservedPathNodes[0][2],
+        )
+        for Node in Candidate.ReservedPathNodes
+    )
+    assert sorted(map(Normalize, First.Candidates)) == sorted(map(
+        Normalize,
+        Second.Candidates,
+    ))
+
+
+def test_explicit_feedthrough_skips_a_port_blocked_preferred_lane():
+    FabricNodes = frozenset(
+        (X, 1, Z)
+        for Z in (0, 3)
+        for X in range(-1, 2)
+    )
+    FabricEdges = frozenset(
+        ((X, 1, Z), (X + 1, 1, Z))
+        for Z in (0, 3)
+        for X in range(-1, 1)
+    )
+    # The z=0 lane has the best geometric score, but a selected port-access
+    # ring seals it from both exterior guide components.  The complete fixed
+    # feedthrough domain must advance to the viable z=3 lane instead of
+    # treating the first lane's failed joins as an assembly proof.
+    PortAccessRing = frozenset((
+        *((X, -1) for X in range(-2, 3)),
+        *((X, 1) for X in range(-2, 3)),
+        (-2, 0),
+        (2, 0),
+    ))
+
+    EndpointDomain = PreparePhysicalComponentFeedthroughEndpointDomain(
+        "Foreign",
+        0,
+        FabricNodes=FabricNodes,
+        FabricEdges=FabricEdges,
+        FabricIngressNodes=frozenset((
+            (-1, 1, 0),
+            (1, 1, 0),
+            (-1, 1, 3),
+            (1, 1, 3),
+        )),
+        FabricFingerprint="two-lane-fabric",
+        ResourceGraph=_ResourceGraph(),
+        MinimumPlacementY=0,
+    )
+    Contract, Guide = BuildExplicitPhysicalComponentFeedthrough(
+        "Foreign",
+        0,
+        frozenset((X, 0) for X in range(-4, 5)),
+        ComponentKeepoutGuideCells=frozenset(
+            (X, 0) for X in range(-1, 2)
+        ),
+        ReservedPortAccessGuideCells=PortAccessRing,
+        FabricNodes=FabricNodes,
+        FabricEdges=FabricEdges,
+        FabricIngressNodes=frozenset((
+            (-1, 1, 0),
+            (1, 1, 0),
+            (-1, 1, 3),
+            (1, 1, 3),
+        )),
+        ResourceGraph=_ResourceGraph(),
+        MinimumPlacementY=0,
+        PreparedEndpointDomain=EndpointDomain,
+    )
+
+    assert Contract.ReservedPathNodes == (
+        (-1, 1, 3),
+        (0, 1, 3),
+        (1, 1, 3),
+    )
+    assert frozenset((X, 3) for X in range(-1, 2)) <= Guide
+    assert not Guide & PortAccessRing
+
+
+def test_cyclic_feedthrough_endpoint_domain_is_explicitly_incomplete():
+    Nodes = frozenset((
+        (0, 1, 0),
+        (1, 1, 0),
+        (1, 1, 1),
+        (0, 1, 1),
+    ))
+    Edges = frozenset((
+        ((0, 1, 0), (1, 1, 0)),
+        ((1, 1, 0), (1, 1, 1)),
+        ((1, 1, 1), (0, 1, 1)),
+        ((0, 1, 1), (0, 1, 0)),
+    ))
+    Domain = PreparePhysicalComponentFeedthroughEndpointDomain(
+        "Foreign",
+        0,
+        FabricNodes=Nodes,
+        FabricEdges=Edges,
+        FabricIngressNodes=Nodes,
+        FabricFingerprint="cyclic-fabric",
+        ResourceGraph=_ResourceGraph(),
+        MinimumPlacementY=0,
+    )
+
+    assert Domain.Complete is False
+    with pytest.raises(RoutingStageError) as Captured:
+        BuildExplicitPhysicalComponentFeedthrough(
+            "Foreign",
+            0,
+            frozenset((X, 0) for X in range(-2, 4)),
+            ComponentKeepoutGuideCells=frozenset((
+                (0, 0),
+                (1, 0),
+            )),
+            ReservedPortAccessGuideCells=frozenset(),
+            FabricNodes=Nodes,
+            FabricEdges=Edges,
+            FabricIngressNodes=Nodes,
+            ResourceGraph=_ResourceGraph(),
+            MinimumPlacementY=0,
+            PreparedEndpointDomain=Domain,
+        )
+
+    assert Captured.value.Failure.Reason == (
+        RoutingFailureReason.PhysicalComponentAssemblyIncomplete
+    )
+    assert Captured.value.Failure.Diagnostics[
+        "FeedthroughEndpointDomainComplete"
+    ] is False
+
+
+def test_explicit_feedthrough_reports_complete_fixed_candidate_exhaustion():
+    BlockedLane = ((0, 1, 0), (1, 1, 0))
+    PortAccessRing = frozenset({
+        (-1, 0),
+        (0, -1),
+        (0, 1),
+        (2, 0),
+        (1, -1),
+        (1, 1),
+    })
+
+    with pytest.raises(RoutingStageError) as Captured:
+        BuildExplicitPhysicalComponentFeedthrough(
+            "Foreign",
+            0,
+            frozenset((X, 0) for X in range(-4, 5)),
+            ComponentKeepoutGuideCells=frozenset(
+                (X, 0) for X in range(-1, 3)
+            ),
+            ReservedPortAccessGuideCells=PortAccessRing,
+            FabricNodes=frozenset(BlockedLane),
+            FabricEdges=frozenset(((BlockedLane[0], BlockedLane[1]),)),
+            FabricIngressNodes=frozenset(BlockedLane),
+            ResourceGraph=_ResourceGraph(),
+            MinimumPlacementY=0,
+        )
+
+    Failure = Captured.value.Failure
+    assert Failure.Reason == (
+        RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+    )
+    assert Failure.Diagnostics["FeedthroughCandidateDomainComplete"] is True
+    assert Failure.Diagnostics["FabricPathCandidateCount"] == 2
+    assert Failure.Diagnostics["OwnershipSearchComplete"] is True
+    assert Failure.Diagnostics["ImplicitForeignTransitDomainCount"] == 0
+    # This helper proves one fixed port/feedthrough candidate domain.  Only
+    # the enclosing boundary-plan enumerator may certify the global cut.
+    assert "GlobalPlanDomainComplete" not in Failure.Diagnostics
+
+
 def test_physical_port_detour_uses_only_external_portal_ownership():
     Source = inspect.getsource(
         SolvePreparedPhysicalComponentPortFactorDomain
     )
     DetourStart = Source.index(
-        "BuildComponentKeepoutAvoidingGlobalGuides("
+        "ReservedPortGuideCells = frozenset("
     )
     DetourEnd = Source.index(
         "ComponentKeepoutGuideCellsByLayer=",
@@ -767,6 +1062,21 @@ def test_physical_port_detour_uses_only_external_portal_ownership():
     assert "for Position in Port.GlobalPath" in DetourCall
     assert "Port.LocalPath" not in DetourCall
     assert "Port.Claims" not in DetourCall
+
+
+def test_feedthrough_endpoint_prescreen_precedes_candidate_detour_search():
+    Source = inspect.getsource(
+        SolvePreparedPhysicalComponentPortFactorDomain
+    )
+    Prescreen = Source.index(
+        '"FeedthroughEndpointPrescreenComplete": True'
+    )
+    Detour = Source.index(
+        "BuildComponentKeepoutAvoidingGlobalGuides(",
+        Prescreen,
+    )
+
+    assert Prescreen < Detour
 
 
 def test_physical_port_seam_has_exclusive_local_and_global_claims():
@@ -896,6 +1206,45 @@ def test_portable_global_aperture_contract_reuses_rigid_planar_geometry():
         Claims,
         DefaultRedstoneRoutingTechnology,
     )
+    Prepared = PreparePhysicalGlobalApertureStaticContract(
+        Direction,
+        2,
+        Targets,
+        EnvelopeMinimum,
+        EnvelopeMaximum,
+        Blocked,
+        Claims,
+        DefaultRedstoneRoutingTechnology,
+    )
+    for CandidateAttachment in (
+        Attachment,
+        (11, 7, 4),
+        (12, 7, 5),
+    ):
+        Direct = BuildPortablePhysicalGlobalApertureContract(
+            CandidateAttachment,
+            Direction,
+            2,
+            Targets,
+            EnvelopeMinimum,
+            EnvelopeMaximum,
+            Blocked,
+            Claims,
+            DefaultRedstoneRoutingTechnology,
+        )
+        Hoisted = BuildPortablePhysicalGlobalApertureContract(
+            CandidateAttachment,
+            Direction,
+            2,
+            Targets,
+            EnvelopeMinimum,
+            EnvelopeMaximum,
+            Blocked,
+            Claims,
+            DefaultRedstoneRoutingTechnology,
+            PreparedStaticContract=Prepared,
+        )
+        assert Hoisted == Direct
 
     def Move(Position):
         return TransformPlanarRoutingPosition(
@@ -1542,6 +1891,25 @@ def _Assembly(Problem, Resources=None):
     )
 
 
+def test_production_tree_fabric_has_complete_feedthrough_endpoint_domain():
+    Problem = _Problem("Foreign")
+    Domain = PreparePhysicalComponentFeedthroughEndpointDomain(
+        "Foreign",
+        0,
+        FabricNodes=frozenset(Problem.Fabric.Nodes),
+        FabricEdges=frozenset(Problem.Fabric.Edges),
+        FabricIngressNodes=frozenset(Problem.Fabric.IngressNodes),
+        FabricFingerprint=Problem.Fabric.FabricFingerprint,
+        ResourceGraph=Problem.ResourceGraph,
+        MinimumPlacementY=6,
+    )
+
+    assert "tree" in Problem.Fabric.TopologyKind
+    assert Problem.Fabric.Complete is True
+    assert Domain.Complete is True
+    assert len(Domain.Candidates) == 1
+
+
 def _BindAssemblyForLocalCompilation(Assembly):
     Candidates = {}
     for Port in Assembly.Plan.GlobalBoundaryPorts:
@@ -1574,6 +1942,7 @@ def _PreparedFactorDomainFixture(DomainFingerprint, **Domains):
         "PreparedPhysicalComponentPortFactorDomain": SimpleNamespace(
             DomainFingerprint=DomainFingerprint,
             Complete=True,
+            Feasible=True,
             ComponentGraphFingerprint="component-graph",
             ResourceGraphFingerprint="resource-graph",
             Problem=SimpleNamespace(Fabric=SimpleNamespace(
@@ -1588,6 +1957,28 @@ def _PreparedFactorDomainFixture(DomainFingerprint, **Domains):
             for Signal, Options in Domains.items()
         },
     }
+
+
+def _PairProofRecords(
+    CurrentSignal,
+    CurrentContracts,
+    CompleteSignal,
+    CompleteContract,
+):
+    return tuple(
+        PhysicalLocalPortPairProofRecord(
+            CurrentSignal=CurrentSignal,
+            CurrentContract=CurrentContract,
+            CompleteSignal=CompleteSignal,
+            CompleteContract=CompleteContract,
+            ProofDomainFingerprint="domain:" + CurrentContract,
+            ProofFingerprint="proof:" + CurrentContract,
+            Status="architectural-unsatisfiable",
+            Complete=True,
+            Feasible=False,
+        )
+        for CurrentContract in CurrentContracts
+    )
 
 
 def test_physical_port_factor_preparation_is_complete_and_retained():
@@ -5253,6 +5644,90 @@ def test_relaxed_complete_two_port_core_prunes_exact_reservation_pair(
     )
 
 
+def test_relaxed_owned_tree_frontier_prunes_complete_signal_domain(
+    monkeypatch,
+):
+    Port = SimpleNamespace(
+        Signal="PortA",
+        Direction="output",
+        OwnedTerminals=((0, 1, 0),),
+        OwnedAccessCandidates=(),
+        Capacity=1,
+        ReservationFingerprint="reservation-a",
+        FabricDomainFingerprint="fabric-a",
+        FabricAttachment=(0, 1, 0),
+        Attachment=(1, 1, 0),
+        LocalPath=((0, 1, 0), (1, 1, 0)),
+        GlobalPath=((1, 1, 0), (2, 1, 0)),
+        OwnedCandidateFingerprints=("access-a",),
+    )
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        PortAssignmentFingerprint="assignment",
+        Channels=(),
+        Ports=(Port,),
+    )
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        ForbiddenPhysicalComponentGlobalCandidateSets=set(),
+        RejectedPhysicalComponentAssemblyPlanFingerprints=set(),
+        PreparedPhysicalComponentPortFactorDomain=SimpleNamespace(
+            Complete=True,
+            Feasible=True,
+            DomainFingerprint="prepared-domain",
+        ),
+    )
+    Solve = ComponentRoutingSolveResult(
+        Status="architectural-unsatisfiable",
+        ProofFingerprint="proof",
+        Diagnostics={
+            "LocalUnsatCoreComplete": True,
+            "LocalUnsatCoreSignals": ["PortA"],
+            "GlobalRelaxedLocalProofComplete": True,
+            "GlobalRelaxedLocalCoreComplete": True,
+            "GlobalRelaxedLocalProofFingerprint": "relaxed-proof",
+            "GlobalRelaxedLocalDomainFingerprint": "relaxed-domain",
+            "GlobalRelaxedLocalUnsatCoreSignals": ["PortA"],
+            "GlobalRelaxedLocalUnsatCoreKind": (
+                "tree-frontier-empty-owned-signal-domain"
+            ),
+            "LocalUnsatCoreProjectionFingerprint": "owned-domain",
+        },
+    )
+    monkeypatch.setattr(
+        ComponentPipeline,
+        "BuildGlobalRelaxedLocalProofDomainFingerprint",
+        lambda _Problem: "relaxed-domain",
+    )
+
+    Diagnostics = RecordPhysicalComponentLocalCompilationNoGood(
+        Solve,
+        Plan,
+        SimpleNamespace(),
+        Resources,
+        Problem=SimpleNamespace(PhysicalAssemblyPlan=Plan),
+    )
+
+    PortSolverCacheKey = (
+        ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+            "prepared-domain"
+        )
+    )
+    SignalDomainKey = "local-signal-domain:" + PortSolverCacheKey
+    assert Diagnostics["NoGoodScope"] == (
+        "global-relaxed-owned-signal-domain"
+    )
+    assert Diagnostics["NoGoodReservationKeys"] == [
+        ["PortA", SignalDomainKey]
+    ]
+    assert Resources.RejectedPhysicalComponentPortReservationSets == {
+        frozenset((("PortA", SignalDomainKey),))
+    }
+    assert not Resources.RejectedPhysicalComponentPortAssignmentFingerprints
+
+
 def test_complete_local_contract_pair_cover_promotes_fabric_pair():
     def Option(Signal, Fabric, LocalX):
         return SimpleNamespace(
@@ -5531,6 +6006,9 @@ def test_local_interface_factor_portfolio_batches_and_reuses_exact_pairs():
         return {
             "GlobalRelaxedLocalProofComplete": True,
             "GlobalRelaxedLocalCoreComplete": True,
+            "GlobalRelaxedLocalProofFingerprint": (
+                "proof-result:" + ProofDomain
+            ),
             "GlobalRelaxedLocalUnsatCoreKind": (
                 "complete-opposing-net-access-pair"
             ),
@@ -5548,6 +6026,7 @@ def test_local_interface_factor_portfolio_batches_and_reuses_exact_pairs():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=Domain,
         EvaluatePair=Evaluate,
     )
@@ -5564,6 +6043,7 @@ def test_local_interface_factor_portfolio_batches_and_reuses_exact_pairs():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=Domain,
         EvaluatePair=lambda *_Arguments: pytest.fail(
             "certified pair should come from the proof cache"
@@ -5621,6 +6101,9 @@ def test_local_interface_factor_portfolio_does_not_lift_incomplete_coverage():
         return {
             "GlobalRelaxedLocalProofComplete": True,
             "GlobalRelaxedLocalCoreComplete": True,
+            "GlobalRelaxedLocalProofFingerprint": (
+                "proof-result:" + ProofDomain
+            ),
             "GlobalRelaxedLocalUnsatCoreKind": (
                 "complete-opposing-net-access-pair"
             ),
@@ -5638,6 +6121,7 @@ def test_local_interface_factor_portfolio_does_not_lift_incomplete_coverage():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=Domain,
         EvaluatePair=Evaluate,
     )
@@ -5657,6 +6141,9 @@ def test_local_interface_factor_portfolio_does_not_lift_incomplete_coverage():
         return {
             "GlobalRelaxedLocalProofComplete": True,
             "GlobalRelaxedLocalCoreComplete": True,
+            "GlobalRelaxedLocalProofFingerprint": (
+                "proof-result:" + ProofDomain
+            ),
             "GlobalRelaxedLocalUnsatCoreKind": (
                 "complete-opposing-net-access-pair"
             ),
@@ -5674,6 +6161,7 @@ def test_local_interface_factor_portfolio_does_not_lift_incomplete_coverage():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=Domain,
         EvaluatePair=EvaluateRetry,
     )
@@ -5743,6 +6231,9 @@ def test_local_interface_factor_portfolio_requires_complete_cartesian_proof():
             "GlobalRelaxedLocalProofComplete": True,
             "GlobalRelaxedLocalCoreComplete": True,
             "GlobalRelaxedLocalProofStatus": "architectural-unsatisfiable",
+            "GlobalRelaxedLocalProofFingerprint": (
+                "proof-result:" + Domain
+            ),
             "GlobalRelaxedLocalUnsatCoreKind": (
                 "complete-opposing-net-access-pair"
             ),
@@ -5757,6 +6248,7 @@ def test_local_interface_factor_portfolio_requires_complete_cartesian_proof():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=ProofDomain,
         EvaluatePair=Evaluate,
     )
@@ -5776,6 +6268,7 @@ def test_local_interface_factor_portfolio_requires_complete_cartesian_proof():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=ProofDomain,
         EvaluatePair=lambda *_Args: pytest.fail(
             "identical local proof domains must reuse the portfolio cache"
@@ -5800,6 +6293,7 @@ def test_local_interface_factor_portfolio_requires_complete_cartesian_proof():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=ChangedDomain,
         EvaluatePair=EvaluateChanged,
     )
@@ -5858,6 +6352,7 @@ def test_local_interface_factor_portfolio_stops_at_feasible_pair():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=ProofDomain,
         EvaluatePair=Feasible,
     )
@@ -6057,6 +6552,7 @@ def test_local_interface_factor_portfolio_yields_after_one_complete_row():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=ProofDomain,
         EvaluatePair=Unsatisfiable,
         MaximumCompletedRows=1,
@@ -6077,6 +6573,7 @@ def test_local_interface_factor_portfolio_yields_after_one_complete_row():
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=ProofDomain,
         EvaluatePair=Unsatisfiable,
     )
@@ -6134,6 +6631,7 @@ def test_local_interface_factor_portfolio_does_not_cache_incomplete_proof():
         CurrentSignal="Current",
         CompleteSignal="Complete",
         Resources=Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=lambda *_Options: "proof-domain",
         EvaluatePair=Incomplete,
     )
@@ -6232,6 +6730,7 @@ def test_local_interface_factor_defers_incomplete_rows_and_finds_later_witness()
         "Current",
         "Complete",
         Resources,
+        LocalProofContextFingerprint="local-proof-context",
         BuildProofDomainFingerprint=ProofDomain,
         EvaluatePair=Evaluate,
         MaximumCompletedRows=None,
@@ -6258,6 +6757,7 @@ def test_local_interface_factor_defers_incomplete_rows_and_finds_later_witness()
 def test_local_pair_support_certificate_requires_complete_proof_row():
     Preparation = SimpleNamespace(
         Complete=True,
+        Feasible=True,
         DomainFingerprint="prepared",
         ComponentGraphFingerprint="component",
         ResourceGraphFingerprint="resource",
@@ -6275,11 +6775,13 @@ def test_local_pair_support_certificate_requires_complete_proof_row():
         RowContract="local-a",
         ColumnSignal="CarryB",
         ColumnContracts=("local-b1", "local-b0"),
-        UnsupportedPairs=frozenset((
-            ("local-a", "local-b0"),
-            ("local-a", "local-b1"),
-        )),
-        ProofFingerprints=("proof-1", "proof-0"),
+        LocalProofContextFingerprint="local-proof-context",
+        PairProofRecords=_PairProofRecords(
+            "CarryB",
+            ("local-b1", "local-b0"),
+            "CarryA",
+            "local-a",
+        ),
     )
 
     First = BuildPhysicalLocalPortPairSupportCertificate(**Arguments)
@@ -6287,18 +6789,19 @@ def test_local_pair_support_certificate_requires_complete_proof_row():
     assert First.Complete
     assert First == Second
     assert First.ColumnContracts == ("local-b0", "local-b1")
-    assert First.ProofFingerprints == ("proof-0", "proof-1")
+    assert First.ProofFingerprints == (
+        "proof:local-b0",
+        "proof:local-b1",
+    )
 
     with pytest.raises(ValueError, match="row is incomplete"):
         BuildPhysicalLocalPortPairSupportCertificate(
             **{
                 **Arguments,
-                "UnsupportedPairs": frozenset((
-                    ("local-a", "local-b0"),
-                )),
+                "PairProofRecords": Arguments["PairProofRecords"][:1],
             }
         )
-    with pytest.raises(ValueError, match="complete preparation"):
+    with pytest.raises(ValueError, match="complete feasible preparation"):
         BuildPhysicalLocalPortPairSupportCertificate(
             **{
                 **Arguments,
@@ -6309,6 +6812,68 @@ def test_local_pair_support_certificate_requires_complete_proof_row():
                     }
                 ),
             }
+        )
+
+    InvalidStatus = replace(
+        Arguments["PairProofRecords"][0],
+        Status="feasible",
+        Feasible=True,
+    )
+    with pytest.raises(ValueError, match="row is incomplete"):
+        BuildPhysicalLocalPortPairSupportCertificate(
+            **{
+                **Arguments,
+                "PairProofRecords": (
+                    InvalidStatus,
+                    Arguments["PairProofRecords"][1],
+                ),
+            }
+        )
+
+
+def test_local_pair_proof_context_rejects_feedthrough_mutation():
+    Problem = _Problem()
+    Placed = _Placed(Problem)
+    Resources = RoutingResources(
+        StaticGeometry=SimpleNamespace(),
+        ResourceGraph=Problem.ResourceGraph,
+    )
+    Preparation = PreparePhysicalComponentPortFactorDomain(
+        Placed,
+        Problem,
+        _Guide(Problem),
+        Resources,
+        AccessCertificate=_AccessCertificate(
+            Problem,
+            Placed,
+            Resources,
+        ),
+    )
+
+    Context = BuildPhysicalLocalPairProofContextFingerprint(
+        Problem,
+        Preparation,
+    )
+    assert Context
+
+    Feedthrough = ComponentFeedthroughContract(
+        Signal="Foreign",
+        EndpointPairs=(((0, 7, 0), (2, 7, 0)),),
+        ReservedPathNodes=((0, 7, 0), (1, 7, 0), (2, 7, 0)),
+        Claims=_Claims(((0, 7, 0), (1, 7, 0), (2, 7, 0))),
+        ReservationFingerprint="feedthrough",
+    )
+    ChangedProblem = replace(
+        Problem,
+        Interface=replace(
+            Problem.Interface,
+            Feedthroughs=(Feedthrough,),
+        ),
+    )
+    with pytest.raises(ValueError, match="differs from its prepared domain"):
+        BuildPhysicalLocalPairProofContextFingerprint(
+            ChangedProblem,
+            Preparation,
         )
 
 

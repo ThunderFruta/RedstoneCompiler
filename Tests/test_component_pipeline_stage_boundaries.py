@@ -2000,6 +2000,7 @@ def test_exact_global_cut_contains_only_ports_and_feedthroughs():
     Channels = (
         Channel("Port", {(0, 1, 0)}),
         Channel("Feed", {(5, 1, 0)}, ("component",)),
+        Channel("Declared", {(7, 1, 0)}),
         Channel("ConflictA", {(10, 1, 0)}),
         Channel("ConflictB", {(10, 1, 0)}),
         Channel("Ordinary", {(20, 1, 0)}),
@@ -2009,10 +2010,13 @@ def test_exact_global_cut_contains_only_ports_and_feedthroughs():
         Channels=(),
         Corridors=Channels,
         PlanningChannels=Channels,
+        Feedthroughs=(SimpleNamespace(Signal="Declared"),),
+        DeclaredFeedthroughSignals=frozenset(("Declared",)),
     )
 
     assert SelectPhysicalComponentExactGlobalChannelSignals(Plan) == {
         "Feed",
+        "Declared",
         "Port",
     }
 
