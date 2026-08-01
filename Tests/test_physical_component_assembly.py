@@ -54,6 +54,7 @@ from Compiler.Routing.ComponentPipeline import (
     BuildPhysicalPortGlobalContractFingerprint,
     BuildPhysicalPortApertureContractFingerprint,
     BuildPhysicalPortLocalContractFingerprint,
+    BuildPhysicalPortSeamContractFingerprint,
     CompileClosedComponent,
     FinalizePhysicalComponentChannelReservations,
     MaterializePreparedPhysicalPortOptionDomains,
@@ -670,6 +671,110 @@ def test_global_boundary_leaf_projects_only_certified_local_no_goods():
         **Arguments,
         CertifiedLocalNoGoodClauses=(Clause,),
     )) == ()
+
+
+def test_retained_boundary_iterator_observes_live_seam_no_goods():
+    AlphaBoundaries = (
+        _BoundaryPort("Alpha", 10),
+        _BoundaryPort("Alpha", 20),
+    )
+    BetaBoundary = _BoundaryPort("Beta", 110)
+    Boundaries = (*AlphaBoundaries, BetaBoundary)
+    Apertures = {
+        Boundary.ReservationFingerprint: SimpleNamespace(
+            Signal=Boundary.Signal,
+            Direction=Boundary.Direction,
+            Capacity=Boundary.Capacity,
+            Attachment=Boundary.Attachment,
+            GlobalPath=Boundary.GlobalPath,
+            ChannelContractFingerprint=(
+                Boundary.ChannelContractFingerprint
+            ),
+            GlobalContractFingerprint=(
+                Boundary.GlobalContractFingerprint
+            ),
+            ApertureContractFingerprint=(
+                Boundary.ApertureContractFingerprint
+            ),
+            ApertureOptionFingerprint=(
+                "aperture:" + Boundary.ReservationFingerprint
+            ),
+        )
+        for Boundary in Boundaries
+    }
+
+    def LocalFactor(Signal, X):
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            Capacity=1,
+            OwnedTerminals=((X, 7, 0),),
+            FabricDomainFingerprint="fabric:" + Signal,
+            FabricAttachment=(X, 7, 0),
+            LocalPath=((X, 7, 0), (X + 1, 7, 0)),
+            LocalAccessFingerprint="local:" + Signal,
+            LocalContractFingerprint="contract:" + Signal,
+            LocalClaims=_Claims(((X, 7, 0),)),
+        )
+
+    LocalFactors = {
+        "Alpha": LocalFactor("Alpha", 300),
+        "Beta": LocalFactor("Beta", 400),
+    }
+    Supports = {
+        "Alpha": tuple(
+            SimpleNamespace(
+                Signal="Alpha",
+                LocalAccessFingerprint="local:Alpha",
+                ApertureOptionFingerprint=(
+                    Apertures[Boundary.ReservationFingerprint]
+                    .ApertureOptionFingerprint
+                ),
+            )
+            for Boundary in AlphaBoundaries
+        ),
+        "Beta": (SimpleNamespace(
+            Signal="Beta",
+            LocalAccessFingerprint="local:Beta",
+            ApertureOptionFingerprint=(
+                Apertures[BetaBoundary.ReservationFingerprint]
+                .ApertureOptionFingerprint
+            ),
+        ),),
+    }
+    LearnedClauses = set()
+    Iterator = iter(IterPhysicalBoundaryPortAssignments(
+        {
+            "Alpha": AlphaBoundaries,
+            "Beta": (BetaBoundary,),
+        },
+        LocalAccessFactorsBySignal={
+            Signal: (Factor,)
+            for Signal, Factor in LocalFactors.items()
+        },
+        ApertureFactorsBySignal={
+            "Alpha": tuple(
+                Apertures[Boundary.ReservationFingerprint]
+                for Boundary in AlphaBoundaries
+            ),
+            "Beta": (
+                Apertures[BetaBoundary.ReservationFingerprint],
+            ),
+        },
+        LocalApertureSupportBySignal=Supports,
+        LearnedLocalSeamNoGoodClauses=LearnedClauses,
+        CertifiedNoGoodProjectionOnly=True,
+    ))
+
+    assert next(Iterator)
+    LearnedClauses.add(frozenset(
+        (
+            Signal,
+            BuildPhysicalPortSeamContractFingerprint(Factor),
+        )
+        for Signal, Factor in LocalFactors.items()
+    ))
+    assert tuple(Iterator) == ()
 
 
 def test_port_seam_ignores_conflicts_owned_only_by_foreign_corridors():
@@ -2814,6 +2919,170 @@ def test_proof_neutral_port_assignment_deferral_selects_a_distinct_plan(
     }
 
 
+def test_fixed_boundary_local_rejections_advance_seams_without_cycling(
+    monkeypatch,
+):
+    Problem = _Problem()
+    Placed = _Placed(Problem)
+    Resources = RoutingResources(
+        StaticGeometry=SimpleNamespace(),
+        ResourceGraph=Problem.ResourceGraph,
+    )
+    OriginalDecompose = (
+        AuthoritativePlanner.DecomposePhysicalPortLaneFactors
+    )
+
+    def DecomposeWithAlternateLocalSupport(*Arguments, **Keywords):
+        LocalDomains, ApertureDomains, SupportDomains = (
+            OriginalDecompose(*Arguments, **Keywords)
+        )
+        Signal, LocalFactors = LocalDomains[0]
+        LocalByFingerprint = {
+            Value.LocalAccessFingerprint: Value
+            for Value in LocalFactors
+        }
+        AlternateLocals = []
+        AlternateSupports = []
+        for Support in SupportDomains[0][1]:
+            Local = LocalByFingerprint[Support.LocalAccessFingerprint]
+            Suffix = ":alternate:" + Support.ApertureOptionFingerprint
+            AlternateLocal = replace(
+                Local,
+                FabricDomainFingerprint=(
+                    Local.FabricDomainFingerprint + Suffix
+                ),
+                LocalAccessFingerprint=(
+                    Local.LocalAccessFingerprint + Suffix
+                ),
+                LocalContractFingerprint="",
+            )
+            AlternateLocal = replace(
+                AlternateLocal,
+                LocalContractFingerprint=(
+                    BuildPhysicalPortLocalContractFingerprint(
+                        AlternateLocal
+                    )
+                ),
+            )
+            AlternateLocals.append(AlternateLocal)
+            AlternateSupports.append(replace(
+                Support,
+                LocalAccessFingerprint=(
+                    AlternateLocal.LocalAccessFingerprint
+                ),
+                SourceSeamFingerprint=(
+                    Support.SourceSeamFingerprint + Suffix
+                ),
+                ReservationFingerprint=(
+                    Support.ReservationFingerprint + Suffix
+                ),
+                SupportFingerprint=(
+                    Support.SupportFingerprint + Suffix
+                ),
+            ))
+        return (
+            ((Signal, (*LocalFactors, *AlternateLocals)),),
+            ApertureDomains,
+            ((Signal, (*SupportDomains[0][1], *AlternateSupports)),),
+        )
+
+    monkeypatch.setattr(
+        AuthoritativePlanner,
+        "DecomposePhysicalPortLaneFactors",
+        DecomposeWithAlternateLocalSupport,
+    )
+    Preparation = PreparePhysicalComponentPortFactorDomain(
+        Placed,
+        Problem,
+        _Guide(Problem),
+        Resources,
+        AccessCertificate=_AccessCertificate(
+            Problem,
+            Placed,
+            Resources,
+        ),
+    )
+    monkeypatch.setattr(
+        "Compiler.Routing.AuthoritativePlanner."
+        "FinalizePhysicalComponentChannelReservations",
+        lambda Channels, *_Arguments, **_Keywords: Channels,
+    )
+    Events = []
+    Current = SolvePreparedPhysicalComponentPortFactorDomain(
+        Preparation,
+        Resources,
+        WorkCheck=Events.append,
+        DeferLocalCompositeSelection=True,
+    )
+    FixedBoundary = Current.Plan.GlobalBoundaryPorts
+    FixedBoundaryFingerprint = (
+        BuildPhysicalBoundaryPortAssignmentFingerprint(FixedBoundary)
+    )
+    FixedGlobalContracts = tuple(
+        (
+            Port.Signal,
+            Port.GlobalContractFingerprint,
+            Port.ApertureContractFingerprint,
+        )
+        for Port in FixedBoundary
+    )
+    SeenAssignments = set()
+    SupportCount = sum(
+        len(Supports)
+        for _Signal, Supports
+        in Preparation.LocalApertureSupportBySignal
+    )
+
+    for _Index in range(SupportCount + 1):
+        AssignmentFingerprint = Current.Plan.PortAssignmentFingerprint
+        assert AssignmentFingerprint not in SeenAssignments
+        SeenAssignments.add(AssignmentFingerprint)
+        Resources.RejectedPhysicalComponentPortAssignmentFingerprints.add(
+            AssignmentFingerprint
+        )
+        try:
+            Current = SolvePreparedPhysicalComponentPortFactorDomain(
+                Preparation,
+                Resources,
+                WorkCheck=Events.append,
+                DeferLocalCompositeSelection=True,
+                RequiredBoundaryPorts=FixedBoundary,
+            )
+        except RoutingStageError as Error:
+            assert Error.Failure.Reason == (
+                RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+            )
+            break
+        assert BuildPhysicalBoundaryPortAssignmentFingerprint(
+            Current.Plan.GlobalBoundaryPorts
+        ) == FixedBoundaryFingerprint
+        assert tuple(
+            (
+                Port.Signal,
+                Port.GlobalContractFingerprint,
+                Port.ApertureContractFingerprint,
+            )
+            for Port in Current.Plan.GlobalBoundaryPorts
+        ) == FixedGlobalContracts
+    else:
+        pytest.fail(
+            "fixed-boundary seam domain did not exhaust after every "
+            "prepared support was rejected"
+        )
+
+    assert len(SeenAssignments) >= 2
+    assert Resources.RejectedPhysicalComponentPortAssignmentFingerprints == (
+        SeenAssignments
+    )
+    SelectedBoundaries = [
+        Event["BoundaryAssignmentFingerprint"]
+        for Event in Events
+        if Event.get("Stage") == "physical-port-global-boundary-selected"
+    ]
+    assert SelectedBoundaries
+    assert set(SelectedBoundaries) == {FixedBoundaryFingerprint}
+
+
 def test_physical_channel_finalization_requires_an_exterior_guide():
     Assembly = _Assembly(_Problem())
     Port = Assembly.Plan.Ports[0]
@@ -4094,7 +4363,11 @@ def test_factorized_certificate_does_not_bind_local_access_variants():
         for Fingerprint in Port.OwnedCandidateFingerprints
         if Fingerprint.startswith("source-option-")
     }
-    assert CertifiedSourceOptions == {"source-option-00"}
+    assert CertifiedSourceOptions == set()
+    assert all(
+        not Port.OwnedAccessCandidates
+        for Port in Assembly.Plan.Ports
+    )
     assert len(
         Assembly.Problem.OwnedTerminalDomains[0].Candidates
     ) == 16

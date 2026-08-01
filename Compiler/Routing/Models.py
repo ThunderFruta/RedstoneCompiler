@@ -827,6 +827,9 @@ class PhysicalComponentPortReservation:
     ] = ()
     Capacity: int = 1
     ReservationFingerprint: str = ""
+    CertifiedLocalContractFingerprint: str = ""
+    CertifiedSeamContractFingerprint: str = ""
+    CertifiedSupportReservationFingerprint: str = ""
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -863,6 +866,15 @@ class PhysicalComponentPortReservation:
             ],
             "Capacity": self.Capacity,
             "ReservationFingerprint": self.ReservationFingerprint,
+            "CertifiedLocalContractFingerprint": (
+                self.CertifiedLocalContractFingerprint
+            ),
+            "CertifiedSeamContractFingerprint": (
+                self.CertifiedSeamContractFingerprint
+            ),
+            "CertifiedSupportReservationFingerprint": (
+                self.CertifiedSupportReservationFingerprint
+            ),
         }
 
 
@@ -2306,6 +2318,12 @@ class PreparedPhysicalComponentPortFactorDomain:
     LocalApertureSupportBySignal: tuple[
         tuple[str, tuple[PhysicalPortLocalApertureSupport, ...]], ...
     ] = ()
+    LocalApertureSupportsByOption: tuple[
+        tuple[
+            tuple[str, str],
+            tuple[PhysicalPortLocalApertureSupport, ...],
+        ], ...
+    ] = ()
     ExteriorFixedClaimCertificates: tuple[
         PhysicalPortExteriorFixedClaimCertificate, ...
     ] = ()
@@ -2601,6 +2619,13 @@ class RoutingResources:
     )
     RejectedPhysicalComponentPortAssignmentFingerprints: set[str] = field(
         default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentSymbolicCapacityAdmissionCache: dict[
+        str, ComponentRoutingSolveResult
+    ] = field(
+        default_factory=dict,
         compare=False,
         repr=False,
     )

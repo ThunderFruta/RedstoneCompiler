@@ -2190,6 +2190,33 @@ def test_tree_frontier_unfiltered_empty_domain_is_port_independent():
     assert Signal["OwnedSignalDomainContractIndependent"] is True
 
 
+def test_unbound_owned_frontier_proof_uses_tree_dp_without_port_contract():
+    Bound = _OwnedFrontierEmptyProblem(RestrictedByPort=False)
+    Unbound = replace(
+        Bound,
+        PhysicalAssemblyPlan=None,
+        Interface=SimpleNamespace(
+            **{
+                **Bound.Interface.__dict__,
+                "PhysicalPortReservations": (),
+            }
+        ),
+        ReservedGlobalClaimsBySignal=(),
+    )
+
+    Result = SolveComponentRoutingProblem(
+        Unbound,
+        StopAfterOwnedSignalFrontierProof=True,
+    )
+
+    assert Result.Status == "architectural-unsatisfiable"
+    assert Result.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"
+    assert Result.Diagnostics["LocalUnsatCoreKind"] == (
+        "tree-frontier-empty-owned-signal-domain"
+    )
+    assert Result.Diagnostics["LocalUnsatCoreProjectionFingerprint"]
+
+
 def test_tree_frontier_dp_is_deterministic_and_typed_incomplete():
     First = SolveComponentRoutingProblemDynamic(_Problem())
     Second = SolveComponentRoutingProblemDynamic(_Problem())
@@ -2428,12 +2455,26 @@ def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
         Problem,
         DeadlineSeconds=30.0,
     )
+    CapacityProof = SolveComponentRoutingProblem(
+        Problem,
+        DeadlineSeconds=30.0,
+        StopAfterSymbolicCapacityProof=True,
+    )
 
     assert First.Status == Data["ExpectedStatus"]
     assert Second.Status == First.Status
     assert Dispatched.Status == First.Status
     assert Second.ProofFingerprint == First.ProofFingerprint
     assert Dispatched.ProofFingerprint == First.ProofFingerprint
+    assert CapacityProof.Status == "architectural-unsatisfiable"
+    assert CapacityProof.Template is None
+    assert CapacityProof.Diagnostics["SymbolicCapacityProofComplete"] is True
+    assert CapacityProof.Diagnostics["LocalUnsatCoreComplete"] is True
+    assert CapacityProof.Diagnostics["LocalUnsatCoreKind"] in {
+        "complete-symbolic-capacity-pair",
+        "tree-frontier-empty-signal",
+    }
+    assert CapacityProof.Diagnostics["LocalUnsatCoreSignals"]
     assert RuntimeSeconds < 30.0
     assert First.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"
     assert Dispatched.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"

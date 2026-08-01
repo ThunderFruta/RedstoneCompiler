@@ -14590,138 +14590,82 @@ def _PlaceAndRoutePcbWithPolicy(
                     Result="complete",
                     PlanFingerprint=PreparedAssembly.Plan.PlanFingerprint,
                 )
+                FrontierProofStartedAt = monotonic()
+                FrontierProof = ProveClosedComponentOwnedSignalFrontiers(
+                    PreparedAssembly.Problem,
+                    DeadlineSeconds=InterfaceDeadline.RemainingSeconds(),
+                    WorkCheck=lambda Diagnostics:
+                    InterfaceDeadline.RaiseIfExpired(
+                        "PhysicalOwnedSignalFrontierEligibility",
+                        Diagnostics,
+                    ),
+                    RouteClaimsConstructionCache=(
+                        ComponentRouteClaimsConstructionCache
+                    ),
+                )
+                RecordPhysicalComponentStageTiming(
+                    "PhysicalOwnedSignalFrontierEligibility",
+                    FrontierProofStartedAt,
+                    Result=FrontierProof.Status,
+                    PlanFingerprint=PreparedAssembly.Plan.PlanFingerprint,
+                )
+                FrontierDiagnostics = dict(
+                    FrontierProof.Diagnostics or {}
+                )
+                if (
+                    FrontierProof.Status == "architectural-unsatisfiable"
+                    and FrontierDiagnostics.get(
+                        "LocalUnsatCoreComplete",
+                        False,
+                    )
+                    and FrontierDiagnostics.get(
+                        "LocalUnsatCoreKind",
+                        "",
+                    ) == "tree-frontier-empty-owned-signal-domain"
+                ):
+                    raise RoutingStageError(RoutingFailure(
+                        Reason=(
+                            RoutingFailureReason
+                            .ComponentPortAssignmentUnsatisfiable
+                        ),
+                        Stage="PhysicalComponentLocalEligibility",
+                        AffectedNets=tuple(FrontierDiagnostics.get(
+                            "LocalUnsatCoreSignals",
+                            (),
+                        )),
+                        Detail=(
+                            "the placed component has an empty owned-signal "
+                            "frontier before global channel reservation"
+                        ),
+                        Diagnostics={
+                            **FrontierDiagnostics,
+                            "OwnedSignalFrontierProofComplete": True,
+                            "PortAssignmentProofComplete": True,
+                            "ComponentFabricConstructionComplete": True,
+                            "OwnershipSearchComplete": True,
+                            "PortAssignmentUnsatCoreSignals": list(
+                                FrontierDiagnostics.get(
+                                    "LocalUnsatCoreSignals",
+                                    (),
+                                )
+                            ),
+                            "PortAssignmentUnsatCoreFingerprint": str(
+                                FrontierDiagnostics.get(
+                                    "LocalUnsatCoreFingerprint",
+                                    FrontierProof.ProofFingerprint,
+                                )
+                            ),
+                            "LocalCompilationEntered": False,
+                            "GlobalPlanningEntered": False,
+                            "ImplicitForeignTransitDomainCount": 0,
+                        },
+                    ))
+                PhysicalAssemblyPlan = PreparedAssembly.Plan
+                ComponentProblem = PreparedAssembly.Problem
                 ComponentBasePlacement = (
                     MaterializedInterfacePlacement
                 )
                 ComponentBaseCandidate = InterfaceCandidate
-                while True:
-                    CapacityProofStartedAt = monotonic()
-                    CapacityProof = (
-                        ProveClosedComponentSymbolicCapacityEligibility(
-                            PreparedAssembly.Problem,
-                            DeadlineSeconds=(
-                                InterfaceDeadline.RemainingSeconds()
-                            ),
-                            WorkCheck=lambda Diagnostics:
-                            InterfaceDeadline.RaiseIfExpired(
-                                "PhysicalSymbolicCapacityEligibility",
-                                Diagnostics,
-                            ),
-                            RouteClaimsConstructionCache=(
-                                ComponentRouteClaimsConstructionCache
-                            ),
-                        )
-                    )
-                    RecordPhysicalComponentStageTiming(
-                        "PhysicalSymbolicCapacityEligibility",
-                        CapacityProofStartedAt,
-                        Result=CapacityProof.Status,
-                        PlanFingerprint=(
-                            PreparedAssembly.Plan.PlanFingerprint
-                        ),
-                    )
-                    CapacityDiagnostics = dict(
-                        CapacityProof.Diagnostics or {}
-                    )
-                    if (
-                        CapacityProof.Status
-                        == "architectural-unsatisfiable"
-                        and CapacityDiagnostics.get(
-                            "LocalUnsatCoreComplete",
-                            False,
-                        )
-                        and CapacityDiagnostics.get(
-                            "LocalUnsatCoreKind",
-                            "",
-                        ) == "tree-frontier-empty-owned-signal-domain"
-                    ):
-                        raise RoutingStageError(RoutingFailure(
-                            Reason=(
-                                RoutingFailureReason
-                                .ComponentPortAssignmentUnsatisfiable
-                            ),
-                            Stage="PhysicalComponentLocalEligibility",
-                            AffectedNets=tuple(CapacityDiagnostics.get(
-                                "LocalUnsatCoreSignals",
-                                (),
-                            )),
-                            Detail=(
-                                "the placed component has an empty owned-"
-                                "signal frontier before global channel "
-                                "reservation"
-                            ),
-                            Diagnostics={
-                                **CapacityDiagnostics,
-                                "OwnedSignalFrontierProofComplete": True,
-                                "PortAssignmentProofComplete": True,
-                                "ComponentFabricConstructionComplete": True,
-                                "OwnershipSearchComplete": True,
-                                "PortAssignmentUnsatCoreSignals": list(
-                                    CapacityDiagnostics.get(
-                                        "LocalUnsatCoreSignals",
-                                        (),
-                                    )
-                                ),
-                                "PortAssignmentUnsatCoreFingerprint": str(
-                                    CapacityDiagnostics.get(
-                                        "LocalUnsatCoreFingerprint",
-                                        CapacityProof.ProofFingerprint,
-                                    )
-                                ),
-                                "LocalCompilationEntered": False,
-                                "GlobalPlanningEntered": False,
-                                "ImplicitForeignTransitDomainCount": 0,
-                            },
-                        ))
-                    if not (
-                        CapacityProof.Status
-                        == "architectural-unsatisfiable"
-                        and CapacityDiagnostics.get(
-                            "SymbolicCapacityProofComplete",
-                            False,
-                        )
-                    ):
-                        break
-                    EligibilityNoGood = (
-                        RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
-                            CapacityProof,
-                            PreparedAssembly.Plan,
-                            InterfaceResources,
-                        )
-                    )
-                    StateAttemptDiagnostics.append({
-                        "Result": (
-                            "pre-global-symbolic-capacity-reject-physical-plan"
-                        ),
-                        "PhysicalAssemblyPlanFingerprint": (
-                            PreparedAssembly.Plan.PlanFingerprint
-                        ),
-                        **EligibilityNoGood,
-                    })
-                    ReplanStartedAt = monotonic()
-                    try:
-                        PreparedAssembly = ReplanPhysicalComponentAssembly(
-                            ComponentBasePlacement,
-                            Resources=InterfaceResources,
-                            Deadline=InterfaceDeadline,
-                        )
-                    except Exception:
-                        RecordPhysicalComponentStageTiming(
-                            "PhysicalAssemblyReplan",
-                            ReplanStartedAt,
-                            Result="failed",
-                        )
-                        raise
-                    RecordPhysicalComponentStageTiming(
-                        "PhysicalAssemblyReplan",
-                        ReplanStartedAt,
-                        Result="complete",
-                        PlanFingerprint=(
-                            PreparedAssembly.Plan.PlanFingerprint
-                        ),
-                    )
-                PhysicalAssemblyPlan = PreparedAssembly.Plan
-                ComponentProblem = PreparedAssembly.Problem
 
                 def ReplanPhysicalAssemblyWithTiming(
                     RequiredGlobalBoundaryPorts: tuple[Any, ...] | None = None,
@@ -15023,6 +14967,200 @@ def _PlaceAndRoutePcbWithPolicy(
 
                     CurrentAssembly = Assembly
                     while True:
+                        # The boundary/aperture tuple is globally selected
+                        # first.  Before spending an authoritative global
+                        # routing slice, materialize one jointly supported
+                        # local seam tuple under that immutable boundary and
+                        # prove only its symbolic capacity CSP.  This is a
+                        # necessary admission certificate: it cannot emit a
+                        # template or choose a different global boundary.
+                        CapacityAssembly = CurrentAssembly
+                        CapacityProofStartedAt = monotonic()
+                        CapacityProof = (
+                            ProveClosedComponentSymbolicCapacityEligibility(
+                                CapacityAssembly.Problem,
+                                DeadlineSeconds=(
+                                    InterfaceDeadline.RemainingSeconds()
+                                ),
+                                WorkCheck=lambda Diagnostics:
+                                InterfaceDeadline.RaiseIfExpired(
+                                    "PhysicalComponentSymbolicCapacity"
+                                    "Admission",
+                                    Diagnostics,
+                                ),
+                                CompletedProofCache=(
+                                    InterfaceResources
+                                    .PhysicalComponentSymbolicCapacityAdmissionCache
+                                ),
+                                RouteClaimsConstructionCache=(
+                                    ComponentRouteClaimsConstructionCache
+                                ),
+                            )
+                        )
+                        RecordPhysicalComponentStageTiming(
+                            "PhysicalComponentSymbolicCapacityAdmission",
+                            CapacityProofStartedAt,
+                            Result=CapacityProof.Status,
+                            PlanFingerprint=(
+                                CapacityAssembly.Plan.PlanFingerprint
+                            ),
+                        )
+                        CapacityDiagnostics = dict(
+                            CapacityProof.Diagnostics or {}
+                        )
+                        if CapacityProof.Status == "capacity-feasible":
+                            CurrentAssembly = CapacityAssembly
+                            StateAttemptDiagnostics.append({
+                                "Result": (
+                                    "pre-global-symbolic-capacity-admitted"
+                                ),
+                                "PhysicalAssemblyPlanFingerprint": (
+                                    CurrentAssembly.Plan.PlanFingerprint
+                                ),
+                                "SymbolicCapacityProofFingerprint": (
+                                    CapacityProof.ProofFingerprint
+                                ),
+                                "SymbolicCapacityAdmissionCacheHit": bool(
+                                    CapacityDiagnostics.get(
+                                        "SymbolicCapacityAdmissionCacheHit",
+                                        False,
+                                    )
+                                ),
+                                "GlobalPlanningEntered": False,
+                                "LocalCompilationEntered": False,
+                                "ImplicitForeignTransitDomainCount": 0,
+                            })
+                        elif (
+                            CapacityProof.Status
+                            == "architectural-unsatisfiable"
+                            and CapacityDiagnostics.get(
+                                "SymbolicCapacityProofComplete",
+                                False,
+                            )
+                        ):
+                            NoGoodDiagnostics = (
+                                RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
+                                    CapacityProof,
+                                    CapacityAssembly.Plan,
+                                    InterfaceResources,
+                                    CapacityAssembly.PortFactorDomain,
+                                )
+                            )
+                            StateAttemptDiagnostics.append({
+                                "Result": (
+                                    "pre-global-symbolic-capacity-rejected"
+                                ),
+                                "PhysicalAssemblyPlanFingerprint": (
+                                    CapacityAssembly.Plan.PlanFingerprint
+                                ),
+                                "LocalUnsatCoreKind": str(
+                                    CapacityDiagnostics.get(
+                                        "LocalUnsatCoreKind",
+                                        "",
+                                    )
+                                ),
+                                "LocalUnsatCoreSignals": list(
+                                    CapacityDiagnostics.get(
+                                        "LocalUnsatCoreSignals",
+                                        (),
+                                    )
+                                ),
+                                **NoGoodDiagnostics,
+                            })
+                            try:
+                                CurrentAssembly = (
+                                    ReplanPhysicalAssemblyWithTiming(
+                                        SelectPhysicalAssemblyGlobalBoundaryPorts(
+                                            CapacityAssembly.Plan
+                                        )
+                                    )
+                                )
+                                StateAttemptDiagnostics.append({
+                                    "Result": (
+                                        "pre-global-fixed-boundary-seam-"
+                                        "advanced"
+                                    ),
+                                    "PreviousPhysicalAssemblyPlanFingerprint": (
+                                        CapacityAssembly.Plan
+                                        .PlanFingerprint
+                                    ),
+                                    "PhysicalAssemblyPlanFingerprint": (
+                                        CurrentAssembly.Plan
+                                        .PlanFingerprint
+                                    ),
+                                    "GlobalBoundaryPreserved": True,
+                                    "GlobalPlanningEntered": False,
+                                    "LocalCompilationEntered": False,
+                                    "ImplicitForeignTransitDomainCount": 0,
+                                })
+                            except RoutingStageError as BoundaryError:
+                                if BoundaryError.Failure.Reason not in {
+                                    RoutingFailureReason
+                                    .ComponentPortAssignmentUnsatisfiable,
+                                    RoutingFailureReason
+                                    .ComponentLocalCompilationUnsatisfiable,
+                                    RoutingFailureReason
+                                    .ComponentChannelCapacityUnsatisfiable,
+                                }:
+                                    raise
+                                StateAttemptDiagnostics.append({
+                                    "Result": (
+                                        "pre-global-fixed-boundary-seam-"
+                                        "exhausted"
+                                    ),
+                                    "PhysicalAssemblyPlanFingerprint": (
+                                        CapacityAssembly.Plan
+                                        .PlanFingerprint
+                                    ),
+                                    "UnderlyingFailure": (
+                                        BoundaryError.Failure.ToDictionary()
+                                    ),
+                                    "GlobalBoundaryPreserved": True,
+                                    "GlobalPlanningEntered": False,
+                                    "LocalCompilationEntered": False,
+                                    "ImplicitForeignTransitDomainCount": 0,
+                                })
+                                CurrentAssembly = (
+                                    SelectFreshOrRetainedAssembly()
+                                )
+                            continue
+                        else:
+                            raise RoutingStageError(RoutingFailure(
+                                Reason=(
+                                    RoutingFailureReason
+                                    .PhysicalComponentAssemblyIncomplete
+                                ),
+                                Stage=(
+                                    "PhysicalComponentSymbolicCapacity"
+                                    "AdmissionIncomplete"
+                                ),
+                                AffectedNets=tuple(
+                                    CapacityDiagnostics.get(
+                                        "LocalUnsatCoreSignals",
+                                        (),
+                                    )
+                                ),
+                                Detail=(
+                                    "the selected physical boundary did not "
+                                    "complete its necessary local capacity "
+                                    "admission proof"
+                                ),
+                                RepairActions=(),
+                                Diagnostics={
+                                    **CapacityDiagnostics,
+                                    "PhysicalAssemblyPlanFingerprint": (
+                                        CapacityAssembly.Plan
+                                        .PlanFingerprint
+                                    ),
+                                    "SymbolicCapacityProofStatus": (
+                                        CapacityProof.Status
+                                    ),
+                                    "GlobalPlanningEntered": False,
+                                    "LocalCompilationEntered": False,
+                                    "NoGoodRecorded": False,
+                                    "ImplicitForeignTransitDomainCount": 0,
+                                },
+                            ))
                         (
                             InterfaceResources
                             .FrozenPhysicalComponentAssemblyPlan
@@ -15556,7 +15694,10 @@ def _PlaceAndRoutePcbWithPolicy(
                                     "GlobalRelaxedLocalUnsatCoreKind",
                                     "",
                                 )
-                                == "complete-opposing-net-access-pair"
+                                in {
+                                    "complete-opposing-net-access-pair",
+                                    "complete-symbolic-capacity-pair",
+                                }
                             ):
                                 PortfolioStartedAt = monotonic()
                                 try:

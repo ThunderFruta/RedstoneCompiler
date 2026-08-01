@@ -20,9 +20,12 @@ from Compiler.Routing.ComponentPipeline import (
     BuildPhysicalGlobalPlanDependencyFingerprint,
     BuildPhysicalPortApertureContractFingerprint,
     BuildPhysicalPortGlobalContractFingerprint,
+    BuildPhysicalPortLocalContractFingerprint,
+    BuildPhysicalPortSeamContractFingerprint,
     BuildPhysicalRequestAperturePortNoGood,
     ClassifyPhysicalComponentGlobalPlanningFailure,
     RecordPhysicalComponentGlobalPlanNoGood,
+    RecordPhysicalComponentSymbolicCapacityEligibilityNoGood,
     PhysicalAssemblyGlobalRouteCanBeRebound,
     SelectContractIndependentOwnedSignalFrontierUnsatCore,
     SelectPhysicalComponentGlobalContractRecommendation,
@@ -41,10 +44,83 @@ from Compiler.Routing.Failures import (
 )
 from Compiler.Routing.ResourceGraph import RoutingResourceClaims
 from Compiler.Routing.Models import (
+    ComponentRoutingSolveResult,
     PhysicalGlobalPlanResumeCursor,
     PhysicalPortCorridorDomain,
     PhysicalPortCorridorFactor,
 )
+
+
+def test_pre_global_symbolic_capacity_proof_rejects_only_exact_port_tuple():
+    Port = SimpleNamespace(
+        Signal="Alpha",
+        Direction="input",
+        FabricDomainFingerprint="fabric",
+        FabricAttachment=(0, 2, 0),
+        Attachment=(2, 2, 0),
+        LocalPath=((0, 2, 0), (1, 2, 0), (2, 2, 0)),
+        GlobalPath=((2, 2, 0), (2, 2, -1)),
+        OwnedTerminals=((0, 2, 0),),
+        OwnedAccessCandidates=(),
+        Capacity=1,
+    )
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        PortAssignmentFingerprint="port-assignment",
+        Ports=(Port,),
+    )
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        RejectedPhysicalComponentAssemblyPlanFingerprints=set(),
+        RejectedPhysicalComponentAssemblyChoiceFingerprints=set(),
+        RejectedPhysicalComponentPortReservationSets=set(),
+        PreferredPhysicalComponentGlobalContractsBySignal={},
+        PhysicalComponentBoundaryTraversalEpoch=0,
+        PhysicalComponentBoundaryAssignmentIteratorCache={"stale": object()},
+    )
+    Proof = ComponentRoutingSolveResult(
+        Status="architectural-unsatisfiable",
+        ProofFingerprint="capacity-proof",
+        Diagnostics={
+            "SymbolicCapacityProofComplete": True,
+            "LocalUnsatCoreComplete": True,
+            "LocalUnsatCoreSignals": ["Alpha"],
+        },
+    )
+
+    Diagnostics = RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
+        Proof,
+        Plan,
+        Resources,
+    )
+
+    assert Diagnostics["NoGoodScope"] == (
+        "pre-global-symbolic-capacity-port-assignment"
+    )
+    assert Resources.RejectedPhysicalComponentPortAssignmentFingerprints == {
+        "port-assignment"
+    }
+    assert Resources.RejectedPhysicalComponentAssemblyPlanFingerprints == {
+        "physical-plan"
+    }
+    assert Resources.PreferredPhysicalComponentGlobalContractsBySignal == {}
+    assert set(Resources.PhysicalComponentBoundaryAssignmentIteratorCache) == {
+        "stale"
+    }
+    assert Diagnostics["BoundaryIteratorContinuationPreserved"] is True
+    assert Diagnostics["BoundaryIteratorCacheCleared"] is False
+    assert Resources.PhysicalComponentBoundaryTraversalEpoch == 0
+    assert Diagnostics["GlobalPlanningEntered"] is False
+    assert Diagnostics["LocalCompilationEntered"] is False
+    assert Diagnostics["LocalCapacityCorePromoted"] is True
+    assert Resources.RejectedPhysicalComponentPortReservationSets == {
+        frozenset((
+            (
+                "Alpha",
+                BuildPhysicalPortSeamContractFingerprint(Port),
+            ),
+        ))
+    }
 
 
 def _MixedPhysicalCorridorDomains():
@@ -549,8 +625,12 @@ def test_incomplete_global_plan_is_retained_without_recording_a_no_good():
     )
     Reservation = Source[ReserveStart:ReserveEnd]
 
+    GlobalFailureStart = Reservation.index(
+        "except RoutingStageError as GlobalPlanningError:"
+    )
     Incomplete = Reservation.index(
-        ".PhysicalComponentAssemblyIncomplete"
+        ".PhysicalComponentAssemblyIncomplete",
+        GlobalFailureStart,
     )
     Retain = Reservation.index(
         "RetainIncompleteGlobalPlan(",

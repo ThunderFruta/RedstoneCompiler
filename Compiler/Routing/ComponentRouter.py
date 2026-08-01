@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from itertools import islice, product
+from itertools import combinations, islice, product
 from math import prod as ProductIntegers
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping
@@ -3487,8 +3487,52 @@ class CompleteComponentNetMultiPortfolioResult:
         return dict(self.PortfoliosByContract)
 
 
+def _PhysicalPortSeamContractFingerprint(Port: Any) -> str:
+    """Mirror the pipeline's witness-free local seam identity."""
+    Origin = Port.FabricAttachment
+
+    def RelativePath(Path: Any) -> tuple[Position3, ...]:
+        return tuple(
+            (
+                int(Position[0]) - int(Origin[0]),
+                int(Position[1]) - int(Origin[1]),
+                int(Position[2]) - int(Origin[2]),
+            )
+            for Position in Path
+        )
+
+    return "local-seam-contract-v1:" + _StableFingerprint((
+        getattr(Port, "Direction", ""),
+        getattr(Port, "FabricDomainFingerprint", ""),
+        tuple(sorted(RelativePath(
+            getattr(Port, "OwnedTerminals", ())
+        ))),
+        RelativePath(getattr(Port, "LocalPath", ())),
+        int(getattr(Port, "Capacity", 1)),
+    ))
+
+
 def _PhysicalPortLocalContractFingerprint(Port: Any) -> str:
     """Mirror the pipeline's translation-stable local contract identity."""
+    CertifiedFingerprint = str(getattr(
+        Port,
+        "CertifiedLocalContractFingerprint",
+        "",
+    ))
+    CertifiedSeamFingerprint = str(getattr(
+        Port,
+        "CertifiedSeamContractFingerprint",
+        "",
+    ))
+    if (
+        CertifiedFingerprint
+        and CertifiedSeamFingerprint
+        and not getattr(Port, "OwnedCandidateFingerprints", ())
+        and not getattr(Port, "OwnedAccessCandidates", ())
+        and _PhysicalPortSeamContractFingerprint(Port)
+        == CertifiedSeamFingerprint
+    ):
+        return CertifiedFingerprint
     Origin = Port.FabricAttachment
 
     def RelativePath(Path: Any) -> tuple[Position3, ...]:
@@ -9111,6 +9155,7 @@ def SolveComponentRoutingProblemDynamic(
                     "LocalUnsatCoreComplete": True,
                     "LocalUnsatCoreSignals": [Signal],
                     "LocalUnsatCoreKind": CoreKind,
+                    "LocalUnsatCoreVariableKinds": ["net"],
                     "LocalUnsatCoreProjectionFingerprint": str(
                         EmptyDiagnostics.get(
                             "OwnedSignalDomainProjectionFingerprint",
@@ -9247,21 +9292,151 @@ def SolveComponentRoutingProblemDynamic(
             )
         )
     if any(not Domain for Domain in Domains.values()):
+        EmptyIndexes = tuple(sorted(
+            Index for Index, Domain in Domains.items() if not Domain
+        ))
+        EmptySignals = tuple(sorted({
+            Variables[Index][2] for Index in EmptyIndexes
+        }))
+        ProjectionFingerprint = _StableFingerprint((
+            "complete-symbolic-empty-capacity-domain-v1",
+            Problem.ProblemFingerprint,
+            tuple(
+                (
+                    Variables[Index][0],
+                    Variables[Index][1],
+                    Variables[Index][2],
+                )
+                for Index in EmptyIndexes
+            ),
+            tuple(
+                (
+                    Owner,
+                    _ClaimsFingerprint(Claims),
+                )
+                for Owner, Claims in StaticClaims
+            ),
+        ))
         return ComponentRoutingSolveResult(
             Status="architectural-unsatisfiable",
-            ProofFingerprint=_StableFingerprint((
-                Problem.ProblemFingerprint,
-                "empty-capacity-domain",
-                tuple(sorted(
-                    Index for Index, Domain in Domains.items() if not Domain
-                )),
-            )),
+            ProofFingerprint=ProjectionFingerprint,
             ExpansionCount=ExpansionCount,
             Detail="a complete symbolic capacity domain is empty",
             Diagnostics={
                 **FinishDiagnostics(),
                 "SymbolicCapacityProofComplete": True,
                 "SymbolicCapacityFeasible": False,
+                "LocalUnsatCoreComplete": True,
+                "LocalUnsatCoreKind": (
+                    "complete-symbolic-empty-capacity-domain"
+                ),
+                "LocalUnsatCoreSignals": list(EmptySignals),
+                "LocalUnsatCoreProjectionFingerprint": (
+                    ProjectionFingerprint
+                ),
+                "LocalUnsatCoreFingerprint": ProjectionFingerprint,
+                "LocalUnsatCoreVariableCount": len(EmptyIndexes),
+                "LocalUnsatCoreVariableKinds": [
+                    Variables[Index][0] for Index in EmptyIndexes
+                ],
+            },
+        )
+
+    def CapacityOptionFingerprint(Kind: str, Value: Any) -> str:
+        return str(
+            Value.NetFingerprint
+            if Kind in {"net", "transit"}
+            else Value.CandidateFingerprint
+        )
+
+    # Detect a complete binary support contradiction before recursive CSP
+    # search.  Every domain above has already been filtered against immutable
+    # claims, so an option-pair Cartesian product with zero compatible pairs
+    # is a self-contained local-contract core.  Publishing that exact core
+    # lets the post-handoff factor portfolio reject the family instead of
+    # learning one whole port tuple per globally routed plan.
+    for FirstIndex, SecondIndex in combinations(sorted(Domains), 2):
+        (
+            FirstKind,
+            FirstIdentity,
+            FirstOwner,
+            FirstOptions,
+            FirstClaimsFor,
+        ) = Variables[FirstIndex]
+        (
+            SecondKind,
+            SecondIdentity,
+            SecondOwner,
+            SecondOptions,
+            SecondClaimsFor,
+        ) = Variables[SecondIndex]
+        if any(
+            ComponentClaimsCompatibleForOwners(
+                FirstOwner,
+                FirstClaimsFor(FirstOptions[FirstOptionIndex]),
+                SecondOwner,
+                SecondClaimsFor(SecondOptions[SecondOptionIndex]),
+            )
+            for FirstOptionIndex in Domains[FirstIndex]
+            for SecondOptionIndex in Domains[SecondIndex]
+        ):
+            continue
+        CoreSignals = tuple(sorted({FirstOwner, SecondOwner}))
+        ProjectionFingerprint = _StableFingerprint((
+            "complete-symbolic-capacity-pair-v1",
+            Problem.ProblemFingerprint,
+            (
+                FirstKind,
+                FirstIdentity,
+                FirstOwner,
+                tuple(
+                    CapacityOptionFingerprint(
+                        FirstKind,
+                        FirstOptions[OptionIndex],
+                    )
+                    for OptionIndex in Domains[FirstIndex]
+                ),
+            ),
+            (
+                SecondKind,
+                SecondIdentity,
+                SecondOwner,
+                tuple(
+                    CapacityOptionFingerprint(
+                        SecondKind,
+                        SecondOptions[OptionIndex],
+                    )
+                    for OptionIndex in Domains[SecondIndex]
+                ),
+            ),
+        ))
+        return ComponentRoutingSolveResult(
+            Status="architectural-unsatisfiable",
+            ProofFingerprint=ProjectionFingerprint,
+            ExpansionCount=ExpansionCount,
+            Detail=(
+                "two complete symbolic capacity domains have no "
+                "compatible option pair"
+            ),
+            Diagnostics={
+                **FinishDiagnostics(),
+                "SymbolicCapacityProofComplete": True,
+                "SymbolicCapacityFeasible": False,
+                "LocalUnsatCoreComplete": True,
+                "LocalUnsatCoreKind": (
+                    "complete-symbolic-capacity-pair"
+                ),
+                "LocalUnsatCoreSignals": list(CoreSignals),
+                "LocalUnsatCoreCurrentSignal": FirstOwner,
+                "LocalUnsatCoreCompleteSignal": SecondOwner,
+                "LocalUnsatCoreProjectionFingerprint": (
+                    ProjectionFingerprint
+                ),
+                "LocalUnsatCoreFingerprint": ProjectionFingerprint,
+                "LocalUnsatCoreVariableKinds": [
+                    FirstKind,
+                    SecondKind,
+                ],
             },
         )
 
@@ -9298,11 +9473,7 @@ def SolveComponentRoutingProblemDynamic(
         )
 
     def OptionFingerprint(Kind: str, Value: Any) -> str:
-        return str(
-            Value.NetFingerprint
-            if Kind in {"net", "transit"}
-            else Value.CandidateFingerprint
-        )
+        return CapacityOptionFingerprint(Kind, Value)
 
     def Search(
         Remaining: dict[int, tuple[int, ...]],
@@ -9388,6 +9559,122 @@ def SolveComponentRoutingProblemDynamic(
     Feasible = Search(Domains)
     if not Feasible:
         Status = "incomplete" if HitLimit else "architectural-unsatisfiable"
+        if (
+            not HitLimit
+            and not ForbiddenAssignmentFingerprints
+            and not ForbiddenForeignAssignmentPairs
+        ):
+            def CapacitySubsetHasSupport(
+                VariableIndexes: tuple[int, ...],
+            ) -> bool:
+                SelectedSubsetClaims = list(StaticClaims)
+
+                def SearchSubset(RemainingIndexes: tuple[int, ...]) -> bool:
+                    if not RemainingIndexes:
+                        return True
+                    SelectedIndex = min(
+                        RemainingIndexes,
+                        key=lambda Index: (
+                            len(Domains[Index]),
+                            Variables[Index][0],
+                            Variables[Index][1],
+                        ),
+                    )
+                    (
+                        _Kind,
+                        _Identity,
+                        Owner,
+                        Options,
+                        ClaimsFor,
+                    ) = Variables[SelectedIndex]
+                    NextIndexes = tuple(
+                        Index for Index in RemainingIndexes
+                        if Index != SelectedIndex
+                    )
+                    for OptionIndex in Domains[SelectedIndex]:
+                        Claims = ClaimsFor(Options[OptionIndex])
+                        if any(
+                            not ComponentClaimsCompatibleForOwners(
+                                Owner,
+                                Claims,
+                                SelectedOwner,
+                                SelectedClaims,
+                            )
+                            for SelectedOwner, SelectedClaims
+                            in SelectedSubsetClaims
+                        ):
+                            continue
+                        SelectedSubsetClaims.append((Owner, Claims))
+                        if SearchSubset(NextIndexes):
+                            return True
+                        SelectedSubsetClaims.pop()
+                    return False
+
+                return SearchSubset(VariableIndexes)
+
+            CoreIndexes = tuple(sorted(Domains))
+            if not CapacitySubsetHasSupport(CoreIndexes):
+                for VariableIndex in tuple(CoreIndexes):
+                    CandidateCore = tuple(
+                        Index for Index in CoreIndexes
+                        if Index != VariableIndex
+                    )
+                    if (
+                        CandidateCore
+                        and not CapacitySubsetHasSupport(CandidateCore)
+                    ):
+                        CoreIndexes = CandidateCore
+                CoreSignals = tuple(sorted({
+                    Variables[Index][2] for Index in CoreIndexes
+                }))
+                CoreProjectionFingerprint = _StableFingerprint((
+                    "complete-symbolic-capacity-core-v1",
+                    Problem.ProblemFingerprint,
+                    tuple(
+                        (
+                            Variables[Index][0],
+                            Variables[Index][1],
+                            Variables[Index][2],
+                            tuple(
+                                CapacityOptionFingerprint(
+                                    Variables[Index][0],
+                                    Variables[Index][3][OptionIndex],
+                                )
+                                for OptionIndex in Domains[Index]
+                            ),
+                        )
+                        for Index in CoreIndexes
+                    ),
+                ))
+                return ComponentRoutingSolveResult(
+                    Status="architectural-unsatisfiable",
+                    ProofFingerprint=CoreProjectionFingerprint,
+                    ExpansionCount=ExpansionCount,
+                    Detail=(
+                        "a deletion-minimal complete symbolic capacity "
+                        "core has no compatible assignment"
+                    ),
+                    Diagnostics={
+                        **FinishDiagnostics(),
+                        "SymbolicCapacityProofComplete": True,
+                        "SymbolicCapacityFeasible": False,
+                        "LocalUnsatCoreComplete": True,
+                        "LocalUnsatCoreKind": (
+                            "complete-symbolic-capacity-core"
+                        ),
+                        "LocalUnsatCoreSignals": list(CoreSignals),
+                        "LocalUnsatCoreProjectionFingerprint": (
+                            CoreProjectionFingerprint
+                        ),
+                        "LocalUnsatCoreFingerprint": (
+                            CoreProjectionFingerprint
+                        ),
+                        "LocalUnsatCoreVariableCount": len(CoreIndexes),
+                        "LocalUnsatCoreVariableKinds": [
+                            Variables[Index][0] for Index in CoreIndexes
+                        ],
+                    },
+                )
         return ComponentRoutingSolveResult(
             Status=Status,
             ProofFingerprint=_StableFingerprint((
@@ -9596,9 +9883,25 @@ def SolveComponentRoutingProblem(
     """Dispatch physical tree fabrics to DP and retain the legacy oracle."""
     UseDynamicSolver = bool(
         StopAfterCompleteNetVariantPortfolioSignal is None
-        and Problem.PhysicalAssemblyPlan is not None
         and Problem.Interface is not None
-        and Problem.Interface.PhysicalPortReservations
+        and (
+            (
+                Problem.PhysicalAssemblyPlan is not None
+                and Problem.Interface.PhysicalPortReservations
+            )
+            or (
+                StopAfterOwnedSignalFrontierProof
+                and Problem.PhysicalAssemblyPlan is None
+                and not Problem.Interface.PhysicalPortReservations
+                and not Problem.ReservedGlobalClaimsBySignal
+            )
+            or (
+                StopAfterSymbolicCapacityProof
+                and Problem.PhysicalAssemblyPlan is None
+                and Problem.Interface.PhysicalPortReservations
+                and not Problem.ReservedGlobalClaimsBySignal
+            )
+        )
         and Problem.Fabric.TopologyKind in {
             "tree",
             "tree-forest",

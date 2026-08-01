@@ -114,7 +114,9 @@ from Compiler.Routing.AuthoritativePlanner import (
     MandatoryPortalTupleSelfConflictEvidence,
     IsPhysicalCandidateRequestDomainComplete,
     PhysicalGlobalAssignmentDomainIsComplete,
+    BuildSeamOnlyPhysicalComponentPortReservation,
     PhysicalPortPathsOwnExclusiveSeam,
+    PhysicalRouteRequestFactorHasNecessaryConnectivity,
     ConflictClassificationSupportsPhysicalPortPairNoGoods,
     PlanPhysicalGlobalAssignmentAvoidingExactNoGoods,
     PropagatePhysicalPortCorridorArcConsistency,
@@ -486,6 +488,93 @@ class AuthoritativePlannerTests(unittest.TestCase):
             ((0, 2, 0), (1, 2, 0)),
             ((2, 2, 0), (3, 2, 0)),
         ))
+
+    def testSeamOnlyPortLeavesTerminalAccessToLocalCompiler(self) -> None:
+        class ResourceGraph:
+            @staticmethod
+            def BuildRouteClaims(Nodes):
+                return RoutingResourceClaims(WireCells=frozenset(Nodes))
+
+        Candidate = SimpleNamespace(
+            CandidateFingerprint="candidate",
+            Path=((0, 0, 0),),
+            Layer=0,
+        )
+        Port = PhysicalComponentPortReservation(
+            Signal="sum",
+            Direction="output",
+            OwnedTerminals=((0, 0, 0),),
+            OwnedTerminalFingerprints=("terminal",),
+            OwnedCandidateFingerprints=("candidate",),
+            FabricDomainFingerprint="fabric",
+            FabricAttachment=(0, 0, 0),
+            Attachment=(2, 0, 0),
+            LocalPath=((0, 0, 0), (1, 0, 0), (2, 0, 0)),
+            GlobalPath=((2, 0, 0), (3, 0, 0)),
+            Claims=RoutingResourceClaims(),
+            LocalClaims=RoutingResourceClaims(),
+            GlobalClaims=RoutingResourceClaims(),
+            OwnedAccessCandidates=(Candidate,),
+            ReservationFingerprint="candidate-bound",
+        )
+
+        SeamOnly = BuildSeamOnlyPhysicalComponentPortReservation(
+            Port,
+            ResourceGraph(),
+        )
+
+        self.assertEqual(SeamOnly.OwnedCandidateFingerprints, ())
+        self.assertEqual(SeamOnly.OwnedAccessCandidates, ())
+        self.assertEqual(
+            SeamOnly.LocalClaims.WireCells,
+            frozenset(Port.LocalPath),
+        )
+        self.assertEqual(
+            SeamOnly.GlobalClaims.WireCells,
+            frozenset(Port.GlobalPath),
+        )
+        self.assertNotEqual(
+            SeamOnly.ReservationFingerprint,
+            Port.ReservationFingerprint,
+        )
+
+    def testPhysicalRouteFactorPrunesOnlyCertifiedDisconnectedGuides(
+        self,
+    ) -> None:
+        Adjacency = {
+            (0, 2, 0): ((1, 2, 0),),
+            (1, 2, 0): ((0, 2, 0), (2, 2, 0)),
+            (2, 2, 0): ((1, 2, 0),),
+        }
+        Nodes = frozenset(Adjacency)
+        Required = frozenset(((0, 2, 0), (2, 2, 0)))
+        self.assertTrue(
+            PhysicalRouteRequestFactorHasNecessaryConnectivity(
+                Adjacency,
+                Nodes,
+                Required,
+                frozenset(),
+                frozenset(((1, 0),)),
+            )
+        )
+        self.assertFalse(
+            PhysicalRouteRequestFactorHasNecessaryConnectivity(
+                Adjacency,
+                Nodes,
+                Required,
+                frozenset(((1, 2, 0),)),
+                frozenset(((1, 0),)),
+            )
+        )
+        self.assertTrue(
+            PhysicalRouteRequestFactorHasNecessaryConnectivity(
+                Adjacency,
+                Nodes,
+                frozenset((*Required, (9, 2, 9))),
+                frozenset(),
+                frozenset(),
+            )
+        )
 
     def testRoutedComponentNoTreeEvidenceRequiresCompletedWindows(
         self,
@@ -6276,7 +6365,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertEqual(Calls, ["rejected"])
         self.assertTrue(IsPhysicalCandidateRequestDomainComplete(0, False))
         self.assertFalse(IsPhysicalCandidateRequestDomainComplete(1, False))
-        self.assertFalse(IsPhysicalCandidateRequestDomainComplete(0, True))
+        self.assertTrue(IsPhysicalCandidateRequestDomainComplete(0, True))
 
     def testPhysicalGlobalAssignmentSuffixUsesNativeCutDeterministically(
         self,

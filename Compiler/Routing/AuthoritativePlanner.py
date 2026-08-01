@@ -97,6 +97,7 @@ from .ComponentPipeline import (
     BuildPhysicalPortApertureContractFingerprint,
     BuildPhysicalPortGlobalContractFingerprint,
     BuildPhysicalPortLocalContractFingerprint,
+    BuildPhysicalPortSeamContractFingerprint,
     BuildPhysicalRequestAperturePortNoGood,
     BuildPhysicalComponentPortSolverCacheKey,
     FinalizePhysicalComponentChannelReservations,
@@ -114,6 +115,7 @@ from .ComponentRouter import (
     FilterExternalSourcePoweredSeamCandidateDomains,
     PreserveRoutedComponentForeignEscapes,
     SelectComponentIncidentSignals,
+    SolveComponentRoutingProblem,
 )
 from .Reliability import (
     BuildRoutingDeadlineDiagnostics,
@@ -3759,10 +3761,16 @@ def IsPhysicalCandidateRequestDomainComplete(
     RemainingRequestCount: int,
     DeadlineExpired: bool,
 ) -> bool:
-    """Report completeness only after every descriptor was consumed."""
+    """Report the immutable completion fact for a finite request domain.
+
+    A deadline sampled after the final descriptor cannot invalidate the
+    completion proof.  The deadline only distinguishes incomplete domains;
+    keep the argument while existing callers transition to that distinction.
+    """
     if RemainingRequestCount < 0:
         raise ValueError("RemainingRequestCount cannot be negative")
-    return RemainingRequestCount == 0 and not DeadlineExpired
+    del DeadlineExpired
+    return RemainingRequestCount == 0
 
 
 def SelectPhysicalGlobalAssignmentSuffixSignals(
@@ -4026,6 +4034,10 @@ def BuildPhysicalPortNoGoodKeys(
         (
             Port.Signal,
             BuildPhysicalPortLocalContractFingerprint(Port),
+        ),
+        (
+            Port.Signal,
+            BuildPhysicalPortSeamContractFingerprint(Port),
         ),
         (
             Port.Signal,
@@ -12845,6 +12857,67 @@ def PhysicalPortPathsOwnExclusiveSeam(
     )
 
 
+def BuildSeamOnlyPhysicalComponentPortReservation(
+    Port: PhysicalComponentPortReservation,
+    ResourceGraph: Any,
+) -> PhysicalComponentPortReservation:
+    """Remove internal terminal witnesses from one physical port contract."""
+    CertifiedLocalContractFingerprint = str(getattr(
+        Port,
+        "CertifiedLocalContractFingerprint",
+        "",
+    )) or BuildPhysicalPortLocalContractFingerprint(Port)
+    CertifiedSeamContractFingerprint = str(getattr(
+        Port,
+        "CertifiedSeamContractFingerprint",
+        "",
+    )) or BuildPhysicalPortSeamContractFingerprint(Port)
+    CertifiedSupportReservationFingerprint = str(getattr(
+        Port,
+        "CertifiedSupportReservationFingerprint",
+        "",
+    )) or Port.ReservationFingerprint
+    LocalClaims = ResourceGraph.BuildRouteClaims(
+        frozenset(Port.LocalPath)
+    )
+    GlobalClaims = ResourceGraph.BuildRouteClaims(
+        frozenset(Port.GlobalPath)
+    )
+    Claims = ResourceGraph.BuildRouteClaims(frozenset((
+        *Port.LocalPath,
+        *Port.GlobalPath,
+    )))
+    return replace(
+        Port,
+        OwnedCandidateFingerprints=(),
+        OwnedAccessCandidates=(),
+        Claims=Claims,
+        LocalClaims=LocalClaims,
+        GlobalClaims=GlobalClaims,
+        CertifiedLocalContractFingerprint=(
+            CertifiedLocalContractFingerprint
+        ),
+        CertifiedSeamContractFingerprint=(
+            CertifiedSeamContractFingerprint
+        ),
+        CertifiedSupportReservationFingerprint=(
+            CertifiedSupportReservationFingerprint
+        ),
+        ReservationFingerprint=BuildStableFingerprint((
+            "physical-port-seam-only-v2",
+            BuildPhysicalPortSeamContractFingerprint(Port),
+            tuple(
+                tuple(
+                    int(Position[Index])
+                    - int(Port.FabricAttachment[Index])
+                    for Index in range(3)
+                )
+                for Position in Port.GlobalPath
+            ),
+        )),
+    )
+
+
 @dataclass(frozen=True)
 class InvariantRouteRequestNodePayload:
     """Sorted native node payload shared by one exact portal tuple."""
@@ -12870,6 +12943,42 @@ def BuildInvariantRouteRequestNodePayload(
             if Position not in RequiredNodeSet
         ),
     )
+
+
+def PhysicalRouteRequestFactorHasNecessaryConnectivity(
+    Adjacency: Mapping[Position3, Iterable[Position3]],
+    RegionNodes: frozenset[Position3],
+    RequiredNodes: frozenset[Position3],
+    BlockedNodes: frozenset[Position3],
+    AllowedColumns: frozenset[Position2],
+) -> bool:
+    """Prove the required terminals share one allowed exterior component.
+
+    A false result is an exact necessary-condition failure and may prune the
+    access/guide factor before native routing.  Missing graph evidence returns
+    true so this prescreen can never manufacture an unsatisfiability proof.
+    """
+    if not RequiredNodes or not RequiredNodes <= RegionNodes:
+        return True
+    TraversableRequired = RequiredNodes - BlockedNodes
+    if TraversableRequired != RequiredNodes:
+        return False
+    Start = min(RequiredNodes)
+    Pending = [Start]
+    Seen = {Start}
+    while Pending:
+        Current = Pending.pop()
+        for Neighbor in Adjacency.get(Current, ()):
+            if Neighbor in Seen or Neighbor in BlockedNodes:
+                continue
+            if (
+                Neighbor not in RequiredNodes
+                and (Neighbor[0], Neighbor[2]) not in AllowedColumns
+            ):
+                continue
+            Seen.add(Neighbor)
+            Pending.append(Neighbor)
+    return RequiredNodes <= Seen
 
 
 def PartitionLocalClaimSeedComponents(
@@ -21205,6 +21314,9 @@ def IterPhysicalBoundaryPortAssignments(
     CertifiedLocalNoGoodClauses: Iterable[
         frozenset[tuple[str, str]]
     ] = (),
+    LearnedLocalSeamNoGoodClauses: Iterable[
+        frozenset[tuple[str, str]]
+    ] = (),
     PortSolverCacheKey: str = "",
     PreferredGlobalContractsBySignal: Mapping[str, str] | None = None,
     RejectedGlobalApertureClauses: Iterable[
@@ -21325,9 +21437,14 @@ def IterPhysicalBoundaryPortAssignments(
         raise ValueError(
             "certified no-good projection requires prepared local support"
         )
-    LocalNoGoods = tuple(CertifiedLocalNoGoodClauses)
+    CertifiedLocalNoGoods = tuple(CertifiedLocalNoGoodClauses)
+    LearnedLocalNoGoodsSource = LearnedLocalSeamNoGoodClauses
     LocalSupportFeasibilityCache: dict[
-        tuple[tuple[str, str], ...], bool
+        tuple[tuple[str, str], ...],
+        tuple[
+            tuple[tuple[tuple[str, str], ...], ...],
+            tuple[PhysicalPortLocalAccessFactor, ...] | None,
+        ],
     ] = {}
     BoundaryPrefixExpansionCount = 0
     LocalSupportSearchExpansionCount = 0
@@ -21346,21 +21463,21 @@ def IterPhysicalBoundaryPortAssignments(
         if PortSolverCacheKey
         else frozenset()
     )
-    ForbiddenLocalKeysBySignal: dict[
-        str, set[tuple[str, str]]
-    ] = {}
-    ResidualLocalNoGoods = []
-    ConstantLocalNoGood = False
-    for Clause in LocalNoGoods:
-        Residual = frozenset(Clause - ConstantDomainKeys)
-        if not Residual:
-            ConstantLocalNoGood = True
-        elif len(Residual) == 1:
-            Key = next(iter(Residual))
-            ForbiddenLocalKeysBySignal.setdefault(Key[0], set()).add(Key)
-        else:
-            ResidualLocalNoGoods.append(Residual)
-    ResidualLocalNoGoods = tuple(ResidualLocalNoGoods)
+    def CurrentLocalNoGoods() -> tuple[
+        frozenset[tuple[str, str]], ...
+    ]:
+        Learned = tuple(
+            Clause
+            for Clause in LearnedLocalNoGoodsSource
+            if Clause
+            and all(
+                str(Fingerprint).startswith(
+                    "local-seam-contract-v1:"
+                )
+                for _Signal, Fingerprint in Clause
+            )
+        )
+        return tuple((*CertifiedLocalNoGoods, *Learned))
 
     def BoundaryApertureMatchIdentity(Value: Any) -> tuple[object, ...]:
         return (
@@ -21423,6 +21540,10 @@ def IterPhysicalBoundaryPortAssignments(
             (Value.Signal, Value.LocalContractFingerprint),
             (
                 Value.Signal,
+                BuildPhysicalPortSeamContractFingerprint(Value),
+            ),
+            (
+                Value.Signal,
                 "fabric-domain:" + Value.FabricDomainFingerprint,
             ),
             (
@@ -21446,10 +21567,9 @@ def IterPhysicalBoundaryPortAssignments(
         nonlocal LocalSupportSearchExpansionCount
         if not UsePreparedLocalSupport:
             return True
+        LocalNoGoods = CurrentLocalNoGoods()
         if CertifiedNoGoodProjectionOnly and not LocalNoGoods:
             return True
-        if ConstantLocalNoGood:
-            return False
         DomainsByLocalSignal = {}
         ApertureIdentityBySignal = {}
         for Boundary in Boundaries:
@@ -21475,16 +21595,59 @@ def IterPhysicalBoundaryPortAssignments(
             if not Domain:
                 return False
             DomainsByLocalSignal[Signal] = Domain
+        ForbiddenLocalKeysBySignal = {}
+        ResidualLocalNoGoods = []
+        ConstantLocalNoGood = False
+        for Clause in LocalNoGoods:
+            Residual = frozenset(Clause - ConstantDomainKeys)
+            if not Residual:
+                ConstantLocalNoGood = True
+            elif len(Residual) == 1:
+                Key = next(iter(Residual))
+                ForbiddenLocalKeysBySignal.setdefault(
+                    Key[0],
+                    set(),
+                ).add(Key)
+            else:
+                ResidualLocalNoGoods.append(Residual)
+        ResidualLocalNoGoodsTuple = tuple(ResidualLocalNoGoods)
+        if ConstantLocalNoGood:
+            return False
+        LocalNoGoodIdentity = tuple(sorted(
+            tuple(sorted(Clause)) for Clause in LocalNoGoods
+        ))
         StateIdentity = tuple(sorted(ApertureIdentityBySignal.items()))
         Cached = LocalSupportFeasibilityCache.get(StateIdentity)
         if Cached is not None:
-            return Cached
+            CachedNoGoodIdentity, CachedWitness = Cached
+            if frozenset(CachedNoGoodIdentity).issubset(
+                frozenset(LocalNoGoodIdentity)
+            ):
+                if CachedWitness is None:
+                    # A complete empty support domain stays empty while
+                    # proof-qualified clauses only grow.
+                    return False
+                CachedWitnessKeys = ConstantDomainKeys | frozenset(
+                    Key
+                    for Value in CachedWitness
+                    for Key in LocalFactorKeys(Value)
+                )
+                if not any(
+                    Clause <= CachedWitnessKeys
+                    for Clause in LocalNoGoods
+                ):
+                    # Preserve a positive existential certificate until a
+                    # newly learned clause actually intersects it.  This is
+                    # the retained local-support frontier for the immutable
+                    # aperture prefix; unrelated cores no longer replay its
+                    # complete DFS.
+                    return True
 
         def LocalSearch(
             Remaining: tuple[str, ...],
             Selected: tuple[PhysicalPortLocalAccessFactor, ...],
             SelectedKeys: frozenset[tuple[str, str]],
-        ) -> bool:
+        ) -> tuple[PhysicalPortLocalAccessFactor, ...] | None:
             nonlocal LocalSupportSearchExpansionCount
             LocalSupportSearchExpansionCount += 1
             if (
@@ -21505,7 +21668,7 @@ def IterPhysicalBoundaryPortAssignments(
                     "ImplicitForeignTransitDomainCount": 0,
                 })
             if not Remaining:
-                return True
+                return Selected
             CompatibleDomains = {}
             for Signal in Remaining:
                 Values = tuple(
@@ -21527,11 +21690,11 @@ def IterPhysicalBoundaryPortAssignments(
                     )
                     and not any(
                         Clause <= (SelectedKeys | LocalFactorKeys(Value))
-                        for Clause in ResidualLocalNoGoods
+                        for Clause in ResidualLocalNoGoodsTuple
                     )
                 )
                 if not Values:
-                    return False
+                    return None
                 CompatibleDomains[Signal] = Values
             Signal = min(
                 Remaining,
@@ -21543,22 +21706,26 @@ def IterPhysicalBoundaryPortAssignments(
             NextRemaining = tuple(
                 Value for Value in Remaining if Value != Signal
             )
-            return any(
-                LocalSearch(
+            for Value in CompatibleDomains[Signal]:
+                Witness = LocalSearch(
                     NextRemaining,
                     (*Selected, Value),
                     SelectedKeys | LocalFactorKeys(Value),
                 )
-                for Value in CompatibleDomains[Signal]
-            )
+                if Witness is not None:
+                    return Witness
+            return None
 
-        Result = LocalSearch(
+        Witness = LocalSearch(
             tuple(sorted(DomainsByLocalSignal)),
             (),
             ConstantDomainKeys,
         )
-        LocalSupportFeasibilityCache[StateIdentity] = Result
-        return Result
+        LocalSupportFeasibilityCache[StateIdentity] = (
+            LocalNoGoodIdentity,
+            Witness,
+        )
+        return Witness is not None
 
     def CompatibleWithSelected(
         Candidate: PhysicalComponentBoundaryPortReservation,
@@ -21638,9 +21805,7 @@ def IterPhysicalBoundaryPortAssignments(
         Signal = min(
             Remaining,
             key=lambda Value: (
-                0
-                if LocalNoGoods
-                else PrioritySignalRank.get(Value, 0),
+                PrioritySignalRank.get(Value, 0),
                 len(CompatibleDomains[Value]),
                 tuple(
                     OptionIdentity(Option)
@@ -24094,6 +24259,27 @@ def PreparePhysicalComponentPortFactorDomain(
             for Value in ExteriorFixedClaimCertificates
         ),
     ))
+    LocalApertureSupportsByOptionValues: dict[
+        tuple[str, str], list[PhysicalPortLocalApertureSupport]
+    ] = defaultdict(list)
+    for Signal, SupportsForSignal in LocalApertureSupportBySignal:
+        for Support in SupportsForSignal:
+            LocalApertureSupportsByOptionValues[(
+                Signal,
+                Support.ApertureOptionFingerprint,
+            )].append(Support)
+    LocalApertureSupportsByOption = tuple(
+        (
+            Key,
+            tuple(sorted(
+                Values,
+                key=lambda Value: Value.SupportFingerprint,
+            )),
+        )
+        for Key, Values in sorted(
+            LocalApertureSupportsByOptionValues.items()
+        )
+    )
     Preparation = PreparedPhysicalComponentPortFactorDomain(
         DomainFingerprint=FactorDomainFingerprint,
         PlacementFingerprint=Problem.PlacementFingerprint,
@@ -24180,6 +24366,9 @@ def PreparePhysicalComponentPortFactorDomain(
         LocalAccessFactorsBySignal=LocalAccessFactorsBySignal,
         ApertureFactorsBySignal=ApertureFactorsBySignal,
         LocalApertureSupportBySignal=LocalApertureSupportBySignal,
+        LocalApertureSupportsByOption=(
+            LocalApertureSupportsByOption
+        ),
         ExteriorFixedClaimCertificates=(
             ExteriorFixedClaimCertificates
         ),
@@ -24503,6 +24692,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         ),
         key=lambda Clause: tuple(sorted(Clause)),
     ))
+    PhysicalLocalNoGoodClauses = CertifiedLocalPairNoGoodClauses
     SelectedPorts: tuple[
         PhysicalComponentPortReservation, ...
     ] | None = None
@@ -24753,10 +24943,14 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
     def PhysicalPortContractClaims(
         Port: PhysicalComponentPortReservation,
     ) -> RoutingResourceClaims:
-        """Return seam plus certified terminal-access resource ownership."""
+        """Return ownership appropriate to the current stage boundary."""
         CacheKey = (
             Port.ReservationFingerprint,
-            tuple(sorted(Port.OwnedCandidateFingerprints)),
+            (
+                ("seam-only",)
+                if DeferLocalCompositeSelection
+                else tuple(sorted(Port.OwnedCandidateFingerprints))
+            ),
         )
         Cached = PhysicalPortContractClaimsCache.get(CacheKey)
         if Cached is None:
@@ -24767,6 +24961,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                     Position
                     for Candidate in Port.OwnedAccessCandidates
                     for Position in Candidate.Path
+                    if not DeferLocalCompositeSelection
                 ),
             )))
             PhysicalPortContractClaimsCache[CacheKey] = Cached
@@ -25945,7 +26140,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         )),
         tuple(sorted(
             tuple(sorted(Clause))
-            for Clause in CertifiedLocalPairNoGoodClauses
+            for Clause in PhysicalLocalNoGoodClauses
         )),
     ))
     BoundaryAssignmentIterator = None
@@ -25983,7 +26178,11 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                 dict(Preparation.LocalApertureSupportBySignal)
             ),
             CertifiedLocalNoGoodClauses=(
-                CertifiedLocalPairNoGoodClauses
+                PhysicalLocalNoGoodClauses
+            ),
+            LearnedLocalSeamNoGoodClauses=(
+                Resources
+                .RejectedPhysicalComponentPortReservationSets
             ),
             PortSolverCacheKey=PortSolverCacheKey,
             PreferredGlobalContractsBySignal=(
@@ -26160,6 +26359,332 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         FailedPortAssignmentStates.add(State)
         return False
 
+    SeamOnlyPortDomainsBySignal: dict[
+        tuple[str, tuple[str, str] | None],
+        tuple[PhysicalComponentPortReservation, ...],
+    ] = {}
+    PreparedLocalFactorsBySignal = {
+        str(Signal): {
+            str(Value.LocalAccessFingerprint): Value
+            for Value in Values
+        }
+        for Signal, Values in Preparation.LocalAccessFactorsBySignal
+    }
+    PreparedApertureFactorsBySignal = {
+        str(Signal): {
+            str(Value.ApertureOptionFingerprint): Value
+            for Value in Values
+        }
+        for Signal, Values in Preparation.ApertureFactorsBySignal
+    }
+    PreparedLocalApertureSupportsByOption = {
+        (str(Key[0]), str(Key[1])): tuple(Values)
+        for Key, Values in Preparation.LocalApertureSupportsByOption
+    }
+
+    def SelectSeamOnlyPorts() -> bool:
+        """Select exact seams without performing the local capacity proof.
+
+        The frozen boundary and learned seam clauses own identity selection.
+        Joint local claim compatibility belongs to the subsequent exact
+        symbolic-capacity admission stage; solving it here would multiply the
+        same local CSP across the global boundary product.
+        """
+        nonlocal SelectedPorts, PortAssignmentExpansionCount
+        for Signal in OrderedSignals:
+            Restriction = ActiveApertureContractRestrictionsBySignal.get(
+                Signal
+            )
+            DomainKey = (Signal, Restriction)
+            if DomainKey in SeamOnlyPortDomainsBySignal:
+                continue
+            ByFingerprint = {}
+            LocalFactors = PreparedLocalFactorsBySignal.get(Signal, {})
+            ApertureFactors = PreparedApertureFactorsBySignal.get(
+                Signal,
+                {},
+            )
+            SeenSeamFingerprints: set[str] = set()
+            ConsideredSupportCount = 0
+            MatchingApertureFingerprints = tuple(
+                Fingerprint
+                for Fingerprint, ApertureFactor
+                in ApertureFactors.items()
+                if Restriction is None or Restriction == (
+                    ApertureFactor.GlobalContractFingerprint,
+                    ApertureFactor.ApertureContractFingerprint,
+                )
+            )
+            SupportsForRestriction = tuple(
+                Support
+                for ApertureFingerprint
+                in MatchingApertureFingerprints
+                for Support in (
+                    PreparedLocalApertureSupportsByOption.get(
+                        (Signal, ApertureFingerprint),
+                        (),
+                    )
+                )
+            )
+            for Support in SupportsForRestriction:
+                ConsideredSupportCount += 1
+                LocalFactor = LocalFactors.get(
+                    str(Support.LocalAccessFingerprint)
+                )
+                ApertureFactor = ApertureFactors.get(
+                    str(Support.ApertureOptionFingerprint)
+                )
+                if LocalFactor is None or ApertureFactor is None:
+                    continue
+                if Restriction is not None and Restriction != (
+                    ApertureFactor.GlobalContractFingerprint,
+                    ApertureFactor.ApertureContractFingerprint,
+                ):
+                    continue
+                SeamFingerprint = (
+                    BuildPhysicalPortSeamContractFingerprint(LocalFactor)
+                )
+                if SeamFingerprint in SeenSeamFingerprints:
+                    continue
+                SeenSeamFingerprints.add(SeamFingerprint)
+                Option = MaterializeSupportedPhysicalPortReservation(
+                    LocalFactor,
+                    ApertureFactor,
+                    Support,
+                    ResourceGraph,
+                )
+                SeamOnly = BuildSeamOnlyPhysicalComponentPortReservation(
+                    Option,
+                    ResourceGraph,
+                )
+                ByFingerprint.setdefault(
+                    SeamOnly.ReservationFingerprint,
+                    SeamOnly,
+                )
+                if WorkCheck is not None and (
+                    len(ByFingerprint) == 1
+                    or len(ByFingerprint) % 128 == 0
+                ):
+                    WorkCheck({
+                        "Stage": "physical-port-seam-domain-materialization",
+                        "Signal": Signal,
+                        "ConsideredSupportCount": ConsideredSupportCount,
+                        "DistinctSeamCount": len(ByFingerprint),
+                        "SeamOnly": True,
+                        "ImplicitForeignTransitDomainCount": 0,
+                    })
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Stage": "physical-port-seam-domain-complete",
+                    "Signal": Signal,
+                    "ConsideredSupportCount": ConsideredSupportCount,
+                    "DistinctSeamCount": len(ByFingerprint),
+                    "Restriction": list(Restriction or ()),
+                    "SeamOnly": True,
+                    "ImplicitForeignTransitDomainCount": 0,
+                })
+            SeamOnlyPortDomainsBySignal[DomainKey] = tuple(
+                ByFingerprint[Fingerprint]
+                for Fingerprint in sorted(ByFingerprint)
+            )
+
+        Domains = {
+            Signal: tuple(
+                Option
+                for Option in SeamOnlyPortDomainsBySignal[(
+                    Signal,
+                    ActiveApertureContractRestrictionsBySignal.get(Signal),
+                )]
+            )
+            for Signal in OrderedSignals
+        }
+        if any(not Values for Values in Domains.values()):
+            return False
+
+        RejectedClauses = tuple(
+            Resources.RejectedPhysicalComponentPortReservationSets
+        )
+
+        def Search(
+            Remaining: tuple[str, ...],
+            Selected: tuple[PhysicalComponentPortReservation, ...],
+            SelectedKeys: frozenset[tuple[str, str]],
+        ) -> bool:
+            nonlocal SelectedPorts, PortAssignmentExpansionCount
+            PortAssignmentExpansionCount += 1
+            if WorkCheck is not None and (
+                PortAssignmentExpansionCount == 1
+                or PortAssignmentExpansionCount % 128 == 0
+            ):
+                WorkCheck({
+                    "Stage": "physical-port-seam-selection",
+                    "AssignedPortCount": len(Selected),
+                    "PortCount": len(OrderedSignals),
+                    "ExpansionCount": PortAssignmentExpansionCount,
+                    "SeamOnly": True,
+                    "ImplicitForeignTransitDomainCount": 0,
+                })
+            if any(
+                Clause and Clause <= SelectedKeys
+                for Clause in RejectedClauses
+            ):
+                return False
+            if not Remaining:
+                PortAssignmentFingerprint = BuildStableFingerprint(tuple(
+                    (
+                        Value.Signal,
+                        Value.ReservationFingerprint,
+                    )
+                    for Value in sorted(
+                        Selected,
+                        key=lambda Candidate: Candidate.Signal,
+                    )
+                ))
+                if PortAssignmentFingerprint in (
+                    Resources
+                    .RejectedPhysicalComponentPortAssignmentFingerprints
+                ) or PortAssignmentFingerprint in getattr(
+                    Resources,
+                    "DeferredPhysicalComponentPortAssignmentFingerprints",
+                    set(),
+                ):
+                    return False
+                SelectedPorts = Selected
+                return True
+            CompatibleDomains = {
+                Signal: tuple(
+                    Option
+                    for Option in Domains[Signal]
+                    if not any(
+                        Clause and Clause <= (
+                            SelectedKeys | PhysicalPortNoGoodKeys(Option)
+                        )
+                        for Clause in RejectedClauses
+                    )
+                )
+                for Signal in Remaining
+            }
+            if any(not Values for Values in CompatibleDomains.values()):
+                return False
+            Signal = SelectPhysicalFactorBranchSignal(
+                {
+                    Value: len(CompatibleDomains[Value])
+                    for Value in Remaining
+                },
+                RejectedClauses,
+            )
+            NextRemaining = tuple(
+                Value for Value in Remaining if Value != Signal
+            )
+            for Option in CompatibleDomains[Signal]:
+                if Search(
+                    NextRemaining,
+                    (*Selected, Option),
+                    SelectedKeys | PhysicalPortNoGoodKeys(Option),
+                ):
+                    return True
+            return False
+
+        return Search(tuple(OrderedSignals), (), frozenset())
+
+    def SelectedSeamHasCertifiedSymbolicCapacity() -> bool:
+        """Prune only complete component-net cores before assembly work."""
+        assert SelectedPorts is not None
+        PortAssignmentFingerprint = BuildStableFingerprint(tuple(
+            (
+                Port.Signal,
+                Port.ReservationFingerprint,
+            )
+            for Port in sorted(
+                SelectedPorts,
+                key=lambda Value: Value.Signal,
+            )
+        ))
+        CapacityInterface = replace(
+            Problem.Interface,
+            PhysicalPortReservations=SelectedPorts,
+            PhysicalAssemblyPlanFingerprint="",
+        )
+        CapacityProblem = replace(
+            Problem,
+            ProblemFingerprint=BuildStableFingerprint((
+                "pre-assembly-symbolic-capacity-v1",
+                Problem.ProblemFingerprint,
+                PortAssignmentFingerprint,
+            )),
+            Interface=CapacityInterface,
+            PhysicalAssemblyPlan=None,
+            ReservedGlobalClaimsBySignal=(),
+        )
+        CapacityProof = SolveComponentRoutingProblem(
+            CapacityProblem,
+            WorkCheck=WorkCheck,
+            StopAfterSymbolicCapacityProof=True,
+        )
+        if CapacityProof.Status != "architectural-unsatisfiable":
+            return True
+        Diagnostics = dict(CapacityProof.Diagnostics or {})
+        CoreSignals = tuple(sorted({
+            str(Signal)
+            for Signal in Diagnostics.get("LocalUnsatCoreSignals", ())
+            if str(Signal)
+        }))
+        VariableKinds = tuple(
+            str(Kind)
+            for Kind in Diagnostics.get(
+                "LocalUnsatCoreVariableKinds",
+                (),
+            )
+        )
+        ComponentNetCoreComplete = bool(
+            Diagnostics.get("SymbolicCapacityProofComplete", False)
+            and Diagnostics.get("LocalUnsatCoreComplete", False)
+            and CoreSignals
+            and set(CoreSignals) <= set(Problem.ComponentSignals)
+            and VariableKinds
+            and all(Kind == "net" for Kind in VariableKinds)
+        )
+        if not ComponentNetCoreComplete:
+            return True
+        PortsBySignal = {
+            Port.Signal: Port for Port in SelectedPorts
+        }
+        CoreClause = frozenset(
+            (
+                Signal,
+                BuildPhysicalPortSeamContractFingerprint(
+                    PortsBySignal[Signal]
+                ),
+            )
+            for Signal in CoreSignals
+        )
+        Resources.RejectedPhysicalComponentPortReservationSets.add(
+            CoreClause
+        )
+        Resources.RejectedPhysicalComponentPortAssignmentFingerprints.add(
+            PortAssignmentFingerprint
+        )
+        if WorkCheck is not None:
+            WorkCheck({
+                "Stage": "physical-port-pre-assembly-symbolic-capacity",
+                "Result": "architectural-unsatisfiable",
+                "PortAssignmentFingerprint": PortAssignmentFingerprint,
+                "LocalUnsatCoreKind": str(
+                    Diagnostics.get("LocalUnsatCoreKind", "")
+                ),
+                "LocalUnsatCoreSignals": list(CoreSignals),
+                "LocalCapacityCoreClause": [
+                    list(Value) for Value in sorted(CoreClause)
+                ],
+                "SymbolicCapacityProofFingerprint": (
+                    CapacityProof.ProofFingerprint
+                ),
+                "GlobalPlanningEntered": False,
+                "LocalCompilationEntered": False,
+                "ImplicitForeignTransitDomainCount": 0,
+            })
+        return False
+
     def SelectNextGloballyPlannedBoundary() -> bool:
         """Freeze one global tuple before any joint local compilation."""
         nonlocal ActiveApertureContractRestrictionsBySignal
@@ -26261,27 +26786,24 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                 })
             SelectedPorts = None
             if DeferLocalCompositeSelection:
-                # Materialize one independently certified local witness per
-                # frozen aperture only to preserve the transitional composite
-                # problem shape.  Do not run the joint local CSP here: global
-                # routing must own the next authoritative decision.  The
-                # complete local compiler will prove or reject this exact plan
-                # after its global channels are frozen.
-                IndependentPorts = []
-                IndependentSupportComplete = True
-                for Signal in OrderedSignals:
-                    SelectedPorts = None
-                    if not SelectFactorizedPorts((Signal,), ()):
-                        IndependentSupportComplete = False
-                        break
+                # The global boundary is already frozen. Select its concrete
+                # local seams jointly, using seam claims only, then discard
+                # the generator's terminal-access witnesses. This establishes
+                # the physical attachment contract without compiling an
+                # internal tree before authoritative global routing.
+                while (
+                    RestrictionState
+                    not in FailedApertureRestrictionStates
+                    and SelectSeamOnlyPorts()
+                ):
                     assert SelectedPorts is not None
-                    IndependentPorts.extend(SelectedPorts)
-                if IndependentSupportComplete:
                     SelectedPorts = tuple(sorted(
-                        IndependentPorts,
+                        SelectedPorts,
                         key=lambda Value: Value.Signal,
                     ))
-                    return True
+                    if SelectedSeamHasCertifiedSymbolicCapacity():
+                        return True
+                    SelectedPorts = None
                 SelectedPorts = None
             elif (
                 RestrictionState not in FailedApertureRestrictionStates
@@ -26650,6 +27172,21 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         # Candidate-specific feedthrough contracts belong to one immutable
         # port/channel plan.  A rejected plan must not leak them into the next
         # boundary assignment.
+        #
+        # The selected global boundary owns a seam and attachment, not one
+        # arbitrary terminal-access witness used while generating that seam.
+        # Keeping OwnedCandidateFingerprints here made the global port object
+        # silently freeze internal tree topology and caused the later local
+        # CSP to reject whole aperture families.  Rebuild the reservation as
+        # a seam-only contract; CompileClosedComponent remains responsible
+        # for choosing terminal access that reaches LocalPath exactly.
+        Ports = tuple(
+            BuildSeamOnlyPhysicalComponentPortReservation(
+                Port,
+                ResourceGraph,
+            )
+            for Port in Ports
+        )
         CandidateProblem = Problem
         if WorkCheck is not None:
             WorkCheck({
@@ -32586,7 +33123,10 @@ def RouteAuthoritativeResources(
                 CompletedPhysicalDescriptorFingerprintsBySignal[
                     Owner[0]
                 ].add(Owner[1])
-        if not RouteTreeNativeDeadlineExceeded:
+        if (
+            not RouteTreeNativeDeadlineExceeded
+            and not Resources.PreparingPhysicalComponentGlobalChannels
+        ):
             CheckRuntimeBudget("Candidate")
         return Values
     InitialRequestLimit = max(
@@ -34230,10 +34770,23 @@ def RouteAuthoritativeResources(
         "SelfConflictCacheHits": 0,
         "GuidePayloadCacheHits": 0,
         "GuidePayloadCacheMisses": 0,
+        "ConnectivityFactorChecks": 0,
+        "ConnectivityFactorCacheHits": 0,
+        "ConnectivityFactorPruned": 0,
     }
     WorkTelemetry["InvariantRequestPayloadCache"] = (
         InvariantRequestPayloadCacheDiagnostics
     )
+    PhysicalRouteFactorAdjacency: dict[
+        Position3, set[Position3]
+    ] = defaultdict(set)
+    if Resources.PreparingPhysicalComponentGlobalChannels:
+        for First, Second in Region.Edges:
+            PhysicalRouteFactorAdjacency[First].add(Second)
+            PhysicalRouteFactorAdjacency[Second].add(First)
+    PhysicalRouteFactorConnectivityCache: dict[
+        tuple[tuple[str, ...], tuple[frozenset[Position2], int]], bool
+    ] = {}
     CandidateConstructionRank = {
         Signal: Index
         for Index, Signal in enumerate(CandidateSignalOrder)
@@ -34976,6 +35529,43 @@ def RouteAuthoritativeResources(
                                 InvariantRequestPayloadCacheDiagnostics[
                                     "AccessPayloadCacheHits"
                                 ] += 1
+                            if (
+                                Resources
+                                .PreparingPhysicalComponentGlobalChannels
+                            ):
+                                ConnectivityKey = (
+                                    PortalTupleKey,
+                                    GuidePayloadKey,
+                                )
+                                ConnectivitySupported = (
+                                    PhysicalRouteFactorConnectivityCache
+                                    .get(ConnectivityKey)
+                                )
+                                if ConnectivitySupported is None:
+                                    InvariantRequestPayloadCacheDiagnostics[
+                                        "ConnectivityFactorChecks"
+                                    ] += 1
+                                    ConnectivitySupported = (
+                                        PhysicalRouteRequestFactorHasNecessaryConnectivity(
+                                            PhysicalRouteFactorAdjacency,
+                                            frozenset(Region.Nodes),
+                                            NodePayload.RequiredNodeSet,
+                                            frozenset(NodePayload.BlockedNodes),
+                                            frozenset(CandidateColumns),
+                                        )
+                                    )
+                                    PhysicalRouteFactorConnectivityCache[
+                                        ConnectivityKey
+                                    ] = ConnectivitySupported
+                                else:
+                                    InvariantRequestPayloadCacheDiagnostics[
+                                        "ConnectivityFactorCacheHits"
+                                    ] += 1
+                                if not ConnectivitySupported:
+                                    InvariantRequestPayloadCacheDiagnostics[
+                                        "ConnectivityFactorPruned"
+                                    ] += 1
+                                    return None
                             TargetBranches = list(
                                 _BuildTargetPortalBranches(
                                     Shape.TargetPortals,
@@ -37127,7 +37717,14 @@ def RouteAuthoritativeResources(
                         **Progress.ToProgressDictionary(),
                         "StrictlyAdvanced": StrictlyAdvanced,
                     }
-                    if RouteTreeNativeDeadlineExceeded:
+                    if Progress.Complete:
+                        CompleteExteriorRouteDomainSignals.add(
+                            SignalValue
+                        )
+                    if (
+                        RouteTreeNativeDeadlineExceeded
+                        and Progress.RemainingDescriptorFingerprints
+                    ):
                         EnforceRoutingRuntimeLimit(
                             Deadline=Deadline,
                             AdaptiveStartedAt=RoutingStarted,
@@ -37567,9 +38164,14 @@ def RouteAuthoritativeResources(
                 **Progress.ToProgressDictionary(),
                 "StrictlyAdvanced": ProgressStrictlyAdvanced,
             }
+            if Progress.Complete:
+                CompleteExteriorRouteDomainSignals.add(Signal)
         if (
             not CandidatesBySignal[Signal]
-            and not RouteTreeNativeDeadlineExceeded
+            and (
+                not RouteTreeNativeDeadlineExceeded
+                or Signal in CompleteExteriorRouteDomainSignals
+            )
         ):
             Rejections = CandidateDiagnostics[Signal].get("Rejections", {})
             RoutedTreeCount = int(
@@ -39395,7 +39997,15 @@ def RouteAuthoritativeResources(
             PreparedAssignment
         )
 
-    if RouteTreeNativeDeadlineExceeded:
+    NativeDeadlineIncompleteSignals = tuple(sorted(
+        Signal
+        for Signal in Profiles
+        if (
+            not CandidatesBySignal.get(Signal)
+            and Signal not in CompleteExteriorRouteDomainSignals
+        )
+    ))
+    if RouteTreeNativeDeadlineExceeded and NativeDeadlineIncompleteSignals:
         EnforceRoutingRuntimeLimit(
             Deadline=Deadline,
             AdaptiveStartedAt=RoutingStarted,
@@ -39410,6 +40020,9 @@ def RouteAuthoritativeResources(
                     )
                 ),
                 "DescriptorProgressPublished": True,
+                "NativeDeadlineIncompleteSignals": list(
+                    NativeDeadlineIncompleteSignals
+                ),
                 "RawResultCacheAuthoritative": False,
                 "GlobalPlanDomainComplete": False,
                 "CompleteAssignmentCutProof": False,
