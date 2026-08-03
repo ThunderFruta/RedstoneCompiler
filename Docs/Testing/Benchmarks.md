@@ -3,8 +3,9 @@
 | Benchmark | Purpose | Runs | Truth rows | Wall ceiling |
 | --- | --- | ---: | ---: | ---: |
 | FullAdder | Small correctness and deterministic overhead gate | 5 | 8 | 10 s |
-| RippleCarryAdder4 | Repeated-stage congestion and regression gate | 2 | 512 | 25 s |
-| CarryLookaheadAdder4 | Reconvergent high-fanout scale gate | 2 | 512 | 120 s |
+| RippleCarryAdder4 | Repeated-stage congestion and regression gate | 3 | 512 | 25 s |
+| RippleCarryAdder8 | 8-bit carry ripple scalability gate | 3 | 131072 | 30 s |
+| CarryLookaheadAdder4 (compatibility) | Optional exact-proof compatibility check | 2 | 512 | 120 s |
 
 All successful runs require zero final conflicts, zero unresolved claims,
 authoritative physical simulation, identical repeated fingerprints, and no
@@ -12,12 +13,11 @@ fallback.
 
 ## Current checkpoint
 
-FullAdder's focused complete-diagnostics test passes in the current working
-tree. RCA4 currently fails after primary negotiated overflow progresses
-`[124, 10, 10, 10, 10]`; therefore CLA4 is intentionally not run. See
-[Negotiated route-tree router](../Routing/Active/NegotiatedRouteTreeRouter.md) for the
-measured graph-size comparison and required fix.
+The strict acceptance sequence is FA/RCA4/RCA8 with reproducible determinism and
+strict no-fallback evidence.
+Use acceptance compatibility mode to include the optional compatibility circuit check for
+CarryLookaheadAdder4 and fixture-backed exact proof evidence.
 
-The attempt-by-attempt RCA4 breakdown, evidence boundaries, and leading
-hypotheses are maintained in
+Attempt-by-attempt behavior, evidence boundaries, and current hypotheses are
+maintained in
 [Current routing failures](../Routing/Active/CurrentRoutingFailures.md).

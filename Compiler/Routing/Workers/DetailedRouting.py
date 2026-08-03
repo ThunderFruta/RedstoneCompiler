@@ -53,6 +53,7 @@ def RoutePcbNets(
     ReservationVariant: int = 0,
     PreparePortalGeometryOnly: bool = False,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
+    ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
@@ -122,6 +123,9 @@ def RoutePcbNets(
         PreparePortalGeometryOnly=PreparePortalGeometryOnly,
         ValidateClusterInterfaceForeignAccessOnly=(
             ValidateClusterInterfaceForeignAccessOnly
+        ),
+        ValidatePhysicalComponentForeignPortalSupportOnly=(
+            ValidatePhysicalComponentForeignPortalSupportOnly
         ),
         PrepareClusterInterfaceAssignmentOnly=(
             PrepareClusterInterfaceAssignmentOnly

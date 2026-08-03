@@ -299,6 +299,9 @@ class ClusterInterfaceStateProof:
 
     PlacementStateFingerprint: str
     Status: str
+    ComponentStateFingerprint: str = ""
+    ComponentVariant: int = -1
+    ComponentSelectionFingerprint: str = ""
     ChannelFingerprint: str = ""
     TransformFingerprint: str = ""
     OwnershipUnsatCoreFingerprint: str = ""
@@ -317,6 +320,9 @@ class ClusterInterfaceStateProof:
     def StructuralIdentity(self) -> tuple[object, ...]:
         return (
             self.PlacementStateFingerprint,
+            self.ComponentStateFingerprint,
+            self.ComponentVariant,
+            self.ComponentSelectionFingerprint,
             self.Status,
             self.ChannelFingerprint,
             self.TransformFingerprint,
@@ -338,6 +344,13 @@ class ClusterInterfaceStateProof:
         return {
             "PlacementStateFingerprint": (
                 self.PlacementStateFingerprint
+            ),
+            "ComponentStateFingerprint": (
+                self.ComponentStateFingerprint
+            ),
+            "ComponentVariant": self.ComponentVariant,
+            "ComponentSelectionFingerprint": (
+                self.ComponentSelectionFingerprint
             ),
             "Status": self.Status,
             "ChannelFingerprint": self.ChannelFingerprint,
@@ -1822,6 +1835,7 @@ class PhysicalPortLocalAccessFactor:
     OwnedCandidateFingerprints: tuple[str, ...]
     LocalContractFingerprint: str
     LocalAccessFingerprint: str
+    SeamContractFingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -2347,6 +2361,186 @@ class PreparedPhysicalComponentPortFactorDomain:
     ExteriorFabrics: tuple[PhysicalExteriorApertureFabric, ...] = ()
 
 
+@dataclass(frozen=True)
+class PhysicalComponentSymbolicPortPairCertificate:
+    """Complete local net-state compatibility relation for two port domains."""
+
+    DomainFingerprint: str
+    PreparedDomainFingerprint: str
+    PlacementFingerprint: str
+    ComponentGraphFingerprint: str
+    FabricFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    AccessCertificateFingerprint: str
+    InterfaceFingerprint: str
+    LocalAccessDomainFingerprint: str
+    SeamDomainFingerprint: str
+    SignalPair: tuple[str, str]
+    LocalAccessFingerprintsBySignal: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    SeamFingerprintByLocalAccess: tuple[
+        tuple[str, str, str], ...
+    ]
+    SeamFingerprintsBySignal: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    UnsupportedUnaryLocalAccess: tuple[tuple[str, str], ...]
+    UnsupportedLocalAccessPairs: tuple[
+        tuple[tuple[str, str], tuple[str, str]], ...
+    ]
+    UnsupportedUnarySeams: tuple[tuple[str, str], ...]
+    UnsupportedSeamPairs: tuple[
+        tuple[tuple[str, str], tuple[str, str]], ...
+    ]
+    NetStateCacheKeys: tuple[tuple[str, str, str], ...]
+    NetStateBindings: tuple[tuple[str, str, str, str], ...]
+    NetStateDomainFingerprint: str
+    ProofFingerprint: str
+    Complete: bool
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": (
+                "physical-component-symbolic-port-pair-certificate-v1"
+            ),
+            "DomainFingerprint": self.DomainFingerprint,
+            "PreparedDomainFingerprint": self.PreparedDomainFingerprint,
+            "PlacementFingerprint": self.PlacementFingerprint,
+            "ComponentGraphFingerprint": self.ComponentGraphFingerprint,
+            "FabricFingerprint": self.FabricFingerprint,
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "AccessCertificateFingerprint": (
+                self.AccessCertificateFingerprint
+            ),
+            "InterfaceFingerprint": self.InterfaceFingerprint,
+            "LocalAccessDomainFingerprint": (
+                self.LocalAccessDomainFingerprint
+            ),
+            "SeamDomainFingerprint": self.SeamDomainFingerprint,
+            "SignalPair": list(self.SignalPair),
+            "LocalAccessFingerprintsBySignal": {
+                Signal: list(Fingerprints)
+                for Signal, Fingerprints
+                in self.LocalAccessFingerprintsBySignal
+            },
+            "SeamFingerprintByLocalAccess": [
+                list(Value) for Value in self.SeamFingerprintByLocalAccess
+            ],
+            "SeamFingerprintsBySignal": {
+                Signal: list(Fingerprints)
+                for Signal, Fingerprints
+                in self.SeamFingerprintsBySignal
+            },
+            "UnsupportedUnarySeams": [
+                list(Value) for Value in self.UnsupportedUnarySeams
+            ],
+            "UnsupportedUnaryLocalAccess": [
+                list(Value) for Value
+                in self.UnsupportedUnaryLocalAccess
+            ],
+            "UnsupportedLocalAccessPairs": [
+                [list(First), list(Second)]
+                for First, Second in self.UnsupportedLocalAccessPairs
+            ],
+            "UnsupportedSeamPairs": [
+                [list(First), list(Second)]
+                for First, Second in self.UnsupportedSeamPairs
+            ],
+            "NetStateCacheKeys": [
+                list(Value) for Value in self.NetStateCacheKeys
+            ],
+            "NetStateBindings": [
+                list(Value) for Value in self.NetStateBindings
+            ],
+            "NetStateDomainFingerprint": (
+                self.NetStateDomainFingerprint
+            ),
+            "ProofFingerprint": self.ProofFingerprint,
+            "Complete": self.Complete,
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalComponentSymbolicHigherOrderCertificate:
+    """Complete exact seam-support relation for three or more port domains."""
+
+    DomainFingerprint: str
+    PreparedDomainFingerprint: str
+    PlacementFingerprint: str
+    ComponentGraphFingerprint: str
+    FabricFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    AccessCertificateFingerprint: str
+    InterfaceFingerprint: str
+    LocalAccessDomainFingerprint: str
+    SeamDomainFingerprint: str
+    SignalDomain: tuple[str, ...]
+    LocalAccessFingerprintsBySignal: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    SeamFingerprintByLocalAccess: tuple[
+        tuple[str, str, str], ...
+    ]
+    SeamFingerprintsBySignal: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    SupportedLocalAccessTuples: tuple[
+        tuple[tuple[str, str], ...], ...
+    ]
+    SupportedSeamTuples: tuple[
+        tuple[tuple[str, str], ...], ...
+    ]
+    NetStateCacheKeys: tuple[tuple[str, str, str], ...]
+    NetStateBindings: tuple[tuple[str, str, str, str], ...]
+    NetStateDomainFingerprint: str
+    ProofFingerprint: str
+    CompatibilityCheckCount: int
+    Complete: bool
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": (
+                "physical-component-symbolic-higher-order-certificate-v1"
+            ),
+            "DomainFingerprint": self.DomainFingerprint,
+            "SignalDomain": list(self.SignalDomain),
+            "SupportedLocalAccessTuples": [
+                [list(Value) for Value in TupleValue]
+                for TupleValue in self.SupportedLocalAccessTuples
+            ],
+            "SupportedSeamTuples": [
+                [list(Value) for Value in TupleValue]
+                for TupleValue in self.SupportedSeamTuples
+            ],
+            "NetStateDomainFingerprint": self.NetStateDomainFingerprint,
+            "ProofFingerprint": self.ProofFingerprint,
+            "CompatibilityCheckCount": self.CompatibilityCheckCount,
+            "Complete": self.Complete,
+        }
+
+
+@dataclass(frozen=True)
+class FrozenPhysicalComponentPostClosurePortalHandoff:
+    """Exact post-closure exterior fabric shared by two routing stages.
+
+    This is deliberately an identity contract, not a portable portal cache.
+    Physical assembly preparation publishes the closed region once and the
+    subsequent authoritative global-channel pass must consume that same
+    region, access set, column set, and portal domain.
+    """
+
+    PreparationDomainFingerprint: str
+    PlacementFingerprint: str
+    ComponentGraphFingerprint: str
+    ResourceGraphFingerprint: str
+    ExteriorRegionFingerprint: str
+    RawPortalGeometryCache: Any = field(compare=False, repr=False)
+
+
 @dataclass
 class RoutingResources:
     StaticGeometry: RoutingStaticGeometry
@@ -2434,6 +2628,13 @@ class RoutingResources:
         compare=False,
         repr=False,
     )
+    FrozenPhysicalComponentPostClosurePortalHandoff: (
+        FrozenPhysicalComponentPostClosurePortalHandoff | None
+    ) = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     PreparedPhysicalComponentUnboundProblem: (
         ComponentRoutingProblem | None
     ) = field(
@@ -2477,6 +2678,34 @@ class RoutingResources:
         compare=False,
         repr=False,
     )
+    PhysicalBoundaryMandatoryPortalFactorCertificateCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalBoundaryMandatoryPortalFactorDomainCache: dict[
+        tuple[str, str, str], Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalBoundaryMandatoryPortalPairRelationCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalBoundaryMandatoryPortalPairStateIndexCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
     PhysicalComponentPortOptionDomainCache: dict[
         str, Any
     ] = field(
@@ -2514,6 +2743,25 @@ class RoutingResources:
     )
     PhysicalComponentBoundaryAssignmentIteratorCache: dict[
         str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentAssemblyPlanDomainFingerprint: str = field(
+        default="",
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentAssemblyPlanClauseStateByDomain: dict[
+        str, tuple[str, int]
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentAssemblyPlanFingerprintsByDomain: dict[
+        str, set[str]
     ] = field(
         default_factory=dict,
         compare=False,
@@ -2583,6 +2831,20 @@ class RoutingResources:
         compare=False,
         repr=False,
     )
+    PreferredPhysicalComponentApertureContractsBySignal: dict[
+        str, str
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentAperturePortalSlackBySignal: dict[
+        str, dict[str, tuple[int, int]]
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
     PreferredPhysicalComponentPortReservationsBySignal: dict[
         str, str
     ] = field(
@@ -2622,8 +2884,38 @@ class RoutingResources:
         compare=False,
         repr=False,
     )
-    PhysicalComponentSymbolicCapacityAdmissionCache: dict[
-        str, ComponentRoutingSolveResult
+    PhysicalComponentSymbolicNetStateCache: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentSymbolicUnaryApertureClauseCache: dict[
+        str,
+        tuple[
+            frozenset[frozenset[tuple[str, str]]],
+            dict[str, Any],
+        ],
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentSymbolicPortPairCertificateCache: dict[
+        str, PhysicalComponentSymbolicPortPairCertificate
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentSymbolicPairCompatibilityIndexCache: dict[
+        str, Any
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalComponentSymbolicHigherOrderCertificateCache: dict[
+        str, PhysicalComponentSymbolicHigherOrderCertificate
     ] = field(
         default_factory=dict,
         compare=False,
@@ -2642,6 +2934,13 @@ class RoutingResources:
         repr=False,
     )
     RejectedPhysicalComponentPortReservationSets: set[
+        frozenset[tuple[str, str]]
+    ] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    RejectedPhysicalComponentLocalSeamReservationSets: set[
         frozenset[tuple[str, str]]
     ] = field(
         default_factory=set,

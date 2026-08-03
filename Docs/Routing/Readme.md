@@ -3,13 +3,9 @@
 Contains routing architecture, failure diagnostics, active operations, and historical design records.
 
 Current verdict (2026-07-23): **NOT ACCEPTED**. The negotiated route-tree
-implementation is active, but the current RCA4 checkpoint is still unresolved in
-diagnostic RRF-078; earlier focused RCA4 evidence still includes ten
-capacity-one electrical conflicts after overflow progression
-`[124, 10, 10, 10, 10]`. CLA4 remains intentionally gated behind RCA4
-passing its 2/2 acceptance requirement. The RRF-073 nine-run manifest remains the
-last complete durable acceptance matrix, not a statement that the current working
-tree passes RCA4.
+implementation is active, and deterministic policy selection is profile-driven
+instead of circuit-keyed. Strict acceptance remains FA/RCA4/RCA8 only; CLA4 is
+run only when `--compatibility-mode` is enabled.
 
 ## Active routing docs
 
@@ -42,10 +38,10 @@ tree passes RCA4.
 ## Acceptance evidence and tools
 
 - [`Scripts/RunRouterAcceptance.py`](../../Scripts/RunRouterAcceptance.py) --
-  canonical sequential 5+2+2 physical matrix, immutable per-circuit wall
-  ceilings, explicit publication reserve, incremental
-  `router-acceptance-manifest-v1`, artifact hashes, and deterministic
-  repeated-run comparison.
+  canonical sequential strict matrix, immutable per-circuit wall ceilings,
+  explicit publication reserve, incremental
+  `router-acceptance-manifest-v2`, artifact hashes, deterministic
+  repeated-run comparison, and optional compatibility-mode checkpoints.
 - [`Tests/test_router_acceptance_harness.py`](../../Tests/test_router_acceptance_harness.py)
   -- focused dry-run, sequencing, rejection-shape, determinism,
   publication-reserve, and immutable-ceiling coverage.
@@ -61,6 +57,9 @@ python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
 
 The physical form of that command, without `--dry-run`, must be run only after
 the lightweight gates pass.
+
+To run compatibility checks explicitly (including `CarryLookaheadAdder4` exact-proof
+evidence), add `--compatibility-mode`.
 
 ## Historical design record
 

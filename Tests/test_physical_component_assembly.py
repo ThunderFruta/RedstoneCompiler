@@ -10,6 +10,7 @@ import Compiler.Routing.ComponentPipeline as ComponentPipeline
 import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
 from Compiler.Placement.Geometry import PlacedDesign
 from Compiler.Placement.PcbFlow import (
+    BuildPhysicalComponentPlacementFeedback,
     BuildRetainedComponentPlacementSearchDomain,
     IsComponentKeepoutGlobalFailure,
     ReuseRetainedPlacementRoutingResources,
@@ -594,6 +595,103 @@ def test_global_boundary_selection_projects_prepared_local_support_only():
     assert not hasattr(SelectedBySignal["Alpha"], "LocalClaims")
 
 
+def test_boundary_local_support_dp_reuses_aperture_alias_domains():
+    Signals = ("Alpha", "Beta", "Gamma")
+    Boundaries = {
+        Signal: tuple(
+            _BoundaryPort(Signal, SignalIndex * 1000 + OptionIndex * 10)
+            for OptionIndex in range(6)
+        )
+        for SignalIndex, Signal in enumerate(Signals)
+    }
+    Apertures = {
+        Signal: tuple(
+            SimpleNamespace(
+                Signal=Boundary.Signal,
+                Direction=Boundary.Direction,
+                Capacity=Boundary.Capacity,
+                Attachment=Boundary.Attachment,
+                GlobalPath=Boundary.GlobalPath,
+                ChannelContractFingerprint=(
+                    Boundary.ChannelContractFingerprint
+                ),
+                GlobalContractFingerprint=(
+                    Boundary.GlobalContractFingerprint
+                ),
+                ApertureContractFingerprint=(
+                    Boundary.ApertureContractFingerprint
+                ),
+                ApertureOptionFingerprint=(
+                    "aperture-option:" + Boundary.ReservationFingerprint
+                ),
+            )
+            for Boundary in Values
+        )
+        for Signal, Values in Boundaries.items()
+    }
+    LocalFactors = {
+        Signal: SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            Capacity=1,
+            OwnedTerminals=((4000 + Index * 10, 7, 0),),
+            FabricDomainFingerprint="fabric:" + Signal,
+            FabricAttachment=(4000 + Index * 10, 7, 0),
+            LocalPath=((4000 + Index * 10, 7, 0),),
+            LocalAccessFingerprint="local:" + Signal,
+            LocalContractFingerprint="contract:" + Signal,
+            LocalClaims=_Claims(((4000 + Index * 10, 7, 0),)),
+        )
+        for Index, Signal in enumerate(Signals)
+    }
+    Supports = {
+        Signal: tuple(
+            SimpleNamespace(
+                Signal=Signal,
+                LocalAccessFingerprint=(
+                    LocalFactors[Signal].LocalAccessFingerprint
+                ),
+                ApertureOptionFingerprint=(
+                    Aperture.ApertureOptionFingerprint
+                ),
+            )
+            for Aperture in Apertures[Signal]
+        )
+        for Signal in Signals
+    }
+    WorkEvents = []
+    Arguments = dict(
+        DomainsBySignal=Boundaries,
+        LocalAccessFactorsBySignal={
+            Signal: (Factor,)
+            for Signal, Factor in LocalFactors.items()
+        },
+        ApertureFactorsBySignal=Apertures,
+        LocalApertureSupportBySignal=Supports,
+        PortSolverCacheKey="alias-domain-test",
+        WorkCheck=WorkEvents.append,
+    )
+
+    Assignments = tuple(IterPhysicalBoundaryPortAssignments(**Arguments))
+
+    assert len(Assignments) == 6 ** len(Signals)
+    # The exact local relation has only one domain per signal.  Aperture names
+    # must not cause the support DFS to cross its 64-expansion report boundary.
+    assert not any(
+        Event.get("Stage")
+        == "physical-port-boundary-support-propagation"
+        for Event in WorkEvents
+    )
+    HigherOrderNoGood = frozenset(
+        (Signal, Factor.LocalContractFingerprint)
+        for Signal, Factor in LocalFactors.items()
+    )
+    assert tuple(IterPhysicalBoundaryPortAssignments(
+        **Arguments,
+        CertifiedLocalNoGoodClauses=(HigherOrderNoGood,),
+    )) == ()
+
+
 def test_global_boundary_leaf_projects_only_certified_local_no_goods():
     Boundaries = {
         Signal: _BoundaryPort(Signal, X)
@@ -671,6 +769,140 @@ def test_global_boundary_leaf_projects_only_certified_local_no_goods():
         **Arguments,
         CertifiedLocalNoGoodClauses=(Clause,),
     )) == ()
+
+
+def test_boundary_pair_arc_uses_direct_compiled_local_support():
+    AlphaBad = _BoundaryPort("Alpha", 10)
+    AlphaGood = _BoundaryPort("Alpha", 20)
+    Beta = _BoundaryPort("Beta", 110)
+    Boundaries = (AlphaBad, AlphaGood, Beta)
+
+    def Aperture(Boundary):
+        return SimpleNamespace(
+            Signal=Boundary.Signal,
+            Direction=Boundary.Direction,
+            Capacity=Boundary.Capacity,
+            Attachment=Boundary.Attachment,
+            GlobalPath=Boundary.GlobalPath,
+            ChannelContractFingerprint=(
+                Boundary.ChannelContractFingerprint
+            ),
+            GlobalContractFingerprint=Boundary.GlobalContractFingerprint,
+            ApertureContractFingerprint=(
+                Boundary.ApertureContractFingerprint
+            ),
+            ApertureOptionFingerprint=(
+                "aperture:" + Boundary.ReservationFingerprint
+            ),
+        )
+
+    Apertures = {
+        Boundary.ReservationFingerprint: Aperture(Boundary)
+        for Boundary in Boundaries
+    }
+
+    def LocalFactor(Signal, Name, X):
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            Capacity=1,
+            OwnedTerminals=((X, 7, 0),),
+            FabricDomainFingerprint="fabric:" + Name,
+            FabricAttachment=(X, 7, 0),
+            LocalPath=((X, 7, 0), (X + 1, 7, 0)),
+            LocalAccessFingerprint="local:" + Name,
+            LocalContractFingerprint="contract:" + Name,
+            LocalClaims=_Claims(((X, 7, 0),)),
+        )
+
+    AlphaBadFactor = LocalFactor("Alpha", "alpha-bad", 300)
+    AlphaGoodFactor = LocalFactor("Alpha", "alpha-good", 320)
+    BetaFactor = LocalFactor("Beta", "beta", 400)
+    Supports = {
+        "Alpha": (
+            SimpleNamespace(
+                Signal="Alpha",
+                LocalAccessFingerprint=(
+                    AlphaBadFactor.LocalAccessFingerprint
+                ),
+                ApertureOptionFingerprint=(
+                    Apertures[AlphaBad.ReservationFingerprint]
+                    .ApertureOptionFingerprint
+                ),
+            ),
+            SimpleNamespace(
+                Signal="Alpha",
+                LocalAccessFingerprint=(
+                    AlphaGoodFactor.LocalAccessFingerprint
+                ),
+                ApertureOptionFingerprint=(
+                    Apertures[AlphaGood.ReservationFingerprint]
+                    .ApertureOptionFingerprint
+                ),
+            ),
+        ),
+        "Beta": (SimpleNamespace(
+            Signal="Beta",
+            LocalAccessFingerprint=BetaFactor.LocalAccessFingerprint,
+            ApertureOptionFingerprint=(
+                Apertures[Beta.ReservationFingerprint]
+                .ApertureOptionFingerprint
+            ),
+        ),),
+    }
+    UnsupportedPair = frozenset((
+        (
+            "Alpha",
+            BuildPhysicalPortSeamContractFingerprint(AlphaBadFactor),
+        ),
+        (
+            "Beta",
+            BuildPhysicalPortSeamContractFingerprint(BetaFactor),
+        ),
+    ))
+
+    Assignments = tuple(IterPhysicalBoundaryPortAssignments(
+        {
+            "Alpha": (AlphaBad, AlphaGood),
+            "Beta": (Beta,),
+        },
+        LocalAccessFactorsBySignal={
+            "Alpha": (AlphaBadFactor, AlphaGoodFactor),
+            "Beta": (BetaFactor,),
+        },
+        ApertureFactorsBySignal={
+            "Alpha": (
+                Apertures[AlphaBad.ReservationFingerprint],
+                Apertures[AlphaGood.ReservationFingerprint],
+            ),
+            "Beta": (Apertures[Beta.ReservationFingerprint],),
+        },
+        LocalApertureSupportBySignal=Supports,
+        LearnedLocalSeamNoGoodClauses=(UnsupportedPair,),
+        CertifiedNoGoodProjectionOnly=True,
+    ))
+
+    assert len(Assignments) == 1
+    Selected = {Value.Signal: Value for Value in Assignments[0]}
+    assert Selected["Alpha"] == AlphaGood
+
+    Source = textwrap.dedent(inspect.getsource(
+        IterPhysicalBoundaryPortAssignments
+    ))
+    Tree = ast.parse(Source)
+    PairArc = next(
+        Node for Node in ast.walk(Tree)
+        if isinstance(Node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and Node.name == "PropagateRejectedBoundaryApertureClauses"
+    )
+    CalledNames = {
+        Node.func.id
+        for Node in ast.walk(PairArc)
+        if isinstance(Node, ast.Call)
+        and isinstance(Node.func, ast.Name)
+    }
+    assert "BoundaryOptionPairHasDirectLocalSupport" in CalledNames
+    assert "BoundaryTupleHasLocalSupport" not in CalledNames
 
 
 def test_retained_boundary_iterator_observes_live_seam_no_goods():
@@ -1975,6 +2207,57 @@ def test_ordinary_global_starvation_rejects_component_keepout_not_ports():
         replace(
             Failure,
             Diagnostics={"Action": "regenerate-affected-candidates"},
+        ),
+        Plan,
+    )
+
+
+def test_complete_ordinary_portal_cut_advances_component_placement():
+    Plan = SimpleNamespace(
+        Ports=(SimpleNamespace(Signal="ComponentPort"),),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.NoPinAccessPattern,
+        Stage="NegotiatedDetailedRouting",
+        AffectedNets=("OrdinaryGlobal",),
+        Detail="no legal portal-aware route tree was found",
+        Diagnostics={
+            "RequestCount": 0,
+            "AttemptedRequestCount": 0,
+            "MandatoryPortalClaimPreScreen": {
+                "Scope": "complete-design",
+                "PreparedSignalCount": 17,
+                "EmptyNetWidePortalTupleSignals": ["OrdinaryGlobal"],
+            },
+            "RoutedComponentGlobalHandoff": {"Enabled": True},
+        },
+    )
+
+    assert IsComponentKeepoutGlobalFailure(Failure, Plan)
+    assert not IsComponentKeepoutGlobalFailure(
+        replace(Failure, AffectedNets=("ComponentPort",)),
+        Plan,
+    )
+    WrappedFailure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentDetailedRoutingFailed,
+        Stage="ComponentGlobalKeepoutAdmission",
+        AffectedNets=("OrdinaryGlobal",),
+        Diagnostics={
+            "PhysicalAssemblyPlanFingerprint": "assembly-plan",
+            "UnderlyingFailure": Failure.ToDictionary(),
+        },
+    )
+    Feedback = BuildPhysicalComponentPlacementFeedback(WrappedFailure)
+    assert Feedback is not None
+    assert Feedback.RelocationSignals == ("OrdinaryGlobal",)
+    assert Feedback.SourcePlanFingerprint == "assembly-plan"
+    assert not IsComponentKeepoutGlobalFailure(
+        replace(
+            Failure,
+            Diagnostics={
+                **Failure.Diagnostics,
+                "AttemptedRequestCount": 1,
+            },
         ),
         Plan,
     )
@@ -5021,6 +5304,9 @@ def test_current_global_blocker_keeps_exact_bound_assignment_scope():
         RejectedPhysicalComponentPortAssignmentFingerprints=set(),
         ForbiddenPhysicalComponentGlobalCandidateSets=set(),
         RejectedPhysicalComponentAssemblyPlanFingerprints=set(),
+        PhysicalComponentBoundaryAssignmentIteratorCache={
+            "active-domain": object(),
+        },
     )
     Solve = ComponentRoutingSolveResult(
         Status="architectural-unsatisfiable",
@@ -5062,6 +5348,12 @@ def test_current_global_blocker_keeps_exact_bound_assignment_scope():
     assert Resources.RejectedPhysicalComponentAssemblyPlanFingerprints == {
         "physical-plan"
     }
+    assert set(Resources.PhysicalComponentBoundaryAssignmentIteratorCache) == {
+        "active-domain",
+    }
+    assert Diagnostics["BoundaryIteratorContinuationPreserved"] is True
+    assert Diagnostics["BoundaryIteratorCacheCleared"] is False
+    assert Diagnostics["AssemblyPlanDomainClauseEpoch"] == 1
 
 
 def test_incomplete_local_core_cannot_prune_a_port_contract():

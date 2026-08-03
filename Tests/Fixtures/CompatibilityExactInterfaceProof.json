@@ -1,5 +1,5 @@
 {
-  "SchemaVersion": "cla4-exact-interface-proof-v1",
+  "SchemaVersion": "compatibility-exact-interface-proof-v1",
   "Circuit": "CarryLookaheadAdder4",
   "AcceptedOutcomes": [
     "completed-artifact",

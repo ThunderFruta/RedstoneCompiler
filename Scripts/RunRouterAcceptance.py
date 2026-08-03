@@ -50,6 +50,7 @@ class AcceptanceCase:
     TruthTableRows: int
     RuntimeCeilingSeconds: float
     MaximumOverflowPeak: int = 1
+    NeedsCompatibilityFixture: bool = False
     PublicationReserveSeconds: float = (
         DefaultRoutingPublicationReserveSeconds
     )
@@ -114,6 +115,7 @@ AcceptanceCases = (
         RequiredRuns=2,
         TruthTableRows=512,
         RuntimeCeilingSeconds=120.0,
+        NeedsCompatibilityFixture=True,
     ),
 )
 
@@ -122,13 +124,21 @@ RegressionCaseNames = frozenset({
     "RippleCarryAdder4",
     "RippleCarryAdder8",
 })
+CompatibilityCaseNames = frozenset(
+    Case.Name
+    for Case in AcceptanceCases
+    if Case.NeedsCompatibilityFixture
+)
 BaselineSchemaVersion = "router-regression-baseline-v1"
 FirstValidBaselineSchemaVersion = "router-first-valid-baseline-v1"
 AcceptanceManifestSchemaVersion = "router-acceptance-manifest-v2"
-Cla4ExactInterfaceProofSchemaVersion = "cla4-exact-interface-proof-v1"
-DefaultCla4ExactInterfaceProofPath = (
-    RepositoryRoot / "Tests/Fixtures/Cla4ExactInterfaceProof.json"
+ExactInterfaceProofSchemaVersion = (
+    "compatibility-exact-interface-proof-v1"
 )
+DefaultExactInterfaceProofPath = (
+    RepositoryRoot / "Tests/Fixtures/CompatibilityExactInterfaceProof.json"
+)
+ExactInterfaceProofCheckpointField = "ExactInterfaceProofCheckpoint"
 CanonicalArithmeticDigests = {
     "FullAdder": (
         "2ac95308cc8e1566382817333b1995734fcd61ae6890c189767935cec96bbd12"
@@ -300,6 +310,7 @@ class AcceptanceConfiguration:
     BaselinePath: Path | None = None
     ExpectedPolicyVersion: str | None = None
     CaptureTimeoutGraceSeconds: float = 0.0
+    CompatibilityMode: bool = False
 
     def __post_init__(self) -> None:
         if self.BaselineMode not in {None, "capture", "compare"}:
@@ -913,11 +924,11 @@ def FindExactClusterInterfaceSolve(
     return next(iter(Unique.values()))
 
 
-def EvaluateCla4ExactInterfaceCheckpoint(
+def EvaluateExactInterfaceProofCheckpoint(
     Artifacts: dict[str, Path],
-    FixturePath: Path = DefaultCla4ExactInterfaceProofPath,
+    FixturePath: Path = DefaultExactInterfaceProofPath,
 ) -> dict[str, object]:
-    """Accept either a completed CLA4 artifact or the frozen terminal proof."""
+    """Accept either a completed deterministic artifact or a frozen exact proof."""
     Completed = all(
         Artifacts[Name].is_file()
         for Name in ("Schematic", "TruthTable", "PhysicalDesign")
@@ -940,13 +951,14 @@ def EvaluateCla4ExactInterfaceCheckpoint(
             "Outcome": "invalid-fixture",
             "ProofFingerprint": None,
             "FallbackOrThrashingObserved": False,
-            "Failures": [f"could not read CLA4 proof fixture: {Error}"],
+            "Failures": [
+                f"could not read exact-interface proof fixture: {Error}"
+            ],
         }
     if (
-        Fixture.get("SchemaVersion")
-        != Cla4ExactInterfaceProofSchemaVersion
+        Fixture.get("SchemaVersion") != ExactInterfaceProofSchemaVersion
     ):
-        Failures.append("CLA4 proof fixture schema mismatch")
+        Failures.append("exact proof fixture schema mismatch")
     if not Artifacts["RoutingFailure"].is_file():
         Failures.append("neither completed artifacts nor routing proof exists")
         FailureDocument: object = {}
@@ -956,14 +968,16 @@ def EvaluateCla4ExactInterfaceCheckpoint(
                 Artifacts["RoutingFailure"].read_text(encoding="utf-8")
             )
         except Exception as Error:
-            Failures.append(f"could not read CLA4 routing proof: {Error}")
+            Failures.append(
+                f"could not read exact-interface routing proof: {Error}"
+            )
             FailureDocument = {}
 
     ExactSolve = FindExactClusterInterfaceSolve(FailureDocument)
     Expected = Fixture.get("ExactProof", {})
     if not isinstance(Expected, dict):
         Expected = {}
-        Failures.append("CLA4 proof fixture has no ExactProof object")
+        Failures.append("exact proof fixture has no ExactProof object")
     if ExactSolve is None:
         Failures.append("routing failure has no unique exact-interface proof")
         ExactSolve = {}
@@ -974,34 +988,99 @@ def EvaluateCla4ExactInterfaceCheckpoint(
         ExpectedStates = []
     if not isinstance(ObservedStates, list):
         ObservedStates = []
-    StateFields = (
-        "PlacementStateFingerprint",
-        "Status",
-        "TransformFingerprint",
-        "OwnershipUnsatCoreFingerprint",
-        "AssignmentFingerprints",
+
+    def BuildStateIdentity(Value: object) -> tuple[object, ...]:
+        if not isinstance(Value, dict):
+            return ()
+        AssignmentFingerprints = tuple(
+            sorted(
+                str(Fingerprint)
+                for Fingerprint in Value.get(
+                    "AssignmentFingerprints",
+                    (),
+                )
+                if Fingerprint is not None
+            )
+        )
+        return (
+            str(Value.get("PlacementStateFingerprint", "")),
+            str(Value.get("Status", "")),
+            str(Value.get("TransformFingerprint", "")),
+            str(Value.get("OwnershipUnsatCoreFingerprint", "")),
+            AssignmentFingerprints,
+        )
+
+    ExpectedStateIdentity = sorted(
+        [
+            {
+                "PlacementStateFingerprint": State.get("PlacementStateFingerprint"),
+                "Status": State.get("Status"),
+                "TransformFingerprint": State.get("TransformFingerprint"),
+                "OwnershipUnsatCoreFingerprint": (
+                    State.get("OwnershipUnsatCoreFingerprint")
+                ),
+                "AssignmentFingerprints": tuple(
+                    sorted(
+                        (
+                            str(Fingerprint)
+                            for Fingerprint in (
+                                State.get(
+                                    "AssignmentFingerprints",
+                                    (),
+                                )
+                                or ()
+                            )
+                            if Fingerprint is not None
+                        )
+                    )
+                ),
+            }
+            for State in ExpectedStates
+            if isinstance(State, dict)
+        ],
+        key=BuildStateIdentity,
     )
-    ExpectedStateIdentity = [
-        {Name: State.get(Name) for Name in StateFields}
-        for State in ExpectedStates
-        if isinstance(State, dict)
-    ]
-    ObservedStateIdentity = [
-        {Name: State.get(Name) for Name in StateFields}
-        for State in ObservedStates
-        if isinstance(State, dict)
-    ]
+    ObservedStateIdentity = sorted(
+        [
+            {
+                "PlacementStateFingerprint": State.get("PlacementStateFingerprint"),
+                "Status": State.get("Status"),
+                "TransformFingerprint": State.get("TransformFingerprint"),
+                "OwnershipUnsatCoreFingerprint": (
+                    State.get("OwnershipUnsatCoreFingerprint")
+                ),
+                "AssignmentFingerprints": tuple(
+                    sorted(
+                        (
+                            str(Fingerprint)
+                            for Fingerprint in (
+                                State.get(
+                                    "AssignmentFingerprints",
+                                    (),
+                                )
+                                or ()
+                            )
+                            if Fingerprint is not None
+                        )
+                    )
+                ),
+            }
+            for State in ObservedStates
+            if isinstance(State, dict)
+        ],
+        key=BuildStateIdentity,
+    )
     for Name in (
         "ProofFingerprint",
         "AttemptedStateCount",
         "BroadFallbackAllowed",
     ):
         if ExactSolve.get(Name) != Expected.get(Name):
-            Failures.append(f"CLA4 exact proof mismatch: {Name}")
+            Failures.append(f"exact-interface proof mismatch: {Name}")
     if ExactSolve.get("ExecutableRepairAllowed", False) is not False:
-        Failures.append("CLA4 exact proof permits executable repair")
+        Failures.append("exact-interface proof permits executable repair")
     if ObservedStateIdentity != ExpectedStateIdentity:
-        Failures.append("CLA4 exact proof state identity mismatch")
+        Failures.append("exact-interface proof state identity mismatch")
 
     Forbidden = {
         str(Value)
@@ -1029,7 +1108,7 @@ def EvaluateCla4ExactInterfaceCheckpoint(
     CollectExecutableResults(FailureDocument)
     if ObservedExecutableResults:
         Failures.append(
-            "CLA4 failure reintroduced executable fallback/thrashing"
+            "exact-interface proof reintroduced executable fallback/thrashing"
         )
     return {
         "Accepted": not Failures,
@@ -1573,6 +1652,7 @@ def EvaluateRun(
     Artifacts: dict[str, Path],
     ExpectedSeed: int,
     ExpectedPolicyVersion: str = CurrentPolicyVersion,
+    CompatibilityMode: bool = False,
     DesignDigestBuilder: Callable[[Path], str] = BuildEmittedDesignDigest,
     LitematicCompositionEvidenceBuilder: Callable[
         [Path], dict[str, int]
@@ -1707,12 +1787,36 @@ def EvaluateRun(
         if not isinstance(Strategy, dict):
             Failures.append("missing Strategy evidence")
             Strategy = {}
-        if Strategy.get("Requested") != "default":
-            Failures.append("requested strategy is not default")
-        if Strategy.get("Used") != "default":
-            Failures.append("used strategy is not default")
-        if Strategy.get("FallbackUsed") is not False:
-            Failures.append("fallback was used or not explicitly disabled")
+        RequestedStrategy = Strategy.get("Requested")
+        UsedStrategy = Strategy.get("Used")
+        if CompatibilityMode:
+            if RequestedStrategy not in {"default", "compatibility"}:
+                Failures.append("requested strategy is not compatibility-safe")
+            if UsedStrategy not in {"default", "compatibility"}:
+                Failures.append("used strategy is not compatibility-safe")
+            if (
+                RequestedStrategy == "compatibility"
+                and UsedStrategy == "default"
+            ):
+                Failures.append(
+                    "requested compatibility strategy but default strategy used"
+                )
+            if (
+                RequestedStrategy == "default"
+                and UsedStrategy == "compatibility"
+            ):
+                Failures.append(
+                    "requested default strategy but compatibility strategy used"
+                )
+        else:
+            if RequestedStrategy != "default":
+                Failures.append("requested strategy is not default")
+            if UsedStrategy != "default":
+                Failures.append("used strategy is not default")
+            if Strategy.get("FallbackUsed") is not False:
+                Failures.append(
+                    "fallback was used or not explicitly disabled"
+                )
 
         RouterReliability = ReadNested(PhysicalDocument, "RouterReliability")
         if not isinstance(RouterReliability, dict):
@@ -2044,20 +2148,33 @@ def WriteManifest(PathValue: Path, Manifest: dict[str, object]) -> None:
     TemporaryPath.replace(PathValue)
 
 
+def _BuildPlannedCases(
+    Configuration: AcceptanceConfiguration,
+) -> tuple[AcceptanceCase, ...]:
+    """Return the ordered case list that this run should execute."""
+    IncludeCompatibilityCases = (
+        Configuration.BaselineMode == "compare"
+        or (
+            Configuration.CompatibilityMode
+            and Configuration.BaselineMode != "capture"
+        )
+    )
+    return tuple(
+        Case
+        for Case in AcceptanceCases
+        if (
+            Case.Name in RegressionCaseNames
+            or (IncludeCompatibilityCases and Case.Name in CompatibilityCaseNames)
+        )
+    )
+
+
 def BuildPlannedRuns(
     Configuration: AcceptanceConfiguration,
 ) -> list[dict[str, object]]:
     Runs = []
     Sequence = 0
-    Cases = tuple(
-        Case
-        for Case in AcceptanceCases
-        if (
-            Configuration.BaselineMode != "capture"
-            or Case.Name in RegressionCaseNames
-        )
-    )
-    for Case in Cases:
+    for Case in _BuildPlannedCases(Configuration):
         Repetitions: list[tuple[int, bool]] = []
         if (
             Configuration.BaselineMode in {"capture", "compare"}
@@ -2161,7 +2278,11 @@ def BuildComparisonCompatibility(
     BenchmarkProfile = {
         "SchemaVersion": "router-regression-profile-v1",
         "Cases": {
-            Case.Name: Case.ToDictionary()
+            Case.Name: {
+                Key: Value
+                for Key, Value in Case.ToDictionary().items()
+                if Key != "NeedsCompatibilityFixture"
+            }
             for Case in AcceptanceCases
         },
         "RegressionCircuits": sorted(RegressionCaseNames),
@@ -2385,7 +2506,11 @@ def BuildCaseBaselineSummary(
             f"{MaximumRuntimeSpreadFraction:.0%}"
         )
     return {
-        "Requirements": Case.ToDictionary(),
+        "Requirements": {
+            Key: Value
+            for Key, Value in Case.ToDictionary().items()
+            if Key != "NeedsCompatibilityFixture"
+        },
         "MeasuredRunCount": len(MeasuredRuns),
         "RunNames": [Run.get("RunName") for Run in MeasuredRuns],
         "Runtime": Runtime,
@@ -2558,7 +2683,11 @@ def ValidateFirstValidCaseSummary(
             f"first-valid baseline case {Case.Name} run-name evidence is "
             "incomplete"
         )
-    if Summary.get("Requirements") != Case.ToDictionary():
+    if Summary.get("Requirements") != {
+        Key: Value
+        for Key, Value in Case.ToDictionary().items()
+        if Key != "NeedsCompatibilityFixture"
+    }:
         raise ValueError(
             f"first-valid baseline case {Case.Name} requirements do not "
             "match the benchmark profile"
@@ -2737,136 +2866,167 @@ def ValidateFirstValidBaselines(
     if not isinstance(FirstValidBaselines, dict):
         raise ValueError("baseline FirstValidBaselines is not an object")
     Unexpected = sorted(
-        set(FirstValidBaselines).difference({"CarryLookaheadAdder4"})
+        set(FirstValidBaselines).difference(CompatibilityCaseNames)
     )
     if Unexpected:
         raise ValueError(
-            "baseline has unexpected first-valid circuits: "
+            "baseline has unexpected compatibility-first-valid circuits: "
             + ", ".join(Unexpected)
         )
     if not FirstValidBaselines:
         return
 
-    Case = next(
-        Value
-        for Value in AcceptanceCases
-        if Value.Name == "CarryLookaheadAdder4"
-    )
-    Entry = FirstValidBaselines.get(Case.Name)
-    if not isinstance(Entry, dict):
-        raise ValueError("CLA4 first-valid baseline is not an object")
-    if Entry.get("SchemaVersion") != FirstValidBaselineSchemaVersion:
-        raise ValueError(
-            "CLA4 first-valid baseline has an invalid schema version"
+    for CompatibilityName in CompatibilityCaseNames:
+        Entry = FirstValidBaselines.get(CompatibilityName)
+        if Entry is None:
+            continue
+        if not isinstance(Entry, dict):
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline is not an object"
+            )
+        if Entry.get("SchemaVersion") != FirstValidBaselineSchemaVersion:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has an "
+                "invalid schema version"
+            )
+        if Entry.get("Circuit") != CompatibilityName:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has an invalid "
+                "circuit"
+            )
+        PromotedAtUtc = Entry.get("PromotedAtUtc")
+        if not isinstance(PromotedAtUtc, str) or not PromotedAtUtc:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has no promotion "
+                "timestamp"
+            )
+        OriginalReferenceSha256 = Entry.get("OriginalReferenceSha256")
+        if (
+            not isinstance(OriginalReferenceSha256, str)
+            or len(OriginalReferenceSha256) != 64
+        ):
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has no original "
+                "reference SHA-256"
+            )
+        try:
+            int(OriginalReferenceSha256, 16)
+        except ValueError as Error:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline original "
+                "reference SHA-256 is invalid"
+            ) from Error
+        OriginalReferenceContentSha256 = Entry.get(
+            "OriginalReferenceContentSha256"
         )
-    if Entry.get("Circuit") != Case.Name:
-        raise ValueError("CLA4 first-valid baseline has an invalid circuit")
-    PromotedAtUtc = Entry.get("PromotedAtUtc")
-    if not isinstance(PromotedAtUtc, str) or not PromotedAtUtc:
-        raise ValueError("CLA4 first-valid baseline has no promotion timestamp")
-    OriginalReferenceSha256 = Entry.get("OriginalReferenceSha256")
-    if (
-        not isinstance(OriginalReferenceSha256, str)
-        or len(OriginalReferenceSha256) != 64
-    ):
-        raise ValueError(
-            "CLA4 first-valid baseline has no original reference SHA-256"
+        if (
+            not isinstance(OriginalReferenceContentSha256, str)
+            or len(OriginalReferenceContentSha256) != 64
+        ):
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has no original "
+                "reference content SHA-256"
+            )
+        try:
+            int(OriginalReferenceContentSha256, 16)
+        except ValueError as Error:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline original reference "
+                "content SHA-256 is invalid"
+            ) from Error
+        OriginalFieldPresent = Entry.get(
+            "OriginalFirstValidBaselinesFieldPresent"
         )
-    try:
-        int(OriginalReferenceSha256, 16)
-    except ValueError as Error:
-        raise ValueError(
-            "CLA4 first-valid baseline original reference SHA-256 is invalid"
-        ) from Error
-    OriginalReferenceContentSha256 = Entry.get(
-        "OriginalReferenceContentSha256"
-    )
-    if (
-        not isinstance(OriginalReferenceContentSha256, str)
-        or len(OriginalReferenceContentSha256) != 64
-    ):
-        raise ValueError(
-            "CLA4 first-valid baseline has no original reference content "
-            "SHA-256"
-        )
-    try:
-        int(OriginalReferenceContentSha256, 16)
-    except ValueError as Error:
-        raise ValueError(
-            "CLA4 first-valid baseline original reference content SHA-256 "
-            "is invalid"
-        ) from Error
-    OriginalFieldPresent = Entry.get(
-        "OriginalFirstValidBaselinesFieldPresent"
-    )
-    if not isinstance(OriginalFieldPresent, bool):
-        raise ValueError(
-            "CLA4 first-valid baseline has invalid original extension state"
-        )
+        if not isinstance(OriginalFieldPresent, bool):
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has invalid "
+                "original extension state"
+            )
 
-    OriginalReference = deepcopy(Baseline)
-    if OriginalFieldPresent:
-        OriginalReference["FirstValidBaselines"] = {}
-    else:
-        OriginalReference.pop("FirstValidBaselines", None)
-    CalculatedOriginalSha256 = sha256(
-        EncodeManifest(OriginalReference)
-    ).hexdigest()
-    if CalculatedOriginalSha256 != OriginalReferenceContentSha256:
-        raise ValueError(
-            "CLA4 first-valid baseline does not match the original reference "
-            "content SHA-256"
-        )
+        OriginalReference = deepcopy(Baseline)
+        if OriginalFieldPresent:
+            OriginalReference["FirstValidBaselines"] = {
+                Name: Value
+                for Name, Value in (
+                    (Name, BaselineEntry)
+                    for Name, BaselineEntry in FirstValidBaselines.items()
+                    if Name in CompatibilityCaseNames
+                )
+                if Name != CompatibilityName
+            }
+        else:
+            OriginalReference.pop("FirstValidBaselines", None)
+        CalculatedOriginalSha256 = sha256(
+            EncodeManifest(OriginalReference)
+        ).hexdigest()
+        if CalculatedOriginalSha256 != OriginalReferenceContentSha256:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline does not match "
+                "its original reference content SHA-256"
+            )
 
-    SourceProvenance = Entry.get("SourceProvenance")
-    Environment = Entry.get("Environment")
-    Compatibility = Entry.get("Compatibility")
-    if not isinstance(SourceProvenance, dict):
-        raise ValueError(
-            "CLA4 first-valid baseline has no SourceProvenance object"
+        SourceProvenance = Entry.get("SourceProvenance")
+        Environment = Entry.get("Environment")
+        Compatibility = Entry.get("Compatibility")
+        if not isinstance(SourceProvenance, dict):
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has no "
+                "SourceProvenance object"
+            )
+        if not isinstance(Environment, dict):
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has no Environment "
+                "object"
+            )
+        if not isinstance(Compatibility, dict):
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has no "
+                "Compatibility object"
+            )
+        if SourceProvenance.get(
+            "ExpectedPolicyVersion"
+        ) != CurrentPolicyVersion:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has an "
+                "unexpected policy version"
+            )
+        if Environment.get("PolicySeed") != 0 or Environment.get(
+            "RoutingThreads"
+        ) != RequiredRegressionRoutingThreads:
+            raise ValueError(
+                f"{CompatibilityName} first-valid baseline has an "
+                "invalid seed/thread profile"
+            )
+        ExpectedCompatibility = BuildComparisonCompatibility(
+            Environment=Environment,
+            SourceProvenance=SourceProvenance,
         )
-    if not isinstance(Environment, dict):
-        raise ValueError("CLA4 first-valid baseline has no Environment object")
-    if not isinstance(Compatibility, dict):
-        raise ValueError(
-            "CLA4 first-valid baseline has no Compatibility object"
+        if Compatibility != ExpectedCompatibility:
+            raise ValueError(
+                f"{CompatibilityName} first-valid Compatibility does not match "
+                "Environment and SourceProvenance"
+            )
+        ProvenanceChecks = Entry.get("ProvenanceChecks")
+        if (
+            not isinstance(ProvenanceChecks, list)
+            or len(ProvenanceChecks) < 2
+            or any(
+                not isinstance(Check, dict)
+                or Check.get("Stable") is not True
+                or Check.get("SourceProvenance") != SourceProvenance
+                for Check in ProvenanceChecks
+            )
+        ):
+            raise ValueError(
+                f"{CompatibilityName} first-valid source provenance checks are "
+                "not stable"
+            )
+        Case = next(
+            Value
+            for Value in AcceptanceCases
+            if Value.Name == CompatibilityName
         )
-    if SourceProvenance.get(
-        "ExpectedPolicyVersion"
-    ) != CurrentPolicyVersion:
-        raise ValueError(
-            "CLA4 first-valid baseline has an unexpected policy version"
-        )
-    if Environment.get("PolicySeed") != 0 or Environment.get(
-        "RoutingThreads"
-    ) != RequiredRegressionRoutingThreads:
-        raise ValueError(
-            "CLA4 first-valid baseline has an invalid seed/thread profile"
-        )
-    ExpectedCompatibility = BuildComparisonCompatibility(
-        Environment=Environment,
-        SourceProvenance=SourceProvenance,
-    )
-    if Compatibility != ExpectedCompatibility:
-        raise ValueError(
-            "CLA4 first-valid Compatibility does not match Environment and "
-            "SourceProvenance"
-        )
-    ProvenanceChecks = Entry.get("ProvenanceChecks")
-    if (
-        not isinstance(ProvenanceChecks, list)
-        or len(ProvenanceChecks) < 2
-        or any(
-            not isinstance(Check, dict)
-            or Check.get("Stable") is not True
-            or Check.get("SourceProvenance") != SourceProvenance
-            for Check in ProvenanceChecks
-        )
-    ):
-        raise ValueError(
-            "CLA4 first-valid source provenance checks are not stable"
-        )
-    ValidateFirstValidCaseSummary(Case, Entry.get("CaseSummary"))
+        ValidateFirstValidCaseSummary(Case, Entry.get("CaseSummary"))
 
 
 def ReadBaselineReference(PathValue: Path) -> dict[str, object]:
@@ -2890,9 +3050,11 @@ def ReadBaselineReference(PathValue: Path) -> dict[str, object]:
         raise ValueError(
             "baseline is missing regression cases: " + ", ".join(Missing)
         )
-    if "CarryLookaheadAdder4" in Cases:
+    UnexpectedCompatibility = sorted(CompatibilityCaseNames.intersection(Cases))
+    if UnexpectedCompatibility:
         raise ValueError(
-            "pre-change baseline must not fabricate a CLA4 circuit record"
+            "baseline must not include pre-change compatibility records: "
+            + ", ".join(UnexpectedCompatibility)
         )
     Unexpected = sorted(set(Cases).difference(RegressionCaseNames))
     if Unexpected:
@@ -2973,11 +3135,15 @@ def ReadBaselineReference(PathValue: Path) -> dict[str, object]:
             raise ValueError(
                 f"baseline case {Case.Name} run-name evidence is incomplete"
             )
-        if Summary.get("Requirements") != Case.ToDictionary():
-            raise ValueError(
-                f"baseline case {Case.Name} requirements do not match "
-                "the benchmark profile"
-            )
+            if Summary.get("Requirements") != {
+                Key: Value
+                for Key, Value in Case.ToDictionary().items()
+                if Key != "NeedsCompatibilityFixture"
+            }:
+                raise ValueError(
+                    f"baseline case {Case.Name} requirements do not match "
+                    "the benchmark profile"
+                )
         ExpectedTruthDigest = CanonicalArithmeticDigests[Case.Name]
         for Name in (
             "TruthTableArithmeticSha256",
@@ -3255,34 +3421,36 @@ def PromoteFirstValidBaseline(
     PathValue: Path,
     Baseline: dict[str, object],
     Entry: dict[str, object],
+    CompatibilityCaseName: str,
     ExpectedOriginalSha256: str,
     ReferenceReader: Callable[[Path], dict[str, object]],
     ReferenceWriter: Callable[[Path, dict[str, object]], None],
 ) -> dict[str, object]:
-    """Stage, validate, atomically publish, and reread one CLA4 baseline."""
+    """Stage, validate, atomically publish, and reread one compatibility baseline."""
     Existing = Baseline.get("FirstValidBaselines")
     if Existing is not None and not isinstance(Existing, dict):
         raise ValueError("baseline FirstValidBaselines is not an object")
     if isinstance(Existing, dict) and Existing:
         raise ValueError(
-            "CLA4 first-valid baseline already exists; overwrite refused"
+            "compatibility-first-valid baseline already exists; overwrite refused"
         )
     OriginalBytes = PathValue.read_bytes()
     ObservedOriginalSha256 = sha256(OriginalBytes).hexdigest()
     if ObservedOriginalSha256 != ExpectedOriginalSha256:
         raise ValueError(
-            "baseline changed before CLA4 promotion; overwrite refused"
+            f"{CompatibilityCaseName} baseline changed before promotion; "
+            "overwrite refused"
         )
     CandidateReference = deepcopy(Baseline)
     CandidateReference["FirstValidBaselines"] = {
-        "CarryLookaheadAdder4": deepcopy(Entry)
+        CompatibilityCaseName: deepcopy(Entry)
     }
     StagingPath = PathValue.with_name(
-        PathValue.name + ".cla4-promotion-stage"
+        PathValue.name + ".compat-first-valid-promotion-stage"
     )
     WriterTemporaryPath = StagingPath.with_suffix(".json.tmp")
     RestorePath = PathValue.with_name(
-        PathValue.name + ".cla4-promotion-restore"
+        PathValue.name + ".compat-first-valid-promotion-restore"
     )
     if (
         StagingPath.exists()
@@ -3290,7 +3458,8 @@ def PromoteFirstValidBaseline(
         or RestorePath.exists()
     ):
         raise ValueError(
-            "CLA4 promotion temporary path already exists; promotion refused"
+            "compatibility promotion temporary path already exists; "
+            "promotion refused"
         )
     ReplacedReference = False
     try:
@@ -3300,18 +3469,20 @@ def PromoteFirstValidBaseline(
             ReadNested(
                 StagedReference,
                 "FirstValidBaselines",
-                "CarryLookaheadAdder4",
+                CompatibilityCaseName,
             )
             != Entry
         ):
             raise ValueError(
-                "staged CLA4 first-valid baseline did not round-trip"
+                "staged compatibility first-valid baseline did not "
+                "round-trip"
             )
         if sha256(PathValue.read_bytes()).hexdigest() != (
             ExpectedOriginalSha256
         ):
             raise ValueError(
-                "baseline changed during CLA4 promotion; overwrite refused"
+                "baseline changed during compatibility promotion; overwrite "
+                "refused"
             )
         StagingPath.replace(PathValue)
         ReplacedReference = True
@@ -3320,12 +3491,13 @@ def PromoteFirstValidBaseline(
             ReadNested(
                 PublishedReference,
                 "FirstValidBaselines",
-                "CarryLookaheadAdder4",
+                CompatibilityCaseName,
             )
             != Entry
         ):
             raise ValueError(
-                "published CLA4 first-valid baseline did not round-trip"
+                "published compatibility first-valid baseline did not "
+                "round-trip"
             )
         return PublishedReference
     except Exception:
@@ -3810,8 +3982,8 @@ def BuildBaselineComparison(
         },
         "Circuits": CircuitComparisons,
         "UnbaselinedCircuits": (
-            ["CarryLookaheadAdder4"]
-            if "CarryLookaheadAdder4" not in CaseNames
+            sorted(CompatibilityCaseNames.difference(CaseNames))
+            if CompatibilityCaseNames
             else []
         ),
     }
@@ -3843,6 +4015,7 @@ def RunAcceptance(
 ) -> dict[str, object]:
     """Execute the configured matrix serially and persist complete evidence."""
     PlannedRuns = BuildPlannedRuns(Configuration)
+    PlannedCases = _BuildPlannedCases(Configuration)
     SourceState = SourceStateProvider(Configuration.RepositoryRoot)
     Environment = BuildEnvironmentRecord(Configuration)
     SourceProvenance = SourceProvenanceProvider(
@@ -3853,6 +4026,16 @@ def RunAcceptance(
         Environment=Environment,
         SourceProvenance=SourceProvenance,
     )
+    CompatibilityRunsToConsider = frozenset(
+        Case.Name
+        for Case in PlannedCases
+        if Case.Name in CompatibilityCaseNames
+    )
+    def BuildRequestedCases() -> list[dict[str, object]]:
+        return [
+            Case.ToDictionary()
+            for Case in PlannedCases
+        ]
     Manifest: dict[str, object] = {
         "SchemaVersion": AcceptanceManifestSchemaVersion,
         "Status": "DRY_RUN" if Configuration.DryRun else "RUNNING",
@@ -3890,14 +4073,7 @@ def RunAcceptance(
         "ProvenanceChecks": [],
         "Environment": Environment,
         "ComparisonCompatibility": ComparisonCompatibility,
-        "Cases": [
-            Case.ToDictionary()
-            for Case in AcceptanceCases
-            if (
-                Configuration.BaselineMode != "capture"
-                or Case.Name in RegressionCaseNames
-            )
-        ],
+        "Cases": BuildRequestedCases(),
         "BaselineComparison": {
             "Mode": Configuration.BaselineMode or "disabled",
             "Passed": None,
@@ -3905,7 +4081,7 @@ def RunAcceptance(
             "QuietRerunRequired": False,
             "Circuits": {},
             "UnbaselinedCircuits": (
-                ["CarryLookaheadAdder4"]
+                sorted(CompatibilityRunsToConsider)
                 if Configuration.BaselineMode == "compare"
                 else []
             ),
@@ -3950,7 +4126,7 @@ def RunAcceptance(
             ),
             "Failure": "; ".join(FailureReasons) + "; capture refused",
             "Circuits": {},
-            "UnbaselinedCircuits": ["CarryLookaheadAdder4"],
+            "UnbaselinedCircuits": sorted(CompatibilityCaseNames),
         }
         Manifest["Runs"] = [
             {
@@ -3987,7 +4163,7 @@ def RunAcceptance(
             ),
             "Failure": Failure + "; comparison refused",
             "Circuits": {},
-            "UnbaselinedCircuits": ["CarryLookaheadAdder4"],
+            "UnbaselinedCircuits": sorted(CompatibilityCaseNames),
         }
         Manifest["Runs"] = [
             {
@@ -4026,7 +4202,10 @@ def RunAcceptance(
             )
             BaselineAvailableBeforeRun = bool(
                 isinstance(FirstValidBaselines, dict)
-                and "CarryLookaheadAdder4" in FirstValidBaselines
+                and any(
+                    Name in FirstValidBaselines
+                    for Name in CompatibilityCaseNames
+                )
             )
             BaselineCompatibility = CompareCompatibility(
                 BaselineReference,
@@ -4046,7 +4225,7 @@ def RunAcceptance(
                 "QuietRerunRequired": False,
                 "Failure": f"could not load baseline: {Error}",
                 "Circuits": {},
-                "UnbaselinedCircuits": ["CarryLookaheadAdder4"],
+                "UnbaselinedCircuits": sorted(CompatibilityCaseNames),
             }
             Manifest["Runs"] = [
                 {
@@ -4071,7 +4250,7 @@ def RunAcceptance(
                 "Failure": "baseline environment is incompatible",
                 "Compatibility": BaselineCompatibility,
                 "Circuits": {},
-                "UnbaselinedCircuits": ["CarryLookaheadAdder4"],
+                "UnbaselinedCircuits": sorted(CompatibilityCaseNames),
             }
             Manifest["Runs"] = [
                 {
@@ -4156,18 +4335,32 @@ def RunAcceptance(
             Artifacts=Artifacts,
             ExpectedSeed=Configuration.ExpectedSeed,
             ExpectedPolicyVersion=Configuration.ExpectedPolicyVersion,
+            CompatibilityMode=(
+                Case.Name in CompatibilityCaseNames
+                and Configuration.CompatibilityMode
+            ),
             DesignDigestBuilder=DesignDigestBuilder,
             LitematicCompositionEvidenceBuilder=(
                 LitematicCompositionEvidenceBuilder
             ),
             TruthTableEvidenceBuilder=TruthTableEvidenceBuilder,
         )
-        Cla4Checkpoint = None
-        if Case.Name == "CarryLookaheadAdder4":
-            Cla4Checkpoint = EvaluateCla4ExactInterfaceCheckpoint(
-                Artifacts
+        CompatibilityCheckpoint = None
+        if (
+            Configuration.CompatibilityMode
+            and Case.Name in CompatibilityCaseNames
+        ):
+            CompatibilityCheckpoint = (
+                EvaluateExactInterfaceProofCheckpoint(Artifacts)
             )
-            Evaluation["Cla4ExactInterfaceCheckpoint"] = Cla4Checkpoint
+            Evaluation[ExactInterfaceProofCheckpointField] = (
+                CompatibilityCheckpoint
+            )
+            if not CompatibilityCheckpoint["Accepted"]:
+                Evaluation["Failures"].extend(
+                    CompatibilityCheckpoint.get("Failures", [])
+                )
+                Evaluation["Accepted"] = False
 
         Determinism = {
             "BaselineRun": None,
@@ -4221,7 +4414,7 @@ def RunAcceptance(
                 ),
             },
             "Evaluation": Evaluation,
-            "Cla4ExactInterfaceCheckpoint": Cla4Checkpoint,
+            "CompatibilityCheckpoint": CompatibilityCheckpoint,
             "Determinism": Determinism,
         }
         return Completed
@@ -4231,10 +4424,10 @@ def RunAcceptance(
         for Run in PlannedRuns
         if Run.get("Circuit") in RegressionCaseNames
     ]
-    ClaPlanned = [
+    CompatibilityPlanned = [
         Run
         for Run in PlannedRuns
-        if Run.get("Circuit") == "CarryLookaheadAdder4"
+        if Run.get("Circuit") in CompatibilityCaseNames
     ]
     if Configuration.BaselineMode in {"capture", "compare"}:
         RunsToExecuteFirst = RegressionPlanned
@@ -4292,7 +4485,7 @@ def RunAcceptance(
                 Configuration.BaselinePath.resolve(strict=False)
             ),
             "Circuits": Baseline["Cases"],
-            "UnbaselinedCircuits": ["CarryLookaheadAdder4"],
+            "UnbaselinedCircuits": sorted(CompatibilityCaseNames),
         }
         Manifest["Runs"] = CompletedRuns
         Manifest["Accepted"] = CapturePassed
@@ -4323,21 +4516,50 @@ def RunAcceptance(
         ExistingFirstValidBaselines = BaselineReference.get(
             "FirstValidBaselines"
         )
-        ExistingClaEntry = (
-            ExistingFirstValidBaselines.get("CarryLookaheadAdder4")
+        ExistingCompatibilityBaselines = (
+            ExistingFirstValidBaselines
             if isinstance(ExistingFirstValidBaselines, dict)
-            else None
-        )
-        Comparison["FirstValidBaselines"] = (
-            {"CarryLookaheadAdder4": deepcopy(ExistingClaEntry)}
-            if isinstance(ExistingClaEntry, dict)
             else {}
         )
-        Comparison["UnbaselinedCircuits"] = (
-            [] if BaselineAvailableBeforeRun else ["CarryLookaheadAdder4"]
+        CompatibilityCases = [
+            Case
+            for Case in AcceptanceCases
+            if Case.Name in CompatibilityCaseNames
+        ]
+        if len(CompatibilityCases) != len(CompatibilityCaseNames):
+            raise ValueError(
+                "unsupported acceptance matrix: missing "
+                "declared compatibility case"
+            )
+        BaselineAvailableBeforeRun = bool(
+            ExistingCompatibilityBaselines
+            and any(
+                Name in ExistingCompatibilityBaselines
+                for Name in CompatibilityCaseNames
+            )
         )
-        Comparison["Cla4PromotionPassed"] = False
-        Comparison["Cla4BaselineComparison"] = None
+        Comparison["FirstValidBaselines"] = {
+            Name: deepcopy(
+                ExistingCompatibilityBaselines[Name]
+            )
+            for Name in CompatibilityCaseNames
+            if Name in ExistingCompatibilityBaselines
+            and isinstance(
+                ExistingCompatibilityBaselines[Name],
+                dict,
+            )
+        }
+        UnbaselinedCompatibility = list(
+            CompatibilityCaseNames.difference(
+                Comparison["FirstValidBaselines"]
+            )
+        )
+        Comparison["UnbaselinedCircuits"] = (
+            UnbaselinedCompatibility
+        )
+        Comparison["CompatibilityPromotionPassed"] = False
+        Comparison["CompatibilityBaselineComparison"] = None
+        Comparison["CompatibilityCandidateBaseline"] = None
         Comparison["ProvenanceStable"] = RegressionProvenanceStable
         if not RegressionProvenanceStable:
             Comparison["Passed"] = False
@@ -4349,7 +4571,7 @@ def RunAcceptance(
         )
         Manifest["BaselineComparison"] = Comparison
         if Comparison["Passed"]:
-            for Planned in ClaPlanned:
+            for Planned in CompatibilityPlanned:
                 Completed = ExecuteOne(Planned)
                 CompletedRuns.append(Completed)
                 Manifest["Runs"] = [
@@ -4358,7 +4580,7 @@ def RunAcceptance(
                 ]
                 WriteManifest(Configuration.ManifestPath, Manifest)
             FinalProvenanceStable = CheckSourceProvenance(
-                "after-cla4-comparison"
+                "after-compatibility-comparison"
             )
             Comparison["ProvenanceStable"] = (
                 bool(Comparison.get("ProvenanceStable"))
@@ -4367,207 +4589,272 @@ def RunAcceptance(
             if not FinalProvenanceStable:
                 Comparison["Passed"] = False
                 Comparison["Failure"] = (
-                    "source/native/policy provenance changed during CLA4"
+                    "source/native/policy provenance changed during "
+                    "compatibility comparison"
                 )
-            ClaCase = next(
-                Case
-                for Case in AcceptanceCases
-                if Case.Name == "CarryLookaheadAdder4"
-            )
-            ClaBaseline = BuildCaseBaselineSummary(
-                ClaCase,
-                CompletedRuns,
-            )
-            ClaCandidateBaseline = {
-                **ClaBaseline,
-                "CapturedAtUtc": UtcNowProvider(),
-                "SourceProvenance": SourceProvenance,
-            }
-            Comparison["Cla4CandidateBaseline"] = ClaCandidateBaseline
-            ClaMeasurementValid = (
-                ReadNested(ClaBaseline, "Runtime", "Stable") is True
-            )
-            Comparison["MeasurementValid"] = (
-                bool(Comparison.get("MeasurementValid"))
-                and ClaMeasurementValid
-            )
-            Comparison["QuietRerunRequired"] = (
-                bool(Comparison.get("QuietRerunRequired"))
-                or not ClaMeasurementValid
-            )
-            ClaEvidencePromotable = bool(ClaBaseline.get("Promotable"))
-            if (
-                not ClaEvidencePromotable
-                and not isinstance(ExistingClaEntry, dict)
-                and Comparison.get("Failure") is None
-            ):
-                Comparison["Passed"] = False
-                Comparison["Failure"] = (
-                    "CLA4 repeated physical baseline is not promotable"
-                )
-                Comparison["FirstValidBaselinePromotion"] = {
-                    "Attempted": False,
-                    "Written": False,
-                    "ReferenceAlreadyAvailable": False,
-                    "OverwriteBlocked": False,
-                    "BaselineAvailableBeforeRun": False,
-                }
-            elif isinstance(ExistingClaEntry, dict):
-                StoredCompatibility = CompareCompatibility(
-                    {"Compatibility": ExistingClaEntry["Compatibility"]},
-                    ComparisonCompatibility,
-                )
-                ClaComparison = BuildBaselineComparison(
-                    Baseline={
-                        "Cases": {
-                            ClaCase.Name: ExistingClaEntry["CaseSummary"]
-                        },
-                        "SourceProvenance": ExistingClaEntry[
-                            "SourceProvenance"
-                        ],
-                    },
-                    CandidateRuns=CompletedRuns,
-                    Compatibility=StoredCompatibility,
-                    CandidateSourceProvenance=SourceProvenance,
-                    CaseNames=frozenset({ClaCase.Name}),
-                    RequireWarmup=False,
-                )
-                ClaComparison["BaselineAvailableBeforeRun"] = True
-                ClaComparison["ReferencePromotedAtUtc"] = (
-                    ExistingClaEntry["PromotedAtUtc"]
-                )
-                ClaComparison["ProvenanceStable"] = bool(
-                    Comparison.get("ProvenanceStable")
-                )
-                ClaComparisonPassed = bool(
-                    ClaComparison.get("Passed")
-                    and Comparison.get("ProvenanceStable")
-                )
-                ClaComparison["Passed"] = ClaComparisonPassed
-                Comparison["Cla4BaselineComparison"] = ClaComparison
-                ClaCircuitComparison = ReadNested(
-                    ClaComparison,
-                    "Circuits",
-                    ClaCase.Name,
-                )
-                if isinstance(ClaCircuitComparison, dict):
-                    Comparison["Circuits"][ClaCase.Name] = (
-                        ClaCircuitComparison
+            for CompatibilityCase in CompatibilityCases:
+                CompatibilityCaseName = CompatibilityCase.Name
+                ExistingCompatibilityEntry = (
+                    ExistingCompatibilityBaselines.get(
+                        CompatibilityCaseName
                     )
+                    if isinstance(
+                        ExistingCompatibilityBaselines,
+                        dict,
+                    )
+                    else None
+                )
+                CompatibilityBaseline = BuildCaseBaselineSummary(
+                    CompatibilityCase,
+                    CompletedRuns,
+                )
+                CompatibilityCandidateBaseline = {
+                    **CompatibilityBaseline,
+                    "CapturedAtUtc": UtcNowProvider(),
+                    "SourceProvenance": SourceProvenance,
+                }
+                Comparison["CompatibilityCandidateBaseline"] = (
+                    CompatibilityCandidateBaseline
+                )
+                CompatibilityMeasurementValid = (
+                    ReadNested(
+                        CompatibilityBaseline,
+                        "Runtime",
+                        "Stable",
+                    )
+                    is True
+                )
                 Comparison["MeasurementValid"] = (
                     bool(Comparison.get("MeasurementValid"))
-                    and bool(ClaComparison.get("MeasurementValid"))
+                    and CompatibilityMeasurementValid
                 )
                 Comparison["QuietRerunRequired"] = (
                     bool(Comparison.get("QuietRerunRequired"))
-                    or bool(ClaComparison.get("QuietRerunRequired"))
+                    or not CompatibilityMeasurementValid
                 )
-                Comparison["Passed"] = bool(
-                    Comparison.get("Passed")
-                    and ClaComparisonPassed
+                CompatibilityEvidencePromotable = bool(
+                    CompatibilityBaseline.get("Promotable")
                 )
-                Comparison["FirstValidBaselinePromotion"] = {
-                    "Attempted": False,
-                    "Written": False,
-                    "ReferenceAlreadyAvailable": True,
-                    "OverwriteBlocked": True,
-                    "BaselineAvailableBeforeRun": True,
-                }
                 if (
-                    not ClaComparisonPassed
+                    not CompatibilityEvidencePromotable
+                    and not isinstance(
+                        ExistingCompatibilityEntry,
+                        dict,
+                    )
                     and Comparison.get("Failure") is None
                 ):
-                    Comparison["Failure"] = (
-                        "CLA4 regressed against its first-valid baseline"
-                    )
-            elif (
-                Comparison.get("Passed")
-                and ClaEvidencePromotable
-                and Comparison.get("ProvenanceStable")
-            ):
-                assert Configuration.BaselinePath is not None
-                assert BaselineReferenceSha256 is not None
-                PromotedAtUtc = UtcNowProvider()
-                Entry = BuildFirstValidBaselineEntry(
-                    Case=ClaCase,
-                    CaseSummary=ClaBaseline,
-                    SourceProvenance=SourceProvenance,
-                    Environment=Environment,
-                    Compatibility=ComparisonCompatibility,
-                    ProvenanceChecks=(
-                        Manifest["ProvenanceChecks"]
-                        if isinstance(
-                            Manifest.get("ProvenanceChecks"),
-                            list,
-                        )
-                        else []
-                    ),
-                    PromotedAtUtc=PromotedAtUtc,
-                    OriginalReferenceSha256=BaselineReferenceSha256,
-                    OriginalReferenceContentSha256=sha256(
-                        EncodeManifest(BaselineReference)
-                    ).hexdigest(),
-                    OriginalFirstValidBaselinesFieldPresent=(
-                        "FirstValidBaselines" in BaselineReference
-                    ),
-                )
-                PromotionFailure: str | None = None
-                try:
-                    PublishedReference = PromoteFirstValidBaseline(
-                        PathValue=Configuration.BaselinePath,
-                        Baseline=BaselineReference,
-                        Entry=Entry,
-                        ExpectedOriginalSha256=BaselineReferenceSha256,
-                        ReferenceReader=BaselineReferenceReader,
-                        ReferenceWriter=BaselineReferenceWriter,
-                    )
-                    PublishedEntry = ReadNested(
-                        PublishedReference,
-                        "FirstValidBaselines",
-                        ClaCase.Name,
-                    )
-                    if PublishedEntry != Entry:
-                        raise ValueError(
-                            "published CLA4 first-valid baseline changed "
-                            "after validation"
-                        )
-                except Exception as Error:
-                    PromotionFailure = str(Error)
-                ClaPromotionPassed = PromotionFailure is None
-                Comparison["Cla4PromotionPassed"] = ClaPromotionPassed
-                Comparison["FirstValidBaselinePromotion"] = {
-                    "Attempted": True,
-                    "Written": ClaPromotionPassed,
-                    "ReferenceAlreadyAvailable": False,
-                    "OverwriteBlocked": False,
-                    "BaselineAvailableBeforeRun": False,
-                    "ReferencePath": str(
-                        Configuration.BaselinePath.resolve(strict=False)
-                    ),
-                    "OriginalReferenceSha256": (
-                        BaselineReferenceSha256
-                    ),
-                    "Failure": PromotionFailure,
-                }
-                if ClaPromotionPassed:
-                    Comparison["FirstValidBaselines"] = {
-                        ClaCase.Name: Entry
-                    }
-                    Comparison["UnbaselinedCircuits"] = []
-                else:
                     Comparison["Passed"] = False
                     Comparison["Failure"] = (
-                        "could not persist CLA4 first-valid baseline: "
-                        + (PromotionFailure or "unknown promotion failure")
+                        f"{CompatibilityCaseName} repeated physical baseline "
+                        "is not promotable"
                     )
-            else:
-                Comparison["FirstValidBaselinePromotion"] = {
-                    "Attempted": False,
-                    "Written": False,
-                    "ReferenceAlreadyAvailable": False,
-                    "OverwriteBlocked": False,
-                    "BaselineAvailableBeforeRun": False,
-                }
+                    Comparison["FirstValidBaselinePromotion"] = {
+                        "Attempted": False,
+                        "Written": False,
+                        "ReferenceAlreadyAvailable": False,
+                        "OverwriteBlocked": False,
+                        "BaselineAvailableBeforeRun": False,
+                    }
+                elif isinstance(ExistingCompatibilityEntry, dict):
+                    StoredCompatibility = CompareCompatibility(
+                        {
+                            "Compatibility": ExistingCompatibilityEntry[
+                                "Compatibility"
+                            ]
+                        },
+                        ComparisonCompatibility,
+                    )
+                    CompatibilityCircuitComparison = BuildBaselineComparison(
+                        Baseline={
+                            "Cases": {
+                                CompatibilityCase.Name: (
+                                    ExistingCompatibilityEntry[
+                                        "CaseSummary"
+                                    ]
+                                )
+                            },
+                            "SourceProvenance": (
+                                ExistingCompatibilityEntry[
+                                    "SourceProvenance"
+                                ]
+                            ),
+                        },
+                        CandidateRuns=CompletedRuns,
+                        Compatibility=StoredCompatibility,
+                        CandidateSourceProvenance=SourceProvenance,
+                        CaseNames=frozenset({CompatibilityCaseName}),
+                        RequireWarmup=False,
+                    )
+                    CompatibilityCircuitComparison[
+                        "BaselineAvailableBeforeRun"
+                    ] = True
+                    CompatibilityCircuitComparison[
+                        "ReferencePromotedAtUtc"
+                    ] = ExistingCompatibilityEntry["PromotedAtUtc"]
+                    CompatibilityCircuitComparison["ProvenanceStable"] = (
+                        bool(Comparison.get("ProvenanceStable"))
+                    )
+                    CompatibilityComparisonPassed = bool(
+                        CompatibilityCircuitComparison.get("Passed")
+                        and Comparison.get("ProvenanceStable")
+                    )
+                    CompatibilityCircuitComparison["Passed"] = (
+                        CompatibilityComparisonPassed
+                    )
+                    Comparison["CompatibilityBaselineComparison"] = (
+                        CompatibilityCircuitComparison
+                    )
+                    CompatibilityCaseComparison = ReadNested(
+                        CompatibilityCircuitComparison,
+                        "Circuits",
+                        CompatibilityCase.Name,
+                    )
+                    if isinstance(
+                        CompatibilityCaseComparison,
+                        dict,
+                    ):
+                        Comparison["Circuits"][
+                            CompatibilityCase.Name
+                        ] = CompatibilityCaseComparison
+                    Comparison["MeasurementValid"] = (
+                        bool(Comparison.get("MeasurementValid"))
+                        and bool(
+                            CompatibilityCircuitComparison.get(
+                                "MeasurementValid"
+                            )
+                        )
+                    )
+                    Comparison["QuietRerunRequired"] = (
+                        bool(Comparison.get("QuietRerunRequired"))
+                        or bool(
+                            CompatibilityCircuitComparison.get(
+                                "QuietRerunRequired"
+                            )
+                        )
+                    )
+                    Comparison["Passed"] = bool(
+                        Comparison.get("Passed")
+                        and CompatibilityComparisonPassed
+                    )
+                    Comparison["FirstValidBaselinePromotion"] = {
+                        "Attempted": False,
+                        "Written": False,
+                        "ReferenceAlreadyAvailable": True,
+                        "OverwriteBlocked": True,
+                        "BaselineAvailableBeforeRun": True,
+                    }
+                    if (
+                        not CompatibilityComparisonPassed
+                        and Comparison.get("Failure") is None
+                    ):
+                        Comparison["Failure"] = (
+                            f"{CompatibilityCaseName} regressed against its "
+                            "first-valid baseline"
+                        )
+                elif (
+                    Comparison.get("Passed")
+                    and CompatibilityEvidencePromotable
+                    and Comparison.get("ProvenanceStable")
+                ):
+                    assert Configuration.BaselinePath is not None
+                    assert BaselineReferenceSha256 is not None
+                    PromotedAtUtc = UtcNowProvider()
+                    Entry = BuildFirstValidBaselineEntry(
+                        Case=CompatibilityCase,
+                        CaseSummary=CompatibilityBaseline,
+                        SourceProvenance=SourceProvenance,
+                        Environment=Environment,
+                        Compatibility=ComparisonCompatibility,
+                        ProvenanceChecks=(
+                            Manifest["ProvenanceChecks"]
+                            if isinstance(
+                                Manifest.get("ProvenanceChecks"),
+                                list,
+                            )
+                            else []
+                        ),
+                        PromotedAtUtc=PromotedAtUtc,
+                        OriginalReferenceSha256=BaselineReferenceSha256,
+                        OriginalReferenceContentSha256=(
+                            sha256(EncodeManifest(BaselineReference)).hexdigest()
+                        ),
+                        OriginalFirstValidBaselinesFieldPresent=(
+                            "FirstValidBaselines" in BaselineReference
+                        ),
+                    )
+                    PromotionFailure: str | None = None
+                    try:
+                        PublishedReference = PromoteFirstValidBaseline(
+                            PathValue=Configuration.BaselinePath,
+                            Baseline=BaselineReference,
+                            Entry=Entry,
+                            ExpectedOriginalSha256=BaselineReferenceSha256,
+                            ReferenceReader=BaselineReferenceReader,
+                            ReferenceWriter=BaselineReferenceWriter,
+                            CompatibilityCaseName=CompatibilityCaseName,
+                        )
+                        PublishedEntry = ReadNested(
+                            PublishedReference,
+                            "FirstValidBaselines",
+                            CompatibilityCase.Name,
+                        )
+                        if PublishedEntry != Entry:
+                            raise ValueError(
+                                "published compatibility first-valid baseline "
+                                "changed after validation"
+                            )
+                    except Exception as Error:
+                        PromotionFailure = str(Error)
+                    CompatibilityPromotionPassed = (
+                        PromotionFailure is None
+                    )
+                    Comparison["CompatibilityPromotionPassed"] = (
+                        CompatibilityPromotionPassed
+                    )
+                    if CompatibilityCaseName in UnbaselinedCompatibility:
+                        UnbaselinedCompatibility.remove(
+                            CompatibilityCaseName
+                        )
+                    Comparison["FirstValidBaselinePromotion"] = {
+                        "Attempted": True,
+                        "Written": CompatibilityPromotionPassed,
+                        "ReferenceAlreadyAvailable": False,
+                        "OverwriteBlocked": False,
+                        "BaselineAvailableBeforeRun": False,
+                        "ReferencePath": str(
+                            Configuration.BaselinePath.resolve(
+                                strict=False
+                            )
+                        ),
+                        "OriginalReferenceSha256": (
+                            BaselineReferenceSha256
+                        ),
+                        "Failure": PromotionFailure,
+                    }
+                    if CompatibilityPromotionPassed:
+                        Comparison["FirstValidBaselines"] = {
+                            **Comparison["FirstValidBaselines"],
+                            CompatibilityCase.Name: Entry,
+                        }
+                    else:
+                        Comparison["Passed"] = False
+                        Comparison["Failure"] = (
+                            "could not persist compatibility first-valid "
+                            "baseline: "
+                            + (PromotionFailure
+                               or "unknown promotion failure")
+                        )
+                else:
+                    Comparison["FirstValidBaselinePromotion"] = {
+                        "Attempted": False,
+                        "Written": False,
+                        "ReferenceAlreadyAvailable": False,
+                        "OverwriteBlocked": False,
+                        "BaselineAvailableBeforeRun": False,
+                    }
+            Comparison["UnbaselinedCircuits"] = sorted(
+                UnbaselinedCompatibility
+            )
         else:
             Comparison["FirstValidBaselinePromotion"] = {
                 "Attempted": False,
@@ -4585,9 +4872,10 @@ def RunAcceptance(
                 "Status": "SKIPPED",
                 "Accepted": False,
                 "SkipReason": (
-                    "CLA4 is gated behind the complete baseline comparison"
+                    "compatibility case is gated behind the complete "
+                    "baseline comparison"
                 ),
-            } for Run in ClaPlanned)
+            } for Run in CompatibilityPlanned)
         Manifest["Runs"] = CompletedRuns
         Manifest["Accepted"] = (
             bool(Comparison["Passed"])
@@ -4686,8 +4974,9 @@ def BuildParser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "compare FA/RCA4/RCA8 against PATH, then run CLA4 only if all "
-            "regression gates pass"
+            "compare FA/RCA4/RCA8 against PATH, then run "
+            "compatibility circuits only with --compatibility-mode "
+            "when all regression gates pass"
         ),
     )
     Parser.add_argument(
@@ -4707,6 +4996,15 @@ def BuildParser() -> argparse.ArgumentParser:
         help=(
             "explicit capture-only subprocess grace, from 0 through "
             f"{SubprocessDeadlineGraceSeconds:g} seconds (default: 0)"
+        ),
+    )
+    Parser.add_argument(
+        "--compatibility-mode",
+        dest="CompatibilityMode",
+        action="store_true",
+        help=(
+            "run compatibility-circuit checkpoints explicitly; strict gates "
+            "remain enabled"
         ),
     )
     Parser.add_argument(
@@ -4824,6 +5122,7 @@ def Main(Arguments: list[str] | None = None) -> int:
         CaptureTimeoutGraceSeconds=(
             Parsed.CaptureTimeoutGraceSeconds
         ),
+        CompatibilityMode=Parsed.CompatibilityMode,
     )
     Manifest = RunAcceptance(Configuration)
     print(f"Acceptance manifest: {Configuration.ManifestPath}")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from heapq import heappop, heappush
+from itertools import combinations, product
 from math import ceil, prod, sqrt
 from dataclasses import dataclass, field, replace
 import os
@@ -82,6 +83,7 @@ from .Models import (
     PreparedPhysicalComponentPortFactorDomain,
     PreparedPhysicalComponentFeedthroughEndpointDomain,
     PreparedPhysicalComponentAssembly,
+    FrozenPhysicalComponentPostClosurePortalHandoff,
     RetainedPhysicalGlobalPlanFrontierEntry,
     RoutedDesign,
     RoutingResources,
@@ -90,8 +92,14 @@ from .ComponentAccess import (
     BuildComponentCutAccessFeasibilityCertificate,
     ValidateComponentAccessCertificateIdentity,
 )
+from .ComponentPlanning import (
+    ComponentInterfaceContract,
+    IterClosedComponentContracts,
+)
 from .ComponentPipeline import (
     ApplyPhysicalComponentAssemblyGlobalProfiles,
+    ProjectPhysicalComponentSignalGlobalProfile,
+    BuildPhysicalComponentAssemblyPlanDomainFingerprint,
     BuildPhysicalComponentAssemblyChoiceFingerprint,
     BuildPhysicalLocalAccessDomainFingerprint,
     BuildPhysicalPortApertureContractFingerprint,
@@ -103,6 +111,7 @@ from .ComponentPipeline import (
     FinalizePhysicalComponentChannelReservations,
     FinalizePhysicalComponentPortReservations,
     SelectPhysicalAssemblyGlobalBoundaryPorts,
+    SelectPhysicalComponentExactGlobalChannelSignals,
     ValidatePhysicalLocalPortPairSupportCertificate,
 )
 from .ComponentRouter import (
@@ -114,8 +123,8 @@ from .ComponentRouter import (
     ComponentClaimsConflict,
     FilterExternalSourcePoweredSeamCandidateDomains,
     PreserveRoutedComponentForeignEscapes,
+    SelectClosedComponentOwnedTerminalPairs,
     SelectComponentIncidentSignals,
-    SolveComponentRoutingProblem,
 )
 from .Reliability import (
     BuildRoutingDeadlineDiagnostics,
@@ -145,6 +154,7 @@ from .ResourceGraph import (
     RoutingResourceId,
     RoutingResourceKind,
     RoutingResourceClaims,
+    RoutingResourceGraph,
     ValidateLocalRouteClaims,
 )
 from ..Placement.Geometry import GetGateInputAccess
@@ -1468,12 +1478,11 @@ def ShouldUseNegotiatedRouting(
 ) -> bool:
     """Use negotiation only when the remaining global domain is large.
 
-    Structural packing can freeze most nets locally.  RCA8 leaves 32 global
-    signals and CLA4 leaves 63, where a broad capacity-one assignment is both
-    tractable and produces a precise physical relocation cut; iterative
-    negotiation discards useful alternatives and can plateau before that cut
-    is exposed. Larger domains retain negotiation's bounded-memory behavior.
+    Structural packing can freeze most nets locally.  Larger fan-in/fanout
+    domains retain negotiation's bounded-memory behavior, while compact
+    domains keep deterministic strict assignment.
     """
+    # Selection is based on domain size and policy only; no circuit identity.
     return Policy.NegotiatedRouting.Enabled and SignalCount > 64
 
 
@@ -2365,6 +2374,8 @@ def BuildUnavoidableMandatoryClaimCutFailure(
         ...,
     ],
     StageTimings: dict[str, float] | None = None,
+    *,
+    PairwiseNoGoodEdges: Iterable[tuple[str, str]] = (),
 ) -> RoutingFailure:
     """Preserve the complete exact portal-cut batch for placement repair."""
     if not Cuts:
@@ -2388,6 +2399,11 @@ def BuildUnavoidableMandatoryClaimCutFailure(
         ConflictPositions,
         len(PairwiseEdges),
     )
+    CertifiedPairwiseEdges = tuple(sorted({
+        tuple(sorted(map(str, Edge)))
+        for Edge in PairwiseNoGoodEdges
+        if len(tuple(Edge)) == 2 and str(tuple(Edge)[0]) != str(tuple(Edge)[1])
+    }))
     return RoutingFailure(
         Reason=RoutingFailureReason.TrackAssignmentConflict,
         Stage="InitialCandidateAssignment",
@@ -2402,6 +2418,12 @@ def BuildUnavoidableMandatoryClaimCutFailure(
             "MandatoryConflictPairCount": len(PairwiseEdges),
             "MandatoryConflictPositionCount": len(ConflictPositions),
             "MandatoryAccessProof": MandatoryAccessProof,
+            "PairwisePortReservationNoGoodProofComplete": bool(
+                CertifiedPairwiseEdges
+            ),
+            "PairwisePortReservationNoGoodEdges": [
+                list(Edge) for Edge in CertifiedPairwiseEdges
+            ],
             "StageTimingsSeconds": dict(StageTimings or {}),
             "ConflictGraph": {
                 "Classification": "mandatory-boundary-capacity-cut",
@@ -2697,6 +2719,2907 @@ class MandatoryPortalPairFeasibilityCertificate:
     ConflictFingerprint: str = ""
     ExpansionCount: int = 0
     MemoizedStateHitCount: int = 0
+    DependencySignals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExactPortalConstraintChoice:
+    """One discrete portal choice represented by its complete wire nodes."""
+
+    ChoiceId: str
+    Nodes: frozenset[Position3]
+
+
+@dataclass(frozen=True)
+class ExactPortalConstraintVariableDomain:
+    """One signal-owned portal variable in an exact resource factor graph."""
+
+    Variable: str
+    Signal: str
+    Choices: tuple[ExactPortalConstraintChoice, ...]
+
+
+@dataclass(frozen=True)
+class ExactPortalConstraintForbiddenTuple:
+    """One inclusion-minimal illegal unary, binary, or ternary assignment."""
+
+    Assignments: tuple[tuple[str, str], ...]
+    ConflictPositions: frozenset[Position3] = frozenset()
+    DependencySignals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExactPortalConstraintFactorExtraction:
+    """Reference factorization certificate derived from full route claims."""
+
+    DomainFingerprint: str
+    Complete: bool
+    Variables: tuple[str, ...]
+    ForbiddenTuples: tuple[ExactPortalConstraintForbiddenTuple, ...]
+    EvaluatedPartialAssignmentCount: int
+    EvaluatedFullAssignmentCount: int
+    MaximumForbiddenTupleArity: int
+
+
+@dataclass(frozen=True)
+class ExactPortalConstraintProjection:
+    """Exact supported relation retained after eliminating portal variables."""
+
+    ProjectionFingerprint: str
+    Complete: bool
+    RetainedVariables: tuple[str, str]
+    SupportedChoicePairs: tuple[tuple[str, str], ...]
+    Witnesses: tuple[
+        tuple[tuple[str, str], tuple[tuple[str, str], ...]], ...
+    ]
+    ExpansionCount: int = 0
+    FailedStateMemoHitCount: int = 0
+
+
+def ProjectExactPortalConstraintFactors(
+    Extraction: ExactPortalConstraintFactorExtraction,
+    VariableDomains: Iterable[ExactPortalConstraintVariableDomain],
+    RetainedVariables: tuple[str, str],
+    ShouldStop: Callable[[], bool] | None = None,
+) -> ExactPortalConstraintProjection:
+    """Eliminate internal variables with exact forbidden-tuple propagation."""
+    Domains = tuple(sorted(
+        VariableDomains,
+        key=lambda Value: Value.Variable,
+    ))
+    DomainChoices = {
+        Domain.Variable: tuple(sorted(
+            (Choice.ChoiceId for Choice in Domain.Choices),
+        ))
+        for Domain in Domains
+    }
+    Retained = tuple(map(str, RetainedVariables))
+    if (
+        not Extraction.Complete
+        or len(Retained) != 2
+        or Retained[0] == Retained[1]
+        or any(Variable not in DomainChoices for Variable in Retained)
+    ):
+        return ExactPortalConstraintProjection(
+            ProjectionFingerprint=BuildStableFingerprint((
+                "exact-portal-constraint-projection-incomplete-v1",
+                Extraction.DomainFingerprint,
+                Retained,
+            )),
+            Complete=False,
+            RetainedVariables=Retained,
+            SupportedChoicePairs=(),
+            Witnesses=(),
+        )
+    ForbiddenAssignments = tuple(
+        dict(Value.Assignments) for Value in Extraction.ForbiddenTuples
+    )
+    InternalVariables = tuple(
+        Variable for Variable in DomainChoices
+        if Variable not in Retained
+    )
+    Supported = []
+    Witnesses = []
+    ExpansionCount = 0
+    FailedStateMemoHitCount = 0
+    Incomplete = False
+
+    def Solve(
+        RetainedAssignment: dict[str, str],
+    ) -> dict[str, str] | None:
+        nonlocal ExpansionCount, FailedStateMemoHitCount, Incomplete
+        FailedStates = set()
+
+        def Search(
+            Assignment: dict[str, str],
+            RemainingDomains: dict[str, frozenset[str]],
+        ) -> dict[str, str] | None:
+            nonlocal ExpansionCount, FailedStateMemoHitCount, Incomplete
+            if ShouldStop is not None and ShouldStop():
+                Incomplete = True
+                return None
+            MutableAssignment = dict(Assignment)
+            MutableDomains = dict(RemainingDomains)
+            Changed = True
+            while Changed:
+                Changed = False
+                for Forbidden in ForbiddenAssignments:
+                    if any(
+                        Variable in MutableAssignment
+                        and MutableAssignment[Variable] != Choice
+                        for Variable, Choice in Forbidden.items()
+                    ):
+                        continue
+                    Pending = tuple(
+                        (Variable, Choice)
+                        for Variable, Choice in Forbidden.items()
+                        if Variable not in MutableAssignment
+                    )
+                    if not Pending:
+                        return None
+                    if len(Pending) != 1:
+                        continue
+                    Variable, Choice = Pending[0]
+                    Domain = MutableDomains.get(Variable)
+                    if Domain is None or Choice not in Domain:
+                        continue
+                    Reduced = Domain - frozenset((Choice,))
+                    if not Reduced:
+                        return None
+                    MutableDomains[Variable] = Reduced
+                    Changed = True
+                SingletonVariables = tuple(sorted(
+                    Variable for Variable, Domain in MutableDomains.items()
+                    if len(Domain) == 1
+                ))
+                for Variable in SingletonVariables:
+                    MutableAssignment[Variable] = next(iter(
+                        MutableDomains.pop(Variable)
+                    ))
+                    Changed = True
+            if not MutableDomains:
+                return MutableAssignment
+            StateKey = (
+                tuple(sorted(MutableAssignment.items())),
+                tuple(
+                    (Variable, tuple(sorted(Domain)))
+                    for Variable, Domain in sorted(MutableDomains.items())
+                ),
+            )
+            if StateKey in FailedStates:
+                FailedStateMemoHitCount += 1
+                return None
+            Variable = min(
+                MutableDomains,
+                key=lambda Value: (
+                    len(MutableDomains[Value]),
+                    Value,
+                ),
+            )
+            Domain = MutableDomains.pop(Variable)
+            for Choice in sorted(Domain):
+                ExpansionCount += 1
+                Result = Search(
+                    {**MutableAssignment, Variable: Choice},
+                    MutableDomains,
+                )
+                if Result is not None or Incomplete:
+                    return Result
+            FailedStates.add(StateKey)
+            return None
+
+        return Search(
+            RetainedAssignment,
+            {
+                Variable: frozenset(DomainChoices[Variable])
+                for Variable in InternalVariables
+            },
+        )
+
+    for FirstChoice in DomainChoices[Retained[0]]:
+        for SecondChoice in DomainChoices[Retained[1]]:
+            Witness = Solve({
+                Retained[0]: FirstChoice,
+                Retained[1]: SecondChoice,
+            })
+            if Incomplete:
+                break
+            if Witness is not None:
+                Pair = (FirstChoice, SecondChoice)
+                Supported.append(Pair)
+                Witnesses.append((Pair, tuple(sorted(Witness.items()))))
+        if Incomplete:
+            break
+    ProjectionFingerprint = BuildStableFingerprint((
+        "exact-portal-constraint-projection-v1",
+        Extraction.DomainFingerprint,
+        Retained,
+        tuple(Supported),
+        not Incomplete,
+    ))
+    return ExactPortalConstraintProjection(
+        ProjectionFingerprint=ProjectionFingerprint,
+        Complete=not Incomplete,
+        RetainedVariables=Retained,
+        SupportedChoicePairs=tuple(Supported) if not Incomplete else (),
+        Witnesses=tuple(Witnesses) if not Incomplete else (),
+        ExpansionCount=ExpansionCount,
+        FailedStateMemoHitCount=FailedStateMemoHitCount,
+    )
+
+
+def ExactPortalConstraintAssignmentSatisfiesFactors(
+    Assignment: Mapping[str, str],
+    ForbiddenTuples: Iterable[ExactPortalConstraintForbiddenTuple],
+) -> bool:
+    """Test a discrete assignment against an extracted forbidden relation."""
+    return not any(all(
+        Assignment.get(Variable) == Choice
+        for Variable, Choice in Factor.Assignments
+    ) for Factor in ForbiddenTuples)
+
+
+def ExtractExactPortalConstraintFactors(
+    VariableDomains: Iterable[ExactPortalConstraintVariableDomain],
+    ResourceGraph: Any,
+    BaseNodesBySignal: Mapping[str, Iterable[Position3]] | None = None,
+) -> ExactPortalConstraintFactorExtraction:
+    """Extract exact minimal route-claim conflicts of arity at most three.
+
+    This deliberately recomputes ``BuildRouteClaims`` over every selected
+    node union.  Componentwise claim union is not equivalent: a primitive
+    joining nodes owned by two different choices can introduce required-air
+    cells, and a third choice can conflict with that newly created air.
+
+    The implementation is a small reference compiler for tests and future
+    tree-DP integration.  It certifies completeness by comparing the emitted
+    factors with every full assignment; a domain containing a genuinely
+    higher-order conflict returns ``Complete=False`` and must not be used for
+    negative pruning.
+    """
+    Domains = tuple(sorted(
+        VariableDomains,
+        key=lambda Value: (str(Value.Variable), str(Value.Signal)),
+    ))
+    if not Domains:
+        raise ValueError("exact portal factor extraction has no variables")
+    if len({Value.Variable for Value in Domains}) != len(Domains):
+        raise ValueError("exact portal factor variables are not unique")
+    for Domain in Domains:
+        if not Domain.Choices:
+            raise ValueError(
+                f"exact portal factor variable {Domain.Variable} is empty"
+            )
+        ChoiceIds = tuple(Value.ChoiceId for Value in Domain.Choices)
+        if len(set(ChoiceIds)) != len(ChoiceIds):
+            raise ValueError(
+                f"exact portal factor choices for {Domain.Variable} "
+                "are not unique"
+            )
+    BaseNodes = {
+        str(Signal): frozenset(Nodes)
+        for Signal, Nodes in (BaseNodesBySignal or {}).items()
+    }
+    DomainByVariable = {Value.Variable: Value for Value in Domains}
+
+    def Evaluate(
+        Assignments: tuple[tuple[str, str], ...],
+    ) -> tuple[bool, frozenset[Position3]]:
+        NodesBySignal = dict(BaseNodes)
+        for Variable, ChoiceId in Assignments:
+            Domain = DomainByVariable[Variable]
+            Choice = next(
+                Value for Value in Domain.Choices
+                if Value.ChoiceId == ChoiceId
+            )
+            NodesBySignal[Domain.Signal] = frozenset((
+                *NodesBySignal.get(Domain.Signal, frozenset()),
+                *Choice.Nodes,
+            ))
+        ClaimsBySignal = {
+            Signal: ResourceGraph.BuildRouteClaims(Nodes)
+            for Signal, Nodes in NodesBySignal.items()
+        }
+        SelfConflicts = FindSelfClaimConflicts(ClaimsBySignal)
+        ForeignConflicts = FindClaimConflicts(ClaimsBySignal)
+        ConflictPositions = frozenset(
+            Resource.Position
+            for Resource in (*SelfConflicts, *ForeignConflicts)
+        )
+        return not SelfConflicts and not ForeignConflicts, ConflictPositions
+
+    BaseLegal, _BaseConflictPositions = Evaluate(())
+    if not BaseLegal:
+        raise ValueError("exact portal factor base claims are already illegal")
+    Factors = []
+    FactorAssignmentSets: list[frozenset[tuple[str, str]]] = []
+    EvaluatedPartialAssignmentCount = 0
+    for Arity in range(1, min(3, len(Domains)) + 1):
+        for SelectedDomains in combinations(Domains, Arity):
+            for Choices in product(*(
+                tuple(sorted(
+                    Domain.Choices,
+                    key=lambda Value: Value.ChoiceId,
+                ))
+                for Domain in SelectedDomains
+            )):
+                Assignments = tuple(sorted(
+                    (
+                        Domain.Variable,
+                        Choice.ChoiceId,
+                    )
+                    for Domain, Choice in zip(SelectedDomains, Choices)
+                ))
+                AssignmentSet = frozenset(Assignments)
+                if any(
+                    Existing <= AssignmentSet
+                    for Existing in FactorAssignmentSets
+                ):
+                    continue
+                EvaluatedPartialAssignmentCount += 1
+                Legal, ConflictPositions = Evaluate(Assignments)
+                if Legal:
+                    continue
+                Factors.append(ExactPortalConstraintForbiddenTuple(
+                    Assignments=Assignments,
+                    ConflictPositions=ConflictPositions,
+                ))
+                FactorAssignmentSets.append(AssignmentSet)
+    Factors = sorted(
+        Factors,
+        key=lambda Value: (len(Value.Assignments), Value.Assignments),
+    )
+    Complete = True
+    EvaluatedFullAssignmentCount = 0
+    for Choices in product(*(
+        tuple(sorted(
+            Domain.Choices,
+            key=lambda Value: Value.ChoiceId,
+        ))
+        for Domain in Domains
+    )):
+        Assignment = {
+            Domain.Variable: Choice.ChoiceId
+            for Domain, Choice in zip(Domains, Choices)
+        }
+        OrderedAssignment = tuple(sorted(Assignment.items()))
+        ExactLegal, _ConflictPositions = Evaluate(OrderedAssignment)
+        FactorLegal = ExactPortalConstraintAssignmentSatisfiesFactors(
+            Assignment,
+            Factors,
+        )
+        EvaluatedFullAssignmentCount += 1
+        if ExactLegal != FactorLegal:
+            Complete = False
+    DomainFingerprint = BuildStableFingerprint((
+        "exact-portal-constraint-factors-v1",
+        tuple(sorted(
+            (Signal, tuple(sorted(Nodes)))
+            for Signal, Nodes in BaseNodes.items()
+        )),
+        tuple(
+            (
+                Domain.Variable,
+                Domain.Signal,
+                tuple(
+                    (Choice.ChoiceId, tuple(sorted(Choice.Nodes)))
+                    for Choice in sorted(
+                        Domain.Choices,
+                        key=lambda Value: Value.ChoiceId,
+                    )
+                ),
+            )
+            for Domain in Domains
+        ),
+        tuple(
+            (Value.Assignments, tuple(sorted(Value.ConflictPositions)))
+            for Value in Factors
+        ),
+        Complete,
+    ))
+    return ExactPortalConstraintFactorExtraction(
+        DomainFingerprint=DomainFingerprint,
+        Complete=Complete,
+        Variables=tuple(Value.Variable for Value in Domains),
+        ForbiddenTuples=tuple(Factors),
+        EvaluatedPartialAssignmentCount=EvaluatedPartialAssignmentCount,
+        EvaluatedFullAssignmentCount=EvaluatedFullAssignmentCount,
+        MaximumForbiddenTupleArity=max(
+            (len(Value.Assignments) for Value in Factors),
+            default=0,
+        ),
+    )
+
+
+def ExtractSparseExactPortalConstraintFactors(
+    VariableDomains: Iterable[ExactPortalConstraintVariableDomain],
+    ResourceGraph: RoutingResourceGraph,
+    BaseNodesBySignal: Mapping[str, Iterable[Position3]] | None = None,
+    FrozenComponentClaims: Iterable[LocalRouteClaim] = (),
+) -> ExactPortalConstraintFactorExtraction:
+    """Analytically extract the exact sparse arity-three claim relation.
+
+    Wire, support, and electrical ownership is unary.  Required-air ownership
+    is activated by a legal primitive edge and therefore has at most two
+    endpoint owners.  Every routing conflict compares two such resources, one
+    side of which is always unary, so every minimal forbidden assignment has
+    arity at most three.  This production form indexes those conditional
+    resource owners directly and never enumerates the full assignment domain.
+    """
+    if not isinstance(ResourceGraph, RoutingResourceGraph):
+        raise TypeError(
+            "sparse exact portal factors require RoutingResourceGraph"
+        )
+    Domains = tuple(sorted(
+        VariableDomains,
+        key=lambda Value: (str(Value.Variable), str(Value.Signal)),
+    ))
+    if not Domains:
+        raise ValueError("sparse exact portal factor extraction has no variables")
+    if len({Value.Variable for Value in Domains}) != len(Domains):
+        raise ValueError("sparse exact portal factor variables are not unique")
+    for Domain in Domains:
+        if not Domain.Choices:
+            raise ValueError(
+                f"sparse exact portal factor variable {Domain.Variable} is empty"
+            )
+        if len({Value.ChoiceId for Value in Domain.Choices}) != len(
+            Domain.Choices
+        ):
+            raise ValueError(
+                f"sparse exact portal factor choices for {Domain.Variable} "
+                "are not unique"
+            )
+    BaseNodes = {
+        str(Signal): frozenset(Nodes)
+        for Signal, Nodes in (BaseNodesBySignal or {}).items()
+    }
+    Assignment = tuple[str, str]
+    Term = frozenset[Assignment]
+    ResourceTerms: dict[
+        tuple[str, str, Position3], set[Term]
+    ] = defaultdict(set)
+    NodeTerms: dict[
+        str, dict[Position3, set[Term]]
+    ] = defaultdict(lambda: defaultdict(set))
+
+    def TermsAreCompatible(Values: Iterable[Assignment]) -> bool:
+        Selected = {}
+        for Variable, Choice in Values:
+            Prior = Selected.get(Variable)
+            if Prior is not None and Prior != Choice:
+                return False
+            Selected[Variable] = Choice
+        return True
+
+    def AddUnaryClaims(
+        Signal: str,
+        Nodes: Iterable[Position3],
+        Owner: Term,
+    ) -> None:
+        for Node in frozenset(Nodes):
+            NodeTerms[Signal][Node].add(Owner)
+            ResourceTerms[(Signal, "Wire", Node)].add(Owner)
+            ResourceTerms[(
+                Signal,
+                "Support",
+                (Node[0], Node[1] - 1, Node[2]),
+            )].add(Owner)
+            ResourceTerms[(Signal, "Electrical", Node)].add(Owner)
+            for Neighbor in ResourceGraph.Technology.NeighborPositions(Node):
+                ResourceTerms[(
+                    Signal,
+                    "Electrical",
+                    Neighbor,
+                )].add(Owner)
+
+    for Signal, Nodes in BaseNodes.items():
+        AddUnaryClaims(Signal, Nodes, frozenset())
+    for Domain in Domains:
+        for Choice in Domain.Choices:
+            AddUnaryClaims(
+                Domain.Signal,
+                Choice.Nodes,
+                frozenset(((Domain.Variable, Choice.ChoiceId),)),
+            )
+
+    # Required-air claims are conditional on both primitive endpoints being
+    # selected.  Endpoint terms may be fixed, unary, or the same choice.
+    for Signal, OwnersByNode in NodeTerms.items():
+        Nodes = frozenset(OwnersByNode)
+        for First in sorted(Nodes):
+            for Second in ResourceGraph.Technology.NeighborPositions(First):
+                if Second not in Nodes or Second <= First:
+                    continue
+                Primitive = ResourceGraph.BuildPrimitive(First, Second)
+                if Primitive is None:
+                    continue
+                for FirstTerm in OwnersByNode[First]:
+                    for SecondTerm in OwnersByNode[Second]:
+                        Combined = frozenset((*FirstTerm, *SecondTerm))
+                        if not TermsAreCompatible(Combined):
+                            continue
+                        for Position in Primitive.Claims.RequiredAirCells:
+                            ResourceTerms[(
+                                Signal,
+                                "Air",
+                                Position,
+                            )].add(Combined)
+
+    ConflictsByAssignments: dict[
+        frozenset[Assignment], set[Position3]
+    ] = defaultdict(set)
+    DependenciesByAssignments: dict[
+        frozenset[Assignment], set[str]
+    ] = defaultdict(set)
+    LocalConflictAssignments: set[frozenset[Assignment]] = set()
+
+    def AddResourceConflicts(
+        FirstSignal: str,
+        FirstKind: str,
+        SecondSignal: str,
+        SecondKind: str,
+    ) -> None:
+        FirstByPosition = {
+            Position: Terms
+            for (Signal, Kind, Position), Terms in ResourceTerms.items()
+            if Signal == FirstSignal and Kind == FirstKind
+        }
+        SecondByPosition = {
+            Position: Terms
+            for (Signal, Kind, Position), Terms in ResourceTerms.items()
+            if Signal == SecondSignal and Kind == SecondKind
+        }
+        for Position in FirstByPosition.keys() & SecondByPosition.keys():
+            for FirstTerm in FirstByPosition[Position]:
+                for SecondTerm in SecondByPosition[Position]:
+                    Combined = frozenset((*FirstTerm, *SecondTerm))
+                    if (
+                        len(Combined) <= 3
+                        and TermsAreCompatible(Combined)
+                    ):
+                        ConflictsByAssignments[Combined].add(Position)
+                        LocalConflictAssignments.add(Combined)
+
+    Signals = tuple(sorted({
+        *BaseNodes,
+        *(Domain.Signal for Domain in Domains),
+    }))
+    for Signal in Signals:
+        AddResourceConflicts(Signal, "Air", Signal, "Wire")
+        AddResourceConflicts(Signal, "Support", Signal, "Wire")
+        AddResourceConflicts(Signal, "Support", Signal, "Air")
+    for SignalIndex, FirstSignal in enumerate(Signals):
+        for SecondSignal in Signals[SignalIndex + 1:]:
+            AddResourceConflicts(
+                FirstSignal, "Wire", SecondSignal, "Electrical"
+            )
+            AddResourceConflicts(
+                SecondSignal, "Wire", FirstSignal, "Electrical"
+            )
+            AddResourceConflicts(
+                FirstSignal, "Support", SecondSignal, "Wire"
+            )
+            AddResourceConflicts(
+                FirstSignal, "Support", SecondSignal, "Air"
+            )
+            AddResourceConflicts(
+                SecondSignal, "Support", FirstSignal, "Wire"
+            )
+            AddResourceConflicts(
+                SecondSignal, "Support", FirstSignal, "Air"
+            )
+            AddResourceConflicts(
+                FirstSignal, "Air", SecondSignal, "Wire"
+            )
+            AddResourceConflicts(
+                SecondSignal, "Air", FirstSignal, "Wire"
+            )
+    FrozenClaims = tuple(FrozenComponentClaims)
+    for (Signal, Kind, Position), Terms in ResourceTerms.items():
+        for Claim in FrozenClaims:
+            if Claim.Signal == Signal:
+                continue
+            Frozen = Claim.Claims
+            Conflicts = bool(
+                (Kind == "Wire" and Position in (
+                    Frozen.WireCells
+                    | Frozen.SupportCells
+                    | Frozen.RequiredAirCells
+                    | Frozen.ElectricalCells
+                ))
+                or (Kind == "Support" and Position in (
+                    Frozen.WireCells | Frozen.RequiredAirCells
+                ))
+                or (Kind == "Air" and Position in (
+                    Frozen.WireCells | Frozen.SupportCells
+                ))
+                or (Kind == "Electrical" and Position in Frozen.WireCells)
+            )
+            if not Conflicts:
+                continue
+            for TermValue in Terms:
+                ConflictsByAssignments[TermValue].add(Position)
+                DependenciesByAssignments[TermValue].add(str(Claim.Signal))
+    if frozenset() in ConflictsByAssignments:
+        if not DependenciesByAssignments.get(frozenset()):
+            raise ValueError(
+                "sparse exact portal factor base claims are already illegal"
+            )
+    LocalMinimalAssignments = []
+    ForeignMinimalAssignments = []
+    for Values in sorted(
+        ConflictsByAssignments,
+        key=lambda Value: (len(Value), tuple(sorted(Value))),
+    ):
+        Dependencies = DependenciesByAssignments.get(Values, set())
+        if Values in LocalConflictAssignments:
+            if any(Prior <= Values for Prior in LocalMinimalAssignments):
+                continue
+            LocalMinimalAssignments.append(Values)
+            continue
+        if any(Prior <= Values for Prior in LocalMinimalAssignments):
+            continue
+        if any(Prior <= Values for Prior in ForeignMinimalAssignments):
+            continue
+        ForeignMinimalAssignments.append(Values)
+    Factors = tuple(sorted((
+        ExactPortalConstraintForbiddenTuple(
+            Assignments=tuple(sorted(Values)),
+            ConflictPositions=frozenset(ConflictsByAssignments[Values]),
+            DependencySignals=tuple(sorted(
+                DependenciesByAssignments.get(Values, set())
+            )),
+        )
+        for Values in (
+            *LocalMinimalAssignments,
+            *ForeignMinimalAssignments,
+        )
+    ), key=lambda Value: (
+        len(Value.Assignments),
+        Value.Assignments,
+        Value.DependencySignals,
+    )))
+    DomainFingerprint = BuildStableFingerprint((
+        "sparse-exact-portal-constraint-factors-v1",
+        tuple(sorted(
+            (Signal, tuple(sorted(Nodes)))
+            for Signal, Nodes in BaseNodes.items()
+        )),
+        tuple(
+            (
+                Domain.Variable,
+                Domain.Signal,
+                tuple(
+                    (Choice.ChoiceId, tuple(sorted(Choice.Nodes)))
+                    for Choice in sorted(
+                        Domain.Choices,
+                        key=lambda Value: Value.ChoiceId,
+                    )
+                ),
+            )
+            for Domain in Domains
+        ),
+        tuple(
+            (
+                Value.Assignments,
+                tuple(sorted(Value.ConflictPositions)),
+                Value.DependencySignals,
+            )
+            for Value in Factors
+        ),
+    ))
+    return ExactPortalConstraintFactorExtraction(
+        DomainFingerprint=DomainFingerprint,
+        Complete=True,
+        Variables=tuple(Value.Variable for Value in Domains),
+        ForbiddenTuples=Factors,
+        EvaluatedPartialAssignmentCount=0,
+        EvaluatedFullAssignmentCount=0,
+        MaximumForbiddenTupleArity=max(
+            (len(Value.Assignments) for Value in Factors),
+            default=0,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class MandatoryPortalFactorClaimState:
+    """One unique self-legal aggregate claim state for an aperture factor."""
+
+    StateFingerprint: str
+    PortalIds: tuple[str, ...]
+    Claims: Any = field(compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class MandatoryPortalFactorFeasibilityCertificate:
+    """Complete quotient of one aperture factor's internal portal choices."""
+
+    FactorDomainFingerprint: str
+    Signal: str
+    Complete: bool
+    StateDomainFingerprint: str = ""
+    States: tuple[MandatoryPortalFactorClaimState, ...] = ()
+    ConflictPositions: frozenset[Position3] = frozenset()
+    DependencySignals: tuple[str, ...] = ()
+    ExpansionCount: int = 0
+    MemoizedStateHitCount: int = 0
+
+
+@dataclass(frozen=True)
+class PhysicalBoundaryMandatoryPortalFactorDomain:
+    """Complete mandatory portal factors for one prepared aperture option."""
+
+    DomainFingerprint: str
+    PreparedDomainFingerprint: str
+    PlacementFingerprint: str
+    ComponentGraphFingerprint: str
+    ResourceGraphFingerprint: str
+    TechnologyFingerprint: str
+    GuideFingerprint: str
+    ExteriorFabricSetFingerprint: str
+    ExteriorRegionFingerprint: str
+    Signal: str
+    ApertureOptionFingerprint: str
+    ApertureContractFingerprint: str
+    GlobalContractFingerprint: str
+    ChannelContractFingerprint: str
+    ChannelLayer: int
+    FixedAccessNodes: frozenset[Position3]
+    CommonFixedAccessNodes: frozenset[Position3]
+    OptionOverlayNodes: frozenset[Position3]
+    OptionOverlayPortalDomainIndex: int
+    PortalDomains: tuple[tuple[PinAccessPortal, ...], ...]
+    GenericPortalDomainFingerprint: str
+    PortalRequestDomainFingerprint: str
+    PortalGuideInputFingerprint: str
+    FrozenComponentClaimsFingerprint: str
+    FrozenComponentClaims: tuple[LocalRouteClaim, ...] = field(
+        compare=False,
+        repr=False,
+    )
+    Complete: bool = False
+
+
+@dataclass(frozen=True)
+class PhysicalBoundaryMandatoryPortalPairOptionCertificate:
+    """One exact aperture-pair binding and its portal feasibility proof."""
+
+    FirstApertureContractFingerprint: str
+    SecondApertureContractFingerprint: str
+    Certificate: MandatoryPortalPairFeasibilityCertificate
+
+
+@dataclass(frozen=True)
+class PhysicalBoundaryMandatoryPortalPairRelation:
+    """Complete aperture cross-product relation for one signal pair."""
+
+    RelationFingerprint: str
+    PreparedDomainFingerprint: str
+    Signals: tuple[str, str]
+    OptionDomainFingerprintsBySignal: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    ExpectedOptionPairCount: int
+    Certificates: tuple[
+        PhysicalBoundaryMandatoryPortalPairOptionCertificate, ...
+    ]
+    UnsatisfiableApertureClauses: tuple[
+        frozenset[tuple[str, str]], ...
+    ]
+    Complete: bool
+    ForeignDependencyCertificateCount: int = 0
+    FactorCertificateCount: int = 0
+    FactorStateCount: int = 0
+    UniqueClaimStateCountsBySignal: tuple[tuple[str, int], ...] = ()
+    FactorExpansionCount: int = 0
+    CompatibilityIndexStatePairUpperBound: int = 0
+
+
+@dataclass(frozen=True)
+class PhysicalBoundaryMandatoryPortalPairStateIndex:
+    """Frozen exact claim compatibility shared by relation work slices."""
+
+    IndexFingerprint: str
+    RelationFingerprint: str
+    FactorStateDomainFingerprints: tuple[tuple[str, str], ...]
+    FactorCertificates: tuple[
+        MandatoryPortalFactorFeasibilityCertificate, ...
+    ] = field(
+        compare=False,
+        repr=False,
+    )
+    FirstStates: tuple[MandatoryPortalFactorClaimState, ...] = field(
+        compare=False,
+        repr=False,
+    )
+    SecondStates: tuple[MandatoryPortalFactorClaimState, ...] = field(
+        compare=False,
+        repr=False,
+    )
+    CompatibleSecondMasksByFirstState: tuple[tuple[str, int], ...] = field(
+        compare=False,
+        repr=False,
+    )
+    SecondMasksByFactorFingerprint: tuple[tuple[str, int], ...] = field(
+        compare=False,
+        repr=False,
+    )
+
+
+def BuildPhysicalBoundaryMandatoryPortalFactorDomains(
+    Preparation: PreparedPhysicalComponentPortFactorDomain,
+    Profiles: Mapping[str, Any],
+    RawPortalCache: RawPortalGeometryCache,
+    ResourceGraph: Any,
+    FrozenComponentClaims: Iterable[LocalRouteClaim] = (),
+) -> tuple[PhysicalBoundaryMandatoryPortalFactorDomain, ...]:
+    """Bind complete raw portal factors to every prepared aperture option.
+
+    This is a projection of the authoritative portal generator's completed
+    raw domain.  It does not generate routes or infer negative reachability.
+    Each component attachment is replaced by the same exact singleton portal
+    that a materialized assembly plan would inject later.
+    """
+    RawPortals = RawPortalCache.BuildPortalDictionary()
+    CompletePortalKeys = frozenset(
+        RawPortalCache.CompletePortalDomainKeys
+    )
+    RequestFingerprints = dict(
+        RawPortalCache.PortalRequestDomainFingerprints
+    )
+    ChannelsBySignal = {
+        Value.Signal: Value for Value in Preparation.ChannelReservations
+    }
+    AperturesBySignal = {
+        str(Signal): tuple(Values)
+        for Signal, Values in Preparation.ApertureFactorsBySignal
+    }
+    BoundariesBySignal = {
+        str(Signal): tuple(Values)
+        for Signal, Values in Preparation.BoundaryPortReservationsBySignal
+    }
+    FrozenClaims = tuple(FrozenComponentClaims)
+    FrozenClaimsFingerprint = BuildStableFingerprint((
+        "physical-boundary-mandatory-frozen-claims-v1",
+        tuple(sorted(
+            (
+                str(Claim.Signal),
+                tuple(sorted(map(str, Claim.Claims.ResourceIds))),
+            )
+            for Claim in FrozenClaims
+        )),
+    ))
+    TechnologyFingerprint = str(getattr(
+        Preparation.AccessCertificate,
+        "TechnologyFingerprint",
+        "",
+    )) or BuildStableFingerprint(repr(getattr(
+        ResourceGraph,
+        "Technology",
+        None,
+    )))
+    OwnedTerminalsBySignal: dict[str, frozenset[Position3]] = {}
+    for OwnedDomain in Preparation.Problem.OwnedTerminalDomains:
+        OwnedTerminalsBySignal[OwnedDomain.Signal] = frozenset((
+            *OwnedTerminalsBySignal.get(
+                OwnedDomain.Signal,
+                frozenset(),
+            ),
+            OwnedDomain.Terminal,
+        ))
+    GenericPortalDomainCache: dict[
+        tuple[str, Position3, int],
+        tuple[tuple[PinAccessPortal, ...], str],
+    ] = {}
+
+    def SelectGenericPortalDomain(
+        Signal: str,
+        Terminal: Position3,
+        ChannelLayer: int,
+    ) -> tuple[tuple[PinAccessPortal, ...], str]:
+        """Reuse one immutable raw portal factor across aperture options."""
+        Key = (Signal, Terminal, ChannelLayer)
+        Cached = GenericPortalDomainCache.get(Key)
+        if Cached is not None:
+            return Cached
+        ValuesById = {
+            Portal.PortalId: Portal
+            for Layer in range(RawPortalCache.LayerCount)
+            for Portal in RawPortals.get(
+                (Signal, Terminal, Layer),
+                (),
+            )
+        }
+        Values = tuple(sorted(
+            ValuesById.values(),
+            key=lambda Portal: (
+                abs(int(Portal.Layer) - ChannelLayer),
+                int(Portal.Cost),
+                int(Portal.Layer),
+                str(Portal.PortalId),
+            ),
+        ))
+        Fingerprint = BuildStableFingerprint((
+            "physical-boundary-generic-portal-domain-v1",
+            Signal,
+            Terminal,
+            ChannelLayer,
+            tuple(
+                (
+                    Portal.PortalId,
+                    tuple(Portal.Path),
+                    tuple(sorted(map(
+                        str,
+                        Portal.Claims.ResourceIds,
+                    ))),
+                )
+                for Portal in Values
+            ),
+        ))
+        Result = (Values, Fingerprint)
+        GenericPortalDomainCache[Key] = Result
+        return Result
+
+    Domains = []
+    for Signal in sorted(BoundariesBySignal):
+        Profile = Profiles.get(Signal)
+        Channel = ChannelsBySignal.get(Signal)
+        if Profile is None or Channel is None:
+            continue
+        ChannelLayer = int(Channel.Layer)
+        ApertureByContract = {
+            str(Value.ApertureContractFingerprint): Value
+            for Value in AperturesBySignal.get(Signal, ())
+        }
+        for Boundary in sorted(
+            BoundariesBySignal[Signal],
+            key=lambda Value: (
+                str(Value.ApertureContractFingerprint),
+                str(Value.GlobalContractFingerprint),
+                tuple(Value.Attachment),
+            ),
+        ):
+            Aperture = ApertureByContract.get(
+                str(Boundary.ApertureContractFingerprint)
+            )
+            if Aperture is None:
+                continue
+            ProjectedProfile = ProjectPhysicalComponentSignalGlobalProfile(
+                Profile,
+                OwnedTerminalsBySignal.get(Signal, frozenset()),
+                Boundary,
+            )
+            if ProjectedProfile is None:
+                continue
+            Terminals = (
+                ProjectedProfile.Root,
+                *ProjectedProfile.Targets,
+            )
+            FixedAccessNodes = frozenset(
+                Position
+                for Path in (
+                    ProjectedProfile.SourceAccessPath,
+                    *(
+                        ProjectedProfile.TargetAccessPaths[Target]
+                        for Target in ProjectedProfile.Targets
+                    ),
+                )
+                for Position in Path
+            )
+            RootIsCovered = Profile.Root in OwnedTerminalsBySignal.get(
+                Signal,
+                frozenset(),
+            )
+            OutsideTargets = tuple(
+                Target for Target in Profile.Targets
+                if Target not in OwnedTerminalsBySignal.get(
+                    Signal,
+                    frozenset(),
+                )
+            )
+            CommonFixedAccessNodes = frozenset(
+                Position
+                for Path in (
+                    *(
+                        ()
+                        if RootIsCovered
+                        else (tuple(Profile.SourceAccessPath),)
+                    ),
+                    *(
+                        tuple(Profile.TargetAccessPaths[Target])
+                        for Target in OutsideTargets
+                    ),
+                )
+                for Position in Path
+            )
+            ExactPath = tuple(Boundary.GlobalPath)
+            ExactPortal = PinAccessPortal(
+                PortalId=BuildPhysicalComponentGlobalPortalId(
+                    Boundary,
+                    ChannelLayer,
+                ),
+                Signal=Signal,
+                Terminal=Boundary.Attachment,
+                Layer=ChannelLayer,
+                Path=ExactPath,
+                Edges=frozenset(
+                    NormalizeRoutingEdge(First, Second)
+                    for First, Second in zip(
+                        ExactPath,
+                        ExactPath[1:],
+                    )
+                ),
+                Claims=ResourceGraph.BuildRouteClaims(ExactPath),
+                Length=len(ExactPath),
+                BendCount=_CountBends(ExactPath),
+                ViaCount=sum(
+                    First[1] != Second[1]
+                    for First, Second in zip(
+                        ExactPath,
+                        ExactPath[1:],
+                    )
+                ),
+                Cost=len(ExactPath),
+            )
+            # Replace the matching synthesized terminal with the immutable
+            # component seam.  The authoritative handoff validator requires
+            # every attachment to be one of the profile's root/targets; an
+            # absent attachment therefore makes this proof domain incomplete.
+            PortalDomains = []
+            PortalDomainFingerprints = []
+            OptionOverlayPortalDomainIndex = -1
+            ExpectedGenericKeys = set()
+            for Terminal in Terminals:
+                if Terminal == Boundary.Attachment:
+                    OptionOverlayPortalDomainIndex = len(PortalDomains)
+                    PortalDomains.append((ExactPortal,))
+                    PortalDomainFingerprints.append(
+                        BuildStableFingerprint((
+                            "physical-boundary-exact-portal-domain-v1",
+                            ExactPortal.PortalId,
+                            tuple(ExactPortal.Path),
+                            tuple(sorted(map(
+                                str,
+                                ExactPortal.Claims.ResourceIds,
+                            ))),
+                        ))
+                    )
+                    continue
+                ExpectedGenericKeys.update(
+                    (Signal, Terminal, Layer)
+                    for Layer in range(RawPortalCache.LayerCount)
+                )
+                Values, Fingerprint = SelectGenericPortalDomain(
+                    Signal,
+                    Terminal,
+                    ChannelLayer,
+                )
+                PortalDomains.append(Values)
+                PortalDomainFingerprints.append(Fingerprint)
+            GenericPortalDomainFingerprint = BuildStableFingerprint((
+                "physical-boundary-generic-portal-domains-v1",
+                Signal,
+                ChannelLayer,
+                tuple(sorted(CommonFixedAccessNodes)),
+                tuple(
+                    Fingerprint
+                    for Index, Fingerprint
+                    in enumerate(PortalDomainFingerprints)
+                    if Index != OptionOverlayPortalDomainIndex
+                ),
+                FrozenClaimsFingerprint,
+                Preparation.ResourceGraphFingerprint,
+                TechnologyFingerprint,
+            ))
+            RequestFingerprint = str(
+                RequestFingerprints.get(Signal, "")
+            )
+            Complete = bool(
+                not RawPortalCache.RetainedPortfolioSliceLimited
+                and RequestFingerprint
+                and RawPortalCache.GuideInputFingerprint
+                and RawPortalCache.ExteriorRegionFingerprint
+                == Preparation.ExteriorRegionFingerprint
+                and RawPortalCache.AuthoritativeResourceGraphFingerprint
+                == Preparation.ResourceGraphFingerprint
+                and ExpectedGenericKeys <= CompletePortalKeys
+                and ExactPath
+                and ExactPath[0] == Boundary.Attachment
+                and Boundary.Attachment in frozenset(Terminals)
+                and 0 <= ChannelLayer < int(RawPortalCache.LayerCount)
+            )
+            DomainFingerprint = BuildStableFingerprint((
+                "physical-boundary-mandatory-portal-factor-v1",
+                Preparation.DomainFingerprint,
+                Preparation.PlacementFingerprint,
+                Preparation.ComponentGraphFingerprint,
+                Preparation.ResourceGraphFingerprint,
+                TechnologyFingerprint,
+                Preparation.GuideFingerprint,
+                Preparation.ExteriorFabricSetFingerprint,
+                Preparation.ExteriorRegionFingerprint,
+                Signal,
+                str(Aperture.ApertureOptionFingerprint),
+                str(Boundary.ApertureContractFingerprint),
+                str(Boundary.GlobalContractFingerprint),
+                str(Boundary.ChannelContractFingerprint),
+                ChannelLayer,
+                tuple(sorted(FixedAccessNodes)),
+                tuple(sorted(CommonFixedAccessNodes)),
+                tuple(sorted(ExactPath)),
+                OptionOverlayPortalDomainIndex,
+                tuple(PortalDomainFingerprints),
+                GenericPortalDomainFingerprint,
+                RequestFingerprint,
+                str(RawPortalCache.GuideInputFingerprint),
+                FrozenClaimsFingerprint,
+                Complete,
+            ))
+            Domains.append(PhysicalBoundaryMandatoryPortalFactorDomain(
+                DomainFingerprint=DomainFingerprint,
+                PreparedDomainFingerprint=Preparation.DomainFingerprint,
+                PlacementFingerprint=Preparation.PlacementFingerprint,
+                ComponentGraphFingerprint=(
+                    Preparation.ComponentGraphFingerprint
+                ),
+                ResourceGraphFingerprint=(
+                    Preparation.ResourceGraphFingerprint
+                ),
+                TechnologyFingerprint=TechnologyFingerprint,
+                GuideFingerprint=Preparation.GuideFingerprint,
+                ExteriorFabricSetFingerprint=(
+                    Preparation.ExteriorFabricSetFingerprint
+                ),
+                ExteriorRegionFingerprint=(
+                    Preparation.ExteriorRegionFingerprint
+                ),
+                Signal=Signal,
+                ApertureOptionFingerprint=str(
+                    Aperture.ApertureOptionFingerprint
+                ),
+                ApertureContractFingerprint=str(
+                    Boundary.ApertureContractFingerprint
+                ),
+                GlobalContractFingerprint=str(
+                    Boundary.GlobalContractFingerprint
+                ),
+                ChannelContractFingerprint=str(
+                    Boundary.ChannelContractFingerprint
+                ),
+                ChannelLayer=ChannelLayer,
+                FixedAccessNodes=FixedAccessNodes,
+                CommonFixedAccessNodes=CommonFixedAccessNodes,
+                OptionOverlayNodes=frozenset(ExactPath),
+                OptionOverlayPortalDomainIndex=(
+                    OptionOverlayPortalDomainIndex
+                ),
+                PortalDomains=tuple(PortalDomains),
+                GenericPortalDomainFingerprint=(
+                    GenericPortalDomainFingerprint
+                ),
+                PortalRequestDomainFingerprint=RequestFingerprint,
+                PortalGuideInputFingerprint=str(
+                    RawPortalCache.GuideInputFingerprint
+                ),
+                FrozenComponentClaimsFingerprint=(
+                    FrozenClaimsFingerprint
+                ),
+                FrozenComponentClaims=FrozenClaims,
+                Complete=Complete,
+            ))
+    return tuple(sorted(
+        Domains,
+        key=lambda Value: (
+            Value.Signal,
+            Value.ApertureContractFingerprint,
+            Value.DomainFingerprint,
+        ),
+    ))
+
+
+def PublishPhysicalBoundaryMandatoryPortalFactorDomains(
+    Resources: RoutingResources,
+    Domains: Iterable[PhysicalBoundaryMandatoryPortalFactorDomain],
+) -> dict[str, object]:
+    """Publish exact aperture factors, retaining completeness explicitly."""
+    Values = tuple(Domains)
+    for Value in Values:
+        Resources.PhysicalBoundaryMandatoryPortalFactorDomainCache[(
+            Value.PreparedDomainFingerprint,
+            Value.Signal,
+            Value.ApertureContractFingerprint,
+        )] = Value
+    return {
+        "FactorDomainCount": len(Values),
+        "CompleteFactorDomainCount": sum(
+            int(Value.Complete) for Value in Values
+        ),
+        "SignalCount": len({Value.Signal for Value in Values}),
+    }
+
+
+def _BuildMandatoryPortalFactorClaimStateFingerprint(
+    Signal: str,
+    Claims: RoutingResourceClaims,
+) -> str:
+    """Identify an aggregate claim state independently of its witness path."""
+    return BuildStableFingerprint((
+        "mandatory-portal-factor-claim-state-v1",
+        Signal,
+        tuple(sorted(map(str, Claims.ResourceIds))),
+    ))
+
+
+def CompileMandatoryPortalFactorFeasibility(
+    Factor: PhysicalBoundaryMandatoryPortalFactorDomain,
+    ResourceGraph: Any,
+    ShouldStop: Callable[[], bool] | None = None,
+    SharedCache: dict[str, Any] | None = None,
+) -> MandatoryPortalFactorFeasibilityCertificate:
+    """Compile a seam over one shared, dominance-compressed generic frontier.
+
+    ``RoutingResourceGraph.BuildRouteClaims`` is monotone under node union:
+    wire, support, electrical, and primitive-air sets can only grow.  Thus a
+    state whose four claim sets are componentwise supersets of another state
+    at the same terminal prefix can never enable an external compatibility
+    that the subset state cannot.  Retaining the subset is an exact
+    existential quotient, including air created by cross-portal adjacency.
+    """
+    Signal = str(Factor.Signal)
+
+    def BuildStateDomainFingerprint(
+        States: Iterable[MandatoryPortalFactorClaimState],
+    ) -> str:
+        return BuildStableFingerprint((
+            "mandatory-portal-factor-state-domain-v1",
+            Factor.DomainFingerprint,
+            tuple(State.StateFingerprint for State in States),
+        ))
+
+    Variables = tuple(sorted(
+        (
+            len(Domain),
+            DomainIndex,
+            tuple(sorted(Domain, key=lambda Value: Value.PortalId)),
+        )
+        for DomainIndex, Domain in enumerate(Factor.PortalDomains)
+    ))
+    if not Factor.Complete or not Variables or any(
+        not Domain for _Size, _Index, Domain in Variables
+    ):
+        return MandatoryPortalFactorFeasibilityCertificate(
+            FactorDomainFingerprint=Factor.DomainFingerprint,
+            Signal=Signal,
+            Complete=bool(Factor.Complete),
+            StateDomainFingerprint=(
+                BuildStateDomainFingerprint(())
+                if Factor.Complete
+                else ""
+            ),
+            DependencySignals=(Signal,),
+        )
+    ExactVariables = tuple(
+        Value for Value in Variables
+        if Value[1] == Factor.OptionOverlayPortalDomainIndex
+    )
+    if len(ExactVariables) != 1:
+        return MandatoryPortalFactorFeasibilityCertificate(
+            FactorDomainFingerprint=Factor.DomainFingerprint,
+            Signal=Signal,
+            Complete=False,
+            DependencySignals=(Signal,),
+        )
+    ExactVariable = ExactVariables[0]
+    GenericVariables = tuple(
+        Value for Value in Variables if Value is not ExactVariable
+    )
+    InitialNodes = frozenset(Factor.CommonFixedAccessNodes)
+    InitialClaims = ResourceGraph.BuildRouteClaims(InitialNodes)
+    InitialSelfConflicts = FindSelfClaimConflicts({Signal: InitialClaims})
+    if InitialSelfConflicts:
+        return MandatoryPortalFactorFeasibilityCertificate(
+            FactorDomainFingerprint=Factor.DomainFingerprint,
+            Signal=Signal,
+            Complete=True,
+            StateDomainFingerprint=BuildStateDomainFingerprint(()),
+            ConflictPositions=frozenset(
+                Resource.Position for Resource in InitialSelfConflicts
+            ),
+            DependencySignals=(Signal,),
+        )
+    GenericDomainFingerprint = Factor.GenericPortalDomainFingerprint
+    CachedGeneric = (
+        SharedCache.get("generic:" + GenericDomainFingerprint)
+        if SharedCache is not None
+        else None
+    )
+    ConflictPositions: set[Position3] = set()
+    DependencySignals = {Signal}
+    ExpansionCount = 0
+    MemoizedStateHitCount = 0
+    Incomplete = False
+    if CachedGeneric is not None:
+        GenericStates = CachedGeneric
+    else:
+        # (nodes, portal ids by original domain index, exact claims)
+        Frontier = ((InitialNodes, {}, InitialClaims),)
+
+        def ClaimsSubset(
+            FirstClaims: RoutingResourceClaims,
+            SecondClaims: RoutingResourceClaims,
+        ) -> bool:
+            return bool(
+                FirstClaims.WireCells <= SecondClaims.WireCells
+                and FirstClaims.SupportCells <= SecondClaims.SupportCells
+                and FirstClaims.RequiredAirCells
+                <= SecondClaims.RequiredAirCells
+                and FirstClaims.ElectricalCells
+                <= SecondClaims.ElectricalCells
+            )
+
+        UseDominance = isinstance(ResourceGraph, RoutingResourceGraph)
+        for _Size, DomainIndex, Domain in GenericVariables:
+            NextByNodes = {}
+            for Nodes, PortalIds, _Claims in Frontier:
+                for Portal in Domain:
+                    if ShouldStop is not None and ShouldStop():
+                        Incomplete = True
+                        break
+                    ExpansionCount += 1
+                    CandidateNodes = frozenset((*Nodes, *Portal.Path))
+                    CandidateClaims = ResourceGraph.BuildRouteClaims(
+                        CandidateNodes
+                    )
+                    if FindSelfClaimConflicts({Signal: CandidateClaims}):
+                        continue
+                    FrozenBlockers = (
+                        PortalTupleConflictsWithFrozenComponentClaims(
+                            Signal,
+                            CandidateClaims,
+                            Factor.FrozenComponentClaims,
+                        )
+                    )
+                    if FrozenBlockers:
+                        DependencySignals.update(map(str, FrozenBlockers))
+                        continue
+                    CandidatePortalIds = dict(PortalIds)
+                    CandidatePortalIds[DomainIndex] = Portal.PortalId
+                    Existing = NextByNodes.get(CandidateNodes)
+                    if Existing is None or tuple(sorted(
+                        CandidatePortalIds.items()
+                    )) < tuple(sorted(Existing[1].items())):
+                        NextByNodes[CandidateNodes] = (
+                            CandidateNodes,
+                            CandidatePortalIds,
+                            CandidateClaims,
+                        )
+                if Incomplete:
+                    break
+            if Incomplete:
+                break
+            Next = list(NextByNodes.values())
+            if UseDominance:
+                Retained = []
+                for Candidate in sorted(
+                    Next,
+                    key=lambda Value: (
+                        len(Value[2].ResourceIds),
+                        tuple(sorted(Value[0])),
+                    ),
+                ):
+                    if any(ClaimsSubset(Value[2], Candidate[2]) for Value in Retained):
+                        MemoizedStateHitCount += 1
+                        continue
+                    Retained = [
+                        Value for Value in Retained
+                        if not ClaimsSubset(Candidate[2], Value[2])
+                    ]
+                    Retained.append(Candidate)
+                Frontier = tuple(Retained)
+            else:
+                Frontier = tuple(Next)
+        GenericStates = tuple(Frontier) if not Incomplete else ()
+        if not Incomplete and SharedCache is not None:
+            SharedCache["generic:" + GenericDomainFingerprint] = GenericStates
+
+    StatesByFingerprint = {}
+    _ExactSize, ExactDomainIndex, ExactDomain = ExactVariable
+    ExactPortal = ExactDomain[0]
+    for Nodes, PortalIds, _Claims in GenericStates:
+        if ShouldStop is not None and ShouldStop():
+            Incomplete = True
+            break
+        ExpansionCount += 1
+        CandidateNodes = frozenset((*Nodes, *ExactPortal.Path))
+        CandidateClaims = ResourceGraph.BuildRouteClaims(CandidateNodes)
+        if FindSelfClaimConflicts({Signal: CandidateClaims}):
+            continue
+        FrozenBlockers = PortalTupleConflictsWithFrozenComponentClaims(
+            Signal,
+            CandidateClaims,
+            Factor.FrozenComponentClaims,
+        )
+        if FrozenBlockers:
+            DependencySignals.update(map(str, FrozenBlockers))
+            continue
+        CompletePortalIds = dict(PortalIds)
+        CompletePortalIds[ExactDomainIndex] = ExactPortal.PortalId
+        StateFingerprint = _BuildMandatoryPortalFactorClaimStateFingerprint(
+            Signal,
+            CandidateClaims,
+        )
+        State = MandatoryPortalFactorClaimState(
+            StateFingerprint=StateFingerprint,
+            PortalIds=tuple(
+                CompletePortalIds[Index]
+                for Index in range(len(Factor.PortalDomains))
+            ),
+            Claims=CandidateClaims,
+        )
+        Existing = StatesByFingerprint.get(StateFingerprint)
+        if Existing is None or State.PortalIds < Existing.PortalIds:
+            StatesByFingerprint[StateFingerprint] = State
+    States = (
+        tuple(
+            StatesByFingerprint[Fingerprint]
+            for Fingerprint in sorted(StatesByFingerprint)
+        )
+        if not Incomplete
+        else ()
+    )
+    return MandatoryPortalFactorFeasibilityCertificate(
+        FactorDomainFingerprint=Factor.DomainFingerprint,
+        Signal=Signal,
+        Complete=not Incomplete,
+        StateDomainFingerprint=(
+            BuildStateDomainFingerprint(States)
+            if not Incomplete
+            else ""
+        ),
+        States=States,
+        ConflictPositions=frozenset(ConflictPositions),
+        DependencySignals=tuple(sorted(DependencySignals)),
+        ExpansionCount=ExpansionCount,
+        MemoizedStateHitCount=MemoizedStateHitCount,
+    )
+
+
+def GetMandatoryPortalFactorFeasibilityCertificate(
+    Cache: dict[str, MandatoryPortalFactorFeasibilityCertificate],
+    Factor: PhysicalBoundaryMandatoryPortalFactorDomain,
+    ResourceGraph: Any,
+    ShouldStop: Callable[[], bool] | None = None,
+) -> tuple[MandatoryPortalFactorFeasibilityCertificate, bool]:
+    """Reuse only a complete certificate for the exact aperture factor."""
+    Cached = Cache.get(Factor.DomainFingerprint)
+    if Cached is not None and Cached.Complete:
+        PortalByDomainAndId = tuple(
+            {Portal.PortalId: Portal for Portal in Domain}
+            for Domain in Factor.PortalDomains
+        )
+        StateFingerprints = tuple(
+            State.StateFingerprint for State in Cached.States
+        )
+        StateDomainFingerprint = BuildStableFingerprint((
+            "mandatory-portal-factor-state-domain-v1",
+            Factor.DomainFingerprint,
+            StateFingerprints,
+        ))
+        CachedStatesValid = bool(
+            len(StateFingerprints) == len(set(StateFingerprints))
+            and StateFingerprints == tuple(sorted(StateFingerprints))
+            and all(
+                len(State.PortalIds) == len(Factor.PortalDomains)
+                and all(
+                    PortalId in PortalByDomainAndId[Index]
+                    for Index, PortalId in enumerate(State.PortalIds)
+                )
+                and State.Claims == ResourceGraph.BuildRouteClaims(
+                    frozenset((
+                        *Factor.FixedAccessNodes,
+                        *(
+                            Position
+                            for Index, PortalId
+                            in enumerate(State.PortalIds)
+                            for Position in PortalByDomainAndId[Index][
+                                PortalId
+                            ].Path
+                        ),
+                    ))
+                )
+                and State.StateFingerprint
+                == _BuildMandatoryPortalFactorClaimStateFingerprint(
+                    Factor.Signal,
+                    State.Claims,
+                )
+                and not FindSelfClaimConflicts({
+                    Factor.Signal: State.Claims
+                })
+                and not PortalTupleConflictsWithFrozenComponentClaims(
+                    Factor.Signal,
+                    State.Claims,
+                    Factor.FrozenComponentClaims,
+                )
+                for State in Cached.States
+            )
+        )
+        if (
+            Cached.FactorDomainFingerprint != Factor.DomainFingerprint
+            or Cached.Signal != Factor.Signal
+            or Cached.StateDomainFingerprint != StateDomainFingerprint
+            or not CachedStatesValid
+        ):
+            raise ValueError(
+                "cached mandatory portal factor identity mismatch"
+            )
+        return Cached, True
+    Certificate = CompileMandatoryPortalFactorFeasibility(
+        Factor,
+        ResourceGraph,
+        ShouldStop=ShouldStop,
+        SharedCache=Cache,
+    )
+    if Certificate.Complete:
+        Cache[Factor.DomainFingerprint] = Certificate
+    return Certificate, False
+
+
+def BuildMandatoryPortalClaimConflictIndexes(
+    States: tuple[MandatoryPortalFactorClaimState, ...],
+) -> tuple[dict[str, dict[Position3, int]], int]:
+    """Index exact claim conflicts as cell-local bitsets."""
+    Mutable: dict[str, dict[Position3, int]] = {
+        "Wire": {},
+        "Support": {},
+        "Air": {},
+        "Electrical": {},
+    }
+    for Index, State in enumerate(States):
+        Bit = 1 << Index
+        for Name, Cells in (
+            ("Wire", State.Claims.WireCells),
+            ("Support", State.Claims.SupportCells),
+            ("Air", State.Claims.RequiredAirCells),
+            ("Electrical", State.Claims.ElectricalCells),
+        ):
+            IndexByCell = Mutable[Name]
+            for Cell in Cells:
+                IndexByCell[Cell] = IndexByCell.get(Cell, 0) | Bit
+    return Mutable, (1 << len(States)) - 1
+
+
+def BuildMandatoryPortalClaimConflictMask(
+    FirstState: MandatoryPortalFactorClaimState,
+    SecondIndexes: Mapping[str, Mapping[Position3, int]],
+    AllSecondStatesMask: int,
+) -> int:
+    """Return the exact second-state mask conflicting with one first state."""
+    ConflictMask = 0
+
+    def Add(Cells: Iterable[Position3], Names: tuple[str, ...]) -> None:
+        nonlocal ConflictMask
+        for Cell in Cells:
+            for Name in Names:
+                ConflictMask |= SecondIndexes[Name].get(Cell, 0)
+            if ConflictMask == AllSecondStatesMask:
+                return
+
+    Add(
+        FirstState.Claims.WireCells,
+        ("Wire", "Support", "Air", "Electrical"),
+    )
+    if ConflictMask != AllSecondStatesMask:
+        Add(FirstState.Claims.SupportCells, ("Wire", "Air"))
+    if ConflictMask != AllSecondStatesMask:
+        Add(FirstState.Claims.RequiredAirCells, ("Wire", "Support"))
+    if ConflictMask != AllSecondStatesMask:
+        Add(FirstState.Claims.ElectricalCells, ("Wire",))
+    return ConflictMask
+
+
+def ValidatePhysicalBoundaryMandatoryPortalPairRelationIdentity(
+    Relation: PhysicalBoundaryMandatoryPortalPairRelation,
+    *,
+    ExpectedRelationFingerprint: str,
+    Preparation: PreparedPhysicalComponentPortFactorDomain,
+    OrderedSignals: tuple[str, str],
+    OptionDomainFingerprintsBySignal: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ],
+    ExpectedApertureContractsBySignal: Mapping[str, tuple[str, ...]],
+    DomainsBySignal: Mapping[
+        str, tuple[PhysicalBoundaryMandatoryPortalFactorDomain, ...]
+    ],
+) -> None:
+    """Reject a complete cached relation whose proof identity has drifted."""
+    ExpectedOptionPairs = frozenset(
+        (First, Second)
+        for First in ExpectedApertureContractsBySignal[OrderedSignals[0]]
+        for Second in ExpectedApertureContractsBySignal[OrderedSignals[1]]
+    )
+    CertificatesByOptionPair = {
+        (
+            Value.FirstApertureContractFingerprint,
+            Value.SecondApertureContractFingerprint,
+        ): Value
+        for Value in Relation.Certificates
+    }
+    DomainsByAperture = {
+        Signal: {
+            Value.ApertureContractFingerprint: Value
+            for Value in DomainsBySignal[Signal]
+        }
+        for Signal in OrderedSignals
+    }
+    FactorIdentitiesMatch = all(
+        Value.PreparedDomainFingerprint == Preparation.DomainFingerprint
+        and Value.PlacementFingerprint == Preparation.PlacementFingerprint
+        and Value.ComponentGraphFingerprint
+        == Preparation.ComponentGraphFingerprint
+        and Value.ResourceGraphFingerprint
+        == Preparation.ResourceGraphFingerprint
+        and Value.GuideFingerprint == Preparation.GuideFingerprint
+        and Value.ExteriorFabricSetFingerprint
+        == Preparation.ExteriorFabricSetFingerprint
+        and Value.ExteriorRegionFingerprint
+        == Preparation.ExteriorRegionFingerprint
+        and Value.Signal == Signal
+        for Signal in OrderedSignals
+        for Value in DomainsBySignal[Signal]
+    )
+    IdentityMatches = bool(
+        Relation.Complete
+        and FactorIdentitiesMatch
+        and Relation.RelationFingerprint == ExpectedRelationFingerprint
+        and Relation.PreparedDomainFingerprint
+        == Preparation.DomainFingerprint
+        and Relation.Signals == OrderedSignals
+        and Relation.OptionDomainFingerprintsBySignal
+        == OptionDomainFingerprintsBySignal
+        and Relation.ExpectedOptionPairCount == len(ExpectedOptionPairs)
+        and len(Relation.Certificates) == len(ExpectedOptionPairs)
+        and len(CertificatesByOptionPair) == len(ExpectedOptionPairs)
+        and frozenset(CertificatesByOptionPair) == ExpectedOptionPairs
+    )
+    ExpectedClauses = set()
+    ForeignDependencyCertificateCount = 0
+    if IdentityMatches:
+        for OptionPair, Value in CertificatesByOptionPair.items():
+            First = DomainsByAperture[OrderedSignals[0]].get(OptionPair[0])
+            Second = DomainsByAperture[OrderedSignals[1]].get(OptionPair[1])
+            Certificate = Value.Certificate
+            if First is None or Second is None:
+                IdentityMatches = False
+                break
+            ExpectedDomainFingerprint = BuildStableFingerprint((
+                "mandatory-portal-pair-factor-certificate-v2",
+                ExpectedRelationFingerprint,
+                First.DomainFingerprint,
+                Second.DomainFingerprint,
+            ))
+            if (
+                not Certificate.Complete
+                or Certificate.DomainFingerprint
+                != ExpectedDomainFingerprint
+                or Certificate.Signals != OrderedSignals
+            ):
+                IdentityMatches = False
+                break
+            DependenciesAreLocal = bool(
+                frozenset(Certificate.DependencySignals)
+                <= frozenset(OrderedSignals)
+            )
+            if not DependenciesAreLocal:
+                ForeignDependencyCertificateCount += 1
+            if Certificate.Feasible is False and DependenciesAreLocal:
+                ExpectedClauses.add(frozenset((
+                    (OrderedSignals[0], OptionPair[0]),
+                    (OrderedSignals[1], OptionPair[1]),
+                )))
+    if (
+        not IdentityMatches
+        or frozenset(Relation.UnsatisfiableApertureClauses)
+        != frozenset(ExpectedClauses)
+        or Relation.ForeignDependencyCertificateCount
+        != ForeignDependencyCertificateCount
+    ):
+        raise ValueError(
+            "cached mandatory portal pair relation identity mismatch"
+        )
+
+
+def CompilePhysicalBoundaryMandatoryPortalPairRelation(
+    Preparation: PreparedPhysicalComponentPortFactorDomain,
+    Signals: tuple[str, str],
+    Resources: RoutingResources,
+    ShouldStop: Callable[[], bool] | None = None,
+    MaximumNewCertificates: int | None = None,
+    PreferredApertureContractsBySignal: Mapping[str, str] | None = None,
+) -> PhysicalBoundaryMandatoryPortalPairRelation:
+    """Exhaust every prepared aperture pair for one certified signal cut."""
+    if MaximumNewCertificates is not None and MaximumNewCertificates < 1:
+        raise ValueError("MaximumNewCertificates must be positive")
+    OrderedSignals = tuple(sorted(map(str, Signals)))
+    if len(OrderedSignals) != 2 or OrderedSignals[0] == OrderedSignals[1]:
+        raise ValueError("mandatory aperture relation requires two signals")
+    DomainsBySignal = {
+        Signal: tuple(sorted(
+            (
+                Value
+                for (PreparedFingerprint, DomainSignal, _Aperture), Value
+                in Resources
+                .PhysicalBoundaryMandatoryPortalFactorDomainCache.items()
+                if PreparedFingerprint == Preparation.DomainFingerprint
+                and DomainSignal == Signal
+            ),
+            key=lambda Value: (
+                Value.ApertureContractFingerprint,
+                Value.DomainFingerprint,
+            ),
+        ))
+        for Signal in OrderedSignals
+    }
+    PreferredApertures = dict(
+        PreferredApertureContractsBySignal or {}
+    )
+    IterationDomainsBySignal = {
+        Signal: tuple(sorted(
+            DomainsBySignal[Signal],
+            key=lambda Value: (
+                str(Value.ApertureContractFingerprint)
+                != str(PreferredApertures.get(Signal, "")),
+                Value.ApertureContractFingerprint,
+                Value.DomainFingerprint,
+            ),
+        ))
+        for Signal in OrderedSignals
+    }
+    PreparedBoundaryDomains = {
+        str(Signal): tuple(Values)
+        for Signal, Values
+        in Preparation.BoundaryPortReservationsBySignal
+    }
+    ExpectedApertureContractsBySignal = {
+        Signal: tuple(sorted(
+            str(Value.ApertureContractFingerprint)
+            for Value in PreparedBoundaryDomains.get(Signal, ())
+        ))
+        for Signal in OrderedSignals
+    }
+    ActualApertureContractsBySignal = {
+        Signal: tuple(sorted(
+            Value.ApertureContractFingerprint
+            for Value in DomainsBySignal[Signal]
+        ))
+        for Signal in OrderedSignals
+    }
+    ExactPreparedOptionSets = bool(all(
+        ExpectedApertureContractsBySignal[Signal]
+        and len(ExpectedApertureContractsBySignal[Signal])
+        == len(set(ExpectedApertureContractsBySignal[Signal]))
+        and ActualApertureContractsBySignal[Signal]
+        == ExpectedApertureContractsBySignal[Signal]
+        and len(DomainsBySignal[Signal])
+        == len({
+            Value.DomainFingerprint for Value in DomainsBySignal[Signal]
+        })
+        for Signal in OrderedSignals
+    ))
+    FactorIdentitiesMatchPreparation = bool(all(
+        Value.PreparedDomainFingerprint == Preparation.DomainFingerprint
+        and Value.PlacementFingerprint == Preparation.PlacementFingerprint
+        and Value.ComponentGraphFingerprint
+        == Preparation.ComponentGraphFingerprint
+        and Value.ResourceGraphFingerprint
+        == Preparation.ResourceGraphFingerprint
+        and Value.GuideFingerprint == Preparation.GuideFingerprint
+        and Value.ExteriorFabricSetFingerprint
+        == Preparation.ExteriorFabricSetFingerprint
+        and Value.ExteriorRegionFingerprint
+        == Preparation.ExteriorRegionFingerprint
+        and Value.Signal == Signal
+        for Signal in OrderedSignals
+        for Value in DomainsBySignal[Signal]
+    ))
+    OptionDomainFingerprintsBySignal = tuple(
+        (
+            Signal,
+            tuple(Value.DomainFingerprint for Value in DomainsBySignal[Signal]),
+        )
+        for Signal in OrderedSignals
+    )
+    RelationFingerprint = BuildStableFingerprint((
+        "physical-boundary-mandatory-portal-pair-relation-v1",
+        Preparation.DomainFingerprint,
+        Preparation.PlacementFingerprint,
+        Preparation.ComponentGraphFingerprint,
+        Preparation.ResourceGraphFingerprint,
+        Preparation.GuideFingerprint,
+        Preparation.ExteriorFabricSetFingerprint,
+        Preparation.ExteriorRegionFingerprint,
+        tuple(sorted(ExpectedApertureContractsBySignal.items())),
+        OptionDomainFingerprintsBySignal,
+    ))
+    Cached = (
+        Resources.PhysicalBoundaryMandatoryPortalPairRelationCache.get(
+            RelationFingerprint
+        )
+    )
+    if Cached is not None and Cached.Complete:
+        ValidatePhysicalBoundaryMandatoryPortalPairRelationIdentity(
+            Cached,
+            ExpectedRelationFingerprint=RelationFingerprint,
+            Preparation=Preparation,
+            OrderedSignals=OrderedSignals,
+            OptionDomainFingerprintsBySignal=(
+                OptionDomainFingerprintsBySignal
+            ),
+            ExpectedApertureContractsBySignal=(
+                ExpectedApertureContractsBySignal
+            ),
+            DomainsBySignal=DomainsBySignal,
+        )
+        return Cached
+    CachedPartialCertificates: tuple[
+        PhysicalBoundaryMandatoryPortalPairOptionCertificate, ...
+    ] = ()
+    CachedPartialForeignDependencyCertificateCount = 0
+    if Cached is not None:
+        ExpectedPartialPairs = frozenset(
+            (First, Second)
+            for First in ExpectedApertureContractsBySignal[
+                OrderedSignals[0]
+            ]
+            for Second in ExpectedApertureContractsBySignal[
+                OrderedSignals[1]
+            ]
+        )
+        CachedPartialPairs = tuple(
+            (
+                Value.FirstApertureContractFingerprint,
+                Value.SecondApertureContractFingerprint,
+            )
+            for Value in Cached.Certificates
+        )
+        PartialIdentityMatches = bool(
+            Cached.RelationFingerprint == RelationFingerprint
+            and Cached.PreparedDomainFingerprint
+            == Preparation.DomainFingerprint
+            and Cached.Signals == OrderedSignals
+            and Cached.OptionDomainFingerprintsBySignal
+            == OptionDomainFingerprintsBySignal
+            and Cached.ExpectedOptionPairCount
+            == len(ExpectedPartialPairs)
+            and len(CachedPartialPairs) == len(set(CachedPartialPairs))
+            and frozenset(CachedPartialPairs) <= ExpectedPartialPairs
+            and all(
+                Value.Certificate.Complete
+                and Value.Certificate.Signals == OrderedSignals
+                for Value in Cached.Certificates
+            )
+        )
+        if not PartialIdentityMatches:
+            raise ValueError(
+                "cached mandatory portal pair relation identity mismatch"
+            )
+        CachedPartialCertificates = Cached.Certificates
+        CachedPartialForeignDependencyCertificateCount = (
+            Cached.ForeignDependencyCertificateCount
+        )
+    ExpectedOptionPairCount = (
+        len(ExpectedApertureContractsBySignal[OrderedSignals[0]])
+        * len(ExpectedApertureContractsBySignal[OrderedSignals[1]])
+    )
+    SharedFrozenClaims = tuple(
+        DomainsBySignal[OrderedSignals[0]][0].FrozenComponentClaims
+        if DomainsBySignal[OrderedSignals[0]]
+        else ()
+    )
+    # Direct forbidden-tuple elimination is cheapest for the small relations
+    # used by focused fixtures.  Large aperture products are compiled through
+    # the exact per-signal frontier quotient below: generic portal states are
+    # built once, shared by every aperture of the signal, and compared with a
+    # bitset compatibility index.  Running one CSP elimination independently
+    # for thousands of retained aperture pairs needlessly repeated the same
+    # internal-variable search and could consume the whole CLA planning
+    # reserve before publishing a single binary certificate.
+    MaximumDirectSparseProjectionOptionPairs = 256
+    CanUseSparseProjection = bool(
+        ExpectedOptionPairCount
+        and ExpectedOptionPairCount
+        <= MaximumDirectSparseProjectionOptionPairs
+        and ExactPreparedOptionSets
+        and FactorIdentitiesMatchPreparation
+        and isinstance(Resources.ResourceGraph, RoutingResourceGraph)
+        and all(
+            Value.Complete
+            and Value.FrozenComponentClaims == SharedFrozenClaims
+            for Signal in OrderedSignals
+            for Value in DomainsBySignal[Signal]
+        )
+    )
+    if CanUseSparseProjection:
+        VariableDomains = []
+        BaseNodesBySignal = {}
+        ApertureVariableBySignal = {}
+        FactorBySignalAndAperture = {}
+        GenericVariableBindingsBySignal = {}
+        SparseIdentityComplete = True
+        for Signal in OrderedSignals:
+            Factors = DomainsBySignal[Signal]
+            GenericFingerprints = {
+                Value.GenericPortalDomainFingerprint for Value in Factors
+            }
+            CommonNodeSets = {
+                Value.CommonFixedAccessNodes for Value in Factors
+            }
+            if len(GenericFingerprints) != 1 or len(CommonNodeSets) != 1:
+                SparseIdentityComplete = False
+                break
+            BaseNodesBySignal[Signal] = next(iter(CommonNodeSets))
+            ApertureVariable = f"aperture:{Signal}"
+            ApertureVariableBySignal[Signal] = ApertureVariable
+            VariableDomains.append(ExactPortalConstraintVariableDomain(
+                Variable=ApertureVariable,
+                Signal=Signal,
+                Choices=tuple(
+                    ExactPortalConstraintChoice(
+                        ChoiceId=Value.ApertureContractFingerprint,
+                        Nodes=Value.OptionOverlayNodes,
+                    )
+                    for Value in Factors
+                ),
+            ))
+            FactorBySignalAndAperture.update(
+                {
+                    (Signal, Value.ApertureContractFingerprint): Value
+                    for Value in Factors
+                }
+            )
+            Representative = Factors[0]
+            RepresentativeGenericDomains = tuple(
+                Domain for Index, Domain
+                in enumerate(Representative.PortalDomains)
+                if Index != Representative.OptionOverlayPortalDomainIndex
+            )
+            ExpectedGenericIdentity = tuple(
+                tuple(
+                    (Portal.PortalId, tuple(Portal.Path))
+                    for Portal in Domain
+                )
+                for Domain in RepresentativeGenericDomains
+            )
+            if any(
+                tuple(
+                    tuple(
+                        (Portal.PortalId, tuple(Portal.Path))
+                        for Portal in Domain
+                    )
+                    for Index, Domain in enumerate(Value.PortalDomains)
+                    if Index != Value.OptionOverlayPortalDomainIndex
+                ) != ExpectedGenericIdentity
+                for Value in Factors[1:]
+            ):
+                SparseIdentityComplete = False
+                break
+            Bindings = []
+            for GenericIndex, Domain in enumerate(
+                RepresentativeGenericDomains
+            ):
+                Variable = f"portal:{Signal}:{GenericIndex}"
+                VariableDomains.append(
+                    ExactPortalConstraintVariableDomain(
+                        Variable=Variable,
+                        Signal=Signal,
+                        Choices=tuple(
+                            ExactPortalConstraintChoice(
+                                ChoiceId=Portal.PortalId,
+                                Nodes=frozenset(Portal.Path),
+                            )
+                            for Portal in Domain
+                        ),
+                    )
+                )
+                Bindings.append(Variable)
+            GenericVariableBindingsBySignal[Signal] = tuple(Bindings)
+        if SparseIdentityComplete:
+            Extraction = ExtractSparseExactPortalConstraintFactors(
+                VariableDomains,
+                Resources.ResourceGraph,
+                BaseNodesBySignal=BaseNodesBySignal,
+                FrozenComponentClaims=SharedFrozenClaims,
+            )
+            Projection = ProjectExactPortalConstraintFactors(
+                Extraction,
+                VariableDomains,
+                (
+                    ApertureVariableBySignal[OrderedSignals[0]],
+                    ApertureVariableBySignal[OrderedSignals[1]],
+                ),
+                ShouldStop=ShouldStop,
+            )
+            LocalFactors = tuple(
+                Value for Value in Extraction.ForbiddenTuples
+                if not Value.DependencySignals
+            )
+            LocalExtraction = replace(
+                Extraction,
+                DomainFingerprint=BuildStableFingerprint((
+                    "sparse-exact-portal-local-factor-projection-v1",
+                    Extraction.DomainFingerprint,
+                    tuple(
+                        (Value.Assignments, Value.ConflictPositions)
+                        for Value in LocalFactors
+                    ),
+                )),
+                ForbiddenTuples=LocalFactors,
+                MaximumForbiddenTupleArity=max(
+                    (len(Value.Assignments) for Value in LocalFactors),
+                    default=0,
+                ),
+            )
+            LocalProjection = ProjectExactPortalConstraintFactors(
+                LocalExtraction,
+                VariableDomains,
+                (
+                    ApertureVariableBySignal[OrderedSignals[0]],
+                    ApertureVariableBySignal[OrderedSignals[1]],
+                ),
+                ShouldStop=ShouldStop,
+            )
+            SupportedPairs = frozenset(Projection.SupportedChoicePairs)
+            LocalSupportedPairs = frozenset(
+                LocalProjection.SupportedChoicePairs
+            )
+            WitnessByPair = dict(Projection.Witnesses)
+            Certificates = []
+            AllConflictPositions = frozenset(
+                Position
+                for Value in Extraction.ForbiddenTuples
+                for Position in Value.ConflictPositions
+            )
+            for First in DomainsBySignal[OrderedSignals[0]]:
+                for Second in DomainsBySignal[OrderedSignals[1]]:
+                    OptionPair = (
+                        First.ApertureContractFingerprint,
+                        Second.ApertureContractFingerprint,
+                    )
+                    Feasible = OptionPair in SupportedPairs
+                    LocallyFeasible = OptionPair in LocalSupportedPairs
+                    WitnessAssignment = dict(
+                        WitnessByPair.get(OptionPair, ())
+                    )
+
+                    def BuildWitnessPortalIds(
+                        Factor: PhysicalBoundaryMandatoryPortalFactorDomain,
+                    ) -> tuple[str, ...]:
+                        GenericVariables = iter(
+                            GenericVariableBindingsBySignal[Factor.Signal]
+                        )
+                        Values = []
+                        for Index, Domain in enumerate(Factor.PortalDomains):
+                            if Index == Factor.OptionOverlayPortalDomainIndex:
+                                Values.append(Domain[0].PortalId)
+                            else:
+                                Values.append(WitnessAssignment[next(
+                                    GenericVariables
+                                )])
+                        return tuple(Values)
+
+                    DomainFingerprint = (
+                        BuildMandatoryPortalPairDomainFingerprint(
+                            OrderedSignals,
+                            {
+                                First.Signal: First.FixedAccessNodes,
+                                Second.Signal: Second.FixedAccessNodes,
+                            },
+                            {
+                                First.Signal: First.PortalDomains,
+                                Second.Signal: Second.PortalDomains,
+                            },
+                            (),
+                            First.ResourceGraphFingerprint,
+                            First.TechnologyFingerprint,
+                        )
+                    )
+                    Certificate = MandatoryPortalPairFeasibilityCertificate(
+                        DomainFingerprint=DomainFingerprint,
+                        Signals=OrderedSignals,
+                        Complete=(
+                            Projection.Complete
+                            and LocalProjection.Complete
+                        ),
+                        Feasible=(
+                            Feasible
+                            if Projection.Complete
+                            and LocalProjection.Complete
+                            else None
+                        ),
+                        WitnessPortalIds=(
+                            (
+                                (
+                                    First.Signal,
+                                    BuildWitnessPortalIds(First),
+                                ),
+                                (
+                                    Second.Signal,
+                                    BuildWitnessPortalIds(Second),
+                                ),
+                            )
+                            if Feasible
+                            and Projection.Complete
+                            and LocalProjection.Complete
+                            else ()
+                        ),
+                        ConflictPositions=(
+                            frozenset()
+                            if Feasible
+                            else AllConflictPositions
+                        ),
+                        ConflictFingerprint=(
+                            ""
+                            if Feasible
+                            or not Projection.Complete
+                            or not LocalProjection.Complete
+                            else BuildStableFingerprint((
+                                DomainFingerprint,
+                                tuple(sorted(AllConflictPositions)),
+                            ))
+                        ),
+                        ExpansionCount=Projection.ExpansionCount,
+                        MemoizedStateHitCount=(
+                            Projection.FailedStateMemoHitCount
+                        ),
+                        DependencySignals=tuple(sorted(frozenset((
+                            *OrderedSignals,
+                            *(
+                                ()
+                                if Feasible or not LocallyFeasible
+                                else (
+                                    Dependency
+                                    for FactorValue
+                                    in Extraction.ForbiddenTuples
+                                    for Dependency
+                                    in FactorValue.DependencySignals
+                                )
+                            ),
+                        )))),
+                    )
+                    Certificates.append(
+                        PhysicalBoundaryMandatoryPortalPairOptionCertificate(
+                            FirstApertureContractFingerprint=(
+                                First.ApertureContractFingerprint
+                            ),
+                            SecondApertureContractFingerprint=(
+                                Second.ApertureContractFingerprint
+                            ),
+                            Certificate=Certificate,
+                        )
+                    )
+            Complete = bool(
+                Extraction.Complete
+                and Projection.Complete
+                and LocalProjection.Complete
+                and len(Certificates) == ExpectedOptionPairCount
+            )
+            Clauses = (
+                tuple(sorted(
+                    (
+                        frozenset((
+                            (
+                                OrderedSignals[0],
+                                Value.FirstApertureContractFingerprint,
+                            ),
+                            (
+                                OrderedSignals[1],
+                                Value.SecondApertureContractFingerprint,
+                            ),
+                        ))
+                        for Value in Certificates
+                        if (
+                            Value.Certificate.Feasible is False
+                            and frozenset(
+                                Value.Certificate.DependencySignals
+                            ) <= frozenset(OrderedSignals)
+                        )
+                    ),
+                    key=lambda Value: tuple(sorted(Value)),
+                ))
+                if Complete
+                else ()
+            )
+            Relation = PhysicalBoundaryMandatoryPortalPairRelation(
+                RelationFingerprint=RelationFingerprint,
+                PreparedDomainFingerprint=Preparation.DomainFingerprint,
+                Signals=OrderedSignals,
+                OptionDomainFingerprintsBySignal=(
+                    OptionDomainFingerprintsBySignal
+                ),
+                ExpectedOptionPairCount=ExpectedOptionPairCount,
+                Certificates=tuple(Certificates),
+                UnsatisfiableApertureClauses=Clauses,
+                Complete=Complete,
+                ForeignDependencyCertificateCount=sum(
+                    int(
+                        not frozenset(Value.Certificate.DependencySignals)
+                        <= frozenset(OrderedSignals)
+                    )
+                    for Value in Certificates
+                ),
+                FactorCertificateCount=len(VariableDomains),
+                FactorStateCount=len(Extraction.ForbiddenTuples),
+                UniqueClaimStateCountsBySignal=tuple(
+                    (
+                        Signal,
+                        sum(
+                            len(Domain.Choices) for Domain in VariableDomains
+                            if Domain.Signal == Signal
+                        ),
+                    )
+                    for Signal in OrderedSignals
+                ),
+                FactorExpansionCount=(
+                    Projection.ExpansionCount
+                    + LocalProjection.ExpansionCount
+                ),
+                CompatibilityIndexStatePairUpperBound=(
+                    ExpectedOptionPairCount
+                ),
+            )
+            if Complete:
+                Resources.PhysicalBoundaryMandatoryPortalPairRelationCache[
+                    RelationFingerprint
+                ] = Relation
+            return Relation
+    # Large relations are usually encountered after the ordinary router has
+    # rejected one exact pair.  Bootstrap the two current-option support rows
+    # once before constructing the full normalized state quotient.  A cached
+    # partial row must fall through to the quotient on the next call; otherwise
+    # successive exterior failures would enumerate a new product row forever
+    # and never publish the complete binary relation.
+    PreferredFactorBySignal = {
+        Signal: next((
+            Value
+            for Value in DomainsBySignal[Signal]
+            if Value.ApertureContractFingerprint
+            == str(PreferredApertures.get(Signal, ""))
+        ), None)
+        for Signal in OrderedSignals
+    }
+    CanCompilePreferredRowsDirectly = bool(
+        ExpectedOptionPairCount > MaximumDirectSparseProjectionOptionPairs
+        and not CachedPartialCertificates
+        and ExactPreparedOptionSets
+        and FactorIdentitiesMatchPreparation
+        and isinstance(Resources.ResourceGraph, RoutingResourceGraph)
+        and all(PreferredFactorBySignal.values())
+    )
+    if CanCompilePreferredRowsDirectly:
+        FirstSignal, SecondSignal = OrderedSignals
+        FirstPreferred = PreferredFactorBySignal[FirstSignal]
+        SecondPreferred = PreferredFactorBySignal[SecondSignal]
+        assert FirstPreferred is not None and SecondPreferred is not None
+        RowSpecifications = [
+            (
+                tuple(DomainsBySignal[FirstSignal]),
+                (SecondPreferred,),
+            ),
+            (
+                (FirstPreferred,),
+                tuple(DomainsBySignal[SecondSignal]),
+            ),
+        ]
+        RowSpecifications.sort(
+            key=lambda Value: (
+                -len(Value[0]) * len(Value[1]),
+                tuple(
+                    Factor.ApertureContractFingerprint
+                    for Factors in Value
+                    for Factor in Factors
+                ),
+            )
+        )
+        TargetPairs = tuple(dict.fromkeys((
+            (
+                FirstPreferred.ApertureContractFingerprint,
+                SecondPreferred.ApertureContractFingerprint,
+            ),
+            *(
+                (
+                    First.ApertureContractFingerprint,
+                    Second.ApertureContractFingerprint,
+                )
+                for FirstFactors, SecondFactors in RowSpecifications
+                for First in FirstFactors
+                for Second in SecondFactors
+            ),
+        )))
+        Certificates = list(CachedPartialCertificates)
+        CompletedOptionPairs = {
+            (
+                Value.FirstApertureContractFingerprint,
+                Value.SecondApertureContractFingerprint,
+            )
+            for Value in Certificates
+        }
+        PairCertificateCache = (
+            Resources.PhysicalGlobalMandatoryPortalPairCertificateCache
+        )
+        NewCertificateCount = 0
+        ForeignDependencyCertificateCount = (
+            CachedPartialForeignDependencyCertificateCount
+        )
+        FactorByAperture = {
+            (
+                Factor.Signal,
+                Factor.ApertureContractFingerprint,
+            ): Factor
+            for Signal in OrderedSignals
+            for Factor in DomainsBySignal[Signal]
+        }
+        for FirstAperture, SecondAperture in TargetPairs:
+            OptionPair = (FirstAperture, SecondAperture)
+            if OptionPair in CompletedOptionPairs:
+                continue
+            if (
+                (
+                    MaximumNewCertificates is not None
+                    and NewCertificateCount >= MaximumNewCertificates
+                )
+                or (ShouldStop is not None and ShouldStop())
+            ):
+                break
+            First = FactorByAperture[(FirstSignal, FirstAperture)]
+            Second = FactorByAperture[(SecondSignal, SecondAperture)]
+            # The normalized factor identities already bind the complete
+            # fixed-access, portal, frozen-claim, graph, and technology
+            # domains.  Re-serializing both full portal products for every
+            # aperture pair made publication quadratic in representation
+            # size after the actual compatibility index was complete.
+            DomainFingerprint = BuildStableFingerprint((
+                "mandatory-portal-pair-factor-certificate-v2",
+                RelationFingerprint,
+                First.DomainFingerprint,
+                Second.DomainFingerprint,
+            ))
+            Certificate, _CacheHit = (
+                GetMandatoryPortalPairFeasibilityCertificate(
+                    PairCertificateCache,
+                    Signals=OrderedSignals,
+                    FixedAccessNodesBySignal={
+                        First.Signal: First.FixedAccessNodes,
+                        Second.Signal: Second.FixedAccessNodes,
+                    },
+                    PortalDomainsBySignal={
+                        First.Signal: First.PortalDomains,
+                        Second.Signal: Second.PortalDomains,
+                    },
+                    FrozenComponentClaims=First.FrozenComponentClaims,
+                    ResourceGraph=Resources.ResourceGraph,
+                    DomainFingerprint=DomainFingerprint,
+                    ShouldStop=ShouldStop,
+                )
+            )
+            if not Certificate.Complete:
+                break
+            Certificates.append(
+                PhysicalBoundaryMandatoryPortalPairOptionCertificate(
+                    FirstApertureContractFingerprint=FirstAperture,
+                    SecondApertureContractFingerprint=SecondAperture,
+                    Certificate=Certificate,
+                )
+            )
+            CompletedOptionPairs.add(OptionPair)
+            NewCertificateCount += 1
+            if not frozenset(Certificate.DependencySignals) <= frozenset(
+                OrderedSignals
+            ):
+                ForeignDependencyCertificateCount += 1
+        Clauses = tuple(sorted(
+            {
+                frozenset((
+                    (
+                        FirstSignal,
+                        Value.FirstApertureContractFingerprint,
+                    ),
+                    (
+                        SecondSignal,
+                        Value.SecondApertureContractFingerprint,
+                    ),
+                ))
+                for Value in Certificates
+                if (
+                    Value.Certificate.Complete
+                    and Value.Certificate.Feasible is False
+                    and frozenset(Value.Certificate.DependencySignals)
+                    <= frozenset(OrderedSignals)
+                )
+            },
+            key=lambda Value: tuple(sorted(Value)),
+        ))
+        Relation = PhysicalBoundaryMandatoryPortalPairRelation(
+            RelationFingerprint=RelationFingerprint,
+            PreparedDomainFingerprint=Preparation.DomainFingerprint,
+            Signals=OrderedSignals,
+            OptionDomainFingerprintsBySignal=(
+                OptionDomainFingerprintsBySignal
+            ),
+            ExpectedOptionPairCount=ExpectedOptionPairCount,
+            Certificates=tuple(Certificates),
+            UnsatisfiableApertureClauses=Clauses,
+            Complete=False,
+            ForeignDependencyCertificateCount=(
+                ForeignDependencyCertificateCount
+            ),
+            FactorCertificateCount=0,
+            FactorStateCount=0,
+            UniqueClaimStateCountsBySignal=(),
+            FactorExpansionCount=sum(
+                Value.Certificate.ExpansionCount
+                for Value in Certificates
+            ),
+            CompatibilityIndexStatePairUpperBound=len(TargetPairs),
+        )
+        Resources.PhysicalBoundaryMandatoryPortalPairRelationCache[
+            RelationFingerprint
+        ] = Relation
+        return Relation
+    # Exact normalized frontier quotient.  This is also the production path
+    # for large relations.  Every state is reconstructed with
+    # BuildRouteClaims, frozen-claim blockers remain explicit dependency
+    # signals, and only pair-local complete certificates may become clauses.
+    # It is therefore not a permissive fallback: uncertainty or a foreign
+    # dependency still produces no negative pruning.
+    Certificates = list(CachedPartialCertificates)
+    NewCertificateCount = 0
+    CompletedOptionPairs = {
+        (
+            Value.FirstApertureContractFingerprint,
+            Value.SecondApertureContractFingerprint,
+        )
+        for Value in Certificates
+    }
+    Incomplete = bool(
+        not ExpectedOptionPairCount
+        or not ExactPreparedOptionSets
+        or not FactorIdentitiesMatchPreparation
+        or any(
+            not Value.Complete
+            for Signal in OrderedSignals
+            for Value in DomainsBySignal[Signal]
+        )
+    )
+    ForeignDependencyCertificateCount = (
+        CachedPartialForeignDependencyCertificateCount
+    )
+    FactorCertificateCache = getattr(
+        Resources,
+        "PhysicalBoundaryMandatoryPortalFactorCertificateCache",
+        None,
+    )
+    if FactorCertificateCache is None:
+        FactorCertificateCache = {}
+        setattr(
+            Resources,
+            "PhysicalBoundaryMandatoryPortalFactorCertificateCache",
+            FactorCertificateCache,
+        )
+    StateIndexCache = getattr(
+        Resources,
+        "PhysicalBoundaryMandatoryPortalPairStateIndexCache",
+        None,
+    )
+    if StateIndexCache is None:
+        StateIndexCache = {}
+        setattr(
+            Resources,
+            "PhysicalBoundaryMandatoryPortalPairStateIndexCache",
+            StateIndexCache,
+        )
+    CachedStateIndex = StateIndexCache.get(RelationFingerprint)
+    ExpectedFactorDomainFingerprints = tuple(sorted(
+        Value.DomainFingerprint
+        for Signal in OrderedSignals
+        for Value in DomainsBySignal[Signal]
+    ))
+    if CachedStateIndex is not None and (
+        CachedStateIndex.RelationFingerprint != RelationFingerprint
+        or tuple(
+            Fingerprint for Fingerprint, _StateFingerprint
+            in CachedStateIndex.FactorStateDomainFingerprints
+        ) != ExpectedFactorDomainFingerprints
+        or tuple(sorted(
+            Value.FactorDomainFingerprint
+            for Value in CachedStateIndex.FactorCertificates
+        )) != ExpectedFactorDomainFingerprints
+        or any(
+            not Value.Complete
+            for Value in CachedStateIndex.FactorCertificates
+        )
+        or any(
+            FactorCertificateCache.get(
+                Value.FactorDomainFingerprint
+            ) != Value
+            for Value in CachedStateIndex.FactorCertificates
+        )
+    ):
+        raise ValueError(
+            "cached mandatory portal pair state index identity mismatch"
+        )
+    FactorCertificatesByFingerprint = (
+        {
+            Value.FactorDomainFingerprint: Value
+            for Value in CachedStateIndex.FactorCertificates
+        }
+        if CachedStateIndex is not None
+        else {}
+    )
+    if not Incomplete and CachedStateIndex is None:
+        for Signal in OrderedSignals:
+            for Factor in DomainsBySignal[Signal]:
+                if ShouldStop is not None and ShouldStop():
+                    Incomplete = True
+                    break
+                FactorCertificate, _FactorCacheHit = (
+                    GetMandatoryPortalFactorFeasibilityCertificate(
+                        FactorCertificateCache,
+                        Factor,
+                        Resources.ResourceGraph,
+                        ShouldStop=ShouldStop,
+                    )
+                )
+                if not FactorCertificate.Complete:
+                    Incomplete = True
+                    break
+                FactorCertificatesByFingerprint[
+                    Factor.DomainFingerprint
+                ] = FactorCertificate
+            if Incomplete:
+                break
+
+    # Compile compatibility once over the normalized state quotient.  Every
+    # aperture is only a mask over this immutable domain, so the relation's
+    # full aperture cross-product no longer reruns portal DFS.  The completed
+    # index is immutable and reused by bounded relation work slices.
+    FactorStateDomainFingerprints = tuple(sorted(
+        (
+            Fingerprint,
+            Certificate.StateDomainFingerprint,
+        )
+        for Fingerprint, Certificate
+        in FactorCertificatesByFingerprint.items()
+    ))
+    StateIndexFingerprint = BuildStableFingerprint((
+        "physical-boundary-mandatory-portal-pair-state-index-v1",
+        RelationFingerprint,
+        FactorStateDomainFingerprints,
+    ))
+    if CachedStateIndex is not None and (
+        CachedStateIndex.RelationFingerprint != RelationFingerprint
+        or CachedStateIndex.IndexFingerprint != StateIndexFingerprint
+        or CachedStateIndex.FactorStateDomainFingerprints
+        != FactorStateDomainFingerprints
+    ):
+        raise ValueError(
+            "cached mandatory portal pair state index identity mismatch"
+        )
+
+    FirstStatesByFingerprint = {}
+    SecondStatesByFingerprint = {}
+
+    def AddCanonicalState(
+        ValuesByFingerprint: dict[
+            str, MandatoryPortalFactorClaimState
+        ],
+        State: MandatoryPortalFactorClaimState,
+    ) -> None:
+        Existing = ValuesByFingerprint.get(State.StateFingerprint)
+        if Existing is not None and Existing.Claims != State.Claims:
+            raise ValueError(
+                "mandatory portal relation claim-state identity collision"
+            )
+        if Existing is None or State.PortalIds < Existing.PortalIds:
+            ValuesByFingerprint[State.StateFingerprint] = State
+
+    if CachedStateIndex is not None:
+        FirstStatesByFingerprint = {
+            State.StateFingerprint: State
+            for State in CachedStateIndex.FirstStates
+        }
+        CanonicalSecondStates = CachedStateIndex.SecondStates
+        CompatibleSecondMaskByFirstStateFingerprint = dict(
+            CachedStateIndex.CompatibleSecondMasksByFirstState
+        )
+        SecondMasksByFactorFingerprint = dict(
+            CachedStateIndex.SecondMasksByFactorFingerprint
+        )
+    elif not Incomplete:
+        for Factor in DomainsBySignal[OrderedSignals[0]]:
+            for State in FactorCertificatesByFingerprint[
+                Factor.DomainFingerprint
+            ].States:
+                AddCanonicalState(FirstStatesByFingerprint, State)
+        for Factor in DomainsBySignal[OrderedSignals[1]]:
+            for State in FactorCertificatesByFingerprint[
+                Factor.DomainFingerprint
+            ].States:
+                AddCanonicalState(SecondStatesByFingerprint, State)
+        CanonicalSecondStates = tuple(
+            SecondStatesByFingerprint[Fingerprint]
+            for Fingerprint in sorted(SecondStatesByFingerprint)
+        )
+        SecondStateIndexByFingerprint = {
+            State.StateFingerprint: Index
+            for Index, State in enumerate(CanonicalSecondStates)
+        }
+        SecondIndexes, AllSecondStatesMask = (
+            BuildMandatoryPortalClaimConflictIndexes(CanonicalSecondStates)
+        )
+        CompatibleSecondMaskByFirstStateFingerprint = {}
+        for Fingerprint in sorted(FirstStatesByFingerprint):
+            if ShouldStop is not None and ShouldStop():
+                Incomplete = True
+                break
+            ConflictMask = BuildMandatoryPortalClaimConflictMask(
+                FirstStatesByFingerprint[Fingerprint],
+                SecondIndexes,
+                AllSecondStatesMask,
+            )
+            CompatibleSecondMaskByFirstStateFingerprint[Fingerprint] = (
+                AllSecondStatesMask & ~ConflictMask
+            )
+        SecondMasksByFactorFingerprint = {}
+        if not Incomplete:
+            for Factor in DomainsBySignal[OrderedSignals[1]]:
+                Mask = 0
+                for State in FactorCertificatesByFingerprint[
+                    Factor.DomainFingerprint
+                ].States:
+                    Mask |= 1 << SecondStateIndexByFingerprint[
+                        State.StateFingerprint
+                    ]
+                SecondMasksByFactorFingerprint[
+                    Factor.DomainFingerprint
+                ] = Mask
+        if not Incomplete:
+            CachedStateIndex = (
+                PhysicalBoundaryMandatoryPortalPairStateIndex(
+                    IndexFingerprint=StateIndexFingerprint,
+                    RelationFingerprint=RelationFingerprint,
+                    FactorStateDomainFingerprints=(
+                        FactorStateDomainFingerprints
+                    ),
+                    FactorCertificates=tuple(
+                        FactorCertificatesByFingerprint[Fingerprint]
+                        for Fingerprint in sorted(
+                            FactorCertificatesByFingerprint
+                        )
+                    ),
+                    FirstStates=tuple(
+                        FirstStatesByFingerprint[Fingerprint]
+                        for Fingerprint in sorted(
+                            FirstStatesByFingerprint
+                        )
+                    ),
+                    SecondStates=CanonicalSecondStates,
+                    CompatibleSecondMasksByFirstState=tuple(sorted(
+                        CompatibleSecondMaskByFirstStateFingerprint.items()
+                    )),
+                    SecondMasksByFactorFingerprint=tuple(sorted(
+                        SecondMasksByFactorFingerprint.items()
+                    )),
+                )
+            )
+            StateIndexCache[RelationFingerprint] = CachedStateIndex
+
+    for First in IterationDomainsBySignal[OrderedSignals[0]]:
+        for Second in IterationDomainsBySignal[OrderedSignals[1]]:
+            OptionPair = (
+                First.ApertureContractFingerprint,
+                Second.ApertureContractFingerprint,
+            )
+            if OptionPair in CompletedOptionPairs:
+                continue
+            if (
+                Incomplete
+                or (
+                    MaximumNewCertificates is not None
+                    and NewCertificateCount >= MaximumNewCertificates
+                )
+                or (ShouldStop is not None and ShouldStop())
+            ):
+                Incomplete = True
+                break
+            if (
+                First.PreparedDomainFingerprint
+                != Second.PreparedDomainFingerprint
+                or First.ResourceGraphFingerprint
+                != Second.ResourceGraphFingerprint
+                or First.TechnologyFingerprint
+                != Second.TechnologyFingerprint
+                or First.GuideFingerprint != Second.GuideFingerprint
+                or First.ExteriorFabricSetFingerprint
+                != Second.ExteriorFabricSetFingerprint
+                or First.ExteriorRegionFingerprint
+                != Second.ExteriorRegionFingerprint
+                or First.FrozenComponentClaimsFingerprint
+                != Second.FrozenComponentClaimsFingerprint
+            ):
+                Incomplete = True
+                break
+            DomainFingerprint = BuildStableFingerprint((
+                "mandatory-portal-pair-factor-certificate-v2",
+                RelationFingerprint,
+                First.DomainFingerprint,
+                Second.DomainFingerprint,
+            ))
+            FirstFactorCertificate = FactorCertificatesByFingerprint[
+                First.DomainFingerprint
+            ]
+            SecondFactorCertificate = FactorCertificatesByFingerprint[
+                Second.DomainFingerprint
+            ]
+            SecondFactorMask = SecondMasksByFactorFingerprint[
+                Second.DomainFingerprint
+            ]
+            WitnessFirstState = None
+            WitnessSecondState = None
+            for FirstState in FirstFactorCertificate.States:
+                SupportedMask = (
+                    CompatibleSecondMaskByFirstStateFingerprint[
+                        FirstState.StateFingerprint
+                    ]
+                    & SecondFactorMask
+                )
+                if not SupportedMask:
+                    continue
+                WitnessFirstState = FirstState
+                SecondStateIndex = (
+                    SupportedMask & -SupportedMask
+                ).bit_length() - 1
+                WitnessSecondState = CanonicalSecondStates[
+                    SecondStateIndex
+                ]
+                break
+            Feasible = WitnessFirstState is not None
+            DependencySignals = tuple(sorted(frozenset((
+                *FirstFactorCertificate.DependencySignals,
+                *SecondFactorCertificate.DependencySignals,
+            ))))
+            ConflictPositions = frozenset((
+                *FirstFactorCertificate.ConflictPositions,
+                *SecondFactorCertificate.ConflictPositions,
+            ))
+            Certificate = MandatoryPortalPairFeasibilityCertificate(
+                DomainFingerprint=DomainFingerprint,
+                Signals=OrderedSignals,
+                Complete=True,
+                Feasible=Feasible,
+                WitnessPortalIds=(
+                    (
+                        (First.Signal, WitnessFirstState.PortalIds),
+                        (Second.Signal, WitnessSecondState.PortalIds),
+                    )
+                    if Feasible
+                    else ()
+                ),
+                ConflictPositions=ConflictPositions,
+                ConflictFingerprint=(
+                    ""
+                    if Feasible
+                    else BuildStableFingerprint((
+                        DomainFingerprint,
+                        tuple(sorted(ConflictPositions)),
+                    ))
+                ),
+                ExpansionCount=(
+                    FirstFactorCertificate.ExpansionCount
+                    + SecondFactorCertificate.ExpansionCount
+                ),
+                MemoizedStateHitCount=(
+                    FirstFactorCertificate.MemoizedStateHitCount
+                    + SecondFactorCertificate.MemoizedStateHitCount
+                ),
+                DependencySignals=DependencySignals,
+            )
+            Certificates.append(
+                PhysicalBoundaryMandatoryPortalPairOptionCertificate(
+                    FirstApertureContractFingerprint=(
+                        First.ApertureContractFingerprint
+                    ),
+                    SecondApertureContractFingerprint=(
+                        Second.ApertureContractFingerprint
+                    ),
+                    Certificate=Certificate,
+                )
+            )
+            CompletedOptionPairs.add(OptionPair)
+            NewCertificateCount += 1
+            if not Certificate.Complete:
+                Incomplete = True
+                break
+            if not frozenset(Certificate.DependencySignals) <= frozenset(
+                OrderedSignals
+            ):
+                ForeignDependencyCertificateCount += 1
+        if Incomplete:
+            break
+    Complete = bool(
+        not Incomplete
+        and len(Certificates) == ExpectedOptionPairCount
+        and all(Value.Certificate.Complete for Value in Certificates)
+    )
+    # Each emitted option certificate is independently complete for one
+    # fixed aperture pair.  Its pair-local negative clause is sound even when
+    # the surrounding cross-product is unfinished; only relation-wide
+    # unsatisfiability still requires Complete=True.
+    Clauses = tuple(sorted(
+        {
+            frozenset((
+                (
+                    OrderedSignals[0],
+                    Value.FirstApertureContractFingerprint,
+                ),
+                (
+                    OrderedSignals[1],
+                    Value.SecondApertureContractFingerprint,
+                ),
+            ))
+            for Value in Certificates
+            if (
+                Value.Certificate.Complete
+                and Value.Certificate.Feasible is False
+                and frozenset(Value.Certificate.DependencySignals)
+                <= frozenset(OrderedSignals)
+            )
+        },
+        key=lambda Value: tuple(sorted(Value)),
+    ))
+    Relation = PhysicalBoundaryMandatoryPortalPairRelation(
+        RelationFingerprint=RelationFingerprint,
+        PreparedDomainFingerprint=Preparation.DomainFingerprint,
+        Signals=OrderedSignals,
+        OptionDomainFingerprintsBySignal=(
+            OptionDomainFingerprintsBySignal
+        ),
+        ExpectedOptionPairCount=ExpectedOptionPairCount,
+        Certificates=tuple(Certificates),
+        UnsatisfiableApertureClauses=Clauses,
+        Complete=Complete,
+        ForeignDependencyCertificateCount=(
+            ForeignDependencyCertificateCount
+        ),
+        FactorCertificateCount=len(FactorCertificatesByFingerprint),
+        FactorStateCount=sum(
+            len(Value.States)
+            for Value in FactorCertificatesByFingerprint.values()
+        ),
+        UniqueClaimStateCountsBySignal=(
+            (
+                OrderedSignals[0],
+                len(FirstStatesByFingerprint),
+            ),
+            (
+                OrderedSignals[1],
+                len(SecondStatesByFingerprint),
+            ),
+        ),
+        FactorExpansionCount=sum(
+            Value.ExpansionCount
+            for Value in FactorCertificatesByFingerprint.values()
+        ),
+        CompatibilityIndexStatePairUpperBound=(
+            len(FirstStatesByFingerprint)
+            * len(SecondStatesByFingerprint)
+        ),
+    )
+    if Complete or Certificates:
+        Resources.PhysicalBoundaryMandatoryPortalPairRelationCache[
+            RelationFingerprint
+        ] = Relation
+    return Relation
 
 
 def BuildMandatoryPortalPairDomainFingerprint(
@@ -2786,6 +5709,7 @@ def SolveMandatoryPortalPairFeasibility(
                 DomainFingerprint,
                 "empty-terminal-domain",
             )),
+            DependencySignals=OrderedSignals,
         )
 
     NodesBySignal = {
@@ -2801,6 +5725,7 @@ def SolveMandatoryPortalPairFeasibility(
     }
     FailedStates: set[tuple[object, ...]] = set()
     ConflictPositions: set[Position3] = set()
+    DependencySignals = set(OrderedSignals)
     ExpansionCount = 0
     MemoizedStateHitCount = 0
     Incomplete = False
@@ -2844,6 +5769,7 @@ def SolveMandatoryPortalPairFeasibility(
                 FrozenComponentClaims,
             )
             if FrozenBlockers:
+                DependencySignals.update(map(str, FrozenBlockers))
                 for Claim in FrozenComponentClaims:
                     if Claim.Signal in FrozenBlockers:
                         ConflictPositions.update(ClaimConflictPositions(
@@ -2884,6 +5810,7 @@ def SolveMandatoryPortalPairFeasibility(
             Feasible=None,
             ExpansionCount=ExpansionCount,
             MemoizedStateHitCount=MemoizedStateHitCount,
+            DependencySignals=tuple(sorted(DependencySignals)),
         )
     ConflictPositionSet = frozenset(ConflictPositions)
     return MandatoryPortalPairFeasibilityCertificate(
@@ -2918,6 +5845,7 @@ def SolveMandatoryPortalPairFeasibility(
         ),
         ExpansionCount=ExpansionCount,
         MemoizedStateHitCount=MemoizedStateHitCount,
+        DependencySignals=tuple(sorted(DependencySignals)),
     )
 
 
@@ -3863,6 +6791,83 @@ def SelectOpenPhysicalGlobalCandidateDomainSignals(
     ))
 
 
+def SelectPhysicalGlobalNativePairCutSuffixSignals(
+    Result: Any,
+    RemainingRequestCounts: Mapping[str, int],
+) -> tuple[str, ...]:
+    """Advance the minimum finite suffix capable of closing a native pair.
+
+    Native pairwise incompatibility is exact for the candidate prefixes it
+    receives.  It becomes a reusable binary clause only after both finite
+    descriptor cursors are complete.  Prefer one open endpoint adjacent to a
+    completed domain.  Otherwise close both endpoints of the smallest
+    reported pair; enumerating unrelated variables cannot prove that clause.
+    """
+    if not bool(getattr(Result, "PairwiseCompatibilityComplete", False)):
+        return ()
+    CompletedPeerCandidates = []
+    OpenPairCandidates = []
+    for FirstSignal, SecondSignal in getattr(
+        Result,
+        "PairwiseIncompatibleSignals",
+        (),
+    ):
+        First = str(FirstSignal)
+        Second = str(SecondSignal)
+        FirstRemaining = int(RemainingRequestCounts.get(First, 0))
+        SecondRemaining = int(RemainingRequestCounts.get(Second, 0))
+        if FirstRemaining == 0 and SecondRemaining > 0:
+            CompletedPeerCandidates.append((
+                SecondRemaining,
+                Second,
+                First,
+            ))
+        elif SecondRemaining == 0 and FirstRemaining > 0:
+            CompletedPeerCandidates.append((
+                FirstRemaining,
+                First,
+                Second,
+            ))
+        elif FirstRemaining > 0 and SecondRemaining > 0:
+            OpenPairCandidates.append((
+                FirstRemaining + SecondRemaining,
+                max(FirstRemaining, SecondRemaining),
+                min(FirstRemaining, SecondRemaining),
+                tuple(sorted((First, Second))),
+            ))
+    if CompletedPeerCandidates:
+        _Remaining, Signal, _CompletedPeer = min(
+            CompletedPeerCandidates
+        )
+        return (Signal,)
+    if OpenPairCandidates:
+        _Total, _Maximum, _Minimum, Signals = min(
+            OpenPairCandidates
+        )
+        return Signals
+    return ()
+
+
+def SelectCompletedPhysicalGlobalPairNoGoodEdges(
+    Result: Any,
+    RemainingRequestCounts: Mapping[str, int],
+) -> tuple[tuple[str, str], ...]:
+    """Return native pair clauses whose two finite route domains are closed."""
+    if not bool(getattr(Result, "PairwiseCompatibilityComplete", False)):
+        return ()
+    return tuple(sorted({
+        tuple(sorted((str(FirstSignal), str(SecondSignal))))
+        for FirstSignal, SecondSignal in getattr(
+            Result,
+            "PairwiseIncompatibleSignals",
+            (),
+        )
+        if str(FirstSignal) != str(SecondSignal)
+        and int(RemainingRequestCounts.get(str(FirstSignal), 0)) == 0
+        and int(RemainingRequestCounts.get(str(SecondSignal), 0)) == 0
+    }))
+
+
 def PhysicalGlobalAssignmentDomainIsComplete(
     RelevantSignals: Iterable[str],
     RemainingRequestCounts: dict[str, int],
@@ -4057,6 +7062,13 @@ def BuildPhysicalPortNoGoodKeys(
         (
             Port.Signal,
             "local-signal-domain:" + PortSolverCacheKey,
+        ),
+        (
+            Port.Signal,
+            "scoped-request-reservation:"
+            + PortSolverCacheKey
+            + ":"
+            + Port.ReservationFingerprint,
         ),
     ))
 
@@ -4379,13 +7391,14 @@ def PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
     *,
     DeadlineExpired: Callable[[], bool] = lambda: False,
 ) -> Any:
-    """Find the first complete assignment outside exact forbidden tuples.
+    """Find the first complete assignment outside forbidden candidate cores.
 
     The native assignment API accepts per-candidate domains but no tuple
-    no-goods.  The complement of one exact tuple is the union of deterministic
-    branches which each exclude one tuple member.  Recursing on a newly found
-    forbidden tuple preserves that identity exactly; it never rejects a port,
-    fabric domain, or candidate independently.
+    no-goods.  The complement of one monotonic core is the union of
+    deterministic branches which each exclude one core member.  Recursing on
+    a newly found forbidden subset preserves that identity exactly; unary and
+    binary learned clauses must not be treated as inert unless they happen to
+    equal the whole assignment.
     """
     Values = list(CandidateValues)
     RequiredSignals = frozenset(str(Value[0]) for Value in Values)
@@ -4444,7 +7457,7 @@ def PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
         ):
             return None
         MatchingNoGood = next(
-            (Value for Value in Forbidden if Value == Selected),
+            (Value for Value in Forbidden if Value <= Selected),
             None,
         )
         if MatchingNoGood is None:
@@ -4457,7 +7470,12 @@ def PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
                 break
         return None
 
-    Result = Search(frozenset())
+    UnaryExclusions = frozenset(
+        next(iter(Clause))
+        for Clause in Forbidden
+        if len(Clause) == 1
+    )
+    Result = Search(UnaryExclusions)
     if Result is not None:
         return Result
     if IncompleteResults:
@@ -4965,6 +7983,58 @@ def BuildMinimalPhysicalRequestApertureNoGood(
     ))
 
 
+def BuildCompletePhysicalRequestAlternativeApertureNoGoods(
+    Signal: str,
+    PortGlobalContractFingerprint: str,
+    CompletePreSiblingCandidates: Iterable[RouteCandidate],
+    BoundaryPortReservationsBySignal: Mapping[
+        str, Iterable[PhysicalComponentBoundaryPortReservation]
+    ],
+) -> tuple[frozenset[tuple[str, str]], ...]:
+    """Certify every alternative aperture that starves one fixed request.
+
+    A complete pre-sibling route domain depends on the victim's frozen global
+    contract, guide, and keepout, but not on a sibling aperture.  Comparing
+    that finite domain with every prepared sibling aperture therefore turns
+    one exact exterior run into a complete family of binary CSP clauses.
+    """
+    Signal = str(Signal)
+    PortGlobalContractFingerprint = str(
+        PortGlobalContractFingerprint
+    )
+    Candidates = tuple(CompletePreSiblingCandidates)
+    if not Signal or not PortGlobalContractFingerprint or not Candidates:
+        return ()
+    Clauses = set()
+    for BlockerSignal, Ports in sorted(
+        BoundaryPortReservationsBySignal.items()
+    ):
+        BlockerSignal = str(BlockerSignal)
+        if BlockerSignal == Signal:
+            continue
+        for Port in Ports:
+            ApertureContractFingerprint = str(
+                Port.ApertureContractFingerprint
+            )
+            if not ApertureContractFingerprint:
+                continue
+            if all(
+                ComponentClaimsConflict(
+                    Candidate.Claims,
+                    Port.GlobalClaims,
+                )
+                for Candidate in Candidates
+            ):
+                Clauses.add(frozenset((
+                    (Signal, PortGlobalContractFingerprint),
+                    (BlockerSignal, ApertureContractFingerprint),
+                )))
+    return tuple(sorted(
+        Clauses,
+        key=lambda Clause: tuple(sorted(Clause)),
+    ))
+
+
 def PhysicalSignalLocalCandidateRequestFactorProofComplete(
     Signal: str,
     DependencyComponents: Mapping[str, object],
@@ -4983,7 +8053,6 @@ def PhysicalSignalLocalCandidateRequestFactorProofComplete(
         or ApertureDomain is None
         or not ApertureDomain.Complete
         or not frozenset(ApertureDomain.CrossingSignals) <= ExactSignals
-        or DependencyComponents.get("GuideFactorFingerprint", "")
     ):
         return False
     MatchingFactors = tuple(
@@ -5000,6 +8069,11 @@ def PhysicalSignalLocalCandidateRequestFactorProofComplete(
         == Factor.ChannelReservationFingerprint
         and DependencyComponents.get("GlobalKeepoutFingerprint", "")
         == ApertureDomain.StableKeepoutCoreFingerprint
+        # A factorized guide fingerprint is a signal-local determinant of
+        # this same finite request domain.  The component planner freezes the
+        # guide-only plan for the retained placement, so its presence cannot
+        # introduce an unrepresented foreign CSP variable.
+        and "GuideFactorFingerprint" in DependencyComponents
         and DependencyComponents.get("BlockedNodesFingerprint", "")
         and DependencyComponents.get("DescriptorDomainFingerprint", "")
         and int(DependencyComponents.get("DescriptorCount", 0)) > 0
@@ -5373,10 +8447,9 @@ def BuildCertifiedEmptyPhysicalSignalRouteDomainFailure(
 class PortablePhysicalSignalRouteDomainContinuation:
     """One complete exterior domain in translation/planar-normal form.
 
-    This is deliberately not a search continuation.  It contains no selected
-    channel and cannot represent an open request cursor.  Portal identities
-    are retained only as source-geometry witnesses and are rebound against the
-    already-fixed assembly plan before candidates become visible again.
+    Capture requires a complete source domain, but replay exposes its
+    candidates only.  It cannot transfer a request cursor, descriptor
+    completion, or an empty-domain proof across a physical plan identity.
     """
 
     PortableDomainFingerprint: str
@@ -5798,16 +8871,43 @@ def SelectPortablePhysicalSignalRouteDomainContinuation(
     CanonicalTransform: str,
     PortalGeometryById: tuple[tuple[str, tuple[object, ...]], ...],
 ) -> PhysicalSignalRouteDomainContinuation | None:
-    """Rebind one complete portable domain to current fixed portal IDs."""
+    """Rebind positive portable witnesses to current fixed portal IDs."""
     CacheKey = "portable-route-domain:" + PortableDomainFingerprint
     Value = Cache.get(CacheKey)
+    return _MaterializePortablePhysicalSignalCompleteDomainCandidates(
+        Value,
+        PortableDomainFingerprint,
+        IdentityFingerprint,
+        Signal,
+        Attachment,
+        CanonicalTransform,
+        PortalGeometryById,
+        RequirePortableDomainIdentity=True,
+    )
+
+
+def _MaterializePortablePhysicalSignalCompleteDomainCandidates(
+    Value: Any,
+    PortableDomainFingerprint: str,
+    IdentityFingerprint: str,
+    Signal: str,
+    Attachment: Position3,
+    CanonicalTransform: str,
+    PortalGeometryById: tuple[tuple[str, tuple[object, ...]], ...],
+    *,
+    RequirePortableDomainIdentity: bool,
+) -> PhysicalSignalRouteDomainContinuation | None:
+    """Transform complete-domain candidates without importing its proof."""
     if not isinstance(Value, PortablePhysicalSignalRouteDomainContinuation):
         return None
     if (
         not Value.Complete
-        or Value.PortableDomainFingerprint != PortableDomainFingerprint
+        or (RequirePortableDomainIdentity and (
+            Value.PortableDomainFingerprint != PortableDomainFingerprint
+        ))
         or Value.IdentityFingerprint != IdentityFingerprint
         or Value.Signal != Signal
+        or not Value.Candidates
     ):
         return None
     CurrentByGeometry = {
@@ -5825,7 +8925,7 @@ def SelectPortablePhysicalSignalRouteDomainContinuation(
         OldId: CurrentByGeometry.get(Geometry, "")
         for OldId, Geometry in Value.PortalGeometryById
     }
-    if not PortalIdMap or any(not Value for Value in PortalIdMap.values()):
+    if not PortalIdMap or any(not Current for Current in PortalIdMap.values()):
         return None
     try:
         Candidates = tuple(
@@ -5866,7 +8966,8 @@ def SelectPortablePhysicalSignalRouteDomainContinuation(
         NextDescriptorCursor=0,
         Candidates=Candidates,
         CandidateMetadata=Metadata,
-        Complete=True,
+        CompletedDescriptorFingerprints=frozenset(),
+        Complete=False,
     )
 
 
@@ -5905,6 +9006,17 @@ def SelectPreparedPortablePhysicalSignalRouteDomainContinuation(
     if Continuation is None:
         return None, "portal-rebind-mismatch"
     return Continuation, "hit"
+
+
+def SelectPortableReplayTelemetryReason(
+    DomainTelemetry: Mapping[str, Any],
+) -> str:
+    """Read the normalized portable replay outcome from any domain row."""
+    return str(
+        DomainTelemetry.get("PortableReplayReason")
+        or DomainTelemetry.get("Reason")
+        or ""
+    )
 
 
 def RetainPortablePhysicalSignalRouteDomainContinuation(
@@ -7249,7 +10361,24 @@ class RawPortalGeometryCache:
     CompletePortalDomainKeys: tuple[
         tuple[str, Position3, int], ...
     ] = ()
+    # Domains closed by routing policy (for example the interface deck being
+    # reserved for inter-component signals) have no native portal request.
+    # Keep their complete-empty proof separate so post-closure regeneration
+    # can replay requests without silently losing those finite domains.
+    PolicyCompleteEmptyPortalDomainKeys: tuple[
+        tuple[str, Position3, int], ...
+    ] = ()
     PortalRequestDomainFingerprints: tuple[tuple[str, str], ...] = ()
+    ExteriorRegionFingerprint: str = ""
+    AuthoritativeResourceGraphFingerprint: str = ""
+    ConfiguredPortalRequests: tuple[tuple[Any, ...], ...] = field(
+        default=(),
+        compare=False,
+        repr=False,
+    )
+    ConfiguredPortalRequestMetadata: tuple[
+        tuple[str, Position3, int], ...
+    ] = ()
 
     def MatchesPlacementResources(
         self,
@@ -7350,6 +10479,143 @@ class RawPortalGeometryCache:
         return dict(self.PortalEntries)
 
 
+def ValidateFrozenPhysicalComponentPostClosurePortalHandoff(
+    Resources: RoutingResources,
+    Preparation: PreparedPhysicalComponentPortFactorDomain | None,
+    Plan: PhysicalComponentAssemblyPlan | None,
+) -> RawPortalGeometryCache:
+    """Return the exact prepared exterior fabric or reject identity drift."""
+
+    Handoff = Resources.FrozenPhysicalComponentPostClosurePortalHandoff
+    Mismatches: list[str] = []
+    if Handoff is None:
+        Mismatches.append("MissingHandoff")
+        RawCache = None
+    else:
+        RawCache = Handoff.RawPortalGeometryCache
+    if Preparation is None:
+        Mismatches.append("MissingPreparation")
+    elif Handoff is not None:
+        if not Preparation.Complete:
+            Mismatches.append("IncompletePreparation")
+        if (
+            Handoff.PreparationDomainFingerprint
+            != Preparation.DomainFingerprint
+        ):
+            Mismatches.append("PreparationDomainFingerprint")
+        if Handoff.PlacementFingerprint != Preparation.PlacementFingerprint:
+            Mismatches.append("PreparationPlacementFingerprint")
+        if (
+            Handoff.ComponentGraphFingerprint
+            != Preparation.ComponentGraphFingerprint
+        ):
+            Mismatches.append("PreparationComponentGraphFingerprint")
+        if (
+            Handoff.ResourceGraphFingerprint
+            != Preparation.ResourceGraphFingerprint
+        ):
+            Mismatches.append("PreparationResourceGraphFingerprint")
+        if (
+            Handoff.ExteriorRegionFingerprint
+            != Preparation.ExteriorRegionFingerprint
+        ):
+            Mismatches.append("PreparationExteriorRegionFingerprint")
+    if Plan is None:
+        Mismatches.append("MissingAssemblyPlan")
+    elif Handoff is not None:
+        if Plan.PlacementFingerprint != Handoff.PlacementFingerprint:
+            Mismatches.append("PlanPlacementFingerprint")
+        if Plan.ComponentGraphFingerprint != Handoff.ComponentGraphFingerprint:
+            Mismatches.append("PlanComponentGraphFingerprint")
+        if Plan.ResourceGraphFingerprint != Handoff.ResourceGraphFingerprint:
+            Mismatches.append("PlanResourceGraphFingerprint")
+        if Plan.ExteriorRegionFingerprint != Handoff.ExteriorRegionFingerprint:
+            Mismatches.append("PlanExteriorRegionFingerprint")
+    if Handoff is not None and not isinstance(RawCache, RawPortalGeometryCache):
+        Mismatches.append("RawPortalGeometryCacheType")
+    elif Handoff is not None and RawCache is not None:
+        if (
+            RawCache.ExteriorRegionFingerprint
+            != Handoff.ExteriorRegionFingerprint
+        ):
+            Mismatches.append("CacheExteriorRegionFingerprint")
+        if (
+            RawCache.AuthoritativeResourceGraphFingerprint
+            != Handoff.ResourceGraphFingerprint
+        ):
+            Mismatches.append("CacheResourceGraphFingerprint")
+        CurrentResourceFingerprint = (
+            BuildPhysicalExteriorResourceGraphFingerprint(
+                Resources.ResourceGraph,
+                Handoff.ExteriorRegionFingerprint,
+                RawCache.Region,
+            )
+        )
+        if CurrentResourceFingerprint != Handoff.ResourceGraphFingerprint:
+            Mismatches.append("CurrentResourceGraphFingerprint")
+    if Mismatches:
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ComponentAssemblyIdentityMismatch,
+            Stage="PhysicalComponentGlobalPlanning",
+            Detail=(
+                "the frozen post-closure portal handoff does not match the "
+                "prepared domain, assembly plan, and resource graph"
+            ),
+            Diagnostics={
+                "IdentityMismatches": sorted(set(Mismatches)),
+                "PreparationDomainFingerprint": str(getattr(
+                    Preparation,
+                    "DomainFingerprint",
+                    "",
+                )),
+                "PhysicalAssemblyPlanFingerprint": str(getattr(
+                    Plan,
+                    "PlanFingerprint",
+                    "",
+                )),
+                "HandoffPreparationDomainFingerprint": str(getattr(
+                    Handoff,
+                    "PreparationDomainFingerprint",
+                    "",
+                )),
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
+    assert RawCache is not None
+    return RawCache
+
+
+def BuildFrozenPostClosurePortalHandoffTelemetry(
+    Resources: RoutingResources,
+    Preparation: PreparedPhysicalComponentPortFactorDomain | None,
+    Plan: PhysicalComponentAssemblyPlan | None,
+) -> dict[str, object]:
+    """Validate and describe the exact exterior fabric consumed globally."""
+    RawPortalCache = (
+        ValidateFrozenPhysicalComponentPostClosurePortalHandoff(
+            Resources,
+            Preparation,
+            Plan,
+        )
+    )
+    return {
+        "Applied": True,
+        "PreparationDomainFingerprint": str(
+            getattr(Preparation, "DomainFingerprint", "")
+        ),
+        "PhysicalAssemblyPlanFingerprint": str(
+            getattr(Plan, "PlanFingerprint", "")
+        ),
+        "ExteriorRegionFingerprint": (
+            RawPortalCache.ExteriorRegionFingerprint
+        ),
+        "AssignedColumnCount": len(RawPortalCache.AssignedColumns),
+        "ReservedAccessCount": len(RawPortalCache.ReservedAccess),
+        "PortalEntryCount": len(RawPortalCache.PortalEntries),
+        "PortableProofUsed": False,
+    }
+
+
 def BuildConfiguredPortalRequestDomainFingerprint(
     Signal: str,
     PortalVariantCount: int,
@@ -7444,6 +10710,83 @@ def BuildTranslatedPortablePortalId(
     return (
         f"{Signal}:{Terminal}:{Layer}:translated:"
         f"{GeometryFingerprint[:16]}"
+    )
+
+
+def MaterializeValidatedPortablePortalPositiveWitness(
+    Portal: PinAccessPortal,
+    *,
+    Signal: str,
+    Terminal: Position3,
+    Layer: int,
+    Transform: str,
+    Translation: Position3,
+    ResourceGraph: Any,
+    RegionNodes: frozenset[Position3],
+    RegionEdges: frozenset[RoutingEdge],
+) -> PinAccessPortal | None:
+    """Rebind one positive portal witness to the current exact geometry.
+
+    This deliberately returns no domain-completeness information.  The
+    caller has already matched routing policy and access topology; this final
+    materialization check binds the witness to the current terminal, resource
+    graph, exterior region, and rebuilt physical claims.
+    """
+    CurrentSignal = str(Signal)
+    CurrentTerminal = tuple(map(int, Terminal))
+    CurrentLayer = int(Layer)
+    if (
+        str(Portal.Signal) != CurrentSignal
+        or int(Portal.Layer) != CurrentLayer
+        or TransformPlanarRoutingPosition(
+            tuple(Portal.Terminal),
+            Transform,
+            Translation,
+        ) != CurrentTerminal
+    ):
+        return None
+    TransformedPath = tuple(
+        TransformPlanarRoutingPosition(
+            tuple(Position),
+            Transform,
+            Translation,
+        )
+        for Position in Portal.Path
+    )
+    TransformedEdges = frozenset(
+        NormalizeRoutingEdge(First, Second)
+        for First, Second in zip(
+            TransformedPath,
+            TransformedPath[1:],
+        )
+    )
+    if (
+        not TransformedPath
+        or not frozenset(TransformedPath) <= RegionNodes
+        or not TransformedEdges <= RegionEdges
+    ):
+        return None
+    Claims = ResourceGraph.BuildRouteClaims(TransformedPath)
+    if FindSelfClaimConflicts({CurrentSignal: Claims}):
+        return None
+    return replace(
+        Portal,
+        PortalId=BuildTranslatedPortablePortalId(
+            CurrentSignal,
+            CurrentTerminal,
+            CurrentLayer,
+            TransformedPath,
+            Length=Portal.Length,
+            BendCount=Portal.BendCount,
+            ViaCount=Portal.ViaCount,
+            Cost=Portal.Cost,
+        ),
+        Signal=CurrentSignal,
+        Terminal=CurrentTerminal,
+        Layer=CurrentLayer,
+        Path=TransformedPath,
+        Edges=TransformedEdges,
+        Claims=Claims,
     )
 
 
@@ -7824,6 +11167,17 @@ def TransformPortableCompletePortalDomainKeys(
     return frozenset(Result)
 
 
+def MergePostClosurePortalCompletionKeys(
+    PolicyCompleteEmptyKeys: Iterable[tuple[str, Position3, int]],
+    RegeneratedRequestKeys: Iterable[tuple[str, Position3, int]],
+) -> tuple[tuple[str, Position3, int], ...]:
+    """Close the regenerated request domain without dropping policy proofs."""
+    return tuple(sorted({
+        *PolicyCompleteEmptyKeys,
+        *RegeneratedRequestKeys,
+    }))
+
+
 def SelectPortablePortalProofReusableSignals(
     ValidatedPositiveSignals: Iterable[str],
     ExactPhysicalAssemblySignals: Iterable[str],
@@ -7832,6 +11186,20 @@ def SelectPortablePortalProofReusableSignals(
     return frozenset(map(str, ValidatedPositiveSignals)) - frozenset(
         map(str, ExactPhysicalAssemblySignals)
     )
+
+
+def SelectPortablePortalPositiveReusableSignals(
+    ValidatedPositiveSignals: Iterable[str],
+) -> frozenset[str]:
+    """Retain validated portal witnesses without transferring completeness.
+
+    Exact physical-plan signals may reuse a positively materialized generic
+    portal after its transformed path has been checked against the current
+    resource graph and exterior region.  That witness says nothing about the
+    rest of the configured request domain, so proof reuse remains a separate
+    and deliberately narrower decision.
+    """
+    return frozenset(map(str, ValidatedPositiveSignals))
 
 
 def PartitionExpectedGenericPortalDomainKeys(
@@ -7875,6 +11243,41 @@ def MergeSignalScopedRawPortalEntries(
         ),
         *GeneratedEntries,
     )))
+
+
+def PartitionPhysicalOwnedTerminalPortalRequests(
+    Requests: Iterable[tuple[Any, ...]],
+    Metadata: Iterable[tuple[str, Position3, int]],
+    OwnedTerminalPairs: frozenset[tuple[str, Position3]],
+) -> tuple[
+    list[tuple[Any, ...]],
+    list[tuple[str, Position3, int]],
+    list[tuple[Any, ...]],
+    list[tuple[str, Position3, int]],
+]:
+    """Split one exact portal domain into owned-first and deferred batches."""
+    RequestValues = list(Requests)
+    MetadataValues = list(Metadata)
+    if len(RequestValues) != len(MetadataValues):
+        raise ValueError("portal request metadata length mismatch")
+    OwnedRequests = []
+    OwnedMetadata = []
+    DeferredRequests = []
+    DeferredMetadata = []
+    for Request, Entry in zip(RequestValues, MetadataValues):
+        Destination = (
+            (OwnedRequests, OwnedMetadata)
+            if (Entry[0], Entry[1]) in OwnedTerminalPairs
+            else (DeferredRequests, DeferredMetadata)
+        )
+        Destination[0].append(Request)
+        Destination[1].append(Entry)
+    return (
+        OwnedRequests,
+        OwnedMetadata,
+        DeferredRequests,
+        DeferredMetadata,
+    )
 
 
 def RetainRawPortalGeometryCache(
@@ -12877,16 +16280,10 @@ def BuildSeamOnlyPhysicalComponentPortReservation(
         "CertifiedSupportReservationFingerprint",
         "",
     )) or Port.ReservationFingerprint
-    LocalClaims = ResourceGraph.BuildRouteClaims(
-        frozenset(Port.LocalPath)
-    )
-    GlobalClaims = ResourceGraph.BuildRouteClaims(
-        frozenset(Port.GlobalPath)
-    )
-    Claims = ResourceGraph.BuildRouteClaims(frozenset((
-        *Port.LocalPath,
-        *Port.GlobalPath,
-    )))
+    del ResourceGraph
+    LocalClaims = Port.LocalClaims
+    GlobalClaims = Port.GlobalClaims
+    Claims = Port.Claims
     return replace(
         Port,
         OwnedCandidateFingerprints=(),
@@ -12904,8 +16301,9 @@ def BuildSeamOnlyPhysicalComponentPortReservation(
             CertifiedSupportReservationFingerprint
         ),
         ReservationFingerprint=BuildStableFingerprint((
-            "physical-port-seam-only-v2",
+            "physical-port-seam-only-v3",
             BuildPhysicalPortSeamContractFingerprint(Port),
+            CertifiedSupportReservationFingerprint,
             tuple(
                 tuple(
                     int(Position[Index])
@@ -14287,11 +17685,22 @@ def _MaterializeCandidate(
     RouteFingerprint = BuildStableFingerprint(
         tuple(sorted(Nodes))
     )[:12]
-    CandidateId = (
-        f"{Signal}:L{Layer}:{Axis}:{Lane}:V{Variant}:"
-        f"S{SourcePortalId}:T{TargetPortalSignature}:"
-        f"R{RouteFingerprint}"
-    )
+    if Resources.PreparingPhysicalComponentGlobalChannels:
+        # Guide axis/lane/variant are search provenance, not physical route
+        # identity.  The same exact tree can be rediscovered through several
+        # coarse descriptors; keeping those aliases distinct causes a learned
+        # exterior/local no-good to revisit an already rejected assignment.
+        CandidateId = (
+            f"{Signal}:PhysicalGlobal:"
+            f"S{SourcePortalId}:T{TargetPortalSignature}:"
+            f"R{RouteFingerprint}"
+        )
+    else:
+        CandidateId = (
+            f"{Signal}:L{Layer}:{Axis}:{Lane}:V{Variant}:"
+            f"S{SourcePortalId}:T{TargetPortalSignature}:"
+            f"R{RouteFingerprint}"
+        )
     IncrementalLength = len(Nodes - SeedNodes)
     IncrementalMaterialCost = (
         IncrementalLength * max(1, LengthPenalty)
@@ -15049,9 +18458,9 @@ def PlanNegotiatedRouteTrees(
                 AvailableBySignal.append((Signal, Available))
             # MRV identifies the actual bounded-domain bottleneck. Use stable
             # demand metrics for ties; exhaustively recomputing incompatibility
-            # against every candidate of every remaining net is quadratic in
-            # the expanded CLA4 pool and can consume the routing deadline
-            # before the first assignment expansion.
+            # against every candidate of every remaining net is quadratic and
+            # can consume the routing deadline before first assignment
+            # expansion in dense candidate pools.
             Signal, Available = min(
                 AvailableBySignal,
                 key=lambda Value: (
@@ -18521,6 +21930,29 @@ def ExpandPhysicalComponentGuideChannels(
     )
 
 
+def RecomputeCoarseGuideCapacity(
+    CoarsePlan: Any,
+) -> Any:
+    """Recompute capacity after immutable component guides are overlaid."""
+    if CoarsePlan is None:
+        return None
+    Usage = Counter(
+        (int(CoarsePlan.Layers.get(Signal, 0)), X, Z)
+        for Signal, Guide in CoarsePlan.Guides.items()
+        for X, Z in Guide
+    )
+    Overflow = {
+        Position: Count - 1
+        for Position, Count in Usage.items()
+        if Count > 1
+    }
+    return replace(
+        CoarsePlan,
+        Usage=dict(Usage),
+        Overflow=Overflow,
+    )
+
+
 def BuildComponentKeepoutGuideCellsByLayer(
     KeepoutClaims: RoutingResourceClaims,
     ResourceGraph: Any,
@@ -18788,7 +22220,7 @@ def BuildExplicitPhysicalComponentFeedthrough(
         return tuple(sorted(Result, key=lambda Value: tuple(sorted(Value))))
 
     ExteriorComponents = Components(OutsideGuide)
-    if len(ExteriorComponents) != 2:
+    if len(ExteriorComponents) < 2:
         raise RoutingStageError(RoutingFailure(
             Reason=(
                 RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
@@ -18797,7 +22229,7 @@ def BuildExplicitPhysicalComponentFeedthrough(
             AffectedNets=(Signal,),
             Detail=(
                 "an explicit capacity-one component feedthrough requires "
-                "exactly two exterior guide components"
+                "at least two exterior guide components"
             ),
             Diagnostics={
                 "Signal": Signal,
@@ -18973,6 +22405,141 @@ def BuildExplicitPhysicalComponentFeedthrough(
     SearchCount = 0
     FabricPathCandidateCount = 2 * len(EndpointCandidates)
     ExteriorJoinRejectedCandidateCount = 0
+    if len(ExteriorComponents) > 2:
+        PathByEndpoints = {
+            frozenset((Candidate.Entry, Candidate.Exit)): (
+                tuple(Candidate.ReservedPathNodes),
+                Candidate.CandidateFingerprint,
+            )
+            for Candidate in EndpointCandidates
+        }
+        JoinsByComponent = tuple(
+            {
+                Node: JoinExterior(Component, (Node[0], Node[2]))
+                for Node in sorted(CandidateNodes)
+            }
+            for Component in ExteriorComponents
+        )
+        NodeDomains = tuple(
+            tuple(
+                Node for Node in sorted(CandidateNodes) if Joins.get(Node)
+            )
+            for Joins in JoinsByComponent
+        )
+        MultiBest: tuple[
+            tuple[object, ...],
+            tuple[tuple[int, int, int], ...],
+            tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...],
+            tuple[tuple[int, int], ...],
+            str,
+        ] | None = None
+        CombinationCount = prod(len(Domain) for Domain in NodeDomains)
+        for CombinationIndex, SelectedNodes in enumerate(
+            product(*NodeDomains),
+            start=1,
+        ):
+            if WorkCheck is not None and CombinationIndex % 1024 == 0:
+                WorkCheck({
+                    "Stage": "physical-component-feedthrough-tree-domain",
+                    "Signal": Signal,
+                    "CombinationIndex": CombinationIndex,
+                    "CombinationCount": CombinationCount,
+                    "ExteriorGuideComponentCount": len(ExteriorComponents),
+                })
+            Root = SelectedNodes[0]
+            ReservedNodes = {Root}
+            EndpointPairs = []
+            CandidateFingerprints = []
+            CompleteTree = True
+            for Endpoint in SelectedNodes[1:]:
+                if Endpoint == Root:
+                    continue
+                PathValue = PathByEndpoints.get(frozenset((Root, Endpoint)))
+                if PathValue is None:
+                    CompleteTree = False
+                    break
+                Path, CandidateFingerprint = PathValue
+                ReservedNodes.update(Path)
+                EndpointPairs.append((Root, Endpoint))
+                CandidateFingerprints.append(CandidateFingerprint)
+            if not CompleteTree:
+                continue
+            Claims = ResourceGraph.BuildRouteClaims(ReservedNodes)
+            if FindSelfClaimConflicts({Signal: Claims}):
+                continue
+            ExteriorJoins = tuple(
+                Position
+                for ComponentIndex, Node in enumerate(SelectedNodes)
+                for Position in JoinsByComponent[ComponentIndex][Node]
+            )
+            Score = (
+                len(ReservedNodes) + len(ExteriorJoins),
+                tuple(SelectedNodes),
+                tuple(sorted(ReservedNodes)),
+            )
+            Candidate = (
+                Score,
+                tuple(sorted(ReservedNodes)),
+                tuple(EndpointPairs),
+                ExteriorJoins,
+                BuildStableFingerprint(tuple(sorted(
+                    CandidateFingerprints
+                ))),
+            )
+            if MultiBest is None or Candidate < MultiBest:
+                MultiBest = Candidate
+        if MultiBest is None:
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+                ),
+                Stage="PhysicalComponentAssemblyPlanning",
+                AffectedNets=(Signal,),
+                Detail=(
+                    "the complete component feedthrough tree domain cannot "
+                    "connect every exterior guide component"
+                ),
+                Diagnostics={
+                    "Signal": Signal,
+                    "ExteriorGuideComponentCount": len(ExteriorComponents),
+                    "FeedthroughTreeCombinationCount": CombinationCount,
+                    "FeedthroughCandidateDomainComplete": True,
+                    "ComponentFabricConstructionComplete": True,
+                    "OwnershipSearchComplete": True,
+                    "ImplicitForeignTransitDomainCount": 0,
+                },
+            ))
+        ReservedPathNodes = MultiBest[1]
+        EndpointPairs = MultiBest[2]
+        ExteriorJoins = MultiBest[3]
+        Claims = ResourceGraph.BuildRouteClaims(ReservedPathNodes)
+        ReservationFingerprint = BuildStableFingerprint((
+            "physical-component-feedthrough-tree-v1",
+            int(Layer),
+            EndpointPairs,
+            tuple(sorted(map(str, Claims.ResourceIds))),
+        ))
+        Contract = ComponentFeedthroughContract(
+            Signal=Signal,
+            EndpointPairs=EndpointPairs,
+            Capacity=1,
+            ReservedPathNodes=ReservedPathNodes,
+            Claims=Claims,
+            ReservationFingerprint=ReservationFingerprint,
+            EndpointDomainFingerprint=EndpointDomain.DomainFingerprint,
+            EndpointCandidateFingerprint=MultiBest[4],
+            EndpointCandidateCount=CombinationCount,
+            EndpointPrescreenRetainedCandidateCount=len(EndpointCandidates),
+            EndpointPrescreenRejectedCandidateCount=(
+                EndpointPrescreenRejectedCandidateCount
+            ),
+        )
+        return Contract, frozenset((
+            *OutsideGuide,
+            *((Node[0], Node[2]) for Node in ReservedPathNodes),
+            *ExteriorJoins,
+        ))
+
     FirstComponent, SecondComponent = ExteriorComponents
     FirstExteriorJoins = {
         Node: JoinExterior(FirstComponent, (Node[0], Node[2]))
@@ -19149,6 +22716,7 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
         DefaultComponentKeepoutCore = (
             ComponentKeepoutGuideCells or frozenset()
         )
+    KeepoutClearance = max(1, int(TrackPitch))
     ComponentKeepoutHaloByLayer: dict[
         int, frozenset[tuple[int, int]]
     ] = {}
@@ -19167,13 +22735,9 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
         Result = frozenset(
             (X + DeltaX, Z + DeltaZ)
             for X, Z in Core
-            for DeltaX, DeltaZ in (
-                (0, 0),
-                (-1, 0),
-                (1, 0),
-                (0, -1),
-                (0, 1),
-            )
+            for DeltaX in range(-KeepoutClearance, KeepoutClearance + 1)
+            for DeltaZ in range(-KeepoutClearance, KeepoutClearance + 1)
+            if abs(DeltaX) + abs(DeltaZ) <= KeepoutClearance
         )
         ComponentKeepoutHaloByLayer[Layer] = Result
         return Result
@@ -19405,10 +22969,32 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
         DetourNodes: set[tuple[int, int]] = set()
         DetourComplete = True
         for TargetComponent in GuideComponents[1:]:
-            Pending = deque(sorted(Connected))
+            TargetMinimumX = min(Value[0] for Value in TargetComponent)
+            TargetMaximumX = max(Value[0] for Value in TargetComponent)
+            TargetMinimumZ = min(Value[1] for Value in TargetComponent)
+            TargetMaximumZ = max(Value[1] for Value in TargetComponent)
+
+            def TargetDistance(Value: tuple[int, int]) -> int:
+                X, Z = Value
+                return (
+                    max(0, TargetMinimumX - X, X - TargetMaximumX)
+                    + max(0, TargetMinimumZ - Z, Z - TargetMaximumZ)
+                )
+
+            Pending: list[tuple[int, int, int, int]] = []
+            Distance: dict[tuple[int, int], int] = {}
             Previous: dict[
                 tuple[int, int], tuple[int, int] | None
-            ] = {Value: None for Value in Connected}
+            ] = {}
+            for Value in sorted(Connected):
+                Distance[Value] = 0
+                Previous[Value] = None
+                heappush(Pending, (
+                    TargetDistance(Value),
+                    0,
+                    Value[0],
+                    Value[1],
+                ))
             Reached = next(
                 (
                     Value
@@ -19418,7 +23004,10 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
                 None,
             )
             while Pending and Reached is None:
-                Current = Pending.popleft()
+                _Estimate, CurrentDistance, X, Z = heappop(Pending)
+                Current = (X, Z)
+                if Distance.get(Current) != CurrentDistance:
+                    continue
                 if WorkCheck is not None and len(Previous) % 1024 == 0:
                     WorkCheck({
                         "Stage": "physical-global-channel-detour-search",
@@ -19426,7 +23015,6 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
                         "VisitedNodeCount": len(Previous),
                         "ExteriorGuideComponentCount": len(GuideComponents),
                     })
-                X, Z = Current
                 NeighborValues = (
                     (X - 1, Z),
                     (X + 1, Z),
@@ -19434,8 +23022,10 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
                     (X, Z + 1),
                 )
                 for Neighbor in NeighborValues:
+                    NeighborDistance = CurrentDistance + 1
                     if (
-                        Neighbor in Previous
+                        NeighborDistance
+                        >= Distance.get(Neighbor, NeighborDistance + 1)
                         or not (
                             MinimumX <= Neighbor[0] <= MaximumX
                             and MinimumZ <= Neighbor[1] <= MaximumZ
@@ -19444,11 +23034,17 @@ def BuildComponentKeepoutAvoidingGlobalGuides(
                         or Neighbor in ReservedPortAccessHaloCells
                     ):
                         continue
+                    Distance[Neighbor] = NeighborDistance
                     Previous[Neighbor] = Current
                     if Neighbor in TargetComponent:
                         Reached = Neighbor
                         break
-                    Pending.append(Neighbor)
+                    heappush(Pending, (
+                        NeighborDistance + TargetDistance(Neighbor),
+                        NeighborDistance,
+                        Neighbor[0],
+                        Neighbor[1],
+                    ))
             if Reached is None:
                 DetourComplete = False
                 break
@@ -19930,6 +23526,14 @@ def DecomposePhysicalPortLaneFactors(
                     LocalContractFingerprint=LocalContractFingerprint,
                     LocalAccessFingerprint=LocalAccessFingerprint,
                 )
+                LocalFactor = replace(
+                    LocalFactor,
+                    SeamContractFingerprint=(
+                        BuildPhysicalPortSeamContractFingerprint(
+                            LocalFactor
+                        )
+                    ),
+                )
                 ApertureFactor = PhysicalPortApertureOptionFactor(
                     Signal=Signal,
                     Direction=LaneFactor.Direction,
@@ -20197,6 +23801,16 @@ def MaterializeSupportedPhysicalPortReservation(
         or LocalFactor.Capacity != ApertureFactor.Capacity
     ):
         raise ValueError("unsupported physical local/aperture factor pair")
+    # Claims are a function of the complete physical node set, not an
+    # additive property of independently compiled path fragments.  In
+    # particular, BuildRouteClaims can discover technology primitives between
+    # spatially adjacent local/global cells that neither fragment contains by
+    # itself.  Recompile the joined seam so the immutable contract exactly
+    # describes what will be frozen into the resource graph.
+    Claims = ResourceGraph.BuildRouteClaims(frozenset((
+        *LocalFactor.LocalPath,
+        *ApertureFactor.GlobalPath,
+    )))
     Port = PhysicalComponentPortReservation(
         Signal=LocalFactor.Signal,
         Direction=LocalFactor.Direction,
@@ -20214,10 +23828,7 @@ def MaterializeSupportedPhysicalPortReservation(
         Attachment=ApertureFactor.Attachment,
         LocalPath=LocalFactor.LocalPath,
         GlobalPath=ApertureFactor.GlobalPath,
-        Claims=ResourceGraph.BuildRouteClaims(frozenset((
-            *LocalFactor.LocalPath,
-            *ApertureFactor.GlobalPath,
-        ))),
+        Claims=Claims,
         LocalClaims=LocalFactor.LocalClaims,
         GlobalClaims=ApertureFactor.GlobalClaims,
         OwnedAccessCandidates=LocalFactor.OwnedAccessCandidates,
@@ -21440,14 +25051,23 @@ def IterPhysicalBoundaryPortAssignments(
     CertifiedLocalNoGoods = tuple(CertifiedLocalNoGoodClauses)
     LearnedLocalNoGoodsSource = LearnedLocalSeamNoGoodClauses
     LocalSupportFeasibilityCache: dict[
-        tuple[tuple[str, str], ...],
+        tuple[tuple[str, tuple[tuple[object, ...], ...]], ...],
         tuple[
             tuple[tuple[tuple[str, str], ...], ...],
             tuple[PhysicalPortLocalAccessFactor, ...] | None,
         ],
     ] = {}
+    LocalSupportSubproblemCache: dict[
+        tuple[object, ...],
+        tuple[PhysicalPortLocalAccessFactor, ...] | None,
+    ] = {}
+    LocalFactorIdentityCache: dict[int, tuple[object, ...]] = {}
+    LocalFactorDomainIdentityCache: dict[
+        tuple[int, ...], tuple[tuple[object, ...], ...]
+    ] = {}
     BoundaryPrefixExpansionCount = 0
     LocalSupportSearchExpansionCount = 0
+    BoundaryPairSupportCheckCount = 0
     PrioritySignalRank = {
         str(Signal): Index + 1
         for Index, Signal in enumerate(PriorityInnermostSignals)
@@ -21466,7 +25086,7 @@ def IterPhysicalBoundaryPortAssignments(
     def CurrentLocalNoGoods() -> tuple[
         frozenset[tuple[str, str]], ...
     ]:
-        Learned = tuple(
+        LearnedLocalNoGoods = tuple(
             Clause
             for Clause in LearnedLocalNoGoodsSource
             if Clause
@@ -21477,7 +25097,10 @@ def IterPhysicalBoundaryPortAssignments(
                 for _Signal, Fingerprint in Clause
             )
         )
-        return tuple((*CertifiedLocalNoGoods, *Learned))
+        return tuple((
+            *CertifiedLocalNoGoods,
+            *LearnedLocalNoGoods,
+        ))
 
     def BoundaryApertureMatchIdentity(Value: Any) -> tuple[object, ...]:
         return (
@@ -21521,6 +25144,16 @@ def IterPhysicalBoundaryPortAssignments(
                 (Signal, str(Value.LocalAccessFingerprint)),
                 [],
             ).append(Value)
+    CompiledLocalNoGoodDomainCache: dict[
+        frozenset[frozenset[tuple[str, str]]],
+        tuple[
+            dict[str, frozenset[tuple[str, str]]],
+            dict[tuple[str, str], frozenset[tuple[str, str]]],
+            tuple[frozenset[tuple[str, str]], ...],
+            bool,
+            tuple[tuple[tuple[str, str], ...], ...],
+        ],
+    ] = {}
 
     def MatchingApertureFingerprint(
         Boundary: PhysicalComponentBoundaryPortReservation,
@@ -21559,6 +25192,176 @@ def IterPhysicalBoundaryPortAssignments(
             ),
         ))
 
+    def LocalFactorIdentity(
+        Value: PhysicalPortLocalAccessFactor,
+    ) -> tuple[object, ...]:
+        """Identify every input used by local support compatibility."""
+        CacheKey = id(Value)
+        Cached = LocalFactorIdentityCache.get(CacheKey)
+        if Cached is not None:
+            return Cached
+        Claims = Value.LocalClaims
+        Identity = (
+            str(Value.Signal),
+            str(Value.LocalAccessFingerprint),
+            str(Value.LocalContractFingerprint),
+            BuildPhysicalPortSeamContractFingerprint(Value),
+            str(Value.FabricDomainFingerprint),
+            tuple(sorted(Claims.WireCells)),
+            tuple(sorted(Claims.SupportCells)),
+            tuple(sorted(Claims.RequiredAirCells)),
+            tuple(sorted(Claims.ElectricalCells)),
+        )
+        LocalFactorIdentityCache[CacheKey] = Identity
+        return Identity
+
+    def LocalFactorDomainIdentity(
+        Values: Iterable[PhysicalPortLocalAccessFactor],
+    ) -> tuple[tuple[object, ...], ...]:
+        ValuesTuple = tuple(Values)
+        CacheKey = tuple(map(id, ValuesTuple))
+        Cached = LocalFactorDomainIdentityCache.get(CacheKey)
+        if Cached is not None:
+            return Cached
+        Identity = tuple(sorted(
+            (LocalFactorIdentity(Value) for Value in ValuesTuple),
+            key=repr,
+        ))
+        LocalFactorDomainIdentityCache[CacheKey] = Identity
+        return Identity
+
+    # Precompute the exact aperture-to-local-access relation.  Learned clauses
+    # remain live, so the pair-support memo below includes their current domain
+    # identity and never reuses an answer after that monotonic domain changes.
+    BoundaryLocalFactorDomains: dict[
+        tuple[str, tuple[object, ...]],
+        tuple[PhysicalPortLocalAccessFactor, ...],
+    ] = {}
+    for Signal, BoundaryValues in Domains.items():
+        for Boundary in BoundaryValues:
+            ApertureFingerprint = MatchingApertureFingerprint(Boundary)
+            SupportedLocalFingerprints = (
+                SupportedLocalFingerprintsByAperture.get(
+                    (Signal, ApertureFingerprint),
+                    (),
+                )
+                if ApertureFingerprint
+                else ()
+            )
+            ByLocalAccessFingerprint = {}
+            for Fingerprint in SupportedLocalFingerprints:
+                for Value in LocalFactorsByAccessFingerprint.get(
+                    (Signal, Fingerprint),
+                    (),
+                ):
+                    ByLocalAccessFingerprint.setdefault(
+                        str(Value.LocalAccessFingerprint),
+                        Value,
+                    )
+            BoundaryLocalFactorDomains[(
+                Signal,
+                OptionIdentity(Boundary),
+            )] = tuple(
+                ByLocalAccessFingerprint[Fingerprint]
+                for Fingerprint in sorted(ByLocalAccessFingerprint)
+            )
+    DirectBoundaryPairSupportCache: dict[
+        tuple[
+            tuple[tuple[tuple[str, str], ...], ...],
+            tuple[tuple[str, tuple[object, ...]], ...],
+        ], bool
+    ] = {}
+    DirectLocalNoGoodCompilationCache: dict[
+        tuple[tuple[tuple[str, str], ...], ...],
+        tuple[
+            tuple[frozenset[tuple[str, str]], ...],
+            bool,
+        ],
+    ] = {}
+
+    def CompileDirectLocalNoGoods() -> tuple[
+        tuple[frozenset[tuple[str, str]], ...],
+        bool,
+        tuple[tuple[tuple[str, str], ...], ...],
+    ]:
+        LocalNoGoods = CurrentLocalNoGoods()
+        LocalNoGoodIdentity = tuple(sorted(
+            tuple(sorted(Clause)) for Clause in LocalNoGoods
+        ))
+        Cached = DirectLocalNoGoodCompilationCache.get(
+            LocalNoGoodIdentity
+        )
+        if Cached is not None:
+            return (*Cached, LocalNoGoodIdentity)
+        Residuals = tuple(
+            frozenset(Clause - ConstantDomainKeys)
+            for Clause in LocalNoGoods
+        )
+        Compiled = (
+            tuple(
+                Residual for Residual in Residuals
+                if Residual and len(Residual) <= 2
+            ),
+            any(not Residual for Residual in Residuals),
+        )
+        DirectLocalNoGoodCompilationCache[LocalNoGoodIdentity] = Compiled
+        return (*Compiled, LocalNoGoodIdentity)
+
+    def BoundaryOptionPairHasDirectLocalSupport(
+        First: PhysicalComponentBoundaryPortReservation,
+        Second: PhysicalComponentBoundaryPortReservation,
+    ) -> bool:
+        """Resolve exact two-option support without entering the local DFS."""
+        if not UsePreparedLocalSupport:
+            return True
+        (
+            DirectLocalNoGoods,
+            DirectLocalDomainUnsatisfiable,
+            LocalNoGoodIdentity,
+        ) = CompileDirectLocalNoGoods()
+        if CertifiedNoGoodProjectionOnly and not LocalNoGoodIdentity:
+            return True
+        OptionPairKey = tuple(sorted((
+            (str(First.Signal), OptionIdentity(First)),
+            (str(Second.Signal), OptionIdentity(Second)),
+        ), key=repr))
+        PairKey = (LocalNoGoodIdentity, OptionPairKey)
+        if PairKey in DirectBoundaryPairSupportCache:
+            return DirectBoundaryPairSupportCache[PairKey]
+        FirstDomain = BoundaryLocalFactorDomains.get(
+            (str(First.Signal), OptionIdentity(First)),
+            (),
+        )
+        SecondDomain = BoundaryLocalFactorDomains.get(
+            (str(Second.Signal), OptionIdentity(Second)),
+            (),
+        )
+        Supported = bool(
+            not DirectLocalDomainUnsatisfiable
+            and FirstDomain
+            and SecondDomain
+            and any(
+                not any(
+                    Clause <= (
+                        LocalFactorKeys(FirstFactor)
+                        | LocalFactorKeys(SecondFactor)
+                    )
+                    for Clause in DirectLocalNoGoods
+                )
+                and (
+                    CertifiedNoGoodProjectionOnly
+                    or not ComponentClaimsConflict(
+                        FirstFactor.LocalClaims,
+                        SecondFactor.LocalClaims,
+                    )
+                )
+                for FirstFactor in FirstDomain
+                for SecondFactor in SecondDomain
+            )
+        )
+        DirectBoundaryPairSupportCache[PairKey] = Supported
+        return Supported
+
     def BoundaryTupleHasLocalSupport(
         Boundaries: tuple[
             PhysicalComponentBoundaryPortReservation, ...
@@ -21571,13 +25374,11 @@ def IterPhysicalBoundaryPortAssignments(
         if CertifiedNoGoodProjectionOnly and not LocalNoGoods:
             return True
         DomainsByLocalSignal = {}
-        ApertureIdentityBySignal = {}
         for Boundary in Boundaries:
             Signal = str(Boundary.Signal)
             ApertureFingerprint = MatchingApertureFingerprint(Boundary)
             if not ApertureFingerprint:
                 return False
-            ApertureIdentityBySignal[Signal] = ApertureFingerprint
             SupportedLocalFingerprints = (
                 SupportedLocalFingerprintsByAperture.get(
                     (Signal, ApertureFingerprint),
@@ -21595,28 +25396,99 @@ def IterPhysicalBoundaryPortAssignments(
             if not Domain:
                 return False
             DomainsByLocalSignal[Signal] = Domain
-        ForbiddenLocalKeysBySignal = {}
-        ResidualLocalNoGoods = []
-        ConstantLocalNoGood = False
-        for Clause in LocalNoGoods:
-            Residual = frozenset(Clause - ConstantDomainKeys)
-            if not Residual:
-                ConstantLocalNoGood = True
-            elif len(Residual) == 1:
-                Key = next(iter(Residual))
-                ForbiddenLocalKeysBySignal.setdefault(
-                    Key[0],
-                    set(),
-                ).add(Key)
-            else:
-                ResidualLocalNoGoods.append(Residual)
-        ResidualLocalNoGoodsTuple = tuple(ResidualLocalNoGoods)
+        if not Boundaries:
+            DomainsByLocalSignal = {
+                str(Signal): tuple(Values)
+                for Signal, Values in LocalFactors.items()
+            }
+            if any(
+                not Values for Values in DomainsByLocalSignal.values()
+            ):
+                return False
+        LocalNoGoodDomainIdentity = frozenset(LocalNoGoods)
+        CompiledLocalNoGoods = CompiledLocalNoGoodDomainCache.get(
+            LocalNoGoodDomainIdentity
+        )
+        if CompiledLocalNoGoods is None:
+            MutableForbiddenLocalKeysBySignal: dict[
+                str, set[tuple[str, str]]
+            ] = {}
+            MutableResidualLocalBinaryByKey: dict[
+                tuple[str, str], set[tuple[str, str]]
+            ] = defaultdict(set)
+            ResidualHigherOrderLocalNoGoods = []
+            ConstantLocalNoGood = False
+            for Clause in LocalNoGoods:
+                Residual = frozenset(Clause - ConstantDomainKeys)
+                if not Residual:
+                    ConstantLocalNoGood = True
+                elif len(Residual) == 1:
+                    Key = next(iter(Residual))
+                    MutableForbiddenLocalKeysBySignal.setdefault(
+                        Key[0],
+                        set(),
+                    ).add(Key)
+                elif len(Residual) == 2:
+                    First, Second = tuple(Residual)
+                    MutableResidualLocalBinaryByKey[First].add(Second)
+                    MutableResidualLocalBinaryByKey[Second].add(First)
+                else:
+                    ResidualHigherOrderLocalNoGoods.append(Residual)
+            CompiledLocalNoGoods = (
+                {
+                    Signal: frozenset(Values)
+                    for Signal, Values
+                    in MutableForbiddenLocalKeysBySignal.items()
+                },
+                {
+                    Key: frozenset(Values)
+                    for Key, Values
+                    in MutableResidualLocalBinaryByKey.items()
+                },
+                tuple(ResidualHigherOrderLocalNoGoods),
+                ConstantLocalNoGood,
+                tuple(sorted(
+                    tuple(sorted(Clause)) for Clause in LocalNoGoods
+                )),
+            )
+            CompiledLocalNoGoodDomainCache[
+                LocalNoGoodDomainIdentity
+            ] = CompiledLocalNoGoods
+        (
+            ForbiddenLocalKeysBySignal,
+            ResidualLocalBinaryByKey,
+            ResidualHigherOrderLocalNoGoodsTuple,
+            ConstantLocalNoGood,
+            LocalNoGoodIdentity,
+        ) = CompiledLocalNoGoods
+
+        def ViolatesResidualLocalNoGood(
+            Keys: frozenset[tuple[str, str]],
+        ) -> bool:
+            if any(
+                Keys.intersection(
+                    ResidualLocalBinaryByKey.get(Key, set())
+                )
+                for Key in Keys
+            ):
+                return True
+            return any(
+                Clause <= Keys
+                for Clause in ResidualHigherOrderLocalNoGoodsTuple
+            )
         if ConstantLocalNoGood:
             return False
-        LocalNoGoodIdentity = tuple(sorted(
-            tuple(sorted(Clause)) for Clause in LocalNoGoods
-        ))
-        StateIdentity = tuple(sorted(ApertureIdentityBySignal.items()))
+        # Aperture names are not local CSP state.  Different global aperture
+        # prefixes frequently project to the exact same local factor domains;
+        # key the retained proof by that canonical projection so those aliases
+        # share one complete existential-support result.
+        StateIdentity = tuple(
+            (
+                Signal,
+                LocalFactorDomainIdentity(DomainsByLocalSignal[Signal]),
+            )
+            for Signal in sorted(DomainsByLocalSignal)
+        )
         Cached = LocalSupportFeasibilityCache.get(StateIdentity)
         if Cached is not None:
             CachedNoGoodIdentity, CachedWitness = Cached
@@ -21632,9 +25504,11 @@ def IterPhysicalBoundaryPortAssignments(
                     for Value in CachedWitness
                     for Key in LocalFactorKeys(Value)
                 )
-                if not any(
-                    Clause <= CachedWitnessKeys
-                    for Clause in LocalNoGoods
+                if not ViolatesResidualLocalNoGood(
+                    CachedWitnessKeys - ConstantDomainKeys
+                ) and not any(
+                    CachedWitnessKeys.intersection(Values)
+                    for Values in ForbiddenLocalKeysBySignal.values()
                 ):
                     # Preserve a positive existential certificate until a
                     # newly learned clause actually intersects it.  This is
@@ -21649,6 +25523,31 @@ def IterPhysicalBoundaryPortAssignments(
             SelectedKeys: frozenset[tuple[str, str]],
         ) -> tuple[PhysicalPortLocalAccessFactor, ...] | None:
             nonlocal LocalSupportSearchExpansionCount
+            # Exact higher-order support DP.  The key includes the complete
+            # live no-good identity, every remaining factor domain, and exact
+            # selected claim geometry.  It therefore reuses suffix proofs
+            # across aperture-prefix aliases without weakening complete
+            # higher-order clauses or physical claim compatibility.
+            SubproblemKey = (
+                LocalNoGoodIdentity,
+                tuple(
+                    (
+                        Signal,
+                        LocalFactorDomainIdentity(
+                            DomainsByLocalSignal[Signal]
+                        ),
+                    )
+                    for Signal in sorted(Remaining)
+                ),
+                tuple(sorted(
+                    (LocalFactorIdentity(Value) for Value in Selected),
+                    key=repr,
+                )),
+                tuple(sorted(SelectedKeys)),
+                bool(CertifiedNoGoodProjectionOnly),
+            )
+            if SubproblemKey in LocalSupportSubproblemCache:
+                return LocalSupportSubproblemCache[SubproblemKey]
             LocalSupportSearchExpansionCount += 1
             if (
                 WorkCheck is not None
@@ -21668,6 +25567,7 @@ def IterPhysicalBoundaryPortAssignments(
                     "ImplicitForeignTransitDomainCount": 0,
                 })
             if not Remaining:
+                LocalSupportSubproblemCache[SubproblemKey] = Selected
                 return Selected
             CompatibleDomains = {}
             for Signal in Remaining:
@@ -21688,12 +25588,12 @@ def IterPhysicalBoundaryPortAssignments(
                             for Existing in Selected
                         )
                     )
-                    and not any(
-                        Clause <= (SelectedKeys | LocalFactorKeys(Value))
-                        for Clause in ResidualLocalNoGoodsTuple
+                    and not ViolatesResidualLocalNoGood(
+                        SelectedKeys | LocalFactorKeys(Value)
                     )
                 )
                 if not Values:
+                    LocalSupportSubproblemCache[SubproblemKey] = None
                     return None
                 CompatibleDomains[Signal] = Values
             Signal = min(
@@ -21713,7 +25613,9 @@ def IterPhysicalBoundaryPortAssignments(
                     SelectedKeys | LocalFactorKeys(Value),
                 )
                 if Witness is not None:
+                    LocalSupportSubproblemCache[SubproblemKey] = Witness
                     return Witness
+            LocalSupportSubproblemCache[SubproblemKey] = None
             return None
 
         Witness = LocalSearch(
@@ -21752,11 +25654,127 @@ def IterPhysicalBoundaryPortAssignments(
                 (Value.Signal, Value.ApertureContractFingerprint)
                 for Value in Selected
             ),
+            *(
+                (Value.Signal, Value.ReservationFingerprint)
+                for Value in Selected
+            ),
         ))
         return any(
             Clause <= SelectedKeys
             for Clause in CurrentRejectedApertureClauses()
         )
+
+    def PropagateRejectedBoundaryApertureClauses(
+        Remaining: tuple[str, ...],
+        Selected: tuple[PhysicalComponentBoundaryPortReservation, ...],
+        CandidateDomains: dict[
+            str, tuple[PhysicalComponentBoundaryPortReservation, ...]
+        ],
+    ) -> dict[
+        str, tuple[PhysicalComponentBoundaryPortReservation, ...]
+    ] | None:
+        """Enforce unary/binary learned aperture cuts to a fixed point."""
+        nonlocal BoundaryPairSupportCheckCount
+        BaseKeys = frozenset((
+            *ConstantDomainKeys,
+            *((Value.Signal, Value.GlobalContractFingerprint)
+              for Value in Selected),
+            *((Value.Signal, Value.ApertureContractFingerprint)
+              for Value in Selected),
+            *((Value.Signal, Value.ReservationFingerprint)
+              for Value in Selected),
+        ))
+
+        def OptionKeys(
+            Value: PhysicalComponentBoundaryPortReservation,
+        ) -> frozenset[tuple[str, str]]:
+            return frozenset((
+                (Value.Signal, Value.GlobalContractFingerprint),
+                (Value.Signal, Value.ApertureContractFingerprint),
+                (Value.Signal, Value.ReservationFingerprint),
+            ))
+
+        ResidualClauses = tuple(
+            Residual
+            for Clause in CurrentRejectedApertureClauses()
+            for Residual in (frozenset(Clause - BaseKeys),)
+            if Residual and len(Residual) <= 2
+        )
+        DirectLocalNoGoods, _ConstantUnsat, _Identity = (
+            CompileDirectLocalNoGoods()
+        )
+        if not ResidualClauses and not DirectLocalNoGoods:
+            return CandidateDomains
+        MutableDomains = {
+            Signal: list(Values)
+            for Signal, Values in CandidateDomains.items()
+        }
+        Changed = True
+        while Changed:
+            Changed = False
+            for Signal in Remaining:
+                Retained = []
+                for Option in MutableDomains[Signal]:
+                    BoundaryPairSupportCheckCount += 1
+                    if (
+                        WorkCheck is not None
+                        and BoundaryPairSupportCheckCount % 64 == 0
+                    ):
+                        WorkCheck({
+                            "Stage": (
+                                "physical-port-boundary-pair-"
+                                "support-propagation"
+                            ),
+                            "BoundaryPrefixExpansionCount": (
+                                BoundaryPrefixExpansionCount
+                            ),
+                            "BoundaryPairSupportCheckCount": (
+                                BoundaryPairSupportCheckCount
+                            ),
+                            "LocalSupportSearchExpansionCount": (
+                                LocalSupportSearchExpansionCount
+                            ),
+                            "LocalSupportStateCount": len(
+                                LocalSupportFeasibilityCache
+                            ),
+                            "ImplicitForeignTransitDomainCount": 0,
+                        })
+                    Keys = OptionKeys(Option)
+                    if any(
+                        Clause <= Keys for Clause in ResidualClauses
+                    ):
+                        continue
+                    Supported = True
+                    for OtherSignal in Remaining:
+                        if OtherSignal == Signal:
+                            continue
+                        if not any(
+                            not any(
+                                Clause <= (Keys | OptionKeys(Other))
+                                for Clause in ResidualClauses
+                            )
+                            and (
+                                not CertifiedNoGoodProjectionOnly
+                                or BoundaryOptionPairHasDirectLocalSupport(
+                                    Option,
+                                    Other,
+                                )
+                            )
+                            for Other in MutableDomains[OtherSignal]
+                        ):
+                            Supported = False
+                            break
+                    if Supported:
+                        Retained.append(Option)
+                if len(Retained) != len(MutableDomains[Signal]):
+                    MutableDomains[Signal] = Retained
+                    Changed = True
+                    if not Retained:
+                        return None
+        return {
+            Signal: tuple(Values)
+            for Signal, Values in MutableDomains.items()
+        }
 
     def Search(
         Remaining: tuple[str, ...],
@@ -21776,7 +25794,10 @@ def IterPhysicalBoundaryPortAssignments(
                 ),
                 "ImplicitForeignTransitDomainCount": 0,
             })
-        if Selected and not BoundaryTupleHasLocalSupport(Selected):
+        if (
+            (Selected or CertifiedNoGoodProjectionOnly)
+            and not BoundaryTupleHasLocalSupport(Selected)
+        ):
             return
         if not Remaining:
             yield tuple(sorted(
@@ -21801,6 +25822,13 @@ def IterPhysicalBoundaryPortAssignments(
             for Signal in Remaining
         }
         if any(not Values for Values in CompatibleDomains.values()):
+            return
+        CompatibleDomains = PropagateRejectedBoundaryApertureClauses(
+            Remaining,
+            Selected,
+            CompatibleDomains,
+        )
+        if CompatibleDomains is None:
             return
         Signal = min(
             Remaining,
@@ -22185,9 +26213,10 @@ def PreparePhysicalComponentPortFactorDomain(
             if (
                 Failure.Reason
                 != RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
-                or Failure.Diagnostics.get(
-                    "ExteriorGuideComponentCount"
-                ) != 2
+                or int(Failure.Diagnostics.get(
+                    "ExteriorGuideComponentCount",
+                    0,
+                )) < 2
                 or not Signal
                 or Signal in ExplicitFeedthroughsBySignal
             ):
@@ -24411,6 +28440,11 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
     CoarsePlan = Preparation.CoarsePlan
     AccessCertificate = Preparation.AccessCertificate
     ResourceGraph = Resources.ResourceGraph
+    LocalSeamNoGoodClauses = getattr(
+        Resources,
+        "RejectedPhysicalComponentLocalSeamReservationSets",
+        set(),
+    )
     if ResourceGraph is None:
         raise RoutingStageError(RoutingFailure(
             Reason=RoutingFailureReason.ComponentAssemblyIdentityMismatch,
@@ -24446,82 +28480,21 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         tuple(sorted(CoarsePlan.Layers.items())),
     ))
     LaneFactorsBySignal = dict(Preparation.LaneFactorsBySignal)
-    CurrentFactorDomainIdentity = tuple(
-        (
-            Signal,
-            tuple(
-                (
-                    Value.FabricDomainFingerprint,
-                    tuple(
-                        Candidate.CandidateFingerprint
-                        for Candidates in Value.CandidateDomains
-                        for Candidate in Candidates
-                    ),
-                    tuple(Seam.SeamFingerprint for Seam in Value.Seams),
-                )
-                for Value in Values
-            ),
-        )
-        for Signal, Values in sorted(LaneFactorsBySignal.items())
+    # The preparation and every nested factor/certificate model are frozen.
+    # Re-decomposing the complete lane domain on each learned-clause re-solve
+    # cannot reveal a valid state change; it only rebuilds the same large
+    # local-support index.  Preserve live resource-graph and guide checks,
+    # then trust the preparation's construction-time factor identity.
+    CurrentLocalAccessFactorsBySignal = (
+        Preparation.LocalAccessFactorsBySignal
     )
-    (
-        CurrentLocalAccessFactorsBySignal,
-        CurrentApertureFactorsBySignal,
-        CurrentLocalApertureSupportBySignal,
-    ) = DecomposePhysicalPortLaneFactors(
-        LaneFactorsBySignal,
-        Preparation.ChannelReservations,
-        ResourceGraph,
-        FabricOrigin=Preparation.FabricOrigin,
+    CurrentApertureFactorsBySignal = (
+        Preparation.ApertureFactorsBySignal
     )
-    CurrentDomainFingerprint = BuildStableFingerprint((
-        Problem.PlacementFingerprint,
-        Preparation.ComponentGraphFingerprint,
-        CurrentResourceGraphFingerprint,
-        CurrentGuideFingerprint,
-        AccessCertificate.CertificateFingerprint,
-        Preparation.ExteriorFabricSetFingerprint,
-        Preparation.ExteriorRegionFingerprint,
-        Preparation.ExteriorCapacityLedgerFingerprint,
-        tuple(
-            Value.ReservationFingerprint
-            for Value in Preparation.ChannelReservations
-        ),
-        tuple(
-            Domain.DomainFingerprint
-            for Domain in Preparation.FeedthroughEndpointDomains
-        ),
-        CurrentFactorDomainIdentity,
-        tuple(
-            (
-                Signal,
-                tuple(
-                    Value.LocalAccessFingerprint for Value in Values
-                ),
-            )
-            for Signal, Values in CurrentLocalAccessFactorsBySignal
-        ),
-        tuple(
-            (
-                Signal,
-                tuple(
-                    Value.ApertureOptionFingerprint for Value in Values
-                ),
-            )
-            for Signal, Values in CurrentApertureFactorsBySignal
-        ),
-        tuple(
-            (
-                Signal,
-                tuple(Value.SupportFingerprint for Value in Values),
-            )
-            for Signal, Values in CurrentLocalApertureSupportBySignal
-        ),
-        tuple(
-            Value.CertificateFingerprint
-            for Value in Preparation.ExteriorFixedClaimCertificates
-        ),
-    ))
+    CurrentLocalApertureSupportBySignal = (
+        Preparation.LocalApertureSupportBySignal
+    )
+    CurrentDomainFingerprint = Preparation.DomainFingerprint
     IdentityMismatches = tuple(
         Name
         for Name, Matches in (
@@ -25022,12 +28995,8 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                     "local-signal-domain:" + PortSolverCacheKey,
                 ),
             ))
-            if any(
-                RejectedSet.issubset(LaneReservationKeys)
-                for RejectedSet in (
-                    Resources
-                    .RejectedPhysicalComponentPortReservationSets
-                )
+            if ReservationKeysContainRejectedPortClause(
+                LaneReservationKeys
             ):
                 continue
             for Seam in InterleavePhysicalPortSeamsByEgressClass(
@@ -25086,6 +29055,51 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                         break
                     CachedOptions.append(Option)
 
+    RejectedPortClauses = tuple((
+        *Resources.RejectedPhysicalComponentPortReservationSets,
+        *LocalSeamNoGoodClauses,
+        *CertifiedLocalPairNoGoodClauses,
+    ))
+    RejectedUnaryPortKeys = frozenset(
+        next(iter(Clause))
+        for Clause in RejectedPortClauses
+        if len(Clause) == 1
+    )
+    MutableRejectedBinaryPortKeysByKey: dict[
+        tuple[str, str], set[tuple[str, str]]
+    ] = defaultdict(set)
+    for Clause in RejectedPortClauses:
+        if len(Clause) != 2:
+            continue
+        First, Second = tuple(Clause)
+        MutableRejectedBinaryPortKeysByKey[First].add(Second)
+        MutableRejectedBinaryPortKeysByKey[Second].add(First)
+    RejectedBinaryPortKeysByKey = {
+        Key: frozenset(Values)
+        for Key, Values in MutableRejectedBinaryPortKeysByKey.items()
+    }
+    RejectedHigherOrderPortClauses = tuple(
+        Clause for Clause in RejectedPortClauses
+        if len(Clause) > 2
+    )
+
+    def ReservationKeysContainRejectedPortClause(
+        Keys: frozenset[tuple[str, str]],
+    ) -> bool:
+        if Keys.intersection(RejectedUnaryPortKeys):
+            return True
+        if any(
+            Keys.intersection(
+                RejectedBinaryPortKeysByKey.get(Key, frozenset())
+            )
+            for Key in Keys
+        ):
+            return True
+        return any(
+            Clause.issubset(Keys)
+            for Clause in RejectedHigherOrderPortClauses
+        )
+
     def CompatibleWithSelected(
         Option: PhysicalComponentPortReservation,
         Selected: tuple[
@@ -25108,12 +29122,8 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             for Value in (*Selected, Option)
             for Key in PhysicalPortNoGoodKeys(Value)
         )
-        if any(
-            RejectedSet.issubset(SelectedReservationKeys)
-            for RejectedSet in (
-                *Resources.RejectedPhysicalComponentPortReservationSets,
-                *CertifiedLocalPairNoGoodClauses,
-            )
+        if ReservationKeysContainRejectedPortClause(
+            SelectedReservationKeys
         ):
             return False
         for Value in Selected:
@@ -25286,12 +29296,17 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             Resources
             .PreferredPhysicalComponentGlobalContractsBySignal
         )
+        PreferredApertureContracts = (
+            Resources
+            .PreferredPhysicalComponentApertureContractsBySignal
+        )
         PreferredReservations = (
             Resources
             .PreferredPhysicalComponentPortReservationsBySignal
         )
         PreferenceEpoch = (
             tuple(sorted(PreferredGlobalContracts.items())),
+            tuple(sorted(PreferredApertureContracts.items())),
             tuple(sorted(PreferredReservations.items())),
             tuple(sorted(
                 ActiveApertureContractRestrictionsBySignal.items()
@@ -25405,6 +29420,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         BinaryRejectedSets = SelectBinaryExactNoGoodClauses(
             (
                 *Resources.RejectedPhysicalComponentPortReservationSets,
+                *LocalSeamNoGoodClauses,
                 *CertifiedLocalPairNoGoodClauses,
             )
         )
@@ -25430,9 +29446,8 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                     PhysicalPortNoGoodKeys(First)
                     | PhysicalPortNoGoodKeys(Second)
                 )
-                Cached = not any(
-                    RejectedSet.issubset(PairKeys)
-                    for RejectedSet in BinaryRejectedSets
+                Cached = not ReservationKeysContainRejectedPortClause(
+                    PairKeys
                 )
                 LearnedPairCompatibilityCache[Key] = Cached
             return Cached
@@ -25445,10 +29460,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                     for Signal, Values in MutableDomains.items()
                 },
                 SelectedNoGoodKeysBySignal,
-                (
-                    *Resources.RejectedPhysicalComponentPortReservationSets,
-                    *CertifiedLocalPairNoGoodClauses,
-                ),
+                RejectedHigherOrderPortClauses,
                 PhysicalPortNoGoodKeys,
             )
             if ClausePropagated is None:
@@ -25588,6 +29600,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             ))
             for RejectedSet in (
                 *Resources.RejectedPhysicalComponentPortReservationSets,
+                *LocalSeamNoGoodClauses,
                 *CertifiedLocalPairNoGoodClauses,
                 *(
                     frozenset(((Signal, Fingerprint),))
@@ -25640,12 +29653,8 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                 "local-signal-domain:" + PortSolverCacheKey,
             ),
         ))
-        return not any(
-            RejectedSet.issubset(ReservationKeys)
-            for RejectedSet in (
-                Resources
-                .RejectedPhysicalComponentPortReservationSets
-            )
+        return not ReservationKeysContainRejectedPortClause(
+            ReservationKeys
         )
 
     def LaneSupportsSelected(
@@ -26046,6 +30055,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             SelectedNoGoodKeysBySignal,
             (
                 *Resources.RejectedPhysicalComponentPortReservationSets,
+                *LocalSeamNoGoodClauses,
                 *CertifiedLocalPairNoGoodClauses,
             ),
             PhysicalPortNoGoodKeys,
@@ -26074,7 +30084,9 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
 
     ApertureSelectionExpansionCount = 0
     FailedApertureRestrictionStates = (
-        PersistentPortCspState.FailedApertureRestrictionStates
+        set()
+        if RequiredBoundaryPorts is not None
+        else PersistentPortCspState.FailedApertureRestrictionStates
     )
     BoundaryPortDomainsBySignal = {
         Signal: tuple(
@@ -26107,6 +30119,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
     SelectedBoundaryPorts: tuple[
         PhysicalComponentBoundaryPortReservation, ...
     ] | None = None
+    SelectedBoundaryAssignmentFingerprint = ""
     BoundaryIteratorCache = getattr(
         Resources,
         "PhysicalComponentBoundaryAssignmentIteratorCache",
@@ -26119,33 +30132,32 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             "PhysicalComponentBoundaryAssignmentIteratorCache",
             BoundaryIteratorCache,
         )
-    BoundaryIteratorCacheKey = BuildStableFingerprint((
-        "physical-boundary-assignment-frontier-v3",
-        Preparation.DomainFingerprint,
-        bool(DeferLocalCompositeSelection),
-        int(getattr(
-            Resources,
-            "PhysicalComponentBoundaryTraversalEpoch",
-            0,
-        )),
-        tuple(getattr(
-            Resources,
-            "PhysicalComponentBoundaryTraversalPrioritySignals",
-            (),
-        )),
-        tuple(sorted(
-            Resources
-            .PreferredPhysicalComponentGlobalContractsBySignal
-            .items()
-        )),
-        tuple(sorted(
-            tuple(sorted(Clause))
-            for Clause in PhysicalLocalNoGoodClauses
-        )),
-    ))
+    BoundaryIteratorCacheKey = (
+        BuildPhysicalComponentAssemblyPlanDomainFingerprint(
+            Preparation.DomainFingerprint,
+            DeferLocalCompositeSelection,
+        )
+    )
+    Resources.PhysicalComponentAssemblyPlanDomainFingerprint = (
+        BoundaryIteratorCacheKey
+    )
+    Resources.PhysicalComponentDeferLocalCompositeSelection = bool(
+        DeferLocalCompositeSelection
+    )
     BoundaryAssignmentIterator = None
     BoundaryAssignmentIteratorReused = False
-    if RequiredBoundaryPorts is not None:
+    ComponentPlannerLiveDiagnostics: dict[str, object] = {}
+
+    def CheckComponentPlannerWork(
+        Diagnostics: dict[str, object],
+    ) -> None:
+        if WorkCheck is not None:
+            WorkCheck({
+                **Diagnostics,
+                **ComponentPlannerLiveDiagnostics,
+            })
+    IsRequiredBoundaryFixed = RequiredBoundaryPorts is not None
+    if IsRequiredBoundaryFixed:
         RequiredBoundaryPorts = tuple(sorted(
             RequiredBoundaryPorts,
             key=lambda Value: Value.Signal,
@@ -26166,50 +30178,48 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             BoundaryAssignmentIterator is not None
         )
     if BoundaryAssignmentIterator is None:
-        BoundaryAssignmentIterator = iter(IterPhysicalBoundaryPortAssignments(
-            BoundaryPortDomainsBySignal,
-            LocalAccessFactorsBySignal=(
-                dict(Preparation.LocalAccessFactorsBySignal)
+        ContractIterator = IterClosedComponentContracts(
+            Preparation,
+            TrackPitch=max(1, int(getattr(
+                ResourceGraph.Technology,
+                "TrackPitch",
+                DefaultRedstoneRoutingTechnology.TrackPitch,
+            ))),
+            RejectedClauses=(
+                Resources.RejectedPhysicalComponentPortReservationSets
             ),
-            ApertureFactorsBySignal=(
-                dict(Preparation.ApertureFactorsBySignal)
-            ),
-            LocalApertureSupportBySignal=(
-                dict(Preparation.LocalApertureSupportBySignal)
-            ),
-            CertifiedLocalNoGoodClauses=(
-                PhysicalLocalNoGoodClauses
-            ),
-            LearnedLocalSeamNoGoodClauses=(
+            RejectedApertureContractFingerprintsBySignal=(
                 Resources
-                .RejectedPhysicalComponentPortReservationSets
+                .RejectedPhysicalComponentPortReservationsBySignal
             ),
-            PortSolverCacheKey=PortSolverCacheKey,
+            RejectedAssignmentFingerprints=(
+                Resources
+                .RejectedPhysicalComponentBoundaryAssignmentFingerprints
+            ),
+            WorkCheck=CheckComponentPlannerWork,
+            # One component-interface CSP option owns the complete selected
+            # contract: local access, seam, aperture, and global guide.  A
+            # global-only option cannot propagate exact unary local/seam
+            # clauses and forces the boundary iterator to rediscover those
+            # failures one tuple at a time.
+            IncludeLocalCompositeFactors=True,
             PreferredGlobalContractsBySignal=(
                 Resources
                 .PreferredPhysicalComponentGlobalContractsBySignal
             ),
-            RejectedGlobalApertureClauses=(
-                Resources.RejectedPhysicalComponentPortReservationSets
-            ),
-            RejectedGlobalApertureFingerprintsBySignal=(
+            PreferredApertureContractsBySignal=(
                 Resources
-                .RejectedPhysicalComponentPortReservationsBySignal
+                .PreferredPhysicalComponentApertureContractsBySignal
             ),
-            PriorityInnermostSignals=(
-                getattr(
-                    Resources,
-                    "PhysicalComponentBoundaryTraversalPrioritySignals",
-                    (),
-                )
-                if DeferLocalCompositeSelection
-                else ()
+            PreferredPortReservationsBySignal=(
+                Resources
+                .PreferredPhysicalComponentPortReservationsBySignal
             ),
-            CertifiedNoGoodProjectionOnly=(
-                DeferLocalCompositeSelection
+            AperturePortalSlackBySignal=(
+                Resources.PhysicalComponentAperturePortalSlackBySignal
             ),
-            WorkCheck=WorkCheck,
-        ))
+        )
+        BoundaryAssignmentIterator = ContractIterator
         BoundaryIteratorCache[BoundaryIteratorCacheKey] = (
             BoundaryAssignmentIterator
         )
@@ -26313,6 +30323,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             },
             (
                 *Resources.RejectedPhysicalComponentPortReservationSets,
+                *LocalSeamNoGoodClauses,
                 *CertifiedLocalPairNoGoodClauses,
             ),
         )
@@ -26360,7 +30371,13 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         return False
 
     SeamOnlyPortDomainsBySignal: dict[
-        tuple[str, tuple[str, str] | None],
+        tuple[
+            str,
+            tuple[str, str] | None,
+            str | None,
+            str | None,
+            str | None,
+        ],
         tuple[PhysicalComponentPortReservation, ...],
     ] = {}
     PreparedLocalFactorsBySignal = {
@@ -26381,6 +30398,99 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         (str(Key[0]), str(Key[1])): tuple(Values)
         for Key, Values in Preparation.LocalApertureSupportsByOption
     }
+    ActiveLocalAccessRestrictionsBySignal: dict[str, str] = {}
+    ActiveSeamRestrictionsBySignal: dict[str, str] = {}
+    ActiveSupportRestrictionsBySignal: dict[str, str] = {}
+
+    def BuildHigherOrderSeamSupportRelation(
+        Certificate: Any,
+    ) -> tuple[
+        frozenset[str],
+        frozenset[frozenset[tuple[str, str]]],
+    ]:
+        SignalDomain = tuple(map(str, Certificate.SignalDomain))
+        SupportedProjections = set()
+        for TupleValue in Certificate.SupportedSeamTuples:
+            SeamBySignal = {
+                str(Signal): str(Seam)
+                for Signal, Seam in TupleValue
+            }
+            for ProjectionMask in range(1, 1 << len(SignalDomain)):
+                SupportedProjections.add(frozenset(
+                    (
+                        Signal,
+                        SeamBySignal[Signal],
+                    )
+                    for Index, Signal in enumerate(SignalDomain)
+                    if ProjectionMask & (1 << Index)
+                ))
+        return frozenset(SignalDomain), frozenset(SupportedProjections)
+
+    HigherOrderSeamSupportRelations = tuple(
+        BuildHigherOrderSeamSupportRelation(Certificate)
+        for Certificate in sorted(
+            getattr(
+                Resources,
+                "PhysicalComponentSymbolicHigherOrderCertificateCache",
+                {},
+            ).values(),
+            key=lambda Value: str(Value.DomainFingerprint),
+        )
+        if (
+            Certificate.Complete
+            and str(Certificate.PreparedDomainFingerprint)
+            == str(Preparation.DomainFingerprint)
+        )
+    )
+
+    def HasHigherOrderSeamSupport(
+        Selected: tuple[PhysicalComponentPortReservation, ...],
+    ) -> bool:
+        """Keep a partial seam tuple only if one certified tuple extends it."""
+        SelectedSeams = frozenset(
+            (
+                str(Port.Signal),
+                str(getattr(
+                    Port,
+                    "CertifiedSeamContractFingerprint",
+                    "",
+                ))
+                or BuildPhysicalPortSeamContractFingerprint(Port)
+            )
+            for Port in Selected
+        )
+        for SignalDomain, SupportedProjections in (
+            HigherOrderSeamSupportRelations
+        ):
+            RestrictedTuple = frozenset(
+                (Signal, Seam)
+                for Signal, Seam in SelectedSeams
+                if Signal in SignalDomain
+            )
+            if not RestrictedTuple:
+                continue
+            if RestrictedTuple in SupportedProjections:
+                continue
+            return False
+        return True
+
+    def BuildSeamOnlyPortDomainKey(
+        Signal: str,
+    ) -> tuple[
+        str,
+        tuple[str, str] | None,
+        str | None,
+        str | None,
+        str | None,
+    ]:
+        """Identify every restriction that changes a seam-only domain."""
+        return (
+            Signal,
+            ActiveApertureContractRestrictionsBySignal.get(Signal),
+            ActiveLocalAccessRestrictionsBySignal.get(Signal),
+            ActiveSeamRestrictionsBySignal.get(Signal),
+            ActiveSupportRestrictionsBySignal.get(Signal),
+        )
 
     def SelectSeamOnlyPorts() -> bool:
         """Select exact seams without performing the local capacity proof.
@@ -26395,7 +30505,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             Restriction = ActiveApertureContractRestrictionsBySignal.get(
                 Signal
             )
-            DomainKey = (Signal, Restriction)
+            DomainKey = BuildSeamOnlyPortDomainKey(Signal)
             if DomainKey in SeamOnlyPortDomainsBySignal:
                 continue
             ByFingerprint = {}
@@ -26404,7 +30514,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                 Signal,
                 {},
             )
-            SeenSeamFingerprints: set[str] = set()
+            SeenSeamFingerprints: set[tuple[str, str]] = set()
             ConsideredSupportCount = 0
             MatchingApertureFingerprints = tuple(
                 Fingerprint
@@ -26428,6 +30538,13 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             )
             for Support in SupportsForRestriction:
                 ConsideredSupportCount += 1
+                if (
+                    ActiveLocalAccessRestrictionsBySignal.get(Signal)
+                    not in (None, str(Support.LocalAccessFingerprint))
+                    or ActiveSupportRestrictionsBySignal.get(Signal)
+                    not in (None, str(Support.SupportFingerprint))
+                ):
+                    continue
                 LocalFactor = LocalFactors.get(
                     str(Support.LocalAccessFingerprint)
                 )
@@ -26441,12 +30558,23 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                     ApertureFactor.ApertureContractFingerprint,
                 ):
                     continue
-                SeamFingerprint = (
-                    BuildPhysicalPortSeamContractFingerprint(LocalFactor)
+                SeamFingerprint = BuildPhysicalPortSeamContractFingerprint(
+                    LocalFactor
                 )
-                if SeamFingerprint in SeenSeamFingerprints:
+                ActiveSeamFingerprint = (
+                    SeamFingerprint,
+                    str(Support.SupportFingerprint),
+                )
+                SeamRestriction = ActiveSeamRestrictionsBySignal.get(Signal)
+                if SeamRestriction not in (
+                    None,
+                    SeamFingerprint,
+                    ActiveSeamFingerprint,
+                ):
                     continue
-                SeenSeamFingerprints.add(SeamFingerprint)
+                if ActiveSeamFingerprint in SeenSeamFingerprints:
+                    continue
+                SeenSeamFingerprints.add(ActiveSeamFingerprint)
                 Option = MaterializeSupportedPhysicalPortReservation(
                     LocalFactor,
                     ApertureFactor,
@@ -26491,19 +30619,19 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         Domains = {
             Signal: tuple(
                 Option
-                for Option in SeamOnlyPortDomainsBySignal[(
-                    Signal,
-                    ActiveApertureContractRestrictionsBySignal.get(Signal),
-                )]
+                for Option in SeamOnlyPortDomainsBySignal[
+                    BuildSeamOnlyPortDomainKey(Signal)
+                ]
             )
             for Signal in OrderedSignals
         }
         if any(not Values for Values in Domains.values()):
             return False
 
-        RejectedClauses = tuple(
-            Resources.RejectedPhysicalComponentPortReservationSets
-        )
+        RejectedClauses = tuple((
+            *Resources.RejectedPhysicalComponentPortReservationSets,
+            *LocalSeamNoGoodClauses,
+        ))
 
         def Search(
             Remaining: tuple[str, ...],
@@ -26524,10 +30652,9 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                     "SeamOnly": True,
                     "ImplicitForeignTransitDomainCount": 0,
                 })
-            if any(
-                Clause and Clause <= SelectedKeys
-                for Clause in RejectedClauses
-            ):
+            if ReservationKeysContainRejectedPortClause(SelectedKeys):
+                return False
+            if not HasHigherOrderSeamSupport(Selected):
                 return False
             if not Remaining:
                 PortAssignmentFingerprint = BuildStableFingerprint(tuple(
@@ -26555,11 +30682,8 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                 Signal: tuple(
                     Option
                     for Option in Domains[Signal]
-                    if not any(
-                        Clause and Clause <= (
-                            SelectedKeys | PhysicalPortNoGoodKeys(Option)
-                        )
-                        for Clause in RejectedClauses
+                    if not ReservationKeysContainRejectedPortClause(
+                        SelectedKeys | PhysicalPortNoGoodKeys(Option)
                     )
                 )
                 for Signal in Remaining
@@ -26587,117 +30711,42 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
 
         return Search(tuple(OrderedSignals), (), frozenset())
 
-    def SelectedSeamHasCertifiedSymbolicCapacity() -> bool:
-        """Prune only complete component-net cores before assembly work."""
-        assert SelectedPorts is not None
-        PortAssignmentFingerprint = BuildStableFingerprint(tuple(
-            (
-                Port.Signal,
-                Port.ReservationFingerprint,
-            )
-            for Port in sorted(
-                SelectedPorts,
-                key=lambda Value: Value.Signal,
-            )
-        ))
-        CapacityInterface = replace(
-            Problem.Interface,
-            PhysicalPortReservations=SelectedPorts,
-            PhysicalAssemblyPlanFingerprint="",
-        )
-        CapacityProblem = replace(
-            Problem,
-            ProblemFingerprint=BuildStableFingerprint((
-                "pre-assembly-symbolic-capacity-v1",
-                Problem.ProblemFingerprint,
-                PortAssignmentFingerprint,
-            )),
-            Interface=CapacityInterface,
-            PhysicalAssemblyPlan=None,
-            ReservedGlobalClaimsBySignal=(),
-        )
-        CapacityProof = SolveComponentRoutingProblem(
-            CapacityProblem,
-            WorkCheck=WorkCheck,
-            StopAfterSymbolicCapacityProof=True,
-        )
-        if CapacityProof.Status != "architectural-unsatisfiable":
-            return True
-        Diagnostics = dict(CapacityProof.Diagnostics or {})
-        CoreSignals = tuple(sorted({
-            str(Signal)
-            for Signal in Diagnostics.get("LocalUnsatCoreSignals", ())
-            if str(Signal)
-        }))
-        VariableKinds = tuple(
-            str(Kind)
-            for Kind in Diagnostics.get(
-                "LocalUnsatCoreVariableKinds",
-                (),
-            )
-        )
-        ComponentNetCoreComplete = bool(
-            Diagnostics.get("SymbolicCapacityProofComplete", False)
-            and Diagnostics.get("LocalUnsatCoreComplete", False)
-            and CoreSignals
-            and set(CoreSignals) <= set(Problem.ComponentSignals)
-            and VariableKinds
-            and all(Kind == "net" for Kind in VariableKinds)
-        )
-        if not ComponentNetCoreComplete:
-            return True
-        PortsBySignal = {
-            Port.Signal: Port for Port in SelectedPorts
-        }
-        CoreClause = frozenset(
-            (
-                Signal,
-                BuildPhysicalPortSeamContractFingerprint(
-                    PortsBySignal[Signal]
-                ),
-            )
-            for Signal in CoreSignals
-        )
-        Resources.RejectedPhysicalComponentPortReservationSets.add(
-            CoreClause
-        )
-        Resources.RejectedPhysicalComponentPortAssignmentFingerprints.add(
-            PortAssignmentFingerprint
-        )
-        if WorkCheck is not None:
-            WorkCheck({
-                "Stage": "physical-port-pre-assembly-symbolic-capacity",
-                "Result": "architectural-unsatisfiable",
-                "PortAssignmentFingerprint": PortAssignmentFingerprint,
-                "LocalUnsatCoreKind": str(
-                    Diagnostics.get("LocalUnsatCoreKind", "")
-                ),
-                "LocalUnsatCoreSignals": list(CoreSignals),
-                "LocalCapacityCoreClause": [
-                    list(Value) for Value in sorted(CoreClause)
-                ],
-                "SymbolicCapacityProofFingerprint": (
-                    CapacityProof.ProofFingerprint
-                ),
-                "GlobalPlanningEntered": False,
-                "LocalCompilationEntered": False,
-                "ImplicitForeignTransitDomainCount": 0,
-            })
-        return False
-
     def SelectNextGloballyPlannedBoundary() -> bool:
         """Freeze one global tuple before any joint local compilation."""
         nonlocal ActiveApertureContractRestrictionsBySignal
+        nonlocal ActiveLocalAccessRestrictionsBySignal
+        nonlocal ActiveSeamRestrictionsBySignal
+        nonlocal ActiveSupportRestrictionsBySignal
         nonlocal ApertureSelectionExpansionCount
         nonlocal SelectedBoundaryPorts, SelectedPorts
+        nonlocal SelectedBoundaryAssignmentFingerprint
         BoundaryClauseSkipCount = 0
         while True:
-            BoundaryPorts = next(BoundaryAssignmentIterator, None)
-            if BoundaryPorts is None:
+            BoundarySelection = next(BoundaryAssignmentIterator, None)
+            if BoundarySelection is None:
                 ActiveApertureContractRestrictionsBySignal = {}
+                ActiveLocalAccessRestrictionsBySignal = {}
+                ActiveSeamRestrictionsBySignal = {}
+                ActiveSupportRestrictionsBySignal = {}
                 SelectedBoundaryPorts = None
                 SelectedPorts = None
                 return False
+            if isinstance(BoundarySelection, ComponentInterfaceContract):
+                BoundaryPorts = BoundarySelection.SelectedBoundaryPorts
+                ActiveLocalAccessRestrictionsBySignal = dict(
+                    BoundarySelection.SelectedLocalAccessFingerprints
+                )
+                ActiveSeamRestrictionsBySignal = dict(
+                    BoundarySelection.SelectedSeamContractFingerprints
+                )
+                ActiveSupportRestrictionsBySignal = dict(
+                    BoundarySelection.SelectedLocalSupportFingerprints
+                )
+            else:
+                BoundaryPorts = BoundarySelection
+                ActiveLocalAccessRestrictionsBySignal = {}
+                ActiveSeamRestrictionsBySignal = {}
+                ActiveSupportRestrictionsBySignal = {}
             ApertureSelectionExpansionCount += 1
             SelectedBoundaryPorts = BoundaryPorts
             ActiveApertureContractRestrictionsBySignal = {
@@ -26707,13 +30756,23 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                 )
                 for Value in BoundaryPorts
             }
-            RestrictionState = tuple(sorted(
-                ActiveApertureContractRestrictionsBySignal.items()
-            ))
+            RestrictionState = (
+                tuple(sorted(
+                    ActiveApertureContractRestrictionsBySignal.items()
+                )),
+                tuple(sorted(
+                    ActiveLocalAccessRestrictionsBySignal.items()
+                )),
+                tuple(sorted(ActiveSeamRestrictionsBySignal.items())),
+                tuple(sorted(ActiveSupportRestrictionsBySignal.items())),
+            )
             BoundaryAssignmentFingerprint = (
                 BuildPhysicalBoundaryPortAssignmentFingerprint(
                     BoundaryPorts
                 )
+            )
+            SelectedBoundaryAssignmentFingerprint = (
+                BoundaryAssignmentFingerprint
             )
             BoundaryKeys = frozenset((
                 *(
@@ -26780,6 +30839,12 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                             ActiveApertureContractRestrictionsBySignal.items()
                         )
                     },
+                    "SelectedLocalAccessContracts": dict(sorted(
+                        ActiveLocalAccessRestrictionsBySignal.items()
+                    )),
+                    "SelectedSeamContracts": dict(sorted(
+                        ActiveSeamRestrictionsBySignal.items()
+                    )),
                     "GlobalBoundaryPlanningComplete": True,
                     "LocalCompositePlanningStarted": False,
                     "ImplicitForeignTransitDomainCount": 0,
@@ -26801,9 +30866,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                         SelectedPorts,
                         key=lambda Value: Value.Signal,
                     ))
-                    if SelectedSeamHasCertifiedSymbolicCapacity():
-                        return True
-                    SelectedPorts = None
+                    return True
                 SelectedPorts = None
             elif (
                 RestrictionState not in FailedApertureRestrictionStates
@@ -26858,6 +30921,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
         # component export as equally responsible.
         RejectedNoGoodClauses = (
             *Resources.RejectedPhysicalComponentPortReservationSets,
+            *LocalSeamNoGoodClauses,
             *CertifiedLocalPairNoGoodClauses,
         )
         UniversalFactorKeysBySignal = {}
@@ -27393,128 +31457,12 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                         "ImplicitForeignTransitDomainCount": 0,
                     },
                 ))
-        while True:
-            try:
-                CandidateCoarsePlan, _PortAwareDetouredSignals = (
-                    BuildComponentKeepoutAvoidingGlobalGuides(
-                        CandidateCoarsePlan,
-                        ComponentPortSignals=PortSignals,
-                        EnvelopeMinimum=(
-                            Preparation.ComponentEnvelopeMinimum
-                        ),
-                        EnvelopeMaximum=(
-                            Preparation.ComponentEnvelopeMaximum
-                        ),
-                        TrackPitch=PortClearance,
-                        ReservedPortGuideCells=ReservedPortGuideCells,
-                        ComponentKeepoutGuideCellsByLayer=(
-                            KeepoutGuideCellsByLayer
-                        ),
-                        DeclaredFeedthroughSignals=(
-                            CandidateProblem.Interface
-                            .DeclaredFeedthroughSignals
-                        ),
-                        WorkCheck=WorkCheck,
-                    )
-                )
-                break
-            except RoutingStageError as Error:
-                Failure = Error.Failure
-                Signal = str(Failure.Diagnostics.get("Signal", ""))
-                if (
-                    Failure.Reason != (
-                        RoutingFailureReason
-                        .ComponentChannelCapacityUnsatisfiable
-                    )
-                    or Failure.Diagnostics.get(
-                        "ExteriorGuideComponentCount"
-                    ) != 2
-                    or not Signal
-                    or Signal in (
-                        CandidateProblem.Interface
-                        .DeclaredFeedthroughSignals
-                    )
-                ):
-                    raise
-                Layer = int(CandidateCoarsePlan.Layers.get(Signal, 0))
-                KeepoutCore = KeepoutGuideCellsByLayer.get(
-                    Layer,
-                    frozenset(),
-                )
-                KeepoutHalo = frozenset(
-                    (X + DeltaX, Z + DeltaZ)
-                    for X, Z in KeepoutCore
-                    for DeltaX, DeltaZ in (
-                        (0, 0),
-                        (-1, 0),
-                        (1, 0),
-                        (0, -1),
-                        (0, 1),
-                    )
-                )
-                Contract, UpdatedGuide = (
-                    BuildExplicitPhysicalComponentFeedthrough(
-                        Signal,
-                        Layer,
-                        frozenset(
-                            CandidateCoarsePlan.Guides.get(Signal, ())
-                        ),
-                        ComponentKeepoutGuideCells=KeepoutHalo,
-                        ReservedPortAccessGuideCells=(
-                            ReservedPortAccessGuideCells
-                        ),
-                        FabricNodes=frozenset(CandidateProblem.Fabric.Nodes),
-                        FabricEdges=frozenset(CandidateProblem.Fabric.Edges),
-                        FabricIngressNodes=frozenset(
-                            CandidateProblem.Fabric.IngressNodes
-                        ),
-                        ResourceGraph=ResourceGraph,
-                        MinimumPlacementY=Preparation.MinimumPlacementY,
-                        PreparedEndpointDomain=(
-                            PreparedFeedthroughDomainsBySignal.get(Signal)
-                        ),
-                        WorkCheck=WorkCheck,
-                    )
-                )
-                Feedthroughs = tuple(sorted(
-                    (*CandidateProblem.Interface.Feedthroughs, Contract),
-                    key=lambda Value: Value.Signal,
-                ))
-                Interface = replace(
-                    CandidateProblem.Interface,
-                    Feedthroughs=Feedthroughs,
-                )
-                FeedthroughProblem = replace(
-                    CandidateProblem,
-                    Interface=Interface,
-                )
-                ForeignTransitDomains = (
-                    BuildDeclaredComponentFeedthroughDomains(
-                        FeedthroughProblem,
-                        Feedthroughs,
-                    )
-                )
-                CandidateProblem = replace(
-                    FeedthroughProblem,
-                    ProblemFingerprint=BuildStableFingerprint((
-                        CandidateProblem.ProblemFingerprint,
-                        Contract.ReservationFingerprint,
-                    )),
-                    ForeignTransitDomains=ForeignTransitDomains,
-                    DomainComplete=bool(
-                        Problem.DomainComplete
-                        and all(
-                            Domain.Complete and Domain.Candidates
-                            for Domain in ForeignTransitDomains
-                        )
-                    ),
-                )
-                Guides = dict(CandidateCoarsePlan.Guides)
-                Guides[Signal] = UpdatedGuide
-                CandidateCoarsePlan = replace(
-                    CandidateCoarsePlan,
-                    Guides=Guides,
-                )
+        # Ordinary-net guide geometry is advisory at this stage. The closed
+        # component planner accounts for its coarse demand, but it does not
+        # convert those nets into exact detours or implicit feedthroughs.
+        # After the local template is frozen, the unchanged authoritative
+        # router owns their exact routes against the immutable component
+        # claims.
         CandidateChannels = []
         for Channel in Preparation.ChannelReservations:
             Layer = int(CandidateCoarsePlan.Layers.get(
@@ -27579,6 +31527,550 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
 
     ChannelPlanRejectionCount = 0
     ExactAssemblyChoiceRejectionCount = 0
+    ExplicitFeedthroughEndpointDomainCache = {
+        str(Domain.Signal): Domain
+        for Domain in Preparation.FeedthroughEndpointDomains
+    }
+
+    def GetPreparedFeedthroughEndpointDomain(
+        Signal: str,
+        Layer: int,
+    ) -> PreparedPhysicalComponentFeedthroughEndpointDomain:
+        Cached = ExplicitFeedthroughEndpointDomainCache.get(str(Signal))
+        if Cached is not None:
+            return Cached
+        Cached = PreparePhysicalComponentFeedthroughEndpointDomain(
+            str(Signal),
+            int(Layer),
+            FabricNodes=frozenset(Problem.Fabric.Nodes),
+            FabricEdges=frozenset(Problem.Fabric.Edges),
+            FabricIngressNodes=frozenset(Problem.Fabric.IngressNodes),
+            FabricFingerprint=BuildStableFingerprint((
+                tuple(sorted(Problem.Fabric.Nodes)),
+                tuple(sorted(Problem.Fabric.Edges)),
+            )),
+            ResourceGraph=ResourceGraph,
+            MinimumPlacementY=Preparation.MinimumPlacementY,
+            WorkCheck=WorkCheck,
+        )
+        ExplicitFeedthroughEndpointDomainCache[str(Signal)] = Cached
+        return Cached
+
+    def MinimizeExteriorGuideDetourNoGood(
+        Failure: RoutingFailure,
+        BoundaryPorts: tuple[
+            PhysicalComponentBoundaryPortReservation, ...
+        ],
+    ) -> tuple[frozenset[tuple[str, str]], int]:
+        """Return the smallest complete aperture cut for a guide detour.
+
+        The exterior guide checker is monotone in reserved port-access cells:
+        adding an aperture can only remove detour nodes.  Deletion therefore
+        produces a complete irreducible core without enumerating assignments.
+        A two-component cut remains repairable by the explicit feedthrough
+        stage and is not a no-good witness here.
+        """
+        if not BoundaryPorts:
+            return frozenset(), 0
+
+        ExpectedSignal = str(Failure.Diagnostics.get("Signal", ""))
+        ExpectedDetail = str(Failure.Detail)
+        CheckCount = 0
+
+        def HasSameCompleteFailure(
+            Ports: tuple[
+                PhysicalComponentBoundaryPortReservation, ...
+            ],
+        ) -> bool:
+            nonlocal CheckCount
+            CheckCount += 1
+            ReservedCells = frozenset(
+                (Position[0], Position[2])
+                for Port in Ports
+                for Position in Port.GlobalPath
+            )
+            try:
+                BuildComponentKeepoutAvoidingGlobalGuides(
+                    Preparation.CoarsePlan,
+                    ComponentPortSignals=frozenset(OrderedSignals),
+                    EnvelopeMinimum=(
+                        Preparation.ComponentEnvelopeMinimum
+                    ),
+                    EnvelopeMaximum=(
+                        Preparation.ComponentEnvelopeMaximum
+                    ),
+                    TrackPitch=max(1, int(getattr(
+                        ResourceGraph.Technology,
+                        "TrackPitch",
+                        DefaultRedstoneRoutingTechnology.TrackPitch,
+                    ))),
+                    ReservedPortGuideCells=ReservedCells,
+                    ComponentKeepoutGuideCellsByLayer=dict(
+                        Preparation.ComponentKeepoutGuideCellsByLayer
+                    ),
+                    DeclaredFeedthroughSignals=(
+                        Preparation.Problem.Interface
+                        .DeclaredFeedthroughSignals
+                    ),
+                    WorkCheck=WorkCheck,
+                )
+            except RoutingStageError as CandidateError:
+                CandidateFailure = CandidateError.Failure
+                CandidateSignal = str(
+                    CandidateFailure.Diagnostics.get("Signal", "")
+                )
+                RepairableExteriorCut = bool(
+                    int(CandidateFailure.Diagnostics.get(
+                        "ExteriorGuideComponentCount",
+                        0,
+                    )) >= 2
+                    and CandidateSignal
+                    and CandidateSignal not in (
+                        Preparation.Problem.Interface
+                        .DeclaredFeedthroughSignals
+                    )
+                )
+                return bool(
+                    not RepairableExteriorCut
+                    and (
+                        not ExpectedSignal
+                        or CandidateSignal == ExpectedSignal
+                    )
+                    and (
+                        not ExpectedDetail
+                        or str(CandidateFailure.Detail) == ExpectedDetail
+                    )
+                )
+            return False
+
+        Core = list(sorted(BoundaryPorts, key=lambda Value: Value.Signal))
+        if not HasSameCompleteFailure(tuple(Core)):
+            return frozenset(), CheckCount
+        for Port in tuple(Core):
+            CandidateCore = tuple(
+                Value for Value in Core if Value.Signal != Port.Signal
+            )
+            if CandidateCore and HasSameCompleteFailure(CandidateCore):
+                Core = list(CandidateCore)
+        return (
+            frozenset(
+                (
+                    str(Port.Signal),
+                    str(Port.ApertureContractFingerprint),
+                )
+                for Port in Core
+            ),
+            CheckCount,
+        )
+
+    def BuildFeedthroughEndpointPrescreenNoGood(
+        Failure: RoutingFailure,
+        BoundaryPorts: tuple[
+            PhysicalComponentBoundaryPortReservation, ...
+        ],
+    ) -> tuple[frozenset[tuple[str, str]], int]:
+        """Prove a minimal aperture core blocking every feedthrough path."""
+        Diagnostics = dict(Failure.Diagnostics or {})
+        Signal = str(Diagnostics.get("Signal", ""))
+        CandidateCount = int(Diagnostics.get(
+            "FeedthroughEndpointCandidateCount",
+            0,
+        ))
+        RejectedCount = int(Diagnostics.get(
+            "FeedthroughEndpointPrescreenRejectedCandidateCount",
+            0,
+        ))
+        if (
+            not Signal
+            or not Diagnostics.get(
+                "FeedthroughEndpointPrescreenComplete",
+                False,
+            )
+            or CandidateCount <= 0
+            or RejectedCount != CandidateCount
+            or not BoundaryPorts
+        ):
+            return frozenset(), 0
+        EndpointDomain = next((
+            Domain
+            for Domain in Preparation.FeedthroughEndpointDomains
+            if str(Domain.Signal) == Signal
+        ), None)
+        if (
+            EndpointDomain is None
+            or not EndpointDomain.Complete
+            or len(EndpointDomain.Candidates) != CandidateCount
+        ):
+            return frozenset(), 0
+        Clearance = max(1, int(getattr(
+            ResourceGraph.Technology,
+            "TrackPitch",
+            DefaultRedstoneRoutingTechnology.TrackPitch,
+        )))
+        HaloBySignal = {
+            str(Port.Signal): frozenset(
+                (X + DeltaX, Z + DeltaZ)
+                for X, _Y, Z in Port.GlobalPath
+                for DeltaX in range(-Clearance, Clearance + 1)
+                for DeltaZ in range(-Clearance, Clearance + 1)
+                if abs(DeltaX) + abs(DeltaZ) <= Clearance
+            )
+            for Port in BoundaryPorts
+        }
+        BlockerSets = tuple(
+            frozenset(
+                PortSignal
+                for PortSignal, Halo in HaloBySignal.items()
+                if any(
+                    (Node[0], Node[2]) in Halo
+                    for Node in Candidate.ReservedPathNodes
+                )
+            )
+            for Candidate in EndpointDomain.Candidates
+        )
+        if any(not Blockers for Blockers in BlockerSets):
+            return frozenset(), 0
+        Signals = tuple(sorted(HaloBySignal))
+        CheckCount = 0
+        Core: tuple[str, ...] = ()
+        for CoreSize in range(1, len(Signals) + 1):
+            for CandidateCore in combinations(Signals, CoreSize):
+                CheckCount += 1
+                if all(
+                    set(CandidateCore) & Blockers
+                    for Blockers in BlockerSets
+                ):
+                    Core = CandidateCore
+                    break
+            if Core:
+                break
+        if not Core:
+            return frozenset(), CheckCount
+        PortsBySignal = {
+            str(Port.Signal): Port for Port in BoundaryPorts
+        }
+        return (
+            frozenset(
+                (
+                    SignalValue,
+                    str(PortsBySignal[
+                        SignalValue
+                    ].ApertureContractFingerprint),
+                )
+                for SignalValue in Core
+            ),
+            CheckCount,
+        )
+
+    ExplicitFeedthroughMinimizationDiagnostics: dict[str, object] = {}
+    ExplicitFeedthroughFeasibilityCache: dict[
+        tuple[str, str, tuple[tuple[str, str], ...]], bool
+    ] = {}
+    CompiledExplicitFeedthroughBinaryRows: set[
+        tuple[str, str, str, str]
+    ] = set()
+
+    def MinimizeExplicitFeedthroughNoGood(
+        Failure: RoutingFailure,
+        BoundaryPorts: tuple[
+            PhysicalComponentBoundaryPortReservation, ...
+        ],
+    ) -> tuple[frozenset[tuple[str, str]], int]:
+        """Delete apertures while preserving one complete feedthrough cut."""
+        ExpectedDetail = str(Failure.Detail)
+        ExpectedSignal = str(
+            (Failure.Diagnostics or {}).get("Signal", "")
+        )
+        if ExpectedDetail not in {
+            "the complete explicit feedthrough endpoint domain cannot reach "
+            "both exterior guide components without crossing a port claim",
+            "the complete component feedthrough tree domain cannot connect "
+            "every exterior guide component",
+        } or not ExpectedSignal or not BoundaryPorts:
+            return frozenset(), 0
+        Layer = int(Preparation.CoarsePlan.Layers.get(
+            ExpectedSignal,
+            (Failure.Diagnostics or {}).get("Layer", 0),
+        ))
+        EndpointDomain = GetPreparedFeedthroughEndpointDomain(
+            ExpectedSignal,
+            Layer,
+        )
+        if not EndpointDomain.Complete:
+            return frozenset(), 0
+        Guide = frozenset(
+            Preparation.CoarsePlan.Guides.get(ExpectedSignal, ())
+        )
+        if not Guide:
+            return frozenset(), 0
+        TrackPitch = max(1, int(getattr(
+            ResourceGraph.Technology,
+            "TrackPitch",
+            DefaultRedstoneRoutingTechnology.TrackPitch,
+        )))
+        KeepoutCore = dict(
+            Preparation.ComponentKeepoutGuideCellsByLayer
+        ).get(Layer, frozenset())
+        KeepoutHalo = frozenset(
+            (X + DeltaX, Z + DeltaZ)
+            for X, Z in KeepoutCore
+            for DeltaX, DeltaZ in (
+                (0, 0),
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+            )
+        )
+        CheckCount = 0
+
+        def HasSameCompleteFailure(
+            Ports: tuple[
+                PhysicalComponentBoundaryPortReservation, ...
+            ],
+        ) -> bool:
+            nonlocal CheckCount
+            CacheKey = (
+                ExpectedSignal,
+                ExpectedDetail,
+                tuple(sorted(
+                    (
+                        str(Port.Signal),
+                        str(Port.ApertureContractFingerprint),
+                    )
+                    for Port in Ports
+                )),
+            )
+            CachedFailure = ExplicitFeedthroughFeasibilityCache.get(
+                CacheKey
+            )
+            if CachedFailure is not None:
+                return CachedFailure
+            CheckCount += 1
+            ReservedCells = frozenset(
+                (Position[0], Position[2])
+                for Port in Ports
+                for Position in Port.GlobalPath
+            )
+            SingleSignalPlan = replace(
+                Preparation.CoarsePlan,
+                Guides={ExpectedSignal: Guide},
+                Layers={ExpectedSignal: Layer},
+            )
+            try:
+                BuildComponentKeepoutAvoidingGlobalGuides(
+                    SingleSignalPlan,
+                    ComponentPortSignals=frozenset(OrderedSignals),
+                    EnvelopeMinimum=(
+                        Preparation.ComponentEnvelopeMinimum
+                    ),
+                    EnvelopeMaximum=(
+                        Preparation.ComponentEnvelopeMaximum
+                    ),
+                    TrackPitch=TrackPitch,
+                    ReservedPortGuideCells=ReservedCells,
+                    ComponentKeepoutGuideCellsByLayer=dict(
+                        Preparation.ComponentKeepoutGuideCellsByLayer
+                    ),
+                    DeclaredFeedthroughSignals=frozenset(),
+                )
+                ExplicitFeedthroughMinimizationDiagnostics.update({
+                    "GuideStatus": "feasible",
+                    "PortCount": len(Ports),
+                })
+                ExplicitFeedthroughFeasibilityCache[CacheKey] = False
+                return False
+            except RoutingStageError as GuideError:
+                GuideFailure = GuideError.Failure
+                ExplicitFeedthroughMinimizationDiagnostics.update({
+                    "GuideStatus": "failed",
+                    "GuideFailureDetail": str(GuideFailure.Detail),
+                    "GuideFailureDiagnostics": dict(
+                        GuideFailure.Diagnostics or {}
+                    ),
+                    "PortCount": len(Ports),
+                })
+                if (
+                    GuideFailure.Reason != RoutingFailureReason
+                    .ComponentChannelCapacityUnsatisfiable
+                    or str((GuideFailure.Diagnostics or {}).get(
+                        "Signal",
+                        "",
+                    )) != ExpectedSignal
+                    or int((GuideFailure.Diagnostics or {}).get(
+                        "ExteriorGuideComponentCount",
+                        0,
+                    )) < 2
+                ):
+                    ExplicitFeedthroughFeasibilityCache[CacheKey] = False
+                    return False
+            ReservedHalo = frozenset(
+                (X + DeltaX, Z + DeltaZ)
+                for X, Z in ReservedCells
+                for DeltaX in range(-TrackPitch, TrackPitch + 1)
+                for DeltaZ in range(-TrackPitch, TrackPitch + 1)
+                if abs(DeltaX) + abs(DeltaZ) <= TrackPitch
+            )
+            try:
+                BuildExplicitPhysicalComponentFeedthrough(
+                    ExpectedSignal,
+                    Layer,
+                    Guide,
+                    ComponentKeepoutGuideCells=KeepoutHalo,
+                    ReservedPortAccessGuideCells=ReservedHalo,
+                    FabricNodes=frozenset(Problem.Fabric.Nodes),
+                    FabricEdges=frozenset(Problem.Fabric.Edges),
+                    FabricIngressNodes=frozenset(
+                        Problem.Fabric.IngressNodes
+                    ),
+                    ResourceGraph=ResourceGraph,
+                    MinimumPlacementY=Preparation.MinimumPlacementY,
+                    PreparedEndpointDomain=EndpointDomain,
+                )
+            except RoutingStageError as CandidateError:
+                ExplicitFeedthroughMinimizationDiagnostics.update({
+                    "FeedthroughStatus": "failed",
+                    "FeedthroughFailureDetail": str(
+                        CandidateError.Failure.Detail
+                    ),
+                    "FeedthroughFailureDiagnostics": dict(
+                        CandidateError.Failure.Diagnostics or {}
+                    ),
+                })
+                Result = bool(
+                    CandidateError.Failure.Reason
+                    == RoutingFailureReason
+                    .ComponentChannelCapacityUnsatisfiable
+                    and str(CandidateError.Failure.Detail)
+                    == ExpectedDetail
+                )
+                ExplicitFeedthroughFeasibilityCache[CacheKey] = Result
+                return Result
+            ExplicitFeedthroughFeasibilityCache[CacheKey] = False
+            return False
+
+        Core = list(sorted(
+            BoundaryPorts,
+            key=lambda Value: Value.Signal,
+        ))
+        if not HasSameCompleteFailure(tuple(Core)):
+            return frozenset(), CheckCount
+        for Port in tuple(Core):
+            CandidateCore = tuple(
+                Value for Value in Core
+                if Value.Signal != Port.Signal
+            )
+            if CandidateCore and HasSameCompleteFailure(CandidateCore):
+                Core = list(CandidateCore)
+        if len(Core) == 2:
+            BoundaryDomains = {
+                str(Signal): tuple(Values)
+                for Signal, Values
+                in Preparation.BoundaryPortReservationsBySignal
+            }
+            UniqueDomains = {}
+            for Signal in (str(Core[0].Signal), str(Core[1].Signal)):
+                ByContract = {}
+                for Value in BoundaryDomains.get(Signal, ()):
+                    ByContract.setdefault(
+                        str(Value.ApertureContractFingerprint),
+                        Value,
+                    )
+                UniqueDomains[Signal] = tuple(
+                    ByContract[Fingerprint]
+                    for Fingerprint in sorted(ByContract)
+                )
+            FixedPort, VariablePort = sorted(
+                Core,
+                key=lambda Value: (
+                    len(UniqueDomains.get(str(Value.Signal), ())),
+                    str(Value.Signal),
+                ),
+            )
+            FixedSignal = str(FixedPort.Signal)
+            VariableSignal = str(VariablePort.Signal)
+            RowKey = (
+                ExpectedSignal,
+                FixedSignal,
+                str(FixedPort.ApertureContractFingerprint),
+                VariableSignal,
+            )
+            VariableDomain = UniqueDomains.get(VariableSignal, ())
+            if (
+                RowKey not in CompiledExplicitFeedthroughBinaryRows
+                and VariableDomain
+            ):
+                IncompatibleCount = 0
+                for AlternativeIndex, Alternative in enumerate(
+                    VariableDomain,
+                    start=1,
+                ):
+                    if WorkCheck is not None and (
+                        AlternativeIndex == 1
+                        or AlternativeIndex % 16 == 0
+                    ):
+                        WorkCheck({
+                            "Stage": (
+                                "physical-feedthrough-binary-support-row"
+                            ),
+                            "FixedSignal": FixedSignal,
+                            "VariableSignal": VariableSignal,
+                            "AlternativeIndex": AlternativeIndex,
+                            "AlternativeCount": len(VariableDomain),
+                            "IncompatibleCount": IncompatibleCount,
+                        })
+                    if not HasSameCompleteFailure(tuple(sorted(
+                        (FixedPort, Alternative),
+                        key=lambda Value: str(Value.Signal),
+                    ))):
+                        continue
+                    IncompatibleCount += 1
+                    LocalSeamNoGoodClauses.add(frozenset((
+                        (
+                            FixedSignal,
+                            str(
+                                FixedPort
+                                .ApertureContractFingerprint
+                            ),
+                        ),
+                        (
+                            VariableSignal,
+                            str(
+                                Alternative
+                                .ApertureContractFingerprint
+                            ),
+                        ),
+                    )))
+                if IncompatibleCount == len(VariableDomain):
+                    LocalSeamNoGoodClauses.add(frozenset(((
+                        FixedSignal,
+                        str(FixedPort.ApertureContractFingerprint),
+                    ),)))
+                CompiledExplicitFeedthroughBinaryRows.add(RowKey)
+                ExplicitFeedthroughMinimizationDiagnostics.update({
+                    "CompiledBinaryRowFixedSignal": FixedSignal,
+                    "CompiledBinaryRowVariableSignal": VariableSignal,
+                    "CompiledBinaryRowAlternativeCount": len(
+                        VariableDomain
+                    ),
+                    "CompiledBinaryRowIncompatibleCount": (
+                        IncompatibleCount
+                    ),
+                    "CompiledBinaryRowPromotedUnary": bool(
+                        IncompatibleCount == len(VariableDomain)
+                    ),
+                })
+        return (
+            frozenset(
+                (
+                    str(Port.Signal),
+                    str(Port.ApertureContractFingerprint),
+                )
+                for Port in Core
+            ),
+            CheckCount,
+        )
+
     while True:
         assert SelectedPorts is not None
         SelectedPorts = tuple(sorted(
@@ -27619,14 +32111,16 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                         ),
                     )
                 )
-            )
+                )
             if AssemblyChoiceFingerprint in getattr(
                 Resources,
                 "RejectedPhysicalComponentAssemblyChoiceFingerprints",
                 set(),
             ):
                 ExactAssemblyChoiceRejectionCount += 1
-                if SelectedBoundaryPorts is not None:
+                if SelectedBoundaryPorts is not None and not (
+                    IsRequiredBoundaryFixed
+                ):
                     RejectedBoundaryAssignmentFingerprints.add(
                         BuildPhysicalBoundaryPortAssignmentFingerprint(
                             SelectedBoundaryPorts
@@ -27670,6 +32164,81 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             ):
                 raise
             ChannelPlanRejectionCount += 1
+            ExteriorGuideDetourNoGood = frozenset()
+            ExteriorGuideDetourCoreCheckCount = 0
+            if SelectedBoundaryPorts is not None and str(
+                Error.Failure.Detail
+            ) in {
+                "a foreign global guide cannot bypass the reserved "
+                "component port-access domain",
+                "a foreign global guide has no exterior segment after "
+                "applying component port and keepout reservations",
+            }:
+                (
+                    ExteriorGuideDetourNoGood,
+                    ExteriorGuideDetourCoreCheckCount,
+                ) = MinimizeExteriorGuideDetourNoGood(
+                    Error.Failure,
+                    SelectedBoundaryPorts,
+                )
+                if ExteriorGuideDetourNoGood:
+                    LocalSeamNoGoodClauses.add(
+                        ExteriorGuideDetourNoGood
+                    )
+            if (
+                SelectedBoundaryPorts is not None
+                and not ExteriorGuideDetourNoGood
+            ):
+                (
+                    ExteriorGuideDetourNoGood,
+                    ExteriorGuideDetourCoreCheckCount,
+                ) = BuildFeedthroughEndpointPrescreenNoGood(
+                    Error.Failure,
+                    SelectedBoundaryPorts,
+                )
+                if ExteriorGuideDetourNoGood:
+                    LocalSeamNoGoodClauses.add(
+                        ExteriorGuideDetourNoGood
+                    )
+            if (
+                SelectedBoundaryPorts is not None
+                and not ExteriorGuideDetourNoGood
+            ):
+                (
+                    ExteriorGuideDetourNoGood,
+                    ExteriorGuideDetourCoreCheckCount,
+                ) = MinimizeExplicitFeedthroughNoGood(
+                    Error.Failure,
+                    SelectedBoundaryPorts,
+                )
+                if ExteriorGuideDetourNoGood:
+                    LocalSeamNoGoodClauses.add(
+                        ExteriorGuideDetourNoGood
+                    )
+            ComponentPlannerLiveDiagnostics.update({
+                "PriorChannelPlanRejectionCount": (
+                    ChannelPlanRejectionCount
+                ),
+                "PriorChannelPlanFailureDetail": str(
+                    Error.Failure.Detail
+                ),
+                "PriorChannelPlanFailureAffectedNets": list(
+                    Error.Failure.AffectedNets
+                ),
+                "PriorChannelPlanFailureDiagnostics": dict(
+                    Error.Failure.Diagnostics or {}
+                ),
+                "PriorChannelPlanLearnedCore": [
+                    list(Key)
+                    for Key in sorted(ExteriorGuideDetourNoGood)
+                ],
+                "PriorChannelPlanCoreCheckCount": (
+                    ExteriorGuideDetourCoreCheckCount
+                ),
+                "PriorChannelPlanCoreCheckDiagnostics": dict(
+                    ExplicitFeedthroughMinimizationDiagnostics
+                ),
+            })
             RejectedFingerprint = BuildStableFingerprint(tuple(
                 (
                     Port.Signal,
@@ -27680,7 +32249,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             Resources.RejectedPhysicalComponentPortAssignmentFingerprints.add(
                 RejectedFingerprint
             )
-            Resources.RejectedPhysicalComponentPortReservationSets.add(
+            LocalSeamNoGoodClauses.add(
                 frozenset(
                     (
                         Port.Signal,
@@ -27689,7 +32258,9 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                     for Port in SelectedPorts
                 )
             )
-            if SelectedBoundaryPorts is not None:
+            if SelectedBoundaryPorts is not None and not (
+                IsRequiredBoundaryFixed
+            ):
                 RejectedBoundaryAssignmentFingerprints.add(
                     BuildPhysicalBoundaryPortAssignmentFingerprint(
                         SelectedBoundaryPorts
@@ -27730,6 +32301,18 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
                         "OwnershipSearchComplete": True,
                         "ChannelPlanRejectionCount": (
                             ChannelPlanRejectionCount
+                        ),
+                        "ExteriorGuideDetourNoGood": [
+                            list(Key)
+                            for Key in sorted(
+                                ExteriorGuideDetourNoGood
+                            )
+                        ],
+                        "ExteriorGuideDetourCoreCheckCount": (
+                            ExteriorGuideDetourCoreCheckCount
+                        ),
+                        "ExteriorGuideDetourCoreMinimal": bool(
+                            ExteriorGuideDetourNoGood
                         ),
                         "PortAssignmentUnsatCoreSignals": list(CutSignals),
                         "PortAssignmentUnsatCoreFingerprint": (
@@ -27907,6 +32490,48 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             and all(Domain.Candidates for Domain in BoundDomains)
         ),
     )
+    EmittedFingerprintsByDomain = getattr(
+        Resources,
+        "PhysicalComponentAssemblyPlanFingerprintsByDomain",
+        None,
+    )
+    if EmittedFingerprintsByDomain is None:
+        EmittedFingerprintsByDomain = {}
+        Resources.PhysicalComponentAssemblyPlanFingerprintsByDomain = (
+            EmittedFingerprintsByDomain
+        )
+    EmittedFingerprints = EmittedFingerprintsByDomain.setdefault(
+        BoundaryIteratorCacheKey,
+        set(),
+    )
+    # Replayed fixed-boundary iterations can still request additional local
+    # assignments for a known global boundary, so do not consume the
+    # returned boundary fingerprint here.
+    #
+    # Infeasible branches add boundary fingerprints above; successful emits
+    # are deduplicated by the physical-plan fingerprint below.
+    if PlanFingerprint in EmittedFingerprints:
+        raise RoutingStageError(RoutingFailure(
+            Reason=(
+                RoutingFailureReason.ComponentAssemblyIdentityMismatch
+            ),
+            Stage="PhysicalAssemblyPlanDomainDuplicate",
+            Detail=(
+                "the monotonic physical assembly domain emitted a prior "
+                "plan fingerprint"
+            ),
+            Diagnostics={
+                "AssemblyPlanDomainFingerprint": (
+                    BoundaryIteratorCacheKey
+                ),
+                "RepeatedPlanFingerprint": PlanFingerprint,
+                "RepeatedPlanFingerprintCount": 1,
+                "BoundaryIteratorContinuationPreserved": True,
+                "BoundaryIteratorCacheCleared": False,
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
+    EmittedFingerprints.add(PlanFingerprint)
     return PreparedPhysicalComponentAssembly(
         Plan=Plan,
         Problem=BoundProblem,
@@ -28047,6 +32672,7 @@ def RouteAuthoritativeResources(
     PreparedPortalCache: PreparedPortalDomainCache | None = None,
     PreparePortalGeometryOnly: bool = False,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
+    ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
@@ -28669,42 +33295,30 @@ def RouteAuthoritativeResources(
         AllLocalClaims,
         DisableLocalBaseClaims,
     )
+    ProfilePlacement = Placed
+    if Resources.PreparingPhysicalComponentGlobalChannels:
+        # A selected local-support witness is materialized before exterior
+        # routing so its resource claims constrain candidate generation.  It
+        # is not, however, a completed global connection.  Exclude frozen
+        # component claims only from connectivity-profile construction while
+        # retaining them in AllLocalClaims/LocalClaims as exact obstacles.
+        ProfilePlacement = replace(
+            Placed,
+            LocalRouteClaims=tuple(
+                Claim
+                for Claim in AllLocalClaims
+                if int(getattr(Claim, "ClusterId", 0)) >= 0
+            ),
+        )
     Profiles = BuildNetRoutingProfiles(
-        Placed,
+        ProfilePlacement,
         AccessLength=Policy.Placement.PinEscapeLength,
     )
-    if Resources.PreparingPhysicalComponentGlobalChannels:
-        ExactGlobalSignals = frozenset(
-            Resources.PhysicalComponentExactGlobalChannelSignals
-        )
-        MissingExactGlobalSignals = tuple(sorted(
-            ExactGlobalSignals - set(Profiles)
-        ))
-        if MissingExactGlobalSignals:
-            raise RoutingStageError(RoutingFailure(
-                Reason=(
-                    RoutingFailureReason.ComponentAssemblyIdentityMismatch
-                ),
-                Stage="PhysicalComponentGlobalPlanning",
-                AffectedNets=MissingExactGlobalSignals,
-                Detail=(
-                    "the physical exact-global cut references signals "
-                    "outside the placed routing profile"
-                ),
-            ))
-        Profiles = {
-            Signal: Profile
-            for Signal, Profile in Profiles.items()
-            if Signal in ExactGlobalSignals
-        }
-        WorkTelemetry["PhysicalComponentExactGlobalCut"] = {
-            "SignalCount": len(ExactGlobalSignals),
-            "Signals": sorted(ExactGlobalSignals),
-            "OrdinaryDetailedRoutingDeferred": True,
-        }
+    WholeDesignProfiles = dict(Profiles)
     PhysicalAssemblyPlan = (
         Resources.FrozenPhysicalComponentAssemblyPlan
     )
+    FrozenPostClosurePortalHandoffApplied = False
     if PhysicalAssemblyPlan is not None:
         PhysicalProblem = (
             Resources.PreparedComponentRoutingProblem
@@ -28751,6 +33365,56 @@ def RouteAuthoritativeResources(
             PhysicalProblem,
             PhysicalAssemblyPlan,
         )
+        if Resources.PreparingPhysicalComponentGlobalChannels:
+            # Component-interface signals can be absent from the ordinary
+            # placed-net profiles: their authoritative terminals are created
+            # by the frozen assembly contract above.  Validate and project the
+            # exact-global cut only after those contract profiles exist.
+            ExactGlobalSignals = frozenset(
+                Resources.PhysicalComponentExactGlobalChannelSignals
+            )
+            MissingExactGlobalSignals = tuple(sorted(
+                ExactGlobalSignals - set(Profiles)
+            ))
+            if MissingExactGlobalSignals:
+                raise RoutingStageError(RoutingFailure(
+                    Reason=(
+                        RoutingFailureReason
+                        .ComponentAssemblyIdentityMismatch
+                    ),
+                    Stage="PhysicalComponentGlobalPlanning",
+                    AffectedNets=MissingExactGlobalSignals,
+                    Detail=(
+                        "the physical exact-global cut references signals "
+                        "outside the frozen assembly routing profile"
+                    ),
+                ))
+            Profiles = {
+                Signal: Profile
+                for Signal, Profile in Profiles.items()
+                if Signal in ExactGlobalSignals
+            }
+            WorkTelemetry["PhysicalComponentExactGlobalCut"] = {
+                "SignalCount": len(ExactGlobalSignals),
+                "Signals": sorted(ExactGlobalSignals),
+                "OrdinaryDetailedRoutingDeferred": True,
+            }
+        if Resources.PreparingPhysicalComponentGlobalChannels:
+            FrozenPostClosurePortalHandoffTelemetry = (
+                BuildFrozenPostClosurePortalHandoffTelemetry(
+                    Resources,
+                    Resources.PreparedPhysicalComponentPortFactorDomain,
+                    PhysicalAssemblyPlan,
+                )
+            )
+            RawPortalCache = (
+                Resources.FrozenPhysicalComponentPostClosurePortalHandoff
+                .RawPortalGeometryCache
+            )
+            FrozenPostClosurePortalHandoffApplied = True
+            WorkTelemetry["FrozenPostClosurePortalHandoff"] = (
+                FrozenPostClosurePortalHandoffTelemetry
+            )
     else:
         Profiles = ApplyRoutedComponentGlobalProfiles(
             Placed,
@@ -29498,6 +34162,24 @@ def RouteAuthoritativeResources(
             LayerCount,
             int(InterfaceDeckLayer) + 1,
         )
+    if (
+        FrozenPostClosurePortalHandoffApplied
+        and RawPortalCache is not None
+        and RawPortalCache.LayerCount != LayerCount
+    ):
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ComponentAssemblyIdentityMismatch,
+            Stage="PhysicalComponentGlobalPlanning",
+            Detail=(
+                "the global-channel pass selected a routing layer domain "
+                "different from the frozen post-closure portal handoff"
+            ),
+            Diagnostics={
+                "PreparedLayerCount": RawPortalCache.LayerCount,
+                "SelectedLayerCount": LayerCount,
+                "ImplicitForeignTransitDomainCount": 0,
+            },
+        ))
     WorkTelemetry["PhysicalAssemblyLayerContract"] = {
         "PlanFingerprint": (
             PhysicalAssemblyPlan.PlanFingerprint
@@ -29550,7 +34232,21 @@ def RouteAuthoritativeResources(
     # reserved escape and lets frozen local claims invalidate the later
     # detailed domain.  Keep partial-cache reuse as an implementation detail,
     # but require the prepared result to cover every routed signal.
-    RawPortalVariantCounts = RoutePortalVariantCounts
+    ClosedComponentOwnedTerminalPairs = (
+        SelectClosedComponentOwnedTerminalPairs(Placed, Profiles)
+        if (
+            PreparePhysicalComponentAssemblyOnly
+            and not Resources.PreparingPhysicalComponentGlobalChannels
+            and UnboundOwnedSignalFrontierProofCallback is not None
+        )
+        else frozenset()
+    )
+    RawPortalVariantCounts = dict(RoutePortalVariantCounts)
+    for OwnedSignal, _Terminal in ClosedComponentOwnedTerminalPairs:
+        RawPortalVariantCounts.setdefault(
+            OwnedSignal,
+            max(1, int(DemandDerivedPortalLimit)),
+        )
     WorkTelemetry["PhysicalComponentPortalPreparation"] = {
         "Selective": False,
         "AuthoritativeScope": "whole-design",
@@ -29656,18 +34352,22 @@ def RouteAuthoritativeResources(
         "FrozenPhysicalComponentGlobalGuidePlan",
         None,
     )
+    PlanningPhysicalComponentExterior = bool(
+        PhysicalAssemblyPlan is not None
+        and Resources.PreparingPhysicalComponentGlobalChannels
+    )
     PhysicalAssemblyPortSignalsForGuide = frozenset(
         Port.Signal
         for Port in (
             SelectPhysicalAssemblyGlobalBoundaryPorts(
                 PhysicalAssemblyPlan
             )
-            if PhysicalAssemblyPlan is not None
+            if PlanningPhysicalComponentExterior
             else ()
         )
     )
     ReuseFrozenPhysicalPortGuidePlan = bool(
-        PhysicalAssemblyPlan is not None
+        PlanningPhysicalComponentExterior
         and CanReuseFrozenPhysicalPortGuidePlan(
             Profiles,
             PhysicalAssemblyPortSignalsForGuide,
@@ -29739,7 +34439,7 @@ def RouteAuthoritativeResources(
         if ComponentGuideObstacleCoordinates
         else None
     )
-    if PhysicalAssemblyPlan is not None:
+    if PlanningPhysicalComponentExterior:
         ComponentGuideObstacleBounds = (
             PhysicalAssemblyPlan.EnvelopeMinimum[0],
             PhysicalAssemblyPlan.EnvelopeMaximum[0],
@@ -29752,7 +34452,7 @@ def RouteAuthoritativeResources(
     ComponentGuideObstacleExemptCellsBySignal: dict[
         str, dict[int, frozenset[tuple[int, int]]]
     ] = {}
-    if PhysicalAssemblyPlan is not None:
+    if PlanningPhysicalComponentExterior:
         RoutingLayerByY = {
             Technology.RoutingY(MinimumY, Layer): Layer
             for Layer in range(LayerCount)
@@ -29841,7 +34541,7 @@ def RouteAuthoritativeResources(
             if BuildGlobalGuidePlan
             else None
         )
-    if PhysicalAssemblyPlan is not None:
+    if PlanningPhysicalComponentExterior:
         if CoarsePlan is None:
             raise RoutingStageError(RoutingFailure(
                 Reason=(
@@ -30107,7 +34807,7 @@ def RouteAuthoritativeResources(
     PhysicalPortGuidesBySignal: dict[
         str, frozenset[Position2]
     ] = {}
-    if PhysicalAssemblyPlan is not None:
+    if PlanningPhysicalComponentExterior:
         PhysicalChannelsBySignal = {
             Channel.Signal: Channel
             for Channel in PhysicalAssemblyPlan.PlanningChannels
@@ -30192,13 +34892,22 @@ def RouteAuthoritativeResources(
         )),
     }
     ResourceGraphStarted = monotonic()
-    EffectiveAssignedColumns = frozenset(AssignedColumns)
+    if FrozenPostClosurePortalHandoffApplied:
+        assert RawPortalCache is not None
+        Bounds = tuple(RawPortalCache.Region.Bounds)
+        EffectiveAssignedColumns = RawPortalCache.AssignedColumns
+        ReservedAccess = RawPortalCache.ReservedAccess
+    else:
+        EffectiveAssignedColumns = frozenset(AssignedColumns)
     ReuseCachedRegion = bool(
-        RawPortalCache is not None
-        and RawPortalCache.MatchesPlacementResources(Placed, Resources)
-        and RawPortalCache.AssignedColumns == EffectiveAssignedColumns
-        and RawPortalCache.ReservedAccess == ReservedAccess
-        and getattr(RawPortalCache.Region, "Bounds", None) == Bounds
+        FrozenPostClosurePortalHandoffApplied
+        or (
+            RawPortalCache is not None
+            and RawPortalCache.MatchesPlacementResources(Placed, Resources)
+            and RawPortalCache.AssignedColumns == EffectiveAssignedColumns
+            and RawPortalCache.ReservedAccess == ReservedAccess
+            and getattr(RawPortalCache.Region, "Bounds", None) == Bounds
+        )
     )
     Region = (
         RawPortalCache.Region
@@ -30213,15 +34922,20 @@ def RouteAuthoritativeResources(
             ),
         )
     )
-    PhysicalExteriorRegionFingerprint = BuildStableFingerprint((
-        "physical-exterior-routing-region-v1",
-        Bounds,
-        tuple(sorted(EffectiveAssignedColumns)),
-        tuple(sorted(ReservedAccess)),
-        getattr(Resources.ResourceGraph, "GraphVersion", ""),
-        getattr(Technology, "TechnologyVersion", ""),
-        repr(Technology),
-    ))
+    PhysicalExteriorRegionFingerprint = (
+        RawPortalCache.ExteriorRegionFingerprint
+        if FrozenPostClosurePortalHandoffApplied
+        and RawPortalCache is not None
+        else BuildStableFingerprint((
+            "physical-exterior-routing-region-v1",
+            Bounds,
+            tuple(sorted(EffectiveAssignedColumns)),
+            tuple(sorted(ReservedAccess)),
+            getattr(Resources.ResourceGraph, "GraphVersion", ""),
+            getattr(Technology, "TechnologyVersion", ""),
+            repr(Technology),
+        ))
+    )
     WorkTelemetry["ResourceGraphCacheHit"] = ReuseCachedRegion
     StageTimings["ResourceGraph"] = monotonic() - ResourceGraphStarted
     if ProgressCallback is not None:
@@ -30236,6 +34950,10 @@ def RouteAuthoritativeResources(
     PortableValidatedCompletePortalDomainKeys: frozenset[
         tuple[str, Position3, int]
     ] = frozenset()
+    PortableValidatedPolicyCompleteEmptyPortalDomainKeys: frozenset[
+        tuple[str, Position3, int]
+    ] = frozenset()
+    PortablePortalProofReusableSignalSet: frozenset[str] = frozenset()
     if (
         ResourceRawPortalReusePlan is not None
         and ResourceRawPortalReusePlan.PortableAcrossPlacement
@@ -30331,51 +35049,23 @@ def RouteAuthoritativeResources(
             for Key, Values in SignalEntries:
                 RebuiltValues = []
                 for Portal in Values:
-                    TranslatedPath = tuple(
-                        TranslatePortablePosition(Position)
-                        for Position in Portal.Path
+                    Rebuilt = (
+                        MaterializeValidatedPortablePortalPositiveWitness(
+                            Portal,
+                            Signal=Signal,
+                            Terminal=Key[1],
+                            Layer=Key[2],
+                            Transform=SignalTransform,
+                            Translation=SignalDelta,
+                            ResourceGraph=Resources.ResourceGraph,
+                            RegionNodes=RegionNodes,
+                            RegionEdges=RegionEdges,
+                        )
                     )
-                    Claims = Resources.ResourceGraph.BuildRouteClaims(
-                        TranslatedPath
-                    )
-                    if (
-                        not frozenset(TranslatedPath) <= RegionNodes
-                        or not frozenset(
-                            NormalizeRoutingEdge(First, Second)
-                            for First, Second in zip(
-                                TranslatedPath,
-                                TranslatedPath[1:],
-                            )
-                        ) <= RegionEdges
-                        or FindSelfClaimConflicts({
-                            Signal: Claims,
-                        })
-                    ):
+                    if Rebuilt is None:
                         SignalIsValid = False
                         break
-                    RebuiltValues.append(replace(
-                        Portal,
-                        PortalId=BuildTranslatedPortablePortalId(
-                            Signal,
-                            Key[1],
-                            Key[2],
-                            TranslatedPath,
-                            Length=Portal.Length,
-                            BendCount=Portal.BendCount,
-                            ViaCount=Portal.ViaCount,
-                            Cost=Portal.Cost,
-                        ),
-                        Terminal=Key[1],
-                        Path=TranslatedPath,
-                        Edges=frozenset(
-                            NormalizeRoutingEdge(First, Second)
-                            for First, Second in zip(
-                                TranslatedPath,
-                                TranslatedPath[1:],
-                            )
-                        ),
-                        Claims=Claims,
-                    ))
+                    RebuiltValues.append(Rebuilt)
                 if not SignalIsValid:
                     break
                 RebuiltSignalEntries.append((
@@ -30387,21 +35077,29 @@ def RouteAuthoritativeResources(
             ValidatedSignals.add(Signal)
             ValidatedEntries.extend(RebuiltSignalEntries)
         ValidatedPositiveSignalSet = frozenset(ValidatedSignals)
-        ValidatedSignalSet = SelectPortablePortalProofReusableSignals(
-            ValidatedPositiveSignalSet,
-            PhysicalPortSignals,
+        PositiveReusableSignalSet = (
+            SelectPortablePortalPositiveReusableSignals(
+                ValidatedPositiveSignalSet
+            )
+        )
+        PortablePortalProofReusableSignalSet = (
+            SelectPortablePortalProofReusableSignals(
+                ValidatedPositiveSignalSet,
+                PhysicalPortSignals,
+            )
         )
         ResourceRawPortalReusePlan = replace(
             ResourceRawPortalReusePlan,
-            ReusedSignals=ValidatedSignalSet,
+            ReusedSignals=PositiveReusableSignalSet,
             GeneratedSignals=(
-                frozenset(RawPortalVariantCounts) - ValidatedSignalSet
+                frozenset(RawPortalVariantCounts)
+                - PositiveReusableSignalSet
             ),
         )
         ReusableRawPortalEntries = tuple(sorted(
             (Key, Values)
             for Key, Values in ValidatedEntries
-            if Key[0] in ValidatedSignalSet
+            if Key[0] in PositiveReusableSignalSet
         ))
         PortableValidatedCompletePortalDomainKeys = (
             TransformPortableCompletePortalDomainKeys(
@@ -30412,24 +35110,48 @@ def RouteAuthoritativeResources(
                 PhysicalPortSignals,
             )
         )
+        PortableValidatedPolicyCompleteEmptyPortalDomainKeys = (
+            TransformPortableCompletePortalDomainKeys(
+                RawPortalCache.PolicyCompleteEmptyPortalDomainKeys,
+                PortableSignalTransforms,
+                (Key for Key, _Values in ReusableRawPortalEntries),
+                ExactPhysicalPortalTerminals,
+                PhysicalPortSignals,
+            )
+        )
         WorkTelemetry["PortablePortalProofRegeneration"] = {
             "ValidatedPositiveSignals": sorted(
                 ValidatedPositiveSignalSet
             ),
-            "ProofReusableSignals": sorted(ValidatedSignalSet),
-            "RegeneratedExactPlanSignals": sorted(
-                ValidatedPositiveSignalSet & PhysicalPortSignals
+            "PositiveReusableSignals": sorted(
+                PositiveReusableSignalSet
             ),
-            "Reason": "request-domain-isomorphism-not-certified",
+            "ProofReusableSignals": sorted(
+                PortablePortalProofReusableSignalSet
+            ),
+            "RegeneratedExactPlanSignals": sorted(
+                (
+                    ValidatedPositiveSignalSet & PhysicalPortSignals
+                ) - PositiveReusableSignalSet
+            ),
+            "PositiveReuseValidation": (
+                "current-resource-graph-region-and-claims"
+            ),
+            "CompletenessDisposition": (
+                "exact-plan-request-domain-proof-not-transferred"
+            ),
+            "Reason": "positive-witness-only-reuse",
         }
-        if not ValidatedSignalSet:
+        if not PositiveReusableSignalSet:
             ResourceRawPortalReusePlan = None
             RawPortalCache = None
     CacheMatches = bool(
-        RawPortalCache is not None
-        and (
-            FrozenPreparedPortalCache is not None
-            or RawPortalCache.Matches(
+        FrozenPostClosurePortalHandoffApplied
+        or (
+            RawPortalCache is not None
+            and (
+                FrozenPreparedPortalCache is not None
+                or RawPortalCache.Matches(
                 Placed,
                 Resources,
                 Region,
@@ -30439,6 +35161,7 @@ def RouteAuthoritativeResources(
                 Policy.DetailedRouting.GuideExpansion,
                 Policy.DetailedRouting.StrictMaximumExpansions,
                 PortalAccessGeometryFingerprint,
+                )
             )
         )
     )
@@ -30510,6 +35233,33 @@ def RouteAuthoritativeResources(
         and ResourceRawPortalReusePlan is not None
         else frozenset()
     )
+    ReusablePortalDomainKeys = frozenset(
+        Key for Key, _Values in ReusableRawPortalEntries
+    )
+    IncompleteClosedComponentReuseSignals = frozenset(
+        Signal
+        for Signal in ReusedPortalSignals
+        if any(
+            (Signal, Terminal, Layer)
+            not in ReusablePortalDomainKeys
+            for OwnedSignal, Terminal
+            in ClosedComponentOwnedTerminalPairs
+            if OwnedSignal == Signal
+            for Layer in range(LayerCount)
+        )
+    )
+    if IncompleteClosedComponentReuseSignals:
+        ReusedPortalSignals = frozenset(
+            ReusedPortalSignals
+            - IncompleteClosedComponentReuseSignals
+        )
+        WorkTelemetry["ClosedComponentPortalReuseRepair"] = {
+            "Applied": True,
+            "RegeneratedSignals": sorted(
+                IncompleteClosedComponentReuseSignals
+            ),
+            "Reason": "incomplete-owned-terminal-domain",
+        }
     WorkTelemetry["RawPortalValidatedPlanarTransforms"] = {
         Signal: {
             "Transform": Transform,
@@ -30542,7 +35292,7 @@ def RouteAuthoritativeResources(
             if CacheMatches
             else frozenset(RawPortalVariantCounts)
         )
-    )
+    ) | IncompleteClosedComponentReuseSignals
     TransactionalLeasePrescreenCompleted = False
 
     def RunTransactionalLeasePrescreen(
@@ -30637,7 +35387,90 @@ def RouteAuthoritativeResources(
             ),
         }
     PortalRequests: list[tuple[Any, ...]] = []
+
+    def BuildReusableConfiguredPortalRequests() -> dict[
+        tuple[str, Position3, int], tuple[Any, ...]
+    ]:
+        CachedItems = tuple(zip(
+            getattr(
+                RawPortalCache,
+                "ConfiguredPortalRequestMetadata",
+                (),
+            ),
+            getattr(RawPortalCache, "ConfiguredPortalRequests", ()),
+        ))
+        if not CachedItems:
+            return {}
+        ReusedSignals = (
+            ReusedPortalSignals
+            if PartialPortalCacheMatches
+            else frozenset(Profiles)
+        )
+        PortableTransforms = {
+            Signal: (Transform, Translation)
+            for Signal, Transform, Translation in (
+                ResourceRawPortalReusePlan.SignalPlanarTransforms
+                if (
+                    PartialPortalCacheMatches
+                    and ResourceRawPortalReusePlan is not None
+                    and ResourceRawPortalReusePlan.PortableAcrossPlacement
+                )
+                else ()
+            )
+        }
+        Result = {}
+        for Metadata, Request in CachedItems:
+            Signal, Terminal, Layer = Metadata
+            if Signal not in ReusedSignals or Signal not in Profiles:
+                continue
+            Transform, Translation = PortableTransforms.get(
+                Signal,
+                ("Identity", (0, 0, 0)),
+            )
+
+            def TransformPosition(Position: Position3) -> Position3:
+                return TransformPlanarRoutingPosition(
+                    Position,
+                    Transform,
+                    Translation,
+                )
+
+            CurrentTerminal = TransformPosition(Terminal)
+            CurrentProfile = Profiles[Signal]
+            if CurrentTerminal not in {
+                CurrentProfile.Root,
+                *CurrentProfile.Targets,
+            }:
+                continue
+            (
+                Starts,
+                Targets,
+                AllowedNodes,
+                RoutingY,
+                CandidateLimit,
+                MaximumExpansions,
+            ) = Request
+            CurrentRequest = (
+                tuple(TransformPosition(Position) for Position in Starts),
+                tuple(TransformPosition(Position) for Position in Targets),
+                tuple(
+                    TransformPosition(Position)
+                    for Position in AllowedNodes
+                ),
+                TransformPosition((0, int(RoutingY), 0))[1],
+                int(CandidateLimit),
+                int(MaximumExpansions),
+            )
+            Result[(Signal, CurrentTerminal, int(Layer))] = CurrentRequest
+        return Result
+
+    ConfiguredPortalRequestByMetadata = (
+        BuildReusableConfiguredPortalRequests()
+    )
     PortalNativeDeadlineExceeded = False
+    PreparedAccessProblem = None
+    UnboundOwnedSignalFrontierProofCompleted = False
+    EarlyAccessProblemSeconds = 0.0
     if CacheMatches:
         assert RawPortalCache is not None
         CompletePortalDomainKeys = set(
@@ -30709,7 +35542,16 @@ def RouteAuthoritativeResources(
                 if RawPortalCache is not None
                 else ()
             )
-            if Signal in ReusedPortalSignals
+            if (
+                Signal in ReusedPortalSignals
+                and (
+                    ResourceRawPortalReusePlan is None
+                    or not ResourceRawPortalReusePlan
+                    .PortableAcrossPlacement
+                    or Signal
+                    in PortablePortalProofReusableSignalSet
+                )
+            )
         }
         Context = (
             RawPortalCache.Context
@@ -30733,6 +35575,25 @@ def RouteAuthoritativeResources(
         CompleteGeneratedPortalDomainKeys: set[
             tuple[str, Position3, int]
         ] = set()
+        PolicyCompleteEmptyPortalDomainKeys: set[
+            tuple[str, Position3, int]
+        ] = set(
+            PortableValidatedPolicyCompleteEmptyPortalDomainKeys
+            if (
+                PartialPortalCacheMatches
+                and ResourceRawPortalReusePlan is not None
+                and ResourceRawPortalReusePlan.PortableAcrossPlacement
+            )
+            else (
+                Key
+                for Key in getattr(
+                    RawPortalCache,
+                    "PolicyCompleteEmptyPortalDomainKeys",
+                    (),
+                )
+                if Key[0] in ReusedPortalSignals
+            )
+        )
         PortalRequestDomainRecordsBySignal: dict[
             str, list[tuple[object, ...]]
         ] = defaultdict(list)
@@ -30819,7 +35680,11 @@ def RouteAuthoritativeResources(
             Profile = Profiles[Signal]
             TerminalPaths = SelectGenericPortalTerminalPaths(
                 Profile,
-                PhysicalAssemblyPlan,
+                (
+                    None
+                    if PreparePhysicalComponentAssemblyOnly
+                    else PhysicalAssemblyPlan
+                ),
             )
             for TerminalIndex, (Terminal, AccessPath) in enumerate(
                 TerminalPaths
@@ -30869,6 +35734,11 @@ def RouteAuthoritativeResources(
                             Terminal,
                             Layer,
                         ))
+                        PolicyCompleteEmptyPortalDomainKeys.add((
+                            Signal,
+                            Terminal,
+                            Layer,
+                        ))
                         PortalRequestDomainRecordsBySignal[Signal].append((
                             Terminal,
                             int(Layer),
@@ -30885,6 +35755,11 @@ def RouteAuthoritativeResources(
                             (Signal, Terminal, Layer)
                         ] = ()
                         CompleteGeneratedPortalDomainKeys.add((
+                            Signal,
+                            Terminal,
+                            Layer,
+                        ))
+                        PolicyCompleteEmptyPortalDomainKeys.add((
                             Signal,
                             Terminal,
                             Layer,
@@ -31098,6 +35973,13 @@ def RouteAuthoritativeResources(
                     tuple(sorted(Records)),
                 )
             )
+        ConfiguredPortalRequestByMetadata.update({
+            Metadata: Request
+            for Metadata, Request in zip(
+                PortalRequestMetadata,
+                PortalRequests,
+            )
+        })
         ReusedPortalRequestCount = sum(
             SignalRequestCounts[Signal]
             for Signal in ReusedPortalSignals
@@ -31280,6 +36162,228 @@ def RouteAuthoritativeResources(
                     Terminal,
                     Layer,
                 ))
+
+        # The local frontier proof depends only on portals for terminals
+        # owned by the selected closed component.  Generate that exact slice
+        # first, while retaining the same whole-design guide, region, policy,
+        # and request configuration that authoritative planning will use.
+        # A complete empty frontier can then reject this placement without
+        # materializing portals for unrelated global nets.  A feasible proof
+        # resumes the untouched request list and publishes the ordinary full
+        # raw cache below.
+        if (
+            PreparePhysicalComponentAssemblyOnly
+            and not Resources.PreparingPhysicalComponentGlobalChannels
+            and UnboundOwnedSignalFrontierProofCallback is not None
+        ):
+            OwnedTerminalPairs = ClosedComponentOwnedTerminalPairs
+            AvailableOwnedPortalDomainKeys = {
+                Key
+                for Key, _Values in ReusableRawPortalEntries
+                if (Key[0], Key[1]) in OwnedTerminalPairs
+            } | {
+                Key
+                for Key in GeneratedRawPortals
+                if (Key[0], Key[1]) in OwnedTerminalPairs
+            } | {
+                Key
+                for Key in PortalRequestMetadata
+                if (Key[0], Key[1]) in OwnedTerminalPairs
+            }
+            MissingOwnedConfiguredRequests = tuple(
+                (Key, ConfiguredPortalRequestByMetadata[Key])
+                for Key in sorted(
+                    (
+                        (Signal, Terminal, Layer)
+                        for Signal, Terminal in OwnedTerminalPairs
+                        for Layer in range(LayerCount)
+                    ),
+                )
+                if Key not in AvailableOwnedPortalDomainKeys
+                and Key in ConfiguredPortalRequestByMetadata
+            )
+            if MissingOwnedConfiguredRequests:
+                PortalRequestMetadata.extend(
+                    Key for Key, _Request in MissingOwnedConfiguredRequests
+                )
+                PortalRequests.extend(
+                    Request
+                    for _Key, Request in MissingOwnedConfiguredRequests
+                )
+            (
+                OwnedRequests,
+                OwnedRequestMetadata,
+                PortalRequests,
+                PortalRequestMetadata,
+            ) = PartitionPhysicalOwnedTerminalPortalRequests(
+                PortalRequests,
+                PortalRequestMetadata,
+                OwnedTerminalPairs,
+            )
+            RemainingOwnedRequests = list(OwnedRequests)
+            RemainingOwnedRequestMetadata = list(OwnedRequestMetadata)
+            PortalNativeDeadlineExceeded = False
+            while RemainingOwnedRequests:
+                (
+                    OwnedResults,
+                    OwnedCompletionMask,
+                    OwnedDeadlineExceeded,
+                ) = GeneratePortalRequestBatch(
+                    RemainingOwnedRequests,
+                    "PhysicalOwnedTerminalPortalEligibility",
+                )
+                PortalNativeDeadlineExceeded = bool(
+                    PortalNativeDeadlineExceeded
+                    or OwnedDeadlineExceeded
+                )
+                MaterializePortalRequestBatch(
+                    RemainingOwnedRequestMetadata,
+                    OwnedResults,
+                    OwnedCompletionMask,
+                    "PhysicalOwnedTerminalPortalMaterialization",
+                )
+                if all(OwnedCompletionMask):
+                    RemainingOwnedRequests = []
+                    RemainingOwnedRequestMetadata = []
+                    break
+                IncompleteIndexes = tuple(
+                    Index
+                    for Index, Complete in enumerate(
+                        OwnedCompletionMask
+                    )
+                    if not Complete
+                )
+                if (
+                    PortalNativeDeadlineExceeded
+                    or not IncompleteIndexes
+                    or len(IncompleteIndexes)
+                    == len(RemainingOwnedRequests)
+                ):
+                    break
+                RemainingOwnedRequests = [
+                    RemainingOwnedRequests[Index]
+                    for Index in IncompleteIndexes
+                ]
+                RemainingOwnedRequestMetadata = [
+                    RemainingOwnedRequestMetadata[Index]
+                    for Index in IncompleteIndexes
+                ]
+            if not PortalNativeDeadlineExceeded:
+                OwnedPortalDictionary = {
+                    Key: Values
+                    for Key, Values in ReusableRawPortalEntries
+                    if (Key[0], Key[1]) in OwnedTerminalPairs
+                }
+                OwnedPortalDictionary.update({
+                    Key: Values
+                    for Key, Values in GeneratedRawPortals.items()
+                    if (Key[0], Key[1]) in OwnedTerminalPairs
+                })
+                ExpectedOwnedPortalDomainKeys = frozenset(
+                    (Signal, Terminal, Layer)
+                    for Signal, Terminal in OwnedTerminalPairs
+                    for Layer in range(LayerCount)
+                )
+                PreparedOwnedPortalDomainKeys = frozenset(
+                    OwnedPortalDictionary
+                )
+                if (
+                    PreparedOwnedPortalDomainKeys
+                    != ExpectedOwnedPortalDomainKeys
+                ):
+                    raise RoutingStageError(RoutingFailure(
+                        Reason=(
+                            RoutingFailureReason
+                            .PhysicalComponentAssemblyIncomplete
+                        ),
+                        Stage="PhysicalOwnedTerminalPortalEligibility",
+                        AffectedNets=tuple(sorted({
+                            Signal
+                            for Signal, _Terminal, _Layer in (
+                                ExpectedOwnedPortalDomainKeys
+                                - PreparedOwnedPortalDomainKeys
+                            )
+                        })),
+                        Detail=(
+                            "the owned-terminal portal slice is incomplete"
+                        ),
+                        Diagnostics={
+                            "OwnedTerminalPairCount": len(
+                                OwnedTerminalPairs
+                            ),
+                            "ExpectedPortalDomainKeyCount": len(
+                                ExpectedOwnedPortalDomainKeys
+                            ),
+                            "PreparedPortalDomainKeyCount": len(
+                                PreparedOwnedPortalDomainKeys
+                            ),
+                            "MissingPortalDomainKeys": [
+                                [Signal, list(Terminal), Layer]
+                                for Signal, Terminal, Layer in sorted(
+                                    ExpectedOwnedPortalDomainKeys
+                                    - PreparedOwnedPortalDomainKeys
+                                )
+                            ],
+                            "ReusedPortalSignals": sorted(
+                                ReusedPortalSignals
+                            ),
+                            "GeneratedPortalSignals": sorted(
+                                GeneratedPortalSignals
+                            ),
+                            "IncompleteClosedComponentReuseSignals": sorted(
+                                IncompleteClosedComponentReuseSignals
+                            ),
+                            "ConfiguredMissingRequestCount": len(
+                                MissingOwnedConfiguredRequests
+                            ),
+                            "CompleteAssignmentCutProof": False,
+                        },
+                    ))
+                AccessPlacementFingerprint = (
+                    ClusterInterfaceStateFingerprint
+                    or BuildStableFingerprint(tuple(sorted(
+                        (
+                            Gate.X,
+                            Gate.Y,
+                            Gate.Z,
+                            str(Gate.Kind),
+                            Gate.Rotation,
+                            Gate.MirrorX,
+                        )
+                        for Gate in Placed.PlacedGates
+                    )))
+                )
+                EarlyAccessProblemStartedAt = monotonic()
+                PreparedAccessProblem = BuildComponentRoutingProblem(
+                    Placed=Placed,
+                    Profiles=Profiles,
+                    RawPortals=OwnedPortalDictionary,
+                    PlacementFingerprint=AccessPlacementFingerprint,
+                    LocalTemplateFingerprint=(
+                        ClusterInterfaceLocalRouteFingerprint
+                    ),
+                    ResourceGraph=Resources.ResourceGraph,
+                )
+                EarlyAccessProblemSeconds = (
+                    monotonic() - EarlyAccessProblemStartedAt
+                )
+                UnboundOwnedSignalFrontierProofCallback(
+                    PreparedAccessProblem
+                )
+                UnboundOwnedSignalFrontierProofCompleted = True
+                WorkTelemetry[
+                    "PhysicalOwnedTerminalPortalEligibility"
+                ] = {
+                    "Complete": True,
+                    "Feasible": True,
+                    "OwnedTerminalPairCount": len(OwnedTerminalPairs),
+                    "OwnedPortalDomainKeyCount": len(
+                        PreparedOwnedPortalDomainKeys
+                    ),
+                    "DeferredPortalRequestCount": len(PortalRequests),
+                    "WholeDesignGuideIdentityPreserved": True,
+                    "WholeDesignRegionIdentityPreserved": True,
+                }
 
         if (
             TransactionalLeasePrescreenSignals
@@ -31565,9 +36669,34 @@ def RouteAuthoritativeResources(
             CompletePortalDomainKeys=tuple(sorted(
                 CompletePortalDomainKeys
             )),
+            PolicyCompleteEmptyPortalDomainKeys=tuple(sorted(
+                PolicyCompleteEmptyPortalDomainKeys
+            )),
             PortalRequestDomainFingerprints=tuple(sorted(
                 PortalRequestDomainFingerprintBySignal.items()
             )),
+            ExteriorRegionFingerprint=(
+                PhysicalExteriorRegionFingerprint
+            ),
+            AuthoritativeResourceGraphFingerprint=(
+                BuildPhysicalExteriorResourceGraphFingerprint(
+                    Resources.ResourceGraph,
+                    PhysicalExteriorRegionFingerprint,
+                    Region,
+                )
+            ),
+            ConfiguredPortalRequests=tuple(
+                Request
+                for _Metadata, Request in sorted(
+                    ConfiguredPortalRequestByMetadata.items()
+                )
+            ),
+            ConfiguredPortalRequestMetadata=tuple(
+                Metadata
+                for Metadata in sorted(
+                    ConfiguredPortalRequestByMetadata
+                )
+            ),
         )
     # Publish complete immutable raw portal work before reservation and
     # mandatory-capacity checks so a later same-geometry cut retry can reuse
@@ -31594,7 +36723,6 @@ def RouteAuthoritativeResources(
             NativeDeadlineExceeded=True,
         )
 
-    PreparedAccessProblem = None
     if (
         PreparePhysicalComponentAssemblyOnly
         and not Resources.PreparingPhysicalComponentGlobalChannels
@@ -31614,17 +36742,29 @@ def RouteAuthoritativeResources(
             )))
         )
         AccessProblemStartedAt = monotonic()
-        PreparedAccessProblem = BuildComponentRoutingProblem(
-            Placed=Placed,
-            Profiles=Profiles,
-            RawPortals=RawPortals,
-            PlacementFingerprint=AccessPlacementFingerprint,
-            LocalTemplateFingerprint=(
-                ClusterInterfaceLocalRouteFingerprint
-            ),
-            ResourceGraph=Resources.ResourceGraph,
+        if PreparedAccessProblem is None:
+            PreparedAccessProblem = BuildComponentRoutingProblem(
+                Placed=Placed,
+                Profiles=Profiles,
+                RawPortals=RawPortals,
+                PlacementFingerprint=AccessPlacementFingerprint,
+                LocalTemplateFingerprint=(
+                    ClusterInterfaceLocalRouteFingerprint
+                ),
+                ResourceGraph=Resources.ResourceGraph,
+            )
+        AccessProblemSeconds = (
+            EarlyAccessProblemSeconds
+            + monotonic()
+            - AccessProblemStartedAt
         )
-        AccessProblemSeconds = monotonic() - AccessProblemStartedAt
+        if (
+            UnboundOwnedSignalFrontierProofCallback is not None
+            and not UnboundOwnedSignalFrontierProofCompleted
+        ):
+            UnboundOwnedSignalFrontierProofCallback(
+                PreparedAccessProblem
+            )
         ComponentGraphFingerprint = str(getattr(
             getattr(Placed, "ComponentGraph", None),
             "StructuralFingerprint",
@@ -31700,11 +36840,6 @@ def RouteAuthoritativeResources(
                     PreparedAccessCertificate.ToDictionary()
                 ),
             ))
-        if UnboundOwnedSignalFrontierProofCallback is not None:
-            UnboundOwnedSignalFrontierProofCallback(
-                PreparedAccessProblem
-            )
-
         # Raw terminal portals are the finite input to component-problem
         # construction, while that problem is the finite input to perimeter
         # seam certification.  Close the resulting two-phase dependency here:
@@ -31824,15 +36959,245 @@ def RouteAuthoritativeResources(
             getattr(Technology, "TechnologyVersion", ""),
             repr(Technology),
         ))
+        ClosedRegionNodes = frozenset(Region.Nodes)
+        ClosureAddedNodes = frozenset(
+            Position
+            for Position in ClosedRegionNodes
+            if (
+                (Position[0], Position[2]) in ExteriorClosureColumns
+                or Position in PhysicalExteriorIngressNodes
+            )
+        )
+        ClosureRequestItems = tuple(sorted(
+            ConfiguredPortalRequestByMetadata.items()
+        ))
+        ClosedPortalEntries = dict(
+            EffectiveRawPortalCache.PortalEntries
+        )
+        ClosedPolicyCompleteEmptyPortalDomainKeys = tuple(sorted(
+            getattr(
+                EffectiveRawPortalCache,
+                "PolicyCompleteEmptyPortalDomainKeys",
+                (),
+            )
+        ))
+        ClosedCompletePortalDomainKeys: tuple[
+            tuple[str, Position3, int], ...
+        ] = ClosedPolicyCompleteEmptyPortalDomainKeys
+        ClosedPortalRequestFingerprints: tuple[tuple[str, str], ...] = ()
+        ClosedPortalDomainComplete = False
+        ClosureContext = RustRoutingContext(
+            Bounds,
+            (MinimumX, MaximumX, MinimumZ, MaximumZ),
+            sorted(Region.Nodes),
+            sorted(Region.Edges),
+        )
+        ClosedRequests = []
+        for Metadata, Request in ClosureRequestItems:
+            Signal, Terminal, _Layer = Metadata
+            Profile = Profiles[Signal]
+            AccessPath = (
+                Profile.SourceAccessPath
+                if Terminal == Profile.Root
+                else Profile.TargetAccessPaths[Terminal]
+            )
+            (
+                Starts,
+                _Targets,
+                AllowedNodes,
+                RoutingY,
+                CandidateLimit,
+                MaximumExpansions,
+            ) = Request
+            ClosedAllowedNodes = tuple(sorted(frozenset((
+                *AllowedNodes,
+                *ClosureAddedNodes,
+            )) & ClosedRegionNodes))
+            ClosedTargets = tuple(sorted(
+                (
+                    Position
+                    for Position in ClosedAllowedNodes
+                    if Position[1] == int(RoutingY)
+                ),
+                key=lambda Position: (
+                    min(
+                        abs(Position[0] - AccessPosition[0])
+                        + abs(Position[1] - AccessPosition[1])
+                        + abs(Position[2] - AccessPosition[2])
+                        for AccessPosition in AccessPath
+                    ),
+                    abs(Position[0] - AccessPath[-1][0]),
+                    abs(Position[2] - AccessPath[-1][2]),
+                    Position,
+                ),
+            ))
+            ClosedTargets = ClosedTargets[:max(
+                1,
+                int(CandidateLimit),
+            )]
+            ClosedRequests.append((
+                list(Starts),
+                list(ClosedTargets),
+                list(ClosedAllowedNodes),
+                int(RoutingY),
+                int(CandidateLimit),
+                int(MaximumExpansions),
+            ))
+        if ClosureRequestItems:
+            if hasattr(
+                ClosureContext,
+                "GeneratePortalCandidateBatchesBounded",
+            ):
+                ClosedBatchResult = (
+                    ClosureContext.GeneratePortalCandidateBatchesBounded(
+                        ClosedRequests,
+                        RemainingRoutingRuntimeMilliseconds(
+                            Deadline,
+                            AdaptiveExpiresAt,
+                        ),
+                    )
+                )
+                ClosedResults, ClosedCompletionMask = (
+                    ReadPortalBatchCandidatesAndCompletionMask(
+                        ClosedBatchResult,
+                        len(ClosedRequests),
+                    )
+                )
+                ClosedDeadlineExceeded = bool(
+                    ClosedBatchResult.DeadlineExceeded
+                )
+            else:
+                ClosedResults = list(
+                    ClosureContext.GeneratePortalCandidateBatches(
+                        ClosedRequests
+                    )
+                )
+                ClosedCompletionMask = (True,) * len(ClosedRequests)
+                ClosedDeadlineExceeded = False
+            ClosedPortalDomainComplete = bool(
+                not ClosedDeadlineExceeded
+                and len(ClosedResults) == len(ClosureRequestItems)
+                and len(ClosedCompletionMask) == len(ClosureRequestItems)
+                and all(ClosedCompletionMask)
+            )
+            if ClosedPortalDomainComplete:
+                for (
+                    (Signal, Terminal, Layer),
+                    Values,
+                ) in zip(
+                    (Value[0] for Value in ClosureRequestItems),
+                    ClosedResults,
+                ):
+                    Profile = Profiles[Signal]
+                    AccessPath = (
+                        Profile.SourceAccessPath
+                        if Terminal == Profile.Root
+                        else Profile.TargetAccessPaths[Terminal]
+                    )
+                    EffectiveValues = (
+                        tuple(
+                            Value
+                            for Value in Values
+                            if PortalPathRespectsOutwardAccess(
+                                Value.Path,
+                                AccessPath,
+                            )
+                        )
+                        if Signal in TransactionalLeasePrescreenSignals
+                        else Values
+                    )
+                    ClosedPortalEntries[(Signal, Terminal, Layer)] = tuple(
+                        _PortalFromRust(
+                            Signal,
+                            Terminal,
+                            Layer,
+                            Value,
+                            Resources,
+                        )
+                        for Value in EffectiveValues
+                    )
+                ClosedCompletePortalDomainKeys = (
+                    MergePostClosurePortalCompletionKeys(
+                        ClosedPolicyCompleteEmptyPortalDomainKeys,
+                        (
+                            Metadata
+                            for Metadata, _Request
+                            in ClosureRequestItems
+                        ),
+                    )
+                )
+                ClosedPortalRequestFingerprints = tuple(sorted(
+                    (
+                        Signal,
+                        BuildStableFingerprint((
+                            "post-closure-portal-request-domain-v1",
+                            Signal,
+                            PhysicalExteriorRegionFingerprint,
+                            tuple(
+                                Key
+                                for Key
+                                in ClosedPolicyCompleteEmptyPortalDomainKeys
+                                if Key[0] == Signal
+                            ),
+                            tuple(
+                                Request
+                                for (RequestSignal, _Terminal, _Layer), Request
+                                in zip(
+                                    (
+                                        Value[0]
+                                        for Value in ClosureRequestItems
+                                    ),
+                                    ClosedRequests,
+                                )
+                                if RequestSignal == Signal
+                            ),
+                        )),
+                    )
+                    for Signal in {
+                        Metadata[0]
+                        for Metadata, _Request in ClosureRequestItems
+                    }
+                ))
         EffectiveRawPortalCache = replace(
             EffectiveRawPortalCache,
             Region=Region,
+            Context=ClosureContext,
             AssignmentIndexed=(
                 Resources.ResourceGraph.BuildIndexedGraph(Region)
             ),
             AssignedColumns=EffectiveAssignedColumns,
             ReservedAccess=ReservedAccess,
+            PortalEntries=tuple(sorted(ClosedPortalEntries.items())),
+            CompletePortalDomainKeys=(
+                ClosedCompletePortalDomainKeys
+            ),
+            PolicyCompleteEmptyPortalDomainKeys=(
+                ClosedPolicyCompleteEmptyPortalDomainKeys
+            ),
+            PortalRequestDomainFingerprints=(
+                ClosedPortalRequestFingerprints
+            ),
+            ExteriorRegionFingerprint=(
+                PhysicalExteriorRegionFingerprint
+                if ClosedPortalDomainComplete
+                else ""
+            ),
+            AuthoritativeResourceGraphFingerprint=(
+                BuildPhysicalExteriorResourceGraphFingerprint(
+                    Resources.ResourceGraph,
+                    PhysicalExteriorRegionFingerprint,
+                    Region,
+                )
+                if ClosedPortalDomainComplete
+                else ""
+            ),
+            ConfiguredPortalRequests=tuple(ClosedRequests),
+            ConfiguredPortalRequestMetadata=tuple(
+                Metadata for Metadata, _Request in ClosureRequestItems
+            ),
         )
+        RawPortalEntries = EffectiveRawPortalCache.PortalEntries
+        RawPortals = EffectiveRawPortalCache.BuildPortalDictionary()
         WorkTelemetry["PhysicalExteriorRegionClosure"] = {
             "Applied": True,
             "IngressNodeCount": len(PhysicalExteriorIngressNodes),
@@ -31849,8 +37214,18 @@ def RouteAuthoritativeResources(
             "RegionFingerprint": PhysicalExteriorRegionFingerprint,
             "RegionNodeCount": len(Region.Nodes),
             "RegionEdgeCount": len(Region.Edges),
+            "PortalDomainRegenerated": True,
+            "PortalDomainComplete": ClosedPortalDomainComplete,
+            "PortalRequestCount": len(ClosedRequests),
+            "PolicyCompleteEmptyPortalDomainCount": len(
+                ClosedPolicyCompleteEmptyPortalDomainKeys
+            ),
             "Seconds": monotonic() - ExteriorRegionStartedAt,
         }
+        RetainRawPortalGeometryCache(
+            Resources,
+            EffectiveRawPortalCache,
+        )
 
     if PrepareComponentRoutingProblemOnly:
         Problem = BuildComponentRoutingProblem(
@@ -32146,6 +37521,7 @@ def RouteAuthoritativeResources(
     if (
         PhysicalAssemblyPlan is not None
         and not PreparePhysicalComponentAssemblyOnly
+        and Resources.PreparingPhysicalComponentGlobalChannels
     ):
         Portals = ApplyPhysicalComponentAssemblyPortalDomains(
             Portals,
@@ -32233,7 +37609,8 @@ def RouteAuthoritativeResources(
             # declared interface deck above the flat-placement policy cap.
             # Reapplying MaximumRoutingLayers here made the access
             # certificate and the physical assembly reason about different
-            # resource graphs (four layers versus three for CLA4).
+            # resource graphs at different layer budgets; keep one authority
+            # boundary.
             LayerCount=min(
                 LayerCount,
                 Technology.MaximumRoutableLayerCount,
@@ -32252,6 +37629,35 @@ def RouteAuthoritativeResources(
                 "PhysicalComponentAssembly",
                 Diagnostics,
             ),
+        )
+        Resources.FrozenPhysicalComponentPostClosurePortalHandoff = (
+            FrozenPhysicalComponentPostClosurePortalHandoff(
+                PreparationDomainFingerprint=Preparation.DomainFingerprint,
+                PlacementFingerprint=Preparation.PlacementFingerprint,
+                ComponentGraphFingerprint=(
+                    Preparation.ComponentGraphFingerprint
+                ),
+                ResourceGraphFingerprint=Preparation.ResourceGraphFingerprint,
+                ExteriorRegionFingerprint=(
+                    Preparation.ExteriorRegionFingerprint
+                ),
+                RawPortalGeometryCache=EffectiveRawPortalCache,
+            )
+        )
+        MandatoryPortalFactorDomains = (
+            BuildPhysicalBoundaryMandatoryPortalFactorDomains(
+                Preparation,
+                Profiles,
+                EffectiveRawPortalCache,
+                Resources.ResourceGraph,
+                FrozenComponentClaims,
+            )
+        )
+        MandatoryPortalFactorDiagnostics = (
+            PublishPhysicalBoundaryMandatoryPortalFactorDomains(
+                Resources,
+                MandatoryPortalFactorDomains,
+            )
         )
         PortFactorDomainSeconds = monotonic() - PortFactorDomainStartedAt
         Preparation = replace(
@@ -32296,6 +37702,9 @@ def RouteAuthoritativeResources(
                 Certificate.Complete and not Certificate.Feasible
                 for Certificate
                 in Preparation.ExteriorFixedClaimCertificates
+            ),
+            "MandatoryPortalFactorDomains": (
+                MandatoryPortalFactorDiagnostics
             ),
             "ImplicitForeignTransitDomainCount": 0,
             "PreparationStageTimings": dict(
@@ -33139,6 +38548,7 @@ def RouteAuthoritativeResources(
         if Policy.AdaptiveRouting.Enabled
         else Policy.TrackAssignment.MaximumRouteCandidatesPerNet,
     )
+    CandidateExpansionRequestLimit = InitialRequestLimit
     if (
         not UseNegotiatedRouting
         and Policy.AdaptiveRouting.Enabled
@@ -33232,7 +38642,12 @@ def RouteAuthoritativeResources(
     )
     ProvisionalCandidateRequestCount = max(
         1,
-        InitialRequestLimit * ActiveCandidateSignalCount,
+        (
+            CandidateExpansionRequestLimit
+            if Resources.PreparingPhysicalComponentGlobalChannels
+            else InitialRequestLimit
+        )
+        * ActiveCandidateSignalCount,
     )
     BaseCandidateExpansionLimit = (
         min(
@@ -33346,7 +38761,7 @@ def RouteAuthoritativeResources(
         )
         for Signal in Profiles
     } if HasRoutedComponentTemplate else {}
-    if PhysicalAssemblyPlan is not None:
+    if PlanningPhysicalComponentExterior:
         ComponentGlobalKeepoutNodes = frozenset(
             PhysicalAssemblyPlan.GlobalKeepoutNodes
         )
@@ -33387,7 +38802,7 @@ def RouteAuthoritativeResources(
             PhysicalAssemblyPlan,
             Complete=True,
         )
-        if PhysicalAssemblyPlan is not None
+        if PlanningPhysicalComponentExterior
         else None
     )
     if CertifiedApertureDomain is not None:
@@ -33413,7 +38828,7 @@ def RouteAuthoritativeResources(
         for Port in SelectPhysicalAssemblyGlobalBoundaryPorts(
             PhysicalAssemblyPlan
         )
-    } if PhysicalAssemblyPlan is not None else {}
+    } if PlanningPhysicalComponentExterior else {}
     AssemblySpecificSiblingApertureClaimsBySignal = {
         Signal: tuple(
             GlobalApertureClaimsByPortSignal[Port.Signal]
@@ -33423,7 +38838,7 @@ def RouteAuthoritativeResources(
             if Port.Signal != Signal
         )
         for Signal in Profiles
-    } if PhysicalAssemblyPlan is not None else {}
+    } if PlanningPhysicalComponentExterior else {}
     AssemblySpecificSiblingAperturesBySignal = {
         Signal: tuple(
             (
@@ -33436,7 +38851,7 @@ def RouteAuthoritativeResources(
             if Port.Signal != Signal
         )
         for Signal in Profiles
-    } if PhysicalAssemblyPlan is not None else {}
+    } if PlanningPhysicalComponentExterior else {}
     AssemblySpecificSiblingBlockedWireNodesBySignal = {
         Signal: ImmutableRoutingClaimsBlockedWireNodes(
             Claims
@@ -33455,7 +38870,7 @@ def RouteAuthoritativeResources(
             if Port.Signal != Signal
         )
         for Signal in Profiles
-    } if PhysicalAssemblyPlan is not None else {}
+    } if PlanningPhysicalComponentExterior else {}
     AssemblySpecificSiblingGlobalPathAperturesBySignal = {
         Signal: tuple(
             (
@@ -33470,7 +38885,7 @@ def RouteAuthoritativeResources(
             if Port.Signal != Signal
         )
         for Signal in Profiles
-    } if PhysicalAssemblyPlan is not None else {}
+    } if PlanningPhysicalComponentExterior else {}
     SiblingApertureConflictSetsBySignal: dict[
         str, list[frozenset[str]]
     ] = defaultdict(list)
@@ -33870,6 +39285,7 @@ def RouteAuthoritativeResources(
             MaximumTupleCount = 16
             CandidateTuples: list[tuple[PinAccessPortal, ...]] = []
             SeenPortalTuples: set[tuple[str, ...]] = set()
+            ComponentHandoffBeamFallbackApplied = False
 
             def AddPortalTuple(
                 CandidatePortals: tuple[PinAccessPortal, ...],
@@ -33888,6 +39304,62 @@ def RouteAuthoritativeResources(
 
             for CandidatePortals in DiagonalCandidates:
                 AddPortalTuple(CandidatePortals)
+            if not CandidateTuples and PhysicalAssemblyPlan is not None:
+                ComponentHandoffBeamFallbackApplied = True
+                # The final closed-component handoff must route every
+                # remaining ordinary net.  A synchronized diagonal can miss
+                # a legal mixed-rank portal tuple even with a complete portal
+                # domain (for example, when sibling terminals require
+                # opposite escape sides).  Search a bounded deterministic
+                # prefix beam before declaring the physical assembly unable
+                # to hand off to the unchanged detailed router.  This branch
+                # is intentionally scoped to the component path so ordinary
+                # non-component route identities remain unchanged.
+                PortalBeam: list[
+                    tuple[int, tuple[PinAccessPortal, ...]]
+                ] = [(0, ())]
+                for Domain in Domains:
+                    NextBeam: dict[
+                        tuple[str, ...],
+                        tuple[int, tuple[PinAccessPortal, ...]],
+                    ] = {}
+                    for PreviousCost, PreviousPortals in PortalBeam:
+                        for Portal in Domain:
+                            CandidatePortals = (*PreviousPortals, Portal)
+                            if not IsSelfLegal(
+                                CandidatePortals,
+                                RecordCompleteClaims=False,
+                            ):
+                                continue
+                            PortalIds = tuple(
+                                Value.PortalId
+                                for Value in CandidatePortals
+                            )
+                            Candidate = (
+                                PreviousCost + Portal.Cost,
+                                CandidatePortals,
+                            )
+                            Existing = NextBeam.get(PortalIds)
+                            if (
+                                Existing is None
+                                or Candidate[0] < Existing[0]
+                            ):
+                                NextBeam[PortalIds] = Candidate
+                    PortalBeam = sorted(
+                        NextBeam.values(),
+                        key=lambda Value: (
+                            Value[0],
+                            tuple(
+                                Portal.PortalId
+                                for Portal in Value[1]
+                            ),
+                        ),
+                    )[:MaximumTupleCount]
+                    if not PortalBeam:
+                        break
+                for _Cost, CandidatePortals in PortalBeam:
+                    if len(CandidatePortals) == len(Domains):
+                        AddPortalTuple(CandidatePortals)
             if CandidateTuples:
                 BaselinePortals = CandidateTuples[0]
                 for RankOffset in (1, 2):
@@ -33921,6 +39393,9 @@ def RouteAuthoritativeResources(
                 "FrozenComponentConflictSignals": tuple(sorted(
                     FrozenComponentConflictSignals
                 )),
+                "ComponentHandoffBeamFallbackApplied": (
+                    ComponentHandoffBeamFallbackApplied
+                ),
             }
         Beam: list[tuple[int, tuple[PinAccessPortal, ...]]] = [(0, ())]
         for AccessPath, Domain in zip(AccessPaths, Domains):
@@ -34379,6 +39854,45 @@ def RouteAuthoritativeResources(
             "LayerFeasibilityCount": len(
                 PortalTupleFeasibilityBySignal.get(Signal, ())
             ),
+            "ConflictResourceCount": len({
+                str(Resource)
+                for Value in PortalTupleFeasibilityBySignal.get(
+                    Signal,
+                    (),
+                )
+                for Resource in Value.get("ConflictResources", ())
+            }),
+            "FrozenComponentConflictTupleCount": sum(
+                int(Value.get(
+                    "FrozenComponentConflictTupleCount",
+                    0,
+                ))
+                for Value in PortalTupleFeasibilityBySignal.get(
+                    Signal,
+                    (),
+                )
+            ),
+            "FrozenComponentConflictSignals": sorted({
+                str(BlockerSignal)
+                for Value in PortalTupleFeasibilityBySignal.get(
+                    Signal,
+                    (),
+                )
+                for BlockerSignal in Value.get(
+                    "FrozenComponentConflictSignals",
+                    (),
+                )
+            }),
+            "ComponentHandoffBeamFallbackApplied": any(
+                bool(Value.get(
+                    "ComponentHandoffBeamFallbackApplied",
+                    False,
+                ))
+                for Value in PortalTupleFeasibilityBySignal.get(
+                    Signal,
+                    (),
+                )
+            ),
             "TerminalPortalCounts": {
                 str(ProfileTerminal): sum(
                     len(
@@ -34402,6 +39916,169 @@ def RouteAuthoritativeResources(
             Signal in RegenerateSignals,
         )
     }
+
+    if ValidatePhysicalComponentForeignPortalSupportOnly:
+        if PhysicalAssemblyPlan is None:
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason
+                    .ComponentAssemblyIdentityMismatch
+                ),
+                Stage="PhysicalComponentForeignPortalSupport",
+                Detail=(
+                    "foreign portal validation requires a frozen "
+                    "physical assembly plan"
+                ),
+            ))
+        ExactComponentSignals = (
+            SelectPhysicalComponentExactGlobalChannelSignals(
+                PhysicalAssemblyPlan
+            )
+        )
+        RejectedTerminalProofs: list[dict[str, object]] = []
+        ProofDomainComplete = True
+        for Signal, Profile in sorted(Profiles.items()):
+            if Signal in ExactComponentSignals:
+                continue
+            FixedAccessNodes = frozenset(
+                Position
+                for Path in (
+                    Profile.SourceAccessPath,
+                    *(
+                        Profile.TargetAccessPaths[Target]
+                        for Target in Profile.Targets
+                    ),
+                )
+                for Position in Path
+            )
+            for Terminal in (Profile.Root, *Profile.Targets):
+                TerminalKeys = tuple(
+                    (Signal, Terminal, Layer)
+                    for Layer in range(LayerCount)
+                )
+                TerminalDomainComplete = all(
+                    Key in CompletePortalDomainKeys
+                    for Key in TerminalKeys
+                )
+                ProofDomainComplete = bool(
+                    ProofDomainComplete and TerminalDomainComplete
+                )
+                TerminalPortals = tuple(
+                    Portal
+                    for Key in TerminalKeys
+                    for Portal in Portals.get(Key, ())
+                )
+                CandidateBlockers = tuple(
+                    PortalTupleConflictsWithFrozenComponentClaims(
+                        Signal,
+                        Resources.ResourceGraph.BuildRouteClaims(
+                            FixedAccessNodes
+                            | frozenset(Portal.Path)
+                        ),
+                        FrozenComponentClaims,
+                    )
+                    for Portal in TerminalPortals
+                )
+                if (
+                    TerminalDomainComplete
+                    and (
+                        not TerminalPortals
+                        or all(CandidateBlockers)
+                    )
+                ):
+                    RejectedTerminalProofs.append({
+                        "Signal": Signal,
+                        "Terminal": list(Terminal),
+                        "PortalCandidateCount": len(TerminalPortals),
+                        "BlockingComponentSignals": sorted({
+                            Blocker
+                            for Blockers in CandidateBlockers
+                            for Blocker in Blockers
+                        }),
+                        "Complete": True,
+                    })
+        if RejectedTerminalProofs:
+            OrdinarySignals = frozenset(
+                str(Proof["Signal"])
+                for Proof in RejectedTerminalProofs
+            )
+            BlockingSignals = frozenset(
+                str(Signal)
+                for Proof in RejectedTerminalProofs
+                for Signal in Proof["BlockingComponentSignals"]
+            )
+            ConflictPairs = tuple(sorted({
+                tuple(sorted((str(Proof["Signal"]), str(Blocker))))
+                for Proof in RejectedTerminalProofs
+                for Blocker in Proof["BlockingComponentSignals"]
+            }))
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason
+                    .ComponentChannelCapacityUnsatisfiable
+                ),
+                Stage="PhysicalComponentForeignPortalSupport",
+                AffectedNets=tuple(sorted(
+                    OrdinarySignals | BlockingSignals
+                )),
+                Detail=(
+                    "the selected exterior contract removes every legal "
+                    "portal for an ordinary global terminal"
+                ),
+                Diagnostics={
+                    "GlobalPlanDomainComplete": ProofDomainComplete,
+                    "CompleteAssignmentCutProof": ProofDomainComplete,
+                    "PhysicalAssemblyPlanFingerprint": (
+                        PhysicalAssemblyPlan.PlanFingerprint
+                    ),
+                    "RejectedTerminalProofs": RejectedTerminalProofs,
+                    "ConflictGraph": {
+                        "Classification": (
+                            "component-ordinary-portal-support-cut"
+                        ),
+                        "ConflictSignals": sorted(
+                            OrdinarySignals | BlockingSignals
+                        ),
+                        "PairwiseIncompatibleEdges": [
+                            list(Pair) for Pair in ConflictPairs
+                        ],
+                    },
+                    "ImplicitForeignTransitDomainCount": 0,
+                },
+            ))
+        if not ProofDomainComplete:
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason
+                    .PhysicalComponentAssemblyIncomplete
+                ),
+                Stage="PhysicalComponentForeignPortalSupport",
+                Detail=(
+                    "ordinary portal support was sampled from an "
+                    "incomplete authoritative portal domain"
+                ),
+                Diagnostics={
+                    "GlobalPlanDomainComplete": False,
+                    "CompleteAssignmentCutProof": False,
+                    "PhysicalAssemblyPlanFingerprint": (
+                        PhysicalAssemblyPlan.PlanFingerprint
+                    ),
+                },
+            ))
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.Stagnated,
+            Stage="PhysicalComponentForeignPortalSupportValidated",
+            Detail=(
+                "the selected exterior contract preserves an ordinary "
+                "portal at every terminal"
+            ),
+            Diagnostics={
+                "Complete": ProofDomainComplete,
+                "PhysicalAssemblyPlanFingerprint": (
+                    PhysicalAssemblyPlan.PlanFingerprint
+                ),
+            },
+        ))
 
     def PortalTupleDomainIsCompleteForSignals(
         Signals: Iterable[str],
@@ -34617,6 +40294,9 @@ def RouteAuthoritativeResources(
                     BuildUnavoidableMandatoryClaimCutFailure(
                         MandatoryPortalCuts,
                         StageTimings,
+                        PairwiseNoGoodEdges=tuple(
+                            Pair for Pair, _Positions in MandatoryPortalCuts
+                        ),
                     )
                 )
             if (
@@ -34705,10 +40385,23 @@ def RouteAuthoritativeResources(
                     ),
                 }
                 if CertifiedCuts:
+                    CertifiedPairwiseNoGoodEdges = tuple(
+                        Certificate.Signals
+                        for Certificate in Certificates
+                        if (
+                            Certificate.Complete
+                            and Certificate.Feasible is False
+                            and frozenset(Certificate.DependencySignals)
+                            <= frozenset(Certificate.Signals)
+                        )
+                    )
                     raise StructuredRoutingStageError(
                         BuildUnavoidableMandatoryClaimCutFailure(
                             CertifiedCuts,
                             StageTimings,
+                            PairwiseNoGoodEdges=(
+                                CertifiedPairwiseNoGoodEdges
+                            ),
                         )
                     )
 
@@ -34933,16 +40626,19 @@ def RouteAuthoritativeResources(
                 Signal,
                 frozenset(),
             )
-            | AssemblySpecificSiblingBlockedWireNodesBySignal.get(
-                Signal,
-                frozenset(),
-            )
             | (
                 DedicatedInterfaceDeckNodes
                 if Signal not in InterClusterChannelSignals
                 else frozenset()
             )
         ))
+        # Compile the signal-local exterior domain against the immutable
+        # component keepout only.  Selected sibling apertures are CSP factors,
+        # not part of this route-domain identity: they are applied by
+        # FilterPhysicalCandidatesAgainstSiblingApertures both for fresh and
+        # replayed candidates.  Including sibling wire nodes here made an
+        # unchanged signal domain regenerate whenever an unrelated aperture
+        # changed, and revisited the same rejected partial assignment.
         AccessPayloadByPortalTuple: dict[
             tuple[str, ...],
             InvariantRouteRequestNodePayload,
@@ -35821,7 +41517,10 @@ def RouteAuthoritativeResources(
             ),
             "DescriptorCount": len(PhysicalRequestShapeDependencies),
         }
-        if CertifiedApertureDomain is not None:
+        if (
+            CertifiedApertureDomain is not None
+            and Resources.PreparingPhysicalComponentGlobalChannels
+        ):
             ApertureCandidateDomainIdentityBySignal[Signal] = (
                 BuildPhysicalSignalApertureCandidateDomainIdentity(
                     CertifiedApertureDomain,
@@ -35967,9 +41666,7 @@ def RouteAuthoritativeResources(
                         RequestDescriptorFingerprints=(
                             DescriptorFingerprints
                         ),
-                        CompletedDescriptorFingerprints=(
-                            DescriptorFingerprints
-                        ),
+                        CompletedDescriptorFingerprints=(),
                         Candidates=Continuation.Candidates,
                         CandidateMetadata=dict(
                             Continuation.CandidateMetadata
@@ -36141,28 +41838,33 @@ def RouteAuthoritativeResources(
                     Continuation.RemainingDescriptorFingerprints
                 ),
                 "Complete": Continuation.Complete,
+                "PortableCompletionTransferred": False,
             }
         WorkTelemetry["PhysicalExteriorRouteDomainReuse"] = {
             "ReusedSignalCount": len(CompleteExteriorRouteDomainSignals),
             "ReusedSignals": sorted(CompleteExteriorRouteDomainSignals),
             "Domains": RestoredExteriorDomainTelemetry,
             "CompleteDomainsOnly": True,
+            "PortableProofReuse": False,
             "PortableLookup": {
                 "HitCount": sum(
-                    Value.get("Reason") == "hit"
-                    or Value.get("PortableReplayReason") == "hit"
+                    SelectPortableReplayTelemetryReason(Value)
+                    == "hit"
                     for Value in RestoredExteriorDomainTelemetry.values()
                 ),
                 "StructuralBucketMissCount": sum(
-                    Value.get("Reason") == "structural-bucket-miss"
+                    SelectPortableReplayTelemetryReason(Value)
+                    == "structural-bucket-miss"
                     for Value in RestoredExteriorDomainTelemetry.values()
                 ),
                 "FullIdentityMismatchCount": sum(
-                    Value.get("Reason") == "full-identity-mismatch"
+                    SelectPortableReplayTelemetryReason(Value)
+                    == "full-identity-mismatch"
                     for Value in RestoredExteriorDomainTelemetry.values()
                 ),
                 "PortalRebindMismatchCount": sum(
-                    Value.get("Reason") == "portal-rebind-mismatch"
+                    SelectPortableReplayTelemetryReason(Value)
+                    == "portal-rebind-mismatch"
                     for Value in RestoredExteriorDomainTelemetry.values()
                 ),
             },
@@ -37721,6 +43423,9 @@ def RouteAuthoritativeResources(
                         CompleteExteriorRouteDomainSignals.add(
                             SignalValue
                         )
+                        IncompletePreSiblingDomainSignals.discard(
+                            SignalValue
+                        )
                     if (
                         RouteTreeNativeDeadlineExceeded
                         and Progress.RemainingDescriptorFingerprints
@@ -37930,6 +43635,15 @@ def RouteAuthoritativeResources(
             # domain.  Continue the current signal in-place until it has a
             # legal witness or its declared requests are exhausted; never
             # encode request-window changes as recursive router retries.
+            # A zero-witness continuation is native batch work, so use one
+            # bounded tranche instead of repeatedly crossing the native
+            # boundary in pass-zero-sized slices.  Descriptor order and the
+            # finite domain are unchanged; the final tranche still stops as
+            # soon as it contains the first legal witness.
+            ZeroWitnessContinuationRequestLimit = max(
+                InitialRequestLimit,
+                min(32, len(RouteRequests)),
+            )
             ContinuationStart = int(
                 CandidateDiagnostics[Signal]["Requests"]
             )
@@ -37939,7 +43653,8 @@ def RouteAuthoritativeResources(
             ):
                 ContinuationEnd = min(
                     len(RouteRequests),
-                    ContinuationStart + InitialRequestLimit,
+                    ContinuationStart
+                    + ZeroWitnessContinuationRequestLimit,
                 )
                 ContinuationRequests = RouteRequests[
                     ContinuationStart:ContinuationEnd
@@ -37985,6 +43700,9 @@ def RouteAuthoritativeResources(
                 ),
                 "MaterializedCandidateCount": len(
                     CandidatesBySignal[Signal]
+                ),
+                "ContinuationRequestLimit": (
+                    ZeroWitnessContinuationRequestLimit
                 ),
                 "RecursiveRetryCount": 0,
             })
@@ -38166,6 +43884,7 @@ def RouteAuthoritativeResources(
             }
             if Progress.Complete:
                 CompleteExteriorRouteDomainSignals.add(Signal)
+                IncompletePreSiblingDomainSignals.discard(Signal)
         if (
             not CandidatesBySignal[Signal]
             and (
@@ -38332,6 +44051,7 @@ def RouteAuthoritativeResources(
                 )
                 RequestApertureFactorNoGood = frozenset()
                 RequestAperturePortNoGood = frozenset()
+                AlternativeAperturePortNoGoods = ()
                 SignalLocalRequestFactorProofComplete = False
                 RequestIdentity = (
                     ApertureCandidateDomainIdentityBySignal.get(Signal)
@@ -38408,6 +44128,39 @@ def RouteAuthoritativeResources(
                                 Resources
                                 .RejectedPhysicalComponentPortReservationSets
                                 .add(RequestAperturePortNoGood)
+                            )
+                        PreparedPortDomain = getattr(
+                            Resources,
+                            "PreparedPhysicalComponentPortFactorDomain",
+                            None,
+                        )
+                        MatchingVictimFactors = tuple(
+                            Factor
+                            for Factor in CertifiedApertureDomain.Factors
+                            if Factor.Signal == Signal
+                        )
+                        if (
+                            SignalLocalRequestFactorProofComplete
+                            and PreparedPortDomain is not None
+                            and len(MatchingVictimFactors) == 1
+                        ):
+                            AlternativeAperturePortNoGoods = (
+                                BuildCompletePhysicalRequestAlternativeApertureNoGoods(
+                                    Signal,
+                                    MatchingVictimFactors[0]
+                                    .PortGlobalContractFingerprint,
+                                    PreSiblingCandidatesBySignal.get(
+                                        Signal,
+                                        (),
+                                    ),
+                                    dict(
+                                        PreparedPortDomain
+                                        .BoundaryPortReservationsBySignal
+                                    ),
+                                )
+                            )
+                            Resources.RejectedPhysicalComponentPortReservationSets.update(
+                                AlternativeAperturePortNoGoods
                             )
                 CandidateDiagnostics[Signal][
                     "SiblingApertureSeamOwnership"
@@ -38511,6 +44264,10 @@ def RouteAuthoritativeResources(
                             for Key in sorted(
                                 RequestAperturePortNoGood
                             )
+                        ],
+                        "AlternativeAperturePortNoGoods": [
+                            [list(Key) for Key in sorted(Clause)]
+                            for Clause in AlternativeAperturePortNoGoods
                         ],
                         "EscalationHistory": (),
                         "ExecutableLegacyRepairCascade": False,
@@ -40316,6 +46073,154 @@ def RouteAuthoritativeResources(
                 CompleteEmptyDomainSignals
                 and not PortalIdentityMismatchSignals
             ):
+                CompletedRequestApertureClauses = tuple(
+                    Clause
+                    for Signal in CompleteEmptyDomainSignals
+                    for Clause in (
+                        BuildMinimalPhysicalRequestApertureNoGood(
+                            Signal,
+                            (
+                                ApertureCandidateDomainIdentityBySignal[
+                                    Signal
+                                ].StableDomainFingerprint
+                            ),
+                            SiblingApertureConflictSetsBySignal.get(
+                                Signal,
+                                (),
+                            ),
+                            {
+                                Factor.Signal: Factor.ApertureFingerprint
+                                for Factor in (
+                                    CertifiedApertureDomain.Factors
+                                    if CertifiedApertureDomain is not None
+                                    else ()
+                                )
+                            },
+                        ),
+                    )
+                    if (
+                        Clause
+                        and Signal
+                        in ApertureCandidateDomainIdentityBySignal
+                        and CertifiedApertureDomain is not None
+                        and CertifiedApertureDomain.Complete
+                    )
+                )
+                SelectedRequestApertureClause = (
+                    min(
+                        CompletedRequestApertureClauses,
+                        key=lambda Clause: (
+                            len(Clause),
+                            tuple(sorted(Clause)),
+                        ),
+                    )
+                    if CompletedRequestApertureClauses
+                    else frozenset()
+                )
+                SelectedRequestSignals = frozenset(
+                    Signal
+                    for Signal, Fingerprint
+                    in SelectedRequestApertureClause
+                    if Fingerprint.startswith("request-factor:")
+                )
+                SignalLocalRequestFactorProofComplete = bool(
+                    len(SelectedRequestSignals) == 1
+                    and PhysicalSignalLocalCandidateRequestFactorProofComplete(
+                        next(iter(SelectedRequestSignals)),
+                        CandidateRequestDependencyComponentsBySignal.get(
+                            next(iter(SelectedRequestSignals)),
+                            {},
+                        ),
+                        Resources.PhysicalComponentExactGlobalChannelSignals,
+                        PhysicalPortGuidesBySignal,
+                        CertifiedApertureDomain,
+                    )
+                )
+                RequestAperturePortNoGood = (
+                    BuildPhysicalRequestAperturePortNoGood(
+                        PhysicalAssemblyPlan,
+                        SelectedRequestApertureClause,
+                        SignalLocalRequestFactorProofComplete=(
+                            SignalLocalRequestFactorProofComplete
+                        ),
+                        PortSolverCacheKey=(
+                            BuildPhysicalComponentPortSolverCacheKey(
+                                str(getattr(
+                                    Resources
+                                    .PreparedPhysicalComponentPortFactorDomain,
+                                    "DomainFingerprint",
+                                    "",
+                                ))
+                            )
+                            if getattr(
+                                Resources,
+                                "PreparedPhysicalComponentPortFactorDomain",
+                                None,
+                            ) is not None
+                            else ""
+                        ),
+                    )
+                    if (
+                        SelectedRequestApertureClause
+                        and PhysicalAssemblyPlan is not None
+                    )
+                    else frozenset()
+                )
+                AlternativeAperturePortNoGoods = ()
+                if (
+                    SignalLocalRequestFactorProofComplete
+                    and len(SelectedRequestSignals) == 1
+                ):
+                    RequestSignal = next(iter(SelectedRequestSignals))
+                    PreparedPortDomain = getattr(
+                        Resources,
+                        "PreparedPhysicalComponentPortFactorDomain",
+                        None,
+                    )
+                    MatchingVictimFactors = tuple(
+                        Factor
+                        for Factor in CertifiedApertureDomain.Factors
+                        if Factor.Signal == RequestSignal
+                    )
+                    if (
+                        PreparedPortDomain is not None
+                        and len(MatchingVictimFactors) == 1
+                    ):
+                        AlternativeAperturePortNoGoods = (
+                            BuildCompletePhysicalRequestAlternativeApertureNoGoods(
+                                RequestSignal,
+                                MatchingVictimFactors[0]
+                                .PortGlobalContractFingerprint,
+                                PreSiblingCandidatesBySignal.get(
+                                    RequestSignal,
+                                    (),
+                                ),
+                                dict(
+                                    PreparedPortDomain
+                                    .BoundaryPortReservationsBySignal
+                                ),
+                            )
+                        )
+                        Resources.RejectedPhysicalComponentPortReservationSets.update(
+                            AlternativeAperturePortNoGoods
+                        )
+                CertifiedConflictSignals = tuple(sorted({
+                    Signal
+                    for Signal, _FingerprintValue
+                    in SelectedRequestApertureClause
+                }))
+                if SelectedRequestApertureClause:
+                    (
+                        Resources
+                        .RejectedPhysicalGlobalRequestApertureFactorSets
+                        .add(SelectedRequestApertureClause)
+                    )
+                if RequestAperturePortNoGood:
+                    (
+                        Resources
+                        .RejectedPhysicalComponentPortReservationSets
+                        .add(RequestAperturePortNoGood)
+                    )
                 IndependentEmptyDomainSignals = tuple(sorted(
                     Signal
                     for Signal in CompleteEmptyDomainSignals
@@ -40329,7 +46234,10 @@ def RouteAuthoritativeResources(
                         .ComponentChannelCapacityUnsatisfiable
                     ),
                     Stage="PhysicalComponentGlobalCandidateDomain",
-                    AffectedNets=CompleteEmptyDomainSignals,
+                    AffectedNets=(
+                        CertifiedConflictSignals
+                        or CompleteEmptyDomainSignals
+                    ),
                     Detail=(
                         "the complete authoritative candidate domain has no "
                         "route compatible with the fixed assembly apertures"
@@ -40337,6 +46245,26 @@ def RouteAuthoritativeResources(
                     Diagnostics={
                         "GlobalPlanDomainComplete": True,
                         "CompleteAssignmentCutProof": True,
+                        "RequestApertureFactorProofComplete": bool(
+                            SelectedRequestApertureClause
+                        ),
+                        "RequestApertureFactorNoGood": [
+                            list(Key)
+                            for Key in sorted(
+                                SelectedRequestApertureClause
+                            )
+                        ],
+                        "SignalLocalRequestFactorProofComplete": (
+                            SignalLocalRequestFactorProofComplete
+                        ),
+                        "RequestAperturePortNoGood": [
+                            list(Key)
+                            for Key in sorted(RequestAperturePortNoGood)
+                        ],
+                        "AlternativeAperturePortNoGoods": [
+                            [list(Key) for Key in sorted(Clause)]
+                            for Clause in AlternativeAperturePortNoGoods
+                        ],
                         "IndependentEmptyCandidateDomainSignals": list(
                             IndependentEmptyDomainSignals
                         ),
@@ -40351,16 +46279,20 @@ def RouteAuthoritativeResources(
                                 "candidate-starvation-placement-conflict"
                             ),
                             "ConflictSignals": list(
-                                CompleteEmptyDomainSignals
+                                CertifiedConflictSignals
+                                or CompleteEmptyDomainSignals
                             ),
                             "NoCandidateSignals": list(
-                                CompleteEmptyDomainSignals
+                                CertifiedConflictSignals[:1]
+                                or CompleteEmptyDomainSignals
                             ),
                             "RelocationSignals": list(
-                                CompleteEmptyDomainSignals
+                                CertifiedConflictSignals
+                                or CompleteEmptyDomainSignals
                             ),
                             "PriorityRelocationSignals": list(
-                                CompleteEmptyDomainSignals
+                                CertifiedConflictSignals
+                                or CompleteEmptyDomainSignals
                             ),
                             "CompleteAssignmentCutProof": True,
                         },
@@ -40562,10 +46494,10 @@ def RouteAuthoritativeResources(
             Key = tuple(sorted((First.CandidateId, Second.CandidateId)))
             Cached = PhysicalAssignmentArcCompatibilityCache.get(Key)
             if Cached is None:
-                Cached = not FindClaimConflicts({
-                    First.Signal: First.Claims,
-                    Second.Signal: Second.Claims,
-                })
+                Cached = not MandatoryClaimsConflict(
+                    First.Claims,
+                    Second.Claims,
+                )
                 PhysicalAssignmentArcCompatibilityCache[Key] = Cached
                 while len(
                     PhysicalAssignmentArcCompatibilityCache
@@ -40664,14 +46596,591 @@ def RouteAuthoritativeResources(
         AssignmentBudget=AssignmentExpansionLimit,
     )
 
-    def PlanAssignment(Values: list[tuple[Any, ...]] | None = None) -> Any:
-        nonlocal BaseValues
-        if Values is None:
-            AssignmentCandidateSets = (
-                ArcConsistentPhysicalCandidateSets()
-                if Resources.PreparingPhysicalComponentGlobalChannels
-                else CandidatesBySignal
+    PublishedPhysicalLocalAccessCandidateNoGoods: set[
+        frozenset[tuple[str, str]]
+    ] = set()
+    PublishedPhysicalForeignPortalCandidateNoGoods: set[
+        frozenset[tuple[str, str]]
+    ] = set()
+    PhysicalForeignPortalDomainsPrepared = False
+    PhysicalForeignPortalDomains: list[
+        tuple[str, Position3, tuple[RoutingResourceClaims, ...]]
+    ] = []
+    PhysicalForeignPortalCompleteIndexesByDomain: dict[
+        int, frozenset[int]
+    ] = {}
+    PhysicalForeignPortalOccurrencesByWireCell: dict[
+        Position3, frozenset[tuple[int, int]]
+    ] = {}
+    PhysicalForeignPortalOccurrencesBySupportCell: dict[
+        Position3, frozenset[tuple[int, int]]
+    ] = {}
+    PhysicalForeignPortalOccurrencesByRequiredAirCell: dict[
+        Position3, frozenset[tuple[int, int]]
+    ] = {}
+    PhysicalForeignPortalOccurrencesByElectricalCell: dict[
+        Position3, frozenset[tuple[int, int]]
+    ] = {}
+    PhysicalForeignPortalIncompleteTerminalCount = 0
+    PhysicalForeignPortalCandidateClaimsById: dict[
+        str, RoutingResourceClaims
+    ] = {}
+    PhysicalForeignPortalBlockedByCandidateAndDomain: dict[
+        tuple[str, int], frozenset[int]
+    ] = {}
+    PhysicalForeignPortalCertifiedCandidateIds: set[str] = set()
+    PhysicalForeignPortalUnaryRejectedCandidateIdsBySignal: dict[
+        str, set[str]
+    ] = defaultdict(set)
+    PhysicalForeignPortalCompatibilityCheckCount = 0
+
+    def PublishPhysicalGlobalForeignPortalCandidateNoGoods(
+        CandidateSets: Mapping[str, Iterable[NetRouteCandidate]],
+    ) -> None:
+        """Preserve one complete ordinary portal per terminal.
+
+        Component exterior candidates are tested against the immutable
+        whole-design portal fabric prepared before the interface CSP.  A
+        unary clause is complete when one exterior candidate blocks every
+        portal for a foreign terminal; a binary clause is complete when the
+        union of two candidates' blocker sets covers that same finite domain.
+        This is the exact pre-assignment counterpart of the post-selection
+        foreign-portal validation and prevents a known-bad contract from
+        consuming an authoritative global-routing slice.
+        """
+        nonlocal PhysicalForeignPortalDomainsPrepared
+        nonlocal PhysicalForeignPortalIncompleteTerminalCount
+        nonlocal PhysicalForeignPortalCompatibilityCheckCount
+        if not Resources.PreparingPhysicalComponentGlobalChannels:
+            return
+        Handoff = (
+            Resources.FrozenPhysicalComponentPostClosurePortalHandoff
+        )
+        if Handoff is None:
+            return
+        Cache = Handoff.RawPortalGeometryCache
+        if not isinstance(Cache, RawPortalGeometryCache):
+            return
+        ExactSignals = frozenset(
+            Resources.PhysicalComponentExactGlobalChannelSignals
+        )
+        OrderedCandidates = tuple(
+            Candidate
+            for Signal in sorted(CandidateSets)
+            for Candidate in sorted(
+                CandidateSets[Signal],
+                key=lambda Value: Value.CandidateId,
             )
+        )
+        if not OrderedCandidates:
+            return
+        NewCandidates = tuple(
+            Candidate
+            for Candidate in OrderedCandidates
+            if Candidate.CandidateId
+            not in PhysicalForeignPortalCertifiedCandidateIds
+        )
+        FixedClaimsBySignal: dict[
+            str, tuple[RoutingResourceClaims, ...]
+        ] = {
+            Signal: tuple(
+                Claim.Claims
+                for Claim in FrozenComponentClaims
+                if Claim.Signal == Signal
+            )
+            for Signal in ExactSignals
+        }
+
+        def CompileCandidateClaims(
+            Candidate: NetRouteCandidate,
+        ) -> RoutingResourceClaims:
+            Claims = (
+                Candidate.Claims,
+                *FixedClaimsBySignal.get(Candidate.Signal, ()),
+            )
+            return RoutingResourceClaims(
+                WireCells=frozenset().union(*(
+                    Value.WireCells for Value in Claims
+                )),
+                SupportCells=frozenset().union(*(
+                    Value.SupportCells for Value in Claims
+                )),
+                RequiredAirCells=frozenset().union(*(
+                    Value.RequiredAirCells for Value in Claims
+                )),
+                ElectricalCells=frozenset().union(*(
+                    Value.ElectricalCells for Value in Claims
+                )),
+            )
+
+        for Candidate in NewCandidates:
+            PhysicalForeignPortalCandidateClaimsById[
+                Candidate.CandidateId
+            ] = CompileCandidateClaims(Candidate)
+        if not PhysicalForeignPortalDomainsPrepared:
+            RawPortals = Cache.BuildPortalDictionary()
+            CompleteKeys = frozenset(Cache.CompletePortalDomainKeys)
+            for Signal, Profile in sorted(WholeDesignProfiles.items()):
+                if Signal in ExactSignals:
+                    continue
+                FixedAccessNodes = frozenset(
+                    Position
+                    for Path in (
+                        Profile.SourceAccessPath,
+                        *(
+                            Profile.TargetAccessPaths[Target]
+                            for Target in Profile.Targets
+                        ),
+                    )
+                    for Position in Path
+                )
+                for Terminal in (Profile.Root, *Profile.Targets):
+                    Keys = tuple(
+                        (Signal, Terminal, Layer)
+                        for Layer in range(Cache.LayerCount)
+                    )
+                    if not all(Key in CompleteKeys for Key in Keys):
+                        PhysicalForeignPortalIncompleteTerminalCount += 1
+                        continue
+                    PortalsById = {
+                        Portal.PortalId: Portal
+                        for Key in Keys
+                        for Portal in RawPortals.get(Key, ())
+                    }
+                    if not PortalsById:
+                        # A complete-empty ordinary domain is placement-level
+                        # evidence, not a candidate-dependent no-good.
+                        continue
+                    PortalClaims = tuple(
+                        Resources.ResourceGraph.BuildRouteClaims(
+                            FixedAccessNodes | frozenset(Portal.Path)
+                        )
+                        for Portal in sorted(
+                            PortalsById.values(),
+                            key=lambda Value: Value.PortalId,
+                        )
+                    )
+                    PhysicalForeignPortalDomains.append((
+                        str(Signal),
+                        Terminal,
+                        PortalClaims,
+                    ))
+            PhysicalForeignPortalCompleteIndexesByDomain.update({
+                DomainIndex: frozenset(range(len(PortalClaims)))
+                for DomainIndex, (_Signal, _Terminal, PortalClaims)
+                in enumerate(PhysicalForeignPortalDomains)
+            })
+            MutableOccurrencesByClaimKind: tuple[
+                defaultdict[Position3, set[tuple[int, int]]], ...
+            ] = tuple(defaultdict(set) for _Index in range(4))
+            for DomainIndex, (
+                _Signal,
+                _Terminal,
+                PortalClaims,
+            ) in enumerate(PhysicalForeignPortalDomains):
+                for PortalIndex, Claims in enumerate(PortalClaims):
+                    Occurrence = (DomainIndex, PortalIndex)
+                    for ClaimIndex, Cells in enumerate((
+                        Claims.WireCells,
+                        Claims.SupportCells,
+                        Claims.RequiredAirCells,
+                        Claims.ElectricalCells,
+                    )):
+                        for Cell in Cells:
+                            MutableOccurrencesByClaimKind[ClaimIndex][
+                                Cell
+                            ].add(Occurrence)
+            for Target, Mutable in zip(
+                (
+                    PhysicalForeignPortalOccurrencesByWireCell,
+                    PhysicalForeignPortalOccurrencesBySupportCell,
+                    PhysicalForeignPortalOccurrencesByRequiredAirCell,
+                    PhysicalForeignPortalOccurrencesByElectricalCell,
+                ),
+                MutableOccurrencesByClaimKind,
+                strict=True,
+            ):
+                Target.update({
+                    Cell: frozenset(Occurrences)
+                    for Cell, Occurrences in Mutable.items()
+                })
+            PhysicalForeignPortalDomainsPrepared = True
+        UnaryCount = 0
+        BinaryCount = 0
+        ComparisonCount = 0
+        for Candidate in NewCandidates:
+            Literal = (Candidate.Signal, Candidate.CandidateId)
+            CandidateUnaryPublished = False
+            CandidateClaims = PhysicalForeignPortalCandidateClaimsById[
+                Candidate.CandidateId
+            ]
+            BlockedOccurrences: set[tuple[int, int]] = set()
+
+            def AddBlockedOccurrences(
+                Cells: Iterable[Position3],
+                Index: Mapping[
+                    Position3, frozenset[tuple[int, int]]
+                ],
+            ) -> None:
+                nonlocal ComparisonCount
+                for Cell in Cells:
+                    ComparisonCount += 1
+                    BlockedOccurrences.update(Index.get(Cell, ()))
+
+            # This is the exact nine-term ComponentClaimsConflict predicate
+            # transposed through the immutable portal-domain resource index.
+            AddBlockedOccurrences(
+                CandidateClaims.WireCells
+                | CandidateClaims.SupportCells
+                | CandidateClaims.RequiredAirCells
+                | CandidateClaims.ElectricalCells,
+                PhysicalForeignPortalOccurrencesByWireCell,
+            )
+            AddBlockedOccurrences(
+                CandidateClaims.WireCells
+                | CandidateClaims.RequiredAirCells,
+                PhysicalForeignPortalOccurrencesBySupportCell,
+            )
+            AddBlockedOccurrences(
+                CandidateClaims.SupportCells,
+                PhysicalForeignPortalOccurrencesByRequiredAirCell,
+            )
+            AddBlockedOccurrences(
+                CandidateClaims.WireCells,
+                PhysicalForeignPortalOccurrencesByElectricalCell,
+            )
+            BlockedIndexesByDomain: dict[int, set[int]] = defaultdict(set)
+            for DomainIndex, PortalIndex in BlockedOccurrences:
+                BlockedIndexesByDomain[DomainIndex].add(PortalIndex)
+            for DomainIndex in range(len(PhysicalForeignPortalDomains)):
+                Blocked = frozenset(
+                    BlockedIndexesByDomain.get(DomainIndex, ())
+                )
+                PhysicalForeignPortalBlockedByCandidateAndDomain[
+                    (Candidate.CandidateId, DomainIndex)
+                ] = Blocked
+                if Blocked == (
+                    PhysicalForeignPortalCompleteIndexesByDomain[
+                        DomainIndex
+                    ]
+                ):
+                    Clause = frozenset((Literal,))
+                    PhysicalForeignPortalUnaryRejectedCandidateIdsBySignal[
+                        Candidate.Signal
+                    ].add(Candidate.CandidateId)
+                    if Clause not in (
+                        Resources
+                        .ForbiddenPhysicalComponentGlobalCandidateSets
+                    ):
+                        (
+                            Resources
+                            .ForbiddenPhysicalComponentGlobalCandidateSets
+                            .add(Clause)
+                        )
+                        PublishedPhysicalForeignPortalCandidateNoGoods.add(
+                            Clause
+                        )
+                        UnaryCount += 1
+                    CandidateUnaryPublished = True
+            if CandidateUnaryPublished:
+                continue
+        NewCandidateIds = frozenset(
+            Candidate.CandidateId for Candidate in NewCandidates
+        )
+        CandidateIdsBySignal = {
+            str(Signal): frozenset(
+                Candidate.CandidateId for Candidate in Candidates
+            )
+            for Signal, Candidates in CandidateSets.items()
+        }
+        IndependentEmptyCandidateDomainSignals = tuple(sorted(
+            Signal
+            for Signal, CandidateIds in CandidateIdsBySignal.items()
+            if (
+                CandidateIds
+                and Signal in CompleteExteriorRouteDomainSignals
+                and CandidateIds <= frozenset(
+                    PhysicalForeignPortalUnaryRejectedCandidateIdsBySignal
+                    .get(Signal, ())
+                )
+            )
+        ))
+        # A complete unary-empty signal is already the smallest possible
+        # fixed-plan core.  Binary clauses cannot restore support or produce
+        # a smaller explanation, so avoid compiling the quadratic relation
+        # after this terminal certificate is known.
+        if not IndependentEmptyCandidateDomainSignals:
+            for FirstIndex, First in enumerate(OrderedCandidates):
+                if First.CandidateId in (
+                    PhysicalForeignPortalUnaryRejectedCandidateIdsBySignal
+                    .get(First.Signal, ())
+                ):
+                    continue
+                FirstLiteral = (First.Signal, First.CandidateId)
+                for Second in OrderedCandidates[FirstIndex + 1:]:
+                    if First.Signal == Second.Signal:
+                        continue
+                    if (
+                        First.CandidateId not in NewCandidateIds
+                        and Second.CandidateId not in NewCandidateIds
+                    ):
+                        continue
+                    if Second.CandidateId in (
+                        PhysicalForeignPortalUnaryRejectedCandidateIdsBySignal
+                        .get(Second.Signal, ())
+                    ):
+                        continue
+                    SecondLiteral = (Second.Signal, Second.CandidateId)
+                    Clause = frozenset((FirstLiteral, SecondLiteral))
+                    if Clause in (
+                        Resources
+                        .ForbiddenPhysicalComponentGlobalCandidateSets
+                    ):
+                        continue
+                    for DomainIndex in range(
+                        len(PhysicalForeignPortalDomains)
+                    ):
+                        FirstBlocked = (
+                            PhysicalForeignPortalBlockedByCandidateAndDomain[
+                                (First.CandidateId, DomainIndex)
+                            ]
+                        )
+                        SecondBlocked = (
+                            PhysicalForeignPortalBlockedByCandidateAndDomain[
+                                (Second.CandidateId, DomainIndex)
+                            ]
+                        )
+                        if not FirstBlocked or not SecondBlocked:
+                            continue
+                        if (
+                            FirstBlocked | SecondBlocked
+                            == PhysicalForeignPortalCompleteIndexesByDomain[
+                                DomainIndex
+                            ]
+                        ):
+                            (
+                                Resources
+                                .ForbiddenPhysicalComponentGlobalCandidateSets
+                                .add(Clause)
+                            )
+                            PublishedPhysicalForeignPortalCandidateNoGoods.add(
+                                Clause
+                            )
+                            BinaryCount += 1
+                            break
+        PhysicalForeignPortalCertifiedCandidateIds.update(NewCandidateIds)
+        PhysicalForeignPortalCompatibilityCheckCount += ComparisonCount
+        WorkTelemetry[
+            "PhysicalGlobalForeignPortalCandidateCertificates"
+        ] = {
+            "ForeignTerminalDomainCount": len(
+                PhysicalForeignPortalDomains
+            ),
+            "IncompleteForeignTerminalDomainCount": (
+                PhysicalForeignPortalIncompleteTerminalCount
+            ),
+            "CandidateCount": len(OrderedCandidates),
+            "NewCandidateCount": len(NewCandidates),
+            "CertifiedCandidateCount": len(
+                PhysicalForeignPortalCertifiedCandidateIds
+            ),
+            "CompatibilityCheckCount": (
+                PhysicalForeignPortalCompatibilityCheckCount
+            ),
+            "IncrementalCompatibilityCheckCount": ComparisonCount,
+            "PublishedUnaryClauseCount": UnaryCount,
+            "PublishedBinaryClauseCount": BinaryCount,
+            "BinaryCompilationSkippedForUnaryEmptyCore": bool(
+                IndependentEmptyCandidateDomainSignals
+            ),
+            "RetainedClauseCount": len(
+                PublishedPhysicalForeignPortalCandidateNoGoods
+            ),
+            "IndependentEmptyCandidateDomainSignals": list(
+                IndependentEmptyCandidateDomainSignals
+            ),
+            "Complete": (
+                PhysicalForeignPortalIncompleteTerminalCount == 0
+            ),
+        }
+
+    def PublishPhysicalGlobalLocalAccessCandidateNoGoods(
+        CandidateSets: Mapping[str, Iterable[NetRouteCandidate]],
+    ) -> None:
+        """Pre-screen exact exterior choices against complete local access.
+
+        A component-global candidate is unary-incompatible when it conflicts
+        with every candidate in one complete owned-terminal domain.  Two
+        exterior candidates are binary-incompatible when their combined
+        blocker sets cover such a domain.  These certificates use the same
+        exact claim predicate as final tree-frontier compilation, so they can
+        be learned before assignment without materializing a local route.
+        """
+        if not Resources.PreparingPhysicalComponentGlobalChannels:
+            return
+        PhysicalProblem = Resources.PreparedComponentRoutingProblem
+        if PhysicalProblem is None:
+            return
+        CompleteDomains = tuple(
+            Domain
+            for Domain in PhysicalProblem.OwnedTerminalDomains
+            if Domain.Complete and Domain.Candidates
+        )
+        if not CompleteDomains:
+            return
+        OrderedCandidates = tuple(
+            Candidate
+            for Signal in sorted(CandidateSets)
+            for Candidate in sorted(
+                CandidateSets[Signal],
+                key=lambda Value: Value.CandidateId,
+            )
+        )
+        BlockedByCandidateAndDomain: dict[
+            tuple[str, int], frozenset[int]
+        ] = {}
+        CompleteIndexesByDomain = {
+            DomainIndex: frozenset(range(len(Domain.Candidates)))
+            for DomainIndex, Domain in enumerate(CompleteDomains)
+        }
+        UnaryCount = 0
+        BinaryCount = 0
+        for Candidate in OrderedCandidates:
+            Literal = (Candidate.Signal, Candidate.CandidateId)
+            CandidateUnaryPublished = False
+            for DomainIndex, Domain in enumerate(CompleteDomains):
+                Blocked = (
+                    frozenset()
+                    if Domain.Signal == Candidate.Signal
+                    else frozenset(
+                        AccessIndex
+                        for AccessIndex, Access in enumerate(
+                            Domain.Candidates
+                        )
+                        if ComponentClaimsConflict(
+                            Candidate.Claims,
+                            Access.Claims,
+                        )
+                    )
+                )
+                BlockedByCandidateAndDomain[
+                    (Candidate.CandidateId, DomainIndex)
+                ] = Blocked
+                if Blocked == CompleteIndexesByDomain[DomainIndex]:
+                    Clause = frozenset((Literal,))
+                    if Clause not in (
+                        Resources
+                        .ForbiddenPhysicalComponentGlobalCandidateSets
+                    ):
+                        Resources.ForbiddenPhysicalComponentGlobalCandidateSets.add(
+                            Clause
+                        )
+                        PublishedPhysicalLocalAccessCandidateNoGoods.add(
+                            Clause
+                        )
+                        UnaryCount += 1
+                    CandidateUnaryPublished = True
+            if CandidateUnaryPublished:
+                continue
+        for FirstIndex, First in enumerate(OrderedCandidates):
+            FirstLiteral = (First.Signal, First.CandidateId)
+            for Second in OrderedCandidates[FirstIndex + 1:]:
+                if First.Signal == Second.Signal:
+                    continue
+                SecondLiteral = (Second.Signal, Second.CandidateId)
+                Clause = frozenset((FirstLiteral, SecondLiteral))
+                if Clause in (
+                    Resources.ForbiddenPhysicalComponentGlobalCandidateSets
+                ):
+                    continue
+                for DomainIndex in range(len(CompleteDomains)):
+                    if (
+                        BlockedByCandidateAndDomain[
+                            (First.CandidateId, DomainIndex)
+                        ]
+                        | BlockedByCandidateAndDomain[
+                            (Second.CandidateId, DomainIndex)
+                        ]
+                    ) == CompleteIndexesByDomain[DomainIndex]:
+                        Resources.ForbiddenPhysicalComponentGlobalCandidateSets.add(
+                            Clause
+                        )
+                        PublishedPhysicalLocalAccessCandidateNoGoods.add(
+                            Clause
+                        )
+                        BinaryCount += 1
+                        break
+        WorkTelemetry["PhysicalGlobalLocalAccessCandidateCertificates"] = {
+            "CompleteTerminalDomainCount": len(CompleteDomains),
+            "CandidateCount": len(OrderedCandidates),
+            "PublishedUnaryClauseCount": UnaryCount,
+            "PublishedBinaryClauseCount": BinaryCount,
+            "RetainedClauseCount": len(
+                PublishedPhysicalLocalAccessCandidateNoGoods
+            ),
+            "Complete": True,
+        }
+
+    def PlanAssignment(
+        Values: list[tuple[Any, ...]] | None = None,
+        *,
+        AvoidExactNoGoods: bool = True,
+    ) -> Any:
+        nonlocal BaseValues
+        if Resources.PreparingPhysicalComponentGlobalChannels:
+            # Layer-capped and localized assignment calls pass pre-encoded
+            # values.  Lazy suffix candidates must still receive the same
+            # exact foreign-portal certificates before native assignment.
+            PublishPhysicalGlobalForeignPortalCandidateNoGoods(
+                CandidatesBySignal
+            )
+            IndependentEmptySignals = tuple(sorted(map(
+                str,
+                WorkTelemetry.get(
+                    "PhysicalGlobalForeignPortalCandidateCertificates",
+                    {},
+                ).get(
+                    "IndependentEmptyCandidateDomainSignals",
+                    (),
+                ),
+            )))
+            if IndependentEmptySignals:
+                # Every candidate in each named, completed exterior domain
+                # has an exact unary foreign-portal no-good.  Native track
+                # assignment cannot restore a removed value, so invoking it
+                # here only repeats work after a complete fixed-plan proof.
+                WorkTelemetry[
+                    "PhysicalGlobalForeignPortalCandidateCertificates"
+                ]["NativeAssignmentSkipped"] = True
+                return SimpleNamespace(
+                    Success=False,
+                    SelectedCandidateIds=(),
+                    ExpansionCount=0,
+                    CompletedWork=0,
+                    BudgetExhausted=False,
+                    DeadlineExceeded=False,
+                    ConflictSignals=IndependentEmptySignals,
+                )
+        if Values is None:
+            AssignmentCandidateSets = CandidatesBySignal
+            PublishPhysicalGlobalLocalAccessCandidateNoGoods(
+                AssignmentCandidateSets
+            )
+            if Resources.PreparingPhysicalComponentGlobalChannels:
+                BeginPhysicalAssignmentArcPass(
+                    PhysicalAssignmentArcTelemetry
+                )
+                PhysicalAssignmentArcTelemetry.update({
+                    "Applied": False,
+                    "Complete": True,
+                    "Reason": "native-exact-assignment-authority",
+                    "CandidateCounts": {
+                        Signal: len(Candidates)
+                        for Signal, Candidates in sorted(
+                            CandidatesBySignal.items()
+                        )
+                    },
+                })
             Values = EncodeCandidateValues(AssignmentCandidateSets)
             if (
                 Resources.PreparingPhysicalComponentGlobalChannels
@@ -40815,14 +47324,80 @@ def RouteAuthoritativeResources(
                     raise
                 return Context.PlanAuthoritativeRoutes(*Arguments)
 
-        if not Resources.PreparingPhysicalComponentGlobalChannels:
+        if (
+            not Resources.PreparingPhysicalComponentGlobalChannels
+            or not AvoidExactNoGoods
+        ):
             return PlanNative(Values)
-        return PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
+        ResultValue = PlanPhysicalGlobalAssignmentAvoidingExactNoGoods(
             Values,
             Resources.ForbiddenPhysicalComponentGlobalCandidateSets,
             PlanNative,
             DeadlineExpired=Deadline.IsExpired,
         )
+        WorkTelemetry["PhysicalGlobalNativeAssignmentResult"] = {
+            "Success": bool(getattr(ResultValue, "Success", False)),
+            "SelectedCandidateIds": [
+                [str(Signal), str(CandidateId)]
+                for Signal, CandidateId in getattr(
+                    ResultValue,
+                    "SelectedCandidateIds",
+                    (),
+                )
+            ],
+            "ExpansionCount": int(getattr(
+                ResultValue,
+                "ExpansionCount",
+                0,
+            )),
+            "CompletedWork": int(getattr(
+                ResultValue,
+                "CompletedWork",
+                0,
+            )),
+            "BudgetExhausted": bool(getattr(
+                ResultValue,
+                "BudgetExhausted",
+                False,
+            )),
+            "DeadlineExceeded": bool(getattr(
+                ResultValue,
+                "DeadlineExceeded",
+                False,
+            )),
+            "FailureNet": getattr(ResultValue, "FailureNet", None),
+            "ConflictSignals": [
+                str(Signal)
+                for Signal in getattr(ResultValue, "ConflictSignals", ())
+            ],
+            "ConflictResourceIndices": [
+                int(Index)
+                for Index in getattr(
+                    ResultValue,
+                    "ConflictResourceIndices",
+                    (),
+                )
+            ],
+            "PairwiseIncompatibleSignals": [
+                [str(FirstSignal), str(SecondSignal)]
+                for FirstSignal, SecondSignal in getattr(
+                    ResultValue,
+                    "PairwiseIncompatibleSignals",
+                    (),
+                )
+            ],
+            "PairwiseCompatibilityComplete": bool(getattr(
+                ResultValue,
+                "PairwiseCompatibilityComplete",
+                False,
+            )),
+            "ExactNoGoodDomainExhausted": bool(getattr(
+                ResultValue,
+                "ExactNoGoodDomainExhausted",
+                False,
+            )),
+        }
+        return ResultValue
 
     def RaiseForNativeAssignmentDeadline(Result: Any) -> None:
         if not getattr(Result, "DeadlineExceeded", False):
@@ -40938,7 +47513,61 @@ def RouteAuthoritativeResources(
             f"elapsed={StageTimings['AssignmentPreparation']:.3f}s",
             flush=True,
         )
+    PhysicalGlobalPreAssignmentCompletion: list[dict[str, object]] = []
+    if Resources.PreparingPhysicalComponentGlobalChannels:
+        # A closed-component contract owns a finite exterior domain.  Finish
+        # those lazy columns before native assignment so exact unary portal
+        # emptiness and complete pair certificates are evaluated once over
+        # the whole domain rather than after a sequence of speculative
+        # prefix assignments.
+        RemainingBeforeAssignment = (
+            BuildPhysicalRouteDescriptorRemainingCounts(
+                Resources.PhysicalSignalRouteDomainContinuationCache,
+                ApertureCandidateDomainIdentityBySignal,
+                PhysicalRequestDomainFingerprintsBySignal,
+                PhysicalRequestDescriptorFingerprintsBySignal,
+            )
+        )
+        for Signal in sorted(RemainingBeforeAssignment):
+            RemainingCount = int(RemainingBeforeAssignment[Signal])
+            Consumer = PhysicalGlobalCandidateSuffixConsumers.get(Signal)
+            if RemainingCount <= 0 or Consumer is None:
+                continue
+            Record = Consumer(RemainingCount)
+            PhysicalGlobalPreAssignmentCompletion.append(dict(Record))
+            CandidateLookup.update({
+                Candidate.CandidateId: Candidate
+                for Candidate in CandidatesBySignal[Signal]
+            })
+            CheckRuntimeBudget(
+                "PhysicalComponentGlobalCandidateDomainCompletion"
+            )
+        WorkTelemetry[
+            "PhysicalGlobalPreAssignmentDomainCompletion"
+        ] = {
+            "Applied": bool(PhysicalGlobalPreAssignmentCompletion),
+            "Signals": [
+                str(Record["Signal"])
+                for Record in PhysicalGlobalPreAssignmentCompletion
+            ],
+            "ExecutedRequestCount": sum(
+                int(Record["RequestCount"])
+                for Record in PhysicalGlobalPreAssignmentCompletion
+            ),
+            "Complete": not any(
+                BuildPhysicalRouteDescriptorRemainingCounts(
+                    Resources
+                    .PhysicalSignalRouteDomainContinuationCache,
+                    ApertureCandidateDomainIdentityBySignal,
+                    PhysicalRequestDomainFingerprintsBySignal,
+                    PhysicalRequestDescriptorFingerprintsBySignal,
+                ).values()
+            ),
+        }
     AssignmentStarted = monotonic()
+    PublishPhysicalGlobalLocalAccessCandidateNoGoods(
+        CandidatesBySignal
+    )
     LayerCappedAssignmentAttempts: list[dict[str, int | bool]] = []
     Result = None
     if Policy.TrackAssignment.MinimizeMaximumRoutingLayer:
@@ -40963,12 +47592,6 @@ def RouteAuthoritativeResources(
                 ]
                 for Signal, Values in CandidatesBySignal.items()
             }
-            if Resources.PreparingPhysicalComponentGlobalChannels:
-                LayerCappedCandidateSets = (
-                    ArcConsistentPhysicalCandidateSets(
-                        LayerCappedCandidateSets
-                    )
-                )
             LayerCappedValues = EncodeCandidateValues(
                 LayerCappedCandidateSets
             )
@@ -41031,9 +47654,21 @@ def RouteAuthoritativeResources(
             Result = PlanAssignment()
             RaiseForNativeAssignmentDeadline(Result)
     PhysicalGlobalAssignmentSuffixHistory: list[dict[str, object]] = []
+    PhysicalGlobalCompletedPairNoGoodEdges: tuple[
+        tuple[str, str], ...
+    ] = ()
     if Resources.PreparingPhysicalComponentGlobalChannels:
+        # Exact physical-domain completion is already conflict-directed: only
+        # signals named by the current native cut are advanced.  Use a wider
+        # first tranche than ordinary witness generation so a complete pair
+        # certificate does not pay for the same native assignment at 4, 8,
+        # and 16 descriptors before reaching a useful domain slice.
+        PhysicalGlobalInitialSuffixTrancheSize = max(
+            InitialRequestLimit,
+            32,
+        )
         PhysicalGlobalSuffixTrancheSizes = {
-            Signal: InitialRequestLimit
+            Signal: PhysicalGlobalInitialSuffixTrancheSize
             for Signal in CandidatesBySignal
         }
         def PhysicalAssignmentIsComplete(Value: Any) -> bool:
@@ -41107,6 +47742,14 @@ def RouteAuthoritativeResources(
                     PhysicalRequestDescriptorFingerprintsBySignal,
                 )
             )
+            PhysicalGlobalCompletedPairNoGoodEdges = (
+                SelectCompletedPhysicalGlobalPairNoGoodEdges(
+                    Result,
+                    RemainingRequestCounts,
+                )
+            )
+            if PhysicalGlobalCompletedPairNoGoodEdges:
+                break
             ArcEmptySignals = tuple(
                 Signal
                 for Signal in PhysicalAssignmentArcTelemetry.get(
@@ -41143,6 +47786,12 @@ def RouteAuthoritativeResources(
                     RemainingRequestCounts,
                 )
             )
+            NativePairCutSuffixSignals = (
+                SelectPhysicalGlobalNativePairCutSuffixSignals(
+                    Result,
+                    RemainingRequestCounts,
+                )
+            )
             ExactCutSuffixSignals = (
                 SelectPhysicalGlobalAssignmentSuffixSignals(
                     CandidatesBySignal,
@@ -41151,12 +47800,16 @@ def RouteAuthoritativeResources(
                     RemainingRequestCounts,
                 )
             )
-            SuffixSignals = tuple(sorted({
-                *ArcEmptySignals,
-                *ArcBlockerSignals,
-                *PairSupportSuffixSignals,
-                *ExactCutSuffixSignals,
-            }))
+            SuffixSignals = (
+                NativePairCutSuffixSignals
+                if NativePairCutSuffixSignals
+                else tuple(sorted({
+                    *ArcEmptySignals,
+                    *ArcBlockerSignals,
+                    *PairSupportSuffixSignals,
+                    *ExactCutSuffixSignals,
+                }))
+            )
             if not SuffixSignals:
                 # Native implementations predating conflict-cut reporting can
                 # return neither a partial prefix nor conflict signals.  Only
@@ -41185,11 +47838,11 @@ def RouteAuthoritativeResources(
                 Signal = str(Record["Signal"])
                 PhysicalGlobalSuffixTrancheSizes[Signal] = min(
                     max(
-                        InitialRequestLimit,
+                        PhysicalGlobalInitialSuffixTrancheSize,
                         PhysicalGlobalSuffixTrancheSizes[Signal] * 2,
                     ),
                     max(
-                        InitialRequestLimit,
+                        PhysicalGlobalInitialSuffixTrancheSize,
                         int(Record["RemainingRequestCount"]),
                     ),
                 )
@@ -41218,6 +47871,9 @@ def RouteAuthoritativeResources(
                 "PairSupportSuffixSignals": list(
                     PairSupportSuffixSignals
                 ),
+                "NativePairCutSuffixSignals": list(
+                    NativePairCutSuffixSignals
+                ),
                 "ExactCutSuffixSignals": list(
                     ExactCutSuffixSignals
                 ),
@@ -41229,9 +47885,44 @@ def RouteAuthoritativeResources(
             ),
             "RecursiveRetryCount": 0,
             "Iterations": PhysicalGlobalAssignmentSuffixHistory,
+            "CompletedPairNoGoodEdges": [
+                list(Edge)
+                for Edge in PhysicalGlobalCompletedPairNoGoodEdges
+            ],
         }
         WorkTelemetry["PhysicalGlobalAssignmentArcConsistency"] = dict(
             PhysicalAssignmentArcTelemetry
+        )
+    PhysicalGlobalConflictResult = Result
+    if PhysicalGlobalCompletedPairNoGoodEdges:
+        PhysicalGlobalConflictResult = SimpleNamespace(
+            Success=False,
+            SelectedCandidateIds=tuple(Result.SelectedCandidateIds),
+            ExpansionCount=int(getattr(Result, "ExpansionCount", 0)),
+            CompletedWork=int(getattr(Result, "CompletedWork", 0)),
+            BudgetExhausted=bool(getattr(
+                Result,
+                "BudgetExhausted",
+                False,
+            )),
+            DeadlineExceeded=bool(getattr(
+                Result,
+                "DeadlineExceeded",
+                False,
+            )),
+            FailureNet=(
+                PhysicalGlobalCompletedPairNoGoodEdges[0][0]
+            ),
+            ConflictSignals=tuple(sorted({
+                Signal
+                for Edge in PhysicalGlobalCompletedPairNoGoodEdges
+                for Signal in Edge
+            })),
+            ConflictResourceIndices=(),
+            PairwiseIncompatibleSignals=(
+                PhysicalGlobalCompletedPairNoGoodEdges
+            ),
+            PairwiseCompatibilityComplete=True,
         )
     # Assignment work is intentionally not the first escalation lever.  A
     # bounded physical change (portal, lane, layer, placement) must happen
@@ -41460,7 +48151,10 @@ def RouteAuthoritativeResources(
                 FindAllUnavoidableMandatoryClaimCuts(
                     MandatoryClaimsBySignal
                 )
-                if CandidateDiversityLevel == 0
+                if (
+                    CandidateDiversityLevel == 0
+                    and not PhysicalGlobalCompletedPairNoGoodEdges
+                )
                 else ()
             )
             if MandatoryCuts:
@@ -41585,7 +48279,7 @@ def RouteAuthoritativeResources(
             elif not MandatoryCuts:
                 ConflictGraph = BuildRoutingConflictGraph(
                     CandidatesBySignal,
-                    Result,
+                    PhysicalGlobalConflictResult,
                     AssignmentIndexed.ResourcePositions,
                     PortalReservations,
                     WorkCheck=lambda Diagnostics: CheckRuntimeBudget(
@@ -42218,7 +48912,11 @@ def RouteAuthoritativeResources(
             )
             NativeConflictSignals = tuple(sorted({
                 str(Signal)
-                for Signal in getattr(Result, "ConflictSignals", ())
+                for Signal in getattr(
+                    PhysicalGlobalConflictResult,
+                    "ConflictSignals",
+                    (),
+                )
                 if str(Signal) in CandidatesBySignal
             }))
             SelectedAssignmentSignals = frozenset(
@@ -42232,7 +48930,7 @@ def RouteAuthoritativeResources(
                 ))
             )
             CandidateDomainComplete = PhysicalGlobalAssignmentDomainIsComplete(
-                CandidatesBySignal,
+                RelevantAssignmentSignals,
                 RemainingRequestCounts,
                 ShouldGrowAssignmentBudget(Result),
                 Deadline.IsExpired(),
@@ -42334,6 +49032,110 @@ def RouteAuthoritativeResources(
                     for First, Second in PairwiseEdges
                 )
             )
+            HigherOrderPortReservationNoGoodSignals: tuple[str, ...] = ()
+            HigherOrderPortReservationNoGoodCandidateCounts: dict[
+                str, int
+            ] = {}
+            HigherOrderPortReservationNoGoodProofAttempts: list[
+                dict[str, object]
+            ] = []
+
+            def ProveIndependentCandidateCoreUnsatisfiable(
+                Signals: tuple[str, ...],
+            ) -> bool:
+                if len(Signals) < 2:
+                    return False
+                if not all(
+                    Signal in CompletedExteriorSignals
+                    and Signal not in IncompletePreSiblingDomainSignals
+                    and PreSiblingCandidatesBySignal.get(Signal, ())
+                    and PhysicalSignalLocalCandidateRequestFactorProofComplete(
+                        Signal,
+                        CandidateRequestDependencyComponentsBySignal.get(
+                            Signal,
+                            {},
+                        ),
+                        Resources
+                        .PhysicalComponentExactGlobalChannelSignals,
+                        PhysicalPortGuidesBySignal,
+                        CertifiedApertureDomain,
+                    )
+                    for Signal in Signals
+                ):
+                    return False
+                CoreCandidates = {
+                    Signal: list(
+                        PreSiblingCandidatesBySignal.get(Signal, ())
+                    )
+                    for Signal in Signals
+                }
+                CoreResult = PlanAssignment(
+                    EncodeCandidateValues(CoreCandidates),
+                    AvoidExactNoGoods=False,
+                )
+                CompleteUnsatisfiable = bool(
+                    not getattr(CoreResult, "Success", False)
+                    and not getattr(
+                        CoreResult,
+                        "BudgetExhausted",
+                        False,
+                    )
+                    and not getattr(
+                        CoreResult,
+                        "DeadlineExceeded",
+                        False,
+                    )
+                )
+                HigherOrderPortReservationNoGoodProofAttempts.append({
+                    "Signals": list(Signals),
+                    "CandidateCounts": {
+                        Signal: len(CoreCandidates[Signal])
+                        for Signal in Signals
+                    },
+                    "ExpansionCount": int(getattr(
+                        CoreResult,
+                        "ExpansionCount",
+                        0,
+                    )),
+                    "CompleteUnsatisfiable": CompleteUnsatisfiable,
+                })
+                return CompleteUnsatisfiable
+
+            ProposedHigherOrderCore = tuple(sorted({
+                str(Signal)
+                for Signal in getattr(
+                    PhysicalGlobalConflictResult,
+                    "ConflictSignals",
+                    (),
+                )
+                if str(Signal) in PreSiblingCandidatesBySignal
+            }))
+            if (
+                CandidateDomainComplete
+                and len(ProposedHigherOrderCore) >= 3
+                and ProveIndependentCandidateCoreUnsatisfiable(
+                    ProposedHigherOrderCore
+                )
+            ):
+                MinimalCore = list(ProposedHigherOrderCore)
+                for Signal in tuple(MinimalCore):
+                    TrialCore = tuple(
+                        Value for Value in MinimalCore
+                        if Value != Signal
+                    )
+                    if ProveIndependentCandidateCoreUnsatisfiable(
+                        TrialCore
+                    ):
+                        MinimalCore = list(TrialCore)
+                HigherOrderPortReservationNoGoodSignals = tuple(
+                    MinimalCore
+                )
+                HigherOrderPortReservationNoGoodCandidateCounts = {
+                    Signal: len(
+                        PreSiblingCandidatesBySignal.get(Signal, ())
+                    )
+                    for Signal in HigherOrderPortReservationNoGoodSignals
+                }
             raise StructuredRoutingStageError(RoutingFailure(
                 Reason=RoutingFailureReason.TrackAssignmentConflict,
                 Stage="PhysicalComponentGlobalAssignmentDomain",
@@ -42354,8 +49156,43 @@ def RouteAuthoritativeResources(
                     "PhysicalComponentGlobalPlanning": True,
                     "GlobalPlanDomainComplete": CandidateDomainComplete,
                     "CompleteAssignmentCutProof": CandidateDomainComplete,
+                    "IndependentEmptyCandidateDomainSignals": list(
+                        WorkTelemetry.get(
+                            (
+                                "PhysicalGlobalForeignPortalCandidate"
+                                "Certificates"
+                            ),
+                            {},
+                        ).get(
+                            "IndependentEmptyCandidateDomainSignals",
+                            (),
+                        )
+                    ),
                     "PairwisePortReservationNoGoodProofComplete": (
                         PairwisePortReservationNoGoodProofComplete
+                    ),
+                    "PairwisePortReservationNoGoodEdges": [
+                        list(Edge)
+                        for Edge in (
+                            PairwiseEdges
+                            if PairwisePortReservationNoGoodProofComplete
+                            else ()
+                        )
+                    ],
+                    "HigherOrderPortReservationNoGoodProofComplete": bool(
+                        HigherOrderPortReservationNoGoodSignals
+                    ),
+                    "HigherOrderPortReservationNoGoodSignals": list(
+                        HigherOrderPortReservationNoGoodSignals
+                    ),
+                    "HigherOrderPortReservationNoGoodCandidateCounts": dict(
+                        sorted(
+                            HigherOrderPortReservationNoGoodCandidateCounts
+                            .items()
+                        )
+                    ),
+                    "HigherOrderPortReservationNoGoodProofAttempts": (
+                        HigherOrderPortReservationNoGoodProofAttempts
                     ),
                     "FinalCompletedExteriorRouteDomainSignals": sorted(
                         CompletedExteriorSignals

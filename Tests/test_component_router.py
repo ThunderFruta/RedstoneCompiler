@@ -30,10 +30,12 @@ from Compiler.Routing.ComponentRouter import (
     FindCompleteComponentNetUnsatSubset,
     MaterializeRoutedComponentTemplate,
     PreserveRoutedComponentForeignEscapes,
+    PrepareComponentSymbolicNetStateContext,
     PruneDominatedComponentAccessCandidates,
     SelectComponentIncidentSignals,
     SolveComponentRoutingProblem,
     SolveComponentRoutingProblemDynamic,
+    CompilePreparedComponentSymbolicNetStates,
     ValidateRoutedComponentHandoff,
     _BuildCanonicalAccessCombinationKey,
     _BuildNetVariant,
@@ -2074,6 +2076,145 @@ def test_tree_frontier_dp_matches_legacy_feasible_template():
     assert Dynamic.Diagnostics["SelectedTreesMaterialized"] == 1
 
 
+def test_prepared_symbolic_net_state_context_matches_dynamic_solver():
+    Problem = _Problem()
+    DynamicCache = {}
+    Dynamic = SolveComponentRoutingProblemDynamic(
+        Problem,
+        SymbolicNetStateCache=DynamicCache,
+        RequestedSymbolicStateSignals=frozenset(("Alpha",)),
+        StopAfterOwnedSignalFrontierProof=True,
+    )
+    DynamicStates = next(iter(DynamicCache.values()))[0]
+
+    PreparedCache = {}
+    Context = PrepareComponentSymbolicNetStateContext(
+        Problem,
+        "Alpha",
+    )
+    Prepared = CompilePreparedComponentSymbolicNetStates(
+        Context,
+        Problem,
+        SymbolicNetStateCache=PreparedCache,
+    )
+
+    assert Dynamic.Status == "frontier-feasible"
+    assert Prepared.Complete
+    assert not Prepared.CacheHit
+    assert Prepared.States == DynamicStates
+    assert tuple(State.NetFingerprint for State in Prepared.States) == tuple(
+        State.NetFingerprint for State in DynamicStates
+    )
+    assert Prepared.CacheKey in PreparedCache
+
+
+def test_prepared_symbolic_net_state_context_reuses_exact_access_cache():
+    Problem = _Problem()
+    RouteClaimsCache = {}
+    StateCache = {}
+    Context = PrepareComponentSymbolicNetStateContext(
+        Problem,
+        "Alpha",
+        RouteClaimsConstructionCache=RouteClaimsCache,
+    )
+
+    First = CompilePreparedComponentSymbolicNetStates(
+        Context,
+        Problem,
+        SymbolicNetStateCache=StateCache,
+    )
+    ParentCacheSize = len(Context.FabricParentCache)
+    RouteClaimsCacheSize = len(RouteClaimsCache)
+    Second = CompilePreparedComponentSymbolicNetStates(
+        Context,
+        Problem,
+        SymbolicNetStateCache=StateCache,
+    )
+
+    assert First.Complete and Second.Complete
+    assert not First.CacheHit and Second.CacheHit
+    assert Second.ExpansionCount == 0
+    assert Second.CacheKey == First.CacheKey
+    assert Second.States == First.States
+    assert len(StateCache) == 1
+    assert len(Context.FabricParentCache) == ParentCacheSize
+    assert len(RouteClaimsCache) == RouteClaimsCacheSize
+
+
+def test_prepared_symbolic_context_reuses_terminal_frontier_across_egresses():
+    Base = _Problem(
+        External=(("Alpha", (3, 7, 0), "target"),),
+    )
+    Certified = tuple(
+        Candidate.CandidateFingerprint
+        for Domain in Base.OwnedTerminalDomains
+        for Candidate in Domain.Candidates
+    )
+
+    def WithEgress(LocalPath):
+        Port = SimpleNamespace(
+            Signal="Alpha",
+            Direction="output",
+            FabricDomainFingerprint="fabric-alpha",
+            FabricAttachment=LocalPath[0],
+            Attachment=LocalPath[-1],
+            LocalPath=tuple(LocalPath),
+            OwnedTerminals=tuple(
+                Domain.Terminal for Domain in Base.OwnedTerminalDomains
+            ),
+            OwnedTerminalFingerprints=(),
+            OwnedCandidateFingerprints=Certified,
+            OwnedAccessCandidates=(),
+            Capacity=1,
+        )
+        return replace(
+            Base,
+            Interface=SimpleNamespace(
+                Complete=True,
+                DeclaredFeedthroughSignals=frozenset(),
+                PhysicalPortReservations=(Port,),
+            ),
+        )
+
+    FirstProblem = WithEgress(((2, 7, 0), (3, 7, 0)))
+    SecondProblem = WithEgress(((2, 7, 0), (2, 7, 1)))
+    Context = PrepareComponentSymbolicNetStateContext(
+        FirstProblem,
+        "Alpha",
+    )
+    SharedStateCache = {}
+
+    First = CompilePreparedComponentSymbolicNetStates(
+        Context,
+        FirstProblem,
+        SymbolicNetStateCache=SharedStateCache,
+    )
+    Second = CompilePreparedComponentSymbolicNetStates(
+        Context,
+        SecondProblem,
+        SymbolicNetStateCache=SharedStateCache,
+    )
+    ColdContext = PrepareComponentSymbolicNetStateContext(
+        SecondProblem,
+        "Alpha",
+    )
+    ColdSecond = CompilePreparedComponentSymbolicNetStates(
+        ColdContext,
+        SecondProblem,
+        SymbolicNetStateCache={},
+    )
+
+    assert First.Complete and Second.Complete and ColdSecond.Complete
+    assert First.States and Second.States
+    assert First.States[0].EgressPath != Second.States[0].EgressPath
+    assert Second.States == ColdSecond.States
+    assert Context.TerminalFrontierBuildCount == 1
+    assert Context.TerminalFrontierCacheHitCount == 1
+    assert len(Context.TerminalFrontierCache) == 1
+    assert Second.Diagnostics["TerminalFrontierCacheHit"] is True
+    assert ColdSecond.Diagnostics["TerminalFrontierCacheHit"] is False
+
+
 def test_tree_frontier_dp_matches_legacy_capacity_unsat():
     Base = _Problem()
     Conflicting = replace(
@@ -2188,6 +2329,52 @@ def test_tree_frontier_unfiltered_empty_domain_is_port_independent():
     assert Signal["EmptyPhase"] == "owned-terminal-frontier"
     assert Signal["CertifiedRejectedCandidateCount"] == 0
     assert Signal["OwnedSignalDomainContractIndependent"] is True
+
+
+def test_prepared_symbolic_context_caches_complete_empty_terminal_frontier():
+    FirstProblem = _OwnedFrontierEmptyProblem(RestrictedByPort=True)
+    FirstPort = FirstProblem.Interface.PhysicalPortReservations[0]
+    SecondProblem = replace(
+        FirstProblem,
+        Interface=SimpleNamespace(
+            **{
+                **FirstProblem.Interface.__dict__,
+                "PhysicalPortReservations": (
+                    SimpleNamespace(
+                        **{
+                            **FirstPort.__dict__,
+                            "LocalPath": (
+                                FirstPort.LocalPath[0],
+                                (FirstPort.LocalPath[0][0], 7, 1),
+                            ),
+                        }
+                    ),
+                ),
+            }
+        ),
+    )
+    Context = PrepareComponentSymbolicNetStateContext(
+        FirstProblem,
+        "Alpha",
+    )
+
+    First = CompilePreparedComponentSymbolicNetStates(
+        Context,
+        FirstProblem,
+        SymbolicNetStateCache={},
+    )
+    Second = CompilePreparedComponentSymbolicNetStates(
+        Context,
+        SecondProblem,
+        SymbolicNetStateCache={},
+    )
+
+    assert First.Complete and Second.Complete
+    assert First.States == Second.States == ()
+    assert Context.TerminalFrontierBuildCount == 1
+    assert Context.TerminalFrontierCacheHitCount == 1
+    assert len(Context.TerminalFrontierCache) == 1
+    assert Second.Diagnostics["TerminalFrontierCacheHit"] is True
 
 
 def test_unbound_owned_frontier_proof_uses_tree_dp_without_port_contract():
@@ -2441,6 +2628,7 @@ def _LoadCla4TreeDpFixture():
 
 def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
     Data, Problem = _LoadCla4TreeDpFixture()
+    SymbolicNetStateCache = {}
     Started = monotonic()
     First = SolveComponentRoutingProblemDynamic(
         Problem,
@@ -2460,6 +2648,18 @@ def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
         DeadlineSeconds=30.0,
         StopAfterSymbolicCapacityProof=True,
     )
+    CachedCapacityProof = SolveComponentRoutingProblemDynamic(
+        Problem,
+        DeadlineSeconds=30.0,
+        StopAfterSymbolicCapacityProof=True,
+        SymbolicNetStateCache=SymbolicNetStateCache,
+    )
+    ReusedCapacityProof = SolveComponentRoutingProblemDynamic(
+        Problem,
+        DeadlineSeconds=30.0,
+        StopAfterSymbolicCapacityProof=True,
+        SymbolicNetStateCache=SymbolicNetStateCache,
+    )
 
     assert First.Status == Data["ExpectedStatus"]
     assert Second.Status == First.Status
@@ -2475,6 +2675,19 @@ def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
         "tree-frontier-empty-signal",
     }
     assert CapacityProof.Diagnostics["LocalUnsatCoreSignals"]
+    assert CachedCapacityProof.ProofFingerprint == (
+        ReusedCapacityProof.ProofFingerprint
+    )
+    StoredNetStateCount = CachedCapacityProof.Diagnostics[
+        "SymbolicNetStateCacheStoreCount"
+    ]
+    assert 0 < StoredNetStateCount <= len(Problem.ComponentSignals)
+    assert ReusedCapacityProof.Diagnostics[
+        "SymbolicNetStateCacheHitCount"
+    ] == StoredNetStateCount
+    assert ReusedCapacityProof.Diagnostics[
+        "SymbolicNetStateCacheStoreCount"
+    ] == 0
     assert RuntimeSeconds < 30.0
     assert First.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"
     assert Dispatched.Diagnostics["SolverKind"] == "tree-frontier-dp-v1"

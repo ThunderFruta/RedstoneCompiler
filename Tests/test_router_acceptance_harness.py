@@ -33,6 +33,7 @@ from Scripts.RunRouterAcceptance import (
     BuildSubprocessTimeoutSeconds,
     BuildTruthTableSemanticEvidence,
     CalculateRuntimeStatistics,
+    CompatibilityCaseNames,
     CandidatePolicyVersion,
     CanonicalArithmeticDigests,
     CompareCompatibility,
@@ -41,7 +42,7 @@ from Scripts.RunRouterAcceptance import (
     DefaultPythonExecutable,
     DeterministicEvidenceFields,
     EvaluateRun,
-    EvaluateCla4ExactInterfaceCheckpoint,
+    EvaluateExactInterfaceProofCheckpoint,
     MaximumDeadlineOverrunSeconds,
     MaximumRuntimeRegressionFraction,
     MaximumRuntimeSpreadFraction,
@@ -279,17 +280,17 @@ def SourceProvenanceFixture(
 
 
 class RouterAcceptanceHarnessTests(unittest.TestCase):
-    def test_cla4_exact_interface_checkpoint_accepts_frozen_proof(self):
+    def test_compatibility_exact_interface_checkpoint_accepts_frozen_proof(self):
         FixturePath = (
             Path(__file__).parent
             / "Fixtures"
-            / "Cla4ExactInterfaceProof.json"
+            / "CompatibilityExactInterfaceProof.json"
         )
         Fixture = json.loads(FixturePath.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as TemporaryDirectory:
             Artifacts = BuildRunArtifacts(
                 Path(TemporaryDirectory),
-                "Cla4Proof",
+                "CompatibilityProof",
             )
             ExactProof = deepcopy(Fixture["ExactProof"])
             ExactProof.update({
@@ -307,7 +308,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            Result = EvaluateCla4ExactInterfaceCheckpoint(
+            Result = EvaluateExactInterfaceProofCheckpoint(
                 Artifacts,
                 FixturePath,
             )
@@ -320,17 +321,88 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         )
         self.assertFalse(Result["FallbackOrThrashingObserved"])
 
-    def test_cla4_exact_interface_checkpoint_rejects_changed_proof_or_retry(self):
+    def test_no_hardcoded_circuit_exceptions_in_active_compiler_code(
+        self,
+    ) -> None:
+        RepositoryRoot = Path(__file__).resolve().parents[1]
+        OffendingFiles: list[str] = []
+        for Candidate in sorted((RepositoryRoot / "Compiler").rglob("*.py")):
+            if "CarryLookaheadAdder4" in Candidate.read_text(
+                encoding="utf-8"
+            ):
+                OffendingFiles.append(
+                    Candidate.relative_to(RepositoryRoot).as_posix()
+                )
+        self.assertEqual(OffendingFiles, [])
+
+    def test_compatibility_exact_interface_checkpoint_normalizes_state_order_and_assignments(
+        self,
+    ):
         FixturePath = (
             Path(__file__).parent
             / "Fixtures"
-            / "Cla4ExactInterfaceProof.json"
+            / "CompatibilityExactInterfaceProof.json"
         )
         Fixture = json.loads(FixturePath.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as TemporaryDirectory:
             Artifacts = BuildRunArtifacts(
                 Path(TemporaryDirectory),
-                "Cla4Proof",
+                "CompatibilityProof",
+            )
+            ExactProof = deepcopy(Fixture["ExactProof"])
+            ExactProof.update({
+                "Result": "exact-cluster-interface-solve",
+                "ExecutableRepairAllowed": False,
+            })
+            ExactProof["StateProofs"] = [
+                {
+                    **State,
+                    "AssignmentFingerprints": (
+                        list(reversed(State["AssignmentFingerprints"]))
+                        if isinstance(
+                            State.get("AssignmentFingerprints"),
+                            list,
+                        )
+                        else State["AssignmentFingerprints"]
+                    ),
+                }
+                for State in reversed(ExactProof["StateProofs"])
+            ]
+            Artifacts["RoutingFailure"].write_text(
+                json.dumps({
+                    "Failure": {
+                        "Diagnostics": {
+                            "InterfaceSolve": ExactProof,
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            Result = EvaluateExactInterfaceProofCheckpoint(
+                Artifacts,
+                FixturePath,
+            )
+
+        self.assertTrue(Result["Accepted"])
+        self.assertEqual(Result["Outcome"], "exact-proof")
+        self.assertEqual(
+            Result["ProofFingerprint"],
+            "3f11c5e51405355b",
+        )
+        self.assertEqual(Result["Failures"], [])
+
+    def test_compatibility_exact_interface_checkpoint_rejects_changed_proof_or_retry(self):
+        FixturePath = (
+            Path(__file__).parent
+            / "Fixtures"
+            / "CompatibilityExactInterfaceProof.json"
+        )
+        Fixture = json.loads(FixturePath.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as TemporaryDirectory:
+            Artifacts = BuildRunArtifacts(
+                Path(TemporaryDirectory),
+                "CompatibilityProof",
             )
             ExactProof = deepcopy(Fixture["ExactProof"])
             ExactProof.update({
@@ -346,7 +418,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            Result = EvaluateCla4ExactInterfaceCheckpoint(
+            Result = EvaluateExactInterfaceProofCheckpoint(
                 Artifacts,
                 FixturePath,
             )
@@ -354,7 +426,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertFalse(Result["Accepted"])
         self.assertTrue(Result["FallbackOrThrashingObserved"])
         self.assertIn(
-            "CLA4 exact proof mismatch: ProofFingerprint",
+            "exact-interface proof mismatch: ProofFingerprint",
             Result["Failures"],
         )
 
@@ -366,6 +438,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         BaselineMode: str | None = None,
         BaselinePath: Path | None = None,
         ExpectedPolicyVersion: str | None = None,
+        CompatibilityMode: bool = False,
     ) -> AcceptanceConfiguration:
         if ExpectedPolicyVersion is None:
             ExpectedPolicyVersion = (
@@ -387,6 +460,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             BaselineMode=BaselineMode,
             BaselinePath=BaselinePath,
             ExpectedPolicyVersion=ExpectedPolicyVersion,
+            CompatibilityMode=CompatibilityMode,
         )
 
     def SyntheticRunner(
@@ -472,7 +546,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertTrue(BaselinePath.is_file())
         return BaselinePath, Manifest
 
-    def PromoteCla4Baseline(
+    def PromoteCompatibilityBaseline(
         self,
         Root: Path,
     ) -> tuple[Path, dict[str, object]]:
@@ -497,7 +571,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         )
         self.assertTrue(Manifest["Accepted"])
         self.assertTrue(
-            Manifest["BaselineComparison"]["Cla4PromotionPassed"]
+            Manifest["BaselineComparison"]["CompatibilityPromotionPassed"]
         )
         return BaselinePath, Manifest
 
@@ -532,10 +606,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     *("FullAdder" for _ in range(5)),
                     *("RippleCarryAdder4" for _ in range(3)),
                     *("RippleCarryAdder8" for _ in range(3)),
-                    *("CarryLookaheadAdder4" for _ in range(2)),
                 ],
             )
-            self.assertEqual(len(Manifest["Runs"]), 13)
+            self.assertEqual(len(Manifest["Runs"]), 11)
             self.assertTrue(all(
                 "default" in Run["Command"]
                 for Run in Manifest["Runs"]
@@ -544,7 +617,6 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 "FullAdder": 8.0,
                 "RippleCarryAdder4": 23.0,
                 "RippleCarryAdder8": 28.0,
-                "CarryLookaheadAdder4": 118.0,
             }
             for Run in Manifest["Runs"]:
                 Command = Run["Command"]
@@ -588,11 +660,11 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
             self.assertEqual(
                 [Case["RuntimeCeilingSeconds"] for Case in Manifest["Cases"]],
-                [10.0, 25.0, 30.0, 120.0],
+                [10.0, 25.0, 30.0],
             )
             self.assertEqual(
                 [Case["RoutingDeadlineSeconds"] for Case in Manifest["Cases"]],
-                [8.0, 23.0, 28.0, 118.0],
+                [8.0, 23.0, 28.0],
             )
             self.assertTrue(all(
                 Case["PublicationReserveSeconds"]
@@ -608,6 +680,44 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 MaximumDeadlineOverrunSeconds,
             )
             self.assertTrue(Configuration.ManifestPath.is_file())
+
+    def testDryRunWithCompatibilityModeIncludesCompatibilityCase(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Calls = []
+
+            def FailIfCalled(**Options):
+                Calls.append(Options)
+                raise AssertionError("dry-run launched a compiler")
+
+            Manifest = RunAcceptance(
+                self.Configuration(
+                    Root,
+                    DryRun=True,
+                    CompatibilityMode=True,
+                ),
+                CommandRunner=FailIfCalled,
+                SourceStateProvider=lambda _Root: {
+                    "Revision": "revision",
+                    "Dirty": True,
+                },
+                SourceProvenanceProvider=SourceProvenanceFixture,
+                UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
+            )
+
+            self.assertEqual(Calls, [])
+            self.assertEqual(Manifest["Status"], "DRY_RUN")
+            self.assertFalse(Manifest["Accepted"])
+            self.assertEqual(
+                [Run["Circuit"] for Run in Manifest["Runs"]],
+                [
+                    *("FullAdder" for _ in range(5)),
+                    *("RippleCarryAdder4" for _ in range(3)),
+                    *("RippleCarryAdder8" for _ in range(3)),
+                    *("CarryLookaheadAdder4" for _ in range(2)),
+                ],
+            )
+            self.assertEqual(len(Manifest["Runs"]), 13)
 
     def testPassingRunsAreSequentialAndDeterministic(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
@@ -655,10 +765,11 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
 
             self.assertEqual(MaximumActive, 1)
-            self.assertEqual(len(Calls), 13)
+            self.assertEqual(len(Calls), 11)
             ExpectedTimeouts = [
                 Case.RuntimeCeilingSeconds
                 for Case in AcceptanceCases
+                if Case.Name in RegressionCaseNames
                 for _RunIndex in range(Case.RequiredRuns)
             ]
             self.assertEqual(
@@ -671,7 +782,6 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     *(f"FullAdderRun{Index}" for Index in range(1, 6)),
                     *(f"RippleCarryAdder4Run{Index}" for Index in range(1, 4)),
                     *(f"RippleCarryAdder8Run{Index}" for Index in range(1, 4)),
-                    *(f"CarryLookaheadAdder4Run{Index}" for Index in range(1, 3)),
                 ],
             )
             self.assertTrue(Manifest["Accepted"])
@@ -2518,7 +2628,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
             self.assertEqual(FirstRunArtifact.read_bytes(), ArtifactBytes)
 
-    def testComparisonRejectsEveryFootprintMetricGrowthAndSkipsCla4(
+    def testComparisonRejectsEveryFootprintMetricGrowthAndSkipsCompatibilityCircuits(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
@@ -2592,14 +2702,14 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         for Name, Value in Metrics.items()
                         if Name != MetricName
                     ))
-                    ClaRuns = [
+                    CompatibilityRuns = [
                         Run
                         for Run in Manifest["Runs"]
-                        if Run["Circuit"] == "CarryLookaheadAdder4"
+                        if Run["Circuit"] in CompatibilityCaseNames
                     ]
                     self.assertTrue(all(
                         Run["Status"] == "SKIPPED"
-                        for Run in ClaRuns
+                        for Run in CompatibilityRuns
                     ))
 
     def testSpeedGateAcceptsFivePercentAndRejectsAboveBoundary(
@@ -3320,7 +3430,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             [],
         )
 
-    def testCla4PromotionRequiresFinalStableProvenance(self) -> None:
+    def testCompatibilityPromotionRequiresFinalStableProvenance(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             BaselinePath, _Capture = self.CaptureBaseline(Root)
@@ -3367,22 +3477,22 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertFalse(Manifest["Accepted"])
             self.assertFalse(Comparison["Passed"])
             self.assertFalse(Comparison["ProvenanceStable"])
-            self.assertFalse(Comparison["Cla4PromotionPassed"])
+            self.assertFalse(Comparison["CompatibilityPromotionPassed"])
             self.assertEqual(Comparison["FirstValidBaselines"], {})
             self.assertEqual(
                 Comparison["UnbaselinedCircuits"],
                 ["CarryLookaheadAdder4"],
             )
             self.assertTrue(
-                Comparison["Cla4CandidateBaseline"]["Promotable"]
+                Comparison["CompatibilityCandidateBaseline"]["Promotable"]
             )
             self.assertIn(
-                "source/native/policy provenance changed during CLA4",
+                "source/native/policy provenance changed during compatibility",
                 Comparison["Failure"],
             )
             self.assertEqual(BaselinePath.read_bytes(), BaselineBytes)
 
-    def testCla4FirstValidBaselinePersistsWithoutFabricatedComparison(
+    def testCompatibilityFirstValidBaselinePersistsWithoutFabricatedComparison(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
@@ -3419,8 +3529,8 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertTrue(Manifest["Accepted"])
             Comparison = Manifest["BaselineComparison"]
             self.assertFalse(Comparison["BaselineAvailableBeforeRun"])
-            self.assertTrue(Comparison["Cla4PromotionPassed"])
-            self.assertIsNone(Comparison["Cla4BaselineComparison"])
+            self.assertTrue(Comparison["CompatibilityPromotionPassed"])
+            self.assertIsNone(Comparison["CompatibilityBaselineComparison"])
             self.assertNotIn(
                 "CarryLookaheadAdder4",
                 Comparison["Circuits"],
@@ -3464,7 +3574,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 2,
             )
 
-    def testCla4FailedEvidenceDoesNotWriteFirstValidBaseline(self) -> None:
+    def testCompatibilityFailedEvidenceDoesNotWriteFirstValidBaseline(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             BaselinePath, _Capture = self.CaptureBaseline(Root)
@@ -3494,7 +3604,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
 
             self.assertFalse(Manifest["Accepted"])
             Comparison = Manifest["BaselineComparison"]
-            self.assertFalse(Comparison["Cla4PromotionPassed"])
+            self.assertFalse(Comparison["CompatibilityPromotionPassed"])
             self.assertEqual(Comparison["FirstValidBaselines"], {})
             self.assertEqual(
                 Comparison["UnbaselinedCircuits"],
@@ -3506,7 +3616,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 ReadBaselineReference(BaselinePath),
             )
 
-    def testCla4PromotionWriteFailureLeavesReferenceUnchanged(self) -> None:
+    def testCompatibilityPromotionWriteFailureLeavesReferenceUnchanged(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             BaselinePath, _Capture = self.CaptureBaseline(Root)
@@ -3553,7 +3663,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 ReadBaselineReference(BaselinePath),
             )
 
-    def testCla4PromotionFinalReadFailureRollsBackReference(self) -> None:
+    def testCompatibilityPromotionFinalReadFailureRollsBackReference(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             BaselinePath, _Capture = self.CaptureBaseline(Root)
@@ -3604,10 +3714,10 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 ReadBaselineReference(BaselinePath),
             )
 
-    def testForgedCla4FirstValidBaselineIsRejected(self) -> None:
+    def testForgedCompatibilityFirstValidBaselineIsRejected(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
-            BaselinePath, _Manifest = self.PromoteCla4Baseline(Root)
+            BaselinePath, _Manifest = self.PromoteCompatibilityBaseline(Root)
             Baseline = json.loads(
                 BaselinePath.read_text(encoding="utf-8")
             )
@@ -3626,10 +3736,10 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             ):
                 ReadBaselineReference(BaselinePath)
 
-    def testExistingCla4FirstValidBaselineIsNeverReplaced(self) -> None:
+    def testExistingCompatibilityFirstValidBaselineIsNeverReplaced(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
-            BaselinePath, _FirstManifest = self.PromoteCla4Baseline(Root)
+            BaselinePath, _FirstManifest = self.PromoteCompatibilityBaseline(Root)
             BaselineBytes = BaselinePath.read_bytes()
 
             Manifest = RunAcceptance(
@@ -3656,14 +3766,14 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertTrue(Manifest["Accepted"])
             Comparison = Manifest["BaselineComparison"]
             self.assertTrue(Comparison["BaselineAvailableBeforeRun"])
-            self.assertFalse(Comparison["Cla4PromotionPassed"])
+            self.assertFalse(Comparison["CompatibilityPromotionPassed"])
             self.assertTrue(
                 Comparison["FirstValidBaselinePromotion"][
                     "OverwriteBlocked"
                 ]
             )
             self.assertTrue(
-                Comparison["Cla4BaselineComparison"]["Passed"]
+                Comparison["CompatibilityBaselineComparison"]["Passed"]
             )
             self.assertIn(
                 "CarryLookaheadAdder4",
@@ -3671,10 +3781,10 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
             self.assertEqual(BaselinePath.read_bytes(), BaselineBytes)
 
-    def testStoredCla4BaselineGatesLaterRegressions(self) -> None:
+    def testStoredCompatibilityBaselineGatesLaterRegressions(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
-            BaselinePath, _FirstManifest = self.PromoteCla4Baseline(Root)
+            BaselinePath, _FirstManifest = self.PromoteCompatibilityBaseline(Root)
             BaselineBytes = BaselinePath.read_bytes()
             Scenarios = {
                 "footprint": {
@@ -3752,7 +3862,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         Comparison["BaselineAvailableBeforeRun"]
                     )
                     self.assertFalse(
-                        Comparison["Cla4BaselineComparison"]["Passed"]
+                        Comparison["CompatibilityBaselineComparison"]["Passed"]
                     )
                     Circuit = Comparison["Circuits"][
                         "CarryLookaheadAdder4"

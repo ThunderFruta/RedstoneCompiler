@@ -31,6 +31,7 @@ from Compiler.Placement.PcbFlow import (
     BuildMandatoryAccessPortfolioExpectedCandidateIndices,
     BuildMandatoryAccessPortfolioRecipeIdentity,
     BuildClusterInterfaceUnsatProof,
+    BuildClusterInterfaceComponentStateFingerprint,
     BuildComponentAccessFeedbackPlacementScore,
     BuildClusterInterfaceStageSchedule,
     BuildLocalComponentCompilationAdmissionFailure,
@@ -505,7 +506,7 @@ class TopologyDemandProfileTests(unittest.TestCase):
             ComponentVariant=0,
             PlacementFingerprint="first",
         ))
-        self.assertFalse(HasDistinctRetainedPhysicalEligibilityState(
+        self.assertTrue(HasDistinctRetainedPhysicalEligibilityState(
             Queue,
             ComponentVariant=1,
             PlacementFingerprint="first",
@@ -3484,6 +3485,164 @@ class TopologyDemandProfileTests(unittest.TestCase):
             Proofs[2],
         ))
         self.assertFalse(Incomplete["Complete"])
+
+        BoundedPlacementPortfolio = BuildClusterInterfaceUnsatProof(
+            Proofs,
+            PlacementPortfolioDomainComplete=False,
+        )
+        self.assertFalse(BoundedPlacementPortfolio["Complete"])
+        self.assertTrue(
+            BoundedPlacementPortfolio[
+                "NamedComponentStateProofComplete"
+            ]
+        )
+        self.assertFalse(
+            BoundedPlacementPortfolio[
+                "ArchitecturalUnsatisfiabilityProven"
+            ]
+        )
+        self.assertEqual(
+            BoundedPlacementPortfolio["ProofScope"],
+            "named-placement-component-states",
+        )
+
+    def testExactInterfaceProofFingerprintIsOrderStable(self) -> None:
+        Proofs = (
+            ClusterInterfaceStateProof(
+                PlacementStateFingerprint="state-1",
+                Status="ownership-unsatisfiable",
+                OwnershipUnsatCoreFingerprint="core-1",
+                DomainComplete=True,
+                OwnershipComplete=True,
+                RealizabilityComplete=True,
+                Exhaustive=True,
+            ),
+            ClusterInterfaceStateProof(
+                PlacementStateFingerprint="state-2",
+                Status="realizability-unsatisfiable",
+                DomainComplete=True,
+                OwnershipComplete=True,
+                RealizabilityComplete=True,
+                Exhaustive=True,
+                AssignmentFingerprints=(
+                    "assignment-b",
+                    "assignment-a",
+                ),
+            ),
+            ClusterInterfaceStateProof(
+                PlacementStateFingerprint="state-3",
+                Status="ownership-unsatisfiable",
+                DomainComplete=True,
+                OwnershipComplete=True,
+                RealizabilityComplete=True,
+                Exhaustive=True,
+            ),
+        )
+        Expected = (
+            "state-3",
+            "state-1",
+            "state-2",
+        )
+
+        Result = BuildClusterInterfaceUnsatProof(Proofs)
+        Permuted = BuildClusterInterfaceUnsatProof(
+            (
+                Proofs[2],
+                Proofs[0],
+                Proofs[1],
+            ),
+            ExpectedComponentStateFingerprints=Expected,
+        )
+
+        self.assertEqual(
+            Result["ProofFingerprint"],
+            Permuted["ProofFingerprint"],
+        )
+        self.assertTrue(Permuted["Complete"])
+        self.assertTrue(Permuted["ComponentStateDomainComplete"])
+        self.assertEqual(
+            Permuted["ExpectedComponentStateCount"],
+            len(Proofs),
+        )
+
+    def testExactInterfaceProofRequiresEveryComponentSearchState(
+        self,
+    ) -> None:
+        Placement = "shared-placement"
+        FirstState = BuildClusterInterfaceComponentStateFingerprint(
+            Placement,
+            0,
+        )
+        SecondState = BuildClusterInterfaceComponentStateFingerprint(
+            Placement,
+            1,
+        )
+        FirstProof = ClusterInterfaceStateProof(
+            PlacementStateFingerprint=Placement,
+            ComponentStateFingerprint=FirstState,
+            ComponentVariant=0,
+            ComponentSelectionFingerprint="component-a",
+            Status="ownership-unsatisfiable",
+            DomainComplete=True,
+            OwnershipComplete=True,
+            RealizabilityComplete=True,
+            Exhaustive=True,
+        )
+
+        Missing = BuildClusterInterfaceUnsatProof(
+            (FirstProof,),
+            ExpectedComponentStateFingerprints=(
+                FirstState,
+                SecondState,
+            ),
+        )
+        Complete = BuildClusterInterfaceUnsatProof(
+            (
+                FirstProof,
+                replace(
+                    FirstProof,
+                    ComponentStateFingerprint=SecondState,
+                    ComponentVariant=1,
+                    ComponentSelectionFingerprint="component-b",
+                ),
+            ),
+            ExpectedComponentStateFingerprints=(
+                FirstState,
+                SecondState,
+            ),
+        )
+
+        self.assertFalse(Missing["Complete"])
+        self.assertFalse(Missing["ComponentStateDomainComplete"])
+        self.assertEqual(
+            Missing["MissingComponentStateFingerprints"],
+            [SecondState],
+        )
+        self.assertTrue(Complete["Complete"])
+        self.assertEqual(Complete["ProvenComponentStateCount"], 2)
+
+    def testExactInterfaceProofRejectsOnlyRepeatedComponentState(
+        self,
+    ) -> None:
+        Placement = "shared-placement"
+        State = BuildClusterInterfaceComponentStateFingerprint(
+            Placement,
+            0,
+        )
+        Proof = ClusterInterfaceStateProof(
+            PlacementStateFingerprint=Placement,
+            ComponentStateFingerprint=State,
+            ComponentVariant=0,
+            ComponentSelectionFingerprint="component-a",
+            Status="ownership-unsatisfiable",
+            DomainComplete=True,
+            OwnershipComplete=True,
+            RealizabilityComplete=True,
+            Exhaustive=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "repeated component state"):
+            BuildClusterInterfaceUnsatProof((Proof, Proof))
 
     def testClusterInterfaceStageUsesOneSharedReservedDeadline(self) -> None:
         Deadline = RoutingDeadline.Start(118.0)

@@ -1307,6 +1307,78 @@ def ScoreClusterInterfaceFacingMismatches(
     return Mismatches
 
 
+def ScoreClusterInterfaceFacingMismatchesForOrientations(
+    Topology: ClusterInterfaceTopology,
+    Assignment: Mapping[int, tuple[int, int]],
+    Orientations: tuple[int, ...],
+    SourceFaces: Mapping[int, tuple[tuple[int, int, int], ...]],
+    TargetFaces: Mapping[int, tuple[tuple[int, int, int], ...]],
+) -> int:
+    """Count facing mismatches using precomputed rigid-transform faces."""
+    Directions = {
+        "East": (1, 0, 0),
+        "West": (-1, 0, 0),
+        "North": (0, 0, -1),
+        "South": (0, 0, 1),
+    }
+
+    def BoundarySide(
+        FromSlot: tuple[int, int],
+        ToSlot: tuple[int, int],
+    ) -> str:
+        DeltaColumn = ToSlot[0] - FromSlot[0]
+        DeltaRow = ToSlot[1] - FromSlot[1]
+        if abs(DeltaColumn) >= abs(DeltaRow):
+            return "East" if DeltaColumn >= 0 else "West"
+        return "South" if DeltaRow >= 0 else "North"
+
+    Mismatches = 0
+
+    def AddInterface(ClusterIndex: int, Side: str, Role: str) -> None:
+        nonlocal Mismatches
+        Faces = SourceFaces if Role == "Source" else TargetFaces
+        PinDirection = Faces[ClusterIndex][Orientations[ClusterIndex]]
+        BoundaryDirection = Directions[Side]
+        if (
+            PinDirection[0] * BoundaryDirection[0]
+            + PinDirection[2] * BoundaryDirection[2]
+            <= 0
+        ):
+            Mismatches += 1
+
+    for (
+        _Signal,
+        SourceCluster,
+        TargetClusters,
+        HasExternalTarget,
+    ) in Topology.SignalEndpoints:
+        if SourceCluster is not None:
+            for TargetCluster in TargetClusters:
+                if TargetCluster == SourceCluster:
+                    continue
+                SourceSide = BoundarySide(
+                    Assignment[SourceCluster],
+                    Assignment[TargetCluster],
+                )
+                AddInterface(SourceCluster, SourceSide, "Source")
+                AddInterface(
+                    TargetCluster,
+                    {
+                        "East": "West",
+                        "West": "East",
+                        "North": "South",
+                        "South": "North",
+                    }[SourceSide],
+                    "Target",
+                )
+            if HasExternalTarget:
+                AddInterface(SourceCluster, "East", "Source")
+        else:
+            for TargetCluster in TargetClusters:
+                AddInterface(TargetCluster, "West", "Target")
+    return Mismatches
+
+
 def ScoreClusterInterfacePlacement(
     Module: Any,
     Clusters: tuple[tuple[str, ...], ...],
@@ -5865,12 +5937,19 @@ def OptimizeJointClusterPlacement(
             ClusterIndex: Slot
             for ClusterIndex, Slot in enumerate(SlotsByCluster)
         }
-        StateVariants = {
-            ClusterIndex: VariantsByCluster[ClusterIndex][
-                Orientations[ClusterIndex]
-            ]
-            for ClusterIndex in range(Count)
-        }
+        StateVariants = (
+            {
+                ClusterIndex: VariantsByCluster[ClusterIndex][
+                    Orientations[ClusterIndex]
+                ]
+                for ClusterIndex in range(Count)
+            }
+            if (
+                CutClusterInterfaceTopologyModel is not None
+                or ObservedClusterInterfaceTopologyModel is not None
+            )
+            else {}
+        )
         CenterByCluster = Centers(SlotsByCluster, Orientations)
         BoundaryContract = (
             ScoreClusterBoundaryContracts(
@@ -5976,10 +6055,12 @@ def OptimizeJointClusterPlacement(
             else 0
         )
         AllInterfaceFacingMismatches = (
-            ScoreClusterInterfaceFacingMismatches(
+            ScoreClusterInterfaceFacingMismatchesForOrientations(
                 ClusterInterfaceTopologyModel,
                 StateAssignment,
-                StateVariants,
+                Orientations,
+                SourceFaces,
+                TargetFaces,
             )
             if ClusterInterfaceTopologyModel is not None
             else 0

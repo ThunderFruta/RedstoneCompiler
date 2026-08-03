@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 
 
@@ -586,16 +586,100 @@ RoutingAcceptanceProfiles = {
         Name="RippleCarryAdder8",
         MaximumRuntimeSeconds=30.0,
     ),
-    "CarryLookaheadAdder4": RoutingAcceptanceProfile(
-        Name="CarryLookaheadAdder4",
-        MaximumRuntimeSeconds=120.0,
-    ),
 }
+
+
+@dataclass(frozen=True)
+class RoutingCircuitComplexityProfile:
+    """Topology-aware signal complexity captured outside runtime execution names."""
+
+    SignalCount: int = 0
+    GateCount: int = 0
+    RoutingGraphEdgeCount: int = 0
+    MaximumFanout: int = 0
+    ReconvergentFanoutCount: int = 0
+    PeakBoundaryDemand: int = 0
+    MandatoryAccessConflictResources: int = 0
+
+    def __post_init__(self) -> None:
+        if self.SignalCount < 0:
+            raise ValueError("SignalCount must be non-negative")
+        if self.GateCount < 0:
+            raise ValueError("GateCount must be non-negative")
+        if self.RoutingGraphEdgeCount < 0:
+            raise ValueError("RoutingGraphEdgeCount must be non-negative")
+        if self.MaximumFanout < 0:
+            raise ValueError("MaximumFanout must be non-negative")
+        if self.ReconvergentFanoutCount < 0:
+            raise ValueError("ReconvergentFanoutCount must be non-negative")
+        if self.PeakBoundaryDemand < 0:
+            raise ValueError("PeakBoundaryDemand must be non-negative")
+        if self.MandatoryAccessConflictResources < 0:
+            raise ValueError(
+                "MandatoryAccessConflictResources must be non-negative"
+            )
+
+
+def _BuildRoutingPolicyComplexityTier(
+    Profile: RoutingCircuitComplexityProfile,
+) -> int:
+    SignalPressure = max(0, min(2, (Profile.SignalCount - 20) // 20))
+    Score = SignalPressure
+    if Profile.GateCount >= 72:
+        Score += 1
+    if Profile.RoutingGraphEdgeCount >= 90:
+        Score += 1
+    if Profile.MaximumFanout >= 4:
+        Score += 1
+    if Profile.ReconvergentFanoutCount >= 2:
+        Score += 1
+    if Profile.PeakBoundaryDemand >= 20:
+        Score += 1
+    if Profile.MandatoryAccessConflictResources > 0:
+        Score += 1
+    return min(6, max(0, Score))
 
 
 def PolicyForRoutingStrategy(Strategy: RoutingStrategy) -> PhysicalDesignPolicy:
     """Resolve the immutable policy attached to one routing implementation."""
     return LocalFirstPhysicalDesignPolicy
+
+
+def BuildRoutingPolicyForCircuit(
+    Policy: PhysicalDesignPolicy,
+    ComplexityProfile: RoutingCircuitComplexityProfile | None = None,
+) -> PhysicalDesignPolicy:
+    """Apply deterministic policy widening from topology metrics only.
+
+    This selection is intentionally independent of any circuit identifier.
+    """
+    if ComplexityProfile is None:
+        return Policy
+    ComplexityTier = _BuildRoutingPolicyComplexityTier(ComplexityProfile)
+    if ComplexityTier < 4:
+        return Policy
+    return replace(
+        Policy,
+        NandPacking=replace(
+            Policy.NandPacking,
+            RetainedJointPlacementCandidates=min(
+                12,
+                6 + ComplexityTier,
+            ),
+        ),
+        AdaptiveRouting=replace(
+            Policy.AdaptiveRouting,
+            MaximumAssignmentExpansions=360_000,
+        ),
+        DetailedRouting=replace(
+            Policy.DetailedRouting,
+            StrictBaseExpansions=max(
+                Policy.DetailedRouting.StrictBaseExpansions,
+                120_000,
+            ),
+            StrictMaximumExpansions=180_000,
+        ),
+    )
 
 
 def ExecutionStrategyForRequest(Strategy: RoutingStrategy) -> RoutingStrategy:

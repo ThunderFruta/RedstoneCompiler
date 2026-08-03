@@ -5,19 +5,26 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 from hashlib import sha256
+from itertools import product
+from math import prod
 from time import monotonic
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .ComponentRouter import (
+    _BuildPreparedComponentSymbolicNetStateContextFingerprint,
+    BuildComponentSymbolicNetStateCacheKey,
     BuildCompleteComponentNetPortfolioStaticContext,
     BuildCompleteOpposingNetAccessContractDomain,
     BuildCompleteOpposingNetAccessRowContext,
     CompileCompleteComponentNetVariantPortfolio,
     CompileCompleteComponentNetVariantPortfolios,
+    CompilePreparedComponentSymbolicNetStates,
+    CompilePreparedComponentPhysicalFactorStateBatch,
     ComponentClaimsConflict,
     EvaluateCompleteOpposingNetAccessContractRow,
     MaterializeRoutedComponentTemplate,
+    PrepareComponentSymbolicNetStateContext,
     SolveComponentRoutingProblem,
     ValidateRoutedComponentHandoff,
 )
@@ -38,6 +45,8 @@ from .Models import (
     PhysicalLocalPortPairSupportCertificate,
     PhysicalComponentPortReservation,
     PhysicalComponentSelectedLocalPortSupport,
+    PhysicalComponentSymbolicHigherOrderCertificate,
+    PhysicalComponentSymbolicPortPairCertificate,
     PhysicalPortCorridorDomain,
     PhysicalPortCorridorFactor,
     PreparedPhysicalComponentAssembly,
@@ -48,6 +57,17 @@ from .Models import (
 )
 from .ResourceGraph import RoutingResourceClaims
 from .Reliability import BuildStableFingerprint
+from .ComponentPlanning import (
+    BuildComponentCapacityGuide,
+    ComponentCapacityGuide,
+    ComponentCapacityGuideOption,
+    ComponentInterfaceContract,
+    ComponentPlanningResult,
+    ComponentPlanningStatus,
+    IterClosedComponentContracts,
+    PlanClosedComponent,
+    SolveComponentInterfaceCsp,
+)
 
 
 _CompletedComponentTemplateCache: dict[
@@ -909,6 +929,53 @@ def BuildPhysicalPortApertureContractFingerprint(
     ))
 
 
+def PhysicalAssemblyPlanViolatesRejectedApertureClauses(
+    Plan: PhysicalComponentAssemblyPlan,
+    RejectedClauses: Iterable[frozenset[tuple[str, str]]],
+) -> bool:
+    """Return whether one frozen plan contains a learned exact aperture cut."""
+    SelectedKeys = frozenset(
+        (
+            str(Port.Signal),
+            BuildPhysicalPortApertureContractFingerprint(Port),
+        )
+        for Port in SelectPhysicalAssemblyGlobalBoundaryPorts(Plan)
+    )
+    return any(
+        frozenset(
+            (str(Signal), str(Fingerprint))
+            for Signal, Fingerprint in Clause
+        ) <= SelectedKeys
+        for Clause in RejectedClauses
+        if Clause
+    )
+
+
+def PruneRetainedPhysicalGlobalPlansByRejectedApertureClauses(
+    Frontier: Mapping[str, Any],
+    RejectedClauses: Iterable[frozenset[tuple[str, str]]],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Remove retained continuations invalidated by monotone exact clauses."""
+    Clauses = tuple(RejectedClauses)
+    RejectedPlanFingerprints = tuple(sorted(
+        str(PlanFingerprint)
+        for PlanFingerprint, Entry in Frontier.items()
+        if PhysicalAssemblyPlanViolatesRejectedApertureClauses(
+            Entry.Assembly.Plan,
+            Clauses,
+        )
+    ))
+    RejectedSet = frozenset(RejectedPlanFingerprints)
+    return (
+        {
+            str(PlanFingerprint): Entry
+            for PlanFingerprint, Entry in Frontier.items()
+            if str(PlanFingerprint) not in RejectedSet
+        },
+        RejectedPlanFingerprints,
+    )
+
+
 def BuildPhysicalComponentAssemblyChoiceFingerprint(
     Plan: PhysicalComponentAssemblyPlan,
 ) -> str:
@@ -985,10 +1052,33 @@ def BuildPhysicalRequestAperturePortNoGood(
     UseScopedProjection = bool(
         SignalLocalRequestFactorProofComplete and PortSolverCacheKey
     )
-    # Eligibility identity fixes physical factors, not the later candidate
-    # request controls (window/diversity, expansion limits, and penalties).
-    # Keep every selected global contract in the clause even when the sibling
-    # aperture support proof is signal-local.
+    RequestSignal = next(iter(RequestSignals))
+    if UseScopedProjection:
+        # The certified signal-local request domain is frozen by the retained
+        # eligibility domain.  Its selected global contract is the remaining
+        # CSP determinant; local reservation representatives do not change
+        # the certified exterior request domain.  A one-blocker starvation
+        # proof therefore becomes a real binary clause instead of an
+        # all-port assignment no-good.
+        return frozenset((
+            (
+                RequestSignal,
+                BuildPhysicalPortGlobalContractFingerprint(
+                    PortsBySignal[RequestSignal]
+                ),
+            ),
+            *(
+                (
+                    Signal,
+                    BuildPhysicalPortApertureContractFingerprint(
+                        PortsBySignal[Signal]
+                    ),
+                )
+                for Signal in sorted(ApertureSignals)
+            ),
+        ))
+    # Without the signal-local certificate, retain every selected global
+    # determinant and do not project the request across sibling contracts.
     GlobalContractKeys = tuple(
         (
             Port.Signal,
@@ -996,18 +1086,8 @@ def BuildPhysicalRequestAperturePortNoGood(
         )
         for Port in GlobalPorts
     )
-    RequestSignal = next(iter(RequestSignals))
-    SolverDomainKeys = (
-        ((
-            RequestSignal,
-            "local-signal-domain:" + PortSolverCacheKey,
-        ),)
-        if UseScopedProjection
-        else ()
-    )
     return frozenset((
         *GlobalContractKeys,
-        *SolverDomainKeys,
         *(
             (
                 Signal,
@@ -1283,6 +1363,64 @@ def BuildPhysicalLocalAccessDomainFingerprint(
     ))
 
 
+def ProjectPhysicalComponentSignalGlobalProfile(
+    Profile: Any,
+    CoveredTerminals: Iterable[Position3],
+    Port: Any | None,
+) -> Any | None:
+    """Project one whole-design profile onto one immutable component seam."""
+    Covered = frozenset(CoveredTerminals)
+    if Port is not None and str(Port.Signal) != str(Profile.Signal):
+        raise ValueError("physical port and projected profile signals differ")
+    RootIsCovered = Profile.Root in Covered
+    OutsideTargets = tuple(
+        Target for Target in Profile.Targets if Target not in Covered
+    )
+    if Port is None:
+        return None if RootIsCovered and not OutsideTargets else Profile
+    if not Port.GlobalPath or Port.GlobalPath[0] != Port.Attachment:
+        raise ValueError(
+            "physical port has no immutable external access path"
+        )
+    if RootIsCovered:
+        if not OutsideTargets:
+            return None
+        Root = Port.Attachment
+        Targets = OutsideTargets
+        SourceAccessPath = tuple(Port.GlobalPath)
+        TargetAccessPaths = {
+            Target: Profile.TargetAccessPaths[Target]
+            for Target in Targets
+        }
+    else:
+        Root = Profile.Root
+        Targets = tuple(dict.fromkeys((
+            *OutsideTargets,
+            Port.Attachment,
+        )))
+        SourceAccessPath = Profile.SourceAccessPath
+        TargetAccessPaths = {
+            **{
+                Target: Profile.TargetAccessPaths[Target]
+                for Target in OutsideTargets
+            },
+            Port.Attachment: tuple(Port.GlobalPath),
+        }
+    return replace(
+        Profile,
+        Root=Root,
+        Targets=Targets,
+        Span=max(
+            abs(Target[0] - Root[0])
+            + abs(Target[2] - Root[2])
+            for Target in Targets
+        ),
+        Fanout=len(Targets),
+        SourceAccessPath=SourceAccessPath,
+        TargetAccessPaths=TargetAccessPaths,
+    )
+
+
 def ApplyPhysicalComponentAssemblyGlobalProfiles(
     Profiles: dict[str, Any],
     Problem: ComponentRoutingProblem,
@@ -1315,58 +1453,15 @@ def ApplyPhysicalComponentAssemblyGlobalProfiles(
         Profile = Result.get(Signal)
         if Profile is None:
             continue
-        Covered = OwnedTerminalsBySignal.get(Signal, frozenset())
-        Port = PortsBySignal.get(Signal)
-        RootIsCovered = Profile.Root in Covered
-        OutsideTargets = tuple(
-            Target for Target in Profile.Targets if Target not in Covered
-        )
-        if Port is None:
-            if RootIsCovered and not OutsideTargets:
-                Result.pop(Signal, None)
-            continue
-        if not Port.GlobalPath or Port.GlobalPath[0] != Port.Attachment:
-            raise ValueError(
-                "physical port has no immutable external access path"
-            )
-        if RootIsCovered:
-            if not OutsideTargets:
-                Result.pop(Signal, None)
-                continue
-            Root = Port.Attachment
-            Targets = OutsideTargets
-            SourceAccessPath = tuple(Port.GlobalPath)
-            TargetAccessPaths = {
-                Target: Profile.TargetAccessPaths[Target]
-                for Target in Targets
-            }
-        else:
-            Root = Profile.Root
-            Targets = tuple(dict.fromkeys((
-                *OutsideTargets,
-                Port.Attachment,
-            )))
-            SourceAccessPath = Profile.SourceAccessPath
-            TargetAccessPaths = {
-                **{
-                    Target: Profile.TargetAccessPaths[Target]
-                    for Target in OutsideTargets
-                },
-                Port.Attachment: tuple(Port.GlobalPath),
-            }
-        Result[Signal] = replace(
+        Projected = ProjectPhysicalComponentSignalGlobalProfile(
             Profile,
-            Root=Root,
-            Targets=Targets,
-            Span=max(
-                abs(Target[0] - Root[0])
-                + abs(Target[2] - Root[2])
-                for Target in Targets
-            ),
-            Fanout=len(Targets),
-            SourceAccessPath=SourceAccessPath,
-            TargetAccessPaths=TargetAccessPaths,
+            OwnedTerminalsBySignal.get(Signal, frozenset()),
+            PortsBySignal.get(Signal),
         )
+        if Projected is None:
+            Result.pop(Signal, None)
+        else:
+            Result[Signal] = Projected
     return Result
 
 
@@ -1516,6 +1611,8 @@ def BindPhysicalComponentAssemblyGlobalChannels(
 def BindPhysicalComponentAssemblyLocalPortSupports(
     Assembly: PreparedPhysicalComponentAssembly,
     Preparation: PreparedPhysicalComponentPortFactorDomain | None = None,
+    *,
+    RequireFrozenGlobalChannels: bool = True,
 ) -> PreparedPhysicalComponentAssembly:
     """Join frozen global apertures to exact local support witnesses.
 
@@ -1531,7 +1628,7 @@ def BindPhysicalComponentAssemblyLocalPortSupports(
         )
     Plan = Assembly.Plan
     ValidatePhysicalExteriorFabricHandoff(Plan, FactorDomain)
-    if not Plan.Channels:
+    if RequireFrozenGlobalChannels and not Plan.Channels:
         raise ValueError(
             "local port supports cannot be selected before authoritative "
             "global channels are frozen"
@@ -1728,8 +1825,28 @@ def PreparePhysicalComponentGlobalPlanningPlacement(
     Placed: Any,
     Problem: ComponentRoutingProblem,
     Plan: PhysicalComponentAssemblyPlan,
+    *,
+    LocalSupportTemplate: RoutedComponentTemplate | None = None,
 ) -> Any:
-    """Remove component-local seeds while global channels are selected."""
+    """Expose selected local support while global channels are selected."""
+    if LocalSupportTemplate is not None:
+        if (
+            LocalSupportTemplate.ProblemFingerprint
+            != Problem.ProblemFingerprint
+            or LocalSupportTemplate.PlacementFingerprint
+            != Problem.PlacementFingerprint
+            or LocalSupportTemplate.FabricFingerprint
+            != Problem.Fabric.FabricFingerprint
+            or LocalSupportTemplate.InterfaceFingerprint
+            != Plan.InterfaceFingerprint
+        ):
+            raise ValueError(
+                "local support template and physical assembly identities differ"
+            )
+        Placed = MaterializeRoutedComponentTemplate(
+            Placed,
+            LocalSupportTemplate,
+        )
     OwnedClaimKeys = frozenset(
         (Claim.Signal, frozenset(Claim.Nodes))
         for Claim in Problem.LocalClaims
@@ -1747,6 +1864,19 @@ def PreparePhysicalComponentGlobalPlanningPlacement(
         "RemovedLocalClaimCount": (
             len(getattr(Placed, "LocalRouteClaims", ()) or ())
             - len(RetainedClaims)
+        ),
+        "SelectedLocalSupportExposed": (
+            LocalSupportTemplate is not None
+        ),
+        "SelectedLocalSupportProofFingerprint": (
+            LocalSupportTemplate.ProofFingerprint
+            if LocalSupportTemplate is not None
+            else ""
+        ),
+        "SelectedLocalSupportClaimsFingerprint": (
+            LocalSupportTemplate.ClaimsFingerprint
+            if LocalSupportTemplate is not None
+            else ""
         ),
         "StageOrder": list(Plan.StageOrder),
         "ImplicitForeignTransitDomainCount": 0,
@@ -1869,7 +1999,7 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
             return ()
         return tuple(str(Signal) for Signal in Value if str(Signal))
 
-    AssemblyDependencySignals = tuple(sorted({
+    ReportedAssemblyDependencySignals = frozenset({
         *(str(Signal) for Signal in Failure.AffectedNets),
         *DependencySignals(UnderlyingConflictGraph.get(
             "ConflictSignals",
@@ -1879,7 +2009,32 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
             "CongestionCutSignals",
             (),
         )),
-    }))
+    })
+    HigherOrderPortReservationNoGoodSignals = frozenset(
+        str(Signal)
+        for Signal in (
+            Diagnostics.get(
+                "HigherOrderPortReservationNoGoodSignals",
+                (),
+            )
+            or ()
+        )
+        if str(Signal)
+    )
+    HasCertifiedHigherOrderDependencyCore = bool(
+        Diagnostics.get(
+            "HigherOrderPortReservationNoGoodProofComplete",
+            False,
+        )
+        and len(HigherOrderPortReservationNoGoodSignals) >= 2
+        and HigherOrderPortReservationNoGoodSignals
+        <= ReportedAssemblyDependencySignals
+    )
+    AssemblyDependencySignals = tuple(sorted(
+        HigherOrderPortReservationNoGoodSignals
+        if HasCertifiedHigherOrderDependencyCore
+        else ReportedAssemblyDependencySignals
+    ))
     if AssemblyDependencySignals:
         # Preserve all signals on which the proof depends in the authoritative
         # graph.  Some exact cuts carry their full support only in
@@ -1912,6 +2067,94 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
             "mandatory-boundary-capacity-cut",
             "mandatory-access-self-conflict",
         }
+    )
+    PairwiseDependencySignals = frozenset(
+        str(Signal)
+        for Edge in UnderlyingConflictGraph.get(
+            "PairwiseIncompatibleEdges",
+            (),
+        )
+        if isinstance(Edge, (tuple, list)) and len(Edge) == 2
+        for Signal in Edge
+    )
+    CertifiedPairwiseEdges = frozenset(
+        tuple(sorted((str(Edge[0]), str(Edge[1]))))
+        for Edge in (
+            Diagnostics.get(
+                "PairwisePortReservationNoGoodEdges",
+                (),
+            )
+            or ()
+        )
+        if (
+            isinstance(Edge, (tuple, list))
+            and len(Edge) == 2
+            and str(Edge[0]) != str(Edge[1])
+        )
+    )
+    ReportedPairwiseEdges = frozenset(
+        tuple(sorted((str(Edge[0]), str(Edge[1]))))
+        for Edge in UnderlyingConflictGraph.get(
+            "PairwiseIncompatibleEdges",
+            (),
+        )
+        if (
+            isinstance(Edge, (tuple, list))
+            and len(Edge) == 2
+            and str(Edge[0]) != str(Edge[1])
+        )
+    )
+    MandatoryPairDependencyIdentityComplete = bool(
+        MandatoryConflictClassification
+        != "mandatory-boundary-capacity-cut"
+        or (
+            Diagnostics.get(
+                "PairwisePortReservationNoGoodProofComplete",
+                False,
+            )
+            and CertifiedPairwiseEdges
+            and CertifiedPairwiseEdges == ReportedPairwiseEdges
+            and frozenset(
+                Signal
+                for Edge in CertifiedPairwiseEdges
+                for Signal in Edge
+            )
+            == frozenset(AssemblyDependencySignals)
+        )
+    )
+    HigherOrderPortReservationNoGoodProofComplete = bool(
+        CompleteCapacityProof
+        and HasCertifiedHigherOrderDependencyCore
+        and len(HigherOrderPortReservationNoGoodSignals) >= 2
+        and HigherOrderPortReservationNoGoodSignals
+        == frozenset(AssemblyDependencySignals)
+        and HigherOrderPortReservationNoGoodSignals
+        <= AssemblyPortSignals
+    )
+    AssemblyPlanDependencyIdentityComplete = bool(
+        CompleteCapacityProof
+        and (
+            HigherOrderPortReservationNoGoodProofComplete
+            or (
+                isinstance(MandatoryAccessProof, dict)
+                and MandatoryAccessProof.get("Complete", False)
+                and not MandatoryAccessProof.get(
+                    "BudgetExhausted",
+                    False,
+                )
+                and not MandatoryAccessProof.get(
+                    "DeadlineExceeded",
+                    False,
+                )
+                and HasMandatoryProofClassification
+                and MandatoryPairDependencyIdentityComplete
+                and PairwiseDependencySignals
+                and PairwiseDependencySignals
+                == frozenset(AssemblyDependencySignals)
+                and frozenset(AssemblyDependencySignals)
+                <= AssemblyPortSignals
+            )
+        )
     )
     PlanIndependentMandatoryCut = bool(
         CompleteCapacityProof
@@ -1972,6 +2215,13 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
             )
         )
     )
+    RequestAperturePortNoGood = tuple(
+        (str(Key[0]), str(Key[1]))
+        for Key in (
+            Diagnostics.get("RequestAperturePortNoGood", ()) or ()
+        )
+        if isinstance(Key, (tuple, list)) and len(Key) == 2
+    )
     return RoutingFailure(
         Reason=(
             RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
@@ -2017,6 +2267,20 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
                 "",
             ),
             "UnderlyingFailure": Failure.ToDictionary(),
+            "FrozenPostClosurePortalHandoff": dict(
+                Diagnostics.get(
+                    "FrozenPostClosurePortalHandoff",
+                    {},
+                )
+                if isinstance(
+                    Diagnostics.get(
+                        "FrozenPostClosurePortalHandoff",
+                        {},
+                    ),
+                    Mapping,
+                )
+                else {}
+            ),
             "ComponentFabricConstructionComplete": True,
             "OwnershipSearchComplete": CompleteCapacityProof,
             "ImplicitForeignTransitDomainCount": 0,
@@ -2035,6 +2299,34 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
             "AssemblyPlanDependentPortSignals": list(
                 AssemblyPlanDependentPortSignals
             ),
+            "AssemblyPlanDependencyIdentityComplete": (
+                AssemblyPlanDependencyIdentityComplete
+            ),
+            "MandatoryPairDependencyIdentityComplete": (
+                MandatoryPairDependencyIdentityComplete
+            ),
+            "HigherOrderPortReservationNoGoodProofComplete": (
+                HigherOrderPortReservationNoGoodProofComplete
+            ),
+            "HigherOrderPortReservationNoGoodSignals": sorted(
+                HigherOrderPortReservationNoGoodSignals
+            ),
+            "HigherOrderPortReservationNoGoodCandidateCounts": dict(
+                sorted(
+                    (
+                        str(Signal),
+                        int(Count),
+                    )
+                    for Signal, Count in dict(
+                        Diagnostics.get(
+                            "HigherOrderPortReservationNoGoodCandidateCounts",
+                            {},
+                        )
+                        or {}
+                    ).items()
+                    if str(Signal)
+                )
+            ),
             "GlobalPlanDependencyFingerprint": (
                 GlobalPlanDependencyFingerprint
             ),
@@ -2047,6 +2339,13 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
                     "PairwisePortReservationNoGoodProofComplete",
                     False,
                 )
+            ),
+            "PairwisePortReservationNoGoodEdges": list(
+                Diagnostics.get(
+                    "PairwisePortReservationNoGoodEdges",
+                    (),
+                )
+                or ()
             ),
             "AssemblyPlanFeedthroughIndependentProofComplete": bool(
                 CompleteCapacityProof
@@ -2061,6 +2360,15 @@ def ClassifyPhysicalComponentGlobalPlanningFailure(
             "RequestApertureFactorNoGood": [
                 list(Key) for Key in RequestApertureFactorNoGood
             ],
+            "RequestAperturePortNoGood": [
+                list(Key) for Key in RequestAperturePortNoGood
+            ],
+            "SignalLocalRequestFactorProofComplete": bool(
+                Diagnostics.get(
+                    "SignalLocalRequestFactorProofComplete",
+                    False,
+                )
+            ),
             "UnderlyingEscalationHistory": list(
                 Diagnostics.get("EscalationHistory", ())
             ),
@@ -2122,10 +2430,147 @@ def AdvancePhysicalComponentBoundaryTraversal(
     }
 
 
+def BuildPhysicalComponentAssemblyPlanDomainFingerprint(
+    PreparedDomainFingerprint: str,
+    DeferLocalCompositeSelection: bool,
+) -> str:
+    """Identify one immutable placed physical assembly search domain."""
+    return "physical-assembly-plan-domain-v1:" + _Fingerprint((
+        str(PreparedDomainFingerprint),
+        bool(DeferLocalCompositeSelection),
+    ))
+
+
+def PreservePhysicalComponentAssemblyPlanDomainContinuation(
+    Resources: Any,
+) -> dict[str, object]:
+    """Publish a monotonic clause epoch without replaying the live frontier.
+
+    The boundary iterator yields each assignment once.  Its consumer checks
+    every yielded aperture tuple against the current monotonic clause set, so
+    retaining the suspended cursor is both sound and necessary to avoid
+    revisiting rejected partial assignments.  Clause epochs remain explicit
+    diagnostics; only an explicit traversal change invalidates the cursor.
+    """
+    DomainFingerprint = str(getattr(
+        Resources,
+        "PhysicalComponentAssemblyPlanDomainFingerprint",
+        "",
+    ))
+    if not DomainFingerprint:
+        Preparation = getattr(
+            Resources,
+            "PreparedPhysicalComponentPortFactorDomain",
+            None,
+        )
+        DomainFingerprint = (
+            BuildPhysicalComponentAssemblyPlanDomainFingerprint(
+                str(getattr(Preparation, "DomainFingerprint", "")),
+                bool(getattr(
+                    Resources,
+                    "PhysicalComponentDeferLocalCompositeSelection",
+                    True,
+                )),
+            )
+        )
+        Resources.PhysicalComponentAssemblyPlanDomainFingerprint = (
+            DomainFingerprint
+        )
+    ClauseFingerprint = _Fingerprint((
+        tuple(sorted(
+            tuple(sorted(
+                (str(Signal), str(Fingerprint))
+                for Signal, Fingerprint in Clause
+            ))
+            for Clause in getattr(
+                Resources,
+                "RejectedPhysicalComponentPortReservationSets",
+                (),
+            )
+        )),
+        tuple(sorted(
+            (
+                str(Signal),
+                tuple(sorted(map(str, Fingerprints))),
+            )
+            for Signal, Fingerprints in getattr(
+                Resources,
+                "RejectedPhysicalComponentPortReservationsBySignal",
+                {},
+            ).items()
+        )),
+        tuple(sorted(map(str, getattr(
+            Resources,
+            "RejectedPhysicalComponentPortAssignmentFingerprints",
+            (),
+        )))),
+        tuple(sorted(map(str, getattr(
+            Resources,
+            "RejectedPhysicalComponentAssemblyChoiceFingerprints",
+            (),
+        )))),
+        tuple(sorted(map(str, getattr(
+            Resources,
+            "RejectedPhysicalComponentAssemblyPlanFingerprints",
+            (),
+        )))),
+        tuple(sorted(
+            tuple(sorted(
+                (str(Signal), str(CandidateId))
+                for Signal, CandidateId in CandidateSet
+            ))
+            for CandidateSet in getattr(
+                Resources,
+                "ForbiddenPhysicalComponentGlobalCandidateSets",
+                (),
+            )
+        )),
+    ))
+    States = getattr(
+        Resources,
+        "PhysicalComponentAssemblyPlanClauseStateByDomain",
+        None,
+    )
+    if States is None:
+        States = {}
+        Resources.PhysicalComponentAssemblyPlanClauseStateByDomain = States
+    PriorFingerprint, PriorEpoch = States.get(
+        DomainFingerprint,
+        ("", 0),
+    )
+    ClauseEpoch = (
+        PriorEpoch + 1
+        if ClauseFingerprint != PriorFingerprint
+        else PriorEpoch
+    )
+    States[DomainFingerprint] = (ClauseFingerprint, ClauseEpoch)
+    ClauseChanged = bool(ClauseFingerprint != PriorFingerprint)
+    return {
+        "AssemblyPlanDomainFingerprint": DomainFingerprint,
+        "AssemblyPlanDomainClauseFingerprint": ClauseFingerprint,
+        "AssemblyPlanDomainClauseEpoch": ClauseEpoch,
+        "BoundaryTraversalEpoch": int(getattr(
+            Resources,
+            "PhysicalComponentBoundaryTraversalEpoch",
+            0,
+        )),
+        "BoundaryTraversalPrioritySignals": list(getattr(
+            Resources,
+            "PhysicalComponentBoundaryTraversalPrioritySignals",
+            (),
+        )),
+        "BoundaryTraversalFocusSignal": "",
+        "BoundaryIteratorCacheCleared": False,
+        "BoundaryIteratorContinuationPreserved": True,
+    }
+
+
 def RecordPhysicalComponentGlobalPlanNoGood(
     Failure: RoutingFailure,
     Plan: PhysicalComponentAssemblyPlan,
     Resources: Any,
+    *,
+    ShouldStop: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     """Record the smallest port contract justified by a complete cut.
 
@@ -2145,6 +2590,9 @@ def RecordPhysicalComponentGlobalPlanNoGood(
     DependencySignals = frozenset(str(Signal) for Signal in (
         Diagnostics.get("AssemblyPlanDependentPortSignals", ()) or ()
     ))
+    AssemblyDependencySignals = frozenset(str(Signal) for Signal in (
+        Diagnostics.get("AssemblyPlanDependencySignals", ()) or ()
+    ))
     Feedthroughs = tuple(getattr(Plan, "Feedthroughs", ()))
     FeedthroughIndependenceProved = bool(Diagnostics.get(
         "AssemblyPlanFeedthroughIndependentProofComplete",
@@ -2160,6 +2608,26 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         raise ValueError(
             "physical global-plan proof names an undeclared component port"
         )
+    DeclaredDependencyFingerprint = str(
+        Diagnostics.get("GlobalPlanDependencyFingerprint", "")
+    )
+    DependencyProjectionProofComplete = bool(
+        Diagnostics.get("CompleteAssignmentCutProof", False)
+        and Diagnostics.get(
+            "AssemblyPlanDependencyIdentityComplete",
+            False,
+        )
+        and AssemblyDependencySignals
+        and AssemblyDependencySignals == DependencySignals
+        and DeclaredDependencyFingerprint
+        and DeclaredDependencyFingerprint
+        == BuildPhysicalGlobalPlanDependencyFingerprint(
+            Plan,
+            AssemblyDependencySignals,
+        )
+        and Diagnostics.get("GlobalPlanCutFamilyFingerprint", "")
+        and Diagnostics.get("GlobalPlanProofFingerprint", "")
+    )
     RequestApertureFactorNoGood = frozenset(
         (str(Key[0]), str(Key[1]))
         for Key in (
@@ -2179,6 +2647,38 @@ def RecordPhysicalComponentGlobalPlanNoGood(
     PortSolverDomainFingerprint = str(
         getattr(Preparation, "DomainFingerprint", "")
     )
+    DeclaredRequestAperturePortNoGood = frozenset(
+        (str(Key[0]), str(Key[1]))
+        for Key in (
+            Diagnostics.get("RequestAperturePortNoGood", ()) or ()
+        )
+        if isinstance(Key, (tuple, list)) and len(Key) == 2
+    )
+    ExpectedRequestAperturePortNoGood = (
+        BuildPhysicalRequestAperturePortNoGood(
+            Plan,
+            RequestApertureFactorNoGood,
+            SignalLocalRequestFactorProofComplete=bool(
+                Diagnostics.get(
+                    "SignalLocalRequestFactorProofComplete",
+                    False,
+                )
+            ),
+            PortSolverCacheKey=BuildPhysicalComponentPortSolverCacheKey(
+                PortSolverDomainFingerprint
+            ),
+        )
+        if RequestApertureFactorNoGood and PortSolverDomainFingerprint
+        else frozenset()
+    )
+    if (
+        DeclaredRequestAperturePortNoGood
+        and DeclaredRequestAperturePortNoGood
+        != ExpectedRequestAperturePortNoGood
+    ):
+        raise ValueError(
+            "request/aperture port no-good identity mismatch"
+        )
     RequestApertureProofComplete = bool(
         Diagnostics.get("RequestApertureFactorProofComplete", False)
         and RequestApertureFactorNoGood
@@ -2199,12 +2699,13 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         raise ValueError(
             "independent empty route-domain proof names an unrelated signal"
         )
-    # A completed request/aperture starvation proof already carries its
-    # dependency closure: the victim request and every exact sibling aperture
-    # needed to block its finite candidate domain.  Pin that projection to the
-    # current prepared port-solver domain.  Other global cuts still require
-    # the complete assembly aperture tuple because their request-factor
-    # support is not certified independently.
+    # A complete assignment cut carries its exact dependency closure.  When
+    # every dependency is an assembly port and its plan-bound identity
+    # fingerprint validates, unrelated ports cannot affect that proof and
+    # must not inflate the learned clause.  Request/aperture starvation keeps
+    # its stronger prepared-domain scoped representation below.  Feedthroughs
+    # still require exact assembly-choice identity unless their independence
+    # is separately certified.
     Ports = (
         tuple(
             Port for Port in Plan.Ports
@@ -2213,6 +2714,8 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         if IndependentEmptyDomainSignals
         else DependencyPorts
         if RequestApertureProofComplete
+        else DependencyPorts
+        if DependencyProjectionProofComplete
         else tuple(Plan.Ports)
     )
     ReservationKeys = frozenset(
@@ -2245,9 +2748,18 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         else frozenset()
     )
     RejectedRequestApertureSet = frozenset((
-        *RequestGlobalDeterminantKeys,
-        *ReservationKeys,
-        *((PortSolverScopeKey,) if PortSolverScopeKey is not None else ()),
+        *(
+            DeclaredRequestAperturePortNoGood
+            or frozenset((
+                *RequestGlobalDeterminantKeys,
+                *ReservationKeys,
+                *((
+                    (PortSolverScopeKey,)
+                    if PortSolverScopeKey is not None
+                    else ()
+                )),
+            ))
+        ),
     ))
     ReservationKeyBySignal = {
         Signal: (Signal, Fingerprint)
@@ -2257,11 +2769,22 @@ def RecordPhysicalComponentGlobalPlanNoGood(
     PairwiseEdges = tuple(
         tuple(map(str, Edge))
         for Edge in (
-            ConflictGraph.get("PairwiseIncompatibleEdges", ())
-            if isinstance(ConflictGraph, dict)
-            else ()
+            Diagnostics.get(
+                "PairwisePortReservationNoGoodEdges",
+                (),
+            )
+            or (
+                ConflictGraph.get("PairwiseIncompatibleEdges", ())
+                if isinstance(ConflictGraph, dict)
+                else ()
+            )
         )
-        if isinstance(Edge, (list, tuple)) and len(Edge) == 2
+        if (
+            isinstance(Edge, (list, tuple))
+            and len(Edge) == 2
+            and str(Edge[0]) in ReservationKeyBySignal
+            and str(Edge[1]) in ReservationKeyBySignal
+        )
     )
     PairwiseProofComplete = bool(Diagnostics.get(
         "PairwisePortReservationNoGoodProofComplete",
@@ -2283,6 +2806,201 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         if PairwiseProofComplete
         else frozenset()
     )
+    CompiledPairRelationDiagnostics: list[dict[str, object]] = []
+    PreparedFactorCache = getattr(
+        Resources,
+        "PhysicalBoundaryMandatoryPortalFactorDomainCache",
+        {},
+    )
+    PairwiseEdgeSignals = frozenset(
+        Signal for Edge in PairwiseEdges for Signal in Edge
+    )
+    PreparedPairFactorDomains = tuple(
+        Value
+        for Key, Value in PreparedFactorCache.items()
+        if (
+            isinstance(Key, tuple)
+            and len(Key) == 3
+            and Key[0] == PortSolverDomainFingerprint
+            and str(Key[1]) in PairwiseEdgeSignals
+        )
+    )
+    HasPreparedPairFactorArchitecture = bool(
+        PreparedPairFactorDomains
+        and {
+            str(getattr(Value, "Signal", ""))
+            for Value in PreparedPairFactorDomains
+        } == PairwiseEdgeSignals
+        and all(
+            bool(getattr(Value, "Complete", False))
+            for Value in PreparedPairFactorDomains
+        )
+    )
+    PreparedPairFactorArchitectureDiagnostics = {
+        "Available": HasPreparedPairFactorArchitecture,
+        "ExpectedSignals": sorted(PairwiseEdgeSignals),
+        "PreparedSignalCount": len({
+            str(getattr(Value, "Signal", ""))
+            for Value in PreparedPairFactorDomains
+        }),
+        "FactorDomainCount": len(PreparedPairFactorDomains),
+        "CompleteFactorDomainCount": sum(
+            int(bool(getattr(Value, "Complete", False)))
+            for Value in PreparedPairFactorDomains
+        ),
+        "IncompleteSignals": sorted({
+            str(getattr(Value, "Signal", ""))
+            for Value in PreparedPairFactorDomains
+            if not bool(getattr(Value, "Complete", False))
+        }),
+        "OtherPreparedDomainFactorCount": sum(
+            1
+            for Key in PreparedFactorCache
+            if (
+                isinstance(Key, tuple)
+                and len(Key) == 3
+                and Key[0] != PortSolverDomainFingerprint
+            )
+        ),
+    }
+    PreparedPairOptionCounts = {
+        Signal: len({
+            str(getattr(Value, "ApertureContractFingerprint", ""))
+            for Value in PreparedPairFactorDomains
+            if str(getattr(Value, "Signal", "")) == Signal
+        })
+        for Signal in PairwiseEdgeSignals
+    }
+    PreparedPairOptionProduct = 1
+    for Signal in sorted(PreparedPairOptionCounts):
+        PreparedPairOptionProduct *= PreparedPairOptionCounts[Signal]
+    # The relation compiler uses a shared symbolic frontier quotient for
+    # larger products, so the gate bounds published certificate size rather
+    # than forcing the exterior router to rediscover each incompatible pair
+    # one contract at a time.
+    MaximumEagerPreparedPairOptionProduct = 65_536
+    CompletePreparedPairSignals = frozenset(
+        Signal
+        for Signal in PairwiseEdgeSignals
+        if (
+            PreparedPairOptionCounts.get(Signal, 0) > 0
+            and all(
+                bool(getattr(Value, "Complete", False))
+                for Value in PreparedPairFactorDomains
+                if str(getattr(Value, "Signal", "")) == Signal
+            )
+        )
+    )
+    PreparedPairEdges = tuple(sorted({
+        tuple(sorted((str(First), str(Second))))
+        for First, Second in PairwiseEdges
+        if str(First) != str(Second)
+    }))
+    EligiblePreparedPairRelations = tuple(sorted(
+        (
+            (
+                PreparedPairOptionCounts.get(Pair[0], 0)
+                * PreparedPairOptionCounts.get(Pair[1], 0)
+            ),
+            Pair,
+        )
+        for Pair in PreparedPairEdges
+        if (
+            frozenset(Pair) <= CompletePreparedPairSignals
+            and 0
+            < (
+                PreparedPairOptionCounts.get(Pair[0], 0)
+                * PreparedPairOptionCounts.get(Pair[1], 0)
+            )
+            <= MaximumEagerPreparedPairOptionProduct
+        )
+    ))
+    ShouldCompilePreparedPairRelation = bool(
+        PairwiseProofComplete
+        and EligiblePreparedPairRelations
+    )
+    PreparedPairFactorArchitectureDiagnostics.update({
+        "OptionCountsBySignal": PreparedPairOptionCounts,
+        "OptionProduct": PreparedPairOptionProduct,
+        "MaximumEagerOptionProduct": (
+            MaximumEagerPreparedPairOptionProduct
+        ),
+        "EagerCompilationSelected": (
+            ShouldCompilePreparedPairRelation
+        ),
+    })
+    if ShouldCompilePreparedPairRelation:
+        # Imported lazily to preserve AuthoritativePlanner's existing use of
+        # this pipeline module.  The relation compiler consumes only portal
+        # domains already produced by that single authoritative planner.
+        from .AuthoritativePlanner import (
+            CompilePhysicalBoundaryMandatoryPortalPairRelation,
+        )
+
+        CompiledPairwiseReservationSets = set(PairwiseReservationSets)
+        # Compile one smallest eligible pair per exterior failure.  The exact
+        # relation itself runs to completion under the shared typed deadline;
+        # imposing a second certificate-count quantum here would repeatedly
+        # revisit the same cached state index without ever publishing its
+        # complete binary clauses.
+        _SelectedPairOptionProduct, Pair = (
+            EligiblePreparedPairRelations[0]
+        )
+        for Pair in (Pair,):
+            Relation = CompilePhysicalBoundaryMandatoryPortalPairRelation(
+                Preparation,
+                Pair,
+                Resources,
+                ShouldStop=ShouldStop,
+                MaximumNewCertificates=None,
+                PreferredApertureContractsBySignal={
+                    Port.Signal: (
+                        BuildPhysicalPortApertureContractFingerprint(Port)
+                    )
+                    for Port in Plan.Ports
+                    if Port.Signal in Pair
+                },
+            )
+            CompiledPairRelationDiagnostics.append({
+                "RelationFingerprint": Relation.RelationFingerprint,
+                "Signals": list(Relation.Signals),
+                "ExpectedOptionPairCount": (
+                    Relation.ExpectedOptionPairCount
+                ),
+                "CertificateCount": len(Relation.Certificates),
+                "UnsatisfiableClauseCount": len(
+                    Relation.UnsatisfiableApertureClauses
+                ),
+                "ForeignDependencyCertificateCount": (
+                    Relation.ForeignDependencyCertificateCount
+                ),
+                "FactorCertificateCount": getattr(
+                    Relation, "FactorCertificateCount", 0
+                ),
+                "FactorStateCount": getattr(
+                    Relation, "FactorStateCount", 0
+                ),
+                "UniqueClaimStateCountsBySignal": dict(getattr(
+                    Relation,
+                    "UniqueClaimStateCountsBySignal",
+                    (),
+                )),
+                "FactorExpansionCount": getattr(
+                    Relation, "FactorExpansionCount", 0
+                ),
+                "CompatibilityIndexStatePairUpperBound": getattr(
+                    Relation,
+                    "CompatibilityIndexStatePairUpperBound",
+                    0,
+                ),
+                "Complete": Relation.Complete,
+            })
+            CompiledPairwiseReservationSets.update(
+                Relation.UnsatisfiableApertureClauses
+            )
+        PairwiseReservationSets = frozenset(
+            CompiledPairwiseReservationSets
+        )
     Scope = "none"
     RejectedAssemblyChoiceFingerprint = ""
     if RequiresExactAssemblyChoice:
@@ -2397,13 +3115,17 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         else {}
     )
     MinimumDeltaPivotSignal = ""
-    MinimumDeltaTraversalFocusSignal = ""
+    MinimumDeltaPivotDomainCounts: dict[str, int] = {}
+    MinimumDeltaCertifiedExteriorDomainCounts: dict[str, int] = {}
     MinimumDeltaRetainedContracts: dict[str, str] = {}
+    MinimumDeltaRetainedApertures: dict[str, str] = {}
+    MinimumDeltaRetainedReservations: dict[str, str] = {}
     if (
         not RecommendedContracts
         and Scope in {
             "exact-assembly-port-aperture-set",
             "request-aperture-factor-port-set",
+            "independent-empty-global-route-domain",
         }
     ):
         # A complete higher-order cut rejects the exact tuple, not each of
@@ -2439,15 +3161,91 @@ def RecordPhysicalComponentGlobalPlanNoGood(
             )
             if str(Signal) in DependencySignals
         ))
-        if RequestAperturePivotSignals:
+        RemainingApertureDomains = {
+            str(Signal): frozenset(
+                BuildPhysicalPortApertureContractFingerprint(Option)
+                for Option in Options
+                if BuildPhysicalPortApertureContractFingerprint(Option)
+                not in (
+                    Resources
+                    .RejectedPhysicalComponentPortReservationsBySignal
+                    .get(str(Signal), set())
+                )
+            )
+            for Signal, Options in (
+                getattr(
+                    Preparation,
+                    "BoundaryPortReservationsBySignal",
+                    (),
+                )
+                if Preparation is not None
+                else ()
+            )
+            if str(Signal) in DependencySignals
+        }
+        MinimumDeltaPivotDomainCounts = {
+            Signal: len(Fingerprints)
+            for Signal, Fingerprints
+            in sorted(RemainingApertureDomains.items())
+        }
+        CertifiedExteriorCoreCandidateCounts = {
+            str(Signal): int(Count)
+            for Signal, Count in dict(
+                Diagnostics.get(
+                    "HigherOrderPortReservationNoGoodCandidateCounts",
+                    {},
+                )
+                or {}
+            ).items()
+            if (
+                str(Signal) in DependencySignals
+                and int(Count) > 0
+            )
+        }
+        MinimumDeltaCertifiedExteriorDomainCounts = dict(
+            CertifiedExteriorCoreCandidateCounts
+        )
+        SmallestCertifiedExteriorDomainSignals = tuple(sorted(
+            CertifiedExteriorCoreCandidateCounts,
+            key=lambda Signal: (
+                CertifiedExteriorCoreCandidateCounts[Signal],
+                Signal,
+            ),
+        ))
+        SmallestRemainingDomainSignals = tuple(sorted(
+            RemainingApertureDomains,
+            key=lambda Signal: (
+                len(RemainingApertureDomains[Signal]),
+                Signal,
+                BuildPhysicalPortApertureContractFingerprint(
+                    next(
+                        Port for Port in Plan.Ports
+                        if Port.Signal == Signal
+                    )
+                ),
+            ),
+        ))
+        if IndependentEmptyDomainSignals:
+            MinimumDeltaPivotSignal = min(
+                IndependentEmptyDomainSignals
+            )
+        elif RequestAperturePivotSignals:
             MinimumDeltaPivotSignal = RequestAperturePivotSignals[0]
-            MinimumDeltaTraversalFocusSignal = MinimumDeltaPivotSignal
+        elif SmallestCertifiedExteriorDomainSignals:
+            MinimumDeltaPivotSignal = (
+                SmallestCertifiedExteriorDomainSignals[0]
+            )
+        elif SmallestRemainingDomainSignals:
+            # Keep the exact proof intact, but enumerate its cheapest useful
+            # delta first.  This is the same MRV rule used by the interface
+            # CSP and avoids retrying a wide port domain while a smaller
+            # dependency domain can disprove the retained context.
+            MinimumDeltaPivotSignal = SmallestRemainingDomainSignals[0]
         elif HubSignals:
             MinimumDeltaPivotSignal = max(
                 HubSignals,
                 key=lambda Value: (Value[1], Value[0]),
             )[0]
-            MinimumDeltaTraversalFocusSignal = MinimumDeltaPivotSignal
         else:
             ReportedFailureNet = str(
                 ConflictGraph.get("FailureNet", "")
@@ -2466,18 +3264,103 @@ def RecordPhysicalComponentGlobalPlanNoGood(
             for Port in Plan.Ports
             if Port.Signal != MinimumDeltaPivotSignal
         }
+        MinimumDeltaRetainedReservations = {
+            Port.Signal: str(getattr(
+                Port,
+                "ReservationFingerprint",
+                "",
+            ))
+            for Port in Plan.Ports
+            if (
+                Port.Signal != MinimumDeltaPivotSignal
+                and str(getattr(
+                    Port,
+                    "ReservationFingerprint",
+                    "",
+                ))
+            )
+        }
+        MinimumDeltaRetainedApertures = {
+            Port.Signal: BuildPhysicalPortApertureContractFingerprint(Port)
+            for Port in Plan.Ports
+            if Port.Signal != MinimumDeltaPivotSignal
+        }
         RecommendedContracts = dict(MinimumDeltaRetainedContracts)
-    Resources.PreferredPhysicalComponentGlobalContractsBySignal = (
-        RecommendedContracts
-    )
-    TraversalDiagnostics = AdvancePhysicalComponentBoundaryTraversal(
+    PreferredGlobalContracts = getattr(
         Resources,
-        DependencySignals,
-        FocusSignal=MinimumDeltaTraversalFocusSignal,
+        "PreferredPhysicalComponentGlobalContractsBySignal",
+        None,
+    )
+    if PreferredGlobalContracts is None:
+        PreferredGlobalContracts = {}
+        Resources.PreferredPhysicalComponentGlobalContractsBySignal = (
+            PreferredGlobalContracts
+        )
+    else:
+        PreferredGlobalContracts.clear()
+    PreferredGlobalContracts.update(RecommendedContracts)
+    PreferredApertureContracts = getattr(
+        Resources,
+        "PreferredPhysicalComponentApertureContractsBySignal",
+        None,
+    )
+    if PreferredApertureContracts is None:
+        PreferredApertureContracts = {}
+        Resources.PreferredPhysicalComponentApertureContractsBySignal = (
+            PreferredApertureContracts
+        )
+    else:
+        PreferredApertureContracts.clear()
+    PreferredApertureContracts.update(MinimumDeltaRetainedApertures)
+    PreferredPortReservations = getattr(
+        Resources,
+        "PreferredPhysicalComponentPortReservationsBySignal",
+        None,
+    )
+    if PreferredPortReservations is None:
+        PreferredPortReservations = {}
+        Resources.PreferredPhysicalComponentPortReservationsBySignal = (
+            PreferredPortReservations
+        )
+    else:
+        PreferredPortReservations.clear()
+    PreferredPortReservations.update(
+        MinimumDeltaRetainedReservations
+    )
+    PrunedRetainedGlobalPlanCount = 0
+    if CompiledPairRelationDiagnostics:
+        Frontier = getattr(
+            Resources,
+            "RetainedPhysicalGlobalPlanFrontier",
+            {},
+        )
+        RejectedSets = tuple(
+            Resources.RejectedPhysicalComponentPortReservationSets
+        )
+        Retained = {}
+        for Fingerprint, Entry in Frontier.items():
+            EntryKeys = frozenset(
+                (
+                    Port.Signal,
+                    BuildPhysicalPortApertureContractFingerprint(Port),
+                )
+                for Port in Entry.Assembly.Plan.Ports
+            )
+            if any(Clause <= EntryKeys for Clause in RejectedSets):
+                PrunedRetainedGlobalPlanCount += 1
+                continue
+            Retained[Fingerprint] = Entry
+        Resources.RetainedPhysicalGlobalPlanFrontier = Retained
+    TraversalDiagnostics = (
+        PreservePhysicalComponentAssemblyPlanDomainContinuation(
+            Resources,
+        )
     )
     return {
         "NoGoodScope": Scope,
-        "NoGoodSignals": sorted(DependencySignals),
+        "NoGoodSignals": sorted(
+            IndependentEmptyDomainSignals or DependencySignals
+        ),
         "NoGoodReservationKeys": [
             [Signal, ReservationFingerprint]
             for Signal, ReservationFingerprint in sorted(
@@ -2490,7 +3373,13 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         ],
         "NoGoodConstraintArity": (
             1
-            if RequiresExactAssemblyChoice
+            if (
+                RequiresExactAssemblyChoice
+                or IndependentEmptyDomainSignals
+                or len(ReservationKeys) == 1
+            )
+            else 2
+            if PairwiseReservationSets
             else len(
                 RejectedRequestApertureSet
                 if RequestApertureProofComplete
@@ -2512,8 +3401,20 @@ def RecordPhysicalComponentGlobalPlanNoGood(
             Recommendation is not None
         ),
         "MinimumDeltaReplanPivotSignal": MinimumDeltaPivotSignal,
+        "MinimumDeltaPivotDomainCounts": dict(sorted(
+            MinimumDeltaPivotDomainCounts.items()
+        )),
+        "MinimumDeltaCertifiedExteriorDomainCounts": dict(sorted(
+            MinimumDeltaCertifiedExteriorDomainCounts.items()
+        )),
         "MinimumDeltaRetainedGlobalContracts": dict(sorted(
             MinimumDeltaRetainedContracts.items()
+        )),
+        "MinimumDeltaRetainedApertureContracts": dict(sorted(
+            MinimumDeltaRetainedApertures.items()
+        )),
+        "MinimumDeltaRetainedPortReservations": dict(sorted(
+            MinimumDeltaRetainedReservations.items()
         )),
         **TraversalDiagnostics,
         "RejectedPortAssignmentFingerprint": (
@@ -2531,11 +3432,28 @@ def RecordPhysicalComponentGlobalPlanNoGood(
         "PairwisePortReservationNoGoodProofComplete": (
             PairwiseProofComplete
         ),
+        "CompiledMandatoryPortalPairRelations": (
+            CompiledPairRelationDiagnostics
+        ),
+        "PreparedMandatoryPortalPairFactorStatus": (
+            PreparedPairFactorArchitectureDiagnostics
+        ),
+        "CompiledMandatoryPortalPairClauseCount": sum(
+            int(Value["UnsatisfiableClauseCount"])
+            for Value in CompiledPairRelationDiagnostics
+        ),
+        "PrunedRetainedGlobalPlanCount": PrunedRetainedGlobalPlanCount,
         "RejectedAssemblyChoiceFingerprint": (
             RejectedAssemblyChoiceFingerprint
         ),
         "AssemblyPlanFeedthroughIndependentProofComplete": (
             FeedthroughIndependenceProved
+        ),
+        "AssemblyPlanDependencyProjectionProofComplete": (
+            DependencyProjectionProofComplete
+        ),
+        "AssemblyPlanDependencyProjectionSignals": sorted(
+            DependencySignals if DependencyProjectionProofComplete else ()
         ),
     }
 
@@ -3300,6 +4218,9 @@ def ProveClosedComponentOwnedSignalFrontiers(
     *,
     DeadlineSeconds: float | None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    CompletedProofCache: dict[
+        str, ComponentRoutingSolveResult
+    ] | None = None,
     RouteClaimsConstructionCache: dict[
         frozenset[Position3], RoutingResourceClaims
     ] | None = None,
@@ -3311,6 +4232,44 @@ def ProveClosedComponentOwnedSignalFrontiers(
     placement whose owned signal domain is structurally empty without
     violating the port-first global-before-local compilation boundary.
     """
+    Plan = Problem.PhysicalAssemblyPlan
+    DomainFingerprint = (
+        BuildGlobalRelaxedLocalProofDomainFingerprint(Problem)
+        if Plan is not None
+        else _Fingerprint((
+            "closed-component-owned-frontier-domain-v1",
+            Problem.ProblemFingerprint,
+            Problem.Fabric.FabricFingerprint,
+            getattr(Problem.Interface, "InterfaceFingerprint", ""),
+            getattr(Problem.ResourceGraph, "GraphVersion", ""),
+            getattr(
+                getattr(Problem.ResourceGraph, "Technology", None),
+                "TechnologyVersion",
+                "",
+            ),
+            Problem.MaximumPowerDistance,
+        ))
+    )
+    Cached = (
+        CompletedProofCache.get(DomainFingerprint)
+        if CompletedProofCache is not None
+        else None
+    )
+    if Cached is not None:
+        if Cached.Template is not None:
+            raise ValueError(
+                "cached owned-signal frontier proof materialized a template"
+            )
+        return replace(
+            Cached,
+            Diagnostics={
+                **dict(Cached.Diagnostics or {}),
+                "OwnedSignalFrontierProofCacheHit": True,
+                "OwnedSignalFrontierProofDomainFingerprint": (
+                    DomainFingerprint
+                ),
+            },
+        )
     Result = SolveComponentRoutingProblem(
         Problem,
         DeadlineSeconds=DeadlineSeconds,
@@ -3322,7 +4281,2569 @@ def ProveClosedComponentOwnedSignalFrontiers(
         raise ValueError(
             "owned-signal frontier eligibility materialized a template"
         )
+    if Result.Exhaustive and CompletedProofCache is not None:
+        CompletedProofCache[DomainFingerprint] = replace(
+            Result,
+            Diagnostics={
+                **dict(Result.Diagnostics or {}),
+                "OwnedSignalFrontierProofCacheHit": False,
+                "OwnedSignalFrontierProofDomainFingerprint": (
+                    DomainFingerprint
+                ),
+            },
+        )
     return Result
+
+
+def _SelectPhysicalComponentSymbolicPortPairFactors(
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    Signals: tuple[str, ...],
+) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], str]]:
+    """Return the complete supported local-access and seam relation."""
+    LocalFactorsBySignal = dict(FactorDomain.LocalAccessFactorsBySignal)
+    SupportedLocalAccessFingerprintsBySignal = {
+        str(Signal): frozenset(
+            str(Support.LocalAccessFingerprint)
+            for Support in Supports
+        )
+        for Signal, Supports
+        in FactorDomain.LocalApertureSupportBySignal
+    }
+    FactorsBySignal: dict[str, dict[str, Any]] = {}
+    SeamFingerprintByLocalAccess: dict[tuple[str, str], str] = {}
+    for Signal in Signals:
+        Supported = SupportedLocalAccessFingerprintsBySignal.get(
+            Signal,
+            frozenset(),
+        )
+        ByLocalAccess = {}
+        for Factor in LocalFactorsBySignal.get(Signal, ()):
+            LocalAccessFingerprint = str(Factor.LocalAccessFingerprint)
+            if LocalAccessFingerprint not in Supported:
+                continue
+            Existing = ByLocalAccess.get(LocalAccessFingerprint)
+            if Existing is not None and Existing != Factor:
+                raise ValueError(
+                    "symbolic port pair local-access identity collision"
+                )
+            ByLocalAccess[LocalAccessFingerprint] = Factor
+            SeamFingerprintByLocalAccess[(
+                Signal,
+                LocalAccessFingerprint,
+            )] = (
+                str(getattr(Factor, "SeamContractFingerprint", ""))
+                or BuildPhysicalPortSeamContractFingerprint(Factor)
+            )
+        if not ByLocalAccess:
+            raise ValueError(
+                f"symbolic port pair has no complete seam domain for {Signal}"
+            )
+        FactorsBySignal[Signal] = ByLocalAccess
+    return FactorsBySignal, SeamFingerprintByLocalAccess
+
+
+def _BuildPhysicalComponentSymbolicPortPairContext(
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    Signals: tuple[str, ...],
+    FactorsBySignal: dict[str, dict[str, Any]],
+    SeamFingerprintByLocalAccess: dict[tuple[str, str], str],
+) -> dict[str, str]:
+    """Build every immutable identity on which a pair proof depends."""
+    PlacementFingerprint = str(Problem.PlacementFingerprint)
+    PreparedDomainFingerprint = str(FactorDomain.DomainFingerprint)
+    ComponentGraphFingerprint = str(FactorDomain.ComponentGraphFingerprint)
+    FabricFingerprint = str(Problem.Fabric.FabricFingerprint)
+    ResourceGraphFingerprint = str(FactorDomain.ResourceGraphFingerprint)
+    TechnologyFingerprint = str(getattr(
+        FactorDomain.AccessCertificate,
+        "TechnologyFingerprint",
+        "",
+    ))
+    AccessCertificateFingerprint = str(getattr(
+        FactorDomain.AccessCertificate,
+        "CertificateFingerprint",
+        "",
+    ))
+    # Pair support is compiled over the complete prepared local-access/seam
+    # domain, not over one subsequently selected global aperture tuple. Bind
+    # cache identity to that immutable preparation interface so equivalent
+    # CSP contracts reuse the same exact signal-local state certificates.
+    InterfaceFingerprint = str(getattr(
+        FactorDomain.Problem.Interface,
+        "InterfaceFingerprint",
+        "",
+    ))
+    SupportIdentity = tuple(sorted(
+        (
+            str(Signal),
+            str(Support.LocalAccessFingerprint),
+            str(Support.ApertureOptionFingerprint),
+            str(Support.SupportFingerprint),
+        )
+        for Signal, Supports
+        in FactorDomain.LocalApertureSupportBySignal
+        if str(Signal) in Signals
+        for Support in Supports
+    ))
+    LocalAccessIdentity = tuple(
+        (
+            Signal,
+            tuple(
+                (
+                    LocalAccessFingerprint,
+                    str(Factor.LocalContractFingerprint),
+                    str(Factor.FabricDomainFingerprint),
+                    tuple(Factor.OwnedTerminalFingerprints),
+                    tuple(Factor.OwnedCandidateFingerprints),
+                    tuple(Factor.LocalPath),
+                    tuple(sorted(map(str, Factor.LocalClaims.ResourceIds))),
+                )
+                for LocalAccessFingerprint, Factor in sorted(
+                    FactorsBySignal[Signal].items()
+                )
+            ),
+        )
+        for Signal in Signals
+    )
+    LocalAccessDomainFingerprint = _Fingerprint((
+        "physical-symbolic-port-pair-local-access-domain-v1",
+        LocalAccessIdentity,
+        SupportIdentity,
+    ))
+    SeamDomainFingerprint = _Fingerprint((
+        "physical-symbolic-port-pair-seam-domain-v1",
+        tuple(sorted(
+            (
+                Signal,
+                LocalAccessFingerprint,
+                SeamFingerprint,
+            )
+            for (Signal, LocalAccessFingerprint), SeamFingerprint
+            in SeamFingerprintByLocalAccess.items()
+        )),
+    ))
+    DomainFingerprint = _Fingerprint((
+        "physical-symbolic-port-pair-domain-v2",
+        PreparedDomainFingerprint,
+        PlacementFingerprint,
+        ComponentGraphFingerprint,
+        FabricFingerprint,
+        ResourceGraphFingerprint,
+        TechnologyFingerprint,
+        AccessCertificateFingerprint,
+        InterfaceFingerprint,
+        LocalAccessDomainFingerprint,
+        SeamDomainFingerprint,
+        Signals,
+    ))
+    return {
+        "DomainFingerprint": DomainFingerprint,
+        "PreparedDomainFingerprint": PreparedDomainFingerprint,
+        "PlacementFingerprint": PlacementFingerprint,
+        "ComponentGraphFingerprint": ComponentGraphFingerprint,
+        "FabricFingerprint": FabricFingerprint,
+        "ResourceGraphFingerprint": ResourceGraphFingerprint,
+        "TechnologyFingerprint": TechnologyFingerprint,
+        "AccessCertificateFingerprint": AccessCertificateFingerprint,
+        "InterfaceFingerprint": InterfaceFingerprint,
+        "LocalAccessDomainFingerprint": LocalAccessDomainFingerprint,
+        "SeamDomainFingerprint": SeamDomainFingerprint,
+    }
+
+
+def _BuildPhysicalComponentSymbolicPortPairVariantProblem(
+    Problem: ComponentRoutingProblem,
+    Signal: str,
+    LocalAccessFingerprint: str,
+    Factor: Any,
+) -> ComponentRoutingProblem:
+    """Bind one exact local access while leaving global ownership relaxed."""
+    if Problem.Interface is None:
+        raise ValueError("symbolic port pair requires a closed interface")
+    BasePort = next((
+        Port
+        for Port in Problem.Interface.PhysicalPortReservations
+        if str(Port.Signal) == Signal
+    ), None)
+    SyntheticBasePort = BasePort is None
+    if BasePort is None:
+        Attachment = (
+            tuple(Factor.LocalPath[-1])
+            if Factor.LocalPath
+            else tuple(Factor.FabricAttachment)
+        )
+        BasePort = PhysicalComponentPortReservation(
+            Signal=Signal,
+            Direction=Factor.Direction,
+            OwnedTerminals=Factor.OwnedTerminals,
+            OwnedTerminalFingerprints=(
+                Factor.OwnedTerminalFingerprints
+            ),
+            OwnedCandidateFingerprints=(
+                Factor.OwnedCandidateFingerprints
+            ),
+            FabricDomainFingerprint=Factor.FabricDomainFingerprint,
+            FabricAttachment=Factor.FabricAttachment,
+            Attachment=Attachment,
+            LocalPath=Factor.LocalPath,
+            GlobalPath=(Attachment,),
+            Claims=Factor.LocalClaims,
+            LocalClaims=Factor.LocalClaims,
+            GlobalClaims=RoutingResourceClaims(),
+            OwnedAccessCandidates=Factor.OwnedAccessCandidates,
+            Capacity=Factor.Capacity,
+        )
+    SeamFingerprint = BuildPhysicalPortSeamContractFingerprint(Factor)
+    VariantPort = replace(
+        BasePort,
+        Direction=Factor.Direction,
+        OwnedTerminals=Factor.OwnedTerminals,
+        OwnedTerminalFingerprints=Factor.OwnedTerminalFingerprints,
+        OwnedCandidateFingerprints=Factor.OwnedCandidateFingerprints,
+        FabricDomainFingerprint=Factor.FabricDomainFingerprint,
+        FabricAttachment=Factor.FabricAttachment,
+        LocalPath=Factor.LocalPath,
+        Claims=Factor.LocalClaims,
+        LocalClaims=Factor.LocalClaims,
+        OwnedAccessCandidates=Factor.OwnedAccessCandidates,
+        Capacity=Factor.Capacity,
+        ReservationFingerprint=_Fingerprint((
+            "symbolic-port-domain-reservation-v1",
+            Signal,
+            SeamFingerprint,
+            BasePort.Attachment,
+            BasePort.GlobalPath,
+        )),
+        CertifiedLocalContractFingerprint=(
+            Factor.LocalContractFingerprint
+        ),
+        CertifiedSeamContractFingerprint=SeamFingerprint,
+        CertifiedSupportReservationFingerprint="",
+    )
+    VariantPorts = tuple(
+        VariantPort if str(Port.Signal) == Signal else Port
+        for Port in Problem.Interface.PhysicalPortReservations
+    )
+    if SyntheticBasePort:
+        VariantPorts = (*VariantPorts, VariantPort)
+    return replace(
+        Problem,
+        ProblemFingerprint=_Fingerprint((
+            "symbolic-port-domain-net-state-v1",
+            Problem.ProblemFingerprint,
+            Signal,
+            LocalAccessFingerprint,
+        )),
+        Interface=replace(
+            Problem.Interface,
+            PhysicalPortReservations=VariantPorts,
+            PhysicalAssemblyPlanFingerprint="",
+        ),
+        ReservedGlobalClaimsBySignal=(),
+    )
+
+
+def _BuildPhysicalComponentSymbolicNetStateFingerprint(
+    States: Iterable[Any],
+) -> str:
+    """Bind a certificate to exact state contents, not only its cache key."""
+    return _Fingerprint((
+        "physical-symbolic-net-state-domain-v1",
+        tuple(sorted(
+            (
+                str(State.Signal),
+                str(State.NetFingerprint),
+                tuple(sorted(State.Nodes)),
+                tuple(sorted(State.Edges)),
+                tuple(sorted(map(str, State.Claims.ResourceIds))),
+                tuple(State.CoveredTerminals),
+                tuple(State.ExportedPorts),
+                tuple(State.Repeaters),
+            )
+            for State in States
+        )),
+    ))
+
+
+def ValidatePhysicalComponentSymbolicPortPairCertificate(
+    Certificate: PhysicalComponentSymbolicPortPairCertificate,
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    SignalPair: Iterable[str],
+    *,
+    NetStateCache: dict[str, Any] | None = None,
+) -> None:
+    """Reject cached pair proofs unless every dependency matches exactly."""
+    Signals = tuple(sorted(frozenset(map(str, SignalPair))))
+    if len(Signals) != 2:
+        raise ValueError("symbolic port pair validation requires two signals")
+    FactorsBySignal, SeamFingerprintByLocalAccess = (
+        _SelectPhysicalComponentSymbolicPortPairFactors(
+            FactorDomain,
+            Signals,
+        )
+    )
+    Context = _BuildPhysicalComponentSymbolicPortPairContext(
+        Problem,
+        FactorDomain,
+        Signals,
+        FactorsBySignal,
+        SeamFingerprintByLocalAccess,
+    )
+    FieldValues = {
+        "DomainFingerprint": Certificate.DomainFingerprint,
+        "PreparedDomainFingerprint": Certificate.PreparedDomainFingerprint,
+        "PlacementFingerprint": Certificate.PlacementFingerprint,
+        "ComponentGraphFingerprint": Certificate.ComponentGraphFingerprint,
+        "FabricFingerprint": Certificate.FabricFingerprint,
+        "ResourceGraphFingerprint": Certificate.ResourceGraphFingerprint,
+        "TechnologyFingerprint": Certificate.TechnologyFingerprint,
+        "AccessCertificateFingerprint": (
+            Certificate.AccessCertificateFingerprint
+        ),
+        "InterfaceFingerprint": Certificate.InterfaceFingerprint,
+        "LocalAccessDomainFingerprint": (
+            Certificate.LocalAccessDomainFingerprint
+        ),
+        "SeamDomainFingerprint": Certificate.SeamDomainFingerprint,
+    }
+    Mismatches = tuple(
+        FieldName
+        for FieldName, Expected in Context.items()
+        if str(FieldValues.get(FieldName, "")) != str(Expected)
+    )
+    if Certificate.SignalPair != Signals:
+        Mismatches = (*Mismatches, "SignalPair")
+    ExpectedAccesses = tuple(
+        (
+            Signal,
+            tuple(sorted(FactorsBySignal[Signal])),
+        )
+        for Signal in Signals
+    )
+    ExpectedSeams = tuple(sorted(
+        (
+            Signal,
+            LocalAccessFingerprint,
+            SeamFingerprint,
+        )
+        for (Signal, LocalAccessFingerprint), SeamFingerprint
+        in SeamFingerprintByLocalAccess.items()
+    ))
+    if Certificate.LocalAccessFingerprintsBySignal != ExpectedAccesses:
+        Mismatches = (*Mismatches, "LocalAccessFingerprintsBySignal")
+    if Certificate.SeamFingerprintByLocalAccess != ExpectedSeams:
+        Mismatches = (*Mismatches, "SeamFingerprintByLocalAccess")
+    BindingKeys = tuple(
+        (Signal, LocalAccessFingerprint, CacheKey)
+        for Signal, LocalAccessFingerprint, CacheKey, _StateFingerprint
+        in Certificate.NetStateBindings
+    )
+    if BindingKeys != Certificate.NetStateCacheKeys:
+        Mismatches = (*Mismatches, "NetStateCacheKeys")
+    RelaxedProblem = replace(
+        FactorDomain.Problem,
+        ReservedGlobalClaimsBySignal=(),
+    )
+    ExpectedCacheKeys = []
+    for Signal in Signals:
+        PreparedContextFingerprint = (
+            _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+                RelaxedProblem,
+                Signal,
+            )
+        )
+        for LocalAccessFingerprint, Factor in sorted(
+            FactorsBySignal[Signal].items()
+        ):
+            VariantProblem = (
+                _BuildPhysicalComponentSymbolicPortPairVariantProblem(
+                    RelaxedProblem,
+                    Signal,
+                    LocalAccessFingerprint,
+                    Factor,
+                )
+            )
+            ExpectedCacheKeys.append((
+                Signal,
+                LocalAccessFingerprint,
+                BuildComponentSymbolicNetStateCacheKey(
+                    VariantProblem,
+                    Signal,
+                    PreparedContextFingerprint=(
+                        PreparedContextFingerprint
+                    ),
+                ),
+            ))
+    ExpectedCacheKeySet = frozenset(ExpectedCacheKeys)
+    ActualCacheKeySet = frozenset(Certificate.NetStateCacheKeys)
+    if (
+        (Certificate.Complete and ActualCacheKeySet != ExpectedCacheKeySet)
+        or not ActualCacheKeySet <= ExpectedCacheKeySet
+        or len(ActualCacheKeySet) != len(Certificate.NetStateCacheKeys)
+    ):
+        Mismatches = (*Mismatches, "NetStateCacheDomain")
+    ExpectedStateDomainFingerprint = _Fingerprint((
+        "physical-symbolic-port-pair-state-bindings-v1",
+        Certificate.NetStateBindings,
+    ))
+    if (
+        Certificate.NetStateDomainFingerprint
+        != ExpectedStateDomainFingerprint
+    ):
+        Mismatches = (*Mismatches, "NetStateDomainFingerprint")
+    if NetStateCache is not None:
+        for (
+            _Signal,
+            _LocalAccessFingerprint,
+            CacheKey,
+            StateFingerprint,
+        ) in Certificate.NetStateBindings:
+            Cached = NetStateCache.get(CacheKey)
+            if Cached is None:
+                continue
+            States, _Diagnostics = Cached
+            if (
+                _BuildPhysicalComponentSymbolicNetStateFingerprint(States)
+                != StateFingerprint
+            ):
+                Mismatches = (*Mismatches, "NetStateCacheContents")
+                break
+    ExpectedProofFingerprint = _Fingerprint((
+        "physical-symbolic-port-pair-proof-v2",
+        Certificate.DomainFingerprint,
+        Certificate.LocalAccessFingerprintsBySignal,
+        Certificate.UnsupportedUnaryLocalAccess,
+        Certificate.UnsupportedLocalAccessPairs,
+        Certificate.UnsupportedUnarySeams,
+        Certificate.UnsupportedSeamPairs,
+        Certificate.NetStateDomainFingerprint,
+        Certificate.Complete,
+    ))
+    if Certificate.ProofFingerprint != ExpectedProofFingerprint:
+        Mismatches = (*Mismatches, "ProofFingerprint")
+    if Mismatches:
+        raise ValueError(
+            "physical symbolic port-pair certificate identity mismatch: "
+            + ", ".join(dict.fromkeys(Mismatches))
+        )
+
+
+def CompilePhysicalComponentSymbolicPortPairDomain(
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    SignalPair: Iterable[str],
+    *,
+    DeadlineSeconds: float | None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    NetStateCache: dict[str, Any] | None = None,
+    CompletedCertificateCache: dict[
+        str, PhysicalComponentSymbolicPortPairCertificate
+    ] | None = None,
+    CompleteCompatibilityIndexCache: dict[str, Any] | None = None,
+    RouteClaimsConstructionCache: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ] | None = None,
+) -> PhysicalComponentSymbolicPortPairCertificate:
+    """Compile exact unary/binary support across two complete seam domains."""
+    if not FactorDomain.Complete:
+        raise ValueError(
+            "symbolic port pair compilation requires a complete factor domain"
+        )
+    if not FactorDomain.Feasible:
+        raise ValueError(
+            "symbolic port pair compilation requires a feasible factor domain"
+        )
+    if (
+        Problem.PlacementFingerprint
+        != FactorDomain.PlacementFingerprint
+    ):
+        raise ValueError(
+            "symbolic port pair placement identity mismatch"
+        )
+    Signals = tuple(sorted(frozenset(map(str, SignalPair))))
+    if len(Signals) != 2:
+        raise ValueError("symbolic port pair compilation requires two signals")
+    FactorsBySignal, SeamFingerprintByLocalAccess = (
+        _SelectPhysicalComponentSymbolicPortPairFactors(
+            FactorDomain,
+            Signals,
+        )
+    )
+    Context = _BuildPhysicalComponentSymbolicPortPairContext(
+        Problem,
+        FactorDomain,
+        Signals,
+        FactorsBySignal,
+        SeamFingerprintByLocalAccess,
+    )
+    DomainFingerprint = Context["DomainFingerprint"]
+    EffectiveNetStateCache = (
+        NetStateCache if NetStateCache is not None else {}
+    )
+    Cached = (
+        CompletedCertificateCache.get(DomainFingerprint)
+        if CompletedCertificateCache is not None
+        else None
+    )
+    if Cached is not None:
+        ValidatePhysicalComponentSymbolicPortPairCertificate(
+            Cached,
+            Problem,
+            FactorDomain,
+            Signals,
+            NetStateCache=EffectiveNetStateCache,
+        )
+        return Cached
+    StartedAt = monotonic()
+    # Signal-local tree-frontier contexts are independent of the subsequently
+    # selected global boundary tuple.  Bind them to the immutable prepared
+    # factor domain so unary compilation performed before CSP assignment and
+    # later binary certificates share the same exact state cache.
+    RelaxedProblem = replace(
+        FactorDomain.Problem,
+        ReservedGlobalClaimsBySignal=(),
+    )
+    PreparedNetStateContexts = {
+        Signal: PrepareComponentSymbolicNetStateContext(
+            RelaxedProblem,
+            Signal,
+            RouteClaimsConstructionCache=(
+                RouteClaimsConstructionCache
+            ),
+        )
+        for Signal in Signals
+    }
+
+    StatesBySignalAndLocalAccess: dict[
+        tuple[str, str], tuple[Any, ...]
+    ] = {}
+    NetStateCacheKeys = []
+    NetStateBindings = []
+    Complete = True
+    for Signal in Signals:
+        VariantProblemsByAccess = {
+            LocalAccessFingerprint: (
+                _BuildPhysicalComponentSymbolicPortPairVariantProblem(
+                    RelaxedProblem,
+                    Signal,
+                    LocalAccessFingerprint,
+                    Factor,
+                )
+            )
+            for LocalAccessFingerprint, Factor in sorted(
+                FactorsBySignal[Signal].items()
+            )
+        }
+        RemainingDeadline = (
+            None
+            if DeadlineSeconds is None
+            else max(
+                0.0,
+                DeadlineSeconds - (monotonic() - StartedAt),
+            )
+        )
+        CompilationsByAccess = (
+            CompilePreparedComponentPhysicalFactorStateBatch(
+                PreparedNetStateContexts[Signal],
+                VariantProblemsByAccess,
+                DeadlineSeconds=RemainingDeadline,
+                WorkCheck=WorkCheck,
+                SymbolicNetStateCache=EffectiveNetStateCache,
+            )
+        )
+        for LocalAccessFingerprint in sorted(VariantProblemsByAccess):
+            Compilation = CompilationsByAccess[LocalAccessFingerprint]
+            CacheKey = Compilation.CacheKey
+            if not Compilation.Complete or Compilation.States is None:
+                Complete = False
+                break
+            States = Compilation.States
+            StatesBySignalAndLocalAccess[
+                (Signal, LocalAccessFingerprint)
+            ] = tuple(States)
+            NetStateCacheKeys.append((
+                Signal,
+                LocalAccessFingerprint,
+                CacheKey,
+            ))
+            NetStateBindings.append((
+                Signal,
+                LocalAccessFingerprint,
+                CacheKey,
+                _BuildPhysicalComponentSymbolicNetStateFingerprint(States),
+            ))
+        if not Complete:
+            break
+
+    # A port-pair certificate is support in the complete closed component,
+    # not merely pairwise non-overlap between those two nets. Compile every
+    # other mandatory component-signal domain once and existentially include
+    # it in each candidate pair check. Other interface signals may choose any
+    # supported local access; internal signals use their unbound exact state
+    # domain.
+    MandatoryStateDomains: list[tuple[Any, ...]] = []
+    MandatoryStateDomainsBySignal: dict[str, tuple[Any, ...]] = {}
+    AllLocalFactorsBySignal = dict(
+        FactorDomain.LocalAccessFactorsBySignal
+    )
+    SupportedAccessesBySignal = {
+        str(Signal): frozenset(
+            str(Support.LocalAccessFingerprint)
+            for Support in Supports
+        )
+        for Signal, Supports
+        in FactorDomain.LocalApertureSupportBySignal
+    }
+    if Complete:
+        # Unary and binary port certificates describe the exact local
+        # support relation at their stated arity.  Requiring every pair to
+        # extend through all remaining component nets turns this stage into
+        # repeated higher-order routing.  Complete multi-net capacity is
+        # proved by ``ProveClosedComponentSymbolicCapacityEligibility`` and
+        # its higher-order certificate path after CSP selection.
+        for OtherSignal in (
+            Signal
+            for Signal in sorted(Problem.ComponentSignals)
+            if str(Signal) not in Signals
+        ):
+            OtherFactors = {
+                str(Factor.LocalAccessFingerprint): Factor
+                for Factor in AllLocalFactorsBySignal.get(
+                    OtherSignal,
+                    (),
+                )
+                if str(Factor.LocalAccessFingerprint)
+                in SupportedAccessesBySignal.get(
+                    OtherSignal,
+                    frozenset(),
+                )
+            }
+            OtherContext = PrepareComponentSymbolicNetStateContext(
+                RelaxedProblem,
+                OtherSignal,
+                RouteClaimsConstructionCache=(
+                    RouteClaimsConstructionCache
+                ),
+            )
+            RemainingDeadline = (
+                None
+                if DeadlineSeconds is None
+                else max(
+                    0.0,
+                    DeadlineSeconds - (monotonic() - StartedAt),
+                )
+            )
+            if OtherFactors:
+                OtherProblems = {
+                    LocalAccessFingerprint: (
+                        _BuildPhysicalComponentSymbolicPortPairVariantProblem(
+                            RelaxedProblem,
+                            OtherSignal,
+                            LocalAccessFingerprint,
+                            Factor,
+                        )
+                    )
+                    for LocalAccessFingerprint, Factor
+                    in sorted(OtherFactors.items())
+                }
+                OtherCompilations = (
+                    CompilePreparedComponentPhysicalFactorStateBatch(
+                        OtherContext,
+                        OtherProblems,
+                        DeadlineSeconds=RemainingDeadline,
+                        WorkCheck=WorkCheck,
+                        SymbolicNetStateCache={},
+                    )
+                )
+                OtherStates = []
+                for LocalAccessFingerprint in sorted(OtherProblems):
+                    Compilation = OtherCompilations[
+                        LocalAccessFingerprint
+                    ]
+                    if (
+                        not Compilation.Complete
+                        or Compilation.States is None
+                    ):
+                        Complete = False
+                        break
+                    OtherStates.extend(Compilation.States)
+                    # Mandatory-domain support is used only to invalidate
+                    # unsupported local access pairs; it is not part of the
+                    # pair-certificate cache identity.
+            else:
+                Compilation = CompilePreparedComponentSymbolicNetStates(
+                    OtherContext,
+                    RelaxedProblem,
+                    DeadlineSeconds=RemainingDeadline,
+                    WorkCheck=WorkCheck,
+                    SymbolicNetStateCache={},
+                )
+                if not Compilation.Complete or Compilation.States is None:
+                    Complete = False
+                    break
+                OtherStates = list(Compilation.States)
+            if not Complete or not OtherStates:
+                Complete = False
+                break
+            OtherStateDomain = tuple(OtherStates)
+            MandatoryStateDomains.append(OtherStateDomain)
+            MandatoryStateDomainsBySignal[OtherSignal] = OtherStateDomain
+
+    UnsupportedUnaryLocalAccess = tuple(sorted(
+        (Signal, LocalAccessFingerprint)
+        for (Signal, LocalAccessFingerprint), States
+        in StatesBySignalAndLocalAccess.items()
+        if not States
+    ))
+    UnsupportedLocalAccessPairs = []
+    CompatibilityCheckCount = 0
+    ConflictIndexCache: dict[
+        tuple[str, ...],
+        tuple[dict[str, dict[Position3, int]], int],
+    ] = {}
+
+    def BuildConflictIndexes(
+        States: tuple[Any, ...],
+    ) -> tuple[dict[str, dict[Position3, int]], int]:
+        Key = tuple(State.NetFingerprint for State in States)
+        CachedIndexes = ConflictIndexCache.get(Key)
+        if CachedIndexes is not None:
+            return CachedIndexes
+        Mutable = {
+            "Wire": {},
+            "Support": {},
+            "Air": {},
+            "Electrical": {},
+        }
+        for Index, State in enumerate(States):
+            Bit = 1 << Index
+            for Name, Cells in (
+                ("Wire", State.Claims.WireCells),
+                ("Support", State.Claims.SupportCells),
+                ("Air", State.Claims.RequiredAirCells),
+                ("Electrical", State.Claims.ElectricalCells),
+            ):
+                IndexByCell = Mutable[Name]
+                for Cell in Cells:
+                    IndexByCell[Cell] = IndexByCell.get(Cell, 0) | Bit
+        Result = (Mutable, (1 << len(States)) - 1)
+        ConflictIndexCache[Key] = Result
+        return Result
+
+    def BuildFirstStateConflictMask(
+        FirstState: Any,
+        SecondIndexes: dict[str, dict[Position3, int]],
+        AllSecondStatesMask: int,
+    ) -> int:
+        ConflictMask = 0
+
+        def Add(Cells: Iterable[Position3], Names: tuple[str, ...]) -> None:
+            nonlocal ConflictMask
+            for Cell in Cells:
+                for Name in Names:
+                    ConflictMask |= SecondIndexes[Name].get(Cell, 0)
+                if ConflictMask == AllSecondStatesMask:
+                    return
+
+        Add(
+            FirstState.Claims.WireCells,
+            ("Wire", "Support", "Air", "Electrical"),
+        )
+        if ConflictMask != AllSecondStatesMask:
+            Add(FirstState.Claims.SupportCells, ("Wire", "Air"))
+        if ConflictMask != AllSecondStatesMask:
+            Add(FirstState.Claims.RequiredAirCells, ("Wire", "Support"))
+        if ConflictMask != AllSecondStatesMask:
+            Add(FirstState.Claims.ElectricalCells, ("Wire",))
+        return ConflictMask
+
+    if Complete and not MandatoryStateDomains:
+        FirstSignal, SecondSignal = Signals
+        FlattenedSecondStates = tuple(
+            State
+            for SecondAccess in sorted(FactorsBySignal[SecondSignal])
+            for State in StatesBySignalAndLocalAccess[
+                (SecondSignal, SecondAccess)
+            ]
+        )
+        SecondAccessMasks = {}
+        SecondStateOffset = 0
+        for SecondAccess in sorted(FactorsBySignal[SecondSignal]):
+            StateCount = len(StatesBySignalAndLocalAccess[
+                (SecondSignal, SecondAccess)
+            ])
+            SecondAccessMasks[SecondAccess] = (
+                ((1 << StateCount) - 1) << SecondStateOffset
+                if StateCount
+                else 0
+            )
+            SecondStateOffset += StateCount
+        SecondIndexes, AllSecondStatesMask = BuildConflictIndexes(
+            FlattenedSecondStates
+        )
+        for FirstAccess in sorted(FactorsBySignal[FirstSignal]):
+            FirstStates = StatesBySignalAndLocalAccess[
+                (FirstSignal, FirstAccess)
+            ]
+            SupportedSecondStateMask = 0
+            for FirstState in FirstStates:
+                CompatibilityCheckCount += len(FlattenedSecondStates)
+                if (
+                    WorkCheck is not None
+                    and CompatibilityCheckCount % 128
+                    < len(FlattenedSecondStates)
+                ):
+                    WorkCheck({
+                        "Stage": (
+                            "physical-symbolic-port-pair-compatibility"
+                        ),
+                        "SignalPair": list(Signals),
+                        "CompatibilityCheckCount": (
+                            CompatibilityCheckCount
+                        ),
+                        "CompatibilityIndexKind": (
+                            "flattened-claim-cell-bitset-v2"
+                        ),
+                    })
+                ConflictMask = BuildFirstStateConflictMask(
+                    FirstState,
+                    SecondIndexes,
+                    AllSecondStatesMask,
+                )
+                SupportedSecondStateMask |= (
+                    AllSecondStatesMask & ~ConflictMask
+                )
+                if SupportedSecondStateMask == AllSecondStatesMask:
+                    break
+            for SecondAccess in sorted(FactorsBySignal[SecondSignal]):
+                if (
+                    SupportedSecondStateMask
+                    & SecondAccessMasks[SecondAccess]
+                ):
+                    continue
+                UnsupportedLocalAccessPairs.append((
+                    (FirstSignal, FirstAccess),
+                    (SecondSignal, SecondAccess),
+                ))
+    elif Complete:
+        FirstSignal, SecondSignal = Signals
+        # Normalize every signal to one immutable state domain.  Accesses are
+        # masks over those domains; they must not rebuild a different target
+        # tuple (and therefore a different conflict matrix) for every access
+        # pair.  This is the same exact k-partite relation used by the
+        # higher-order compiler, specialized to two restricted domains plus
+        # the complete mandatory component domain.
+        def NormalizeStateDomain(
+            States: Iterable[Any],
+        ) -> tuple[Any, ...]:
+            StateByFingerprint = {}
+            for State in States:
+                Fingerprint = str(State.NetFingerprint)
+                Existing = StateByFingerprint.get(Fingerprint)
+                if Existing is not None and Existing != State:
+                    raise ValueError(
+                        "port-pair symbolic net-state identity collision"
+                    )
+                StateByFingerprint[Fingerprint] = State
+            return tuple(
+                StateByFingerprint[Fingerprint]
+                for Fingerprint in sorted(StateByFingerprint)
+            )
+
+        CanonicalSignals = tuple(sorted(Problem.ComponentSignals))
+        DomainsToSearch = tuple(
+            NormalizeStateDomain(
+                (
+                    State
+                    for Access in sorted(FactorsBySignal[Signal])
+                    for State in StatesBySignalAndLocalAccess[
+                        (Signal, Access)
+                    ]
+                )
+                if Signal in Signals
+                else MandatoryStateDomainsBySignal[Signal]
+            )
+            for Signal in CanonicalSignals
+        )
+        StateIndexByFingerprint = tuple(
+            {
+                str(State.NetFingerprint): Index
+                for Index, State in enumerate(Domain)
+            }
+            for Domain in DomainsToSearch
+        )
+        AccessMasks = {}
+        SignalIndexByName = {
+            Signal: Index
+            for Index, Signal in enumerate(CanonicalSignals)
+        }
+        for Signal in Signals:
+            SignalIndex = SignalIndexByName[Signal]
+            for Access in sorted(FactorsBySignal[Signal]):
+                Mask = 0
+                for State in StatesBySignalAndLocalAccess[(Signal, Access)]:
+                    Mask |= 1 << StateIndexByFingerprint[SignalIndex][
+                        str(State.NetFingerprint)
+                    ]
+                AccessMasks[(Signal, Access)] = Mask
+        CompatibilityIndexFingerprint = _Fingerprint((
+            "complete-component-compatibility-index-v2",
+            Problem.PlacementFingerprint,
+            FactorDomain.DomainFingerprint,
+            tuple(
+                (
+                    Signal,
+                    tuple(State.NetFingerprint for State in Domain),
+                )
+                for Signal, Domain in zip(
+                    CanonicalSignals,
+                    DomainsToSearch,
+                )
+            ),
+        ))
+        CachedCompatibilityIndex = (
+            CompleteCompatibilityIndexCache.get(
+                CompatibilityIndexFingerprint
+            )
+            if CompleteCompatibilityIndexCache is not None
+            else None
+        )
+        if CachedCompatibilityIndex is None:
+            PairCompatibleStateMasks: dict[
+                tuple[int, int, int], int
+            ] = {}
+            for FirstDomainIndex in range(len(DomainsToSearch)):
+                FirstDomain = DomainsToSearch[FirstDomainIndex]
+                for SecondDomainIndex in range(
+                    FirstDomainIndex + 1,
+                    len(DomainsToSearch),
+                ):
+                    SecondDomain = DomainsToSearch[SecondDomainIndex]
+                    SecondIndexes, AllSecondStatesMask = (
+                        BuildConflictIndexes(SecondDomain)
+                    )
+                    for FirstStateIndex, State in enumerate(FirstDomain):
+                        ConflictMask = BuildFirstStateConflictMask(
+                            State,
+                            SecondIndexes,
+                            AllSecondStatesMask,
+                        )
+                        CompatibleMask = (
+                            AllSecondStatesMask & ~ConflictMask
+                        )
+                        PairCompatibleStateMasks[(
+                            FirstDomainIndex,
+                            FirstStateIndex,
+                            SecondDomainIndex,
+                        )] = CompatibleMask
+                        CompatibilityCheckCount += len(SecondDomain)
+                        if (
+                            WorkCheck is not None
+                            and CompatibilityCheckCount % 16384
+                            < len(SecondDomain)
+                        ):
+                            WorkCheck({
+                                "Stage": (
+                                    "physical-symbolic-port-pair-complete-"
+                                    "component-compatibility"
+                                ),
+                                "SignalPair": list(Signals),
+                                "MandatorySignalDomainCount": len(
+                                    MandatoryStateDomains
+                                ),
+                                "CompatibilityCheckCount": (
+                                    CompatibilityCheckCount
+                                ),
+                                "CompatibilityIndexKind": (
+                                    "normalized-claim-cell-bitset-v2"
+                                ),
+                            })
+                    # Build the reverse relation directly from the same
+                    # claim-cell indexes.  Transposing the forward bitsets by
+                    # walking every compatible state pair makes sparse claim
+                    # domains pay the full dense Cartesian-product cost in
+                    # Python.  Direct construction is exact and scales with
+                    # symbolic states plus their physical claims instead.
+                    FirstIndexes, AllFirstStatesMask = (
+                        BuildConflictIndexes(FirstDomain)
+                    )
+                    for SecondStateIndex, State in enumerate(SecondDomain):
+                        ConflictMask = BuildFirstStateConflictMask(
+                            State,
+                            FirstIndexes,
+                            AllFirstStatesMask,
+                        )
+                        PairCompatibleStateMasks[(
+                            SecondDomainIndex,
+                            SecondStateIndex,
+                            FirstDomainIndex,
+                        )] = AllFirstStatesMask & ~ConflictMask
+                        CompatibilityCheckCount += len(FirstDomain)
+                        if (
+                            WorkCheck is not None
+                            and CompatibilityCheckCount % 16384
+                            < len(FirstDomain)
+                        ):
+                            WorkCheck({
+                                "Stage": (
+                                    "physical-symbolic-port-pair-complete-"
+                                    "component-compatibility"
+                                ),
+                                "SignalPair": list(Signals),
+                                "MandatorySignalDomainCount": len(
+                                    MandatoryStateDomains
+                                ),
+                                "CompatibilityCheckCount": (
+                                    CompatibilityCheckCount
+                                ),
+                                "CompatibilityIndexKind": (
+                                    "normalized-claim-cell-bitset-v2"
+                                ),
+                            })
+            FailedCompatibilityResiduals: set[
+                tuple[int, tuple[int, ...]]
+            ] = set()
+            CompleteCompatibilityWitnesses: list[
+                tuple[int, ...]
+            ] = []
+            UnsupportedRestrictionMasks: dict[
+                tuple[int, int], list[tuple[int, int]]
+            ] = {}
+            ArcConsistencyCache: dict[
+                tuple[int, tuple[int, ...]], tuple[int, ...] | None
+            ] = {}
+            CachedCompatibilityIndex = {
+                "PairCompatibleStateMasks": (
+                    PairCompatibleStateMasks
+                ),
+                "FailedCompatibilityResiduals": (
+                    FailedCompatibilityResiduals
+                ),
+                "CompleteCompatibilityWitnesses": (
+                    CompleteCompatibilityWitnesses
+                ),
+                "UnsupportedRestrictionMasks": (
+                    UnsupportedRestrictionMasks
+                ),
+                "ArcConsistencyCache": ArcConsistencyCache,
+            }
+            if CompleteCompatibilityIndexCache is not None:
+                CompleteCompatibilityIndexCache[
+                    CompatibilityIndexFingerprint
+                ] = CachedCompatibilityIndex
+            CompatibilityIndexCacheHit = False
+        else:
+            PairCompatibleStateMasks = CachedCompatibilityIndex[
+                "PairCompatibleStateMasks"
+            ]
+            FailedCompatibilityResiduals = CachedCompatibilityIndex[
+                "FailedCompatibilityResiduals"
+            ]
+            CompleteCompatibilityWitnesses = CachedCompatibilityIndex[
+                "CompleteCompatibilityWitnesses"
+            ]
+            UnsupportedRestrictionMasks = CachedCompatibilityIndex[
+                "UnsupportedRestrictionMasks"
+            ]
+            ArcConsistencyCache = CachedCompatibilityIndex.setdefault(
+                "ArcConsistencyCache",
+                {},
+            )
+            CompatibilityIndexCacheHit = True
+        if WorkCheck is not None:
+            WorkCheck({
+                "Stage": (
+                    "physical-symbolic-port-pair-complete-component-"
+                    "compatibility-index-complete"
+                ),
+                "SignalPair": list(Signals),
+                "MandatorySignalDomainCount": len(MandatoryStateDomains),
+                "NormalizedStateDomainSizes": [
+                    len(Domain) for Domain in DomainsToSearch
+                ],
+                "CompatibilityCheckCount": CompatibilityCheckCount,
+                "CompatibilityIndexKind": (
+                    "normalized-claim-cell-bitset-v2"
+                ),
+                "CompatibilityIndexCacheHit": (
+                    CompatibilityIndexCacheHit
+                ),
+            })
+
+        def HasCompleteComponentSupport(
+            FirstAccess: str,
+            SecondAccess: str,
+        ) -> bool:
+            InitialMasksList = [
+                (1 << len(Domain)) - 1
+                for Domain in DomainsToSearch
+            ]
+            InitialMasksList[
+                SignalIndexByName[FirstSignal]
+            ] = AccessMasks[(FirstSignal, FirstAccess)]
+            InitialMasksList[
+                SignalIndexByName[SecondSignal]
+            ] = AccessMasks[(SecondSignal, SecondAccess)]
+            InitialMasks = tuple(InitialMasksList)
+            FirstSignalIndex = SignalIndexByName[FirstSignal]
+            SecondSignalIndex = SignalIndexByName[SecondSignal]
+            if any(
+                Witness[FirstSignalIndex]
+                & InitialMasks[FirstSignalIndex]
+                and Witness[SecondSignalIndex]
+                & InitialMasks[SecondSignalIndex]
+                for Witness in CompleteCompatibilityWitnesses
+            ):
+                return True
+            RestrictionKey = (
+                FirstSignalIndex,
+                SecondSignalIndex,
+            )
+            if any(
+                not (
+                    InitialMasks[FirstSignalIndex] & ~FirstMask
+                    or InitialMasks[SecondSignalIndex] & ~SecondMask
+                )
+                for FirstMask, SecondMask
+                in UnsupportedRestrictionMasks.get(
+                    RestrictionKey,
+                    (),
+                )
+            ):
+                return False
+            SelectedStateBits = [0] * len(DomainsToSearch)
+
+            def PropagateArcConsistency(
+                RemainingDomains: int,
+                AllowedMasks: tuple[int, ...],
+            ) -> tuple[int, ...] | None:
+                """Remove every state lacking support in a live domain.
+
+                Exact complete-component support is a binary-constraint CSP
+                over immutable symbolic net states.  Forward checking only
+                against the most recently selected state leaves large
+                mutually incompatible residual products intact.  Bitset arc
+                consistency reaches the required fixed point before search
+                and is shared by every aperture-pair restriction.
+                """
+                CacheKey = (RemainingDomains, AllowedMasks)
+                if CacheKey in ArcConsistencyCache:
+                    return ArcConsistencyCache[CacheKey]
+                MutableMasks = list(AllowedMasks)
+                RemainingIndexes = tuple(
+                    Index
+                    for Index in range(len(DomainsToSearch))
+                    if RemainingDomains & (1 << Index)
+                )
+                Changed = True
+                while Changed:
+                    Changed = False
+                    for SourceIndex in RemainingIndexes:
+                        SourceMask = MutableMasks[SourceIndex]
+                        SupportedSourceMask = 0
+                        CandidateMask = SourceMask
+                        while CandidateMask:
+                            CandidateBit = CandidateMask & -CandidateMask
+                            CandidateMask ^= CandidateBit
+                            CandidateStateIndex = (
+                                CandidateBit.bit_length() - 1
+                            )
+                            if all(
+                                TargetIndex == SourceIndex
+                                or bool(
+                                    PairCompatibleStateMasks[(
+                                        SourceIndex,
+                                        CandidateStateIndex,
+                                        TargetIndex,
+                                    )]
+                                    & MutableMasks[TargetIndex]
+                                )
+                                for TargetIndex in RemainingIndexes
+                            ):
+                                SupportedSourceMask |= CandidateBit
+                        if not SupportedSourceMask:
+                            ArcConsistencyCache[CacheKey] = None
+                            return None
+                        if SupportedSourceMask != SourceMask:
+                            MutableMasks[SourceIndex] = (
+                                SupportedSourceMask
+                            )
+                            Changed = True
+                Result = tuple(MutableMasks)
+                ArcConsistencyCache[CacheKey] = Result
+                return Result
+
+            def Search(
+                RemainingDomains: int,
+                AllowedMasks: tuple[int, ...],
+            ) -> bool:
+                if not RemainingDomains:
+                    return True
+                PropagatedMasks = PropagateArcConsistency(
+                    RemainingDomains,
+                    AllowedMasks,
+                )
+                if PropagatedMasks is None:
+                    return False
+                AllowedMasks = PropagatedMasks
+                ResidualKey = (RemainingDomains, AllowedMasks)
+                if ResidualKey in FailedCompatibilityResiduals:
+                    return False
+                RemainingIndexes = tuple(
+                    Index
+                    for Index in range(len(DomainsToSearch))
+                    if RemainingDomains & (1 << Index)
+                )
+                SelectedIndex = min(
+                    RemainingIndexes,
+                    key=lambda Index: (
+                        AllowedMasks[Index].bit_count(),
+                        Index,
+                    ),
+                )
+                CandidateMask = AllowedMasks[SelectedIndex]
+                NextRemainingDomains = (
+                    RemainingDomains & ~(1 << SelectedIndex)
+                )
+                while CandidateMask:
+                    CandidateBit = CandidateMask & -CandidateMask
+                    CandidateMask ^= CandidateBit
+                    CandidateStateIndex = (
+                        CandidateBit.bit_length() - 1
+                    )
+                    SelectedStateBits[SelectedIndex] = CandidateBit
+                    NextMasks = list(AllowedMasks)
+                    NextMasks[SelectedIndex] = 0
+                    Viable = True
+                    for TargetIndex in RemainingIndexes:
+                        if TargetIndex == SelectedIndex:
+                            continue
+                        NextMasks[TargetIndex] &= (
+                            PairCompatibleStateMasks[(
+                                SelectedIndex,
+                                CandidateStateIndex,
+                                TargetIndex,
+                            )]
+                        )
+                        if not NextMasks[TargetIndex]:
+                            Viable = False
+                            break
+                    if Viable and Search(
+                        NextRemainingDomains,
+                        tuple(NextMasks),
+                    ):
+                        return True
+                    SelectedStateBits[SelectedIndex] = 0
+                FailedCompatibilityResiduals.add(ResidualKey)
+                return False
+
+            if any(not Mask for Mask in InitialMasks):
+                return False
+            Supported = Search(
+                (1 << len(DomainsToSearch)) - 1,
+                InitialMasks,
+            )
+            if Supported:
+                CompleteCompatibilityWitnesses.append(
+                    tuple(SelectedStateBits)
+                )
+                return True
+            UnsupportedRestrictionMasks.setdefault(
+                RestrictionKey,
+                [],
+            ).append((
+                InitialMasks[FirstSignalIndex],
+                InitialMasks[SecondSignalIndex],
+            ))
+            return False
+
+        for FirstAccess in sorted(FactorsBySignal[FirstSignal]):
+            for SecondAccess in sorted(FactorsBySignal[SecondSignal]):
+                if WorkCheck is not None:
+                    WorkCheck({
+                        "Stage": (
+                            "physical-symbolic-port-pair-complete-component-"
+                            "compatibility"
+                        ),
+                        "SignalPair": list(Signals),
+                        "MandatorySignalDomainCount": len(
+                            MandatoryStateDomains
+                        ),
+                        "CompatibilityCheckCount": (
+                            CompatibilityCheckCount
+                        ),
+                    })
+                if HasCompleteComponentSupport(
+                    FirstAccess,
+                    SecondAccess,
+                ):
+                    continue
+                UnsupportedLocalAccessPairs.append((
+                    (FirstSignal, FirstAccess),
+                    (SecondSignal, SecondAccess),
+                ))
+    UnsupportedUnaryLocalAccessSet = frozenset(
+        UnsupportedUnaryLocalAccess
+    )
+    UnsupportedLocalAccessPairSet = frozenset(
+        frozenset(Value) for Value in UnsupportedLocalAccessPairs
+    )
+    AccessesBySignalAndSeam: dict[
+        tuple[str, str], set[str]
+    ] = {}
+    for (Signal, LocalAccessFingerprint), SeamFingerprint in (
+        SeamFingerprintByLocalAccess.items()
+    ):
+        AccessesBySignalAndSeam.setdefault(
+            (Signal, SeamFingerprint),
+            set(),
+        ).add(LocalAccessFingerprint)
+    UnsupportedUnarySeams = tuple(sorted(
+        (Signal, SeamFingerprint)
+        for (Signal, SeamFingerprint), Accesses
+        in AccessesBySignalAndSeam.items()
+        if all(
+            (Signal, Access) in UnsupportedUnaryLocalAccessSet
+            for Access in Accesses
+        )
+    ))
+    UnsupportedSeamPairs = []
+    if Complete:
+        FirstSignal, SecondSignal = Signals
+        FirstSeams = tuple(sorted(
+            Seam
+            for Signal, Seam in AccessesBySignalAndSeam
+            if Signal == FirstSignal
+        ))
+        SecondSeams = tuple(sorted(
+            Seam
+            for Signal, Seam in AccessesBySignalAndSeam
+            if Signal == SecondSignal
+        ))
+        for FirstSeam in FirstSeams:
+            for SecondSeam in SecondSeams:
+                if all(
+                    (
+                        (FirstSignal, FirstAccess)
+                        in UnsupportedUnaryLocalAccessSet
+                        or (SecondSignal, SecondAccess)
+                        in UnsupportedUnaryLocalAccessSet
+                        or frozenset((
+                            (FirstSignal, FirstAccess),
+                            (SecondSignal, SecondAccess),
+                        )) in UnsupportedLocalAccessPairSet
+                    )
+                    for FirstAccess in AccessesBySignalAndSeam[
+                        (FirstSignal, FirstSeam)
+                    ]
+                    for SecondAccess in AccessesBySignalAndSeam[
+                        (SecondSignal, SecondSeam)
+                    ]
+                ):
+                    UnsupportedSeamPairs.append((
+                        (FirstSignal, FirstSeam),
+                        (SecondSignal, SecondSeam),
+                    ))
+    NetStateBindingsTuple = tuple(sorted(NetStateBindings))
+    NetStateDomainFingerprint = _Fingerprint((
+        "physical-symbolic-port-pair-state-bindings-v1",
+        NetStateBindingsTuple,
+    ))
+    LocalAccessFingerprintsBySignal = tuple(
+        (
+            Signal,
+            tuple(sorted(FactorsBySignal[Signal])),
+        )
+        for Signal in Signals
+    )
+    ProofFingerprint = _Fingerprint((
+        "physical-symbolic-port-pair-proof-v2",
+        DomainFingerprint,
+        LocalAccessFingerprintsBySignal,
+        UnsupportedUnaryLocalAccess,
+        tuple(UnsupportedLocalAccessPairs),
+        UnsupportedUnarySeams,
+        tuple(UnsupportedSeamPairs),
+        NetStateDomainFingerprint,
+        Complete,
+    ))
+    Certificate = PhysicalComponentSymbolicPortPairCertificate(
+        DomainFingerprint=DomainFingerprint,
+        PreparedDomainFingerprint=Context["PreparedDomainFingerprint"],
+        PlacementFingerprint=Context["PlacementFingerprint"],
+        ComponentGraphFingerprint=Context["ComponentGraphFingerprint"],
+        FabricFingerprint=Context["FabricFingerprint"],
+        ResourceGraphFingerprint=Context["ResourceGraphFingerprint"],
+        TechnologyFingerprint=Context["TechnologyFingerprint"],
+        AccessCertificateFingerprint=(
+            Context["AccessCertificateFingerprint"]
+        ),
+        InterfaceFingerprint=Context["InterfaceFingerprint"],
+        LocalAccessDomainFingerprint=(
+            Context["LocalAccessDomainFingerprint"]
+        ),
+        SeamDomainFingerprint=Context["SeamDomainFingerprint"],
+        SignalPair=Signals,
+        LocalAccessFingerprintsBySignal=(
+            LocalAccessFingerprintsBySignal
+        ),
+        SeamFingerprintByLocalAccess=tuple(sorted(
+            (
+                Signal,
+                LocalAccessFingerprint,
+                SeamFingerprint,
+            )
+            for (Signal, LocalAccessFingerprint), SeamFingerprint
+            in SeamFingerprintByLocalAccess.items()
+        )),
+        SeamFingerprintsBySignal=tuple(
+            (
+                Signal,
+                tuple(sorted({
+                    SeamFingerprintByLocalAccess[(
+                        Signal,
+                        LocalAccessFingerprint,
+                    )]
+                    for LocalAccessFingerprint
+                    in FactorsBySignal[Signal]
+                })),
+            )
+            for Signal in Signals
+        ),
+        UnsupportedUnaryLocalAccess=(
+            UnsupportedUnaryLocalAccess
+        ),
+        UnsupportedLocalAccessPairs=tuple(
+            UnsupportedLocalAccessPairs
+        ),
+        UnsupportedUnarySeams=UnsupportedUnarySeams,
+        UnsupportedSeamPairs=tuple(UnsupportedSeamPairs),
+        NetStateCacheKeys=tuple(sorted(NetStateCacheKeys)),
+        NetStateBindings=NetStateBindingsTuple,
+        NetStateDomainFingerprint=NetStateDomainFingerprint,
+        ProofFingerprint=ProofFingerprint,
+        Complete=Complete,
+    )
+    ValidatePhysicalComponentSymbolicPortPairCertificate(
+        Certificate,
+        Problem,
+        FactorDomain,
+        Signals,
+        NetStateCache=EffectiveNetStateCache,
+    )
+    if Complete and CompletedCertificateCache is not None:
+        CompletedCertificateCache[DomainFingerprint] = Certificate
+    return Certificate
+
+
+def _BuildPhysicalComponentSymbolicHigherOrderContext(
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    Signals: tuple[str, ...],
+    FactorsBySignal: dict[str, dict[str, Any]],
+    SeamFingerprintByLocalAccess: dict[tuple[str, str], str],
+) -> dict[str, str]:
+    """Build immutable identities for a complete higher-order proof."""
+    PairContext = _BuildPhysicalComponentSymbolicPortPairContext(
+        Problem,
+        FactorDomain,
+        Signals,
+        FactorsBySignal,
+        SeamFingerprintByLocalAccess,
+    )
+    Result = dict(PairContext)
+    Result["DomainFingerprint"] = _Fingerprint((
+        "physical-symbolic-higher-order-domain-v1",
+        Signals,
+        tuple(
+            (Name, Value)
+            for Name, Value in sorted(PairContext.items())
+            if Name != "DomainFingerprint"
+        ),
+    ))
+    return Result
+
+
+def ValidatePhysicalComponentSymbolicHigherOrderCertificate(
+    Certificate: PhysicalComponentSymbolicHigherOrderCertificate,
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    SignalDomain: Iterable[str],
+    *,
+    NetStateCache: dict[str, Any] | None = None,
+) -> None:
+    """Reject a higher-order proof if any structural identity has drifted."""
+    Signals = tuple(sorted(frozenset(map(str, SignalDomain))))
+    if len(Signals) < 3:
+        raise ValueError(
+            "symbolic higher-order validation requires at least three signals"
+        )
+    FactorsBySignal, SeamFingerprintByLocalAccess = (
+        _SelectPhysicalComponentSymbolicPortPairFactors(
+            FactorDomain,
+            Signals,
+        )
+    )
+    Context = _BuildPhysicalComponentSymbolicHigherOrderContext(
+        Problem,
+        FactorDomain,
+        Signals,
+        FactorsBySignal,
+        SeamFingerprintByLocalAccess,
+    )
+    FieldValues = {
+        "DomainFingerprint": Certificate.DomainFingerprint,
+        "PreparedDomainFingerprint": Certificate.PreparedDomainFingerprint,
+        "PlacementFingerprint": Certificate.PlacementFingerprint,
+        "ComponentGraphFingerprint": Certificate.ComponentGraphFingerprint,
+        "FabricFingerprint": Certificate.FabricFingerprint,
+        "ResourceGraphFingerprint": Certificate.ResourceGraphFingerprint,
+        "TechnologyFingerprint": Certificate.TechnologyFingerprint,
+        "AccessCertificateFingerprint": (
+            Certificate.AccessCertificateFingerprint
+        ),
+        "InterfaceFingerprint": Certificate.InterfaceFingerprint,
+        "LocalAccessDomainFingerprint": (
+            Certificate.LocalAccessDomainFingerprint
+        ),
+        "SeamDomainFingerprint": Certificate.SeamDomainFingerprint,
+    }
+    Mismatches = [
+        Name
+        for Name, Expected in Context.items()
+        if str(FieldValues.get(Name, "")) != str(Expected)
+    ]
+    ExpectedAccesses = tuple(
+        (Signal, tuple(sorted(FactorsBySignal[Signal])))
+        for Signal in Signals
+    )
+    ExpectedSeams = tuple(sorted(
+        (
+            Signal,
+            LocalAccessFingerprint,
+            SeamFingerprint,
+        )
+        for (Signal, LocalAccessFingerprint), SeamFingerprint
+        in SeamFingerprintByLocalAccess.items()
+    ))
+    if Certificate.SignalDomain != Signals:
+        Mismatches.append("SignalDomain")
+    if Certificate.LocalAccessFingerprintsBySignal != ExpectedAccesses:
+        Mismatches.append("LocalAccessFingerprintsBySignal")
+    if Certificate.SeamFingerprintByLocalAccess != ExpectedSeams:
+        Mismatches.append("SeamFingerprintByLocalAccess")
+    BindingKeys = tuple(
+        (Signal, LocalAccessFingerprint, CacheKey)
+        for Signal, LocalAccessFingerprint, CacheKey, _StateFingerprint
+        in Certificate.NetStateBindings
+    )
+    if BindingKeys != Certificate.NetStateCacheKeys:
+        Mismatches.append("NetStateCacheKeys")
+    ExpectedBindingFingerprint = _Fingerprint((
+        "physical-symbolic-higher-order-state-bindings-v1",
+        Certificate.NetStateBindings,
+    ))
+    if Certificate.NetStateDomainFingerprint != ExpectedBindingFingerprint:
+        Mismatches.append("NetStateDomainFingerprint")
+    if NetStateCache is not None:
+        for (
+            _Signal,
+            _LocalAccessFingerprint,
+            CacheKey,
+            StateFingerprint,
+        ) in Certificate.NetStateBindings:
+            Cached = NetStateCache.get(CacheKey)
+            if Cached is None:
+                continue
+            States, _Diagnostics = Cached
+            if (
+                _BuildPhysicalComponentSymbolicNetStateFingerprint(States)
+                != StateFingerprint
+            ):
+                Mismatches.append("NetStateCacheContents")
+                break
+    ExpectedProofFingerprint = _Fingerprint((
+        "physical-symbolic-higher-order-proof-v1",
+        Certificate.DomainFingerprint,
+        Certificate.LocalAccessFingerprintsBySignal,
+        Certificate.SupportedLocalAccessTuples,
+        Certificate.SupportedSeamTuples,
+        Certificate.NetStateDomainFingerprint,
+        Certificate.CompatibilityCheckCount,
+        Certificate.Complete,
+    ))
+    if Certificate.ProofFingerprint != ExpectedProofFingerprint:
+        Mismatches.append("ProofFingerprint")
+    if Mismatches:
+        raise ValueError(
+            "physical symbolic higher-order certificate identity mismatch: "
+            + ", ".join(dict.fromkeys(Mismatches))
+        )
+
+
+def CompilePhysicalComponentSymbolicHigherOrderDomain(
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    SignalDomain: Iterable[str],
+    *,
+    DeadlineSeconds: float | None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    NetStateCache: dict[str, Any] | None = None,
+    CompletedCertificateCache: dict[
+        str, PhysicalComponentSymbolicHigherOrderCertificate
+    ] | None = None,
+    RouteClaimsConstructionCache: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ] | None = None,
+) -> PhysicalComponentSymbolicHigherOrderCertificate:
+    """Compile the exact joint local-state relation for 3+ signal seams."""
+    if not FactorDomain.Complete or not FactorDomain.Feasible:
+        raise ValueError(
+            "higher-order compilation requires a complete feasible factor domain"
+        )
+    if Problem.PlacementFingerprint != FactorDomain.PlacementFingerprint:
+        raise ValueError("higher-order placement identity mismatch")
+    Signals = tuple(sorted(frozenset(map(str, SignalDomain))))
+    if len(Signals) < 3:
+        raise ValueError(
+            "symbolic higher-order compilation requires at least three signals"
+        )
+    FactorsBySignal, SeamFingerprintByLocalAccess = (
+        _SelectPhysicalComponentSymbolicPortPairFactors(
+            FactorDomain,
+            Signals,
+        )
+    )
+    Context = _BuildPhysicalComponentSymbolicHigherOrderContext(
+        Problem,
+        FactorDomain,
+        Signals,
+        FactorsBySignal,
+        SeamFingerprintByLocalAccess,
+    )
+    DomainFingerprint = Context["DomainFingerprint"]
+    EffectiveNetStateCache = (
+        NetStateCache if NetStateCache is not None else {}
+    )
+    Cached = (
+        CompletedCertificateCache.get(DomainFingerprint)
+        if CompletedCertificateCache is not None
+        else None
+    )
+    if Cached is not None:
+        ValidatePhysicalComponentSymbolicHigherOrderCertificate(
+            Cached,
+            Problem,
+            FactorDomain,
+            Signals,
+            NetStateCache=EffectiveNetStateCache,
+        )
+        return Cached
+
+    StartedAt = monotonic()
+    RelaxedProblem = replace(Problem, ReservedGlobalClaimsBySignal=())
+    PreparedNetStateContexts = {
+        Signal: PrepareComponentSymbolicNetStateContext(
+            RelaxedProblem,
+            Signal,
+            RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+        )
+        for Signal in Signals
+    }
+    StatesBySignalAndLocalAccess: dict[
+        tuple[str, str], tuple[Any, ...]
+    ] = {}
+    NetStateCacheKeys: list[tuple[str, str, str]] = []
+    NetStateBindings: list[tuple[str, str, str, str]] = []
+    Complete = True
+    for Signal in Signals:
+        VariantProblemsByAccess = {
+            LocalAccessFingerprint: (
+                _BuildPhysicalComponentSymbolicPortPairVariantProblem(
+                    RelaxedProblem,
+                    Signal,
+                    LocalAccessFingerprint,
+                    Factor,
+                )
+            )
+            for LocalAccessFingerprint, Factor
+            in sorted(FactorsBySignal[Signal].items())
+        }
+        RemainingDeadline = (
+            None
+            if DeadlineSeconds is None
+            else max(0.0, DeadlineSeconds - (monotonic() - StartedAt))
+        )
+        CompilationsByAccess = (
+            CompilePreparedComponentPhysicalFactorStateBatch(
+                PreparedNetStateContexts[Signal],
+                VariantProblemsByAccess,
+                DeadlineSeconds=RemainingDeadline,
+                WorkCheck=WorkCheck,
+                SymbolicNetStateCache=EffectiveNetStateCache,
+            )
+        )
+        for LocalAccessFingerprint in sorted(VariantProblemsByAccess):
+            Compilation = CompilationsByAccess[LocalAccessFingerprint]
+            if not Compilation.Complete or Compilation.States is None:
+                Complete = False
+                break
+            States = tuple(Compilation.States)
+            StatesBySignalAndLocalAccess[
+                (Signal, LocalAccessFingerprint)
+            ] = States
+            NetStateCacheKeys.append((
+                Signal,
+                LocalAccessFingerprint,
+                Compilation.CacheKey,
+            ))
+            NetStateBindings.append((
+                Signal,
+                LocalAccessFingerprint,
+                Compilation.CacheKey,
+                _BuildPhysicalComponentSymbolicNetStateFingerprint(States),
+            ))
+        if not Complete:
+            break
+
+    SupportedLocalAccessTuples: set[
+        tuple[tuple[str, str], ...]
+    ] = set()
+    CompatibilityCheckCount = 0
+    CompatibilitySearchStateCount = 0
+
+    # Compile the higher-order relation once over deduplicated symbolic net
+    # states.  The earlier access-tuple implementation repeated Python set
+    # conflict checks for every local-factor product.  These immutable
+    # bitsets turn the same exact problem into a k-partite compatibility CSP
+    # whose state relation is reusable across every access and seam tuple.
+    UniqueStatesBySignal: dict[str, tuple[Any, ...]] = {}
+    AccessStateMasks: dict[tuple[str, str], int] = {}
+    PairCompatibleStateMasks: dict[tuple[int, int, int], int] = {}
+    if Complete:
+        for Signal in Signals:
+            StateByFingerprint: dict[str, Any] = {}
+            for Access in sorted(FactorsBySignal[Signal]):
+                for State in StatesBySignalAndLocalAccess[(Signal, Access)]:
+                    Fingerprint = str(State.NetFingerprint)
+                    Existing = StateByFingerprint.get(Fingerprint)
+                    if Existing is not None and Existing != State:
+                        raise ValueError(
+                            "higher-order symbolic net-state identity "
+                            "collision"
+                        )
+                    StateByFingerprint[Fingerprint] = State
+            States = tuple(
+                StateByFingerprint[Fingerprint]
+                for Fingerprint in sorted(StateByFingerprint)
+            )
+            UniqueStatesBySignal[Signal] = States
+            StateIndexByFingerprint = {
+                str(State.NetFingerprint): Index
+                for Index, State in enumerate(States)
+            }
+            for Access in sorted(FactorsBySignal[Signal]):
+                Mask = 0
+                for State in StatesBySignalAndLocalAccess[(Signal, Access)]:
+                    Mask |= 1 << StateIndexByFingerprint[
+                        str(State.NetFingerprint)
+                    ]
+                AccessStateMasks[(Signal, Access)] = Mask
+
+        for FirstSignalIndex in range(len(Signals)):
+            FirstSignal = Signals[FirstSignalIndex]
+            FirstStates = UniqueStatesBySignal[FirstSignal]
+            for SecondSignalIndex in range(
+                FirstSignalIndex + 1,
+                len(Signals),
+            ):
+                SecondSignal = Signals[SecondSignalIndex]
+                SecondStates = UniqueStatesBySignal[SecondSignal]
+                ReverseMasks = [0] * len(SecondStates)
+                SecondClaimIndexes: dict[
+                    str, dict[Position3, int]
+                ] = {
+                    "Wire": {},
+                    "Support": {},
+                    "Air": {},
+                    "Electrical": {},
+                }
+                for SecondStateIndex, SecondState in enumerate(
+                    SecondStates
+                ):
+                    StateBit = 1 << SecondStateIndex
+                    for Name, Cells in (
+                        ("Wire", SecondState.Claims.WireCells),
+                        ("Support", SecondState.Claims.SupportCells),
+                        ("Air", SecondState.Claims.RequiredAirCells),
+                        (
+                            "Electrical",
+                            SecondState.Claims.ElectricalCells,
+                        ),
+                    ):
+                        IndexByCell = SecondClaimIndexes[Name]
+                        for Cell in Cells:
+                            IndexByCell[Cell] = (
+                                IndexByCell.get(Cell, 0) | StateBit
+                            )
+                AllSecondStatesMask = (1 << len(SecondStates)) - 1
+                for FirstStateIndex, FirstState in enumerate(FirstStates):
+                    PriorCheckCount = CompatibilityCheckCount
+                    CompatibilityCheckCount += len(SecondStates)
+                    if (
+                        WorkCheck is not None
+                        and PriorCheckCount // 1024
+                        != CompatibilityCheckCount // 1024
+                    ):
+                        WorkCheck({
+                            "Stage": (
+                                "physical-symbolic-higher-order-"
+                                "compatibility-index"
+                            ),
+                            "SignalDomain": list(Signals),
+                            "CompatibilityCheckCount": (
+                                CompatibilityCheckCount
+                            ),
+                        })
+                    ConflictMask = 0
+
+                    def AddConflicts(
+                        Cells: Iterable[Position3],
+                        Names: tuple[str, ...],
+                    ) -> None:
+                        nonlocal ConflictMask
+                        for Cell in Cells:
+                            for Name in Names:
+                                ConflictMask |= (
+                                    SecondClaimIndexes[Name].get(Cell, 0)
+                                )
+                            if ConflictMask == AllSecondStatesMask:
+                                return
+
+                    AddConflicts(
+                        FirstState.Claims.WireCells,
+                        ("Wire", "Support", "Air", "Electrical"),
+                    )
+                    if ConflictMask != AllSecondStatesMask:
+                        AddConflicts(
+                            FirstState.Claims.SupportCells,
+                            ("Wire", "Air"),
+                        )
+                    if ConflictMask != AllSecondStatesMask:
+                        AddConflicts(
+                            FirstState.Claims.RequiredAirCells,
+                            ("Wire", "Support"),
+                        )
+                    if ConflictMask != AllSecondStatesMask:
+                        AddConflicts(
+                            FirstState.Claims.ElectricalCells,
+                            ("Wire",),
+                        )
+                    CompatibleMask = (
+                        AllSecondStatesMask & ~ConflictMask
+                    )
+                    CompatibleStateMask = CompatibleMask
+                    while CompatibleStateMask:
+                        StateBit = (
+                            CompatibleStateMask & -CompatibleStateMask
+                        )
+                        CompatibleStateMask ^= StateBit
+                        SecondStateIndex = StateBit.bit_length() - 1
+                        ReverseMasks[SecondStateIndex] |= (
+                            1 << FirstStateIndex
+                        )
+                    PairCompatibleStateMasks[(
+                        FirstSignalIndex,
+                        FirstStateIndex,
+                        SecondSignalIndex,
+                    )] = CompatibleMask
+                for SecondStateIndex, ReverseMask in enumerate(
+                    ReverseMasks
+                ):
+                    PairCompatibleStateMasks[(
+                        SecondSignalIndex,
+                        SecondStateIndex,
+                        FirstSignalIndex,
+                    )] = ReverseMask
+
+    CompatibilitySearchCache: dict[
+        tuple[tuple[int, ...], tuple[int, ...]], bool
+    ] = {}
+
+    def HasCompatibleStateTuple(
+        AccessTuple: tuple[tuple[str, str], ...],
+    ) -> bool:
+        nonlocal CompatibilitySearchStateCount
+        AllowedMasks = tuple(
+            AccessStateMasks[Value] for Value in AccessTuple
+        )
+        if any(not Mask for Mask in AllowedMasks):
+            return False
+
+        def Search(
+            RemainingIndexes: tuple[int, ...],
+            CurrentMasks: tuple[int, ...],
+        ) -> bool:
+            nonlocal CompatibilitySearchStateCount
+            if not RemainingIndexes:
+                return True
+            CacheKey = (RemainingIndexes, CurrentMasks)
+            Cached = CompatibilitySearchCache.get(CacheKey)
+            if Cached is not None:
+                return Cached
+            CompatibilitySearchStateCount += 1
+            if (
+                WorkCheck is not None
+                and CompatibilitySearchStateCount % 1024 == 0
+            ):
+                WorkCheck({
+                    "Stage": (
+                        "physical-symbolic-higher-order-compatibility-csp"
+                    ),
+                    "SignalDomain": list(Signals),
+                    "CompatibilityCheckCount": CompatibilityCheckCount,
+                    "CompatibilitySearchStateCount": (
+                        CompatibilitySearchStateCount
+                    ),
+                })
+            SelectedIndex = min(
+                RemainingIndexes,
+                key=lambda Index: (
+                    CurrentMasks[Index].bit_count(),
+                    Index,
+                ),
+            )
+            NextRemaining = tuple(
+                Index for Index in RemainingIndexes
+                if Index != SelectedIndex
+            )
+            CandidateMask = CurrentMasks[SelectedIndex]
+            while CandidateMask:
+                StateBit = CandidateMask & -CandidateMask
+                CandidateMask ^= StateBit
+                StateIndex = StateBit.bit_length() - 1
+                NextMasks = list(CurrentMasks)
+                NextMasks[SelectedIndex] = 0
+                Feasible = True
+                for OtherIndex in NextRemaining:
+                    NextMasks[OtherIndex] &= (
+                        PairCompatibleStateMasks.get(
+                            (SelectedIndex, StateIndex, OtherIndex),
+                            0,
+                        )
+                    )
+                    if not NextMasks[OtherIndex]:
+                        Feasible = False
+                        break
+                if Feasible and Search(
+                    NextRemaining,
+                    tuple(NextMasks),
+                ):
+                    CompatibilitySearchCache[CacheKey] = True
+                    return True
+            CompatibilitySearchCache[CacheKey] = False
+            return False
+
+        return Search(tuple(range(len(Signals))), AllowedMasks)
+
+    if Complete:
+        AccessDomains = tuple(
+            tuple(sorted(FactorsBySignal[Signal]))
+            for Signal in Signals
+        )
+        for AccessTupleIndex, AccessValues in enumerate(
+            product(*AccessDomains)
+        ):
+            AccessTuple = tuple(zip(Signals, AccessValues))
+            if (
+                WorkCheck is not None
+                and AccessTupleIndex % 128 == 0
+            ):
+                WorkCheck({
+                    "Stage": "physical-symbolic-higher-order-compatibility",
+                    "SignalDomain": list(Signals),
+                    "CompatibilityCheckCount": CompatibilityCheckCount,
+                    "CompatibilitySearchStateCount": (
+                        CompatibilitySearchStateCount
+                    ),
+                    "AccessTupleCount": AccessTupleIndex,
+            })
+            if HasCompatibleStateTuple(AccessTuple):
+                SupportedLocalAccessTuples.add(AccessTuple)
+
+    AccessesBySignalAndSeam: dict[tuple[str, str], tuple[str, ...]] = {}
+    for Signal in Signals:
+        for Seam in sorted({
+            SeamFingerprintByLocalAccess[(Signal, Access)]
+            for Access in FactorsBySignal[Signal]
+        }):
+            AccessesBySignalAndSeam[(Signal, Seam)] = tuple(sorted(
+                Access
+                for Access in FactorsBySignal[Signal]
+                if SeamFingerprintByLocalAccess[(Signal, Access)] == Seam
+            ))
+    SupportedSeamTuples: frozenset[
+        tuple[tuple[str, str], ...]
+    ] = frozenset()
+    if Complete:
+        SupportedSeamTuples = frozenset(
+            tuple(
+                (
+                    Signal,
+                    SeamFingerprintByLocalAccess[(Signal, Access)],
+                )
+                for Signal, Access in AccessTuple
+            )
+            for AccessTuple in SupportedLocalAccessTuples
+        )
+
+    NetStateBindingsTuple = tuple(sorted(NetStateBindings))
+    NetStateDomainFingerprint = _Fingerprint((
+        "physical-symbolic-higher-order-state-bindings-v1",
+        NetStateBindingsTuple,
+    ))
+    LocalAccessFingerprintsBySignal = tuple(
+        (Signal, tuple(sorted(FactorsBySignal[Signal])))
+        for Signal in Signals
+    )
+    SupportedLocalAccessTuplesTuple = tuple(sorted(
+        SupportedLocalAccessTuples
+    ))
+    SupportedSeamTuplesTuple = tuple(sorted(
+        SupportedSeamTuples
+    ))
+    ProofFingerprint = _Fingerprint((
+        "physical-symbolic-higher-order-proof-v1",
+        DomainFingerprint,
+        LocalAccessFingerprintsBySignal,
+        SupportedLocalAccessTuplesTuple,
+        SupportedSeamTuplesTuple,
+        NetStateDomainFingerprint,
+        CompatibilityCheckCount,
+        Complete,
+    ))
+    Certificate = PhysicalComponentSymbolicHigherOrderCertificate(
+        DomainFingerprint=DomainFingerprint,
+        PreparedDomainFingerprint=Context["PreparedDomainFingerprint"],
+        PlacementFingerprint=Context["PlacementFingerprint"],
+        ComponentGraphFingerprint=Context["ComponentGraphFingerprint"],
+        FabricFingerprint=Context["FabricFingerprint"],
+        ResourceGraphFingerprint=Context["ResourceGraphFingerprint"],
+        TechnologyFingerprint=Context["TechnologyFingerprint"],
+        AccessCertificateFingerprint=(
+            Context["AccessCertificateFingerprint"]
+        ),
+        InterfaceFingerprint=Context["InterfaceFingerprint"],
+        LocalAccessDomainFingerprint=(
+            Context["LocalAccessDomainFingerprint"]
+        ),
+        SeamDomainFingerprint=Context["SeamDomainFingerprint"],
+        SignalDomain=Signals,
+        LocalAccessFingerprintsBySignal=LocalAccessFingerprintsBySignal,
+        SeamFingerprintByLocalAccess=tuple(sorted(
+            (
+                Signal,
+                Access,
+                Seam,
+            )
+            for (Signal, Access), Seam
+            in SeamFingerprintByLocalAccess.items()
+        )),
+        SeamFingerprintsBySignal=tuple(
+            (
+                Signal,
+                tuple(sorted(
+                    Seam
+                    for DomainSignal, Seam in AccessesBySignalAndSeam
+                    if DomainSignal == Signal
+                )),
+            )
+            for Signal in Signals
+        ),
+        SupportedLocalAccessTuples=(
+            SupportedLocalAccessTuplesTuple
+        ),
+        SupportedSeamTuples=SupportedSeamTuplesTuple,
+        NetStateCacheKeys=tuple(sorted(NetStateCacheKeys)),
+        NetStateBindings=NetStateBindingsTuple,
+        NetStateDomainFingerprint=NetStateDomainFingerprint,
+        ProofFingerprint=ProofFingerprint,
+        CompatibilityCheckCount=CompatibilityCheckCount,
+        Complete=Complete,
+    )
+    ValidatePhysicalComponentSymbolicHigherOrderCertificate(
+        Certificate,
+        Problem,
+        FactorDomain,
+        Signals,
+        NetStateCache=EffectiveNetStateCache,
+    )
+    if Complete and CompletedCertificateCache is not None:
+        CompletedCertificateCache[DomainFingerprint] = Certificate
+    return Certificate
+
+
+def CompilePhysicalComponentSymbolicUnaryApertureDomain(
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    SignalDomain: Iterable[str],
+    *,
+    DeadlineSeconds: float | None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    NetStateCache: dict[str, Any] | None = None,
+    CompletedClauseCache: dict[
+        str,
+        tuple[
+            frozenset[frozenset[tuple[str, str]]],
+            dict[str, Any],
+        ],
+    ] | None = None,
+    RouteClaimsConstructionCache: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ] | None = None,
+) -> tuple[
+    frozenset[frozenset[tuple[str, str]]],
+    dict[str, Any],
+]:
+    """Compile a requested signal domain and project complete unary cuts."""
+    if not FactorDomain.Complete or not FactorDomain.Feasible:
+        raise ValueError(
+            "symbolic unary compilation requires a complete feasible domain"
+        )
+    if Problem.PlacementFingerprint != FactorDomain.PlacementFingerprint:
+        raise ValueError("symbolic unary placement identity mismatch")
+    Signals = tuple(sorted(frozenset(map(str, SignalDomain))))
+    AvailableSignals = frozenset(
+        str(Signal)
+        for Signal, _Values in FactorDomain.LocalAccessFactorsBySignal
+    )
+    if not Signals or not frozenset(Signals) <= AvailableSignals:
+        raise ValueError(
+            "symbolic unary compilation requires available signals"
+        )
+    CacheKey = _Fingerprint((
+        "physical-symbolic-unary-aperture-domain-v7",
+        FactorDomain.DomainFingerprint,
+        Problem.Fabric.FabricFingerprint,
+        Signals,
+    ))
+    Cached = (
+        CompletedClauseCache.get(CacheKey)
+        if CompletedClauseCache is not None
+        else None
+    )
+    if Cached is not None:
+        Clauses, Diagnostics = Cached
+        return Clauses, {**Diagnostics, "UnaryCertificateCacheHit": True}
+
+    LocalFactorsBySignal = dict(FactorDomain.LocalAccessFactorsBySignal)
+    SupportedAccessesBySignal = {
+        str(Signal): frozenset(
+            str(Support.LocalAccessFingerprint) for Support in Supports
+        )
+        for Signal, Supports
+        in FactorDomain.LocalApertureSupportBySignal
+    }
+    EffectiveNetStateCache = (
+        NetStateCache if NetStateCache is not None else {}
+    )
+    RelaxedProblem = replace(Problem, ReservedGlobalClaimsBySignal=())
+    StartedAt = monotonic()
+    UnsupportedAccesses: set[tuple[str, str]] = set()
+    CompiledStatesByAccess: dict[
+        tuple[str, str], tuple[Any, ...]
+    ] = {}
+    CompiledAccessCount = 0
+    for Signal in Signals:
+        Factors = {
+            str(Factor.LocalAccessFingerprint): Factor
+            for Factor in LocalFactorsBySignal.get(Signal, ())
+            if str(Factor.LocalAccessFingerprint)
+            in SupportedAccessesBySignal.get(Signal, frozenset())
+        }
+        PreparedContext = PrepareComponentSymbolicNetStateContext(
+            RelaxedProblem,
+            Signal,
+            RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+        )
+        VariantProblemsByAccess = {
+            LocalAccessFingerprint: (
+                _BuildPhysicalComponentSymbolicPortPairVariantProblem(
+                    RelaxedProblem,
+                    Signal,
+                    LocalAccessFingerprint,
+                    Factor,
+                )
+            )
+            for LocalAccessFingerprint, Factor in sorted(Factors.items())
+        }
+        RemainingDeadline = (
+            None
+            if DeadlineSeconds is None
+            else max(
+                0.0,
+                DeadlineSeconds - (monotonic() - StartedAt),
+            )
+        )
+        CompilationsByAccess = (
+            CompilePreparedComponentPhysicalFactorStateBatch(
+                PreparedContext,
+                VariantProblemsByAccess,
+                DeadlineSeconds=RemainingDeadline,
+                WorkCheck=WorkCheck,
+                SymbolicNetStateCache=EffectiveNetStateCache,
+            )
+        )
+        for LocalAccessFingerprint in sorted(VariantProblemsByAccess):
+            Compilation = CompilationsByAccess[LocalAccessFingerprint]
+            if not Compilation.Complete or Compilation.States is None:
+                return frozenset(), {
+                    "Complete": False,
+                    "Signal": Signal,
+                    "CompiledAccessCount": CompiledAccessCount,
+                    "UnaryCertificateCacheHit": False,
+                }
+            CompiledAccessCount += 1
+            CompiledStatesByAccess[(
+                Signal,
+                LocalAccessFingerprint,
+            )] = tuple(Compilation.States)
+            if not Compilation.States:
+                UnsupportedAccesses.add((Signal, LocalAccessFingerprint))
+
+    ApertureFactorsBySignal = dict(FactorDomain.ApertureFactorsBySignal)
+    SupportsByOption = dict(FactorDomain.LocalApertureSupportsByOption)
+    Clauses: set[frozenset[tuple[str, str]]] = set()
+    UnsupportedLocalContracts: set[tuple[str, str]] = set()
+    UnsupportedApertureOptions: set[tuple[str, str]] = set()
+    UnsupportedLocalApertureSupports: set[tuple[str, str]] = set()
+
+    for Signal in Signals:
+        FactorsByAccess = {
+            str(Factor.LocalAccessFingerprint): Factor
+            for Factor in LocalFactorsBySignal.get(Signal, ())
+        }
+        for LocalAccessFingerprint in sorted(
+            Access
+            for CandidateSignal, Access in UnsupportedAccesses
+            if CandidateSignal == Signal
+        ):
+            # The physical port CSP represents an option through its stable
+            # local contract, seam contract, and aperture contract.  The
+            # factor-local access fingerprint is a compilation cache key and
+            # is deliberately not part of ``BuildPhysicalPortNoGoodKeys``.
+            # Project the complete unary proof onto the solver-visible local
+            # contract instead of publishing an inert cache identity.
+            LocalFactor = FactorsByAccess[LocalAccessFingerprint]
+            LocalContractKey = (
+                Signal,
+                str(LocalFactor.LocalContractFingerprint),
+            )
+            UnsupportedLocalContracts.add(LocalContractKey)
+            Clauses.add(frozenset((LocalContractKey,)))
+        AccessesBySeam: dict[str, set[str]] = {}
+        for LocalAccessFingerprint, Factor in FactorsByAccess.items():
+            SeamFingerprint = (
+                str(getattr(Factor, "SeamContractFingerprint", ""))
+                or BuildPhysicalPortSeamContractFingerprint(Factor)
+            )
+            AccessesBySeam.setdefault(SeamFingerprint, set()).add(
+                LocalAccessFingerprint
+            )
+        for SeamFingerprint, LocalAccessFingerprints in (
+            AccessesBySeam.items()
+        ):
+            if LocalAccessFingerprints and all(
+                (Signal, LocalAccessFingerprint) in UnsupportedAccesses
+                for LocalAccessFingerprint in LocalAccessFingerprints
+            ):
+                Clauses.add(frozenset(((Signal, SeamFingerprint),)))
+        OptionsByContract: dict[str, list[Any]] = {}
+        for Aperture in ApertureFactorsBySignal.get(Signal, ()):
+            OptionsByContract.setdefault(
+                str(Aperture.ApertureContractFingerprint),
+                [],
+            ).append(Aperture)
+            OptionSupports = tuple(
+                SupportsByOption.get((
+                    Signal,
+                    str(Aperture.ApertureOptionFingerprint),
+                ), ())
+            )
+            ForbiddenGlobalNodes = (
+                frozenset(Aperture.GlobalPath)
+                - frozenset((Aperture.Attachment,))
+            )
+            SupportedEdgeCount = 0
+            for Support in OptionSupports:
+                EdgeSupported = any(
+                    not (ForbiddenGlobalNodes & State.Nodes)
+                    for State in CompiledStatesByAccess.get((
+                        Signal,
+                        str(Support.LocalAccessFingerprint),
+                    ), ())
+                )
+                if EdgeSupported:
+                    SupportedEdgeCount += 1
+                    continue
+                UnsupportedLocalApertureSupports.add((
+                    Signal,
+                    str(Support.SupportFingerprint),
+                ))
+                Clauses.add(frozenset(((
+                    Signal,
+                    str(Support.SupportFingerprint),
+                ),)))
+            if not SupportedEdgeCount:
+                UnsupportedApertureOptions.add((
+                    Signal,
+                    str(Aperture.ApertureOptionFingerprint),
+                ))
+        for ApertureContract, Apertures in OptionsByContract.items():
+            if Apertures and all(
+                (
+                    Signal,
+                    str(Aperture.ApertureOptionFingerprint),
+                ) in UnsupportedApertureOptions
+                for Aperture in Apertures
+            ):
+                Clauses.add(frozenset(((Signal, ApertureContract),)))
+    Result = frozenset(Clauses)
+    Diagnostics = {
+        "Complete": True,
+        "SignalCount": len(Signals),
+        "CompiledAccessCount": CompiledAccessCount,
+        "UnsupportedLocalAccessCount": len(UnsupportedAccesses),
+        "UnsupportedApertureOptionCount": len(
+            UnsupportedApertureOptions
+        ),
+        "UnsupportedLocalApertureSupportCount": len(
+            UnsupportedLocalApertureSupports
+        ),
+        "UnaryLocalAccessClauseCount": sum(
+            1
+            for Clause in Result
+            if bool(Clause & UnsupportedLocalContracts)
+        ),
+        "UnarySeamClauseCount": sum(
+            1
+            for Clause in Result
+            if any(
+                str(Fingerprint).startswith("local-seam-contract-v1:")
+                for _Signal, Fingerprint in Clause
+            )
+        ),
+        "UnaryApertureClauseCount": len(Result),
+        "UnaryCertificateCacheHit": False,
+        "DomainFingerprint": CacheKey,
+    }
+    if CompletedClauseCache is not None:
+        CompletedClauseCache[CacheKey] = (Result, Diagnostics)
+    return Result, Diagnostics
+
+
+def SelectPhysicalComponentResourceRelevantSignalPairs(
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+) -> tuple[tuple[str, str], ...]:
+    """Select only signal pairs whose exact local claims can intersect."""
+    ResourceIdsBySignal = {
+        str(Signal): frozenset(
+            Resource
+            for Factor in Factors
+            for Resource in Factor.LocalClaims.ResourceIds
+        )
+        for Signal, Factors in FactorDomain.LocalAccessFactorsBySignal
+    }
+    Signals = tuple(sorted(ResourceIdsBySignal))
+    return tuple(
+        (FirstSignal, SecondSignal)
+        for FirstIndex, FirstSignal in enumerate(Signals)
+        for SecondSignal in Signals[FirstIndex + 1:]
+        if ResourceIdsBySignal[FirstSignal].intersection(
+            ResourceIdsBySignal[SecondSignal]
+        )
+    )
+
+
+def CompilePhysicalComponentForeignPortalUnaryApertureClauses(
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    RawPortalCache: Any,
+    ResourceGraph: Any,
+) -> tuple[
+    frozenset[frozenset[tuple[str, str]]],
+    dict[str, object],
+]:
+    """Reject apertures whose fixed claims erase a foreign terminal domain.
+
+    The whole-design portal cache is complete before component CSP solving.
+    Intersecting every portal path for one terminal recovers its immutable
+    access stem; the union of those stems is mandatory for that ordinary net.
+    If one component aperture conflicts with every portal alternative for a
+    terminal, the resulting unary clause is exact and independent of any
+    exterior route candidate later materialized for that aperture.
+    """
+    if RawPortalCache is None or ResourceGraph is None:
+        return frozenset(), {
+            "Complete": False,
+            "Reason": "missing-portal-cache-or-resource-graph",
+        }
+    RawPortals = RawPortalCache.BuildPortalDictionary()
+    CompleteKeys = frozenset(
+        getattr(RawPortalCache, "CompletePortalDomainKeys", ())
+    )
+    LayerCount = int(getattr(RawPortalCache, "LayerCount", 0))
+    ComponentSignals = frozenset(
+        str(Signal)
+        for Signal, _Options in (
+            FactorDomain.BoundaryPortReservationsBySignal
+        )
+    )
+    TerminalsBySignal: dict[str, set[Position3]] = {}
+    for Signal, Terminal, _Layer in CompleteKeys:
+        if str(Signal) in ComponentSignals:
+            continue
+        TerminalsBySignal.setdefault(str(Signal), set()).add(Terminal)
+    ForeignDomains: list[
+        tuple[str, Position3, tuple[RoutingResourceClaims, ...]]
+    ] = []
+    IncompleteTerminalCount = 0
+    for Signal in sorted(TerminalsBySignal):
+        PortalsByTerminal: dict[
+            Position3, tuple[Any, ...]
+        ] = {}
+        MandatoryNodes: set[Position3] = set()
+        for Terminal in sorted(TerminalsBySignal[Signal]):
+            Keys = tuple(
+                (Signal, Terminal, Layer)
+                for Layer in range(LayerCount)
+            )
+            if not all(Key in CompleteKeys for Key in Keys):
+                IncompleteTerminalCount += 1
+                continue
+            PortalsById = {
+                Portal.PortalId: Portal
+                for Key in Keys
+                for Portal in RawPortals.get(Key, ())
+            }
+            Portals = tuple(sorted(
+                PortalsById.values(),
+                key=lambda Value: Value.PortalId,
+            ))
+            if not Portals:
+                continue
+            PortalsByTerminal[Terminal] = Portals
+            CommonNodes = set(Portals[0].Path)
+            for Portal in Portals[1:]:
+                CommonNodes.intersection_update(Portal.Path)
+            MandatoryNodes.update(CommonNodes)
+        FrozenMandatoryNodes = frozenset(MandatoryNodes)
+        for Terminal, Portals in sorted(PortalsByTerminal.items()):
+            ForeignDomains.append((
+                Signal,
+                Terminal,
+                tuple(
+                    ResourceGraph.BuildRouteClaims(
+                        FrozenMandatoryNodes | frozenset(Portal.Path)
+                    )
+                    for Portal in Portals
+                ),
+            ))
+    Clauses: set[frozenset[tuple[str, str]]] = set()
+    RejectedCountsBySignal: dict[str, int] = {}
+    AperturePortalSlackBySignal: dict[
+        str, dict[str, tuple[int, int]]
+    ] = {}
+    CompatibilityCheckCount = 0
+    for Signal, Options in (
+        FactorDomain.BoundaryPortReservationsBySignal
+    ):
+        for Option in Options:
+            Unsupported = False
+            MinimumRemainingAlternativeCount: int | None = None
+            TotalRemainingAlternativeCount = 0
+            for _ForeignSignal, _Terminal, ClaimsDomain in ForeignDomains:
+                CompatibilityCheckCount += len(ClaimsDomain)
+                ConflictCount = sum(
+                    ComponentClaimsConflict(
+                        Option.GlobalClaims,
+                        Claims,
+                    )
+                    for Claims in ClaimsDomain
+                )
+                RemainingAlternativeCount = (
+                    len(ClaimsDomain) - ConflictCount
+                )
+                MinimumRemainingAlternativeCount = min(
+                    RemainingAlternativeCount,
+                    (
+                        MinimumRemainingAlternativeCount
+                        if MinimumRemainingAlternativeCount is not None
+                        else RemainingAlternativeCount
+                    ),
+                )
+                TotalRemainingAlternativeCount += (
+                    RemainingAlternativeCount
+                )
+                if ClaimsDomain and RemainingAlternativeCount == 0:
+                    Unsupported = True
+                    break
+            StoredFingerprint = str(
+                Option.ApertureContractFingerprint
+            )
+            CanonicalFingerprint = (
+                BuildPhysicalPortApertureContractFingerprint(Option)
+            )
+            if not Unsupported:
+                for Fingerprint in {
+                    StoredFingerprint,
+                    CanonicalFingerprint,
+                }:
+                    if Fingerprint:
+                        AperturePortalSlackBySignal.setdefault(
+                            str(Signal),
+                            {},
+                        )[Fingerprint] = (
+                            int(MinimumRemainingAlternativeCount or 0),
+                            int(TotalRemainingAlternativeCount),
+                        )
+                continue
+            for Fingerprint in {
+                StoredFingerprint,
+                CanonicalFingerprint,
+            }:
+                if Fingerprint:
+                    Clauses.add(frozenset(((
+                        str(Signal),
+                        Fingerprint,
+                    ),)))
+            RejectedCountsBySignal[str(Signal)] = (
+                RejectedCountsBySignal.get(str(Signal), 0) + 1
+            )
+    return frozenset(Clauses), {
+        "Complete": IncompleteTerminalCount == 0,
+        "ForeignTerminalDomainCount": len(ForeignDomains),
+        "IncompleteForeignTerminalDomainCount": IncompleteTerminalCount,
+        "ComponentSignalCount": len(ComponentSignals),
+        "ApertureOptionCount": sum(
+            len(Options)
+            for _Signal, Options in (
+                FactorDomain.BoundaryPortReservationsBySignal
+            )
+        ),
+        "RejectedApertureCount": len(Clauses),
+        "RejectedApertureCountsBySignal": dict(sorted(
+            RejectedCountsBySignal.items()
+        )),
+        "AperturePortalSlackBySignal": {
+            Signal: dict(sorted(Values.items()))
+            for Signal, Values in sorted(
+                AperturePortalSlackBySignal.items()
+            )
+        },
+        "CompatibilityCheckCount": CompatibilityCheckCount,
+    }
 
 
 def ProveClosedComponentSymbolicCapacityEligibility(
@@ -3336,6 +6857,7 @@ def ProveClosedComponentSymbolicCapacityEligibility(
     RouteClaimsConstructionCache: dict[
         frozenset[Position3], RoutingResourceClaims
     ] | None = None,
+    SymbolicNetStateCache: dict[str, Any] | None = None,
 ) -> ComponentRoutingSolveResult:
     """Certify one selected local port tuple before routing its corridors.
 
@@ -3376,6 +6898,7 @@ def ProveClosedComponentSymbolicCapacityEligibility(
         DeadlineSeconds=DeadlineSeconds,
         WorkCheck=WorkCheck,
         RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+        SymbolicNetStateCache=SymbolicNetStateCache,
         StopAfterSymbolicCapacityProof=True,
     )
     if Result.Template is not None:
@@ -3406,6 +6929,492 @@ def ProveClosedComponentSymbolicCapacityEligibility(
     if CompletedProofCache is not None and Complete:
         CompletedProofCache[DomainFingerprint] = Result
     return Result
+
+
+def ProjectCompletePhysicalPortPairCertificateToApertureClauses(
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    Certificate: PhysicalComponentSymbolicPortPairCertificate,
+) -> tuple[
+    frozenset[frozenset[tuple[str, str]]],
+    dict[str, object],
+]:
+    """Project one complete local seam relation onto absolute apertures.
+
+    Portable reservation fingerprints deliberately do not participate in this
+    projection: they are translation-normalized and may alias distinct
+    physical apertures.  A cut is sound only when every local-access factor in
+    both certificate domains maps through the prepared support relation to an
+    authoritative ``ApertureContractFingerprint``.  Any missing or ambiguous
+    edge therefore suppresses the entire projection rather than publishing a
+    partial global no-good.
+    """
+    Signals = tuple(map(str, Certificate.SignalPair))
+    Diagnostics: dict[str, object] = {
+        "PortPairCompatibilityComplete": bool(Certificate.Complete),
+        "ApertureProjectionComplete": False,
+        "ApertureProjectionSignals": list(Signals),
+        "ApertureProjectionFailureReason": "",
+    }
+    if not Certificate.Complete or len(Signals) != 2 or len(set(Signals)) != 2:
+        Diagnostics["ApertureProjectionFailureReason"] = (
+            "pair-certificate-incomplete-or-invalid"
+        )
+        return frozenset(), Diagnostics
+
+    ExpectedLocalAccessBySignal = {
+        str(Signal): frozenset(map(str, LocalAccessFingerprints))
+        for Signal, LocalAccessFingerprints
+        in Certificate.LocalAccessFingerprintsBySignal
+        if str(Signal) in Signals
+    }
+    if (
+        set(ExpectedLocalAccessBySignal) != set(Signals)
+        or any(
+            not ExpectedLocalAccessBySignal.get(Signal)
+            for Signal in Signals
+        )
+    ):
+        Diagnostics["ApertureProjectionFailureReason"] = (
+            "certificate-local-access-domain-incomplete"
+        )
+        return frozenset(), Diagnostics
+
+    SeamByLocalAccess: dict[tuple[str, str], str] = {}
+    for Signal, LocalAccessFingerprint, SeamFingerprint in (
+        Certificate.SeamFingerprintByLocalAccess
+    ):
+        Key = (str(Signal), str(LocalAccessFingerprint))
+        Seam = str(SeamFingerprint)
+        Existing = SeamByLocalAccess.get(Key)
+        if (
+            Key[0] not in Signals
+            or not Seam
+            or (Existing is not None and Existing != Seam)
+        ):
+            Diagnostics["ApertureProjectionFailureReason"] = (
+                "certificate-seam-map-incomplete-or-ambiguous"
+            )
+            return frozenset(), Diagnostics
+        SeamByLocalAccess[Key] = Seam
+    if any(
+        set(
+            LocalAccess
+            for (CandidateSignal, LocalAccess) in SeamByLocalAccess
+            if CandidateSignal == Signal
+        ) != set(ExpectedLocalAccessBySignal[Signal])
+        for Signal in Signals
+    ):
+        Diagnostics["ApertureProjectionFailureReason"] = (
+            "certificate-seam-map-does-not-cover-local-domain"
+        )
+        return frozenset(), Diagnostics
+
+    ApertureContractByOption: dict[tuple[str, str], str] = {}
+    for Signal, Factors in FactorDomain.ApertureFactorsBySignal:
+        Signal = str(Signal)
+        if Signal not in Signals:
+            continue
+        for Factor in Factors:
+            Key = (
+                Signal,
+                str(Factor.ApertureOptionFingerprint),
+            )
+            Contract = str(Factor.ApertureContractFingerprint)
+            Existing = ApertureContractByOption.get(Key)
+            if (
+                not Key[1]
+                or not Contract
+                or (Existing is not None and Existing != Contract)
+            ):
+                Diagnostics["ApertureProjectionFailureReason"] = (
+                    "aperture-option-contract-incomplete-or-ambiguous"
+                )
+                return frozenset(), Diagnostics
+            ApertureContractByOption[Key] = Contract
+    if any(
+        not any(Key[0] == Signal for Key in ApertureContractByOption)
+        for Signal in Signals
+    ):
+        Diagnostics["ApertureProjectionFailureReason"] = (
+            "aperture-option-domain-incomplete"
+        )
+        return frozenset(), Diagnostics
+
+    SupportsByOption: dict[tuple[str, str], list[str]] = {
+        Key: [] for Key in ApertureContractByOption
+    }
+    MappedLocalAccessBySignal: dict[str, set[str]] = {
+        Signal: set() for Signal in Signals
+    }
+    for Signal, Supports in FactorDomain.LocalApertureSupportBySignal:
+        Signal = str(Signal)
+        if Signal not in Signals:
+            continue
+        for Support in Supports:
+            Key = (
+                Signal,
+                str(Support.ApertureOptionFingerprint),
+            )
+            LocalAccess = str(Support.LocalAccessFingerprint)
+            if (
+                Key not in ApertureContractByOption
+                or LocalAccess not in ExpectedLocalAccessBySignal[Signal]
+                or (Signal, LocalAccess) not in SeamByLocalAccess
+            ):
+                Diagnostics["ApertureProjectionFailureReason"] = (
+                    "prepared-support-edge-unresolved"
+                )
+                return frozenset(), Diagnostics
+            SupportsByOption[Key].append(LocalAccess)
+            MappedLocalAccessBySignal[Signal].add(LocalAccess)
+    if (
+        any(not Values for Values in SupportsByOption.values())
+        or any(
+            MappedLocalAccessBySignal[Signal]
+            != set(ExpectedLocalAccessBySignal[Signal])
+            for Signal in Signals
+        )
+    ):
+        Diagnostics["ApertureProjectionFailureReason"] = (
+            "prepared-support-domain-incomplete"
+        )
+        return frozenset(), Diagnostics
+
+    SeamsByApertureContract: dict[tuple[str, str], set[str]] = {}
+    for OptionKey, LocalAccessFingerprints in SupportsByOption.items():
+        ApertureKey = (
+            OptionKey[0],
+            ApertureContractByOption[OptionKey],
+        )
+        SeamsByApertureContract.setdefault(ApertureKey, set()).update(
+            SeamByLocalAccess[(OptionKey[0], LocalAccessFingerprint)]
+            for LocalAccessFingerprint in LocalAccessFingerprints
+        )
+
+    UnsupportedUnarySeams = frozenset(
+        (str(Signal), str(Seam))
+        for Signal, Seam in Certificate.UnsupportedUnarySeams
+    )
+    UnsupportedSeamPairs = frozenset(
+        frozenset((
+            (str(First[0]), str(First[1])),
+            (str(Second[0]), str(Second[1])),
+        ))
+        for First, Second in Certificate.UnsupportedSeamPairs
+    )
+    Clauses: set[frozenset[tuple[str, str]]] = set()
+    for ApertureKey, Seams in SeamsByApertureContract.items():
+        if Seams and all(
+            (ApertureKey[0], Seam) in UnsupportedUnarySeams
+            for Seam in Seams
+        ):
+            Clauses.add(frozenset((ApertureKey,)))
+
+    FirstSignal, SecondSignal = Signals
+    FirstApertures = tuple(
+        (Key, Seams)
+        for Key, Seams in SeamsByApertureContract.items()
+        if Key[0] == FirstSignal
+    )
+    SecondApertures = tuple(
+        (Key, Seams)
+        for Key, Seams in SeamsByApertureContract.items()
+        if Key[0] == SecondSignal
+    )
+    for FirstKey, FirstSeams in FirstApertures:
+        for SecondKey, SecondSeams in SecondApertures:
+            if FirstSeams and SecondSeams and all(
+                (FirstSignal, FirstSeam) in UnsupportedUnarySeams
+                or (SecondSignal, SecondSeam) in UnsupportedUnarySeams
+                or frozenset((
+                    (FirstSignal, FirstSeam),
+                    (SecondSignal, SecondSeam),
+                )) in UnsupportedSeamPairs
+                for FirstSeam in FirstSeams
+                for SecondSeam in SecondSeams
+            ):
+                Clauses.add(frozenset((FirstKey, SecondKey)))
+
+    Diagnostics.update({
+        "ApertureProjectionComplete": True,
+        "ApertureProjectionFailureReason": "",
+        "ApertureProjectionOptionCount": len(
+            ApertureContractByOption
+        ),
+        "ApertureProjectionClauseCount": len(Clauses),
+    })
+    return frozenset(Clauses), Diagnostics
+
+
+def ProjectCompletePhysicalHigherOrderCertificateToApertureClauses(
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    Certificate: PhysicalComponentSymbolicHigherOrderCertificate,
+    *,
+    RestrictedApertureContractsBySignal: (
+        Mapping[str, str | frozenset[str]] | None
+    ) = None,
+) -> tuple[
+    frozenset[frozenset[tuple[str, str]]],
+    dict[str, object],
+]:
+    """Project one complete 3+ signal seam relation onto exact apertures.
+
+    The projection is universal: an aperture tuple is rejected only when
+    every local seam tuple supported behind it is disproven by the complete
+    certificate.  Production callers may restrict the absolute contracts to
+    the current physical plan so proof compilation stays core-driven instead
+    of eagerly enumerating the whole global aperture product.
+    """
+    Signals = tuple(map(str, Certificate.SignalDomain))
+    Diagnostics: dict[str, object] = {
+        "HigherOrderCompatibilityComplete": bool(Certificate.Complete),
+        "HigherOrderApertureProjectionComplete": False,
+        "HigherOrderApertureProjectionSignals": list(Signals),
+        "HigherOrderApertureProjectionFailureReason": "",
+    }
+
+    def Incomplete(Reason: str) -> tuple[
+        frozenset[frozenset[tuple[str, str]]],
+        dict[str, object],
+    ]:
+        Diagnostics["HigherOrderApertureProjectionFailureReason"] = Reason
+        return frozenset(), Diagnostics
+
+    if (
+        not Certificate.Complete
+        or len(Signals) < 3
+        or len(set(Signals)) != len(Signals)
+    ):
+        return Incomplete("higher-order-certificate-incomplete-or-invalid")
+    if (
+        not FactorDomain.Complete
+        or not FactorDomain.Feasible
+        or str(Certificate.PreparedDomainFingerprint)
+        != str(FactorDomain.DomainFingerprint)
+    ):
+        return Incomplete("prepared-domain-identity-mismatch")
+
+    ExpectedAccessesBySignal: dict[str, frozenset[str]] = {}
+    for Signal, Accesses in Certificate.LocalAccessFingerprintsBySignal:
+        Signal = str(Signal)
+        Values = frozenset(map(str, Accesses))
+        if Signal in ExpectedAccessesBySignal:
+            return Incomplete(
+                "certificate-local-access-domain-incomplete-or-ambiguous"
+            )
+        ExpectedAccessesBySignal[Signal] = Values
+    if (
+        set(ExpectedAccessesBySignal) != set(Signals)
+        or any(not ExpectedAccessesBySignal[Signal] for Signal in Signals)
+    ):
+        return Incomplete("certificate-local-access-domain-incomplete")
+
+    SeamByAccess: dict[tuple[str, str], str] = {}
+    for Signal, Access, Seam in Certificate.SeamFingerprintByLocalAccess:
+        Key = (str(Signal), str(Access))
+        Seam = str(Seam)
+        Existing = SeamByAccess.get(Key)
+        if (
+            Key[0] not in Signals
+            or not Seam
+            or (Existing is not None and Existing != Seam)
+        ):
+            return Incomplete(
+                "certificate-access-seam-map-incomplete-or-ambiguous"
+            )
+        SeamByAccess[Key] = Seam
+    if any(
+        frozenset(
+            Access
+            for CandidateSignal, Access in SeamByAccess
+            if CandidateSignal == Signal
+        ) != ExpectedAccessesBySignal[Signal]
+        for Signal in Signals
+    ):
+        return Incomplete("certificate-access-seam-map-does-not-cover-domain")
+
+    PreparedSeamByAccess: dict[tuple[str, str], str] = {}
+    for Signal, Factors in FactorDomain.LocalAccessFactorsBySignal:
+        Signal = str(Signal)
+        if Signal not in Signals:
+            continue
+        for Factor in Factors:
+            Access = str(Factor.LocalAccessFingerprint)
+            Key = (Signal, Access)
+            Seam = (
+                str(getattr(Factor, "SeamContractFingerprint", ""))
+                or BuildPhysicalPortSeamContractFingerprint(Factor)
+            )
+            Existing = PreparedSeamByAccess.get(Key)
+            if Existing is not None and Existing != Seam:
+                return Incomplete("prepared-access-seam-map-ambiguous")
+            PreparedSeamByAccess[Key] = Seam
+    if any(
+        PreparedSeamByAccess.get((Signal, Access))
+        != SeamByAccess.get((Signal, Access))
+        for Signal in Signals
+        for Access in ExpectedAccessesBySignal[Signal]
+    ):
+        return Incomplete("prepared-access-seam-identity-mismatch")
+
+    ContractByOption: dict[tuple[str, str], str] = {}
+    for Signal, Apertures in FactorDomain.ApertureFactorsBySignal:
+        Signal = str(Signal)
+        if Signal not in Signals:
+            continue
+        for Aperture in Apertures:
+            Key = (Signal, str(Aperture.ApertureOptionFingerprint))
+            Contract = str(Aperture.ApertureContractFingerprint)
+            Existing = ContractByOption.get(Key)
+            if (
+                not Key[1]
+                or not Contract
+                or (Existing is not None and Existing != Contract)
+            ):
+                return Incomplete(
+                    "aperture-option-contract-incomplete-or-ambiguous"
+                )
+            ContractByOption[Key] = Contract
+
+    SupportsByOption = {
+        (str(Key[0]), str(Key[1])): tuple(Supports)
+        for Key, Supports in FactorDomain.LocalApertureSupportsByOption
+        if str(Key[0]) in Signals
+    }
+    if any(Key not in ContractByOption for Key in SupportsByOption):
+        return Incomplete("prepared-support-option-unresolved")
+    SeamsByContract: dict[tuple[str, str], set[str]] = {}
+    MappedAccessesBySignal: dict[str, set[str]] = {
+        Signal: set() for Signal in Signals
+    }
+    for OptionKey, Contract in ContractByOption.items():
+        Supports = SupportsByOption.get(OptionKey)
+        if not Supports:
+            return Incomplete("aperture-option-has-no-local-support")
+        for Support in Supports:
+            Access = str(Support.LocalAccessFingerprint)
+            if (
+                str(Support.ApertureOptionFingerprint) != OptionKey[1]
+                or Access not in ExpectedAccessesBySignal[OptionKey[0]]
+            ):
+                return Incomplete("prepared-support-access-unresolved")
+            Seam = SeamByAccess.get((OptionKey[0], Access))
+            if Seam is None:
+                return Incomplete("prepared-support-seam-unresolved")
+            MappedAccessesBySignal[OptionKey[0]].add(Access)
+            SeamsByContract.setdefault(
+                (OptionKey[0], Contract), set()
+            ).add(Seam)
+    if any(
+        MappedAccessesBySignal[Signal]
+        != set(ExpectedAccessesBySignal[Signal])
+        for Signal in Signals
+    ):
+        return Incomplete("prepared-support-domain-incomplete")
+
+    Restriction = {}
+    for Signal, Contracts in (
+        RestrictedApertureContractsBySignal or {}
+    ).items():
+        Restriction[str(Signal)] = (
+            frozenset((str(Contracts),))
+            if isinstance(Contracts, str)
+            else frozenset(map(str, Contracts))
+        )
+    if Restriction and not set(Signals) <= set(Restriction):
+        return Incomplete("restricted-aperture-contract-domain-incomplete")
+    ContractDomains = []
+    for Signal in Signals:
+        Contracts = tuple(sorted(
+            Contract
+            for CandidateSignal, Contract in SeamsByContract
+            if CandidateSignal == Signal
+            and (
+                Signal not in Restriction
+                or Contract in Restriction[Signal]
+            )
+        ))
+        if not Contracts:
+            return Incomplete("aperture-contract-domain-empty")
+        if Signal in Restriction and frozenset(Contracts) != Restriction[Signal]:
+            return Incomplete("restricted-aperture-contract-unresolved")
+        ContractDomains.append(Contracts)
+
+    CertifiedSeamsBySignal = {
+        str(Signal): frozenset(map(str, Seams))
+        for Signal, Seams in Certificate.SeamFingerprintsBySignal
+    }
+    if (
+        set(CertifiedSeamsBySignal) != set(Signals)
+        or any(
+            not CertifiedSeamsBySignal[Signal]
+            or CertifiedSeamsBySignal[Signal] != frozenset(
+                Seam
+                for (CandidateSignal, _Access), Seam
+                in SeamByAccess.items()
+                if CandidateSignal == Signal
+            )
+            for Signal in Signals
+        )
+    ):
+        return Incomplete("certificate-seam-domain-incomplete-or-ambiguous")
+    MutableSupportedSeamTuples = set()
+    for TupleValue in Certificate.SupportedSeamTuples:
+        BySignal = {
+            str(Signal): str(Seam) for Signal, Seam in TupleValue
+        }
+        if (
+            len(BySignal) != len(TupleValue)
+            or set(BySignal) != set(Signals)
+            or any(
+                BySignal[Signal] not in CertifiedSeamsBySignal[Signal]
+                for Signal in Signals
+            )
+        ):
+            return Incomplete("certificate-supported-seam-tuple-invalid")
+        MutableSupportedSeamTuples.add(tuple(
+            (Signal, BySignal[Signal]) for Signal in Signals
+        ))
+    SupportedSeamTuples = frozenset(MutableSupportedSeamTuples)
+    Clauses: set[frozenset[tuple[str, str]]] = set()
+    SeamTupleCheckCount = 0
+    for ContractValues in product(*ContractDomains):
+        ContractTuple = tuple(zip(Signals, ContractValues))
+        SeamDomains = tuple(
+            tuple(sorted(SeamsByContract[(Signal, Contract)]))
+            for Signal, Contract in ContractTuple
+        )
+        if any(not Seams for Seams in SeamDomains):
+            return Incomplete("aperture-contract-seam-domain-empty")
+        UniversallyUnsupported = True
+        SeamDomainsBySignal = {
+            Signal: frozenset(Seams)
+            for Signal, Seams in zip(Signals, SeamDomains)
+        }
+        for SupportedTuple in SupportedSeamTuples:
+            SeamTupleCheckCount += 1
+            if all(
+                Seam in SeamDomainsBySignal[Signal]
+                for Signal, Seam in SupportedTuple
+            ):
+                UniversallyUnsupported = False
+                break
+        if UniversallyUnsupported:
+            Clauses.add(frozenset(ContractTuple))
+
+    Diagnostics.update({
+        "HigherOrderApertureProjectionComplete": True,
+        "HigherOrderApertureProjectionFailureReason": "",
+        "HigherOrderApertureProjectionRestricted": bool(Restriction),
+        "HigherOrderApertureProjectionContractTupleCount": int(
+            prod(map(len, ContractDomains))
+        ),
+        "HigherOrderApertureProjectionSeamTupleCheckCount": (
+            SeamTupleCheckCount
+        ),
+        "HigherOrderApertureProjectionClauseCount": len(Clauses),
+    })
+    return frozenset(Clauses), Diagnostics
 
 
 def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
@@ -3446,11 +7455,25 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
     PortsBySignal = {
         str(Port.Signal): Port for Port in Plan.Ports
     }
+    PortCoreSignals = tuple(
+        Signal for Signal in CoreSignals if Signal in PortsBySignal
+    )
+    LocalSeamNoGoodClauses = getattr(
+        Resources,
+        "RejectedPhysicalComponentLocalSeamReservationSets",
+        None,
+    )
+    if LocalSeamNoGoodClauses is None:
+        LocalSeamNoGoodClauses = set()
+        setattr(
+            Resources,
+            "RejectedPhysicalComponentLocalSeamReservationSets",
+            LocalSeamNoGoodClauses,
+        )
     LocalCoreClause = frozenset()
     if (
         Diagnostics.get("LocalUnsatCoreComplete", False)
-        and CoreSignals
-        and all(Signal in PortsBySignal for Signal in CoreSignals)
+        and PortCoreSignals
     ):
         LocalCoreClause = frozenset(
             (
@@ -3459,8 +7482,12 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
                     PortsBySignal[Signal]
                 ),
             )
-            for Signal in CoreSignals
+            for Signal in PortCoreSignals
         )
+        LocalSeamNoGoodClauses.add(LocalCoreClause)
+        # Publish complete seam clauses to the staged CSP's canonical live
+        # no-good set. Keep the legacy seam set mirrored until its remaining
+        # consumers are removed after physical parity.
         Resources.RejectedPhysicalComponentPortReservationSets.add(
             LocalCoreClause
         )
@@ -3468,6 +7495,7 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
         frozenset[tuple[str, str]]
     ] = set()
     PromotedApertureSignals: set[str] = set()
+    CoreSeamDomainSizes: dict[str, int] = {}
     if FactorDomain is not None and LocalCoreClause:
         BoundaryBySignal = {
             str(Port.Signal): Port
@@ -3483,7 +7511,7 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
             FactorDomain.LocalApertureSupportsByOption
         )
         SeamFingerprintsBySignal: dict[str, frozenset[str]] = {}
-        for Signal in CoreSignals:
+        for Signal in PortCoreSignals:
             Boundary = BoundaryBySignal.get(Signal)
             if Boundary is None:
                 continue
@@ -3512,12 +7540,11 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
             )
             if SeamFingerprints:
                 SeamFingerprintsBySignal[Signal] = SeamFingerprints
+                CoreSeamDomainSizes[Signal] = len(SeamFingerprints)
 
         RejectedLocalSeamClauses = tuple(
             Clause
-            for Clause in (
-                Resources.RejectedPhysicalComponentPortReservationSets
-            )
+            for Clause in LocalSeamNoGoodClauses
             if Clause and all(
                 str(Fingerprint).startswith(
                     "local-seam-contract-v1:"
@@ -3525,12 +7552,70 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
                 for _Signal, Fingerprint in Clause
             )
         )
+        RejectedUnarySeamKeys = frozenset(
+            next(iter(Clause))
+            for Clause in RejectedLocalSeamClauses
+            if len(Clause) == 1
+        )
+        MutableRejectedSeamPartners: dict[
+            tuple[str, str], set[tuple[str, str]]
+        ] = {}
+        RejectedHigherOrderSeamClauses = []
+        for Clause in RejectedLocalSeamClauses:
+            if len(Clause) == 2:
+                First, Second = tuple(Clause)
+                MutableRejectedSeamPartners.setdefault(
+                    First, set()
+                ).add(Second)
+                MutableRejectedSeamPartners.setdefault(
+                    Second, set()
+                ).add(First)
+            elif len(Clause) > 2:
+                RejectedHigherOrderSeamClauses.append(Clause)
+        RejectedSeamPartners = {
+            Key: frozenset(Values)
+            for Key, Values in MutableRejectedSeamPartners.items()
+        }
 
         def SeamTupleIsRejected(
             Keys: frozenset[tuple[str, str]],
         ) -> bool:
+            return bool(
+                Keys & RejectedUnarySeamKeys
+                or any(
+                    RejectedSeamPartners.get(Key, frozenset()) & Keys
+                    for Key in Keys
+                )
+                or any(
+                    Clause <= Keys
+                    for Clause in RejectedHigherOrderSeamClauses
+                )
+            )
+
+        def HasSupportedSeamTuple(
+            RemainingSignals: tuple[str, ...],
+            Keys: frozenset[tuple[str, str]],
+        ) -> bool:
+            if SeamTupleIsRejected(Keys):
+                return False
+            if not RemainingSignals:
+                return True
+            Signal = min(
+                RemainingSignals,
+                key=lambda Value: (
+                    len(SeamFingerprintsBySignal[Value]),
+                    Value,
+                ),
+            )
+            NextRemaining = tuple(
+                Value for Value in RemainingSignals if Value != Signal
+            )
             return any(
-                Clause <= Keys for Clause in RejectedLocalSeamClauses
+                HasSupportedSeamTuple(
+                    NextRemaining,
+                    Keys | frozenset(((Signal, Seam),)),
+                )
+                for Seam in sorted(SeamFingerprintsBySignal[Signal])
             )
 
         for Signal, SeamFingerprints in (
@@ -3548,32 +7633,20 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
                     .add(Boundary.ApertureContractFingerprint)
                 )
                 PromotedApertureSignals.add(Signal)
-        if len(CoreSignals) == 2 and all(
+        if len(PortCoreSignals) >= 2 and all(
             Signal in SeamFingerprintsBySignal
             and Signal in BoundaryBySignal
-            for Signal in CoreSignals
+            for Signal in PortCoreSignals
         ):
-            FirstSignal, SecondSignal = CoreSignals
-            if all(
-                SeamTupleIsRejected(frozenset((
-                    (FirstSignal, FirstSeam),
-                    (SecondSignal, SecondSeam),
-                )))
-                for FirstSeam in SeamFingerprintsBySignal[FirstSignal]
-                for SecondSeam in SeamFingerprintsBySignal[SecondSignal]
-            ):
-                ApertureClause = frozenset((
+            if not HasSupportedSeamTuple(PortCoreSignals, frozenset()):
+                ApertureClause = frozenset(
                     (
-                        FirstSignal,
-                        BoundaryBySignal[FirstSignal]
+                        Signal,
+                        BoundaryBySignal[Signal]
                         .ApertureContractFingerprint,
-                    ),
-                    (
-                        SecondSignal,
-                        BoundaryBySignal[SecondSignal]
-                        .ApertureContractFingerprint,
-                    ),
-                ))
+                    )
+                    for Signal in PortCoreSignals
+                )
                 Resources.RejectedPhysicalComponentPortReservationSets.add(
                     ApertureClause
                 )
@@ -3607,6 +7680,9 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
         "RejectedPhysicalAssemblyPlanFingerprint": Plan.PlanFingerprint,
         "RejectedAssemblyChoiceFingerprint": AssemblyChoiceFingerprint,
         "LocalCapacityCoreSignals": list(CoreSignals),
+        "LocalCapacityProjectedInterfaceCoreSignals": list(
+            PortCoreSignals
+        ),
         "LocalCapacityCoreClause": [
             list(Value) for Value in sorted(LocalCoreClause)
         ],
@@ -3621,6 +7697,17 @@ def RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
                 key=lambda Value: tuple(sorted(Value)),
             )
         ],
+        "LocalCapacityCoreSeamDomainSizes": dict(sorted(
+            CoreSeamDomainSizes.items()
+        )),
+        "SymbolicNetStateCacheHitCount": int(Diagnostics.get(
+            "SymbolicNetStateCacheHitCount",
+            0,
+        )),
+        "SymbolicNetStateCacheStoreCount": int(Diagnostics.get(
+            "SymbolicNetStateCacheStoreCount",
+            0,
+        )),
         "SymbolicCapacityProofComplete": True,
         "SymbolicCapacityProofFingerprint": Proof.ProofFingerprint,
         "LocalCompilationEntered": False,
@@ -3669,6 +7756,11 @@ def SelectContractIndependentOwnedSignalFrontierUnsatCore(
         or not isinstance(SignalDiagnostics, dict)
     ):
         return ()
+    # Every signal admitted below is independently empty before a port is
+    # assigned.  Return one deterministic singleton rather than the union of
+    # all empty signals: the singleton is the deletion-minimal placement core
+    # and can therefore drive a proof-qualified geometry change without
+    # pretending that unrelated signals participated in the contradiction.
     for Signal in CoreSignals:
         SignalProof = SignalDiagnostics.get(Signal, {})
         if not isinstance(SignalProof, dict) or not (
@@ -3685,7 +7777,7 @@ def SelectContractIndependentOwnedSignalFrontierUnsatCore(
             )) == 0
         ):
             return ()
-    return CoreSignals
+    return (CoreSignals[0],)
 
 
 def PromoteCoveredLocalContractNoGoods(
@@ -5247,6 +9339,48 @@ def BuildUniversalPromotedFabricPortAssignmentFailure(
     )
 
 
+def RecordPhysicalComponentDetailedRoutingNoGood(
+    Plan: PhysicalComponentAssemblyPlan,
+    GlobalChannelDesign: Any,
+    Resources: Any,
+) -> dict[str, object]:
+    """Reject only the exact bound channels after detailed-route failure."""
+    Assignment = getattr(GlobalChannelDesign, "RoutingAssignment", None)
+    if Assignment is None:
+        raise ValueError(
+            "detailed routing no-good requires a bound global assignment"
+        )
+    CandidateSet = frozenset(
+        (str(Signal), str(Candidate.CandidateId))
+        for Signal, Candidate in Assignment.SelectedCandidates.items()
+    )
+    BoundCandidateSet = frozenset(
+        (str(Channel.Signal), str(Channel.RouteCandidateId))
+        for Channel in Plan.Channels
+    )
+    if not CandidateSet or CandidateSet != BoundCandidateSet:
+        raise ValueError(
+            "detailed routing no-good global assignment identity mismatch"
+        )
+    Resources.ForbiddenPhysicalComponentGlobalCandidateSets.add(
+        CandidateSet
+    )
+    Resources.RejectedPhysicalComponentAssemblyPlanFingerprints.add(
+        Plan.PlanFingerprint
+    )
+    return {
+        "NoGoodScope": "exact-physical-global-candidate-set",
+        "ForbiddenGlobalCandidateSet": [
+            [Signal, CandidateId]
+            for Signal, CandidateId in sorted(CandidateSet)
+        ],
+        "RejectedPhysicalAssemblyPlanFingerprint": (
+            Plan.PlanFingerprint
+        ),
+        "PortAssignmentRejected": False,
+    }
+
+
 def RecordPhysicalComponentLocalCompilationNoGood(
     Solve: ComponentRoutingSolveResult,
     Plan: PhysicalComponentAssemblyPlan,
@@ -5420,9 +9554,10 @@ def RecordPhysicalComponentLocalCompilationNoGood(
             Port.Signal: BuildPhysicalPortGlobalContractFingerprint(Port)
             for Port in Plan.Ports
         }
-        TraversalDiagnostics = AdvancePhysicalComponentBoundaryTraversal(
-            Resources,
-            RelaxedCoreSignals,
+        TraversalDiagnostics = (
+            PreservePhysicalComponentAssemblyPlanDomainContinuation(
+                Resources,
+            )
         )
         Result = {
             "NoGoodScope": Scope,
@@ -5488,23 +9623,65 @@ def RecordPhysicalComponentLocalCompilationNoGood(
         raise ValueError(
             "local component no-good global assignment identity mismatch"
         )
+    SignalDiagnostics = Diagnostics.get("SignalDiagnostics", {})
+    ProvenExteriorCoreSignals: set[str] = set()
+    ExteriorCoreComplete = bool(
+        isinstance(SignalDiagnostics, dict)
+        and CoreSignals
+    )
+    for Signal in sorted(CoreSignals):
+        PerSignalDiagnostics = SignalDiagnostics.get(Signal, {})
+        if not (
+            isinstance(PerSignalDiagnostics, dict)
+            and PerSignalDiagnostics.get(
+                "ReservedGlobalRouteUnsatCoreComplete",
+                False,
+            )
+        ):
+            ExteriorCoreComplete = False
+            break
+        ProvenExteriorCoreSignals.update(map(str, (
+            PerSignalDiagnostics.get(
+                "ReservedGlobalRouteUnsatCoreSignals",
+                (),
+            )
+        )))
+    CandidateNoGood = frozenset(
+        (Signal, CandidateId)
+        for Signal, CandidateId in CandidateSet
+        if Signal in ProvenExteriorCoreSignals
+    )
+    if not (
+        ExteriorCoreComplete
+        and CandidateNoGood
+        and len(CandidateNoGood) <= 2
+        and len(CandidateNoGood) == len(ProvenExteriorCoreSignals)
+    ):
+        CandidateNoGood = CandidateSet
+        ExteriorCoreComplete = False
     Resources.ForbiddenPhysicalComponentGlobalCandidateSets.add(
-        CandidateSet
+        CandidateNoGood
     )
     Resources.RejectedPhysicalComponentAssemblyPlanFingerprints.add(
         Plan.PlanFingerprint
     )
-    TraversalDiagnostics = AdvancePhysicalComponentBoundaryTraversal(
-        Resources,
-        CoreSignals,
+    TraversalDiagnostics = (
+        PreservePhysicalComponentAssemblyPlanDomainContinuation(
+            Resources,
+        )
     )
     return {
         "NoGoodScope": "exact-physical-global-candidate-set",
         "NoGoodSignals": sorted(CoreSignals),
         "ForbiddenGlobalCandidateSet": [
             [Signal, CandidateId]
-            for Signal, CandidateId in sorted(CandidateSet)
+            for Signal, CandidateId in sorted(CandidateNoGood)
         ],
+        "ExteriorCandidateCoreSignals": sorted(
+            ProvenExteriorCoreSignals
+        ),
+        "ExteriorCandidateCoreComplete": ExteriorCoreComplete,
+        "NoGoodConstraintArity": len(CandidateNoGood),
         "LocalUnsatCoreFingerprint": str(
             Diagnostics.get("LocalUnsatCoreFingerprint", "")
         ),

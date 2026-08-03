@@ -1,8 +1,25 @@
 # Hierarchical Region Router Design
 
-> **Future-design notice (2026-07-21):** This is a proposed hierarchical
-> direction, not the active PCB router. Current implementation requirements are
-> in the [router reliability design](Docs/Routing/Active/RouterReliabilityDesignDoc.md).
+This document is the active reference for the routed-logic architecture and
+acceptance behavior. It supersedes older compatibility-era planning notes and the
+historical fallback strategy discussions.
+
+Canonical implementation focus remains:
+
+- staged hierarchical reasoning (regions, boundaries, and contracts),
+- shared canonical contracts for repeated arithmetic structure,
+- resource-ownership-aware inter-region routing,
+- deterministic materialization plus authoritative validation and simulation.
+
+Current implementation note (2026-08-02):
+
+- `Main.py` / `Compiler/Main.py` drives the authoritative default router.
+- The active default strategy is `default`.
+- RCA4 currently compiles to a routed, truth-verified artifact in live runs.
+- Compatibility checks are now profile-driven by normalized circuit metrics and are
+  no longer keyed to circuit names.
+- Acceptance now includes the full FA/RCA4/RCA8 matrix and compatibility checks
+  once regression gates pass.
 
 ## Purpose
 

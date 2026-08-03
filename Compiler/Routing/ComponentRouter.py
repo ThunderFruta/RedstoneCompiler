@@ -1263,6 +1263,112 @@ def BuildClosedComponentInterface(
     )
 
 
+def SelectClosedComponentOwnedTerminalPairs(
+    Placed: Any,
+    Profiles: Mapping[str, Any],
+) -> frozenset[tuple[str, Position3]]:
+    """Select terminals owned by the placed closed component.
+
+    This topology-only selection deliberately has no portal dependency.  It
+    lets physical planning prepare the exact owned-terminal portal slice and
+    prove its local frontier before spending work on unrelated global nets.
+    """
+    Channel = getattr(Placed, "InterClusterRoutingChannel", None)
+    SelectedClusters = tuple(sorted(
+        int(Value)
+        for Value in getattr(Channel, "AffectedClusters", ())
+    ))
+    SelectedClusterSet = frozenset(SelectedClusters)
+    BoundaryRequests = tuple(
+        getattr(Placed, "ClusterBoundaryLeaseRequests", ()) or ()
+    )
+    IncidentSignals = {
+        str(Signal)
+        for Signal in getattr(Channel, "AffectedSignals", ())
+        if str(Signal) in Profiles
+    }
+    IncidentSignals.update(SelectComponentIncidentSignals(
+        BoundaryRequests,
+        SelectedClusters,
+        dict(Profiles),
+    ))
+    ComponentGraph = getattr(Placed, "ComponentGraph", None)
+    ComponentId = getattr(Channel, "ComponentId", None)
+    TopologyComponent = next(
+        (
+            Value
+            for Value in getattr(ComponentGraph, "Components", ())
+            if Value.ComponentId == ComponentId
+        ),
+        None,
+    )
+    ComponentGateNames = frozenset(
+        getattr(TopologyComponent, "GateNames", ())
+    )
+    ComponentPairs: set[tuple[str, Position3]] = set()
+    for Request in BoundaryRequests:
+        Signal = str(Request.Signal)
+        if Signal not in IncidentSignals:
+            continue
+        Profile = Profiles[Signal]
+        ProfileTerminals = frozenset((
+            tuple(Profile.Root),
+            *(tuple(Terminal) for Terminal in Profile.Targets),
+        ))
+        SourceIsSelected = (
+            int(Request.SourceCluster) in SelectedClusterSet
+        )
+        TargetIsSelected = (
+            int(Request.TargetCluster) in SelectedClusterSet
+        )
+        if not (SourceIsSelected or TargetIsSelected):
+            continue
+        if (
+            SourceIsSelected
+            and Request.SourceTerminal is not None
+            and tuple(Request.SourceTerminal) in ProfileTerminals
+        ):
+            ComponentPairs.add((
+                Signal,
+                tuple(Request.SourceTerminal),
+            ))
+        if TargetIsSelected:
+            ComponentPairs.update(
+                (Signal, tuple(Terminal))
+                for Terminal in Request.TargetTerminals
+                if tuple(Terminal) in ProfileTerminals
+            )
+    if ComponentGateNames:
+        for Gate in getattr(Placed, "PlacedGates", ()):
+            if Gate.Name not in ComponentGateNames:
+                continue
+            OutputPin = getattr(Gate, "OutputPin", None)
+            if OutputPin is not None:
+                for Signal, Profile in Profiles.items():
+                    if (
+                        Signal in IncidentSignals
+                        and tuple(Profile.Root) == tuple(OutputPin)
+                    ):
+                        ComponentPairs.add((
+                            str(Signal),
+                            tuple(OutputPin),
+                        ))
+            InputPins = frozenset(map(
+                tuple,
+                getattr(Gate, "InputPins", ()),
+            ))
+            if InputPins:
+                for Signal, Profile in Profiles.items():
+                    if Signal not in IncidentSignals:
+                        continue
+                    ComponentPairs.update(
+                        (str(Signal), tuple(Terminal))
+                        for Terminal in Profile.Targets
+                        if tuple(Terminal) in InputPins
+                    )
+    return frozenset(ComponentPairs)
+
+
 def BuildComponentRoutingProblem(
     *,
     Placed: Any,
@@ -1287,7 +1393,6 @@ def BuildComponentRoutingProblem(
     BoundaryRequests = tuple(
         getattr(Placed, "ClusterBoundaryLeaseRequests", ()) or ()
     )
-    ComponentPairValues: set[tuple[str, Position3]] = set()
     # A closed component owns every terminal inside its selected clusters.
     # The channel's internal signals are only the seed; all topological cut
     # crossings become explicit interface ports instead of remaining porous
@@ -1302,71 +1407,10 @@ def BuildComponentRoutingProblem(
         SelectedClusters,
         Profiles,
     ))
-    ComponentGraph = getattr(Placed, "ComponentGraph", None)
-    ComponentId = getattr(Channel, "ComponentId", None)
-    TopologyComponent = next(
-        (
-            Value
-            for Value in getattr(ComponentGraph, "Components", ())
-            if Value.ComponentId == ComponentId
-        ),
-        None,
+    ComponentPairs = SelectClosedComponentOwnedTerminalPairs(
+        Placed,
+        Profiles,
     )
-    ComponentGateNames = frozenset(
-        getattr(TopologyComponent, "GateNames", ())
-    )
-    TopologyOwnedSignals = frozenset(IncidentSignals)
-    for Request in BoundaryRequests:
-        Signal = str(Request.Signal)
-        if Signal not in IncidentSignals:
-            continue
-        SourceIsSelected = (
-            int(Request.SourceCluster) in SelectedClusterSet
-        )
-        TargetIsSelected = (
-            int(Request.TargetCluster) in SelectedClusterSet
-        )
-        if not (SourceIsSelected or TargetIsSelected):
-            continue
-        if SourceIsSelected and Request.SourceTerminal is not None:
-            ComponentPairValues.add((
-                Signal,
-                tuple(Request.SourceTerminal),
-            ))
-        if TargetIsSelected:
-            ComponentPairValues.update(
-                (Signal, tuple(Terminal))
-                for Terminal in Request.TargetTerminals
-            )
-    if ComponentGateNames:
-        for Gate in getattr(Placed, "PlacedGates", ()):
-            if Gate.Name not in ComponentGateNames:
-                continue
-            OutputPin = getattr(Gate, "OutputPin", None)
-            if OutputPin is not None:
-                for Signal, Profile in Profiles.items():
-                    if (
-                        Signal in IncidentSignals
-                        and tuple(Profile.Root) == tuple(OutputPin)
-                    ):
-                        ComponentPairValues.add((
-                            str(Signal),
-                            tuple(OutputPin),
-                        ))
-            InputPins = frozenset(map(
-                tuple,
-                getattr(Gate, "InputPins", ()),
-            ))
-            if InputPins:
-                for Signal, Profile in Profiles.items():
-                    if Signal not in IncidentSignals:
-                        continue
-                    ComponentPairValues.update(
-                        (str(Signal), tuple(Terminal))
-                        for Terminal in Profile.Targets
-                        if tuple(Terminal) in InputPins
-                    )
-    ComponentPairs = frozenset(ComponentPairValues)
     EffectiveComponentPairs = set(ComponentPairs)
     RoutableComponentSignals = tuple(sorted(
         Signal
@@ -6445,6 +6489,7 @@ def _SolveComponentRoutingProblemLegacy(
         )
         for Signal in Problem.ComponentSignals
     }
+
     if StopAfterCompleteNetVariantPortfolioSignal is not None:
         PortfolioSignal = str(StopAfterCompleteNetVariantPortfolioSignal)
         if PortfolioSignal not in DomainsBySignal:
@@ -8435,6 +8480,362 @@ class ComponentTreeDpNetState:
     NetFingerprint: str
 
 
+def SelectComponentSymbolicPhysicalPort(
+    Problem: ComponentRoutingProblem,
+    Signal: str,
+) -> Any | None:
+    return next((
+        Port
+        for Port in (
+            Problem.Interface.PhysicalPortReservations
+            if Problem.Interface is not None
+            else ()
+        )
+        if Port.Signal == Signal
+    ), None)
+
+
+def BuildComponentSymbolicNetStateCacheKey(
+    Problem: ComponentRoutingProblem,
+    Signal: str,
+    ForbiddenExportPortsBySignal: dict[
+        str, tuple[Position3, ...]
+    ] | None = None,
+    *,
+    PreparedContextFingerprint: str | None = None,
+) -> str:
+    """Identify one signal-local exact tree-frontier compilation."""
+    PhysicalPort = SelectComponentSymbolicPhysicalPort(Problem, Signal)
+    ContextFingerprint = (
+        str(PreparedContextFingerprint)
+        if PreparedContextFingerprint is not None
+        else _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+            Problem,
+            Signal,
+        )
+    )
+    return _StableFingerprint((
+        "component-symbolic-net-state-v2",
+        ContextFingerprint,
+        Signal,
+        tuple(getattr(PhysicalPort, "LocalPath", ())),
+        tuple(getattr(
+            PhysicalPort,
+            "OwnedCandidateFingerprints",
+            (),
+        )),
+        tuple((ForbiddenExportPortsBySignal or {}).get(Signal, ())),
+    ))
+
+
+def _BuildPreparedComponentSymbolicNetStateContextIdentity(
+    Problem: ComponentRoutingProblem,
+    Signal: str,
+) -> dict[str, object]:
+    """Build a stable semantic identity for one prepared symbolic context."""
+    OwnedDomains = tuple(
+        Domain
+        for Domain in Problem.OwnedTerminalDomains
+        if str(Domain.Signal) == str(Signal)
+    )
+    return {
+        "FabricFingerprint": Problem.Fabric.FabricFingerprint,
+        "PlacementFingerprint": Problem.PlacementFingerprint,
+        "ResourceGraphFingerprint": str(
+            getattr(
+                Problem.PhysicalAssemblyPlan,
+                "ResourceGraphFingerprint",
+                "",
+            )
+        ),
+        "TechnologyFingerprint": str(
+            getattr(
+                Problem.PhysicalAssemblyPlan,
+                "TechnologyFingerprint",
+                "",
+            )
+        ),
+        "Signal": str(Signal),
+        "OwnedDomains": tuple(
+            (
+                Domain.TerminalRole,
+                Domain.TerminalFingerprint,
+                tuple(sorted(
+                    (
+                        Candidate.CandidateFingerprint,
+                        Candidate.Attachment,
+                        Candidate.Path,
+                        _ClaimsFingerprint(Candidate.Claims),
+                        Candidate.Layer,
+                        Candidate.Cost,
+                    )
+                    for Candidate in Domain.Candidates
+                )),
+                Domain.Complete,
+            )
+            for Domain in sorted(
+                OwnedDomains,
+                key=lambda Value: (
+                    Value.TerminalFingerprint,
+                    Value.TerminalRole,
+                    Value.Terminal,
+                ),
+            )
+        ),
+        "LocalClaims": tuple(
+            (
+                str(Claim.Signal),
+                tuple(sorted(
+                    Value for Value in Claim.Nodes
+                )),
+                tuple(
+                    _NormalizedEdge(First, Second)
+                    for First, Second in sorted(Claim.Edges)
+                ),
+            )
+            for Claim in sorted(
+                (
+                    Claim
+                    for Claim in Problem.LocalClaims
+                    if str(Claim.Signal) == str(Signal)
+                ),
+                key=lambda Value: (
+                    str(Value.Signal),
+                    Value.Root,
+                ),
+            )
+        ),
+        "ImmutableClaims": tuple(
+            (
+                str(Claim.Signal),
+                _ClaimsFingerprint(Claim.Claims),
+            )
+            for Claim in sorted(
+                (
+                    Claim
+                    for Claim in Problem.ImmutableClaims
+                    if str(Claim.Signal) not in Problem.ComponentSignals
+                ),
+                key=lambda Value: str(Value.Signal),
+            )
+        ),
+        "ReservedGlobalClaims": tuple(
+            (
+                str(ReservedSignal),
+                _ClaimsFingerprint(Claims),
+            )
+            for ReservedSignal, Claims in sorted(
+                Problem.ReservedGlobalClaimsBySignal,
+                key=lambda Value: str(Value[0]),
+            )
+            if str(ReservedSignal) != str(Signal)
+        ),
+        "ExternalContinuations": tuple(
+            Value
+            for Value in sorted(
+                Problem.ExternalContinuationTerminals,
+                key=lambda Value: (
+                    str(Value[0]),
+                    Value[1],
+                    Value[2],
+                ),
+            )
+            if str(Value[0]) == str(Signal)
+        ),
+        "MaximumPowerDistance": Problem.MaximumPowerDistance,
+        "ResourceGraphVersion": getattr(
+            Problem.ResourceGraph,
+            "GraphVersion",
+            "",
+        ),
+    }
+
+
+def _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+    Problem: ComponentRoutingProblem,
+    Signal: str,
+) -> str:
+    """Identify every port-independent input to one signal tree compiler."""
+    Identity = _BuildPreparedComponentSymbolicNetStateContextIdentity(
+        Problem,
+        Signal,
+    )
+    return _StableFingerprint((
+        "prepared-component-symbolic-net-state-context-v1",
+        tuple(sorted(Identity.items())),
+    ))
+
+
+@dataclass
+class PreparedComponentSymbolicTerminalFrontier:
+    """Complete owned-terminal frontier independent of one physical egress."""
+
+    FilteredByDomain: tuple[
+        tuple[ComponentTerminalAccessCandidate, ...], ...
+    ]
+    Frontier: tuple[
+        tuple[
+            int,
+            tuple[tuple[int, ComponentTerminalAccessCandidate], ...],
+            frozenset[Position3],
+            frozenset[RoutingEdge],
+            RoutingResourceClaims,
+        ], ...
+    ]
+    ImmutableRejectedCandidateCount: int
+    CertifiedRejectedCandidateCount: int
+    CandidateFilterEmpty: bool
+
+
+@dataclass
+class PreparedComponentSymbolicNetStateContext:
+    """Reusable port-independent tree data for one component signal."""
+
+    ContextFingerprint: str
+    Signal: str
+    FabricAdjacency: dict[Position3, set[Position3]]
+    FabricParentCache: dict[
+        Position3, dict[Position3, Position3 | None]
+    ]
+    FabricComponentByNode: dict[Position3, int]
+    Domains: tuple[ComponentTerminalAccessDomain, ...]
+    ImmutableEligibleCandidateFingerprintsByDomain: tuple[
+        frozenset[str], ...
+    ]
+    LocalClaims: tuple[LocalRouteClaim, ...]
+    ImmutableClaimsBySignal: tuple[
+        tuple[str, RoutingResourceClaims], ...
+    ]
+    BlockingImmutableClaims: tuple[
+        tuple[str, RoutingResourceClaims], ...
+    ]
+    RouteClaimsConstructionCache: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ]
+    TerminalFrontierCache: dict[
+        frozenset[str], PreparedComponentSymbolicTerminalFrontier
+    ]
+    TerminalFrontierBuildCount: int
+    TerminalFrontierCacheHitCount: int
+    TreeRepeaterSubproblemCache: dict[
+        tuple[int, int, str],
+        tuple[tuple[Position3, str], ...] | None,
+    ]
+    TreeRepeaterCacheStatistics: dict[str, int]
+
+
+def PrepareComponentSymbolicNetStateContext(
+    Problem: ComponentRoutingProblem,
+    Signal: str,
+    *,
+    RouteClaimsConstructionCache: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ] | None = None,
+) -> PreparedComponentSymbolicNetStateContext:
+    """Prepare the static fabric and claim context once for many port accesses."""
+    Signal = str(Signal)
+    if Signal not in Problem.ComponentSignals:
+        raise ValueError(
+            "prepared symbolic net-state signal is outside the component"
+        )
+    FabricAdjacency = _BuildAdjacency(Problem.Fabric.Edges)
+    FabricComponentByNode: dict[Position3, int] = {}
+    ComponentIndex = 0
+    for Start in sorted(Problem.Fabric.Nodes):
+        if Start in FabricComponentByNode:
+            continue
+        FabricComponentByNode[Start] = ComponentIndex
+        Pending = [Start]
+        while Pending:
+            Current = Pending.pop()
+            for Neighbor in sorted(FabricAdjacency.get(Current, ())):
+                if Neighbor in FabricComponentByNode:
+                    continue
+                FabricComponentByNode[Neighbor] = ComponentIndex
+                Pending.append(Neighbor)
+        ComponentIndex += 1
+    ImmutableClaimsBySignal = tuple(
+        (str(Claim.Signal), Claim.Claims)
+        for Claim in Problem.ImmutableClaims
+        if Claim.Signal not in Problem.ComponentSignals
+    )
+    BlockingImmutableClaims = (
+        *ImmutableClaimsBySignal,
+        *tuple(
+            (str(ReservedSignal), Claims)
+            for ReservedSignal, Claims
+            in Problem.ReservedGlobalClaimsBySignal
+            if str(ReservedSignal) != Signal
+        ),
+    )
+    Domains = tuple(
+        Domain for Domain in Problem.OwnedTerminalDomains
+        if str(Domain.Signal) == Signal
+    )
+    ImmutableEligibleCandidateFingerprintsByDomain = tuple(
+        frozenset(
+            Candidate.CandidateFingerprint
+            for Candidate in Domain.Candidates
+            if Candidate.Attachment in FabricComponentByNode
+            and not any(
+                ComponentClaimsConflict(
+                    Candidate.Claims,
+                    ImmutableClaims,
+                )
+                for _Owner, ImmutableClaims in BlockingImmutableClaims
+            )
+        )
+        for Domain in Domains
+    )
+    return PreparedComponentSymbolicNetStateContext(
+        ContextFingerprint=(
+            _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+                Problem,
+                Signal,
+            )
+        ),
+        Signal=Signal,
+        FabricAdjacency=FabricAdjacency,
+        FabricParentCache={},
+        FabricComponentByNode=FabricComponentByNode,
+        Domains=Domains,
+        ImmutableEligibleCandidateFingerprintsByDomain=(
+            ImmutableEligibleCandidateFingerprintsByDomain
+        ),
+        LocalClaims=tuple(
+            Claim for Claim in Problem.LocalClaims
+            if str(Claim.Signal) == Signal
+        ),
+        ImmutableClaimsBySignal=ImmutableClaimsBySignal,
+        BlockingImmutableClaims=BlockingImmutableClaims,
+        RouteClaimsConstructionCache=(
+            RouteClaimsConstructionCache
+            if RouteClaimsConstructionCache is not None
+            else {}
+        ),
+        TerminalFrontierCache={},
+        TerminalFrontierBuildCount=0,
+        TerminalFrontierCacheHitCount=0,
+        TreeRepeaterSubproblemCache={},
+        TreeRepeaterCacheStatistics={
+            "HitCount": 0,
+            "MissCount": 0,
+        },
+    )
+
+
+@dataclass(frozen=True)
+class PreparedComponentSymbolicNetStateCompilation:
+    """One exact access-bound state domain compiled from a prepared context."""
+
+    CacheKey: str
+    States: tuple[ComponentTreeDpNetState, ...] | None
+    Complete: bool
+    CacheHit: bool
+    ExpansionCount: int
+    Diagnostics: dict[str, object]
+
+
 def SolveComponentRoutingProblemDynamic(
     Problem: ComponentRoutingProblem,
     *,
@@ -8454,6 +8855,12 @@ def SolveComponentRoutingProblemDynamic(
     RouteClaimsConstructionCache: dict[
         frozenset[Position3], RoutingResourceClaims
     ] | None = None,
+    SymbolicNetStateCache: dict[str, Any] | None = None,
+    RequestedSymbolicStateSignals: frozenset[str] | None = None,
+    PreparedSymbolicNetStateContext: (
+        PreparedComponentSymbolicNetStateContext | None
+    ) = None,
+    PreparedPhysicalPortVariants: tuple[Any, ...] = (),
     StopAfterOwnedSignalFrontierProof: bool = False,
     StopAfterSymbolicCapacityProof: bool = False,
 ) -> ComponentRoutingSolveResult:
@@ -8471,14 +8878,22 @@ def SolveComponentRoutingProblemDynamic(
         ForbiddenForeignCandidateFingerprintsBySignal or {}
     )
     RouteClaimsCache = (
-        RouteClaimsConstructionCache
+        PreparedSymbolicNetStateContext.RouteClaimsConstructionCache
+        if PreparedSymbolicNetStateContext is not None
+        else RouteClaimsConstructionCache
         if RouteClaimsConstructionCache is not None
+        else {}
+    )
+    NetStateCache = (
+        SymbolicNetStateCache
+        if SymbolicNetStateCache is not None
         else {}
     )
     ExpansionCount = 0
     ExploredStateCount = 0
     PeakFrontierStateCount = 0
     DominatedStateCount = 0
+    IncrementalPhysicalEgressMaterializationCount = 0
     HitLimit = False
     SignalDiagnostics: dict[str, dict[str, object]] = {}
     SolverDiagnostics: dict[str, object] = {
@@ -8492,6 +8907,8 @@ def SolveComponentRoutingProblemDynamic(
         "OwnedTerminalDomainCount": len(Problem.OwnedTerminalDomains),
         "CompleteTreesMaterialized": 0,
         "SelectedTreesMaterialized": 0,
+        "SymbolicNetStateCacheHitCount": 0,
+        "SymbolicNetStateCacheStoreCount": 0,
     }
 
     def Advance(Phase: str) -> bool:
@@ -8523,6 +8940,9 @@ def SolveComponentRoutingProblemDynamic(
             "ExploredStateCount": ExploredStateCount,
             "PeakFrontierStateCount": PeakFrontierStateCount,
             "DominatedStateCount": DominatedStateCount,
+            "IncrementalPhysicalEgressMaterializationCount": (
+                IncrementalPhysicalEgressMaterializationCount
+            ),
             "CompleteTreesMaterialized": 0,
             "SignalDiagnostics": SignalDiagnostics,
             "RuntimeSeconds": monotonic() - Started,
@@ -8593,38 +9013,77 @@ def SolveComponentRoutingProblemDynamic(
             Diagnostics=FinishDiagnostics(),
         )
 
-    FabricAdjacency = _BuildAdjacency(Problem.Fabric.Edges)
-    FabricParentCache: dict[
-        Position3, dict[Position3, Position3 | None]
-    ] = {}
-    FabricComponentByNode: dict[Position3, int] = {}
-    for Start in sorted(Problem.Fabric.Nodes):
-        if Start in FabricComponentByNode:
-            continue
-        ComponentIndex = len(set(FabricComponentByNode.values()))
-        FabricComponentByNode[Start] = ComponentIndex
-        Pending = [Start]
-        while Pending:
-            Current = Pending.pop()
-            for Neighbor in sorted(FabricAdjacency.get(Current, ())):
-                if Neighbor in FabricComponentByNode:
-                    continue
-                FabricComponentByNode[Neighbor] = ComponentIndex
-                Pending.append(Neighbor)
-
-    LocalClaimsBySignal = {
-        Signal: tuple(
-            Claim
-            for Claim in Problem.LocalClaims
-            if Claim.Signal == Signal
+    if PreparedSymbolicNetStateContext is not None:
+        PreparedSignal = PreparedSymbolicNetStateContext.Signal
+        if (
+            _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+                Problem,
+                PreparedSignal,
+            )
+            != PreparedSymbolicNetStateContext.ContextFingerprint
+        ):
+            raise ValueError(
+                "prepared symbolic net-state context identity mismatch"
+            )
+        FabricAdjacency = (
+            PreparedSymbolicNetStateContext.FabricAdjacency
         )
-        for Signal in Problem.ComponentSignals
-    }
-    ImmutableClaimsBySignal = tuple(
-        (str(Claim.Signal), Claim.Claims)
-        for Claim in Problem.ImmutableClaims
-        if Claim.Signal not in Problem.ComponentSignals
-    )
+        FabricParentCache = (
+            PreparedSymbolicNetStateContext.FabricParentCache
+        )
+        FabricComponentByNode = (
+            PreparedSymbolicNetStateContext.FabricComponentByNode
+        )
+        LocalClaimsBySignal = {
+            PreparedSignal: PreparedSymbolicNetStateContext.LocalClaims
+        }
+        ImmutableClaimsBySignal = (
+            PreparedSymbolicNetStateContext.ImmutableClaimsBySignal
+        )
+        DomainsBySignal = {
+            PreparedSignal: PreparedSymbolicNetStateContext.Domains
+        }
+    else:
+        FabricAdjacency = _BuildAdjacency(Problem.Fabric.Edges)
+        FabricParentCache: dict[
+            Position3, dict[Position3, Position3 | None]
+        ] = {}
+        FabricComponentByNode: dict[Position3, int] = {}
+        for Start in sorted(Problem.Fabric.Nodes):
+            if Start in FabricComponentByNode:
+                continue
+            ComponentIndex = len(set(FabricComponentByNode.values()))
+            FabricComponentByNode[Start] = ComponentIndex
+            Pending = [Start]
+            while Pending:
+                Current = Pending.pop()
+                for Neighbor in sorted(FabricAdjacency.get(Current, ())):
+                    if Neighbor in FabricComponentByNode:
+                        continue
+                    FabricComponentByNode[Neighbor] = ComponentIndex
+                    Pending.append(Neighbor)
+
+        LocalClaimsBySignal = {
+            Signal: tuple(
+                Claim
+                for Claim in Problem.LocalClaims
+                if Claim.Signal == Signal
+            )
+            for Signal in Problem.ComponentSignals
+        }
+        ImmutableClaimsBySignal = tuple(
+            (str(Claim.Signal), Claim.Claims)
+            for Claim in Problem.ImmutableClaims
+            if Claim.Signal not in Problem.ComponentSignals
+        )
+        DomainsBySignal = {
+            Signal: tuple(
+                Domain
+                for Domain in Problem.OwnedTerminalDomains
+                if Domain.Signal == Signal
+            )
+            for Signal in Problem.ComponentSignals
+        }
 
     def ClaimsForNodes(
         Nodes: frozenset[Position3],
@@ -8652,6 +9111,11 @@ def SolveComponentRoutingProblemDynamic(
     def BlockingImmutableClaims(
         Signal: str,
     ) -> tuple[tuple[str, RoutingResourceClaims], ...]:
+        if (
+            PreparedSymbolicNetStateContext is not None
+            and str(Signal) == PreparedSymbolicNetStateContext.Signal
+        ):
+            return PreparedSymbolicNetStateContext.BlockingImmutableClaims
         return (
             *ImmutableClaimsBySignal,
             *tuple(
@@ -8661,6 +9125,74 @@ def SolveComponentRoutingProblemDynamic(
                 if str(ReservedSignal) != Signal
             ),
         )
+
+    ReservedGlobalGeometryBlockerSetsBySignal: dict[
+        str, list[frozenset[str]]
+    ] = defaultdict(list)
+    ReservedGlobalCandidateBlockerSetsBySignalDomain: dict[
+        tuple[str, int], list[frozenset[str]]
+    ] = defaultdict(list)
+    ReservedGlobalClaimSignals = frozenset(
+        str(Signal)
+        for Signal, _Claims in Problem.ReservedGlobalClaimsBySignal
+    )
+    ReservedGlobalWireCellsBySignal: dict[
+        str, frozenset[Position3]
+    ] = {
+        Signal: frozenset().union(*(
+            Claims.WireCells
+            for ReservedSignal, Claims
+            in Problem.ReservedGlobalClaimsBySignal
+            if str(ReservedSignal) == Signal
+        ))
+        for Signal in ReservedGlobalClaimSignals
+    }
+
+    def HasBlockingClaimConflict(
+        Signal: str,
+        Claims: RoutingResourceClaims,
+    ) -> bool:
+        ConflictingOwners = frozenset(
+            str(Owner)
+            for Owner, ImmutableClaims in BlockingImmutableClaims(Signal)
+            if ComponentClaimsConflict(Claims, ImmutableClaims)
+        )
+        if not ConflictingOwners:
+            return False
+        ImmutableBlockers = ConflictingOwners - ReservedGlobalClaimSignals
+        ReservedBlockers = ConflictingOwners & ReservedGlobalClaimSignals
+        # A geometry that also conflicts with an immutable claim is
+        # intrinsically unavailable and needs no exterior literal.  Every
+        # otherwise legal geometry rejected only by selected global routes
+        # contributes one exact blocker set to the cut proof.
+        if not ImmutableBlockers and ReservedBlockers:
+            ReservedGlobalGeometryBlockerSetsBySignal[Signal].append(
+                ReservedBlockers
+            )
+        return True
+
+    def HasSameSignalReservedSelfConflict(
+        Signal: str,
+        Nodes: frozenset[Position3],
+    ) -> bool:
+        SameSignalReservedNodes = (
+            ReservedGlobalWireCellsBySignal.get(
+                Signal,
+                frozenset(),
+            )
+        )
+        if not SameSignalReservedNodes:
+            return False
+        CombinedClaims = ClaimsForNodes(frozenset((
+            *Nodes,
+            *SameSignalReservedNodes,
+        )))
+        if not FindSelfClaimConflicts({Signal: CombinedClaims}):
+            return False
+        ReservedGlobalGeometryBlockerSetsBySignal[Signal].append(
+            frozenset((Signal,))
+        )
+        return True
 
     def BuildGeometry(
         Signal: str,
@@ -8712,77 +9244,213 @@ def SolveComponentRoutingProblemDynamic(
         Claims = ClaimsForNodes(FrozenNodes)
         if FindSelfClaimConflicts({Signal: Claims}):
             return None
-        if any(
-            ComponentClaimsConflict(Claims, ImmutableClaims)
-            for _Owner, ImmutableClaims in BlockingImmutableClaims(Signal)
-        ):
+        if HasSameSignalReservedSelfConflict(Signal, FrozenNodes):
+            return None
+        if HasBlockingClaimConflict(Signal, Claims):
             return None
         return FrozenNodes, FrozenEdges, Claims
-
-    DomainsBySignal = {
-        Signal: tuple(
-            Domain
-            for Domain in Problem.OwnedTerminalDomains
-            if Domain.Signal == Signal
-        )
-        for Signal in Problem.ComponentSignals
-    }
 
     def BuildSignalStates(
         Signal: str,
     ) -> tuple[ComponentTreeDpNetState, ...] | None:
         nonlocal PeakFrontierStateCount, DominatedStateCount
+        nonlocal IncrementalPhysicalEgressMaterializationCount
         Domains = DomainsBySignal[Signal]
-        PhysicalPort = next(
-            (
-                Port
-                for Port in (
-                    Problem.Interface.PhysicalPortReservations
-                    if Problem.Interface is not None
-                    else ()
-                )
-                if Port.Signal == Signal
-            ),
-            None,
+        DefaultPhysicalPort = SelectComponentSymbolicPhysicalPort(
+            Problem,
+            Signal,
         )
-        Certified = frozenset(getattr(
-            PhysicalPort,
-            "OwnedCandidateFingerprints",
-            (),
-        ))
-        FilteredByDomain: dict[int, tuple[
-            ComponentTerminalAccessCandidate, ...
-        ]] = {}
-        ImmutableRejected = 0
-        CertifiedRejected = 0
-        for DomainIndex, Domain in enumerate(Domains):
-            Retained = []
-            for Candidate in sorted(
-                Domain.Candidates,
-                key=lambda Value: Value.CandidateFingerprint,
-            ):
-                if (
-                    Certified
-                    and Candidate.CandidateFingerprint not in Certified
+        PhysicalPorts = (
+            tuple(PreparedPhysicalPortVariants)
+            if PreparedPhysicalPortVariants
+            else (DefaultPhysicalPort,)
+            if DefaultPhysicalPort is not None
+            else ()
+        )
+        if any(str(Port.Signal) != Signal for Port in PhysicalPorts):
+            raise ValueError(
+                "prepared physical port variants contain another signal"
+            )
+        CertifiedDomains = {
+            frozenset(getattr(
+                Port,
+                "OwnedCandidateFingerprints",
+                (),
+            ))
+            for Port in PhysicalPorts
+        }
+        if len(CertifiedDomains) > 1:
+            raise ValueError(
+                "prepared physical port variants require one exact owned "
+                "candidate domain"
+            )
+        Certified = (
+            next(iter(CertifiedDomains))
+            if CertifiedDomains
+            else frozenset()
+        )
+        CachedTerminalFrontier = (
+            PreparedSymbolicNetStateContext.TerminalFrontierCache.get(
+                Certified
+            )
+            if PreparedSymbolicNetStateContext is not None
+            else None
+        )
+        TerminalFrontierCacheHit = CachedTerminalFrontier is not None
+        if CachedTerminalFrontier is not None:
+            PreparedSymbolicNetStateContext.TerminalFrontierCacheHitCount += 1
+            FilteredByDomain = {
+                Index: Values for Index, Values in enumerate(
+                    CachedTerminalFrontier.FilteredByDomain
+                )
+            }
+            Frontier = CachedTerminalFrontier.Frontier
+            ImmutableRejected = (
+                CachedTerminalFrontier.ImmutableRejectedCandidateCount
+            )
+            CertifiedRejected = (
+                CachedTerminalFrontier.CertifiedRejectedCandidateCount
+            )
+            CandidateFilterEmpty = (
+                CachedTerminalFrontier.CandidateFilterEmpty
+            )
+            PeakFrontierStateCount = max(
+                PeakFrontierStateCount,
+                len(Frontier),
+            )
+        else:
+            FilteredByDomain: dict[int, tuple[
+                ComponentTerminalAccessCandidate, ...
+            ]] = {}
+            ImmutableRejected = 0
+            CertifiedRejected = 0
+            for DomainIndex, Domain in enumerate(Domains):
+                Retained = []
+                PreparedEligibleCandidateFingerprints = (
+                    PreparedSymbolicNetStateContext
+                    .ImmutableEligibleCandidateFingerprintsByDomain[
+                        DomainIndex
+                    ]
+                    if PreparedSymbolicNetStateContext is not None
+                    else None
+                )
+                for Candidate in sorted(
+                    Domain.Candidates,
+                    key=lambda Value: Value.CandidateFingerprint,
                 ):
-                    CertifiedRejected += 1
-                    continue
-                if Candidate.Attachment not in FabricComponentByNode:
-                    ImmutableRejected += 1
-                    continue
-                if any(
-                    ComponentClaimsConflict(
-                        Candidate.Claims,
-                        ImmutableClaims,
+                    if (
+                        Certified
+                        and Candidate.CandidateFingerprint not in Certified
+                    ):
+                        CertifiedRejected += 1
+                        continue
+                    if PreparedEligibleCandidateFingerprints is not None:
+                        CandidateEligible = bool(
+                            Candidate.CandidateFingerprint
+                            in PreparedEligibleCandidateFingerprints
+                        )
+                    else:
+                        CandidateEligible = bool(
+                            Candidate.Attachment in FabricComponentByNode
+                        )
+                        if CandidateEligible:
+                            ConflictingOwners = frozenset(
+                                str(Owner)
+                                for Owner, ImmutableClaims
+                                in BlockingImmutableClaims(Signal)
+                                if ComponentClaimsConflict(
+                                    Candidate.Claims,
+                                    ImmutableClaims,
+                                )
+                            )
+                            if ConflictingOwners:
+                                ImmutableBlockers = (
+                                    ConflictingOwners
+                                    - ReservedGlobalClaimSignals
+                                )
+                                ReservedBlockers = (
+                                    ConflictingOwners
+                                    & ReservedGlobalClaimSignals
+                                )
+                                if (
+                                    not ImmutableBlockers
+                                    and ReservedBlockers
+                                ):
+                                    (
+                                        ReservedGlobalCandidateBlockerSetsBySignalDomain[
+                                            (Signal, DomainIndex)
+                                        ]
+                                        .append(ReservedBlockers)
+                                    )
+                                CandidateEligible = False
+                    if not CandidateEligible:
+                        ImmutableRejected += 1
+                        continue
+                    Retained.append(Candidate)
+                FilteredByDomain[DomainIndex] = tuple(Retained)
+            CandidateFilterEmpty = any(
+                not Values for Values in FilteredByDomain.values()
+            )
+            Frontier = ()
+            if CandidateFilterEmpty:
+                if PreparedSymbolicNetStateContext is not None:
+                    PreparedSymbolicNetStateContext.TerminalFrontierCache[
+                        Certified
+                    ] = PreparedComponentSymbolicTerminalFrontier(
+                        FilteredByDomain=tuple(
+                            FilteredByDomain[Index]
+                            for Index in range(len(Domains))
+                        ),
+                        Frontier=(),
+                        ImmutableRejectedCandidateCount=ImmutableRejected,
+                        CertifiedRejectedCandidateCount=CertifiedRejected,
+                        CandidateFilterEmpty=True,
                     )
-                    for _Owner, ImmutableClaims
-                    in BlockingImmutableClaims(Signal)
-                ):
-                    ImmutableRejected += 1
+                    PreparedSymbolicNetStateContext.TerminalFrontierBuildCount += 1
+        if CandidateFilterEmpty:
+            MinimumCandidateGlobalRouteCore: tuple[str, ...] = ()
+            CandidateBlockerSets: tuple[frozenset[str], ...] = ()
+            for DomainIndex in sorted(FilteredByDomain):
+                if FilteredByDomain[DomainIndex]:
                     continue
-                Retained.append(Candidate)
-            FilteredByDomain[DomainIndex] = tuple(Retained)
-        if any(not Values for Values in FilteredByDomain.values()):
+                DomainBlockerSets = tuple(
+                    ReservedGlobalCandidateBlockerSetsBySignalDomain.get(
+                        (Signal, DomainIndex),
+                        (),
+                    )
+                )
+                if not DomainBlockerSets:
+                    continue
+                BlockerUniverse = tuple(sorted(set().union(
+                    *DomainBlockerSets
+                )))
+                DomainCore: tuple[str, ...] = ()
+                for CoreSize in range(1, len(BlockerUniverse) + 1):
+                    DomainCore = next((
+                        CandidateCore
+                        for CandidateCore in combinations(
+                            BlockerUniverse,
+                            CoreSize,
+                        )
+                        if all(
+                            set(CandidateCore) & Blockers
+                            for Blockers in DomainBlockerSets
+                        )
+                    ), ())
+                    if DomainCore:
+                        break
+                if DomainCore and (
+                    not MinimumCandidateGlobalRouteCore
+                    or (
+                        len(DomainCore),
+                        DomainCore,
+                    ) < (
+                        len(MinimumCandidateGlobalRouteCore),
+                        MinimumCandidateGlobalRouteCore,
+                    )
+                ):
+                    MinimumCandidateGlobalRouteCore = DomainCore
+                    CandidateBlockerSets = DomainBlockerSets
             SignalDiagnostics[Signal] = {
                 "TerminalDomainSizes": [
                     len(FilteredByDomain[Index])
@@ -8792,8 +9460,29 @@ def SolveComponentRoutingProblemDynamic(
                 "CertifiedRejectedCandidateCount": CertifiedRejected,
                 "EmptyPhase": "candidate-filter",
                 "OwnedSignalDomainContractIndependent": False,
+                "ReservedGlobalRouteBlockerSetCount": len(
+                    CandidateBlockerSets
+                ),
+                "ReservedGlobalRouteUnsatCoreSignals": list(
+                    MinimumCandidateGlobalRouteCore
+                ),
+                "ReservedGlobalRouteUnsatCoreComplete": bool(
+                    MinimumCandidateGlobalRouteCore
+                ),
+                "ReservedGlobalRouteUnsatCoreFingerprint": (
+                    _StableFingerprint((
+                        "reserved-global-candidate-filter-core-v1",
+                        Problem.ProblemFingerprint,
+                        Signal,
+                        tuple(sorted(CandidateBlockerSets, key=repr)),
+                        MinimumCandidateGlobalRouteCore,
+                    ))
+                    if MinimumCandidateGlobalRouteCore
+                    else ""
+                ),
                 "Complete": True,
                 "StateCount": 0,
+                "TerminalFrontierCacheHit": TerminalFrontierCacheHit,
             }
             return ()
         OrderedDomainIndexes = tuple(sorted(
@@ -8805,16 +9494,11 @@ def SolveComponentRoutingProblemDynamic(
             ),
         ))
         # (component, selected domain/candidate pairs, nodes, edges, claims)
-        Frontier: tuple[
-            tuple[
-                int,
-                tuple[tuple[int, ComponentTerminalAccessCandidate], ...],
-                frozenset[Position3],
-                frozenset[RoutingEdge],
-                RoutingResourceClaims,
-            ], ...
-        ] = ()
-        for Depth, DomainIndex in enumerate(OrderedDomainIndexes):
+        for Depth, DomainIndex in (
+            enumerate(OrderedDomainIndexes)
+            if not TerminalFrontierCacheHit
+            else ()
+        ):
             NextByKey: dict[
                 tuple[object, ...],
                 tuple[
@@ -8908,7 +9592,48 @@ def SolveComponentRoutingProblemDynamic(
             if not Frontier:
                 break
 
+        if (
+            not TerminalFrontierCacheHit
+            and PreparedSymbolicNetStateContext is not None
+        ):
+            PreparedSymbolicNetStateContext.TerminalFrontierCache[
+                Certified
+            ] = PreparedComponentSymbolicTerminalFrontier(
+                FilteredByDomain=tuple(
+                    FilteredByDomain[Index]
+                    for Index in range(len(Domains))
+                ),
+                Frontier=Frontier,
+                ImmutableRejectedCandidateCount=ImmutableRejected,
+                CertifiedRejectedCandidateCount=CertifiedRejected,
+                CandidateFilterEmpty=False,
+            )
+            PreparedSymbolicNetStateContext.TerminalFrontierBuildCount += 1
+
         if not Frontier:
+            BlockerSets = tuple(
+                ReservedGlobalGeometryBlockerSetsBySignal.get(
+                    Signal,
+                    (),
+                )
+            )
+            MinimumGlobalRouteCore: tuple[str, ...] = ()
+            if BlockerSets:
+                BlockerUniverse = tuple(sorted(set().union(*BlockerSets)))
+                for CoreSize in range(1, len(BlockerUniverse) + 1):
+                    MinimumGlobalRouteCore = next((
+                        CandidateCore
+                        for CandidateCore in combinations(
+                            BlockerUniverse,
+                            CoreSize,
+                        )
+                        if all(
+                            set(CandidateCore) & Blockers
+                            for Blockers in BlockerSets
+                        )
+                    ), ())
+                    if MinimumGlobalRouteCore:
+                        break
             ContractIndependent = bool(
                 not CertifiedRejected
                 and not Problem.ReservedGlobalClaimsBySignal
@@ -8962,7 +9687,26 @@ def SolveComponentRoutingProblemDynamic(
                 "OwnedSignalDomainProjectionFingerprint": (
                     OwnedDomainProjectionFingerprint
                 ),
+                "ReservedGlobalRouteBlockerSetCount": len(BlockerSets),
+                "ReservedGlobalRouteUnsatCoreSignals": list(
+                    MinimumGlobalRouteCore
+                ),
+                "ReservedGlobalRouteUnsatCoreComplete": bool(
+                    MinimumGlobalRouteCore
+                ),
+                "ReservedGlobalRouteUnsatCoreFingerprint": (
+                    _StableFingerprint((
+                        "reserved-global-route-frontier-core-v1",
+                        Problem.ProblemFingerprint,
+                        Signal,
+                        tuple(sorted(BlockerSets, key=repr)),
+                        MinimumGlobalRouteCore,
+                    ))
+                    if MinimumGlobalRouteCore
+                    else ""
+                ),
                 "Complete": True,
+                "TerminalFrontierCacheHit": TerminalFrontierCacheHit,
             }
             return ()
 
@@ -8975,43 +9719,131 @@ def SolveComponentRoutingProblemDynamic(
         for (
             _ComponentIndex,
             Selections,
-            _PartialNodes,
-            _PartialEdges,
-            _PartialClaims,
+            PartialNodes,
+            PartialEdges,
+            PartialClaims,
         ) in Frontier:
             CandidatesByDomain = dict(Selections)
             Candidates = tuple(
                 CandidatesByDomain[Index]
                 for Index in range(len(Domains))
             )
-            if External:
-                EgressPaths = (
-                    (tuple(PhysicalPort.LocalPath),)
-                    if PhysicalPort is not None
-                    else tuple(
-                        EgressPath
-                        for Attachment in sorted({
-                            Candidate.Attachment
-                            for Candidate in Candidates
-                        })
-                        for EgressPath in BuildComponentEgressPaths(
-                            Attachment
-                        )
+            if External and PhysicalPorts:
+                EgressVariants = tuple(
+                    (tuple(Port.LocalPath), Port)
+                    for Port in PhysicalPorts
+                )
+            elif External:
+                EgressVariants = tuple(
+                    (EgressPath, None)
+                    for Attachment in sorted({
+                        Candidate.Attachment
+                        for Candidate in Candidates
+                    })
+                    for EgressPath in BuildComponentEgressPaths(
+                        Attachment
                     )
                 )
             else:
-                EgressPaths = ((),)
-            for EgressPath in EgressPaths:
+                EgressVariants = (((), None),)
+            for EgressPath, ActivePhysicalPort in EgressVariants:
                 if not Advance("tree-frontier-egress"):
                     return None
-                Geometry = BuildGeometry(
-                    Signal,
-                    Candidates,
-                    tuple(EgressPath),
+                EgressPath = tuple(EgressPath)
+                PhysicalLocalClaims = getattr(
+                    ActivePhysicalPort,
+                    "LocalClaims",
+                    None,
                 )
+                UseIncrementalPhysicalEgress = bool(
+                    ActivePhysicalPort is not None
+                    and EgressPath
+                    and EgressPath
+                    == tuple(ActivePhysicalPort.LocalPath)
+                    and isinstance(
+                        PhysicalLocalClaims,
+                        RoutingResourceClaims,
+                    )
+                )
+                if UseIncrementalPhysicalEgress:
+                    IncrementalPhysicalEgressMaterializationCount += 1
+                    ConnectorSubtree = _UniqueFabricSubtree(
+                        Problem.Fabric,
+                        tuple(
+                            Candidate.Attachment
+                            for Candidate in Candidates
+                        ) + (EgressPath[0],),
+                        Adjacency=FabricAdjacency,
+                        ParentCache=FabricParentCache,
+                    )
+                    if ConnectorSubtree is None:
+                        Geometry = None
+                    else:
+                        ConnectorNodes, ConnectorEdges = ConnectorSubtree
+                        DeltaNodes = frozenset((
+                            *(ConnectorNodes - PartialNodes),
+                            *EgressPath,
+                        ))
+                        Nodes = frozenset((
+                            *PartialNodes,
+                            *ConnectorNodes,
+                            *EgressPath,
+                        ))
+                        Edges = frozenset((
+                            *PartialEdges,
+                            *ConnectorEdges,
+                            *(
+                                _NormalizedEdge(First, Second)
+                                for First, Second in zip(
+                                    EgressPath,
+                                    EgressPath[1:],
+                                )
+                            ),
+                        ))
+                        Claims = _MergeClaims((
+                            PartialClaims,
+                            ClaimsForNodes(DeltaNodes),
+                        ))
+                        Geometry = (
+                            None
+                            if FindSelfClaimConflicts({Signal: Claims})
+                            or HasSameSignalReservedSelfConflict(
+                                Signal,
+                                Nodes,
+                            )
+                            or HasBlockingClaimConflict(Signal, Claims)
+                            else (Nodes, Edges, Claims)
+                        )
+                else:
+                    Geometry = BuildGeometry(
+                        Signal,
+                        Candidates,
+                        EgressPath,
+                    )
                 if Geometry is None:
                     continue
                 Nodes, Edges, Claims = Geometry
+                if ActivePhysicalPort is not None and (
+                    (
+                        frozenset(getattr(
+                            ActivePhysicalPort,
+                            "GlobalPath",
+                            (),
+                        ))
+                        - frozenset((getattr(
+                            ActivePhysicalPort,
+                            "Attachment",
+                            None,
+                        ),))
+                    )
+                    & Nodes
+                ):
+                    # The seam attachment is shared by the two ownership
+                    # halves, but every later exterior node is globally
+                    # owned. Reject the geometry during frontier
+                    # compilation instead of discovering the violation only
+                    # when validating an otherwise feasible template.
+                    continue
                 ExportedPorts = (
                     (tuple(EgressPath[-1]),)
                     if External and EgressPath
@@ -9042,6 +9874,18 @@ def SolveComponentRoutingProblemDynamic(
                     Edges,
                     Root,
                     Problem.MaximumPowerDistance,
+                    SubproblemCache=(
+                        PreparedSymbolicNetStateContext
+                        .TreeRepeaterSubproblemCache
+                        if PreparedSymbolicNetStateContext is not None
+                        else None
+                    ),
+                    CacheStatistics=(
+                        PreparedSymbolicNetStateContext
+                        .TreeRepeaterCacheStatistics
+                        if PreparedSymbolicNetStateContext is not None
+                        else None
+                    ),
                 )
                 if Repeaters is None:
                     continue
@@ -9083,6 +9927,77 @@ def SolveComponentRoutingProblemDynamic(
             FinalByFingerprint[Fingerprint]
             for Fingerprint in sorted(FinalByFingerprint)
         )
+        EgressBlockerSets = tuple(
+            ReservedGlobalGeometryBlockerSetsBySignal.get(
+                Signal,
+                (),
+            )
+        )
+        MinimumEgressGlobalRouteCore: tuple[str, ...] = ()
+        CompleteExteriorBlockerSets = EgressBlockerSets
+        if not Result:
+            CandidateDomainCores = []
+            for DomainIndex in range(len(Domains)):
+                DomainBlockerSets = tuple(
+                    ReservedGlobalCandidateBlockerSetsBySignalDomain.get(
+                        (Signal, DomainIndex),
+                        (),
+                    )
+                )
+                if not DomainBlockerSets:
+                    continue
+                BlockerUniverse = tuple(sorted(set().union(
+                    *DomainBlockerSets
+                )))
+                DomainCore: tuple[str, ...] = ()
+                for CoreSize in range(1, len(BlockerUniverse) + 1):
+                    DomainCore = next((
+                        CandidateCore
+                        for CandidateCore in combinations(
+                            BlockerUniverse,
+                            CoreSize,
+                        )
+                        if all(
+                            set(CandidateCore) & Blockers
+                            for Blockers in DomainBlockerSets
+                        )
+                    ), ())
+                    if DomainCore:
+                        break
+                if DomainCore:
+                    CandidateDomainCores.append((
+                        DomainCore,
+                        DomainBlockerSets,
+                    ))
+            if CandidateDomainCores:
+                (
+                    MinimumEgressGlobalRouteCore,
+                    CompleteExteriorBlockerSets,
+                ) = min(
+                    CandidateDomainCores,
+                    key=lambda Value: (
+                        len(Value[0]),
+                        Value[0],
+                    ),
+                )
+            elif EgressBlockerSets:
+                BlockerUniverse = tuple(sorted(set().union(
+                    *EgressBlockerSets
+                )))
+                for CoreSize in range(1, len(BlockerUniverse) + 1):
+                    MinimumEgressGlobalRouteCore = next((
+                        CandidateCore
+                        for CandidateCore in combinations(
+                            BlockerUniverse,
+                            CoreSize,
+                        )
+                        if all(
+                            set(CandidateCore) & Blockers
+                            for Blockers in EgressBlockerSets
+                        )
+                    ), ())
+                    if MinimumEgressGlobalRouteCore:
+                        break
         SignalDiagnostics[Signal] = {
             "TerminalDomainSizes": [
                 len(FilteredByDomain[Index])
@@ -9096,15 +10011,60 @@ def SolveComponentRoutingProblemDynamic(
                 "fixed-egress-or-power" if not Result else ""
             ),
             "OwnedSignalDomainContractIndependent": False,
+            "ReservedGlobalRouteBlockerSetCount": len(
+                CompleteExteriorBlockerSets
+            ),
+            "ReservedGlobalRouteUnsatCoreSignals": list(
+                MinimumEgressGlobalRouteCore
+            ),
+            "ReservedGlobalRouteUnsatCoreComplete": bool(
+                MinimumEgressGlobalRouteCore
+            ),
+            "ReservedGlobalRouteUnsatCoreFingerprint": (
+                _StableFingerprint((
+                    "reserved-global-route-egress-core-v1",
+                    Problem.ProblemFingerprint,
+                    Signal,
+                    tuple(sorted(
+                        CompleteExteriorBlockerSets,
+                        key=repr,
+                    )),
+                    MinimumEgressGlobalRouteCore,
+                ))
+                if MinimumEgressGlobalRouteCore
+                else ""
+            ),
             "Complete": True,
+            "TerminalFrontierCacheHit": TerminalFrontierCacheHit,
         }
         return Result
 
+    RequestedSignals = (
+        frozenset(Problem.ComponentSignals)
+        if RequestedSymbolicStateSignals is None
+        else frozenset(map(str, RequestedSymbolicStateSignals))
+    )
+    UnknownRequestedSignals = RequestedSignals.difference(
+        Problem.ComponentSignals
+    )
+    if UnknownRequestedSignals:
+        raise ValueError(
+            "requested symbolic state signals are outside the component: "
+            + ", ".join(sorted(UnknownRequestedSignals))
+        )
+    if (
+        PreparedSymbolicNetStateContext is not None
+        and RequestedSignals
+        != frozenset((PreparedSymbolicNetStateContext.Signal,))
+    ):
+        raise ValueError(
+            "prepared symbolic net-state context requires its exact signal"
+        )
     NetStatesBySignal: dict[
         str, tuple[ComponentTreeDpNetState, ...]
     ] = {}
     for Signal in sorted(
-        Problem.ComponentSignals,
+        RequestedSignals,
         key=lambda Value: (
             sum(
                 len(Domain.Candidates)
@@ -9113,7 +10073,33 @@ def SolveComponentRoutingProblemDynamic(
             Value,
         ),
     ):
-        States = BuildSignalStates(Signal)
+        CacheKey = BuildComponentSymbolicNetStateCacheKey(
+            Problem,
+            Signal,
+            ForbiddenExportPortsBySignal,
+        )
+        CachedNetState = NetStateCache.get(CacheKey)
+        if CachedNetState is not None:
+            States, CachedDiagnostics = CachedNetState
+            SignalDiagnostics[Signal] = dict(CachedDiagnostics)
+            SignalDiagnostics[Signal]["SymbolicNetStateCacheHit"] = True
+            SolverDiagnostics["SymbolicNetStateCacheHitCount"] = int(
+                SolverDiagnostics["SymbolicNetStateCacheHitCount"]
+            ) + 1
+        else:
+            States = BuildSignalStates(Signal)
+            if States is not None:
+                CachedDiagnostics = dict(
+                    SignalDiagnostics.get(Signal, {})
+                )
+                CachedDiagnostics["SymbolicNetStateCacheHit"] = False
+                NetStateCache[CacheKey] = (
+                    States,
+                    CachedDiagnostics,
+                )
+                SolverDiagnostics["SymbolicNetStateCacheStoreCount"] = int(
+                    SolverDiagnostics["SymbolicNetStateCacheStoreCount"]
+                ) + 1
         if States is None:
             return ComponentRoutingSolveResult(
                 Status="incomplete",
@@ -9847,6 +10833,368 @@ def SolveComponentRoutingProblemDynamic(
     )
 
 
+def CompilePreparedComponentSymbolicNetStates(
+    Context: PreparedComponentSymbolicNetStateContext,
+    Problem: ComponentRoutingProblem,
+    *,
+    DeadlineSeconds: float | None = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    SymbolicNetStateCache: dict[str, Any] | None = None,
+    ForbiddenExportPorts: tuple[Position3, ...] = (),
+) -> PreparedComponentSymbolicNetStateCompilation:
+    """Compile one access-bound state domain using reusable static tree data."""
+    Signal = Context.Signal
+    if (
+        _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+            Problem,
+            Signal,
+        )
+        != Context.ContextFingerprint
+    ):
+        raise ValueError(
+            "prepared symbolic net-state compilation identity mismatch"
+        )
+    Forbidden = (
+        {Signal: tuple(ForbiddenExportPorts)}
+        if ForbiddenExportPorts
+        else {}
+    )
+    Cache = (
+        SymbolicNetStateCache
+        if SymbolicNetStateCache is not None
+        else {}
+    )
+    CacheKey = BuildComponentSymbolicNetStateCacheKey(
+        Problem,
+        Signal,
+        Forbidden,
+    )
+    Cached = Cache.get(CacheKey)
+    if Cached is not None:
+        States, Diagnostics = Cached
+        return PreparedComponentSymbolicNetStateCompilation(
+            CacheKey=CacheKey,
+            States=tuple(States),
+            Complete=True,
+            CacheHit=True,
+            ExpansionCount=0,
+            Diagnostics={
+                **dict(Diagnostics),
+                "SymbolicNetStateCacheHit": True,
+                "PreparedSymbolicNetStateContextFingerprint": (
+                    Context.ContextFingerprint
+                ),
+            },
+        )
+    Result = SolveComponentRoutingProblemDynamic(
+        Problem,
+        DeadlineSeconds=DeadlineSeconds,
+        WorkCheck=WorkCheck,
+        ForbiddenExportPortsBySignal=Forbidden,
+        RouteClaimsConstructionCache=(
+            Context.RouteClaimsConstructionCache
+        ),
+        SymbolicNetStateCache=Cache,
+        RequestedSymbolicStateSignals=frozenset((Signal,)),
+        PreparedSymbolicNetStateContext=Context,
+        StopAfterOwnedSignalFrontierProof=True,
+    )
+    Cached = Cache.get(CacheKey)
+    Complete = bool(Result.Status != "incomplete" and Cached is not None)
+    States = tuple(Cached[0]) if Cached is not None else None
+    Diagnostics = dict(Cached[1]) if Cached is not None else {}
+    Diagnostics.update({
+        "SymbolicNetStateCacheHit": False,
+        "PreparedSymbolicNetStateContextFingerprint": (
+            Context.ContextFingerprint
+        ),
+        "PreparedSymbolicNetStateResultStatus": Result.Status,
+    })
+    return PreparedComponentSymbolicNetStateCompilation(
+        CacheKey=CacheKey,
+        States=States,
+        Complete=Complete,
+        CacheHit=False,
+        ExpansionCount=Result.ExpansionCount,
+        Diagnostics=Diagnostics,
+    )
+
+
+def CompilePreparedComponentPhysicalFactorStateBatch(
+    Context: PreparedComponentSymbolicNetStateContext,
+    ProblemsByAccess: Mapping[str, ComponentRoutingProblem],
+    *,
+    DeadlineSeconds: float | None = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    SymbolicNetStateCache: dict[str, Any] | None = None,
+) -> dict[str, PreparedComponentSymbolicNetStateCompilation]:
+    """Compile exact physical egress factors in shared frontier batches.
+
+    Factors with the same certified owned-candidate domain share one dynamic
+    solver invocation.  Results are then partitioned by the immutable local
+    egress path and stored under the unchanged per-factor cache identities.
+    """
+    Cache = (
+        SymbolicNetStateCache
+        if SymbolicNetStateCache is not None
+        else {}
+    )
+    StartedAt = monotonic()
+    Results: dict[str, PreparedComponentSymbolicNetStateCompilation] = {}
+    MissesByCertifiedDomain: dict[
+        frozenset[str],
+        list[tuple[str, ComponentRoutingProblem, str, Any]],
+    ] = defaultdict(list)
+    RepresentativeProblem = next(iter(ProblemsByAccess.values()), None)
+    ReferenceIdentity: dict[str, object] = {}
+    if RepresentativeProblem is not None:
+        ReferenceIdentity = (
+            _BuildPreparedComponentSymbolicNetStateContextIdentity(
+                RepresentativeProblem,
+                Context.Signal,
+            )
+        )
+    if RepresentativeProblem is not None:
+        if (
+            _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+                RepresentativeProblem,
+                Context.Signal,
+            )
+            != Context.ContextFingerprint
+        ):
+            raise ValueError(
+                "prepared physical factor batch identity mismatch: "
+                "representative context does not match prepared context"
+            )
+
+    def BuildContextFieldDiffs(
+        Problem: ComponentRoutingProblem,
+    ) -> tuple[str, ...]:
+        ProblemIdentity = (
+            _BuildPreparedComponentSymbolicNetStateContextIdentity(
+                Problem,
+                Context.Signal,
+            )
+        )
+        if ProblemIdentity == ReferenceIdentity:
+            return ()
+        return tuple(
+            Name
+            for Name in sorted(ReferenceIdentity)
+            if ReferenceIdentity.get(Name) != ProblemIdentity.get(Name)
+        )
+
+    def SharesPreparedContextInputs(
+        Problem: ComponentRoutingProblem,
+    ) -> tuple[str, ...]:
+        if RepresentativeProblem is None:
+            return ()
+        if (
+            _BuildPreparedComponentSymbolicNetStateContextFingerprint(
+                Problem,
+                Context.Signal,
+            )
+            != Context.ContextFingerprint
+        ):
+            return ("context-fingerprint",)
+        return BuildContextFieldDiffs(Problem)
+
+    for AccessFingerprint, Problem in sorted(ProblemsByAccess.items()):
+        Mismatches = SharesPreparedContextInputs(Problem)
+        if Mismatches:
+            raise ValueError(
+                "prepared physical factor batch identity mismatch: "
+                f"semantic context mismatch ({', '.join(Mismatches)})"
+            )
+        Port = SelectComponentSymbolicPhysicalPort(
+            Problem,
+            Context.Signal,
+        )
+        if Port is None:
+            raise ValueError(
+                "prepared physical factor batch requires a fixed port"
+            )
+        CacheKey = BuildComponentSymbolicNetStateCacheKey(
+            Problem,
+            Context.Signal,
+            {},
+            PreparedContextFingerprint=Context.ContextFingerprint,
+        )
+        Cached = Cache.get(CacheKey)
+        if Cached is not None:
+            States, Diagnostics = Cached
+            Results[str(AccessFingerprint)] = (
+                PreparedComponentSymbolicNetStateCompilation(
+                    CacheKey=CacheKey,
+                    States=tuple(States),
+                    Complete=True,
+                    CacheHit=True,
+                    ExpansionCount=0,
+                    Diagnostics={
+                        **dict(Diagnostics),
+                        "SymbolicNetStateCacheHit": True,
+                        "PhysicalFactorBatchCacheHit": True,
+                    },
+                )
+            )
+            continue
+        Certified = frozenset(getattr(
+            Port,
+            "OwnedCandidateFingerprints",
+            (),
+        ))
+        MissesByCertifiedDomain[Certified].append((
+            str(AccessFingerprint),
+            Problem,
+            CacheKey,
+            Port,
+        ))
+
+    for Certified, Members in sorted(
+        MissesByCertifiedDomain.items(),
+        key=lambda Value: tuple(sorted(Value[0])),
+    ):
+        # A certified physical access domain is a hard intersection with
+        # every owned terminal domain.  Detect an empty intersection before
+        # entering the tree DP: the dynamic solver would reach the same
+        # complete empty frontier, but doing so once per distinct rejected
+        # access certificate dominated CLA-sized unary/pair compilation.
+        CandidateFilterEmpty = bool(
+            Certified
+            and any(
+                not Certified.intersection(Eligible)
+                for Eligible in (
+                    Context
+                    .ImmutableEligibleCandidateFingerprintsByDomain
+                )
+            )
+        )
+        if CandidateFilterEmpty:
+            Diagnostics = {
+                "SymbolicNetStateCacheHit": False,
+                "PhysicalFactorBatchCacheHit": False,
+                "PhysicalFactorBatchSize": len(Members),
+                "PhysicalFactorBatchCertifiedCandidateCount": len(
+                    Certified
+                ),
+                "PhysicalFactorBatchCandidateFilterEmpty": True,
+                "PreparedSymbolicNetStateResultStatus": (
+                    "architectural-unsatisfiable"
+                ),
+            }
+            for AccessFingerprint, _Problem, CacheKey, _Port in Members:
+                Cache[CacheKey] = ((), Diagnostics)
+                Results[AccessFingerprint] = (
+                    PreparedComponentSymbolicNetStateCompilation(
+                        CacheKey=CacheKey,
+                        States=(),
+                        Complete=True,
+                        CacheHit=False,
+                        ExpansionCount=0,
+                        Diagnostics=Diagnostics,
+                    )
+                )
+            continue
+        RemainingDeadline = (
+            None
+            if DeadlineSeconds is None
+            else max(0.0, DeadlineSeconds - (monotonic() - StartedAt))
+        )
+        RepresentativeProblem = Members[0][1]
+        BatchCache: dict[str, Any] = {}
+        Result = SolveComponentRoutingProblemDynamic(
+            RepresentativeProblem,
+            DeadlineSeconds=RemainingDeadline,
+            WorkCheck=WorkCheck,
+            RouteClaimsConstructionCache=(
+                Context.RouteClaimsConstructionCache
+            ),
+            SymbolicNetStateCache=BatchCache,
+            RequestedSymbolicStateSignals=frozenset((Context.Signal,)),
+            PreparedSymbolicNetStateContext=Context,
+            PreparedPhysicalPortVariants=tuple(
+                Member[3] for Member in Members
+            ),
+            StopAfterOwnedSignalFrontierProof=True,
+        )
+        RepresentativeCacheKey = BuildComponentSymbolicNetStateCacheKey(
+            RepresentativeProblem,
+            Context.Signal,
+            {},
+            PreparedContextFingerprint=Context.ContextFingerprint,
+        )
+        CachedBatch = BatchCache.get(RepresentativeCacheKey)
+        BatchComplete = bool(
+            Result.Status != "incomplete" and CachedBatch is not None
+        )
+        BatchStates = (
+            tuple(CachedBatch[0]) if CachedBatch is not None else ()
+        )
+        BatchDiagnostics = (
+            dict(CachedBatch[1]) if CachedBatch is not None else {}
+        )
+        for AccessFingerprint, _Problem, CacheKey, Port in Members:
+            if BatchComplete:
+                LocalPath = tuple(Port.LocalPath)
+                States = tuple(
+                    State for State in BatchStates
+                    if tuple(State.EgressPath) == LocalPath
+                )
+                Diagnostics = {
+                    **BatchDiagnostics,
+                    "SymbolicNetStateCacheHit": False,
+                    "PhysicalFactorBatchCacheHit": False,
+                    "PhysicalFactorBatchSize": len(Members),
+                    "PhysicalFactorBatchCertifiedCandidateCount": len(
+                        Certified
+                    ),
+                    "PreparedSymbolicNetStateResultStatus": Result.Status,
+                }
+                Cache[CacheKey] = (States, Diagnostics)
+            else:
+                States = None
+                Diagnostics = {
+                    "PhysicalFactorBatchCacheHit": False,
+                    "PhysicalFactorBatchSize": len(Members),
+                    "PreparedSymbolicNetStateResultStatus": Result.Status,
+                }
+            Results[AccessFingerprint] = (
+                PreparedComponentSymbolicNetStateCompilation(
+                    CacheKey=CacheKey,
+                    States=States,
+                    Complete=BatchComplete,
+                    CacheHit=False,
+                    ExpansionCount=Result.ExpansionCount,
+                    Diagnostics=Diagnostics,
+                )
+            )
+        if not BatchComplete:
+            break
+
+    for AccessFingerprint, Problem in sorted(ProblemsByAccess.items()):
+        if str(AccessFingerprint) in Results:
+            continue
+        CacheKey = BuildComponentSymbolicNetStateCacheKey(
+            Problem,
+            Context.Signal,
+            {},
+            PreparedContextFingerprint=Context.ContextFingerprint,
+        )
+        Results[str(AccessFingerprint)] = (
+            PreparedComponentSymbolicNetStateCompilation(
+                CacheKey=CacheKey,
+                States=None,
+                Complete=False,
+                CacheHit=False,
+                ExpansionCount=0,
+                Diagnostics={
+                    "PhysicalFactorBatchDeferredAfterIncompleteGroup": True,
+                },
+            )
+        )
+    return Results
+
+
 def SolveComponentRoutingProblem(
     Problem: ComponentRoutingProblem,
     *,
@@ -9867,6 +11215,7 @@ def SolveComponentRoutingProblem(
     RouteClaimsConstructionCache: dict[
         frozenset[Position3], RoutingResourceClaims
     ] | None = None,
+    SymbolicNetStateCache: dict[str, Any] | None = None,
     NetVariantDiscoveryStateCache: dict[Any, Any] | None = None,
     DiscoveryVariantLimit: int | None = 8,
     DiscoveryVariantLimitsBySignal: dict[
@@ -9925,6 +11274,7 @@ def SolveComponentRoutingProblem(
             ),
             RequiredForeignTransitSignals=RequiredForeignTransitSignals,
             RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+            SymbolicNetStateCache=SymbolicNetStateCache,
             StopAfterOwnedSignalFrontierProof=(
                 StopAfterOwnedSignalFrontierProof
             ),

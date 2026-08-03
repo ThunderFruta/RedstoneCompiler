@@ -637,24 +637,6 @@ def _PinAccessTransitionOptions(
     )
 
 
-def BuildChannelPlan(
-    Placed: Any,
-    ExistingGuides: dict[str, Iterable[Position2]] | None = None,
-    RetryCounts: dict[str, int] | None = None,
-    CorridorCapacity: int | None = None,
-    OverflowPenalty: int | None = None,
-    LayerCount: int | None = None,
-    Policy: GlobalRoutingPolicy | None = None,
-    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
-    ResourceGraph: RoutingResourceGraph | None = None,
-) -> ChannelPlan:
-    """Legacy planner is retired and fails fast to prevent accidental fallback."""
-    raise NotImplementedError(
-        "BuildChannelPlan is retired. Use BuildNetRoutingProfiles and "
-        "BuildPcbRoutingConfigurations/RoutePcbNets for the authoritative router."
-    )
-
-
 def CountRouteBends(Positions: set[Position3]) -> int:
     """Count cells whose same-net neighbors form a direction change."""
     Bends = 0

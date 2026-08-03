@@ -28,6 +28,14 @@ class RoutingDeadline:
 
     StartedAt: float
     ExpiresAt: float
+    ExpirationKind: str = "OverallDeadlineExpired"
+
+    def __post_init__(self) -> None:
+        if self.ExpirationKind not in {
+            "OverallDeadlineExpired",
+            "StageReserveExpired",
+        }:
+            raise ValueError("invalid routing deadline expiration kind")
 
     @classmethod
     def Start(cls, MaximumRuntimeSeconds: float) -> "RoutingDeadline":
@@ -63,12 +71,20 @@ class RoutingDeadline:
             return
         DeadlineDiagnostics = dict(Diagnostics or {})
         DeadlineDiagnostics["Deadline"] = self.ToDictionary()
+        DeadlineDiagnostics["DeadlineExpirationKind"] = (
+            self.ExpirationKind
+        )
         raise RoutingStageError(
             RoutingFailure(
                 Reason=RoutingFailureReason.RuntimeBudgetExceeded,
                 Stage=Stage,
                 Detail=(
-                    "shared routing deadline expired after "
+                    (
+                        "routing stage reserve expired after "
+                        if self.ExpirationKind == "StageReserveExpired"
+                        else "overall routing deadline expired after "
+                    )
+                    +
                     f"{self.ElapsedSeconds():.3f}s"
                 ),
                 Diagnostics=DeadlineDiagnostics,
@@ -80,6 +96,7 @@ class RoutingDeadline:
             "ElapsedSeconds": round(self.ElapsedSeconds(), 6),
             "RemainingMilliseconds": self.RemainingMilliseconds(),
             "Expired": self.IsExpired(),
+            "ExpirationKind": self.ExpirationKind,
         }
 
 

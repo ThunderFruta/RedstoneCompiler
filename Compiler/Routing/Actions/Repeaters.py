@@ -394,20 +394,6 @@ def PruneRedundantRepeaterReservations(
     return tuple(Retained[Position] for Position in sorted(Retained))
 
 
-def BuildRepeaters(
-    NetWires: dict[str, set[Position3]],
-    Producers: dict[str, Any],
-    Targets: dict[str, list[Position3]],
-    PhysicalGraphs: dict[str, dict[Position3, list[Position3]]],
-    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
-) -> dict[Position3, str]:
-    """Legacy repeater synthesis was retired in favor of reserved repeater materialization."""
-    raise NotImplementedError(
-        "BuildRepeaters is retired. Use MaterializeReservedRepeaters "
-        "with authoritative track reservations."
-    )
-
-
 def MaterializeReservedRepeaters(
     NetWires: dict[str, set[Position3]],
     Producers: dict[str, Any],

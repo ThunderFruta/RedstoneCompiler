@@ -12,7 +12,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from time import monotonic
-from typing import Callable
+from typing import Any, Callable
 
 from SVDecoder import Sv
 from .Synthesis.Diagram import WriteNandDiagram
@@ -36,6 +36,8 @@ from .Routing.Failures import (
 from .Routing.Policy import (
     ExecutionStrategyForRequest,
     PhysicalDesignPolicy,
+    RoutingCircuitComplexityProfile,
+    BuildRoutingPolicyForCircuit,
     PolicyForRoutingStrategy,
     RoutingStrategy,
 )
@@ -98,6 +100,73 @@ def _JsonDiagnosticValue(Value: object) -> object:
     if isinstance(Value, (list, tuple, set, frozenset)):
         return [_JsonDiagnosticValue(Item) for Item in Value]
     return Value
+
+
+def BuildRoutingCircuitComplexityProfile(
+    Module: Any,
+) -> RoutingCircuitComplexityProfile:
+    """Build a routing-aware complexity profile from an unmodified module."""
+    Gates = tuple(Module.Gates)
+    if not Gates:
+        return RoutingCircuitComplexityProfile()
+    SignalProducers: dict[str, int] = {}
+    SignalConsumers: dict[str, set[int]] = {}
+    for GateIndex, Gate in enumerate(Gates):
+        for Signal in map(str, getattr(Gate, "Outputs", ())):
+            SignalProducers[Signal] = GateIndex
+        for Signal in map(str, getattr(Gate, "Inputs", ())):
+            SignalConsumers.setdefault(Signal, set()).add(GateIndex)
+    Successors: dict[int, set[int]] = {GateIndex: set() for GateIndex in range(len(Gates))}
+    for Signal, ProducerIndex in SignalProducers.items():
+        for ConsumerIndex in SignalConsumers.get(Signal, ()):
+            Successors[ProducerIndex].add(ConsumerIndex)
+    MaxFanout = max(
+        (len(Consumers) for Consumers in SignalConsumers.values()),
+        default=0,
+    )
+    ReconvergentSignals = 0
+    for Consumers in SignalConsumers.values():
+        if len(Consumers) >= 2:
+            ReconvergentSignals += 1
+
+    SignalLevel = {GateIndex: 0 for GateIndex in range(len(Gates))}
+    Pending = set(range(len(Gates)))
+    while Pending:
+        Advanced = False
+        for GateIndex in tuple(Pending):
+            Predecessors = {
+                SignalProducers[Signal]
+                for Signal in map(
+                    str,
+                    getattr(Gates[GateIndex], "Inputs", ()),
+                )
+                if Signal in SignalProducers
+            }
+            if Predecessors.issubset(SignalLevel):
+                SignalLevel[GateIndex] = 1 + max(
+                    (SignalLevel[Predecessor] for Predecessor in Predecessors),
+                    default=0,
+                )
+                Pending.remove(GateIndex)
+                Advanced = True
+        if not Advanced:
+            for GateIndex in tuple(Pending):
+                SignalLevel[GateIndex] = SignalLevel.get(GateIndex, 1)
+                Pending.remove(GateIndex)
+
+    return RoutingCircuitComplexityProfile(
+        SignalCount=len(set(
+            str(Value)
+            for Gate in Gates
+            for Value in (*getattr(Gate, "Inputs", ()), *getattr(Gate, "Outputs", ()))
+        )),
+        GateCount=len(Gates),
+        RoutingGraphEdgeCount=sum(len(Consumers) for Consumers in SignalConsumers.values()),
+        MaximumFanout=MaxFanout,
+        ReconvergentFanoutCount=ReconvergentSignals,
+        PeakBoundaryDemand=max(SignalLevel.values(), default=0),
+        MandatoryAccessConflictResources=0,
+    )
 
 
 RoutingFailureArtifactAggregateDiagnosticKeys = frozenset({
@@ -644,6 +713,13 @@ def CompileSvToLitematic(
         TopModule=TopModule,
         Workdir=Workdir,
     )
+    ComplexityProfile = BuildRoutingCircuitComplexityProfile(
+        Netlist.Modules[Netlist.Top]
+    )
+    EffectivePolicy = BuildRoutingPolicyForCircuit(
+        EffectivePolicy,
+        ComplexityProfile=ComplexityProfile,
+    )
     Stages.append("parse")
 
     OriginalLogicGateCount = len(Netlist.Modules[Netlist.Top].Gates)
@@ -697,6 +773,7 @@ def CompileSvToLitematic(
             NandIR,
             ProgressCallback=ProgressCallback,
             Strategy=RequestedStrategy,
+            Policy=EffectivePolicy,
             RoutedValidationCallback=ValidateRoutedCandidate,
             RoutingDeadlineSeconds=RoutingDeadlineSeconds,
         )

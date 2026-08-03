@@ -26,12 +26,12 @@ python3 Scripts/RunRouterAcceptance.py \
 ```
 
 Remove `--dry-run` only after fast tests pass and no other scale routing job is
-running. The harness runs FullAdder, RCA4, and CLA4 sequentially and stops
-judging acceptance when a required gate fails.
+running. The harness runs FullAdder, RCA4, and RCA8 sequentially by default and
+stops judging acceptance when a required gate fails. Add `--compatibility-mode`
+to include the optional compatibility circuit sequence.
 
 ## Evidence
 
 Keep stdout, stderr, `.PhysicalDesign.json` or `.RoutingFailure.json`, truth
 table, schematic hash, source identity, and acceptance manifest. Terminal text
 without retained artifacts is diagnostic evidence only.
-

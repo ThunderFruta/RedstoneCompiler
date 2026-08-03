@@ -254,13 +254,3 @@ def _RepeaterOpportunities(Guide: frozenset[Position2]) -> frozenset[Position2]:
             Result.add((X, Z))
     return frozenset(Result)
 
-
-def AssignGlobalTracks(
-    Plan: ChannelPlan,
-    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
-) -> TrackAssignment:
-    """Legacy track assignment helper was retired with authoritative planner rollout."""
-    raise NotImplementedError(
-        "AssignGlobalTracks is retired. Use AuthoritativePlanner and "
-        "MaterializeReservedRepeaters to perform exact track ownership."
-    )

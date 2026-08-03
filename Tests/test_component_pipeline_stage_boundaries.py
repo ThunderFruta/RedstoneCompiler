@@ -15,6 +15,7 @@ from Compiler.Placement.PcbFlow import (
 import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
 from Compiler.Routing.ComponentPipeline import (
     BuildPhysicalComponentAssemblyChoiceFingerprint,
+    BuildPhysicalComponentAssemblyPlanDomainFingerprint,
     BuildPhysicalAssemblyGlobalReuseFingerprint,
     BuildPhysicalGlobalPlanCutFamilyFingerprint,
     BuildPhysicalGlobalPlanDependencyFingerprint,
@@ -26,11 +27,34 @@ from Compiler.Routing.ComponentPipeline import (
     ClassifyPhysicalComponentGlobalPlanningFailure,
     RecordPhysicalComponentGlobalPlanNoGood,
     RecordPhysicalComponentSymbolicCapacityEligibilityNoGood,
+    PreservePhysicalComponentAssemblyPlanDomainContinuation,
+    ProjectCompletePhysicalPortPairCertificateToApertureClauses,
     PhysicalAssemblyGlobalRouteCanBeRebound,
+    PruneRetainedPhysicalGlobalPlansByRejectedApertureClauses,
+    RecordPhysicalComponentDetailedRoutingNoGood,
     SelectContractIndependentOwnedSignalFrontierUnsatCore,
     SelectPhysicalComponentGlobalContractRecommendation,
     SelectPhysicalComponentExactGlobalChannelSignals,
 )
+
+
+def test_closed_region_portals_replace_discovery_domain_before_consumers():
+    Source = inspect.getsource(
+        AuthoritativePlanner.RouteAuthoritativeResources
+    )
+    Publish = Source.index(
+        "RawPortalEntries = EffectiveRawPortalCache.PortalEntries"
+    )
+    Dictionary = Source.index(
+        "RawPortals = EffectiveRawPortalCache.BuildPortalDictionary()",
+        Publish,
+    )
+    Consumer = Source.index(
+        "if PrepareComponentRoutingProblemOnly:",
+        Dictionary,
+    )
+
+    assert Publish < Dictionary < Consumer
 import Compiler.Routing.Pcb as RoutingPcb
 from Compiler.Routing.Pcb import (
     ReplanPhysicalComponentAssembly,
@@ -84,7 +108,7 @@ def test_pre_global_symbolic_capacity_proof_rejects_only_exact_port_tuple():
         Diagnostics={
             "SymbolicCapacityProofComplete": True,
             "LocalUnsatCoreComplete": True,
-            "LocalUnsatCoreSignals": ["Alpha"],
+            "LocalUnsatCoreSignals": ["Alpha", "InternalNet"],
         },
     )
 
@@ -113,14 +137,258 @@ def test_pre_global_symbolic_capacity_proof_rejects_only_exact_port_tuple():
     assert Diagnostics["GlobalPlanningEntered"] is False
     assert Diagnostics["LocalCompilationEntered"] is False
     assert Diagnostics["LocalCapacityCorePromoted"] is True
+    assert Diagnostics["LocalCapacityCoreSignals"] == [
+        "Alpha",
+        "InternalNet",
+    ]
+    assert Diagnostics["LocalCapacityProjectedInterfaceCoreSignals"] == [
+        "Alpha"
+    ]
+    ExpectedClause = frozenset(((
+        "Alpha",
+        BuildPhysicalPortSeamContractFingerprint(Port),
+    ),))
     assert Resources.RejectedPhysicalComponentPortReservationSets == {
-        frozenset((
-            (
-                "Alpha",
-                BuildPhysicalPortSeamContractFingerprint(Port),
-            ),
-        ))
+        ExpectedClause
     }
+    assert Resources.RejectedPhysicalComponentLocalSeamReservationSets == {
+        ExpectedClause
+    }
+
+
+def test_seam_domain_cache_identity_includes_every_composite_restriction():
+    Source = inspect.getsource(
+        AuthoritativePlanner.SolvePreparedPhysicalComponentPortFactorDomain
+    )
+
+    HelperStart = Source.index("def BuildSeamOnlyPortDomainKey")
+    HelperEnd = Source.index("def SelectSeamOnlyPorts", HelperStart)
+    HelperSource = Source[HelperStart:HelperEnd]
+    assert "ActiveApertureContractRestrictionsBySignal" in HelperSource
+    assert "ActiveLocalAccessRestrictionsBySignal" in HelperSource
+    assert "ActiveSeamRestrictionsBySignal" in HelperSource
+    assert "ActiveSupportRestrictionsBySignal" in HelperSource
+    assert Source.count("BuildSeamOnlyPortDomainKey(Signal)") >= 2
+
+
+def test_deferred_local_selection_keeps_boundary_csp_port_first():
+    Source = inspect.getsource(
+        AuthoritativePlanner.SolvePreparedPhysicalComponentPortFactorDomain
+    )
+
+    assert "IncludeLocalCompositeFactors=True" in Source
+    assert "PreferredApertureContractsBySignal" in Source
+
+
+def test_complete_local_pair_domain_promotes_to_aperture_cut():
+    def LocalPort(Signal, Offset):
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="input",
+            FabricDomainFingerprint="fabric:" + Signal,
+            FabricAttachment=(Offset, 2, 0),
+            Attachment=(Offset + 2, 2, 0),
+            LocalPath=((Offset, 2, 0), (Offset + 1, 2, 0)),
+            GlobalPath=((Offset + 2, 2, 0),),
+            OwnedTerminals=((Offset, 2, 0),),
+            OwnedAccessCandidates=(),
+            LocalAccessFingerprint="access:" + Signal,
+            Capacity=1,
+        )
+
+    Ports = (LocalPort("Alpha", 0), LocalPort("Beta", 10))
+    Boundaries = tuple(
+        SimpleNamespace(
+            Signal=Port.Signal,
+            GlobalContractFingerprint="global:" + Port.Signal,
+            ApertureContractFingerprint="aperture:" + Port.Signal,
+        )
+        for Port in Ports
+    )
+    Apertures = tuple(
+        SimpleNamespace(
+            GlobalContractFingerprint=Boundary.GlobalContractFingerprint,
+            ApertureContractFingerprint=(
+                Boundary.ApertureContractFingerprint
+            ),
+            ApertureOptionFingerprint="option:" + Boundary.Signal,
+        )
+        for Boundary in Boundaries
+    )
+    FactorDomain = SimpleNamespace(
+        LocalAccessFactorsBySignal=tuple(
+            (Port.Signal, (Port,)) for Port in Ports
+        ),
+        ApertureFactorsBySignal=tuple(
+            (Boundary.Signal, (Aperture,))
+            for Boundary, Aperture in zip(Boundaries, Apertures)
+        ),
+        LocalApertureSupportsByOption=tuple(
+            (
+                (Boundary.Signal, Aperture.ApertureOptionFingerprint),
+                (SimpleNamespace(
+                    LocalAccessFingerprint="access:" + Boundary.Signal,
+                ),),
+            )
+            for Boundary, Aperture in zip(Boundaries, Apertures)
+        ),
+    )
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        PortAssignmentFingerprint="port-assignment",
+        Ports=Ports,
+        GlobalBoundaryPorts=Boundaries,
+    )
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        RejectedPhysicalComponentAssemblyPlanFingerprints=set(),
+        RejectedPhysicalComponentAssemblyChoiceFingerprints=set(),
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        PreferredPhysicalComponentGlobalContractsBySignal={},
+        PhysicalComponentBoundaryTraversalEpoch=0,
+        PhysicalComponentBoundaryAssignmentIteratorCache={},
+    )
+    Proof = ComponentRoutingSolveResult(
+        Status="architectural-unsatisfiable",
+        ProofFingerprint="capacity-proof",
+        Diagnostics={
+            "SymbolicCapacityProofComplete": True,
+            "LocalUnsatCoreComplete": True,
+            "LocalUnsatCoreSignals": ["Alpha", "Beta"],
+        },
+    )
+
+    Diagnostics = RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
+        Proof,
+        Plan,
+        Resources,
+        FactorDomain,
+    )
+
+    ApertureClause = frozenset((
+        ("Alpha", "aperture:Alpha"),
+        ("Beta", "aperture:Beta"),
+    ))
+    assert ApertureClause in (
+        Resources.RejectedPhysicalComponentPortReservationSets
+    )
+    assert Diagnostics["LocalCapacityApertureClausesPromoted"] == [[
+        ["Alpha", "aperture:Alpha"],
+        ["Beta", "aperture:Beta"],
+    ]]
+    assert Diagnostics["BoundaryIteratorContinuationPreserved"] is True
+
+
+def _PhysicalPairApertureProjectionFixture(*, CompleteSupports=True):
+    Apertures = (
+        (
+            "Alpha",
+            (
+                SimpleNamespace(
+                    ApertureOptionFingerprint="alpha-left-option",
+                    ApertureContractFingerprint="alpha-absolute-left",
+                    ReservationFingerprint="alpha-portable-reservation",
+                ),
+                SimpleNamespace(
+                    ApertureOptionFingerprint="alpha-right-option",
+                    ApertureContractFingerprint="alpha-absolute-right",
+                    ReservationFingerprint="alpha-portable-reservation",
+                ),
+            ),
+        ),
+        (
+            "Beta",
+            (SimpleNamespace(
+                ApertureOptionFingerprint="beta-option",
+                ApertureContractFingerprint="beta-absolute",
+                ReservationFingerprint="beta-portable-reservation",
+            ),),
+        ),
+    )
+    Supports = [
+        SimpleNamespace(
+            ApertureOptionFingerprint="alpha-left-option",
+            LocalAccessFingerprint="alpha-left-access",
+        ),
+    ]
+    if CompleteSupports:
+        Supports.append(SimpleNamespace(
+            ApertureOptionFingerprint="alpha-right-option",
+            LocalAccessFingerprint="alpha-right-access",
+        ))
+    FactorDomain = SimpleNamespace(
+        ApertureFactorsBySignal=Apertures,
+        LocalApertureSupportBySignal=(
+            ("Alpha", tuple(Supports)),
+            ("Beta", (SimpleNamespace(
+                ApertureOptionFingerprint="beta-option",
+                LocalAccessFingerprint="beta-access",
+            ),)),
+        ),
+    )
+    Certificate = SimpleNamespace(
+        Complete=True,
+        SignalPair=("Alpha", "Beta"),
+        LocalAccessFingerprintsBySignal=(
+            ("Alpha", (
+                "alpha-left-access",
+                "alpha-right-access",
+            )),
+            ("Beta", ("beta-access",)),
+        ),
+        SeamFingerprintByLocalAccess=(
+            ("Alpha", "alpha-left-access", "alpha-left-seam"),
+            ("Alpha", "alpha-right-access", "alpha-right-seam"),
+            ("Beta", "beta-access", "beta-seam"),
+        ),
+        UnsupportedUnarySeams=(
+            ("Alpha", "alpha-left-seam"),
+            ("Alpha", "alpha-right-seam"),
+        ),
+        UnsupportedSeamPairs=(),
+    )
+    return FactorDomain, Certificate
+
+
+def test_translated_port_options_with_portable_alias_project_distinct_apertures():
+    FactorDomain, Certificate = _PhysicalPairApertureProjectionFixture()
+
+    Clauses, Diagnostics = (
+        ProjectCompletePhysicalPortPairCertificateToApertureClauses(
+            FactorDomain,
+            Certificate,
+        )
+    )
+
+    assert frozenset((("Alpha", "alpha-absolute-left"),)) in Clauses
+    assert frozenset((("Alpha", "alpha-absolute-right"),)) in Clauses
+    assert all(
+        "portable-reservation" not in Fingerprint
+        for Clause in Clauses
+        for _Signal, Fingerprint in Clause
+    )
+    assert Diagnostics["ApertureProjectionComplete"] is True
+    assert Diagnostics["ApertureProjectionOptionCount"] == 3
+
+
+def test_incomplete_support_mapping_does_not_promote_aperture_cuts():
+    FactorDomain, Certificate = _PhysicalPairApertureProjectionFixture(
+        CompleteSupports=False,
+    )
+
+    Clauses, Diagnostics = (
+        ProjectCompletePhysicalPortPairCertificateToApertureClauses(
+            FactorDomain,
+            Certificate,
+        )
+    )
+
+    assert Clauses == frozenset()
+    assert Diagnostics["ApertureProjectionComplete"] is False
+    assert Diagnostics["ApertureProjectionFailureReason"] == (
+        "prepared-support-domain-incomplete"
+    )
 
 
 def _MixedPhysicalCorridorDomains():
@@ -213,6 +481,79 @@ def test_local_unsat_rejects_only_the_complete_assembly_plan():
     assert "ReplanPhysicalAssemblyWithTiming(" in LocalCompilation
 
 
+def test_detailed_failure_rejects_exact_channels_not_port_assignment():
+    Plan = SimpleNamespace(
+        PlanFingerprint="plan",
+        PortAssignmentFingerprint="ports",
+        Channels=(
+            SimpleNamespace(Signal="A", RouteCandidateId="route-a"),
+            SimpleNamespace(Signal="B", RouteCandidateId="route-b"),
+        ),
+    )
+    Design = SimpleNamespace(
+        RoutingAssignment=SimpleNamespace(SelectedCandidates={
+            "A": SimpleNamespace(CandidateId="route-a"),
+            "B": SimpleNamespace(CandidateId="route-b"),
+        }),
+    )
+    Resources = SimpleNamespace(
+        ForbiddenPhysicalComponentGlobalCandidateSets=set(),
+        RejectedPhysicalComponentAssemblyPlanFingerprints=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+    )
+
+    Diagnostics = RecordPhysicalComponentDetailedRoutingNoGood(
+        Plan,
+        Design,
+        Resources,
+    )
+
+    assert Resources.ForbiddenPhysicalComponentGlobalCandidateSets == {
+        frozenset((("A", "route-a"), ("B", "route-b")))
+    }
+    assert Resources.RejectedPhysicalComponentAssemblyPlanFingerprints == {
+        "plan"
+    }
+    assert not Resources.RejectedPhysicalComponentPortAssignmentFingerprints
+    assert Diagnostics["ForbiddenGlobalCandidateSet"] == [
+        ["A", "route-a"],
+        ["B", "route-b"],
+    ]
+    assert Diagnostics["RejectedPhysicalAssemblyPlanFingerprint"] == "plan"
+    assert Diagnostics["PortAssignmentRejected"] is False
+    with pytest.raises(ValueError, match="assignment identity mismatch"):
+        RecordPhysicalComponentDetailedRoutingNoGood(
+            SimpleNamespace(
+                PlanFingerprint="different-plan",
+                PortAssignmentFingerprint="ports",
+                Channels=(SimpleNamespace(
+                    Signal="A",
+                    RouteCandidateId="different",
+                ),),
+            ),
+            Design,
+            Resources,
+        )
+
+
+def test_detailed_failure_orchestration_has_no_broad_port_rejection():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Start = Source.index(
+        '"detailed-failure-reject-physical-plan"',
+    )
+    End = Source.index(
+        "PreparedAssembly = (",
+        Start,
+    )
+    Rejection = Source[Start:End]
+
+    assert "RecordPhysicalComponentDetailedRoutingNoGood(" in Source[:Start]
+    assert "RejectedPhysicalComponentPortAssignmentFingerprints" not in (
+        Rejection
+    )
+    assert "RejectedPortAssignmentFingerprint" not in Rejection
+
+
 def test_local_compilation_requires_explicit_admission_without_floor():
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
     Start = Source.index("ActiveComponentDeadline = SharedInterfaceDeadline")
@@ -232,14 +573,15 @@ def test_admitted_local_compilation_is_not_reclassified_by_planning_clock():
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
     Compile = Source.index("ComponentSolve = CompileClosedComponent(")
     Result = Source.index("if not ComponentSolve.Feasible:", Compile)
-    LocalProof = Source.index(
-        "ProveGlobalRelaxedLocalUnsatisfiability(",
+    Template = Source.index(
+        "assert ComponentSolve.Template is not None",
         Result,
     )
-    Classification = Source[Result:LocalProof]
+    Classification = Source[Result:Template]
 
     assert "InterfaceDeadline.IsExpired()" not in Classification
-    assert "not ActiveComponentDeadline.IsExpired()" in Classification
+    assert 'Stage=(\n                                    "ClosedComponentCompilationIncomplete"' in Classification
+    assert "RecordPhysicalComponentLocalCompilationNoGood(" in Classification
 
 
 def test_physical_planning_uses_planning_clock_until_bound_handoff():
@@ -276,14 +618,17 @@ def test_stage_specific_incomplete_failures_preserve_handoff_identity():
 
     assert BeforeCompile.count(
         "BuildPhysicalAssemblyPlanningIncompleteFailure("
-    ) == 2
+    ) == 3
     assert BeforeCompile.count(
         "BuildLocalComponentCompilationAdmissionFailure("
     ) == 1
     assert "BuildClosedComponentExecutionIncompleteFailure(" not in (
         BeforeCompile
     )
-    assert "BuildClosedComponentExecutionIncompleteFailure(" in AfterCompile
+    assert "BuildClosedComponentExecutionIncompleteFailure(" not in (
+        AfterCompile
+    )
+    assert '"ClosedComponentCompilationIncomplete"' in AfterCompile
     assert "PhysicalAssemblyPlan.PlanFingerprint" in AfterCompile
 
 
@@ -316,6 +661,23 @@ def test_unbound_owned_frontier_core_requires_complete_independence():
         Problem,
         Result,
     ) == ("NandLike",)
+    MultipleEmptySignals = SimpleNamespace(
+        **{
+            **Result.__dict__,
+            "Diagnostics": {
+                **Result.Diagnostics,
+                "LocalUnsatCoreSignals": ["Zulu", "Alpha"],
+                "SignalDiagnostics": {
+                    "Zulu": SignalProof,
+                    "Alpha": SignalProof,
+                },
+            },
+        }
+    )
+    assert SelectContractIndependentOwnedSignalFrontierUnsatCore(
+        Problem,
+        MultipleEmptySignals,
+    ) == ("Alpha",)
     Incomplete = SimpleNamespace(
         **{**Result.__dict__, "Status": "incomplete"}
     )
@@ -357,17 +719,62 @@ def test_unbound_frontier_callback_precedes_port_factor_preparation():
     Source = inspect.getsource(
         AuthoritativePlanner.RouteAuthoritativeResources
     )
-    Access = Source.index("if not PreparedAccessCertificate.Feasible:")
+    Problem = Source.index("PreparedAccessProblem = BuildComponentRoutingProblem(")
     Callback = Source.index(
         "UnboundOwnedSignalFrontierProofCallback(",
-        Access,
+        Problem,
+    )
+    Access = Source.index(
+        "BuildComponentCutAccessFeasibilityCertificate(",
+        Callback,
     )
     Factors = Source.index(
         "Preparation = PreparePhysicalComponentPortFactorDomain(",
         Callback,
     )
 
-    assert Access < Callback < Factors
+    assert Problem < Callback < Access < Factors
+
+
+def test_unbound_frontier_failure_exports_minimal_placement_core():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Callback = Source.index("def ProveUnboundOwnedSignalFrontier(")
+    Preparation = Source.index(
+        "PreparedEligibility = PreparePhysicalComponentEligibility(",
+        Callback,
+    )
+    CallbackSource = Source[Callback:Preparation]
+
+    assert '"PortAssignmentUnsatCoreMinimal": True' in CallbackSource
+    assert '"PortAssignmentUnsatCoreSignals": list(' in CallbackSource
+    assert '"PortAssignmentUnsatCoreFingerprint": (' in CallbackSource
+
+
+def test_owned_terminal_portals_precede_unbound_frontier_and_global_portals():
+    Source = inspect.getsource(
+        AuthoritativePlanner.RouteAuthoritativeResources
+    )
+    OwnedBatch = Source.index(
+        '"PhysicalOwnedTerminalPortalEligibility"',
+    )
+    OwnedProblem = Source.index(
+        "PreparedAccessProblem = BuildComponentRoutingProblem(",
+        OwnedBatch,
+    )
+    Callback = Source.index(
+        "UnboundOwnedSignalFrontierProofCallback(",
+        OwnedProblem,
+    )
+    GlobalBatch = Source.index(
+        "GeneratePortalRequestBatch(\n                PortalRequests,",
+        Callback,
+    )
+    RawCache = Source.index(
+        "EffectiveRawPortalCache = RawPortalGeometryCache(",
+        GlobalBatch,
+    )
+
+    assert OwnedBatch < OwnedProblem < Callback < GlobalBatch < RawCache
 
 
 @pytest.mark.parametrize(
@@ -412,6 +819,31 @@ def test_deadline_expiry_is_incomplete_without_complete_proof():
         ComponentSolveStatus="",
         ExplicitCompleteUnsatProof=CompleteProof,
     )
+
+
+def test_component_materialization_unsat_does_not_exhaust_sibling_selections():
+    assert not IsClusterInterfaceStateIncomplete(
+        FailureReason=(
+            RoutingFailureReason.ClusterInterfaceArchitectureUnsatisfiable
+        ),
+        InterfaceDeadlineExpired=False,
+        ComponentSolveStatus="",
+        ExplicitCompleteUnsatProof=False,
+    )
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    assert "duplicate-component-selection-proof-reused" in Source
+    assert "and Proof.Exhaustive" in Source
+    assert "ExpectedComponentStateFingerprints=tuple(sorted(" in Source
+    assert "PlacementPortfolioDomainComplete=(" in Source
+    PortfolioGuard = Source.index(
+        '"ClusterInterfacePlacementPortfolioIncomplete"',
+    )
+    DomainGuard = Source.index(
+        '"ClusterInterfaceComponentStateDomainIncomplete"',
+        PortfolioGuard,
+    )
+    assert PortfolioGuard < DomainGuard
+    assert '"ArchitecturalUnsatisfiabilityProven": False' in Source
 
 
 def test_explicit_complete_proof_overrides_stale_incomplete_status():
@@ -462,6 +894,26 @@ def test_minimal_physical_port_core_builds_explicit_placement_feedback():
     assert Feedback.RelocationSignals == ("Alpha", "Beta")
     assert Feedback.SourcePlanFingerprint == "plan"
     assert Feedback.DomainFingerprint == "domain"
+
+
+def test_complete_singleton_access_core_builds_placement_feedback():
+    Feedback = BuildPhysicalComponentPlacementFeedback(RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="ComponentAccessCertification",
+        AffectedNets=("NandNet",),
+        Diagnostics={
+            "Complete": True,
+            "Feasible": False,
+            "AffectedSignals": ["NandNet"],
+            "CertificateFingerprint": "access-core",
+            "DomainFingerprint": "access-domain",
+        },
+    ))
+
+    assert Feedback is not None
+    assert Feedback.ProofFingerprint == "access-core"
+    assert Feedback.RelocationSignals == ("NandNet",)
+    assert Feedback.DomainFingerprint == "access-domain"
 
 
 @pytest.mark.parametrize(
@@ -1373,13 +1825,44 @@ def test_physical_component_pipeline_records_explicit_stage_durations():
     assert '"PhysicalComponentStageTimings"' in Source
     for Stage in (
         "PhysicalEligibilityPreparation",
-        "PhysicalEligibilitySolve",
+        "PhysicalEligibilitySolveAfterUnarySupport",
         "AuthoritativeGlobalReserve",
         "PhysicalAssemblyReplan",
         "BoundLocalCompilation",
-        "GlobalRelaxedLocalProof",
     ):
         assert f'"{Stage}"' in Source
+
+
+def test_physical_component_pipeline_compiles_symbolic_unary_support():
+    PipelineSource = "\n".join((
+        inspect.getsource(_PlaceAndRoutePcbWithPolicy),
+        inspect.getsource(SolvePreparedPhysicalComponentEligibility),
+    ))
+    EligibilitySource = inspect.getsource(
+        SolvePreparedPhysicalComponentEligibility
+    )
+
+    assert (
+        "CompilePhysicalComponentSymbolicUnaryApertureClauses"
+        not in PipelineSource
+    )
+    assert "PhysicalComponentUnarySupportCompilation" in PipelineSource
+    assert (
+        "PhysicalComponentSymbolicUnaryApertureClauseCache"
+        in PipelineSource
+    )
+    assert (
+        "CompilePhysicalComponentSymbolicUnaryApertureDomain"
+        not in EligibilitySource
+    )
+    assert (
+        "CompilePhysicalComponentSymbolicPortPairDomain"
+        not in EligibilitySource
+    )
+    assert (
+        "PhysicalComponentSymbolicPairDomainPrecompileFingerprint"
+        not in EligibilitySource
+    )
 
 
 def test_successful_global_plan_returns_its_frontier_source_identity():
@@ -1396,7 +1879,97 @@ def test_successful_global_plan_returns_its_frontier_source_identity():
     assert "if SuccessfulGlobalPlanWasRetained" in Source[ReserveStart:]
 
 
+def test_boundary_iterator_identity_excludes_branch_and_preference_hints():
+    Source = inspect.getsource(
+        AuthoritativePlanner.SolvePreparedPhysicalComponentPortFactorDomain
+    )
+    IdentityStart = Source.index("BoundaryIteratorCacheKey = (")
+    IdentityEnd = Source.index(
+        "BoundaryAssignmentIterator = None",
+        IdentityStart,
+    )
+    Identity = Source[IdentityStart:IdentityEnd]
+
+    assert "BuildPhysicalComponentAssemblyPlanDomainFingerprint(" in Identity
+    assert "Preparation.DomainFingerprint" in Identity
+    assert "DeferLocalCompositeSelection" in Identity
+    assert "PhysicalComponentBoundaryTraversalEpoch" not in Identity
+    assert "PhysicalComponentBoundaryTraversalPrioritySignals" not in Identity
+    assert "PreferredPhysicalComponentGlobalContractsBySignal" not in Identity
+
+
+def test_assembly_domain_clause_epoch_is_monotone_and_order_stable():
+    DomainFingerprint = BuildPhysicalComponentAssemblyPlanDomainFingerprint(
+        "prepared-domain",
+        True,
+    )
+
+    def Resources(Clauses):
+        return SimpleNamespace(
+            PhysicalComponentAssemblyPlanDomainFingerprint=(
+                DomainFingerprint
+            ),
+            PhysicalComponentAssemblyPlanClauseStateByDomain={},
+            RejectedPhysicalComponentPortReservationSets=set(Clauses),
+            RejectedPhysicalComponentPortReservationsBySignal={},
+            RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+            RejectedPhysicalComponentAssemblyChoiceFingerprints=set(),
+            RejectedPhysicalComponentAssemblyPlanFingerprints=set(),
+            ForbiddenPhysicalComponentGlobalCandidateSets=set(),
+            PhysicalComponentBoundaryTraversalEpoch=0,
+            PhysicalComponentBoundaryTraversalPrioritySignals=(),
+            PhysicalComponentBoundaryAssignmentIteratorCache={
+                DomainFingerprint: object(),
+            },
+        )
+
+    FirstClause = frozenset((("Alpha", "alpha-0"),))
+    SecondClause = frozenset((
+        ("Alpha", "alpha-1"),
+        ("Beta", "beta-0"),
+    ))
+    Forward = Resources((FirstClause, SecondClause))
+    Reverse = Resources((SecondClause, FirstClause))
+    ForwardFirst = PreservePhysicalComponentAssemblyPlanDomainContinuation(
+        Forward
+    )
+    ReverseFirst = PreservePhysicalComponentAssemblyPlanDomainContinuation(
+        Reverse
+    )
+
+    assert ForwardFirst["AssemblyPlanDomainClauseEpoch"] == 1
+    assert (
+        ForwardFirst["AssemblyPlanDomainClauseFingerprint"]
+        == ReverseFirst["AssemblyPlanDomainClauseFingerprint"]
+    )
+    assert PreservePhysicalComponentAssemblyPlanDomainContinuation(
+        Forward
+    )["AssemblyPlanDomainClauseEpoch"] == 1
+    Forward.RejectedPhysicalComponentPortReservationSets.add(
+        frozenset((("Beta", "beta-1"),))
+    )
+    Advanced = PreservePhysicalComponentAssemblyPlanDomainContinuation(
+        Forward
+    )
+    assert Advanced["AssemblyPlanDomainClauseEpoch"] == 2
+    assert Advanced["BoundaryIteratorContinuationPreserved"] is True
+    assert Advanced["BoundaryIteratorCacheCleared"] is False
+    assert set(Forward.PhysicalComponentBoundaryAssignmentIteratorCache) == {
+        DomainFingerprint,
+    }
+
+
 def test_single_port_global_proof_records_only_targeted_reservation_no_good():
+    FrozenHandoff = {
+        "Applied": True,
+        "PreparationDomainFingerprint": "prepared-domain",
+        "PhysicalAssemblyPlanFingerprint": "physical-plan",
+        "ExteriorRegionFingerprint": "closed-region",
+        "AssignedColumnCount": 41,
+        "ReservedAccessCount": 7,
+        "PortalEntryCount": 23,
+        "PortableProofUsed": False,
+    }
     Plan = SimpleNamespace(
         PlanFingerprint="physical-plan",
         PortAssignmentFingerprint="whole-assignment",
@@ -1421,10 +1994,14 @@ def test_single_port_global_proof_records_only_targeted_reservation_no_good():
             Diagnostics={
                 "GlobalPlanDomainComplete": True,
                 "CompleteAssignmentCutProof": True,
+                "FrozenPostClosurePortalHandoff": FrozenHandoff,
             },
         ),
         Plan,
         DeadlineExpired=False,
+    )
+    assert Failure.Diagnostics["FrozenPostClosurePortalHandoff"] == (
+        FrozenHandoff
     )
     Resources = SimpleNamespace(
         RejectedPhysicalComponentPortReservationsBySignal={},
@@ -1457,12 +2034,15 @@ def test_single_port_global_proof_records_only_targeted_reservation_no_good():
     }
     assert not Resources.RejectedPhysicalComponentPortReservationsBySignal
     assert not Resources.RejectedPhysicalComponentPortAssignmentFingerprints
-    assert Diagnostics["BoundaryTraversalFocusSignal"] == "PortA"
-    assert Diagnostics["BoundaryTraversalPrioritySignals"] == [
-        "PortA",
-    ]
-    assert Diagnostics["BoundaryTraversalEpoch"] == 1
-    assert Resources.PhysicalComponentBoundaryAssignmentIteratorCache == {}
+    assert Diagnostics["BoundaryTraversalFocusSignal"] == ""
+    assert Diagnostics["BoundaryTraversalPrioritySignals"] == []
+    assert Diagnostics["BoundaryTraversalEpoch"] == 0
+    assert set(Resources.PhysicalComponentBoundaryAssignmentIteratorCache) == {
+        "stale-frontier",
+    }
+    assert Diagnostics["BoundaryIteratorContinuationPreserved"] is True
+    assert Diagnostics["BoundaryIteratorCacheCleared"] is False
+    assert Diagnostics["AssemblyPlanDomainClauseEpoch"] == 1
     assert Diagnostics["MinimumDeltaReplanPivotSignal"] == "PortA"
     assert Diagnostics["MinimumDeltaRetainedGlobalContracts"] == {
         "PortB": BuildPhysicalPortGlobalContractFingerprint(Plan.Ports[1]),
@@ -1787,23 +2367,245 @@ def test_joint_port_global_proof_records_only_targeted_reservation_tuple():
     }
     assert not Resources.RejectedPhysicalComponentPortReservationsBySignal
     assert not Resources.RejectedPhysicalComponentPortAssignmentFingerprints
-    assert Diagnostics["BoundaryTraversalFocusSignal"] == "PortA"
-    assert Diagnostics["BoundaryTraversalPrioritySignals"] == [
-        "PortB",
-        "PortA",
-    ]
+    assert Diagnostics["BoundaryTraversalFocusSignal"] == ""
+    assert Diagnostics["BoundaryTraversalPrioritySignals"] == []
+    assert Diagnostics["BoundaryIteratorContinuationPreserved"] is True
+    assert Diagnostics["BoundaryIteratorCacheCleared"] is False
+    assert Diagnostics["AssemblyPlanDomainClauseEpoch"] == 1
 
     Rotated = RecordPhysicalComponentGlobalPlanNoGood(
         Failure,
         Plan,
         Resources,
     )
-    assert Rotated["BoundaryTraversalFocusSignal"] == "PortB"
-    assert Rotated["BoundaryTraversalPrioritySignals"] == [
-        "PortA",
-        "PortB",
-    ]
-    assert Rotated["BoundaryTraversalEpoch"] == 2
+    assert Rotated["BoundaryTraversalFocusSignal"] == ""
+    assert Rotated["BoundaryTraversalPrioritySignals"] == []
+    assert Rotated["BoundaryTraversalEpoch"] == 0
+    assert Rotated["AssemblyPlanDomainClauseEpoch"] == 1
+
+
+def test_complete_dependency_cut_ignores_unrelated_port_variation():
+    DependencySignals = (
+        "CarryIn",
+        "CarryOut",
+        "NandNet28",
+        "NandNet29",
+        "NandNet31",
+    )
+
+    def Port(Signal, Index, *, UnrelatedOffset=0):
+        X = Index + UnrelatedOffset
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            FabricDomainFingerprint=f"fabric-{Signal}",
+            FabricAttachment=(X, 2, 1),
+            Attachment=(X, 2, 0),
+            OwnedTerminals=((X, 2, 2),),
+            LocalPath=((X, 2, 1), (X, 2, 0)),
+            GlobalPath=((X, 2, 0), (X, 2, -1)),
+            Capacity=1,
+            ReservationFingerprint=f"reservation-{Signal}-{X}",
+            GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+        )
+
+    def Plan(UnrelatedOffset):
+        return SimpleNamespace(
+            PlanFingerprint=f"physical-plan-{UnrelatedOffset}",
+            PortAssignmentFingerprint=f"assignment-{UnrelatedOffset}",
+            Ports=tuple((
+                *(Port(Signal, Index) for Index, Signal in enumerate(
+                    DependencySignals
+                )),
+                Port("NandNet26", 20, UnrelatedOffset=UnrelatedOffset),
+            )),
+            Feedthroughs=(),
+        )
+
+    FirstPlan = Plan(0)
+    FirstFailure = ClassifyPhysicalComponentGlobalPlanningFailure(
+        RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="PhysicalComponentGlobalAssignmentDomain",
+            AffectedNets=DependencySignals,
+            Diagnostics={
+                "GlobalPlanDomainComplete": True,
+                "CompleteAssignmentCutProof": True,
+                "MandatoryAccessProof": {"Complete": True},
+                "PairwisePortReservationNoGoodProofComplete": True,
+                "PairwisePortReservationNoGoodEdges": [
+                    ["CarryIn", "CarryOut"],
+                    ["CarryOut", "NandNet29"],
+                    ["NandNet28", "NandNet31"],
+                ],
+                "ConflictGraph": {
+                    "Classification": "mandatory-boundary-capacity-cut",
+                    "ConflictSignals": list(DependencySignals),
+                    "CongestionCutSignals": list(DependencySignals),
+                    "PairwiseIncompatibleEdges": [
+                        ["CarryIn", "CarryOut"],
+                        ["CarryOut", "NandNet29"],
+                        ["NandNet28", "NandNet31"],
+                    ],
+                },
+            },
+        ),
+        FirstPlan,
+        DeadlineExpired=False,
+    )
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        PhysicalComponentBoundaryAssignmentIteratorCache={},
+    )
+    FirstDiagnostics = RecordPhysicalComponentGlobalPlanNoGood(
+        FirstFailure,
+        FirstPlan,
+        Resources,
+    )
+    ExpectedClauses = set(
+        Resources.RejectedPhysicalComponentPortReservationSets
+    )
+
+    SecondPlan = Plan(100)
+    SecondFailure = ClassifyPhysicalComponentGlobalPlanningFailure(
+        RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="PhysicalComponentGlobalAssignmentDomain",
+            AffectedNets=DependencySignals,
+            Diagnostics={
+                "GlobalPlanDomainComplete": True,
+                "CompleteAssignmentCutProof": True,
+                "MandatoryAccessProof": {"Complete": True},
+                "PairwisePortReservationNoGoodProofComplete": True,
+                "PairwisePortReservationNoGoodEdges": [
+                    ["CarryIn", "CarryOut"],
+                    ["CarryOut", "NandNet29"],
+                    ["NandNet28", "NandNet31"],
+                ],
+                "ConflictGraph": {
+                    "Classification": "mandatory-boundary-capacity-cut",
+                    "ConflictSignals": list(DependencySignals),
+                    "CongestionCutSignals": list(DependencySignals),
+                    "PairwiseIncompatibleEdges": [
+                        ["CarryIn", "CarryOut"],
+                        ["CarryOut", "NandNet29"],
+                        ["NandNet28", "NandNet31"],
+                    ],
+                },
+            },
+        ),
+        SecondPlan,
+        DeadlineExpired=False,
+    )
+    SecondDiagnostics = RecordPhysicalComponentGlobalPlanNoGood(
+        SecondFailure,
+        SecondPlan,
+        Resources,
+    )
+
+    assert len(ExpectedClauses) == 3
+    assert all(len(Clause) == 2 for Clause in ExpectedClauses)
+    assert Resources.RejectedPhysicalComponentPortReservationSets == (
+        ExpectedClauses
+    )
+    assert FirstDiagnostics["NoGoodConstraintArity"] == 2
+    assert SecondDiagnostics["NoGoodConstraintArity"] == 2
+    assert len(FirstDiagnostics["NoGoodReservationSets"]) == 3
+    assert len(SecondDiagnostics["NoGoodReservationSets"]) == 3
+    assert FirstDiagnostics[
+        "AssemblyPlanDependencyProjectionProofComplete"
+    ] is True
+    assert SecondDiagnostics[
+        "AssemblyPlanDependencyProjectionProofComplete"
+    ] is True
+
+
+def test_complete_higher_order_exterior_core_projects_exact_port_subset():
+    def Port(Signal, X):
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            Attachment=(X, 2, 0),
+            GlobalPath=((X, 2, 0), (X, 2, -1)),
+            Capacity=1,
+            ReservationFingerprint=f"reservation-{Signal}",
+            GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+        )
+
+    CoreSignals = ("CarryIn", "CarryOut", "NandNet29")
+    ReportedDeadEndSignals = (*CoreSignals, "DeadEndWitness")
+    Plan = SimpleNamespace(
+        PlanFingerprint="higher-order-plan",
+        PortAssignmentFingerprint="higher-order-assignment",
+        Ports=tuple(Port(Signal, Index) for Index, Signal in enumerate((
+            *ReportedDeadEndSignals,
+            "Unrelated",
+        ))),
+        Feedthroughs=(),
+    )
+    Failure = ClassifyPhysicalComponentGlobalPlanningFailure(
+        RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="PhysicalComponentGlobalAssignmentDomain",
+            AffectedNets=ReportedDeadEndSignals,
+            Diagnostics={
+                "GlobalPlanDomainComplete": True,
+                "CompleteAssignmentCutProof": True,
+                "HigherOrderPortReservationNoGoodProofComplete": True,
+                "HigherOrderPortReservationNoGoodSignals": list(
+                    CoreSignals
+                ),
+                "HigherOrderPortReservationNoGoodCandidateCounts": {
+                    "CarryIn": 25,
+                    "CarryOut": 20,
+                    "NandNet29": 32,
+                },
+                "ConflictGraph": {
+                    "Classification": "higher-order-placement-conflict",
+                    "ConflictSignals": list(ReportedDeadEndSignals),
+                },
+            },
+        ),
+        Plan,
+        DeadlineExpired=False,
+    )
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        PhysicalComponentBoundaryAssignmentIteratorCache={},
+    )
+
+    Diagnostics = RecordPhysicalComponentGlobalPlanNoGood(
+        Failure,
+        Plan,
+        Resources,
+    )
+
+    assert Failure.Diagnostics[
+        "HigherOrderPortReservationNoGoodProofComplete"
+    ] is True
+    assert Failure.Diagnostics[
+        "AssemblyPlanDependencyIdentityComplete"
+    ] is True
+    assert Diagnostics[
+        "AssemblyPlanDependencyProjectionProofComplete"
+    ] is True
+    assert Diagnostics["NoGoodConstraintArity"] == 3
+    assert Diagnostics["MinimumDeltaReplanPivotSignal"] == "CarryOut"
+    assert Diagnostics[
+        "MinimumDeltaCertifiedExteriorDomainCounts"
+    ] == {
+        "CarryIn": 25,
+        "CarryOut": 20,
+        "NandNet29": 32,
+    }
+    Clause = next(iter(
+        Resources.RejectedPhysicalComponentPortReservationSets
+    ))
+    assert {Signal for Signal, _Fingerprint in Clause} == set(CoreSignals)
 
 
 def test_complete_independent_empty_route_domains_reject_exact_ports():
@@ -1963,7 +2765,9 @@ def test_request_aperture_proof_retains_global_determinants_and_scope():
         if Port.Signal != "Blocker"
     }
     assert Diagnostics["MinimumDeltaReplanPivotSignal"] == "Blocker"
-    assert Diagnostics["BoundaryTraversalFocusSignal"] == "Blocker"
+    assert Diagnostics["BoundaryTraversalFocusSignal"] == ""
+    assert Diagnostics["BoundaryIteratorContinuationPreserved"] is True
+    assert Diagnostics["BoundaryIteratorCacheCleared"] is False
     assert Diagnostics["MinimumDeltaRetainedGlobalContracts"] == (
         ExpectedRetainedContracts
     )
@@ -2176,24 +2980,20 @@ def test_certified_signal_local_request_aperture_proof_is_domain_scoped():
         PortSolverCacheKey="solver-domain",
     )
 
-    assert {
-        (Port.Signal, BuildPhysicalPortGlobalContractFingerprint(Port))
-        for Port in Ports
-    } <= NoGood
     assert (
         "Alpha",
-        "local-signal-domain:solver-domain",
+        BuildPhysicalPortGlobalContractFingerprint(Ports[0]),
     ) in NoGood
-    assert {
+    assert NoGood == frozenset((
         (
             "Alpha",
-            BuildPhysicalPortApertureContractFingerprint(Ports[0]),
+            BuildPhysicalPortGlobalContractFingerprint(Ports[0]),
         ),
         (
             "Beta",
             BuildPhysicalPortApertureContractFingerprint(Ports[1]),
         ),
-    } <= NoGood
+    ))
     assert (
         "Gamma",
         BuildPhysicalPortApertureContractFingerprint(Ports[2]),
@@ -2373,6 +3173,14 @@ def test_complete_pairwise_global_cut_records_each_exact_reservation_edge():
         RejectedPhysicalComponentPortReservationsBySignal={},
         RejectedPhysicalComponentPortReservationSets=set(),
         RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        PreparedPhysicalComponentPortFactorDomain=SimpleNamespace(
+            DomainFingerprint="prepared-domain",
+        ),
+        PhysicalBoundaryMandatoryPortalFactorDomainCache={
+            ("prepared-domain", Signal, f"aperture-{Signal}"):
+            SimpleNamespace(Signal=Signal, Complete=False)
+            for Signal in ("PortA", "PortB", "PortC")
+        },
     )
 
     Diagnostics = RecordPhysicalComponentGlobalPlanNoGood(
@@ -2384,6 +3192,7 @@ def test_complete_pairwise_global_cut_records_each_exact_reservation_edge():
     assert Diagnostics["NoGoodScope"] == (
         "pairwise-port-aperture-reservation-sets"
     )
+    assert Diagnostics["NoGoodConstraintArity"] == 2
     GlobalKeys = {
         Port.Signal: BuildPhysicalPortApertureContractFingerprint(Port)
         for Port in Plan.Ports
@@ -2399,6 +3208,276 @@ def test_complete_pairwise_global_cut_records_each_exact_reservation_edge():
         )),
     }
     assert len(Diagnostics["NoGoodReservationSets"]) == 2
+    assert Diagnostics["PreparedMandatoryPortalPairFactorStatus"] == {
+        "Available": False,
+        "ExpectedSignals": ["PortA", "PortB", "PortC"],
+        "PreparedSignalCount": 3,
+        "FactorDomainCount": 3,
+        "CompleteFactorDomainCount": 0,
+        "IncompleteSignals": ["PortA", "PortB", "PortC"],
+        "OtherPreparedDomainFactorCount": 0,
+        "OptionCountsBySignal": {
+            "PortA": 1,
+            "PortB": 1,
+            "PortC": 1,
+        },
+        "OptionProduct": 1,
+        "MaximumEagerOptionProduct": 65_536,
+        "EagerCompilationSelected": False,
+    }
+
+
+def test_pair_relation_deadline_retains_only_current_exact_pair_clause(
+    monkeypatch,
+):
+    Plan = SimpleNamespace(
+        PlanFingerprint="physical-plan",
+        PortAssignmentFingerprint="whole-assignment",
+        Ports=tuple(
+            SimpleNamespace(
+                Signal=Signal,
+                ReservationFingerprint=f"reservation-{Signal.lower()}",
+                GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+            )
+            for Signal in ("PortA", "PortB")
+        ),
+    )
+    Failure = ClassifyPhysicalComponentGlobalPlanningFailure(
+        RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="PhysicalComponentGlobalAssignmentDomain",
+            AffectedNets=("PortA", "PortB"),
+            Diagnostics={
+                "GlobalPlanDomainComplete": True,
+                "CompleteAssignmentCutProof": True,
+                "PairwisePortReservationNoGoodProofComplete": True,
+                "PairwisePortReservationNoGoodEdges": [
+                    ["PortA", "PortB"],
+                ],
+                "MandatoryAccessProof": {
+                    "Kind": "generated-fixed-portal-domain-exhausted",
+                    "Complete": True,
+                    "PortalTupleDomainComplete": True,
+                    "ProofScope": "complete-portal-tuple-domain",
+                    "BudgetExhausted": False,
+                    "DeadlineExceeded": False,
+                },
+                "ConflictGraph": {
+                    "Classification": "mandatory-boundary-capacity-cut",
+                    "ConflictSignals": ["PortA", "PortB"],
+                    "CongestionCutSignals": ["PortA", "PortB"],
+                    "PairwiseIncompatibleEdges": [["PortA", "PortB"]],
+                },
+            },
+        ),
+        Plan,
+        DeadlineExpired=False,
+    )
+    Preparation = SimpleNamespace(DomainFingerprint="prepared-domain")
+    Resources = SimpleNamespace(
+        PreparedPhysicalComponentPortFactorDomain=Preparation,
+        PhysicalBoundaryMandatoryPortalFactorDomainCache={
+            ("prepared-domain", "PortA", "aperture-a"):
+            SimpleNamespace(Signal="PortA", Complete=True),
+            ("prepared-domain", "PortB", "aperture-b"):
+            SimpleNamespace(Signal="PortB", Complete=True),
+        },
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+    )
+    DeadlineChecks = []
+
+    def Compile(
+        _Preparation,
+        Signals,
+        _Resources,
+        ShouldStop=None,
+        **_Options,
+    ):
+        DeadlineChecks.append(ShouldStop())
+        return SimpleNamespace(
+            RelationFingerprint="pair-relation",
+            Signals=tuple(sorted(Signals)),
+            ExpectedOptionPairCount=4,
+            Certificates=(),
+            UnsatisfiableApertureClauses=(),
+            ForeignDependencyCertificateCount=0,
+            Complete=False,
+        )
+
+    monkeypatch.setattr(
+        AuthoritativePlanner,
+        "CompilePhysicalBoundaryMandatoryPortalPairRelation",
+        Compile,
+    )
+
+    NoGood = RecordPhysicalComponentGlobalPlanNoGood(
+        Failure,
+        Plan,
+        Resources,
+        ShouldStop=lambda: True,
+    )
+
+    assert DeadlineChecks == [True]
+    assert NoGood["NoGoodConstraintArity"] == 2
+    assert len(Resources.RejectedPhysicalComponentPortReservationSets) == 1
+    assert NoGood[
+        "CompiledMandatoryPortalPairRelations"
+    ][0]["Complete"] is False
+
+
+def test_foreign_dependent_mandatory_pair_cannot_project_port_subset():
+    def Port(Signal, X):
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            Capacity=1,
+            Attachment=(X, 2, 0),
+            GlobalPath=((X, 2, 0), (X, 2, -1)),
+            GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+            ReservationFingerprint=f"reservation-{Signal}",
+        )
+
+    Plan = SimpleNamespace(
+        PlanFingerprint="foreign-dependent-plan",
+        PortAssignmentFingerprint="foreign-dependent-assignment",
+        Ports=(Port("PortA", 0), Port("PortB", 2), Port("Unrelated", 4)),
+        Feedthroughs=(),
+    )
+    Failure = ClassifyPhysicalComponentGlobalPlanningFailure(
+        RoutingFailure(
+            Reason=RoutingFailureReason.TrackAssignmentConflict,
+            Stage="InitialCandidateAssignment",
+            AffectedNets=("PortA", "PortB"),
+            Diagnostics={
+                "GlobalPlanDomainComplete": True,
+                "CompleteAssignmentCutProof": True,
+                "MandatoryAccessProof": {
+                    "Kind": "generated-fixed-portal-domain-exhausted",
+                    "Complete": True,
+                    "PortalTupleDomainComplete": True,
+                    "ProofScope": "complete-portal-tuple-domain",
+                    "BudgetExhausted": False,
+                    "DeadlineExceeded": False,
+                },
+                # The observed edge exists, but its exact certificate also
+                # depended on a frozen foreign owner and was not promoted.
+                "PairwisePortReservationNoGoodProofComplete": False,
+                "PairwisePortReservationNoGoodEdges": [],
+                "ConflictGraph": {
+                    "Classification": "mandatory-boundary-capacity-cut",
+                    "ConflictSignals": ["PortA", "PortB"],
+                    "CongestionCutSignals": ["PortA", "PortB"],
+                    "PairwiseIncompatibleEdges": [["PortA", "PortB"]],
+                },
+            },
+        ),
+        Plan,
+        DeadlineExpired=False,
+    )
+
+    assert not Failure.Diagnostics[
+        "MandatoryPairDependencyIdentityComplete"
+    ]
+    assert not Failure.Diagnostics[
+        "AssemblyPlanDependencyIdentityComplete"
+    ]
+    Resources = SimpleNamespace(
+        RejectedPhysicalComponentPortReservationsBySignal={},
+        RejectedPhysicalComponentPortReservationSets=set(),
+        RejectedPhysicalComponentPortAssignmentFingerprints=set(),
+        PhysicalComponentBoundaryAssignmentIteratorCache={},
+    )
+    Diagnostics = RecordPhysicalComponentGlobalPlanNoGood(
+        Failure,
+        Plan,
+        Resources,
+    )
+
+    Clause = next(iter(
+        Resources.RejectedPhysicalComponentPortReservationSets
+    ))
+    assert {Signal for Signal, _Fingerprint in Clause} == {
+        "PortA",
+        "PortB",
+        "Unrelated",
+    }
+    assert Diagnostics["NoGoodScope"] == (
+        "exact-assembly-port-aperture-set"
+    )
+    assert not Diagnostics[
+        "AssemblyPlanDependencyProjectionProofComplete"
+    ]
+
+
+def test_new_aperture_clause_purges_matching_retained_global_plan():
+    def Port(Signal, X):
+        return SimpleNamespace(
+            Signal=Signal,
+            Direction="output",
+            Capacity=1,
+            Attachment=(X, 2, 0),
+            GlobalPath=((X, 2, 0), (X, 2, -1)),
+            GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
+        )
+
+    RejectedPlan = SimpleNamespace(
+        PlanFingerprint="rejected-plan",
+        Ports=(Port("PortA", 0), Port("PortB", 2)),
+    )
+    RetainedPlan = SimpleNamespace(
+        PlanFingerprint="retained-plan",
+        Ports=(Port("PortA", 8), Port("PortB", 2)),
+    )
+    Clause = frozenset(
+        (
+            PortValue.Signal,
+            BuildPhysicalPortApertureContractFingerprint(PortValue),
+        )
+        for PortValue in RejectedPlan.Ports
+    )
+    Frontier = {
+        "rejected-plan": SimpleNamespace(
+            Assembly=SimpleNamespace(Plan=RejectedPlan)
+        ),
+        "retained-plan": SimpleNamespace(
+            Assembly=SimpleNamespace(Plan=RetainedPlan)
+        ),
+    }
+
+    Pruned, RejectedFingerprints = (
+        PruneRetainedPhysicalGlobalPlansByRejectedApertureClauses(
+            Frontier,
+            (Clause,),
+        )
+    )
+
+    assert tuple(Pruned) == ("retained-plan",)
+    assert RejectedFingerprints == ("rejected-plan",)
+
+
+def test_retained_global_scheduler_prunes_live_clauses_before_selection():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Rebuild = Source.index("def RebuildFrontierDeferrals()")
+    Prune = Source.index(
+        "PruneRetainedPhysicalGlobalPlansByRejectedApertureClauses(",
+        Rebuild,
+    )
+    Select = Source.index(
+        "SelectNextRetainedPhysicalGlobalPlan(",
+        Prune,
+    )
+    FreshOrRetained = Source.index(
+        "def SelectFreshOrRetainedAssembly()",
+        Select,
+    )
+    Recheck = Source.index(
+        "RebuildFrontierDeferrals()",
+        FreshOrRetained,
+    )
+
+    assert Rebuild < Prune < Select < FreshOrRetained < Recheck
 
 
 def test_global_contract_recommendation_rejects_uncertified_mixed_factors():
@@ -2554,76 +3633,171 @@ def test_global_port_replans_route_and_bind_each_exact_corridor_contract():
     assert "CurrentAssembly" in Reservation
 
 
-def test_local_interface_factor_portfolio_runs_after_fixed_plan_proof():
+def test_authoritative_global_reservation_precedes_closed_component_compile():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    ReserveDefinition = Source.index(
+        "def ReserveAuthoritativeGlobalChannels(",
+    )
+    ReserveCall = Source.index(
+        "ReserveAuthoritativeGlobalChannels(\n"
+        "                        PreparedAssembly",
+        ReserveDefinition,
+    )
+    Compile = Source.index(
+        "ComponentSolve = CompileClosedComponent(",
+        ReserveCall,
+    )
+
+    assert ReserveDefinition < ReserveCall < Compile
+    CapacityProof = Source.index(
+        "ProveClosedComponentSymbolicCapacityEligibility("
+    )
+    assert CapacityProof < ReserveCall < Compile
+    assert 'if Proof.Status == "capacity-feasible"' in Source
+
+
+def test_foreign_portal_certificates_cover_preencoded_assignments():
+    Source = inspect.getsource(
+        AuthoritativePlanner.RouteAuthoritativeResources
+    )
+    Assignment = Source.index("def PlanAssignment(")
+    Publish = Source.index(
+        "PublishPhysicalGlobalForeignPortalCandidateNoGoods(\n"
+        "                CandidatesBySignal",
+        Assignment,
+    )
+    ValuesBranch = Source.index("if Values is None:", Assignment)
+
+    assert Assignment < Publish < ValuesBranch
+    assert "PhysicalForeignPortalCertifiedCandidateIds" in Source
+    assert (
+        "PhysicalForeignPortalCandidateCertificatesCompiled"
+        not in Source
+    )
+    NativeAssignment = Source.index(
+        "def PlanNative(",
+        ValuesBranch,
+    )
+    ExactEmptyReturn = Source.index(
+        '"NativeAssignmentSkipped"] = True',
+        Publish,
+    )
+    assert Publish < ExactEmptyReturn < NativeAssignment
+
+
+def test_component_global_domains_close_before_native_assignment():
+    Source = inspect.getsource(
+        AuthoritativePlanner.RouteAuthoritativeResources
+    )
+    Completion = Source.index(
+        '"PhysicalGlobalPreAssignmentDomainCompletion"'
+    )
+    AssignmentStart = Source.index(
+        'AssignmentStarted = monotonic()',
+        Completion,
+    )
+    InitialAssignment = Source.index(
+        "Result = PlanAssignment(",
+        AssignmentStart,
+    )
+
+    assert Completion < AssignmentStart < InitialAssignment
+
+
+def test_foreign_portal_unary_empty_core_precedes_binary_certificates():
+    Source = inspect.getsource(
+        AuthoritativePlanner.RouteAuthoritativeResources
+    )
+    EmptyCore = Source.index(
+        "if not IndependentEmptyCandidateDomainSignals:"
+    )
+    BinaryLoop = Source.index(
+        "for FirstIndex, First in enumerate(OrderedCandidates):",
+        EmptyCore,
+    )
+    Telemetry = Source.index(
+        '"BinaryCompilationSkippedForUnaryEmptyCore"',
+        BinaryLoop,
+    )
+
+    assert EmptyCore < BinaryLoop < Telemetry
+
+
+def test_pair_certificate_edges_are_scoped_to_component_ports():
+    Source = inspect.getsource(
+        RecordPhysicalComponentGlobalPlanNoGood
+    )
+
+    assert "str(Edge[0]) in ReservationKeyBySignal" in Source
+    assert "str(Edge[1]) in ReservationKeyBySignal" in Source
+
+
+def test_local_unsat_rejects_exact_plan_before_distinct_global_replan():
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
     Compile = Source.index("CompileClosedComponent(")
-    RelaxedProof = Source.index(
-        "ProveGlobalRelaxedLocalUnsatisfiability(", Compile
+    RecordNoGood = Source.index(
+        "RecordPhysicalComponentLocalCompilationNoGood(", Compile
+    )
+    Replan = Source.index(
+        "ReplanPhysicalAssemblyWithTiming()", RecordNoGood
+    )
+    Reserve = Source.index(
+        "ReserveAuthoritativeGlobalChannels(", Replan
+    )
+    Continue = Source.index("continue", Reserve)
+    LocalFailure = Source[Compile:Continue]
+
+    assert Compile < RecordNoGood < Replan < Reserve < Continue
+    assert (
+        "RejectedPhysicalComponentAssemblyPlanFingerprints"
+        in LocalFailure
+    )
+    assert '"PerSignalReservationFeedbackUsed": False' in LocalFailure
+    assert "ProveGlobalRelaxedLocalUnsatisfiability(" not in LocalFailure
+    assert "CertifyLocalInterfaceFactorPortfolio(" not in LocalFailure
+    assert "PhysicalAssemblyGlobalRouteCanBeRebound(" not in LocalFailure
+
+
+def test_bound_local_compiles_once_per_physical_assembly_plan():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Guard = Source.index(
+        "CompiledPhysicalAssemblyPlanFingerprints: set[str] = set()"
+    )
+    Duplicate = Source.index(
+        'Stage="DuplicateClosedComponentCompilation"',
+        Guard,
+    )
+    Add = Source.index(
+        "CompiledPhysicalAssemblyPlanFingerprints.add(",
+        Duplicate,
+    )
+    Compile = Source.index(
+        "ComponentSolve = CompileClosedComponent(",
+        Add,
+    )
+
+    assert Guard < Duplicate < Add < Compile
+    assert "ActiveComponentRemainingSeconds" in Source[Add:Compile + 500]
+
+
+def test_incomplete_local_compile_stops_before_exact_plan_replan():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Compile = Source.index("CompileClosedComponent(")
+    Incomplete = Source.index(
+        '"ClosedComponentCompilationIncomplete"', Compile
     )
     RecordNoGood = Source.index(
-        "RecordPhysicalComponentLocalCompilationNoGood(", RelaxedProof
-    )
-    CertifyPortfolio = Source.index(
-        "CertifyLocalInterfaceFactorPortfolio(", RecordNoGood
+        "RecordPhysicalComponentLocalCompilationNoGood(", Incomplete
     )
     Replan = Source.index(
-        "ReplanPhysicalAssemblyWithTiming()", CertifyPortfolio
+        "ReplanPhysicalAssemblyWithTiming()", RecordNoGood
     )
+    Guard = Source[Incomplete:RecordNoGood]
 
-    assert Compile < RelaxedProof < RecordNoGood < CertifyPortfolio < Replan
-
-
-def test_local_feedback_proofs_use_the_authoritative_component_deadline():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    Compile = Source.index("CompileClosedComponent(")
-    FeedbackDeadline = Source.index(
-        "FeedbackProofDeadline = ActiveComponentDeadline",
-        Compile,
-    )
-    RelaxedProof = Source.index(
-        "ProveGlobalRelaxedLocalUnsatisfiability(",
-        FeedbackDeadline,
-    )
-    CertifyPortfolio = Source.index(
-        "CertifyLocalInterfaceFactorPortfolio(",
-        RelaxedProof,
-    )
-    Replan = Source.index(
-        "ReplanPhysicalAssemblyWithTiming()",
-        CertifyPortfolio,
-    )
-    RelaxedSlice = Source[RelaxedProof:CertifyPortfolio]
-    PortfolioSlice = Source[CertifyPortfolio:Replan]
-
-    assert FeedbackDeadline < RelaxedProof < CertifyPortfolio < Replan
-    assert "FeedbackProofRemainingSeconds" in RelaxedSlice
-    assert "FeedbackProofDeadline.RaiseIfExpired(" in RelaxedSlice
-    assert "FeedbackProofDeadline" in PortfolioSlice
-    assert "FeedbackProofDeadline.RaiseIfExpired(" in PortfolioSlice
-    assert "FeedbackPlanningDeadline" not in RelaxedSlice
-    assert "FeedbackPlanningDeadline" not in PortfolioSlice
-
-
-def test_incomplete_local_factor_portfolio_stops_before_global_replan():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    Compile = Source.index("CompileClosedComponent(")
-    CertifyPortfolio = Source.index(
-        "CertifyLocalInterfaceFactorPortfolio(", Compile
-    )
-    TypedIncomplete = Source.index(
-        '"CertificationIncomplete"',
-        CertifyPortfolio,
-    )
-    Replan = Source.index(
-        "ReplanPhysicalAssemblyWithTiming()", CertifyPortfolio
-    )
-    Guard = Source[CertifyPortfolio:Replan]
-
-    assert CertifyPortfolio < TypedIncomplete < Replan
-    assert 'not PortfolioDiagnostics.get(' in Guard
-    assert '"Complete", False' in Guard
-    assert '"FeasibleWitness"' in Guard
-    assert '"GlobalReplanEntered": False' in Guard
+    assert Compile < Incomplete < RecordNoGood < Replan
+    assert "raise RoutingStageError(RoutingFailure(" in Guard
+    assert '"Complete": False' in Guard
+    assert "ReplanPhysicalAssemblyWithTiming(" not in Guard
 
 
 def test_physical_guide_overlay_preserves_complete_ordinary_plan_coverage():

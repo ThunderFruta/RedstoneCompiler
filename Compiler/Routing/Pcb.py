@@ -591,6 +591,7 @@ def RoutePcbAttempt(
     Deadline: RoutingDeadline | None = None,
     PreparePortalGeometryOnly: bool = False,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
+    ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
@@ -746,6 +747,9 @@ def RoutePcbAttempt(
                 PreparePortalGeometryOnly=PreparePortalGeometryOnly,
                 ValidateClusterInterfaceForeignAccessOnly=(
                     ValidateClusterInterfaceForeignAccessOnly
+                ),
+                ValidatePhysicalComponentForeignPortalSupportOnly=(
+                    ValidatePhysicalComponentForeignPortalSupportOnly
                 ),
                 PrepareClusterInterfaceAssignmentOnly=(
                     PrepareClusterInterfaceAssignmentOnly
@@ -1567,6 +1571,36 @@ def ValidateClusterInterfaceForeignAccess(
         raise
     raise RuntimeError(
         "foreign-access validation returned without a typed result"
+    )
+
+
+def ValidatePhysicalComponentForeignPortalSupport(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+) -> dict[str, object]:
+    """Prove the frozen exterior leaves an access option per foreign pin."""
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            Placement,
+            Configuration,
+            Resources=Resources,
+            Policy=Policy,
+            Deadline=Deadline,
+            ValidatePhysicalComponentForeignPortalSupportOnly=True,
+            RequireCompleteClusterInterfaceDomain=True,
+        )
+    except RoutingStageError as Error:
+        if Error.Failure.Stage == (
+            "PhysicalComponentForeignPortalSupportValidated"
+        ):
+            return dict(Error.Failure.Diagnostics or {})
+        raise
+    raise RuntimeError(
+        "physical foreign-portal validation returned without a typed result"
     )
 
 

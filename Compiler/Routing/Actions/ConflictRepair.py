@@ -135,26 +135,3 @@ def AnalyzeFlatRouteConflicts(
         })
     return ConflictCells, ConflictCounts, SelfConflictSignals, ConflictPairs
 
-
-def SelectConflictRepairSignals(
-    NetWires: dict[str, set[Position3]],
-    SelfConflictSignals: set[str],
-    ConflictPairs: Counter[tuple[str, str]],
-) -> set[str]:
-    """Legacy conflict-repair selection was retired from the active router."""
-    raise NotImplementedError(
-        "SelectConflictRepairSignals is retired. "
-        "Use the conflict metrics exported from detailed authoritative routing instead."
-    )
-
-
-def ExpandConflictRepairNeighborhood(
-    SeedSignal: str,
-    ConflictPairs: set[tuple[str, str]],
-    Depth: int,
-) -> set[str]:
-    """Legacy conflict neighborhood expansion was retired with shim migration."""
-    raise NotImplementedError(
-        "ExpandConflictRepairNeighborhood is retired. "
-        "Conflict neighborhoods are no longer expanded by heuristic passes."
-    )
