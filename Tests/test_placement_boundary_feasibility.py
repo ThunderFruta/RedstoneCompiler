@@ -199,6 +199,48 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             )
             self.assertTrue(Lane.PhysicalClaims.ElectricalCells)
 
+    def testBoundedInterClusterChannelClearanceMovesLaneIntoTranslatedGap(
+        self,
+    ) -> None:
+        Source = self.BuildChannelPlacement(((0, 0), (12, 0)))
+        with patch.object(
+            PcbModule,
+            "BuildPlacedCellGeometry",
+            return_value=(set(), set(), set()),
+        ):
+            Compact = BuildBoundedInterClusterRoutingChannel(Source)
+            Cleared = BuildBoundedInterClusterRoutingChannel(
+                Source,
+                ChannelClearanceTracks=1,
+            )
+        CompactChannel = Compact.InterClusterRoutingChannel
+        ClearedChannel = Cleared.InterClusterRoutingChannel
+        assert CompactChannel is not None
+        assert ClearedChannel is not None
+        self.assertEqual(ClearedChannel.ChannelClearanceTracks, 1)
+        self.assertNotEqual(
+            CompactChannel.ChannelFingerprint,
+            ClearedChannel.ChannelFingerprint,
+        )
+        self.assertGreater(
+            max(
+                abs(Delta[0]) + abs(Delta[2])
+                for _Cluster, Delta in ClearedChannel.ClusterTranslations
+            ),
+            max(
+                abs(Delta[0]) + abs(Delta[2])
+                for _Cluster, Delta in CompactChannel.ClusterTranslations
+            ),
+        )
+        self.assertTrue(all(
+            Cell not in {
+                (Gate.X, Gate.Y, Gate.Z)
+                for Gate in Cleared.Placed.PlacedGates
+            }
+            for Lane in ClearedChannel.Lanes
+            for Cell in Lane.Cells
+        ))
+
     def testBoundedInterClusterChannelBuildsTwoStripLShape(
         self,
     ) -> None:

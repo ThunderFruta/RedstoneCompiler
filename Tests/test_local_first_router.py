@@ -9,7 +9,7 @@ from unittest.mock import patch
 from typing import Any
 
 from SVDecoder import Sv
-from Compiler.Main import BuildParser, Main
+from Compiler.Main import BuildParser, Main, PrintRoutingFailureSummary
 from Compiler.Pipeline import CompileSvToLitematic
 from Compiler.Placement.PcbFlow import (
     BuildPlacementGenerationPlan,
@@ -295,6 +295,43 @@ class LocalFirstRouterTests(unittest.TestCase):
             Compile.call_args.kwargs["RoutingDeadlineSeconds"],
             3.5,
         )
+
+    def testCliRoutingFailureSummaryIncludesComponentAttempts(self) -> None:
+        Output = StringIO()
+        Failure = RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="ClusterInterfaceSolveIncomplete",
+            Diagnostics={
+                "Deadline": {
+                    "ElapsedSeconds": 100.4,
+                    "RemainingMilliseconds": 19595,
+                    "ExpirationKind": "StageReserveExpired",
+                },
+                "CompletedComponentStateAttempts": [{
+                    "CandidateId": "ChannelPlacement-test",
+                    "Result": "unsatisfiable",
+                    "PlacementFingerprint": "placement",
+                    "Failure": {
+                        "Stage": "PhysicalComponentAssemblyPlanning",
+                        "Reason": "ComponentPortAssignmentUnsatisfiable",
+                        "AffectedNets": ["NandNet26"],
+                        "OwnershipUnsatCoreFingerprint": "core",
+                    },
+                }],
+            },
+        ))
+
+        with redirect_stderr(Output):
+            PrintRoutingFailureSummary(
+                Failure,
+                Path("Output/CLA4/CLA4.litematic"),
+            )
+
+        Text = Output.getvalue()
+        self.assertIn("deadline: elapsed=100.4s", Text)
+        self.assertIn("component placement attempts (1)", Text)
+        self.assertIn("NandNet26", Text)
+        self.assertIn("CLA4.RoutingFailure.json", Text)
 
     def testDefaultPolicyEnablesAuthoritativeRoutingFeatures(self) -> None:
         self.assertTrue(
@@ -844,13 +881,12 @@ class LocalFirstRouterTests(unittest.TestCase):
             None,
         )
 
-        self.assertEqual(PlaceGraph.call_count, 2)
+        self.assertEqual(PlaceGraph.call_count, 1)
         PackingPolicies = [
             Call.kwargs["PackingPolicy"] for Call in PlaceGraph.call_args_list
         ]
         self.assertTrue(PackingPolicies[0].Enabled)
         self.assertFalse(PackingPolicies[0].GraphBeamEnabled)
-        self.assertFalse(PackingPolicies[1].Enabled)
         self.assertFalse(any(
             Value.Enabled and Value.GraphBeamEnabled
             for Value in PackingPolicies
@@ -889,8 +925,8 @@ class LocalFirstRouterTests(unittest.TestCase):
         Selection = Result.Routed.RoutingControlEffectiveness[
             "RoutingPercentageSelection"
         ]
-        self.assertEqual(RouteDesign[1].call_count, 2)
-        self.assertEqual(Selection["CandidateCount"], 2)
+        self.assertEqual(RouteDesign[1].call_count, 1)
+        self.assertEqual(Selection["CandidateCount"], 1)
         self.assertEqual(Selection["Selected"]["FullFootprint"], 1000)
         self.assertEqual(
             Result.Routed.RoutingControlEffectiveness[
@@ -899,8 +935,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             "first",
         )
 
-    def testConfiguredGraphBeamRunsAfterEveryPrimaryPlacementFails(self) -> None:
-        GraphPlacement = self._BuildPlacementFlowFixture("graph-beam")
+    def testConfiguredGraphBeamIsNotTriedAfterPrimaryPlacementFails(self) -> None:
         PlacementResults = [
             ValueError("row beam rejected"),
             ValueError("unpacked placement rejected"),
@@ -908,31 +943,15 @@ class LocalFirstRouterTests(unittest.TestCase):
             ValueError("configured-spacing unpacked rejected"),
             ValueError("wider-spacing unpacked rejected"),
             ValueError("configured packing rejected"),
-            GraphPlacement,
         ]
-        _, PlaceGraph, _ = self._RunMockedPlacementFlow(
-            PlacementResults,
-            ["configured-graph"],
-            None,
-        )
+        with self.assertRaises(RoutingStageError):
+            self._RunMockedPlacementFlow(
+                PlacementResults,
+                ["configured-graph"],
+                None,
+            )
 
-        self.assertEqual(PlaceGraph.call_count, 7)
-        PackingPolicies = [
-            Call.kwargs["PackingPolicy"] for Call in PlaceGraph.call_args_list
-        ]
-        self.assertTrue(PackingPolicies[0].Enabled)
-        self.assertFalse(PackingPolicies[0].GraphBeamEnabled)
-        self.assertFalse(PackingPolicies[1].Enabled)
-        self.assertTrue(PackingPolicies[2].Enabled)
-        self.assertFalse(PackingPolicies[2].GraphBeamEnabled)
-        self.assertFalse(PackingPolicies[3].Enabled)
-        self.assertFalse(PackingPolicies[4].Enabled)
-        self.assertTrue(PackingPolicies[5].Enabled)
-        self.assertTrue(PackingPolicies[5].GraphBeamEnabled)
-        self.assertTrue(PackingPolicies[6].Enabled)
-        self.assertTrue(PackingPolicies[6].GraphBeamEnabled)
-
-    def testRetainedCandidatesUseSlicesOfOneAbsoluteRoutingDeadline(self) -> None:
+    def testSingleAttemptDoesNotRouteASecondPlacementAfterFailure(self) -> None:
         Placements = [
             self._BuildPlacementFlowFixture("first"),
             self._BuildPlacementFlowFixture("second"),
@@ -944,32 +963,12 @@ class LocalFirstRouterTests(unittest.TestCase):
                 Detail="force the next retained placement",
             )
         )
-        Routed = RoutedDesign(
-            Module=SimpleNamespace(Gates=[]),
-            PlacedGates=[],
-            Wires=[],
-            Supports=[],
-            Repeaters={},
-            NetWires={},
-        )
-        _, _, (StartDeadline, RouteDesign) = self._RunMockedPlacementFlow(
-            Placements,
-            ["a-first", "b-second"],
-            [Failure, Routed],
-        )
-
-        self.assertEqual(StartDeadline.call_count, 1)
-        self.assertEqual(RouteDesign.call_count, 2)
-        FirstDeadline = RouteDesign.call_args_list[0].kwargs["Deadline"]
-        SecondDeadline = RouteDesign.call_args_list[1].kwargs["Deadline"]
-        self.assertIsNot(FirstDeadline, SecondDeadline)
-        self.assertEqual(FirstDeadline.StartedAt, SecondDeadline.StartedAt)
-        self.assertLess(FirstDeadline.ExpiresAt, SecondDeadline.ExpiresAt)
-        FirstPolicy = RouteDesign.call_args_list[0].kwargs["Policy"]
-        self.assertLessEqual(
-            FirstPolicy.AdaptiveRouting.MaximumRuntimeSeconds,
-            2.6,
-        )
+        with self.assertRaises(RoutingStageError):
+            self._RunMockedPlacementFlow(
+                Placements,
+                ["a-first", "b-second"],
+                [Failure],
+            )
 
     def testDeferredPlacementAlternativesAreDemandAware(self) -> None:
         def Candidate(
@@ -1001,7 +1000,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             PlacementNeedsDemandDiversity([Pressured, Clear], 6)
         )
 
-    def testPressuredRetainedPlacementRoutesBeforeDeferredAlternative(self) -> None:
+    def testPressuredPlacementDoesNotFailOverToDeferredAlternative(self) -> None:
         Placements = [
             self._BuildPlacementFlowFixture("row-beam"),
             self._BuildPlacementFlowFixture("unpacked"),
@@ -1013,14 +1012,6 @@ class LocalFirstRouterTests(unittest.TestCase):
                 Stage="TrackAssignment",
                 Detail="force placement failover",
             )
-        )
-        Routed = RoutedDesign(
-            Module=SimpleNamespace(Gates=[]),
-            PlacedGates=[],
-            Wires=[],
-            Supports=[],
-            Repeaters={},
-            NetWires={},
         )
 
         def Feedback(Placement, *_Arguments):
@@ -1034,22 +1025,13 @@ class LocalFirstRouterTests(unittest.TestCase):
                 }
             )
 
-        _Result, PlaceGraph, (_StartDeadline, RouteDesign) = (
+        with self.assertRaises(RoutingStageError):
             self._RunMockedPlacementFlow(
                 Placements,
                 ["row-beam", "unpacked", "deferred-clear"],
-                [Failure, Routed],
+                [Failure],
                 FeedbackSideEffect=Feedback,
             )
-        )
-
-        self.assertEqual(PlaceGraph.call_count, 2)
-        self.assertEqual(RouteDesign.call_count, 2)
-        self.assertEqual(
-            RouteDesign.call_args_list[1].args[0]
-            .Placed.LocalRouteDiagnostics["Fixture"],
-            "row-beam",
-        )
 
     def testCyclicContractedClusterGraphUsesCompactPlacement(self) -> None:
         Module = ModuleIR(

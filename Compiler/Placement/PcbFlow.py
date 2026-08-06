@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from ..Cells.Library import GetCellMacro
 from ..Routing.Pcb import (
     PrepareClusterInterfaceAssignment,
+    PrepareTrackAssignment,
     PreparePhysicalComponentEligibility,
     ReplanPhysicalComponentAssembly,
     RoutePcbDesign,
@@ -60,6 +61,7 @@ from ..Routing.Models import (
     ClusterInterfacePlacementState,
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceStateProof,
+    ComponentRoutabilityCore,
     RoutedComponentTemplate,
     RoutedDesign,
     PhysicalGlobalPlanDescriptorProgressState,
@@ -210,6 +212,579 @@ class PhysicalComponentPlacementFeedback:
         }
 
 
+@dataclass(frozen=True)
+class PhysicalInterfaceRepairCore:
+    """Immutable, proof-qualified local-assembly or channel repair core."""
+
+    RepairLevel: str
+    Signals: tuple[str, ...]
+    ClusterIds: tuple[int, ...]
+    BoundaryClasses: tuple[str, ...]
+    ForcedSeamClasses: tuple[tuple[str, str], ...]
+    ProofKind: str
+    SourceProofFingerprint: str
+    EquivalentGeometryFingerprint: str
+    RepairDomainFingerprint: str = ""
+    AvailableSeamClassesBySignal: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    SelectedSeamAssignment: tuple[tuple[str, str], ...] = ()
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "RepairLevel": self.RepairLevel,
+            "Signals": list(self.Signals),
+            "ClusterIds": list(self.ClusterIds),
+            "BoundaryClasses": list(self.BoundaryClasses),
+            "ForcedSeamClasses": [list(Value) for Value in self.ForcedSeamClasses],
+            "ProofKind": self.ProofKind,
+            "SourceProofFingerprint": self.SourceProofFingerprint,
+            "EquivalentGeometryFingerprint": self.EquivalentGeometryFingerprint,
+            "RepairDomainFingerprint": self.RepairDomainFingerprint,
+            "AvailableSeamClassesBySignal": [
+                [Signal, list(Seams)]
+                for Signal, Seams in self.AvailableSeamClassesBySignal
+            ],
+            "SelectedSeamAssignment": [
+                list(Value) for Value in self.SelectedSeamAssignment
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalLocalFactorDiversificationCore:
+    """One complete singleton assembly core eligible for a local ECO."""
+
+    Signal: str
+    SourceProofFingerprint: str
+    LocalFactorIdentityFingerprint: str
+    LocalGeometryFingerprint: str
+    ClusterIds: tuple[int, ...]
+    CoreFingerprint: str
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "SourceProofFingerprint": self.SourceProofFingerprint,
+            "LocalFactorIdentityFingerprint": (
+                self.LocalFactorIdentityFingerprint
+            ),
+            "LocalGeometryFingerprint": self.LocalGeometryFingerprint,
+            "ClusterIds": list(self.ClusterIds),
+            "CoreFingerprint": self.CoreFingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalOwnedFrontierTopologyRepairCore:
+    """A complete ownership proof that requires a component topology change.
+
+    Unlike a port or seam core, this is admitted only when the unbound
+    component forest has already proved that a signal has no owned frontier.
+    Binding a different port cannot repair that contradiction.
+    """
+
+    Signals: tuple[str, ...]
+    ProducerGateNames: tuple[str, ...]
+    ConsumerGateNames: tuple[str, ...]
+    ClusterIds: tuple[int, ...]
+    TerminalPositions: tuple[tuple[int, int, int], ...]
+    SourceProofFingerprint: str
+    SourceTopologyFingerprint: str
+    EquivalentTopologyFingerprint: str
+    CoreFingerprint: str
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signals": list(self.Signals),
+            "ProducerGateNames": list(self.ProducerGateNames),
+            "ConsumerGateNames": list(self.ConsumerGateNames),
+            "ClusterIds": list(self.ClusterIds),
+            "TerminalPositions": [list(Value) for Value in self.TerminalPositions],
+            "SourceProofFingerprint": self.SourceProofFingerprint,
+            "SourceTopologyFingerprint": self.SourceTopologyFingerprint,
+            "EquivalentTopologyFingerprint": (
+                self.EquivalentTopologyFingerprint
+            ),
+            "CoreFingerprint": self.CoreFingerprint,
+        }
+
+
+def BuildPhysicalOwnedFrontierTopologyRepairCore(
+    Failure: RoutingFailure,
+    SourceCandidate: PcbPlacementCandidate,
+) -> PhysicalOwnedFrontierTopologyRepairCore | None:
+    """Lift only a complete, port-independent owned-frontier contradiction."""
+    Diagnostics = (
+        Failure.Diagnostics
+        if isinstance(Failure.Diagnostics, Mapping)
+        else {}
+    )
+    Signals = tuple(sorted({
+        str(Value)
+        for Value in Diagnostics.get("LocalUnsatCoreSignals", ())
+        if str(Value)
+    }))
+    SignalDiagnostics = Diagnostics.get("SignalDiagnostics", {})
+    if not (
+        Failure.Reason == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+        and Failure.Stage == "PhysicalComponentLocalEligibility"
+        and Signals
+        and Diagnostics.get("LocalUnsatCoreComplete", False)
+        and Diagnostics.get("LocalUnsatCoreKind", "")
+        == "tree-frontier-empty-owned-signal-domain"
+        and isinstance(SignalDiagnostics, Mapping)
+        and all(
+            isinstance(SignalDiagnostics.get(Signal), Mapping)
+            and SignalDiagnostics[Signal].get("Complete", False)
+            and SignalDiagnostics[Signal].get(
+                "OwnedSignalDomainContractIndependent", False
+            )
+            for Signal in Signals
+        )
+    ):
+        return None
+    ProofFingerprint = str(Diagnostics.get("LocalUnsatCoreFingerprint", ""))
+    if not ProofFingerprint:
+        return None
+    Placed = SourceCandidate.Placement.Placed
+    GateByName = {str(Gate.Name): Gate for Gate in Placed.PlacedGates}
+    ProducerNames = tuple(sorted(
+        Gate.Name
+        for Gate in Placed.PlacedGates
+        if set(map(str, Gate.Outputs)).intersection(Signals)
+    ))
+    ConsumerNames = tuple(sorted(
+        Gate.Name
+        for Gate in Placed.PlacedGates
+        if set(map(str, Gate.Inputs)).intersection(Signals)
+    ))
+    if not ProducerNames or not ConsumerNames:
+        return None
+    ClusterByGate = {
+        str(Name): ClusterId
+        for ClusterId, Names in enumerate(SourceCandidate.Placement.Clusters)
+        for Name in Names
+    }
+    ClusterIds = tuple(sorted({
+        ClusterByGate[Name]
+        for Name in (*ProducerNames, *ConsumerNames)
+        if Name in ClusterByGate
+    }))
+    TerminalPositions = tuple(sorted({
+        tuple(GateByName[Name].OutputPin)
+        for Name in ProducerNames
+        if GateByName[Name].OutputPin is not None
+    }.union({
+        tuple(GateByName[Name].InputPins[Index])
+        for Name in ConsumerNames
+        for Index, Signal in enumerate(GateByName[Name].Inputs)
+        if str(Signal) in Signals
+    })))
+    TopologyFingerprint = str(
+        SourceCandidate.InterfaceTopologyFingerprint
+        or BuildClusterInterfacePlacementTopologyFingerprint(
+            SourceCandidate.Placement,
+            {},
+        )
+    )
+    EquivalentTopologyFingerprint = BuildStableFingerprint((
+        "owned-frontier-topology-equivalence-v1",
+        Signals,
+        ProducerNames,
+        ConsumerNames,
+        ClusterIds,
+        TerminalPositions,
+        TopologyFingerprint,
+    ))
+    return PhysicalOwnedFrontierTopologyRepairCore(
+        Signals=Signals,
+        ProducerGateNames=ProducerNames,
+        ConsumerGateNames=ConsumerNames,
+        ClusterIds=ClusterIds,
+        TerminalPositions=TerminalPositions,
+        SourceProofFingerprint=ProofFingerprint,
+        SourceTopologyFingerprint=TopologyFingerprint,
+        EquivalentTopologyFingerprint=EquivalentTopologyFingerprint,
+        CoreFingerprint=BuildStableFingerprint((
+            "physical-owned-frontier-topology-repair-core-v1",
+            ProofFingerprint,
+            EquivalentTopologyFingerprint,
+        )),
+    )
+
+
+def BuildPhysicalLocalFactorDiversificationCore(
+    Failure: RoutingFailure,
+    SourceCandidate: PcbPlacementCandidate,
+) -> PhysicalLocalFactorDiversificationCore | None:
+    """Admit one singleton ECO only from a complete minimal assembly proof."""
+    Diagnostics = (
+        Failure.Diagnostics
+        if isinstance(Failure.Diagnostics, Mapping)
+        else {}
+    )
+    Signals = tuple(sorted({
+        str(Value)
+        for Value in Diagnostics.get("PortAssignmentUnsatCoreSignals", ())
+        if str(Value)
+    }))
+    if not (
+        Failure.Reason == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+        and Diagnostics.get("PortAssignmentProofComplete", False)
+        and Diagnostics.get("PortAssignmentUnsatCoreMinimal", False)
+        and len(Signals) == 1
+    ):
+        return None
+    Signal = Signals[0]
+    ProofFingerprint = str(
+        Diagnostics.get("PortAssignmentUnsatCoreFingerprint", "")
+    )
+    DomainFingerprint = str(Diagnostics.get("DomainFingerprint", ""))
+    if not ProofFingerprint or not DomainFingerprint:
+        return None
+    Claims = getattr(SourceCandidate.Placement.Placed, "LocalRouteClaims", ()) or ()
+    ClusterIds = tuple(sorted({
+        int(getattr(Claim, "ClusterId", -1))
+        for Claim in Claims
+        if str(getattr(Claim, "Signal", "")) == Signal
+        and int(getattr(Claim, "ClusterId", -1)) >= 0
+    }))
+    LocalGeometryFingerprint = BuildCapacityRepairGeometryFingerprint(
+        SourceCandidate,
+        (Signal,),
+    )
+    return PhysicalLocalFactorDiversificationCore(
+        Signal=Signal,
+        SourceProofFingerprint=ProofFingerprint,
+        LocalFactorIdentityFingerprint=BuildStableFingerprint((
+            "singleton-local-factor-domain-v1",
+            Signal,
+            DomainFingerprint,
+            LocalGeometryFingerprint,
+        )),
+        LocalGeometryFingerprint=LocalGeometryFingerprint,
+        ClusterIds=ClusterIds,
+        CoreFingerprint=BuildStableFingerprint((
+            "singleton-local-factor-diversification-core-v1",
+            Signal,
+            ProofFingerprint,
+            DomainFingerprint,
+            LocalGeometryFingerprint,
+            ClusterIds,
+        )),
+    )
+
+
+def BuildCapacityRepairGeometryFingerprint(
+    Candidate: PcbPlacementCandidate,
+    Signals: Iterable[str],
+) -> str:
+    """Identify only the implicated local geometry, never a whole placement."""
+    SignalSet = frozenset(map(str, Signals))
+    Placed = Candidate.Placement.Placed
+    Claims = getattr(Placed, "LocalRouteClaims", ()) or ()
+    OutputPins = tuple(
+        (
+            str(Gate.Name),
+            str(Signal),
+            "output",
+            tuple(Gate.OutputPin),
+        )
+        for Gate in getattr(Placed, "PlacedGates", ())
+        if getattr(Gate, "OutputPin", None) is not None
+        for Signal in getattr(Gate, "Outputs", ())
+        if str(Signal) in SignalSet
+    )
+    InputPins = tuple(
+        (
+            str(Gate.Name),
+            str(Signal),
+            "input",
+            tuple(Gate.InputPins[Index]),
+        )
+        for Gate in getattr(Placed, "PlacedGates", ())
+        for Index, Signal in enumerate(getattr(Gate, "Inputs", ()))
+        if str(Signal) in SignalSet
+    )
+    SignalPins = tuple(sorted((*OutputPins, *InputPins)))
+    return BuildStableFingerprint((
+        "physical-capacity-repair-geometry-v2",
+        tuple(sorted(
+            (
+                str(Claim.Signal),
+                int(getattr(Claim, "ClusterId", -1)),
+                tuple(sorted(map(
+                    tuple,
+                    getattr(Claim, "Nodes", ()),
+                ))),
+            )
+            for Claim in Claims
+            if str(Claim.Signal) in SignalSet
+        )),
+        SignalPins,
+    ))
+
+
+def BuildPhysicalInterfaceRepairCore(
+    Failure: RoutingFailure,
+    SourceCandidate: PcbPlacementCandidate,
+) -> PhysicalInterfaceRepairCore | None:
+    """Lift only complete assembly/channel proofs into geometry guidance."""
+    Diagnostics = Failure.Diagnostics if isinstance(Failure.Diagnostics, Mapping) else {}
+    IsAssemblyCore = bool(
+        Failure.Reason == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+        and Diagnostics.get("PortAssignmentProofComplete", False)
+        and Diagnostics.get("PortAssignmentUnsatCoreMinimal", False)
+    )
+    IsChannelCore = bool(
+        Failure.Reason == RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+        and Diagnostics.get("GlobalPlanDomainComplete", False)
+        and Diagnostics.get("CompleteAssignmentCutProof", False)
+    )
+    IsFeedthroughEndpointCore = bool(
+        Failure.Reason == RoutingFailureReason.ComponentChannelCapacityUnsatisfiable
+        and Failure.Stage == "PhysicalComponentAssemblyPlanning"
+        and Diagnostics.get("FeedthroughCandidateDomainComplete", False)
+        and Diagnostics.get("ComponentFabricConstructionComplete", False)
+        and Diagnostics.get("OwnershipSearchComplete", False)
+        and Diagnostics.get("FeedthroughEndpointPrescreenComplete", True)
+    )
+    if not (IsAssemblyCore or IsChannelCore or IsFeedthroughEndpointCore):
+        return None
+    RepairLevel = "local-assembly" if IsAssemblyCore else "channel-capacity"
+    Signals = tuple(sorted({
+        str(Value) for Value in (
+            Diagnostics.get("PortAssignmentUnsatCoreSignals", ())
+            if IsAssemblyCore else Failure.AffectedNets
+        ) if str(Value)
+    }))
+    if not Signals:
+        return None
+    SeamClasses = tuple(sorted(
+        (str(Value[0]), str(Value[1]))
+        for Value in Diagnostics.get(
+            "PortAssignmentUnsatCoreClause" if IsAssemblyCore
+            else "LocalCapacityCoreClause",
+            (),
+        )
+        if isinstance(Value, (tuple, list)) and len(Value) == 2
+        and str(Value[0]) in Signals
+    ))
+    # A singleton with any seam choice is a symptom, not a geometry core.
+    if IsAssemblyCore and len(Signals) == 1:
+        return None
+    ProofFingerprint = str(Diagnostics.get(
+        "PortAssignmentUnsatCoreFingerprint" if IsAssemblyCore
+        else "GlobalPlanDependencyFingerprint",
+        "",
+    )) or str(Diagnostics.get(
+        "FeedthroughEndpointDomainFingerprint",
+        "",
+    )) or str(Diagnostics.get(
+        "PhysicalAssemblyPlanFingerprint", "",
+    ))
+    if not ProofFingerprint:
+        return None
+    Claims = getattr(SourceCandidate.Placement.Placed, "LocalRouteClaims", ()) or ()
+    ClusterIds = tuple(sorted({
+        int(getattr(Claim, "ClusterId", -1))
+        for Claim in Claims
+        if str(getattr(Claim, "Signal", "")) in Signals
+        and int(getattr(Claim, "ClusterId", -1)) >= 0
+    }))
+    BoundaryClasses = tuple(sorted({
+        str(Value[1]) for Value in SeamClasses
+    }))
+    return PhysicalInterfaceRepairCore(
+        RepairLevel=RepairLevel,
+        Signals=Signals,
+        ClusterIds=ClusterIds,
+        BoundaryClasses=BoundaryClasses,
+        ForcedSeamClasses=SeamClasses,
+        ProofKind=(
+            "complete-port-assignment-unsat-core"
+            if IsAssemblyCore else (
+                "complete-feedthrough-endpoint-domain"
+                if IsFeedthroughEndpointCore
+                else "complete-channel-capacity-core"
+            )
+        ),
+        SourceProofFingerprint=ProofFingerprint,
+        EquivalentGeometryFingerprint=BuildCapacityRepairGeometryFingerprint(
+            SourceCandidate, Signals,
+        ),
+        RepairDomainFingerprint=BuildStableFingerprint((
+            "physical-interface-repair-domain-v4",
+            RepairLevel,
+            Signals,
+            ClusterIds,
+            BoundaryClasses,
+            SeamClasses,
+            ProofFingerprint,
+        )),
+    )
+
+
+def BuildSymbolicCapacityRepairEvidence(
+    NoGoodDiagnostics: Mapping[str, object],
+    PressureSignals: Iterable[str],
+) -> dict[str, object]:
+    """Keep only complete local-capacity proof data safe for placement."""
+    Signals = tuple(sorted({
+        str(Signal) for Signal in PressureSignals if str(Signal)
+    }))
+    ProofFingerprint = str(
+        NoGoodDiagnostics.get("SymbolicCapacityProofFingerprint", "")
+    )
+    SeamClause = tuple(sorted(
+        (str(Value[0]), str(Value[1]))
+        for Value in NoGoodDiagnostics.get("LocalCapacityCoreClause", ())
+        if isinstance(Value, (tuple, list)) and len(Value) == 2
+        and str(Value[0]) in Signals
+    ))
+    if (
+        not Signals
+        or not ProofFingerprint
+        or {Signal for Signal, _Seam in SeamClause} != set(Signals)
+    ):
+        return {}
+    return {
+        "SymbolicCapacityProofComplete": True,
+        "SymbolicCapacityProofFingerprint": ProofFingerprint,
+        "LocalCapacityCoreClause": [list(Value) for Value in SeamClause],
+    }
+
+
+def PreparedEligibilityHasDisjointCapacitySeams(
+    Preparation: Any,
+    Constraint: PhysicalInterfaceRepairCore,
+) -> tuple[
+    bool,
+    str,
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, tuple[str, ...]], ...],
+]:
+    """Return the first complete capacity-one local seam assignment."""
+    FactorsBySignal = dict(getattr(Preparation, "LocalAccessFactorsBySignal", ()))
+    Domains = {
+        Signal: tuple(sorted(
+            FactorsBySignal.get(Signal, ()),
+            key=lambda Factor: (
+                str(Factor.SeamContractFingerprint),
+                tuple(sorted(map(str, Factor.LocalClaims.ResourceIds))),
+            ),
+        ))
+        for Signal in Constraint.Signals
+    }
+    AvailableSeamClasses = tuple(
+        (Signal, tuple(
+            str(Factor.SeamContractFingerprint)
+            for Factor in Domains[Signal]
+        ))
+        for Signal in Constraint.Signals
+    )
+    if any(not Domains[Signal] for Signal in Constraint.Signals):
+        return False, "", (), AvailableSeamClasses
+
+    def Search(
+        Remaining: tuple[str, ...],
+        UsedClaims: frozenset[object],
+        Selected: tuple[tuple[str, str], ...],
+    ) -> tuple[tuple[str, str], ...] | None:
+        if not Remaining:
+            return Selected
+        # Preserve the canonical signal order while trying each canonical
+        # seam domain.  A smallest-domain heuristic is deterministic but can
+        # return a later assignment, which is not the contract here.
+        Signal = Remaining[0]
+        NextRemaining = Remaining[1:]
+        for Factor in Domains[Signal]:
+            Claims = frozenset(Factor.LocalClaims.ResourceIds)
+            if Claims.isdisjoint(UsedClaims):
+                Result = Search(
+                    NextRemaining,
+                    UsedClaims | Claims,
+                    (*Selected, (Signal, str(Factor.SeamContractFingerprint))),
+                )
+                if Result is not None:
+                    return Result
+        return None
+
+    Assignment = Search(tuple(sorted(Constraint.Signals)), frozenset(), ())
+    if Assignment is None:
+        return False, "", (), AvailableSeamClasses
+    OrderedAssignment = tuple(sorted(Assignment))
+    return True, BuildStableFingerprint((
+        Constraint.RepairDomainFingerprint,
+        OrderedAssignment,
+    )), OrderedAssignment, AvailableSeamClasses
+
+
+def BuildComponentRoutabilityCore(
+    Failure: RoutingFailure,
+    *,
+    PlacementStateFingerprint: str,
+    ComponentStateFingerprint: str,
+    DomainFingerprint: str,
+    CoreFingerprint: str,
+    Complete: bool,
+) -> ComponentRoutabilityCore | None:
+    """Freeze a complete ownership proof into placement-safe evidence."""
+    if not Complete:
+        return None
+    Diagnostics = (
+        Failure.Diagnostics
+        if isinstance(Failure.Diagnostics, Mapping)
+        else {}
+    )
+    PlacementPressureSignals = tuple(sorted({
+        str(Signal)
+        for Signal in Diagnostics.get(
+            "PlacementInterfacePressureSignals",
+            (),
+        )
+        if str(Signal)
+    }))
+    # A selected-contract capacity proof is narrower than the final
+    # ownership UNSAT summary.  Preserve it as the feedback identity so a
+    # NandNet28/NandNet29 seam core cannot be rewritten into the older broad
+    # NandNet26 ownership core before placement sees it.
+    EvidenceFingerprint = (
+        BuildStableFingerprint((
+            "physical-component-placement-pressure-v1",
+            PlacementStateFingerprint,
+            ComponentStateFingerprint,
+            PlacementPressureSignals,
+        ))
+        if PlacementPressureSignals
+        else str(
+            Diagnostics.get("OwnershipUnsatCoreFingerprint", "")
+            or Diagnostics.get("PortAssignmentUnsatCoreFingerprint", "")
+            or Diagnostics.get("AuthoritativeCutAccessDomainFingerprint", "")
+            or CoreFingerprint
+        )
+    )
+    Signals = tuple(sorted({
+        str(Signal)
+        for Signal in (
+            PlacementPressureSignals
+            or Diagnostics.get("PortAssignmentUnsatCoreSignals", ())
+            or Failure.AffectedNets
+        )
+        if str(Signal)
+    }))
+    if not EvidenceFingerprint or not Signals:
+        return None
+    return ComponentRoutabilityCore(
+        CoreFingerprint=EvidenceFingerprint,
+        Signals=Signals,
+        PlacementStateFingerprint=PlacementStateFingerprint,
+        ComponentStateFingerprint=ComponentStateFingerprint,
+        DomainFingerprint=DomainFingerprint,
+        BlockingResources=tuple(sorted(map(str, Failure.Resources))),
+        BlockingPorts=tuple(sorted(Failure.Locations)),
+    )
+
+
 def BuildPhysicalComponentPlacementFeedback(
     Failure: RoutingFailure,
 ) -> PhysicalComponentPlacementFeedback | None:
@@ -225,6 +800,13 @@ def BuildPhysicalComponentPlacementFeedback(
         Failure.Diagnostics
         if isinstance(Failure.Diagnostics, Mapping)
         else {}
+    )
+    RoutabilityCore = Diagnostics.get("ComponentRoutabilityCore", {})
+    CompleteRoutabilityCore = bool(
+        isinstance(RoutabilityCore, Mapping)
+        and RoutabilityCore.get("Complete", False)
+        and RoutabilityCore.get("CoreFingerprint", "")
+        and RoutabilityCore.get("Signals", ())
     )
     CompleteSingletonAccessCore = bool(
         Failure.Stage == "ComponentAccessCertification"
@@ -268,7 +850,8 @@ def BuildPhysicalComponentPlacementFeedback(
         and int(UnderlyingDiagnostics.get("AttemptedRequestCount", -1)) == 0
     )
     if (
-        not CompleteSingletonAccessCore
+        not CompleteRoutabilityCore
+        and not CompleteSingletonAccessCore
         and not CompleteGlobalKeepoutCore
         and (
         Failure.Reason
@@ -282,11 +865,19 @@ def BuildPhysicalComponentPlacementFeedback(
         str(Signal)
         for Signal in (
             (
-                Failure.AffectedNets
-                if CompleteGlobalKeepoutCore
-                else Diagnostics.get("AffectedSignals", ())
+                RoutabilityCore.get("Signals", ())
+                if CompleteRoutabilityCore
+                else (
+                    Failure.AffectedNets
+                    if CompleteGlobalKeepoutCore
+                    else Diagnostics.get("AffectedSignals", ())
+                )
             )
-            if CompleteSingletonAccessCore or CompleteGlobalKeepoutCore
+            if (
+                CompleteRoutabilityCore
+                or CompleteSingletonAccessCore
+                or CompleteGlobalKeepoutCore
+            )
             else Diagnostics.get("PortAssignmentUnsatCoreSignals", ())
         )
         if str(Signal)
@@ -297,10 +888,14 @@ def BuildPhysicalComponentPlacementFeedback(
         Diagnostics.get("PhysicalAssemblyPlanFingerprint", "")
     )
     DomainFingerprint = str(
-        Diagnostics.get("DomainFingerprint", "")
+        RoutabilityCore.get("DomainFingerprint", "")
+        if CompleteRoutabilityCore
+        else Diagnostics.get("DomainFingerprint", "")
     )
     ProofFingerprint = str(
-        Diagnostics.get(
+        RoutabilityCore.get("CoreFingerprint", "")
+        if CompleteRoutabilityCore
+        else Diagnostics.get(
             (
                 "CertificateFingerprint"
                 if CompleteSingletonAccessCore
@@ -314,9 +909,13 @@ def BuildPhysicalComponentPlacementFeedback(
         )
     ) or BuildStableFingerprint((
         (
-            "physical-component-global-keepout-core"
-            if CompleteGlobalKeepoutCore
-            else "physical-component-port-unsat-core"
+            "physical-component-routability-core"
+            if CompleteRoutabilityCore
+            else (
+                "physical-component-global-keepout-core"
+                if CompleteGlobalKeepoutCore
+                else "physical-component-port-unsat-core"
+            )
         ),
         RelocationSignals,
         SourcePlanFingerprint,
@@ -353,6 +952,7 @@ def IsCompletePhysicalAssemblyUnsatisfiable(
             Diagnostics.get("GlobalPlanDomainComplete", False)
             or Diagnostics.get("CompleteAssignmentCutProof", False)
             or Diagnostics.get("PortAssignmentProofComplete", False)
+            or Diagnostics.get("ComponentFabricConstructionComplete", False)
         )
     )
 
@@ -1166,25 +1766,39 @@ def BuildClusterInterfaceStageSchedule(
         raise ValueError("global routing reserve cannot be negative")
     if PublicationReserveSeconds < 0:
         raise ValueError("publication reserve cannot be negative")
+    AvailableSeconds = max(0.0, Deadline.RemainingSeconds())
+    # Keep fixed per-interface reserves for generous deadlines, but avoid
+    # consuming the entire tail for late-stage cases (CLA4) where remaining
+    # time is already scarce.
+    ScaledGlobalReserveSeconds = min(
+        GlobalRoutingReserveSeconds,
+        # Before a component reaches global handoff, an unused global reserve
+        # cannot legalize the design.  Keep a bounded tail for global routing,
+        # but fund the complete local port proof instead of expiring it with
+        # roughly twenty seconds of the overall CLA4 deadline still idle.
+        AvailableSeconds * 0.07,
+    )
+    ScaledLocalReserveSeconds = min(
+        LocalCompilationReserveSeconds,
+        AvailableSeconds * 0.20,
+    )
     StartedAt = monotonic()
     ExpiresAt = max(
         StartedAt,
         Deadline.ExpiresAt
-        - GlobalRoutingReserveSeconds
+        - ScaledGlobalReserveSeconds
         - PublicationReserveSeconds,
     )
     PlanningExpiresAt = max(
         StartedAt,
-        ExpiresAt - LocalCompilationReserveSeconds,
+        ExpiresAt - ScaledLocalReserveSeconds,
     )
     return ClusterInterfaceStageSchedule(
         StartedAt=StartedAt,
         PlanningExpiresAt=PlanningExpiresAt,
         ExpiresAt=ExpiresAt,
-        LocalCompilationReserveSeconds=(
-            LocalCompilationReserveSeconds
-        ),
-        GlobalRoutingReserveSeconds=GlobalRoutingReserveSeconds,
+        LocalCompilationReserveSeconds=ScaledLocalReserveSeconds,
+        GlobalRoutingReserveSeconds=ScaledGlobalReserveSeconds,
         PublicationReserveSeconds=PublicationReserveSeconds,
         StateFingerprints=tuple(StateFingerprints),
     )
@@ -1412,10 +2026,7 @@ def ApplyRoutingRuntimeBudget(
         RuntimeBudgetSeconds=EffectiveSeconds,
         AdaptiveRouting=replace(
             Policy.AdaptiveRouting,
-            MaximumRuntimeSeconds=min(
-                Policy.AdaptiveRouting.MaximumRuntimeSeconds,
-                EffectiveSeconds,
-            ),
+            MaximumRuntimeSeconds=EffectiveSeconds,
         ),
     )
 
@@ -3898,88 +4509,6 @@ def BuildTopologyDemandPressureProfile(
         DistributedBoundaryPressure=DistributedBoundaryPressure,
         ScaleGeometryPressure=(
             TerminalBankPressure or DistributedBoundaryPressure
-        ),
-    )
-
-
-def ApplyTopologyDemandPolicyWidening(
-    Policy: PhysicalDesignPolicy,
-    Technology: RedstoneRoutingTechnology,
-    Pressure: TopologyDemandPressureProfile,
-) -> PhysicalDesignPolicy:
-    """Apply only the geometry controls justified by typed demand."""
-    ScaleGeometryPressure = Pressure.ScaleGeometryPressure
-    ReconvergentAccessPressure = Pressure.ReconvergentAccessPressure
-    if not ScaleGeometryPressure and not ReconvergentAccessPressure:
-        return Policy
-    return replace(
-        Policy,
-        Placement=replace(
-            Policy.Placement,
-            MaximumRoutingLayers=(
-                max(
-                    Policy.Placement.MaximumRoutingLayers,
-                    Technology.MaximumRoutableLayerCount,
-                )
-                if ScaleGeometryPressure
-                else Policy.Placement.MaximumRoutingLayers
-            ),
-            PreferWideTerminalBanks=(
-                Policy.Placement.PreferWideTerminalBanks
-                or ScaleGeometryPressure
-                or ReconvergentAccessPressure
-            ),
-        ),
-        NandPacking=replace(
-            Policy.NandPacking,
-            MaximumClusterCells=(
-                # A reconvergent fanout cut needs independently owned access
-                # faces. Six-cell clusters keep the paired portal domains in
-                # one compact shell; retain a bounded six-cell portfolio so
-                # exact access scoring does not consume the routing budget.
-                min(Policy.NandPacking.MaximumClusterCells, 6)
-                if ReconvergentAccessPressure
-                else Policy.NandPacking.MaximumClusterCells
-            ),
-            JointPlacementBeamWidth=(
-                min(Policy.NandPacking.JointPlacementBeamWidth, 32)
-                if ReconvergentAccessPressure
-                else Policy.NandPacking.JointPlacementBeamWidth
-            ),
-            TerminalShellLateralSearch=(
-                max(Policy.NandPacking.TerminalShellLateralSearch, 8)
-                # A reconvergent cut can be electrically blocked at an I/O
-                # shell even when its gate footprint is below the scale
-                # threshold.  Keep the wider shell exclusively behind the
-                # typed topology trigger; compact/ripple terminal geometry
-                # must remain unchanged.
-                if ScaleGeometryPressure or ReconvergentAccessPressure
-                else Policy.NandPacking.TerminalShellLateralSearch
-            ),
-            MaximumTerminalAssignmentExpansions=(
-                min(
-                    Policy.NandPacking.MaximumTerminalAssignmentExpansions,
-                    4_096,
-                )
-                if ReconvergentAccessPressure
-                else Policy.NandPacking.MaximumTerminalAssignmentExpansions
-            ),
-            LocalGeometryRepairColumnGap=(
-                max(Policy.NandPacking.LocalGeometryRepairColumnGap, 8)
-                if ScaleGeometryPressure
-                else Policy.NandPacking.LocalGeometryRepairColumnGap
-            ),
-        ),
-        NegotiatedRouting=replace(
-            Policy.NegotiatedRouting,
-            MaximumPackedAreaGrowth=(
-                max(
-                    Policy.NegotiatedRouting.MaximumPackedAreaGrowth,
-                    4.5,
-                )
-                if ScaleGeometryPressure
-                else Policy.NegotiatedRouting.MaximumPackedAreaGrowth
-            ),
         ),
     )
 
@@ -6572,33 +7101,9 @@ def _PlaceAndRoutePcbWithPolicy(
         TopologyDemand,
         Policy,
     )
-    if not TopologyDemand.RequiresJointPortfolio:
-        # Preserve the proven v15 compact/ripple repair envelope.  The v16
-        # reconvergent-access bounds apply only after topology proves that the
-        # joint portfolio is needed, so generic compact workloads keep stable
-        # placement recovery behavior unless demand requires an expanded deck.
-        Policy = replace(
-            Policy,
-            NegotiatedRouting=replace(
-                Policy.NegotiatedRouting,
-                MaximumPlacementFeedbackRounds=max(
-                    5,
-                    Policy.NegotiatedRouting.MaximumPlacementFeedbackRounds,
-                ),
-                MaximumPackedAreaGrowth=max(
-                    4.5,
-                    Policy.NegotiatedRouting.MaximumPackedAreaGrowth,
-                ),
-            ),
-        )
-    # Broad terminal/boundary scale and reconvergent access require different
-    # controls. Keep compact geometry unless its typed demand exceeds the
-    # configured capacity; never infer a circuit identity from its NAND count.
-    Policy = ApplyTopologyDemandPolicyWidening(
-        Policy,
-        Technology,
-        TopologyPressure,
-    )
+    # A compile owns one immutable policy.  Topology pressure is diagnostic
+    # evidence for the component solver, never permission to widen budgets,
+    # retain more placements, or start a second routing attempt.
     Deadline = RoutingDeadline.Start(Policy.RuntimeBudgetSeconds)
     Started = Deadline.StartedAt
     ValidateNandOnlyDesign(Netlist)
@@ -6781,14 +7286,13 @@ def _PlaceAndRoutePcbWithPolicy(
     ConsumedPairedLeaseRepairProfileFingerprints: set[str] = set()
     NeedsCurrentStructuredCutRegeneration = False
     NeedsFeedbackPlacementGeneration = False
-    PreferPackedPlacements = (
-        Policy.NegotiatedRouting.Enabled
-        and Policy.NandPacking.Enabled
-        and Policy.NandPacking.DeferUnpackedOracle
-    )
     GenerationPlan = BuildPlacementGenerationPlan(
         Policy,
-        PreferPackedPlacements=PreferPackedPlacements,
+        PreferPackedPlacements=(
+            Policy.NegotiatedRouting.Enabled
+            and Policy.NandPacking.Enabled
+            and Policy.NandPacking.DeferUnpackedOracle
+        ),
         PrioritizeSeparatedPacking=(
             TopologyPressure.ScaleGeometryPressure
         ),
@@ -7975,6 +8479,7 @@ def _PlaceAndRoutePcbWithPolicy(
         CountPlacementGenerationAttempt: bool = True,
         QueueRetainedJointPortfolioStates: bool = True,
         UseCompletePlacementGenerationBudget: bool = False,
+        AllowCapacityPairRepair: bool = False,
     ) -> bool:
         nonlocal PlacementGenerationAttempts, LastStructuredPlacementFailure
         nonlocal LastRelocationSignalsUsed
@@ -8069,6 +8574,7 @@ def _PlaceAndRoutePcbWithPolicy(
             and CountPlacementGenerationAttempt
             and PlacementGenerationAttempts >= GenerationPlan.MaximumAttempts
             and not StrongMandatoryAccessRepair
+            and not AllowCapacityPairRepair
         ):
             return False
         if (
@@ -10096,6 +10602,7 @@ def _PlaceAndRoutePcbWithPolicy(
         PreferRelocation: bool = False,
         PreferDirectOnly: bool = False,
         RequireExactCutBeforeBroad: bool = False,
+        AllowCapacityPairRepair: bool = False,
     ) -> PlacementGenerationRequest | None:
         nonlocal DeferredRequestIndex
         nonlocal NeedsCurrentStructuredCutRegeneration
@@ -10258,7 +10765,10 @@ def _PlaceAndRoutePcbWithPolicy(
                 ),
                 UseCurrentAssignmentCutRelocationSignals=True,
             )
-        if PlacementGenerationAttempts >= GenerationPlan.MaximumAttempts:
+        if (
+            PlacementGenerationAttempts >= GenerationPlan.MaximumAttempts
+            and not AllowCapacityPairRepair
+        ):
             return None
         if (
             TopologyDemand.RequiresJointPortfolio
@@ -10542,8 +11052,11 @@ def _PlaceAndRoutePcbWithPolicy(
             return ConsumeDeferredRequest(DeferredRequestIndex)
         if (
             PlacementRelocationSignals
-            and TotalRelocationGenerationCount
-            < MaximumFeedbackRounds
+            and (
+                AllowCapacityPairRepair
+                or TotalRelocationGenerationCount
+                < MaximumFeedbackRounds
+            )
             and (
                 PlacementRelocationSignals != LastRelocationSignalsUsed
                 or PlacementRelocationPrioritySignals
@@ -10589,76 +11102,11 @@ def _PlaceAndRoutePcbWithPolicy(
                 Stage=f"spacing {RoutingSpacing} | placing clustered NAND graph",
                     )
                 )
-    for Request in GenerationPlan.PrimaryRequests:
-        if PlacementGenerationAttempts >= GenerationPlan.MaximumAttempts:
-            break
-        _TryPlacement(Request)
-        while PendingJointPlacementStates and not UniquePlacements:
-            JointState = PendingJointPlacementStates.pop(0)
-            _TryPlacement(
-                JointState.Request,
-                JointPlacementCandidateIndex=JointState.CandidateIndex,
-                FixedRelocationVariant=JointState.RelocationVariant,
-                FixedCandidateSpacing=JointState.RoutingSpacing,
-                FixedRelocationSignals=JointState.RelocationSignals,
-                FixedRelocationPrioritySignals=(
-                    JointState.RelocationPrioritySignals
-                ),
-                FixedRequiredRelocationSignals=(
-                    JointState.RequiredRelocationSignals
-                ),
-                FixedAssignmentCut=JointState.AssignmentCut,
-                FixedAssignmentConstraints=JointState.AssignmentConstraints,
-                FixedCoordinatedCandidateDiversificationSignals=(
-                    JointState.CoordinatedCandidateDiversificationSignals
-                ),
-                FixedTopologyCutFrontier=(
-                    JointState.TopologyCutFrontier
-                ),
-                MaterializeRoutingResources=False,
-            )
-
-    if ProactiveRelocationRequested and not UniquePlacements:
-        for RequestIndex, Request in enumerate(GenerationPlan.DeferredRequests):
-            if Request.SourceGenerator != "row-beam-conflict-relocation":
-                continue
-            _TryPlacement(Request)
-            ConsumedDeferredRequestIndexes.add(RequestIndex)
-            while (
-                DeferredRequestIndex < len(GenerationPlan.DeferredRequests)
-                and DeferredRequestIndex in ConsumedDeferredRequestIndexes
-            ):
-                DeferredRequestIndex += 1
-            break
-
-    while not UniquePlacements:
-        if PendingJointPlacementStates:
-            JointState = PendingJointPlacementStates.pop(0)
-            _TryPlacement(
-                JointState.Request,
-                JointPlacementCandidateIndex=JointState.CandidateIndex,
-                FixedRelocationVariant=JointState.RelocationVariant,
-                FixedCandidateSpacing=JointState.RoutingSpacing,
-                FixedRelocationSignals=JointState.RelocationSignals,
-                FixedRelocationPrioritySignals=(
-                    JointState.RelocationPrioritySignals
-                ),
-                FixedRequiredRelocationSignals=(
-                    JointState.RequiredRelocationSignals
-                ),
-                FixedAssignmentCut=JointState.AssignmentCut,
-                FixedAssignmentConstraints=JointState.AssignmentConstraints,
-                FixedCoordinatedCandidateDiversificationSignals=(
-                    JointState.CoordinatedCandidateDiversificationSignals
-                ),
-                FixedTopologyCutFrontier=(
-                    JointState.TopologyCutFrontier
-                ),
-                MaterializeRoutingResources=False,
-            )
-            continue
-        Request = _TakeNextDeferredRequest()
-        if Request is None:
+    # Materialize one deterministic placement.  Deferred geometry and later
+    # primary requests are evidence candidates only; they are never retried
+    # or promoted after this attempt fails.
+    for Request in GenerationPlan.PrimaryRequests[:1]:
+        if Deadline.IsExpired():
             break
         _TryPlacement(Request)
 
@@ -11268,6 +11716,10 @@ def _PlaceAndRoutePcbWithPolicy(
         )
         TopologyDemandByFingerprint[Fingerprint] = CandidateTopologyDemand
         RoutingResourcesByFingerprint[Fingerprint] = CandidateResources
+        # Transactional endpoint repair already returns a fully materialized
+        # local-claim placement.  Its inherited scoring-only recipe must not
+        # send the exact-interface stage back through joint materialization.
+        MaterializedPlacementByFingerprint[Fingerprint] = Candidate
         SeenTransactionalEndpointRepairFingerprints.add(Fingerprint)
         SeenTransactionalEndpointRepairRetentionFingerprints.add(
             RetentionFingerprint
@@ -11318,6 +11770,123 @@ def _PlaceAndRoutePcbWithPolicy(
         return True
 
     CandidateRecords = _BuildCandidateRecords()
+
+    def PreparePrePlacementTrackCapacity(
+        Candidates: Iterable[PcbPlacementCandidate],
+    ) -> tuple[list[dict[str, object]], list[PcbPlacementCandidate]]:
+        Preparations: list[dict[str, object]] = []
+        Feasible: list[PcbPlacementCandidate] = []
+        for Candidate in Candidates:
+            CandidateResources = RoutingResourcesByFingerprint.get(
+                Candidate.PlacementFingerprint
+            )
+            if CandidateResources is None:
+                CandidateResources = BuildRoutingResources(
+                    Candidate.Placement.Placed
+                )
+                RoutingResourcesByFingerprint[Candidate.PlacementFingerprint] = (
+                    CandidateResources
+                )
+            Preparation = PrepareTrackAssignment(
+                Candidate.Placement,
+                Resources=CandidateResources,
+                Policy=Policy,
+                Deadline=Deadline,
+            )
+            Preparations.append({
+                "CandidateId": Candidate.CandidateId,
+                "PlacementFingerprint": Candidate.PlacementFingerprint,
+                **Preparation.ToDictionary(),
+            })
+            if Preparation.Success and Preparation.Complete:
+                Feasible.append(Candidate)
+        return Preparations, Feasible
+
+    PrePlacementTrackPreparations, PrePlacementTrackFeasible = (
+        PreparePrePlacementTrackCapacity(CandidateRecords)
+    )
+    if not PrePlacementTrackFeasible:
+        FirstCompleteCore = next((
+            Value for Value in PrePlacementTrackPreparations
+            if Value["Complete"] and Value["ConflictSignals"]
+        ), None)
+        if FirstCompleteCore is not None and GenerationPlan.DeferredRequests:
+            CoreSignals = frozenset(map(
+                str,
+                FirstCompleteCore["ConflictSignals"],
+            ))
+            _TryPlacement(
+                GenerationPlan.DeferredRequests[0],
+                FixedRelocationVariant=1,
+                FixedRelocationSignals=CoreSignals,
+                FixedRelocationPrioritySignals=CoreSignals,
+                FixedRequiredRelocationSignals=CoreSignals,
+            )
+            CandidateRecords = _BuildCandidateRecords()
+            PrePlacementTrackPreparations, PrePlacementTrackFeasible = (
+                PreparePrePlacementTrackCapacity(CandidateRecords)
+            )
+            PlacementGenerationDecisions.append({
+                "Result": "pre-placement-track-core-geometry",
+                "ConflictSignals": sorted(CoreSignals),
+                "GeometryConstructionCount": 1,
+                "RoutingAttemptCount": 0,
+            })
+    if not PrePlacementTrackFeasible:
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="PrePlacementTrackCapacity",
+            Detail=(
+                "no fixed primary placement has a complete capacity-one "
+                "track-assignment witness"
+            ),
+            RepairActions=(),
+            Diagnostics={
+                "PrePlacementTrackPreparations": PrePlacementTrackPreparations,
+                "PlacementDomainComplete": False,
+            },
+        ))
+    # The selected geometry is the only placement permitted to route.
+    OrderedPlacements = PrePlacementTrackFeasible[:1]
+    """One pre-placement track-capacity proof and at most one core geometry."""
+    '''
+    for Candidate in CandidateRecords:
+        CandidateResources = RoutingResourcesByFingerprint.get(
+            Candidate.PlacementFingerprint
+        )
+        if CandidateResources is None:
+            CandidateResources = BuildRoutingResources(Candidate.Placement.Placed)
+            RoutingResourcesByFingerprint[Candidate.PlacementFingerprint] = (
+                CandidateResources
+            )
+        Preparation = PrepareTrackAssignment(
+            Candidate.Placement,
+            Resources=CandidateResources,
+            Policy=Policy,
+            Deadline=Deadline,
+        )
+        PrePlacementTrackPreparations.append({
+            "CandidateId": Candidate.CandidateId,
+            "PlacementFingerprint": Candidate.PlacementFingerprint,
+            **Preparation.ToDictionary(),
+        })
+        if Preparation.Success and Preparation.Complete:
+            PrePlacementTrackFeasible.append(Candidate)
+    if not PrePlacementTrackFeasible:
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="PrePlacementTrackCapacity",
+            Detail=(
+                "no fixed primary placement has a complete capacity-one "
+                "track-assignment witness"
+            ),
+            RepairActions=(),
+            Diagnostics={
+                "PrePlacementTrackPreparations": PrePlacementTrackPreparations,
+                "PlacementDomainComplete": False,
+            },
+        ))
+    '''
     ExactClusterInterfaceSolveEnabled = any(
             RequiresExactClusterInterfaceSolve(
                 Candidate.TopologyDemand,
@@ -11352,9 +11921,7 @@ def _PlaceAndRoutePcbWithPolicy(
         ),
     })
 
-    OrderedPlacements = CandidateRecords[
-        : RetainedRoutingCandidateLimit(CandidateRecords)
-    ]
+    OrderedPlacements = PrePlacementTrackFeasible[:1]
     PlacementFeedback = [
         Candidate.ToDictionary() for Candidate in CandidateRecords
     ]
@@ -13687,8 +14254,11 @@ def _PlaceAndRoutePcbWithPolicy(
                 Candidate.ToDictionary() for Candidate in CandidateRecords
             ]
 
+    # The default compiler deliberately routes exactly one deterministic
+    # placement.  The legacy generator remains available to reference tests,
+    # but is not reachable from the production path.
     CandidateRoutingIterable: Iterable[PcbPlacementCandidate] = (
-        _PlacementCandidatesForRouting()
+        OrderedPlacements[:1]
     )
     if ExactClusterInterfaceSolveEnabled:
         # The closed-component planner owns interface alternatives and emits
@@ -13969,7 +14539,15 @@ def _PlaceAndRoutePcbWithPolicy(
         LastGlobalHandoffError: RoutingStageError | None = None
         MaximumComponentVariants = 1
         MaximumProofGuidedRetainedPlacements = 0
-        MaximumProofGuidedGeneratedPlacements = 12
+        # A complete physical core gets a compact, deterministic repair
+        # portfolio.  More variants only replay the same ownership problem
+        # under the shared CLA4 deadline.
+        MaximumProofGuidedGeneratedPlacements = 2
+        # A complete selected-port capacity core is narrower than the
+        # ownership-core portfolio above.  It gets one independent geometry
+        # repair after the ownership repairs have been exhausted; sharing the
+        # global counter would silently suppress that repair.
+        MaximumProofGuidedSymbolicCapacityPairPlacements = 2
         ComponentPlacementSearchDomain = (
             BuildRetainedComponentPlacementSearchDomain(
                 (
@@ -14070,15 +14648,59 @@ def _PlaceAndRoutePcbWithPolicy(
         ProofGuidedPlacementFingerprints: set[str] = set()
         GeneratedProofGuidedPlacementFingerprints: set[str] = set()
         ProofGuidedRelocationCoreCounts: dict[tuple[str, ...], int] = {}
+        RepeatedOwnershipCoreAttempts: dict[
+            tuple[str, str],
+            int,
+        ] = {}
         CumulativeProofGuidedRelocationSignals: set[str] = set()
         ProofGuidedPlacementPressureEdges: set[tuple[str, str]] = set()
         AppliedProofGuidedPlacementPressureEdges: set[
             tuple[str, str]
         ] = set()
         ProofGuidedPlacementGenerationCount = 0
+        ProofGuidedPlacementGenerationCountByCore: dict[
+            tuple[str, ...], int
+        ] = {}
         ProofGuidedRetainedPlacementCount = 0
         PendingProofGuidedPlacementByComponentVariant: dict[
             int, tuple[RoutingFailure, PcbPlacementCandidate]
+        ] = {}
+        CapacityRepairConstraintByPlacementFingerprint: dict[
+            str, PhysicalInterfaceRepairCore
+        ] = {}
+        CapacityRepairPortfolioDiagnostics: list[dict[str, object]] = []
+        CapacityRepairGeneratedCountByProofFingerprint: dict[str, int] = {}
+        CapacityRepairGeometryKindByPlacementFingerprint: dict[str, str] = {}
+        CapacityRepairCandidateByPlacementFingerprint: dict[
+            str, PcbPlacementCandidate
+        ] = {}
+        CapacityRepairEquivalentGeometryRejectsByProofFingerprint: dict[
+            str, int
+        ] = {}
+        DequeuedCapacityRepairPlacementFingerprints: set[str] = set()
+        LocalFactorDiversificationPortfolioDiagnostics: list[
+            dict[str, object]
+        ] = []
+        LocalFactorDiversificationAttemptCountByProofFingerprint: dict[
+            str, int
+        ] = {}
+        LocalFactorDiversificationCandidateByPlacementFingerprint: dict[
+            str, PcbPlacementCandidate
+        ] = {}
+        OwnedFrontierTopologyRepairPortfolioDiagnostics: list[
+            dict[str, object]
+        ] = []
+        OwnedFrontierTopologyRepairAttemptCountByProofFingerprint: dict[
+            str, int
+        ] = {}
+        OwnedFrontierTopologyRepairCandidateByPlacementFingerprint: dict[
+            str, PcbPlacementCandidate
+        ] = {}
+        OwnedFrontierTopologyRepairKindByPlacementFingerprint: dict[
+            str, str
+        ] = {}
+        OwnedFrontierTopologyRepairEquivalentRejectsByProofFingerprint: dict[
+            str, int
         ] = {}
 
         def ReorderRemainingPlacementsForAccessCore(
@@ -14154,6 +14776,67 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
                 if str(Signal)
             }))
+            SymbolicCapacityFeedback = bool(
+                Diagnostics.get("SymbolicCapacityPlacementFeedback", False)
+                and PlacementPressureSignals
+            )
+            CapacityRepairConstraint = (
+                BuildPhysicalInterfaceRepairCore(Failure, SourceCandidate)
+            )
+            InheritedCapacityRepairConstraint = (
+                CapacityRepairConstraintByPlacementFingerprint.get(
+                    SourceCandidate.PlacementFingerprint
+                )
+            )
+            if (
+                CapacityRepairConstraint is None
+                and InheritedCapacityRepairConstraint is not None
+            ):
+                CapacityRepairConstraint = (
+                    InheritedCapacityRepairConstraint
+                )
+            if (
+                CapacityRepairConstraint is not None
+                and PhysicalPlacementFeedback is None
+            ):
+                PhysicalPlacementFeedback = PhysicalComponentPlacementFeedback(
+                    ProofFingerprint=(
+                        CapacityRepairConstraint.SourceProofFingerprint
+                    ),
+                    RelocationSignals=CapacityRepairConstraint.Signals,
+                    DomainFingerprint=(
+                        CapacityRepairConstraint.RepairDomainFingerprint
+                    ),
+                )
+            CapacityRepairActive = bool(
+                CapacityRepairConstraint is not None
+            )
+            if CapacityRepairActive:
+                CapacityRepairPortfolioDiagnostics.append({
+                    "Result": "interface-repair-epoch-started",
+                    "SourceCandidateId": SourceCandidate.CandidateId,
+                    "SourceProofFingerprint": (
+                        CapacityRepairConstraint.SourceProofFingerprint
+                    ),
+                    "Signals": list(CapacityRepairConstraint.Signals),
+                    "ProofComplete": True,
+                    "CoreSignalCount": len(CapacityRepairConstraint.Signals),
+                    "RepairLevel": CapacityRepairConstraint.RepairLevel,
+                    "ProofKind": CapacityRepairConstraint.ProofKind,
+                    "ClusterIds": list(CapacityRepairConstraint.ClusterIds),
+                    "BoundaryClasses": list(
+                        CapacityRepairConstraint.BoundaryClasses
+                    ),
+                    "RepairDomainFingerprint": (
+                        CapacityRepairConstraint.RepairDomainFingerprint
+                    ),
+                    "ForcedSeamClasses": [
+                        list(Value)
+                        for Value in CapacityRepairConstraint.ForcedSeamClasses
+                    ],
+                    "PreemptedCandidateIds": [],
+                    "ElapsedSeconds": round(monotonic() - Deadline.StartedAt, 6),
+                })
             PressureGuidance = bool(
                 Diagnostics.get("PlacementWorkSliceExpired", False)
                 and PlacementPressureSignals
@@ -14191,7 +14874,9 @@ def _PlaceAndRoutePcbWithPolicy(
                     OrderedEdge = tuple(sorted(map(str, Edge)))
                     if OrderedEdge[0] and OrderedEdge[0] != OrderedEdge[1]:
                         ProofGuidedPlacementPressureEdges.add(OrderedEdge)
-            if PhysicalPlacementFeedback is None and PressureGuidance:
+            if PhysicalPlacementFeedback is None and (
+                PressureGuidance or SymbolicCapacityFeedback
+            ):
                 PhysicalPlacementFeedback = (
                     PhysicalComponentPlacementFeedback(
                         ProofFingerprint=BuildStableFingerprint((
@@ -14224,7 +14909,11 @@ def _PlaceAndRoutePcbWithPolicy(
                 if CompleteGlobalAssignmentCut
                 else None
             )
-            if CompleteGlobalAssignmentCut and AssignmentCut is None:
+            if (
+                CompleteGlobalAssignmentCut
+                and AssignmentCut is None
+                and CapacityRepairConstraint is None
+            ):
                 return False
             RelocationSignals = frozenset(
                 (
@@ -14245,6 +14934,12 @@ def _PlaceAndRoutePcbWithPolicy(
                 RelocationSignals = frozenset(
                     PlacementPressureSignals
                 )
+            if CapacityRepairConstraint is not None:
+                # The complete repair core, not an earlier symbolic symptom,
+                # determines the geometry this bounded portfolio moves.
+                RelocationSignals = frozenset(
+                    CapacityRepairConstraint.Signals
+                )
             if not RelocationSignals:
                 return False
             RelocationCore = tuple(sorted(RelocationSignals))
@@ -14259,6 +14954,7 @@ def _PlaceAndRoutePcbWithPolicy(
             )
             ImmediatePhysicalGeometryFeedback = bool(
                 PressureGuidance
+                or SymbolicCapacityFeedback
                 or RepeatedPlacementLocalCore
                 or SourceCandidate.PlacementFingerprint
                 in GeneratedProofGuidedPlacementFingerprints
@@ -14312,7 +15008,7 @@ def _PlaceAndRoutePcbWithPolicy(
                     AppliedProofGuidedPlacementPressureEdges.add(
                         FocusedEdge
                     )
-                if PressureGuidance:
+                if PressureGuidance or SymbolicCapacityFeedback:
                     # A later exact exterior-domain signal supersedes the
                     # local core that produced the current, locally feasible
                     # placement.  Carrying that already-repaired core into
@@ -14325,12 +15021,20 @@ def _PlaceAndRoutePcbWithPolicy(
                 RelocationSignals = frozenset(
                     CumulativeProofGuidedRelocationSignals
                 )
-            if HasDistinctRetainedPhysicalEligibilityState(
-                InterfaceCandidateQueue,
-                ComponentVariant=ComponentVariant,
-                PlacementFingerprint=(
-                    SourceCandidate.PlacementFingerprint
-                ),
+            # A complete local routability core is stronger than the pending
+            # retained portal states: those states share the already-proven
+            # impossible owned-terminal geometry.  Do not defer the bounded
+            # repair behind them; only a complete global assignment cut may
+            # legitimately benefit from finishing retained global states.
+            if (
+                AssignmentCut is not None
+                and HasDistinctRetainedPhysicalEligibilityState(
+                    InterfaceCandidateQueue,
+                    ComponentVariant=ComponentVariant,
+                    PlacementFingerprint=(
+                        SourceCandidate.PlacementFingerprint
+                    ),
+                )
             ):
                 PendingProofGuidedPlacementByComponentVariant[
                     ComponentVariant
@@ -14400,9 +15104,15 @@ def _PlaceAndRoutePcbWithPolicy(
                     "ExecutableLegacyRepairCascade": False,
                 })
                 return True
-            if ProofGuidedPlacementGenerationCount >= (
-                MaximumProofGuidedGeneratedPlacements
-            ):
+            MaximumPlacementsForRelocationCore = (
+                MaximumProofGuidedSymbolicCapacityPairPlacements
+                if CapacityRepairActive
+                else MaximumProofGuidedGeneratedPlacements
+            )
+            if ProofGuidedPlacementGenerationCountByCore.get(
+                RelocationCore,
+                0,
+            ) >= MaximumPlacementsForRelocationCore:
                 return False
             if AssignmentCut is not None:
                 CurrentPlacementAssignmentCut = AssignmentCut
@@ -14420,6 +15130,43 @@ def _PlaceAndRoutePcbWithPolicy(
                 # attach an unrelated legacy cut identity to the new state.
                 CurrentPlacementAssignmentCut = None
                 PendingTopologyCutEpoch = None
+            CapacityRepairGeometryKind = ""
+            CapacityRepairRelocationVariant = ImmediateRelocationVariant
+            CapacityRepairRoutingSpacing = ImmediateRoutingSpacing
+            if CapacityRepairActive:
+                RepairAttempt = CapacityRepairGeneratedCountByProofFingerprint.get(
+                    CapacityRepairConstraint.SourceProofFingerprint,
+                    0,
+                )
+                # The bounded portfolio deliberately changes geometry twice:
+                # first enlarge the interface envelope, then split/relocate
+                # the implicated geometry.  The parent retains ordering and
+                # rejects a locally equivalent result below.
+                CapacityRepairGeometryKind = (
+                    (
+                        "widen-channel-deck"
+                        if CapacityRepairConstraint.RepairLevel
+                        == "channel-capacity"
+                        else "widen-interface"
+                    )
+                    if RepairAttempt == 0
+                    else (
+                        "split-channel-endpoints"
+                        if CapacityRepairConstraint.RepairLevel
+                        == "channel-capacity"
+                        else "split-relocate"
+                    )
+                )
+                CapacityRepairRelocationVariant = (
+                    None
+                    if RepairAttempt == 0
+                    else ImmediateRelocationVariant
+                )
+                CapacityRepairRoutingSpacing = (
+                    ConfiguredRoutingSpacing + 1
+                    if RepairAttempt == 0
+                    else ConfiguredRoutingSpacing + 2
+                )
             PlacementRelocationSignals = RelocationSignals
             PlacementRelocationPrioritySignals = RelocationSignals
             PlacementRequiredRelocationSignals = RelocationSignals
@@ -14436,24 +15183,46 @@ def _PlaceAndRoutePcbWithPolicy(
             Request = _TakeNextDeferredRequest(
                 PreferRelocation=True,
                 RequireExactCutBeforeBroad=(AssignmentCut is not None),
+                AllowCapacityPairRepair=(
+                    CapacityRepairActive
+                ),
             )
+            if (
+                CapacityRepairActive
+            ):
+                Request = PlacementGenerationRequest(
+                    SourceGenerator="row-beam-conflict-relocation",
+                    RoutingSpacing=ConfiguredRoutingSpacing,
+                    PackingPolicy=replace(
+                        Policy.NandPacking,
+                        GraphBeamEnabled=False,
+                        EnableJointClusterOrientation=True,
+                    ),
+                )
             GeneratedUniquePlacement = False
             while Request is not None:
                 try:
                     GeneratedUniquePlacement = _TryPlacement(
                         Request,
                         FixedRelocationVariant=(
-                            ImmediateRelocationVariant
+                            CapacityRepairRelocationVariant
                         ),
                         FixedCandidateSpacing=(
-                            ImmediateRoutingSpacing
+                            CapacityRepairRoutingSpacing
                         ),
                         MaterializeRoutingResources=False,
                         SkipMandatoryAccessPreScreen=True,
                         PlacementGenerationNotAfter=(
-                            SharedInterfacePlanningDeadline.ExpiresAt
+                            Deadline.ExpiresAt
+                            if (
+                                CapacityRepairActive
+                            )
+                            else SharedInterfacePlanningDeadline.ExpiresAt
                         ),
                         UseCompletePlacementGenerationBudget=True,
+                        AllowCapacityPairRepair=(
+                            CapacityRepairActive
+                        ),
                     )
                 except RoutingStageError as Error:
                     LastRoutingError = Error
@@ -14484,13 +15253,103 @@ def _PlaceAndRoutePcbWithPolicy(
                     None,
                 )
                 if Candidate is not None:
+                    if CapacityRepairConstraint is not None and (
+                        BuildCapacityRepairGeometryFingerprint(
+                            Candidate, CapacityRepairConstraint.Signals,
+                        ) == CapacityRepairConstraint
+                        .EquivalentGeometryFingerprint
+                    ):
+                        PlacementGenerationDecisions.append({
+                            "Result": "capacity-repair-equivalent-geometry-rejected",
+                            "SourceCandidateId": SourceCandidate.CandidateId,
+                            "PlacementFingerprint": Candidate.PlacementFingerprint,
+                            "CapacityRepairConstraint": (
+                                CapacityRepairConstraint.ToDictionary()
+                            ),
+                        })
+                        CapacityRepairEquivalentGeometryRejectsByProofFingerprint[
+                            CapacityRepairConstraint.SourceProofFingerprint
+                        ] = (
+                            CapacityRepairEquivalentGeometryRejectsByProofFingerprint.get(
+                                CapacityRepairConstraint.SourceProofFingerprint,
+                                0,
+                            )
+                            + 1
+                        )
+                        ExistingPlacementFingerprints.add(
+                            Candidate.PlacementFingerprint
+                        )
+                        continue
                     ProofGuidedPlacementFingerprints.add(
                         Candidate.PlacementFingerprint
                     )
                     GeneratedProofGuidedPlacementFingerprints.add(
                         Candidate.PlacementFingerprint
                     )
+                    if CapacityRepairConstraint is not None:
+                        CapacityRepairConstraintByPlacementFingerprint[
+                            Candidate.PlacementFingerprint
+                        ] = CapacityRepairConstraint
+                        CapacityRepairCandidateByPlacementFingerprint[
+                            Candidate.PlacementFingerprint
+                        ] = Candidate
+                        CapacityRepairGeometryKindByPlacementFingerprint[
+                            Candidate.PlacementFingerprint
+                        ] = CapacityRepairGeometryKind
+                        CapacityRepairPortfolioDiagnostics.append({
+                            "Result": "capacity-pair-repair-generated",
+                            "SourceCandidateId": SourceCandidate.CandidateId,
+                            "SourceProofFingerprint": (
+                                CapacityRepairConstraint.SourceProofFingerprint
+                            ),
+                            "Signals": list(CapacityRepairConstraint.Signals),
+                            "ProofComplete": True,
+                            "PlacementFingerprint": Candidate.PlacementFingerprint,
+                            "GeometryFingerprint": (
+                                BuildCapacityRepairGeometryFingerprint(
+                                    Candidate,
+                                    CapacityRepairConstraint.Signals,
+                                )
+                            ),
+                            "GeometryKind": CapacityRepairGeometryKind,
+                            "CoreSignalCount": len(
+                                CapacityRepairConstraint.Signals
+                            ),
+                            "RepairDomainFingerprint": (
+                                CapacityRepairConstraint.RepairDomainFingerprint
+                            ),
+                            "EquivalentGeometryRejectCount": (
+                                CapacityRepairEquivalentGeometryRejectsByProofFingerprint
+                                .get(
+                                    CapacityRepairConstraint
+                                    .SourceProofFingerprint,
+                                    0,
+                                )
+                            ),
+                            "ElapsedSeconds": round(
+                                monotonic() - Deadline.StartedAt, 6,
+                            ),
+                        })
                     ProofGuidedPlacementGenerationCount += 1
+                    if CapacityRepairConstraint is not None:
+                        CapacityRepairGeneratedCountByProofFingerprint[
+                            CapacityRepairConstraint.SourceProofFingerprint
+                        ] = (
+                            CapacityRepairGeneratedCountByProofFingerprint.get(
+                                CapacityRepairConstraint.SourceProofFingerprint,
+                                0,
+                            )
+                            + 1
+                        )
+                    ProofGuidedPlacementGenerationCountByCore[
+                        RelocationCore
+                    ] = (
+                        ProofGuidedPlacementGenerationCountByCore.get(
+                            RelocationCore,
+                            0,
+                        )
+                        + 1
+                    )
                     RequestedComponentStateFingerprints.add(
                         BuildClusterInterfaceComponentStateFingerprint(
                             Candidate.PlacementFingerprint,
@@ -14522,32 +15381,105 @@ def _PlaceAndRoutePcbWithPolicy(
                             if AssignmentCut is not None
                             else PhysicalPlacementFeedback.ProofFingerprint
                         ),
+                        "CapacityRepairConstraint": (
+                            CapacityRepairConstraint.ToDictionary()
+                            if CapacityRepairConstraint is not None
+                            else None
+                        ),
                         "RelocationSignals": sorted(RelocationSignals),
                         "RelocationVariant": (
-                            ImmediateRelocationVariant
+                            CapacityRepairRelocationVariant
                         ),
                         "ImmediatePhysicalGeometryFeedback": (
                             ImmediatePhysicalGeometryFeedback
                         ),
                         "RoutingSpacing": (
-                            ImmediateRoutingSpacing
-                            if ImmediateRoutingSpacing is not None
+                            CapacityRepairRoutingSpacing
+                            if CapacityRepairRoutingSpacing is not None
                             else ConfiguredRoutingSpacing
                         ),
                         "PlacementFingerprint": (
                             Candidate.PlacementFingerprint
                         ),
                         "LivePlacementStateBound": (
-                            MaximumProofGuidedGeneratedPlacements
+                            MaximumPlacementsForRelocationCore
                         ),
                         "PendingImmutablePlacementStateCount": len(
                             PendingJointPlacementStates
                         ),
                         "IncrementalPlacementMaterialization": True,
                         "ExecutableLegacyRepairCascade": False,
+                        "CapacityRepairGeometryKind": CapacityRepairGeometryKind,
                     })
+                    if (
+                        CapacityRepairActive
+                        and CapacityRepairGeometryKind.startswith("widen-")
+                    ):
+                        # Freeze both members of the bounded proof portfolio
+                        # before eligibility work begins.  The recursive call
+                        # sees the same immutable proof, produces only the
+                        # split/relocate member, and keeps ordinary placement
+                        # states preempted.  Sorting restores canonical widen
+                        # then split evaluation despite front insertion.
+                        EnqueueProofGuidedPhysicalPlacement(
+                            Failure,
+                            SourceCandidate,
+                            ComponentVariant,
+                        )
+                        IndexedRepairQueue = tuple(
+                            enumerate(InterfaceCandidateQueue)
+                        )
+                        InterfaceCandidateQueue[:] = [
+                            Entry
+                            for _Index, Entry in sorted(
+                                IndexedRepairQueue,
+                                key=lambda Value: (
+                                    0
+                                    if CapacityRepairGeometryKindByPlacementFingerprint
+                                    .get(Value[1][2].PlacementFingerprint, "")
+                                    .startswith("widen-")
+                                    else 1,
+                                    Value[0],
+                                ),
+                            )
+                        ]
+                        CapacityRepairPortfolioDiagnostics.append({
+                            "Result": "capacity-repair-portfolio-prefetched",
+                            "SourceProofFingerprint": (
+                                CapacityRepairConstraint
+                                .SourceProofFingerprint
+                            ),
+                            "GeometryKinds": [
+                                CapacityRepairGeometryKind,
+                                (
+                                    "split-channel-endpoints"
+                                    if CapacityRepairConstraint.RepairLevel
+                                    == "channel-capacity"
+                                    else "split-relocate"
+                                ),
+                            ],
+                            "ElapsedSeconds": round(
+                                monotonic() - Deadline.StartedAt, 6,
+                            ),
+                        })
                     return True
                 if not PendingJointPlacementStates:
+                    if CapacityRepairConstraint is not None:
+                        CapacityRepairPortfolioDiagnostics.append({
+                            "Result": "bounded-proof-driven-repair-exhausted",
+                            "SourceCandidateId": SourceCandidate.CandidateId,
+                            "SourceProofFingerprint": (
+                                CapacityRepairConstraint.SourceProofFingerprint
+                            ),
+                            "Signals": list(CapacityRepairConstraint.Signals),
+                            "EquivalentGeometryFingerprint": (
+                                CapacityRepairConstraint
+                                .EquivalentGeometryFingerprint
+                            ),
+                            "ElapsedSeconds": round(
+                                monotonic() - Deadline.StartedAt, 6,
+                            ),
+                        })
                     return False
                 JointState = PendingJointPlacementStates.pop(0)
                 try:
@@ -14587,6 +15519,426 @@ def _PlaceAndRoutePcbWithPolicy(
                     LastRoutingError = Error
                     LastStructuredRoutingError = Error
                     return False
+        def EnqueueSingletonLocalFactorDiversification(
+            Failure: RoutingFailure,
+            SourceCandidate: PcbPlacementCandidate,
+            ComponentVariant: int,
+        ) -> bool:
+            """Publish at most two access-distinct local ECO factor domains."""
+            Core = BuildPhysicalLocalFactorDiversificationCore(
+                Failure,
+                SourceCandidate,
+            )
+            if Core is None or Deadline.IsExpired():
+                return False
+            AttemptCount = (
+                LocalFactorDiversificationAttemptCountByProofFingerprint
+                .get(Core.SourceProofFingerprint, 0)
+            )
+            if AttemptCount >= 2:
+                LocalFactorDiversificationPortfolioDiagnostics.append({
+                    "Result": "singleton-local-factor-portfolio-exhausted",
+                    "SourceCandidateId": SourceCandidate.CandidateId,
+                    "Core": Core.ToDictionary(),
+                    "ElapsedSeconds": round(
+                        monotonic() - Deadline.StartedAt,
+                        6,
+                    ),
+                })
+                return False
+            ExistingFingerprints = frozenset(UniquePlacements)
+            PublishedCandidates: list[PcbPlacementCandidate] = []
+            for Variant in range(AttemptCount, 2):
+                LocalFactorDiversificationAttemptCountByProofFingerprint[
+                    Core.SourceProofFingerprint
+                ] = Variant + 1
+                Published = _PublishTransactionalClusterEndpointRepair(
+                    SourceCandidate,
+                    frozenset((Core.Signal,)),
+                    RepairVariant=Variant,
+                    RepairClusterCount=1,
+                )
+                if not Published:
+                    LocalFactorDiversificationPortfolioDiagnostics.append({
+                        "Result": "singleton-local-factor-eco-rejected",
+                        "SourceCandidateId": SourceCandidate.CandidateId,
+                        "Core": Core.ToDictionary(),
+                        "Variant": Variant,
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt,
+                            6,
+                        ),
+                    })
+                    continue
+                try:
+                    CandidateRecords = _BuildCandidateRecords()
+                except RoutingStageError as Error:
+                    LocalFactorDiversificationPortfolioDiagnostics.append({
+                        "Result": "singleton-local-factor-eco-incomplete",
+                        "SourceCandidateId": SourceCandidate.CandidateId,
+                        "Core": Core.ToDictionary(),
+                        "Variant": Variant,
+                        "Failure": Error.Failure.ToDictionary(),
+                    })
+                    continue
+                NewCandidates = tuple(
+                    Candidate
+                    for Candidate in CandidateRecords
+                    if (
+                        Candidate.PlacementFingerprint not in ExistingFingerprints
+                        and Candidate.SourceGenerator
+                        == "transactional-cluster-endpoint-repair"
+                    )
+                )
+                for Candidate in NewCandidates:
+                    NewGeometryFingerprint = (
+                        BuildCapacityRepairGeometryFingerprint(
+                            Candidate,
+                            (Core.Signal,),
+                        )
+                    )
+                    if NewGeometryFingerprint == Core.LocalGeometryFingerprint:
+                        LocalFactorDiversificationPortfolioDiagnostics.append({
+                            "Result": "singleton-local-factor-geometry-unchanged",
+                            "SourceCandidateId": SourceCandidate.CandidateId,
+                            "Core": Core.ToDictionary(),
+                            "Variant": Variant,
+                            "PlacementFingerprint": (
+                                Candidate.PlacementFingerprint
+                            ),
+                        })
+                        continue
+                    ExistingFingerprints = frozenset((
+                        *ExistingFingerprints,
+                        Candidate.PlacementFingerprint,
+                    ))
+                    LocalFactorDiversificationCandidateByPlacementFingerprint[
+                        Candidate.PlacementFingerprint
+                    ] = Candidate
+                    RequestedComponentStateFingerprints.add(
+                        BuildClusterInterfaceComponentStateFingerprint(
+                            Candidate.PlacementFingerprint,
+                            ComponentVariant,
+                        )
+                    )
+                    PublishedCandidates.append(Candidate)
+                    LocalFactorDiversificationPortfolioDiagnostics.append({
+                        "Result": "singleton-local-factor-eco-published",
+                        "SourceCandidateId": SourceCandidate.CandidateId,
+                        "Core": Core.ToDictionary(),
+                        "Variant": Variant,
+                        "PlacementFingerprint": Candidate.PlacementFingerprint,
+                        "LocalGeometryFingerprint": NewGeometryFingerprint,
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt,
+                            6,
+                        ),
+                    })
+            if not PublishedCandidates:
+                return False
+            InterfaceCandidateQueue[0:0] = [
+                (
+                    "prepare-eligibility",
+                    len(InterfaceCandidates) + Index,
+                    Candidate,
+                    0,
+                    ComponentVariant,
+                )
+                for Index, Candidate in enumerate(PublishedCandidates)
+            ]
+            return True
+
+        def EnqueueOwnedFrontierTopologyRepair(
+            Failure: RoutingFailure,
+            SourceCandidate: PcbPlacementCandidate,
+            ComponentVariant: int,
+        ) -> bool:
+            """Publish two fresh cluster-topology candidates for one proof.
+
+            This deliberately regenerates a complete packed placement.  It
+            must not reuse the endpoint ECO, because a contract-independent
+            empty owned frontier is a component-fabric contradiction rather
+            than a pin-access contradiction.
+            """
+            Core = BuildPhysicalOwnedFrontierTopologyRepairCore(
+                Failure,
+                SourceCandidate,
+            )
+            if Core is None or Deadline.IsExpired():
+                return False
+            AttemptCount = (
+                OwnedFrontierTopologyRepairAttemptCountByProofFingerprint
+                .get(Core.SourceProofFingerprint, 0)
+            )
+            if AttemptCount >= 2:
+                OwnedFrontierTopologyRepairPortfolioDiagnostics.append({
+                    "Result": "owned-frontier-topology-portfolio-exhausted",
+                    "SourceCandidateId": SourceCandidate.CandidateId,
+                    "Core": Core.ToDictionary(),
+                    "ElapsedSeconds": round(monotonic() - Deadline.StartedAt, 6),
+                })
+                return False
+
+            ExistingFingerprints = frozenset(UniquePlacements)
+            ExistingTopologyFingerprints = frozenset(
+                Candidate.InterfaceTopologyFingerprint
+                for Candidate in OwnedFrontierTopologyRepairCandidateByPlacementFingerprint.values()
+            )
+            PublishedCandidates: list[PcbPlacementCandidate] = []
+            # Candidate indices select immutable retained joint-placement
+            # states.  Reusing 0/1 for a later topology proof simply
+            # regenerates the first repair portfolio and makes a hierarchical
+            # repair look equivalent to its ancestor.  Advance through the
+            # canonical retained-state order as prior topology candidates are
+            # published; the two-candidate bound remains per proof.
+            TopologyCandidateBaseIndex = len(
+                OwnedFrontierTopologyRepairCandidateByPlacementFingerprint
+            )
+            MaximumTopologyCandidateCount = max(
+                1,
+                Policy.NandPacking.RetainedJointPlacementCandidates * 2,
+            )
+            if TopologyCandidateBaseIndex >= MaximumTopologyCandidateCount:
+                OwnedFrontierTopologyRepairPortfolioDiagnostics.append({
+                    "Result": "owned-frontier-topology-retained-domain-exhausted",
+                    "SourceCandidateId": SourceCandidate.CandidateId,
+                    "Core": Core.ToDictionary(),
+                    "RetainedStateCount": MaximumTopologyCandidateCount,
+                    "ElapsedSeconds": round(monotonic() - Deadline.StartedAt, 6),
+                })
+                return False
+            # Variant 3 drives a cut-refined cluster split.  Variant 12 is
+            # the existing stronger deterministic relocation geometry, but
+            # is run through full placement regeneration rather than the
+            # transactional pin-bank ECO.
+            for TopologyCandidateOffset, (Variant, Kind) in enumerate((
+                (3, "split-interface-cut"),
+                (12, "relocate-endpoint-cluster"),
+            )):
+                if (
+                    AttemptCount >= 2
+                    or Deadline.IsExpired()
+                    or (
+                        TopologyCandidateBaseIndex
+                        + TopologyCandidateOffset
+                        >= MaximumTopologyCandidateCount
+                    )
+                ):
+                    break
+                AttemptCount += 1
+                OwnedFrontierTopologyRepairAttemptCountByProofFingerprint[
+                    Core.SourceProofFingerprint
+                ] = AttemptCount
+                StartedAt = monotonic()
+                TopologyCandidateIndex = (
+                    TopologyCandidateBaseIndex + TopologyCandidateOffset
+                )
+                try:
+                    Candidate = PlacePcbGraph(
+                        Netlist,
+                        RoutingSpacing=SourceCandidate.RoutingSpacing,
+                        PlacementPolicy=Policy.Placement,
+                        ClusterPolicy=Policy.Clustering,
+                        MaximumBoundaryTerminals=(
+                            Policy.Organization.MaximumClusterEntrances
+                        ),
+                        MaximumEntrancesPerSignal=(
+                            Policy.Organization.MaximumClusterEntrancesPerSignal
+                        ),
+                        PackingPolicy=Policy.NandPacking,
+                        RelocationSignals=frozenset(Core.Signals),
+                        RelocationPrioritySignals=frozenset(Core.Signals),
+                        RequiredRelocationSignals=frozenset(Core.Signals),
+                        RelocationVariant=Variant,
+                        # Relocation variants encode placement geometry, not
+                        # a joint-portfolio ordinal.  The latter advances
+                        # canonically when hierarchical repairs need states
+                        # distinct from an already-published ancestor.
+                        JointPlacementCandidateIndex=TopologyCandidateIndex,
+                        AssignmentConstraints=PlacementAssignmentConstraints,
+                        EnableClusterBoundaryLeases=True,
+                        EnableClusterInterfacePlacementFeasibility=True,
+                        CutDrivenClusterRefinementSignals=frozenset(Core.Signals),
+                        FocusedCutEpochPlacement=True,
+                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                            "OwnedFrontierTopologyRepair",
+                            {
+                                "SourceCandidateId": SourceCandidate.CandidateId,
+                                "CandidateKind": Kind,
+                                "CoreFingerprint": Core.CoreFingerprint,
+                                **Diagnostics,
+                            },
+                        ),
+                    )
+                    Profile = MeasureMandatoryAccessConflictProfile(
+                        Candidate.Placed.PlacedGates,
+                        Candidate.SignalOrder,
+                    )
+                    MandatoryConflicts = {
+                        Resource: set(map(str, Owners))
+                        for Resource, Owners in (
+                            *Profile.CrossConflicts,
+                            *Profile.SelfConflicts,
+                        )
+                    }
+                    CandidateTopologyDemand = MeasurePlacementTopologyDemand(
+                        TopologyDemand,
+                        Candidate,
+                        MandatoryConflicts=MandatoryConflicts,
+                        MandatoryProfile=Profile,
+                    )
+                    CandidateDiagnostics = dict(
+                        Candidate.Placed.LocalRouteDiagnostics or {}
+                    )
+                    CandidateDiagnostics["__OwnedFrontierTopologyRepair__"] = {
+                        "Core": Core.ToDictionary(),
+                        "CandidateKind": Kind,
+                        "SourceCandidateId": SourceCandidate.CandidateId,
+                    }
+                    Candidate.Placed.LocalRouteDiagnostics = CandidateDiagnostics
+                    Fingerprint = BuildPlacementFingerprint(
+                        Candidate,
+                        CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint,
+                        IncludeLocalClaims=False,
+                    )
+                    RetentionFingerprint = BuildPlacementRetentionFingerprint(
+                        Candidate,
+                        CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint,
+                        IncludeLocalClaims=False,
+                    )
+                    CandidateTopologyFingerprint = (
+                        BuildClusterInterfacePlacementTopologyFingerprint(
+                            Candidate,
+                            SignalTopologyFingerprints,
+                        )
+                    )
+                    if (
+                        Fingerprint in ExistingFingerprints
+                        or RetentionFingerprint in RetainedPlacementTopologyFingerprints
+                        or CandidateTopologyFingerprint
+                        in ExistingTopologyFingerprints
+                        or CandidateTopologyFingerprint
+                        == Core.SourceTopologyFingerprint
+                    ):
+                        OwnedFrontierTopologyRepairEquivalentRejectsByProofFingerprint[
+                            Core.SourceProofFingerprint
+                        ] = (
+                            OwnedFrontierTopologyRepairEquivalentRejectsByProofFingerprint
+                            .get(Core.SourceProofFingerprint, 0) + 1
+                        )
+                        OwnedFrontierTopologyRepairPortfolioDiagnostics.append({
+                            "Result": "owned-frontier-topology-equivalent-rejected",
+                            "SourceCandidateId": SourceCandidate.CandidateId,
+                            "Core": Core.ToDictionary(),
+                            "CandidateKind": Kind,
+                            "PlacementFingerprint": Fingerprint,
+                            "TopologyFingerprint": CandidateTopologyFingerprint,
+                            "ElapsedSeconds": round(monotonic() - StartedAt, 6),
+                        })
+                        continue
+                    CandidateResources = BuildRoutingResources(
+                        Candidate.Placed,
+                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                            "OwnedFrontierTopologyRepairResources",
+                            {"CandidateKind": Kind, **Diagnostics},
+                        ),
+                    )
+                except (RoutingStageError, ValueError) as Error:
+                    OwnedFrontierTopologyRepairPortfolioDiagnostics.append({
+                        "Result": "owned-frontier-topology-incomplete",
+                        "SourceCandidateId": SourceCandidate.CandidateId,
+                        "Core": Core.ToDictionary(),
+                        "CandidateKind": Kind,
+                        "Failure": (
+                            Error.Failure.ToDictionary()
+                            if isinstance(Error, RoutingStageError)
+                            else str(Error)
+                        ),
+                        "ElapsedSeconds": round(monotonic() - StartedAt, 6),
+                    })
+                    continue
+                UniquePlacements[Fingerprint] = (
+                    "proof-driven-owned-frontier-topology-repair",
+                    SourceCandidate.RoutingSpacing,
+                    Candidate,
+                )
+                PlacementRetentionFingerprintByFingerprint[Fingerprint] = (
+                    RetentionFingerprint
+                )
+                RetainedPlacementTopologyFingerprints[RetentionFingerprint] = (
+                    Fingerprint,
+                    "proof-driven-owned-frontier-topology-repair",
+                )
+                TopologyDemandByFingerprint[Fingerprint] = CandidateTopologyDemand
+                RoutingResourcesByFingerprint[Fingerprint] = CandidateResources
+                MaterializedPlacementByFingerprint[Fingerprint] = Candidate
+                ExistingFingerprints = frozenset((*ExistingFingerprints, Fingerprint))
+                ExistingTopologyFingerprints = frozenset((
+                    *ExistingTopologyFingerprints,
+                    CandidateTopologyFingerprint,
+                ))
+                # This candidate was fully materialized above.  Do not route
+                # it back through the scoring-only retained-placement path:
+                # that path expects a feedback record created by the primary
+                # generator and would make a valid repair depend on unrelated
+                # feedback cache state.
+                CandidateRecord = PcbPlacementCandidate(
+                    CandidateId=f"Placement-{Fingerprint[:12]}",
+                    SourceGenerator=(
+                        "proof-driven-owned-frontier-topology-repair"
+                    ),
+                    RoutingSpacing=SourceCandidate.RoutingSpacing,
+                    PlacementFingerprint=Fingerprint,
+                    FeedbackScore=(Variant,),
+                    BoundaryOverflow=0,
+                    PinScarcityCount=0,
+                    GuideOverflowPeak=0,
+                    GuideOverflowCells=0,
+                    PinEscapeConflictCount=0,
+                    EstimatedGlobalExtensionNodes=0,
+                    EstimatedGlobalExtensionNets=0,
+                    PreOwnedNodeCount=0,
+                    Placement=Candidate,
+                    TopologyDemand=CandidateTopologyDemand,
+                    PlacementRetentionFingerprint=RetentionFingerprint,
+                    InterfaceTopologyFingerprint=CandidateTopologyFingerprint,
+                )
+                OwnedFrontierTopologyRepairCandidateByPlacementFingerprint[
+                    Fingerprint
+                ] = CandidateRecord
+                OwnedFrontierTopologyRepairKindByPlacementFingerprint[
+                    Fingerprint
+                ] = Kind
+                RequestedComponentStateFingerprints.add(
+                    BuildClusterInterfaceComponentStateFingerprint(
+                        Fingerprint,
+                        ComponentVariant,
+                    )
+                )
+                PublishedCandidates.append(CandidateRecord)
+                OwnedFrontierTopologyRepairPortfolioDiagnostics.append({
+                    "Result": "owned-frontier-topology-published",
+                    "SourceCandidateId": SourceCandidate.CandidateId,
+                    "Core": Core.ToDictionary(),
+                    "CandidateKind": Kind,
+                    "PlacementFingerprint": Fingerprint,
+                    "TopologyFingerprint": CandidateTopologyFingerprint,
+                    "ElapsedSeconds": round(monotonic() - StartedAt, 6),
+                })
+            if not PublishedCandidates:
+                return False
+            InterfaceCandidateQueue[0:0] = [
+                (
+                    "prepare-eligibility",
+                    len(InterfaceCandidates) + Index,
+                    Candidate,
+                    0,
+                    ComponentVariant,
+                )
+                for Index, Candidate in enumerate(PublishedCandidates)
+            ]
+            return True
+
         while (
             InterfaceCandidateQueue
             or PendingProofGuidedPlacementByComponentVariant
@@ -14616,6 +15968,83 @@ def _PlaceAndRoutePcbWithPolicy(
                     PendingComponentVariant,
                 )
             if not InterfaceCandidateQueue:
+                # A complete capacity proof may enqueue its bounded repair
+                # portfolio while the enclosing source state is unwinding.
+                # Keep those immutable candidates parent-owned and do not
+                # report the proof as terminal until every generated member
+                # has reached the serial eligibility stage at least once.
+                AttemptedRepairPlacementFingerprints = {
+                    str(Attempt.get("PlacementFingerprint", ""))
+                    for Attempt in InterfaceAttemptDiagnostics
+                    if str(Attempt.get("PlacementFingerprint", ""))
+                }
+                # A repair placement is attempted when it is dequeued, even
+                # when the subsequent channelized state receives a different
+                # placement fingerprint.  Otherwise queue recovery mistakes
+                # a completed channel failure for an untried base repair and
+                # spends the remaining deadline rerunning the same candidate.
+                AttemptedRepairPlacementFingerprints.update(
+                    str(Attempt.get("PlacementFingerprint", ""))
+                    for Attempt in CapacityRepairPortfolioDiagnostics
+                    if (
+                        Attempt.get("Result")
+                        in {
+                            "capacity-pair-repair-dequeued",
+                            "bounded-proof-driven-repair-candidate-failed",
+                        }
+                        and str(Attempt.get("PlacementFingerprint", ""))
+                    )
+                )
+                UnattemptedCapacityRepairCandidates = tuple(
+                    (Fingerprint, Candidate)
+                    for Fingerprint, Candidate in sorted(
+                        CapacityRepairCandidateByPlacementFingerprint.items(),
+                        key=lambda Value: (
+                            0
+                            if CapacityRepairGeometryKindByPlacementFingerprint
+                            .get(Value[0], "").startswith("widen-")
+                            else 1,
+                            Value[0],
+                        ),
+                    )
+                    if Fingerprint not in AttemptedRepairPlacementFingerprints
+                )
+                if UnattemptedCapacityRepairCandidates and not Deadline.IsExpired():
+                    InterfaceCandidateQueue.extend(
+                        (
+                            "prepare-eligibility",
+                            len(InterfaceCandidates) + Index,
+                            Candidate,
+                            0,
+                            0,
+                        )
+                        for Index, (_Fingerprint, Candidate) in enumerate(
+                            UnattemptedCapacityRepairCandidates,
+                        )
+                    )
+                    CapacityRepairPortfolioDiagnostics.append({
+                        "Result": "capacity-repair-unattempted-candidates-requeued",
+                        "PlacementFingerprints": [
+                            Fingerprint
+                            for Fingerprint, _Candidate in (
+                                UnattemptedCapacityRepairCandidates
+                            )
+                        ],
+                        "GeometryKinds": [
+                            CapacityRepairGeometryKindByPlacementFingerprint.get(
+                                Fingerprint,
+                                "",
+                            )
+                            for Fingerprint, _Candidate in (
+                                UnattemptedCapacityRepairCandidates
+                            )
+                        ],
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt,
+                            6,
+                        ),
+                    })
+                    continue
                 break
             (
                 InterfaceWorkPhase,
@@ -14674,6 +16103,10 @@ def _PlaceAndRoutePcbWithPolicy(
             # planning work.  The local execution reserve becomes available
             # only at the explicit post-bind handoff below.
             InterfaceDeadline = SharedInterfacePlanningDeadline
+            if RetainedPlacementFingerprint in (
+                CapacityRepairConstraintByPlacementFingerprint
+            ):
+                InterfaceDeadline = Deadline
             StateRealizabilityNogoods: list[
                 ClusterInterfaceRealizabilityNogood
             ] = []
@@ -14682,6 +16115,69 @@ def _PlaceAndRoutePcbWithPolicy(
             StateFrozenPatternFingerprints: dict[str, str] = {}
             StateFrozenReservations: tuple[Any, ...] = ()
             StateActiveComponentSignals: set[str] = set()
+            CapacityRepairWitnessReserved = False
+            CapacityRepairConstraint = (
+                CapacityRepairConstraintByPlacementFingerprint.get(
+                    RetainedPlacementFingerprint
+                )
+            )
+            OwnedFrontierTopologyRepairKind = (
+                OwnedFrontierTopologyRepairKindByPlacementFingerprint.get(
+                    RetainedPlacementFingerprint,
+                    "",
+                )
+            )
+            EffectiveComponentVariant = (
+                ComponentVariantForState
+                + (
+                    1
+                    if OwnedFrontierTopologyRepairKind
+                    == "relocate-endpoint-cluster"
+                    else 0
+                )
+            )
+            if CapacityRepairConstraint is not None:
+                if (
+                    InterfaceWorkPhase == "prepare-eligibility"
+                    and
+                    RetainedPlacementFingerprint
+                    in DequeuedCapacityRepairPlacementFingerprints
+                ):
+                    CapacityRepairPortfolioDiagnostics.append({
+                        "Result": "capacity-pair-repair-duplicate-dequeue-suppressed",
+                        "CandidateId": InterfaceCandidate.CandidateId,
+                        "PlacementFingerprint": RetainedPlacementFingerprint,
+                        "SourceProofFingerprint": (
+                            CapacityRepairConstraint.SourceProofFingerprint
+                        ),
+                        "Signals": list(CapacityRepairConstraint.Signals),
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt,
+                            6,
+                        ),
+                    })
+                    continue
+                if InterfaceWorkPhase == "prepare-eligibility":
+                    # The serial solve work item intentionally reuses this
+                    # base placement fingerprint after its immutable domain
+                    # has been prepared.  Only suppress a second *prepare*
+                    # dequeue; suppressing the solve item discards a complete
+                    # domain before assembly/channel planning can consume it.
+                    DequeuedCapacityRepairPlacementFingerprints.add(
+                        RetainedPlacementFingerprint
+                    )
+                    CapacityRepairPortfolioDiagnostics.append({
+                        "Result": "capacity-pair-repair-dequeued",
+                        "CandidateId": InterfaceCandidate.CandidateId,
+                        "PlacementFingerprint": RetainedPlacementFingerprint,
+                        "SourceProofFingerprint": (
+                            CapacityRepairConstraint.SourceProofFingerprint
+                        ),
+                        "Signals": list(CapacityRepairConstraint.Signals),
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt, 6,
+                        ),
+                    })
             Transforms: dict[object, object] = {}
             NormalizedTransforms: tuple[
                 tuple[str, int, bool], ...
@@ -14701,7 +16197,11 @@ def _PlaceAndRoutePcbWithPolicy(
                     MaterializeSelectedJointPlacementLocalRouting(
                         InterfaceCandidate,
                         lambda Diagnostics, Candidate=InterfaceCandidate:
-                        InterfaceDeadline.RaiseIfExpired(
+                        (
+                            Deadline
+                            if CapacityRepairConstraint is not None
+                            else InterfaceDeadline
+                        ).RaiseIfExpired(
                             "ClusterInterfacePlacementMaterialization",
                             {
                                 "CandidateId": Candidate.CandidateId,
@@ -14718,6 +16218,19 @@ def _PlaceAndRoutePcbWithPolicy(
                         InterfaceCandidate,
                         Placement=MaterializedInterfacePlacement,
                     )
+                if CapacityRepairConstraint is not None:
+                    CapacityRepairPortfolioDiagnostics.append({
+                        "Result": "capacity-pair-repair-local-materialized",
+                        "CandidateId": InterfaceCandidate.CandidateId,
+                        "PlacementFingerprint": RetainedPlacementFingerprint,
+                        "SourceProofFingerprint": (
+                            CapacityRepairConstraint.SourceProofFingerprint
+                        ),
+                        "Signals": list(CapacityRepairConstraint.Signals),
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt, 6,
+                        ),
+                    })
                 try:
                     PreviewInterfacePlacement = (
                         BuildBoundedInterClusterRoutingDeck(
@@ -14732,9 +16245,7 @@ def _PlaceAndRoutePcbWithPolicy(
                             # coupling the state index to a different cluster
                             # partition made five states test unrelated,
                             # exact-unsatisfiable components.
-                            ComponentVariant=(
-                                ComponentVariantForState
-                            ),
+                            ComponentVariant=EffectiveComponentVariant,
                             PreferredSignals=(),
                         )
                     )
@@ -14765,6 +16276,32 @@ def _PlaceAndRoutePcbWithPolicy(
                             ForcedAffectedClusters=(
                                 SelectedComponentClusters
                             ),
+                            # A complete feedthrough/channel repair needs a
+                            # real clearance transform when ordinary channel
+                            # roots are all occupied by placed geometry.  The
+                            # bounded extra track enlarges only the selected
+                            # component seam; ordinary candidates retain the
+                            # compact zero-clearance architecture.
+                            ChannelClearanceTracks=(
+                                1
+                                if (
+                                    CapacityRepairConstraint is not None
+                                    and CapacityRepairConstraint.RepairLevel
+                                    == "channel-capacity"
+                                )
+                                else 0
+                            ),
+                            # The second bounded owned-frontier candidate
+                            # must exercise the next legal channel topology,
+                            # not merely a different packed gate geometry
+                            # that the channel builder collapses back to its
+                            # first root/axis solution.
+                            ChannelTopologyVariant=(
+                                1
+                                if OwnedFrontierTopologyRepairKind
+                                == "relocate-endpoint-cluster"
+                                else 0
+                            ),
                         )
                     )
                     MaterializedInterfacePlacement = (
@@ -14774,9 +16311,7 @@ def _PlaceAndRoutePcbWithPolicy(
                             MaximumAffectedClusters=3,
                             MaximumDeckLanes=12,
                             InterfaceDeckLayer=3,
-                            ComponentVariant=(
-                                ComponentVariantForState
-                            ),
+                            ComponentVariant=EffectiveComponentVariant,
                             PreferredSignals=(),
                             ForcedAffectedClusters=(
                                 SelectedComponentClusters
@@ -14831,10 +16366,13 @@ def _PlaceAndRoutePcbWithPolicy(
                         set(),
                     )
                 )
+                CapacityRepairPlacementState = (
+                    CapacityRepairConstraint is not None
+                )
                 if (
                     InterfaceWorkPhase == "prepare-eligibility"
-                    and
-                    ComponentSelectionFingerprint
+                    and not CapacityRepairPlacementState
+                    and ComponentSelectionFingerprint
                     in SeenComponentSelections
                 ):
                     EquivalentProof = next(
@@ -14904,6 +16442,10 @@ def _PlaceAndRoutePcbWithPolicy(
                         ),
                     )
                 )
+                if CapacityRepairConstraint is not None:
+                    CapacityRepairConstraintByPlacementFingerprint[
+                        ChannelizedPlacementFingerprint
+                    ] = CapacityRepairConstraint
                 InterfaceCandidate = replace(
                     InterfaceCandidate,
                     CandidateId=(
@@ -14943,7 +16485,11 @@ def _PlaceAndRoutePcbWithPolicy(
                         MaterializedInterfacePlacement.Placed,
                         WorkCheck=lambda Diagnostics,
                         Candidate=InterfaceCandidate:
-                        InterfaceDeadline.RaiseIfExpired(
+                        (
+                            Deadline
+                            if CapacityRepairConstraint is not None
+                            else InterfaceDeadline
+                        ).RaiseIfExpired(
                             "ClusterInterfaceResourceMaterialization",
                             {
                                 "CandidateId": Candidate.CandidateId,
@@ -15224,6 +16770,11 @@ def _PlaceAndRoutePcbWithPolicy(
                                 InterfaceCandidate.PlacementFingerprint
                             ),
                             LocalRouteFingerprint=LocalRouteFingerprint,
+                            DeferClusterBoundaryLeaseUntilCapacityPrecheck=(
+                                CapacityRepairConstraint is not None
+                                and CapacityRepairConstraint.RepairLevel
+                                == "local-assembly"
+                            ),
                             UnboundOwnedSignalFrontierProofCallback=(
                                 None
                                 if DeferUnboundFrontierToUnaryCompilation
@@ -15337,6 +16888,152 @@ def _PlaceAndRoutePcbWithPolicy(
                                 "ImplicitForeignTransitDomainCount": 0,
                             },
                         ))
+                    CapacityRepairConstraint = (
+                        CapacityRepairConstraintByPlacementFingerprint.get(
+                            RetainedPlacementFingerprint
+                        )
+                    )
+                    # Channel-capacity/feedthrough repairs do not reserve a
+                    # local seam witness.  Keep their telemetry explicit
+                    # rather than reading a branch-local variable below.
+                    AchievedSeamFingerprint = ""
+                    if (
+                        CapacityRepairConstraint is not None
+                        and CapacityRepairConstraint.RepairLevel
+                        == "local-assembly"
+                    ):
+                        (
+                            HasDisjointSeams,
+                            AchievedSeamFingerprint,
+                            SelectedSeamAssignment,
+                            AvailableSeamClassesBySignal,
+                        ) = (
+                            PreparedEligibilityHasDisjointCapacitySeams(
+                                PreparedEligibility,
+                                CapacityRepairConstraint,
+                            )
+                        )
+                        if not HasDisjointSeams:
+                            CapacityRepairPortfolioDiagnostics.append({
+                                "Result": "capacity-pair-repair-rejected-overlapping-seams",
+                                "CandidateId": InterfaceCandidate.CandidateId,
+                                "PlacementFingerprint": (
+                                    RetainedPlacementFingerprint
+                                ),
+                                "SourceProofFingerprint": (
+                                    CapacityRepairConstraint
+                                    .SourceProofFingerprint
+                                ),
+                                "Signals": list(
+                                    CapacityRepairConstraint.Signals
+                                ),
+                                "ProofComplete": True,
+                                "CoreSignalCount": len(
+                                    CapacityRepairConstraint.Signals
+                                ),
+                                "AvailableSeamClassesBySignal": [
+                                    [Signal, list(Seams)]
+                                    for Signal, Seams
+                                    in AvailableSeamClassesBySignal
+                                ],
+                                "GeometryFingerprint": (
+                                    BuildCapacityRepairGeometryFingerprint(
+                                        InterfaceCandidate,
+                                        CapacityRepairConstraint.Signals,
+                                    )
+                                ),
+                                "ElapsedSeconds": round(
+                                    monotonic() - Deadline.StartedAt, 6,
+                                ),
+                            })
+                            raise RoutingStageError(RoutingFailure(
+                                Reason=(
+                                    RoutingFailureReason
+                                    .ComponentPortAssignmentUnsatisfiable
+                                ),
+                                Stage="PhysicalCapacityRepairPrecheck",
+                                AffectedNets=CapacityRepairConstraint.Signals,
+                                Detail=(
+                                    "the repaired placement still has no "
+                                    "disjoint local seam capacity for the "
+                                    "complete symbolic core"
+                                ),
+                                Diagnostics={
+                                    "SymbolicCapacityPlacementFeedback": True,
+                                    "SymbolicCapacityProofFingerprint": (
+                                        CapacityRepairConstraint
+                                        .SourceProofFingerprint
+                                    ),
+                                    "PlacementInterfacePressureSignals": list(
+                                        CapacityRepairConstraint.Signals
+                                    ),
+                                    "LocalCapacityCoreClause": [
+                                        list(Value)
+                                        for Value in CapacityRepairConstraint
+                                        .ForcedSeamClasses
+                                    ],
+                                    "CapacityRepairConstraint": (
+                                        CapacityRepairConstraint.ToDictionary()
+                                    ),
+                                    "CapacityRepairAchievedSeamFingerprint": "",
+                                    "GlobalPlanningEntered": False,
+                                    "LocalCompilationEntered": False,
+                                },
+                            ))
+                        CapacityRepairPortfolioDiagnostics.append({
+                            "Result": "capacity-repair-witness-reserved",
+                            "CandidateId": InterfaceCandidate.CandidateId,
+                            "PlacementFingerprint": RetainedPlacementFingerprint,
+                            "SourceProofFingerprint": (
+                                CapacityRepairConstraint.SourceProofFingerprint
+                            ),
+                            "Signals": list(CapacityRepairConstraint.Signals),
+                            "ProofComplete": True,
+                            "CoreSignalCount": len(
+                                CapacityRepairConstraint.Signals
+                            ),
+                            "AchievedSeamFingerprint": AchievedSeamFingerprint,
+                            "AvailableSeamClassesBySignal": [
+                                [Signal, list(Seams)]
+                                for Signal, Seams
+                                in AvailableSeamClassesBySignal
+                            ],
+                            "SelectedSeamAssignment": [
+                                list(Value) for Value in SelectedSeamAssignment
+                            ],
+                            "ElapsedSeconds": round(
+                                monotonic() - Deadline.StartedAt, 6,
+                            ),
+                        })
+                        CapacityRepairConstraint = replace(
+                            CapacityRepairConstraint,
+                            AvailableSeamClassesBySignal=(
+                                AvailableSeamClassesBySignal
+                            ),
+                            SelectedSeamAssignment=SelectedSeamAssignment,
+                        )
+                        CapacityRepairConstraintByPlacementFingerprint[
+                            RetainedPlacementFingerprint
+                        ] = CapacityRepairConstraint
+                        CapacityRepairWitnessReserved = True
+                        # Make the witness a hard parent-owned reservation.
+                        # The prepared domain is immutable; publish unary
+                        # no-goods for every other local seam so the serial
+                        # assembly CSP cannot silently choose an overlapping
+                        # alternative after this admission proof.
+                        SelectedSeamsBySignal = dict(SelectedSeamAssignment)
+                        LocalFactorsBySignal = dict(
+                            PreparedEligibility.LocalAccessFactorsBySignal
+                        )
+                        for Signal, SelectedSeam in SelectedSeamsBySignal.items():
+                            for Factor in LocalFactorsBySignal.get(Signal, ()):
+                                Seam = str(Factor.SeamContractFingerprint)
+                                if Seam != SelectedSeam:
+                                    (
+                                        InterfaceResources
+                                        .RejectedPhysicalComponentLocalSeamReservationSets
+                                        .add(frozenset(((Signal, Seam),)))
+                                    )
                     PreparedEligibilityByState[
                         EligibilityStateKey
                     ] = PreparedEligibility
@@ -15366,6 +17063,32 @@ def _PlaceAndRoutePcbWithPolicy(
                             PreparedEligibility.PreparationStageTimings
                         ),
                         "PhysicalConnectorDiagnostics": {
+                            "CapacityRepairConstraint": (
+                                CapacityRepairConstraint.ToDictionary()
+                                if CapacityRepairConstraint is not None
+                                else None
+                            ),
+                            "CapacityRepairAchievedSeamFingerprint": (
+                                AchievedSeamFingerprint
+                                if CapacityRepairConstraint is not None
+                                else ""
+                            ),
+                            "LocalFactorCacheHitSignals": list(
+                                PreparedEligibility
+                                .LocalFactorCacheHitSignals
+                            ),
+                            "LocalFactorRebuiltSignals": list(
+                                PreparedEligibility
+                                .LocalFactorRebuiltSignals
+                            ),
+                            "LocalFactorPreparationElapsedSeconds": (
+                                PreparedEligibility
+                                .LocalFactorPreparationElapsedSeconds
+                            ),
+                            "ExteriorFactorPreparationElapsedSeconds": (
+                                PreparedEligibility
+                                .ExteriorFactorPreparationElapsedSeconds
+                            ),
                             "SearchCount": (
                                 PreparedEligibility
                                 .GlobalConnectorSearchCount
@@ -15405,6 +17128,14 @@ def _PlaceAndRoutePcbWithPolicy(
                             "GuideFieldFallbackCount": (
                                 PreparedEligibility
                                 .GlobalGuideFieldFallbackCount
+                            ),
+                            "NativeBatchWorkItems": (
+                                PreparedEligibility
+                                .NativeConnectorBatchWorkItems
+                            ),
+                            "NativeBatchActiveWorkerCount": (
+                                PreparedEligibility
+                                .NativeConnectorBatchActiveWorkerCount
                             ),
                             "LaneFactorExpansionCount": (
                                 PreparedEligibility
@@ -15456,6 +17187,118 @@ def _PlaceAndRoutePcbWithPolicy(
                     if QueuedCandidate.PlacementFingerprint
                     != RetainedPlacementFingerprint
                 }
+                # Once a complete local rejection has focused this placement
+                # epoch, prove the next selected capacity contract before
+                # compiling the broad unary aperture support.  Unary support
+                # is valuable after a feasible proof, but it previously
+                # consumed the entire planning reserve and prevented the
+                # complete proof required to admit a geometry repair.
+                ProofFirstCapacityEligible = bool(
+                    ActiveComponentCutSignals
+                    or CapacityRepairConstraint is not None
+                )
+                if ProofFirstCapacityEligible:
+                    ProofFirstStartedAt = monotonic()
+                    ProofFirstDeadline = RoutingDeadline(
+                        StartedAt=Deadline.StartedAt,
+                        ExpiresAt=max(
+                            monotonic(),
+                            Deadline.ExpiresAt - 2.0,
+                        ),
+                        ExpirationKind="StageReserveExpired",
+                    )
+                    ProofFirstAssembly = (
+                        SolvePreparedPhysicalComponentEligibility(
+                            PreparedEligibility,
+                            Resources=InterfaceResources,
+                            Deadline=ProofFirstDeadline,
+                        )
+                    )
+                    ProofFirst = ProveClosedComponentSymbolicCapacityEligibility(
+                        ProofFirstAssembly.Problem,
+                        DeadlineSeconds=ProofFirstDeadline.RemainingSeconds(),
+                        # The proof routine reports an incomplete result on
+                        # its own bounded deadline.  Do not raise here: an
+                        # incomplete proof is not repair evidence and must
+                        # fall through to the existing compilation path.
+                        WorkCheck=None,
+                        CompletedProofCache=(
+                            ComponentSymbolicCapacityProofCache
+                        ),
+                        RouteClaimsConstructionCache=(
+                            ComponentRouteClaimsConstructionCache
+                        ),
+                        SymbolicNetStateCache=(
+                            InterfaceResources
+                            .PhysicalComponentSymbolicNetStateCache
+                        ),
+                    )
+                    RecordPhysicalComponentStageTiming(
+                        "PhysicalSymbolicCapacityProofFirst",
+                        ProofFirstStartedAt,
+                        Result=ProofFirst.Status,
+                        PlanFingerprint=(
+                            ProofFirstAssembly.Plan.PlanFingerprint
+                        ),
+                    )
+                    InterfaceAttemptDiagnostics.append({
+                        "CandidateId": InterfaceCandidate.CandidateId,
+                        "PlacementFingerprint": (
+                            InterfaceCandidate.PlacementFingerprint
+                        ),
+                        "ComponentVariant": ComponentVariantForState,
+                        "Result": "symbolic-capacity-proof-first",
+                        "Status": ProofFirst.Status,
+                        "ProofComplete": bool(
+                            dict(ProofFirst.Diagnostics or {}).get(
+                                "SymbolicCapacityProofComplete", False,
+                            )
+                        ),
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt, 6,
+                        ),
+                    })
+                    if ProofFirst.Status == "architectural-unsatisfiable":
+                        ProofFirstDiagnostics = (
+                            RecordPhysicalComponentSymbolicCapacityEligibilityNoGood(
+                                ProofFirst,
+                                ProofFirstAssembly.Plan,
+                                InterfaceResources,
+                                FactorDomain=PreparedEligibility,
+                            )
+                        )
+                        ProofFirstSignals = tuple(sorted(set(map(
+                            str,
+                            dict(ProofFirst.Diagnostics or {}).get(
+                                "LocalUnsatCoreSignals", ()
+                            ),
+                        ))))
+                        raise RoutingStageError(RoutingFailure(
+                            Reason=(
+                                RoutingFailureReason
+                                .ComponentPortAssignmentUnsatisfiable
+                            ),
+                            Stage=(
+                                "PhysicalSymbolicCapacityPlacementFeedback"
+                            ),
+                            AffectedNets=ProofFirstSignals,
+                            Detail=(
+                                "complete proof-first local capacity core "
+                                "requires geometry repair"
+                            ),
+                            Diagnostics={
+                                "SymbolicCapacityPlacementFeedback": True,
+                                "PlacementInterfacePressureSignals": list(
+                                    ProofFirstSignals
+                                ),
+                                **BuildSymbolicCapacityRepairEvidence(
+                                    ProofFirstDiagnostics,
+                                    ProofFirstSignals,
+                                ),
+                                "GlobalPlanningEntered": False,
+                                "LocalCompilationEntered": False,
+                            },
+                        ))
                 UnarySupportStartedAt = monotonic()
                 UnarySupportSignals = tuple(
                     Signal
@@ -15471,10 +17314,10 @@ def _PlaceAndRoutePcbWithPolicy(
                     PreparedEligibility,
                     UnarySupportSignals,
                     DeadlineSeconds=(
-                        SharedInterfacePlanningDeadline.RemainingSeconds()
+                        InterfaceDeadline.RemainingSeconds()
                     ),
                     WorkCheck=lambda Diagnostics:
-                    SharedInterfacePlanningDeadline.RaiseIfExpired(
+                    InterfaceDeadline.RaiseIfExpired(
                         "PhysicalComponentUnarySupportCompilation",
                         Diagnostics,
                     ),
@@ -15535,7 +17378,19 @@ def _PlaceAndRoutePcbWithPolicy(
                     InterfaceResources
                     .FrozenPhysicalComponentPostClosurePortalHandoff
                 )
-                if FrozenPortalHandoff is not None:
+                # A proof-guided local repair must first prove that its owned
+                # component can assemble.  The complete exterior aperture
+                # deck is deferred until that local proof succeeds; global
+                # and detailed routing still legalize those claims later.
+                DeferForeignPortalUnarySupport = bool(
+                    InterfaceCandidate.PlacementFingerprint
+                    in GeneratedProofGuidedPlacementFingerprints
+                    or ActiveComponentCutSignals
+                )
+                if (
+                    FrozenPortalHandoff is not None
+                    and not DeferForeignPortalUnarySupport
+                ):
                     (
                         ForeignPortalUnaryClauses,
                         ForeignPortalUnaryDiagnostics,
@@ -15558,6 +17413,11 @@ def _PlaceAndRoutePcbWithPolicy(
                             )
                         ).items()
                     })
+                elif FrozenPortalHandoff is not None:
+                    ForeignPortalUnaryDiagnostics = {
+                        "Complete": True,
+                        "DeferredForProofGuidedLocalEligibility": True,
+                    }
                 NewUnaryClauses = frozenset(
                     Clause
                     for Clause in (
@@ -15606,6 +17466,23 @@ def _PlaceAndRoutePcbWithPolicy(
                     Result="complete",
                     PlanFingerprint=PreparedAssembly.Plan.PlanFingerprint,
                 )
+                if CapacityRepairWitnessReserved:
+                    CapacityRepairPortfolioDiagnostics.append({
+                        "Result": "capacity-repair-csp-admitted",
+                        "CandidateId": InterfaceCandidate.CandidateId,
+                        "PlacementFingerprint": RetainedPlacementFingerprint,
+                        "SourceProofFingerprint": (
+                            CapacityRepairConstraint.SourceProofFingerprint
+                        ),
+                        "SelectedSeamAssignment": [
+                            list(Value)
+                            for Value
+                            in CapacityRepairConstraint.SelectedSeamAssignment
+                        ],
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt, 6,
+                        ),
+                    })
                 PairSupportStartedAt = monotonic()
                 # Complete selected-contract failures below identify the
                 # small resource-relevant binary core. Compiling the dense
@@ -15766,7 +17643,11 @@ def _PlaceAndRoutePcbWithPolicy(
                 # planning reserve was still available.  Keep the explicit
                 # local-compilation and final-routing reserves in the shared
                 # schedule, but do not introduce another deadline here.
-                InterfaceDeadline = SharedInterfacePlanningDeadline
+                InterfaceDeadline = (
+                    Deadline
+                    if CapacityRepairConstraint is not None
+                    else SharedInterfacePlanningDeadline
+                )
                 PhysicalAssemblyPlan = PreparedAssembly.Plan
                 ComponentProblem = PreparedAssembly.Problem
                 ComponentBasePlacement = (
@@ -15774,20 +17655,27 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
                 ComponentBaseCandidate = InterfaceCandidate
                 CumulativeSymbolicCapacityPressureSignals: set[str] = set()
+                LatestSymbolicCapacityRepairEvidence: dict[str, object] = {}
                 CapacityFeasibleLocalContractFingerprints: set[str] = set()
                 CompiledSymbolicCapacityBinaryCores: set[
                     tuple[str, str]
                 ] = set()
-                MaximumCompleteBinaryCoreCertificates = (
-                    len(ComponentProblem.ComponentSignals)
-                    * max(0, len(ComponentProblem.ComponentSignals) - 1)
-                    // 2
+                SymbolicCapacityAssemblyReplanCount = 0
+                MaximumSymbolicCapacityAssemblyReplans = (
+                    MaximumProofGuidedSymbolicCapacityPairPlacements
                 )
+                # A complete capacity proof already yields an exact selected
+                # port/assembly no-good below.  Exhaustively materializing a
+                # pair certificate is deferred from the CLA4 critical path;
+                # it may be warmed later, but must not consume the local
+                # placement-repair reserve before the no-good is replanned.
+                MaximumCompleteBinaryCoreCertificates = 0
 
                 def AdmitSymbolicLocalCapacity(
                     Assembly: Any,
                 ) -> bool:
                     """Prove selected local support before exterior routing."""
+                    nonlocal LatestSymbolicCapacityRepairEvidence
                     LocalCapacityContractFingerprint = BuildStableFingerprint((
                         "closed-component-local-capacity-contract-v1",
                         Assembly.Problem.PlacementFingerprint,
@@ -16018,6 +17906,12 @@ def _PlaceAndRoutePcbWithPolicy(
                             else ()
                         ))
                     )
+                    LatestSymbolicCapacityRepairEvidence = (
+                        BuildSymbolicCapacityRepairEvidence(
+                            NoGoodDiagnostics,
+                            CumulativeSymbolicCapacityPressureSignals,
+                        )
+                    )
                     StateAttemptDiagnostics.append({
                         "Result": (
                             "symbolic-capacity-reject-before-global"
@@ -16035,7 +17929,48 @@ def _PlaceAndRoutePcbWithPolicy(
                 def ReplanPhysicalAssemblyWithTiming(
                     RequiredGlobalBoundaryPorts: tuple[Any, ...] | None = None,
                 ) -> Any:
+                    nonlocal SymbolicCapacityAssemblyReplanCount
                     while True:
+                        if (
+                            SymbolicCapacityAssemblyReplanCount
+                            >= MaximumSymbolicCapacityAssemblyReplans
+                        ):
+                            raise RoutingStageError(RoutingFailure(
+                                Reason=(
+                                    RoutingFailureReason
+                                    .ComponentPortAssignmentUnsatisfiable
+                                ),
+                                Stage=(
+                                    "PhysicalSymbolicCapacity"
+                                    "PlacementFeedback"
+                                ),
+                                AffectedNets=tuple(sorted(
+                                    CumulativeSymbolicCapacityPressureSignals
+                                )),
+                                Detail=(
+                                    "a complete selected local capacity core "
+                                    "rejected the bounded assembly-replan "
+                                    "portfolio; advancing to "
+                                    "targeted placement feedback"
+                                ),
+                                Diagnostics={
+                                    "SymbolicCapacityPlacementFeedback": True,
+                                    "PlacementInterfacePressureSignals": (
+                                        sorted(
+                                            CumulativeSymbolicCapacityPressureSignals
+                                        )
+                                    ),
+                                    "SymbolicCapacityAssemblyReplanCount": (
+                                        SymbolicCapacityAssemblyReplanCount
+                                    ),
+                                    "MaximumSymbolicCapacityAssemblyReplans": (
+                                        MaximumSymbolicCapacityAssemblyReplans
+                                    ),
+                                    **LatestSymbolicCapacityRepairEvidence,
+                                    "GlobalPlanningEntered": False,
+                                    "LocalCompilationEntered": False,
+                                },
+                            ))
                         ReplanStartedAt = monotonic()
                         try:
                             Result = ReplanPhysicalComponentAssembly(
@@ -16072,6 +18007,7 @@ def _PlaceAndRoutePcbWithPolicy(
                                         )
                                     ),
                                     "SymbolicCapacityPlacementFeedback": True,
+                                    **LatestSymbolicCapacityRepairEvidence,
                                 },
                             )) from Error
                         except Exception:
@@ -16087,6 +18023,7 @@ def _PlaceAndRoutePcbWithPolicy(
                             Result="complete",
                             PlanFingerprint=Result.Plan.PlanFingerprint,
                         )
+                        SymbolicCapacityAssemblyReplanCount += 1
                         if AdmitSymbolicLocalCapacity(Result):
                             return Result
                         if RequiredGlobalBoundaryPorts is not None:
@@ -17389,6 +19326,22 @@ def _PlaceAndRoutePcbWithPolicy(
                 InterfaceSolveIncompleteError = None
                 break
             except RoutingStageError as Error:
+                if CapacityRepairConstraint is not None:
+                    CapacityRepairPortfolioDiagnostics.append({
+                        "Result": "bounded-proof-driven-repair-candidate-failed",
+                        "CandidateId": InterfaceCandidate.CandidateId,
+                        "PlacementFingerprint": RetainedPlacementFingerprint,
+                        "SourceProofFingerprint": (
+                            CapacityRepairConstraint.SourceProofFingerprint
+                        ),
+                        "Signals": list(CapacityRepairConstraint.Signals),
+                        "FailureReason": Error.Failure.Reason.value,
+                        "FailureStage": Error.Failure.Stage,
+                        "FailureDetail": Error.Failure.Detail,
+                        "ElapsedSeconds": round(
+                            monotonic() - Deadline.StartedAt, 6,
+                        ),
+                    })
                 CaptureResources = RoutingResourcesByFingerprint.get(
                     InterfaceCandidate.PlacementFingerprint
                 )
@@ -17499,6 +19452,18 @@ def _PlaceAndRoutePcbWithPolicy(
                             PhysicalComponentStageTimings
                         ),
                     })
+                    if bool(
+                        Error.Failure.Diagnostics.get(
+                            "SymbolicCapacityPlacementFeedback",
+                            False,
+                        )
+                        if isinstance(
+                            Error.Failure.Diagnostics,
+                            dict,
+                        )
+                        else False
+                    ):
+                        break
                     continue
                 PlacementSliceExpired = bool(
                     InterfaceDeadline is not SharedInterfacePlanningDeadline
@@ -17742,6 +19707,127 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
                 if not StateExhaustive:
                     StateIncomplete = True
+                if (
+                    StateExhaustive
+                    and not StateIncomplete
+                    and FinalOwnershipUnsatisfiable
+                    and OwnershipCoreFingerprint
+                ):
+                    CoreIdentity = (
+                        ComponentStateFingerprint
+                        if ComponentStateFingerprint
+                        else InterfaceCandidate.PlacementFingerprint
+                    )
+                    CoreAttemptKey = (
+                        CoreIdentity,
+                        OwnershipCoreFingerprint,
+                    )
+                    CoreAttempts = (
+                        RepeatedOwnershipCoreAttempts.get(CoreAttemptKey, 0)
+                        + 1
+                    )
+                    RepeatedOwnershipCoreAttempts[
+                        CoreAttemptKey
+                    ] = CoreAttempts
+                    PendingOwnedFrontierTopologyRepair = (
+                        BuildPhysicalOwnedFrontierTopologyRepairCore(
+                            Error.Failure,
+                            RetainedBaseInterfaceCandidate,
+                        )
+                    )
+                    OwnedFrontierTopologyPortfolioRemaining = bool(
+                        PendingOwnedFrontierTopologyRepair is not None
+                        and OwnedFrontierTopologyRepairAttemptCountByProofFingerprint
+                        .get(
+                            PendingOwnedFrontierTopologyRepair
+                            .SourceProofFingerprint,
+                            0,
+                        ) < 2
+                    )
+                    ProvenRequestedComponentStates = {
+                        (
+                            Proof.ComponentStateFingerprint
+                            or Proof.PlacementStateFingerprint
+                        )
+                        for Proof in InterfaceStateProofs
+                    }
+                    GlobalComponentStateDomainExhausted = bool(
+                        not InterfaceCandidateQueue
+                        and not PendingProofGuidedPlacementByComponentVariant
+                        and RequestedComponentStateFingerprints
+                        <= ProvenRequestedComponentStates
+                    )
+                    if (
+                        CoreAttempts >= 2
+                        and not OwnedFrontierTopologyPortfolioRemaining
+                        and GlobalComponentStateDomainExhausted
+                    ):
+                        InterfaceSolveIncompleteError = RoutingStageError(
+                            replace(
+                                Error.Failure,
+                                Reason=(
+                                    RoutingFailureReason
+                                    .ClusterInterfaceSolveIncomplete
+                                ),
+                                Stage=(
+                                    "OwnedFrontierTopologyRepairExhausted"
+                                    if PendingOwnedFrontierTopologyRepair
+                                    is not None else
+                                    "ClusterInterfaceSolveDuplicateUnsatCore"
+                                ),
+                                Detail=(
+                                    "complete owned-frontier topology repair "
+                                    "portfolio was exhausted without a "
+                                    "feasible interface domain"
+                                    if PendingOwnedFrontierTopologyRepair
+                                    is not None else Error.Failure.Detail
+                                ),
+                                RepairActions=(),
+                                Diagnostics={
+                                    **FailureDiagnostics,
+                                    "RepeatedOwnershipCoreAttempts": (
+                                        CoreAttempts
+                                    ),
+                                    "OwnershipUnsatCoreFingerprint": (
+                                        OwnershipCoreFingerprint
+                                    ),
+                                    "ComponentStateFingerprint": (
+                                        CoreIdentity
+                                    ),
+                                    "DomainFingerprint": (
+                                        DomainFingerprint
+                                    ),
+                                    "CompletedComponentStateAttempts": (
+                                        list(InterfaceAttemptDiagnostics)
+                                    ),
+                                    "PhysicalLocalFactorDiversificationPortfolio": (
+                                        list(
+                                            LocalFactorDiversificationPortfolioDiagnostics
+                                        )
+                                    ),
+                                    "PhysicalOwnedFrontierTopologyRepairPortfolio": (
+                                        list(
+                                            OwnedFrontierTopologyRepairPortfolioDiagnostics
+                                        )
+                                    ),
+                                    "ComponentPlacementSearchOrder": (
+                                        "component-outer-placement-inner"
+                                    ),
+                                    "InterfaceSolve": {
+                                        "Complete": False,
+                                        "DomainComplete": (
+                                            DomainComplete
+                                        ),
+                                        "OwnershipComplete": True,
+                                        "RealizabilityComplete": (
+                                            RealizabilityComplete
+                                        ),
+                                        "ExecutableRepairAllowed": False,
+                                    },
+                                },
+                            )
+                        )
+                        break
                 StateStatus = (
                     "incomplete"
                     if StateIncomplete
@@ -17751,6 +19837,33 @@ def _PlaceAndRoutePcbWithPolicy(
                         else "realizability-unsatisfiable"
                     )
                 )
+                RoutabilityCore = BuildComponentRoutabilityCore(
+                    Error.Failure,
+                    PlacementStateFingerprint=(
+                        InterfaceCandidate.PlacementFingerprint
+                    ),
+                    ComponentStateFingerprint=(
+                        ComponentStateFingerprint
+                    ),
+                    DomainFingerprint=DomainFingerprint,
+                    CoreFingerprint=OwnershipCoreFingerprint,
+                    Complete=bool(
+                        StateExhaustive
+                        and not StateIncomplete
+                        and FinalOwnershipUnsatisfiable
+                    ),
+                )
+                CoreFailure = Error.Failure
+                if RoutabilityCore is not None:
+                    CoreFailure = replace(
+                        Error.Failure,
+                        Diagnostics={
+                            **FailureDiagnostics,
+                            "ComponentRoutabilityCore": (
+                                RoutabilityCore.ToDictionary()
+                            ),
+                        },
+                    )
                 InterfaceStateProofs.append(
                     ClusterInterfaceStateProof(
                         PlacementStateFingerprint=(
@@ -17776,6 +19889,7 @@ def _PlaceAndRoutePcbWithPolicy(
                             if FinalOwnershipUnsatisfiable
                             else ()
                         ),
+                        RoutabilityCore=RoutabilityCore,
                         AssignmentFingerprints=tuple(
                             StateAssignmentFingerprints
                         ),
@@ -17825,6 +19939,11 @@ def _PlaceAndRoutePcbWithPolicy(
                         "OwnershipUnsatCoreFingerprint": (
                             OwnershipCoreFingerprint
                         ),
+                        "ComponentRoutabilityCore": (
+                            RoutabilityCore.ToDictionary()
+                            if RoutabilityCore is not None
+                            else None
+                        ),
                         "DomainFingerprint": DomainFingerprint,
                         "ExpansionCount": int(
                             FailureDiagnostics.get(
@@ -17860,7 +19979,24 @@ def _PlaceAndRoutePcbWithPolicy(
                         for Nogood in StateRealizabilityNogoods
                     ],
                 })
-                if StateExhaustive and not StateIncomplete:
+                # A selected-port symbolic capacity proof may complete before
+                # its enclosing assembly-domain replan reaches exhaustion.
+                # It is still exact evidence for one local geometry repair;
+                # waiting for the outer state to become exhaustive discards
+                # the NandNet28/NandNet29 core at the stage-reserve boundary.
+                CompleteSymbolicCapacityPlacementFeedback = bool(
+                    FailureDiagnostics.get(
+                        "SymbolicCapacityPlacementFeedback",
+                        False,
+                    )
+                    and FailureDiagnostics.get(
+                        "PlacementInterfacePressureSignals",
+                        (),
+                    )
+                )
+                if (
+                    StateExhaustive and not StateIncomplete
+                ) or CompleteSymbolicCapacityPlacementFeedback:
                     PortDomainSizes = FailureDiagnostics.get(
                         "PortDomainSizes",
                         {},
@@ -17902,6 +20038,7 @@ def _PlaceAndRoutePcbWithPolicy(
                         or CompleteEmptyPortSignals
                         or tuple(map(str, Error.Failure.AffectedNets))
                     )
+                    PlacementAdvanced = False
                     if ComponentAccessCoreSignals:
                         # Complete global channel cuts are placement evidence
                         # too.  Feed their affected signals into the retained
@@ -17919,10 +20056,22 @@ def _PlaceAndRoutePcbWithPolicy(
                         ReorderRemainingPlacementsForAccessCore(
                             RetainedPlacementFingerprint
                         )
-                        EnqueueProofGuidedPhysicalPlacement(
-                            Error.Failure,
-                            RetainedBaseInterfaceCandidate,
-                            ComponentVariantForState,
+                        OwnedFrontierTopologyRepairAdvanced = (
+                            EnqueueOwnedFrontierTopologyRepair(
+                                Error.Failure,
+                                RetainedBaseInterfaceCandidate,
+                                ComponentVariantForState,
+                            )
+                            if StateExhaustive and not StateIncomplete
+                            else False
+                        )
+                        PlacementAdvanced = (
+                            OwnedFrontierTopologyRepairAdvanced
+                            or EnqueueProofGuidedPhysicalPlacement(
+                                CoreFailure,
+                                RetainedBaseInterfaceCandidate,
+                                ComponentVariantForState,
+                            )
                         )
                         InterfaceAttemptDiagnostics.append({
                             "CandidateId": (
@@ -17936,8 +20085,12 @@ def _PlaceAndRoutePcbWithPolicy(
                                 ComponentVariantForState
                             ),
                             "Result": (
-                                "component-access-core-ranked-remaining-"
-                                "placements"
+                                "owned-frontier-topology-repair"
+                                if OwnedFrontierTopologyRepairAdvanced
+                                else (
+                                    "component-access-core-ranked-remaining-"
+                                    "placements"
+                                )
                             ),
                             "ActiveComponentCutSignals": sorted(
                                 ActiveComponentCutSignals
@@ -17965,7 +20118,10 @@ def _PlaceAndRoutePcbWithPolicy(
                                 )
                             ),
                         })
-                if StateIncomplete:
+                if (
+                    StateIncomplete
+                    or CompleteSymbolicCapacityPlacementFeedback
+                ):
                     PreservePhysicalReason = (
                         Error.Failure.Reason
                         in {
@@ -17992,6 +20148,19 @@ def _PlaceAndRoutePcbWithPolicy(
                             RepairActions=(),
                             Diagnostics={
                                 **FailureDiagnostics,
+                                "PhysicalCapacityRepairPortfolio": list(
+                                    CapacityRepairPortfolioDiagnostics
+                                ),
+                                "PhysicalLocalFactorDiversificationPortfolio": (
+                                    list(
+                                        LocalFactorDiversificationPortfolioDiagnostics
+                                    )
+                                ),
+                                "PhysicalOwnedFrontierTopologyRepairPortfolio": (
+                                    list(
+                                        OwnedFrontierTopologyRepairPortfolioDiagnostics
+                                    )
+                                ),
                                 "CompletedComponentStateAttempts": list(
                                     InterfaceAttemptDiagnostics
                                 ),
@@ -18011,25 +20180,42 @@ def _PlaceAndRoutePcbWithPolicy(
                         )
                     )
                     if (
-                        FailureDiagnostics.get(
-                            "PlacementWorkSliceExpired",
-                            False,
+                        (
+                            CompleteSymbolicCapacityPlacementFeedback
+                            or (
+                                FailureDiagnostics.get(
+                                    "PlacementWorkSliceExpired",
+                                    False,
+                                )
+                                and PlacementAdvanced
+                            )
                         )
-                        and not SharedInterfacePlanningDeadline.IsExpired()
+                        and not (
+                            Deadline
+                            if CompleteSymbolicCapacityPlacementFeedback
+                            else InterfaceDeadline
+                        ).IsExpired()
                     ):
                         # This is proof-neutral placement pressure, not an
                         # UNSAT classification.  Preserve the placement-local
                         # CSP/no-good caches, but advance geometry instead of
                         # recursively reopening the same placement planner.
-                        PlacementAdvanced = (
-                            EnqueueProofGuidedPhysicalPlacement(
-                                Error.Failure,
-                                RetainedBaseInterfaceCandidate,
-                                ComponentVariantForState,
-                            )
+                        continue
+                    if (
+                        any(
+                            Candidate.PlacementFingerprint
+                            in CapacityRepairConstraintByPlacementFingerprint
+                            for (
+                                _QueuedPhase,
+                                _QueuedIndex,
+                                Candidate,
+                                _QueuedCutEpoch,
+                                _QueuedComponentVariant,
+                            ) in InterfaceCandidateQueue
                         )
-                        if PlacementAdvanced:
-                            continue
+                        and not Deadline.IsExpired()
+                    ):
+                        continue
                     break
         LatestInterfaceProofByComponentState: dict[
             str, ClusterInterfaceStateProof
@@ -18164,6 +20350,66 @@ def _PlaceAndRoutePcbWithPolicy(
             "ExecutableLegacyRepairCascade": False,
         })
         if InterfaceSolveIncompleteError is not None:
+            # The source failure is captured before the queue advances to a
+            # proof-guided repair.  Publish final parent-owned telemetry, not
+            # that stale snapshot, so callers can distinguish an untried
+            # repair from a portfolio that was actually evaluated.
+            IncompleteFailure = InterfaceSolveIncompleteError.Failure
+            IncompleteDiagnostics = dict(IncompleteFailure.Diagnostics or {})
+            RepairPlacementFingerprints = frozenset(
+                CapacityRepairCandidateByPlacementFingerprint
+            )
+            AttemptedRepairPlacementFingerprints = tuple(sorted({
+                str(Attempt.get("PlacementFingerprint", ""))
+                for Attempt in InterfaceAttemptDiagnostics
+                if str(Attempt.get("PlacementFingerprint", ""))
+                in RepairPlacementFingerprints
+            } | {
+                str(Attempt.get("PlacementFingerprint", ""))
+                for Attempt in CapacityRepairPortfolioDiagnostics
+                if (
+                    Attempt.get("Result")
+                    in {
+                        "capacity-pair-repair-dequeued",
+                        "bounded-proof-driven-repair-candidate-failed",
+                    }
+                    and str(Attempt.get("PlacementFingerprint", ""))
+                    in RepairPlacementFingerprints
+                )
+            }))
+            if AttemptedRepairPlacementFingerprints:
+                IncompleteFailure = replace(
+                    IncompleteFailure,
+                    Detail=(
+                        "bounded proof-driven repair portfolio was "
+                        "evaluated without a feasible assignment"
+                    ),
+                )
+            InterfaceSolveIncompleteError = RoutingStageError(replace(
+                IncompleteFailure,
+                Diagnostics={
+                    **IncompleteDiagnostics,
+                    "PhysicalCapacityRepairPortfolio": list(
+                        CapacityRepairPortfolioDiagnostics
+                    ),
+                    "PhysicalLocalFactorDiversificationPortfolio": list(
+                        LocalFactorDiversificationPortfolioDiagnostics
+                    ),
+                    "PhysicalOwnedFrontierTopologyRepairPortfolio": list(
+                        OwnedFrontierTopologyRepairPortfolioDiagnostics
+                    ),
+                    "CompletedComponentStateAttempts": list(
+                        InterfaceAttemptDiagnostics
+                    ),
+                    "CapacityRepairGeneratedPlacementFingerprints": sorted(
+                        RepairPlacementFingerprints
+                    ),
+                    "CapacityRepairAttemptedPlacementFingerprints": list(
+                        AttemptedRepairPlacementFingerprints
+                    ),
+                    "InterfaceSolve": InterfaceProof,
+                },
+            ))
             LastRoutingError = InterfaceSolveIncompleteError
             LastStructuredRoutingError = InterfaceSolveIncompleteError
             CandidateRoutingIterable = ()

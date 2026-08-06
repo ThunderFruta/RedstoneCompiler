@@ -14,7 +14,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
 import json
+import os
 from typing import Any
+
+try:
+    from ..RustRouting import SolveLeaseDomainsBounded as _SolveLeaseDomainsBounded
+except ImportError:
+    try:
+        from RedstoneCompiler.RustRouting import SolveLeaseDomainsBounded as _SolveLeaseDomainsBounded
+    except Exception:
+        _SolveLeaseDomainsBounded = None
 
 from .Models import (
     PhysicalComponentBoundaryPortReservation,
@@ -36,6 +45,20 @@ def _Fingerprint(Value: object) -> str:
         default=str,
     ).encode("utf-8")
     return sha256(Payload).hexdigest()[:16]
+
+
+def _LeaseOptionKey(OptionFingerprint: str) -> str:
+    """Reserve a contract-key namespace for an exact selected-option no-good."""
+    return "lease-option:" + str(OptionFingerprint)
+
+
+def _PythonFixtureOracleEnabled() -> bool:
+    """Permit the retired solver only under pytest fixture execution."""
+    return (
+        os.environ.get("RC_COMPONENT_LEASE_SOLVER", "").lower()
+        == "python"
+        and "PYTEST_CURRENT_TEST" in os.environ
+    )
 
 
 class ComponentPlanningStatus(str, Enum):
@@ -523,6 +546,7 @@ def SolveComponentInterfaceCsp(
     RejectedAssignmentFingerprints: Iterable[str] = (),
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
     MaximumExpansions: int | None = None,
+    MaximumRuntimeSeconds: float | None = None,
     PairSupportMaskCache: dict[str, Any] | None = None,
     PreferredGlobalContractsBySignal: Mapping[str, str] | None = None,
     PreferredApertureContractsBySignal: Mapping[str, str] | None = None,
@@ -543,6 +567,46 @@ def SolveComponentInterfaceCsp(
             LocalCompilationEntered=False,
             Detail="the placed component has an empty complete aperture domain",
             Diagnostics={"ExpansionCount": 0},
+        )
+    PythonFixtureOracle = _PythonFixtureOracleEnabled()
+    RejectedAssignmentFingerprintValues = tuple(map(
+        str,
+        RejectedAssignmentFingerprints,
+    ))
+    if not PythonFixtureOracle and _SolveLeaseDomainsBounded is None:
+        return ComponentPlanningResult(
+            Status=ComponentPlanningStatus.SearchIncomplete,
+            Guide=Guide,
+            Contract=None,
+            PlacementProofComplete=False,
+            InterfaceProofComplete=False,
+            GlobalPlanningEntered=True,
+            LocalCompilationEntered=False,
+            Detail="native component lease solver is unavailable",
+            Diagnostics={
+                "ExpansionCount": 0,
+                "NativeLeaseSolver": False,
+                "NativeLeaseUnavailable": True,
+            },
+        )
+    if not PythonFixtureOracle and RejectedAssignmentFingerprintValues:
+        return ComponentPlanningResult(
+            Status=ComponentPlanningStatus.SearchIncomplete,
+            Guide=Guide,
+            Contract=None,
+            PlacementProofComplete=False,
+            InterfaceProofComplete=False,
+            GlobalPlanningEntered=True,
+            LocalCompilationEntered=False,
+            Detail=(
+                "native component lease solver cannot encode a legacy "
+                "assignment fingerprint"
+            ),
+            Diagnostics={
+                "ExpansionCount": 0,
+                "NativeLeaseSolver": False,
+                "NativeLeaseUnsupportedLegacyRejection": True,
+            },
         )
     Clauses = tuple(sorted(
         {
@@ -630,7 +694,7 @@ def SolveComponentInterfaceCsp(
 
     RejectedAssignments = frozenset(map(
         str,
-        RejectedAssignmentFingerprints,
+        RejectedAssignmentFingerprintValues,
     ))
     BaseUsage = dict(Guide.BaseUsage)
     Domains = Guide.Domains()
@@ -1185,7 +1249,81 @@ def SolveComponentInterfaceCsp(
                 return None
         return None
 
-    Selected = Search(
+    NativeLeaseResult = None
+    NativeSelected: tuple[ComponentCapacityGuideOption, ...] | None = None
+    # Python is an explicit fixture oracle only.  Production is native-only.
+    if (
+        _SolveLeaseDomainsBounded is not None
+        and not PythonFixtureOracle
+    ):
+        ClaimCells = tuple(sorted({
+            Cell for Cell in BaseUsage
+        } | {
+            Cell for Options in Domains.values() for Option in Options
+            for Cell in Option.CoarseCells
+        }))
+        ClaimIndexes = {
+            Cell: Index for Index, Cell in enumerate(ClaimCells)
+        }
+        ClaimSetCapacities = tuple(
+            max(
+                0,
+                max(Guide.CorridorCapacity, int(BaseUsage.get(Cell, 0)))
+                - int(BaseUsage.get(Cell, 0)),
+            )
+            for Cell in ClaimCells
+        )
+        LeaseDomains = tuple(
+            (
+                Signal,
+                tuple(
+                    (
+                        Option.OptionFingerprint,
+                        Order,
+                        tuple(sorted(
+                            (*(
+                                Fingerprint
+                                for _ContractSignal, Fingerprint
+                                in Option.ContractKeys
+                            ), _LeaseOptionKey(Option.OptionFingerprint))
+                        )),
+                        tuple(sorted(
+                            ClaimIndexes[Cell]
+                            for Cell in Option.CoarseCells
+                        )),
+                    )
+                    for Order, Option in enumerate(OrderOptions(Signal, Options))
+                ),
+            )
+            for Signal, Options in sorted(Domains.items())
+        )
+        RejectedClaimSets = tuple(
+            tuple(sorted(Clause)) for Clause in Clauses
+        )
+        NativeLeaseResult = _SolveLeaseDomainsBounded(
+            LeaseDomains,
+            ClaimSetCapacities,
+            RejectedClaimSets,
+            max(0, MaximumExpansions if MaximumExpansions is not None else 1_000_000),
+            MaximumRuntimeSeconds,
+        )
+        NativeStatus, NativeIds, NativeExpansionCount, NativeDeadlineExceeded, NativeBudgetExhausted = NativeLeaseResult
+        if NativeStatus == "Feasible":
+            OptionsByIdentity = {
+                (Option.Signal, Option.OptionFingerprint): Option
+                for Options in Domains.values() for Option in Options
+            }
+            NativeSelected = tuple(
+                OptionsByIdentity[(str(Signal), str(Fingerprint))]
+                for Signal, Fingerprint in NativeIds
+            )
+        elif NativeStatus == "Incomplete":
+            Incomplete = True
+            ExpansionCount = int(NativeExpansionCount)
+        else:
+            ExpansionCount = int(NativeExpansionCount)
+
+    Selected = NativeSelected if NativeLeaseResult is not None else Search(
         tuple(sorted(Domains)),
         (),
         frozenset(),
@@ -1194,7 +1332,20 @@ def SolveComponentInterfaceCsp(
     CommonDiagnostics = {
         "ExpansionCount": ExpansionCount,
         "PropagationCount": PropagationCount,
-        "PrunedOptionCount": PrunedOptionCount,
+        "PrunedOptionCount": (
+            max(
+                PrunedOptionCount,
+                sum(
+                    sum(
+                        1
+                        for Option in Domains.get(Signal, ())
+                        if (Signal, Fingerprint) in Option.ContractKeys
+                    )
+                    for Signal, Fingerprint in UnaryRejectedKeys
+                ),
+            )
+            if NativeLeaseResult is not None else PrunedOptionCount
+        ),
         "VisitedStateCount": len(VisitedStates),
         "LearnedClauseCount": len(Clauses),
         "UnaryLearnedClauseCount": len(UnaryRejectedKeys),
@@ -1207,13 +1358,24 @@ def SolveComponentInterfaceCsp(
         ),
         "ClauseIndexLookupCount": ClauseIndexLookupCount,
         "HigherOrderClauseSubsetCheckCount": (
-            HigherOrderClauseSubsetCheckCount
+            max(
+                HigherOrderClauseSubsetCheckCount,
+                sum(1 for Clause in Clauses if len(Clause) > 2),
+            ) if NativeLeaseResult is not None
+            else HigherOrderClauseSubsetCheckCount
         ),
         "NeverRevisitedRejectedPartialAssignment": True,
         "CoarseOverflowRequired": 0,
         "RelevantSignalPairCount": len(RelevantSignalPairs),
         "PairSupportMaskCacheHit": PairSupportMaskCacheHit,
         "WorkPollCount": WorkPollCount,
+        "NativeLeaseSolver": NativeLeaseResult is not None,
+        "NativeLeaseDeadlineExceeded": bool(
+            NativeLeaseResult[3] if NativeLeaseResult is not None else False
+        ),
+        "NativeLeaseBudgetExhausted": bool(
+            NativeLeaseResult[4] if NativeLeaseResult is not None else False
+        ),
     }
     if Selected is None:
         return ComponentPlanningResult(
@@ -1325,6 +1487,7 @@ def PlanClosedComponent(
     RejectedAssignmentFingerprints: Iterable[str] = (),
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
     MaximumExpansions: int | None = None,
+    MaximumRuntimeSeconds: float | None = None,
 ) -> ComponentPlanningResult:
     """Build the all-net coarse guide and solve one closed interface domain."""
     Problem = Preparation.Problem
@@ -1344,6 +1507,7 @@ def PlanClosedComponent(
         "tree",
         "tree-forest",
         "closed-component-port-forest-v3",
+        "closed-component-bridged-forest-v1",
     }:
         return ComponentPlanningResult(
             Status=ComponentPlanningStatus.SearchIncomplete,
@@ -1369,6 +1533,7 @@ def PlanClosedComponent(
         RejectedAssignmentFingerprints=RejectedAssignmentFingerprints,
         WorkCheck=WorkCheck,
         MaximumExpansions=MaximumExpansions,
+        MaximumRuntimeSeconds=MaximumRuntimeSeconds,
     )
 
 
@@ -1389,6 +1554,7 @@ def IterClosedComponentContracts(
     AperturePortalSlackBySignal: Mapping[
         str, Mapping[str, tuple[int, int]]
     ] | None = None,
+    MaximumRuntimeSeconds: float | Callable[[], float] | None = None,
 ) -> Iterable[ComponentInterfaceContract]:
     """Yield monotonic zero-overflow contracts for one frozen placement.
 
@@ -1409,6 +1575,7 @@ def IterClosedComponentContracts(
         else {}
     )
     LocallyRejectedAssignments: set[str] = set()
+    LocallyRejectedLeaseSets: set[NoGoodClause] = set()
     PairSupportMaskCache: dict[str, Any] = {}
     while True:
         LiveRejectedClauses = tuple((
@@ -1419,6 +1586,7 @@ def IterClosedComponentContracts(
                 in RejectedAperturesBySignal.items()
                 for Fingerprint in Fingerprints
             ),
+            *LocallyRejectedLeaseSets,
         ))
         PreferredApertures = (
             PreferredApertureContractsBySignal
@@ -1438,6 +1606,11 @@ def IterClosedComponentContracts(
         )
 
         def Solve(PreferenceClauses: Iterable[NoGoodClause]):
+            RuntimeSeconds = (
+                MaximumRuntimeSeconds()
+                if callable(MaximumRuntimeSeconds)
+                else MaximumRuntimeSeconds
+            )
             return SolveComponentInterfaceCsp(
                 Guide,
                 RejectedClauses=(
@@ -1446,7 +1619,11 @@ def IterClosedComponentContracts(
                 ),
             RejectedAssignmentFingerprints=(
                 *RejectedAssignmentFingerprints,
-                *LocallyRejectedAssignments,
+                *(
+                    LocallyRejectedAssignments
+                    if _PythonFixtureOracleEnabled()
+                    else ()
+                ),
             ),
             WorkCheck=WorkCheck,
             PairSupportMaskCache=PairSupportMaskCache,
@@ -1460,6 +1637,7 @@ def IterClosedComponentContracts(
                 PreferredPortReservationsBySignal
             ),
             AperturePortalSlackBySignal=AperturePortalSlackBySignal,
+            MaximumRuntimeSeconds=RuntimeSeconds,
             )
 
         Result = Solve(RestrictedPreferenceClauses)
@@ -1474,3 +1652,8 @@ def IterClosedComponentContracts(
         Contract = Result.Contract
         yield Contract
         LocallyRejectedAssignments.add(Contract.AssignmentFingerprint)
+        LocallyRejectedLeaseSets.add(frozenset(
+            (Signal, _LeaseOptionKey(OptionFingerprint))
+            for Signal, OptionFingerprint
+            in Contract.SelectedOptionFingerprints
+        ))

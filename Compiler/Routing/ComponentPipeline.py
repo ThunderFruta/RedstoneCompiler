@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from itertools import product
 from math import prod
+import multiprocessing
+import os
 from time import monotonic
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
@@ -6385,6 +6388,39 @@ def CompilePhysicalComponentSymbolicHigherOrderDomain(
     return Certificate
 
 
+def CompilePhysicalComponentSymbolicUnaryApertureSignalWorker(
+    Problem: ComponentRoutingProblem,
+    FactorDomain: PreparedPhysicalComponentPortFactorDomain,
+    Signal: str,
+    DeadlineAt: float | None,
+) -> tuple[
+    str,
+    frozenset[frozenset[tuple[str, str]]],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    """Compile one immutable unary signal snapshot in a child process."""
+    # The parent owns the eight-way signal fan-out.  Keep each child at one
+    # native routing worker so six unary processes do not each create an
+    # additional eight-thread Rayon pool.
+    os.environ["RC_ROUTING_THREADS"] = "1"
+    RemainingDeadline = (
+        None
+        if DeadlineAt is None
+        else max(0.0, DeadlineAt - monotonic())
+    )
+    SymbolicNetStateCache: dict[str, Any] = {}
+    Clauses, Diagnostics = CompilePhysicalComponentSymbolicUnaryApertureDomain(
+        Problem,
+        FactorDomain,
+        (Signal,),
+        DeadlineSeconds=RemainingDeadline,
+        NetStateCache=SymbolicNetStateCache,
+        AllowParallelSignalCompilation=False,
+    )
+    return str(Signal), Clauses, Diagnostics, SymbolicNetStateCache
+
+
 def CompilePhysicalComponentSymbolicUnaryApertureDomain(
     Problem: ComponentRoutingProblem,
     FactorDomain: PreparedPhysicalComponentPortFactorDomain,
@@ -6403,6 +6439,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
     RouteClaimsConstructionCache: dict[
         frozenset[Position3], RoutingResourceClaims
     ] | None = None,
+    AllowParallelSignalCompilation: bool = True,
 ) -> tuple[
     frozenset[frozenset[tuple[str, str]]],
     dict[str, Any],
@@ -6438,6 +6475,150 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         Clauses, Diagnostics = Cached
         return Clauses, {**Diagnostics, "UnaryCertificateCacheHit": True}
 
+    EffectiveNetStateCache = (
+        NetStateCache if NetStateCache is not None else {}
+    )
+
+    # Each signal's local access factors are immutable after physical factor
+    # preparation.  Compile them in separate CPython processes so the
+    # Python-heavy frontier DP can use real cores despite the GIL.  The parent
+    # remains the only writer of the shared caches and merges sorted results
+    # deterministically.
+    WorkerCount = min(8, len(Signals))
+    # The parent owns the persistent local proof cache.  A spawned worker
+    # receives a copy, so using it after a repair would discard the exact
+    # local-state hits we prepared for this process.  The serial path below
+    # consults that cache directly; a cold domain still uses all cores.
+    if (
+        AllowParallelSignalCompilation
+        and WorkerCount > 1
+        and not NetStateCache
+    ):
+        DeadlineAt = (
+            None
+            if DeadlineSeconds is None
+            else monotonic() + max(0.0, DeadlineSeconds)
+        )
+        StartedParallelAt = monotonic()
+        try:
+            Context = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=WorkerCount,
+                mp_context=Context,
+            ) as Executor:
+                FuturesBySignal = {
+                    Signal: Executor.submit(
+                        CompilePhysicalComponentSymbolicUnaryApertureSignalWorker,
+                        Problem,
+                        FactorDomain,
+                        Signal,
+                        DeadlineAt,
+                    )
+                    for Signal in Signals
+                }
+                ResultsBySignal = {}
+                for Signal in Signals:
+                    Remaining = (
+                        None
+                        if DeadlineAt is None
+                        else max(0.0, DeadlineAt - monotonic())
+                    )
+                    if Remaining is not None and Remaining <= 0.0:
+                        return frozenset(), {
+                            "Complete": False,
+                            "Signal": Signal,
+                            "CompiledAccessCount": 0,
+                            "UnaryCertificateCacheHit": False,
+                            "UnarySignalProcessWorkerCount": WorkerCount,
+                            "UnarySignalProcessStatus": "deadline-expired",
+                        }
+                    ResultsBySignal[Signal] = FuturesBySignal[Signal].result(
+                        timeout=Remaining,
+                    )
+        except TimeoutError:
+            return frozenset(), {
+                "Complete": False,
+                "CompiledAccessCount": 0,
+                "UnarySignalProcessWorkerCount": WorkerCount,
+                "UnarySignalProcessStatus": "deadline-expired",
+            }
+        except Exception:
+            # Spawn/pickle failures are environment-specific.  Preserve the
+            # existing exact compiler rather than rejecting a legal design.
+            ResultsBySignal = {}
+        if ResultsBySignal:
+            OrderedResults = tuple(
+                ResultsBySignal[Signal]
+                for Signal in Signals
+            )
+            Incomplete = next((
+                (Signal, Diagnostics)
+                for Signal, _Clauses, Diagnostics, _WorkerCache in OrderedResults
+                if not Diagnostics.get("Complete", False)
+            ), None)
+            if Incomplete is not None:
+                Signal, Diagnostics = Incomplete
+                return frozenset(), {
+                    **Diagnostics,
+                    "Complete": False,
+                    "Signal": Signal,
+                    "UnarySignalProcessWorkerCount": WorkerCount,
+                    "UnarySignalProcessStatus": "incomplete-worker-result",
+                }
+            Result = frozenset(
+                Clause
+                for _Signal, Clauses, _Diagnostics, _WorkerCache in OrderedResults
+                for Clause in Clauses
+            )
+            for _Signal, _Clauses, _Diagnostics, WorkerCache in OrderedResults:
+                for WorkerCacheKey, WorkerCacheValue in WorkerCache.items():
+                    EffectiveNetStateCache.setdefault(
+                        WorkerCacheKey,
+                        WorkerCacheValue,
+                    )
+            Diagnostics = {
+                "Complete": True,
+                "SignalCount": len(Signals),
+                "CompiledAccessCount": sum(
+                    int(Diagnostics.get("CompiledAccessCount", 0))
+                    for _Signal, _Clauses, Diagnostics, _WorkerCache in OrderedResults
+                ),
+                "UnsupportedLocalAccessCount": sum(
+                    int(Diagnostics.get("UnsupportedLocalAccessCount", 0))
+                    for _Signal, _Clauses, Diagnostics, _WorkerCache in OrderedResults
+                ),
+                "UnsupportedApertureOptionCount": sum(
+                    int(Diagnostics.get("UnsupportedApertureOptionCount", 0))
+                    for _Signal, _Clauses, Diagnostics, _WorkerCache in OrderedResults
+                ),
+                "UnsupportedLocalApertureSupportCount": sum(
+                    int(Diagnostics.get(
+                        "UnsupportedLocalApertureSupportCount",
+                        0,
+                    ))
+                    for _Signal, _Clauses, Diagnostics, _WorkerCache in OrderedResults
+                ),
+                "UnaryLocalAccessClauseCount": sum(
+                    int(Diagnostics.get("UnaryLocalAccessClauseCount", 0))
+                    for _Signal, _Clauses, Diagnostics, _WorkerCache in OrderedResults
+                ),
+                "UnarySeamClauseCount": sum(
+                    int(Diagnostics.get("UnarySeamClauseCount", 0))
+                    for _Signal, _Clauses, Diagnostics, _WorkerCache in OrderedResults
+                ),
+                "UnaryApertureClauseCount": len(Result),
+                "UnaryCertificateCacheHit": False,
+                "DomainFingerprint": CacheKey,
+                "UnarySignalProcessWorkerCount": WorkerCount,
+                "UnarySignalProcessStatus": "complete",
+                "UnarySignalProcessElapsedSeconds": (
+                    monotonic() - StartedParallelAt
+                ),
+            }
+            if CompletedClauseCache is not None:
+                CompletedClauseCache[CacheKey] = (Result, Diagnostics)
+            return Result, Diagnostics
+
     LocalFactorsBySignal = dict(FactorDomain.LocalAccessFactorsBySignal)
     SupportedAccessesBySignal = {
         str(Signal): frozenset(
@@ -6446,9 +6627,6 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         for Signal, Supports
         in FactorDomain.LocalApertureSupportBySignal
     }
-    EffectiveNetStateCache = (
-        NetStateCache if NetStateCache is not None else {}
-    )
     RelaxedProblem = replace(Problem, ReservedGlobalClaimsBySignal=())
     StartedAt = monotonic()
     UnsupportedAccesses: set[tuple[str, str]] = set()

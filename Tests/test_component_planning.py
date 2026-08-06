@@ -1,4 +1,9 @@
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
+
+import Compiler.Routing.ComponentPlanning as ComponentPlanning
 
 from Compiler.Routing.ComponentPlanning import (
     BuildComponentCapacityGuide,
@@ -75,6 +80,99 @@ def test_capacity_guide_preserves_ordinary_demand_and_replaces_component_guides(
     assert dict(Guide.BaseUsage) == {(0, 0): 1, (2, 0): 1, (9, 9): 1}
     assert Guide.Diagnostics["AllNetCoarseDemandIncluded"] is True
     assert set(Guide.Domains()) == {"Alpha", "Beta"}
+
+
+def test_native_lease_fixture_cross_checks_python_fallback(monkeypatch):
+    """The native serialized lease fixture must retain Python's exact answer."""
+    Alpha = (_Boundary("Alpha", 0, Fingerprint="a0"), _Boundary("Alpha", 12, Fingerprint="a1"))
+    Beta = (_Boundary("Beta", 24, Fingerprint="b0"), _Boundary("Beta", 36, Fingerprint="b1"))
+    Guide = BuildComponentCapacityGuide(
+        _Preparation({"Alpha": Alpha, "Beta": Beta}), TrackPitch=3,
+    )
+    Clauses = (
+        frozenset({("Alpha", Alpha[0].ApertureContractFingerprint)}),
+        frozenset({
+            ("Alpha", Alpha[1].ApertureContractFingerprint),
+            ("Beta", Beta[0].ApertureContractFingerprint),
+        }),
+    )
+
+    monkeypatch.delenv("RC_COMPONENT_LEASE_SOLVER", raising=False)
+    Native = SolveComponentInterfaceCsp(Guide, RejectedClauses=Clauses)
+    monkeypatch.setenv("RC_COMPONENT_LEASE_SOLVER", "python")
+    Python = SolveComponentInterfaceCsp(Guide, RejectedClauses=Clauses)
+
+    assert Native.Diagnostics["NativeLeaseSolver"] is True
+    assert Native.Status == Python.Status == ComponentPlanningStatus.Feasible
+    assert Native.Contract is not None and Python.Contract is not None
+    assert Native.Contract.SelectedOptionFingerprints == (
+        Python.Contract.SelectedOptionFingerprints
+    )
+
+
+def test_native_lease_fixture_cross_checks_unsat_and_budget(monkeypatch):
+    Alpha = _Boundary("Alpha", 0, Fingerprint="a")
+    Beta = _Boundary("Beta", 0, Fingerprint="b")
+    Guide = BuildComponentCapacityGuide(
+        _Preparation({"Alpha": (Alpha,), "Beta": (Beta,)}, Capacity=1),
+        TrackPitch=3,
+    )
+
+    monkeypatch.delenv("RC_COMPONENT_LEASE_SOLVER", raising=False)
+    NativeUnsat = SolveComponentInterfaceCsp(Guide)
+    NativeBudget = SolveComponentInterfaceCsp(Guide, MaximumExpansions=0)
+    monkeypatch.setenv("RC_COMPONENT_LEASE_SOLVER", "python")
+    PythonUnsat = SolveComponentInterfaceCsp(Guide)
+    PythonBudget = SolveComponentInterfaceCsp(Guide, MaximumExpansions=0)
+
+    assert NativeUnsat.Status == PythonUnsat.Status == (
+        ComponentPlanningStatus.InterfaceUnsatisfiable
+    )
+    assert NativeBudget.Status == PythonBudget.Status == (
+        ComponentPlanningStatus.SearchIncomplete
+    )
+    assert NativeBudget.Diagnostics["NativeLeaseBudgetExhausted"] is True
+
+
+def test_native_lease_deadline_and_unavailable_fail_closed(monkeypatch):
+    Guide = BuildComponentCapacityGuide(
+        _Preparation({"Alpha": (_Boundary("Alpha", 0),)}), TrackPitch=3,
+    )
+
+    NativeDeadline = SolveComponentInterfaceCsp(
+        Guide,
+        MaximumRuntimeSeconds=0.0,
+    )
+    assert NativeDeadline.Status == ComponentPlanningStatus.SearchIncomplete
+    assert NativeDeadline.Diagnostics["NativeLeaseDeadlineExceeded"] is True
+
+    monkeypatch.setattr(ComponentPlanning, "_SolveLeaseDomainsBounded", None)
+    Unavailable = SolveComponentInterfaceCsp(Guide)
+    assert Unavailable.Status == ComponentPlanningStatus.SearchIncomplete
+    assert Unavailable.Diagnostics["NativeLeaseUnavailable"] is True
+
+
+def test_native_lease_assignment_is_stable_across_rayon_thread_counts():
+    Script = """
+from Compiler.Routing.ComponentPlanning import BuildComponentCapacityGuide, SolveComponentInterfaceCsp
+from Tests.test_component_planning import _Boundary, _Preparation
+Guide = BuildComponentCapacityGuide(_Preparation({
+    'Alpha': (_Boundary('Alpha', 0, Fingerprint='a0'), _Boundary('Alpha', 12, Fingerprint='a1')),
+    'Beta': (_Boundary('Beta', 0, Fingerprint='b0'),),
+}, Capacity=1), TrackPitch=3)
+Result = SolveComponentInterfaceCsp(Guide)
+print(Result.Contract.SelectedOptionFingerprints if Result.Contract else Result.Status.value)
+"""
+    Results = []
+    for ThreadCount in ("1", "4"):
+        Environment = dict(os.environ, RC_ROUTING_THREADS=ThreadCount)
+        Results.append(subprocess.check_output(
+            [sys.executable, "-c", Script],
+            text=True,
+            env=Environment,
+        ).strip())
+
+    assert Results[0] == Results[1]
 
 
 def test_port_first_capacity_guide_does_not_expand_local_composites():
@@ -376,7 +474,10 @@ def test_interface_csp_reports_search_incomplete_separately():
     assert "work limit" in Result.Detail
 
 
-def test_incremental_binary_cache_adds_newly_relevant_signal_pair():
+def test_incremental_binary_cache_adds_newly_relevant_signal_pair(monkeypatch):
+    # Legacy assignment-fingerprint rejections are retained solely for the
+    # Python fixture oracle; production uses exact native lease no-goods.
+    monkeypatch.setenv("RC_COMPONENT_LEASE_SOLVER", "python")
     Alpha0 = _Boundary("Alpha", 0, Fingerprint="a0")
     Alpha1 = _Boundary("Alpha", 12, Fingerprint="a1")
     Beta0 = _Boundary("Beta", 100, Fingerprint="b0")

@@ -491,41 +491,42 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         ExistingGuideHintWeight=2,
         IntraClusterEnvelope=2,
         SharedBoundaryEnvelope=6,
-        MaximumRipupPasses=2,
-        StagnationPassLimit=2,
+        MaximumRipupPasses=1,
+        StagnationPassLimit=1,
         EnableCapacityAwareGuides=True,
     ),
     NegotiatedRouting=NegotiatedRoutingPolicy(
         Enabled=True,
+        MaximumIterations=1,
         MaximumPlacementFeedbackRounds=1,
         MaximumPackedAreaGrowth=4.0,
         # Retained-domain assignment distinguishes a changing tree set from a
         # real plateau before placement feedback.  RCA4 otherwise repeats the
         # same overflow through its complete acceptance deadline, so keep the
         # bounded three-pass stagnation window.
-        StagnationPassLimit=3,
+        StagnationPassLimit=1,
     ),
     TrackAssignment=TrackAssignmentPolicy(
-        ReassignmentLimit=20,
+        ReassignmentLimit=1,
         ReserveRepeaterSites=True,
-        MaximumPortalsPerTerminal=48,
-        MaximumRouteCandidatesPerNet=2048,
-        MaximumAssignmentExpansions=500_000,
+        MaximumPortalsPerTerminal=8,
+        MaximumRouteCandidatesPerNet=160,
+        MaximumAssignmentExpansions=50_000,
         MinimizeMaximumRoutingLayer=True,
     ),
     AdaptiveRouting=AdaptiveRoutingPolicy(
         Enabled=True,
-        InitialPortalsPerTerminal=6,
+        InitialPortalsPerTerminal=4,
         PortalGrowthFactor=2,
-        InitialLaneCount=4,
+        InitialLaneCount=3,
         LaneGrowthFactor=2,
-        MaximumPortalReservationAlternatives=2,
-        MaximumLaneDiversityEscalations=4,
+        MaximumPortalReservationAlternatives=1,
+        MaximumLaneDiversityEscalations=1,
         InitialCandidateRequestsPerSignal=4,
-        MaximumCandidateDiversityEscalations=12,
-        InitialCandidatesPerNet=96,
+        MaximumCandidateDiversityEscalations=1,
+        InitialCandidatesPerNet=72,
         CandidateGrowthFactor=2,
-        MinimumCandidatesPerNet=8,
+        MinimumCandidatesPerNet=16,
         CandidateClaimWorkQuantum=64,
         MaximumCandidateGenerationExpansions=2_000_000,
         InitialAssignmentExpansions=64,
@@ -533,8 +534,8 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         BaseAssignmentExpansions=8_000,
         AssignmentExpansionsPerNet=1_200,
         AssignmentExpansionsPerTerminal=250,
-        MaximumAssignmentExpansions=180_000,
-        MaximumRuntimeSeconds=360.0,
+        MaximumAssignmentExpansions=50_000,
+        MaximumRuntimeSeconds=120.0,
     ),
     DetailedRouting=DetailedRoutingPolicy(
         GuideExpansion=3,
@@ -549,12 +550,8 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
         CandidateBendWeight=8,
         CandidateViaWeight=6,
         RepeaterPenalty=24,
-        StagnationPassLimit=6,
-        # Initial adaptive batches are intentionally small.  If every portal
-        # request for a large net exhausts that batch, the authoritative
-        # planner retries only that net at this strict budget; 90k is needed
-        # to reach a legal repeater refresh site in the RCA8 sparse region.
-        StrictBaseExpansions=90_000,
+        StagnationPassLimit=1,
+        StrictBaseExpansions=40_000,
         StrictExpansionsPerNet=1_200,
         StrictMaximumExpansions=90_000,
         RepairBaseExpansions=70_000,
@@ -589,97 +586,9 @@ RoutingAcceptanceProfiles = {
 }
 
 
-@dataclass(frozen=True)
-class RoutingCircuitComplexityProfile:
-    """Topology-aware signal complexity captured outside runtime execution names."""
-
-    SignalCount: int = 0
-    GateCount: int = 0
-    RoutingGraphEdgeCount: int = 0
-    MaximumFanout: int = 0
-    ReconvergentFanoutCount: int = 0
-    PeakBoundaryDemand: int = 0
-    MandatoryAccessConflictResources: int = 0
-
-    def __post_init__(self) -> None:
-        if self.SignalCount < 0:
-            raise ValueError("SignalCount must be non-negative")
-        if self.GateCount < 0:
-            raise ValueError("GateCount must be non-negative")
-        if self.RoutingGraphEdgeCount < 0:
-            raise ValueError("RoutingGraphEdgeCount must be non-negative")
-        if self.MaximumFanout < 0:
-            raise ValueError("MaximumFanout must be non-negative")
-        if self.ReconvergentFanoutCount < 0:
-            raise ValueError("ReconvergentFanoutCount must be non-negative")
-        if self.PeakBoundaryDemand < 0:
-            raise ValueError("PeakBoundaryDemand must be non-negative")
-        if self.MandatoryAccessConflictResources < 0:
-            raise ValueError(
-                "MandatoryAccessConflictResources must be non-negative"
-            )
-
-
-def _BuildRoutingPolicyComplexityTier(
-    Profile: RoutingCircuitComplexityProfile,
-) -> int:
-    SignalPressure = max(0, min(2, (Profile.SignalCount - 20) // 20))
-    Score = SignalPressure
-    if Profile.GateCount >= 72:
-        Score += 1
-    if Profile.RoutingGraphEdgeCount >= 90:
-        Score += 1
-    if Profile.MaximumFanout >= 4:
-        Score += 1
-    if Profile.ReconvergentFanoutCount >= 2:
-        Score += 1
-    if Profile.PeakBoundaryDemand >= 20:
-        Score += 1
-    if Profile.MandatoryAccessConflictResources > 0:
-        Score += 1
-    return min(6, max(0, Score))
-
-
 def PolicyForRoutingStrategy(Strategy: RoutingStrategy) -> PhysicalDesignPolicy:
     """Resolve the immutable policy attached to one routing implementation."""
     return LocalFirstPhysicalDesignPolicy
-
-
-def BuildRoutingPolicyForCircuit(
-    Policy: PhysicalDesignPolicy,
-    ComplexityProfile: RoutingCircuitComplexityProfile | None = None,
-) -> PhysicalDesignPolicy:
-    """Apply deterministic policy widening from topology metrics only.
-
-    This selection is intentionally independent of any circuit identifier.
-    """
-    if ComplexityProfile is None:
-        return Policy
-    ComplexityTier = _BuildRoutingPolicyComplexityTier(ComplexityProfile)
-    if ComplexityTier < 4:
-        return Policy
-    return replace(
-        Policy,
-        NandPacking=replace(
-            Policy.NandPacking,
-            RetainedJointPlacementCandidates=min(
-                12,
-                6 + ComplexityTier,
-            ),
-        ),
-        AdaptiveRouting=replace(
-            Policy.AdaptiveRouting,
-            MaximumAssignmentExpansions=360_000,
-        ),
-        DetailedRouting=replace(
-            Policy.DetailedRouting,
-            StrictBaseExpansions=max(
-                Policy.DetailedRouting.StrictBaseExpansions,
-                120_000,
-            ),
-            StrictMaximumExpansions=180_000,
-        ),
-    )
 
 
 def ExecutionStrategyForRequest(Strategy: RoutingStrategy) -> RoutingStrategy:

@@ -92,6 +92,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     CaptureCompletePhysicalPortCorridorDomains,
     BuildPreparedPhysicalExteriorGuideColumnsBySignal,
     BuildPhysicalExteriorConnectorDistanceField,
+    FrozenPhysicalExteriorConnectorSearchRequest,
     BuildPhysicalPortCorridorFactor,
     BuildPhysicalGlobalPlanContinuationState,
     BuildPhysicalGlobalPlanYieldDeadline,
@@ -142,6 +143,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     SelectExactNoGoodCspBranch,
     OrderPhysicalPortOptionsByPreferences,
     DecomposePhysicalPortLaneFactors,
+    PreparePhysicalSignalLocalFactorDomain,
     MaterializeSupportedPhysicalPortReservation,
     MaterializePhysicalPortFactorPair,
     FilterPhysicalCandidatesToCurrentPortalDomain,
@@ -235,6 +237,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     SelectRawPortalGeometryReusePlan,
     SelectPreparedPortalDomainCache,
     SelectPhysicalExteriorConnectorPath,
+    SearchFrozenPhysicalExteriorConnectorBatch,
     SelectTransactionalLeasePrescreenSignals,
     TransformPlanarRoutingPosition,
     TransformPortableCompletePortalDomainKeys,
@@ -8490,6 +8493,73 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 ))),
             )
 
+    def testPhysicalSignalLocalFactorIdentityExcludesExteriorAperture(
+        self,
+    ) -> None:
+        """The reuse key changes for local inputs, never a guide-only move."""
+        Claims = RoutingResourceClaims(
+            WireCells=frozenset(((0, 1, 0), (1, 1, 0))),
+            ElectricalCells=frozenset(((0, 1, 0), (1, 1, 0))),
+        )
+        Factor = SimpleNamespace(
+            LocalAccessFingerprint="local-access",
+            FabricDomainFingerprint="fabric-domain",
+            FabricAttachment=(0, 1, 0),
+            LocalPath=((0, 1, 0), (1, 1, 0)),
+            OwnedCandidateFingerprints=frozenset(("candidate",)),
+            LocalClaims=Claims,
+            SeamContractFingerprint="local-seam",
+        )
+        Certificate = SimpleNamespace(
+            Complete=True,
+            PortDomains=(SimpleNamespace(
+                Signal="sum",
+                Direction="output",
+                Candidates=(),
+            ),),
+        )
+        Problem = SimpleNamespace(
+            Fabric=SimpleNamespace(FabricFingerprint="fabric-topology"),
+            OwnedTerminalDomains=(SimpleNamespace(
+                Signal="sum",
+                TerminalFingerprint="terminal",
+                TerminalRole="source",
+                Terminal=(0, 1, 0),
+                Candidates=(SimpleNamespace(CandidateFingerprint="candidate"),),
+            ),),
+        )
+        ResourceGraph = SimpleNamespace(
+            GraphVersion="graph-v1",
+            Nodes=((0, 1, 0),),
+            Edges=(),
+            Technology="technology-v1",
+        )
+        First = PreparePhysicalSignalLocalFactorDomain(
+            Problem, Certificate, "sum", ResourceGraph,
+            LocalAccessFactors=(Factor,),
+        )
+        Second = PreparePhysicalSignalLocalFactorDomain(
+            Problem, Certificate, "sum", ResourceGraph,
+            LocalAccessFactors=(Factor,),
+        )
+        ChangedFactor = SimpleNamespace(
+            **{
+                **vars(Factor),
+                "OwnedCandidateFingerprints": frozenset(("changed",)),
+            }
+        )
+        Changed = PreparePhysicalSignalLocalFactorDomain(
+            Problem, Certificate, "sum", ResourceGraph,
+            LocalAccessFactors=(ChangedFactor,),
+        )
+
+        self.assertEqual(First, Second)
+        self.assertEqual(First.LocalAccessFactors, (Factor,))
+        self.assertNotEqual(
+            First.LocalIdentityFingerprint,
+            Changed.LocalIdentityFingerprint,
+        )
+
     def testPhysicalPortDecompositionDoesNotInventCartesianSupport(self) -> None:
         def Claims(Nodes):
             Values = frozenset(Nodes)
@@ -15927,6 +15997,53 @@ class PhysicalExteriorConnectorDistanceFieldTests(unittest.TestCase):
             tuple(Result.Path[-1] for Result in Results),
             ((4, 0, 0), (4, 0, 0)),
         )
+
+    def testFrozenNativeBatchMatchesExactStaticSelector(self):
+        Graph = self.GridResourceGraph()
+        Field = self.BuildField(ResourceGraph=Graph)
+        Nodes = frozenset(
+            (X, 0, Z)
+            for X in range(-1, 6)
+            for Z in range(-2, 3)
+        )
+        Edges = frozenset(
+            tuple(sorted((Position, Neighbor)))
+            for Position in Nodes
+            for Neighbor in (
+                (Position[0] + 1, 0, Position[2]),
+                (Position[0], 0, Position[2] + 1),
+            )
+            if Neighbor in Nodes
+        )
+        FrozenField = replace(
+            Field,
+            AllowedNodes=Nodes,
+            AllowedEdges=Edges,
+            Complete=True,
+        )
+        Starts = ((0, 0, -1), (0, 0, 0), (0, 0, 1), (1, 0, 1),
+                  (2, 0, -1), (3, 0, 1), (0, 0, 2), (1, 0, -2))
+        Expected = tuple(
+            SelectPhysicalExteriorConnectorPath(
+                FrozenField,
+                Graph,
+                Start,
+                BlockedLocalNodes=frozenset(),
+                EdgeIsLegal=lambda _First, _Second: True,
+                ValidateCandidate=lambda _Path: True,
+            )
+            for Start in Starts
+        )
+        Actual, ActiveWorkers = SearchFrozenPhysicalExteriorConnectorBatch(
+            FrozenPhysicalExteriorConnectorSearchRequest(
+                FrozenField,
+                Start,
+                frozenset(),
+            )
+            for Start in Starts
+        )
+        self.assertEqual(Actual, Expected)
+        self.assertEqual(ActiveWorkers, 8)
 
     def testFieldExcludesKeepoutAndForeignIllegalEdges(self):
         ForbiddenEdge = frozenset(((1, 0, 0), (1, 0, -1)))

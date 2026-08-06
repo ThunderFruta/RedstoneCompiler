@@ -52,12 +52,14 @@ def RoutePcbNets(
     SkipStrictPortalReservation: bool = False,
     ReservationVariant: int = 0,
     PreparePortalGeometryOnly: bool = False,
+    PrepareTrackAssignmentOnly: bool = False,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
     PreparePhysicalComponentPortFactorDomainOnly: bool = False,
+    DeferClusterBoundaryLeaseUntilCapacityPrecheck: bool = False,
     UnboundOwnedSignalFrontierProofCallback: Callable[
         [ComponentRoutingProblem], None
     ] | None = None,
@@ -121,6 +123,7 @@ def RoutePcbNets(
         SkipStrictPortalReservation=SkipStrictPortalReservation,
         ReservationVariant=ReservationVariant,
         PreparePortalGeometryOnly=PreparePortalGeometryOnly,
+        PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
         ValidateClusterInterfaceForeignAccessOnly=(
             ValidateClusterInterfaceForeignAccessOnly
         ),
@@ -138,6 +141,9 @@ def RoutePcbNets(
         ),
         PreparePhysicalComponentPortFactorDomainOnly=(
             PreparePhysicalComponentPortFactorDomainOnly
+        ),
+        DeferClusterBoundaryLeaseUntilCapacityPrecheck=(
+            DeferClusterBoundaryLeaseUntilCapacityPrecheck
         ),
         UnboundOwnedSignalFrontierProofCallback=(
             UnboundOwnedSignalFrontierProofCallback

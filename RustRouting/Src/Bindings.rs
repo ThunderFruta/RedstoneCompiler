@@ -7,10 +7,15 @@ use crate::Generation::{
     GeneratePortalCandidateBatchesNative, GenerateRouteTreeDetailedBatchNative,
     GenerateRouteTreesNative,
 };
+use crate::LeasePlanning::{
+    LeaseCandidate, LeaseDomain, LeaseSolveStatus, SolveLeaseDomainsWithDeadline,
+};
 use crate::Models::*;
 use crate::PathRouting::FindPath;
 use crate::{
-    EvaluateLogicPrograms, GenerateRectilinearTopology, GetRoutingThreadCount, RoutingThreadPool,
+    BuildFabricSubtreesBatchWithTelemetry, BuildRouteClaimsBatch,
+    BuildRouteClaimsBatchWithTelemetry, EvaluateLogicPrograms, GenerateRectilinearTopology,
+    GetRoutingThreadCount, RoutingThreadPool, SearchExteriorConnectorsBatchWithTelemetry,
 };
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -168,9 +173,76 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_class::<RouteTreeDetailedBatchResult>()?;
     Module.add_class::<RoutingAssignmentResult>()?;
     Module.add_function(wrap_pyfunction!(GetRoutingThreadCount, Module)?)?;
+    Module.add_function(wrap_pyfunction!(BuildRouteClaimsBatch, Module)?)?;
+    Module.add_function(wrap_pyfunction!(
+        BuildRouteClaimsBatchWithTelemetry,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        BuildFabricSubtreesBatchWithTelemetry,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        SearchExteriorConnectorsBatchWithTelemetry,
+        Module
+    )?)?;
     Module.add_function(wrap_pyfunction!(GenerateRectilinearTopology, Module)?)?;
     Module.add_function(wrap_pyfunction!(EvaluateLogicPrograms, Module)?)?;
+    Module.add_function(wrap_pyfunction!(SolveLeaseDomainsBounded, Module)?)?;
     Ok(())
+}
+
+/// Solves sorted component-boundary lease domains.  The first branching level
+/// runs in Rayon, while one atomic budget and one absolute deadline cover the
+/// entire batch.  Results are reduced in lexical branch order.
+#[pyfunction]
+#[pyo3(signature=(LeaseDomains, ClaimSetCapacities, RejectedClaimSets, MaximumExpansions, MaximumRuntimeSeconds=None))]
+fn SolveLeaseDomainsBounded(
+    PythonValue: Python<'_>,
+    LeaseDomains: Vec<(String, Vec<(String, usize, Vec<String>, Vec<usize>)>)>,
+    ClaimSetCapacities: Vec<usize>,
+    RejectedClaimSets: Vec<Vec<(String, String)>>,
+    MaximumExpansions: usize,
+    MaximumRuntimeSeconds: Option<f64>,
+) -> PyResult<(String, Vec<(String, String)>, usize, bool, bool)> {
+    let Deadline = RuntimeDeadline::FromSeconds(MaximumRuntimeSeconds)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let Domains = LeaseDomains
+        .into_iter()
+        .map(|(Signal, Candidates)| LeaseDomain {
+            Signal,
+            Candidates: Candidates
+                .into_iter()
+                .map(|(Id, Order, ContractKeys, Claims)| LeaseCandidate {
+                    Id,
+                    Order,
+                    ContractKeys,
+                    Claims,
+                })
+                .collect(),
+        })
+        .collect();
+    let Result = PythonValue.allow_threads(|| {
+        SolveLeaseDomainsWithDeadline(
+            Domains,
+            ClaimSetCapacities,
+            RejectedClaimSets,
+            MaximumExpansions,
+            Deadline,
+        )
+    });
+    Ok((
+        match Result.Status {
+            LeaseSolveStatus::Feasible => "Feasible",
+            LeaseSolveStatus::Unsatisfiable => "Unsatisfiable",
+            LeaseSolveStatus::Incomplete => "Incomplete",
+        }
+        .to_string(),
+        Result.Selected,
+        Result.ExpansionCount,
+        Result.DeadlineExceeded,
+        Result.BudgetExhausted,
+    ))
 }
 
 #[pymethods]

@@ -54,6 +54,7 @@ from Scripts.RunRouterAcceptance import (
     RunAcceptance,
     RunCompilerCommand,
     SubprocessDeadlineGraceSeconds,
+    SubprocessFinalizationGraceSeconds,
 )
 from SchemEncoder.Writer262 import WriteLitematic
 
@@ -655,6 +656,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         DefaultRoutingPublicationReserveSeconds
                     ),
                     "WallRuntimeCeilingsUnchanged": True,
+                    "SubprocessFinalizationGraceSeconds": (
+                        SubprocessFinalizationGraceSeconds
+                    ),
                     "CaptureTimeoutGraceSeconds": 0.0,
                 },
             )
@@ -837,19 +841,23 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
 
             self.assertEqual(
                 BuildSubprocessTimeoutSeconds(Case, Normal),
-                Case.RuntimeCeilingSeconds,
+                Case.RuntimeCeilingSeconds
+                + SubprocessFinalizationGraceSeconds,
             )
             self.assertEqual(
                 BuildSubprocessTimeoutSeconds(Case, Capture),
-                Case.RuntimeCeilingSeconds,
+                Case.RuntimeCeilingSeconds
+                + SubprocessFinalizationGraceSeconds,
             )
             self.assertEqual(
                 BuildSubprocessTimeoutSeconds(Case, Comparison),
-                Case.RuntimeCeilingSeconds,
+                Case.RuntimeCeilingSeconds
+                + SubprocessFinalizationGraceSeconds,
             )
             self.assertEqual(
                 BuildSubprocessTimeoutSeconds(Case, ExplicitCapture),
                 Case.RuntimeCeilingSeconds
+                + SubprocessFinalizationGraceSeconds
                 + SubprocessDeadlineGraceSeconds,
             )
             with self.assertRaisesRegex(
@@ -894,6 +902,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 Timeouts,
                 [
                     CaseValue.RuntimeCeilingSeconds
+                    + SubprocessFinalizationGraceSeconds
                     + SubprocessDeadlineGraceSeconds
                     for CaseValue in AcceptanceCases
                     if CaseValue.Name in RegressionCaseNames

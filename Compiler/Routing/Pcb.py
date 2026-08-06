@@ -33,6 +33,8 @@ from .ChannelPlanner import MeasureRoutingStage
 from .Models import (
     ClusterInterfaceAssignment,
     ClusterInterfaceAssignmentPrepared,
+    TrackAssignmentPreparation,
+    TrackAssignmentPrepared,
     ClusterInterfaceRealizabilityNogood,
     ComponentRoutingProblem,
     ComponentRoutingProblemPrepared,
@@ -590,12 +592,14 @@ def RoutePcbAttempt(
     Policy: PhysicalDesignPolicy = DefaultPhysicalDesignPolicy,
     Deadline: RoutingDeadline | None = None,
     PreparePortalGeometryOnly: bool = False,
+    PrepareTrackAssignmentOnly: bool = False,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
     PreparePhysicalComponentPortFactorDomainOnly: bool = False,
+    DeferClusterBoundaryLeaseUntilCapacityPrecheck: bool = False,
     UnboundOwnedSignalFrontierProofCallback: Callable[
         [ComponentRoutingProblem], None
     ] | None = None,
@@ -745,6 +749,7 @@ def RoutePcbAttempt(
                 SkipStrictPortalReservation=False,
                 ReservationVariant=LeaseReservationVariant,
                 PreparePortalGeometryOnly=PreparePortalGeometryOnly,
+                PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
                 ValidateClusterInterfaceForeignAccessOnly=(
                     ValidateClusterInterfaceForeignAccessOnly
                 ),
@@ -762,6 +767,9 @@ def RoutePcbAttempt(
                 ),
                 PreparePhysicalComponentPortFactorDomainOnly=(
                     PreparePhysicalComponentPortFactorDomainOnly
+                ),
+                DeferClusterBoundaryLeaseUntilCapacityPrecheck=(
+                    DeferClusterBoundaryLeaseUntilCapacityPrecheck
                 ),
                 UnboundOwnedSignalFrontierProofCallback=(
                     UnboundOwnedSignalFrontierProofCallback
@@ -1072,6 +1080,7 @@ def PrepareClusterInterfaceAssignment(
     ] = (),
     StateFingerprint: str = "",
     LocalRouteFingerprint: str = "",
+    DeferClusterBoundaryLeaseUntilCapacityPrecheck: bool = False,
     ForbiddenAssignmentFingerprints: frozenset[str] = frozenset(),
     FrozenPatternFingerprints: dict[str, str] | None = None,
     FrozenReservations: tuple[Any, ...] = (),
@@ -1201,6 +1210,31 @@ def PrepareClusterInterfaceAssignment(
     )
 
 
+def PrepareTrackAssignment(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+) -> TrackAssignmentPreparation:
+    """Build portal/track domains and stop before route-tree construction."""
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            Placement,
+            Configuration,
+            Resources=Resources,
+            Policy=Policy,
+            Deadline=Deadline,
+            PrepareTrackAssignmentOnly=True,
+        )
+    except TrackAssignmentPrepared as Prepared:
+        return Prepared.Preparation
+    raise RuntimeError(
+        "track assignment preparation returned without a capacity result"
+    )
+
+
 def PrepareComponentRoutingProblem(
     Placement: PcbPlacement,
     *,
@@ -1250,6 +1284,7 @@ def PreparePhysicalComponentEligibility(
     Deadline: RoutingDeadline,
     StateFingerprint: str = "",
     LocalRouteFingerprint: str = "",
+    DeferClusterBoundaryLeaseUntilCapacityPrecheck: bool = False,
     ProgressCallback: Callable[[int, int], None] | None = None,
     StatusCallback: Callable[[str], None] | None = None,
     UnboundOwnedSignalFrontierProofCallback: Callable[
@@ -1278,6 +1313,9 @@ def PreparePhysicalComponentEligibility(
         Deadline=Deadline,
         PreparePhysicalComponentAssemblyOnly=True,
         PreparePhysicalComponentPortFactorDomainOnly=True,
+        DeferClusterBoundaryLeaseUntilCapacityPrecheck=(
+            DeferClusterBoundaryLeaseUntilCapacityPrecheck
+        ),
         UnboundOwnedSignalFrontierProofCallback=(
             UnboundOwnedSignalFrontierProofCallback
         ),
@@ -1318,6 +1356,7 @@ def SolvePreparedPhysicalComponentEligibility(
         Assembly = SolvePreparedPhysicalComponentPortFactorDomain(
             Preparation,
             Resources,
+            Deadline=Deadline,
             DeferLocalCompositeSelection=DeferLocalCompositeSelection,
             RequiredBoundaryPorts=RequiredBoundaryPorts,
             WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(

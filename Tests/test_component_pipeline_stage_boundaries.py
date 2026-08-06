@@ -6,6 +6,13 @@ import pytest
 
 from Compiler.Placement.PcbFlow import (
     BuildPhysicalGlobalPlanResumeCursorFromDiagnostics,
+    BuildComponentRoutabilityCore,
+    BuildCapacityRepairGeometryFingerprint,
+    BuildPhysicalLocalFactorDiversificationCore,
+    BuildPhysicalOwnedFrontierTopologyRepairCore,
+    BuildPhysicalInterfaceRepairCore,
+    BuildSymbolicCapacityRepairEvidence,
+    PreparedEligibilityHasDisjointCapacitySeams,
     BuildPhysicalComponentPlacementFeedback,
     ClassifyPhysicalGlobalPlanRetentionAdmission,
     IsClusterInterfaceStateIncomplete,
@@ -13,6 +20,7 @@ from Compiler.Placement.PcbFlow import (
     _PlaceAndRoutePcbWithPolicy,
 )
 import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
+import Compiler.Routing.Pcb as Pcb
 from Compiler.Routing.ComponentPipeline import (
     BuildPhysicalComponentAssemblyChoiceFingerprint,
     BuildPhysicalComponentAssemblyPlanDomainFingerprint,
@@ -72,7 +80,46 @@ from Compiler.Routing.Models import (
     PhysicalGlobalPlanResumeCursor,
     PhysicalPortCorridorDomain,
     PhysicalPortCorridorFactor,
+    TrackAssignmentPreparation,
+    TrackAssignmentPrepared,
 )
+from Compiler.Routing.Policy import DefaultPhysicalDesignPolicy
+from Compiler.Routing.Reliability import RoutingDeadline
+
+
+def test_prepare_track_assignment_stops_before_route_tree_construction(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    Expected = TrackAssignmentPreparation(
+        Success=True,
+        SelectedCandidateIds=(("Signal", "candidate"),),
+        CandidateCounts=(("Signal", 1),),
+        ConflictSignals=(),
+        ConflictResourceIndices=(),
+        ExpansionCount=1,
+        Complete=True,
+    )
+    Calls: list[dict[str, object]] = []
+
+    def Prepare(*_Arguments: object, **KeywordArguments: object) -> None:
+        Calls.append(dict(KeywordArguments))
+        raise TrackAssignmentPrepared(Expected)
+
+    monkeypatch.setattr(Pcb, "BuildPcbRoutingConfigurations", lambda _Value: (object(),))
+    monkeypatch.setattr(Pcb, "RoutePcbAttempt", Prepare)
+
+    Actual = Pcb.PrepareTrackAssignment(
+        SimpleNamespace(),
+        Resources=SimpleNamespace(),
+        Policy=DefaultPhysicalDesignPolicy,
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+
+    assert Actual is Expected
+    assert len(Calls) == 1
+    assert Calls[0]["Policy"] is DefaultPhysicalDesignPolicy
+    assert Calls[0]["PrepareTrackAssignmentOnly"] is True
+    assert isinstance(Calls[0]["Deadline"], RoutingDeadline)
 
 
 def test_pre_global_symbolic_capacity_proof_rejects_only_exact_port_tuple():
@@ -608,6 +655,7 @@ def test_physical_planning_uses_planning_clock_until_bound_handoff():
     Selection = Source[StateDeadline:Admission]
     assert "InterfaceDeadline = SharedInterfacePlanningDeadline" in Selection
     assert "SharedInterfaceDeadline" not in Selection
+    assert "if RetainedPlacementFingerprint in (" in Selection
 
 
 def test_stage_specific_incomplete_failures_preserve_handoff_identity():
@@ -859,7 +907,11 @@ def test_explicit_complete_proof_overrides_stale_incomplete_status():
 
 def test_complete_port_assignment_core_advances_placement_after_deadline():
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    Exhaustive = Source.index("if StateExhaustive and not StateIncomplete:")
+    Exhaustive = Source.index(
+        "if (\n"
+        "                    StateExhaustive and not StateIncomplete\n"
+        "                )"
+    )
     Advance = Source.index(
         "if ComponentAccessCoreSignals:",
         Exhaustive,
@@ -916,6 +968,652 @@ def test_complete_singleton_access_core_builds_placement_feedback():
     assert Feedback.DomainFingerprint == "access-domain"
 
 
+def test_complete_ownership_core_is_serialized_and_drives_feedback():
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalEligibilitySolveAfterUnarySupport",
+        AffectedNets=("NandNet26", "CarryIn"),
+        Resources=("portal-a",),
+        Locations=((3, 7, 2),),
+        Diagnostics={
+            "OwnershipUnsatCoreFingerprint": "44136fa355b3678a",
+        },
+    )
+    Core = BuildComponentRoutabilityCore(
+        Failure,
+        PlacementStateFingerprint="placement",
+        ComponentStateFingerprint="component",
+        DomainFingerprint="domain",
+        CoreFingerprint="fallback",
+        Complete=True,
+    )
+
+    assert Core is not None
+    assert Core.Signals == ("CarryIn", "NandNet26")
+    assert Core.BlockingResources == ("portal-a",)
+    assert Core.BlockingPorts == ((3, 7, 2),)
+    Feedback = BuildPhysicalComponentPlacementFeedback(replace(
+        Failure,
+        Diagnostics={"ComponentRoutabilityCore": Core.ToDictionary()},
+    ))
+    assert Feedback is not None
+    assert Feedback.ProofFingerprint == "44136fa355b3678a"
+    assert Feedback.RelocationSignals == ("CarryIn", "NandNet26")
+
+
+def test_complete_capacity_pressure_core_overrides_broad_ownership_feedback():
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        AffectedNets=("CarryIn", "NandNet26", "NandNet28", "NandNet29"),
+        Diagnostics={
+            "OwnershipUnsatCoreFingerprint": "44136fa355b3678a",
+            "PlacementInterfacePressureSignals": [
+                "NandNet29",
+                "NandNet28",
+            ],
+        },
+    )
+
+    Core = BuildComponentRoutabilityCore(
+        Failure,
+        PlacementStateFingerprint="placement",
+        ComponentStateFingerprint="component",
+        DomainFingerprint="domain",
+        CoreFingerprint="fallback",
+        Complete=True,
+    )
+
+    assert Core is not None
+    assert Core.CoreFingerprint != "44136fa355b3678a"
+    assert Core.Signals == ("NandNet28", "NandNet29")
+    Feedback = BuildPhysicalComponentPlacementFeedback(replace(
+        Failure,
+        Diagnostics={"ComponentRoutabilityCore": Core.ToDictionary()},
+    ))
+    assert Feedback is not None
+    assert Feedback.RelocationSignals == ("NandNet28", "NandNet29")
+
+
+def test_complete_capacity_pair_builds_disjoint_seam_constraint():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        Diagnostics={
+            "PortAssignmentProofComplete": True,
+            "PortAssignmentUnsatCoreMinimal": True,
+            "PortAssignmentUnsatCoreFingerprint": "proof",
+            "PortAssignmentUnsatCoreSignals": ["Beta", "Alpha"],
+            "PortAssignmentUnsatCoreClause": [
+                ["Alpha", "seam-alpha"],
+                ["Beta", "seam-beta"],
+            ],
+        },
+    )
+
+    Constraint = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+
+    assert Constraint is not None
+    assert Constraint.Signals == ("Alpha", "Beta")
+    assert Constraint.ForcedSeamClasses == (
+        ("Alpha", "seam-alpha"),
+        ("Beta", "seam-beta"),
+    )
+    Preparation = SimpleNamespace(LocalAccessFactorsBySignal=(
+        ("Alpha", (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("a",))),
+            SeamContractFingerprint="new-alpha",
+        ),)),
+        ("Beta", (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("b",))),
+            SeamContractFingerprint="new-beta",
+        ),)),
+    ))
+    assert PreparedEligibilityHasDisjointCapacitySeams(
+        Preparation, Constraint,
+    )[0] is True
+    Overlapping = SimpleNamespace(LocalAccessFactorsBySignal=(
+        ("Alpha", (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("shared",))),
+            SeamContractFingerprint="alpha",
+        ),)),
+        ("Beta", (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("shared",))),
+            SeamContractFingerprint="beta",
+        ),)),
+    ))
+    assert PreparedEligibilityHasDisjointCapacitySeams(
+        Overlapping, Constraint,
+    )[0] is False
+
+
+def test_complete_capacity_core_uses_lexicographic_multi_signal_matching():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        Diagnostics={
+            "PortAssignmentProofComplete": True,
+            "PortAssignmentUnsatCoreMinimal": True,
+            "PortAssignmentUnsatCoreFingerprint": "triple-proof",
+            "PortAssignmentUnsatCoreSignals": ["Gamma", "Alpha", "Beta"],
+            "PortAssignmentUnsatCoreClause": [
+                ["Alpha", "seam-alpha"],
+                ["Beta", "seam-beta"],
+                ["Gamma", "seam-gamma"],
+            ],
+        },
+    )
+    Constraint = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+
+    assert Constraint is not None
+    assert Constraint.Signals == ("Alpha", "Beta", "Gamma")
+    Preparation = SimpleNamespace(LocalAccessFactorsBySignal=(
+        ("Alpha", (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("a",))),
+            SeamContractFingerprint="alpha",
+        ),)),
+        ("Beta", (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("b",))),
+            SeamContractFingerprint="beta",
+        ),)),
+        ("Gamma", (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("c",))),
+            SeamContractFingerprint="gamma",
+        ),)),
+    ))
+    First = PreparedEligibilityHasDisjointCapacitySeams(Preparation, Constraint)
+    Second = PreparedEligibilityHasDisjointCapacitySeams(Preparation, Constraint)
+
+    assert First == Second
+    assert First[0] is True
+    assert First[2] == (
+        ("Alpha", "alpha"),
+        ("Beta", "beta"),
+        ("Gamma", "gamma"),
+    )
+
+
+def test_complete_capacity_core_rejects_higher_order_claim_conflict():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        Diagnostics={
+            "PortAssignmentProofComplete": True,
+            "PortAssignmentUnsatCoreMinimal": True,
+            "PortAssignmentUnsatCoreFingerprint": "triple-conflict",
+            "PortAssignmentUnsatCoreSignals": ["Alpha", "Beta", "Gamma"],
+            "PortAssignmentUnsatCoreClause": [
+                ["Alpha", "a"], ["Beta", "b"], ["Gamma", "c"],
+            ],
+        },
+    )
+    Constraint = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+    assert Constraint is not None
+    Preparation = SimpleNamespace(LocalAccessFactorsBySignal=tuple(
+        (Signal, (SimpleNamespace(
+            LocalClaims=SimpleNamespace(ResourceIds=frozenset(("shared",))),
+            SeamContractFingerprint=Signal,
+        ),))
+        for Signal in Constraint.Signals
+    ))
+
+    assert PreparedEligibilityHasDisjointCapacitySeams(
+        Preparation, Constraint,
+    ) == (
+        False,
+        "",
+        (),
+        (
+            ("Alpha", ("Alpha",)),
+            ("Beta", ("Beta",)),
+            ("Gamma", ("Gamma",)),
+        ),
+    )
+
+
+def test_complete_single_signal_capacity_core_does_not_admit_geometry_repair():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        Diagnostics={
+            "PortAssignmentProofComplete": True,
+            "PortAssignmentUnsatCoreMinimal": True,
+            "PortAssignmentUnsatCoreFingerprint": "single-proof",
+            "PortAssignmentUnsatCoreSignals": ["Alpha"],
+            "PortAssignmentUnsatCoreClause": [["Alpha", "seam-alpha"]],
+        },
+    )
+    Constraint = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+    assert Constraint is None
+
+
+def test_complete_singleton_assembly_core_admits_local_factor_diversification():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        Diagnostics={
+            "PortAssignmentProofComplete": True,
+            "PortAssignmentUnsatCoreMinimal": True,
+            "PortAssignmentUnsatCoreFingerprint": "singleton-proof",
+            "PortAssignmentUnsatCoreSignals": ["Alpha"],
+            "DomainFingerprint": "factor-domain",
+        },
+    )
+
+    First = BuildPhysicalLocalFactorDiversificationCore(Failure, Candidate)
+    Second = BuildPhysicalLocalFactorDiversificationCore(Failure, Candidate)
+
+    assert First == Second
+    assert First is not None
+    assert First.Signal == "Alpha"
+    assert First.SourceProofFingerprint == "singleton-proof"
+
+
+def test_incomplete_singleton_assembly_core_cannot_diversify_local_factor():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        Diagnostics={
+            "PortAssignmentUnsatCoreMinimal": True,
+            "PortAssignmentUnsatCoreFingerprint": "singleton-proof",
+            "PortAssignmentUnsatCoreSignals": ["Alpha"],
+            "DomainFingerprint": "factor-domain",
+        },
+    )
+
+    assert BuildPhysicalLocalFactorDiversificationCore(
+        Failure,
+        Candidate,
+    ) is None
+
+
+def test_complete_contract_independent_owned_frontier_lifts_topology_core():
+    Producer = SimpleNamespace(
+        Name="Producer",
+        Outputs=("Alpha",),
+        Inputs=(),
+        OutputPin=(0, 1, 0),
+        InputPins=(),
+    )
+    Consumer = SimpleNamespace(
+        Name="Consumer",
+        Outputs=(),
+        Inputs=("Alpha",),
+        OutputPin=None,
+        InputPins=((4, 1, 0),),
+    )
+    Candidate = SimpleNamespace(
+        InterfaceTopologyFingerprint="source-topology",
+        Placement=SimpleNamespace(
+            Clusters=(("Producer", "Consumer"),),
+            Placed=SimpleNamespace(PlacedGates=(Producer, Consumer)),
+        ),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentLocalEligibility",
+        Diagnostics={
+            "LocalUnsatCoreComplete": True,
+            "LocalUnsatCoreKind": "tree-frontier-empty-owned-signal-domain",
+            "LocalUnsatCoreFingerprint": "owned-frontier-proof",
+            "LocalUnsatCoreSignals": ["Alpha"],
+            "SignalDiagnostics": {
+                "Alpha": {
+                    "Complete": True,
+                    "OwnedSignalDomainContractIndependent": True,
+                },
+            },
+        },
+    )
+
+    First = BuildPhysicalOwnedFrontierTopologyRepairCore(Failure, Candidate)
+    Second = BuildPhysicalOwnedFrontierTopologyRepairCore(Failure, Candidate)
+
+    assert First == Second
+    assert First is not None
+    assert First.Signals == ("Alpha",)
+    assert First.ProducerGateNames == ("Producer",)
+    assert First.ConsumerGateNames == ("Consumer",)
+    assert First.ClusterIds == (0,)
+
+
+def test_port_dependent_or_incomplete_owned_frontier_cannot_lift_topology_core():
+    Candidate = SimpleNamespace(
+        InterfaceTopologyFingerprint="source-topology",
+        Placement=SimpleNamespace(
+            Clusters=(("Producer", "Consumer"),),
+            Placed=SimpleNamespace(PlacedGates=()),
+        ),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalComponentLocalEligibility",
+        Diagnostics={
+            "LocalUnsatCoreComplete": False,
+            "LocalUnsatCoreKind": "tree-frontier-empty-owned-signal-domain",
+            "LocalUnsatCoreFingerprint": "incomplete",
+            "LocalUnsatCoreSignals": ["Alpha"],
+            "SignalDiagnostics": {"Alpha": {"Complete": False}},
+        },
+    )
+
+    assert BuildPhysicalOwnedFrontierTopologyRepairCore(
+        Failure,
+        Candidate,
+    ) is None
+
+
+def test_complete_channel_capacity_core_lifts_deterministically():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentChannelCapacityUnsatisfiable,
+        Stage="PhysicalComponentGlobalChannelUnsatisfiable",
+        AffectedNets=("Gamma", "Alpha", "Beta"),
+        Diagnostics={
+            "GlobalPlanDomainComplete": True,
+            "CompleteAssignmentCutProof": True,
+            "GlobalPlanDependencyFingerprint": "channel-proof",
+        },
+    )
+
+    First = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+    Second = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+
+    assert First == Second
+    assert First is not None
+    assert First.RepairLevel == "channel-capacity"
+    assert First.ProofKind == "complete-channel-capacity-core"
+    assert First.Signals == ("Alpha", "Beta", "Gamma")
+
+
+def test_complete_feedthrough_endpoint_domain_lifts_channel_repair_core():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentChannelCapacityUnsatisfiable,
+        Stage="PhysicalComponentAssemblyPlanning",
+        AffectedNets=("Transit",),
+        Diagnostics={
+            "FeedthroughCandidateDomainComplete": True,
+            "ComponentFabricConstructionComplete": True,
+            "OwnershipSearchComplete": True,
+            "FeedthroughEndpointPrescreenComplete": True,
+            "FeedthroughEndpointDomainFingerprint": "feedthrough-proof",
+        },
+    )
+
+    Core = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+
+    assert Core is not None
+    assert Core.RepairLevel == "channel-capacity"
+    assert Core.ProofKind == "complete-feedthrough-endpoint-domain"
+    assert Core.Signals == ("Transit",)
+
+
+def test_capacity_repair_precheck_defers_dense_boundary_lease_only():
+    FlowSource = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    PrepareCall = FlowSource.index(
+        "PreparedEligibility = PreparePhysicalComponentEligibility("
+    )
+    PrepareSource = FlowSource[PrepareCall:PrepareCall + 1200]
+    PlannerSource = inspect.getsource(
+        AuthoritativePlanner.RouteAuthoritativeResources
+    )
+    PcbSource = inspect.getsource(Pcb.PreparePhysicalComponentEligibility)
+
+    assert "DeferClusterBoundaryLeaseUntilCapacityPrecheck=(" in PrepareSource
+    assert "CapacityRepairConstraint is not None" in PrepareSource
+    assert "and not DeferClusterBoundaryLeaseUntilCapacityPrecheck" in (
+        PlannerSource
+    )
+    assert "deferred-for-capacity-repair-precheck" in PlannerSource
+    DeferredLease = PlannerSource.index(
+        '"deferred-for-capacity-repair-precheck"'
+    )
+    assert "PortalReservations = ()" in PlannerSource[
+        DeferredLease:DeferredLease + 500
+    ]
+    assert "DeferClusterBoundaryLeaseUntilCapacityPrecheck=(" in PcbSource
+
+
+def test_complete_capacity_pair_evidence_survives_feedback_escalation():
+    Evidence = BuildSymbolicCapacityRepairEvidence(
+        {
+            "SymbolicCapacityProofFingerprint": "complete-pair-proof",
+            "LocalCapacityCoreClause": [
+                ["Beta", "seam-beta"],
+                ["Alpha", "seam-alpha"],
+            ],
+        },
+        ("Beta", "Alpha"),
+    )
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalSymbolicCapacityPlacementFeedback",
+        Diagnostics={
+            "SymbolicCapacityPlacementFeedback": True,
+            "PlacementInterfacePressureSignals": ["Alpha", "Beta"],
+            **Evidence,
+        },
+    )
+
+    Constraint = BuildPhysicalInterfaceRepairCore(Failure, Candidate)
+
+    assert Evidence == {
+        "SymbolicCapacityProofComplete": True,
+        "SymbolicCapacityProofFingerprint": "complete-pair-proof",
+        "LocalCapacityCoreClause": [
+            ["Alpha", "seam-alpha"],
+            ["Beta", "seam-beta"],
+        ],
+    }
+    # Symbolic pair evidence may guide local replanning, but it is not yet
+    # an exact assembly/channel repair core.
+    assert Constraint is None
+    assert BuildSymbolicCapacityRepairEvidence(
+        {"SymbolicCapacityProofFingerprint": "incomplete"},
+        ("Alpha", "Beta"),
+    ) == {}
+
+
+def test_capacity_repair_geometry_includes_pair_pin_positions():
+    def CandidateAt(X):
+        Gate = SimpleNamespace(
+            Name="Producer",
+            Outputs=("Alpha",),
+            OutputPin=(X, 7, 0),
+            Inputs=("Beta",),
+            InputPins=((X, 7, 1),),
+        )
+        return SimpleNamespace(
+            Placement=SimpleNamespace(Placed=SimpleNamespace(
+                LocalRouteClaims=(),
+                PlacedGates=(Gate,),
+            )),
+        )
+
+    First = BuildCapacityRepairGeometryFingerprint(
+        CandidateAt(1), ("Alpha", "Beta"),
+    )
+    Second = BuildCapacityRepairGeometryFingerprint(
+        CandidateAt(2), ("Alpha", "Beta"),
+    )
+
+    assert First != Second
+
+
+def test_complete_capacity_feedback_advances_queued_repair_placement():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    FeedbackStart = Source.index(
+        "CompleteSymbolicCapacityPlacementFeedback = bool("
+    )
+    FeedbackEnd = Source.index(
+        "LatestInterfaceProofByComponentState",
+        FeedbackStart,
+    )
+    Feedback = Source[FeedbackStart:FeedbackEnd]
+
+    assert "EnqueueOwnedFrontierTopologyRepair(" in Feedback
+    assert "or EnqueueProofGuidedPhysicalPlacement(" in Feedback
+    assert "or CompleteSymbolicCapacityPlacementFeedback" in Feedback
+    assert "and PlacementAdvanced" in Feedback
+    assert "and not (\n                            Deadline" in Feedback
+    assert "GlobalHandoffPlacementAdvanced" in Source
+    assert '"SymbolicCapacityPlacementFeedback"' in Source
+
+    DeferredRequestSource = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    assert "AllowCapacityPairRepair=(" in DeferredRequestSource
+    assert "CapacityRepairActive" in DeferredRequestSource
+    assert "AllowCapacityPairRepair: bool = False" in DeferredRequestSource
+    assert "and not AllowCapacityPairRepair" in DeferredRequestSource
+    assert "AllowCapacityPairRepair\n                or" in DeferredRequestSource
+    assert "AllowCapacityPairRepair=(" in DeferredRequestSource
+    assert "PlacementGenerationNotAfter=(" in DeferredRequestSource
+    assert "Deadline.ExpiresAt\n                            if" in (
+        DeferredRequestSource
+    )
+    assert 'SourceGenerator="row-beam-conflict-relocation"' in (
+        DeferredRequestSource
+    )
+
+
+def test_owned_frontier_topology_repair_regenerates_before_eligibility():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    DeferredRequestSource = Source
+    RepairStart = Source.index("def EnqueueOwnedFrontierTopologyRepair(")
+    RepairEnd = Source.index("while (", RepairStart)
+    Repair = Source[RepairStart:RepairEnd]
+
+    assert "PlacePcbGraph(" in Repair
+    assert "CutDrivenClusterRefinementSignals=frozenset(Core.Signals)" in Repair
+    assert "BuildRoutingResources(" in Repair
+    assert "BuildTransactionalClusterEndpointRepair(" not in Repair
+    assert '"prepare-eligibility"' in Repair
+    assert "JointPlacementCandidateIndex=TopologyCandidateIndex" in Repair
+    assert "TopologyCandidateBaseIndex" in Repair
+    assert "TopologyCandidateBaseIndex + TopologyCandidateOffset" in Repair
+    assert "owned-frontier-topology-retained-domain-exhausted" in Repair
+    assert "RetainedJointPlacementCandidates * 2" in Repair
+    assert "EffectiveComponentVariant" in Source
+    assert '"relocate-endpoint-cluster"' in Source
+    assert "JointPlacementCandidateIndex=Variant" not in Repair
+    assert "GlobalComponentStateDomainExhausted" in Source
+
+
+def test_capacity_repair_requeue_counts_dequeued_channelized_placement():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    DeferredRequestSource = Source
+    RequeueStart = Source.index("AttemptedRepairPlacementFingerprints = {")
+    RequeueEnd = Source.index("UnattemptedCapacityRepairCandidates", RequeueStart)
+    Requeue = Source[RequeueStart:RequeueEnd]
+
+    assert "capacity-pair-repair-dequeued" in Requeue
+    assert "bounded-proof-driven-repair-candidate-failed" in Requeue
+    assert "DequeuedCapacityRepairPlacementFingerprints" in Source
+    assert "capacity-pair-repair-duplicate-dequeue-suppressed" in Source
+    assert 'InterfaceWorkPhase == "prepare-eligibility"' in Source
+    assert "serial solve work item intentionally reuses this" in Source
+    assert "if CapacityRepairConstraint is not None:" in (
+        DeferredRequestSource
+    )
+    assert "CapacityRepairPlacementState = (" in DeferredRequestSource
+    assert "and not CapacityRepairPlacementState" in DeferredRequestSource
+    assert "PairwiseConflictEdges=(" in DeferredRequestSource
+    assert "CapacityRepairConstraint.Signals" in DeferredRequestSource
+    assert "CapacityRepairConstraint is None\n                and InheritedCapacityRepairConstraint is not None" in Source
+    assert "ClusterInterfacePlacementMaterialization" in (
+        DeferredRequestSource
+    )
+    assert "if CapacityRepairConstraint is not None\n                            else InterfaceDeadline" in (
+        DeferredRequestSource
+    )
+    assert "in CapacityRepairConstraintByPlacementFingerprint" in (
+        DeferredRequestSource
+    )
+
+
+def test_interface_repair_preserves_broad_work_and_records_outcomes():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+
+    assert '"interface-repair-epoch-started"' in Source
+    assert "PreemptedCandidateIds" in Source
+    assert "PreemptedCandidateIds\": []" in Source
+    assert '"capacity-pair-repair-generated"' in Source
+    assert '"capacity-pair-repair-dequeued"' in Source
+    assert '"capacity-pair-repair-local-materialized"' in Source
+    assert '"capacity-pair-repair-rejected-overlapping-seams"' in Source
+    assert '"capacity-repair-witness-reserved"' in Source
+    assert '"capacity-repair-csp-admitted"' in Source
+    assert '"bounded-proof-driven-repair-candidate-failed"' in Source
+    assert '"bounded-proof-driven-repair-exhausted"' in Source
+    assert '"PhysicalCapacityRepairPortfolio"' in Source
+    assert '"capacity-repair-portfolio-prefetched"' in Source
+    assert '"split-relocate"' in Source
+    assert '"widen-channel-deck"' in Source
+    assert '"split-channel-endpoints"' in Source
+
+
+def test_incomplete_capacity_pair_cannot_build_repair_constraint():
+    Candidate = SimpleNamespace(
+        Placement=SimpleNamespace(Placed=SimpleNamespace(LocalRouteClaims=())),
+    )
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable,
+        Stage="PhysicalSymbolicCapacityPlacementFeedback",
+        Diagnostics={
+            "SymbolicCapacityPlacementFeedback": True,
+            "PlacementInterfacePressureSignals": ["Alpha", "Beta"],
+            "LocalCapacityCoreClause": [
+                ["Alpha", "seam-alpha"], ["Beta", "seam-beta"],
+            ],
+        },
+    )
+
+    assert BuildPhysicalInterfaceRepairCore(Failure, Candidate) is None
+
+
+def test_incomplete_ownership_core_cannot_drive_feedback():
+    Failure = RoutingFailure(
+        Reason=RoutingFailureReason.RuntimeBudgetExceeded,
+        Stage="PhysicalEligibilitySolveAfterUnarySupport",
+        AffectedNets=("NandNet26",),
+        Diagnostics={"OwnershipUnsatCoreFingerprint": "core"},
+    )
+
+    assert BuildComponentRoutabilityCore(
+        Failure,
+        PlacementStateFingerprint="placement",
+        ComponentStateFingerprint="component",
+        DomainFingerprint="domain",
+        CoreFingerprint="core",
+        Complete=False,
+    ) is None
+
+
 @pytest.mark.parametrize(
     "Diagnostics",
     (
@@ -966,9 +1664,11 @@ def test_two_assembly_plans_reuse_one_prepared_factor_domain(monkeypatch):
         Resources,
         *,
         WorkCheck=None,
+        Deadline=None,
         DeferLocalCompositeSelection=False,
         RequiredBoundaryPorts=None,
     ):
+        assert Deadline is not None
         assert DeferLocalCompositeSelection
         assert RequiredBoundaryPorts is None
         Calls.append((Value, Value.DomainFingerprint))

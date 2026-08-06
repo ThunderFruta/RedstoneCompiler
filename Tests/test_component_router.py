@@ -8,6 +8,7 @@ import unittest
 from Compiler.Routing.ComponentRouter import (
     ApplyRoutedComponentGlobalProfiles,
     BuildCoalescedComponentAccessCandidates,
+    CoalesceOwnedSignalAccessDomains,
     BuildClosedComponentInterface,
     BuildDeclaredComponentFeedthroughDomains,
     BuildComponentForeignTransitDomains,
@@ -42,9 +43,12 @@ from Compiler.Routing.ComponentRouter import (
     _PlanTreeRepeaters,
     _SolveComponentRoutingProblemLegacy,
 )
+from Compiler.Routing import ComponentRouter as ComponentRouterModule
+from Compiler.Routing import ComponentPipeline as ComponentPipelineModule
 from Compiler.Routing.ComponentPipeline import CompileClosedComponent
 from Compiler.Routing.ComponentPipeline import (
     BuildPhysicalPortLocalContractFingerprint,
+    CompilePhysicalComponentSymbolicUnaryApertureDomain,
 )
 from Compiler.Routing.Models import (
     ClosedComponentInterface,
@@ -1168,6 +1172,50 @@ def test_component_access_coalesces_adjacent_terminal_into_shared_trunk():
     assert Values[0].Attachment == Trunk.Attachment
 
 
+def test_owned_signal_domains_include_bounded_coalesced_accesses():
+    class HorizontalResourceGraph:
+        def BuildPrimitive(self, First, Second):
+            return (
+                object()
+                if sum(
+                    abs(First[Index] - Second[Index])
+                    for Index in range(3)
+                ) == 1
+                else None
+            )
+
+        def BuildRouteClaims(self, Nodes):
+            return _Claims(*Nodes)
+
+    Source = ComponentTerminalAccessDomain(
+        Signal="Shared",
+        Terminal=(0, 1, 0),
+        TerminalRole="source",
+        TerminalFingerprint="source",
+        Candidates=(_Candidate(((0, 1, 0), (0, 1, 2))),),
+    )
+    Target = ComponentTerminalAccessDomain(
+        Signal="Shared",
+        Terminal=(2, 1, 0),
+        TerminalRole="target",
+        TerminalFingerprint="target",
+        Candidates=(_Candidate(((2, 1, 0), (2, 1, 2))),),
+    )
+
+    Domains = CoalesceOwnedSignalAccessDomains(
+        (Source, Target),
+        ResourceGraph=HorizontalResourceGraph(),
+        MaximumAdditionalCandidatesPerDomain=2,
+    )
+
+    assert len(Domains) == 2
+    assert all(len(Domain.Candidates) > 1 for Domain in Domains)
+    assert any(
+        Candidate.Attachment == (2, 1, 2)
+        for Candidate in Domains[0].Candidates
+    )
+
+
 def test_exact_port_realizability_reports_self_claim_conflict():
     class SelfConflictingResourceGraph:
         GraphVersion = "self-conflict-test"
@@ -2141,6 +2189,31 @@ def test_prepared_symbolic_net_state_context_reuses_exact_access_cache():
     assert len(RouteClaimsCache) == RouteClaimsCacheSize
 
 
+def test_prepared_symbolic_context_reuses_local_proof_across_placement():
+    """A placement-wide repair does not invalidate unchanged local inputs."""
+    FirstProblem = _Problem()
+    RepairedPlacement = replace(
+        FirstProblem,
+        PlacementFingerprint="placement-after-exterior-repair",
+    )
+    StateCache = {}
+    Context = PrepareComponentSymbolicNetStateContext(
+        FirstProblem,
+        "Alpha",
+    )
+
+    First = CompilePreparedComponentSymbolicNetStates(
+        Context, FirstProblem, SymbolicNetStateCache=StateCache,
+    )
+    Reused = CompilePreparedComponentSymbolicNetStates(
+        Context, RepairedPlacement, SymbolicNetStateCache=StateCache,
+    )
+
+    assert First.Complete and Reused.Complete
+    assert Reused.CacheHit
+    assert Reused.States == First.States
+
+
 def test_prepared_symbolic_context_reuses_terminal_frontier_across_egresses():
     Base = _Problem(
         External=(("Alpha", (3, 7, 0), "target"),),
@@ -2626,6 +2699,80 @@ def _LoadCla4TreeDpFixture():
     return Data, Problem
 
 
+def test_parallel_unary_workers_merge_symbolic_state_cache_into_parent():
+    Problem = _Problem()
+    FactorDomain = SimpleNamespace(
+        Complete=True,
+        Feasible=True,
+        PlacementFingerprint=Problem.PlacementFingerprint,
+        DomainFingerprint="parallel-unary-cache-fixture",
+        LocalAccessFactorsBySignal=(
+            ("Alpha", ()),
+            ("Beta", ()),
+        ),
+    )
+
+    class Future:
+        def __init__(self, Result):
+            self.Result = Result
+
+        def result(self, timeout=None):
+            return self.Result
+
+    class Executor:
+        def __init__(self, **_Arguments):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_Arguments):
+            return False
+
+        def submit(self, _Worker, _Problem, _FactorDomain, Signal, _Deadline):
+            Clause = frozenset(((Signal, f"aperture-{Signal}"),))
+            return Future((
+                Signal,
+                frozenset((Clause,)),
+                {
+                    "Complete": True,
+                    "CompiledAccessCount": 1,
+                    "UnsupportedLocalAccessCount": 0,
+                    "UnsupportedApertureOptionCount": 0,
+                    "UnsupportedLocalApertureSupportCount": 0,
+                    "UnaryLocalAccessClauseCount": 1,
+                    "UnarySeamClauseCount": 0,
+                },
+                {f"symbolic-state:{Signal}": Signal},
+            ))
+
+    OriginalExecutor = ComponentPipelineModule.ProcessPoolExecutor
+    ComponentPipelineModule.ProcessPoolExecutor = Executor
+    try:
+        NetStateCache = {}
+        Clauses, Diagnostics = (
+            CompilePhysicalComponentSymbolicUnaryApertureDomain(
+                Problem,
+                FactorDomain,
+                ("Alpha", "Beta"),
+                DeadlineSeconds=1.0,
+                NetStateCache=NetStateCache,
+            )
+        )
+    finally:
+        ComponentPipelineModule.ProcessPoolExecutor = OriginalExecutor
+
+    assert Clauses == frozenset((
+        frozenset((("Alpha", "aperture-Alpha"),)),
+        frozenset((("Beta", "aperture-Beta"),)),
+    ))
+    assert NetStateCache == {
+        "symbolic-state:Alpha": "Alpha",
+        "symbolic-state:Beta": "Beta",
+    }
+    assert Diagnostics["UnarySignalProcessStatus"] == "complete"
+
+
 def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
     Data, Problem = _LoadCla4TreeDpFixture()
     SymbolicNetStateCache = {}
@@ -2635,6 +2782,16 @@ def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
         DeadlineSeconds=30.0,
     )
     RuntimeSeconds = monotonic() - Started
+    if ComponentRouterModule._BuildRouteClaimsBatchWithTelemetry is not None:
+        # The captured CLA4 tree frontier has more than eight independent
+        # physical claim sets.  Keep the native worker split honest: the
+        # bounded pool must execute one deterministic shard on every worker,
+        # rather than merely advertising an eight-thread capacity.
+        assert First.Diagnostics["NativeClaimBatchWorkerCount"] == 8
+        assert First.Diagnostics["NativeClaimBatchActiveWorkerCount"] == 8
+        assert First.Diagnostics["NativeClaimBatchWorkItems"] >= 8
+        assert First.Diagnostics["NativeFabricSubtreeBatchActiveWorkerCount"] == 8
+        assert First.Diagnostics["NativeFabricSubtreeBatchWorkItems"] >= 8
     Second = SolveComponentRoutingProblemDynamic(
         Problem,
         DeadlineSeconds=30.0,

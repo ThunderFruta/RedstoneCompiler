@@ -2820,6 +2820,8 @@ def BuildBoundedInterClusterRoutingChannel(
     ForcedAffectedClusters: tuple[int, ...] | None = None,
     ForcedRoot: int | None = None,
     ForcedAxisPattern: tuple[str, ...] | None = None,
+    ChannelClearanceTracks: int = 0,
+    ChannelTopologyVariant: int = 0,
 ) -> PcbPlacement:
     """Insert one bounded physical channel through the densest interface.
 
@@ -2841,6 +2843,10 @@ def BuildBoundedInterClusterRoutingChannel(
         raise ValueError("inter-cluster channel supports one or two strips")
     if RoutingLayerCount < 1:
         raise ValueError("inter-cluster channel requires routing layers")
+    if ChannelClearanceTracks < 0 or ChannelClearanceTracks > 1:
+        raise ValueError("channel clearance tracks must be zero or one")
+    if ChannelTopologyVariant < 0:
+        raise ValueError("channel topology variant must be non-negative")
     if Source.InterClusterRoutingChannel is not None:
         return Source
 
@@ -3159,6 +3165,7 @@ def BuildBoundedInterClusterRoutingChannel(
     ))
     if ForcedRoot is None:
         RootFailures = []
+        RemainingTopologyVariants = ChannelTopologyVariant
         PreferredAxes = tuple(
             (
                 "X"
@@ -3184,7 +3191,7 @@ def BuildBoundedInterClusterRoutingChannel(
         for RootCandidate in RankedRoots:
             for AxisPattern in AxisPatterns:
                 try:
-                    return BuildBoundedInterClusterRoutingChannel(
+                    Candidate = BuildBoundedInterClusterRoutingChannel(
                         Source,
                         TrackPitch=TrackPitch,
                         MaximumAffectedClusters=MaximumAffectedClusters,
@@ -3193,7 +3200,11 @@ def BuildBoundedInterClusterRoutingChannel(
                         ForcedAffectedClusters=tuple(AffectedClusters),
                         ForcedRoot=RootCandidate,
                         ForcedAxisPattern=tuple(AxisPattern),
+                        ChannelClearanceTracks=ChannelClearanceTracks,
                     )
+                    if RemainingTopologyVariants == 0:
+                        return Candidate
+                    RemainingTopologyVariants -= 1
                 except ValueError as Error:
                     RootFailures.append(
                         "root-"
@@ -3203,6 +3214,12 @@ def BuildBoundedInterClusterRoutingChannel(
         raise ValueError(
             "no legal bounded channel root: "
             + "; ".join(RootFailures)
+            + (
+                ""
+                if not RootFailures else
+                f"; requested topology variant {ChannelTopologyVariant} "
+                "exceeds legal channel alternatives"
+            )
         )
     if ForcedRoot not in AffectedSet:
         raise ValueError("forced channel root is outside the component")
@@ -3236,41 +3253,58 @@ def BuildBoundedInterClusterRoutingChannel(
                 else -1
             )
             ParentDelta = ClusterTranslations[Parent]
+            ShiftDistance = TrackPitch * (1 + ChannelClearanceTracks)
             Shift = (
-                Direction * TrackPitch,
+                Direction * ShiftDistance,
                 0,
                 0,
             ) if Axis == "X" else (
                 0,
                 0,
-                Direction * TrackPitch,
+                Direction * ShiftDistance,
             )
             ClusterTranslations[Child] = tuple(
                 ParentDelta[Index] + Shift[Index]
                 for Index in range(3)
             )
             if any(
-                abs(ClusterTranslations[Child][Index]) > TrackPitch
+                abs(ClusterTranslations[Child][Index]) > ShiftDistance
                 for Index in (0, 2)
             ):
                 raise ValueError(
                     "inter-cluster channel exceeds per-axis growth bound"
                 )
-            Bounds = Envelopes[Child]
+            # The lane belongs in the newly opened translated gap, not at
+            # the child's source boundary.  Using the source coordinate
+            # made a clearance transform move the cluster while leaving its
+            # channel lane inside the old placed geometry.
+            ParentBounds = Envelopes[Parent]
+            ChildBounds = Envelopes[Child]
             if Axis == "X":
-                Coordinate = (
-                    Bounds[0] + ParentDelta[0] + TrackPitch // 2
-                    if Direction > 0
-                    else Bounds[2] + ParentDelta[0]
-                    - TrackPitch + TrackPitch // 2
+                GapMinimum, GapMaximum = (
+                    (
+                        ParentBounds[2] + ParentDelta[0] + 1,
+                        ChildBounds[0] + ClusterTranslations[Child][0] - 1,
+                    )
+                    if Direction > 0 else (
+                        ChildBounds[2] + ClusterTranslations[Child][0] + 1,
+                        ParentBounds[0] + ParentDelta[0] - 1,
+                    )
                 )
             else:
-                Coordinate = (
-                    Bounds[1] + ParentDelta[2] + TrackPitch // 2
-                    if Direction > 0
-                    else Bounds[3] + ParentDelta[2]
-                    - TrackPitch + TrackPitch // 2
+                GapMinimum, GapMaximum = (
+                    (
+                        ParentBounds[3] + ParentDelta[2] + 1,
+                        ChildBounds[1] + ClusterTranslations[Child][2] - 1,
+                    )
+                    if Direction > 0 else (
+                        ChildBounds[3] + ClusterTranslations[Child][2] + 1,
+                        ParentBounds[1] + ParentDelta[2] - 1,
+                    )
                 )
+            if GapMinimum > GapMaximum:
+                raise ValueError("translated channel has no physical gap")
+            Coordinate = (GapMinimum + GapMaximum) // 2
             StripSeeds.append((Axis, Coordinate, Parent, Child))
             Queue.append((Child, Parent))
 
@@ -3457,6 +3491,7 @@ def BuildBoundedInterClusterRoutingChannel(
     ))
     ChannelFingerprint = sha256(repr((
         StructuralClusters,
+        ChannelClearanceTracks,
         tuple(
             (
                 Axis,
@@ -3493,6 +3528,7 @@ def BuildBoundedInterClusterRoutingChannel(
         )),
         Lanes=tuple(LaneRecords),
         TrackPitch=TrackPitch,
+        ChannelClearanceTracks=ChannelClearanceTracks,
         MaximumAffectedClusters=MaximumAffectedClusters,
         MaximumBoundaryStrips=MaximumBoundaryStrips,
         ComponentId=ComponentId,

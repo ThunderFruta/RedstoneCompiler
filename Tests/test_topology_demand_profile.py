@@ -26,7 +26,6 @@ from Compiler.Placement.Pcb import (
 from Compiler.Placement.PcbFlow import (
     AddMandatoryAccessPortfolioPairwiseConstraints,
     ApplyJointPlacementPortfolioTrigger,
-    ApplyTopologyDemandPolicyWidening,
     BuildMandatoryAccessPairwiseEdges,
     BuildMandatoryAccessPortfolioExpectedCandidateIndices,
     BuildMandatoryAccessPortfolioRecipeIdentity,
@@ -104,7 +103,6 @@ from Compiler.Routing.Models import (
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceStateProof,
 )
-from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
 from SVDecoder.Sv import ParseSvToNetlist
@@ -1815,78 +1813,6 @@ class TopologyDemandProfileTests(unittest.TestCase):
                         "ScaleGeometryPressure": False,
                     },
                 )
-
-    def testTypedPolicyWideningUsesPassedTechnologyAndPressureKind(
-        self,
-    ) -> None:
-        Policy = LocalFirstPhysicalDesignPolicy
-        Capacity = Policy.Organization.MaximumClusterEntrances
-        Technology = replace(
-            DefaultRedstoneRoutingTechnology,
-            MaximumRoutableLayerCount=7,
-        )
-        Cla4Policy = ApplyTopologyDemandPolicyWidening(
-            Policy,
-            Technology,
-            BuildTopologyDemandPressureProfile(
-                BuildExampleProfile("CarryLookaheadAdder4"),
-                Capacity,
-            ),
-        )
-        Rca8Policy = ApplyTopologyDemandPolicyWidening(
-            Policy,
-            Technology,
-            BuildTopologyDemandPressureProfile(
-                BuildExampleProfile("RippleCarryAdder8"),
-                Capacity,
-            ),
-        )
-
-        self.assertEqual(
-            Cla4Policy.Placement.MaximumRoutingLayers,
-            Policy.Placement.MaximumRoutingLayers,
-        )
-        self.assertTrue(Cla4Policy.Placement.PreferWideTerminalBanks)
-        self.assertEqual(Cla4Policy.NandPacking.MaximumClusterCells, 6)
-        self.assertEqual(Cla4Policy.NandPacking.JointPlacementBeamWidth, 32)
-        self.assertEqual(
-            Cla4Policy.NandPacking.MaximumTerminalAssignmentExpansions,
-            4_096,
-        )
-        self.assertEqual(
-            Cla4Policy.NandPacking.TerminalShellLateralSearch,
-            8,
-        )
-        self.assertEqual(
-            Cla4Policy.NandPacking.LocalGeometryRepairColumnGap,
-            Policy.NandPacking.LocalGeometryRepairColumnGap,
-        )
-        self.assertEqual(
-            Cla4Policy.NegotiatedRouting.MaximumPackedAreaGrowth,
-            Policy.NegotiatedRouting.MaximumPackedAreaGrowth,
-        )
-        self.assertEqual(Rca8Policy.Placement.MaximumRoutingLayers, 7)
-        self.assertTrue(Rca8Policy.Placement.PreferWideTerminalBanks)
-        self.assertEqual(
-            Rca8Policy.NandPacking.MaximumClusterCells,
-            Policy.NandPacking.MaximumClusterCells,
-        )
-        self.assertEqual(
-            Rca8Policy.NandPacking.JointPlacementBeamWidth,
-            Policy.NandPacking.JointPlacementBeamWidth,
-        )
-        self.assertEqual(
-            Rca8Policy.NandPacking.TerminalShellLateralSearch,
-            8,
-        )
-        self.assertEqual(
-            Rca8Policy.NandPacking.LocalGeometryRepairColumnGap,
-            8,
-        )
-        self.assertEqual(
-            Rca8Policy.NegotiatedRouting.MaximumPackedAreaGrowth,
-            4.5,
-        )
 
     def testMandatoryCapacityCutInfersStructuredPair(self) -> None:
         Cut = BuildMandatoryCapacityCut("Left", "Right")

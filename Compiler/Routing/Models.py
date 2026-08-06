@@ -70,6 +70,7 @@ class InterClusterRoutingChannel:
     PhysicalModel: str = "bounded-inter-cluster-channel-v1"
     InterfaceDeckLayer: int | None = None
     TrackPitch: int = 3
+    ChannelClearanceTracks: int = 0
     MaximumAffectedClusters: int = 3
     MaximumBoundaryStrips: int = 2
     ComponentId: int | None = None
@@ -102,6 +103,7 @@ class InterClusterRoutingChannel:
             "PhysicalModel": self.PhysicalModel,
             "InterfaceDeckLayer": self.InterfaceDeckLayer,
             "TrackPitch": self.TrackPitch,
+            "ChannelClearanceTracks": self.ChannelClearanceTracks,
             "MaximumAffectedClusters": self.MaximumAffectedClusters,
             "MaximumBoundaryStrips": self.MaximumBoundaryStrips,
             "ComponentId": self.ComponentId,
@@ -294,6 +296,42 @@ class ClusterInterfaceRealizabilityNogood:
 
 
 @dataclass(frozen=True)
+class ComponentRoutabilityCore:
+    """A complete physical ownership conflict suitable for placement repair."""
+
+    CoreFingerprint: str
+    Signals: tuple[str, ...]
+    PlacementStateFingerprint: str
+    ComponentStateFingerprint: str
+    DomainFingerprint: str
+    BlockingResources: tuple[str, ...] = ()
+    BlockingPorts: tuple[Position3, ...] = ()
+
+    def StructuralIdentity(self) -> tuple[object, ...]:
+        return (
+            self.CoreFingerprint,
+            self.Signals,
+            self.PlacementStateFingerprint,
+            self.ComponentStateFingerprint,
+            self.DomainFingerprint,
+            self.BlockingResources,
+            self.BlockingPorts,
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "CoreFingerprint": self.CoreFingerprint,
+            "Signals": list(self.Signals),
+            "PlacementStateFingerprint": self.PlacementStateFingerprint,
+            "ComponentStateFingerprint": self.ComponentStateFingerprint,
+            "DomainFingerprint": self.DomainFingerprint,
+            "BlockingResources": list(self.BlockingResources),
+            "BlockingPorts": [list(Position) for Position in self.BlockingPorts],
+            "Complete": True,
+        }
+
+
+@dataclass(frozen=True)
 class ClusterInterfaceStateProof:
     """Terminal proof for one retained coherent placement state."""
 
@@ -306,6 +344,7 @@ class ClusterInterfaceStateProof:
     TransformFingerprint: str = ""
     OwnershipUnsatCoreFingerprint: str = ""
     OwnershipUnsatSignals: tuple[str, ...] = ()
+    RoutabilityCore: ComponentRoutabilityCore | None = None
     AssignmentFingerprints: tuple[str, ...] = ()
     RealizabilityNogoods: tuple[
         ClusterInterfaceRealizabilityNogood, ...
@@ -327,6 +366,11 @@ class ClusterInterfaceStateProof:
             self.ChannelFingerprint,
             self.TransformFingerprint,
             self.OwnershipUnsatCoreFingerprint,
+            (
+                self.RoutabilityCore.StructuralIdentity()
+                if self.RoutabilityCore is not None
+                else None
+            ),
             self.AssignmentFingerprints,
             tuple(
                 Nogood.StructuralIdentity()
@@ -360,6 +404,11 @@ class ClusterInterfaceStateProof:
             ),
             "OwnershipUnsatSignals": list(
                 self.OwnershipUnsatSignals
+            ),
+            "ComponentRoutabilityCore": (
+                self.RoutabilityCore.ToDictionary()
+                if self.RoutabilityCore is not None
+                else None
             ),
             "AssignmentFingerprints": list(
                 self.AssignmentFingerprints
@@ -512,6 +561,38 @@ class ClusterInterfaceAssignmentPrepared(RuntimeError):
     def __init__(self, Assignment: ClusterInterfaceAssignment) -> None:
         super().__init__("cluster interface assignment prepared")
         self.Assignment = Assignment
+
+
+@dataclass(frozen=True)
+class TrackAssignmentPreparation:
+    """Immutable pre-route capacity result for one fixed placement."""
+
+    Success: bool
+    SelectedCandidateIds: tuple[tuple[str, str], ...]
+    CandidateCounts: tuple[tuple[str, int], ...]
+    ConflictSignals: tuple[str, ...]
+    ConflictResourceIndices: tuple[int, ...]
+    ExpansionCount: int
+    Complete: bool
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Success": self.Success,
+            "SelectedCandidateIds": [list(Value) for Value in self.SelectedCandidateIds],
+            "CandidateCounts": [list(Value) for Value in self.CandidateCounts],
+            "ConflictSignals": list(self.ConflictSignals),
+            "ConflictResourceIndices": list(self.ConflictResourceIndices),
+            "ExpansionCount": self.ExpansionCount,
+            "Complete": self.Complete,
+        }
+
+
+class TrackAssignmentPrepared(RuntimeError):
+    """Internal control transfer after pre-route capacity assignment."""
+
+    def __init__(self, Preparation: TrackAssignmentPreparation) -> None:
+        super().__init__("track assignment prepared")
+        self.Preparation = Preparation
 
 
 @dataclass(frozen=True)
@@ -2277,6 +2358,32 @@ class PhysicalSignalApertureCandidateDomainIdentity:
 
 
 @dataclass(frozen=True)
+class PreparedPhysicalSignalLocalFactorDomain:
+    """Immutable, placement-independent access facts for one signal."""
+
+    Signal: str
+    LocalIdentityFingerprint: str
+    ComponentTopologyFingerprint: str
+    TerminalContractFingerprint: str
+    LocalGeometryFingerprint: str
+    LocalClaimsFingerprint: str
+    TechnologyFingerprint: str
+    Complete: bool
+    Feasible: bool
+    LocalAccessFactors: tuple[PhysicalPortLocalAccessFactor, ...]
+    LocalSupportFacts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PhysicalSignalLocalFactorReuseEntry:
+    """Parent-owned publication record for one complete local domain."""
+
+    LocalIdentityFingerprint: str
+    Domain: PreparedPhysicalSignalLocalFactorDomain
+    SourcePlacementFingerprint: str
+
+
+@dataclass(frozen=True)
 class PreparedPhysicalComponentPortFactorDomain:
     """Complete pre-assignment physical port factor-domain boundary."""
 
@@ -2338,6 +2445,13 @@ class PreparedPhysicalComponentPortFactorDomain:
             tuple[PhysicalPortLocalApertureSupport, ...],
         ], ...
     ] = ()
+    SignalLocalFactorDomains: tuple[
+        tuple[str, PreparedPhysicalSignalLocalFactorDomain], ...
+    ] = ()
+    LocalFactorCacheHitSignals: tuple[str, ...] = ()
+    LocalFactorRebuiltSignals: tuple[str, ...] = ()
+    LocalFactorPreparationElapsedSeconds: float = 0.0
+    ExteriorFactorPreparationElapsedSeconds: float = 0.0
     ExteriorFixedClaimCertificates: tuple[
         PhysicalPortExteriorFixedClaimCertificate, ...
     ] = ()
@@ -2359,6 +2473,8 @@ class PreparedPhysicalComponentPortFactorDomain:
     ExteriorRegionFingerprint: str = ""
     ExteriorCapacityLedgerFingerprint: str = ""
     ExteriorFabrics: tuple[PhysicalExteriorApertureFabric, ...] = ()
+    NativeConnectorBatchWorkItems: int = 0
+    NativeConnectorBatchActiveWorkerCount: int = 0
 
 
 @dataclass(frozen=True)
@@ -2895,6 +3011,15 @@ class RoutingResources:
             frozenset[frozenset[tuple[str, str]]],
             dict[str, Any],
         ],
+    ] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    # This cache deliberately has no placement identity.  Entries are only
+    # published by the parent after complete signal-local preparation.
+    PhysicalSignalLocalFactorDomainCache: dict[
+        str, PhysicalSignalLocalFactorReuseEntry
     ] = field(
         default_factory=dict,
         compare=False,

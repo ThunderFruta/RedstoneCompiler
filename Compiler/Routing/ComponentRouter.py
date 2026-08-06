@@ -10,6 +10,7 @@ from math import prod as ProductIntegers
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping
 
+
 from .Models import (
     ClosedComponentInterface,
     ComponentFeedthroughContract,
@@ -35,6 +36,35 @@ from .ResourceGraph import (
     RoutingResourceClaims,
 )
 from .Technology import DefaultRedstoneRoutingTechnology
+
+try:
+    from ..RustRouting import (
+        BuildFabricSubtreesBatchWithTelemetry as _BuildFabricSubtreesBatchWithTelemetry,
+    )
+    from ..RustRouting import BuildRouteClaimsBatch as _BuildRouteClaimsBatch
+    from ..RustRouting import (
+        BuildRouteClaimsBatchWithTelemetry as _BuildRouteClaimsBatchWithTelemetry,
+    )
+    from ..RustRouting import GetRoutingThreadCount as _GetRoutingThreadCount
+except ImportError:
+    try:
+        from RedstoneCompiler.RustRouting import (
+            BuildFabricSubtreesBatchWithTelemetry as _BuildFabricSubtreesBatchWithTelemetry,
+        )
+        from RedstoneCompiler.RustRouting import (
+            BuildRouteClaimsBatch as _BuildRouteClaimsBatch,
+        )
+        from RedstoneCompiler.RustRouting import (
+            BuildRouteClaimsBatchWithTelemetry as _BuildRouteClaimsBatchWithTelemetry,
+        )
+        from RedstoneCompiler.RustRouting import (
+            GetRoutingThreadCount as _GetRoutingThreadCount,
+        )
+    except ImportError:
+        _BuildFabricSubtreesBatchWithTelemetry = None
+        _BuildRouteClaimsBatch = None
+        _BuildRouteClaimsBatchWithTelemetry = None
+        _GetRoutingThreadCount = None
 
 
 def _StableFingerprint(Value: object) -> str:
@@ -990,6 +1020,141 @@ def AugmentComponentRoutingFabric(
     )
 
 
+def BridgeDisconnectedOwnedSignalFabric(
+    Fabric: ComponentRoutingFabric,
+    Domains: Iterable[ComponentTerminalAccessDomain],
+    ResourceGraph: Any,
+) -> ComponentRoutingFabric:
+    """Add a legal channel bridge when one owned net spans forest islands.
+
+    A closed component may own both terminals of a net while its generated
+    channel consists of independent lane trees.  That is not a placement
+    conflict: without a bridge the net has no local tree at all.  Connect the
+    nearest pair of its terminal attachment islands through authoritative
+    routing primitives, retaining a forest by never traversing an existing
+    island before the target is reached.
+    """
+    if ResourceGraph is None or not Fabric.Nodes:
+        return Fabric
+    Nodes = set(Fabric.Nodes)
+    Edges = set(Fabric.Edges)
+
+    def Components() -> dict[Position3, int]:
+        Adjacency = _BuildAdjacency(Edges)
+        Result: dict[Position3, int] = {}
+        for Start in sorted(Nodes):
+            if Start in Result:
+                continue
+            Index = len(set(Result.values()))
+            Pending = [Start]
+            Result[Start] = Index
+            while Pending:
+                Current = Pending.pop()
+                for Neighbor in Adjacency.get(Current, ()):
+                    if Neighbor not in Result:
+                        Result[Neighbor] = Index
+                        Pending.append(Neighbor)
+        return Result
+
+    BySignal: dict[str, list[ComponentTerminalAccessDomain]] = defaultdict(list)
+    for Domain in Domains:
+        BySignal[str(Domain.Signal)].append(Domain)
+    BridgedSignals: list[str] = []
+    for Signal, SignalDomains in sorted(BySignal.items()):
+        if len(SignalDomains) < 2:
+            continue
+        ComponentByNode = Components()
+        AttachmentsByDomain = [
+            tuple(sorted({
+                Candidate.Attachment for Candidate in Domain.Candidates
+                if Candidate.Attachment in ComponentByNode
+            }))
+            for Domain in SignalDomains
+        ]
+        if any(not Values for Values in AttachmentsByDomain):
+            continue
+        Common = set(ComponentByNode[Value] for Value in AttachmentsByDomain[0])
+        for Values in AttachmentsByDomain[1:]:
+            Common.intersection_update(ComponentByNode[Value] for Value in Values)
+        if Common:
+            continue
+        Start = AttachmentsByDomain[0][0]
+        Target = min(
+            (
+                Value
+                for Values in AttachmentsByDomain[1:]
+                for Value in Values
+                if ComponentByNode[Value] != ComponentByNode[Start]
+            ),
+            key=lambda Value: (
+                abs(Start[0] - Value[0]) + abs(Start[1] - Value[1])
+                + abs(Start[2] - Value[2]),
+                Value,
+            ),
+            default=None,
+        )
+        if Target is None:
+            continue
+        TargetComponent = ComponentByNode[Target]
+        TargetNodes = frozenset(
+            Node
+            for Node, ComponentIndex in ComponentByNode.items()
+            if ComponentIndex == TargetComponent
+        )
+        Minimum = tuple(min(Value[Index] for Value in (*Nodes, Start, Target)) - 2 for Index in range(3))
+        Maximum = tuple(max(Value[Index] for Value in (*Nodes, Start, Target)) + 2 for Index in range(3))
+        Pending = deque((Start,))
+        Previous: dict[Position3, Position3 | None] = {Start: None}
+        Reached: Position3 | None = None
+        while Pending and Reached is None:
+            Current = Pending.popleft()
+            for Neighbor in sorted(ResourceGraph.Technology.NeighborPositions(Current)):
+                if (
+                    Neighbor in Previous
+                    or any(Neighbor[Index] < Minimum[Index] or Neighbor[Index] > Maximum[Index] for Index in range(3))
+                    or (Neighbor in Nodes and Neighbor not in TargetNodes)
+                    or ResourceGraph.BuildPrimitive(Current, Neighbor) is None
+                ):
+                    continue
+                Previous[Neighbor] = Current
+                if Neighbor in TargetNodes:
+                    Reached = Neighbor
+                    break
+                Pending.append(Neighbor)
+        if Reached is None:
+            continue
+        Path = [Reached]
+        while Path[-1] != Start:
+            Parent = Previous[Path[-1]]
+            assert Parent is not None
+            Path.append(Parent)
+        Path.reverse()
+        Nodes.update(Path)
+        Edges.update(
+            _NormalizedEdge(First, Second)
+            for First, Second in zip(Path, Path[1:])
+        )
+        BridgedSignals.append(Signal)
+    if not BridgedSignals:
+        return Fabric
+    Origin = tuple(min(Value[Index] for Value in Nodes) for Index in range(3))
+    return ComponentRoutingFabric(
+        FabricFingerprint=_StableFingerprint((
+            "closed-component-bridged-forest-v1",
+            Fabric.FabricFingerprint,
+            tuple(BridgedSignals),
+            tuple(sorted(tuple(Value[Index] - Origin[Index] for Index in range(3)) for Value in Nodes)),
+            tuple(sorted(Edges)),
+        )),
+        Nodes=tuple(sorted(Nodes)),
+        Edges=tuple(sorted(Edges)),
+        IngressNodes=Fabric.IngressNodes,
+        TopologyKind="closed-component-bridged-forest-v1",
+        Complete=Fabric.Complete,
+        IncompleteReason=Fabric.IncompleteReason,
+    )
+
+
 def _BuildAccessCandidate(
     Portal: PinAccessPortal,
 ) -> ComponentTerminalAccessCandidate:
@@ -1061,6 +1226,10 @@ def BuildCoalescedComponentAccessCandidates(
     if ResourceGraph is None or not Candidate.Path or not Trunks:
         return ()
     Terminal = tuple(Candidate.Path[0])
+    # Preserve part of the bounded portfolio for non-planar branches.  Without
+    # this, two X/Z orderings from the first flat merge can consume the whole
+    # cap and make the 3D repair path unreachable.
+    MaximumFlatCandidates = max(1, MaximumCandidates // 2)
 
     def HorizontalPath(
         Target: Position3,
@@ -1100,6 +1269,8 @@ def BuildCoalescedComponentAccessCandidates(
         if Merge[1] == Terminal[1]
     )
     for _Distance, _Fingerprint, MergeIndex, Trunk, Merge in RankedMerges:
+        if len(Results) >= MaximumFlatCandidates:
+            break
         for XFirst in (True, False):
             Branch = HorizontalPath(Merge, XFirst=XFirst)
             if not Branch:
@@ -1140,9 +1311,229 @@ def BuildCoalescedComponentAccessCandidates(
                     Cost=len(Path) - 1,
                 ),
             )
+            if len(Results) >= MaximumFlatCandidates:
+                break
+    # The normal portal deck often changes elevation before reaching its
+    # channel attachment.  A same-height Manhattan branch can be individually
+    # legal yet electrically incompatible with its peer staircase.  Add a
+    # bounded graph-derived branch portfolio as well; the exact frontier DP
+    # still selects the canonical minimum legal geometry.
+    Technology = getattr(ResourceGraph, "Technology", None)
+    NeighborPositions = getattr(Technology, "NeighborPositions", None)
+    if len(Results) >= MaximumCandidates or not callable(NeighborPositions):
+        return tuple(Results.values())
+
+    def BuildBoundedBranch(
+        Merge: Position3,
+        Trunk: ComponentTerminalAccessCandidate,
+        FirstStep: Position3 | None = None,
+    ) -> tuple[Position3, ...]:
+        Padding = 2
+        Minimum = tuple(
+            min(Terminal[Index], Merge[Index]) - Padding
+            for Index in range(3)
+        )
+        Maximum = tuple(
+            max(Terminal[Index], Merge[Index]) + Padding
+            for Index in range(3)
+        )
+        Pending = deque((Terminal,))
+        Previous: dict[Position3, Position3 | None] = {Terminal: None}
+        # A branch may enter its peer path only at the nominated merge.  This
+        # avoids a hidden earlier join followed by a non-contiguous suffix.
+        BlockedTrunkNodes = frozenset(Trunk.Path) - frozenset((Merge,))
+        if FirstStep is not None:
+            if (
+                FirstStep in BlockedTrunkNodes
+                or any(
+                    FirstStep[Index] < Minimum[Index]
+                    or FirstStep[Index] > Maximum[Index]
+                    for Index in range(3)
+                )
+                or ResourceGraph.BuildPrimitive(Terminal, FirstStep) is None
+            ):
+                return ()
+            Previous[FirstStep] = Terminal
+            Pending = deque((FirstStep,))
+        while Pending:
+            Current = Pending.popleft()
+            if Current == Merge:
+                Path = [Current]
+                while Path[-1] != Terminal:
+                    Parent = Previous[Path[-1]]
+                    assert Parent is not None
+                    Path.append(Parent)
+                return tuple(reversed(Path))
+            for Neighbor in sorted(NeighborPositions(Current)):
+                if (
+                    Neighbor in Previous
+                    or any(
+                        Neighbor[Index] < Minimum[Index]
+                        or Neighbor[Index] > Maximum[Index]
+                        for Index in range(3)
+                    )
+                    or Neighbor in BlockedTrunkNodes
+                    or ResourceGraph.BuildPrimitive(Current, Neighbor) is None
+                ):
+                    continue
+                Previous[Neighbor] = Current
+                Pending.append(Neighbor)
+        return ()
+
+    AllMerges = sorted(
+        (
+            sum(
+                abs(Terminal[Index] - Merge[Index])
+                for Index in range(3)
+            ),
+            Trunk.CandidateFingerprint,
+            MergeIndex,
+            Trunk,
+            Merge,
+        )
+        for Trunk in Trunks
+        for MergeIndex, Merge in enumerate(Trunk.Path)
+    )
+    for _Distance, _Fingerprint, MergeIndex, Trunk, Merge in AllMerges:
+        FirstSteps = (None, *sorted(NeighborPositions(Terminal)))
+        for FirstStep in FirstSteps:
+            Branch = BuildBoundedBranch(Merge, Trunk, FirstStep)
+            if not Branch:
+                continue
+            Path = tuple(dict.fromkeys((
+                *Branch,
+                *Trunk.Path[MergeIndex + 1 :],
+            )))
+            if Path[-1] != Trunk.Attachment:
+                continue
+            if any(
+                ResourceGraph.BuildPrimitive(First, Second) is None
+                for First, Second in zip(Path, Path[1:])
+            ):
+                continue
+            Claims = ResourceGraph.BuildRouteClaims(frozenset(Path))
+            if FindSelfClaimConflicts({
+                "component-coalesced-access": ResourceGraph.BuildRouteClaims(
+                    ExistingNodes | frozenset(Path)
+                )
+            }):
+                continue
+            Fingerprint = _StableFingerprint((
+                "coalesced-component-access-bounded-v1",
+                _RelativeGeometry(Path),
+                _ClaimsFingerprint(Claims),
+                Candidate.Layer,
+            ))
+            Results.setdefault(Fingerprint, ComponentTerminalAccessCandidate(
+                CandidateFingerprint=Fingerprint,
+                Attachment=Trunk.Attachment,
+                Path=Path,
+                Claims=Claims,
+                Layer=Candidate.Layer,
+                Cost=len(Path) - 1,
+            ))
             if len(Results) >= MaximumCandidates:
-                return tuple(Results.values())
+                break
+        if len(Results) >= MaximumCandidates:
+            break
     return tuple(Results.values())
+
+
+def CoalesceOwnedSignalAccessDomains(
+    Domains: Iterable[ComponentTerminalAccessDomain],
+    *,
+    ResourceGraph: Any,
+    MaximumAdditionalCandidatesPerDomain: int = 2,
+) -> tuple[ComponentTerminalAccessDomain, ...]:
+    """Add bounded same-net access branches for jointly owned terminals.
+
+    Raw pin portals are generated independently.  Two legal staircases can
+    nevertheless claim mutually exclusive redstone support when a component
+    owns both terminals of the same net.  A coalesced branch joins one
+    terminal to a peer's already legal trunk before its fabric attachment;
+    the tree-frontier solver can then select one shared electrical geometry.
+    """
+    BySignal: dict[str, list[ComponentTerminalAccessDomain]] = defaultdict(list)
+    for Domain in Domains:
+        BySignal[str(Domain.Signal)].append(Domain)
+    Result: list[ComponentTerminalAccessDomain] = []
+    for Signal in sorted(BySignal):
+        SignalDomains = sorted(
+            BySignal[Signal],
+            key=lambda Value: (
+                Value.TerminalRole,
+                Value.Terminal,
+                Value.TerminalFingerprint,
+            ),
+        )
+        # Coalescing is a repair for a locally owned driver and sink that
+        # independently chose incompatible portal staircases.  Input-only
+        # fanout terminals have no local driver to share and expanding them
+        # turns a compact symbolic frontier into an unnecessary cross product.
+        HasLocalSource = any(
+            Domain.TerminalRole == "source" for Domain in SignalDomains
+        )
+        HasLocalTarget = any(
+            Domain.TerminalRole == "target" for Domain in SignalDomains
+        )
+        for Domain in SignalDomains:
+            Original = tuple(sorted(
+                Domain.Candidates,
+                key=lambda Value: Value.CandidateFingerprint,
+            ))
+            PeerTrunks = tuple(
+                Candidate
+                for Peer in SignalDomains
+                if Peer.Terminal != Domain.Terminal
+                for Candidate in sorted(
+                    Peer.Candidates,
+                    key=lambda Value: Value.CandidateFingerprint,
+                )
+            )
+            Added: list[ComponentTerminalAccessCandidate] = []
+            if (
+                ResourceGraph is not None
+                and PeerTrunks
+                and HasLocalSource
+                and HasLocalTarget
+            ):
+                for Candidate in Original:
+                    Remaining = (
+                        MaximumAdditionalCandidatesPerDomain - len(Added)
+                    )
+                    if Remaining <= 0:
+                        break
+                    Added.extend(BuildCoalescedComponentAccessCandidates(
+                        Candidate,
+                        PeerTrunks,
+                        ResourceGraph=ResourceGraph,
+                        MaximumCandidates=Remaining,
+                    ))
+            CandidatesByFingerprint = {
+                Candidate.CandidateFingerprint: Candidate
+                for Candidate in (*Original, *Added)
+            }
+            Candidates = PruneDominatedComponentAccessCandidates(
+                CandidatesByFingerprint[Fingerprint]
+                for Fingerprint in sorted(CandidatesByFingerprint)
+            )
+            Result.append(ComponentTerminalAccessDomain(
+                Signal=Domain.Signal,
+                Terminal=Domain.Terminal,
+                TerminalRole=Domain.TerminalRole,
+                TerminalFingerprint=_StableFingerprint((
+                    "coalesced-owned-component-access-domain-v1",
+                    Domain.TerminalRole,
+                    len(Candidates),
+                    tuple(
+                        Candidate.CandidateFingerprint
+                        for Candidate in Candidates
+                    ),
+                )),
+                Candidates=Candidates,
+                Complete=Domain.Complete,
+            ))
+    return tuple(Result)
 
 
 def BuildClosedComponentInterface(
@@ -1497,6 +1888,15 @@ def BuildComponentRoutingProblem(
             Complete=True,
         )
         OwnedDomains.append(Domain)
+    OwnedDomains = list(CoalesceOwnedSignalAccessDomains(
+        OwnedDomains,
+        ResourceGraph=ResourceGraph,
+    ))
+    Fabric = BridgeDisconnectedOwnedSignalFabric(
+        Fabric,
+        OwnedDomains,
+        ResourceGraph,
+    )
     ExternalContinuationTerminals = tuple(sorted(
         (
             Signal,
@@ -8515,7 +8915,9 @@ def BuildComponentSymbolicNetStateCacheKey(
         )
     )
     return _StableFingerprint((
-        "component-symbolic-net-state-v2",
+        # v3: the prepared context is the signal-local identity; it omits
+        # placement-wide exterior geometry by construction.
+        "component-symbolic-net-state-v3-local-domain",
         ContextFingerprint,
         Signal,
         tuple(getattr(PhysicalPort, "LocalPath", ())),
@@ -8540,7 +8942,12 @@ def _BuildPreparedComponentSymbolicNetStateContextIdentity(
     )
     return {
         "FabricFingerprint": Problem.Fabric.FabricFingerprint,
-        "PlacementFingerprint": Problem.PlacementFingerprint,
+        # Placement-wide identity is deliberately excluded.  This context is
+        # consumed only by the closed-component unary tree compiler; its
+        # remaining fields below cover every local geometry, terminal,
+        # obstacle, claim, power, resource-graph, and technology input it
+        # reads.  Exterior placement changes must rebuild seams and capacity,
+        # but need not invalidate an exact local tree proof.
         "ResourceGraphFingerprint": str(
             getattr(
                 Problem.PhysicalAssemblyPlan,
@@ -9108,6 +9515,75 @@ def SolveComponentRoutingProblemDynamic(
         RouteClaimsCache[Nodes] = Claims
         return Claims
 
+    def ClaimsForNodeBatch(
+        NodeSets: Iterable[frozenset[Position3]],
+    ) -> dict[frozenset[Position3], RoutingResourceClaims]:
+        """Materialize independent claim sets through the bounded native pool.
+
+        The tree frontier retains ownership, ordering, and dominance in this
+        process.  Only the pure physical expansion (wire/support/air/electrical
+        cells) is batched, so a Rayon worker never observes mutable router
+        state.  Non-default technologies keep the existing authoritative
+        Python implementation until they have an equivalent native contract.
+        """
+        UniqueNodes = tuple(sorted(set(NodeSets), key=repr))
+        Missing = tuple(
+            Nodes for Nodes in UniqueNodes
+            if Nodes not in RouteClaimsCache
+        )
+        if not Missing:
+            return {
+                Nodes: RouteClaimsCache[Nodes]
+                for Nodes in UniqueNodes
+            }
+        ResourceGraph = Problem.ResourceGraph
+        Technology = getattr(ResourceGraph, "Technology", None)
+        NativeCompatible = bool(
+            _BuildRouteClaimsBatchWithTelemetry is not None
+            and (
+                ResourceGraph is None
+                or Technology == DefaultRedstoneRoutingTechnology
+            )
+        )
+        if NativeCompatible and len(Missing) > 1:
+            NativeClaims, ActiveWorkerCount = _BuildRouteClaimsBatchWithTelemetry(
+                [tuple(sorted(Nodes)) for Nodes in Missing],
+                tuple(sorted(getattr(ResourceGraph, "ActualBlocks", ()))),
+                tuple(sorted(getattr(ResourceGraph, "SolidBlocks", ()))),
+            )
+            for Nodes, (Wire, Support, Air, Electrical) in zip(
+                Missing,
+                NativeClaims,
+                strict=True,
+            ):
+                RouteClaimsCache[Nodes] = RoutingResourceClaims(
+                    WireCells=frozenset(Wire),
+                    SupportCells=frozenset(Support),
+                    RequiredAirCells=frozenset(Air),
+                    ElectricalCells=frozenset(Electrical),
+                )
+            SolverDiagnostics["NativeClaimBatchCount"] = int(
+                SolverDiagnostics.get("NativeClaimBatchCount", 0)
+            ) + 1
+            SolverDiagnostics["NativeClaimBatchWorkItems"] = int(
+                SolverDiagnostics.get("NativeClaimBatchWorkItems", 0)
+            ) + len(Missing)
+            SolverDiagnostics["NativeClaimBatchWorkerCount"] = (
+                int(_GetRoutingThreadCount())
+                if _GetRoutingThreadCount is not None
+                else 0
+            )
+            SolverDiagnostics["NativeClaimBatchActiveWorkerCount"] = int(
+                ActiveWorkerCount
+            )
+        else:
+            for Nodes in Missing:
+                ClaimsForNodes(Nodes)
+        return {
+            Nodes: RouteClaimsCache[Nodes]
+            for Nodes in UniqueNodes
+        }
+
     def BlockingImmutableClaims(
         Signal: str,
     ) -> tuple[tuple[str, RoutingResourceClaims], ...]:
@@ -9174,6 +9650,7 @@ def SolveComponentRoutingProblemDynamic(
     def HasSameSignalReservedSelfConflict(
         Signal: str,
         Nodes: frozenset[Position3],
+        CombinedClaims: RoutingResourceClaims | None = None,
     ) -> bool:
         SameSignalReservedNodes = (
             ReservedGlobalWireCellsBySignal.get(
@@ -9183,10 +9660,14 @@ def SolveComponentRoutingProblemDynamic(
         )
         if not SameSignalReservedNodes:
             return False
-        CombinedClaims = ClaimsForNodes(frozenset((
-            *Nodes,
-            *SameSignalReservedNodes,
-        )))
+        CombinedClaims = (
+            ClaimsForNodes(frozenset((
+                *Nodes,
+                *SameSignalReservedNodes,
+            )))
+            if CombinedClaims is None
+            else CombinedClaims
+        )
         if not FindSelfClaimConflicts({Signal: CombinedClaims}):
             return False
         ReservedGlobalGeometryBlockerSetsBySignal[Signal].append(
@@ -9194,23 +9675,26 @@ def SolveComponentRoutingProblemDynamic(
         )
         return True
 
-    def BuildGeometry(
+    def BuildGeometryStructure(
         Signal: str,
         Candidates: tuple[ComponentTerminalAccessCandidate, ...],
         EgressPath: tuple[Position3, ...],
-    ) -> tuple[
-        frozenset[Position3],
-        frozenset[RoutingEdge],
-        RoutingResourceClaims,
-    ] | None:
+        FabricSubtree: (
+            tuple[frozenset[Position3], frozenset[RoutingEdge]] | None
+        ) = None,
+    ) -> tuple[frozenset[Position3], frozenset[RoutingEdge]] | None:
         Attachments = tuple(
             Candidate.Attachment for Candidate in Candidates
         ) + ((EgressPath[0],) if EgressPath else ())
-        Subtree = _UniqueFabricSubtree(
-            Problem.Fabric,
-            Attachments,
-            Adjacency=FabricAdjacency,
-            ParentCache=FabricParentCache,
+        Subtree = (
+            FabricSubtree
+            if FabricSubtree is not None
+            else _UniqueFabricSubtree(
+                Problem.Fabric,
+                Attachments,
+                Adjacency=FabricAdjacency,
+                ParentCache=FabricParentCache,
+            )
         )
         if Subtree is None:
             return None
@@ -9241,14 +9725,97 @@ def SolveComponentRoutingProblemDynamic(
             )
         FrozenNodes = frozenset(Nodes)
         FrozenEdges = frozenset(Edges)
-        Claims = ClaimsForNodes(FrozenNodes)
+        return FrozenNodes, FrozenEdges
+
+    def BuildFabricSubtreeBatch(
+        AttachmentSets: Iterable[tuple[Position3, ...]],
+    ) -> tuple[
+        tuple[
+            tuple[frozenset[Position3], frozenset[RoutingEdge]] | None,
+            ...,
+        ],
+        int,
+    ]:
+        Values = tuple(AttachmentSets)
+        if (
+            _BuildFabricSubtreesBatchWithTelemetry is None
+            or len(Values) < 2
+        ):
+            return (
+                tuple(
+                    _UniqueFabricSubtree(
+                        Problem.Fabric,
+                        Attachments,
+                        Adjacency=FabricAdjacency,
+                        ParentCache=FabricParentCache,
+                    )
+                    for Attachments in Values
+                ),
+                0,
+            )
+        NativeSubtrees, ActiveWorkerCount = (
+            _BuildFabricSubtreesBatchWithTelemetry(
+                tuple(sorted(Problem.Fabric.Nodes)),
+                tuple(sorted(Problem.Fabric.Edges)),
+                Values,
+            )
+        )
+        Result = tuple(
+            None if Subtree is None else (
+                frozenset(Subtree[0]),
+                frozenset(
+                    _NormalizedEdge(First, Second)
+                    for First, Second in Subtree[1]
+                ),
+            )
+            for Subtree in NativeSubtrees
+        )
+        SolverDiagnostics["NativeFabricSubtreeBatchCount"] = int(
+            SolverDiagnostics.get("NativeFabricSubtreeBatchCount", 0)
+        ) + 1
+        SolverDiagnostics["NativeFabricSubtreeBatchWorkItems"] = int(
+            SolverDiagnostics.get("NativeFabricSubtreeBatchWorkItems", 0)
+        ) + len(Values)
+        SolverDiagnostics["NativeFabricSubtreeBatchActiveWorkerCount"] = int(
+            ActiveWorkerCount
+        )
+        return Result, int(ActiveWorkerCount)
+
+    def IsGeometryClaimsEligible(
+        Signal: str,
+        Nodes: frozenset[Position3],
+        Claims: RoutingResourceClaims,
+        SameSignalCombinedClaims: RoutingResourceClaims | None = None,
+    ) -> bool:
         if FindSelfClaimConflicts({Signal: Claims}):
-            return None
-        if HasSameSignalReservedSelfConflict(Signal, FrozenNodes):
-            return None
+            return False
+        if HasSameSignalReservedSelfConflict(
+            Signal,
+            Nodes,
+            SameSignalCombinedClaims,
+        ):
+            return False
         if HasBlockingClaimConflict(Signal, Claims):
+            return False
+        return True
+
+    def BuildGeometry(
+        Signal: str,
+        Candidates: tuple[ComponentTerminalAccessCandidate, ...],
+        EgressPath: tuple[Position3, ...],
+    ) -> tuple[
+        frozenset[Position3],
+        frozenset[RoutingEdge],
+        RoutingResourceClaims,
+    ] | None:
+        Structure = BuildGeometryStructure(Signal, Candidates, EgressPath)
+        if Structure is None:
             return None
-        return FrozenNodes, FrozenEdges, Claims
+        Nodes, Edges = Structure
+        Claims = ClaimsForNodes(Nodes)
+        if not IsGeometryClaimsEligible(Signal, Nodes, Claims):
+            return None
+        return Nodes, Edges, Claims
 
     def BuildSignalStates(
         Signal: str,
@@ -9522,6 +10089,14 @@ def SolveComponentRoutingProblemDynamic(
                 for Candidate in FilteredByDomain[DomainIndex]
             )
             Bootstrap = not Frontier
+            PendingCandidateTransitions: list[
+                tuple[
+                    int,
+                    tuple[
+                        tuple[int, ComponentTerminalAccessCandidate], ...
+                    ],
+                ]
+            ] = []
             for SourceOffset, Source in enumerate(Sources):
                 CandidateValues = (
                     (FilteredByDomain[DomainIndex][SourceOffset],)
@@ -9537,48 +10112,106 @@ def SolveComponentRoutingProblemDynamic(
                     if ComponentIndex != Source[0]:
                         continue
                     Selections = tuple(sorted((
-                        *Source[1],
-                        (DomainIndex, Candidate),
+                        *Source[1], (DomainIndex, Candidate),
                     )))
-                    OrderedCandidates = tuple(
-                        Value
-                        for _Index, Value in Selections
-                    )
-                    Geometry = BuildGeometry(
-                        Signal,
-                        OrderedCandidates,
-                        (),
-                    )
-                    if Geometry is None:
-                        continue
-                    Nodes, Edges, Claims = Geometry
-                    Key = (
-                        Depth + 1,
-                        ComponentIndex,
-                        Nodes,
-                        Edges,
-                    )
-                    Value = (
+                    PendingCandidateTransitions.append((
                         ComponentIndex,
                         Selections,
-                        Nodes,
-                        Edges,
-                        Claims,
+                    ))
+            FabricSubtrees, _ActiveFabricWorkers = BuildFabricSubtreeBatch(
+                tuple(
+                    Candidate.Attachment
+                    for _DomainIndex, Candidate in Selections
+                )
+                for _ComponentIndex, Selections in PendingCandidateTransitions
+            )
+            PendingTransitions: list[
+                tuple[
+                    int,
+                    tuple[
+                        tuple[int, ComponentTerminalAccessCandidate], ...
+                    ],
+                    frozenset[Position3],
+                    frozenset[RoutingEdge],
+                ]
+            ] = []
+            for (
+                (ComponentIndex, Selections),
+                FabricSubtree,
+            ) in zip(
+                PendingCandidateTransitions,
+                FabricSubtrees,
+                strict=True,
+            ):
+                if FabricSubtree is None:
+                    continue
+                OrderedCandidates = tuple(
+                    Value for _Index, Value in Selections
+                )
+                Structure = BuildGeometryStructure(
+                    Signal,
+                    OrderedCandidates,
+                    (),
+                    FabricSubtree,
+                )
+                if Structure is None:
+                    continue
+                Nodes, Edges = Structure
+                PendingTransitions.append((
+                    ComponentIndex,
+                    Selections,
+                    Nodes,
+                    Edges,
+                ))
+            SameSignalReservedNodes = (
+                ReservedGlobalWireCellsBySignal.get(Signal, frozenset())
+            )
+            ClaimNodeSets = [
+                Nodes for _ComponentIndex, _Selections, Nodes, _Edges
+                in PendingTransitions
+            ]
+            if SameSignalReservedNodes:
+                ClaimNodeSets.extend(
+                    frozenset((*Nodes, *SameSignalReservedNodes))
+                    for _ComponentIndex, _Selections, Nodes, _Edges
+                    in PendingTransitions
+                )
+            ClaimsByNodes = ClaimsForNodeBatch(ClaimNodeSets)
+            for ComponentIndex, Selections, Nodes, Edges in PendingTransitions:
+                Claims = ClaimsByNodes[Nodes]
+                SameSignalCombinedClaims = (
+                    ClaimsByNodes[frozenset((
+                        *Nodes,
+                        *SameSignalReservedNodes,
+                    ))]
+                    if SameSignalReservedNodes
+                    else None
+                )
+                if not IsGeometryClaimsEligible(
+                    Signal,
+                    Nodes,
+                    Claims,
+                    SameSignalCombinedClaims,
+                ):
+                    continue
+                Key = (Depth + 1, ComponentIndex, Nodes, Edges)
+                Value = (
+                    ComponentIndex, Selections, Nodes, Edges, Claims,
+                )
+                Existing = NextByKey.get(Key)
+                if Existing is not None:
+                    DominatedStateCount += 1
+                    ExistingIds = tuple(
+                        CandidateValue.CandidateFingerprint
+                        for _Index, CandidateValue in Existing[1]
                     )
-                    Existing = NextByKey.get(Key)
-                    if Existing is not None:
-                        DominatedStateCount += 1
-                        ExistingIds = tuple(
-                            CandidateValue.CandidateFingerprint
-                            for _Index, CandidateValue in Existing[1]
-                        )
-                        ValueIds = tuple(
-                            CandidateValue.CandidateFingerprint
-                            for _Index, CandidateValue in Value[1]
-                        )
-                        if ExistingIds <= ValueIds:
-                            continue
-                    NextByKey[Key] = Value
+                    ValueIds = tuple(
+                        CandidateValue.CandidateFingerprint
+                        for _Index, CandidateValue in Value[1]
+                    )
+                    if ExistingIds <= ValueIds:
+                        continue
+                NextByKey[Key] = Value
             Frontier = tuple(
                 NextByKey[Key] for Key in sorted(
                     NextByKey,
@@ -11255,6 +11888,7 @@ def SolveComponentRoutingProblem(
             "tree",
             "tree-forest",
             "closed-component-port-forest-v3",
+            "closed-component-bridged-forest-v1",
         }
     )
     if UseDynamicSolver:

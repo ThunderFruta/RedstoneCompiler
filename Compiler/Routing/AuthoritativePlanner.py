@@ -16,15 +16,18 @@ try:
     from ..RustRouting import (
         GetRoutingThreadCount as GetRustRoutingThreadCount,
         RoutingContext as RustRoutingContext,
+        SearchExteriorConnectorsBatchWithTelemetry as _SearchExteriorConnectorsBatchWithTelemetry,
     )
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import (
             GetRoutingThreadCount as GetRustRoutingThreadCount,
             RoutingContext as RustRoutingContext,
+            SearchExteriorConnectorsBatchWithTelemetry as _SearchExteriorConnectorsBatchWithTelemetry,
         )
     except Exception:
         RustRoutingContext = None
+        _SearchExteriorConnectorsBatchWithTelemetry = None
 
         def GetRustRoutingThreadCount() -> int:
             return 1
@@ -51,6 +54,8 @@ from .Models import (
     CertifiedPhysicalComponentApertureDomain,
     ClusterInterfaceAssignment,
     ClusterInterfaceAssignmentPrepared,
+    TrackAssignmentPreparation,
+    TrackAssignmentPrepared,
     ClusterInterfaceConflictComponent,
     ClusterInterfaceProblem,
     ClusterInterfaceRealizabilityNogood,
@@ -79,6 +84,8 @@ from .Models import (
     PhysicalPortLocalAccessFactor,
     PhysicalPortLocalApertureSupport,
     PhysicalPortSeamFactor,
+    PreparedPhysicalSignalLocalFactorDomain,
+    PhysicalSignalLocalFactorReuseEntry,
     PhysicalSignalApertureCandidateDomainIdentity,
     PreparedPhysicalComponentPortFactorDomain,
     PreparedPhysicalComponentFeedthroughEndpointDomain,
@@ -23624,6 +23631,141 @@ def DecomposePhysicalPortLaneFactors(
     )
 
 
+def PreparePhysicalSignalLocalFactorDomain(
+    Problem: ComponentRoutingProblem,
+    AccessCertificate: ComponentCutAccessFeasibilityCertificate,
+    Signal: str,
+    ResourceGraph: Any,
+    *,
+    LocalAccessFactors: Iterable[PhysicalPortLocalAccessFactor],
+    TechnologyFingerprint: str = "",
+) -> PreparedPhysicalSignalLocalFactorDomain:
+    """Freeze the exact local inputs that may survive a placement repair.
+
+    This intentionally accepts no guide, aperture, or exterior-path input.
+    Those facts are reconstructed by the caller for every placement.
+    """
+    Signal = str(Signal)
+    Factors = tuple(sorted(
+        LocalAccessFactors,
+        key=lambda Value: str(Value.LocalAccessFingerprint),
+    ))
+    CertificatePortDomains = tuple(sorted(
+        (
+            Domain
+            for Domain in AccessCertificate.PortDomains
+            if str(Domain.Signal) == Signal
+        ),
+        key=lambda Value: (str(Value.Direction), str(Value.Signal)),
+    ))
+    TerminalDomains = tuple(sorted(
+        (
+            Domain
+            for Domain in getattr(Problem, "OwnedTerminalDomains", ())
+            if str(Domain.Signal) == Signal
+        ),
+        key=lambda Value: (
+            str(Value.TerminalFingerprint),
+            str(Value.TerminalRole),
+            tuple(Value.Terminal),
+        ),
+    ))
+    TerminalContract = tuple(
+        (
+            str(Domain.TerminalFingerprint),
+            tuple(map(int, Domain.Terminal)),
+            str(Domain.TerminalRole),
+            tuple(sorted(
+                str(Candidate.CandidateFingerprint)
+                for Candidate in Domain.Candidates
+            )),
+        )
+        for Domain in TerminalDomains
+    )
+    LocalGeometry = tuple(
+        (
+            str(Factor.FabricDomainFingerprint),
+            tuple(map(int, Factor.FabricAttachment)),
+            tuple(tuple(map(int, Node)) for Node in Factor.LocalPath),
+            tuple(sorted(map(str, Factor.OwnedCandidateFingerprints))),
+        )
+        for Factor in Factors
+    )
+    LocalClaims = tuple(
+        sorted(
+            (
+                str(Factor.LocalAccessFingerprint),
+                tuple(sorted(map(str, Factor.LocalClaims.ResourceIds))),
+                tuple(sorted(map(str, Factor.LocalClaims.WireCells))),
+                tuple(sorted(map(str, Factor.LocalClaims.SupportCells))),
+                tuple(sorted(map(str, Factor.LocalClaims.RequiredAirCells))),
+                tuple(sorted(map(str, Factor.LocalClaims.ElectricalCells))),
+            )
+            for Factor in Factors
+        )
+    )
+    CertifiedLocalWitnesses = tuple(
+        (
+            str(Domain.Direction),
+            tuple(sorted(
+                (
+                    str(Candidate.CandidateFingerprint),
+                    str(Candidate.FabricDomainFingerprint),
+                    tuple(map(int, Candidate.FabricAttachment)),
+                    tuple(tuple(map(int, Node)) for Node in Candidate.LocalPath),
+                    tuple(sorted(map(str, Candidate.OwnedCandidateFingerprints))),
+                    tuple(sorted(map(str, Candidate.Claims.ResourceIds))),
+                )
+                for Candidate in Domain.Candidates
+            )),
+        )
+        for Domain in CertificatePortDomains
+    )
+    ComponentTopologyFingerprint = str(getattr(
+        Problem.Fabric,
+        "FabricFingerprint",
+        "",
+    ))
+    TerminalContractFingerprint = BuildStableFingerprint(TerminalContract)
+    LocalGeometryFingerprint = BuildStableFingerprint(LocalGeometry)
+    LocalClaimsFingerprint = BuildStableFingerprint(LocalClaims)
+    EffectiveTechnologyFingerprint = (
+        str(TechnologyFingerprint)
+        or BuildStableFingerprint(repr(getattr(ResourceGraph, "Technology", None)))
+    )
+    ResourceGraphFingerprint = BuildStableFingerprint((
+        getattr(ResourceGraph, "GraphVersion", ""),
+        len(getattr(ResourceGraph, "Nodes", ())),
+        len(getattr(ResourceGraph, "Edges", ())),
+    ))
+    LocalIdentityFingerprint = BuildStableFingerprint((
+        "physical-signal-local-factor-domain-v1",
+        Signal,
+        ComponentTopologyFingerprint,
+        TerminalContractFingerprint,
+        LocalGeometryFingerprint,
+        LocalClaimsFingerprint,
+        CertifiedLocalWitnesses,
+        EffectiveTechnologyFingerprint,
+        ResourceGraphFingerprint,
+    ))
+    return PreparedPhysicalSignalLocalFactorDomain(
+        Signal=Signal,
+        LocalIdentityFingerprint=LocalIdentityFingerprint,
+        ComponentTopologyFingerprint=ComponentTopologyFingerprint,
+        TerminalContractFingerprint=TerminalContractFingerprint,
+        LocalGeometryFingerprint=LocalGeometryFingerprint,
+        LocalClaimsFingerprint=LocalClaimsFingerprint,
+        TechnologyFingerprint=EffectiveTechnologyFingerprint,
+        Complete=bool(AccessCertificate.Complete),
+        Feasible=bool(Factors),
+        LocalAccessFactors=Factors,
+        LocalSupportFacts=tuple(
+            str(Factor.SeamContractFingerprint) for Factor in Factors
+        ),
+    )
+
+
 def CertifyPhysicalPortExteriorFixedClaims(
     Problem: ComponentRoutingProblem,
     Profiles: Mapping[str, Any],
@@ -24235,6 +24377,90 @@ class PhysicalExteriorConnectorPathResult:
     UsedCanonicalField: bool
     UsedFallback: bool
     FallbackExpansionCount: int
+
+
+@dataclass(frozen=True)
+class FrozenPhysicalExteriorConnectorSearchRequest:
+    """One immutable exterior search that can run outside the Python GIL."""
+
+    Field: PhysicalExteriorConnectorDistanceField
+    Start: Position3
+    BlockedLocalNodes: frozenset[Position3]
+
+
+def SearchFrozenPhysicalExteriorConnectorBatch(
+    Requests: Iterable[FrozenPhysicalExteriorConnectorSearchRequest],
+) -> tuple[tuple[PhysicalExteriorConnectorPathResult, ...], int]:
+    """Search complete frozen exterior fabrics in deterministic request order.
+
+    The caller must still validate redstone claims before accepting a path.
+    Incomplete or custom-resource contracts deliberately remain on the Python
+    exact path, so native work can never weaken route legality.
+    """
+    Values = tuple(Requests)
+    if not Values:
+        return (), 0
+    if (
+        _SearchExteriorConnectorsBatchWithTelemetry is None
+        or any(not Request.Field.Complete for Request in Values)
+    ):
+        return (), 0
+    FieldsByFingerprint: dict[
+        str, PhysicalExteriorConnectorDistanceField
+    ] = {}
+    FieldIndexByFingerprint: dict[str, int] = {}
+    for Request in Values:
+        Fingerprint = Request.Field.FieldFingerprint
+        if Fingerprint not in FieldsByFingerprint:
+            FieldIndexByFingerprint[Fingerprint] = len(
+                FieldsByFingerprint
+            )
+            FieldsByFingerprint[Fingerprint] = Request.Field
+    NativeFields = tuple(
+        (
+            tuple(sorted(Field.Targets)),
+            tuple(Field.EnvelopeMinimum),
+            tuple(Field.EnvelopeMaximum),
+            tuple(sorted(Field.BlockedGuideCells)),
+            tuple(Field.Bounds),
+            tuple(sorted(Field.AllowedNodes)),
+            tuple(sorted(Field.AllowedEdges)),
+        )
+        for Field in FieldsByFingerprint.values()
+    )
+    NativeRequests = tuple(
+        (
+            FieldIndexByFingerprint[Request.Field.FieldFingerprint],
+            tuple(Request.Start),
+            tuple(sorted(Request.BlockedLocalNodes)),
+        )
+        for Request in Values
+    )
+    NativeResults, ActiveWorkerCount = (
+        _SearchExteriorConnectorsBatchWithTelemetry(
+            NativeFields,
+            NativeRequests,
+        )
+    )
+    if len(NativeResults) != len(Values):
+        raise RuntimeError("native exterior connector batch lost a request")
+    return (
+        tuple(
+            PhysicalExteriorConnectorPathResult(
+                Path=tuple(tuple(Position) for Position in Path),
+                UsedCanonicalField=bool(UsedCanonicalField),
+                UsedFallback=bool(UsedFallback),
+                FallbackExpansionCount=int(FallbackExpansionCount),
+            )
+            for (
+                Path,
+                UsedCanonicalField,
+                UsedFallback,
+                FallbackExpansionCount,
+            ) in NativeResults
+        ),
+        int(ActiveWorkerCount),
+    )
 
 
 def BuildPhysicalExteriorConnectorDistanceField(
@@ -26635,6 +26861,7 @@ def PreparePhysicalComponentPortFactorDomain(
     LaneFactorsBySignal: dict[
         str, tuple[PhysicalPortLaneFactor, ...]
     ] = {}
+    ExteriorFactorPreparationStartedAt = monotonic()
     LaneFactorExpansionCount = 0
     AccessFactorExpansionCount = 0
     SeamFactorExpansionCount = 0
@@ -26651,6 +26878,14 @@ def PreparePhysicalComponentPortFactorDomain(
     GlobalGuideFieldFallbackCount = 0
     GlobalApertureTargetContextBuildCount = 0
     GlobalApertureStaticContractBuildCount = 0
+    NativeConnectorSearchRequests: dict[
+        tuple[object, ...], FrozenPhysicalExteriorConnectorSearchRequest
+    ] = {}
+    NativeConnectorSearchResults: dict[
+        tuple[object, ...], PhysicalExteriorConnectorPathResult
+    ] = {}
+    NativeConnectorBatchWorkItems = 0
+    NativeConnectorBatchActiveWorkerCount = 0
     GlobalConnectorCache: dict[
         tuple[
             str,
@@ -26695,6 +26930,8 @@ def PreparePhysicalComponentPortFactorDomain(
         Signal: str,
         Layer: int,
         ForeignCorridorClaims: Mapping[str, RoutingResourceClaims],
+        *,
+        CollectNativeConnectorRequest: bool = False,
     ) -> tuple[tuple[int, int, int], ...]:
         nonlocal GlobalConnectorSearchCount
         nonlocal GlobalConnectorExpansionCount
@@ -26995,46 +27232,6 @@ def PreparePhysicalComponentPortFactorDomain(
             )
             GlobalConnectorPortableCacheStoreCount += 1
 
-        GlobalConnectorSearchCount += 1
-        if WorkCheck is not None and (
-            GlobalConnectorSearchCount == 1
-            or GlobalConnectorSearchCount % 64 == 0
-        ):
-            WorkCheck({
-                "Stage": "physical-port-global-connector",
-                "Signal": Signal,
-                "ConnectorSearchCount": GlobalConnectorSearchCount,
-                "ConnectorExpansionCount": GlobalConnectorExpansionCount,
-                "ConnectorCacheHitCount": GlobalConnectorCacheHitCount,
-                "ConnectorPortableCacheHitCount": (
-                    GlobalConnectorPortableCacheHitCount
-                ),
-                "ConnectorPortableCacheValidationRejectCount": (
-                    GlobalConnectorPortableCacheValidationRejectCount
-                ),
-                "ConnectorPortableCacheStoreCount": (
-                    GlobalConnectorPortableCacheStoreCount
-                ),
-                "GuideFieldBuildCount": GlobalGuideFieldBuildCount,
-                "GuideFieldExpansionCount": (
-                    GlobalGuideFieldExpansionCount
-                ),
-                "GuideFieldHitCount": GlobalGuideFieldHitCount,
-                "GuideFieldCanonicalPathCount": (
-                    GlobalGuideFieldCanonicalPathCount
-                ),
-                "GuideFieldFallbackCount": (
-                    GlobalGuideFieldFallbackCount
-                ),
-                "ApertureTargetContextBuildCount": (
-                    GlobalApertureTargetContextBuildCount
-                ),
-                "ApertureStaticContractBuildCount": (
-                    GlobalApertureStaticContractBuildCount
-                ),
-                "GuideCellCount": len(GuideCells),
-            })
-
         MaximumStemLength = max(
             MinimumStemLength,
             (
@@ -27185,6 +27382,87 @@ def PreparePhysicalComponentPortFactorDomain(
         else:
             GlobalGuideFieldHitCount += 1
 
+        NativeSearchKey = tuple(CacheKey)
+        NativeEligible = bool(
+            Field.Complete
+            and not HasForeignCorridorClaims
+            and _SearchExteriorConnectorsBatchWithTelemetry is not None
+        )
+        if CollectNativeConnectorRequest:
+            if NativeEligible:
+                NativeConnectorSearchRequests.setdefault(
+                    NativeSearchKey,
+                    FrozenPhysicalExteriorConnectorSearchRequest(
+                        Field=Field,
+                        Start=Start,
+                        BlockedLocalNodes=BlockedLocalNodes,
+                    ),
+                )
+            return ()
+
+        GlobalConnectorSearchCount += 1
+        if WorkCheck is not None and (
+            GlobalConnectorSearchCount == 1
+            or GlobalConnectorSearchCount % 64 == 0
+        ):
+            WorkCheck({
+                "Stage": "physical-port-global-connector",
+                "Signal": Signal,
+                "ConnectorSearchCount": GlobalConnectorSearchCount,
+                "ConnectorExpansionCount": GlobalConnectorExpansionCount,
+                "ConnectorCacheHitCount": GlobalConnectorCacheHitCount,
+                "ConnectorPortableCacheHitCount": (
+                    GlobalConnectorPortableCacheHitCount
+                ),
+                "ConnectorPortableCacheValidationRejectCount": (
+                    GlobalConnectorPortableCacheValidationRejectCount
+                ),
+                "ConnectorPortableCacheStoreCount": (
+                    GlobalConnectorPortableCacheStoreCount
+                ),
+                "GuideFieldBuildCount": GlobalGuideFieldBuildCount,
+                "GuideFieldExpansionCount": (
+                    GlobalGuideFieldExpansionCount
+                ),
+                "GuideFieldHitCount": GlobalGuideFieldHitCount,
+                "GuideFieldCanonicalPathCount": (
+                    GlobalGuideFieldCanonicalPathCount
+                ),
+                "GuideFieldFallbackCount": (
+                    GlobalGuideFieldFallbackCount
+                ),
+                "NativeConnectorBatchWorkItems": (
+                    NativeConnectorBatchWorkItems
+                ),
+                "NativeConnectorBatchActiveWorkerCount": (
+                    NativeConnectorBatchActiveWorkerCount
+                ),
+                "ApertureTargetContextBuildCount": (
+                    GlobalApertureTargetContextBuildCount
+                ),
+                "ApertureStaticContractBuildCount": (
+                    GlobalApertureStaticContractBuildCount
+                ),
+                "GuideCellCount": len(GuideCells),
+            })
+
+        NativePathResult = NativeConnectorSearchResults.get(
+            NativeSearchKey
+        ) if NativeEligible else None
+        if NativePathResult is not None and NativePathResult.Path:
+            Candidate = tuple((*StemPath[:-1], *NativePathResult.Path))
+            if ConnectorClaimsAreLegal(Candidate):
+                if NativePathResult.UsedCanonicalField:
+                    GlobalGuideFieldCanonicalPathCount += 1
+                if NativePathResult.UsedFallback:
+                    GlobalGuideFieldFallbackCount += 1
+                    GlobalConnectorExpansionCount += (
+                        NativePathResult.FallbackExpansionCount
+                    )
+                GlobalConnectorCache[CacheKey] = Candidate
+                RetainPortablePath(Candidate)
+                return Candidate
+
         PathResult = SelectPhysicalExteriorConnectorPath(
             Field,
             ResourceGraph,
@@ -27223,6 +27501,48 @@ def PreparePhysicalComponentPortFactorDomain(
         GlobalConnectorCache[CacheKey] = Result
         RetainPortablePath(Result)
         return Result
+
+    # Collect the expensive portion of every certified port search first.
+    # This pass is intentionally read-only apart from immutable-contract
+    # caches; the normal port loop below remains the sole owner of factor
+    # construction, claim validation, and placement feedback.
+    for Port in Problem.Interface.Ports:
+        CertifiedDomain = CertifiedPortDomainBySignal.get(Port.Signal)
+        if CertifiedDomain is None or not CertifiedDomain.Candidates:
+            continue
+        GuideCells = frozenset(CoarsePlan.Guides.get(Port.Signal, ()))
+        PortLayer = int(CoarsePlan.Layers.get(Port.Signal, 0))
+        for CertifiedCandidate in CertifiedDomain.Candidates:
+            if CertifiedCandidate.Layer != PortLayer:
+                continue
+            LocalPath = tuple(CertifiedCandidate.LocalPath)
+            if len(LocalPath) < 2:
+                continue
+            BuildGlobalPathToGuide(
+                LocalPath[-1],
+                tuple(
+                    LocalPath[-1][Index] - LocalPath[-2][Index]
+                    for Index in range(3)
+                ),
+                GuideCells,
+                Port.Signal,
+                PortLayer,
+                {},
+                CollectNativeConnectorRequest=True,
+            )
+    if NativeConnectorSearchRequests:
+        NativeConnectorKeys = tuple(NativeConnectorSearchRequests)
+        NativeConnectorResults, NativeConnectorBatchActiveWorkerCount = (
+            SearchFrozenPhysicalExteriorConnectorBatch(
+                NativeConnectorSearchRequests[Key]
+                for Key in NativeConnectorKeys
+            )
+        )
+        NativeConnectorBatchWorkItems = len(NativeConnectorResults)
+        NativeConnectorSearchResults.update(zip(
+            NativeConnectorKeys,
+            NativeConnectorResults,
+        ))
 
     for Port in Problem.Interface.Ports:
         PortLayer = int(CoarsePlan.Layers.get(Port.Signal, 0))
@@ -27282,6 +27602,12 @@ def PreparePhysicalComponentPortFactorDomain(
             "UnarySeamInfeasiblePathCount": 0,
             "GeneratedSeamCount": 0,
             "LaneFactorCount": 0,
+            "NativeConnectorBatchWorkItems": (
+                NativeConnectorBatchWorkItems
+            ),
+            "NativeConnectorBatchActiveWorkerCount": (
+                NativeConnectorBatchActiveWorkerCount
+            ),
             "Reason": "unclassified",
         }
         LaneFactorDiagnosticsBySignal[Port.Signal] = (
@@ -28202,6 +28528,53 @@ def PreparePhysicalComponentPortFactorDomain(
                 if not LaneFactorsBySignal.get(Signal)
                 else "exterior-fixed-claim-apertures-pruned"
             )
+    # The decomposed local half is the only portion that can cross a repair
+    # boundary.  Aperture factors and their support relation above were built
+    # from this placement's seams and are never retrieved from this cache.
+    LocalFactorPreparationStartedAt = monotonic()
+    LocalFactorDomainsBySignal: dict[
+        str, PreparedPhysicalSignalLocalFactorDomain
+    ] = {}
+    LocalFactorCacheHitSignals: list[str] = []
+    LocalFactorRebuiltSignals: list[str] = []
+    CachedLocalFactorsBySignal: dict[
+        str, tuple[PhysicalPortLocalAccessFactor, ...]
+    ] = {}
+    LocalFactorCache = Resources.PhysicalSignalLocalFactorDomainCache
+    for Signal, Factors in LocalAccessFactorsBySignal:
+        Domain = PreparePhysicalSignalLocalFactorDomain(
+            Problem, AccessCertificate, Signal, ResourceGraph,
+            LocalAccessFactors=Factors,
+            TechnologyFingerprint=TechnologyFingerprint,
+        )
+        Existing = LocalFactorCache.get(Domain.LocalIdentityFingerprint)
+        if Existing is not None:
+            if Existing.Domain != Domain:
+                raise ValueError(
+                    "physical signal-local factor cache identity mismatch"
+                )
+            LocalFactorCacheHitSignals.append(Signal)
+            Domain = Existing.Domain
+        else:
+            LocalFactorRebuiltSignals.append(Signal)
+            if Domain.Complete:
+                LocalFactorCache[Domain.LocalIdentityFingerprint] = (
+                    PhysicalSignalLocalFactorReuseEntry(
+                        LocalIdentityFingerprint=Domain.LocalIdentityFingerprint,
+                        Domain=Domain,
+                        SourcePlacementFingerprint=Problem.PlacementFingerprint,
+                    )
+                )
+        LocalFactorDomainsBySignal[Signal] = Domain
+        CachedLocalFactorsBySignal[Signal] = Domain.LocalAccessFactors
+    LocalAccessFactorsBySignal = tuple(
+        (Signal, CachedLocalFactorsBySignal[Signal])
+        for Signal, _Factors in LocalAccessFactorsBySignal
+    )
+    LocalFactorPreparationElapsedSeconds = monotonic() - LocalFactorPreparationStartedAt
+    ExteriorFactorPreparationElapsedSeconds = (
+        LocalFactorPreparationStartedAt - ExteriorFactorPreparationStartedAt
+    )
     EmptySignals = tuple(sorted(
         Signal
         for Signal, Values in LaneFactorsBySignal.items()
@@ -28372,6 +28745,10 @@ def PreparePhysicalComponentPortFactorDomain(
             GlobalGuideFieldCanonicalPathCount
         ),
         GlobalGuideFieldFallbackCount=GlobalGuideFieldFallbackCount,
+        NativeConnectorBatchWorkItems=NativeConnectorBatchWorkItems,
+        NativeConnectorBatchActiveWorkerCount=(
+            NativeConnectorBatchActiveWorkerCount
+        ),
         Complete=bool(
             all(
                 Domain.Complete
@@ -28397,6 +28774,19 @@ def PreparePhysicalComponentPortFactorDomain(
         LocalApertureSupportBySignal=LocalApertureSupportBySignal,
         LocalApertureSupportsByOption=(
             LocalApertureSupportsByOption
+        ),
+        SignalLocalFactorDomains=tuple(sorted(
+            LocalFactorDomainsBySignal.items()
+        )),
+        LocalFactorCacheHitSignals=tuple(sorted(LocalFactorCacheHitSignals)),
+        LocalFactorRebuiltSignals=tuple(
+            sorted(LocalFactorRebuiltSignals)
+        ),
+        LocalFactorPreparationElapsedSeconds=(
+            LocalFactorPreparationElapsedSeconds
+        ),
+        ExteriorFactorPreparationElapsedSeconds=(
+            ExteriorFactorPreparationElapsedSeconds
         ),
         ExteriorFixedClaimCertificates=(
             ExteriorFixedClaimCertificates
@@ -28424,6 +28814,7 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
     Resources: RoutingResources,
     *,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    Deadline: RoutingDeadline | None = None,
     DeferLocalCompositeSelection: bool = False,
     RequiredBoundaryPorts: tuple[
         PhysicalComponentBoundaryPortReservation, ...
@@ -30217,6 +30608,12 @@ def SolvePreparedPhysicalComponentPortFactorDomain(
             ),
             AperturePortalSlackBySignal=(
                 Resources.PhysicalComponentAperturePortalSlackBySignal
+            ),
+            # Each native lease solve receives the remaining shared routing
+            # deadline.  The closure is evaluated again when the iterator
+            # advances, so a rejected contract never receives a fresh budget.
+            MaximumRuntimeSeconds=(
+                Deadline.RemainingSeconds if Deadline is not None else None
             ),
         )
         BoundaryAssignmentIterator = ContractIterator
@@ -32671,12 +33068,14 @@ def RouteAuthoritativeResources(
     RawPortalCache: RawPortalGeometryCache | None = None,
     PreparedPortalCache: PreparedPortalDomainCache | None = None,
     PreparePortalGeometryOnly: bool = False,
+    PrepareTrackAssignmentOnly: bool = False,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
     PrepareComponentRoutingProblemOnly: bool = False,
     PreparePhysicalComponentAssemblyOnly: bool = False,
     PreparePhysicalComponentPortFactorDomainOnly: bool = False,
+    DeferClusterBoundaryLeaseUntilCapacityPrecheck: bool = False,
     UnboundOwnedSignalFrontierProofCallback: Callable[
         [ComponentRoutingProblem], None
     ] | None = None,
@@ -37333,7 +37732,10 @@ def RouteAuthoritativeResources(
             WorkTelemetry["RepeaterReadyPortalRepair"] = (
                 RepeaterReadyPortalTelemetry
             )
-        if BoundaryLeaseSignals:
+        if (
+            BoundaryLeaseSignals
+            and not DeferClusterBoundaryLeaseUntilCapacityPrecheck
+        ):
             LeasePortals = {
                 Key: Values
                 for Key, Values in Portals.items()
@@ -37477,6 +37879,18 @@ def RouteAuthoritativeResources(
                     "OwnershipFingerprint"
                 ]
             )
+        elif BoundaryLeaseSignals:
+            # A complete local-capacity repair must prove and reserve its
+            # implicated seams before a dense whole-component lease can use
+            # the last shared deadline slice.  This preparation invocation
+            # builds only immutable local factors; the normal post-precheck
+            # routing call materializes the authoritative full lease.
+            WorkTelemetry["ClusterBoundaryLeases"] = {
+                **dict(WorkTelemetry["ClusterBoundaryLeases"]),
+                "Status": "deferred-for-capacity-repair-precheck",
+                "DeferredUntil": "local-disjoint-seam-reservation",
+            }
+            PortalReservations = ()
         elif UnreservedPortalMode:
             Portals = {
                 Key: tuple(
@@ -47620,39 +48034,34 @@ def RouteAuthoritativeResources(
     if Result is None:
         Result = PlanAssignment()
         RaiseForNativeAssignmentDeadline(Result)
-    if Policy.AdaptiveRouting.Enabled:
-        while (
-            not Result.Success
-            and ShouldGrowAssignmentBudget(Result)
-            and AssignmentExpansionLimit < AdaptiveBudget.AssignmentExpansions
-            and not (
-                PlacementWasRelocated
-                and LaneDiversityLevel >= 1
-            )
-        ):
-            NextAssignmentExpansionLimit = GrowAssignmentExpansionLimit(
-                AssignmentExpansionLimit,
-                AdaptiveBudget.AssignmentExpansions,
-                Policy.AdaptiveRouting.AssignmentGrowthFactor,
-            )
-            if NextAssignmentExpansionLimit <= AssignmentExpansionLimit:
-                break
-            AssignmentRetryHistory.append({
-                "Stage": "TrackAssignment",
-                "Action": "increase-assignment-budget",
-                "FromAssignmentExpansionLimit": AssignmentExpansionLimit,
-                "ToAssignmentExpansionLimit": NextAssignmentExpansionLimit,
-                "ExactExpansions": Result.ExpansionCount,
-                "Reason": "exact capacity-one assignment exhausted current budget",
-            })
-            AssignmentExpansionLimit = NextAssignmentExpansionLimit
-            RuntimeEscalationState = replace(
-                RuntimeEscalationState,
-                AssignmentBudget=AssignmentExpansionLimit,
-            )
-            CheckRuntimeBudget("Track")
-            Result = PlanAssignment()
-            RaiseForNativeAssignmentDeadline(Result)
+    if PrepareTrackAssignmentOnly:
+        raise TrackAssignmentPrepared(TrackAssignmentPreparation(
+            Success=bool(Result.Success),
+            SelectedCandidateIds=tuple(sorted(
+                (str(Signal), str(CandidateId))
+                for Signal, CandidateId in Result.SelectedCandidateIds
+            )),
+            CandidateCounts=tuple(sorted(
+                (str(Signal), len(Candidates))
+                for Signal, Candidates in CandidatesBySignal.items()
+            )),
+            ConflictSignals=tuple(sorted(map(
+                str,
+                getattr(Result, "ConflictSignals", ()),
+            ))),
+            ConflictResourceIndices=tuple(sorted(map(
+                int,
+                getattr(Result, "ConflictResourceIndices", ()),
+            ))),
+            ExpansionCount=int(Result.ExpansionCount),
+            Complete=not bool(
+                getattr(Result, "BudgetExhausted", False)
+                or getattr(Result, "DeadlineExceeded", False)
+            ),
+        ))
+    # A bounded assignment is one proof attempt.  Exhaustion is surfaced to
+    # the caller as incomplete; it is never authorization to enlarge the
+    # assignment budget and rerun the same state.
     PhysicalGlobalAssignmentSuffixHistory: list[dict[str, object]] = []
     PhysicalGlobalCompletedPairNoGoodEdges: tuple[
         tuple[str, str], ...

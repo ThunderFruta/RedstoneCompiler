@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 from math import isfinite
 from pathlib import Path
@@ -10,7 +11,7 @@ import shutil
 import sys
 import os
 import time
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, active_count
 
 if __package__:
     from .Pipeline import CompileSvToLitematic
@@ -51,6 +52,198 @@ BuiltInDefaults = {
         "minecraft:magenta_concrete",
     ],
 }
+
+
+class CpuRunTelemetry:
+    """Process CPU and thread telemetry for one CLI invocation."""
+
+    def __init__(self) -> None:
+        self.StartedAt = time.monotonic()
+        self.StartTimes = os.times()
+        self.CompileStartedAt: float | None = None
+        self.CompileStartTimes: os.times_result | None = None
+        self.CompileFinishedAt: float | None = None
+        self.CompileFinishTimes: os.times_result | None = None
+        self.RoutingStages: list[tuple[str, float, os.times_result]] = []
+        self.PeakOsThreads = self.ReadOsThreadCount()
+        self.PeakPythonThreads = active_count()
+        self.LastOsThreads = self.PeakOsThreads
+        self.LastPythonThreads = self.PeakPythonThreads
+        self.StopEvent = Event()
+        self.SampleThread = Thread(
+            target=self.Sample,
+            name="redstone-cpu-telemetry",
+            daemon=True,
+        )
+        self.SampleThread.start()
+        self.HasPrinted = False
+        self.PrintLock = Lock()
+
+    @staticmethod
+    def ReadOsThreadCount() -> int:
+        """Return Linux process thread count without requiring psutil."""
+        try:
+            for Line in Path("/proc/self/status").read_text().splitlines():
+                if Line.startswith("Threads:"):
+                    return max(1, int(Line.split(":", 1)[1].strip()))
+        except (OSError, ValueError):
+            pass
+        return 1
+
+    def Sample(self) -> None:
+        while not self.StopEvent.wait(0.1):
+            self.LastOsThreads = self.ReadOsThreadCount()
+            self.LastPythonThreads = active_count()
+            self.PeakOsThreads = max(self.PeakOsThreads, self.LastOsThreads)
+            self.PeakPythonThreads = max(
+                self.PeakPythonThreads,
+                self.LastPythonThreads,
+            )
+
+    def BeginCompilation(self) -> None:
+        self.CompileStartedAt = time.monotonic()
+        self.CompileStartTimes = os.times()
+
+    def FinishCompilation(self) -> None:
+        if self.CompileStartedAt is not None:
+            self.CompileFinishedAt = time.monotonic()
+            self.CompileFinishTimes = os.times()
+
+    def RecordRoutingProgress(self, Progress: PcbProgress) -> None:
+        """Record only stage transitions; rendering remains independent."""
+        Stage = str(Progress.Stage)
+        # Progress text may append per-net/iteration diagnostics after a
+        # separator.  Keep the stable stage name so the final CPU report is
+        # useful rather than hundreds of near-duplicate lines.
+        if " | " in Stage:
+            Stage = Stage.split(" | ", 1)[-1]
+        if self.RoutingStages and self.RoutingStages[-1][0] == Stage:
+            return
+        self.RoutingStages.append((Stage, time.monotonic(), os.times()))
+
+    @staticmethod
+    def FormatInterval(
+        Label: str,
+        StartedAt: float,
+        StartedTimes: os.times_result,
+        FinishedAt: float,
+        FinishedTimes: os.times_result,
+    ) -> str:
+        WallSeconds = max(0.0, FinishedAt - StartedAt)
+        UserSeconds = max(0.0, FinishedTimes.user - StartedTimes.user)
+        SystemSeconds = max(0.0, FinishedTimes.system - StartedTimes.system)
+        ChildUserSeconds = max(
+            0.0,
+            FinishedTimes.children_user - StartedTimes.children_user,
+        )
+        ChildSystemSeconds = max(
+            0.0,
+            FinishedTimes.children_system - StartedTimes.children_system,
+        )
+        ChildCpuSeconds = ChildUserSeconds + ChildSystemSeconds
+        CpuSeconds = UserSeconds + SystemSeconds + ChildCpuSeconds
+        AverageCores = CpuSeconds / WallSeconds if WallSeconds else 0.0
+        return (
+            f"  {Label}: wall={WallSeconds:.3f}s "
+            f"cpu={CpuSeconds:.3f}s "
+            f"(user={UserSeconds:.3f}s system={SystemSeconds:.3f}s "
+            f"child_cpu={ChildCpuSeconds:.3f}s) "
+            f"average_cores={AverageCores:.2f}"
+        )
+
+    def PrintSummary(self) -> None:
+        """Print exactly once, including after an unexpected traceback."""
+        with self.PrintLock:
+            if self.HasPrinted:
+                return
+            self.HasPrinted = True
+        self.StopEvent.set()
+        self.SampleThread.join(timeout=0.25)
+        FinishedAt = time.monotonic()
+        FinishedTimes = os.times()
+        self.LastOsThreads = self.ReadOsThreadCount()
+        self.LastPythonThreads = active_count()
+        self.PeakOsThreads = max(self.PeakOsThreads, self.LastOsThreads)
+        self.PeakPythonThreads = max(
+            self.PeakPythonThreads,
+            self.LastPythonThreads,
+        )
+        print("CPU telemetry:")
+        print(self.FormatInterval(
+            "total",
+            self.StartedAt,
+            self.StartTimes,
+            FinishedAt,
+            FinishedTimes,
+        ))
+        if self.CompileStartedAt is not None:
+            print(self.FormatInterval(
+                "compile",
+                self.CompileStartedAt,
+                self.CompileStartTimes or self.StartTimes,
+                self.CompileFinishedAt or FinishedAt,
+                self.CompileFinishTimes or FinishedTimes,
+            ))
+        if self.RoutingStages:
+            print("  routing stages:")
+            StageTotals: dict[str, list[float]] = {}
+            for Index, (Stage, StartedAt, StartedTimes) in enumerate(
+                self.RoutingStages
+            ):
+                if Index + 1 < len(self.RoutingStages):
+                    _NextStage, EndedAt, EndedTimes = (
+                        self.RoutingStages[Index + 1]
+                    )
+                else:
+                    EndedAt = self.CompileFinishedAt or FinishedAt
+                    EndedTimes = self.CompileFinishTimes or FinishedTimes
+                Totals = StageTotals.setdefault(
+                    Stage,
+                    [0.0, 0.0, 0.0, 0.0, 0.0],
+                )
+                Totals[0] += max(0.0, EndedAt - StartedAt)
+                Totals[1] += max(0.0, EndedTimes.user - StartedTimes.user)
+                Totals[2] += max(
+                    0.0,
+                    EndedTimes.system - StartedTimes.system,
+                )
+                Totals[3] += max(
+                    0.0,
+                    (
+                        EndedTimes.children_user
+                        + EndedTimes.children_system
+                        - StartedTimes.children_user
+                        - StartedTimes.children_system
+                    ),
+                )
+                Totals[4] += 1
+            for Stage, (
+                WallSeconds,
+                UserSeconds,
+                SystemSeconds,
+                ChildCpuSeconds,
+                Count,
+            ) in (
+                StageTotals.items()
+            ):
+                CpuSeconds = UserSeconds + SystemSeconds + ChildCpuSeconds
+                AverageCores = CpuSeconds / WallSeconds if WallSeconds else 0.0
+                print(
+                    f"    {Stage} (events={int(Count)}): "
+                    f"wall={WallSeconds:.3f}s cpu={CpuSeconds:.3f}s "
+                    f"(user={UserSeconds:.3f}s system={SystemSeconds:.3f}s "
+                    f"child_cpu={ChildCpuSeconds:.3f}s) "
+                    f"average_cores={AverageCores:.2f}"
+                )
+        print(
+            "  threads: "
+            f"os_current={self.LastOsThreads} "
+            f"os_peak={self.PeakOsThreads} "
+            f"python_current={self.LastPythonThreads} "
+            f"python_peak={self.PeakPythonThreads} "
+            f"native_routing_limit={os.environ.get('RC_ROUTING_THREADS', 'auto')} "
+            f"logical_cpus={os.cpu_count() or 1}"
+        )
 
 
 def ParsePositiveSeconds(Value: str) -> float:
@@ -423,7 +616,7 @@ def GuidedMenu(
 class TerminalProgressReporter:
     """Render routing status in place and terminate it exactly once."""
 
-    def __init__(self) -> None:
+    def __init__(self, CpuTelemetry: CpuRunTelemetry | None = None) -> None:
         self.StartTime = time.monotonic()
         self.Interactive = sys.stderr.isatty()
         self.RefreshIntervalSeconds = 0.1
@@ -436,6 +629,7 @@ class TerminalProgressReporter:
         self.RenderLock = Lock()
         self.RefreshStop = Event()
         self.RefreshThread: Thread | None = None
+        self.CpuTelemetry = CpuTelemetry
         if self.Interactive:
             self.RefreshThread = Thread(
                 target=self._RefreshLoop,
@@ -445,6 +639,8 @@ class TerminalProgressReporter:
             self.RefreshThread.start()
 
     def __call__(self, Progress: PcbProgress) -> None:
+        if self.CpuTelemetry is not None:
+            self.CpuTelemetry.RecordRoutingProgress(Progress)
         with self.RenderLock:
             self.LatestProgress = Progress
             self._Render(Progress)
@@ -540,15 +736,109 @@ class TerminalProgressReporter:
                 self.HasRendered = False
 
 
-def BuildProgressReporter() -> TerminalProgressReporter:
+def BuildProgressReporter(
+    CpuTelemetry: CpuRunTelemetry | None = None,
+) -> TerminalProgressReporter:
     """Build a terminal-aware PCB routing progress callback."""
-    return TerminalProgressReporter()
+    return TerminalProgressReporter(CpuTelemetry)
+
+
+def PrintRoutingFailureSummary(Error: Exception, OutputPath: Path | None) -> None:
+    """Print compact, actionable physical-routing evidence for CLI failures."""
+    Failure = getattr(Error, "Failure", None)
+    if Failure is None:
+        return
+    Diagnostics = (
+        Failure.Diagnostics
+        if isinstance(getattr(Failure, "Diagnostics", None), dict)
+        else {}
+    )
+    print("Routing failure details:", file=sys.stderr)
+    if Failure.AffectedNets:
+        print(
+            "  affected nets: " + ", ".join(Failure.AffectedNets),
+            file=sys.stderr,
+        )
+    if Failure.Resources:
+        print(
+            "  affected resources: " + ", ".join(Failure.Resources),
+            file=sys.stderr,
+        )
+    Deadline = Diagnostics.get("Deadline", {})
+    if isinstance(Deadline, dict):
+        Elapsed = Deadline.get("ElapsedSeconds")
+        Remaining = Deadline.get("RemainingMilliseconds")
+        if Elapsed is not None or Remaining is not None:
+            print(
+                "  deadline: "
+                f"elapsed={Elapsed}s remaining={Remaining}ms "
+                f"kind={Deadline.get('ExpirationKind', '')}",
+                file=sys.stderr,
+            )
+    Core = Diagnostics.get("ComponentRoutabilityCore", {})
+    if isinstance(Core, dict) and Core.get("Complete", False):
+        print(
+            "  routability core: "
+            f"{Core.get('CoreFingerprint', '')} "
+            f"signals={','.join(map(str, Core.get('Signals', ())))}",
+            file=sys.stderr,
+        )
+    Attempts = Diagnostics.get("CompletedComponentStateAttempts", ())
+    if isinstance(Attempts, list) and Attempts:
+        print(
+            f"  component placement attempts ({len(Attempts)}):",
+            file=sys.stderr,
+        )
+        for Attempt in Attempts[:24]:
+            if not isinstance(Attempt, dict):
+                continue
+            AttemptFailure = Attempt.get("Failure", {})
+            if not isinstance(AttemptFailure, dict):
+                AttemptFailure = {}
+            AttemptCore = AttemptFailure.get(
+                "OwnershipUnsatCoreFingerprint", ""
+            )
+            Nets = ",".join(map(
+                str,
+                AttemptFailure.get("AffectedNets", ()),
+            ))
+            print(
+                "    "
+                f"{Attempt.get('CandidateId', '<unknown>')} "
+                f"result={Attempt.get('Result', '')} "
+                f"placement={Attempt.get('PlacementFingerprint', '')} "
+                f"failure={AttemptFailure.get('Stage', '')}:"
+                f"{AttemptFailure.get('Reason', '')} "
+                f"nets={Nets} core={AttemptCore}",
+                file=sys.stderr,
+            )
+        if len(Attempts) > 24:
+            print("    ... remaining attempts are in the artifact", file=sys.stderr)
+    Decisions = Diagnostics.get("PlacementGenerationDecisions", ())
+    if isinstance(Decisions, list) and Decisions:
+        print("  latest placement decisions:", file=sys.stderr)
+        for Decision in Decisions[-6:]:
+            if isinstance(Decision, dict):
+                print(
+                    "    "
+                    f"{Decision.get('Result', '')} "
+                    f"signals={','.join(map(str, Decision.get('RelocationSignals', ())))} "
+                    f"placement={Decision.get('PlacementFingerprint', '')}",
+                    file=sys.stderr,
+                )
+    if OutputPath is not None:
+        print(
+            "  full diagnostic artifact: "
+            f"{OutputPath.with_suffix('.RoutingFailure.json')}",
+            file=sys.stderr,
+        )
 
 
 def Main(Args: list[str] | None = None) -> int:
     RawArgs = list(sys.argv[1:] if Args is None else Args)
     Parser = BuildParser()
     Parsed = Parser.parse_args(RawArgs)
+    OutputPath: Path | None = None
 
     try:
         Defaults = LoadDefaults(Parsed.defaults_file)
@@ -607,14 +897,21 @@ def Main(Args: list[str] | None = None) -> int:
         if OutputPath.suffix.lower() != ".litematic":
             OutputPath = OutputPath.with_suffix(".litematic")
 
+        # Start telemetry after guided input.  Otherwise the total interval
+        # includes arbitrary time spent answering CLI prompts and can look
+        # like a harness timeout despite the compiler having finished within
+        # its actual routing budget.
+        CpuTelemetry = CpuRunTelemetry()
+        atexit.register(CpuTelemetry.PrintSummary)
         SearchDescription = "Generating clustered PCB-style multilayer routing..."
         print(SearchDescription, file=sys.stderr)
-        ProgressReporter = BuildProgressReporter()
+        ProgressReporter = BuildProgressReporter(CpuTelemetry)
         try:
             if Parsed.routing_threads is not None:
                 if Parsed.routing_threads <= 0:
                     Parser.error("--routing-threads must be positive")
                 os.environ["RC_ROUTING_THREADS"] = str(Parsed.routing_threads)
+            CpuTelemetry.BeginCompilation()
             Result = CompileSvToLitematic(
                 InputPath=InputPath,
                 OutputPath=OutputPath,
@@ -627,6 +924,7 @@ def Main(Args: list[str] | None = None) -> int:
                 TraceSupportBlocks=TraceSupportBlocks,
             )
         finally:
+            CpuTelemetry.FinishCompilation()
             ProgressReporter.Finish()
 
         DestinationPath = None
@@ -637,6 +935,7 @@ def Main(Args: list[str] | None = None) -> int:
             )
     except (FileNotFoundError, ValueError, NotImplementedError) as Error:
         print(f"Operation failed: {Error}", file=sys.stderr)
+        PrintRoutingFailureSummary(Error, OutputPath)
         return 1
 
     print(
