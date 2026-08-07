@@ -21,6 +21,7 @@ from ..Models import (
     ComponentRoutingProblem,
     RoutedDesign,
     RoutingResources,
+    TrackAssignmentPreparation,
 )
 from ..Reliability import RoutingDeadline
 from ..Policy import DefaultPhysicalDesignPolicy, PhysicalDesignPolicy
@@ -53,6 +54,7 @@ def RoutePcbNets(
     ReservationVariant: int = 0,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
+    FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
@@ -124,6 +126,7 @@ def RoutePcbNets(
         ReservationVariant=ReservationVariant,
         PreparePortalGeometryOnly=PreparePortalGeometryOnly,
         PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
+        FrozenTrackAssignmentPreparation=FrozenTrackAssignmentPreparation,
         ValidateClusterInterfaceForeignAccessOnly=(
             ValidateClusterInterfaceForeignAccessOnly
         ),

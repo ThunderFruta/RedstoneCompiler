@@ -46,6 +46,8 @@ class PlacedDesign:
     ClusterBoundaryLeaseRequests: tuple[Any, ...] = ()
     CompleteClusterInterfaceAccess: bool = False
     InterClusterRoutingChannel: Any | None = None
+    PlacementAccessFabric: Any | None = None
+    PlacementAccessAssignment: Any | None = None
     RoutedComponentTemplates: tuple[Any, ...] = ()
     RoutedComponentRoutingChannels: tuple[Any, ...] = ()
     PackedClusters: tuple[Any, ...] = ()

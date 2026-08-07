@@ -49,6 +49,27 @@ class RedstoneSimulationTests(unittest.TestCase):
         self.assertEqual(Report.Backend, "native-parallel")
         self.assertEqual(PythonReport.Backend, "python")
         self.assertTrue(Report.Passed)
+        self.assertFalse(Physical.FallbackUsed)
+        self.assertTrue(Physical.Routed.ZeroResourceConflicts)
+        self.assertEqual(Physical.Routed.AssignmentExpansionCount, 0)
+        self.assertNotIn(
+            "AdaptiveEscalationHistory",
+            Physical.Routed.RoutingControlEffectiveness,
+        )
+        self.assertNotIn(
+            "RoutingEscalationState",
+            Physical.Routed.RoutingControlEffectiveness,
+        )
+        self.assertIn(
+            "FixedRoutingControls",
+            Physical.Routed.RoutingControlEffectiveness,
+        )
+        CapacitySelection = Physical.Routed.RoutingControlEffectiveness[
+            "PrePlacementCapacitySelection"
+        ]
+        self.assertEqual(CapacitySelection["GeometryDomainSize"], 1)
+        self.assertEqual(CapacitySelection["CapacitySolveCount"], 1)
+        self.assertEqual(CapacitySelection["RouteAttemptCount"], 1)
         self.assertTrue(
             any(
                 0 < Progress.Completed < Progress.Total

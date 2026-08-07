@@ -64,6 +64,7 @@ from ..Routing.Models import (
     ComponentRoutabilityCore,
     RoutedComponentTemplate,
     RoutedDesign,
+    TrackAssignmentPreparation,
     PhysicalGlobalPlanDescriptorProgressState,
     PhysicalGlobalPlanResumeCursor,
     PhysicalGlobalPlanContinuationState,
@@ -104,6 +105,12 @@ from .Pcb import (
     PlacementAssignmentConstraintSet,
     PcbPlacement,
     PlacePcbGraph,
+)
+from .AccessFabric import (
+    AttachPlacementAccessAssignment,
+    AttachPlacementAccessFabric,
+    BuildPlacementAccessFabric,
+    SolvePlacementAccessFabricCapacity,
 )
 from .Rotation import RotatedCellSize
 from .Geometry import PlacedDesign
@@ -5075,6 +5082,55 @@ def BuildPlacementGenerationPlan(
         DeferredRequests=tuple(DeferredRequests),
         MaximumAttempts=max(1, MaximumAttempts),
     )
+
+
+def SelectFixedPrimaryPlacementRequests(
+    GenerationPlan: PlacementGenerationPlan,
+    NandGateCount: int,
+) -> tuple[PlacementGenerationRequest, ...]:
+    """Return the complete immutable geometry domain built before routing."""
+    if NandGateCount < 0:
+        raise ValueError("NAND gate count cannot be negative")
+    Primary = GenerationPlan.PrimaryRequests[:1]
+    ScaleAlternative = tuple(
+        Request
+        for Request in GenerationPlan.DeferredRequests
+        if (
+            NandGateCount > 32
+            and Request.SourceGenerator == "row-beam-direct-only"
+        )
+    )[:1]
+    return (
+        *Primary,
+        *ScaleAlternative,
+    )
+
+
+def SummarizePrePlacementCapacityResults(
+    Results: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Retain the bounded proof outcome without embedding full domains."""
+    Summaries: list[dict[str, object]] = []
+    for Result in Results:
+        SelectedCandidateIds = Result.get("SelectedCandidateIds", ())
+        Summaries.append({
+            "CandidateId": Result.get("CandidateId", ""),
+            "PlacementFingerprint": Result.get(
+                "PlacementFingerprint",
+                "",
+            ),
+            "Success": bool(Result.get("Success", False)),
+            "Complete": bool(Result.get("Complete", False)),
+            "ExpansionCount": int(Result.get("ExpansionCount", 0)),
+            "SelectedCandidateCount": (
+                len(SelectedCandidateIds)
+                if isinstance(SelectedCandidateIds, (list, tuple))
+                else 0
+            ),
+            "ConflictSignals": list(Result.get("ConflictSignals", ())),
+            "IncompleteReason": str(Result.get("IncompleteReason", "")),
+        })
+    return Summaries
 
 
 def PlacementCandidateOrder(
@@ -11102,10 +11158,15 @@ def _PlaceAndRoutePcbWithPolicy(
                 Stage=f"spacing {RoutingSpacing} | placing clustered NAND graph",
                     )
                 )
-    # Materialize one deterministic placement.  Deferred geometry and later
-    # primary requests are evidence candidates only; they are never retried
-    # or promoted after this attempt fails.
-    for Request in GenerationPlan.PrimaryRequests[:1]:
+    # Materialize the complete fixed geometry domain before capacity solving.
+    # The second member is structurally distinct but is never promoted in
+    # response to a routing failure; both are alternatives in one immutable
+    # pre-route selection problem.
+    FixedPrimaryRequests = SelectFixedPrimaryPlacementRequests(
+        GenerationPlan,
+        NandGateCount,
+    )
+    for Request in FixedPrimaryRequests:
         if Deadline.IsExpired():
             break
         _TryPlacement(Request)
@@ -11770,13 +11831,112 @@ def _PlaceAndRoutePcbWithPolicy(
         return True
 
     CandidateRecords = _BuildCandidateRecords()
+    FabricCandidateRecords: list[PcbPlacementCandidate] = []
+    for Candidate in CandidateRecords:
+        if len(Module.Gates) > 32:
+            FabricCandidateRecords.append(Candidate)
+            continue
+        CandidateResources = RoutingResourcesByFingerprint.get(
+            Candidate.PlacementFingerprint
+        )
+        if CandidateResources is None:
+            CandidateResources = BuildRoutingResources(
+                Candidate.Placement.Placed
+            )
+        Fabric = BuildPlacementAccessFabric(
+            Candidate.Placement,
+            Resources=CandidateResources,
+            Technology=Technology,
+            AccessLength=Technology.AccessLength,
+            WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                "PrePlacementAccessFabric",
+                Diagnostics,
+            ),
+        )
+        AttachedPlacement = AttachPlacementAccessFabric(
+            Candidate.Placement,
+            Fabric,
+        )
+        AccessAssignment = SolvePlacementAccessFabricCapacity(
+            Fabric,
+            WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                "PrePlacementAccessCapacity",
+                Diagnostics,
+            ),
+        )
+        AttachedPlacement = AttachPlacementAccessAssignment(
+            AttachedPlacement,
+            AccessAssignment,
+        )
+        RoutingResourcesByFingerprint[
+            Candidate.PlacementFingerprint
+        ] = CandidateResources
+        FabricCandidateRecords.append(replace(
+            Candidate,
+            Placement=AttachedPlacement,
+        ))
+    CandidateRecords = FabricCandidateRecords
 
-    def PreparePrePlacementTrackCapacity(
+    PrePlacementTrackPreparationWitnesses: dict[
+        str,
+        TrackAssignmentPreparation,
+    ] = {}
+
+    def SolvePrePlacementCapacityProblem(
         Candidates: Iterable[PcbPlacementCandidate],
     ) -> tuple[list[dict[str, object]], list[PcbPlacementCandidate]]:
+        """Solve the fixed placement disjunction once before routing."""
         Preparations: list[dict[str, object]] = []
         Feasible: list[PcbPlacementCandidate] = []
         for Candidate in Candidates:
+            Fabric = Candidate.Placement.PlacementAccessFabric
+            AccessAssignment = (
+                Candidate.Placement.PlacementAccessAssignment
+            )
+            if (
+                AccessAssignment is not None
+                and not AccessAssignment.Success
+            ):
+                Preparations.append({
+                    "CandidateId": Candidate.CandidateId,
+                    "PlacementFingerprint": Candidate.PlacementFingerprint,
+                    **AccessAssignment.ToDictionary(),
+                    "PlacementAccessFabric": (
+                        Fabric.ToDictionary() if Fabric is not None else None
+                    ),
+                })
+                continue
+            if (
+                AccessAssignment is not None
+                and AccessAssignment.Success
+                and AccessAssignment.Complete
+            ):
+                Preparations.append({
+                    "CandidateId": Candidate.CandidateId,
+                    "PlacementFingerprint": Candidate.PlacementFingerprint,
+                    **AccessAssignment.ToDictionary(),
+                    "PlacementAccessFabric": (
+                        Fabric.ToDictionary() if Fabric is not None else None
+                    ),
+                    "RoutingAttemptCount": 0,
+                })
+                Feasible.append(Candidate)
+                continue
+            if Fabric is not None and not Fabric.Complete:
+                Preparations.append({
+                    "CandidateId": Candidate.CandidateId,
+                    "PlacementFingerprint": Candidate.PlacementFingerprint,
+                    "Success": False,
+                    "SelectedCandidateIds": [],
+                    "CandidateCounts": [],
+                    "ConflictSignals": [],
+                    "ConflictResourceIndices": [],
+                    "ExpansionCount": 0,
+                    "Complete": False,
+                    "IncompleteReason": Fabric.IncompleteReason,
+                    "PlacementAccessFabric": Fabric.ToDictionary(),
+                })
+                continue
             CandidateResources = RoutingResourcesByFingerprint.get(
                 Candidate.PlacementFingerprint
             )
@@ -11787,51 +11947,83 @@ def _PlaceAndRoutePcbWithPolicy(
                 RoutingResourcesByFingerprint[Candidate.PlacementFingerprint] = (
                     CandidateResources
                 )
-            Preparation = PrepareTrackAssignment(
-                Candidate.Placement,
-                Resources=CandidateResources,
-                Policy=Policy,
-                Deadline=Deadline,
-            )
+            try:
+                Preparation = PrepareTrackAssignment(
+                    Candidate.Placement,
+                    Resources=CandidateResources,
+                    Policy=Policy,
+                    Deadline=Deadline,
+                )
+            except RoutingStageError as Error:
+                # A local-claim release is a proof that this fixed geometry
+                # cannot route under its immutable local ownership.  It is
+                # not permission to repair or retry it.  Record the member
+                # as incomplete and continue the already-materialized
+                # placement domain so a distinct upfront geometry may still
+                # provide the one certified route attempt.
+                if (
+                    Error.Failure.Reason
+                    == RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                    and Error.Failure.Stage == "LocalClaimReleasePreScreen"
+                ):
+                    FailureDiagnostics = dict(Error.Failure.Diagnostics or {})
+                    Preparations.append({
+                        "CandidateId": Candidate.CandidateId,
+                        "PlacementFingerprint": (
+                            Candidate.PlacementFingerprint
+                        ),
+                        "Success": False,
+                        "SelectedCandidateIds": [],
+                        "CandidateCounts": [],
+                        "ConflictSignals": list(Error.Failure.AffectedNets),
+                        "ConflictResourceIndices": [],
+                        "ExpansionCount": int(
+                            dict(
+                                FailureDiagnostics.get(
+                                    "LocalClaimReleaseSelection",
+                                    {},
+                                )
+                            ).get("SearchExpansionCount", 0)
+                        ),
+                        "Complete": False,
+                        "IncompleteReason": (
+                            "immutable-local-claim-conflict"
+                        ),
+                        "LocalClaimReleaseSelection": (
+                            FailureDiagnostics.get(
+                                "LocalClaimReleaseSelection",
+                                {},
+                            )
+                        ),
+                        "PlacementAccessFabric": (
+                            Fabric.ToDictionary()
+                            if Fabric is not None
+                            else None
+                        ),
+                    })
+                    continue
+                raise
             Preparations.append({
                 "CandidateId": Candidate.CandidateId,
                 "PlacementFingerprint": Candidate.PlacementFingerprint,
                 **Preparation.ToDictionary(),
+                "PlacementAccessFabric": (
+                    Fabric.ToDictionary() if Fabric is not None else None
+                ),
             })
             if Preparation.Success and Preparation.Complete:
+                PrePlacementTrackPreparationWitnesses[
+                    Candidate.PlacementFingerprint
+                ] = Preparation
                 Feasible.append(Candidate)
         return Preparations, Feasible
 
     PrePlacementTrackPreparations, PrePlacementTrackFeasible = (
-        PreparePrePlacementTrackCapacity(CandidateRecords)
+        SolvePrePlacementCapacityProblem(CandidateRecords)
     )
-    if not PrePlacementTrackFeasible:
-        FirstCompleteCore = next((
-            Value for Value in PrePlacementTrackPreparations
-            if Value["Complete"] and Value["ConflictSignals"]
-        ), None)
-        if FirstCompleteCore is not None and GenerationPlan.DeferredRequests:
-            CoreSignals = frozenset(map(
-                str,
-                FirstCompleteCore["ConflictSignals"],
-            ))
-            _TryPlacement(
-                GenerationPlan.DeferredRequests[0],
-                FixedRelocationVariant=1,
-                FixedRelocationSignals=CoreSignals,
-                FixedRelocationPrioritySignals=CoreSignals,
-                FixedRequiredRelocationSignals=CoreSignals,
-            )
-            CandidateRecords = _BuildCandidateRecords()
-            PrePlacementTrackPreparations, PrePlacementTrackFeasible = (
-                PreparePrePlacementTrackCapacity(CandidateRecords)
-            )
-            PlacementGenerationDecisions.append({
-                "Result": "pre-placement-track-core-geometry",
-                "ConflictSignals": sorted(CoreSignals),
-                "GeometryConstructionCount": 1,
-                "RoutingAttemptCount": 0,
-            })
+    PrePlacementTrackPreparationByFingerprint = (
+        PrePlacementTrackPreparationWitnesses
+    )
     if not PrePlacementTrackFeasible:
         raise RoutingStageError(RoutingFailure(
             Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
@@ -11848,45 +12040,6 @@ def _PlaceAndRoutePcbWithPolicy(
         ))
     # The selected geometry is the only placement permitted to route.
     OrderedPlacements = PrePlacementTrackFeasible[:1]
-    """One pre-placement track-capacity proof and at most one core geometry."""
-    '''
-    for Candidate in CandidateRecords:
-        CandidateResources = RoutingResourcesByFingerprint.get(
-            Candidate.PlacementFingerprint
-        )
-        if CandidateResources is None:
-            CandidateResources = BuildRoutingResources(Candidate.Placement.Placed)
-            RoutingResourcesByFingerprint[Candidate.PlacementFingerprint] = (
-                CandidateResources
-            )
-        Preparation = PrepareTrackAssignment(
-            Candidate.Placement,
-            Resources=CandidateResources,
-            Policy=Policy,
-            Deadline=Deadline,
-        )
-        PrePlacementTrackPreparations.append({
-            "CandidateId": Candidate.CandidateId,
-            "PlacementFingerprint": Candidate.PlacementFingerprint,
-            **Preparation.ToDictionary(),
-        })
-        if Preparation.Success and Preparation.Complete:
-            PrePlacementTrackFeasible.append(Candidate)
-    if not PrePlacementTrackFeasible:
-        raise RoutingStageError(RoutingFailure(
-            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
-            Stage="PrePlacementTrackCapacity",
-            Detail=(
-                "no fixed primary placement has a complete capacity-one "
-                "track-assignment witness"
-            ),
-            RepairActions=(),
-            Diagnostics={
-                "PrePlacementTrackPreparations": PrePlacementTrackPreparations,
-                "PlacementDomainComplete": False,
-            },
-        ))
-    '''
     ExactClusterInterfaceSolveEnabled = any(
             RequiresExactClusterInterfaceSolve(
                 Candidate.TopologyDemand,
@@ -21198,12 +21351,20 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
             )
             if Routed is None:
+                FrozenTrackAssignmentPreparation = (
+                    PrePlacementTrackPreparationByFingerprint.get(
+                        CandidateRecord.PlacementFingerprint
+                    )
+                )
                 Routed = RoutePcbDesign(
                     CandidatePlacement,
                     ProgressCallback=ReportRoutingProgress,
                     Policy=AttemptPolicy,
                     Deadline=AttemptDeadline,
                     Resources=CandidateResources,
+                    FrozenTrackAssignmentPreparation=(
+                        FrozenTrackAssignmentPreparation
+                    ),
                 )
             CapturePortableRawPortalGeometryCaches(
                 CandidateResources
@@ -21279,6 +21440,25 @@ def _PlaceAndRoutePcbWithPolicy(
             # A returned route is not eligible until every routed validation
             # and deadline check has completed successfully.
             Routed = None
+            # The pre-placement capacity selection has already committed the
+            # sole geometry permitted to route.  A route failure is terminal:
+            # it is evidence about that fixed domain, never authorization to
+            # mutate controls, release claims, or generate another placement.
+            if isinstance(Error, RoutingStageError):
+                LastStructuredRoutingError = Error
+            PlacementAttemptFailures.append({
+                "CandidateId": CandidateRecord.CandidateId,
+                "PlacementFingerprint": CandidateRecord.PlacementFingerprint,
+                "Result": "terminal-fixed-route-failure",
+                "Failure": str(Error),
+                "Diagnostics": (
+                    Error.Failure.ToDictionary()
+                    if isinstance(Error, RoutingStageError)
+                    else {}
+                ),
+                "ElapsedSeconds": round(monotonic() - AttemptStarted, 6),
+            })
+            break
             if ExactClusterInterfaceSolveEnabled:
                 if isinstance(Error, RoutingStageError):
                     LastStructuredRoutingError = Error
@@ -22378,25 +22558,24 @@ def _PlaceAndRoutePcbWithPolicy(
             in sorted(RoutedCandidates, key=lambda Value: Value[0])
         ],
     }
-    Routed.RoutingControlEffectiveness["PlacementAttempts"] = (
-        PlacementAttemptFailures
-    )
-    Routed.RoutingControlEffectiveness["PlacementGenerationFailures"] = (
-        PlacementGenerationFailures
-    )
-    Routed.RoutingControlEffectiveness["JointPlacementStateEvents"] = (
-        JointPlacementStateEvents
-    )
-    Routed.RoutingControlEffectiveness["PlacementGenerationDecisions"] = (
-        PlacementGenerationDecisions
-    )
-    Routed.RoutingControlEffectiveness["AssignmentCutHistory"] = [
-        AssignmentCut.ToDictionary()
-        for AssignmentCut in PlacementAssignmentCutHistory
-    ]
-    Routed.RoutingControlEffectiveness["ActivePlacementConstraints"] = (
-        PlacementAssignmentConstraints.ToDictionary()
-    )
+    Routed.RoutingControlEffectiveness["PrePlacementCapacitySelection"] = {
+        "GeometryDomainSize": len(CandidateRecords),
+        "CapacitySolveCount": 1,
+        "RouteAttemptCount": 1,
+        "SelectedCandidateId": (
+            SelectedCandidate.CandidateId
+            if SelectedCandidate is not None
+            else ""
+        ),
+        "SelectedPlacementFingerprint": (
+            SelectedCandidate.PlacementFingerprint
+            if SelectedCandidate is not None
+            else ""
+        ),
+        "CandidateResults": SummarizePrePlacementCapacityResults(
+            PrePlacementTrackPreparations
+        ),
+    }
     Routed.SupportBlock = Technology.DefaultSupportBlock
     Footprint, EstimatedBlocks, Width, Depth = MeasurePcbDesign(
         Placement.Placed,

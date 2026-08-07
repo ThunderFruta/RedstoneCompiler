@@ -2761,6 +2761,8 @@ class PcbPlacement:
         "MandatoryAccessConflictProfile | None"
     ) = None
     InterClusterRoutingChannel: InterClusterRoutingChannel | None = None
+    PlacementAccessFabric: Any | None = None
+    PlacementAccessAssignment: Any | None = None
     ComponentGraph: Any | None = None
 
 

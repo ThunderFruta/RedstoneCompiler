@@ -12,6 +12,7 @@ from .ResourceGraph import (
     PinAccessSelection,
     RoutingAssignment,
     RoutingResourceClaims,
+    RoutingResourceId,
 )
 
 Position2 = tuple[int, int]
@@ -574,6 +575,8 @@ class TrackAssignmentPreparation:
     ConflictResourceIndices: tuple[int, ...]
     ExpansionCount: int
     Complete: bool
+    IncompleteReason: str = ""
+    Diagnostics: tuple[tuple[str, object], ...] = ()
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -584,6 +587,8 @@ class TrackAssignmentPreparation:
             "ConflictResourceIndices": list(self.ConflictResourceIndices),
             "ExpansionCount": self.ExpansionCount,
             "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+            "Diagnostics": dict(self.Diagnostics),
         }
 
 
@@ -593,6 +598,158 @@ class TrackAssignmentPrepared(RuntimeError):
     def __init__(self, Preparation: TrackAssignmentPreparation) -> None:
         super().__init__("track assignment prepared")
         self.Preparation = Preparation
+
+
+@dataclass(frozen=True)
+class PlacementAccessEscapeStub:
+    """One exact terminal-to-fabric escape with capacity-one claims."""
+
+    Terminal: Position3
+    Ingress: Position3
+    Path: tuple[Position3, ...]
+    PhysicalClaims: RoutingResourceClaims
+    CapacityResourceIds: tuple[RoutingResourceId, ...]
+    Complete: bool
+    IncompleteReason: str = ""
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Terminal": list(self.Terminal),
+            "Ingress": list(self.Ingress),
+            "Path": [list(Value) for Value in self.Path],
+            "PhysicalClaims": {
+                "WireCells": len(self.PhysicalClaims.WireCells),
+                "SupportCells": len(self.PhysicalClaims.SupportCells),
+                "RequiredAirCells": len(
+                    self.PhysicalClaims.RequiredAirCells
+                ),
+                "ElectricalCells": len(
+                    self.PhysicalClaims.ElectricalCells
+                ),
+            },
+            "CapacityResourceIds": [
+                str(Value) for Value in self.CapacityResourceIds
+            ],
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+        }
+
+
+@dataclass(frozen=True)
+class PlacementAccessTerminalDomain:
+    """Complete finite escape domain for one placed signal terminal."""
+
+    Signal: str
+    Terminal: Position3
+    EscapeStubs: tuple[PlacementAccessEscapeStub, ...]
+    Complete: bool
+    IncompleteReason: str = ""
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "Terminal": list(self.Terminal),
+            "EscapeStubs": [
+                Value.ToDictionary() for Value in self.EscapeStubs
+            ],
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+        }
+
+
+@dataclass(frozen=True)
+class PlacementAccessFabric:
+    """Immutable placement-wide routing fabric built before capacity solve."""
+
+    FabricFingerprint: str
+    Nodes: tuple[Position3, ...]
+    Edges: tuple[tuple[Position3, Position3], ...]
+    IngressNodes: tuple[Position3, ...]
+    PhysicalClaims: RoutingResourceClaims
+    CapacityResourceIds: tuple[RoutingResourceId, ...]
+    TerminalDomains: tuple[PlacementAccessTerminalDomain, ...]
+    TopologyKind: str
+    Complete: bool
+    IncompleteReason: str = ""
+    Technology: Any = field(default=None, compare=False, repr=False)
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "FabricFingerprint": self.FabricFingerprint,
+            "NodeCount": len(self.Nodes),
+            "EdgeCount": len(self.Edges),
+            "IngressNodes": [list(Value) for Value in self.IngressNodes],
+            "PhysicalClaims": {
+                "WireCells": len(self.PhysicalClaims.WireCells),
+                "SupportCells": len(self.PhysicalClaims.SupportCells),
+                "RequiredAirCells": len(
+                    self.PhysicalClaims.RequiredAirCells
+                ),
+                "ElectricalCells": len(
+                    self.PhysicalClaims.ElectricalCells
+                ),
+            },
+            "CapacityResourceIds": [
+                str(Value) for Value in self.CapacityResourceIds
+            ],
+            "TerminalDomains": [
+                Value.ToDictionary() for Value in self.TerminalDomains
+            ],
+            "TopologyKind": self.TopologyKind,
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+        }
+
+
+@dataclass(frozen=True)
+class PlacementAccessAssignment:
+    """One frozen capacity-one escape selection for a fixed fabric."""
+
+    FabricFingerprint: str
+    AssignmentFingerprint: str
+    SelectedStubIndices: tuple[tuple[str, Position3, int], ...]
+    CapacityResourceIds: tuple[RoutingResourceId, ...]
+    ExpansionCount: int
+    Success: bool
+    Complete: bool
+    ConflictSignals: tuple[str, ...] = ()
+    FrontierSignals: tuple[str, ...] = ()
+    MaximumRoutedSignalCount: int = 0
+    FirstUnroutableSignal: str = ""
+    IncompleteReason: str = ""
+    SignalRoutes: tuple[tuple[str, tuple[Position3, ...]], ...] = ()
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "FabricFingerprint": self.FabricFingerprint,
+            "AssignmentFingerprint": self.AssignmentFingerprint,
+            "SelectedStubIndices": [
+                {
+                    "Signal": Signal,
+                    "Terminal": list(Terminal),
+                    "StubIndex": StubIndex,
+                }
+                for Signal, Terminal, StubIndex in self.SelectedStubIndices
+            ],
+            "CapacityResourceIds": [
+                str(Value) for Value in self.CapacityResourceIds
+            ],
+            "ExpansionCount": self.ExpansionCount,
+            "Success": self.Success,
+            "Complete": self.Complete,
+            "ConflictSignals": list(self.ConflictSignals),
+            "FrontierSignals": list(self.FrontierSignals),
+            "MaximumRoutedSignalCount": self.MaximumRoutedSignalCount,
+            "FirstUnroutableSignal": self.FirstUnroutableSignal,
+            "IncompleteReason": self.IncompleteReason,
+            "SignalRoutes": [
+                {
+                    "Signal": Signal,
+                    "Nodes": [list(Position) for Position in Nodes],
+                }
+                for Signal, Nodes in self.SignalRoutes
+            ],
+        }
 
 
 @dataclass(frozen=True)

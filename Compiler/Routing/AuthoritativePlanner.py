@@ -134,16 +134,12 @@ from .ComponentRouter import (
     SelectComponentIncidentSignals,
 )
 from .Reliability import (
-    BuildRoutingDeadlineDiagnostics,
     BuildStableFingerprint,
-    ChooseRoutingEscalationAction,
     EnforceRoutingRuntimeLimit,
-    HasAdaptiveEscalationBudget,
     RemainingRoutingRuntimeMilliseconds,
     RetainUnaffectedCandidateCache,
     SelectBoundedDiverseCandidatePool,
     RoutingDeadline,
-    RoutingEscalationState,
 )
 from .Policy import DefaultPhysicalDesignPolicy, PhysicalDesignPolicy
 from .ResourceGraph import (
@@ -16967,6 +16963,74 @@ def ApplyPhysicalComponentAssemblyPortalDomains(
     return Result
 
 
+def ApplyPlacementAccessAssignmentPortalDomains(
+    Portals: dict[
+        tuple[str, Position3, int],
+        tuple[PinAccessPortal, ...],
+    ],
+    Fabric: Any,
+    Assignment: Any,
+    ResourceGraph: Any,
+    Technology: RedstoneRoutingTechnology,
+    MinimumY: int,
+    LayerCount: int,
+) -> dict[
+    tuple[str, Position3, int],
+    tuple[PinAccessPortal, ...],
+]:
+    """Replace generic portals with the frozen pre-placement escapes."""
+    if not getattr(Assignment, "Success", False):
+        return Portals
+    Domains = {
+        (str(Domain.Signal), tuple(Domain.Terminal)): Domain
+        for Domain in Fabric.TerminalDomains
+    }
+    Result = dict(Portals)
+    for Signal, Terminal, StubIndex in Assignment.SelectedStubIndices:
+        Domain = Domains[(str(Signal), tuple(Terminal))]
+        Stub = Domain.EscapeStubs[int(StubIndex)]
+        Layer = next((
+            CandidateLayer
+            for CandidateLayer in range(LayerCount)
+            if Technology.RoutingY(MinimumY, CandidateLayer)
+            == int(Stub.Ingress[1])
+        ), None)
+        if Layer is None:
+            raise ValueError(
+                "placement access escape is outside the routing layer domain"
+            )
+        Result = {
+            Key: Values
+            for Key, Values in Result.items()
+            if not (Key[0] == Signal and Key[1] == Terminal)
+        }
+        Path = tuple(Stub.Path)
+        Portal = PinAccessPortal(
+            PortalId=(
+                f"{Signal}:{Terminal}:{Layer}:AccessFabric:"
+                f"{Assignment.AssignmentFingerprint}:{StubIndex}"
+            ),
+            Signal=str(Signal),
+            Terminal=tuple(Terminal),
+            Layer=Layer,
+            Path=Path,
+            Edges=frozenset(
+                NormalizeRoutingEdge(First, Second)
+                for First, Second in zip(Path, Path[1:])
+            ),
+            Claims=ResourceGraph.BuildRouteClaims(Path),
+            Length=len(Path),
+            BendCount=_CountBends(Path),
+            ViaCount=sum(
+                First[1] != Second[1]
+                for First, Second in zip(Path, Path[1:])
+            ),
+            Cost=len(Path),
+        )
+        Result[(str(Signal), tuple(Terminal), Layer)] = (Portal,)
+    return Result
+
+
 def ValidatePhysicalComponentExactAttachmentPortals(
     Profiles: Mapping[str, Any],
     Portals: Mapping[
@@ -33069,6 +33133,7 @@ def RouteAuthoritativeResources(
     PreparedPortalCache: PreparedPortalDomainCache | None = None,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
+    FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
@@ -33112,6 +33177,26 @@ def RouteAuthoritativeResources(
 ) -> RoutedDesign | PreparedPhysicalComponentPortFactorDomain:
     """Generate portals and select complete capacity-one routes in Rust."""
     RoutingCallStarted = monotonic()
+    if EscalationHistory:
+        LastAttempt = EscalationHistory[-1]
+        raise StructuredRoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="RoutingAttempt",
+            AffectedNets=tuple(
+                str(Signal)
+                for Signal in LastAttempt.get("AffectedSignals", ())
+            ),
+            RepairActions=(),
+            Detail=(
+                "the fixed routing attempt is terminal; automatic relaunch "
+                "is disabled"
+            ),
+            Diagnostics={
+                "Action": "terminal-fixed-domain-incomplete",
+                "RejectedAutomaticAction": LastAttempt.get("Action", ""),
+                "Complete": False,
+            },
+        ))
     FrozenPreparedPortalCache = (
         Resources.FrozenPreparedPortalDomainCache
     )
@@ -33576,35 +33661,32 @@ def RouteAuthoritativeResources(
             **dict(ExistingLocalClaimRelease),
             "RawPortalCacheReuseRequested": True,
         }
-    RuntimeEscalationState = RoutingEscalationState(
-        PortalMode=(
-            "unreserved"
-            if not Policy.AdaptiveRouting.Enabled or SkipStrictPortalReservation
-            else "reserved"
-        ),
-        ReservationVariant=ReservationVariant,
-        LaneDiversityLevel=LaneDiversityLevel,
-        CandidateDiversityLevel=CandidateDiversityLevel,
-        EffectiveRoutingLayers=max(0, AdaptiveLayerFloor or 0),
-        AssignmentBudget=0,
-    )
-    AssignmentRetryHistory: list[dict[str, object]] = []
     AdaptiveExpiresAt = Deadline.ExpiresAt
 
     def CurrentRuntimeBudgetDiagnostics(
         AdditionalDiagnostics: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        return BuildRoutingDeadlineDiagnostics(
-            Deadline=Deadline,
-            WorkTelemetry=WorkTelemetry,
-            EscalationHistory=tuple((
-                *EscalationHistory,
-                *AssignmentRetryHistory,
-            )),
-            EscalationState=RuntimeEscalationState,
-            StageTimingsSeconds=StageTimings,
-            AdditionalDiagnostics=AdditionalDiagnostics,
-        )
+        Diagnostics = dict(WorkTelemetry)
+        Diagnostics.update({
+            "FixedRoutingControls": {
+                "PortalMode": (
+                    "unreserved"
+                    if SkipStrictPortalReservation
+                    else "reserved"
+                ),
+                "ReservationVariant": ReservationVariant,
+                "LaneDiversityLevel": LaneDiversityLevel,
+                "CandidateDiversityLevel": CandidateDiversityLevel,
+                "ConfiguredLayerFloor": max(0, AdaptiveLayerFloor or 0),
+            },
+            "StageTimingsSeconds": {
+                Stage: round(Seconds, 6)
+                for Stage, Seconds in StageTimings.items()
+            },
+            "Deadline": Deadline.ToDictionary(),
+        })
+        Diagnostics.update(AdditionalDiagnostics or {})
+        return Diagnostics
 
     def StructuredRoutingStageError(
         Failure: RoutingFailure,
@@ -33835,6 +33917,42 @@ def RouteAuthoritativeResources(
         "InterClusterRoutingChannel",
         None,
     )
+    PlacementAccessFabric = getattr(
+        Placed,
+        "PlacementAccessFabric",
+        None,
+    )
+    PlacementAccessAssignment = getattr(
+        Placed,
+        "PlacementAccessAssignment",
+        None,
+    )
+    SelectedPlacementAccessStubIndices = {
+        (str(Signal), tuple(Terminal)): int(StubIndex)
+        for Signal, Terminal, StubIndex in getattr(
+            PlacementAccessAssignment,
+            "SelectedStubIndices",
+            (),
+        )
+    }
+    PlacementAccessDomains = {}
+    for Domain in getattr(
+        PlacementAccessFabric,
+        "TerminalDomains",
+        (),
+    ):
+        DomainIdentity = (str(Domain.Signal), tuple(Domain.Terminal))
+        SelectedStubIndex = SelectedPlacementAccessStubIndices.get(
+            DomainIdentity
+        )
+        PlacementAccessDomains[DomainIdentity] = (
+            replace(
+                Domain,
+                EscapeStubs=(Domain.EscapeStubs[SelectedStubIndex],),
+            )
+            if SelectedStubIndex is not None
+            else Domain
+        )
     DeclaredInterClusterChannelSignals = frozenset(
         str(Signal)
         for Signal in getattr(
@@ -34224,11 +34342,8 @@ def RouteAuthoritativeResources(
     RouteLaneCount = (
         min(
             Policy.GlobalRouting.CandidateLaneCount,
-            min(
-                AdaptiveBudget.LaneCount,
-                Policy.AdaptiveRouting.InitialLaneCount,
-            )
-            * Policy.AdaptiveRouting.LaneGrowthFactor ** LaneDiversityLevel,
+            AdaptiveBudget.LaneCount,
+            Policy.AdaptiveRouting.InitialLaneCount,
         )
         if Policy.AdaptiveRouting.Enabled
         else Policy.GlobalRouting.CandidateLaneCount
@@ -34417,6 +34532,16 @@ def RouteAuthoritativeResources(
         # ordinary routable resources on the recursive attempt.
         Position for Claim in AllLocalClaims for Position in Claim.Nodes
     )
+    if PlacementAccessFabric is not None:
+        ReservedAccess = frozenset((
+            *ReservedAccess,
+            *(
+                Position
+                for Domain in PlacementAccessDomains.values()
+                for Stub in Domain.EscapeStubs
+                for Position in Stub.Path
+            ),
+        ))
     if (
         Resources.PreparingPhysicalComponentGlobalChannels
         and Resources.PreparedPhysicalComponentPortFactorDomain is not None
@@ -34700,10 +34825,6 @@ def RouteAuthoritativeResources(
         **dict(WorkTelemetry["MaturePortfolioSearchCaps"]),
         "ReusedRawPortalProfile": ReusedRawPortalProfile,
     }
-    RuntimeEscalationState = replace(
-        RuntimeEscalationState,
-        EffectiveRoutingLayers=LayerCount,
-    )
     GuideInputFingerprint = BuildCapacityAwareGuideInputFingerprint(
         Profiles,
         LayerCount,
@@ -35005,6 +35126,51 @@ def RouteAuthoritativeResources(
                 },
             },
         )
+    if PlacementAccessFabric is not None and CoarsePlan is not None:
+        FabricGuideColumns = frozenset(
+            (int(Position[0]), int(Position[2]))
+            for Position in PlacementAccessFabric.Nodes
+        )
+        FabricSignals = frozenset(
+            str(Domain.Signal)
+            for Domain in PlacementAccessFabric.TerminalDomains
+        )
+        FabricLayers = tuple(sorted({
+            Layer
+            for Layer in range(LayerCount)
+            if any(
+                int(Ingress[1])
+                == Technology.RoutingY(MinimumY, Layer)
+                for Ingress in PlacementAccessFabric.IngressNodes
+            )
+        }))
+        FabricLayer = FabricLayers[0] if FabricLayers else None
+        CoarsePlan = replace(
+            CoarsePlan,
+            Guides={
+                **dict(CoarsePlan.Guides),
+                **{
+                    Signal: frozenset((
+                        *CoarsePlan.Guides.get(Signal, ()),
+                        *FabricGuideColumns,
+                    ))
+                    for Signal in FabricSignals
+                    if Signal in Profiles
+                },
+            },
+            Layers={
+                **dict(CoarsePlan.Layers),
+                **(
+                    {
+                        Signal: FabricLayer
+                        for Signal in FabricSignals
+                        if Signal in Profiles
+                    }
+                    if FabricLayer is not None
+                    else {}
+                ),
+            },
+        )
     FactorizedGuideIdentity = None
     FactorizedGuideFingerprintBySignal: dict[str, str] = {}
     if CoarsePlan is not None:
@@ -35190,6 +35356,17 @@ def RouteAuthoritativeResources(
                     ):
                         AssignedColumns.add((AccessColumn[0], Z))
                         AssignedColumns.add((IngressColumn[0], Z))
+    if PlacementAccessFabric is not None:
+        AssignedColumns.update(
+            (int(Position[0]), int(Position[2]))
+            for Position in PlacementAccessFabric.Nodes
+        )
+        AssignedColumns.update(
+            (int(Position[0]), int(Position[2]))
+            for Domain in PlacementAccessFabric.TerminalDomains
+            for Stub in Domain.EscapeStubs
+            for Position in Stub.Path
+        )
     PhysicalPortTerminals = frozenset(
         (Port.Signal, Port.Attachment)
         for Port in (
@@ -36117,8 +36294,44 @@ def RouteAuthoritativeResources(
                     for Column in AllowedColumns
                     for Position in NodesByColumn.get(Column, ())
                 } | set(AccessPath)
+                AccessFabricDomain = PlacementAccessDomains.get((
+                    str(Signal),
+                    tuple(Terminal),
+                ))
+                if AccessFabricDomain is not None:
+                    AllowedNodeSet.update(
+                        Position
+                        for Stub in AccessFabricDomain.EscapeStubs
+                        for Position in Stub.Path
+                    )
                 AllowedNodes = sorted(AllowedNodeSet)
                 for Layer in range(LayerCount):
+                    RoutingY = Technology.RoutingY(MinimumY, Layer)
+                    if (
+                        AccessFabricDomain is not None
+                        and not any(
+                            int(Stub.Ingress[1]) == RoutingY
+                            for Stub in AccessFabricDomain.EscapeStubs
+                        )
+                    ):
+                        GeneratedRawPortals[(Signal, Terminal, Layer)] = ()
+                        CompleteGeneratedPortalDomainKeys.add((
+                            Signal,
+                            Terminal,
+                            Layer,
+                        ))
+                        PolicyCompleteEmptyPortalDomainKeys.add((
+                            Signal,
+                            Terminal,
+                            Layer,
+                        ))
+                        PortalRequestDomainRecordsBySignal[Signal].append((
+                            Terminal,
+                            int(Layer),
+                            "ineligible-placement-access-fabric-layer",
+                            str(GuideInputFingerprint),
+                        ))
+                        continue
                     if (
                         RequireCompleteClusterInterfaceDomain
                         and InterfaceDeckLayer is not None
@@ -36170,7 +36383,6 @@ def RouteAuthoritativeResources(
                             str(GuideInputFingerprint),
                         ))
                         continue
-                    RoutingY = Technology.RoutingY(MinimumY, Layer)
                     ChannelIngressTargets: list[Position3] = []
                     if (
                         InterClusterChannel is not None
@@ -36231,6 +36443,18 @@ def RouteAuthoritativeResources(
                         )
                         AllowedNodeSet.update(ChannelIngressTargets)
                         AllowedNodes = sorted(AllowedNodeSet)
+                    AccessFabricIngressTargets = (
+                        sorted({
+                            tuple(Stub.Ingress)
+                            for Stub in AccessFabricDomain.EscapeStubs
+                            if (
+                                int(Stub.Ingress[1]) == RoutingY
+                                and tuple(Stub.Ingress) in RegionNodeSet
+                            )
+                        })
+                        if AccessFabricDomain is not None
+                        else []
+                    )
                     PortalStarts = list(
                         SelectGraphAccessStarts(
                             AccessPath,
@@ -36277,6 +36501,18 @@ def RouteAuthoritativeResources(
                                 ),
                             ]
                         )
+                    if AccessFabricIngressTargets:
+                        AccessFabricTargetSet = frozenset(
+                            AccessFabricIngressTargets
+                        )
+                        PortalTargets = [
+                            *AccessFabricIngressTargets,
+                            *(
+                                Position
+                                for Position in PortalTargets
+                                if Position not in AccessFabricTargetSet
+                            ),
+                        ]
                     if len(PortalTargets) == 0:
                         # Expand only the target envelope. Starts remain
                         # graph-valid terminal cells; unavailable layers do
@@ -37931,6 +38167,43 @@ def RouteAuthoritativeResources(
             Reservations=PortalReservations,
         )
 
+    if (
+        PlacementAccessFabric is not None
+        and PlacementAccessAssignment is not None
+    ):
+        Portals = ApplyPlacementAccessAssignmentPortalDomains(
+            Portals,
+            PlacementAccessFabric,
+            PlacementAccessAssignment,
+            Resources.ResourceGraph,
+            Technology,
+            MinimumY,
+            LayerCount,
+        )
+        PlacementAccessTerminalKeys = frozenset(
+            (str(Signal), tuple(Terminal))
+            for Signal, Terminal, _StubIndex
+            in PlacementAccessAssignment.SelectedStubIndices
+        )
+        PortalReservations = tuple(
+            Reservation
+            for Reservation in PortalReservations
+            if (Reservation.Signal, Reservation.Terminal)
+            not in PlacementAccessTerminalKeys
+        ) + tuple(
+            PortalReservation(
+                Signal=Signal,
+                Terminal=Terminal,
+                Layer=Layer,
+                SlotIndex=0,
+                PortalId=Values[0].PortalId,
+                Claims=Values[0].Claims,
+                Purpose="placement-access-fabric",
+                FirstSegment=Values[0].Path,
+            )
+            for (Signal, Terminal, Layer), Values in sorted(Portals.items())
+            if (Signal, Terminal) in PlacementAccessTerminalKeys
+        )
     ExactAttachmentDiagnostics: dict[str, object] = {}
     if (
         PhysicalAssemblyPlan is not None
@@ -38955,9 +39228,10 @@ def RouteAuthoritativeResources(
     InitialRequestLimit = max(
         1,
         (
-            Policy.AdaptiveRouting.InitialCandidateRequestsPerSignal
-            * Policy.AdaptiveRouting.CandidateGrowthFactor
-            ** max(CandidateDiversityLevel, LaneDiversityLevel)
+            min(
+                Policy.TrackAssignment.MaximumRouteCandidatesPerNet,
+                Policy.AdaptiveRouting.InitialCandidateRequestsPerSignal,
+            )
         )
         if Policy.AdaptiveRouting.Enabled
         else Policy.TrackAssignment.MaximumRouteCandidatesPerNet,
@@ -39094,22 +39368,132 @@ def RouteAuthoritativeResources(
         for Signal, Profile in Profiles.items()
     }
     CandidateExpansionLimits = {
-        Signal: SelectCoordinatedCandidateExpansionLimit(
-            BaseCandidateExpansionLimits[Signal],
-            Policy.DetailedRouting.StrictMaximumExpansions,
-            Policy.AdaptiveRouting.CandidateGrowthFactor,
-            CoordinatedCandidateDiversityLevel,
-            (
-                Signal in CoordinatedCandidateDiversificationSignals
-                and CoordinatedCandidateDiversityLevel
-                > CandidateDiversityLevel
-            ),
-        )
+        Signal: BaseCandidateExpansionLimits[Signal]
         for Signal in Profiles
     }
     CandidatesBySignal: dict[str, list[NetRouteCandidate]] = defaultdict(list)
     CandidateLimitsBySignal: dict[str, int] = {}
     CandidateDiagnostics: dict[str, dict[str, object]] = {}
+    if (
+        PlacementAccessFabric is not None
+        and PlacementAccessAssignment is not None
+        and getattr(PlacementAccessAssignment, "Success", False)
+    ):
+        FabricGuide = frozenset(
+            (int(Position[0]), int(Position[2]))
+            for Position in PlacementAccessFabric.Nodes
+        )
+        for Signal, RouteNodes in getattr(
+            PlacementAccessAssignment,
+            "SignalRoutes",
+            (),
+        ):
+            Profile = Profiles.get(Signal)
+            if Profile is None:
+                continue
+            RouteNodes = tuple(RouteNodes)
+            Layer = next((
+                CandidateLayer
+                for CandidateLayer in range(LayerCount)
+                if RouteNodes
+                and Technology.RoutingY(MinimumY, CandidateLayer)
+                == int(RouteNodes[0][1])
+            ), None)
+            SourcePortalValues = (
+                ()
+                if Layer is None
+                else Portals.get((Signal, Profile.Root, Layer), ())
+            )
+            TargetPortalValues = (
+                ()
+                if Layer is None
+                else tuple(
+                    Portals.get((Signal, Target, Layer), ())
+                    for Target in Profile.Targets
+                )
+            )
+            if (
+                Layer is None
+                or not SourcePortalValues
+                or any(not Values for Values in TargetPortalValues)
+            ):
+                raise RoutingStageError(RoutingFailure(
+                    Reason=(
+                        RoutingFailureReason
+                        .ClusterInterfaceSolveIncomplete
+                    ),
+                    Stage="PlacementAccessWitnessRealization",
+                    AffectedNets=(Signal,),
+                    Detail=(
+                        "the frozen placement-access witness has no exact "
+                        "authoritative portal domain"
+                    ),
+                    Diagnostics={
+                        "Complete": False,
+                        "FabricFingerprint": (
+                            PlacementAccessFabric.FabricFingerprint
+                        ),
+                        "AssignmentFingerprint": (
+                            PlacementAccessAssignment.AssignmentFingerprint
+                        ),
+                    },
+                ))
+            RejectionCounts: Counter[str] = Counter()
+            Candidate = _MaterializeCandidate(
+                Signal,
+                Profile,
+                SourcePortalValues[0],
+                tuple(Values[0] for Values in TargetPortalValues),
+                FabricGuide,
+                Layer,
+                "X",
+                0,
+                0,
+                list(RouteNodes),
+                Region,
+                Resources,
+                Technology,
+                Policy.DetailedRouting.LengthPenalty,
+                Policy.DetailedRouting.CandidateBendWeight,
+                Policy.DetailedRouting.CandidateViaWeight,
+                Policy.DetailedRouting.LayerPenalty,
+                0,
+                Policy.DetailedRouting.RepeaterPenalty,
+                RejectionCounts=RejectionCounts,
+            )
+            if Candidate is None:
+                raise RoutingStageError(RoutingFailure(
+                    Reason=(
+                        RoutingFailureReason
+                        .ClusterInterfaceSolveIncomplete
+                    ),
+                    Stage="PlacementAccessWitnessRealization",
+                    AffectedNets=(Signal,),
+                    Detail=(
+                        "the frozen placement-access tree failed exact "
+                        "materialization"
+                    ),
+                    Diagnostics={
+                        "Complete": False,
+                        "Rejections": dict(RejectionCounts),
+                        "FabricFingerprint": (
+                            PlacementAccessFabric.FabricFingerprint
+                        ),
+                        "AssignmentFingerprint": (
+                            PlacementAccessAssignment.AssignmentFingerprint
+                        ),
+                    },
+                ))
+            CandidatesBySignal[Signal] = [Candidate]
+            CandidateLimitsBySignal[Signal] = 1
+            CandidateDiagnostics[Signal] = {
+                "FrozenPlacementAccessWitness": True,
+                "Requests": 0,
+                "RoutedTrees": 1,
+                "Materialized": 1,
+                "DeferredRequests": 0,
+                "Rejections": {},
+            }
     InterfacePreparationSignals = (
         LeaseOwnershipSignals
         if PrepareClusterInterfaceAssignmentOnly
@@ -41081,13 +41465,6 @@ def RouteAuthoritativeResources(
             )
             else InitialRequestLimit
         )
-        if SignalCandidateDiversityLevel > CandidateDiversityLevel:
-            SignalInitialRequestLimit = max(
-                SignalInitialRequestLimit,
-                Policy.AdaptiveRouting.InitialCandidateRequestsPerSignal
-                * Policy.AdaptiveRouting.CandidateGrowthFactor
-                ** SignalCandidateDiversityLevel,
-            )
         if (
             not UseNegotiatedRouting
             and 33 <= len(Profiles) <= 72
@@ -41112,12 +41489,7 @@ def RouteAuthoritativeResources(
                 SignalInitialRequestLimit,
                 8,
             )
-        RequestWindowOffset = CandidateRequestWindowOffset(
-            Policy.AdaptiveRouting.InitialCandidateRequestsPerSignal,
-            Policy.AdaptiveRouting.CandidateGrowthFactor,
-            LayerCount,
-            SignalCandidateDiversityLevel,
-        )
+        RequestWindowOffset = 0
         ApplyCoordinatedPortalWindow = (
             Signal in CoordinatedCandidateDiversificationSignals
             and (
@@ -41238,31 +41610,6 @@ def RouteAuthoritativeResources(
                         RouteLaneCount,
                         Technology.TrackPitch,
                     )
-                    if LaneDiversityLevel:
-                        PreviousLaneCount = min(
-                            RouteLaneCount,
-                            Policy.AdaptiveRouting.InitialLaneCount
-                            * Policy.AdaptiveRouting.LaneGrowthFactor ** (
-                                LaneDiversityLevel - 1
-                            ),
-                        )
-                        PreviousLanes = frozenset(CandidateLanes(
-                            AlignedCenter,
-                            PreviousLaneCount,
-                            Technology.TrackPitch,
-                        ))
-                        # Escalation must expose lanes not present in the
-                        # previous pass.  Merely increasing the lane-count
-                        # ceiling while retaining the centered prefix retries
-                        # exactly the same four candidates.
-                        LaneValues = tuple(sorted(
-                            LaneValues,
-                            key=lambda Value: (
-                                0 if Value not in PreviousLanes else 1,
-                                abs(Value - AlignedCenter),
-                                Value,
-                            ),
-                        ))
                     if UnreservedPortalMode and len(Profiles) <= 32:
                         LaneValues = LaneValues[:1]
                     for LaneIndex, Lane in enumerate(LaneValues):
@@ -41297,14 +41644,7 @@ def RouteAuthoritativeResources(
                                     Layer,
                                     PhysicalPortalVariantCount,
                                     len(LaneValues),
-                                    CandidateRequestWindowOffset(
-                                        Policy.AdaptiveRouting
-                                        .InitialCandidateRequestsPerSignal,
-                                        Policy.AdaptiveRouting
-                                        .CandidateGrowthFactor,
-                                        LayerCount,
-                                        BootstrapLevel,
-                                    )
+                                    0
                                     + SignalPortalPhase,
                                 )
                                 for BootstrapLevel in range(6)
@@ -41426,8 +41766,11 @@ def RouteAuthoritativeResources(
                             ReservedPhysicalGuide=(
                                 frozenset(CoarsePlan.Guides[Signal])
                                 if (
-                                    Resources
-                                    .PreparingPhysicalComponentGlobalChannels
+                                    (
+                                        Resources
+                                        .PreparingPhysicalComponentGlobalChannels
+                                        or PlacementAccessFabric is not None
+                                    )
                                     and CoarsePlan is not None
                                     and Signal in CoarsePlan.Guides
                                 )
@@ -41462,7 +41805,9 @@ def RouteAuthoritativeResources(
                             and Lane == CoarsePlan.Lanes[Signal]
                         )
                         GuideExpansion = (
-                            Policy.GlobalRouting.IntraClusterEnvelope
+                            0
+                            if PlacementAccessFabric is not None
+                            else Policy.GlobalRouting.IntraClusterEnvelope
                             if IsPlannedGuide and Signal in CoarsePlan.LocalSignals
                             else Policy.DetailedRouting.GuideExpansion
                         )
@@ -41803,8 +42148,11 @@ def RouteAuthoritativeResources(
                 Lane,
                 ImmutablePhysicalGuide=(
                     (
-                        Resources
-                        .PreparingPhysicalComponentGlobalChannels
+                        (
+                            Resources
+                            .PreparingPhysicalComponentGlobalChannels
+                            or PlacementAccessFabric is not None
+                        )
                         and CoarsePlan is not None
                         and Signal in CoarsePlan.Guides
                     )
@@ -42548,82 +42896,25 @@ def RouteAuthoritativeResources(
             LocalClaimReleaseDiagnostics
         )
         if ReleaseSelection.ReleasedSignals:
-            ReleasedSignals = ReleaseSelection.ReleasedSignals
-            RetainedClaims = tuple(
-                Claim for Claim in AllLocalClaims
-                if Claim.Signal not in ReleasedSignals
-            )
-            ReleasedDiagnostics = dict(
-                getattr(Placed, "LocalRouteDiagnostics", {}) or {}
-            )
-            ReleasedDiagnostics["PreRoutingLocalClaimRelease"] = {
-                **ReleaseSelection.ToDictionary(),
-                "OriginalLocalClaimCount": len(AllLocalClaims),
-                "RetainedLocalClaimCount": len(RetainedClaims),
-                "RawPortalCacheReuseRequested": True,
-            }
-            ReleasedPlaced = replace(
-                Placed,
-                LocalRouteClaims=RetainedClaims,
-                FrozenNetWires={
-                    Signal: Nodes
-                    for Signal, Nodes in (
-                        getattr(Placed, "FrozenNetWires", {}) or {}
-                    ).items()
-                    if Signal not in ReleasedSignals
+            raise StructuredRoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                ),
+                Stage="LocalClaimReleasePreScreen",
+                AffectedNets=tuple(ReleaseSelection.ReleasedSignals),
+                RepairActions=(),
+                Detail=(
+                    "the fixed routing attempt conflicts with immutable "
+                    "local claims; automatic claim release is disabled"
+                ),
+                Diagnostics={
+                    "Action": "terminal-fixed-domain-incomplete",
+                    "Complete": False,
+                    "LocalClaimReleaseSelection": (
+                        ReleaseSelection.ToDictionary()
+                    ),
                 },
-                LocalNetBranches={
-                    Signal: Nodes
-                    for Signal, Nodes in (
-                        getattr(Placed, "LocalNetBranches", {}) or {}
-                    ).items()
-                    if Signal not in ReleasedSignals
-                },
-                LocalNetTargets={
-                    Signal: Nodes
-                    for Signal, Nodes in (
-                        getattr(Placed, "LocalNetTargets", {}) or {}
-                    ).items()
-                    if Signal not in ReleasedSignals
-                },
-                LocalRouteDiagnostics=ReleasedDiagnostics,
-            )
-            return RouteAuthoritativeResources(
-                ReleasedPlaced,
-                Resources,
-                SearchMarginX,
-                SearchMarginZ,
-                MaximumRoutingHeight,
-                Policy,
-                Technology,
-                ProgressCallback,
-                DiagnosticCallback,
-                AdaptiveLayerFloor=AdaptiveLayerFloor,
-                SharedRoutingStarted=RoutingStarted,
-                EscalationHistory=(*EscalationHistory, {
-                    "Stage": "LocalClaimReleasePreScreen",
-                    "Action": "release-conflicting-local-claims",
-                    **ReleaseSelection.ToDictionary(),
-                }),
-                ReservationVariant=ReservationVariant,
-                LaneDiversityLevel=LaneDiversityLevel,
-                CandidateDiversityLevel=CandidateDiversityLevel,
-                SkipStrictPortalReservation=SkipStrictPortalReservation,
-                EscalationStates=EscalationStates,
-                Deadline=Deadline,
-                RetainedCandidateCache=RetainedCandidateCache,
-                RetainedCandidateMetadata=RetainedCandidateMetadata,
-                PriorCandidateCache=PriorCandidateCache,
-                PriorCandidateMetadata=PriorCandidateMetadata,
-                RegenerateSignals=RegenerateSignals,
-                RawPortalCache=EffectiveRawPortalCache,
-                PreparedPortalCache=EffectivePreparedPortalCache,
-                LocalClaimReleaseHistory=frozenset((
-                    *LocalClaimReleaseHistory,
-                    *ReleasedSignals,
-                )),
-            )
-
+            ))
     if UseNegotiatedRouting:
         try:
             NegotiatedPlan = PlanNegotiatedWithTelemetry(
@@ -42651,120 +42942,6 @@ def RouteAuthoritativeResources(
                 ),
             )
         except RoutingStageError as Error:
-            if ShouldExpandNegotiatedOffenderHalo(
-                Error.Failure,
-                Policy.AdaptiveRouting.Enabled,
-                LaneDiversityLevel,
-                (
-                    Policy.AdaptiveRouting
-                    .MaximumLaneDiversityEscalations
-                ),
-                TopologyRequiresJointPortfolio,
-            ):
-                NextLaneDiversityLevel = (
-                    SelectNegotiatedOffenderHaloLaneDiversityLevel(
-                        LaneDiversityLevel,
-                        (
-                            Policy.AdaptiveRouting
-                            .MaximumLaneDiversityEscalations
-                        ),
-                    )
-                )
-                return RouteAuthoritativeResources(
-                    Placed,
-                    Resources,
-                    SearchMarginX,
-                    SearchMarginZ,
-                    MaximumRoutingHeight,
-                    Policy,
-                    Technology,
-                    ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=AdaptiveLayerFloor,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(
-                        *EscalationHistory,
-                        BuildNegotiatedOffenderHaloEscalation(
-                            Error.Failure,
-                            LaneDiversityLevel,
-                            NextLaneDiversityLevel,
-                        ),
-                    ),
-                    ReservationVariant=ReservationVariant,
-                    LaneDiversityLevel=NextLaneDiversityLevel,
-                    CandidateDiversityLevel=CandidateDiversityLevel,
-                    SkipStrictPortalReservation=(
-                        SkipStrictPortalReservation
-                    ),
-                    EscalationStates=EscalationStates,
-                    Deadline=Deadline,
-                    RetainedCandidateCache=None,
-                    RetainedCandidateMetadata=None,
-                    PriorCandidateCache=None,
-                    PriorCandidateMetadata=None,
-                    RegenerateSignals=frozenset(
-                        Error.Failure.AffectedNets
-                    ),
-                    RawPortalCache=EffectiveRawPortalCache,
-                    PreparedPortalCache=EffectivePreparedPortalCache,
-                    LocalClaimReleaseHistory=LocalClaimReleaseHistory,
-                    AvoidRoutingPositions=AvoidRoutingPositions,
-                    AvoidRoutingPositionsBySignal=(
-                        EffectiveAvoidRoutingPositionsBySignal
-                    ),
-                )
-            if (
-                "AddRoutingLayer" in Error.Failure.RepairActions
-                and LayerCount < EffectiveMaximumLayerCount
-            ):
-                NextLayerCount = SelectEscalatedRoutingLayerCount(
-                    LayerCount,
-                    EffectiveMaximumLayerCount,
-                    "exact-assignment-cut",
-                    (
-                        Policy.Placement
-                        .ForceMaximumRoutingLayersAfterPlacementRelocation
-                    ),
-                )
-                return RouteAuthoritativeResources(
-                    Placed,
-                    Resources,
-                    SearchMarginX,
-                    SearchMarginZ,
-                    MaximumRoutingHeight,
-                    Policy,
-                    Technology,
-                    ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=NextLayerCount,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(*EscalationHistory, {
-                        "Stage": "InitialCandidateAssignment",
-                        "Action": "add-routing-layer",
-                        "FromLayerCount": LayerCount,
-                        "ToLayerCount": NextLayerCount,
-                        "AffectedSignals": list(
-                            Error.Failure.AffectedNets
-                        ),
-                        "Diagnostics": Error.Failure.Diagnostics,
-                    }),
-                    ReservationVariant=0,
-                    LaneDiversityLevel=0,
-                    CandidateDiversityLevel=0,
-                    SkipStrictPortalReservation=(
-                        SkipStrictPortalReservation
-                    ),
-                    EscalationStates=EscalationStates,
-                    Deadline=Deadline,
-                    RetainedCandidateCache=None,
-                    RetainedCandidateMetadata=None,
-                    PriorCandidateCache=None,
-                    PriorCandidateMetadata=None,
-                    RegenerateSignals=frozenset(),
-                    RawPortalCache=None,
-                    PreparedPortalCache=None,
-                    LocalClaimReleaseHistory=LocalClaimReleaseHistory,
-                )
             raise
         MissingNegotiatedSignals = tuple(sorted(
             set(Profiles) - set(NegotiatedPlan.SelectedCandidates)
@@ -42908,31 +43085,10 @@ def RouteAuthoritativeResources(
             > CandidateDiversityLevel
         )
         SignalInitialWindowLimit = (
-            SelectCoordinatedInitialRequestWindowLimit(
-                InitialRequestLimit,
-                len(RouteRequestsBySignal[Signal]),
-                Policy.AdaptiveRouting.CandidateGrowthFactor,
-                CoordinatedCandidateDiversityLevel,
-                ApplyCoordinatedInitialWindow,
-            )
+            min(InitialRequestLimit, len(RouteRequestsBySignal[Signal]))
         )
         SignalContinuationWindowLimit = (
-            SelectCoordinatedContinuationRequestWindowLimit(
-                SignalInitialWindowLimit,
-                len(RouteRequestsBySignal[Signal]),
-                InitialRequestLimit,
-                Policy.AdaptiveRouting.CandidateGrowthFactor,
-                CoordinatedCandidateDiversityLevel,
-                (
-                    Policy.AdaptiveRouting
-                    .MaximumCandidateDiversityEscalations
-                ),
-                (
-                    UseMatureStagedInitialCandidateScheduler
-                    and ApplyCoordinatedInitialWindow
-                    and Signal not in JointHigherOrderConstraintSignals
-                ),
-            )
+            SignalInitialWindowLimit
         )
         ProofRequests = RouteRequestsBySignal[Signal][
             :SignalInitialWindowLimit
@@ -43528,12 +43684,7 @@ def RouteAuthoritativeResources(
     MaximumCandidates = (
         min(
             Policy.TrackAssignment.MaximumRouteCandidatesPerNet,
-            AdaptiveBudget.CandidatesPerNet
-            * Policy.AdaptiveRouting.CandidateGrowthFactor ** max(
-                0,
-                (AdaptiveLayerFloor or AdaptiveBudget.LayerCount)
-                - AdaptiveBudget.LayerCount,
-            ),
+            AdaptiveBudget.CandidatesPerNet,
         )
         if Policy.AdaptiveRouting.Enabled
         else Policy.TrackAssignment.MaximumRouteCandidatesPerNet
@@ -44171,12 +44322,7 @@ def RouteAuthoritativeResources(
         MaximumCandidates = (
             min(
                 Policy.TrackAssignment.MaximumRouteCandidatesPerNet,
-                AdaptiveBudget.CandidatesPerNet
-                * Policy.AdaptiveRouting.CandidateGrowthFactor ** max(
-                    0,
-                    (AdaptiveLayerFloor or AdaptiveBudget.LayerCount)
-                    - AdaptiveBudget.LayerCount,
-                ),
+                AdaptiveBudget.CandidatesPerNet,
             )
             if Policy.AdaptiveRouting.Enabled
             else Policy.TrackAssignment.MaximumRouteCandidatesPerNet
@@ -44353,54 +44499,6 @@ def RouteAuthoritativeResources(
                     LayerCount,
                     RouteLaneCount,
                 ))
-            )
-            PriorFailureFingerprintCount = (
-                CountPriorCandidateFailureFingerprint(
-                    EscalationHistory,
-                    CandidateFailureFingerprint,
-                )
-            )
-            PriorRequestDomainFingerprintCount = (
-                CountPriorCandidateRequestDomainFingerprint(
-                    EscalationHistory,
-                    CandidateRequestDomainFingerprint,
-                )
-            )
-            CandidateStarvationClassFingerprint = (
-                BuildCandidateStarvationClassFingerprint(
-                    Signal,
-                    CandidateDiagnostics[Signal],
-                )
-            )
-            PriorStarvationClassFingerprintCount = (
-                CountPriorCandidateStarvationClassFingerprint(
-                    EscalationHistory,
-                    CandidateStarvationClassFingerprint,
-                )
-            )
-            RepeatedCandidateFailureFingerprint = (
-                PriorFailureFingerprintCount > 0
-            )
-            RepeatedCandidateStarvationClass = (
-                Demand.TerminalCount > 64
-                and int(
-                    CandidateDiagnostics[Signal].get("Materialized", 0)
-                )
-                == 0
-                and (
-                    RoutedTreeCount == 0
-                    or FixedLegalityRejectedEveryRoutedTree
-                )
-                and PriorStarvationClassFingerprintCount > 0
-            )
-            EffectiveRepeatedCandidateStarvationClass = (
-                RepeatedCandidateStarvationClass
-                or CutScopedFixedLegalityContinuationExhausted
-            )
-            PriorRoutedComponentNoTreeAttempts = (
-                CountRoutedComponentGlobalNoTreeAttempts(
-                    EscalationHistory,
-                )
             )
             if Resources.PreparingPhysicalComponentGlobalChannels:
                 RemainingRequestCounts = (
@@ -44683,7 +44781,6 @@ def RouteAuthoritativeResources(
                             [list(Key) for Key in sorted(Clause)]
                             for Clause in AlternativeAperturePortNoGoods
                         ],
-                        "EscalationHistory": (),
                         "ExecutableLegacyRepairCascade": False,
                     },
                 ))
@@ -44716,9 +44813,6 @@ def RouteAuthoritativeResources(
                             ),
                             "CandidateFailureFingerprint": (
                                 CandidateFailureFingerprint
-                            ),
-                            "PriorNoTreeAttemptCount": (
-                                PriorRoutedComponentNoTreeAttempts
                             ),
                             "CandidateDiversityLevel": (
                                 CandidateDiversityLevel
@@ -44781,1337 +44875,69 @@ def RouteAuthoritativeResources(
                     )
                 )
 
-            def RetryCandidateGeneration(
-                Action: str,
-                *,
-                NextReservationVariant: int = ReservationVariant,
-                NextLaneDiversityLevel: int = LaneDiversityLevel,
-                NextCandidateDiversityLevel: int = CandidateDiversityLevel,
-                NextLayerFloor: int | None = AdaptiveLayerFloor,
-                NextSkipStrictPortalReservation: bool = (
-                    SkipStrictPortalReservation
-                ),
-                NextClusterLeaseCandidateDomainOffsets: (
-                    dict[str, int] | None
-                ) = ClusterLeaseCandidateDomainOffsets,
-                NextClusterLeaseCandidateRealizabilityNogoods: tuple[
-                    ClusterLeaseCandidateRealizabilityNogood,
-                    ...,
-                ] = ClusterLeaseCandidateRealizabilityNogoods,
-                NextPriorClusterLeaseSignalPatternFingerprints: (
-                    dict[str, str] | None
-                ) = PriorClusterLeaseSignalPatternFingerprints,
-                ContinueCandidateRealizabilityProof: bool = False,
-            ) -> RoutedDesign:
-                if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
-                    print(
-                        "[debug] authoritative: retrying candidate generation "
-                        f"signal={Signal} action={Action} "
-                        f"reservation_variant={NextReservationVariant} "
-                        f"candidate_diversity={NextCandidateDiversityLevel} "
-                        f"lane_diversity={NextLaneDiversityLevel} "
-                        f"unreserved={NextSkipStrictPortalReservation} "
-                        f"elapsed={monotonic() - RoutingStarted:.3f}",
-                        flush=True,
-                    )
-                PreserveUnaffected = (
-                    ShouldRetainUnaffectedCandidatesForControl(Action)
-                )
-                RetainedCandidates, RetainedMetadata = (
-                    RetainUnaffectedCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        frozenset({Signal}),
-                    )
-                    if PreserveUnaffected
-                    else ({}, {})
-                )
-                IsCandidateRealizabilityProbe = (
-                    Action
-                    == (
-                        "exclude-candidate-unrealizable-cluster-lease-"
-                        "template"
-                    )
-                )
-                ProbeSliceSeconds = (
-                    SelectCandidateRealizabilityProbeSliceSeconds(
-                        Deadline.RemainingSeconds()
-                    )
-                    if (
-                        IsCandidateRealizabilityProbe
-                        and not ContinueCandidateRealizabilityProof
-                    )
-                    else 0.0
-                )
-                NestedDeadline = (
-                    RoutingDeadline(
-                        StartedAt=Deadline.StartedAt,
-                        ExpiresAt=min(
-                            Deadline.ExpiresAt,
-                            monotonic() + ProbeSliceSeconds,
-                        ),
-                    )
-                    if ProbeSliceSeconds > 0
-                    else Deadline
-                )
-                try:
-                    return RouteAuthoritativeResources(
-                        Placed,
-                        Resources,
-                        SearchMarginX,
-                        SearchMarginZ,
-                        MaximumRoutingHeight,
-                        Policy,
-                        Technology,
-                        ProgressCallback,
-                        DiagnosticCallback,
-                        AdaptiveLayerFloor=NextLayerFloor,
-                        SharedRoutingStarted=RoutingStarted,
-                        EscalationHistory=(
-                            *EscalationHistory,
-                            {
-                                "Stage": "CandidateGeneration",
-                                "Action": (
-                                    "continue-unique-access-distinct-"
-                                    "candidate-realizability-proof"
-                                    if ContinueCandidateRealizabilityProof
-                                    else Action
-                                ),
-                                "CandidateGenerationAction": Action,
-                                "AffectedSignals": [Signal],
-                                "CandidateFailureFingerprint": (
-                                    CandidateFailureFingerprint
-                                ),
-                                "CandidateStarvationClassFingerprint": (
-                                    CandidateStarvationClassFingerprint
-                                ),
-                                "CandidateRequestDomainFingerprint": (
-                                    CandidateRequestDomainFingerprint
-                                ),
-                                "PriorRequestDomainFingerprintCount": (
-                                    PriorRequestDomainFingerprintCount
-                                ),
-                                "RepeatedCandidateFailureFingerprint": (
-                                    RepeatedCandidateFailureFingerprint
-                                ),
-                                "RepeatedCandidateStarvationClass": (
-                                    RepeatedCandidateStarvationClass
-                                ),
-                                "PriorFingerprintCount": (
-                                    PriorFailureFingerprintCount
-                                ),
-                                "PriorStarvationClassFingerprintCount": (
-                                    PriorStarvationClassFingerprintCount
-                                ),
-                                "Diagnostics": CandidateDiagnostics[Signal],
-                            },
-                        ),
-                        ReservationVariant=NextReservationVariant,
-                        LaneDiversityLevel=NextLaneDiversityLevel,
-                        CandidateDiversityLevel=NextCandidateDiversityLevel,
-                        SkipStrictPortalReservation=(
-                            NextSkipStrictPortalReservation
-                        ),
-                        EscalationStates=EscalationStates,
-                        Deadline=NestedDeadline,
-                        RetainedCandidateCache=RetainedCandidates or None,
-                        RetainedCandidateMetadata=RetainedMetadata or None,
-                        PriorCandidateCache=(
-                            {
-                                Signal: tuple(CandidatesBySignal[Signal])
-                            }
-                            if Action in {
-                                "increase-guide-lane-diversity",
-                                "add-routing-layer",
-                            }
-                            and CandidatesBySignal.get(Signal)
-                            else None
-                        ),
-                        PriorCandidateMetadata=(
-                            {
-                                Signal: dict(
-                                    CandidateAxisLaneBySignal.get(
-                                        Signal,
-                                        {},
-                                    )
+            def RaiseTerminalCandidateIncomplete(Action: str) -> None:
+                if PrepareTrackAssignmentOnly:
+                    raise TrackAssignmentPrepared(
+                        TrackAssignmentPreparation(
+                            Success=False,
+                            SelectedCandidateIds=(),
+                            CandidateCounts=tuple(sorted(
+                                (
+                                    str(CandidateSignal),
+                                    len(CandidateValues),
                                 )
-                            }
-                            if Action in {
-                                "increase-guide-lane-diversity",
-                                "add-routing-layer",
-                            }
-                            and CandidatesBySignal.get(Signal)
-                            else None
-                        ),
-                        RegenerateSignals=(
-                            frozenset({Signal})
-                            if PreserveUnaffected
-                            else frozenset()
-                        ),
-                        RawPortalCache=(
-                            EffectiveRawPortalCache
-                            if NextLayerFloor is None
-                            or NextLayerFloor <= LayerCount
-                            else None
-                        ),
-                        PreparedPortalCache=(
-                            EffectivePreparedPortalCache
-                            if (
-                                not (
-                                    NextClusterLeaseCandidateRealizabilityNogoods
+                                for CandidateSignal, CandidateValues
+                                in CandidatesBySignal.items()
+                            )),
+                            ConflictSignals=(str(Signal),),
+                            ConflictResourceIndices=(),
+                            ExpansionCount=0,
+                            Complete=False,
+                            IncompleteReason=Action,
+                            Diagnostics=tuple(sorted(
+                                (
+                                    str(Key),
+                                    Value,
                                 )
-                                and (
-                                    NextLayerFloor is None
-                                    or NextLayerFloor <= LayerCount
-                                )
-                                and NextReservationVariant
-                                == ReservationVariant
-                                and NextSkipStrictPortalReservation
-                                == SkipStrictPortalReservation
-                            )
-                            else None
-                        ),
-                        LocalClaimReleaseHistory=LocalClaimReleaseHistory,
-                        AvoidRoutingPositions=AvoidRoutingPositions,
-                        ClusterLeaseCandidateDomainOffsets=(
-                            NextClusterLeaseCandidateDomainOffsets
-                        ),
-                        ClusterLeaseCandidateRealizabilityNogoods=(
-                            NextClusterLeaseCandidateRealizabilityNogoods
-                        ),
-                        PrepareClusterInterfaceAssignmentOnly=(
-                            PrepareClusterInterfaceAssignmentOnly
-                        ),
-                        RequireCompleteClusterInterfaceDomain=(
-                            RequireCompleteClusterInterfaceDomain
-                        ),
-                        ClusterInterfaceRealizabilityNogoods=(
-                            ClusterInterfaceRealizabilityNogoods
-                        ),
-                        ClusterInterfaceStateFingerprint=(
-                            ClusterInterfaceStateFingerprint
-                        ),
-                        ClusterInterfaceLocalRouteFingerprint=(
-                            ClusterInterfaceLocalRouteFingerprint
-                        ),
-                        ForbiddenClusterInterfaceAssignmentFingerprints=(
-                            ForbiddenClusterInterfaceAssignmentFingerprints
-                        ),
-                        ClusterInterfaceFrozenPatternFingerprints=(
-                            ClusterInterfaceFrozenPatternFingerprints
-                        ),
-                        ClusterInterfaceFrozenReservations=(
-                            ClusterInterfaceFrozenReservations
-                        ),
-                        PriorClusterLeaseSignalPatternFingerprints=(
-                            NextPriorClusterLeaseSignalPatternFingerprints
-                        ),
-                    )
-                except RoutingStageError as Error:
-                    if (
-                        not IsCandidateRealizabilityProbe
-                        or ProbeSliceSeconds <= 0
-                        or not NestedDeadline.IsExpired()
-                        or Deadline.IsExpired()
-                        or Error.Failure.Reason
-                        != RoutingFailureReason.RuntimeBudgetExceeded
-                    ):
-                        raise
-                    ContinuationDiagnostics = (
-                        PlacementLocalRouteDiagnostics.get(
-                            "__CandidateRealizabilityContinuation__",
-                            {},
+                                for Key, Value in {
+                                    **CandidateDiagnostics[Signal],
+                                    "PortalTupleFeasibility": (
+                                        PortalTupleFeasibilityBySignal.get(
+                                            Signal,
+                                            (),
+                                        )
+                                    ),
+                                }.items()
+                            )),
                         )
                     )
-                    if (
-                        ShouldContinueUniqueAccessDistinctCandidateRealizabilityProof(
-                            TopologyRequiresJointPortfolio,
-                            ContinuationDiagnostics,
-                            Deadline.RemainingSeconds(),
-                        )
-                    ):
-                        return RetryCandidateGeneration(
-                            Action,
-                            NextReservationVariant=NextReservationVariant,
-                            NextLaneDiversityLevel=NextLaneDiversityLevel,
-                            NextCandidateDiversityLevel=(
-                                NextCandidateDiversityLevel
-                            ),
-                            NextLayerFloor=NextLayerFloor,
-                            NextSkipStrictPortalReservation=(
-                                NextSkipStrictPortalReservation
-                            ),
-                            NextClusterLeaseCandidateDomainOffsets=(
-                                NextClusterLeaseCandidateDomainOffsets
-                            ),
-                            NextClusterLeaseCandidateRealizabilityNogoods=(
-                                NextClusterLeaseCandidateRealizabilityNogoods
-                            ),
-                            NextPriorClusterLeaseSignalPatternFingerprints=(
-                                NextPriorClusterLeaseSignalPatternFingerprints
-                            ),
-                            ContinueCandidateRealizabilityProof=True,
-                        )
-                    raise StructuredRoutingStageError(RoutingFailure(
-                        Reason=(
-                            RoutingFailureReason.RuntimeBudgetExceeded
-                        ),
-                        Stage="CandidateRealizabilityProbe",
-                        AffectedNets=(Signal,),
-                        RepairActions=("AdvancePlacementCandidate",),
-                        Detail=(
-                            "the bounded lease-state candidate probe "
-                            "exhausted its private slice; global repair "
-                            "time remains"
-                        ),
-                        Diagnostics={
-                            "Action": (
-                                "advance-placement-after-bounded-"
-                                "candidate-realizability-slice"
-                            ),
-                            "CompleteAssignmentCutProof": False,
-                            "ProbeSliceSeconds": ProbeSliceSeconds,
-                            "GlobalDeadline": Deadline.ToDictionary(),
-                            "CandidateDiagnostics": (
-                                CandidateDiagnostics[Signal]
-                            ),
-                            "CandidateRealizabilityNogoods": [
-                                Nogood.ToDictionary()
-                                for Nogood in (
-                                    NextClusterLeaseCandidateRealizabilityNogoods
-                                )
-                            ],
-                            "NestedFailure": (
-                                Error.Failure.ToDictionary()
-                            ),
-                        },
-                    )) from Error
-
-            PriorCandidateDomainPairExpansion = (
-                FindPriorCandidateDomainPairExpansion(
-                    EscalationHistory,
-                    Signal,
-                    CandidateFailureFingerprint,
-                )
-            )
-            if (
-                PriorCandidateDomainPairExpansion is not None
-                and PlacementWasRelocated
-                and ExactLegalRetainedJointStateCount > 1
-            ):
-                raise StructuredRoutingStageError(
-                    RoutingFailure(
-                        Reason=(
-                            RoutingFailureReason.TrackAssignmentConflict
-                        ),
-                        Stage="Candidate",
-                        AffectedNets=(Signal,),
-                        RepairActions=("AdvancePlacementCandidate",),
-                        Detail=(
-                            "the combined starved-signal and exact-pair "
-                            "candidate expansion still left an empty domain"
-                        ),
-                        Diagnostics={
-                            "Action": (
-                                "advance-retained-joint-portfolio-after-"
-                                "candidate-domain-pair-expansion"
-                            ),
-                            "ConflictGraph": {
-                                "Classification": (
-                                    "candidate-starvation-placement-conflict"
-                                ),
-                                "ConflictSignals": [Signal],
-                                "NoCandidateSignals": [Signal],
-                                "RelocationSignals": [Signal],
-                                "PriorityRelocationSignals": [Signal],
-                            },
-                            "PriorCandidateDomainPairExpansion": (
-                                PriorCandidateDomainPairExpansion
-                            ),
-                            "CandidateDiagnostics": (
-                                CandidateDiagnostics[Signal]
-                            ),
-                            "EscalationHistory": tuple(
-                                EscalationHistory
-                            ),
-                        },
-                    )
-                )
-
-            # Exact topology epochs own their retained access-distinct
-            # placements before generic same-geometry fallbacks. A complete
-            # capacity-one boundary lease is different: an otherwise viable
-            # placement with one downstream-empty access template must finish
-            # its bounded lease-realizability refinements before geometry is
-            # discarded. Placements without such leases retain the original
-            # exact-epoch ordering.
-            HasTopologyCutEpochConstraintEvidence = (
-                HasCumulativeAssignmentConstraints
-                or (
-                    TopologyRequiresJointPortfolio
-                    and (
-                        JointHigherOrderConstraintCount
-                        + JointPairwiseConstraintCount
-                    ) > 0
-                )
-            )
-            if (
-                not BoundaryLeaseReservations
-                and not ClusterLeaseCandidateRealizabilityNogoods
-                and (
-                    ShouldAdvanceRetainedJointPortfolioOnCandidateStarvation(
-                        PlacementWasRelocated,
-                        ExactLegalRetainedJointStateCount,
-                        HasTopologyCutEpochConstraintEvidence,
-                        CandidateDiversityLevel,
-                        ReservationVariant,
-                        LaneDiversityLevel,
-                        SkipStrictPortalReservation,
-                        RoutedTreeCount,
-                        int(
-                            CandidateDiagnostics[Signal].get(
-                                "Materialized",
-                                0,
-                            )
-                        ),
-                        AllRoutedTreesRejectedByFixedLegality=(
-                            FixedLegalityRejectedEveryRoutedTree
-                        ),
-                        RepeatedCandidateStarvationClass=(
-                            EffectiveRepeatedCandidateStarvationClass
-                        ),
-                    )
-                    or ShouldAdvanceTopologyCutEpochOnCandidateStarvation(
-                        PlacementWasRelocated=PlacementWasRelocated,
-                        TopologyRequiresJointPortfolio=(
-                            TopologyRequiresJointPortfolio
-                        ),
-                        HasTopologyCutConstraintEvidence=(
-                            HasTopologyCutEpochConstraintEvidence
-                        ),
-                        CandidateDiversityLevel=CandidateDiversityLevel,
-                        ReservationVariant=ReservationVariant,
-                        LaneDiversityLevel=LaneDiversityLevel,
-                        SkipStrictPortalReservation=(
-                            SkipStrictPortalReservation
-                        ),
-                        RoutedTreeCount=RoutedTreeCount,
-                        MaterializedCandidateCount=int(
-                            CandidateDiagnostics[Signal].get(
-                                "Materialized",
-                                0,
-                            )
-                        ),
-                    )
-                )
-            ):
                 raise StructuredRoutingStageError(RoutingFailure(
-                    Reason=RoutingFailureReason.TrackAssignmentConflict,
+                    Reason=(
+                        RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                    ),
                     Stage="Candidate",
-                    AffectedNets=(Signal,),
-                    RepairActions=("AdvancePlacementCandidate",),
+                    AffectedNets=(str(Signal),),
+                    RepairActions=(),
                     Detail=(
-                        "the complete initial bounded candidate window "
-                        "materialized no route while another exact-legal "
-                        "access-distinct joint placement remains"
+                        "the one fixed candidate domain produced no legal "
+                        "route; automatic relaunch is disabled"
                     ),
                     Diagnostics={
-                        "Action": (
-                            "advance-retained-joint-portfolio-before-"
-                            "lease-controls"
-                        ),
-                        "ConflictGraph": {
-                            "Classification": (
-                                "candidate-starvation-placement-conflict"
-                            ),
-                            "ConflictSignals": [Signal],
-                            "NoCandidateSignals": [Signal],
-                            "RelocationSignals": [Signal],
-                            "PriorityRelocationSignals": [Signal],
-                        },
-                        "CandidateDiagnostics": (
-                            CandidateDiagnostics[Signal]
-                        ),
-                        "AllRoutedTreesRejectedByFixedLegality": (
-                            FixedLegalityRejectedEveryRoutedTree
-                        ),
-                        "RepeatedCandidateStarvationClass": (
-                            EffectiveRepeatedCandidateStarvationClass
-                        ),
-                        "CutScopedFixedLegalityContinuationApplied": (
-                            CutScopedFixedLegalityContinuationApplied
-                        ),
-                        "ExactLegalRetainedJointStateCount": (
-                            ExactLegalRetainedJointStateCount
-                        ),
-                        "JointHigherOrderConstraintCount": (
-                            JointHigherOrderConstraintCount
-                        ),
-                        "JointPairwiseConstraintCount": (
-                            JointPairwiseConstraintCount
-                        ),
-                    },
-                ))
-
-            CurrentLeasePatternFingerprint = (
-                BuildClusterLeaseSignalPatternFingerprint(
-                    BoundaryLeaseReservations,
-                    Signal,
-                )
-            )
-            SignalHasClusterLeasePattern = (
-                Signal
-                in CurrentClusterLeaseSignalPatternFingerprints
-            )
-            ExactCandidateFailureFingerprint = BuildStableFingerprint((
-                CurrentLeasePatternFingerprint,
-                tuple(sorted(
-                    (
-                        str(Key),
-                        Value,
-                    )
-                    for Key, Value
-                    in CandidateDiagnostics[Signal].items()
-                    if isinstance(Value, int | float | bool)
-                )),
-                tuple(sorted(
-                    (
-                        str(Key),
-                        int(Value),
-                    )
-                    for Key, Value
-                    in dict(
-                        CandidateDiagnostics[Signal].get(
-                            "Rejections",
-                            {},
-                        )
-                    ).items()
-                )),
-                LayerCount,
-                RouteLaneCount,
-            ))
-            MayRefineCandidateRealizabilityLease = (
-                SignalHasClusterLeasePattern
-                and
-                not PrepareClusterInterfaceAssignmentOnly
-                and
-                ShouldRefineCandidateRealizabilityLeaseNogood(
-                    TopologyRequiresJointPortfolio,
-                    CompleteClusterInterfaceAccess,
-                    bool(BoundaryLeaseReservations),
-                    ReservationVariant,
-                    (
-                        Policy.AdaptiveRouting
-                        .MaximumPortalReservationAlternatives
-                    ),
-                    SkipStrictPortalReservation,
-                    CurrentLeasePatternFingerprint,
-                    ClusterLeaseCandidateRealizabilityNogoods,
-                    Deadline.RemainingSeconds(),
-                    Signal=Signal,
-                )
-            )
-            if MayRefineCandidateRealizabilityLease:
-                return RetryCandidateGeneration(
-                    (
-                        "exclude-candidate-unrealizable-cluster-lease-"
-                        "template"
-                    ),
-                    NextCandidateDiversityLevel=0,
-                    NextClusterLeaseCandidateDomainOffsets=None,
-                    NextClusterLeaseCandidateRealizabilityNogoods=(
-                        *ClusterLeaseCandidateRealizabilityNogoods,
-                        ClusterLeaseCandidateRealizabilityNogood(
-                            Signal=Signal,
-                            PatternFingerprint=(
-                                CurrentLeasePatternFingerprint
-                            ),
-                            CandidateFailureFingerprint=(
-                                CandidateFailureFingerprint
-                            ),
-                        ),
-                    ),
-                    NextPriorClusterLeaseSignalPatternFingerprints=(
-                        CurrentClusterLeaseSignalPatternFingerprints
-                    ),
-                )
-
-            if ShouldAdvanceAfterCompleteClusterLeasePortfolio(
-                TopologyRequiresJointPortfolio,
-                CompleteClusterInterfaceAccess,
-                bool(BoundaryLeaseReservations),
-                ReservationVariant,
-                SkipStrictPortalReservation,
-                (
-                    Policy.AdaptiveRouting
-                    .MaximumPortalReservationAlternatives
-                ),
-                (
-                    SignalHasClusterLeasePattern
-                    and not MayRefineCandidateRealizabilityLease
-                ),
-            ):
-                raise StructuredRoutingStageError(RoutingFailure(
-                    Reason=RoutingFailureReason.TrackAssignmentConflict,
-                    Stage="Candidate",
-                    AffectedNets=(Signal,),
-                    RepairActions=("AdvancePlacementCandidate",),
-                    Detail=(
-                        "the bounded candidate-realizability lease "
-                        "portfolio produced no route tree for one signal"
-                    ),
-                    Diagnostics={
-                        "Action": (
-                            "advance-placement-after-complete-cluster-"
-                            "lease-portfolio"
-                        ),
-                        "ReservationVariant": ReservationVariant,
-                        "CompleteLeaseStateCount": (
-                            1 + len(
-                                ClusterLeaseCandidateRealizabilityNogoods
-                            )
-                        ),
-                        "CandidateDiagnostics": (
-                            CandidateDiagnostics[Signal]
-                        ),
-                        "CandidateRealizabilityNogoods": [
-                            Nogood.ToDictionary()
-                            for Nogood in (
-                                ClusterLeaseCandidateRealizabilityNogoods
-                            )
-                        ],
-                        "CurrentLeasePatternFingerprint": (
-                            CurrentLeasePatternFingerprint
-                        ),
+                        "Action": "terminal-fixed-domain-incomplete",
+                        "RejectedAutomaticAction": Action,
+                        "Complete": False,
                         "CandidateFailureFingerprint": (
-                            (
-                                ExactCandidateFailureFingerprint
-                                if PrepareClusterInterfaceAssignmentOnly
-                                else CandidateFailureFingerprint
-                            )
-                        ),
-                        "AuthoritativeAccessDomainFingerprint": (
-                            WorkTelemetry.get(
-                                "ClusterBoundaryLeases",
-                                {},
-                            ).get(
-                                "AuthoritativeAccessDomainFingerprint",
-                                "",
-                            )
-                        ),
-                        "RejectedInterfaceAssignment": (
-                            Resources.PreparedClusterInterfaceAssignment
-                            .ToDictionary()
-                            if Resources
-                            .PreparedClusterInterfaceAssignment
-                            is not None
-                            else None
-                        ),
-                        "SelectedClusterInterfacePatternFingerprints": (
-                            dict(sorted(
-                                CurrentClusterLeaseSignalPatternFingerprints
-                                .items()
-                            ))
-                        ),
-                        "ExactInterfaceRealizabilityNogoodRequired": (
-                            PrepareClusterInterfaceAssignmentOnly
-                        ),
-                        "ConflictGraph": {
-                            "Classification": (
-                                "candidate-starvation-placement-conflict"
-                            ),
-                            "ConflictSignals": [Signal],
-                            "NoCandidateSignals": [Signal],
-                            "RelocationSignals": [Signal],
-                            "PriorityRelocationSignals": [Signal],
-                        },
-                    },
-                ))
-
-            CandidateDomainPairCutValue = None
-            if ShouldScanCandidateDomainPairCut(
-                Policy.AdaptiveRouting.Enabled,
-                PlacementWasRelocated,
-                ExactLegalRetainedJointStateCount,
-                JointHigherOrderConstraintCount,
-                Signal,
-                JointHigherOrderConstraintSignals,
-                CandidateDiversityLevel,
-                ReservationVariant,
-                LaneDiversityLevel,
-                SkipStrictPortalReservation,
-                (
-                    Policy.AdaptiveRouting
-                    .MaximumCandidateDiversityEscalations
-                ),
-            ):
-                CandidatePortalById = {
-                    Portal.PortalId: Portal
-                    for Values in Portals.values()
-                    for Portal in Values
-                }
-                MandatoryAccessClaimsCache = {}
-                CandidateDomainPairScanStarted = monotonic()
-                CandidateDomainPairScanSliceSeconds = (
-                    SelectCandidateDomainPairScanSliceSeconds(
-                        Deadline.RemainingSeconds(),
-                    )
-                )
-                CandidateDomainPairScanExpiresAt = (
-                    CandidateDomainPairScanStarted
-                    + CandidateDomainPairScanSliceSeconds
-                )
-                CandidateDomainPairScanProgress = {}
-
-                def CheckCandidateDomainPairScan(
-                    Diagnostics: dict[str, object],
-                ) -> None:
-                    CandidateDomainPairScanProgress.clear()
-                    CandidateDomainPairScanProgress.update(Diagnostics)
-                    CheckRuntimeBudget(
-                        "CandidateDomainPairCut",
-                        Diagnostics,
-                    )
-                    if monotonic() >= CandidateDomainPairScanExpiresAt:
-                        raise CandidateDomainPairScanExpired
-
-                CandidateDomainSignalOrder = tuple(sorted(
-                    (
-                        CandidateSignal
-                        for CandidateSignal, Candidates
-                        in CandidatesBySignal.items()
-                        if Candidates
-                    ),
-                    key=lambda CandidateSignal: (
-                        Profiles[CandidateSignal].Root,
-                        tuple(Profiles[CandidateSignal].Targets),
-                        len(CandidatesBySignal[CandidateSignal]),
-                    ),
-                ))
-
-                def ValidateCandidateDomainPairCut(
-                    Cut: CandidateDomainPairCut,
-                ) -> bool:
-                    CheckCandidateDomainPairScan({
-                        "Phase": "validate-cut-start",
-                        **Cut.ToDictionary(),
-                    })
-                    for PairSignal in Cut.Signals:
-                        if PairSignal not in MandatoryAccessClaimsCache:
-                            MandatoryAccessClaimsCache[PairSignal] = (
-                                BuildCandidateMandatoryAccessClaims(
-                                    PairSignal,
-                                    CandidatesBySignal[PairSignal],
-                                    Profiles[PairSignal],
-                                    CandidatePortalById,
-                                    Resources.ResourceGraph,
-                                )
-                            )
-                    MandatoryCut = FindUnavoidableMandatoryClaimCut({
-                        PairSignal: MandatoryAccessClaimsCache[
-                            PairSignal
-                        ]
-                        for PairSignal in Cut.Signals
-                    })
-                    return (
-                        MandatoryCut is not None
-                        and frozenset(MandatoryCut[0])
-                        == frozenset(Cut.Signals)
-                    )
-
-                CandidateDomainPairScanExpiredValue = False
-                try:
-                    CandidateDomainPairCutValue = (
-                        FindFirstUnavoidableCandidateDomainPairCut(
-                            CandidatesBySignal,
-                            WorkCheck=CheckCandidateDomainPairScan,
-                            CutValidator=ValidateCandidateDomainPairCut,
-                            MaximumCandidatePairChecks=4096,
-                            OrderedSignals=CandidateDomainSignalOrder,
-                            PrioritySignals=(
-                                JointHigherOrderConstraintSignals
-                            ),
-                        )
-                    )
-                except CandidateDomainPairScanExpired:
-                    CandidateDomainPairScanExpiredValue = True
-                    CandidateDomainPairCutValue = None
-                CandidateDomainPairScanSeconds = (
-                    monotonic() - CandidateDomainPairScanStarted
-                )
-                WorkTelemetry["CandidateDomainPairCutScan"] = {
-                    "Applied": True,
-                    "ElapsedSeconds": round(
-                        CandidateDomainPairScanSeconds,
-                        6,
-                    ),
-                    "Expired": CandidateDomainPairScanExpiredValue,
-                    "MaximumCandidatePairChecks": 4096,
-                    "PrivateSliceSeconds": round(
-                        CandidateDomainPairScanSliceSeconds,
-                        6,
-                    ),
-                    "Progress": dict(
-                        CandidateDomainPairScanProgress
-                    ),
-                    "StarvedSignal": Signal,
-                    "Result": (
-                        CandidateDomainPairCutValue.ToDictionary()
-                        if CandidateDomainPairCutValue is not None
-                        else None
-                    ),
-                }
-            if CandidateDomainPairCutValue is not None:
-                PairSignals = frozenset(
-                    CandidateDomainPairCutValue.Signals
-                )
-                AffectedSignals = frozenset({
-                    Signal,
-                    *PairSignals,
-                })
-                RetainedCandidates, RetainedMetadata = (
-                    RetainUnaffectedCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        AffectedSignals,
-                    )
-                )
-                ConflictGraph = {
-                    "Classification": "candidate-domain-pair-conflict",
-                    "ConflictSignals": sorted({
-                        Signal,
-                        *PairSignals,
-                    }),
-                    "NoCandidateSignals": [Signal],
-                    "PairwiseIncompatibleEdges": [
-                        list(CandidateDomainPairCutValue.Signals)
-                    ],
-                    "RelocationSignals": sorted({
-                        Signal,
-                        *PairSignals,
-                    }),
-                    "PriorityRelocationSignals": sorted(PairSignals),
-                    "ResourceHotspots": [
-                        list(Position)
-                        for Position in sorted(
-                            CandidateDomainPairCutValue.ConflictPositions
-                        )[:32]
-                    ],
-                    "CandidateCounts": {
-                        CandidateSignal: len(Candidates)
-                        for CandidateSignal, Candidates
-                        in sorted(CandidatesBySignal.items())
-                    },
-                }
-                CandidateDomainPairExpansion = {
-                    "Stage": "TrackAssignment",
-                    "Action": "regenerate-affected-candidates",
-                    "Reason": (
-                        "one empty domain was accompanied by an unavoidable "
-                        "pair in the completed bounded candidate domains"
-                    ),
-                    "AffectedSignals": sorted(AffectedSignals),
-                    "CandidateDomainPairExpansion": True,
-                    "ExactPairEndpointExpansion": True,
-                    "ConflictClassification": (
-                        ConflictGraph["Classification"]
-                    ),
-                    "PairwiseIncompatibleEdges": (
-                        ConflictGraph["PairwiseIncompatibleEdges"]
-                    ),
-                    "NoCandidateSignals": [Signal],
-                    "ConflictGraph": ConflictGraph,
-                    "CandidateFailureFingerprint": (
-                        CandidateFailureFingerprint
-                    ),
-                    "CandidateStarvationClassFingerprint": (
-                        CandidateStarvationClassFingerprint
-                    ),
-                    "CandidateDomainPairCut": (
-                        CandidateDomainPairCutValue.ToDictionary()
-                    ),
-                    "FromCandidateDiversityLevel": (
-                        CandidateDiversityLevel
-                    ),
-                    "ToCandidateDiversityLevel": (
-                        CandidateDiversityLevel + 1
-                    ),
-                }
-                return RouteAuthoritativeResources(
-                    Placed,
-                    Resources,
-                    SearchMarginX,
-                    SearchMarginZ,
-                    MaximumRoutingHeight,
-                    Policy,
-                    Technology,
-                    ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=AdaptiveLayerFloor,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(
-                        *EscalationHistory,
-                        CandidateDomainPairExpansion,
-                    ),
-                    ReservationVariant=ReservationVariant,
-                    LaneDiversityLevel=LaneDiversityLevel,
-                    CandidateDiversityLevel=CandidateDiversityLevel + 1,
-                    SkipStrictPortalReservation=(
-                        SkipStrictPortalReservation
-                    ),
-                    EscalationStates=EscalationStates,
-                    Deadline=Deadline,
-                    RawPortalCache=EffectiveRawPortalCache,
-                    PreparedPortalCache=EffectivePreparedPortalCache,
-                    RetainedCandidateCache=RetainedCandidates or None,
-                    RetainedCandidateMetadata=RetainedMetadata or None,
-                    PriorCandidateCache={
-                        AffectedSignal: tuple(
-                            CandidatesBySignal[AffectedSignal]
-                        )
-                        for AffectedSignal in PairSignals
-                        if CandidatesBySignal.get(AffectedSignal)
-                    } or None,
-                    PriorCandidateMetadata={
-                        AffectedSignal: dict(
-                            CandidateAxisLaneBySignal.get(
-                                AffectedSignal,
-                                {},
-                            )
-                        )
-                        for AffectedSignal in PairSignals
-                        if CandidatesBySignal.get(AffectedSignal)
-                    } or None,
-                    RegenerateSignals=AffectedSignals,
-                    LocalClaimReleaseHistory=LocalClaimReleaseHistory,
-                    AvoidRoutingPositions=AvoidRoutingPositions,
-                    AvoidRoutingPositionsBySignal=(
-                        MergeSignalScopedAvoidancePositions(
-                            EffectiveAvoidRoutingPositionsBySignal,
-                            PairSignals,
-                            frozenset(
-                                sorted(
-                                    CandidateDomainPairCutValue
-                                    .ConflictPositions
-                                )[:64]
-                            ),
-                        )
-                    ),
-                )
-
-            if ShouldAdvanceAfterCompleteClusterLeasePortfolio(
-                TopologyRequiresJointPortfolio,
-                CompleteClusterInterfaceAccess,
-                bool(BoundaryLeaseReservations),
-                ReservationVariant,
-                SkipStrictPortalReservation,
-                (
-                    Policy.AdaptiveRouting
-                    .MaximumPortalReservationAlternatives
-                ),
-                (
-                    SignalHasClusterLeasePattern
-                    and (
-                        bool(ClusterLeaseCandidateDomainOffsets)
-                        or not MayRefineCandidateRealizabilityLease
-                    )
-                ),
-            ):
-                raise StructuredRoutingStageError(RoutingFailure(
-                    Reason=RoutingFailureReason.TrackAssignmentConflict,
-                    Stage="Candidate",
-                    AffectedNets=(Signal,),
-                    RepairActions=("AdvancePlacementCandidate",),
-                    Detail=(
-                        "the bounded complete-interface lease portfolio "
-                        "produced no route tree for one signal"
-                    ),
-                    Diagnostics={
-                        "Action": (
-                            "advance-placement-after-complete-cluster-"
-                            "lease-portfolio"
-                        ),
-                        "ReservationVariant": ReservationVariant,
-                        "CompleteLeaseStateCount": (
-                            Policy.AdaptiveRouting
-                            .MaximumPortalReservationAlternatives
-                            + 1
+                            CandidateFailureFingerprint
                         ),
                         "CandidateDiagnostics": (
                             CandidateDiagnostics[Signal]
                         ),
-                        "CandidateRealizabilityNogoods": [
-                            Nogood.ToDictionary()
-                            for Nogood in (
-                                ClusterLeaseCandidateRealizabilityNogoods
-                            )
-                        ],
-                        "ConflictGraph": {
-                            "Classification": (
-                                "candidate-starvation-placement-conflict"
-                            ),
-                            "ConflictSignals": [Signal],
-                            "NoCandidateSignals": [Signal],
-                            "RelocationSignals": [Signal],
-                            "PriorityRelocationSignals": [Signal],
-                        },
+                        "PortalTupleFeasibility": (
+                            PortalTupleFeasibilityBySignal.get(Signal, ())
+                        ),
                     },
                 ))
-
-            if ShouldAdvanceRetainedJointPortfolioOnCandidateStarvation(
-                PlacementWasRelocated,
-                ExactLegalRetainedJointStateCount,
-                HasCumulativeAssignmentConstraints,
-                CandidateDiversityLevel,
-                ReservationVariant,
-                LaneDiversityLevel,
-                SkipStrictPortalReservation,
-                RoutedTreeCount,
-                int(CandidateDiagnostics[Signal].get("Materialized", 0)),
-                AllRoutedTreesRejectedByFixedLegality=(
-                    FixedLegalityRejectedEveryRoutedTree
-                ),
-                RepeatedCandidateStarvationClass=(
-                    EffectiveRepeatedCandidateStarvationClass
-                ),
-            ):
-                PortfolioAdvance = {
-                    "Stage": "CandidateGeneration",
-                    "Action": (
-                        "advance-retained-joint-portfolio-candidate-starvation"
-                    ),
-                    "AffectedSignals": [Signal],
-                    "ExactLegalRetainedJointStateCount": (
-                        ExactLegalRetainedJointStateCount
-                    ),
-                    "JointHigherOrderConstraintCount": (
-                        JointHigherOrderConstraintCount
-                    ),
-                    "JointPairwiseConstraintCount": (
-                        JointPairwiseConstraintCount
-                    ),
-                    "CandidateFailureFingerprint": (
-                        CandidateFailureFingerprint
-                    ),
-                    "CandidateStarvationClassFingerprint": (
-                        CandidateStarvationClassFingerprint
-                    ),
-                    "Diagnostics": CandidateDiagnostics[Signal],
-                    "AllRoutedTreesRejectedByFixedLegality": (
-                        FixedLegalityRejectedEveryRoutedTree
-                    ),
-                    "RepeatedCandidateStarvationClass": (
-                        EffectiveRepeatedCandidateStarvationClass
-                    ),
-                    "CutScopedFixedLegalityContinuationApplied": (
-                        CutScopedFixedLegalityContinuationApplied
-                    ),
-                }
-                WorkTelemetry["PortfolioCandidateStarvationAdvance"] = (
-                    PortfolioAdvance
-                )
-                StageTimings["CandidateGeneration"] = (
-                    monotonic() - CandidateStarted
-                )
-                raise StructuredRoutingStageError(
-                    RoutingFailure(
-                        Reason=(
-                            RoutingFailureReason.TrackAssignmentConflict
-                        ),
-                        Stage="Candidate",
-                        AffectedNets=(Signal,),
-                        RepairActions=("AdvancePlacementCandidate",),
-                        Detail=(
-                            "the complete initial bounded candidate window "
-                            "materialized no route while another exact-legal "
-                            "access-distinct joint placement remains"
-                        ),
-                        Diagnostics={
-                            "Action": PortfolioAdvance["Action"],
-                            "ConflictGraph": {
-                                "Classification": (
-                                    "candidate-starvation-placement-conflict"
-                                ),
-                                "ConflictSignals": [Signal],
-                                "NoCandidateSignals": [Signal],
-                                "RelocationSignals": [Signal],
-                                "PriorityRelocationSignals": [Signal],
-                            },
-                            "CandidateDiagnostics": (
-                                CandidateDiagnostics[Signal]
-                            ),
-                            "AllRoutedTreesRejectedByFixedLegality": (
-                                FixedLegalityRejectedEveryRoutedTree
-                            ),
-                            "RepeatedCandidateStarvationClass": (
-                                EffectiveRepeatedCandidateStarvationClass
-                            ),
-                            "CutScopedFixedLegalityContinuationApplied": (
-                                CutScopedFixedLegalityContinuationApplied
-                            ),
-                            "ExactLegalRetainedJointStateCount": (
-                                ExactLegalRetainedJointStateCount
-                            ),
-                            "JointHigherOrderConstraintCount": (
-                                JointHigherOrderConstraintCount
-                            ),
-                            "JointPairwiseConstraintCount": (
-                                JointPairwiseConstraintCount
-                            ),
-                        },
-                    )
-                )
-
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and (
-                    RepeatedCandidateFailureFingerprint
-                    or RepeatedCandidateStarvationClass
-                    or PriorRequestDomainFingerprintCount > 0
-                )
-                # A repeated empty candidate window is ordinary adaptive
-                # routing evidence until placement has established the
-                # reconvergent, access-distinct cut that owns coordinated
-                # diversification.  Applying this shortcut to a compact
-                # ripple placement changes its otherwise canonical portal
-                # sequence and can select a longer legal route.
-                and (
-                    (
-                        TopologyRequiresJointPortfolio
-                        and Signal
-                        in CoordinatedCandidateDiversificationSignals
-                        and ExactLegalRetainedJointStateCount > 1
-                        and HasCumulativeAssignmentConstraints
-                    )
-                    or (
-                        PhysicalAssemblyPlan is not None
-                        and PriorRequestDomainFingerprintCount > 0
-                    )
-                )
-                and not SkipStrictPortalReservation
-                and LaneDiversityLevel + 1
-                < Policy.AdaptiveRouting.MaximumLaneDiversityEscalations
-                and not SeedRejectedEveryRoutedTree
-            ):
-                # The candidate-diversity portfolio has returned to an exact
-                # prior starvation state. Advance the reported signal directly
-                # to one combined portal/lane hypothesis instead of paying for
-                # two intermediate controls which preserve the empty domain.
-                return RetryCandidateGeneration(
-                    "diversify-repeated-candidate-cut",
-                    NextReservationVariant=min(
-                        ReservationVariant + 1,
-                        (
-                            Policy.AdaptiveRouting
-                            .MaximumPortalReservationAlternatives
-                            - 1
-                        ),
-                    ),
-                    NextLaneDiversityLevel=LaneDiversityLevel + 1,
-                    NextCandidateDiversityLevel=0,
-                    NextSkipStrictPortalReservation=True,
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and not RepeatedCandidateFailureFingerprint
-                and not RepeatedCandidateStarvationClass
-                and CandidateDiagnostics[Signal]["DeferredRequests"] > 0
-                and CandidateDiversityLevel + 1
-                < Policy.AdaptiveRouting.MaximumCandidateDiversityEscalations
-                and (
-                    not PlacementWasRelocated
-                    or AllowRelocatedStarvationLaneRetry
-                    or ShouldContinueSoleRetainedCutCandidateStarvation(
-                        PlacementWasRelocated,
-                        ExactLegalRetainedJointStateCount,
-                        HasCumulativeAssignmentConstraints,
-                        Signal,
-                        JointAssignmentConstraintSignals,
-                    )
-                )
-            ):
-                return RetryCandidateGeneration(
-                    "regenerate-affected-candidates",
-                    NextCandidateDiversityLevel=(
-                        max(5, CandidateDiversityLevel + 1)
-                        if UseSparseCandidateBootstrap
-                        else CandidateDiversityLevel + 1
-                    ),
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and (
-                    AllowRelocatedStarvationLaneRetry
-                    or (
-                        TopologyRequiresJointPortfolio
-                        and ShouldContinueSoleRetainedCutCandidateStarvation(
-                            PlacementWasRelocated,
-                            ExactLegalRetainedJointStateCount,
-                            HasCumulativeAssignmentConstraints,
-                            Signal,
-                            JointAssignmentConstraintSignals,
-                        )
-                    )
-                )
-                and CandidateDiagnostics[Signal]["DeferredRequests"] == 0
-                and not SkipStrictPortalReservation
-            ):
-                # A compact relocation, or the sole exact-legal survivor of a
-                # topology cut epoch, has not yet exercised its unreserved
-                # portal domain for the reported cut signal.
-                return RetryCandidateGeneration(
-                    (
-                        "retry-sole-topology-cut-starvation-unreserved"
-                        if TopologyRequiresJointPortfolio
-                        and ShouldContinueSoleRetainedCutCandidateStarvation(
-                            PlacementWasRelocated,
-                            ExactLegalRetainedJointStateCount,
-                            HasCumulativeAssignmentConstraints,
-                            Signal,
-                            JointAssignmentConstraintSignals,
-                        )
-                        else "retry-compact-relocated-starvation-unreserved"
-                    ),
-                    NextCandidateDiversityLevel=0,
-                    NextSkipStrictPortalReservation=True,
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and (
-                    CandidateDiversityLevel + 1
-                    >= Policy.AdaptiveRouting.MaximumCandidateDiversityEscalations
-                    or (
-                        PlacementWasRelocated
-                        and (
-                            not AllowRelocatedStarvationLaneRetry
-                            or LaneDiversityLevel >= 1
-                        )
-                    )
-                    or (
-                        CandidateDiagnostics[Signal]["DeferredRequests"] == 0
-                        and "__PlacementRelocation__"
-                        in (
-                            getattr(Placed, "LocalRouteDiagnostics", {}) or {}
-                        )
-                    )
-                )
-                and (
-                    LocalClaimsBySignal.get(Signal)
-                    or "__PlacementRelocation__"
-                    in (getattr(Placed, "LocalRouteDiagnostics", {}) or {})
-                )
-            ):
-                ConflictGraph = {
-                    "Classification": "candidate-starvation-placement-conflict",
-                    "ConflictSignals": [Signal],
-                    "NoCandidateSignals": [Signal],
-                }
-                raise StructuredRoutingStageError(
-                    RoutingFailure(
-                        Reason=RoutingFailureReason.TrackAssignmentConflict,
-                        Stage="Candidate",
-                        AffectedNets=(Signal,),
-                        RepairActions=(
-                            "RelocateAffectedClusters",
-                            "AdvancePlacementCandidate",
-                        ),
-                        Detail=(
-                            "the fixed placement exhausted bounded candidate "
-                            "diversity for one signal"
-                        ),
-                        Diagnostics={
-                            "Action": "advance-placement-candidate-starvation",
-                            "ConflictGraph": ConflictGraph,
-                            "CandidateDiagnostics": CandidateDiagnostics[Signal],
-                            "CandidateFailureFingerprint": (
-                                CandidateFailureFingerprint
-                            ),
-                            "EscalationHistory": tuple(EscalationHistory),
-                            "Deadline": Deadline.ToDictionary(),
-                        },
-                    )
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and not SkipStrictPortalReservation
-                and ReservationVariant + 1
-                < Policy.AdaptiveRouting.MaximumPortalReservationAlternatives
-            ):
-                return RetryCandidateGeneration(
-                    "alternate-portal-slots",
-                    NextReservationVariant=ReservationVariant + 1,
-                    NextCandidateDiversityLevel=0,
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and not SkipStrictPortalReservation
-            ):
-                return RetryCandidateGeneration(
-                    "try-bounded-unreserved-portals",
-                    NextCandidateDiversityLevel=0,
-                    NextSkipStrictPortalReservation=True,
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and LaneDiversityLevel + 1
-                < Policy.AdaptiveRouting.MaximumLaneDiversityEscalations
-                and not SeedRejectedEveryRoutedTree
-                and (
-                    not PlacementWasRelocated
-                    or AllowRelocatedStarvationLaneRetry
-                )
-            ):
-                return RetryCandidateGeneration(
-                    "increase-guide-lane-diversity",
-                    NextLaneDiversityLevel=LaneDiversityLevel + 1,
-                    NextCandidateDiversityLevel=CandidateDiversityLevel,
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and LayerCount < EffectiveMaximumLayerCount
-            ):
-                return RetryCandidateGeneration(
-                    "add-routing-layer",
-                    NextReservationVariant=0,
-                    NextLaneDiversityLevel=0,
-                    NextCandidateDiversityLevel=0,
-                    NextLayerFloor=LayerCount + 1,
-                )
-            if (
-                Policy.AdaptiveRouting.Enabled
-                and not SkipStrictPortalReservation
-            ):
-                return RetryCandidateGeneration(
-                    "final-bounded-unreserved-portals",
-                    NextReservationVariant=0,
-                    NextLaneDiversityLevel=0,
-                    NextCandidateDiversityLevel=0,
-                    NextSkipStrictPortalReservation=True,
-                )
-            if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
-                print(
-                    "[debug] authoritative: candidate generation failed to materialize "
-                    f"signal={Signal} reason={CandidateDiagnostics[Signal]}",
-                    flush=True,
-                )
-            raise StructuredRoutingStageError(
-                RoutingFailure(
-                    Reason=RoutingFailureReason.DetailedSearchExhausted,
-                    Stage="Candidate",
-                    AffectedNets=(Signal,),
-                    Detail=(
-                        "bounded Rust search produced no complete legal route "
-                        f"candidate (candidate_expansion_limit={CandidateExpansionLimit}, "
-                        f"diagnostics={CandidateDiagnostics[Signal]})"
-                    ),
-                    Diagnostics={
-                        "CandidateDiagnostics": CandidateDiagnostics[Signal],
-                        "CandidateFailureFingerprint": CandidateFailureFingerprint,
-                        "EscalationHistory": tuple(EscalationHistory),
-                        "Deadline": Deadline.ToDictionary(),
-                    },
-                )
-            )
+            RaiseTerminalCandidateIncomplete("fixed-domain-exhausted")
         if not RouteTreeNativeDeadlineExceeded:
             CheckRuntimeBudget("Candidate")
 
@@ -46230,135 +45056,6 @@ def RouteAuthoritativeResources(
                 f"limit={CandidateLimitsBySignal[Signal]} "
                 f"final={len(CandidatesBySignal[Signal])}",
                 flush=True,
-            )
-
-    PriorGlobalTrunkEntries = tuple(
-        Entry
-        for Entry in EscalationHistory
-        if (
-            isinstance(Entry, dict)
-            and Entry.get("Action")
-            == "freeze-universal-global-trunk"
-        )
-    )
-    if (
-        getattr(Placed, "RoutedComponentTemplates", ())
-        and not PriorGlobalTrunkEntries
-        and CandidateDiversityLevel == 0
-    ):
-        ProactiveTrunkChoices = []
-        for Signal, Profile in Profiles.items():
-            SignalCandidates = tuple(
-                CandidatesBySignal.get(Signal, ())
-            )
-            if not SignalCandidates or Profile.Fanout < 4:
-                continue
-            MinimumWireCount = min(
-                len(Candidate.Claims.WireCells)
-                for Candidate in SignalCandidates
-            )
-            if MinimumWireCount < 64:
-                continue
-            Candidate = min(
-                SignalCandidates,
-                key=lambda Value: (
-                    len(Value.Claims.ResourceIds),
-                    Value.MaterialCost,
-                    Value.Length,
-                    Value.BendCount,
-                    Value.ViaCount,
-                    Value.CandidateId,
-                ),
-            )
-            ProactiveTrunkChoices.append((
-                -Profile.Fanout,
-                -Profile.Span,
-                -MinimumWireCount,
-                tuple(sorted(
-                    (
-                        len(Value.Claims.ResourceIds),
-                        Value.Length,
-                        Value.BendCount,
-                        Value.ViaCount,
-                    )
-                    for Value in SignalCandidates
-                )),
-                tuple(sorted(Candidate.Nodes)),
-                Signal,
-                Candidate,
-            ))
-        if (
-            ProactiveTrunkChoices
-            and Deadline.RemainingSeconds() > 2.0
-        ):
-            (
-                _Fanout,
-                _Span,
-                _WireCount,
-                _StructuralDomain,
-                _CandidateGeometry,
-                TrunkSignal,
-                TrunkCandidate,
-            ) = min(ProactiveTrunkChoices)
-            RegeneratedSignals = frozenset(
-                Signal
-                for Signal in Profiles
-                if Signal != TrunkSignal
-            )
-            TrunkAvoidancePositions = frozenset(
-                Resource.Position
-                for Resource in TrunkCandidate.Claims.ResourceIds
-            )
-            Escalation = {
-                "Stage": "TrackAssignment",
-                "Action": "freeze-universal-global-trunk",
-                "Admission": "proactive-structural-trunk",
-                "TrunkSignal": TrunkSignal,
-                "TrunkCandidateId": TrunkCandidate.CandidateId,
-                "TrunkCandidateResourceCount": len(
-                    TrunkCandidate.Claims.ResourceIds
-                ),
-                "TrunkFanout": Profiles[TrunkSignal].Fanout,
-                "TrunkSpan": Profiles[TrunkSignal].Span,
-                "RegeneratedSignalCount": len(
-                    RegeneratedSignals
-                ),
-                "PriorTrunkCandidateCount": 0,
-            }
-            return RouteAuthoritativeResources(
-                Placed,
-                Resources,
-                SearchMarginX,
-                SearchMarginZ,
-                MaximumRoutingHeight,
-                Policy,
-                Technology,
-                ProgressCallback,
-                DiagnosticCallback,
-                AdaptiveLayerFloor=AdaptiveLayerFloor,
-                SharedRoutingStarted=RoutingStarted,
-                EscalationHistory=(
-                    *EscalationHistory,
-                    Escalation,
-                ),
-                ReservationVariant=ReservationVariant,
-                LaneDiversityLevel=LaneDiversityLevel,
-                CandidateDiversityLevel=CandidateDiversityLevel,
-                EscalationStates=EscalationStates,
-                SkipStrictPortalReservation=(
-                    SkipStrictPortalReservation
-                ),
-                Deadline=Deadline,
-                RawPortalCache=EffectiveRawPortalCache,
-                RetainedCandidateCache={
-                    TrunkSignal: (TrunkCandidate,),
-                },
-                RegenerateSignals=RegeneratedSignals,
-                PreparedPortalCache=EffectivePreparedPortalCache,
-                AvoidRoutingPositions=(
-                    AvoidRoutingPositions
-                    | TrunkAvoidancePositions
-                ),
             )
 
     if Resources.PreparingPhysicalComponentGlobalChannels:
@@ -46745,16 +45442,6 @@ def RouteAuthoritativeResources(
         for Values in CandidatesBySignal.values()
         for Candidate in Values
     }
-    RuntimeEscalationState = replace(
-        RuntimeEscalationState,
-        CandidateFingerprint=BuildStableFingerprint({
-            Signal: [
-                Candidate.CandidateId
-                for Candidate in CandidatesBySignal[Signal]
-            ]
-            for Signal in sorted(CandidatesBySignal)
-        }),
-    )
     BaseLocalClaims = LocalClaims
     AssignmentIndexed = EffectiveRawPortalCache.AssignmentIndexed
     AssignmentEncodingCache = (
@@ -46992,22 +45679,8 @@ def RouteAuthoritativeResources(
         PhysicalAssignmentArcTelemetry["Applied"] = True
         return Mutable
 
-    EscalationLevel = max(
-        0,
-        LayerCount - AdaptiveBudget.LayerCount,
-    )
     AssignmentExpansionLimit = (
-        min(
-            AdaptiveBudget.AssignmentExpansions,
-            Policy.AdaptiveRouting.InitialAssignmentExpansions
-            * Policy.AdaptiveRouting.AssignmentGrowthFactor ** EscalationLevel,
-        )
-        if Policy.AdaptiveRouting.Enabled
-        else Policy.TrackAssignment.MaximumAssignmentExpansions
-    )
-    RuntimeEscalationState = replace(
-        RuntimeEscalationState,
-        AssignmentBudget=AssignmentExpansionLimit,
+        Policy.TrackAssignment.MaximumAssignmentExpansions
     )
 
     PublishedPhysicalLocalAccessCandidateNoGoods: set[
@@ -47826,98 +46499,6 @@ def RouteAuthoritativeResources(
             }),
             NativeDeadlineExceeded=True,
         )
-
-    if (
-        UseNegotiatedPortalDomain
-        and not UseNegotiatedRouting
-        and len(Profiles) <= 32
-        and set(CandidatesBySignal) == set(Profiles)
-        and all(CandidatesBySignal.values())
-    ):
-        HybridPlan = PlanNegotiatedWithTelemetry(
-            Context,
-            Profiles,
-            RouteRequestsBySignal,
-            RouteMetadataBySignal,
-            Region,
-            ReservedAccess,
-            Resources,
-            Technology,
-            Policy,
-            Deadline,
-            AdaptiveExpiresAt,
-            CheckRuntimeBudget,
-            RegenerateSignals=RegenerateSignals,
-            SeedCandidatesBySignal={
-                Signal: tuple(Values)
-                for Signal, Values in CandidatesBySignal.items()
-            },
-            LocalClaimReleaseDiagnostics=LocalClaimReleaseDiagnostics,
-            RequestHigherLayerOnExactCut=False,
-            AdvancePlacementOnExhaustedExactCut=False,
-            CompleteSeedDomain=True,
-        )
-        MissingHybridSignals = tuple(sorted(
-            set(Profiles) - set(HybridPlan.SelectedCandidates)
-        ))
-        if MissingHybridSignals:
-            raise StructuredRoutingStageError(RoutingFailure(
-                Reason=RoutingFailureReason.TrackAssignmentConflict,
-                Stage="NegotiatedDetailedRouting",
-                AffectedNets=MissingHybridSignals,
-                Detail=(
-                    "hybrid exact-seeded negotiation produced no legal "
-                    "route tree"
-                ),
-                RepairActions=("RelocateAffectedClusters",),
-                Diagnostics={
-                    "MissingSignals": list(MissingHybridSignals),
-                    "OverflowProgression": list(
-                        HybridPlan.OverflowProgression
-                    ),
-                    **HybridPlan.Diagnostics,
-                },
-            ))
-        return RouteAuthoritativeResources(
-            Placed,
-            Resources,
-            SearchMarginX,
-            SearchMarginZ,
-            MaximumRoutingHeight,
-            Policy,
-            Technology,
-            ProgressCallback,
-            DiagnosticCallback,
-            AdaptiveLayerFloor=LayerCount,
-            SharedRoutingStarted=RoutingStarted,
-            EscalationHistory=(*EscalationHistory, {
-                "Stage": "TrackAssignment",
-                "Action": "validate-hybrid-exact-seeded-negotiation",
-                "OverflowProgression": list(
-                    HybridPlan.OverflowProgression
-                ),
-            }),
-            ReservationVariant=ReservationVariant,
-            LaneDiversityLevel=LaneDiversityLevel,
-            CandidateDiversityLevel=CandidateDiversityLevel,
-            SkipStrictPortalReservation=True,
-            EscalationStates=EscalationStates,
-            Deadline=Deadline,
-            RetainedCandidateCache={
-                Signal: (Candidate,)
-                for Signal, Candidate in (
-                    HybridPlan.SelectedCandidates.items()
-                )
-            },
-            RetainedCandidateMetadata=None,
-            PriorCandidateCache=None,
-            PriorCandidateMetadata=None,
-            RegenerateSignals=frozenset(),
-            RawPortalCache=EffectiveRawPortalCache,
-            PreparedPortalCache=EffectivePreparedPortalCache,
-            LocalClaimReleaseHistory=LocalClaimReleaseHistory,
-        )
-
     StageTimings["AssignmentPreparation"] = (
         monotonic() - AssignmentPreparationStarted
     )
@@ -47984,7 +46565,95 @@ def RouteAuthoritativeResources(
     )
     LayerCappedAssignmentAttempts: list[dict[str, int | bool]] = []
     Result = None
-    if Policy.TrackAssignment.MinimizeMaximumRoutingLayer:
+    if FrozenTrackAssignmentPreparation is not None:
+        FrozenSelections = tuple(
+            (str(Signal), str(CandidateId))
+            for Signal, CandidateId in (
+                FrozenTrackAssignmentPreparation.SelectedCandidateIds
+            )
+        )
+        FrozenSignals = frozenset(
+            Signal for Signal, _CandidateId in FrozenSelections
+        )
+        CandidateIdsBySignal = {
+            Signal: frozenset(
+                Candidate.CandidateId for Candidate in Candidates
+            )
+            for Signal, Candidates in CandidatesBySignal.items()
+        }
+        MissingFrozenSelections = tuple(sorted(
+            (Signal, CandidateId)
+            for Signal, CandidateId in FrozenSelections
+            if CandidateId not in CandidateIdsBySignal.get(Signal, ())
+        ))
+        if (
+            FrozenSignals != frozenset(CandidatesBySignal)
+            or len(FrozenSignals) != len(FrozenSelections)
+            or MissingFrozenSelections
+        ):
+            raise StructuredRoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                Stage="FrozenTrackAssignmentHandoff",
+                RepairActions=(),
+                Detail=(
+                    "the authoritative candidate domain no longer contains "
+                    "the pre-placement capacity witness"
+                ),
+                Diagnostics={
+                    "Complete": False,
+                    "FrozenSignalCount": len(FrozenSignals),
+                    "RoutedSignalCount": len(CandidatesBySignal),
+                    "MissingFrozenSelections": [
+                        list(Value)
+                        for Value in MissingFrozenSelections[:16]
+                    ],
+                },
+            ))
+        Result = SimpleNamespace(
+            Success=True,
+            SelectedCandidateIds=FrozenSelections,
+            ExpansionCount=0,
+            ConflictSignals=(),
+            ConflictResourceIndices=(),
+            BudgetExhausted=False,
+            DeadlineExceeded=False,
+        )
+        WorkTelemetry["PrePlacementTrackAssignmentHandoff"] = {
+            "Applied": True,
+            "SelectedSignalCount": len(FrozenSelections),
+            "PrePlacementExpansionCount": (
+                FrozenTrackAssignmentPreparation.ExpansionCount
+            ),
+            "NativeAssignmentExpansionCount": 0,
+        }
+    if (
+        Result is None
+        and PlacementAccessAssignment is not None
+        and getattr(PlacementAccessAssignment, "Success", False)
+        and set(CandidatesBySignal) == set(Profiles)
+        and all(len(Values) == 1 for Values in CandidatesBySignal.values())
+    ):
+        Result = SimpleNamespace(
+            Success=True,
+            SelectedCandidateIds=tuple(
+                (Signal, Values[0].CandidateId)
+                for Signal, Values in sorted(CandidatesBySignal.items())
+            ),
+            ExpansionCount=0,
+            ConflictSignals=(),
+            ConflictResourceIndices=(),
+            BudgetExhausted=False,
+            DeadlineExceeded=False,
+        )
+        WorkTelemetry["PlacementAccessAssignmentReuse"] = {
+            "Applied": True,
+            "AssignmentFingerprint": (
+                PlacementAccessAssignment.AssignmentFingerprint
+            ),
+            "SelectedSignalCount": len(CandidatesBySignal),
+            "NativeAssignmentExpansionCount": 0,
+        }
+    if Result is None and Policy.TrackAssignment.MinimizeMaximumRoutingLayer:
         MinimumFeasibleLayer = max(
             min(Candidate.Layer for Candidate in Values)
             for Values in CandidatesBySignal.values()
@@ -48066,242 +46735,6 @@ def RouteAuthoritativeResources(
     PhysicalGlobalCompletedPairNoGoodEdges: tuple[
         tuple[str, str], ...
     ] = ()
-    if Resources.PreparingPhysicalComponentGlobalChannels:
-        # Exact physical-domain completion is already conflict-directed: only
-        # signals named by the current native cut are advanced.  Use a wider
-        # first tranche than ordinary witness generation so a complete pair
-        # certificate does not pay for the same native assignment at 4, 8,
-        # and 16 descriptors before reaching a useful domain slice.
-        PhysicalGlobalInitialSuffixTrancheSize = max(
-            InitialRequestLimit,
-            32,
-        )
-        PhysicalGlobalSuffixTrancheSizes = {
-            Signal: PhysicalGlobalInitialSuffixTrancheSize
-            for Signal in CandidatesBySignal
-        }
-        def PhysicalAssignmentIsComplete(Value: Any) -> bool:
-            SelectedSignals = frozenset(
-                str(Signal)
-                for Signal, _CandidateId
-                in Value.SelectedCandidateIds
-            )
-            return bool(
-                Value.Success
-                and frozenset(CandidatesBySignal) <= SelectedSignals
-            )
-
-        # Candidate generation above stops once every signal owns a legal
-        # witness.  An exact assignment cut is the authority to advance only
-        # the involved lazy cursors.  Consume one deterministic tranche, rerun
-        # assignment in-place, and repeat without entering the legacy recursive
-        # control cascade.
-        while (
-            not PhysicalAssignmentIsComplete(Result)
-            and not Deadline.IsExpired()
-        ):
-            if ShouldGrowAssignmentBudget(Result):
-                if (
-                    Policy.AdaptiveRouting.Enabled
-                    and AssignmentExpansionLimit
-                    < AdaptiveBudget.AssignmentExpansions
-                ):
-                    NextAssignmentExpansionLimit = GrowAssignmentExpansionLimit(
-                        AssignmentExpansionLimit,
-                        AdaptiveBudget.AssignmentExpansions,
-                        Policy.AdaptiveRouting.AssignmentGrowthFactor,
-                    )
-                    if NextAssignmentExpansionLimit > AssignmentExpansionLimit:
-                        AssignmentRetryHistory.append({
-                            "Stage": "PhysicalComponentGlobalAssignment",
-                            "Action": "complete-fixed-plan-assignment-domain",
-                            "FromAssignmentExpansionLimit": (
-                                AssignmentExpansionLimit
-                            ),
-                            "ToAssignmentExpansionLimit": (
-                                NextAssignmentExpansionLimit
-                            ),
-                            "ExactExpansions": Result.ExpansionCount,
-                            "Reason": (
-                                "the immutable physical plan enlarged its "
-                                "lazy candidate domain"
-                            ),
-                        })
-                        AssignmentExpansionLimit = NextAssignmentExpansionLimit
-                        RuntimeEscalationState = replace(
-                            RuntimeEscalationState,
-                            AssignmentBudget=AssignmentExpansionLimit,
-                        )
-                        CheckRuntimeBudget(
-                            "PhysicalComponentGlobalAssignmentCompletion"
-                        )
-                        Result = PlanAssignment()
-                        RaiseForNativeAssignmentDeadline(Result)
-                        continue
-                # A bounded failure over a strict prefix cannot close the
-                # physical channel domain.  Grow that domain from the exact
-                # conflict cut even when the legacy assignment budget has
-                # reached its flat-routing ceiling.
-            RemainingRequestCounts = (
-                BuildPhysicalRouteDescriptorRemainingCounts(
-                    Resources
-                    .PhysicalSignalRouteDomainContinuationCache,
-                    ApertureCandidateDomainIdentityBySignal,
-                    PhysicalRequestDomainFingerprintsBySignal,
-                    PhysicalRequestDescriptorFingerprintsBySignal,
-                )
-            )
-            PhysicalGlobalCompletedPairNoGoodEdges = (
-                SelectCompletedPhysicalGlobalPairNoGoodEdges(
-                    Result,
-                    RemainingRequestCounts,
-                )
-            )
-            if PhysicalGlobalCompletedPairNoGoodEdges:
-                break
-            ArcEmptySignals = tuple(
-                Signal
-                for Signal in PhysicalAssignmentArcTelemetry.get(
-                    "EmptySignals",
-                    (),
-                )
-                if int(RemainingRequestCounts.get(Signal, 0)) > 0
-            )
-            ArcBlockerSignals = tuple(sorted({
-                str(BlockerSignal)
-                for EmptySignal in PhysicalAssignmentArcTelemetry.get(
-                    "EmptySignals",
-                    (),
-                )
-                for BlockerSignal in dict(
-                    PhysicalAssignmentArcTelemetry.get(
-                        "BlockerSignalsByEmptySignal",
-                        {},
-                    )
-                ).get(str(EmptySignal), ())
-                if int(RemainingRequestCounts.get(
-                    str(BlockerSignal),
-                    0,
-                )) > 0
-            }))
-            PairSupportSuffixSignals = (
-                SelectPhysicalGlobalPairSupportSuffixSignals(
-                    CandidatesBySignal,
-                    (
-                        Signal
-                        for Signal in CandidatesBySignal
-                        if int(RemainingRequestCounts.get(Signal, 0)) == 0
-                    ),
-                    RemainingRequestCounts,
-                )
-            )
-            NativePairCutSuffixSignals = (
-                SelectPhysicalGlobalNativePairCutSuffixSignals(
-                    Result,
-                    RemainingRequestCounts,
-                )
-            )
-            ExactCutSuffixSignals = (
-                SelectPhysicalGlobalAssignmentSuffixSignals(
-                    CandidatesBySignal,
-                    Result.SelectedCandidateIds,
-                    getattr(Result, "ConflictSignals", ()),
-                    RemainingRequestCounts,
-                )
-            )
-            SuffixSignals = (
-                NativePairCutSuffixSignals
-                if NativePairCutSuffixSignals
-                else tuple(sorted({
-                    *ArcEmptySignals,
-                    *ArcBlockerSignals,
-                    *PairSupportSuffixSignals,
-                    *ExactCutSuffixSignals,
-                }))
-            )
-            if not SuffixSignals:
-                # Native implementations predating conflict-cut reporting can
-                # return neither a partial prefix nor conflict signals.  Only
-                # that proof-neutral case advances every open cursor.
-                SuffixSignals = (
-                    SelectOpenPhysicalGlobalCandidateDomainSignals(
-                        RemainingRequestCounts
-                    )
-                )
-            if not SuffixSignals:
-                break
-            TrancheRecords = tuple(
-                PhysicalGlobalCandidateSuffixConsumers[Signal](
-                    PhysicalGlobalSuffixTrancheSizes[Signal]
-                )
-                for Signal in SuffixSignals
-                if Signal in PhysicalGlobalCandidateSuffixConsumers
-            )
-            ExecutedRequestCount = sum(
-                int(Record["RequestCount"])
-                for Record in TrancheRecords
-            )
-            if ExecutedRequestCount == 0:
-                break
-            for Record in TrancheRecords:
-                Signal = str(Record["Signal"])
-                PhysicalGlobalSuffixTrancheSizes[Signal] = min(
-                    max(
-                        PhysicalGlobalInitialSuffixTrancheSize,
-                        PhysicalGlobalSuffixTrancheSizes[Signal] * 2,
-                    ),
-                    max(
-                        PhysicalGlobalInitialSuffixTrancheSize,
-                        int(Record["RemainingRequestCount"]),
-                    ),
-                )
-            for Signal in SuffixSignals:
-                CandidateLookup.update({
-                    Candidate.CandidateId: Candidate
-                    for Candidate in CandidatesBySignal[Signal]
-                })
-            CheckRuntimeBudget("PhysicalComponentGlobalAssignmentSuffix")
-            Result = PlanAssignment()
-            RaiseForNativeAssignmentDeadline(Result)
-            PhysicalGlobalAssignmentSuffixHistory.append({
-                "Iteration": len(PhysicalGlobalAssignmentSuffixHistory),
-                "Signals": list(SuffixSignals),
-                "Tranches": list(TrancheRecords),
-                "ExecutedRequestCount": ExecutedRequestCount,
-                "NextTrancheSizes": {
-                    Signal: PhysicalGlobalSuffixTrancheSizes[Signal]
-                    for Signal in SuffixSignals
-                },
-                "AssignmentSuccess": PhysicalAssignmentIsComplete(Result),
-                "AssignmentExpansionCount": int(Result.ExpansionCount),
-                "AssignmentBudgetExhausted": bool(
-                    ShouldGrowAssignmentBudget(Result)
-                ),
-                "PairSupportSuffixSignals": list(
-                    PairSupportSuffixSignals
-                ),
-                "NativePairCutSuffixSignals": list(
-                    NativePairCutSuffixSignals
-                ),
-                "ExactCutSuffixSignals": list(
-                    ExactCutSuffixSignals
-                ),
-            })
-        WorkTelemetry["PhysicalGlobalAssignmentSuffixExpansion"] = {
-            "Applied": bool(PhysicalGlobalAssignmentSuffixHistory),
-            "IterationCount": len(
-                PhysicalGlobalAssignmentSuffixHistory
-            ),
-            "RecursiveRetryCount": 0,
-            "Iterations": PhysicalGlobalAssignmentSuffixHistory,
-            "CompletedPairNoGoodEdges": [
-                list(Edge)
-                for Edge in PhysicalGlobalCompletedPairNoGoodEdges
-            ],
-        }
-        WorkTelemetry["PhysicalGlobalAssignmentArcConsistency"] = dict(
-            PhysicalAssignmentArcTelemetry
-        )
     PhysicalGlobalConflictResult = Result
     if PhysicalGlobalCompletedPairNoGoodEdges:
         PhysicalGlobalConflictResult = SimpleNamespace(
@@ -48391,118 +46824,6 @@ def RouteAuthoritativeResources(
             f" elapsed={StageTimings['Assignment']:.3f}s",
             flush=True,
         )
-    if (
-        not Result.Success
-        and UseNegotiatedPortalDomain
-        and not UseNegotiatedRouting
-        and 33 <= len(Profiles) <= 64
-        and CandidateDiversityLevel >= 6
-        and len(Result.SelectedCandidateIds) * 10 >= len(Profiles) * 9
-    ):
-        CandidateById = {
-            Candidate.CandidateId: Candidate
-            for Values in CandidatesBySignal.values()
-            for Candidate in Values
-        }
-        PartialCandidates = {
-            str(Signal): CandidateById[str(CandidateId)]
-            for Signal, CandidateId in Result.SelectedCandidateIds
-            if str(CandidateId) in CandidateById
-        }
-        MissingPartialSignals = frozenset(Profiles) - frozenset(
-            PartialCandidates
-        )
-        if MissingPartialSignals:
-            PartialHybridPlan = None
-            try:
-                PartialHybridPlan = PlanNegotiatedWithTelemetry(
-                    Context,
-                    Profiles,
-                    RouteRequestsBySignal,
-                    RouteMetadataBySignal,
-                    Region,
-                    ReservedAccess,
-                    Resources,
-                    Technology,
-                    Policy,
-                    Deadline,
-                    AdaptiveExpiresAt,
-                    CheckRuntimeBudget,
-                    RegenerateSignals=MissingPartialSignals,
-                    SeedCandidatesBySignal={
-                        Signal: (Candidate,)
-                        for Signal, Candidate in PartialCandidates.items()
-                    },
-                    InitialCandidatesBySignal={
-                        Signal: tuple(CandidatesBySignal[Signal])
-                        for Signal in MissingPartialSignals
-                    },
-                    LocalClaimReleaseDiagnostics=(
-                        LocalClaimReleaseDiagnostics
-                    ),
-                    RequestHigherLayerOnExactCut=False,
-                    AdvancePlacementOnExhaustedExactCut=False,
-                    CompleteSeedDomain=True,
-                )
-            except RoutingStageError as PartialHybridError:
-                if (
-                    PartialHybridError.Failure.Reason
-                    == RoutingFailureReason.RuntimeBudgetExceeded
-                ):
-                    raise
-            MissingHybridSignals = tuple(sorted(
-                frozenset(Profiles)
-                - frozenset(
-                    PartialHybridPlan.SelectedCandidates
-                    if PartialHybridPlan is not None
-                    else ()
-                )
-            ))
-            if PartialHybridPlan is not None and not MissingHybridSignals:
-                return RouteAuthoritativeResources(
-                    Placed,
-                    Resources,
-                    SearchMarginX,
-                    SearchMarginZ,
-                    MaximumRoutingHeight,
-                    Policy,
-                    Technology,
-                    ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=LayerCount,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(*EscalationHistory, {
-                        "Stage": "TrackAssignment",
-                        "Action": (
-                            "validate-partial-exact-seeded-negotiation"
-                        ),
-                        "InitialSelectedSignalCount": len(
-                            PartialCandidates
-                        ),
-                        "OverflowProgression": list(
-                            PartialHybridPlan.OverflowProgression
-                        ),
-                    }),
-                    ReservationVariant=ReservationVariant,
-                    LaneDiversityLevel=LaneDiversityLevel,
-                    CandidateDiversityLevel=CandidateDiversityLevel,
-                    SkipStrictPortalReservation=True,
-                    EscalationStates=EscalationStates,
-                    Deadline=Deadline,
-                    RetainedCandidateCache={
-                        Signal: (Candidate,)
-                        for Signal, Candidate in (
-                            PartialHybridPlan.SelectedCandidates.items()
-                        )
-                    },
-                    RetainedCandidateMetadata=None,
-                    PriorCandidateCache=None,
-                    PriorCandidateMetadata=None,
-                    RegenerateSignals=frozenset(),
-                    RawPortalCache=EffectiveRawPortalCache,
-                    PreparedPortalCache=EffectivePreparedPortalCache,
-                    LocalClaimReleaseHistory=LocalClaimReleaseHistory,
-                )
     if not Result.Success:
         if Policy.AdaptiveRouting.Enabled:
             ConflictClassificationStarted = monotonic()
@@ -48696,349 +47017,6 @@ def RouteAuthoritativeResources(
                         Diagnostics,
                     ),
                 )
-            if (
-                getattr(Placed, "RoutedComponentTemplates", ())
-                and not MandatoryCuts
-            ):
-                PriorTrunkCandidateIds = frozenset(
-                    str(Entry.get("TrunkCandidateId", ""))
-                    for Entry in EscalationHistory
-                    if (
-                        isinstance(Entry, dict)
-                        and Entry.get("Action")
-                        == "freeze-universal-global-trunk"
-                    )
-                )
-                UniversalHubSignals = tuple(sorted(
-                    Signal
-                    for Signal, Diagnostics in (
-                        ConflictGraph.get(
-                            "UniversalConflictHubs",
-                            {},
-                        )
-                    ).items()
-                    if (
-                        int(Diagnostics.get("PairDegree", 0))
-                        >= len(CandidatesBySignal) - 1
-                        and CandidatesBySignal.get(Signal)
-                    )
-                ))
-                if UniversalHubSignals:
-                    TrunkSignal = UniversalHubSignals[0]
-                    TrunkCandidates = tuple(sorted(
-                        (
-                            Candidate
-                            for Candidate
-                            in CandidatesBySignal[TrunkSignal]
-                            if Candidate.CandidateId
-                            not in PriorTrunkCandidateIds
-                        ),
-                        key=lambda Candidate: (
-                            len(Candidate.Claims.ResourceIds),
-                            Candidate.MaterialCost,
-                            Candidate.Length,
-                            Candidate.BendCount,
-                            Candidate.ViaCount,
-                            Candidate.CandidateId,
-                        ),
-                    ))
-                    if (
-                        TrunkCandidates
-                        and Deadline.RemainingSeconds() > 2.0
-                    ):
-                        TrunkCandidate = TrunkCandidates[0]
-                        RegeneratedSignals = frozenset(
-                            Signal
-                            for Signal in Profiles
-                            if Signal != TrunkSignal
-                        )
-                        TrunkAvoidancePositions = frozenset(
-                            Resource.Position
-                            for Resource
-                            in TrunkCandidate.Claims.ResourceIds
-                        )
-                        TrunkMetadata = {
-                            TrunkCandidate.CandidateId: (
-                                CandidateAxisLaneBySignal.get(
-                                    TrunkSignal,
-                                    {},
-                                ).get(TrunkCandidate.CandidateId)
-                            )
-                        }
-                        TrunkMetadata = {
-                            CandidateId: Value
-                            for CandidateId, Value
-                            in TrunkMetadata.items()
-                            if Value is not None
-                        }
-                        Escalation = {
-                            "Stage": "TrackAssignment",
-                            "Action": (
-                                "freeze-universal-global-trunk"
-                            ),
-                            "TrunkSignal": TrunkSignal,
-                            "TrunkCandidateId": (
-                                TrunkCandidate.CandidateId
-                            ),
-                            "TrunkCandidateResourceCount": len(
-                                TrunkCandidate.Claims.ResourceIds
-                            ),
-                            "RegeneratedSignalCount": len(
-                                RegeneratedSignals
-                            ),
-                            "PriorTrunkCandidateCount": len(
-                                PriorTrunkCandidateIds
-                            ),
-                        }
-                        return RouteAuthoritativeResources(
-                            Placed,
-                            Resources,
-                            SearchMarginX,
-                            SearchMarginZ,
-                            MaximumRoutingHeight,
-                            Policy,
-                            Technology,
-                            ProgressCallback,
-                            DiagnosticCallback,
-                            AdaptiveLayerFloor=AdaptiveLayerFloor,
-                            SharedRoutingStarted=RoutingStarted,
-                            EscalationHistory=(
-                                *EscalationHistory,
-                                Escalation,
-                            ),
-                            ReservationVariant=ReservationVariant,
-                            LaneDiversityLevel=LaneDiversityLevel,
-                            CandidateDiversityLevel=(
-                                CandidateDiversityLevel
-                            ),
-                            EscalationStates=EscalationStates,
-                            SkipStrictPortalReservation=(
-                                SkipStrictPortalReservation
-                            ),
-                            Deadline=Deadline,
-                            RawPortalCache=EffectiveRawPortalCache,
-                            RetainedCandidateCache={
-                                TrunkSignal: (TrunkCandidate,),
-                            },
-                            RetainedCandidateMetadata=(
-                                {
-                                    TrunkSignal: TrunkMetadata,
-                                }
-                                if TrunkMetadata
-                                else None
-                            ),
-                            RegenerateSignals=RegeneratedSignals,
-                            PreparedPortalCache=(
-                                EffectivePreparedPortalCache
-                            ),
-                            AvoidRoutingPositions=(
-                                AvoidRoutingPositions
-                                | TrunkAvoidancePositions
-                            ),
-                        )
-                PriorTrunkEntries = tuple(
-                    Entry
-                    for Entry in EscalationHistory
-                    if (
-                        isinstance(Entry, dict)
-                        and Entry.get("Action")
-                        == "freeze-universal-global-trunk"
-                    )
-                )
-                PriorCoverEntries = tuple(
-                    Entry
-                    for Entry in EscalationHistory
-                    if (
-                        isinstance(Entry, dict)
-                        and Entry.get("Action")
-                        == "freeze-global-conflict-cover"
-                    )
-                )
-                ResidualPairs = tuple(
-                    tuple(str(Signal) for Signal in Pair)
-                    for Pair in ConflictGraph.get(
-                        "PairwiseIncompatibleEdges",
-                        (),
-                    )
-                    if len(Pair) == 2
-                )
-                if (
-                    PriorTrunkEntries
-                    and ResidualPairs
-                    and len(ResidualPairs) <= 4
-                    and len(PriorCoverEntries) < 2
-                    and Deadline.RemainingSeconds() > 2.0
-                ):
-                    ResidualDegrees = Counter(
-                        Signal
-                        for Pair in ResidualPairs
-                        for Signal in Pair
-                    )
-                    CoverSignals = tuple(sorted(
-                        ResidualDegrees,
-                        key=lambda Signal: (
-                            -ResidualDegrees[Signal],
-                            len(CandidatesBySignal.get(Signal, ())),
-                            tuple(sorted(
-                                (
-                                    len(Candidate.Claims.ResourceIds),
-                                    Candidate.Length,
-                                    Candidate.BendCount,
-                                    Candidate.ViaCount,
-                                )
-                                for Candidate
-                                in CandidatesBySignal.get(Signal, ())
-                            )),
-                        ),
-                    ))
-                    PriorCoverCandidateIds = frozenset(
-                        str(Entry.get("CoverCandidateId", ""))
-                        for Entry in PriorCoverEntries
-                    )
-                    CoverChoice = next(
-                        (
-                            (Signal, Candidate)
-                            for Signal in CoverSignals
-                            for Candidate in sorted(
-                                CandidatesBySignal.get(Signal, ()),
-                                key=lambda Value: (
-                                    len(Value.Claims.ResourceIds),
-                                    Value.MaterialCost,
-                                    Value.Length,
-                                    Value.BendCount,
-                                    Value.ViaCount,
-                                    Value.CandidateId,
-                                ),
-                            )
-                            if Candidate.CandidateId
-                            not in PriorCoverCandidateIds
-                        ),
-                        None,
-                    )
-                    if CoverChoice is not None:
-                        CoverSignal, CoverCandidate = CoverChoice
-                        FrozenCandidateIds = {
-                            str(Entry["TrunkSignal"]): str(
-                                Entry["TrunkCandidateId"]
-                            )
-                            for Entry in PriorTrunkEntries
-                            if (
-                                Entry.get("TrunkSignal")
-                                and Entry.get("TrunkCandidateId")
-                            )
-                        }
-                        FrozenCandidateIds.update({
-                            str(Entry["CoverSignal"]): str(
-                                Entry["CoverCandidateId"]
-                            )
-                            for Entry in PriorCoverEntries
-                            if (
-                                Entry.get("CoverSignal")
-                                and Entry.get("CoverCandidateId")
-                            )
-                        })
-                        FrozenCandidateIds[CoverSignal] = (
-                            CoverCandidate.CandidateId
-                        )
-                        FrozenCandidates = {
-                            Signal: next(
-                                (
-                                    Candidate
-                                    for Candidate
-                                    in CandidatesBySignal.get(Signal, ())
-                                    if Candidate.CandidateId
-                                    == CandidateId
-                                ),
-                                None,
-                            )
-                            for Signal, CandidateId
-                            in FrozenCandidateIds.items()
-                        }
-                        FrozenCandidates = {
-                            Signal: Candidate
-                            for Signal, Candidate
-                            in FrozenCandidates.items()
-                            if Candidate is not None
-                        }
-                        if CoverSignal in FrozenCandidates:
-                            RegeneratedSignals = frozenset(
-                                Signal
-                                for Signal in Profiles
-                                if Signal not in FrozenCandidates
-                            )
-                            FrozenAvoidancePositions = frozenset(
-                                Resource.Position
-                                for Candidate
-                                in FrozenCandidates.values()
-                                for Resource
-                                in Candidate.Claims.ResourceIds
-                            )
-                            Escalation = {
-                                "Stage": "TrackAssignment",
-                                "Action": (
-                                    "freeze-global-conflict-cover"
-                                ),
-                                "CoverSignal": CoverSignal,
-                                "CoverCandidateId": (
-                                    CoverCandidate.CandidateId
-                                ),
-                                "FrozenSignalCount": len(
-                                    FrozenCandidates
-                                ),
-                                "ResidualPairCount": len(
-                                    ResidualPairs
-                                ),
-                                "RegeneratedSignalCount": len(
-                                    RegeneratedSignals
-                                ),
-                            }
-                            return RouteAuthoritativeResources(
-                                Placed,
-                                Resources,
-                                SearchMarginX,
-                                SearchMarginZ,
-                                MaximumRoutingHeight,
-                                Policy,
-                                Technology,
-                                ProgressCallback,
-                                DiagnosticCallback,
-                                AdaptiveLayerFloor=AdaptiveLayerFloor,
-                                SharedRoutingStarted=RoutingStarted,
-                                EscalationHistory=(
-                                    *EscalationHistory,
-                                    Escalation,
-                                ),
-                                ReservationVariant=(
-                                    ReservationVariant
-                                ),
-                                LaneDiversityLevel=LaneDiversityLevel,
-                                CandidateDiversityLevel=(
-                                    CandidateDiversityLevel
-                                ),
-                                EscalationStates=EscalationStates,
-                                SkipStrictPortalReservation=(
-                                    SkipStrictPortalReservation
-                                ),
-                                Deadline=Deadline,
-                                RawPortalCache=(
-                                    EffectiveRawPortalCache
-                                ),
-                                RetainedCandidateCache={
-                                    Signal: (Candidate,)
-                                    for Signal, Candidate
-                                    in FrozenCandidates.items()
-                                },
-                                RegenerateSignals=(
-                                    RegeneratedSignals
-                                ),
-                                PreparedPortalCache=(
-                                    EffectivePreparedPortalCache
-                                ),
-                                AvoidRoutingPositions=(
-                                    AvoidRoutingPositions
-                                    | FrozenAvoidancePositions
-                                ),
-                            )
             StackedConflictPairs = tuple(
                 tuple(Pair)
                 for Pair in ConflictGraph["PairwiseIncompatibleEdges"]
@@ -49288,27 +47266,6 @@ def RouteAuthoritativeResources(
             for Signal in sorted(CandidatesBySignal)
         })
         ConflictFingerprint = BuildStableFingerprint(ConflictGraph)
-        EffectiveState = RoutingEscalationState(
-            PortalMode=("unreserved" if UnreservedPortalMode else "reserved"),
-            ReservationVariant=ReservationVariant,
-            LaneDiversityLevel=LaneDiversityLevel,
-            CandidateDiversityLevel=CandidateDiversityLevel,
-            EffectiveRoutingLayers=LayerCount,
-            AssignmentBudget=AssignmentExpansionLimit,
-            CandidateFingerprint=CandidateFingerprint,
-            ConflictFingerprint=ConflictFingerprint,
-        )
-        EffectiveWorkFingerprint = BuildStableFingerprint({
-            "PortalMode": EffectiveState.PortalMode,
-            "PortalReservations": [
-                Value.ToDictionary() for Value in PortalReservations
-            ],
-            "LaneCount": RouteLaneCount,
-            "LayerCount": LayerCount,
-            "AssignmentBudget": AssignmentExpansionLimit,
-            "CandidateFingerprint": CandidateFingerprint,
-            "ConflictFingerprint": ConflictFingerprint,
-        })
         if Resources.PreparingPhysicalComponentGlobalChannels:
             RemainingRequestCounts = (
                 BuildPhysicalRouteDescriptorRemainingCounts(
@@ -49626,882 +47583,9 @@ def RouteAuthoritativeResources(
                     "CandidateFingerprint": CandidateFingerprint,
                     "ConflictFingerprint": ConflictFingerprint,
                     "ConflictGraph": ConflictGraph,
-                    "EscalationHistory": (),
                     "ExecutableLegacyRepairCascade": False,
                 },
             ))
-        PriorWorkFingerprints = {
-            Entry.get("EffectiveWorkFingerprint")
-            for Entry in EscalationHistory
-            if isinstance(Entry, dict)
-        }
-        if ShouldHandoffContinuedCandidateRealizabilityCut(
-            EscalationHistory,
-            ConflictGraph,
-            ShouldGrowAssignmentBudget(Result),
-        ):
-            AnonymousCandidateDomainFingerprints = {
-                Signal: BuildAnonymousCandidateDomainFingerprint(Candidates)
-                for Signal, Candidates in CandidatesBySignal.items()
-            }
-            HandoffConflictGraph = {
-                **ConflictGraph,
-                "CompleteAssignmentCutProof": True,
-                "PriorityRelocationSignals": (
-                    SelectAnonymousMinimumFailurePairRelocationSignals(
-                        ConflictGraph,
-                        AnonymousCandidateDomainFingerprints,
-                    )
-                ),
-            }
-            raise StructuredRoutingStageError(
-                RoutingFailure(
-                    Reason=RoutingFailureReason.TrackAssignmentConflict,
-                    Stage="TrackAssignment",
-                    AffectedNets=tuple(
-                        sorted(ConflictGraph.get("ConflictSignals", ()))
-                    ),
-                    RepairActions=(
-                        "RelocateAffectedClusters",
-                        "AdvancePlacementCandidate",
-                    ),
-                    Detail=(
-                        "the continued unique access-distinct candidate "
-                        "proved a complete assignment cut; return it before "
-                        "repeating unchanged routing controls"
-                    ),
-                    Diagnostics={
-                        "Action": (
-                            "handoff-continued-candidate-realizability-cut"
-                        ),
-                        "CompleteAssignmentCutProof": True,
-                        "EscalationHistory": tuple(EscalationHistory),
-                        "ConflictGraph": HandoffConflictGraph,
-                        "RoutingEscalationState": (
-                            EffectiveState.ToDictionary()
-                        ),
-                        "EffectiveWorkFingerprint": (
-                            EffectiveWorkFingerprint
-                        ),
-                        "CandidateFingerprint": CandidateFingerprint,
-                        "ConflictFingerprint": ConflictFingerprint,
-                    },
-                )
-            )
-        if EffectiveWorkFingerprint in PriorWorkFingerprints:
-            RepeatedTransition = ChooseRepeatedWorkTransition(
-                UnreservedPortalMode,
-                Deadline,
-            )
-            if RepeatedTransition.Action == "TryUnreservedPortals":
-                NoOpReservationEscalation = {
-                    "Stage": "TrackAssignment",
-                    "Action": "try-bounded-unreserved-portals",
-                    "Reason": (
-                        "reserved portal retry reproduced identical effective "
-                        "work; advance once to the complete generated portal set"
-                    ),
-                    "FromPortalMode": "reserved",
-                    "ToPortalMode": "unreserved",
-                    "ReservationVariant": ReservationVariant,
-                    "RoutingEscalationState": EffectiveState.ToDictionary(),
-                    "EffectiveWorkFingerprint": EffectiveWorkFingerprint,
-                    "CandidateFingerprint": CandidateFingerprint,
-                    "ConflictFingerprint": ConflictFingerprint,
-                }
-                return RouteAuthoritativeResources(
-                    Placed,
-                    Resources,
-                    SearchMarginX,
-                    SearchMarginZ,
-                    MaximumRoutingHeight,
-                    Policy,
-                    Technology,
-                    ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=AdaptiveLayerFloor,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(
-                        *EscalationHistory,
-                        NoOpReservationEscalation,
-                    ),
-                    ReservationVariant=ReservationVariant,
-                    LaneDiversityLevel=LaneDiversityLevel,
-                    CandidateDiversityLevel=CandidateDiversityLevel,
-                    SkipStrictPortalReservation=(
-                        RepeatedTransition.SkipStrictPortalReservation
-                    ),
-                    EscalationStates=EscalationStates,
-                    Deadline=RepeatedTransition.Deadline,
-                    RawPortalCache=EffectiveRawPortalCache,
-                )
-            raise StructuredRoutingStageError(
-                RoutingFailure(
-                    Reason=RoutingFailureReason.Stagnated,
-                    Stage="TrackAssignment",
-                    AffectedNets=tuple(ConflictGraph.get("ConflictSignals", ())),
-                    Detail=(
-                        "routing escalation reproduced the same portals, "
-                        "candidates, conflicts, layers, and assignment budget"
-                    ),
-                    Diagnostics={
-                        "EscalationHistory": tuple(EscalationHistory),
-                        "RoutingEscalationState": EffectiveState.ToDictionary(),
-                        "EffectiveWorkFingerprint": EffectiveWorkFingerprint,
-                        "CandidateFingerprint": CandidateFingerprint,
-                        "ConflictFingerprint": ConflictFingerprint,
-                        "ConflictGraph": ConflictGraph,
-                    },
-                )
-            )
-        MaximumLayerCount = (
-            min(Technology.MaximumRoutableLayerCount, PolicyLayerLimit)
-            if PolicyLayerLimit > 0
-            else Technology.MaximumRoutableLayerCount
-        )
-        PairwiseConflictAttempts = sum(
-            1
-            for EscalationEntry in EscalationHistory
-            if isinstance(EscalationEntry, dict)
-            and EscalationEntry.get("Stage") == "TrackAssignment"
-            and EscalationEntry.get("ConflictClassification")
-            == "pairwise-incompatibility"
-        )
-        if (
-            bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE"))
-            and Policy.AdaptiveRouting.Enabled
-            and ConflictGraph["Classification"] == "pairwise-incompatibility"
-            and ConflictGraph["PairwiseIncompatibleEdges"]
-            and PairwiseConflictAttempts >= 6
-        ):
-            print(
-                "[debug] authoritative: pairwise conflict attempt budget reached; "
-                f"continuing adaptive escalation (attempts={PairwiseConflictAttempts})",
-                flush=True,
-            )
-        if monotonic() - RoutingStarted < AdaptiveBudget.RuntimeSeconds:
-            FailureKind = (
-                "assignment work budget remained exhausted"
-                if ShouldGrowAssignmentBudget(Result)
-                else "complete candidate set has no capacity-one assignment"
-            )
-            Escalation = {
-                "Stage": "TrackAssignment",
-                "AssignmentExpansions": Result.ExpansionCount,
-                "ExactExpansions": Result.ExpansionCount,
-                "BudgetExhausted": ShouldGrowAssignmentBudget(Result),
-                "FailureNet": Result.FailureNet,
-                "Reason": FailureKind,
-                "ConflictClassification": ConflictGraph["Classification"],
-                "PairwiseIncompatible": HasPairwiseIncompatibility,
-                "RoutingEscalationState": EffectiveState.ToDictionary(),
-                "EffectiveWorkFingerprint": EffectiveWorkFingerprint,
-                "CandidateFingerprint": CandidateFingerprint,
-                "ConflictFingerprint": ConflictFingerprint,
-                "PairwiseIncompatibleEdges": [
-                    list(Pair)
-                    for Pair in ConflictGraph.get(
-                        "PairwiseIncompatibleEdges",
-                        (),
-                    )
-                ],
-                # Candidate regeneration can intentionally widen beyond the
-                # physical cut to diversify a retained assignment. Preserve
-                # the exact geometry feedback separately so a later slice
-                # timeout does not relocate that broad regeneration cover.
-                "RelocationSignals": list(
-                    ConflictGraph.get("RelocationSignals", ())
-                ),
-                "PriorityRelocationSignals": list(
-                    ConflictGraph.get("PriorityRelocationSignals", ())
-                ),
-            }
-            EscalationDecision = ChooseRoutingEscalationAction(
-                Classification=ConflictGraph["Classification"],
-                BudgetExhausted=bool(
-                    getattr(Result, "BudgetExhausted", False)
-                ),
-                State=EffectiveState,
-                MaximumAssignmentBudget=AdaptiveBudget.AssignmentExpansions,
-                MaximumReservationVariants=(
-                    Policy.AdaptiveRouting.MaximumPortalReservationAlternatives
-                    if Policy.AdaptiveRouting.Enabled
-                    else ReservationVariant + 1
-                ),
-                MaximumLaneDiversityLevels=(
-                    (
-                        Policy.AdaptiveRouting.MaximumLaneDiversityEscalations
-                        if (
-                            not PlacementWasRelocated
-                            or PlacementWasBroadlyRelocated
-                            or ConflictGraph["Classification"]
-                            == "relocated-pairwise-incompatibility"
-                        )
-                        else min(
-                            2,
-                            Policy.AdaptiveRouting.MaximumLaneDiversityEscalations,
-                        )
-                    )
-                    if Policy.AdaptiveRouting.Enabled
-                    else LaneDiversityLevel + 1
-                ),
-                MaximumCandidateDiversityLevels=(
-                    (
-                        Policy.AdaptiveRouting
-                        .MaximumCandidateDiversityEscalations
-                        if (
-                            not PlacementWasRelocated
-                            or AllowRelocatedStarvationLaneRetry
-                        )
-                        else CandidateDiversityLevel + 1
-                    )
-                    if Policy.AdaptiveRouting.Enabled
-                    else CandidateDiversityLevel + 1
-                ),
-                MaximumEffectiveRoutingLayers=(
-                    EffectiveMaximumLayerCount
-                    if Policy.AdaptiveRouting.Enabled
-                    else LayerCount
-                ),
-            )
-            PriorRegeneratedSignals = frozenset({
-                *RegenerateSignals,
-                *(
-                    str(Signal)
-                    for Entry in EscalationHistory
-                    if isinstance(Entry, dict)
-                    and Entry.get("Action")
-                    == "regenerate-affected-candidates"
-                    for Signal in Entry.get("AffectedSignals", ())
-                ),
-            })
-            NewExactConflictSignals = frozenset(
-                (
-                    SelectPlacementRelocationSignals(ConflictGraph)
-                    if ConflictGraph["Classification"]
-                    == "relocated-higher-order-conflict"
-                    else SelectCandidateRegenerationSignals(ConflictGraph)
-                )
-            )
-            CanEscalateExistingExactCut = (
-                ConflictGraph["Classification"]
-                in {
-                    "relocated-higher-order-conflict",
-                    "relocated-larger-matching-failure",
-                    "relocated-multi-pair-conflict",
-                    "relocated-pairwise-incompatibility",
-                }
-                and CandidateDiversityLevel
-                < (
-                    Policy.AdaptiveRouting
-                    .MaximumCandidateDiversityEscalations
-                    - 1
-                )
-            )
-            if (
-                EscalationDecision.Action
-                in {"AdvancePlacement", "IncreaseLaneDiversity"}
-                and not UseNegotiatedRouting
-                and (
-                    CanEscalateExistingExactCut
-                    or ShouldRegenerateNewExactConflictSignals(
-                        str(ConflictGraph["Classification"]),
-                        len(Profiles),
-                        PriorRegeneratedSignals,
-                        NewExactConflictSignals,
-                    )
-                )
-            ):
-                EscalationDecision = replace(
-                    EscalationDecision,
-                    Action="RegenerateAffectedCandidates",
-                    Reason=(
-                        "the exact conflict cut contains endpoints that have "
-                        "not received the final candidate-domain expansion"
-                    ),
-                )
-            CoveredPairCutAfterEndpointExpansion = (
-                PlacementWasRelocated
-                and HasCoveredPairCutAfterEndpointExpansion(
-                    EscalationHistory,
-                    ConflictGraph,
-                )
-            )
-            AllowCoordinatedPairRetry = (
-                TopologyRequiresJointPortfolio
-                and bool(CoordinatedCandidateDiversificationSignals)
-                and CandidateDiversityLevel == 0
-            )
-            if CoveredPairCutAfterEndpointExpansion and not AllowCoordinatedPairRetry:
-                EscalationDecision = replace(
-                    EscalationDecision,
-                    Action="AdvancePlacement",
-                    Reason=(
-                        "the current capacity-one pair cut is covered by a "
-                        "prior endpoint-only candidate-domain expansion"
-                    ),
-                )
-                Escalation[
-                    "CoveredPairCutAfterEndpointExpansion"
-                ] = True
-            elif CoveredPairCutAfterEndpointExpansion:
-                EscalationDecision = replace(
-                    EscalationDecision,
-                    Action="RegenerateAffectedCandidates",
-                    Reason=(
-                        "access-distinct dense lease evidence authorizes one "
-                        "cut-scoped coordinated candidate regeneration"
-                    ),
-                )
-                Escalation["AccessDistinctLeasePairRetry"] = True
-            Escalation["Decision"] = EscalationDecision.Action
-            Escalation["DecisionReason"] = EscalationDecision.Reason
-            AdaptiveElapsedSeconds = monotonic() - RoutingStarted
-            AdaptiveRemainingSeconds = max(
-                0.0,
-                AdaptiveBudget.RuntimeSeconds - AdaptiveElapsedSeconds,
-            )
-            ObservedPassSeconds = monotonic() - RoutingCallStarted
-            if (
-                EscalationDecision.Action != "AdvancePlacement"
-                and not HasAdaptiveEscalationBudget(
-                    AdaptiveRemainingSeconds,
-                    ObservedPassSeconds,
-                    bool(EscalationHistory),
-                )
-            ):
-                if TopologyRequiresJointPortfolio:
-                    # A topology epoch owns the remaining global time.  Do
-                    # not spend its last per-placement slice attempting a
-                    # routing-control pass that we have already proved cannot
-                    # finish; return the authoritative cut so the placement
-                    # scheduler can materialize the next access-distinct
-                    # exact state.  The compact/ripple path preserves the
-                    # established hard failure and retry behavior.
-                    EscalationDecision = replace(
-                        EscalationDecision,
-                        Action="AdvancePlacement",
-                        Reason=(
-                            "the next routing control pass cannot fit the "
-                            "candidate slice; topology epoch requires an "
-                            "access-distinct exact placement"
-                        ),
-                    )
-                    Escalation["Action"] = (
-                        "advance-placement-topology-slice-handoff"
-                    )
-                    Escalation["Decision"] = EscalationDecision.Action
-                    Escalation["DecisionReason"] = EscalationDecision.Reason
-                else:
-                    Escalation.update({
-                        "Action": "advance-placement-insufficient-adaptive-slice",
-                        "AdaptiveElapsedSeconds": round(
-                            AdaptiveElapsedSeconds,
-                            6,
-                        ),
-                        "AdaptiveRemainingSeconds": round(
-                            AdaptiveRemainingSeconds,
-                            6,
-                        ),
-                        "ObservedPassSeconds": round(ObservedPassSeconds, 6),
-                    })
-                    raise StructuredRoutingStageError(
-                        RoutingFailure(
-                            Reason=RoutingFailureReason.TrackAssignmentConflict,
-                            Stage="TrackAssignment",
-                            AffectedNets=tuple(
-                                sorted(ConflictGraph.get("ConflictSignals", ()))
-                            ),
-                            Detail=(
-                                "the next routing control pass cannot fit the "
-                                "remaining per-placement escalation slice"
-                            ),
-                            RepairActions=("AdvancePlacementCandidate",),
-                            Diagnostics={
-                                "EscalationHistory": tuple(
-                                    (*EscalationHistory, Escalation)
-                                ),
-                                "ConflictGraph": ConflictGraph,
-                                "RoutingEscalationState": (
-                                    EffectiveState.ToDictionary()
-                                ),
-                                "EffectiveWorkFingerprint": (
-                                    EffectiveWorkFingerprint
-                                ),
-                            },
-                        )
-                    )
-            if EscalationDecision.Action == "AdvancePlacement":
-                Escalation["Action"] = (
-                    "advance-placement-conflict-relocation"
-                    if ConflictGraph["Classification"]
-                    in {
-                        "higher-order-placement-conflict",
-                        "multi-pair-placement-conflict",
-                        "relocated-higher-order-conflict",
-                        "relocated-larger-matching-failure",
-                        "relocated-multi-pair-conflict",
-                        "relocated-pairwise-incompatibility",
-                        "portal-coverage-pair-conflict",
-                        "stacked-placement-conflict",
-                    }
-                    else "advance-placement"
-                )
-                raise StructuredRoutingStageError(
-                    RoutingFailure(
-                        Reason=RoutingFailureReason.TrackAssignmentConflict,
-                        Stage="TrackAssignment",
-                        AffectedNets=tuple(
-                            sorted(ConflictGraph.get("ConflictSignals", ()))
-                        ),
-                        RepairActions=(
-                            "RelocateAffectedClusters",
-                            "AdvancePlacementCandidate",
-                        ),
-                        Detail=(
-                            f"{EscalationDecision.Reason}; the current placement "
-                            "has no remaining meaningful routing control change"
-                        ),
-                        Diagnostics={
-                            "EscalationHistory": tuple(
-                                (*EscalationHistory, Escalation)
-                            ),
-                            "ConflictGraph": ConflictGraph,
-                            "RoutingEscalationState": EffectiveState.ToDictionary(),
-                            "EffectiveWorkFingerprint": EffectiveWorkFingerprint,
-                        },
-                    )
-                )
-            if (
-                EscalationDecision.Action == "RegenerateAffectedCandidates"
-            ):
-                ExactCutExpansion = (
-                    ConflictGraph["Classification"]
-                    == "portal-coverage-pair-conflict"
-                    and bool(
-                        ConflictGraph.get(
-                            "PairwiseIncompatibleEdges",
-                            (),
-                        )
-                    )
-                ) or (
-                    not UseNegotiatedRouting
-                    and 33 <= len(Profiles) <= 72
-                    and ConflictGraph["Classification"]
-                    in {
-                        "multi-pair-placement-conflict",
-                        "relocated-larger-matching-failure",
-                        "relocated-multi-pair-conflict",
-                        "relocated-higher-order-conflict",
-                        "relocated-pairwise-incompatibility",
-                    }
-                    and bool(
-                        frozenset(
-                            SelectCandidateRegenerationSignals(
-                                ConflictGraph
-                            )
-                        )
-                        - PriorRegeneratedSignals
-                    )
-                    or CanEscalateExistingExactCut
-                )
-                FinalRelocatedCutExpansion = ExactCutExpansion and (
-                    bool(
-                        ConflictGraph.get(
-                            "PairwiseIncompatibleEdges",
-                            (),
-                        )
-                    )
-                    or ConflictGraph["Classification"]
-                    in {
-                        "relocated-higher-order-conflict",
-                        "relocated-larger-matching-failure",
-                    }
-                )
-                AffectedSignals = frozenset(
-                    (
-                        SelectCandidateRegenerationSignals(ConflictGraph)
-                        if (
-                            ConflictGraph["Classification"]
-                            == "portal-coverage-pair-conflict"
-                        )
-                        else SelectCandidateRegenerationCoverSignals(
-                            ConflictGraph,
-                            PriorRegeneratedSignals,
-                            (
-                                frozenset(Profiles)
-                                if (
-                                    not UseNegotiatedRouting
-                                    and 33 <= len(Profiles) <= 72
-                                    and CandidateDiversityLevel == 2
-                                )
-                                else frozenset()
-                            ),
-                        )
-                    )
-                    if FinalRelocatedCutExpansion
-                    else ConflictGraph.get("NoCandidateSignals", ())
-                )
-                if not AffectedSignals:
-                    AffectedSignals = frozenset(
-                        ConflictGraph.get("ConflictSignals", ())
-                    )
-                SelectedPartialSignals = frozenset(
-                    str(Signal)
-                    for Signal, _CandidateId in getattr(
-                        Result,
-                        "SelectedCandidateIds",
-                        (),
-                    )
-                )
-                FreezePartialAssignment = False
-                FinalCandidateDiversityLevel = (
-                    Policy.AdaptiveRouting
-                    .MaximumCandidateDiversityEscalations
-                    - 1
-                )
-                if FinalRelocatedCutExpansion:
-                    IntermediateDiversityLevel = max(
-                        1,
-                        min(2, FinalCandidateDiversityLevel - 1),
-                    )
-                    HasFreshAffectedSignals = bool(
-                        AffectedSignals - PriorRegeneratedSignals
-                    )
-                    FreezePartialAssignment = (
-                        ShouldFreezePartialAssignmentForExactCut(
-                            str(ConflictGraph["Classification"]),
-                            len(SelectedPartialSignals),
-                            len(Profiles),
-                            HasFreshAffectedSignals,
-                        )
-                    )
-                    if FreezePartialAssignment:
-                        MissingPartialSignals = (
-                            frozenset(Profiles)
-                            - SelectedPartialSignals
-                        )
-                        PartialBlockerSignals = (
-                            SelectPartialAssignmentBlockerSignals(
-                                list(getattr(
-                                    Result,
-                                    "SelectedCandidateIds",
-                                    (),
-                                )),
-                                CandidatesBySignal,
-                                MissingPartialSignals,
-                                MaximumBlockers=(
-                                    48
-                                    if (
-                                        len(SelectedPartialSignals) * 10
-                                        >= len(Profiles) * 9
-                                    )
-                                    else 16
-                                ),
-                            )
-                        )
-                        AffectedSignals = (
-                            AffectedSignals
-                            | MissingPartialSignals
-                            | PartialBlockerSignals
-                        )
-                    NextCandidateDiversityLevel = max(
-                        CandidateDiversityLevel,
-                        IntermediateDiversityLevel,
-                    )
-                    if (
-                        not HasFreshAffectedSignals
-                        and NextCandidateDiversityLevel
-                        < FinalCandidateDiversityLevel
-                    ):
-                        NextCandidateDiversityLevel += 1
-                else:
-                    NextCandidateDiversityLevel = (
-                        CandidateDiversityLevel + 1
-                    )
-                ReleaseFrozenPartialAssignment = (
-                    ShouldReleaseFrozenPartialAssignment(
-                        FreezePartialAssignment,
-                        NextCandidateDiversityLevel,
-                        FinalCandidateDiversityLevel,
-                    )
-                )
-                RetainedCandidates, RetainedMetadata = (
-                    RetainPartialAssignmentCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        list(getattr(
-                            Result,
-                            "SelectedCandidateIds",
-                            (),
-                        )),
-                        AffectedSignals,
-                    )
-                    if (
-                        FreezePartialAssignment
-                        and not ReleaseFrozenPartialAssignment
-                    )
-                    else RetainUnaffectedCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        AffectedSignals,
-                    )
-                )
-                Escalation.update({
-                    "Action": "regenerate-affected-candidates",
-                    "AffectedSignals": sorted(AffectedSignals),
-                    "FromCandidateDiversityLevel": CandidateDiversityLevel,
-                    "ToCandidateDiversityLevel": (
-                        NextCandidateDiversityLevel
-                    ),
-                    "ExactPairEndpointExpansion": (
-                        ExactCutExpansion
-                    ),
-                    "ReleasedFrozenPartialAssignment": (
-                        ReleaseFrozenPartialAssignment
-                    ),
-                })
-                return RouteAuthoritativeResources(
-                    Placed,
-                    Resources,
-                    SearchMarginX,
-                    SearchMarginZ,
-                    MaximumRoutingHeight,
-                    Policy,
-                    Technology,
-                    ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=AdaptiveLayerFloor,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(*EscalationHistory, Escalation),
-                    ReservationVariant=ReservationVariant,
-                    LaneDiversityLevel=LaneDiversityLevel,
-                    CandidateDiversityLevel=NextCandidateDiversityLevel,
-                    EscalationStates=EscalationStates,
-                    SkipStrictPortalReservation=SkipStrictPortalReservation,
-                    Deadline=Deadline,
-                    RawPortalCache=EffectiveRawPortalCache,
-                    RetainedCandidateCache=RetainedCandidates or None,
-                    RetainedCandidateMetadata=RetainedMetadata or None,
-                    PriorCandidateCache={
-                        Signal: tuple(CandidatesBySignal[Signal])
-                        for Signal in AffectedSignals
-                        if CandidatesBySignal.get(Signal)
-                    } or None,
-                    PriorCandidateMetadata={
-                        Signal: dict(
-                            CandidateAxisLaneBySignal.get(Signal, {})
-                        )
-                        for Signal in AffectedSignals
-                        if CandidatesBySignal.get(Signal)
-                    } or None,
-                    RegenerateSignals=AffectedSignals,
-                    PreparedPortalCache=EffectivePreparedPortalCache,
-                    AvoidRoutingPositions=(
-                        SelectConflictAvoidancePositions(ConflictGraph)
-                        | (
-                            SelectPartialAssignmentAvoidancePositions(
-                                list(getattr(
-                                    Result,
-                                    "SelectedCandidateIds",
-                                    (),
-                                )),
-                                CandidatesBySignal,
-                                AffectedSignals,
-                            )
-                            if FreezePartialAssignment
-                            else frozenset()
-                        )
-                    ),
-                )
-            if (
-                EscalationDecision.Action == "ChangePortalReservation"
-            ):
-                LocalizePortalRegeneration = not LocalClaims
-                RetainedCandidates, RetainedMetadata = (
-                    RetainUnaffectedCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        AffectedCandidateSignals,
-                    )
-                    if LocalizePortalRegeneration
-                    else ({}, {})
-                )
-                Escalation.update({
-                    "Action": "alternate-portal-slots",
-                    "AffectedSignals": sorted(AffectedCandidateSignals),
-                    "LocalizedCandidateRegeneration": (
-                        LocalizePortalRegeneration
-                    ),
-                    "FromReservationVariant": ReservationVariant,
-                    "ToReservationVariant": ReservationVariant + 1,
-                })
-                return RouteAuthoritativeResources(
-                    Placed, Resources, SearchMarginX, SearchMarginZ,
-                    MaximumRoutingHeight, Policy, Technology, ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=AdaptiveLayerFloor,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(*EscalationHistory, Escalation),
-                    ReservationVariant=ReservationVariant + 1,
-                    LaneDiversityLevel=LaneDiversityLevel,
-                    CandidateDiversityLevel=0,
-                    EscalationStates=EscalationStates,
-                    SkipStrictPortalReservation=SkipStrictPortalReservation,
-                    Deadline=Deadline,
-                    RawPortalCache=EffectiveRawPortalCache,
-                    PreparedPortalCache=EffectivePreparedPortalCache,
-                    RetainedCandidateCache=RetainedCandidates or None,
-                    RetainedCandidateMetadata=RetainedMetadata or None,
-                    RegenerateSignals=(
-                        AffectedCandidateSignals
-                        if LocalizePortalRegeneration
-                        else frozenset()
-                    ),
-                )
-            if EscalationDecision.Action == "TryUnreservedPortals":
-                LocalizePortalRegeneration = not LocalClaims
-                RetainedCandidates, RetainedMetadata = (
-                    RetainUnaffectedCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        AffectedCandidateSignals,
-                    )
-                    if LocalizePortalRegeneration
-                    else ({}, {})
-                )
-                Escalation.update({
-                    "Action": "try-bounded-unreserved-portals",
-                    "AffectedSignals": sorted(AffectedCandidateSignals),
-                    "LocalizedCandidateRegeneration": (
-                        LocalizePortalRegeneration
-                    ),
-                    "FromPortalMode": "reserved",
-                    "ToPortalMode": "unreserved",
-                    "ReservationVariant": ReservationVariant,
-                })
-                return RouteAuthoritativeResources(
-                    Placed, Resources, SearchMarginX, SearchMarginZ,
-                    MaximumRoutingHeight, Policy, Technology, ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=AdaptiveLayerFloor,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(*EscalationHistory, Escalation),
-                    ReservationVariant=ReservationVariant,
-                    LaneDiversityLevel=LaneDiversityLevel,
-                    CandidateDiversityLevel=CandidateDiversityLevel,
-                    EscalationStates=EscalationStates,
-                    SkipStrictPortalReservation=True,
-                    Deadline=Deadline,
-                    RawPortalCache=EffectiveRawPortalCache,
-                    RetainedCandidateCache=RetainedCandidates or None,
-                    RetainedCandidateMetadata=RetainedMetadata or None,
-                    RegenerateSignals=(
-                        AffectedCandidateSignals
-                        if LocalizePortalRegeneration
-                        else frozenset()
-                    ),
-                )
-            if (
-                EscalationDecision.Action == "IncreaseLaneDiversity"
-            ):
-                NextLaneDiversityLevel = LaneDiversityLevel + 1
-                RetainedCandidates, RetainedMetadata = (
-                    RetainUnaffectedCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        AffectedCandidateSignals,
-                    )
-                )
-                Escalation.update({
-                    "Action": "increase-guide-lane-diversity",
-                    "AffectedSignals": sorted(AffectedCandidateSignals),
-                    "FromLaneDiversityLevel": LaneDiversityLevel,
-                    "ToLaneDiversityLevel": NextLaneDiversityLevel,
-                })
-                return RouteAuthoritativeResources(
-                    Placed, Resources, SearchMarginX, SearchMarginZ,
-                    MaximumRoutingHeight, Policy, Technology, ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=AdaptiveLayerFloor,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(*EscalationHistory, Escalation),
-                    ReservationVariant=ReservationVariant,
-                    LaneDiversityLevel=NextLaneDiversityLevel,
-                    CandidateDiversityLevel=CandidateDiversityLevel,
-                    EscalationStates=EscalationStates,
-                    SkipStrictPortalReservation=SkipStrictPortalReservation,
-                    Deadline=Deadline,
-                    RawPortalCache=EffectiveRawPortalCache,
-                    PreparedPortalCache=EffectivePreparedPortalCache,
-                    RetainedCandidateCache=RetainedCandidates or None,
-                    RetainedCandidateMetadata=RetainedMetadata or None,
-                    PriorCandidateCache={
-                        Signal: tuple(Values)
-                        for Signal, Values in CandidatesBySignal.items()
-                        if Values and Signal in AffectedCandidateSignals
-                    },
-                    PriorCandidateMetadata={
-                        Signal: dict(Values)
-                        for Signal, Values in CandidateAxisLaneBySignal.items()
-                        if Signal in AffectedCandidateSignals
-                    },
-                    RegenerateSignals=AffectedCandidateSignals,
-                )
-            if (
-                EscalationDecision.Action == "AddRoutingLayer"
-            ):
-                NextLayerCount = SelectEscalatedRoutingLayerCount(
-                    LayerCount=LayerCount,
-                    EffectiveMaximumLayerCount=EffectiveMaximumLayerCount,
-                    ConflictClassification=str(
-                        ConflictGraph["Classification"]
-                    ),
-                    ForceMaximumAfterPlacementRelocation=(
-                        Policy.Placement
-                        .ForceMaximumRoutingLayersAfterPlacementRelocation
-                    ),
-                )
-                RetainedCandidates, RetainedMetadata = (
-                    RetainUnaffectedCandidateCache(
-                        CandidatesBySignal,
-                        CandidateAxisLaneBySignal,
-                        AffectedCandidateSignals,
-                    )
-                )
-                Escalation.update({
-                    "Action": "add-routing-layer",
-                    "AffectedSignals": sorted(AffectedCandidateSignals),
-                    "FromLayerCount": LayerCount,
-                    "ToLayerCount": NextLayerCount,
-                })
-                return RouteAuthoritativeResources(
-                    Placed, Resources, SearchMarginX, SearchMarginZ,
-                    MaximumRoutingHeight, Policy, Technology, ProgressCallback,
-                    DiagnosticCallback,
-                    AdaptiveLayerFloor=NextLayerCount,
-                    SharedRoutingStarted=RoutingStarted,
-                    EscalationHistory=(*EscalationHistory, Escalation),
-                    ReservationVariant=0,
-                    LaneDiversityLevel=0,
-                    CandidateDiversityLevel=0,
-                    EscalationStates=EscalationStates,
-                    SkipStrictPortalReservation=SkipStrictPortalReservation,
-                    Deadline=Deadline,
-                    RetainedCandidateCache=RetainedCandidates or None,
-                    RetainedCandidateMetadata=RetainedMetadata or None,
-                    PriorCandidateCache={
-                        Signal: tuple(Values)
-                        for Signal, Values in CandidatesBySignal.items()
-                        if Values and Signal in AffectedCandidateSignals
-                    },
-                    PriorCandidateMetadata={
-                        Signal: dict(Values)
-                        for Signal, Values in CandidateAxisLaneBySignal.items()
-                        if Signal in AffectedCandidateSignals
-                    },
-                    RegenerateSignals=AffectedCandidateSignals,
-                )
         Locations = tuple(
             AssignmentIndexed.ResourcePositions[Index]
             for Index in Result.ConflictResourceIndices[:8]
@@ -50528,7 +47612,11 @@ def RouteAuthoritativeResources(
                         ZeroCompatibilityPairs.append((FirstSignal, SecondSignal))
         raise StructuredRoutingStageError(
             RoutingFailure(
-                Reason=RoutingFailureReason.TrackAssignmentConflict,
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                    if ShouldGrowAssignmentBudget(Result)
+                    else RoutingFailureReason.TrackAssignmentConflict
+                ),
                 Stage="Track",
                 AffectedNets=((Result.FailureNet,) if Result.FailureNet else ()),
                 Locations=Locations,
@@ -50545,9 +47633,7 @@ def RouteAuthoritativeResources(
                 Diagnostics={
                     **ConflictGraph,
                     "ConflictGraph": ConflictGraph,
-                    "EscalationHistory": tuple(EscalationHistory),
-                    "RoutingEscalationState": EffectiveState.ToDictionary(),
-                    "EffectiveWorkFingerprint": EffectiveWorkFingerprint,
+                    "Complete": not ShouldGrowAssignmentBudget(Result),
                     "CandidateFingerprint": CandidateFingerprint,
                     "ConflictFingerprint": ConflictFingerprint,
                 },
@@ -51338,7 +48424,7 @@ def RouteAuthoritativeResources(
             "LayerPenalty": Policy.DetailedRouting.LayerPenalty,
             "RoutingDemandEstimate": Demand.ToDictionary(),
             "DerivedRoutingBudget": AdaptiveBudget.ToDictionary(),
-            "EffectiveAdaptiveControls": {
+            "FixedRoutingControls": {
                 "LayerCount": LayerCount,
                 "MaximumPortalsPerTerminal": PortalLimit,
                 "LaneCount": RouteLaneCount,
@@ -51349,26 +48435,7 @@ def RouteAuthoritativeResources(
                     for Signal, Values in sorted(CandidatesBySignal.items())
                 },
             },
-            "RoutingEscalationState": RoutingEscalationState(
-                PortalMode=("unreserved" if UnreservedPortalMode else "reserved"),
-                ReservationVariant=ReservationVariant,
-                LaneDiversityLevel=LaneDiversityLevel,
-                CandidateDiversityLevel=CandidateDiversityLevel,
-                EffectiveRoutingLayers=LayerCount,
-                AssignmentBudget=AssignmentExpansionLimit,
-                CandidateFingerprint=BuildStableFingerprint({
-                    Signal: [
-                        Candidate.CandidateId
-                        for Candidate in CandidatesBySignal[Signal]
-                    ]
-                    for Signal in sorted(CandidatesBySignal)
-                }),
-            ).ToDictionary(),
             "Deadline": Deadline.ToDictionary(),
-            "AdaptiveEscalationHistory": [
-                *EscalationHistory,
-                *AssignmentRetryHistory,
-            ],
             "RustAssignmentUsed": True,
             "NativeBatching": {
                 "PortalRequestCount": WorkTelemetry["PortalRequestCount"],
@@ -51409,6 +48476,12 @@ def RouteAuthoritativeResources(
             ],
             "RustAssignmentExpansionLimit": AssignmentExpansionLimit,
             "RustAssignmentExpansions": InitialAssignmentExpansionCount,
+            "PrePlacementTrackAssignmentHandoff": dict(
+                WorkTelemetry.get(
+                    "PrePlacementTrackAssignmentHandoff",
+                    {"Applied": False},
+                )
+            ),
             "LayerCappedAssignmentAttempts": LayerCappedAssignmentAttempts,
             "LocalizedRepairPasses": len(RepairIterations),
             "LocalizedReroutedNetCount": len(ReroutedSignals),

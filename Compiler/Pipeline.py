@@ -101,7 +101,10 @@ def _JsonDiagnosticValue(Value: object) -> object:
 
 
 RoutingFailureArtifactAggregateDiagnosticKeys = frozenset({
+    "AdaptiveEscalationHistory",
+    "EscalationHistory",
     "PlacementAttempts",
+    "RoutingEscalationState",
 })
 
 
@@ -246,9 +249,6 @@ def BuildRoutingFingerprintEnvelope(
     Evidence: dict[str, object],
 ) -> dict[str, object]:
     """Normalize placement, graph, search, and conflict fingerprints."""
-    EscalationState = Evidence.get("RoutingEscalationState", {})
-    if not isinstance(EscalationState, dict):
-        EscalationState = {}
     SelectedPlacement = Evidence.get("SelectedPlacementCandidate", {})
     if not isinstance(SelectedPlacement, dict):
         SelectedPlacement = {}
@@ -312,14 +312,8 @@ def BuildRoutingFingerprintEnvelope(
             ),
         ),
         "ResourceGraph": ResourceGraphFingerprint,
-        "Candidate": Evidence.get(
-            "CandidateFingerprint",
-            EscalationState.get("CandidateFingerprint"),
-        ),
-        "Conflict": Evidence.get(
-            "ConflictFingerprint",
-            EscalationState.get("ConflictFingerprint"),
-        ),
+        "Candidate": Evidence.get("CandidateFingerprint"),
+        "Conflict": Evidence.get("ConflictFingerprint"),
         "EffectiveWork": Evidence.get("EffectiveWorkFingerprint"),
     }
 
@@ -404,10 +398,6 @@ def BuildSuccessRouterReliability(
         ),
         "SelectedPlacementCandidate": Evidence.get(
             "SelectedPlacementCandidate"
-        ),
-        "PlacementAttempts": Evidence.get("PlacementAttempts", []),
-        "RoutingEscalationState": Evidence.get(
-            "RoutingEscalationState", {}
         ),
         "Fingerprints": BuildRoutingFingerprintEnvelope(Evidence),
         "NativeWork": BuildNativeWorkSummary(
@@ -558,10 +548,9 @@ def WriteRoutingFailureArtifact(
                         list(Location) for Location in Failure.Locations
                     ],
                 },
-                "PlacementAttempts": Diagnostics.get("PlacementAttempts", []),
                 "EffectiveControls": Diagnostics.get(
-                    "RoutingEscalationState",
-                    Diagnostics.get("EffectiveAdaptiveControls", {}),
+                    "FixedRoutingControls",
+                    {},
                 ),
                 "Fingerprints": BuildRoutingFingerprintEnvelope(Diagnostics),
                 "NativeWork": BuildNativeWorkSummary(Diagnostics),

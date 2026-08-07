@@ -593,6 +593,7 @@ def RoutePcbAttempt(
     Deadline: RoutingDeadline | None = None,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
+    FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
     PrepareClusterInterfaceAssignmentOnly: bool = False,
@@ -750,6 +751,9 @@ def RoutePcbAttempt(
                 ReservationVariant=LeaseReservationVariant,
                 PreparePortalGeometryOnly=PreparePortalGeometryOnly,
                 PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
+                FrozenTrackAssignmentPreparation=(
+                    FrozenTrackAssignmentPreparation
+                ),
                 ValidateClusterInterfaceForeignAccessOnly=(
                     ValidateClusterInterfaceForeignAccessOnly
                 ),
@@ -1653,6 +1657,7 @@ def RoutePcbDesign(
     Deadline: RoutingDeadline | None = None,
     Resources: Any | None = None,
     RequireCompleteClusterInterfaceDomain: bool = False,
+    FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
 ) -> RoutedDesign:
     """Run one strict guided route and fail immediately if it is illegal."""
     Configuration = BuildPcbRoutingConfigurations(Placement)[0]
@@ -1803,6 +1808,9 @@ def RoutePcbDesign(
                     Deadline=VariantDeadline,
                     RequireCompleteClusterInterfaceDomain=(
                         RequireCompleteClusterInterfaceDomain
+                    ),
+                    FrozenTrackAssignmentPreparation=(
+                        FrozenTrackAssignmentPreparation
                     ),
                     PreparePortalGeometryOnly=(
                         LeaseStateCount > 1 and LeaseVariant == 0
