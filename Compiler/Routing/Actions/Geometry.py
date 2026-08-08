@@ -198,6 +198,28 @@ def BuildRoutingResources(
     )
 
 
+def ForkRoutingResourcesWithSharedStaticGeometry(
+    Source: RoutingResources,
+) -> RoutingResources:
+    """Create an isolated routing context over immutable placed geometry.
+
+    Sibling pre-route envelopes for one placed geometry may share static
+    occupancy and the resource graph's pure region/claim memoization.  They
+    must *not* share portal caches, prepared assignment state, native routing
+    contexts, or any proof result: those carry layer and envelope identity.
+    ``RoutingResources`` defaults create fresh values for all of that mutable
+    state, leaving only the immutable geometry/legality substrate shared.
+    """
+    if Source.ResourceGraph is None:
+        raise ValueError(
+            "routing-resource fork requires a static resource graph"
+        )
+    return RoutingResources(
+        StaticGeometry=Source.StaticGeometry,
+        ResourceGraph=Source.ResourceGraph,
+    )
+
+
 def AreConnected(First: Position3, Second: Position3) -> bool:
     """Return whether redstone dust at two coordinates can connect."""
     return DefaultRedstoneRoutingTechnology.AreConnected(First, Second)

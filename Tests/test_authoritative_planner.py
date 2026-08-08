@@ -6,7 +6,16 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from Compiler.Placement.Pcb import PlacementAssignmentConstraintSet
+import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
+from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
+from Compiler.Placement.AccessFabric import (
+    AttachPlacementAccessFabric,
+    BuildPlacementAccessFabric,
+)
+from Compiler.Placement.Pcb import (
+    PlacementAssignmentConstraintSet,
+    PlacePcbGraph,
+)
 from Compiler.Routing.AuthoritativePlanner import (
     BuildNegotiatedInitialColumns,
     BuildConfiguredPortalRequestDomainFingerprint,
@@ -149,6 +158,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     FilterPhysicalCandidatesToCurrentPortalDomain,
     ClassifyEmptyPhysicalCandidateDomains,
     ApplyPhysicalComponentAssemblyPortalDomains,
+    ApplyPlacementAccessFabricPortalDomains,
     SelectGenericPortalTerminalPaths,
     GetPersistentPhysicalComponentPortCspState,
     FindProofQualifiedCompleteDomainNoGoodCore,
@@ -275,6 +285,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     ShouldUseNegotiatedRouting,
     ShouldUseMatureStagedInitialCandidateScheduler,
     ShouldRunShapeOptimization,
+    FilterSourceConnectedTargetBranches,
     _BuildTargetPortalBranches,
     _MaterializeCandidate,
     _ReserveRepeaters,
@@ -301,6 +312,15 @@ from Compiler.Routing.Models import (
     FrozenPhysicalComponentPostClosurePortalHandoff,
     RoutingResources,
     RoutingStaticGeometry,
+    PlacementAccessEscapeStub,
+    PlacementAccessFabric,
+    PlacementAccessTerminalDomain,
+)
+from Compiler.Routing.Actions.Geometry import BuildRoutingResources
+from Compiler.Routing.Pcb import (
+    PrepareRawTrackAssignmentDomain,
+    PrepareTrackAssignment,
+    RoutePcbDesign,
 )
 from Compiler.Routing.ComponentPipeline import (
     BuildPhysicalLocalPortPairSupportCertificate,
@@ -15014,6 +15034,802 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         self.assertIn(Portal.Path[-1], Tree)
         self.assertNotIn(Portal.Path[-1], RawTree)
+
+    def testTargetPortalBranchKeepsSharedAccessForkAsOneChain(self) -> None:
+        """A shared access prefix must not turn into a terminal-side jump."""
+        Graph, Region, Context = self.BuildGraph()
+        Terminal = (0, 1, 0)
+        SharedAccessNode = (1, 1, 0)
+        AlternateAccessLanding = (2, 1, 0)
+        Portal = PinAccessPortal(
+            PortalId="A:shared-access-fork",
+            Signal="A",
+            Terminal=Terminal,
+            Layer=0,
+            Path=(Terminal, SharedAccessNode),
+            Edges=frozenset(),
+            Claims=RoutingResourceClaims(),
+            Length=2,
+            BendCount=0,
+            ViaCount=0,
+            Cost=2,
+        )
+
+        Branch = _BuildTargetPortalBranches(
+            (Portal,),
+            ((Terminal, SharedAccessNode, AlternateAccessLanding),),
+        )[0]
+
+        # The old de-duplication emitted
+        # ``shared -> terminal -> alternate``.  The last transition is not a
+        # routing edge, so native correctly rejected the whole request.
+        self.assertEqual(Branch, [SharedAccessNode, Terminal])
+        self.assertTrue(all(
+            Graph.BuildPrimitive(First, Second) is not None
+            for First, Second in zip(Branch, Branch[1:])
+        ))
+        Tree = Context.GenerateRouteTree(
+            [(4, 1, 0)],
+            [Branch],
+            sorted(Region.Nodes),
+            [(Index, 0) for Index in range(5)],
+            1,
+            0,
+            0,
+            0,
+            1_000,
+        )
+        self.assertIn(SharedAccessNode, Tree)
+        self.assertIn(Terminal, Tree)
+
+    def testSourceConnectedTargetBranchIsOmittedFromNativePayload(self) -> None:
+        Graph, _Region, _Context = self.BuildGraph()
+        Root = (0, 1, 0)
+        ConnectedBranch = (
+            (2, 1, 0),
+            (1, 1, 0),
+            Root,
+        )
+        DisconnectedBranch = ((4, 1, 0),)
+
+        Actual = FilterSourceConnectedTargetBranches(
+            Root,
+            (Root, (1, 1, 0), (2, 1, 0)),
+            (ConnectedBranch, DisconnectedBranch),
+            Graph,
+        )
+
+        self.assertEqual(Actual, (DisconnectedBranch,))
+
+    def testPlacementAccessFabricPublishesEveryStubPortalDeterministically(
+        self,
+    ) -> None:
+        """An unfrozen fabric owns the complete terminal escape domain."""
+        Graph, _Region, _Context = self.BuildGraph()
+        Terminal = (0, 1, 0)
+
+        def BuildStub(
+            Ingress: tuple[int, int, int],
+            Path: tuple[tuple[int, int, int], ...],
+        ) -> PlacementAccessEscapeStub:
+            return PlacementAccessEscapeStub(
+                Terminal=Terminal,
+                Ingress=Ingress,
+                Path=Path,
+                PhysicalClaims=Graph.BuildRouteClaims(Path),
+                CapacityResourceIds=(),
+                Complete=True,
+            )
+
+        FirstStub = BuildStub(
+            (1, 1, 0),
+            (Terminal, (1, 1, 0)),
+        )
+        SecondStub = BuildStub(
+            (0, 1, 1),
+            (Terminal, (0, 1, 1)),
+        )
+        ThirdStub = BuildStub(
+            (0, 3, 1),
+            (Terminal, (0, 2, 1), (0, 3, 1)),
+        )
+        Fabric = PlacementAccessFabric(
+            FabricFingerprint="fabric-domain",
+            Nodes=(
+                FirstStub.Ingress,
+                SecondStub.Ingress,
+                ThirdStub.Ingress,
+            ),
+            Edges=(),
+            IngressNodes=(
+                FirstStub.Ingress,
+                SecondStub.Ingress,
+                ThirdStub.Ingress,
+            ),
+            PhysicalClaims=RoutingResourceClaims(),
+            CapacityResourceIds=(),
+            TerminalDomains=(
+                PlacementAccessTerminalDomain(
+                    Signal="Signal",
+                    Terminal=Terminal,
+                    EscapeStubs=(FirstStub, SecondStub, ThirdStub),
+                    Complete=True,
+                ),
+            ),
+            TopologyKind="derived-perimeter-access-v1",
+            Complete=True,
+        )
+
+        def GenericPortal(
+            Layer: int,
+            Signal: str = "Signal",
+            PortalTerminal: tuple[int, int, int] = Terminal,
+        ) -> PinAccessPortal:
+            Path = ((9, 1 + 2 * Layer, 0),)
+            return PinAccessPortal(
+                PortalId=f"generic:{Signal}:{Layer}",
+                Signal=Signal,
+                Terminal=PortalTerminal,
+                Layer=Layer,
+                Path=Path,
+                Edges=frozenset(),
+                Claims=Graph.BuildRouteClaims(Path),
+                Length=len(Path),
+                BendCount=0,
+                ViaCount=0,
+                Cost=len(Path),
+            )
+
+        UnrelatedKey = ("Other", (4, 1, 0), 0)
+        Unrelated = (GenericPortal(
+            0,
+            Signal="Other",
+            PortalTerminal=UnrelatedKey[1],
+        ),)
+        GenericPortals = {
+            ("Signal", Terminal, 0): (GenericPortal(0),),
+            ("Signal", Terminal, 1): (GenericPortal(1),),
+            UnrelatedKey: Unrelated,
+        }
+
+        First = ApplyPlacementAccessFabricPortalDomains(
+            GenericPortals,
+            Fabric,
+            Graph,
+            DefaultRedstoneRoutingTechnology,
+            0,
+            2,
+        )
+        Second = ApplyPlacementAccessFabricPortalDomains(
+            GenericPortals,
+            Fabric,
+            Graph,
+            DefaultRedstoneRoutingTechnology,
+            0,
+            2,
+        )
+
+        self.assertEqual(First, Second)
+        self.assertIs(First[UnrelatedKey], Unrelated)
+        self.assertEqual(
+            [Portal.PortalId for Portal in First[("Signal", Terminal, 0)]],
+            [
+                "Signal:(0, 1, 0):0:AccessFabricDomain:fabric-domain:0",
+                "Signal:(0, 1, 0):0:AccessFabricDomain:fabric-domain:1",
+            ],
+        )
+        self.assertEqual(
+            [Portal.PortalId for Portal in First[("Signal", Terminal, 1)]],
+            [
+                "Signal:(0, 1, 0):1:AccessFabricDomain:fabric-domain:2",
+            ],
+        )
+        self.assertEqual(
+            [Portal.Layer for Values in First.values() for Portal in Values
+             if Portal.Signal == "Signal"],
+            [0, 0, 1],
+        )
+        self.assertTrue(all(
+            "generic:" not in Portal.PortalId
+            for Values in First.values()
+            for Portal in Values
+            if Portal.Signal == "Signal"
+        ))
+
+    def testUnassignedPlacementAccessFabricDomainReachesTrackPreparation(
+        self,
+    ) -> None:
+        """Track preparation receives every retained fabric alternative."""
+        Module = ModuleIR(
+            Name="AccessFabricPortalPreparation",
+            Inputs=["A", "B"],
+            Outputs=["Z"],
+            Gates=[
+                Gate("InputA", GateKind.INPUT, ["A"]),
+                Gate("InputB", GateKind.INPUT, ["B"]),
+                Gate("Nand", GateKind.NAND, ["Z"], ["A", "B"]),
+                Gate("OutputZ", GateKind.OUTPUT, [], ["Z"]),
+            ],
+        )
+        Netlist = NetlistIR(
+            Top=Module.Name,
+            Modules={Module.Name: Module},
+        )
+        Placement = PlacePcbGraph(
+            Netlist,
+            RoutingSpacing=0,
+            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
+        )
+        BuiltFabric = BuildPlacementAccessFabric(
+            Placement,
+            TopologyKind="derived-perimeter-access-v1",
+            AccessRingTrackCount=1,
+        )
+        Domain = next(
+            Value for Value in BuiltFabric.TerminalDomains
+            if Value.Signal == "Z"
+        )
+        # Keep a compact two-layer domain small enough that exact preparation
+        # can demonstrate every choice rather than a policy-sized slice.
+        Fabric = replace(
+            BuiltFabric,
+            TerminalDomains=(replace(
+                Domain,
+                EscapeStubs=Domain.EscapeStubs[:3],
+            ),),
+        )
+        AttachedPlacement = AttachPlacementAccessFabric(Placement, Fabric)
+        Resources = BuildRoutingResources(AttachedPlacement.Placed)
+        MinimumY = min(
+            GateValue.Y
+            for GateValue in AttachedPlacement.Placed.PlacedGates
+        )
+        ExpectedPortalIds = {
+            Portal.PortalId
+            for Values in ApplyPlacementAccessFabricPortalDomains(
+                {},
+                Fabric,
+                Resources.ResourceGraph,
+                DefaultRedstoneRoutingTechnology,
+                MinimumY,
+                AttachedPlacement.LayerCount,
+            ).values()
+            for Portal in Values
+        }
+        SeenPortalIds: set[str] = set()
+        OriginalIdentity = (
+            AuthoritativePlanner.BuildCandidateRequestGeometryIdentity
+        )
+
+        def RecordCandidateRequestIdentity(
+            SourcePortalId: str,
+            TargetPortalIds: tuple[str, ...],
+            *Arguments: object,
+            **KeywordArguments: object,
+        ) -> tuple[object, ...]:
+            SeenPortalIds.add(SourcePortalId)
+            SeenPortalIds.update(TargetPortalIds)
+            return OriginalIdentity(
+                SourcePortalId,
+                TargetPortalIds,
+                *Arguments,
+                **KeywordArguments,
+            )
+
+        with patch.object(
+            AuthoritativePlanner,
+            "BuildCandidateRequestGeometryIdentity",
+            RecordCandidateRequestIdentity,
+        ):
+            Preparation = PrepareTrackAssignment(
+                AttachedPlacement,
+                Resources=Resources,
+                Policy=LocalFirstPhysicalDesignPolicy,
+                Deadline=RoutingDeadline.Start(5.0),
+            )
+
+        self.assertTrue(Preparation.Success)
+        self.assertTrue(Preparation.Complete)
+        self.assertTrue(ExpectedPortalIds)
+        self.assertEqual(SeenPortalIds, ExpectedPortalIds)
+        self.assertTrue(all(
+            "AccessFabricDomain:" in PortalId
+            for PortalId in SeenPortalIds
+        ))
+        self.assertTrue(all(
+            Count > 0
+            for _Signal, Count in Preparation.CandidateCounts
+        ))
+
+    def testRawTrackAssignmentDomainStopsBeforeNativeAssignment(
+        self,
+    ) -> None:
+        """One frozen envelope exports the same values without solving them."""
+        from Compiler.Placement.PcbFlow import (
+            BuildDerivedRoutingEnvelopeDomain,
+            BuildFrozenEnvelopeRoutingPolicy,
+            BuildPlacementAccessDemand,
+        )
+
+        Module = ModuleIR(
+            Name="RawTrackAssignmentDomain",
+            Inputs=["A", "B"],
+            Outputs=["Z"],
+            Gates=[
+                Gate("InputA", GateKind.INPUT, ["A"]),
+                Gate("InputB", GateKind.INPUT, ["B"]),
+                Gate("Nand", GateKind.NAND, ["Z"], ["A", "B"]),
+                Gate("OutputZ", GateKind.OUTPUT, [], ["Z"]),
+            ],
+        )
+        Netlist = NetlistIR(
+            Top=Module.Name,
+            Modules={Module.Name: Module},
+        )
+        Placement = PlacePcbGraph(
+            Netlist,
+            RoutingSpacing=0,
+            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
+        )
+        Demand = BuildPlacementAccessDemand(
+            Placement,
+            0,
+            DefaultRedstoneRoutingTechnology,
+        )
+        Envelope = BuildDerivedRoutingEnvelopeDomain(
+            Demand,
+            Placement,
+        )[0]
+        Policy = BuildFrozenEnvelopeRoutingPolicy(
+            LocalFirstPhysicalDesignPolicy,
+            Envelope,
+        )
+        NativeContext = AuthoritativePlanner.RustRoutingContext
+
+        class RefuseAssignmentContext:
+            def __init__(self, *Arguments) -> None:
+                self.Inner = NativeContext(*Arguments)
+
+            def __getattr__(self, Name):
+                return getattr(self.Inner, Name)
+
+            def PlanAuthoritativeRoutesBounded(self, *_Arguments):
+                raise AssertionError(
+                    "raw-domain preparation must not run assignment"
+                )
+
+            def PlanAuthoritativeRoutesWithBaseBounded(
+                self,
+                *_Arguments,
+            ):
+                raise AssertionError(
+                    "raw-domain preparation must not run assignment"
+                )
+
+        with patch.object(
+            AuthoritativePlanner,
+            "RustRoutingContext",
+            RefuseAssignmentContext,
+        ):
+            Domain = PrepareRawTrackAssignmentDomain(
+                Placement,
+                Resources=BuildRoutingResources(Placement.Placed),
+                Policy=Policy,
+                Deadline=RoutingDeadline.Start(5.0),
+            )
+
+        self.assertTrue(Domain.Complete)
+        self.assertFalse(Domain.IncompleteReason)
+        self.assertGreater(len(Domain.Values), 0)
+        self.assertTrue(Domain.CandidateDomainFingerprint)
+        self.assertIsNotNone(Domain.NativeAssignmentContext)
+        self.assertTrue(all(
+            Count > 0
+            for _Signal, Count in Domain.CandidateCounts
+        ))
+
+    def testRawTemplateSelectionFreezesTheOnlyRouteAssignment(
+        self,
+    ) -> None:
+        """The selected raw witness reaches routing without a second solve."""
+        from Compiler.Placement.PcbFlow import (
+            BuildDerivedRoutingEnvelopeDomain,
+            BuildFrozenEnvelopeRoutingPolicy,
+            BuildPlacementAccessDemand,
+        )
+        from Compiler.Routing.TemplateAssignment import (
+            RawTrackAssignmentProblem,
+            RawTrackAssignmentTemplate,
+            SolveRawTrackAssignmentProblemWithContext,
+        )
+
+        Module = ModuleIR(
+            Name="RawTemplateFrozenHandoff",
+            Inputs=["A", "B"],
+            Outputs=["Z"],
+            Gates=[
+                Gate("InputA", GateKind.INPUT, ["A"]),
+                Gate("InputB", GateKind.INPUT, ["B"]),
+                Gate("Nand", GateKind.NAND, ["Z"], ["A", "B"]),
+                Gate("OutputZ", GateKind.OUTPUT, [], ["Z"]),
+            ],
+        )
+        Netlist = NetlistIR(
+            Top=Module.Name,
+            Modules={Module.Name: Module},
+        )
+        Placement = PlacePcbGraph(
+            Netlist,
+            RoutingSpacing=0,
+            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
+        )
+        Demand = BuildPlacementAccessDemand(
+            Placement,
+            0,
+            DefaultRedstoneRoutingTechnology,
+        )
+        Envelope = BuildDerivedRoutingEnvelopeDomain(
+            Demand,
+            Placement,
+        )[0]
+        Policy = BuildFrozenEnvelopeRoutingPolicy(
+            LocalFirstPhysicalDesignPolicy,
+            Envelope,
+        )
+        Placement = replace(
+            Placement,
+            LayerCount=Envelope.RoutingLayerCount,
+        )
+        Resources = BuildRoutingResources(Placement.Placed)
+        Fabric = BuildPlacementAccessFabric(
+            Placement,
+            Resources=Resources,
+            Technology=DefaultRedstoneRoutingTechnology,
+            AccessLength=Envelope.AccessLength,
+            TopologyKind="derived-perimeter-access-v1",
+            AccessRingTrackCount=Envelope.AccessRingTrackCount,
+            DeriveLegalEscapeWorkLimit=True,
+        )
+        # The raw authoritative selector owns all portal/stub choices.  Do
+        # not attach a local capacity assignment here: that would collapse
+        # the finite fabric domain to a preselected terminal witness.
+        Placement = AttachPlacementAccessFabric(Placement, Fabric)
+        Resources = BuildRoutingResources(Placement.Placed)
+        Domain = PrepareRawTrackAssignmentDomain(
+            Placement,
+            Resources=Resources,
+            Policy=Policy,
+            Deadline=RoutingDeadline.Start(5.0),
+        )
+        Selection = SolveRawTrackAssignmentProblemWithContext(
+            RawTrackAssignmentProblem(
+                Templates=(RawTrackAssignmentTemplate(
+                    TemplateId="only",
+                    Objective=(1,),
+                    Domain=Domain,
+                ),),
+                MaximumAssignmentExpansions=(
+                    Domain.MaximumAssignmentExpansions
+                ),
+            ),
+            Deadline=RoutingDeadline.Start(5.0),
+        )
+
+        self.assertTrue(Selection.Success)
+        self.assertTrue(Selection.Complete)
+        self.assertIsNotNone(Selection.Preparation)
+        self.assertTrue(Domain.Complete)
+        self.assertTrue(dict(Domain.Diagnostics)[
+            "ExcludedConfiguredRequestCounts"
+        ])
+        Routed = RoutePcbDesign(
+            Placement,
+            Resources=Resources,
+            Policy=Policy,
+            Deadline=RoutingDeadline.Start(5.0),
+            FrozenTrackAssignmentPreparation=Selection.Preparation,
+        )
+
+        self.assertTrue(Routed.ZeroResourceConflicts)
+        self.assertEqual(Routed.AssignmentExpansionCount, 0)
+
+    def testPreRouteLocalClaimChoiceUsesOneNativeAssignment(
+        self,
+    ) -> None:
+        """A complete local tree is one value in the frozen capacity solve.
+
+        The controlled tree materialization gives ``B`` one cheap ordinary
+        route which conflicts with ``A``'s complete local tree and one
+        compatible ordinary route.  The native assignment must choose the
+        local tree plus the compatible route in its single bounded call;
+        it must not release a claim or schedule another assignment attempt.
+        """
+        Module = ModuleIR(
+            Name="PreRouteLocalClaimChoice",
+            Inputs=["A", "B"],
+            Outputs=["Z"],
+            Gates=[
+                Gate("InputA", GateKind.INPUT, ["A"]),
+                Gate("InputB", GateKind.INPUT, ["B"]),
+                Gate("Nand", GateKind.NAND, ["Z"], ["A", "B"]),
+                Gate("OutputZ", GateKind.OUTPUT, [], ["Z"]),
+            ],
+        )
+        Netlist = NetlistIR(
+            Top=Module.Name,
+            Modules={Module.Name: Module},
+        )
+        InitialPlacement = PlacePcbGraph(
+            Netlist,
+            RoutingSpacing=0,
+            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
+        )
+        ExistingLocalClaim = next(
+            Claim
+            for Claim in InitialPlacement.Placed.LocalRouteClaims
+            if Claim.Signal == "A"
+        )
+        LocalClaim = replace(
+            ExistingLocalClaim,
+            BoundaryNodes=(ExistingLocalClaim.ConnectedTargets[0],),
+        )
+        ConflictPosition = min(LocalClaim.Nodes)
+        Placed = replace(
+            InitialPlacement.Placed,
+            # Make A and B ordinary profiles again.  The claim below is
+            # deliberately derived-only, so it is an optional value rather
+            # than a pre-owned base obstacle.
+            LocalRouteClaims=(),
+            LocalNetTargets={},
+            FrozenNetWires={},
+            DerivedLocalRouteClaims=(LocalClaim,),
+        )
+        Placement = replace(InitialPlacement, Placed=Placed)
+        Resources = BuildRoutingResources(Placed)
+        MaterializedBySignal = Counter()
+        NativeAssignmentCalls: list[tuple[object, ...]] = []
+
+        def MaterializeControlledCandidate(
+            Signal,
+            Profile,
+            SourcePortal,
+            TargetPortals,
+            Guide,
+            Layer,
+            Axis,
+            Lane,
+            Variant,
+            RoutedTree,
+            Region,
+            CandidateResources,
+            *Arguments,
+            **KeywordArguments,
+        ):
+            del Axis, Variant, RoutedTree, Region, Arguments, KeywordArguments
+            MaterializedBySignal[Signal] += 1
+            if Signal == "A":
+                CandidateId = "A:ordinary"
+                Position = (30, 1, 30)
+                MaterialCost = 100
+            elif Signal == "B" and MaterializedBySignal[Signal] == 1:
+                CandidateId = "B:conflicts-local"
+                Position = ConflictPosition
+                MaterialCost = 1
+            elif Signal == "B":
+                CandidateId = "B:compatible"
+                Position = (40, 1, 40)
+                MaterialCost = 2
+            else:
+                CandidateId = f"{Signal}:ordinary"
+                Position = (50, 1, 50)
+                MaterialCost = 1
+            return NetRouteCandidate(
+                CandidateId=CandidateId,
+                Signal=Signal,
+                SourcePortalId=SourcePortal.PortalId,
+                TargetPortalIds={
+                    Target: Portal.PortalId
+                    for Target, Portal in zip(
+                        Profile.Targets,
+                        TargetPortals,
+                    )
+                },
+                Nodes=frozenset((Position,)),
+                Edges=frozenset(),
+                Claims=CandidateResources.ResourceGraph.BuildRouteClaims(
+                    (Position,)
+                ),
+                Layer=0,
+                Guide=frozenset(Guide),
+                RepeaterWaypoints=(),
+                MaterialCost=MaterialCost,
+                FootprintGrowth=1,
+                Length=1,
+                BendCount=0,
+                ViaCount=0,
+            )
+
+        NativeRoutingContext = AuthoritativePlanner.RustRoutingContext
+
+        class RecordingRoutingContext:
+            def __init__(self, *Arguments) -> None:
+                self.Inner = NativeRoutingContext(*Arguments)
+
+            def __getattr__(self, Name):
+                return getattr(self.Inner, Name)
+
+            def PlanAuthoritativeRoutesBounded(self, *Arguments):
+                NativeAssignmentCalls.append(Arguments)
+                return self.Inner.PlanAuthoritativeRoutesBounded(*Arguments)
+
+        # Candidate trees are deliberately controlled, but the assignment
+        # call remains the real Rust solver and is instrumented below.
+        with patch.object(
+            AuthoritativePlanner,
+            "_MaterializeCandidate",
+            MaterializeControlledCandidate,
+        ), patch.object(
+            AuthoritativePlanner,
+            "RustRoutingContext",
+            RecordingRoutingContext,
+        ):
+            Preparation = PrepareTrackAssignment(
+                Placement,
+                Resources=Resources,
+                Policy=LocalFirstPhysicalDesignPolicy,
+                Deadline=RoutingDeadline.Start(5.0),
+            )
+
+        self.assertTrue(Preparation.Success)
+        self.assertTrue(Preparation.Complete)
+        self.assertEqual(len(NativeAssignmentCalls), 1)
+        self.assertEqual(
+            dict(Preparation.SelectedCandidateIds),
+            {
+                "B": "B:compatible",
+                "Z": "Z:ordinary",
+            },
+        )
+        self.assertEqual(len(Preparation.SelectedLocalClaimChoiceIds), 1)
+        SelectedSignal, SelectedChoiceId = (
+            Preparation.SelectedLocalClaimChoiceIds[0]
+        )
+        self.assertEqual(SelectedSignal, "A")
+        self.assertTrue(SelectedChoiceId.startswith("A:DerivedLocal:"))
+        self.assertTrue(Preparation.LocalClaimDomainFingerprint)
+        # The preparation is also the resource-bearing witness exported to
+        # the pre-route interface selector.  It must retain claims from both
+        # the selected local-tree value and the selected ordinary candidates;
+        # otherwise component/template selection would see a false empty
+        # capacity contract.
+        SelectedCapacityResources = set(
+            Preparation.SelectedCapacityResourceIds
+        )
+        self.assertTrue({
+            str(ResourceId) for ResourceId in LocalClaim.Claims.ResourceIds
+        }.issubset(SelectedCapacityResources))
+        self.assertTrue({
+            str(ResourceId)
+            for ResourceId in Resources.ResourceGraph.BuildRouteClaims(
+                ((40, 1, 40),)
+            ).ResourceIds
+        }.issubset(SelectedCapacityResources))
+        EncodedValues = NativeAssignmentCalls[0][0]
+        ConflictingCandidateClaims = Resources.ResourceGraph.BuildRouteClaims(
+            (ConflictPosition,)
+        )
+        self.assertTrue(
+            MandatoryClaimsConflict(
+                LocalClaim.Claims,
+                ConflictingCandidateClaims,
+            )
+        )
+        self.assertIn(
+            ("A", SelectedChoiceId),
+            {(str(Value[0]), str(Value[1])) for Value in EncodedValues},
+        )
+        self.assertIn(
+            ("B", "B:conflicts-local"),
+            {(str(Value[0]), str(Value[1])) for Value in EncodedValues},
+        )
+        self.assertIn(
+            ("B", "B:compatible"),
+            {(str(Value[0]), str(Value[1])) for Value in EncodedValues},
+        )
+
+    def testFrozenTrackAssignmentRejectsSameIdWithMutatedClaims(
+        self,
+    ) -> None:
+        """The frozen capacity witness owns its physical value domain.
+
+        Candidate IDs are stable routing labels, not proof identities.  A
+        regenerated candidate which keeps an ID but gains a physical claim
+        must therefore be rejected before the authoritative route starts.
+        """
+        Module = ModuleIR(
+            Name="FrozenTrackAssignmentCandidateDomain",
+            Inputs=["A", "B"],
+            Outputs=["Z"],
+            Gates=[
+                Gate("InputA", GateKind.INPUT, ["A"]),
+                Gate("InputB", GateKind.INPUT, ["B"]),
+                Gate("Nand", GateKind.NAND, ["Z"], ["A", "B"]),
+                Gate("OutputZ", GateKind.OUTPUT, [], ["Z"]),
+            ],
+        )
+        Netlist = NetlistIR(
+            Top=Module.Name,
+            Modules={Module.Name: Module},
+        )
+        Placement = PlacePcbGraph(
+            Netlist,
+            RoutingSpacing=0,
+            PlacementPolicy=LocalFirstPhysicalDesignPolicy.Placement,
+            PackingPolicy=LocalFirstPhysicalDesignPolicy.NandPacking,
+        )
+        Resources = BuildRoutingResources(Placement.Placed)
+        Preparation = PrepareTrackAssignment(
+            Placement,
+            Resources=Resources,
+            Policy=LocalFirstPhysicalDesignPolicy,
+            Deadline=RoutingDeadline.Start(5.0),
+        )
+
+        self.assertTrue(Preparation.Success)
+        self.assertTrue(Preparation.Complete)
+        self.assertTrue(Preparation.CandidateDomainFingerprint)
+        self.assertEqual(
+            Preparation.ToDictionary()["CandidateDomainFingerprint"],
+            Preparation.CandidateDomainFingerprint,
+        )
+
+        OriginalMaterialize = AuthoritativePlanner._MaterializeCandidate
+
+        def MaterializeWithMutatedClaims(*Arguments, **KeywordArguments):
+            Candidate = OriginalMaterialize(*Arguments, **KeywordArguments)
+            Extra = (999, 1, 999)
+            return replace(
+                Candidate,
+                Claims=RoutingResourceClaims(
+                    WireCells=Candidate.Claims.WireCells | {Extra},
+                    SupportCells=Candidate.Claims.SupportCells,
+                    RequiredAirCells=Candidate.Claims.RequiredAirCells,
+                    ElectricalCells=(
+                        Candidate.Claims.ElectricalCells | {Extra}
+                    ),
+                ),
+            )
+
+        with patch.object(
+            AuthoritativePlanner,
+            "_MaterializeCandidate",
+            MaterializeWithMutatedClaims,
+        ), self.assertRaises(RoutingStageError) as Raised:
+            RoutePcbDesign(
+                Placement,
+                Resources=Resources,
+                Policy=LocalFirstPhysicalDesignPolicy,
+                Deadline=RoutingDeadline.Start(5.0),
+                FrozenTrackAssignmentPreparation=Preparation,
+            )
+
+        self.assertEqual(
+            Raised.exception.Failure.Stage,
+            "FrozenTrackAssignmentHandoff",
+        )
+        Diagnostics = dict(Raised.exception.Failure.Diagnostics or {})
+        self.assertEqual(
+            Diagnostics["FrozenCandidateDomainFingerprint"],
+            Preparation.CandidateDomainFingerprint,
+        )
+        self.assertNotEqual(
+            Diagnostics["CurrentCandidateDomainFingerprint"],
+            Preparation.CandidateDomainFingerprint,
+        )
 
     def testRustAssignmentSelectsDisjointCandidate(self) -> None:
         _Graph, _Region, Context = self.BuildGraph()

@@ -17,6 +17,7 @@ from Compiler.Placement.PcbFlow import (
     ClassifyPhysicalGlobalPlanRetentionAdmission,
     IsClusterInterfaceStateIncomplete,
     IsCompletePhysicalAssemblyUnsatisfiable,
+    SummarizePreRouteAccessFabric,
     _PlaceAndRoutePcbWithPolicy,
 )
 import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
@@ -63,6 +64,178 @@ def test_closed_region_portals_replace_discovery_domain_before_consumers():
     )
 
     assert Publish < Dictionary < Consumer
+
+
+def test_single_component_selection_freezes_raw_tracks_before_route():
+    """A compact portfolio has one raw selector and no post-selection solve."""
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    RawDomain = Source.index(
+        "RawDomain = PrepareRawTrackAssignmentDomain("
+    )
+    Selection = Source.index(
+        "SolveRawTrackAssignmentPortfolioWithContext(",
+        RawDomain,
+    )
+    FrozenPreparation = Source.index(
+        "SelectedTrackPreparation = RawTrackAssignmentResult.Preparation",
+        Selection,
+    )
+    MultiComponentPreparation = Source.index(
+        "Preparation = PrepareTrackAssignment("
+    )
+    LegacyPreparation = Source.index(
+        "SelectedTrackPreparation = PrepareTrackAssignment(",
+        FrozenPreparation,
+    )
+    FirstRoute = Source.index("RoutePcbDesign(", LegacyPreparation)
+
+    # Each fixed candidate exports its raw native values, then one aggregate
+    # selector supplies the selected frozen witness.  The remaining ordinary
+    # preparation belongs only to the legacy multi-component compatibility
+    # path; it cannot run on the single packed component path.  The first
+    # call prepares a legacy candidate before selection, and the second is a
+    # defensive fallback guarded by a missing frozen witness.
+    assert Source.count("PrepareRawTrackAssignmentDomain(") == 1
+    assert Source.count("SolveRawTrackAssignmentPortfolioWithContext(") == 1
+    assert Source.count("PrepareTrackAssignment(") == 2
+    assert RawDomain < Selection < FrozenPreparation < LegacyPreparation
+    assert MultiComponentPreparation < Selection
+    assert "if SelectedTrackPreparation is None:" in Source[
+        FrozenPreparation:LegacyPreparation
+    ]
+    assert LegacyPreparation < FirstRoute
+
+
+def test_multi_component_missing_access_assignment_uses_frozen_track_witness():
+    """Legacy components must not be mislabeled missing small-design fabric."""
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    MissingAssignment = Source.index("if AccessAssignment is None:")
+    Preparation = Source.index(
+        "Preparation = PrepareTrackAssignment(",
+        MissingAssignment,
+    )
+    StoredWitness = Source.index(
+        "PrePlacementTrackPreparationWitnesses[",
+        Preparation,
+    )
+    PublishedWitness = Source.index(
+        "PrePlacementTrackPreparationWitnesses.get(",
+        StoredWitness,
+    )
+    SelectedWitness = Source.index(
+        "SelectedTrackPreparation = (",
+        PublishedWitness,
+    )
+    DefensiveFallback = Source.index(
+        "if SelectedTrackPreparation is None:",
+        SelectedWitness,
+    )
+
+    assert "missing-access-assignment" not in Source[
+        MissingAssignment:Preparation
+    ]
+    assert Preparation < StoredWitness < PublishedWitness < SelectedWitness
+    assert SelectedWitness < DefensiveFallback
+
+
+def test_single_component_defers_derived_fabric_until_raw_materialization():
+    """A declared shell ranks first; its escape search is not eager work."""
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Shell = Source.index("Shell = BuildDerivedPerimeterFabricShell(")
+    Descriptor = Source.index("PreRouteFabricDescriptorsByCandidateId[")
+    DeferredCandidate = Source.index(
+        "FabricCandidateRecords.append(DescriptorCandidate)",
+    )
+    Materializer = Source.index("def MaterializeRawTemplate(")
+    Fabric = Source.index("Fabric = BuildPlacementAccessFabric(", Materializer)
+    RawDomain = Source.index("RawDomain = PrepareRawTrackAssignmentDomain(")
+    Attached = Source.index(
+        "AttachedPlacement = AttachPlacementAccessFabric(",
+        Materializer,
+    )
+
+    assert Shell < Descriptor < DeferredCandidate < Materializer
+    assert Materializer < Fabric < Attached < RawDomain
+    assert "Shell=FabricDescriptor.Shell" in Source[Fabric:RawDomain]
+
+
+def test_single_component_selected_contract_cannot_reenter_legacy_portfolio():
+    """One selected packed contract owns the whole remaining route attempt."""
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    ExactGate = Source.index("ExactClusterInterfaceSolveEnabled = (")
+    DeferredAlternatives = Source.index(
+        "HasRemainingPlacementAlternative = (",
+        ExactGate,
+    )
+    SingleAttemptSlots = Source.index(
+        "PlannedRoutingSlots = (",
+        DeferredAlternatives,
+    )
+    Route = Source.index("RoutePcbDesign(", SingleAttemptSlots)
+
+    ExactGateSource = Source[ExactGate:DeferredAlternatives]
+    RouteBudgetSource = Source[DeferredAlternatives:Route]
+    assert "not SinglePackedComponent" in ExactGateSource
+    assert "False\n            if SinglePackedComponent" in RouteBudgetSource
+    assert "1\n            if SinglePackedComponent" in RouteBudgetSource
+
+
+def test_pre_route_fabric_summary_exposes_frontier_not_all_stub_claims():
+    """Failure artifacts keep the proof frontier without duplicating stubs."""
+    IncompleteDomain = SimpleNamespace(
+        Signal="Signal",
+        Terminal=(1, 2, 3),
+        EscapeStubs=(object(), object()),
+        Complete=False,
+        IncompleteReason="no-legal-fabric-escape",
+    )
+    CompleteDomain = SimpleNamespace(
+        Signal="Other",
+        Terminal=(4, 5, 6),
+        EscapeStubs=(object(),),
+        Complete=True,
+        IncompleteReason="",
+    )
+    Fabric = SimpleNamespace(
+        FabricFingerprint="fabric",
+        TopologyKind="derived-perimeter-access-v1",
+        Complete=False,
+        IncompleteReason="no-legal-fabric-escape",
+        AccessRingTrackCount=1,
+        AccessRingFingerprint="ring",
+        OuterBounds=(-2, -3, 8, 9),
+        ActiveFaces=("north", "south"),
+        Nodes=((0, 1, 0),),
+        Edges=(),
+        CapacityResourceIds=("resource",),
+        TerminalDomains=(IncompleteDomain, CompleteDomain),
+        LegalEscapeExpansionCount=41,
+        LegalEscapeExpansionLimit=64,
+        LegalEscapeWorkLimitKind="derived-direction-state-v1",
+        LegalEscapeDirectionStateUpperBound=128,
+        PhysicalClaims=SimpleNamespace(
+            WireCells=frozenset({(0, 1, 0)}),
+            SupportCells=frozenset(),
+            RequiredAirCells=frozenset(),
+            ElectricalCells=frozenset(),
+        ),
+    )
+
+    Summary = SummarizePreRouteAccessFabric(Fabric)
+
+    assert Summary is not None
+    assert Summary["TerminalDomainCount"] == 2
+    assert Summary["CompleteTerminalDomainCount"] == 1
+    assert Summary["LegalEscapeExpansionLimit"] == 64
+    assert Summary["LegalEscapeWorkLimitKind"] == "derived-direction-state-v1"
+    assert Summary["LegalEscapeDirectionStateUpperBound"] == 128
+    assert Summary["IncompleteTerminalDomains"] == [{
+        "Signal": "Signal",
+        "Terminal": [1, 2, 3],
+        "EscapeStubCount": 2,
+        "IncompleteReason": "no-legal-fabric-escape",
+    }]
+    assert "TerminalDomains" not in Summary
 import Compiler.Routing.Pcb as RoutingPcb
 from Compiler.Routing.Pcb import (
     ReplanPhysicalComponentAssembly,
@@ -119,6 +292,63 @@ def test_prepare_track_assignment_stops_before_route_tree_construction(
     assert len(Calls) == 1
     assert Calls[0]["Policy"] is DefaultPhysicalDesignPolicy
     assert Calls[0]["PrepareTrackAssignmentOnly"] is True
+    assert isinstance(Calls[0]["Deadline"], RoutingDeadline)
+
+
+def test_prepare_raw_track_assignment_domain_stops_before_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The portfolio bridge exports values, not a second native solve."""
+    Position = (1, 1, 1)
+    Expected = AuthoritativePlanner.RawTrackAssignmentDomain(
+        ResourcePositions=(Position,),
+        Values=(AuthoritativePlanner.RawTrackAssignmentValue(
+            Signal="Signal",
+            CandidateId="candidate",
+            Claims=RoutingResourceClaims(WireCells=frozenset({Position})),
+            MaterialCost=1,
+            FootprintGrowth=1,
+            Length=1,
+            BendCount=0,
+            ViaCount=0,
+        ),),
+        BaseClaims=(),
+        CandidateCounts=(("Signal", 1),),
+        CandidateDomainFingerprint="candidate-domain",
+        LocalClaimDomainFingerprint="local-domain",
+        PlacementFingerprint="placement",
+        ResourceGraphFingerprint="resources",
+        PortalDomainFingerprint="portals",
+        Complete=True,
+        MaximumAssignmentExpansions=16,
+    )
+    Calls: list[dict[str, object]] = []
+
+    def Prepare(*_Arguments: object, **KeywordArguments: object) -> None:
+        Calls.append(dict(KeywordArguments))
+        raise AuthoritativePlanner.RawTrackAssignmentDomainPrepared(
+            Expected
+        )
+
+    monkeypatch.setattr(
+        Pcb,
+        "BuildPcbRoutingConfigurations",
+        lambda _Value: (object(),),
+    )
+    monkeypatch.setattr(Pcb, "RoutePcbAttempt", Prepare)
+
+    Actual = Pcb.PrepareRawTrackAssignmentDomain(
+        SimpleNamespace(),
+        Resources=SimpleNamespace(),
+        Policy=DefaultPhysicalDesignPolicy,
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+
+    assert Actual is Expected
+    assert len(Calls) == 1
+    assert Calls[0]["Policy"] is DefaultPhysicalDesignPolicy
+    assert Calls[0]["PrepareRawTrackAssignmentDomainOnly"] is True
+    assert "PrepareTrackAssignmentOnly" not in Calls[0]
     assert isinstance(Calls[0]["Deadline"], RoutingDeadline)
 
 

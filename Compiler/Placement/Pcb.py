@@ -27,7 +27,14 @@ from .Geometry import (
     PlacedDesign,
     RectanglesOverlap,
 )
+from .PreRouteInterface import (
+    DerivedPerimeterSlotAssignment,
+    DerivedPerimeterSlotDomain,
+    DerivedPerimeterTerminalSlot,
+    SolveDerivedPerimeterSlotDomain,
+)
 from ..Routing.Technology import DefaultRedstoneRoutingTechnology
+from ..Routing.Reliability import BuildStableFingerprint
 from ..Routing.Models import (
     InterClusterChannelLane,
     InterClusterRoutingChannel,
@@ -89,6 +96,10 @@ _PackedClusterBaseLayoutCache: dict[
         int,
         int,
     ],
+] = {}
+_PinAlignedPackedClusterPortfolioCache: dict[
+    tuple[object, ...],
+    tuple["PinAlignedPackedClusterState", ...],
 ] = {}
 _PlacementTopologyCache: dict[
     tuple[object, ...],
@@ -184,6 +195,106 @@ class ExactJointPlacementScreen:
             ),
             None,
         )
+
+
+@dataclass(frozen=True)
+class PinAlignedPackedClusterState:
+    """One immutable retained graph-core placement state.
+
+    ``CandidateIndex`` is the stable index accepted by the legacy indexed
+    builder.  It is intentionally retained even when a portfolio filters a
+    dominated state, so a caller can materialize a validated state without
+    guessing a dense index later in the placement flow.
+    """
+
+    CandidateIndex: int
+    Positions: tuple[tuple[str, tuple[int, int]], ...]
+    Rotations: tuple[tuple[str, int], ...]
+    Mirrors: tuple[tuple[str, bool], ...]
+    Objective: tuple[int, int, int, int, int]
+    Fingerprint: str
+
+    @classmethod
+    def FromMutableCandidate(
+        cls,
+        CandidateIndex: int,
+        Candidate: tuple[
+            dict[str, tuple[int, int]],
+            dict[str, int],
+            dict[str, bool],
+        ],
+        Objective: tuple[int, int, int, int, int],
+    ) -> "PinAlignedPackedClusterState":
+        """Freeze one normalized graph-core candidate for cache sharing."""
+        Positions, Rotations, Mirrors = Candidate
+        CanonicalPositions = tuple(sorted(
+            (str(Name), (int(Position[0]), int(Position[1])))
+            for Name, Position in Positions.items()
+        ))
+        CanonicalRotations = tuple(sorted(
+            (str(Name), int(Rotation))
+            for Name, Rotation in Rotations.items()
+        ))
+        CanonicalMirrors = tuple(sorted(
+            (str(Name), bool(MirrorX))
+            for Name, MirrorX in Mirrors.items()
+        ))
+        Fingerprint = sha256(repr((
+            CanonicalPositions,
+            CanonicalRotations,
+            CanonicalMirrors,
+        )).encode("utf-8")).hexdigest()[:16]
+        return cls(
+            CandidateIndex=CandidateIndex,
+            Positions=CanonicalPositions,
+            Rotations=CanonicalRotations,
+            Mirrors=CanonicalMirrors,
+            Objective=Objective,
+            Fingerprint=Fingerprint,
+        )
+
+    def Materialize(
+        self,
+    ) -> tuple[
+        dict[str, tuple[int, int]],
+        dict[str, int],
+        dict[str, bool],
+    ]:
+        """Return fresh mutable placement maps for one placement consumer."""
+        return (
+            dict(self.Positions),
+            dict(self.Rotations),
+            dict(self.Mirrors),
+        )
+
+
+@dataclass(frozen=True)
+class PinAlignedPackedClusterPortfolio:
+    """Finite non-dominated graph-core states retained by one bounded beam.
+
+    The portfolio is not an exhaustive placement proof: the graph beam itself
+    is deliberately bounded.  It is a fixed, materialized domain that callers
+    can inspect before selecting a state, rather than an implicit sequence of
+    indexed placement attempts.
+    """
+
+    States: tuple[PinAlignedPackedClusterState, ...]
+    RawCandidateCount: int
+
+    def __post_init__(self) -> None:
+        CandidateIndexes = tuple(State.CandidateIndex for State in self.States)
+        if len(set(CandidateIndexes)) != len(CandidateIndexes):
+            raise ValueError("graph-core portfolio candidate indexes must be unique")
+        if self.RawCandidateCount < len(self.States):
+            raise ValueError(
+                "graph-core portfolio raw candidate count cannot be smaller "
+                "than retained state count"
+            )
+
+    @property
+    def CandidateCount(self) -> int:
+        """Return the number of valid materializable portfolio states."""
+        return len(self.States)
 
 
 @dataclass(frozen=True)
@@ -2763,6 +2874,14 @@ class PcbPlacement:
     InterClusterRoutingChannel: InterClusterRoutingChannel | None = None
     PlacementAccessFabric: Any | None = None
     PlacementAccessAssignment: Any | None = None
+    DerivedPerimeterSlotDomain: Any | None = None
+    DerivedPerimeterSlotAssignment: Any | None = None
+    # A compact single-component candidate may publish previously materialized
+    # complete local trees as alternatives of its immutable pre-route access
+    # problem.  They are not live placement ownership until that problem
+    # selects them; keeping the source claims here avoids a post-failure
+    # release/rebuild cycle.
+    DerivedLocalRouteClaims: tuple[Any, ...] = ()
     ComponentGraph: Any | None = None
 
 
@@ -7086,6 +7205,36 @@ def _PhysicalGateGeometry(
     return frozenset(Actual), frozenset(Electrical)
 
 
+@lru_cache(maxsize=4096)
+def _PhysicalGateElectricalExclusions(
+    Kind: str,
+    X: int,
+    Y: int,
+    Z: int,
+    Rotation: int,
+    MirrorX: bool,
+) -> frozenset[tuple[int, int, int]]:
+    """Cache the exact electrical keep-out for one transformed macro.
+
+    Packed graph states revisit the same physical macro transforms many times.
+    The routing technology owns the keep-out rule, so caching its immutable
+    result here changes neither the rule nor a conflict decision.
+    """
+    _Actual, Electrical = _PhysicalGateGeometry(
+        Kind,
+        X,
+        Y,
+        Z,
+        Rotation,
+        MirrorX,
+    )
+    return frozenset(
+        DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+            set(Electrical)
+        )
+    )
+
+
 def PcbGatesConflict(First: Any, Second: Any) -> bool:
     """Reject footprint, pin-access, and template electrical conflicts."""
 
@@ -7096,15 +7245,33 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
             DeltaX, DeltaY, DeltaZ = Gate.OutputDirection
             for Signal in Gate.Outputs:
                 Values.extend(
-                    (((X + DeltaX * Offset, Y + DeltaY * Offset, Z + DeltaZ * Offset), Signal)
-                     for Offset in range(3))
+                    (
+                        (
+                            X + DeltaX * Offset,
+                            Y + DeltaY * Offset,
+                            Z + DeltaZ * Offset,
+                        ),
+                        Signal,
+                    )
+                    for Offset in range(
+                        DefaultRedstoneRoutingTechnology.AccessLength
+                    )
                 )
         for Signal, Pin, Direction in zip(Gate.Inputs, Gate.InputPins, Gate.InputDirections):
             X, Y, Z = Pin
             DeltaX, DeltaY, DeltaZ = Direction
             Values.extend(
-                (((X + DeltaX * Offset, Y + DeltaY * Offset, Z + DeltaZ * Offset), Signal)
-                 for Offset in range(3))
+                (
+                    (
+                        X + DeltaX * Offset,
+                        Y + DeltaY * Offset,
+                        Z + DeltaZ * Offset,
+                    ),
+                    Signal,
+                )
+                for Offset in range(
+                    DefaultRedstoneRoutingTechnology.AccessLength
+                )
             )
         return Values
 
@@ -7112,7 +7279,11 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         return True
     FirstWidth, FirstDepth = RotatedCellSize(First.Kind, First.Rotation)
     SecondWidth, SecondDepth = RotatedCellSize(Second.Kind, Second.Rotation)
-    BroadPhaseMargin = 3
+    # Gate access clearance is a routing-technology fact.  Keeping it tied
+    # to the same derived access length used by terminal and fabric
+    # construction prevents a hidden literal from changing legal compact
+    # slot geometry when the technology changes.
+    BroadPhaseMargin = DefaultRedstoneRoutingTechnology.AccessLength
     if (
         First.X + FirstWidth - 1 + BroadPhaseMargin
         < Second.X - BroadPhaseMargin
@@ -7124,7 +7295,7 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         < First.Z - BroadPhaseMargin
     ):
         return False
-    FirstActual, FirstElectrical = _PhysicalGateGeometry(
+    FirstActual, _FirstElectrical = _PhysicalGateGeometry(
         First.Kind,
         First.X,
         First.Y,
@@ -7132,7 +7303,7 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         First.Rotation,
         First.MirrorX,
     )
-    SecondActual, SecondElectrical = _PhysicalGateGeometry(
+    SecondActual, _SecondElectrical = _PhysicalGateGeometry(
         Second.Kind,
         Second.X,
         Second.Y,
@@ -7141,15 +7312,25 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         Second.MirrorX,
     )
     if (
-        DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
-            set(FirstElectrical)
+        _PhysicalGateElectricalExclusions(
+            First.Kind,
+            First.X,
+            First.Y,
+            First.Z,
+            First.Rotation,
+            First.MirrorX,
         )
-        & set(SecondActual)
+        & SecondActual
     ) or (
-        DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
-            set(SecondElectrical)
+        _PhysicalGateElectricalExclusions(
+            Second.Kind,
+            Second.X,
+            Second.Y,
+            Second.Z,
+            Second.Rotation,
+            Second.MirrorX,
         )
-        & set(FirstActual)
+        & FirstActual
     ):
         return True
     if abs(First.Y - Second.Y) >= 3:
@@ -7158,14 +7339,12 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
     SecondWidth, SecondDepth = RotatedCellSize(Second.Kind, Second.Rotation)
     FirstAccess = AccessSignals(First)
     SecondAccess = AccessSignals(Second)
-    FirstSignalsByPosition = {
-        Position: {Signal for Value, Signal in FirstAccess if Value == Position}
-        for Position, _Signal in FirstAccess
-    }
-    SecondSignalsByPosition = {
-        Position: {Signal for Value, Signal in SecondAccess if Value == Position}
-        for Position, _Signal in SecondAccess
-    }
+    FirstSignalsByPosition: dict[tuple[int, int, int], set[str]] = {}
+    SecondSignalsByPosition: dict[tuple[int, int, int], set[str]] = {}
+    for Position, Signal in FirstAccess:
+        FirstSignalsByPosition.setdefault(Position, set()).add(Signal)
+    for Position, Signal in SecondAccess:
+        SecondSignalsByPosition.setdefault(Position, set()).add(Signal)
     if any(
         Second.X <= Position[0] < Second.X + SecondWidth
         and Second.Z <= Position[2] < Second.Z + SecondDepth
@@ -7185,8 +7364,8 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
     ):
         return True
 
-    for FirstPosition, FirstSignal in AccessSignals(First):
-        for SecondPosition, SecondSignal in AccessSignals(Second):
+    for FirstPosition, FirstSignal in FirstAccess:
+        for SecondPosition, SecondSignal in SecondAccess:
             if FirstSignal == SecondSignal:
                 continue
             DeltaX = abs(FirstPosition[0] - SecondPosition[0])
@@ -7199,6 +7378,347 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
             ):
                 return True
     return False
+
+
+def BuildDerivedPerimeterTerminalSlotDomain(
+    TerminalGates: Iterable[Any],
+    CoreGates: Iterable[PlacedGate],
+    DesiredPinsByTerminal: Mapping[
+        str,
+        Iterable[tuple[int, int, int]],
+    ],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> DerivedPerimeterSlotDomain:
+    """Materialize the finite outward-facing I/O slot domain once.
+
+    This deliberately derives every coordinate from the committed NAND hull,
+    terminal macro pin geometry, and the pins served by that terminal.  It
+    contains no terminal-bank spacing, lateral-radius, or setback policy.  A
+    later access-capacity solver may consume the complete domain, but this
+    placement step only proves macro/electrical legality and freezes one
+    deterministic compact member.
+    """
+    Core = tuple(CoreGates)
+    Terminals = tuple(TerminalGates)
+    if not Core:
+        raise ValueError("derived perimeter terminals require a placed core")
+    MinimumX = min(Gate.X for Gate in Core)
+    MaximumX = max(
+        Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0] - 1
+        for Gate in Core
+    )
+    MinimumZ = min(Gate.Z for Gate in Core)
+    MaximumZ = max(
+        Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
+        for Gate in Core
+    )
+    CoreBounds = (MinimumX, MinimumZ, MaximumX, MaximumZ)
+    TerminalDeckY = min(Gate.Y for Gate in Core)
+    FaceDirections = {
+        "north": (0, 0, -1),
+        "south": (0, 0, 1),
+        "west": (-1, 0, 0),
+        "east": (1, 0, 0),
+    }
+
+    def TerminalKind(Gate: Any) -> str:
+        Kind = getattr(Gate, "Kind", "")
+        return str(getattr(Kind, "value", Kind))
+
+    def TerminalSignal(Gate: Any) -> str:
+        return str(
+            Gate.Outputs[0]
+            if TerminalKind(Gate) == "INPUT"
+            else Gate.Inputs[0]
+        )
+
+    # First inspect every supported terminal transform.  Pin-plane distances
+    # are derived from the actual macro shape, then shared per face so an
+    # access fabric receives one coherent aperture plane rather than a
+    # terminal-kind-specific shell offset.
+    PrototypesByTerminal: dict[str, list[tuple[
+        Any,
+        str,
+        int,
+        bool,
+        tuple[int, int, int],
+        tuple[int, int, int],
+        int,
+        int,
+    ]]] = {}
+    FaceReach = {Face: 1 for Face in FaceDirections}
+    for Gate in sorted(Terminals, key=lambda Value: Value.Name):
+        TerminalPrototypes = []
+        Seen = set()
+        for Rotation in (0, 90, 180, 270):
+            for MirrorX in (False, True):
+                Prototype = BuildPlacedGate(
+                    Gate,
+                    0,
+                    TerminalDeckY,
+                    0,
+                    Rotation,
+                    MirrorX,
+                )
+                if TerminalKind(Gate) == "INPUT":
+                    Pin = Prototype.OutputPin
+                    Direction = Prototype.OutputDirection
+                else:
+                    Pin = Prototype.InputPins[0]
+                    Direction = Prototype.InputDirections[0]
+                if Pin is None or Direction not in FaceDirections.values():
+                    continue
+                Face = next(
+                    Name
+                    for Name, FaceDirection in FaceDirections.items()
+                    if Direction == FaceDirection
+                )
+                Width, Depth = RotatedCellSize(
+                    Prototype.Kind,
+                    Prototype.Rotation,
+                )
+                Identity = (
+                    Face,
+                    Prototype.Rotation,
+                    Prototype.MirrorX,
+                    Pin,
+                    Direction,
+                    Width,
+                    Depth,
+                )
+                if Identity in Seen:
+                    continue
+                Seen.add(Identity)
+                TerminalPrototypes.append((
+                    Gate,
+                    Face,
+                    Prototype.Rotation,
+                    Prototype.MirrorX,
+                    Pin,
+                    Direction,
+                    Width,
+                    Depth,
+                ))
+                Reach = (
+                    Depth - Pin[2]
+                    if Face == "north"
+                    else Pin[2] + 1
+                    if Face == "south"
+                    else Width - Pin[0]
+                    if Face == "west"
+                    else Pin[0] + 1
+                )
+                FaceReach[Face] = max(FaceReach[Face], Reach)
+        PrototypesByTerminal[Gate.Name] = TerminalPrototypes
+
+    FaceNormalCoordinate = {
+        "north": MinimumZ - FaceReach["north"],
+        "south": MaximumZ + FaceReach["south"],
+        "west": MinimumX - FaceReach["west"],
+        "east": MaximumX + FaceReach["east"],
+    }
+
+    def TangentialOrigins(
+        Face: str,
+        Pin: tuple[int, int, int],
+        Width: int,
+        Depth: int,
+        Targets: tuple[tuple[int, int, int], ...],
+    ) -> tuple[int, ...]:
+        if Face in {"north", "south"}:
+            Lower = MinimumX
+            Upper = MaximumX - Width + 1
+            Raw = {Target[0] - Pin[0] for Target in Targets}
+        else:
+            Lower = MinimumZ
+            Upper = MaximumZ - Depth + 1
+            Raw = {Target[2] - Pin[2] for Target in Targets}
+        # If a terminal is wider than its core projection, its two exact
+        # hull-boundary alignments remain the finite derived possibilities.
+        if Lower > Upper:
+            return tuple(sorted({Lower, Upper}))
+        return tuple(sorted({
+            Lower,
+            Upper,
+            *(min(Upper, max(Lower, Value)) for Value in Raw),
+        }))
+
+    TerminalSlots = []
+    WorkCount = 0
+    Complete = True
+    IncompleteReason = ""
+    for TerminalName, Prototypes in sorted(PrototypesByTerminal.items()):
+        Targets = tuple(sorted(
+            DesiredPinsByTerminal.get(TerminalName, ())
+        ))
+        Slots = []
+        if not Targets:
+            Complete = False
+            IncompleteReason = (
+                IncompleteReason
+                or f"missing-served-pin:{TerminalName}"
+            )
+        for (
+            Gate,
+            Face,
+            Rotation,
+            MirrorX,
+            LocalPin,
+            Direction,
+            Width,
+            Depth,
+        ) in Prototypes:
+            for TangentialOrigin in TangentialOrigins(
+                Face,
+                LocalPin,
+                Width,
+                Depth,
+                Targets,
+            ) if Targets else ():
+                WorkCount += 1
+                if WorkCheck is not None:
+                    WorkCheck({
+                        "Phase": "derived-perimeter-slot-domain",
+                        "TerminalName": TerminalName,
+                        "Face": Face,
+                        "WorkCount": WorkCount,
+                    })
+                OriginX = (
+                    TangentialOrigin
+                    if Face in {"north", "south"}
+                    else FaceNormalCoordinate[Face] - LocalPin[0]
+                )
+                OriginZ = (
+                    FaceNormalCoordinate[Face] - LocalPin[2]
+                    if Face in {"north", "south"}
+                    else TangentialOrigin
+                )
+                Candidate = BuildPlacedGate(
+                    Gate,
+                    OriginX,
+                    TerminalDeckY,
+                    OriginZ,
+                    Rotation,
+                    MirrorX,
+                )
+                ConnectionPin = (
+                    Candidate.OutputPin
+                    if TerminalKind(Gate) == "INPUT"
+                    else Candidate.InputPins[0]
+                )
+                ConnectionDirection = (
+                    Candidate.OutputDirection
+                    if TerminalKind(Gate) == "INPUT"
+                    else Candidate.InputDirections[0]
+                )
+                if ConnectionPin is None or ConnectionDirection != Direction:
+                    raise ValueError("derived perimeter terminal transform drifted")
+                if any(
+                    PcbGatesConflict(Candidate, Existing)
+                    for Existing in Core
+                ):
+                    continue
+                MaximumSlotX = Candidate.X + Width - 1
+                MaximumSlotZ = Candidate.Z + Depth - 1
+                InteriorSpan = sum(
+                    abs(ConnectionPin[0] - Target[0])
+                    + abs(ConnectionPin[2] - Target[2])
+                    for Target in Targets
+                )
+                SlotId = BuildStableFingerprint({
+                    "TerminalName": TerminalName,
+                    "Signal": TerminalSignal(Gate),
+                    "Face": Face,
+                    "Origin": (Candidate.X, Candidate.Y, Candidate.Z),
+                    "Rotation": Candidate.Rotation,
+                    "MirrorX": Candidate.MirrorX,
+                    "ConnectionPin": ConnectionPin,
+                    "ConnectionDirection": ConnectionDirection,
+                })
+                Slots.append(DerivedPerimeterTerminalSlot(
+                    SlotId=SlotId,
+                    TerminalName=TerminalName,
+                    Signal=TerminalSignal(Gate),
+                    Face=Face,
+                    Origin=(Candidate.X, Candidate.Y, Candidate.Z),
+                    Rotation=Candidate.Rotation,
+                    MirrorX=Candidate.MirrorX,
+                    MacroBounds=(
+                        Candidate.X,
+                        Candidate.Z,
+                        MaximumSlotX,
+                        MaximumSlotZ,
+                    ),
+                    ConnectionPin=ConnectionPin,
+                    ConnectionDirection=ConnectionDirection,
+                    InteriorSpan=InteriorSpan,
+                ))
+        Slots = sorted(
+            Slots,
+            key=lambda Slot: (
+                Slot.Face,
+                Slot.MacroBounds,
+                Slot.Rotation,
+                Slot.MirrorX,
+                Slot.SlotId,
+            ),
+        )
+        if not Slots:
+            Complete = False
+            IncompleteReason = (
+                IncompleteReason
+                or f"no-legal-outward-slot:{TerminalName}"
+            )
+        TerminalSlots.append((TerminalName, tuple(Slots)))
+
+    TerminalGateByName = {Gate.Name: Gate for Gate in Terminals}
+    AllSlots = tuple(
+        Slot
+        for _TerminalName, Slots in TerminalSlots
+        for Slot in Slots
+    )
+    IncompatibleSlotPairs = tuple(sorted({
+        tuple(sorted((First.SlotId, Second.SlotId)))
+        for FirstIndex, First in enumerate(AllSlots)
+        for Second in AllSlots[FirstIndex + 1:]
+        if First.TerminalName != Second.TerminalName
+        and (
+            (
+                First.Face == Second.Face
+                and (
+                    First.ConnectionPin[2]
+                    if First.Face in {"north", "south"}
+                    else First.ConnectionPin[0]
+                ) != (
+                    Second.ConnectionPin[2]
+                    if Second.Face in {"north", "south"}
+                    else Second.ConnectionPin[0]
+                )
+            )
+            or PcbGatesConflict(
+                BuildPlacedGate(
+                    TerminalGateByName[First.TerminalName],
+                    *First.Origin,
+                    First.Rotation,
+                    First.MirrorX,
+                ),
+                BuildPlacedGate(
+                    TerminalGateByName[Second.TerminalName],
+                    *Second.Origin,
+                    Second.Rotation,
+                    Second.MirrorX,
+                ),
+            )
+        )
+    }))
+    return DerivedPerimeterSlotDomain(
+        CoreBounds=CoreBounds,
+        TerminalSlots=tuple(TerminalSlots),
+        IncompatibleSlotPairs=IncompatibleSlotPairs,
+        Complete=Complete,
+        WorkCount=WorkCount,
+        IncompleteReason=IncompleteReason,
+    )
 
 
 @dataclass(frozen=True)
@@ -8971,17 +9491,162 @@ def ShouldIncludeNearPortalPackedAccessRepair(
     )
 
 
+def BuildDerivedPinAlignmentOffsets(
+    Technology: Any = DefaultRedstoneRoutingTechnology,
+) -> tuple[tuple[int, int], ...]:
+    """Derive compact pin offsets from connectivity and track geometry."""
+    Origin = (0, 0, 0)
+    PlanarNeighborOffsets = {
+        (Position[0], Position[2])
+        for Position in Technology.NeighborPositions(Origin)
+        if Position[1] == Origin[1]
+    }
+    CardinalX = sorted({
+        DeltaX for DeltaX, DeltaZ in PlanarNeighborOffsets
+        if DeltaX and not DeltaZ
+    })
+    CardinalZ = sorted({
+        DeltaZ for DeltaX, DeltaZ in PlanarNeighborOffsets
+        if DeltaZ and not DeltaX
+    })
+    TrackLandingDistance = max(1, Technology.TrackPitch - 1)
+    Offsets = {
+        (0, 0),
+        *PlanarNeighborOffsets,
+        *((DeltaX, DeltaZ) for DeltaX in CardinalX for DeltaZ in CardinalZ),
+        *((Sign * TrackLandingDistance, 0) for Sign in (-1, 1)),
+        *((0, Sign * TrackLandingDistance) for Sign in (-1, 1)),
+    }
+    return tuple(sorted(Offsets))
+
+
 def BuildPinAlignedPackedCluster(
     Names: tuple[str, ...],
     InternalByName: dict[str, Any],
     BeamWidth: int,
+    CandidateIndex: int = 0,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[
     dict[str, tuple[int, int]],
     dict[str, int],
     dict[str, bool],
 ] | None:
-    """Embed a NAND graph around connected pins without circuit recognition."""
+    """Materialize one explicitly selected retained graph-core state.
+
+    ``None`` continues to mean that the bounded graph beam could not form any
+    legal state.  An index beyond a non-empty retained beam is a caller error,
+    not a request to quietly use a row-beam placement instead.
+    """
+    if CandidateIndex < 0:
+        raise ValueError("packed cluster candidate index cannot be negative")
+    States = _BuildPinAlignedPackedClusterStates(
+        Names,
+        InternalByName,
+        BeamWidth,
+        WorkCheck=WorkCheck,
+    )
+    if not States:
+        return None
+    if CandidateIndex >= len(States):
+        raise ValueError(
+            "packed cluster candidate index exceeds retained state count "
+            f"({CandidateIndex} >= {len(States)})"
+        )
+    return States[CandidateIndex].Materialize()
+
+
+def BuildPinAlignedPackedClusterPortfolio(
+    Names: tuple[str, ...],
+    InternalByName: dict[str, Any],
+    BeamWidth: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> PinAlignedPackedClusterPortfolio:
+    """Materialize the finite non-dominated graph-core domain up front.
+
+    States retain their legacy ``CandidateIndex`` values.  A caller that needs
+    to invoke :func:`BuildPinAlignedPackedCluster` later must use that explicit
+    index, rather than enumerating a guessed contiguous range.
+    """
+    States = _BuildPinAlignedPackedClusterStates(
+        Names,
+        InternalByName,
+        BeamWidth,
+        WorkCheck=WorkCheck,
+    )
+    NonDominatedStates = tuple(
+        State
+        for State in States
+        if not any(
+            Other is not State
+            and _PinAlignedPackedClusterStateDominates(Other, State)
+            for Other in States
+        )
+    )
+    return PinAlignedPackedClusterPortfolio(
+        States=NonDominatedStates,
+        RawCandidateCount=len(States),
+    )
+
+
+def CountPinAlignedPackedClusterPortfolio(
+    Names: tuple[str, ...],
+    InternalByName: dict[str, Any],
+    BeamWidth: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> int:
+    """Return the exact finite count of valid graph-core portfolio states."""
+    return BuildPinAlignedPackedClusterPortfolio(
+        Names,
+        InternalByName,
+        BeamWidth,
+        WorkCheck=WorkCheck,
+    ).CandidateCount
+
+
+def _PinAlignedPackedClusterStateDominates(
+    First: PinAlignedPackedClusterState,
+    Second: PinAlignedPackedClusterState,
+) -> bool:
+    """Compare graph states on physical objectives, excluding tie-breakers."""
+    return (
+        all(
+            FirstValue <= SecondValue
+            for FirstValue, SecondValue in zip(First.Objective, Second.Objective)
+        )
+        and any(
+            FirstValue < SecondValue
+            for FirstValue, SecondValue in zip(First.Objective, Second.Objective)
+        )
+    )
+
+
+def _BuildPinAlignedPackedClusterStates(
+    Names: tuple[str, ...],
+    InternalByName: dict[str, Any],
+    BeamWidth: int,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[PinAlignedPackedClusterState, ...]:
+    """Build and cache the raw bounded graph beam without selecting a state."""
+    if BeamWidth < 1:
+        raise ValueError("packed cluster beam width must be positive")
+    PortfolioKey = (
+        tuple(Names),
+        tuple(
+            (
+                Name,
+                tuple(map(str, InternalByName[Name].Inputs)),
+                tuple(map(str, InternalByName[Name].Outputs)),
+            )
+            for Name in sorted(Names)
+        ),
+        BeamWidth,
+        repr(DefaultRedstoneRoutingTechnology),
+    )
+    CachedPortfolio = _PinAlignedPackedClusterPortfolioCache.get(
+        PortfolioKey
+    )
+    if CachedPortfolio is not None:
+        return CachedPortfolio
     NameSet = set(Names)
     ProducerBySignal = {
         Signal: Gate.Name
@@ -9004,6 +9669,37 @@ def BuildPinAlignedPackedCluster(
     StartGate = BuildPlacedGate(InternalByName[Start], 0, 1, 0, 0, False)
     Beam: list[dict[str, Any]] = [{Start: StartGate}]
     PlacedNames = {Start}
+    # A bounded graph beam revisits the same transformed macro pairs across
+    # many partial states.  Exact physical conflict checking is authoritative,
+    # but recomputing its electrical footprints for every revisit made the
+    # finite upfront portfolio dominate the entire small-design deadline.
+    # Cache only immutable geometry/signals of this one module; it cannot
+    # create a candidate or relax a conflict.
+    ConflictCache: dict[
+        tuple[
+            tuple[str, int, int, int, int, bool],
+            tuple[str, int, int, int, int, bool],
+        ],
+        bool,
+    ] = {}
+
+    def ConflictKey(Gate: Any) -> tuple[str, int, int, int, int, bool]:
+        return (
+            str(Gate.Name),
+            int(Gate.X),
+            int(Gate.Y),
+            int(Gate.Z),
+            int(Gate.Rotation),
+            bool(Gate.MirrorX),
+        )
+
+    def CachedPcbGatesConflict(First: Any, Second: Any) -> bool:
+        Key = (ConflictKey(First), ConflictKey(Second))
+        Cached = ConflictCache.get(Key)
+        if Cached is None:
+            Cached = PcbGatesConflict(First, Second)
+            ConflictCache[Key] = Cached
+        return Cached
 
     def ChooseNext() -> str:
         return min(
@@ -9018,6 +9714,10 @@ def BuildPinAlignedPackedCluster(
     def Score(State: dict[str, Any]) -> tuple[Any, ...]:
         Endpoints: dict[str, list[tuple[int, int]]] = {}
         PinOwners: list[tuple[tuple[int, int, int], str]] = []
+        AccessPositionsBySignal: dict[
+            str,
+            set[tuple[int, int, int]],
+        ] = {}
         for Gate in State.values():
             if Gate.OutputPin is not None:
                 for Signal in Gate.Outputs:
@@ -9025,10 +9725,41 @@ def BuildPinAlignedPackedCluster(
                         (Gate.OutputPin[0], Gate.OutputPin[2])
                     )
                     PinOwners.append((Gate.OutputPin, Signal))
+                    if Gate.OutputDirection is not None:
+                        AccessPositionsBySignal.setdefault(
+                            str(Signal),
+                            set(),
+                        ).update(
+                            (
+                                Gate.OutputPin[0]
+                                + Gate.OutputDirection[0] * Offset,
+                                Gate.OutputPin[1]
+                                + Gate.OutputDirection[1] * Offset,
+                                Gate.OutputPin[2]
+                                + Gate.OutputDirection[2] * Offset,
+                            )
+                            for Offset in range(
+                                DefaultRedstoneRoutingTechnology.AccessLength
+                            )
+                        )
             for InputIndex, Signal in enumerate(Gate.Inputs):
                 Pin = Gate.InputPins[InputIndex]
                 Endpoints.setdefault(Signal, []).append((Pin[0], Pin[2]))
                 PinOwners.append((Pin, Signal))
+                Direction = Gate.InputDirections[InputIndex]
+                AccessPositionsBySignal.setdefault(
+                    str(Signal),
+                    set(),
+                ).update(
+                    (
+                        Pin[0] + Direction[0] * Offset,
+                        Pin[1] + Direction[1] * Offset,
+                        Pin[2] + Direction[2] * Offset,
+                    )
+                    for Offset in range(
+                        DefaultRedstoneRoutingTechnology.AccessLength
+                    )
+                )
         CrossElectricalPenalty = sum(
             1
             for Index, (FirstPin, FirstSignal) in enumerate(PinOwners)
@@ -9039,6 +9770,26 @@ def BuildPinAlignedPackedCluster(
                 abs(FirstPin[0] - SecondPin[0])
                 + abs(FirstPin[2] - SecondPin[2])
                 <= 1
+            )
+        )
+        Signals = tuple(sorted(AccessPositionsBySignal))
+        ElectricalExclusionsBySignal = {
+            Signal: DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+                AccessPositionsBySignal[Signal]
+            )
+            for Signal in Signals
+        }
+        AccessConflictPenalty = sum(
+            1
+            for FirstIndex, FirstSignal in enumerate(Signals)
+            for SecondSignal in Signals[FirstIndex + 1 :]
+            if (
+                AccessPositionsBySignal[FirstSignal]
+                & ElectricalExclusionsBySignal[SecondSignal]
+            )
+            or (
+                AccessPositionsBySignal[SecondSignal]
+                & ElectricalExclusionsBySignal[FirstSignal]
             )
         )
         Hpwl = sum(
@@ -9066,10 +9817,11 @@ def BuildPinAlignedPackedCluster(
             for Name in sorted(State)
         )
         return (
+            AccessConflictPenalty,
             CrossElectricalPenalty,
-            Hpwl,
             Width * Depth,
             max(Width, Depth),
+            Hpwl,
             Stable,
         )
 
@@ -9118,21 +9870,7 @@ def BuildPinAlignedPackedCluster(
                             if PinKind == "Input"
                             else Origin.OutputPin
                         )
-                        for DeltaX, DeltaZ in (
-                            (0, 0),
-                            (1, 0),
-                            (-1, 0),
-                            (0, 1),
-                            (0, -1),
-                            (2, 0),
-                            (-2, 0),
-                            (0, 2),
-                            (0, -2),
-                            (1, 1),
-                            (1, -1),
-                            (-1, 1),
-                            (-1, -1),
-                        ):
+                        for DeltaX, DeltaZ in BuildDerivedPinAlignmentOffsets():
                             CandidateKeys.add(
                                 (
                                     ExistingPin[0] + DeltaX - LocalPin[0],
@@ -9142,21 +9880,21 @@ def BuildPinAlignedPackedCluster(
                                 )
                             )
             OrderedCandidateKeys = sorted(CandidateKeys)
-            for CandidateIndex, (X, Z, Rotation, MirrorX) in enumerate(
+            for CandidateKeyIndex, (X, Z, Rotation, MirrorX) in enumerate(
                 OrderedCandidateKeys
             ):
-                if WorkCheck is not None and CandidateIndex % 32 == 0:
+                if WorkCheck is not None and CandidateKeyIndex % 32 == 0:
                     WorkCheck({
                         "Phase": "graph-beam-candidate",
                         "GateName": Name,
-                        "CompletedCandidates": CandidateIndex,
+                        "CompletedCandidates": CandidateKeyIndex,
                         "TotalCandidates": len(OrderedCandidateKeys),
                     })
                 Candidate = BuildPlacedGate(
                     GateValue, X, 1, Z, Rotation, MirrorX
                 )
                 if any(
-                    PcbGatesConflict(Candidate, Existing)
+                    CachedPcbGatesConflict(Candidate, Existing)
                     for Existing in State.values()
                 ):
                     continue
@@ -9169,17 +9907,45 @@ def BuildPinAlignedPackedCluster(
         Beam = [State for _Key, State in NextBeam[:BeamWidth]]
         PlacedNames.add(Name)
 
-    Best = min(Beam, key=Score)
-    MinimumX = min(Gate.X for Gate in Best.values())
-    MinimumZ = min(Gate.Z for Gate in Best.values())
-    return (
-        {
-            Name: (Gate.X - MinimumX, Gate.Z - MinimumZ)
-            for Name, Gate in Best.items()
-        },
-        {Name: Gate.Rotation for Name, Gate in Best.items()},
-        {Name: Gate.MirrorX for Name, Gate in Best.items()},
-    )
+    Portfolio: list[PinAlignedPackedClusterState] = []
+    SeenGeometry = set()
+    for State in sorted(Beam, key=Score):
+        MinimumX = min(Gate.X for Gate in State.values())
+        MinimumZ = min(Gate.Z for Gate in State.values())
+        Candidate = (
+            {
+                Name: (Gate.X - MinimumX, Gate.Z - MinimumZ)
+                for Name, Gate in State.items()
+            },
+            {Name: Gate.Rotation for Name, Gate in State.items()},
+            {Name: Gate.MirrorX for Name, Gate in State.items()},
+        )
+        Identity = tuple(
+            (
+                Name,
+                Candidate[0][Name],
+                Candidate[1][Name],
+                Candidate[2][Name],
+            )
+            for Name in sorted(State)
+        )
+        if Identity in SeenGeometry:
+            continue
+        SeenGeometry.add(Identity)
+        CandidateScore = Score(State)
+        Portfolio.append(
+            PinAlignedPackedClusterState.FromMutableCandidate(
+                CandidateIndex=len(Portfolio),
+                Candidate=Candidate,
+                Objective=tuple(
+                    int(Value)
+                    for Value in CandidateScore[:5]
+                ),
+            )
+        )
+    CachedPortfolio = tuple(Portfolio)
+    _PinAlignedPackedClusterPortfolioCache[PortfolioKey] = CachedPortfolio
+    return CachedPortfolio
 
 
 def CompactWeightedPlacement(
@@ -9365,7 +10131,14 @@ def AddPcbRoutingGuides(
             else DefaultRedstoneRoutingTechnology.MaximumRoutableLayerCount
         ),
         max(
-            DefaultRedstoneRoutingTechnology.MinimumRoutingLayerCount,
+            # An explicitly selected pre-route envelope is a proof-backed
+            # routing contract.  Preserve the legacy technology floor only
+            # when no finite layer envelope was requested.
+            (
+                1
+                if MaximumLayerCount > 0
+                else DefaultRedstoneRoutingTechnology.MinimumRoutingLayerCount
+            ),
             ceil(sqrt(max(1, len(Signals)))),
         ),
     )
@@ -9379,12 +10152,20 @@ def AddPcbRoutingGuides(
         LocalNetTargets=Placed.LocalNetTargets,
         LocalRouteClaims=Placed.LocalRouteClaims,
         LocalRouteDiagnostics=Placed.LocalRouteDiagnostics,
+        DerivedPerimeterSlotDomain=Placed.DerivedPerimeterSlotDomain,
+        DerivedPerimeterSlotAssignment=(
+            Placed.DerivedPerimeterSlotAssignment
+        ),
     )
     return PcbPlacement(
         Placed=Guided,
         Clusters=(),
         SignalOrder=tuple(sorted(Signals)),
         LayerCount=LayerCount,
+        DerivedPerimeterSlotDomain=Guided.DerivedPerimeterSlotDomain,
+        DerivedPerimeterSlotAssignment=(
+            Guided.DerivedPerimeterSlotAssignment
+        ),
     )
 
 
@@ -9416,6 +10197,9 @@ def PlacePcbGraph(
     TopologyCutFrontier: tuple[RoutingAssignmentCut, ...] = (),
     MandatoryAccessPreScreenOnly: bool = False,
     PlacementScoringOnly: bool = False,
+    PreferAccessRingTerminals: bool = False,
+    UseDerivedPerimeterTerminals: bool = False,
+    DerivedTerminalLayoutVariantIndex: int = 0,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PcbPlacement:
     """Cluster, optimize, legalize, and guide a generic NAND graph."""
@@ -9426,6 +10210,17 @@ def PlacePcbGraph(
     CheckWork("start")
     if RoutingSpacing < 0:
         raise ValueError("RoutingSpacing cannot be negative")
+    if DerivedTerminalLayoutVariantIndex < 0:
+        raise ValueError(
+            "derived terminal layout variant index cannot be negative"
+        )
+    if (
+        DerivedTerminalLayoutVariantIndex
+        and not UseDerivedPerimeterTerminals
+    ):
+        raise ValueError(
+            "terminal layout variants require derived perimeter terminals"
+        )
     Module = Netlist.Modules[Netlist.Top]
     ModuleLayoutFingerprint = tuple(
         (
@@ -9750,6 +10545,11 @@ def PlacePcbGraph(
             RoutingSpacing,
             PackingPolicy.BeamWidth if PackedMode else 0,
             PackingPolicy.GraphBeamEnabled if PackedMode else False,
+            (
+                JointPlacementCandidateIndex
+                if PackedMode and PackingPolicy.GraphBeamEnabled
+                else 0
+            ),
             PackingPolicy.EnableStructuralReuse if PackedMode else False,
             (
                 PackingPolicy.MaximumStructuralReuseMappings
@@ -10099,6 +10899,7 @@ def PlacePcbGraph(
                                 Names,
                                 InternalByName,
                                 PackingPolicy.BeamWidth,
+                                CandidateIndex=JointPlacementCandidateIndex,
                                 WorkCheck=WorkCheck,
                             )
                         )
@@ -10131,6 +10932,7 @@ def PlacePcbGraph(
                         Names,
                         InternalByName,
                         PackingPolicy.BeamWidth,
+                        CandidateIndex=JointPlacementCandidateIndex,
                         WorkCheck=WorkCheck,
                     )
                     if PackingPolicy.GraphBeamEnabled
@@ -11674,6 +12476,9 @@ def PlacePcbGraph(
                 repr(PlacementPolicy),
                 repr(PackingPolicy),
                 bool(MandatoryAccessPreScreenOnly),
+                bool(PreferAccessRingTerminals),
+                bool(UseDerivedPerimeterTerminals),
+                int(DerivedTerminalLayoutVariantIndex),
                 RelocationVariant,
                 tuple(sorted(RelocationSignals)),
                 tuple(sorted(RelocationPrioritySignals)),
@@ -11694,8 +12499,14 @@ def PlacePcbGraph(
             ExactStatePlacementCacheFingerprint = sha256(
                 repr(ExactStatePlacementCacheKey).encode("utf-8")
             ).hexdigest()
+            # A cached full placement includes its historical terminal bank.
+            # Derived perimeter slots must instead be rebuilt from the cached
+            # NAND core so their immutable pre-route domain is visible on
+            # every placement construction.
             CachedExactStateGeometry = (
-                _ExactStatePlacementGeometryCache.get(
+                None
+                if UseDerivedPerimeterTerminals
+                else _ExactStatePlacementGeometryCache.get(
                     ExactStatePlacementCacheKey
                 )
             )
@@ -11971,6 +12782,15 @@ def PlacePcbGraph(
         Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
         for Gate in PlacedGates
     )
+    UseDerivedSingleComponentPlacement = (
+        PackedMode
+        and len(Clusters) == 1
+        and UseDerivedPerimeterTerminals
+    )
+    DerivedPerimeterSlotDomainValue: DerivedPerimeterSlotDomain | None = None
+    DerivedPerimeterSlotAssignmentValue: (
+        DerivedPerimeterSlotAssignment | None
+    ) = None
     def PlaceTerminalBank(
         Gates: list[Any],
         BankZ: int,
@@ -12111,6 +12931,8 @@ def PlacePcbGraph(
         PortIndexes: dict[str, int],
     ) -> list[Any] | None:
         """Place packed-mode I/O on the exterior shell of the NAND fabric."""
+        nonlocal DerivedPerimeterSlotDomainValue
+        nonlocal DerivedPerimeterSlotAssignmentValue
         PlacedMinimumX = min(Gate.X for Gate in PlacedGates)
         PlacedMaximumX = max(
             Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
@@ -12143,6 +12965,55 @@ def PlacePcbGraph(
                 else Gate.Inputs[0]
             )
 
+        if UseDerivedSingleComponentPlacement:
+            # This is the sole derived perimeter placement domain.  It is
+            # materialized before any access-fabric or global-routing work;
+            # `DerivedTerminalLayoutVariantIndex` intentionally has no effect
+            # here because it represented a former post-failure portfolio.
+            DesiredPinsByTerminal = {
+                Gate.Name: tuple(
+                    Targets.get(TerminalSignal(Gate), ())
+                    if TerminalKind(Gate) == "INPUT"
+                    else (
+                        (Producers[TerminalSignal(Gate)].OutputPin,)
+                        if (
+                            TerminalSignal(Gate) in Producers
+                            and Producers[TerminalSignal(Gate)].OutputPin
+                            is not None
+                        )
+                        else ()
+                    )
+                )
+                for Gate in Gates
+            }
+            DerivedPerimeterSlotDomainValue = (
+                BuildDerivedPerimeterTerminalSlotDomain(
+                    Gates,
+                    PlacedGates,
+                    DesiredPinsByTerminal,
+                    WorkCheck=CheckWork,
+                )
+            )
+            DerivedPerimeterSlotAssignmentValue = (
+                SolveDerivedPerimeterSlotDomain(
+                    DerivedPerimeterSlotDomainValue,
+                    TerminalPlacementPolicy.MaximumTerminalAssignmentExpansions,
+                    WorkCheck=CheckWork,
+                )
+            )
+            if not DerivedPerimeterSlotAssignmentValue.Success:
+                return None
+            TerminalGateByName = {Gate.Name: Gate for Gate in Gates}
+            return [
+                BuildPlacedGate(
+                    TerminalGateByName[Slot.TerminalName],
+                    *Slot.Origin,
+                    Slot.Rotation,
+                    Slot.MirrorX,
+                )
+                for Slot in DerivedPerimeterSlotAssignmentValue.SelectedSlots
+            ]
+
         def TerminalCluster(Gate: Any) -> int | None:
             Signal = TerminalSignal(Gate)
             if TerminalKind(Gate) == "INPUT":
@@ -12166,6 +13037,22 @@ def PlacePcbGraph(
                 PortIndexes[TerminalSignal(Value)],
                 Value.Name,
             )
+
+        def CandidateExteriorFace(Candidate: Any) -> str:
+            """Classify the shell face reached by one legal terminal cell."""
+            Width, Depth = RotatedCellSize(
+                Candidate.Kind,
+                Candidate.Rotation,
+            )
+            MaximumX = Candidate.X + Width - 1
+            MaximumZ = Candidate.Z + Depth - 1
+            if MaximumZ < InternalMinimumZ:
+                return "north"
+            if Candidate.Z > InternalMaximumZ:
+                return "south"
+            if MaximumX < InternalMinimumX:
+                return "west"
+            return "east"
 
         PreCutInternalSignalsByTerminal: dict[
             str, frozenset[str]
@@ -12259,26 +13146,37 @@ def PlacePcbGraph(
                 DesiredPins[0][1],
                 (TargetZs[(len(TargetZs) - 1) // 2] + TargetZs[TargetMiddle]) // 2,
             )
-            CandidatePinPositions = {
-                (
-                    Pin[0] + DeltaX,
-                    Pin[1],
-                    Pin[2] + DeltaZ,
-                )
-                for Pin in DesiredPins
-                for DeltaX, DeltaZ in (
-                    (0, 0),
-                    (1, 0),
-                    (-1, 0),
-                    (0, 1),
-                    (0, -1),
-                    (2, 0),
-                    (-2, 0),
-                    (0, 2),
-                    (0, -2),
-                )
-            }
-            if len(DesiredPins) > 1:
+            if UseDerivedSingleComponentPlacement:
+                PinY = DesiredPins[0][1]
+                CandidatePinPositions = {
+                    *(
+                        (X, PinY, InternalMinimumZ - 1)
+                        for X in range(InternalMinimumX, InternalMaximumX + 1)
+                    ),
+                    *(
+                        (X, PinY, InternalMaximumZ + 1)
+                        for X in range(InternalMinimumX, InternalMaximumX + 1)
+                    ),
+                    *(
+                        (InternalMinimumX - 1, PinY, Z)
+                        for Z in range(InternalMinimumZ, InternalMaximumZ + 1)
+                    ),
+                    *(
+                        (InternalMaximumX + 1, PinY, Z)
+                        for Z in range(InternalMinimumZ, InternalMaximumZ + 1)
+                    ),
+                }
+            else:
+                CandidatePinPositions = {
+                    (
+                        Pin[0] + DeltaX,
+                        Pin[1],
+                        Pin[2] + DeltaZ,
+                    )
+                    for Pin in DesiredPins
+                    for DeltaX, DeltaZ in BuildDerivedPinAlignmentOffsets()
+                }
+            if len(DesiredPins) > 1 and not UseDerivedSingleComponentPlacement:
                 CandidatePinPositions.update(
                     (
                         MedianAnchor[0] + DeltaX,
@@ -12295,37 +13193,38 @@ def PlacePcbGraph(
             # serve.  This avoids four-sided horizontal sprawl while ensuring
             # every terminal is visible and approachable at the edge of an
             # arbitrary packed graph.
-            ShellAnchors = (*DesiredPins, MedianAnchor)
-            ShellClearance = (
-                TerminalPlacementPolicy.TerminalShellClearance
-            )
-            ShellLateralSearch = (
-                TerminalPlacementPolicy.TerminalShellLateralSearch
-                + (
-                    PreCutTerminalPinSpacing
-                    if Signal in PreCutInternalSignalsByTerminal
-                    else 0
+            if not UseDerivedSingleComponentPlacement:
+                ShellAnchors = (*DesiredPins, MedianAnchor)
+                ShellClearance = (
+                    TerminalPlacementPolicy.TerminalShellClearance
                 )
-            )
-            ShellZ = (
-                InternalMinimumZ - ShellClearance
-                if TerminalKind(Gate) == "INPUT"
-                else InternalMaximumZ + ShellClearance
-            )
-            for Anchor in ShellAnchors:
-                CandidatePinPositions.update(
-                    (
-                        (
-                            Anchor[0] + Delta,
-                            Anchor[1],
-                            ShellZ,
-                        )
-                        for Delta in range(
-                            -ShellLateralSearch,
-                            ShellLateralSearch + 1,
-                        )
+                ShellLateralSearch = (
+                    TerminalPlacementPolicy.TerminalShellLateralSearch
+                    + (
+                        PreCutTerminalPinSpacing
+                        if Signal in PreCutInternalSignalsByTerminal
+                        else 0
                     )
                 )
+                ShellZ = (
+                    InternalMinimumZ - ShellClearance
+                    if TerminalKind(Gate) == "INPUT"
+                    else InternalMaximumZ + ShellClearance
+                )
+                for Anchor in ShellAnchors:
+                    CandidatePinPositions.update(
+                        (
+                            (
+                                Anchor[0] + Delta,
+                                Anchor[1],
+                                ShellZ,
+                            )
+                            for Delta in range(
+                                -ShellLateralSearch,
+                                ShellLateralSearch + 1,
+                            )
+                        )
+                    )
             Options = []
             for Rotation in (0, 90, 180, 270):
                 CheckWork(
@@ -12450,21 +13349,7 @@ def PlacePcbGraph(
             )
 
             def ExteriorFace(Option: tuple[tuple[Any, ...], Any]) -> str:
-                """Classify the shell face reached by one legal terminal cell."""
-                Candidate = Option[1]
-                Width, Depth = RotatedCellSize(
-                    Candidate.Kind,
-                    Candidate.Rotation,
-                )
-                MaximumX = Candidate.X + Width - 1
-                MaximumZ = Candidate.Z + Depth - 1
-                if MaximumZ < InternalMinimumZ:
-                    return "north"
-                if Candidate.Z > InternalMaximumZ:
-                    return "south"
-                if MaximumX < InternalMinimumX:
-                    return "west"
-                return "east"
+                return CandidateExteriorFace(Option[1])
 
             # Keep one low-cost representative on every exterior face before
             # truncating the bounded candidate pool.  A terminal that looks
@@ -12497,12 +13382,28 @@ def PlacePcbGraph(
                 ],
             ))
 
-        BestSelection: tuple[Any, ...] | None = None
-        BestScore: tuple[Any, ...] | None = None
+        # A derived perimeter placement may publish a bounded set of complete,
+        # access-distinct terminal layouts before routing.  The requested
+        # variant index is part of the placement recipe; it is never advanced
+        # in response to a capacity or routing failure.  Ordinary placements
+        # retain their historical one-layout behaviour.
+        RequiredTerminalLayoutCount = (
+            DerivedTerminalLayoutVariantIndex + 1
+            if UseDerivedSingleComponentPlacement
+            else 1
+        )
+        RetainedTerminalSelections: dict[
+            tuple[object, ...],
+            tuple[
+                tuple[Any, ...],
+                tuple[tuple[tuple[Any, ...], Any], ...],
+            ],
+        ] = {}
         AssignmentExpansions = 0
         StopAfterFirstLegalTerminalAssignment = (
             TypedTerminalPlacementPressure
             and RelocationVariant >= 2
+            and RequiredTerminalLayoutCount == 1
         )
         TerminalAssignmentExpansionLimit = (
             min(
@@ -12652,6 +13553,203 @@ def PlacePcbGraph(
                 TerminalConflictCache[Key] = Conflict
             return Conflict
 
+        InternalAccessPositionsBySignal: dict[
+            str,
+            frozenset[tuple[int, int, int]],
+        ] = {}
+        MutableInternalAccessPositionsBySignal: dict[
+            str,
+            set[tuple[int, int, int]],
+        ] = {}
+        for Existing in PlacedGates:
+            if Existing.OutputPin is not None and Existing.OutputDirection is not None:
+                for Signal in Existing.Outputs:
+                    MutableInternalAccessPositionsBySignal.setdefault(
+                        str(Signal),
+                        set(),
+                    ).update(
+                        (
+                            Existing.OutputPin[0]
+                            + Existing.OutputDirection[0] * Offset,
+                            Existing.OutputPin[1]
+                            + Existing.OutputDirection[1] * Offset,
+                            Existing.OutputPin[2]
+                            + Existing.OutputDirection[2] * Offset,
+                        )
+                        for Offset in range(
+                            DefaultRedstoneRoutingTechnology.AccessLength
+                        )
+                    )
+            for InputIndex, Signal in enumerate(Existing.Inputs):
+                Pin = Existing.InputPins[InputIndex]
+                Direction = Existing.InputDirections[InputIndex]
+                MutableInternalAccessPositionsBySignal.setdefault(
+                    str(Signal),
+                    set(),
+                ).update(
+                    (
+                        Pin[0] + Direction[0] * Offset,
+                        Pin[1] + Direction[1] * Offset,
+                        Pin[2] + Direction[2] * Offset,
+                    )
+                    for Offset in range(
+                        DefaultRedstoneRoutingTechnology.AccessLength
+                    )
+                )
+        InternalAccessPositionsBySignal = {
+            Signal: frozenset(Positions)
+            for Signal, Positions
+            in MutableInternalAccessPositionsBySignal.items()
+        }
+
+        def TerminalAccessPositions(
+            Candidate: Any,
+        ) -> frozenset[tuple[int, int, int]]:
+            Pin = TerminalConnectionPin(Candidate)
+            Direction = (
+                Candidate.OutputDirection
+                if getattr(Candidate.Kind, "value", Candidate.Kind) == "INPUT"
+                else Candidate.InputDirections[0]
+            )
+            return frozenset(
+                (
+                    Pin[0] + Direction[0] * Offset,
+                    Pin[1] + Direction[1] * Offset,
+                    Pin[2] + Direction[2] * Offset,
+                )
+                for Offset in range(
+                    DefaultRedstoneRoutingTechnology.AccessLength
+                )
+            )
+
+        TerminalAccessPositionsByIdentity = {
+            id(Candidate): TerminalAccessPositions(Candidate)
+            for Candidate in TerminalCandidates
+        }
+        TerminalAccessExclusionsByIdentity = {
+            Identity: (
+                DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+                    Positions
+                )
+            )
+            for Identity, Positions
+            in TerminalAccessPositionsByIdentity.items()
+        }
+        InternalAccessExclusionsBySignal = {
+            Signal: (
+                DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+                    Positions
+                )
+            )
+            for Signal, Positions
+            in InternalAccessPositionsBySignal.items()
+        }
+        TerminalInternalAccessConflictCountByIdentity = {
+            id(Candidate): sum(
+                1
+                for OtherSignal, OtherPositions
+                in InternalAccessPositionsBySignal.items()
+                if TerminalSignal(Candidate) != OtherSignal
+                and (
+                    TerminalAccessPositionsByIdentity[id(Candidate)]
+                    & InternalAccessExclusionsBySignal[OtherSignal]
+                    or OtherPositions
+                    & TerminalAccessExclusionsByIdentity[id(Candidate)]
+                )
+            )
+            for Candidate in TerminalCandidates
+        }
+        TerminalAccessConflictCache: dict[tuple[int, int], bool] = {}
+
+        def TerminalAccessConflicts(First: Any, Second: Any) -> bool:
+            FirstIdentity = id(First)
+            SecondIdentity = id(Second)
+            Key = (
+                (FirstIdentity, SecondIdentity)
+                if FirstIdentity < SecondIdentity
+                else (SecondIdentity, FirstIdentity)
+            )
+            Conflict = TerminalAccessConflictCache.get(Key)
+            if Conflict is None:
+                Conflict = bool(
+                    TerminalAccessPositionsByIdentity[FirstIdentity]
+                    & TerminalAccessExclusionsByIdentity[SecondIdentity]
+                    or TerminalAccessPositionsByIdentity[SecondIdentity]
+                    & TerminalAccessExclusionsByIdentity[FirstIdentity]
+                )
+                TerminalAccessConflictCache[Key] = Conflict
+            return Conflict
+
+        def SelectionAccessConflictCount(
+            Selected: tuple[tuple[tuple[Any, ...], Any], ...],
+        ) -> int:
+            Candidates = tuple(
+                Candidate for _Key, Candidate in Selected
+            )
+            return (
+                sum(
+                    TerminalInternalAccessConflictCountByIdentity[
+                        id(Candidate)
+                    ]
+                    for Candidate in Candidates
+                )
+                + sum(
+                    TerminalSignal(First) != TerminalSignal(Second)
+                    and TerminalAccessConflicts(First, Second)
+                    for Index, First in enumerate(Candidates)
+                    for Second in Candidates[Index + 1:]
+                )
+            )
+
+        def SelectionAccessIdentity(
+            Selected: tuple[tuple[tuple[Any, ...], Any], ...],
+        ) -> tuple[object, ...]:
+            """Identify a complete terminal layout by physical access shape.
+
+            A rotation-only change on the same side rarely alters the shared
+            capacity problem.  Retain the best legal representative for each
+            signal-to-perimeter-face pattern, so every fixed member changes
+            the topology of its terminal escape domain rather than spending a
+            domain slot on cosmetic orientation.
+            """
+            return tuple(sorted(
+                (
+                    str(TerminalSignal(Candidate)),
+                    str(Candidate.Name),
+                    CandidateExteriorFace(Candidate),
+                )
+                for _Key, Candidate in Selected
+            ))
+
+        def WorstRetainedTerminalScore() -> tuple[Any, ...] | None:
+            if len(RetainedTerminalSelections) < RequiredTerminalLayoutCount:
+                return None
+            return max(
+                Score
+                for Score, _Selection in RetainedTerminalSelections.values()
+            )
+
+        def RetainTerminalSelection(
+            Selected: tuple[tuple[tuple[Any, ...], Any], ...],
+        ) -> None:
+            """Retain the best fixed representatives without a retry queue."""
+            Identity = SelectionAccessIdentity(Selected)
+            Score = SelectionScore(Selected)
+            Existing = RetainedTerminalSelections.get(Identity)
+            if Existing is not None and Existing[0] <= Score:
+                return
+            RetainedTerminalSelections[Identity] = (Score, Selected)
+            if len(RetainedTerminalSelections) <= RequiredTerminalLayoutCount:
+                return
+            WorstIdentity = max(
+                RetainedTerminalSelections,
+                key=lambda Value: (
+                    RetainedTerminalSelections[Value][0],
+                    Value,
+                ),
+            )
+            del RetainedTerminalSelections[WorstIdentity]
+
         def SelectionScore(
             Selected: tuple[tuple[tuple[Any, ...], Any], ...],
         ) -> tuple[Any, ...]:
@@ -12682,11 +13780,30 @@ def PlacePcbGraph(
                 sum(Key[0] for Key, _Candidate in Selected),
                 sum(Key[1] for Key, _Candidate in Selected),
             )
+            FaceCounts = {
+                Face: sum(
+                    CandidateExteriorFace(Candidate) == Face
+                    for _Key, Candidate in Selected
+                )
+                for Face in ("north", "south", "east", "west")
+            }
+            RingScore = (
+                max(FaceCounts.values(), default=0),
+                sum(Count * Count for Count in FaceCounts.values()),
+                *AreaScore,
+            )
+            BaseScore = (
+                (*RingScore, *RoutingScore)
+                if PreferAccessRingTerminals
+                else (*RoutingScore, *AreaScore)
+                if PreferTerminalRoutingCost
+                else (*AreaScore, *RoutingScore)
+            )
             return (
                 (
-                    (*RoutingScore, *AreaScore)
-                    if PreferTerminalRoutingCost
-                    else (*AreaScore, *RoutingScore)
+                    (SelectionAccessConflictCount(Selected), *BaseScore)
+                    if UseDerivedSingleComponentPlacement
+                    else BaseScore
                 )
                 + (
                 tuple(
@@ -12724,6 +13841,24 @@ def PlacePcbGraph(
             Width = MaximumX - MinimumX
             Depth = MaximumZ - MinimumZ
             AreaScore = (Width * Depth, max(Width, Depth))
+            if PreferAccessRingTerminals:
+                FaceCounts = {
+                    Face: sum(
+                        CandidateExteriorFace(Candidate) == Face
+                        for _Key, Candidate in Selected
+                    )
+                    for Face in ("north", "south", "east", "west")
+                }
+                BaseLowerBound = (
+                    max(FaceCounts.values(), default=0),
+                    sum(Count * Count for Count in FaceCounts.values()),
+                    *AreaScore,
+                )
+                return (
+                    (SelectionAccessConflictCount(Selected), *BaseLowerBound)
+                    if UseDerivedSingleComponentPlacement
+                    else BaseLowerBound
+                )
             RemainingMaximumDistance, RemainingTotalDistance = (
                 MinimumRemainingRoutingCosts[Index]
             )
@@ -12733,10 +13868,15 @@ def PlacePcbGraph(
                 sum(Key[1] for Key, _Candidate in Selected)
                 + RemainingTotalDistance,
             )
-            return (
+            BaseLowerBound = (
                 (*RoutingScore, *AreaScore)
                 if PreferTerminalRoutingCost
                 else (*AreaScore, *RoutingScore)
+            )
+            return (
+                (SelectionAccessConflictCount(Selected), *BaseLowerBound)
+                if UseDerivedSingleComponentPlacement
+                else BaseLowerBound
             )
 
         PrunedAssignmentExpansions = 0
@@ -12745,23 +13885,21 @@ def PlacePcbGraph(
             Index: int,
             Selected: tuple[tuple[tuple[Any, ...], Any], ...],
         ) -> None:
-            nonlocal AssignmentExpansions, BestSelection, BestScore
+            nonlocal AssignmentExpansions
             nonlocal PrunedAssignmentExpansions
             if AssignmentExpansions >= TerminalAssignmentExpansionLimit:
                 return
             AssignmentExpansions += 1
+            LowerBound = SelectionLowerBound(Index, Selected)
+            WorstScore = WorstRetainedTerminalScore()
             if (
-                BestScore is not None
-                and SelectionLowerBound(Index, Selected)
-                > BestScore[:4]
+                WorstScore is not None
+                and LowerBound > WorstScore[:len(LowerBound)]
             ):
                 PrunedAssignmentExpansions += 1
                 return
             if Index == len(OptionsByGate):
-                Score = SelectionScore(Selected)
-                if BestScore is None or Score < BestScore:
-                    BestScore = Score
-                    BestSelection = Selected
+                RetainTerminalSelection(Selected)
                 return
             _GateName, Options = OptionsByGate[Index]
             for Option in Options:
@@ -12829,7 +13967,7 @@ def PlacePcbGraph(
                 SearchTerminalAssignments(Index + 1, (*Selected, Option))
                 if (
                     StopAfterFirstLegalTerminalAssignment
-                    and BestSelection is not None
+                    and RetainedTerminalSelections
                 ):
                     return
 
@@ -12840,13 +13978,32 @@ def PlacePcbGraph(
             StopAfterFirstLegalTerminalAssignment=(
                 StopAfterFirstLegalTerminalAssignment
             ),
+            RequestedDerivedTerminalLayoutVariantIndex=(
+                DerivedTerminalLayoutVariantIndex
+            ),
+            RetainedTerminalLayoutCount=len(RetainedTerminalSelections),
             NandCount=NandCount,
             RelocationVariant=RelocationVariant,
             PrunedAssignmentExpansions=PrunedAssignmentExpansions,
         )
-        if BestSelection is None:
+        OrderedTerminalSelections = tuple(sorted(
+            RetainedTerminalSelections.values(),
+            key=lambda Value: Value[0],
+        ))
+        if not OrderedTerminalSelections:
             return None
-        return [Candidate for _Key, Candidate in BestSelection]
+        if (
+            DerivedTerminalLayoutVariantIndex
+            >= len(OrderedTerminalSelections)
+        ):
+            raise ValueError(
+                "derived terminal layout variant exceeds the complete "
+                "access-distinct terminal domain"
+            )
+        _Score, SelectedTerminalLayout = OrderedTerminalSelections[
+            DerivedTerminalLayoutVariantIndex
+        ]
+        return [Candidate for _Key, Candidate in SelectedTerminalLayout]
 
     if MandatoryAccessPreScreenOnly:
         if (
@@ -12932,6 +14089,10 @@ def PlacePcbGraph(
         )
         else None
     )
+    if UseDerivedSingleComponentPlacement and PlannedTerminals is None:
+        raise ValueError(
+            "derived single-component terminal domain has no legal assignment"
+        )
     if PlannedTerminals is not None:
         CandidatePlacement = BasePlacement + PlannedTerminals
         try:
@@ -13009,6 +14170,7 @@ def PlacePcbGraph(
     if (
         ExactStatePlacementCacheKey is not None
         and CachedExactStateGeometry is None
+        and not UseDerivedSingleComponentPlacement
     ):
         CachedExactStateGeometry = tuple(
             ExactStatePlacedGateGeometry.FromPlacedGate(Gate)
@@ -13021,7 +14183,14 @@ def PlacePcbGraph(
             "ExactStatePlacementCache"
         ]["CachedGateCount"] = len(CachedExactStateGeometry)
     CheckWork("terminal-placement-complete", GateCount=len(PlacedGates))
-    Placed = PlacedDesign(Module=Module, PlacedGates=PlacedGates)
+    Placed = PlacedDesign(
+        Module=Module,
+        PlacedGates=PlacedGates,
+        DerivedPerimeterSlotDomain=DerivedPerimeterSlotDomainValue,
+        DerivedPerimeterSlotAssignment=(
+            DerivedPerimeterSlotAssignmentValue
+        ),
+    )
     if PackedMode:
         Producers = {
             Signal: Gate
@@ -14373,6 +15542,12 @@ def PlacePcbGraph(
             LocalNetTargets=Guided.Placed.LocalNetTargets,
             LocalRouteClaims=Guided.Placed.LocalRouteClaims,
             LocalRouteDiagnostics=Guided.Placed.LocalRouteDiagnostics,
+            DerivedPerimeterSlotDomain=(
+                Guided.Placed.DerivedPerimeterSlotDomain
+            ),
+            DerivedPerimeterSlotAssignment=(
+                Guided.Placed.DerivedPerimeterSlotAssignment
+            ),
             ClusterBoundaryLeaseRequests=BoundaryLeaseRequests,
             CompleteClusterInterfaceAccess=(
                 EnableClusterInterfacePlacementFeasibility
@@ -14387,6 +15562,12 @@ def PlacePcbGraph(
         ClusterLocalRouteTemplates=ClusterLocalRouteTemplates,
         CompleteClusterInterfaceAccess=(
             EnableClusterInterfacePlacementFeasibility
+        ),
+        DerivedPerimeterSlotDomain=(
+            Guided.Placed.DerivedPerimeterSlotDomain
+        ),
+        DerivedPerimeterSlotAssignment=(
+            Guided.Placed.DerivedPerimeterSlotAssignment
         ),
         ComponentGraph=LogicalComponentGraph,
     )

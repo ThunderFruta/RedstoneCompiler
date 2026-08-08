@@ -54,6 +54,7 @@ def RoutePcbNets(
     ReservationVariant: int = 0,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
+    PrepareRawTrackAssignmentDomainOnly: bool = False,
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
@@ -126,6 +127,9 @@ def RoutePcbNets(
         ReservationVariant=ReservationVariant,
         PreparePortalGeometryOnly=PreparePortalGeometryOnly,
         PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
+        PrepareRawTrackAssignmentDomainOnly=(
+            PrepareRawTrackAssignmentDomainOnly
+        ),
         FrozenTrackAssignmentPreparation=FrozenTrackAssignmentPreparation,
         ValidateClusterInterfaceForeignAccessOnly=(
             ValidateClusterInterfaceForeignAccessOnly

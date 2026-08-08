@@ -1,9 +1,12 @@
 use crate::Assignment::{AssignCandidates, SortCandidatesWithDeadline};
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
-use crate::Models::{AssignmentCandidate, ClaimMask, ClaimMaskBuildError, RoutingAssignmentResult};
+use crate::Models::{
+    AssignmentCandidate, ClaimMask, ClaimMaskBuildError, RoutingAssignmentResult,
+    TemplateRoutingAssignmentResult,
+};
 use pyo3::prelude::*;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
@@ -30,6 +33,22 @@ pub(crate) type AssignmentCandidateValue = (
     i32,
 );
 pub(crate) type BaseAssignmentValue = (String, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>);
+/// One immutable, complete routing-template assignment domain supplied by
+/// Python after it has materialized the template's own resource graph.
+///
+/// Resource indices are intentionally local to each template: templates are
+/// mutually exclusive, so `ClaimMask` comparisons are only meaningful inside
+/// the selected template's indexed graph.  `RequiredSignals` preserves an
+/// explicit empty complete domain, which flattened candidate payloads alone
+/// cannot represent.
+pub(crate) type TemplateAssignmentDomainValue = (
+    String,
+    Vec<i64>,
+    usize,
+    Vec<String>,
+    Vec<AssignmentCandidateValue>,
+    Vec<BaseAssignmentValue>,
+);
 
 pub(crate) fn DeadlineExceededAssignmentResult(CompletedWork: usize) -> RoutingAssignmentResult {
     RoutingAssignmentResult {
@@ -38,6 +57,22 @@ pub(crate) fn DeadlineExceededAssignmentResult(CompletedWork: usize) -> RoutingA
         ExpansionCount: CompletedWork,
         BudgetExhausted: false,
         DeadlineExceeded: true,
+        CompletedWork,
+        FailureNet: None,
+        ConflictSignals: Vec::new(),
+        ConflictResourceIndices: Vec::new(),
+        PairwiseIncompatibleSignals: Vec::new(),
+        PairwiseCompatibilityComplete: false,
+    }
+}
+
+fn BudgetExceededAssignmentResult(CompletedWork: usize) -> RoutingAssignmentResult {
+    RoutingAssignmentResult {
+        Success: false,
+        SelectedCandidateIds: Vec::new(),
+        ExpansionCount: CompletedWork,
+        BudgetExhausted: true,
+        DeadlineExceeded: false,
         CompletedWork,
         FailureNet: None,
         ConflictSignals: Vec::new(),
@@ -203,25 +238,52 @@ pub(crate) fn PlanAuthoritativeRoutesWithDeadline(
     MaximumExpansionCount: usize,
     Deadline: RuntimeDeadline,
 ) -> PyResult<RoutingAssignmentResult> {
+    PlanAuthoritativeRoutesWithInitialExpansionAndDeadline(
+        CandidateValues,
+        ResourceCount,
+        0,
+        MaximumExpansionCount,
+        Deadline,
+    )
+}
+
+/// Run one assignment domain while continuing an already-spent expansion
+/// counter.  The aggregate template selector uses this to make the existing
+/// exact `ClaimMask` search share one fixed budget without changing ordinary
+/// single-template binding semantics.
+pub(crate) fn PlanAuthoritativeRoutesWithInitialExpansionAndDeadline(
+    CandidateValues: Vec<AssignmentCandidateValue>,
+    ResourceCount: usize,
+    InitialExpansionCount: usize,
+    MaximumExpansionCount: usize,
+    Deadline: RuntimeDeadline,
+) -> PyResult<RoutingAssignmentResult> {
     if ResourceCount == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "resource count must be positive",
         ));
     }
+    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(
+        1,
+        MAXIMUM_EXPANSIONS,
+    );
+    if InitialExpansionCount >= EffectiveMaximumExpansionCount {
+        return Ok(BudgetExceededAssignmentResult(InitialExpansionCount));
+    }
     let Some(mut Groups) = BuildCandidateGroups(CandidateValues, ResourceCount, &Deadline)? else {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
     if !SortCandidateGroups(&mut Groups, &Deadline) {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     }
     let Some(Remaining) = BuildRemainingSignals(&Groups, &Deadline) else {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
     let Some(Owned) = ClaimMask::NewWithDeadline(ResourceCount, &Deadline) else {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
     let mut Selected = Vec::new();
-    let mut ExpansionCount = 0usize;
+    let mut ExpansionCount = InitialExpansionCount;
     let mut FailureNet = None;
     let mut BudgetExhausted = false;
     let mut ConflictSignals = Vec::new();
@@ -235,7 +297,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithDeadline(
         &BTreeMap::new(),
         &mut Selected,
         &mut ExpansionCount,
-        MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS),
+        EffectiveMaximumExpansionCount,
         &mut BudgetExhausted,
         &Deadline,
         &mut FailureNet,
@@ -292,10 +354,37 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
     MaximumExpansionCount: usize,
     Deadline: RuntimeDeadline,
 ) -> PyResult<RoutingAssignmentResult> {
+    PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
+        CandidateValues,
+        BaseValues,
+        ResourceCount,
+        0,
+        MaximumExpansionCount,
+        Deadline,
+    )
+}
+
+/// Base-claim variant of
+/// `PlanAuthoritativeRoutesWithInitialExpansionAndDeadline`.
+pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
+    CandidateValues: Vec<AssignmentCandidateValue>,
+    BaseValues: Vec<BaseAssignmentValue>,
+    ResourceCount: usize,
+    InitialExpansionCount: usize,
+    MaximumExpansionCount: usize,
+    Deadline: RuntimeDeadline,
+) -> PyResult<RoutingAssignmentResult> {
     if ResourceCount == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "resource count must be positive",
         ));
+    }
+    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(
+        1,
+        MAXIMUM_EXPANSIONS,
+    );
+    if InitialExpansionCount >= EffectiveMaximumExpansionCount {
+        return Ok(BudgetExceededAssignmentResult(InitialExpansionCount));
     }
     let mut BaseBySignal: BTreeMap<String, ClaimMask> = BTreeMap::new();
     for (BaseIndex, (Signal, Wire, Support, Air, Electrical)) in BaseValues.into_iter().enumerate()
@@ -313,7 +402,9 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
         ) {
             Ok(Value) => Value,
             Err(ClaimMaskBuildError::DeadlineExceeded) => {
-                return Ok(DeadlineExceededAssignmentResult(0));
+                return Ok(DeadlineExceededAssignmentResult(
+                    InitialExpansionCount,
+                ));
             }
             Err(ClaimMaskBuildError::IndexOutOfRange) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -323,19 +414,23 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
         };
         if let Some(Existing) = BaseBySignal.get_mut(&Signal) {
             if !Existing.UnionWithDeadline(&Claims, &Deadline) {
-                return Ok(DeadlineExceededAssignmentResult(0));
+                return Ok(DeadlineExceededAssignmentResult(
+                    InitialExpansionCount,
+                ));
             }
         } else {
             BaseBySignal.insert(Signal, Claims);
         }
     }
     if Deadline.WasExceeded() {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     }
     let mut BaseSignals = Vec::with_capacity(BaseBySignal.len());
     for (Index, Signal) in BaseBySignal.keys().enumerate() {
         if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
-            return Ok(DeadlineExceededAssignmentResult(0));
+            return Ok(DeadlineExceededAssignmentResult(
+                InitialExpansionCount,
+            ));
         }
         BaseSignals.push(Signal.clone());
     }
@@ -351,21 +446,25 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
             let Conflicts =
                 match Claims.ConflictsWithDeadline(&BaseBySignal[OtherSignal], &Deadline) {
                     Some(Value) => Value,
-                    None => return Ok(DeadlineExceededAssignmentResult(0)),
+                    None => return Ok(DeadlineExceededAssignmentResult(
+                        InitialExpansionCount,
+                    )),
                 };
             if Conflicts {
                 let Some(ConflictResourceIndices) =
                     Claims.ConflictIndicesWithDeadline(&BaseBySignal[OtherSignal], &Deadline)
                 else {
-                    return Ok(DeadlineExceededAssignmentResult(0));
+                    return Ok(DeadlineExceededAssignmentResult(
+                        InitialExpansionCount,
+                    ));
                 };
                 return Ok(RoutingAssignmentResult {
                     Success: false,
                     SelectedCandidateIds: Vec::new(),
-                    ExpansionCount: 0,
+                    ExpansionCount: InitialExpansionCount,
                     BudgetExhausted: false,
                     DeadlineExceeded: false,
-                    CompletedWork: 0,
+                    CompletedWork: InitialExpansionCount,
                     FailureNet: Some(Signal.clone()),
                     ConflictSignals: vec![Signal.clone(), OtherSignal.clone()],
                     ConflictResourceIndices,
@@ -379,23 +478,23 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
         }
     }
     if Deadline.WasExceeded() {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     }
 
     let Some(mut Groups) = BuildCandidateGroups(CandidateValues, ResourceCount, &Deadline)? else {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
     if !SortCandidateGroups(&mut Groups, &Deadline) {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     }
     let Some(Remaining) = BuildRemainingSignals(&Groups, &Deadline) else {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
     let Some(Owned) = ClaimMask::NewWithDeadline(ResourceCount, &Deadline) else {
-        return Ok(DeadlineExceededAssignmentResult(0));
+        return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
     let mut Selected = Vec::new();
-    let mut ExpansionCount = 0usize;
+    let mut ExpansionCount = InitialExpansionCount;
     let mut FailureNet = None;
     let mut BudgetExhausted = false;
     let mut ConflictSignals = Vec::new();
@@ -409,7 +508,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndDeadline(
         &BaseBySignal,
         &mut Selected,
         &mut ExpansionCount,
-        MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS),
+        EffectiveMaximumExpansionCount,
         &mut BudgetExhausted,
         &Deadline,
         &mut FailureNet,

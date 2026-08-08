@@ -31,6 +31,12 @@ class RedstoneRoutingTechnology:
     AccessLength: int = 3
     DefaultSupportBlock: str = "minecraft:light_gray_concrete"
     RoutingLayerPitch: int = 2
+    # A routing deck is physically legal as soon as it can be represented by
+    # the technology's support/headroom and electrical rules.  The historic
+    # three-deck value below remains the conservative legacy floor for paths
+    # that have not selected an explicit pre-route envelope.  Small derived
+    # placement domains may prove that one or two decks suffice.
+    MinimumPhysicalRoutingLayerCount: int = 1
     MinimumRoutingLayerCount: int = 3
     MaximumRoutableLayerCount: int = 8
 

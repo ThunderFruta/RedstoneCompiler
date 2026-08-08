@@ -2304,6 +2304,27 @@ class RouterReliabilityTests(unittest.TestCase):
         )
         self.assertEqual(ClusterBoundaryLeaseStateCount(Placement), 1)
 
+    def testFrozenPrePlacementTrackWitnessUsesOneLeaseState(
+        self,
+    ) -> None:
+        """A frozen capacity witness must not reopen lease alternatives."""
+        Request = SimpleNamespace(TargetTerminals=((1, 1, 1),) * 3)
+        Placement = SimpleNamespace(
+            Placed=SimpleNamespace(
+                ClusterBoundaryLeaseRequests=(Request,) * 6,
+                LocalRouteDiagnostics={},
+                RoutedComponentTemplates=(),
+            ),
+        )
+        self.assertEqual(ClusterBoundaryLeaseStateCount(Placement), 3)
+        self.assertEqual(
+            ClusterBoundaryLeaseStateCount(
+                Placement,
+                HasFrozenTrackAssignment=True,
+            ),
+            1,
+        )
+
     def testEmptySerializedConstraintManifestDoesNotSuppressLeaseStates(
         self,
     ) -> None:

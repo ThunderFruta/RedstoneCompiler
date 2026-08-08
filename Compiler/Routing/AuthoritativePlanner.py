@@ -176,6 +176,264 @@ Position2 = tuple[int, int]
 Position3 = tuple[int, int, int]
 
 
+@dataclass(frozen=True)
+class RawTrackAssignmentValue:
+    """One immutable ordinary or local value before native assignment.
+
+    The normal router materializes these values immediately before invoking
+    the Rust MRV assignment.  Keeping the physical claims and objective in a
+    typed value lets a pre-route portfolio publish the *same* finite domain
+    without pretending that one candidate's selected result is a proof for a
+    different placement.
+    """
+
+    Signal: str
+    CandidateId: str
+    Claims: RoutingResourceClaims
+    MaterialCost: int
+    FootprintGrowth: int
+    Length: int
+    BendCount: int
+    ViaCount: int
+    ValueKind: str = "ordinary"
+
+    def __post_init__(self) -> None:
+        if not self.Signal or not self.CandidateId:
+            raise ValueError("raw track-assignment values require identities")
+        if self.ValueKind not in {"ordinary", "local-claim"}:
+            raise ValueError("raw track-assignment value kind is invalid")
+        if min(
+            self.MaterialCost,
+            self.FootprintGrowth,
+            self.Length,
+            self.BendCount,
+            self.ViaCount,
+        ) < 0:
+            raise ValueError("raw track-assignment objective cannot be negative")
+
+    @property
+    def ResourceIds(self) -> tuple[str, ...]:
+        return tuple(sorted(map(str, self.Claims.ResourceIds)))
+
+    def Encode(
+        self,
+        Indexed: IndexedRoutingResourceGraph,
+    ) -> tuple[Any, ...]:
+        """Return the existing Rust value tuple with no policy translation."""
+        Wire, Support, Air, Electrical = Indexed.EncodeClaims(self.Claims)
+        return (
+            self.Signal,
+            self.CandidateId,
+            list(Wire),
+            list(Support),
+            list(Air),
+            list(Electrical),
+            self.MaterialCost,
+            self.FootprintGrowth,
+            self.Length,
+            self.BendCount,
+            self.ViaCount,
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "CandidateId": self.CandidateId,
+            "ValueKind": self.ValueKind,
+            "MaterialCost": self.MaterialCost,
+            "FootprintGrowth": self.FootprintGrowth,
+            "Length": self.Length,
+            "BendCount": self.BendCount,
+            "ViaCount": self.ViaCount,
+            "ResourceIds": list(self.ResourceIds),
+        }
+
+
+@dataclass(frozen=True)
+class RawTrackAssignmentBaseClaim:
+    """One immutable same-signal claim supplied to the native base mask."""
+
+    Signal: str
+    ClaimId: str
+    Claims: RoutingResourceClaims
+
+    def __post_init__(self) -> None:
+        if not self.Signal or not self.ClaimId:
+            raise ValueError("raw assignment base claims require identities")
+
+    def Encode(
+        self,
+        Indexed: IndexedRoutingResourceGraph,
+    ) -> tuple[Any, ...]:
+        Wire, Support, Air, Electrical = Indexed.EncodeClaims(self.Claims)
+        return (
+            self.Signal,
+            list(Wire),
+            list(Support),
+            list(Air),
+            list(Electrical),
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "ClaimId": self.ClaimId,
+            "ResourceIds": sorted(map(str, self.Claims.ResourceIds)),
+        }
+
+
+@dataclass(frozen=True)
+class RawTrackAssignmentDomain:
+    """A complete-or-typed-incomplete native track-assignment input domain.
+
+    Resource indices are intentionally local to this domain.  Placement
+    alternatives describe mutually exclusive physical worlds, so a future
+    aggregate native selector must choose one domain before comparing its
+    resource masks; flattening their signals into one assignment would demand
+    that every placement route simultaneously.
+    """
+
+    ResourcePositions: tuple[Position3, ...]
+    Values: tuple[RawTrackAssignmentValue, ...]
+    BaseClaims: tuple[RawTrackAssignmentBaseClaim, ...]
+    CandidateCounts: tuple[tuple[str, int], ...]
+    CandidateDomainFingerprint: str
+    LocalClaimDomainFingerprint: str
+    PlacementFingerprint: str
+    ResourceGraphFingerprint: str
+    PortalDomainFingerprint: str
+    Complete: bool
+    IncompleteReason: str = ""
+    MaximumAssignmentExpansions: int = 1
+    MinimizeMaximumRoutingLayer: bool = False
+    Diagnostics: tuple[tuple[str, object], ...] = ()
+    # The native assignment API is attached as an execution handle only.  It
+    # is deliberately excluded from every physical identity: raw domains from
+    # different placement worlds retain local resource indices and may carry
+    # different routing contexts, while their frozen proof fingerprints stay
+    # purely geometric.
+    NativeAssignmentContext: Any | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.ResourcePositions != tuple(sorted(set(self.ResourcePositions))):
+            raise ValueError("raw assignment resources must be sorted and unique")
+        if self.MaximumAssignmentExpansions < 1:
+            raise ValueError("raw assignment requires a positive work cap")
+        if self.Complete and self.IncompleteReason:
+            raise ValueError("complete raw assignment domain has an incomplete reason")
+        Keys = tuple((Value.Signal, Value.CandidateId) for Value in self.Values)
+        if len(Keys) != len(set(Keys)):
+            raise ValueError("raw assignment domain repeats a value identity")
+        CandidateSignals = tuple(Signal for Signal, _Count in self.CandidateCounts)
+        if CandidateSignals != tuple(sorted(set(CandidateSignals))):
+            raise ValueError("raw assignment candidate counts must be sorted")
+        if any(Count < 0 for _Signal, Count in self.CandidateCounts):
+            raise ValueError("raw assignment candidate counts cannot be negative")
+        IndexedPositions = frozenset(self.ResourcePositions)
+        for Value in (*self.Values, *self.BaseClaims):
+            Claims = Value.Claims
+            if any(
+                Position not in IndexedPositions
+                for Cells in (
+                    Claims.WireCells,
+                    Claims.SupportCells,
+                    Claims.RequiredAirCells,
+                    Claims.ElectricalCells,
+                )
+                for Position in Cells
+            ):
+                raise ValueError("raw assignment claim is outside its index")
+
+    @property
+    def IndexedResources(self) -> IndexedRoutingResourceGraph:
+        return IndexedRoutingResourceGraph(
+            ResourcePositions=self.ResourcePositions,
+            PositionIndices={
+                Position: Index
+                for Index, Position in enumerate(self.ResourcePositions)
+            },
+        )
+
+    @property
+    def DomainFingerprint(self) -> str:
+        return BuildStableFingerprint({
+            "Kind": "raw-track-assignment-domain-v1",
+            "ResourcePositions": self.ResourcePositions,
+            "Values": [Value.ToDictionary() for Value in self.Values],
+            "BaseClaims": [Claim.ToDictionary() for Claim in self.BaseClaims],
+            "CandidateCounts": self.CandidateCounts,
+            "CandidateDomainFingerprint": self.CandidateDomainFingerprint,
+            "LocalClaimDomainFingerprint": self.LocalClaimDomainFingerprint,
+            "PlacementFingerprint": self.PlacementFingerprint,
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "PortalDomainFingerprint": self.PortalDomainFingerprint,
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+            "MaximumAssignmentExpansions": self.MaximumAssignmentExpansions,
+            "MinimizeMaximumRoutingLayer": self.MinimizeMaximumRoutingLayer,
+        })
+
+    def NativeCandidateValues(self) -> list[tuple[Any, ...]]:
+        Indexed = self.IndexedResources
+        return [Value.Encode(Indexed) for Value in self.Values]
+
+    def NativeBaseValues(self) -> list[tuple[Any, ...]]:
+        Indexed = self.IndexedResources
+        return [Claim.Encode(Indexed) for Claim in self.BaseClaims]
+
+    def SelectedCapacityResourceIds(
+        self,
+        SelectedCandidateIds: Iterable[tuple[str, str]],
+    ) -> tuple[str, ...]:
+        SelectedKeys = frozenset(
+            (str(Signal), str(CandidateId))
+            for Signal, CandidateId in SelectedCandidateIds
+        )
+        KnownKeys = frozenset(
+            (Value.Signal, Value.CandidateId) for Value in self.Values
+        )
+        Unknown = SelectedKeys - KnownKeys
+        if Unknown:
+            raise ValueError("raw assignment selected an unknown value")
+        return tuple(sorted({
+            ResourceId
+            for Value in self.Values
+            if (Value.Signal, Value.CandidateId) in SelectedKeys
+            for ResourceId in Value.ResourceIds
+        }))
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "DomainFingerprint": self.DomainFingerprint,
+            "ResourceCount": len(self.ResourcePositions),
+            "ValueCount": len(self.Values),
+            "BaseClaimCount": len(self.BaseClaims),
+            "CandidateCounts": [list(Value) for Value in self.CandidateCounts],
+            "CandidateDomainFingerprint": self.CandidateDomainFingerprint,
+            "LocalClaimDomainFingerprint": self.LocalClaimDomainFingerprint,
+            "PlacementFingerprint": self.PlacementFingerprint,
+            "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
+            "PortalDomainFingerprint": self.PortalDomainFingerprint,
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+            "MaximumAssignmentExpansions": self.MaximumAssignmentExpansions,
+            "MinimizeMaximumRoutingLayer": self.MinimizeMaximumRoutingLayer,
+            "Diagnostics": dict(self.Diagnostics),
+        }
+
+
+class RawTrackAssignmentDomainPrepared(RuntimeError):
+    """Internal control transfer after immutable native inputs are frozen."""
+
+    def __init__(self, Domain: RawTrackAssignmentDomain) -> None:
+        super().__init__("raw track-assignment domain prepared")
+        self.Domain = Domain
+
+
 class OptionalPortalSeedSliceExpired(RuntimeError):
     """The optional portal-seed hint exhausted only its private time slice."""
 
@@ -12237,6 +12495,133 @@ class LocalClaimReleaseSelection:
         }
 
 
+@dataclass(frozen=True)
+class PreRouteLocalClaimChoice:
+    """One complete local tree offered beside ordinary route candidates.
+
+    The choice remains under its real logical signal.  This is important: the
+    native capacity solver may merge same-signal ownership, but must reject
+    collisions with every other signal.  A synthetic auxiliary signal would
+    incorrectly turn that same-signal exception into a foreign conflict.
+    """
+
+    Signal: str
+    ChoiceId: str
+    Claim: LocalRouteClaim
+    ClaimFingerprint: str
+    MaterialCost: int
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "ChoiceId": self.ChoiceId,
+            "ClaimFingerprint": self.ClaimFingerprint,
+            "NodeCount": len(self.Claim.Nodes),
+            "ResourceCount": len(self.Claim.Claims.ResourceIds),
+            "ConnectedTargetCount": len(self.Claim.ConnectedTargets),
+            "RepeaterReservationCount": len(
+                self.Claim.RepeaterReservations
+            ),
+            "MaterialCost": self.MaterialCost,
+        }
+
+
+def BuildPreRouteLocalClaimChoices(
+    Claims: Iterable[LocalRouteClaim],
+    Profiles: Mapping[str, Any],
+    ResourceGraph: RoutingResourceGraph,
+) -> tuple[
+    dict[str, tuple[PreRouteLocalClaimChoice, ...]],
+    tuple[dict[str, object], ...],
+]:
+    """Validate complete local trees as same-signal pre-route values.
+
+    A placement-local tree is eligible only when it roots at, and reaches all
+    terminals of, its current logical routing profile.  Invalid or partial
+    source fragments are retained as diagnostics but never become a hidden
+    base claim or a synthetic candidate.  The ordinary portal domain remains
+    available for every signal, so omitting an unsupported optional tree does
+    not make the placement unsound.
+    """
+    ChoicesBySignal: dict[str, list[PreRouteLocalClaimChoice]] = {}
+    Rejections: list[dict[str, object]] = []
+    SeenChoiceIds: set[str] = set()
+    for Claim in sorted(
+        Claims,
+        key=lambda Value: (
+            str(Value.Signal),
+            int(Value.ClusterId),
+            tuple(sorted(Value.Nodes)),
+        ),
+    ):
+        Signal = str(Claim.Signal)
+        Profile = Profiles.get(Signal)
+        Rejection: str | None = None
+        if Profile is None:
+            Rejection = "signal-has-no-routing-profile"
+        elif tuple(Claim.Root) != tuple(Profile.Root):
+            Rejection = "local-root-does-not-match-profile-root"
+        elif not set(Profile.Targets).issubset(Claim.ConnectedTargets):
+            Rejection = "local-tree-does-not-cover-profile-targets"
+        elif Claim.RepeaterReservations:
+            # The first immutable local-choice increment has no separate
+            # repeater reservation encoding.  Do not silently discard such
+            # reservations: retain the ordinary portal alternative instead.
+            Rejection = "local-tree-repeater-reservations-not-supported"
+        else:
+            try:
+                ValidateLocalRouteClaims(ResourceGraph, (Claim,))
+            except ValueError as Error:
+                Rejection = f"invalid-local-tree:{Error}"
+        if Rejection is not None:
+            Rejections.append({
+                "Signal": Signal,
+                "ClusterId": int(Claim.ClusterId),
+                "Reason": Rejection,
+            })
+            continue
+        ClaimFingerprint = BuildStableFingerprint({
+            "Signal": Signal,
+            "Root": tuple(Claim.Root),
+            "Targets": tuple(sorted(Claim.ConnectedTargets)),
+            "Nodes": tuple(sorted(Claim.Nodes)),
+            "Edges": tuple(sorted(Claim.Edges)),
+            "Claims": {
+                "Wire": tuple(sorted(Claim.Claims.WireCells)),
+                "Support": tuple(sorted(Claim.Claims.SupportCells)),
+                "Air": tuple(sorted(Claim.Claims.RequiredAirCells)),
+                "Electrical": tuple(sorted(Claim.Claims.ElectricalCells)),
+            },
+        })
+        ChoiceId = f"{Signal}:DerivedLocal:{ClaimFingerprint[:16]}"
+        if ChoiceId in SeenChoiceIds:
+            continue
+        SeenChoiceIds.add(ChoiceId)
+        ChoicesBySignal.setdefault(Signal, []).append(
+            PreRouteLocalClaimChoice(
+                Signal=Signal,
+                ChoiceId=ChoiceId,
+                Claim=Claim,
+                ClaimFingerprint=ClaimFingerprint,
+                MaterialCost=len(Claim.Claims.ResourceIds),
+            )
+        )
+    return (
+        {
+            Signal: tuple(sorted(
+                Values,
+                key=lambda Value: (
+                    Value.MaterialCost,
+                    Value.ClaimFingerprint,
+                    Value.ChoiceId,
+                ),
+            ))
+            for Signal, Values in sorted(ChoicesBySignal.items())
+        },
+        tuple(Rejections),
+    )
+
+
 def SelectAccessAwareLocalClaimReleases(
     MandatoryClaimsBySignal: dict[str, tuple[RoutingResourceClaims, ...]],
     LocalClaims: tuple[LocalRouteClaim, ...],
@@ -15691,6 +16076,362 @@ def BuildAnonymousCandidateDomainFingerprint(
     ])
 
 
+def BuildTrackAssignmentCandidateDomainFingerprint(
+    Resources: Any,
+    CandidatesBySignal: Mapping[str, Iterable[NetRouteCandidate]],
+    LocalChoicesBySignal: Mapping[
+        str,
+        Iterable[PreRouteLocalClaimChoice],
+    ],
+) -> str:
+    """Identify the complete physical value domain of one assignment solve.
+
+    A frozen selection cannot safely be replayed merely because every
+    candidate ID still exists: portal regeneration could otherwise preserve
+    an ID while changing the claimed cells.  Keep the immutable resource
+    graph identity and every ordinary/local value's exact resource identity
+    in one order-independent contract.
+    """
+    OrdinaryValues = tuple(
+        (
+            str(Signal),
+            str(Candidate.CandidateId),
+            tuple(sorted(map(str, Candidate.Claims.ResourceIds))),
+        )
+        for Signal in sorted(CandidatesBySignal)
+        for Candidate in sorted(
+            CandidatesBySignal[Signal],
+            key=lambda Value: str(Value.CandidateId),
+        )
+    )
+    LocalValues = tuple(
+        (
+            str(Signal),
+            str(Choice.ChoiceId),
+            str(Choice.ClaimFingerprint),
+            tuple(sorted(map(str, Choice.Claim.Claims.ResourceIds))),
+        )
+        for Signal in sorted(LocalChoicesBySignal)
+        for Choice in sorted(
+            LocalChoicesBySignal[Signal],
+            key=lambda Value: (
+                str(Value.ChoiceId),
+                str(Value.ClaimFingerprint),
+            ),
+        )
+    )
+    return BuildStableFingerprint({
+        "Kind": "track-assignment-candidate-domain-v1",
+        "ResourceGraph": BuildRawPortalResourceGeometryFingerprint(
+            Resources
+        ),
+        "OrdinaryValues": OrdinaryValues,
+        "LocalValues": LocalValues,
+    })
+
+
+def BuildRawTrackAssignmentPortalDomainFingerprint(
+    Portals: Mapping[
+        tuple[str, Position3, int],
+        Iterable[PinAccessPortal],
+    ],
+    BoundaryLeaseReservations: Iterable[PortalReservation],
+) -> str:
+    """Fingerprint the immutable portal/lease handoff behind one domain."""
+    return BuildStableFingerprint({
+        "Kind": "raw-track-assignment-portal-domain-v1",
+        "Portals": tuple(
+            (
+                str(Signal),
+                tuple(Terminal),
+                int(Layer),
+                tuple(sorted(
+                    str(Portal.PortalId) for Portal in Values
+                )),
+            )
+            for (Signal, Terminal, Layer), Values in sorted(
+                Portals.items(),
+                key=lambda Value: (
+                    str(Value[0][0]),
+                    tuple(Value[0][1]),
+                    int(Value[0][2]),
+                ),
+            )
+        ),
+        "BoundaryLeaseReservations": tuple(
+            (
+                str(Reservation.Signal),
+                tuple(Reservation.Terminal),
+                int(Reservation.Layer),
+                int(Reservation.SlotIndex),
+                str(Reservation.PortalId),
+                tuple(sorted(map(
+                    str,
+                    Reservation.Claims.ResourceIds,
+                ))),
+            )
+            for Reservation in sorted(
+                BoundaryLeaseReservations,
+                key=lambda Value: (
+                    str(Value.Signal),
+                    tuple(Value.Terminal),
+                    int(Value.Layer),
+                    int(Value.SlotIndex),
+                    str(Value.PortalId),
+                ),
+            )
+        ),
+    })
+
+
+def BuildRawTrackAssignmentDomain(
+    *,
+    Signals: Iterable[str],
+    CandidatesBySignal: Mapping[str, Iterable[NetRouteCandidate]],
+    LocalChoicesBySignal: Mapping[
+        str,
+        Iterable[PreRouteLocalClaimChoice],
+    ],
+    BaseLocalClaims: Iterable[LocalRouteClaim],
+    BoundaryLeaseReservations: Iterable[PortalReservation],
+    AssignmentIndexed: IndexedRoutingResourceGraph,
+    CandidateDomainFingerprint: str,
+    LocalClaimDomainFingerprint: str,
+    PlacementFingerprint: str,
+    ResourceGraphFingerprint: str,
+    PortalDomainFingerprint: str,
+    Complete: bool,
+    IncompleteReason: str = "",
+    MaximumAssignmentExpansions: int = 1,
+    MinimizeMaximumRoutingLayer: bool = False,
+    Diagnostics: Iterable[tuple[str, object]] = (),
+    NativeAssignmentContext: Any | None = None,
+) -> RawTrackAssignmentDomain:
+    """Freeze the exact Python-side input to one later native assignment.
+
+    This function deliberately does not call the Rust solver.  It makes the
+    candidate/value domain, immutable base ownership, canonical resource
+    index, and handoff identities available to a higher-level placement
+    selector in one pass.
+    """
+    SignalOrder = tuple(sorted({str(Signal) for Signal in Signals}))
+    OrdinaryBySignal = {
+        Signal: tuple(sorted(
+            CandidatesBySignal.get(Signal, ()),
+            key=lambda Value: str(Value.CandidateId),
+        ))
+        for Signal in SignalOrder
+    }
+    LocalBySignal = {
+        Signal: tuple(sorted(
+            LocalChoicesBySignal.get(Signal, ()),
+            key=lambda Value: (
+                str(Value.ChoiceId),
+                str(Value.ClaimFingerprint),
+            ),
+        ))
+        for Signal in SignalOrder
+    }
+    OrderedBaseLocalClaims = tuple(sorted(
+        BaseLocalClaims,
+        key=lambda Value: (
+            str(Value.Signal),
+            int(Value.ClusterId),
+            tuple(Value.Root),
+            tuple(sorted(Value.Nodes)),
+        ),
+    ))
+    OrderedBoundaryLeases = tuple(sorted(
+        BoundaryLeaseReservations,
+        key=lambda Value: (
+            str(Value.Signal),
+            tuple(Value.Terminal),
+            int(Value.Layer),
+            int(Value.SlotIndex),
+            str(Value.PortalId),
+        ),
+    ))
+    Indexed = ExtendIndexedRoutingResourceGraph(
+        AssignmentIndexed,
+        (
+            *(
+                Candidate.Claims
+                for Values in OrdinaryBySignal.values()
+                for Candidate in Values
+            ),
+            *(
+                Choice.Claim.Claims
+                for Values in LocalBySignal.values()
+                for Choice in Values
+            ),
+            *(Claim.Claims for Claim in OrderedBaseLocalClaims),
+            *(Reservation.Claims for Reservation in OrderedBoundaryLeases),
+        ),
+    )
+    Values = tuple(
+        Value
+        for Signal in SignalOrder
+        for Value in (
+            *(
+                RawTrackAssignmentValue(
+                    Signal=Signal,
+                    CandidateId=str(Candidate.CandidateId),
+                    Claims=Candidate.Claims,
+                    MaterialCost=int(Candidate.MaterialCost),
+                    FootprintGrowth=int(Candidate.FootprintGrowth),
+                    Length=int(Candidate.Length),
+                    BendCount=int(Candidate.BendCount),
+                    ViaCount=int(Candidate.ViaCount),
+                )
+                for Candidate in OrdinaryBySignal[Signal]
+            ),
+            *(
+                RawTrackAssignmentValue(
+                    Signal=Signal,
+                    CandidateId=str(Choice.ChoiceId),
+                    Claims=Choice.Claim.Claims,
+                    MaterialCost=int(Choice.MaterialCost),
+                    FootprintGrowth=len({
+                        (X, Z) for X, _Y, Z in Choice.Claim.Nodes
+                    }),
+                    Length=len(Choice.Claim.Nodes),
+                    BendCount=0,
+                    ViaCount=0,
+                    ValueKind="local-claim",
+                )
+                for Choice in LocalBySignal[Signal]
+            ),
+        )
+    )
+    BaseClaims = tuple(
+        (
+            *(
+                RawTrackAssignmentBaseClaim(
+                    Signal=str(Claim.Signal),
+                    ClaimId=(
+                        f"local:{Index}:{Claim.Signal}:"
+                        f"{Claim.ClusterId}"
+                    ),
+                    Claims=Claim.Claims,
+                )
+                for Index, Claim in enumerate(OrderedBaseLocalClaims)
+            ),
+            *(
+                RawTrackAssignmentBaseClaim(
+                    Signal=str(Reservation.Signal),
+                    ClaimId=(
+                        f"lease:{Index}:{Reservation.PortalId}"
+                    ),
+                    Claims=Reservation.Claims,
+                )
+                for Index, Reservation in enumerate(OrderedBoundaryLeases)
+            ),
+        )
+    )
+    return RawTrackAssignmentDomain(
+        ResourcePositions=Indexed.ResourcePositions,
+        Values=Values,
+        BaseClaims=BaseClaims,
+        CandidateCounts=tuple(
+            (Signal, len(OrdinaryBySignal[Signal]) + len(LocalBySignal[Signal]))
+            for Signal in SignalOrder
+        ),
+        CandidateDomainFingerprint=CandidateDomainFingerprint,
+        LocalClaimDomainFingerprint=LocalClaimDomainFingerprint,
+        PlacementFingerprint=PlacementFingerprint,
+        ResourceGraphFingerprint=ResourceGraphFingerprint,
+        PortalDomainFingerprint=PortalDomainFingerprint,
+        Complete=bool(Complete),
+        IncompleteReason=IncompleteReason,
+        MaximumAssignmentExpansions=max(1, int(MaximumAssignmentExpansions)),
+        MinimizeMaximumRoutingLayer=bool(MinimizeMaximumRoutingLayer),
+        Diagnostics=tuple(Diagnostics),
+        NativeAssignmentContext=NativeAssignmentContext,
+    )
+
+
+def BuildTrackAssignmentPreparationFromRawDomain(
+    Domain: RawTrackAssignmentDomain,
+    NativeResult: Any,
+) -> TrackAssignmentPreparation:
+    """Convert one future aggregate-native selection into the live handoff.
+
+    The existing detailed router already knows how to consume a
+    ``TrackAssignmentPreparation`` and validate it against regenerated
+    candidates.  Reusing that handoff keeps the extraction slice isolated
+    from route materialization until the aggregate native solver exists.
+    """
+    Selected = tuple(sorted(
+        (str(Signal), str(CandidateId))
+        for Signal, CandidateId in getattr(
+            NativeResult,
+            "SelectedCandidateIds",
+            (),
+        )
+    ))
+    ValuesByKey = {
+        (Value.Signal, Value.CandidateId): Value
+        for Value in Domain.Values
+    }
+    Unknown = tuple(
+        Value for Value in Selected if Value not in ValuesByKey
+    )
+    if Unknown:
+        raise ValueError(
+            "native track-assignment result selected a value outside the "
+            "frozen raw domain"
+        )
+    BudgetExhausted = bool(getattr(NativeResult, "BudgetExhausted", False))
+    DeadlineExceeded = bool(getattr(NativeResult, "DeadlineExceeded", False))
+    Complete = bool(Domain.Complete and not BudgetExhausted and not DeadlineExceeded)
+    IncompleteReason = (
+        Domain.IncompleteReason
+        if not Domain.Complete
+        else "assignment-work-cap"
+        if BudgetExhausted
+        else "assignment-deadline"
+        if DeadlineExceeded
+        else ""
+    )
+    LocalSelections = tuple(
+        Value
+        for Value in Selected
+        if ValuesByKey[Value].ValueKind == "local-claim"
+    )
+    OrdinarySelections = tuple(
+        Value
+        for Value in Selected
+        if ValuesByKey[Value].ValueKind == "ordinary"
+    )
+    return TrackAssignmentPreparation(
+        Success=bool(getattr(NativeResult, "Success", False) and Complete),
+        SelectedCandidateIds=OrdinarySelections,
+        CandidateCounts=Domain.CandidateCounts,
+        ConflictSignals=tuple(sorted(map(
+            str,
+            getattr(NativeResult, "ConflictSignals", ()),
+        ))),
+        ConflictResourceIndices=tuple(sorted(map(
+            int,
+            getattr(NativeResult, "ConflictResourceIndices", ()),
+        ))),
+        ExpansionCount=int(getattr(NativeResult, "ExpansionCount", 0)),
+        Complete=Complete,
+        IncompleteReason=IncompleteReason,
+        Diagnostics=(
+            ("RawTrackAssignmentDomainFingerprint", Domain.DomainFingerprint),
+            ("RawTrackAssignmentResourceCount", len(Domain.ResourcePositions)),
+            *Domain.Diagnostics,
+        ),
+        SelectedLocalClaimChoiceIds=LocalSelections,
+        LocalClaimDomainFingerprint=Domain.LocalClaimDomainFingerprint,
+        CandidateDomainFingerprint=Domain.CandidateDomainFingerprint,
+        SelectedCapacityResourceIds=Domain.SelectedCapacityResourceIds(
+            Selected
+        ),
+    )
+
+
 def SelectCandidateRegenerationSignals(
     ConflictGraph: dict[str, object],
 ) -> list[str]:
@@ -16531,23 +17272,134 @@ def _BuildTargetPortalBranches(
     TargetPortals: tuple[PinAccessPortal, ...],
     TargetAccessPaths: tuple[tuple[Position3, ...], ...] | None = None,
 ) -> list[list[Position3]]:
-    """Orient complete target escapes from their outer endpoint inward."""
+    """Orient complete target escapes from their outer endpoint inward.
+
+    A portal and its fixed pin-access path can share an initial segment and
+    then split.  Concatenating their reversed position lists in that case
+    creates a walk which goes through the terminal and jumps to the other
+    branch.  The Rust tree kernel correctly rejects that non-edge, even
+    though the immutable union is physically connected.  When the two paths
+    share geometry, retain one deterministic simple chain from the portal
+    ingress to the terminal; the remaining fixed branch is still carried in
+    the required-node payload and restored during materialization.
+    """
     if (
         TargetAccessPaths is not None
         and len(TargetAccessPaths) != len(TargetPortals)
     ):
         raise ValueError("target portal/access branch count mismatch")
+
+    def BuildBranch(
+        Portal: PinAccessPortal,
+        TargetAccessPath: tuple[Position3, ...],
+    ) -> list[Position3]:
+        PortalPath = tuple(Portal.Path)
+        if not PortalPath:
+            return list(reversed(TargetAccessPath))
+        if not TargetAccessPath:
+            return list(reversed(PortalPath))
+
+        SharedNodes = frozenset(PortalPath) & frozenset(TargetAccessPath)
+        if not SharedNodes:
+            # A generic portal can begin immediately beyond the outer access
+            # landing.  In that non-overlapping form, the established joined
+            # chain remains the only available representation.
+            return list(dict.fromkeys((
+                *reversed(PortalPath),
+                *reversed(TargetAccessPath),
+            )))
+
+        Adjacency: dict[Position3, set[Position3]] = defaultdict(set)
+        for Path in (PortalPath, TargetAccessPath):
+            for First, Second in zip(Path, Path[1:]):
+                Adjacency[First].add(Second)
+                Adjacency[Second].add(First)
+        Start = PortalPath[-1]
+        Terminal = TargetAccessPath[0]
+        Pending = deque((Start,))
+        Parent: dict[Position3, Position3 | None] = {Start: None}
+        while Pending:
+            Current = Pending.popleft()
+            if Current == Terminal:
+                break
+            for Next in sorted(Adjacency.get(Current, ())):
+                if Next in Parent:
+                    continue
+                Parent[Next] = Current
+                Pending.append(Next)
+        if Terminal not in Parent:
+            # Preserve the prior conservative representation if a custom
+            # portal reports shared cells but not a connected path graph.
+            return list(dict.fromkeys((
+                *reversed(PortalPath),
+                *reversed(TargetAccessPath),
+            )))
+        Branch = []
+        Cursor: Position3 | None = Terminal
+        while Cursor is not None:
+            Branch.append(Cursor)
+            Cursor = Parent[Cursor]
+        return list(reversed(Branch))
+
     return [
-        list(dict.fromkeys((
-            *reversed(Portal.Path),
-            *(
-                reversed(TargetAccessPaths[Index])
+        BuildBranch(
+            Portal,
+            (
+                TargetAccessPaths[Index]
                 if TargetAccessPaths is not None
                 else ()
             ),
-        )))
+        )
         for Index, Portal in enumerate(TargetPortals)
     ]
+
+
+def FilterSourceConnectedTargetBranches(
+    Root: Position3,
+    SourceNodes: Iterable[Position3],
+    TargetBranches: Iterable[Iterable[Position3]],
+    ResourceGraph: Any,
+) -> tuple[tuple[Position3, ...], ...]:
+    """Omit target branches already connected by immutable access geometry.
+
+    A terminal can legitimately be both a target and part of the producer's
+    fixed access path (for example, a reconvergent fanout whose portal
+    ingress coincides with the source ingress).  The native tree kernel owns
+    *new* connections.  Asking it to add such a branch makes it reject the
+    already-present overlap as a cyclic second attachment, even though the
+    final immutable access geometry is connected and electrically legal.
+
+    Build the same-signal fixed graph up front, then pass only target branches
+    outside the root component to native search.  Omitted branches remain in
+    the required-node payload and are restored by ``_MaterializeCandidate``,
+    so this normalizes one immutable request; it does not release a claim or
+    create a second route attempt.
+    """
+    BranchValues = []
+    for Branch in TargetBranches:
+        Value = tuple(Branch)
+        if Value:
+            BranchValues.append(Value)
+    Branches = tuple(BranchValues)
+    if not Branches:
+        return ()
+    FixedNodes = {
+        tuple(Root),
+        *(tuple(Position) for Position in SourceNodes),
+        *(Position for Branch in Branches for Position in Branch),
+    }
+    FixedGraph = _BuildCandidateGraph(FixedNodes, ResourceGraph)
+    RootComponent = _FindComponentNodes(FixedGraph, tuple(Root))
+    if not RootComponent:
+        # A missing source node is not proof that any branch is redundant.
+        # Leave the native request untouched and let its ordinary typed
+        # failure classification describe the incomplete route domain.
+        return Branches
+    return tuple(
+        Branch
+        for Branch in Branches
+        if not frozenset(Branch) <= RootComponent
+    )
 
 
 def SelectGraphAccessStarts(
@@ -16600,6 +17452,7 @@ def RequiredRoutingLayerCountForAccess(
     AccessPositions: frozenset[Position3],
     GuideExpansion: int,
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
+    MinimumLayerCount: int | None = None,
 ) -> int:
     """Return the lowest layer count that can serve the highest terminal.
 
@@ -16610,8 +17463,15 @@ def RequiredRoutingLayerCountForAccess(
     """
     if GuideExpansion < 0:
         raise ValueError("GuideExpansion cannot be negative")
+    LayerFloor = (
+        Technology.MinimumRoutingLayerCount
+        if MinimumLayerCount is None
+        else int(MinimumLayerCount)
+    )
+    if LayerFloor < 1:
+        raise ValueError("MinimumLayerCount must be positive")
     if not AccessPositions:
-        return Technology.MinimumRoutingLayerCount
+        return LayerFloor
     HighestAccessY = max(Position[1] for Position in AccessPositions)
     LowestRoutingY = Technology.RoutingY(MinimumY, 0)
     RequiredRoutingY = max(
@@ -16620,7 +17480,7 @@ def RequiredRoutingLayerCountForAccess(
     )
     AdditionalHeight = max(0, RequiredRoutingY - LowestRoutingY)
     return max(
-        Technology.MinimumRoutingLayerCount,
+        LayerFloor,
         1 + ceil(AdditionalHeight / Technology.RoutingLayerPitch),
     )
 
@@ -17029,6 +17889,152 @@ def ApplyPlacementAccessAssignmentPortalDomains(
         )
         Result[(str(Signal), tuple(Terminal), Layer)] = (Portal,)
     return Result
+
+
+def ApplyPlacementAccessFabricPortalDomains(
+    Portals: dict[
+        tuple[str, Position3, int],
+        tuple[PinAccessPortal, ...],
+    ],
+    Fabric: Any,
+    ResourceGraph: Any,
+    Technology: RedstoneRoutingTechnology,
+    MinimumY: int,
+    LayerCount: int,
+) -> dict[
+    tuple[str, Position3, int],
+    tuple[PinAccessPortal, ...],
+]:
+    """Publish every fixed fabric escape as an authoritative portal choice.
+
+    A placement access fabric describes a finite terminal escape domain, not
+    a completed global assignment.  Retaining every legal stub here lets the
+    authoritative track-capacity solver choose the stub together with the
+    remaining portal candidates and immutable local claims.  The later
+    frozen track preparation then records that single combined witness.
+    """
+    Result = {
+        Key: Values
+        for Key, Values in Portals.items()
+        if not any(
+            Key[0] == str(Domain.Signal)
+            and Key[1] == tuple(Domain.Terminal)
+            for Domain in Fabric.TerminalDomains
+        )
+    }
+    for Domain in Fabric.TerminalDomains:
+        Signal = str(Domain.Signal)
+        Terminal = tuple(Domain.Terminal)
+        for StubIndex, Stub in enumerate(Domain.EscapeStubs):
+            Layer = next((
+                CandidateLayer
+                for CandidateLayer in range(LayerCount)
+                if Technology.RoutingY(MinimumY, CandidateLayer)
+                == int(Stub.Ingress[1])
+            ), None)
+            if Layer is None:
+                raise ValueError(
+                    "placement access escape is outside the routing layer "
+                    "domain"
+                )
+            Path = tuple(Stub.Path)
+            Portal = PinAccessPortal(
+                PortalId=(
+                    f"{Signal}:{Terminal}:{Layer}:AccessFabricDomain:"
+                    f"{Fabric.FabricFingerprint}:{StubIndex}"
+                ),
+                Signal=Signal,
+                Terminal=Terminal,
+                Layer=Layer,
+                Path=Path,
+                Edges=frozenset(
+                    NormalizeRoutingEdge(First, Second)
+                    for First, Second in zip(Path, Path[1:])
+                ),
+                Claims=ResourceGraph.BuildRouteClaims(Path),
+                Length=len(Path),
+                BendCount=_CountBends(Path),
+                ViaCount=sum(
+                    First[1] != Second[1]
+                    for First, Second in zip(Path, Path[1:])
+                ),
+                Cost=len(Path),
+            )
+            Key = (Signal, Terminal, Layer)
+            Result[Key] = tuple(sorted((
+                *Result.get(Key, ()),
+                Portal,
+            ), key=lambda Value: (Value.Cost, Value.PortalId)))
+    return Result
+
+
+def ResolvePlacementAccessFabricRegionContract(
+    MinimumX: int,
+    MaximumX: int,
+    MinimumZ: int,
+    MaximumZ: int,
+    Fabric: Any | None,
+    Domains: Mapping[tuple[str, Position3], Any],
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    frozenset[Position3],
+    tuple[int, int, int, int] | None,
+]:
+    """Expand an authoritative region to the immutable access contract.
+
+    Portal construction and detailed routing must see every physical node the
+    frozen fabric can select. This includes fabric edges, ingress nodes, and
+    all still-selectable terminal stubs; otherwise an ingress can be emitted
+    outside the native context and falsely appear to have no tree.
+    """
+    Positions = frozenset(
+        Position
+        for Position in (
+            *getattr(Fabric, "Nodes", ()),
+            *getattr(Fabric, "IngressNodes", ()),
+            *(
+                Position
+                for Domain in Domains.values()
+                for Stub in Domain.EscapeStubs
+                for Position in Stub.Path
+            ),
+        )
+    )
+    RawOuterBounds = getattr(Fabric, "OuterBounds", None)
+    OuterBounds: tuple[int, int, int, int] | None = None
+    if RawOuterBounds is not None:
+        if len(RawOuterBounds) != 4:
+            raise ValueError("placement access fabric outer bounds are invalid")
+        OuterBounds = tuple(int(Value) for Value in RawOuterBounds)
+        OuterMinimumX, OuterMinimumZ, OuterMaximumX, OuterMaximumZ = (
+            OuterBounds
+        )
+        if OuterMinimumX > OuterMaximumX or OuterMinimumZ > OuterMaximumZ:
+            raise ValueError("placement access fabric outer bounds are inverted")
+    if Positions:
+        MinimumX = min(MinimumX, min(Position[0] for Position in Positions))
+        MaximumX = max(MaximumX, max(Position[0] for Position in Positions))
+        MinimumZ = min(MinimumZ, min(Position[2] for Position in Positions))
+        MaximumZ = max(MaximumZ, max(Position[2] for Position in Positions))
+    if OuterBounds is not None:
+        OuterMinimumX, OuterMinimumZ, OuterMaximumX, OuterMaximumZ = (
+            OuterBounds
+        )
+        MinimumX = min(MinimumX, OuterMinimumX)
+        MaximumX = max(MaximumX, OuterMaximumX)
+        MinimumZ = min(MinimumZ, OuterMinimumZ)
+        MaximumZ = max(MaximumZ, OuterMaximumZ)
+    return (
+        MinimumX,
+        MaximumX,
+        MinimumZ,
+        MaximumZ,
+        Positions,
+        OuterBounds,
+    )
 
 
 def ValidatePhysicalComponentExactAttachmentPortals(
@@ -33133,6 +34139,7 @@ def RouteAuthoritativeResources(
     PreparedPortalCache: PreparedPortalDomainCache | None = None,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
+    PrepareRawTrackAssignmentDomainOnly: bool = False,
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
@@ -33953,6 +34960,30 @@ def RouteAuthoritativeResources(
             if SelectedStubIndex is not None
             else Domain
         )
+    # The access fabric is a frozen physical contract, rather than a guide
+    # hint. Keep its exact materialized domain in the cache identity as well
+    # as the later resource-region bounds.
+    (
+        _AccessContractMinimumX,
+        _AccessContractMaximumX,
+        _AccessContractMinimumZ,
+        _AccessContractMaximumZ,
+        PlacementAccessContractPositions,
+        PlacementAccessOuterBounds,
+    ) = ResolvePlacementAccessFabricRegionContract(
+        0,
+        0,
+        0,
+        0,
+        PlacementAccessFabric,
+        PlacementAccessDomains,
+    )
+    PlacementAccessContractFingerprint = BuildStableFingerprint((
+        "placement-access-fabric-region-v1",
+        str(getattr(PlacementAccessFabric, "FabricFingerprint", "")),
+        PlacementAccessOuterBounds,
+        tuple(sorted(PlacementAccessContractPositions)),
+    ))
     DeclaredInterClusterChannelSignals = frozenset(
         str(Signal)
         for Signal in getattr(
@@ -34289,6 +35320,44 @@ def RouteAuthoritativeResources(
     WorkTelemetry["TerminalCount"] = Demand.TerminalCount
     if LocalClaims:
         ValidateLocalRouteClaims(Resources.ResourceGraph, LocalClaims)
+    (
+        PreRouteLocalClaimChoicesBySignal,
+        PreRouteLocalClaimChoiceRejections,
+    ) = BuildPreRouteLocalClaimChoices(
+        tuple(getattr(Placed, "DerivedLocalRouteClaims", ()) or ()),
+        Profiles,
+        Resources.ResourceGraph,
+    )
+    PreRouteLocalClaimChoices = tuple(
+        Choice
+        for Signal in sorted(PreRouteLocalClaimChoicesBySignal)
+        for Choice in PreRouteLocalClaimChoicesBySignal[Signal]
+    )
+    PreRouteLocalClaimChoiceById = {
+        Choice.ChoiceId: Choice
+        for Choice in PreRouteLocalClaimChoices
+    }
+    PreRouteLocalClaimDomainFingerprint = BuildStableFingerprint({
+        "Choices": [
+            (
+                Choice.Signal,
+                Choice.ChoiceId,
+                Choice.ClaimFingerprint,
+            )
+            for Choice in PreRouteLocalClaimChoices
+        ],
+        "Rejections": PreRouteLocalClaimChoiceRejections,
+    })
+    if PreRouteLocalClaimChoices or PreRouteLocalClaimChoiceRejections:
+        WorkTelemetry["PreRouteLocalClaimChoices"] = {
+            "DomainFingerprint": PreRouteLocalClaimDomainFingerprint,
+            "Choices": [
+                Choice.ToDictionary()
+                for Choice in PreRouteLocalClaimChoices
+            ],
+            "Rejections": list(PreRouteLocalClaimChoiceRejections),
+            "Complete": True,
+        }
     if not Profiles:
         return RoutedDesign(
             Module=Placed.Module,
@@ -34501,6 +35570,10 @@ def RouteAuthoritativeResources(
                 )
             ),
         ),
+        (
+            "placement-access-fabric-region-v1",
+            PlacementAccessContractFingerprint,
+        ),
     )
     PhysicalGlobalKeepoutFingerprint = str(
         getattr(
@@ -34520,6 +35593,25 @@ def RouteAuthoritativeResources(
         for Gate in Placed.PlacedGates
     )
     MinimumY = min(Gate.Y for Gate in Placed.PlacedGates)
+    (
+        MinimumX,
+        MaximumX,
+        MinimumZ,
+        MaximumZ,
+        _PlacementAccessContractPositions,
+        _PlacementAccessOuterBounds,
+    ) = ResolvePlacementAccessFabricRegionContract(
+        MinimumX,
+        MaximumX,
+        MinimumZ,
+        MaximumZ,
+        PlacementAccessFabric,
+        PlacementAccessDomains,
+    )
+    if _PlacementAccessContractPositions != PlacementAccessContractPositions:
+        raise RuntimeError("placement access region contract changed during routing")
+    if _PlacementAccessOuterBounds != PlacementAccessOuterBounds:
+        raise RuntimeError("placement access outer bounds changed during routing")
     ReservedAccess = frozenset(
         Position
         for Profile in Profiles.values()
@@ -34535,12 +35627,7 @@ def RouteAuthoritativeResources(
     if PlacementAccessFabric is not None:
         ReservedAccess = frozenset((
             *ReservedAccess,
-            *(
-                Position
-                for Domain in PlacementAccessDomains.values()
-                for Stub in Domain.EscapeStubs
-                for Position in Stub.Path
-            ),
+            *PlacementAccessContractPositions,
         ))
     if (
         Resources.PreparingPhysicalComponentGlobalChannels
@@ -34583,22 +35670,23 @@ def RouteAuthoritativeResources(
             - MinimumY
             + 1,
         )
-    RequiredAccessLayerCount = RequiredRoutingLayerCountForAccess(
-        MinimumY,
-        ReservedAccess,
-        Policy.DetailedRouting.GuideExpansion,
-        Technology,
-    )
-    RequiredPhysicalAssemblyLayerCount = (
-        RequiredPhysicalAssemblyRoutingLayerCount(PhysicalAssemblyPlan)
-    )
-    RouteLayers = getattr(Placed, "RouteLayers", None) or {}
     PolicyLayerLimit = Policy.Placement.MaximumRoutingLayers
     MinimumLayerCount = (
         min(Technology.MinimumRoutingLayerCount, PolicyLayerLimit)
         if PolicyLayerLimit > 0
         else Technology.MinimumRoutingLayerCount
     )
+    RequiredAccessLayerCount = RequiredRoutingLayerCountForAccess(
+        MinimumY,
+        ReservedAccess,
+        Policy.DetailedRouting.GuideExpansion,
+        Technology,
+        MinimumLayerCount=MinimumLayerCount,
+    )
+    RequiredPhysicalAssemblyLayerCount = (
+        RequiredPhysicalAssemblyRoutingLayerCount(PhysicalAssemblyPlan)
+    )
+    RouteLayers = getattr(Placed, "RouteLayers", None) or {}
     MaximumLayerCount = SelectHierarchicalRoutingMaximumLayerCount(
         PolicyLayerLimit,
         Technology.MaximumRoutableLayerCount,
@@ -35126,6 +36214,14 @@ def RouteAuthoritativeResources(
                 },
             },
         )
+    DerivedPerimeterAccess = bool(
+        PlacementAccessFabric is not None
+        and getattr(
+            PlacementAccessFabric,
+            "TopologyKind",
+            "",
+        ) == "derived-perimeter-access-v1"
+    )
     if PlacementAccessFabric is not None and CoarsePlan is not None:
         FabricGuideColumns = frozenset(
             (int(Position[0]), int(Position[2]))
@@ -38204,6 +39300,35 @@ def RouteAuthoritativeResources(
             for (Signal, Terminal, Layer), Values in sorted(Portals.items())
             if (Signal, Terminal) in PlacementAccessTerminalKeys
         )
+    elif PlacementAccessFabric is not None:
+        # A derived compact candidate intentionally reaches this branch
+        # before an access assignment exists.  Its fabric contributes a
+        # finite set of portal alternatives to the same authoritative
+        # candidate-capacity problem, rather than selecting stubs in a
+        # separate ring-only solve and hoping that result survives final
+        # routing.
+        Portals = ApplyPlacementAccessFabricPortalDomains(
+            Portals,
+            PlacementAccessFabric,
+            Resources.ResourceGraph,
+            Technology,
+            MinimumY,
+            LayerCount,
+        )
+        FabricTerminalKeys = frozenset(
+            (str(Domain.Signal), tuple(Domain.Terminal))
+            for Domain in PlacementAccessFabric.TerminalDomains
+        )
+        # Generic reservations belong to the portal alternatives that the
+        # fabric just replaced.  Keeping them would reserve every old escape
+        # while the authoritative solver is meant to choose exactly one
+        # fabric stub per terminal.
+        PortalReservations = tuple(
+            Reservation
+            for Reservation in PortalReservations
+            if (Reservation.Signal, Reservation.Terminal)
+            not in FabricTerminalKeys
+        )
     ExactAttachmentDiagnostics: dict[str, object] = {}
     if (
         PhysicalAssemblyPlan is not None
@@ -39374,6 +40499,13 @@ def RouteAuthoritativeResources(
     CandidatesBySignal: dict[str, list[NetRouteCandidate]] = defaultdict(list)
     CandidateLimitsBySignal: dict[str, int] = {}
     CandidateDiagnostics: dict[str, dict[str, object]] = {}
+    # Raw-domain extraction must preserve the same terminal distinction as
+    # ordinary track preparation.  A candidate construction failure before
+    # every signal has been materialized is not an empty exact assignment
+    # domain; retain it here so the later aggregate selector can terminate
+    # the fixed template portfolio as incomplete without invoking native
+    # assignment for a partial domain.
+    RawTrackAssignmentExtractionIncompleteReasons: dict[str, str] = {}
     if (
         PlacementAccessFabric is not None
         and PlacementAccessAssignment is not None
@@ -41610,7 +42742,11 @@ def RouteAuthoritativeResources(
                         RouteLaneCount,
                         Technology.TrackPitch,
                     )
-                    if UnreservedPortalMode and len(Profiles) <= 32:
+                    if (
+                        UnreservedPortalMode
+                        and PlacementAccessFabric is None
+                        and len(Profiles) <= 32
+                    ):
                         LaneValues = LaneValues[:1]
                     for LaneIndex, Lane in enumerate(LaneValues):
                         UsePhysicalGlobalLazyRequestDomain = bool(
@@ -41805,7 +42941,15 @@ def RouteAuthoritativeResources(
                             and Lane == CoarsePlan.Lanes[Signal]
                         )
                         GuideExpansion = (
-                            0
+                            (
+                                int(
+                                    PlacementAccessFabric
+                                    .AccessRingTrackCount
+                                )
+                                * int(Technology.TrackPitch)
+                            )
+                            if DerivedPerimeterAccess
+                            else 0
                             if PlacementAccessFabric is not None
                             else Policy.GlobalRouting.IntraClusterEnvelope
                             if IsPlannedGuide and Signal in CoarsePlan.LocalSignals
@@ -42030,6 +43174,18 @@ def RouteAuthoritativeResources(
                             TargetBranches.extend(
                                 [Anchor]
                                 for Anchor in DetachedSeedAnchorsValue
+                            )
+                            TargetBranches = list(
+                                FilterSourceConnectedTargetBranches(
+                                    ProfileValue.Root,
+                                    (
+                                        *SeedStartsValue,
+                                        *ProfileValue.SourceAccessPath,
+                                        *Shape.SourcePortal.Path,
+                                    ),
+                                    TargetBranches,
+                                    Resources.ResourceGraph,
+                                )
                             )
                             if len(TargetBranches) > 1:
                                 SourcePosition = (
@@ -44447,6 +45603,7 @@ def RouteAuthoritativeResources(
                 IncompletePreSiblingDomainSignals.discard(Signal)
         if (
             not CandidatesBySignal[Signal]
+            and not PreRouteLocalClaimChoicesBySignal.get(Signal)
             and (
                 not RouteTreeNativeDeadlineExceeded
                 or Signal in CompleteExteriorRouteDomainSignals
@@ -44876,6 +46033,11 @@ def RouteAuthoritativeResources(
                 )
 
             def RaiseTerminalCandidateIncomplete(Action: str) -> None:
+                if PrepareRawTrackAssignmentDomainOnly:
+                    RawTrackAssignmentExtractionIncompleteReasons[
+                        str(Signal)
+                    ] = Action
+                    return
                 if PrepareTrackAssignmentOnly:
                     raise TrackAssignmentPrepared(
                         TrackAssignmentPreparation(
@@ -44945,7 +46107,11 @@ def RouteAuthoritativeResources(
         FrozenPreparedPortalCache is not None
         and not PrepareClusterInterfaceAssignmentOnly
         and not ValidateClusterInterfaceForeignAccessOnly
-        and all(CandidatesBySignal.get(Signal) for Signal in Profiles)
+        and all(
+            CandidatesBySignal.get(Signal)
+            or PreRouteLocalClaimChoicesBySignal.get(Signal)
+            for Signal in Profiles
+        )
     ):
         Resources.FrozenInterfaceGlobalCandidateCache = {
             Signal: tuple(Values)
@@ -44999,6 +46165,7 @@ def RouteAuthoritativeResources(
         for Signal in Profiles
         if (
             not CandidatesBySignal.get(Signal)
+            and not PreRouteLocalClaimChoicesBySignal.get(Signal)
             and Signal not in CompleteExteriorRouteDomainSignals
         )
     ))
@@ -45450,9 +46617,12 @@ def RouteAuthoritativeResources(
     BaseValues: list[tuple[Any, ...]] | None = None
 
     def EnsurePhysicalAssignmentIndexComplete() -> None:
-        """Index all claims in the current immutable physical-plan domain."""
+        """Index all claims in the current immutable capacity domain."""
         nonlocal AssignmentIndexed, AssignmentEncodingCache, BaseValues
-        if not Resources.PreparingPhysicalComponentGlobalChannels:
+        if not (
+            Resources.PreparingPhysicalComponentGlobalChannels
+            or PreRouteLocalClaimChoices
+        ):
             return
         Extended = ExtendIndexedRoutingResourceGraph(
             AssignmentIndexed,
@@ -45463,6 +46633,10 @@ def RouteAuthoritativeResources(
                     for Candidate in SignalCandidates
                 ),
                 *(Claim.Claims for Claim in BaseLocalClaims),
+                *(
+                    Choice.Claim.Claims
+                    for Choice in PreRouteLocalClaimChoices
+                ),
                 *(
                     Reservation.Claims
                     for Reservation in BoundaryLeaseReservations
@@ -45489,6 +46663,9 @@ def RouteAuthoritativeResources(
                 len(AssignmentIndexed.ResourcePositions) - OldResourceCount
             ),
             "CandidateCount": sum(map(len, CandidatesBySignal.values())),
+            "PreRouteLocalClaimChoiceCount": len(
+                PreRouteLocalClaimChoices
+            ),
         })
 
     def EncodeCandidateValues(
@@ -45561,6 +46738,31 @@ def RouteAuthoritativeResources(
                 Values.append(Value)
                 if UseEncodingCache:
                     AssignmentEncodingCache[Candidate.CandidateId] = Value
+            for Choice in PreRouteLocalClaimChoicesBySignal.get(Signal, ()):
+                UnindexedPositions = FindUnindexedClaimPositions(
+                    AssignmentIndexed,
+                    Choice.Claim.Claims,
+                )
+                if UnindexedPositions:
+                    raise RuntimeError(
+                        "pre-route local claim choice has unindexed claims"
+                    )
+                Wire, Support, Air, Electrical = AssignmentIndexed.EncodeClaims(
+                    Choice.Claim.Claims
+                )
+                Values.append((
+                    Signal,
+                    Choice.ChoiceId,
+                    list(Wire),
+                    list(Support),
+                    list(Air),
+                    list(Electrical),
+                    Choice.MaterialCost,
+                    len({(X, Z) for X, _Y, Z in Choice.Claim.Nodes}),
+                    len(Choice.Claim.Nodes),
+                    0,
+                    0,
+                ))
         return Values
 
     PhysicalAssignmentArcCompatibilityCache = (
@@ -46563,6 +47765,120 @@ def RouteAuthoritativeResources(
     PublishPhysicalGlobalLocalAccessCandidateNoGoods(
         CandidatesBySignal
     )
+    CandidateDomainFingerprint = (
+        BuildTrackAssignmentCandidateDomainFingerprint(
+            Resources,
+            CandidatesBySignal,
+            PreRouteLocalClaimChoicesBySignal,
+        )
+    )
+    if PrepareRawTrackAssignmentDomainOnly:
+        IncompleteReasons = tuple(sorted(
+            (
+                str(Signal),
+                str(Reason),
+            )
+            for Signal, Reason in (
+                RawTrackAssignmentExtractionIncompleteReasons.items()
+            )
+        ))
+        DeferredRequestCounts = tuple(sorted(
+            (
+                str(Signal),
+                int(Diagnostics.get("DeferredRequests", 0)),
+            )
+            for Signal, Diagnostics in CandidateDiagnostics.items()
+            if int(Diagnostics.get("DeferredRequests", 0)) > 0
+        ))
+        # Outside physical-component global planning, deferred request shapes
+        # are the intentionally excluded suffix of this fixed primary
+        # candidate portfolio.  They are not a partially executed request:
+        # the current finite values are complete enough to produce a positive
+        # witness, while an all-template failure remains ``incomplete``
+        # because the enclosing template portfolio is declared non-exhaustive.
+        # Physical global channels retain their lazy-domain meaning and must
+        # still classify as incomplete until every descriptor is materialized.
+        IncompleteDeferredSignals = (
+            tuple(Signal for Signal, _Count in DeferredRequestCounts)
+            if Resources.PreparingPhysicalComponentGlobalChannels
+            else ()
+        )
+        IncompletePhysicalPreSiblingSignals = (
+            tuple(sorted(map(str, IncompletePreSiblingDomainSignals)))
+            if Resources.PreparingPhysicalComponentGlobalChannels
+            else ()
+        )
+        IncompleteSignals = tuple(sorted({
+            *(
+                Signal
+                for Signal, _Reason in IncompleteReasons
+            ),
+            *IncompleteDeferredSignals,
+            *IncompletePhysicalPreSiblingSignals,
+        }))
+        RawDomainComplete = bool(
+            not RouteTreeNativeDeadlineExceeded
+            and not Deadline.IsExpired()
+            and not IncompleteSignals
+        )
+        RawDomainIncompleteReason = (
+            ""
+            if RawDomainComplete
+            else "candidate-domain-incomplete"
+        )
+        raise RawTrackAssignmentDomainPrepared(
+            BuildRawTrackAssignmentDomain(
+                Signals=tuple(sorted(Profiles)),
+                CandidatesBySignal=CandidatesBySignal,
+                LocalChoicesBySignal=PreRouteLocalClaimChoicesBySignal,
+                BaseLocalClaims=BaseLocalClaims,
+                BoundaryLeaseReservations=BoundaryLeaseReservations,
+                AssignmentIndexed=AssignmentIndexed,
+                CandidateDomainFingerprint=CandidateDomainFingerprint,
+                LocalClaimDomainFingerprint=(
+                    PreRouteLocalClaimDomainFingerprint
+                ),
+                PlacementFingerprint=(
+                    BuildRawPortalPlacementGeometryFingerprint(Placed)
+                ),
+                ResourceGraphFingerprint=(
+                    BuildRawPortalResourceGeometryFingerprint(Resources)
+                ),
+                PortalDomainFingerprint=(
+                    BuildRawTrackAssignmentPortalDomainFingerprint(
+                        Portals,
+                        BoundaryLeaseReservations,
+                    )
+                ),
+                Complete=RawDomainComplete,
+                IncompleteReason=RawDomainIncompleteReason,
+                MaximumAssignmentExpansions=AssignmentExpansionLimit,
+                MinimizeMaximumRoutingLayer=(
+                    Policy.TrackAssignment.MinimizeMaximumRoutingLayer
+                ),
+                Diagnostics=(
+                    ("CandidateRequestCount", CandidateRequestCount),
+                    (
+                        "RouteTreeNativeDeadlineExceeded",
+                        RouteTreeNativeDeadlineExceeded,
+                    ),
+                    ("IncompleteSignals", IncompleteSignals),
+                    (
+                        "ExcludedConfiguredRequestCounts",
+                        DeferredRequestCounts,
+                    ),
+                    (
+                        "DeferredRequestsRequireCompletion",
+                        Resources.PreparingPhysicalComponentGlobalChannels,
+                    ),
+                    (
+                        "CandidateExtractionIncompleteReasons",
+                        IncompleteReasons,
+                    ),
+                ),
+                NativeAssignmentContext=EffectiveRawPortalCache.Context,
+            )
+        )
     LayerCappedAssignmentAttempts: list[dict[str, int | bool]] = []
     Result = None
     if FrozenTrackAssignmentPreparation is not None:
@@ -46572,8 +47888,19 @@ def RouteAuthoritativeResources(
                 FrozenTrackAssignmentPreparation.SelectedCandidateIds
             )
         )
+        FrozenLocalSelections = tuple(
+            (str(Signal), str(ChoiceId))
+            for Signal, ChoiceId in (
+                FrozenTrackAssignmentPreparation
+                .SelectedLocalClaimChoiceIds
+            )
+        )
         FrozenSignals = frozenset(
-            Signal for Signal, _CandidateId in FrozenSelections
+            Signal
+            for Signal, _CandidateId in (
+                *FrozenSelections,
+                *FrozenLocalSelections,
+            )
         )
         CandidateIdsBySignal = {
             Signal: frozenset(
@@ -46586,10 +47913,44 @@ def RouteAuthoritativeResources(
             for Signal, CandidateId in FrozenSelections
             if CandidateId not in CandidateIdsBySignal.get(Signal, ())
         ))
+        MissingFrozenLocalSelections = tuple(sorted(
+            (Signal, ChoiceId)
+            for Signal, ChoiceId in FrozenLocalSelections
+            if (
+                ChoiceId not in {
+                    Choice.ChoiceId
+                    for Choice in PreRouteLocalClaimChoicesBySignal.get(
+                        Signal,
+                        ()
+                    )
+                }
+            )
+        ))
         if (
             FrozenSignals != frozenset(CandidatesBySignal)
-            or len(FrozenSignals) != len(FrozenSelections)
+            or len(FrozenSignals) != (
+                len(FrozenSelections) + len(FrozenLocalSelections)
+            )
             or MissingFrozenSelections
+            or MissingFrozenLocalSelections
+            or (
+                bool(
+                    FrozenTrackAssignmentPreparation
+                    .LocalClaimDomainFingerprint
+                )
+                and FrozenTrackAssignmentPreparation
+                .LocalClaimDomainFingerprint
+                != PreRouteLocalClaimDomainFingerprint
+            )
+            or (
+                bool(
+                    FrozenTrackAssignmentPreparation
+                    .CandidateDomainFingerprint
+                )
+                and FrozenTrackAssignmentPreparation
+                .CandidateDomainFingerprint
+                != CandidateDomainFingerprint
+            )
         ):
             raise StructuredRoutingStageError(RoutingFailure(
                 Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
@@ -46607,11 +47968,32 @@ def RouteAuthoritativeResources(
                         list(Value)
                         for Value in MissingFrozenSelections[:16]
                     ],
+                    "MissingFrozenLocalSelections": [
+                        list(Value)
+                        for Value in MissingFrozenLocalSelections[:16]
+                    ],
+                    "FrozenLocalClaimDomainFingerprint": (
+                        FrozenTrackAssignmentPreparation
+                        .LocalClaimDomainFingerprint
+                    ),
+                    "CurrentLocalClaimDomainFingerprint": (
+                        PreRouteLocalClaimDomainFingerprint
+                    ),
+                    "FrozenCandidateDomainFingerprint": (
+                        FrozenTrackAssignmentPreparation
+                        .CandidateDomainFingerprint
+                    ),
+                    "CurrentCandidateDomainFingerprint": (
+                        CandidateDomainFingerprint
+                    ),
                 },
             ))
         Result = SimpleNamespace(
             Success=True,
-            SelectedCandidateIds=FrozenSelections,
+            SelectedCandidateIds=(
+                *FrozenSelections,
+                *FrozenLocalSelections,
+            ),
             ExpansionCount=0,
             ConflictSignals=(),
             ConflictResourceIndices=(),
@@ -46620,40 +48002,31 @@ def RouteAuthoritativeResources(
         )
         WorkTelemetry["PrePlacementTrackAssignmentHandoff"] = {
             "Applied": True,
-            "SelectedSignalCount": len(FrozenSelections),
+            "SelectedSignalCount": len(FrozenSignals),
+            "SelectedLocalClaimChoiceCount": len(FrozenLocalSelections),
             "PrePlacementExpansionCount": (
                 FrozenTrackAssignmentPreparation.ExpansionCount
             ),
             "NativeAssignmentExpansionCount": 0,
         }
+    # A placement-access assignment certifies only terminal escape ownership.
+    # It is not a substitute for the authoritative global candidate-capacity
+    # proof: distinct portal candidates can still collide with immutable local
+    # claims after their stubs have been selected.  The only zero-search
+    # handoff permitted here is ``FrozenTrackAssignmentPreparation``, which
+    # was produced by this same authoritative candidate domain before the one
+    # route attempt.  Do not infer global feasibility from one portal candidate
+    # per signal, or final DRC can discover a conflict that the pre-route
+    # selector incorrectly advertised as complete.
     if (
         Result is None
-        and PlacementAccessAssignment is not None
-        and getattr(PlacementAccessAssignment, "Success", False)
-        and set(CandidatesBySignal) == set(Profiles)
-        and all(len(Values) == 1 for Values in CandidatesBySignal.values())
+        and Policy.TrackAssignment.MinimizeMaximumRoutingLayer
+        # A complete placement-local tree is an alternative to an ordinary
+        # portal candidate, not a candidate with a synthetic layer.  If a
+        # signal has only that local value, there is no meaningful ordinary
+        # layer ceiling to try first; submit the one combined domain below.
+        and all(CandidatesBySignal.values())
     ):
-        Result = SimpleNamespace(
-            Success=True,
-            SelectedCandidateIds=tuple(
-                (Signal, Values[0].CandidateId)
-                for Signal, Values in sorted(CandidatesBySignal.items())
-            ),
-            ExpansionCount=0,
-            ConflictSignals=(),
-            ConflictResourceIndices=(),
-            BudgetExhausted=False,
-            DeadlineExceeded=False,
-        )
-        WorkTelemetry["PlacementAccessAssignmentReuse"] = {
-            "Applied": True,
-            "AssignmentFingerprint": (
-                PlacementAccessAssignment.AssignmentFingerprint
-            ),
-            "SelectedSignalCount": len(CandidatesBySignal),
-            "NativeAssignmentExpansionCount": 0,
-        }
-    if Result is None and Policy.TrackAssignment.MinimizeMaximumRoutingLayer:
         MinimumFeasibleLayer = max(
             min(Candidate.Layer for Candidate in Values)
             for Values in CandidatesBySignal.values()
@@ -46704,14 +48077,39 @@ def RouteAuthoritativeResources(
         Result = PlanAssignment()
         RaiseForNativeAssignmentDeadline(Result)
     if PrepareTrackAssignmentOnly:
+        SelectedLocalClaimChoiceIds = tuple(sorted(
+            (str(Signal), str(CandidateId))
+            for Signal, CandidateId in Result.SelectedCandidateIds
+            if str(CandidateId) in PreRouteLocalClaimChoiceById
+        ))
+        SelectedCapacityResourceIds = tuple(sorted({
+            str(ResourceId)
+            for Signal, CandidateId in Result.SelectedCandidateIds
+            for ResourceId in (
+                PreRouteLocalClaimChoiceById[str(CandidateId)]
+                .Claim.Claims.ResourceIds
+                if str(CandidateId) in PreRouteLocalClaimChoiceById
+                else CandidateLookup[str(CandidateId)].Claims.ResourceIds
+                if str(CandidateId) in CandidateLookup
+                else ()
+            )
+        }))
         raise TrackAssignmentPrepared(TrackAssignmentPreparation(
             Success=bool(Result.Success),
             SelectedCandidateIds=tuple(sorted(
                 (str(Signal), str(CandidateId))
                 for Signal, CandidateId in Result.SelectedCandidateIds
+                if str(CandidateId) not in PreRouteLocalClaimChoiceById
             )),
             CandidateCounts=tuple(sorted(
-                (str(Signal), len(Candidates))
+                (
+                    str(Signal),
+                    len(Candidates)
+                    + len(PreRouteLocalClaimChoicesBySignal.get(
+                        str(Signal),
+                        ()
+                    )),
+                )
                 for Signal, Candidates in CandidatesBySignal.items()
             )),
             ConflictSignals=tuple(sorted(map(
@@ -46727,6 +48125,12 @@ def RouteAuthoritativeResources(
                 getattr(Result, "BudgetExhausted", False)
                 or getattr(Result, "DeadlineExceeded", False)
             ),
+            SelectedLocalClaimChoiceIds=SelectedLocalClaimChoiceIds,
+            LocalClaimDomainFingerprint=(
+                PreRouteLocalClaimDomainFingerprint
+            ),
+            CandidateDomainFingerprint=CandidateDomainFingerprint,
+            SelectedCapacityResourceIds=SelectedCapacityResourceIds,
         ))
     # A bounded assignment is one proof attempt.  Exhaustion is surfaced to
     # the caller as incomplete; it is never authorization to enlarge the
@@ -47642,10 +49046,66 @@ def RouteAuthoritativeResources(
     if ProgressCallback is not None:
         ProgressCallback(5, StageCount)
     InitialAssignmentExpansionCount = Result.ExpansionCount
-    Selected = {
-        Signal: CandidateLookup[CandidateId]
-        for Signal, CandidateId in Result.SelectedCandidateIds
-    }
+    Selected: dict[str, NetRouteCandidate] = {}
+    SelectedLocalClaimChoicesBySignal: dict[
+        str,
+        PreRouteLocalClaimChoice,
+    ] = {}
+    for SignalValue, CandidateIdValue in Result.SelectedCandidateIds:
+        Signal = str(SignalValue)
+        CandidateId = str(CandidateIdValue)
+        LocalChoice = PreRouteLocalClaimChoiceById.get(CandidateId)
+        if LocalChoice is not None:
+            if LocalChoice.Signal != Signal:
+                raise StructuredRoutingStageError(RoutingFailure(
+                    Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                    Stage="PreRouteLocalClaimChoice",
+                    AffectedNets=(Signal,),
+                    Detail=(
+                        "the native assignment selected a local claim under "
+                        "a different logical signal"
+                    ),
+                ))
+            if Signal in SelectedLocalClaimChoicesBySignal:
+                raise StructuredRoutingStageError(RoutingFailure(
+                    Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                    Stage="PreRouteLocalClaimChoice",
+                    AffectedNets=(Signal,),
+                    Detail="the native assignment selected duplicate local claims",
+                ))
+            SelectedLocalClaimChoicesBySignal[Signal] = LocalChoice
+            continue
+        Candidate = CandidateLookup.get(CandidateId)
+        if Candidate is None or Candidate.Signal != Signal:
+            raise StructuredRoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                Stage="PreRouteLocalClaimChoice",
+                AffectedNets=(Signal,),
+                Detail=(
+                    "the native assignment selected an unknown ordinary "
+                    "candidate"
+                ),
+            ))
+        Selected[Signal] = Candidate
+    SelectedClaimChoiceSignals = frozenset(
+        SelectedLocalClaimChoicesBySignal
+    )
+    if frozenset((*Selected, *SelectedClaimChoiceSignals)) != frozenset(Profiles):
+        raise StructuredRoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="PreRouteLocalClaimChoice",
+            Detail=(
+                "the selected ordinary/local candidate values do not cover "
+                "the immutable routing profile domain"
+            ),
+            Diagnostics={
+                "SelectedOrdinarySignals": sorted(Selected),
+                "SelectedLocalClaimSignals": sorted(
+                    SelectedClaimChoiceSignals
+                ),
+                "ProfileSignals": sorted(Profiles),
+            },
+        ))
     AssignmentExpansionCount = InitialAssignmentExpansionCount
     RepairIterations = []
     ReroutedSignals: set[str] = set()
@@ -47673,7 +49133,11 @@ def RouteAuthoritativeResources(
             ),
             None,
         )
-    if CoarsePlan is not None and NegotiatedPlan is None:
+    if (
+        CoarsePlan is not None
+        and NegotiatedPlan is None
+        and not SelectedLocalClaimChoicesBySignal
+    ):
         if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
             print("[debug] authoritative: entering offline repair loop", flush=True)
         CongestionHistory: Counter[Position2] = Counter()
@@ -47876,6 +49340,20 @@ def RouteAuthoritativeResources(
     SelectedClaimsBySignal = {
         Signal: Value.Claims for Signal, Value in Selected.items()
     }
+    for Signal, Choice in sorted(
+        SelectedLocalClaimChoicesBySignal.items()
+    ):
+        SelectedClaimsBySignal[Signal] = Choice.Claim.Claims
+    if SelectedLocalClaimChoicesBySignal:
+        WorkTelemetry["SelectedPreRouteLocalClaimChoices"] = {
+            "DomainFingerprint": PreRouteLocalClaimDomainFingerprint,
+            "Selected": [
+                Choice.ToDictionary()
+                for _Signal, Choice in sorted(
+                    SelectedLocalClaimChoicesBySignal.items()
+                )
+            ],
+        }
     for Signal, SignalClaims in sorted(LocalClaimsBySignal.items()):
         CheckRuntimeBudget("MaterializationClaims")
         if not SignalClaims:
@@ -48034,16 +49512,34 @@ def RouteAuthoritativeResources(
         )
         for Signal, Candidate in Selected.items()
     }
+    ResourceClaimsBySignal.update({
+        Signal: frozenset(
+            Resource
+            for Resource in Choice.Claim.Claims.ResourceIds
+            if Resource.Kind != RoutingResourceKind.Electrical
+        )
+        for Signal, Choice in SelectedLocalClaimChoicesBySignal.items()
+    })
     ResourceUsage = Counter(
         Resource
         for Claims in ResourceClaimsBySignal.values()
         for Resource in Claims
     )
     Plan = ChannelPlan(
-        Profiles=Profiles,
+        # A complete local-tree choice has no portal/access transition.  Keep
+        # it out of the channel plan so later compaction does not demand an
+        # ordinary portal path for a signal whose frozen local tree already
+        # reaches every logical target.
+        Profiles={
+            Signal: Profile
+            for Signal, Profile in Profiles.items()
+            if Signal not in SelectedClaimChoiceSignals
+        },
         SignalOrder=SignalOrder,
         TrunkSignals=frozenset(
-            Signal for Signal, Profile in Profiles.items() if Profile.IsTrunk
+            Signal
+            for Signal, Profile in Profiles.items()
+            if Signal not in SelectedClaimChoiceSignals and Profile.IsTrunk
         ),
         Guides={Signal: Candidate.Guide for Signal, Candidate in Selected.items()},
         CorridorUsage={},
@@ -48098,7 +49594,13 @@ def RouteAuthoritativeResources(
             SignalSignalTargets = SignalTargets.get(Signal)
             if SignalSignalTargets:
                 Targets[Signal] = list(SignalSignalTargets)
-    MissingTargetSignals = tuple(sorted(set(Selected) - set(Targets)))
+    SelectedRouteOrLocalSignals = frozenset((
+        *Selected,
+        *SelectedLocalClaimChoicesBySignal,
+    ))
+    MissingTargetSignals = tuple(sorted(
+        SelectedRouteOrLocalSignals - set(Targets)
+    ))
     if MissingTargetSignals:
         raise StructuredRoutingStageError(
             RoutingFailure(
@@ -48110,7 +49612,14 @@ def RouteAuthoritativeResources(
             )
         )
     CheckRuntimeBudget("RouteMaterialization")
-    NetWires = {Signal: set(Candidate.Nodes) for Signal, Candidate in Selected.items()}
+    NetWires = {
+        Signal: set(Candidate.Nodes)
+        for Signal, Candidate in Selected.items()
+    }
+    NetWires.update({
+        Signal: set(Choice.Claim.Nodes)
+        for Signal, Choice in SelectedLocalClaimChoicesBySignal.items()
+    })
     LocalSignalWireClaims = {
         Signal: tuple(Claim.Nodes for Claim in SignalClaims)
         for Signal, SignalClaims in LocalClaimsBySignal.items()
@@ -48165,7 +49674,9 @@ def RouteAuthoritativeResources(
             Diagnostics,
         ),
     )
-    MissingSourceSignals = tuple(sorted(set(Selected) - set(Producers)))
+    MissingSourceSignals = tuple(sorted(
+        SelectedRouteOrLocalSignals - set(Producers)
+    ))
     if MissingSourceSignals:
         raise StructuredRoutingStageError(
             RoutingFailure(
@@ -48182,7 +49693,8 @@ def RouteAuthoritativeResources(
     MissingNoOutputSignals = tuple(
         sorted(
             Signal for Signal, Producer in Producers.items()
-            if Signal in Selected and Producer.OutputPin is None
+            if Signal in SelectedRouteOrLocalSignals
+            and Producer.OutputPin is None
         )
     )
     if MissingNoOutputSignals:
@@ -48197,14 +49709,16 @@ def RouteAuthoritativeResources(
     CheckRuntimeBudget("PhysicalConnectivityValidation")
     ValidationProducers = (
         {
-            Signal: Producers[Signal] for Signal in Selected
+            Signal: Producers[Signal]
+            for Signal in SelectedRouteOrLocalSignals
         }
         if Resources.PreparingPhysicalComponentGlobalChannels
         else Producers
     )
     ValidationTargets = (
         {
-            Signal: Targets[Signal] for Signal in Selected
+            Signal: Targets[Signal]
+            for Signal in SelectedRouteOrLocalSignals
         }
         if Resources.PreparingPhysicalComponentGlobalChannels
         else Targets
@@ -48333,6 +49847,55 @@ def RouteAuthoritativeResources(
             OwnedNodes=Candidate.Nodes,
             OwnedEdges=Candidate.Edges,
         )
+    for Signal, Choice in sorted(SelectedLocalClaimChoicesBySignal.items()):
+        # Local choices were admitted only after validating that they have no
+        # unencoded repeater reservation.  Treat their complete, immutable
+        # tree as a first-class assigned track: it owns resources and
+        # participates in physical connectivity and signal-strength checks,
+        # but has no portal transition or channel-layer assignment.
+        CheckRuntimeBudget("LocalClaimMaterialization")
+        Claim = Choice.Claim
+        if Claim.RepeaterReservations:
+            raise StructuredRoutingStageError(
+                RoutingFailure(
+                    Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                    Stage="PreRouteLocalClaimChoice",
+                    AffectedNets=(Signal,),
+                    Detail=(
+                        "selected local tree carries repeater reservations "
+                        "outside the frozen capacity encoding"
+                    ),
+                )
+            )
+        for Resource in ResourceClaimsBySignal[Signal]:
+            Owners[Resource].append(Signal)
+        Tracks[Signal] = AssignedTrack(
+            Signal=Signal,
+            TrackId=Choice.ChoiceId,
+            # The tree is already concrete geometry rather than a generated
+            # channel track.  Layer zero is an artifact-neutral marker; its
+            # physical elevations are exactly Claim.Nodes.
+            Layer=0,
+            Guide=frozenset(
+                (Position[0], Position[2]) for Position in Claim.Nodes
+            ),
+            RepeaterSites=frozenset(),
+            RepeaterWaypointsByTarget={
+                Target: () for Target in Targets[Signal]
+            },
+            ReservedResources=ResourceClaimsBySignal[Signal],
+            RepeaterReservations=(),
+            AssignedPathsByTarget={
+                Target: () for Target in Targets[Signal]
+            },
+            SourcePinAccessPath=(),
+            TargetPinAccessPathsByTarget={
+                Target: () for Target in Targets[Signal]
+            },
+            SelectedPortalIds=(),
+            OwnedNodes=Claim.Nodes,
+            OwnedEdges=Claim.Edges,
+        )
     ReportMaterializationStage("Repeater reservation planning")
     TrackAssignmentValue = TrackAssignment(
         Tracks=Tracks,
@@ -48358,7 +49921,9 @@ def RouteAuthoritativeResources(
         ResourceOwners=TrackAssignmentValue.ResourceOwners,
         ExpansionCount=AssignmentExpansionCount,
         PortalCount=sum(len(Values) for Values in Portals.values()),
-        CandidateCount=len(CandidateLookup),
+        CandidateCount=(
+            len(CandidateLookup) + len(PreRouteLocalClaimChoices)
+        ),
     )
     OwnershipCounts = Counter(
         Resource.Kind.value

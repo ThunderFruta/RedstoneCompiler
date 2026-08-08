@@ -398,6 +398,55 @@ pub(crate) struct RoutingAssignmentResult {
     pub(crate) PairwiseCompatibilityComplete: bool,
 }
 
+/// Result of selecting one mutually exclusive, already-materialized routing
+/// template and solving its ordinary authoritative track-assignment domain.
+///
+/// A successful result is a complete witness for the selected template.  It
+/// is deliberately separate from `RoutingAssignmentResult`: the latter has
+/// no placement/template identity and remains the stable single-resource-
+/// graph binding used by ordinary routing.
+#[pyclass]
+pub(crate) struct TemplateRoutingAssignmentResult {
+    #[pyo3(get)]
+    pub(crate) Status: String,
+    #[pyo3(get)]
+    pub(crate) Success: bool,
+    #[pyo3(get)]
+    pub(crate) Complete: bool,
+    #[pyo3(get)]
+    pub(crate) Unsatisfiable: bool,
+    #[pyo3(get)]
+    pub(crate) IncompleteReason: String,
+    #[pyo3(get)]
+    pub(crate) SelectedTemplateId: Option<String>,
+    #[pyo3(get)]
+    pub(crate) SelectedTemplateObjective: Vec<i64>,
+    #[pyo3(get)]
+    pub(crate) SelectedCandidateIds: Vec<(String, String)>,
+    #[pyo3(get)]
+    pub(crate) ExpansionCount: usize,
+    #[pyo3(get)]
+    pub(crate) BudgetExhausted: bool,
+    #[pyo3(get)]
+    pub(crate) DeadlineExceeded: bool,
+    #[pyo3(get)]
+    pub(crate) CompletedWork: usize,
+    #[pyo3(get)]
+    pub(crate) FailureNet: Option<String>,
+    #[pyo3(get)]
+    pub(crate) ConflictSignals: Vec<String>,
+    #[pyo3(get)]
+    pub(crate) ConflictResourceIndices: Vec<usize>,
+    #[pyo3(get)]
+    pub(crate) PairwiseIncompatibleSignals: Vec<(String, String)>,
+    #[pyo3(get)]
+    pub(crate) PairwiseCompatibilityComplete: bool,
+    #[pyo3(get)]
+    pub(crate) AttemptedTemplateIds: Vec<String>,
+    #[pyo3(get)]
+    pub(crate) NonExhaustiveTemplateDomain: bool,
+}
+
 #[pyclass]
 pub(crate) struct RoutingContext {
     pub(crate) Adjacency: HashMap<Position, Vec<Position>>,

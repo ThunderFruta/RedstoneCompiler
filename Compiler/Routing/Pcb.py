@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable
 
 from ..Placement.Pcb import PcbPlacement
 from ..Placement.Geometry import GetGateInputAccess
+from ..Placement.Rotation import RotatedCellSize
 try:
     from ..RustRouting import GetRoutingThreadCount
 except ImportError:
@@ -31,8 +32,10 @@ from .Actions import (
 )
 from .ChannelPlanner import MeasureRoutingStage
 from .Models import (
+    AccessContractBounds,
     ClusterInterfaceAssignment,
     ClusterInterfaceAssignmentPrepared,
+    DetailedRoutingBounds,
     TrackAssignmentPreparation,
     TrackAssignmentPrepared,
     ClusterInterfaceRealizabilityNogood,
@@ -55,6 +58,7 @@ from .ResourceGraph import (
     RoutingResourceKind,
 )
 from .TrackAssignment import TrackAssignment
+from .Technology import DefaultRedstoneRoutingTechnology
 from .Policy import (
     BuildRoutingAttemptPolicies,
     DefaultPhysicalDesignPolicy,
@@ -62,6 +66,10 @@ from .Policy import (
     RoutingAttemptPolicy,
 )
 from .Workers.DetailedRouting import RoutePcbNets
+from .AuthoritativePlanner import (
+    RawTrackAssignmentDomain,
+    RawTrackAssignmentDomainPrepared,
+)
 
 
 def ClusterBoundaryLeaseStateSliceSeconds(
@@ -583,6 +591,74 @@ def CompactRoutedTrees(
     )
 
 
+def _BuildPlacementAccessRoutingBoundsAudit(
+    Placement: PcbPlacement,
+    Fabric: Any,
+    *,
+    SearchMargin: int,
+) -> DetailedRoutingBounds | None:
+    """Measure the existing router canvas without changing its contract.
+
+    ``RouteAuthoritativeResources`` narrows a legacy
+    ``PlacementAccessAssignment`` to its selected stub before it expands the
+    detailed-routing region.  Mirror that *read-only* projection here so the
+    audit record describes the same region, while the fabric's own
+    ``AccessContractBounds`` still describes the complete pre-route domain.
+    """
+    Gates = tuple(getattr(Placement.Placed, "PlacedGates", ()))
+    if not Gates:
+        return None
+    CoreBounds = (
+        min(int(Gate.X) for Gate in Gates),
+        min(int(Gate.Z) for Gate in Gates),
+        max(
+            int(Gate.X) + RotatedCellSize(Gate.Kind, Gate.Rotation)[0] - 1
+            for Gate in Gates
+        ),
+        max(
+            int(Gate.Z) + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
+            for Gate in Gates
+        ),
+    )
+    Assignment = getattr(
+        Placement.Placed,
+        "PlacementAccessAssignment",
+        getattr(Placement, "PlacementAccessAssignment", None),
+    )
+    SelectedStubIndices = {
+        (str(Signal), tuple(Terminal)): int(StubIndex)
+        for Signal, Terminal, StubIndex in getattr(
+            Assignment,
+            "SelectedStubIndices",
+            (),
+        )
+    }
+    Domains = tuple(
+        replace(
+            Domain,
+            EscapeStubs=(
+                Domain.EscapeStubs[
+                    SelectedStubIndices[(str(Domain.Signal), tuple(Domain.Terminal))]
+                ],
+            ),
+        )
+        if (str(Domain.Signal), tuple(Domain.Terminal))
+        in SelectedStubIndices
+        else Domain
+        for Domain in getattr(Fabric, "TerminalDomains", ())
+    )
+    AccessBounds = AccessContractBounds.FromPlacementAccessFabric(
+        Fabric,
+        Domains=Domains,
+    )
+    return DetailedRoutingBounds.FromCoreAndAccessContract(
+        CoreBounds,
+        AccessBounds,
+        SearchMarginX=SearchMargin,
+        SearchMarginZ=SearchMargin,
+    )
+
+
 def RoutePcbAttempt(
     Placement: PcbPlacement,
     Configuration: RoutingAttemptPolicy,
@@ -593,6 +669,7 @@ def RoutePcbAttempt(
     Deadline: RoutingDeadline | None = None,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
+    PrepareRawTrackAssignmentDomainOnly: bool = False,
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
@@ -634,6 +711,33 @@ def RoutePcbAttempt(
         return lambda Diagnostics: CheckRoutingDeadline(Stage, Diagnostics)
 
     SearchMargin = Configuration.SearchMargin
+    PlacementAccessFabric = getattr(
+        Placement,
+        "PlacementAccessFabric",
+        None,
+    )
+    if (
+        PlacementAccessFabric is not None
+        and getattr(
+            PlacementAccessFabric,
+            "TopologyKind",
+            "",
+        ) == "derived-perimeter-access-v1"
+    ):
+        # The pre-route selector has already committed a finite perimeter
+        # contract.  Letting detailed routing reopen the legacy search margin
+        # would make its compactness objective fictitious and silently add
+        # exterior geometry after the only capacity solve.  The ring's
+        # physical pitch and selected track count are the exact allowed
+        # exterior margin for this frozen candidate.
+        FabricTechnology = (
+            getattr(PlacementAccessFabric, "Technology", None)
+            or DefaultRedstoneRoutingTechnology
+        )
+        SearchMargin = (
+            int(PlacementAccessFabric.AccessRingTrackCount)
+            * int(FabricTechnology.TrackPitch)
+        )
     GuidePenalty = Configuration.GuidePenalty
     DetourRatio = Configuration.MaximumDetourRatio
     DetourAllowance = Configuration.MaximumDetourAllowance
@@ -751,6 +855,9 @@ def RoutePcbAttempt(
                 ReservationVariant=LeaseReservationVariant,
                 PreparePortalGeometryOnly=PreparePortalGeometryOnly,
                 PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
+                PrepareRawTrackAssignmentDomainOnly=(
+                    PrepareRawTrackAssignmentDomainOnly
+                ),
                 FrozenTrackAssignmentPreparation=(
                     FrozenTrackAssignmentPreparation
                 ),
@@ -1008,6 +1115,20 @@ def RoutePcbAttempt(
         "BoundedEscapes": [],
         "IslandCrossings": 0,
     }
+    if PlacementAccessFabric is not None:
+        DetailedBounds = _BuildPlacementAccessRoutingBoundsAudit(
+            Placement,
+            PlacementAccessFabric,
+            SearchMargin=SearchMargin,
+        )
+        Routed.RoutingControlEffectiveness["AccessContractBounds"] = (
+            PlacementAccessFabric.AccessContractBounds.ToDictionary()
+        )
+        Routed.RoutingControlEffectiveness["DetailedRoutingBounds"] = (
+            DetailedBounds.ToDictionary()
+            if DetailedBounds is not None
+            else None
+        )
     if Deadline is not None:
         Deadline.RaiseIfExpired("RoutingFinalization")
     ReportStatus("authoritative route complete")
@@ -1024,7 +1145,11 @@ def BuildPcbRoutingConfigurations(
     return BuildRoutingAttemptPolicies()
 
 
-def ClusterBoundaryLeaseStateCount(Placement: PcbPlacement) -> int:
+def ClusterBoundaryLeaseStateCount(
+    Placement: PcbPlacement,
+    *,
+    HasFrozenTrackAssignment: bool = False,
+) -> int:
     """Select the bounded lease portfolio for one placed geometry.
 
     A dense original placement needs multiple ownership states to establish
@@ -1037,8 +1162,13 @@ def ClusterBoundaryLeaseStateCount(Placement: PcbPlacement) -> int:
 
     A routed component has already discharged the dense interface proof and
     frozen its physical claims.  Its handoff is therefore an ordinary global
-    route over the remaining nets, not another dense lease portfolio.
+    route over the remaining nets, not another dense lease portfolio.  The
+    same rule applies when the caller supplies a frozen pre-placement track
+    witness: revisiting lease variants would be a second route attempt with
+    a different ownership state, not consumption of the selected contract.
     """
+    if HasFrozenTrackAssignment:
+        return 1
     if getattr(
         Placement.Placed,
         "RoutedComponentTemplates",
@@ -1236,6 +1366,37 @@ def PrepareTrackAssignment(
         return Prepared.Preparation
     raise RuntimeError(
         "track assignment preparation returned without a capacity result"
+    )
+
+
+def PrepareRawTrackAssignmentDomain(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+) -> RawTrackAssignmentDomain:
+    """Materialize one exact candidate domain without solving it yet.
+
+    This is the bridge between a fixed placement portfolio and the aggregate
+    raw-template selector.  It does not route, retry, or choose a track
+    assignment; it only freezes the exact values the existing authoritative
+    preparer would otherwise immediately submit to Rust.
+    """
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            Placement,
+            Configuration,
+            Resources=Resources,
+            Policy=Policy,
+            Deadline=Deadline,
+            PrepareRawTrackAssignmentDomainOnly=True,
+        )
+    except RawTrackAssignmentDomainPrepared as Prepared:
+        return Prepared.Domain
+    raise RuntimeError(
+        "raw track-assignment preparation returned without a domain"
     )
 
 
@@ -1724,7 +1885,12 @@ def RoutePcbDesign(
     LeaseStateCount = (
         1
         if Resources.FrozenClusterInterfaceAssignment is not None
-        else ClusterBoundaryLeaseStateCount(Placement)
+        else ClusterBoundaryLeaseStateCount(
+            Placement,
+            HasFrozenTrackAssignment=(
+                FrozenTrackAssignmentPreparation is not None
+            ),
+        )
     )
     LeaseFailures: list[RoutingStageError] = []
     LeaseAttemptDiagnostics: list[dict[str, object]] = []

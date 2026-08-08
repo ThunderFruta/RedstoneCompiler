@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from Compiler.Routing.Actions import (
     BuildPhysicalGraphs,
     BuildRoutingResources,
+    ForkRoutingResourcesWithSharedStaticGeometry,
     FindFlatRouteConflicts,
     MaterializeReservedRepeaters,
     ValidatePhysicalRoutes,
@@ -25,6 +26,28 @@ from Compiler.Synthesis.NandTransform import ToNandOnly
 
 
 class RoutingResourceTests(unittest.TestCase):
+    def testStaticGeometryForkKeepsEnvelopeProofStateIndependent(self) -> None:
+        Base = BuildRoutingResources(SimpleNamespace(PlacedGates=[]))
+        Base.RustContexts[(1, 2, 3, 4, 5)] = object()
+        Base.RawPortalGeometryCaches = ("base-portal",)
+        Base.PreparedPortalDomainCaches = ("base-prepared",)
+
+        First = ForkRoutingResourcesWithSharedStaticGeometry(Base)
+        Second = ForkRoutingResourcesWithSharedStaticGeometry(Base)
+
+        self.assertIs(First.StaticGeometry, Base.StaticGeometry)
+        self.assertIs(Second.StaticGeometry, Base.StaticGeometry)
+        self.assertIs(First.ResourceGraph, Base.ResourceGraph)
+        self.assertIs(Second.ResourceGraph, Base.ResourceGraph)
+        self.assertIsNot(First.RustContexts, Base.RustContexts)
+        self.assertIsNot(First.RustContexts, Second.RustContexts)
+        self.assertEqual(First.RustContexts, {})
+        self.assertEqual(Second.RustContexts, {})
+        self.assertEqual(First.RawPortalGeometryCaches, ())
+        self.assertEqual(Second.RawPortalGeometryCaches, ())
+        self.assertEqual(First.PreparedPortalDomainCaches, ())
+        self.assertEqual(Second.PreparedPortalDomainCaches, ())
+
     def testRoutingEnvelopeUsesAllAxesAndExactMaterialCounts(self) -> None:
         Envelope = BuildRoutingEnvelope(
             ((4, 3, 9), (7, 5, 12)),

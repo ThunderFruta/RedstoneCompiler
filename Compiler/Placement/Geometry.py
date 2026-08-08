@@ -48,6 +48,16 @@ class PlacedDesign:
     InterClusterRoutingChannel: Any | None = None
     PlacementAccessFabric: Any | None = None
     PlacementAccessAssignment: Any | None = None
+    # A derived packed-core placement freezes terminal face ownership before
+    # access-fabric construction.  It remains optional so ordinary placement
+    # backends preserve their historical terminal behavior.
+    DerivedPerimeterSlotDomain: Any | None = None
+    DerivedPerimeterSlotAssignment: Any | None = None
+    # Complete placement-local trees offered as immutable alternatives to
+    # ordinary portal/track candidates in the pre-route capacity problem.
+    # They are deliberately distinct from ``LocalRouteClaims``, which are
+    # already-selected base ownership.
+    DerivedLocalRouteClaims: tuple[Any, ...] = ()
     RoutedComponentTemplates: tuple[Any, ...] = ()
     RoutedComponentRoutingChannels: tuple[Any, ...] = ()
     PackedClusters: tuple[Any, ...] = ()
