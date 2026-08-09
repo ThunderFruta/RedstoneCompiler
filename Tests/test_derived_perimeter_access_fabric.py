@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -9,23 +10,34 @@ import Compiler.Placement.AccessFabric as AccessFabricModule
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
 from Compiler.Placement.AccessFabric import (
+    BuildPlacementAccessAssignmentFromStubFactor,
     _DerivePerimeterRootAccessFace,
     BuildDerivedPerimeterFabricShell,
     BuildPlacementAccessFabric,
+    AttachPlacementAccessFabric,
     MeasureDerivedPerimeterInterfaceDemand,
     MeasureDerivedPerimeterInterfaceLaunchDemandByFace,
 )
 from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
 from Compiler.Placement.Pcb import PcbPlacement
+from Compiler.Placement.PcbFlow import BuildPlacementAccessDemand
 from Compiler.Placement.PreRouteInterface import (
     DerivedPerimeterFaceReservation,
     DerivedPerimeterSlotAssignment,
     DerivedPerimeterTerminalSlot,
+    DeriveRoutingEnvelopes,
 )
 from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Routing.Actions.Geometry import BuildRoutingResources
 from Compiler.Routing.ChannelPlanner import BuildNetRoutingProfiles
 from Compiler.Routing.ResourceGraph import FindSelfClaimConflicts
+from Compiler.Routing.Models import RoutedDesign
+from Compiler.Routing.Pcb import RoutePcbAttempt
+from Compiler.Routing.Policy import (
+    BuildRoutingAttemptPolicies,
+    LocalFirstPhysicalDesignPolicy,
+)
+from Compiler.Routing.Reliability import RoutingDeadline
 from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
 
 
@@ -498,6 +510,20 @@ def test_derived_perimeter_fabric_freezes_face_and_outer_ring_bounds():
     # domains instead of receiving a speculative four-side ring.
     assert Fabric.ActiveFaces == ("north",)
     assert Fabric.OuterBounds is not None
+    Envelope = Fabric.FrozenRoutingEnvelope
+    assert Envelope is not None
+    assert Envelope.RoutingRegionBounds == Fabric.OuterBounds
+    assert Envelope.PermittedLayers == tuple(range(Placement.LayerCount))
+    assert dict(Envelope.PerimeterFaceTrackCounts) == {
+        "north": 2,
+        "south": 0,
+        "west": 0,
+        "east": 0,
+    }
+    assert Envelope.CanvasBounds[0] <= Envelope.RoutingRegionBounds[0]
+    assert Envelope.CanvasBounds[1] <= Envelope.RoutingRegionBounds[1]
+    assert Envelope.CanvasBounds[2] >= Envelope.RoutingRegionBounds[2]
+    assert Envelope.CanvasBounds[3] >= Envelope.RoutingRegionBounds[3]
     MinimumX, MinimumZ, MaximumX, MaximumZ = Fabric.OuterBounds
     # The active north segment spans its exact lateral ring extent, while
     # inactive faces do not enlarge the physical contract.
@@ -547,6 +573,45 @@ def test_derived_perimeter_fabric_freezes_face_and_outer_ring_bounds():
     assert Serialized["PerimeterSlotAssignmentFingerprint"] == (
         Assignment.AssignmentFingerprint
     )
+    assert Serialized["FrozenRoutingEnvelope"] == Envelope.ToDictionary()
+
+
+def test_representative_ingress_factor_is_a_fixed_subset_of_full_ring_domain():
+    """Pre-route factoring may reduce ingress values without moving geometry."""
+    Placement, Slot, _Assignment = BuildNorthFacingPerimeterFixture()
+    Resources = BuildRoutingResources(Placement.Placed)
+    Full = BuildPlacementAccessFabric(
+        Placement,
+        Resources=Resources,
+        TopologyKind="derived-perimeter-access-v1",
+        AccessRingTrackCount=2,
+    )
+    Representatives = BuildPlacementAccessFabric(
+        Placement,
+        Resources=Resources,
+        TopologyKind="derived-perimeter-access-v1",
+        AccessRingTrackCount=2,
+        RestrictDerivedIngressToRepresentatives=True,
+    )
+
+    FullDomain = next(
+        Value for Value in Full.TerminalDomains
+        if (Value.Signal, Value.Terminal) == (Slot.Signal, Slot.ConnectionPin)
+    )
+    RepresentativeDomain = next(
+        Value for Value in Representatives.TerminalDomains
+        if (Value.Signal, Value.Terminal) == (Slot.Signal, Slot.ConnectionPin)
+    )
+    assert Representatives.FabricFingerprint != Full.FabricFingerprint
+    assert Representatives.OuterBounds == Full.OuterBounds
+    assert Representatives.ActiveFaces == Full.ActiveFaces
+    assert RepresentativeDomain.Complete is True
+    assert 0 < len(RepresentativeDomain.EscapeStubs) < len(
+        FullDomain.EscapeStubs
+    )
+    assert {
+        Stub.Path for Stub in RepresentativeDomain.EscapeStubs
+    }.issubset({Stub.Path for Stub in FullDomain.EscapeStubs})
 
 
 def test_derived_perimeter_shell_reuses_fixed_prefabric_geometry(
@@ -608,7 +673,111 @@ def test_derived_perimeter_shell_reuses_fixed_prefabric_geometry(
     assert Shell.Bounds == Fabric.OuterBounds
     assert Shell.OuterBounds == Fabric.OuterBounds
     assert Shell.ActiveFaces == Fabric.ActiveFaces
+    assert Shell.PerimeterFaceTrackCounts == (
+        ("north", 2),
+        ("south", 0),
+        ("west", 0),
+        ("east", 0),
+    )
     assert Shell.SlotFaceByTerminal
+
+
+def test_derived_perimeter_fabric_honors_asymmetric_face_track_contract():
+    Placement = BuildAsymmetricPerimeterLaunchFixture()
+    AsymmetricPlacement = replace(Placement, LayerCount=1)
+    Demand = BuildPlacementAccessDemand(
+        AsymmetricPlacement,
+        0,
+        Technology=DefaultRedstoneRoutingTechnology,
+    )
+    Envelope = DeriveRoutingEnvelopes(Demand)[0]
+    assert Envelope.AccessRingTrackCount == 2
+    assert dict(Demand.PerimeterFaceLaunchDemand) == {
+        "north": 2,
+        "south": 1,
+    }
+    PerimeterFaceTrackCounts = (
+        ("north", 2),
+        ("south", 1),
+        ("west", 0),
+        ("east", 0),
+    )
+    Resources = BuildRoutingResources(Placement.Placed)
+    Shell = BuildDerivedPerimeterFabricShell(
+        AsymmetricPlacement,
+        Resources=Resources,
+        Technology=DefaultRedstoneRoutingTechnology,
+        AccessRingTrackCount=Envelope.AccessRingTrackCount,
+        AccessLength=Demand.AccessLength,
+        PerimeterFaceTrackCounts=PerimeterFaceTrackCounts,
+    )
+    Fabric = BuildPlacementAccessFabric(
+        AsymmetricPlacement,
+        Resources=Resources,
+        TopologyKind="derived-perimeter-access-v1",
+        AccessRingTrackCount=Envelope.AccessRingTrackCount,
+        Shell=Shell,
+    )
+
+    assert Fabric.Complete is True
+    assert Fabric.FrozenRoutingEnvelope is not None
+    assert Shell.PerimeterFaceTrackCounts == PerimeterFaceTrackCounts
+    assert Fabric.FrozenRoutingEnvelope.PerimeterFaceTrackCounts == (
+        PerimeterFaceTrackCounts
+    )
+    assert dict(Fabric.FrozenRoutingEnvelope.PerimeterFaceTrackCounts) == {
+        "north": 2,
+        "south": 1,
+        "west": 0,
+        "east": 0,
+    }
+    assert Fabric.FrozenRoutingEnvelope.RoutingRegionBounds == Shell.OuterBounds
+
+
+def test_route_attempt_passes_the_frozen_envelope_to_detailed_routing():
+    """The derived canvas is a hard route input, not an artifact-only audit."""
+    Placement, _Slot, _Assignment = BuildNorthFacingPerimeterFixture()
+    Fabric = BuildPlacementAccessFabric(
+        Placement,
+        Resources=BuildRoutingResources(Placement.Placed),
+        TopologyKind="derived-perimeter-access-v1",
+        AccessRingTrackCount=1,
+    )
+    AttachedPlacement = AttachPlacementAccessFabric(Placement, Fabric)
+    SeenEnvelopes = []
+    Routed = RoutedDesign(
+        Module=AttachedPlacement.Placed.Module,
+        PlacedGates=[],
+        Wires=[],
+        Supports=[],
+        Repeaters={},
+        NetWires={},
+    )
+
+    def Route(*_Arguments, **Options):
+        SeenEnvelopes.append(Options["FrozenRoutingEnvelope"])
+        return Routed
+
+    with (
+        patch("Compiler.Routing.Pcb.RoutePcbNets", side_effect=Route),
+        patch(
+            "Compiler.Routing.Pcb.CompactRoutedTrees",
+            return_value=Routed,
+        ),
+    ):
+        Result = RoutePcbAttempt(
+            AttachedPlacement,
+            BuildRoutingAttemptPolicies()[0],
+            Resources=object(),
+            Policy=LocalFirstPhysicalDesignPolicy,
+            Deadline=RoutingDeadline.Start(5.0),
+        )
+
+    assert Result is Routed
+    assert SeenEnvelopes == [Fabric.FrozenRoutingEnvelope]
+    assert Routed.RoutingControlEffectiveness[
+        "FrozenPerFaceRoutingEnvelope"
+    ] == Fabric.FrozenRoutingEnvelope.ToDictionary()
 
 
 def test_derived_perimeter_shell_rejects_changed_candidate_identity():
@@ -837,6 +1006,7 @@ def test_derived_perimeter_uses_earlier_access_pivot_when_farthest_conflicts(
             (-2, 0, 4, 11),
             ("south",),
             {("Result", SlotTerminal): "south"},
+            (("north", 0), ("south", 1), ("west", 0), ("east", 0)),
         ),
     )
 
@@ -924,6 +1094,7 @@ def test_derived_perimeter_retains_all_legal_access_prefix_pivots(
             (-2, 0, 4, 11),
             ("south",),
             {("Result", SlotTerminal): "south"},
+            (("north", 0), ("south", 1), ("west", 0), ("east", 0)),
         ),
     )
 

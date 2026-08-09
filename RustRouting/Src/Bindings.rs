@@ -1,8 +1,13 @@
 use crate::AssignmentPlanning::{
     AssignmentCandidateValue, BaseAssignmentValue, DeadlineExceededAssignmentResult,
     PlanAuthoritativeRoutesWithBaseAndDeadline, PlanAuthoritativeRoutesWithDeadline,
+    SolveTemplateAssignmentDomainsWithDeadline as SolveTemplateAssignmentDomainsNative,
+    TemplateAssignmentDomainValue,
 };
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
+use crate::EscapePlanning::{
+    BuildDerivedEscapeStatePathsWithDeadline, EscapeRequest, EscapeRequestResult,
+};
 use crate::Generation::{
     GeneratePortalCandidateBatchesNative, GenerateRouteTreeDetailedBatchNative,
     GenerateRouteTreesNative,
@@ -71,9 +76,10 @@ fn ExtractAssignmentCandidateValuesWithDeadline(
             return Ok(None);
         }
         let Candidate = Values.get_item(CandidateIndex)?;
-        if Candidate.len()? != 11 {
+        let CandidateLength = Candidate.len()?;
+        if CandidateLength != 11 && CandidateLength != 12 && CandidateLength != 13 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "assignment candidate must contain exactly 11 values",
+                "assignment candidate must contain 11, 12, or 13 values",
             ));
         }
         let Some(Wire) = ExtractIndexValuesWithDeadline(&Candidate.get_item(2)?, Deadline)? else {
@@ -105,6 +111,18 @@ fn ExtractAssignmentCandidateValuesWithDeadline(
             Candidate.get_item(8)?.extract::<i32>()?,
             Candidate.get_item(9)?.extract::<i32>()?,
             Candidate.get_item(10)?.extract::<i32>()?,
+            if CandidateLength == 12 {
+                Candidate.get_item(11)?.extract::<String>()?
+            } else if CandidateLength == 13 {
+                Candidate.get_item(11)?.extract::<String>()?
+            } else {
+                String::new()
+            },
+            if CandidateLength == 13 {
+                Candidate.get_item(12)?.extract::<String>()?
+            } else {
+                Candidate.get_item(0)?.extract::<String>()?
+            },
         ));
     }
     if Deadline.Check() {
@@ -164,6 +182,72 @@ fn ExtractBaseAssignmentValuesWithDeadline(
     Ok(Some(Result))
 }
 
+fn ExtractTemplateAssignmentDomainsWithDeadline(
+    Values: &Bound<'_, PyAny>,
+    Deadline: &RuntimeDeadline,
+) -> PyResult<Option<Vec<TemplateAssignmentDomainValue>>> {
+    if Deadline.Check() {
+        return Ok(None);
+    }
+    let Count = Values.len()?;
+    let mut Result = Vec::with_capacity(Count.min(128));
+    for Index in 0..Count {
+        if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+            return Ok(None);
+        }
+        let Domain = Values.get_item(Index)?;
+        if Domain.len()? != 6 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "template assignment domain must contain exactly 6 values",
+            ));
+        }
+        let ObjectiveValues = &Domain.get_item(1)?;
+        let ObjectiveCount = ObjectiveValues.len()?;
+        let mut Objective = Vec::with_capacity(ObjectiveCount);
+        for ObjectiveIndex in 0..ObjectiveCount {
+            if ObjectiveIndex % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return Ok(None);
+            }
+            Objective.push(ObjectiveValues.get_item(ObjectiveIndex)?.extract::<i64>()?);
+        }
+        let RequiredSignalValues = &Domain.get_item(3)?;
+        let RequiredSignalCount = RequiredSignalValues.len()?;
+        let mut RequiredSignals = Vec::with_capacity(RequiredSignalCount);
+        for SignalIndex in 0..RequiredSignalCount {
+            if SignalIndex % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return Ok(None);
+            }
+            RequiredSignals.push(
+                RequiredSignalValues
+                    .get_item(SignalIndex)?
+                    .extract::<String>()?,
+            );
+        }
+        let Some(Candidates) =
+            ExtractAssignmentCandidateValuesWithDeadline(&Domain.get_item(4)?, Deadline)?
+        else {
+            return Ok(None);
+        };
+        let Some(BaseValues) =
+            ExtractBaseAssignmentValuesWithDeadline(&Domain.get_item(5)?, Deadline)?
+        else {
+            return Ok(None);
+        };
+        Result.push((
+            Domain.get_item(0)?.extract::<String>()?,
+            Objective,
+            Domain.get_item(2)?.extract::<usize>()?,
+            RequiredSignals,
+            Candidates,
+            BaseValues,
+        ));
+    }
+    if Deadline.Check() {
+        return Ok(None);
+    }
+    Ok(Some(Result))
+}
+
 pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_class::<RoutingContext>()?;
     Module.add_class::<PortalCandidate>()?;
@@ -172,6 +256,7 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_class::<RouteTreeSearchResult>()?;
     Module.add_class::<RouteTreeDetailedBatchResult>()?;
     Module.add_class::<RoutingAssignmentResult>()?;
+    Module.add_class::<TemplateRoutingAssignmentResult>()?;
     Module.add_function(wrap_pyfunction!(GetRoutingThreadCount, Module)?)?;
     Module.add_function(wrap_pyfunction!(BuildRouteClaimsBatch, Module)?)?;
     Module.add_function(wrap_pyfunction!(
@@ -189,7 +274,94 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_function(wrap_pyfunction!(GenerateRectilinearTopology, Module)?)?;
     Module.add_function(wrap_pyfunction!(EvaluateLogicPrograms, Module)?)?;
     Module.add_function(wrap_pyfunction!(SolveLeaseDomainsBounded, Module)?)?;
+    Module.add_function(wrap_pyfunction!(
+        BuildDerivedEscapeStatePathsBounded,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        SolveTemplateAssignmentDomainsBounded,
+        Module
+    )?)?;
     Ok(())
+}
+
+/// Enumerate bounded directional escape candidates; Python validates exact
+/// redstone claims and turns cap/deadline exhaustion into typed incomplete.
+#[pyfunction]
+#[pyo3(signature=(AdjacencyValues, Requests, BendPenalty, MaximumExpansionCount, MaximumRuntimeMilliseconds))]
+fn BuildDerivedEscapeStatePathsBounded(
+    PythonValue: Python<'_>,
+    AdjacencyValues: Vec<(Position, Vec<Position>)>,
+    Requests: Vec<EscapeRequest>,
+    BendPenalty: usize,
+    MaximumExpansionCount: usize,
+    MaximumRuntimeMilliseconds: u64,
+) -> PyResult<(String, Vec<EscapeRequestResult>, usize, bool, bool)> {
+    if MaximumExpansionCount < 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "maximum escape expansions must be positive",
+        ));
+    }
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(PythonValue.allow_threads(move || {
+        BuildDerivedEscapeStatePathsWithDeadline(
+            AdjacencyValues,
+            Requests,
+            BendPenalty,
+            MaximumExpansionCount,
+            Deadline,
+        )
+    }))
+}
+
+/// Select one fixed assignment template portfolio in Rust.  Each domain has
+/// a separate local resource index, but all members share one deadline and
+/// expansion cap.  This is a pre-route capacity choice, never a relaunch.
+#[pyfunction]
+#[pyo3(signature=(TemplateDomains, MaximumExpansionCount, MaximumRuntimeMilliseconds, NonExhaustiveTemplateDomain=true))]
+fn SolveTemplateAssignmentDomainsBounded<'py>(
+    PythonValue: Python<'py>,
+    TemplateDomains: &Bound<'py, PyAny>,
+    MaximumExpansionCount: usize,
+    MaximumRuntimeMilliseconds: u64,
+    NonExhaustiveTemplateDomain: bool,
+) -> PyResult<TemplateRoutingAssignmentResult> {
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let Some(Domains) = ExtractTemplateAssignmentDomainsWithDeadline(TemplateDomains, &Deadline)?
+    else {
+        return Ok(TemplateRoutingAssignmentResult {
+            Status: "Incomplete".to_string(),
+            Success: false,
+            Complete: false,
+            Unsatisfiable: false,
+            IncompleteReason: "assignment-deadline".to_string(),
+            SelectedTemplateId: None,
+            SelectedTemplateObjective: Vec::new(),
+            SelectedCandidateIds: Vec::new(),
+            ExpansionCount: 0,
+            BudgetExhausted: false,
+            DeadlineExceeded: true,
+            CompletedWork: 0,
+            FailureNet: None,
+            ConflictSignals: Vec::new(),
+            ConflictResourceIndices: Vec::new(),
+            PairwiseIncompatibleSignals: Vec::new(),
+            PairwiseCompatibilityComplete: false,
+            AttemptedTemplateIds: Vec::new(),
+            AttemptPairwiseIncompatibleSignals: Vec::new(),
+            NonExhaustiveTemplateDomain,
+        });
+    };
+    PythonValue.allow_threads(move || {
+        SolveTemplateAssignmentDomainsNative(
+            Domains,
+            MaximumExpansionCount,
+            Deadline,
+            NonExhaustiveTemplateDomain,
+        )
+    })
 }
 
 /// Solves sorted component-boundary lease domains.  The first branching level

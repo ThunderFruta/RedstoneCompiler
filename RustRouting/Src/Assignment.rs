@@ -8,6 +8,29 @@ use std::collections::{BTreeMap, BTreeSet};
 type CandidateDomain = Vec<u64>;
 type CandidateCompatibility = Vec<Vec<Vec<CandidateDomain>>>;
 
+fn ParseContractRequirements(Encoded: &str) -> Vec<(&str, &str)> {
+    Encoded
+        .split(';')
+        .filter_map(|Entry| {
+            if Entry.is_empty() {
+                None
+            } else {
+                Some(Entry.split_once('=').unwrap_or(("template", Entry)))
+            }
+        })
+        .collect()
+}
+
+fn TemplatesAreCompatible(First: &AssignmentCandidate, Second: &AssignmentCandidate) -> bool {
+    ParseContractRequirements(&First.TemplateKey)
+        .iter()
+        .all(|(FirstName, FirstValue)| {
+            ParseContractRequirements(&Second.TemplateKey).iter().all(
+                |(SecondName, SecondValue)| FirstName != SecondName || FirstValue == SecondValue,
+            )
+        })
+}
+
 fn DomainWordCount(CandidateCount: usize) -> usize {
     CandidateCount.div_ceil(64)
 }
@@ -652,7 +675,10 @@ fn TryAssignIndexedCandidates(
                         let First = &Groups[&SignalNames[FirstSignalIndex]][*FirstCandidateIndex];
                         let Second =
                             &Groups[&SignalNames[SecondSignalIndex]][*SecondCandidateIndex];
-                        if !First.Claims.Conflicts(&Second.Claims) {
+                        if TemplatesAreCompatible(First, Second)
+                            && (First.OwnerSignal == Second.OwnerSignal
+                                || !First.Claims.Conflicts(&Second.Claims))
+                        {
                             CompatiblePairs.push((*FirstCandidateIndex, *SecondCandidateIndex));
                         }
                     }
@@ -1092,9 +1118,17 @@ fn AssignCandidateDomains(
                     *FailureNet = Some(OtherSignal.clone());
                     return false;
                 }
+                let Other = &Groups[OtherSignal][OtherIndex];
+                if !TemplatesAreCompatible(Candidate, Other) {
+                    continue;
+                }
+                if Candidate.OwnerSignal == Other.OwnerSignal {
+                    Compatible.push(OtherIndex);
+                    continue;
+                }
                 match Candidate
                     .Claims
-                    .ConflictsWithDeadline(&Groups[OtherSignal][OtherIndex].Claims, Deadline)
+                    .ConflictsWithDeadline(&Other.Claims, Deadline)
                 {
                     Some(false) => Compatible.push(OtherIndex),
                     Some(true) => {}
@@ -1205,6 +1239,8 @@ mod Tests {
     fn Candidate(CandidateId: &str, MaterialCost: i32) -> AssignmentCandidate {
         AssignmentCandidate {
             CandidateId: CandidateId.to_string(),
+            OwnerSignal: "Signal".to_string(),
+            TemplateKey: String::new(),
             Claims: std::sync::Arc::new(ClaimMask::default()),
             MaterialCost,
             FootprintGrowth: 1,
@@ -1212,6 +1248,34 @@ mod Tests {
             BendCount: 0,
             ViaCount: 0,
         }
+    }
+
+    #[test]
+    fn NamedContractRequirementsPermitFactoredDimensions() {
+        let CoreA = AssignmentCandidate {
+            CandidateId: "core-a".to_string(),
+            OwnerSignal: "Core".to_string(),
+            TemplateKey: "core=a".to_string(),
+            Claims: std::sync::Arc::new(ClaimMask::default()),
+            MaterialCost: 0,
+            FootprintGrowth: 0,
+            Length: 0,
+            BendCount: 0,
+            ViaCount: 0,
+        };
+        let InterfaceNorth = AssignmentCandidate {
+            CandidateId: "interface-north".to_string(),
+            TemplateKey: "interface=north".to_string(),
+            ..CoreA.clone()
+        };
+        let CoreB = AssignmentCandidate {
+            CandidateId: "core-b".to_string(),
+            TemplateKey: "core=b".to_string(),
+            ..CoreA.clone()
+        };
+
+        assert!(TemplatesAreCompatible(&CoreA, &InterfaceNorth));
+        assert!(!TemplatesAreCompatible(&CoreA, &CoreB));
     }
 
     #[test]

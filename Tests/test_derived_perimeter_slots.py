@@ -6,7 +6,11 @@ from tempfile import TemporaryDirectory
 
 from SVDecoder import Sv
 
-from Compiler.Placement.Pcb import PlacePcbGraph
+from Compiler.Placement.Pcb import (
+    ApplyDerivedPerimeterInterfaceTemplate,
+    MaterializeSelectedDerivedPerimeterInterfaceTemplate,
+    PlacePcbGraph,
+)
 from Compiler.Placement.PreRouteInterface import (
     SolveDerivedPerimeterSlotDomain,
 )
@@ -99,3 +103,59 @@ def test_derived_perimeter_slot_work_cap_is_terminal_incomplete():
     assert Result.Complete is False
     assert Result.IncompleteReason == "work-cap"
     assert Result.AssignmentFingerprint == ""
+
+
+def test_interface_template_commits_only_its_declared_terminal_geometry():
+    Source = BuildDerivedFullAdderPlacement()
+    Domain = Source.DerivedPerimeterInterfaceTemplateDomain
+    assert Domain is not None
+    OriginalAssignment = Source.DerivedPerimeterSlotAssignment
+    assert OriginalAssignment is not None
+    Template = next(
+        Value for Value in Domain.Templates
+        if (
+            Value.SlotAssignment.AssignmentFingerprint
+            != OriginalAssignment.AssignmentFingerprint
+        )
+    )
+
+    Committed = ApplyDerivedPerimeterInterfaceTemplate(Source, Template)
+
+    assert Committed.DerivedPerimeterSlotAssignment is Template.SlotAssignment
+    assert Committed.Placed.DerivedPerimeterSlotAssignment is (
+        Template.SlotAssignment
+    )
+    assert Committed.PlacementAccessFabric is None
+    assert Committed.PlacementAccessAssignment is None
+    SlotsByName = {
+        Slot.TerminalName: Slot
+        for Slot in Template.SlotAssignment.SelectedSlots
+    }
+    GatesByName = {
+        Gate.Name: Gate for Gate in Committed.Placed.PlacedGates
+    }
+    for Name, Slot in SlotsByName.items():
+        Gate = GatesByName[Name]
+        assert (Gate.X, Gate.Y, Gate.Z) == Slot.Origin
+        assert Gate.Rotation == Slot.Rotation
+        assert Gate.MirrorX == Slot.MirrorX
+
+
+def test_selected_interface_key_materializes_only_a_declared_template():
+    Source = BuildDerivedFullAdderPlacement()
+    Domain = Source.DerivedPerimeterInterfaceTemplateDomain
+    assert Domain is not None
+    Template = Domain.Templates[1]
+
+    Selected = MaterializeSelectedDerivedPerimeterInterfaceTemplate(
+        Source,
+        Template.TemplateId,
+    )
+
+    assert Selected.DerivedPerimeterSlotAssignment is (
+        Template.SlotAssignment
+    )
+    assert MaterializeSelectedDerivedPerimeterInterfaceTemplate(
+        Source,
+        "",
+    ) is Source

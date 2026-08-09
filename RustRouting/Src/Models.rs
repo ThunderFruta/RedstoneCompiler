@@ -364,6 +364,11 @@ pub(crate) struct RouteTreeDetailedBatchResult {
 #[derive(Clone)]
 pub(crate) struct AssignmentCandidate {
     pub(crate) CandidateId: String,
+    pub(crate) OwnerSignal: String,
+    /// Empty means this ordinary value has no interface-template coupling.
+    /// Nonempty values may coexist only with the same key, allowing one
+    /// capacity solve to select a coherent conditional physical interface.
+    pub(crate) TemplateKey: String,
     pub(crate) Claims: Arc<ClaimMask>,
     pub(crate) MaterialCost: i32,
     pub(crate) FootprintGrowth: i32,
@@ -443,6 +448,8 @@ pub(crate) struct TemplateRoutingAssignmentResult {
     pub(crate) PairwiseCompatibilityComplete: bool,
     #[pyo3(get)]
     pub(crate) AttemptedTemplateIds: Vec<String>,
+    #[pyo3(get)]
+    pub(crate) AttemptPairwiseIncompatibleSignals: Vec<(String, Vec<(String, String)>)>,
     #[pyo3(get)]
     pub(crate) NonExhaustiveTemplateDomain: bool,
 }

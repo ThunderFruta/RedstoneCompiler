@@ -28,6 +28,7 @@ from .Geometry import (
     RectanglesOverlap,
 )
 from .PreRouteInterface import (
+    BuildDerivedPerimeterInterfaceTemplateDomain,
     DerivedPerimeterSlotAssignment,
     DerivedPerimeterSlotDomain,
     DerivedPerimeterTerminalSlot,
@@ -2876,6 +2877,7 @@ class PcbPlacement:
     PlacementAccessAssignment: Any | None = None
     DerivedPerimeterSlotDomain: Any | None = None
     DerivedPerimeterSlotAssignment: Any | None = None
+    DerivedPerimeterInterfaceTemplateDomain: Any | None = None
     # A compact single-component candidate may publish previously materialized
     # complete local trees as alternatives of its immutable pre-route access
     # problem.  They are not live placement ownership until that problem
@@ -2883,6 +2885,127 @@ class PcbPlacement:
     # release/rebuild cycle.
     DerivedLocalRouteClaims: tuple[Any, ...] = ()
     ComponentGraph: Any | None = None
+
+
+def ApplyDerivedPerimeterInterfaceTemplate(
+    Source: PcbPlacement,
+    Template: Any,
+) -> PcbPlacement:
+    """Commit one already-declared compact terminal template immutably.
+
+    The perimeter domain is built before access construction, but its members
+    must become ordinary placed geometry before their paired-root launch,
+    ingress, and capacity factors can be measured.  This helper performs
+    that mechanical commitment without moving the NAND core or generating a
+    new terminal slot.  It deliberately clears access witnesses because they
+    belong to the previous mutually-exclusive geometry world.
+    """
+    Assignment = getattr(Template, "SlotAssignment", None)
+    if (
+        Assignment is None
+        or not bool(getattr(Assignment, "Success", False))
+        or not bool(getattr(Assignment, "Complete", False))
+    ):
+        raise ValueError(
+            "derived perimeter interface template requires a complete slot "
+            "assignment"
+        )
+    ModuleGates = {
+        str(Gate.Name): Gate
+        for Gate in getattr(Source.Placed.Module, "Gates", ())
+    }
+    SlotsByTerminal = {
+        str(Slot.TerminalName): Slot
+        for Slot in getattr(Assignment, "SelectedSlots", ())
+    }
+    if len(SlotsByTerminal) != len(getattr(Assignment, "SelectedSlots", ())):
+        raise ValueError("derived perimeter template repeats a terminal")
+    ExistingByName = {
+        str(Gate.Name): Gate for Gate in Source.Placed.PlacedGates
+    }
+    MissingModuleGates = tuple(sorted(
+        Name for Name in SlotsByTerminal if Name not in ModuleGates
+    ))
+    MissingPlacedGates = tuple(sorted(
+        Name for Name in SlotsByTerminal if Name not in ExistingByName
+    ))
+    if MissingModuleGates or MissingPlacedGates:
+        raise ValueError(
+            "derived perimeter template references an unknown terminal: "
+            + ", ".join((*MissingModuleGates, *MissingPlacedGates))
+        )
+    PlacedGates = [
+        (
+            BuildPlacedGate(
+                ModuleGates[Gate.Name],
+                *SlotsByTerminal[Gate.Name].Origin,
+                SlotsByTerminal[Gate.Name].Rotation,
+                SlotsByTerminal[Gate.Name].MirrorX,
+            )
+            if Gate.Name in SlotsByTerminal
+            else Gate
+        )
+        for Gate in Source.Placed.PlacedGates
+    ]
+    if any(
+        PcbGatesConflict(First, Second)
+        for Index, First in enumerate(PlacedGates)
+        for Second in PlacedGates[Index + 1 :]
+    ):
+        raise ValueError("derived perimeter template overlaps placed geometry")
+    Placed = replace(
+        Source.Placed,
+        PlacedGates=PlacedGates,
+        PlacementAccessFabric=None,
+        PlacementAccessAssignment=None,
+        DerivedPerimeterSlotAssignment=Assignment,
+    )
+    # Rebuild the placed-cell representation now, before routing sees this
+    # member.  This checks transformed macro geometry only; dynamic access
+    # claims are intentionally rebuilt by the one fixed pre-route problem.
+    BuildPlacedCellGeometry(Placed)
+    return replace(
+        Source,
+        Placed=Placed,
+        PlacementAccessFabric=None,
+        PlacementAccessAssignment=None,
+        DerivedPerimeterSlotAssignment=Assignment,
+    )
+
+
+def MaterializeSelectedDerivedPerimeterInterfaceTemplate(
+    Source: PcbPlacement,
+    SelectedTemplateKey: str,
+) -> PcbPlacement:
+    """Commit exactly the pre-route interface template named by a witness.
+
+    A conditional raw assignment key is an identity, not a request to search
+    for another geometry.  Resolve it only against the immutable domain
+    produced during placement, then use the mechanical commit helper above.
+    Empty keys preserve ordinary non-conditional placement behavior.
+    """
+    Key = str(SelectedTemplateKey)
+    if not Key:
+        return Source
+    Domain = (
+        Source.DerivedPerimeterInterfaceTemplateDomain
+        or Source.Placed.DerivedPerimeterInterfaceTemplateDomain
+    )
+    if Domain is None or not bool(getattr(Domain, "Complete", False)):
+        raise ValueError(
+            "selected conditional interface key has no complete domain"
+        )
+    Templates = {
+        str(Template.TemplateId): Template
+        for Template in getattr(Domain, "Templates", ())
+    }
+    Template = Templates.get(Key)
+    if Template is None:
+        raise ValueError(
+            "selected conditional interface key is outside the fixed domain: "
+            + Key
+        )
+    return ApplyDerivedPerimeterInterfaceTemplate(Source, Template)
 
 
 def BuildPhysicalClusterBoundaryLeaseRequests(
@@ -7176,25 +7299,22 @@ def PlacementCompactKey(
     )
 
 
-@lru_cache(maxsize=4096)
-def _PhysicalGateGeometry(
+@lru_cache(maxsize=64)
+def _PhysicalGateLocalGeometry(
     Kind: str,
-    X: int,
-    Y: int,
-    Z: int,
     Rotation: int,
     MirrorX: bool,
 ) -> tuple[frozenset[tuple[int, int, int]], frozenset[tuple[int, int, int]]]:
-    """Cache exact template occupancy used by packed-cell legalization."""
+    """Cache exact origin-relative occupancy for one cell transform."""
     Gate = type(
         "CachedPlacedGate",
         (),
         {
             "Name": "CachedCell",
             "Kind": Kind,
-            "X": X,
-            "Y": Y,
-            "Z": Z,
+            "X": 0,
+            "Y": 0,
+            "Z": 0,
             "Rotation": Rotation,
             "MirrorX": MirrorX,
         },
@@ -7205,7 +7325,53 @@ def _PhysicalGateGeometry(
     return frozenset(Actual), frozenset(Electrical)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=65536)
+def _PhysicalGateGeometry(
+    Kind: str,
+    X: int,
+    Y: int,
+    Z: int,
+    Rotation: int,
+    MirrorX: bool,
+) -> tuple[frozenset[tuple[int, int, int]], frozenset[tuple[int, int, int]]]:
+    """Translate exact cached local occupancy for one placed cell."""
+    LocalActual, LocalElectrical = _PhysicalGateLocalGeometry(
+        Kind,
+        Rotation,
+        MirrorX,
+    )
+    return (
+        frozenset(
+            (X + LocalX, Y + LocalY, Z + LocalZ)
+            for LocalX, LocalY, LocalZ in LocalActual
+        ),
+        frozenset(
+            (X + LocalX, Y + LocalY, Z + LocalZ)
+            for LocalX, LocalY, LocalZ in LocalElectrical
+        ),
+    )
+
+
+@lru_cache(maxsize=64)
+def _PhysicalGateLocalElectricalExclusions(
+    Kind: str,
+    Rotation: int,
+    MirrorX: bool,
+) -> frozenset[tuple[int, int, int]]:
+    """Return the exact origin-relative electrical keep-out."""
+    _Actual, Electrical = _PhysicalGateLocalGeometry(
+        Kind,
+        Rotation,
+        MirrorX,
+    )
+    return frozenset(
+        DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+            set(Electrical)
+        )
+    )
+
+
+@lru_cache(maxsize=65536)
 def _PhysicalGateElectricalExclusions(
     Kind: str,
     X: int,
@@ -7220,18 +7386,14 @@ def _PhysicalGateElectricalExclusions(
     The routing technology owns the keep-out rule, so caching its immutable
     result here changes neither the rule nor a conflict decision.
     """
-    _Actual, Electrical = _PhysicalGateGeometry(
+    LocalElectricalExclusions = _PhysicalGateLocalElectricalExclusions(
         Kind,
-        X,
-        Y,
-        Z,
         Rotation,
         MirrorX,
     )
     return frozenset(
-        DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
-            set(Electrical)
-        )
+        (X + LocalX, Y + LocalY, Z + LocalZ)
+        for LocalX, LocalY, LocalZ in LocalElectricalExclusions
     )
 
 
@@ -9510,12 +9672,22 @@ def BuildDerivedPinAlignmentOffsets(
         if DeltaZ and not DeltaX
     })
     TrackLandingDistance = max(1, Technology.TrackPitch - 1)
+    ClearanceLandingDistance = (
+        int(Technology.TrackPitch) + TrackLandingDistance
+    )
     Offsets = {
         (0, 0),
         *PlanarNeighborOffsets,
         *((DeltaX, DeltaZ) for DeltaX in CardinalX for DeltaZ in CardinalZ),
         *((Sign * TrackLandingDistance, 0) for Sign in (-1, 1)),
         *((0, Sign * TrackLandingDistance) for Sign in (-1, 1)),
+        # A pin-aligned macro may need one legal routing pitch beyond the
+        # landing point to clear an already placed sibling's electrical
+        # exclusion.  Treat that composed technology distance as part of the
+        # original finite alignment shell; this does not change beam width,
+        # placement spacing, or the retained member count.
+        *((Sign * ClearanceLandingDistance, 0) for Sign in (-1, 1)),
+        *((0, Sign * ClearanceLandingDistance) for Sign in (-1, 1)),
     }
     return tuple(sorted(Offsets))
 
@@ -9561,11 +9733,13 @@ def BuildPinAlignedPackedClusterPortfolio(
     BeamWidth: int,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PinAlignedPackedClusterPortfolio:
-    """Materialize the finite non-dominated graph-core domain up front.
+    """Materialize the complete retained graph-core beam up front.
 
     States retain their legacy ``CandidateIndex`` values.  A caller that needs
     to invoke :func:`BuildPinAlignedPackedCluster` later must use that explicit
-    index, rather than enumerating a guessed contiguous range.
+    index, rather than enumerating a guessed contiguous range.  Objective
+    dominance is deliberately not a feasibility proof: a larger NAND-only
+    rectangle can expose a distinct, legal terminal/access domain.
     """
     States = _BuildPinAlignedPackedClusterStates(
         Names,
@@ -9573,17 +9747,8 @@ def BuildPinAlignedPackedClusterPortfolio(
         BeamWidth,
         WorkCheck=WorkCheck,
     )
-    NonDominatedStates = tuple(
-        State
-        for State in States
-        if not any(
-            Other is not State
-            and _PinAlignedPackedClusterStateDominates(Other, State)
-            for Other in States
-        )
-    )
     return PinAlignedPackedClusterPortfolio(
-        States=NonDominatedStates,
+        States=States,
         RawCandidateCount=len(States),
     )
 
@@ -9601,23 +9766,6 @@ def CountPinAlignedPackedClusterPortfolio(
         BeamWidth,
         WorkCheck=WorkCheck,
     ).CandidateCount
-
-
-def _PinAlignedPackedClusterStateDominates(
-    First: PinAlignedPackedClusterState,
-    Second: PinAlignedPackedClusterState,
-) -> bool:
-    """Compare graph states on physical objectives, excluding tie-breakers."""
-    return (
-        all(
-            FirstValue <= SecondValue
-            for FirstValue, SecondValue in zip(First.Objective, Second.Objective)
-        )
-        and any(
-            FirstValue < SecondValue
-            for FirstValue, SecondValue in zip(First.Objective, Second.Objective)
-        )
-    )
 
 
 def _BuildPinAlignedPackedClusterStates(
@@ -9665,8 +9813,63 @@ def _BuildPinAlignedPackedClusterStates(
             if Consumer in NameSet and Consumer != Producer:
                 Adjacency[Producer].add(Consumer)
                 Adjacency[Consumer].add(Producer)
+    # Pin-aligned beam states revisit the same immutable transformed gate at
+    # the same origin through many different parent states.  Cache that exact
+    # physical construction identity; this removes no candidate and leaves
+    # scoring, conflict checks, and stable ordering authoritative.
+    PlacedGateCache: dict[
+        tuple[str, int, int, int, int, bool],
+        Any,
+    ] = {}
+    OriginPlacedGateCache: dict[tuple[str, int, bool], Any] = {}
+
+    def BuildCachedPlacedGate(
+        Name: str,
+        X: int,
+        Y: int,
+        Z: int,
+        Rotation: int,
+        MirrorX: bool,
+    ) -> Any:
+        Key = (Name, X, Y, Z, Rotation, MirrorX)
+        Cached = PlacedGateCache.get(Key)
+        if Cached is None:
+            OriginKey = (Name, Rotation, MirrorX)
+            Origin = OriginPlacedGateCache.get(OriginKey)
+            if Origin is None:
+                Origin = BuildPlacedGate(
+                    InternalByName[Name],
+                    0,
+                    0,
+                    0,
+                    Rotation,
+                    MirrorX,
+                )
+                OriginPlacedGateCache[OriginKey] = Origin
+            Cached = replace(
+                Origin,
+                X=X,
+                Y=Y,
+                Z=Z,
+                InputPins=[
+                    (X + Pin[0], Y + Pin[1], Z + Pin[2])
+                    for Pin in Origin.InputPins
+                ],
+                OutputPin=(
+                    None
+                    if Origin.OutputPin is None
+                    else (
+                        X + Origin.OutputPin[0],
+                        Y + Origin.OutputPin[1],
+                        Z + Origin.OutputPin[2],
+                    )
+                ),
+            )
+            PlacedGateCache[Key] = Cached
+        return Cached
+
     Start = min(Names, key=lambda Name: (-len(Adjacency[Name]), Name))
-    StartGate = BuildPlacedGate(InternalByName[Start], 0, 1, 0, 0, False)
+    StartGate = BuildCachedPlacedGate(Start, 0, 1, 0, 0, False)
     Beam: list[dict[str, Any]] = [{Start: StartGate}]
     PlacedNames = {Start}
     # A bounded graph beam revisits the same transformed macro pairs across
@@ -9682,6 +9885,11 @@ def _BuildPinAlignedPackedClusterStates(
         ],
         bool,
     ] = {}
+    ElectricalExclusionCache: dict[
+        frozenset[tuple[int, int, int]],
+        frozenset[tuple[int, int, int]],
+    ] = {}
+    GateSizeCache: dict[tuple[str, int], tuple[int, int]] = {}
 
     def ConflictKey(Gate: Any) -> tuple[str, int, int, int, int, bool]:
         return (
@@ -9694,6 +9902,32 @@ def _BuildPinAlignedPackedClusterStates(
         )
 
     def CachedPcbGatesConflict(First: Any, Second: Any) -> bool:
+        FirstSizeKey = (str(First.Kind), int(First.Rotation))
+        SecondSizeKey = (str(Second.Kind), int(Second.Rotation))
+        FirstSize = GateSizeCache.get(FirstSizeKey)
+        if FirstSize is None:
+            FirstSize = RotatedCellSize(First.Kind, First.Rotation)
+            GateSizeCache[FirstSizeKey] = FirstSize
+        SecondSize = GateSizeCache.get(SecondSizeKey)
+        if SecondSize is None:
+            SecondSize = RotatedCellSize(Second.Kind, Second.Rotation)
+            GateSizeCache[SecondSizeKey] = SecondSize
+        FirstWidth, FirstDepth = FirstSize
+        SecondWidth, SecondDepth = SecondSize
+        BroadPhaseMargin = (
+            DefaultRedstoneRoutingTechnology.AccessLength
+        )
+        if (
+            First.X + FirstWidth - 1 + BroadPhaseMargin
+            < Second.X - BroadPhaseMargin
+            or Second.X + SecondWidth - 1 + BroadPhaseMargin
+            < First.X - BroadPhaseMargin
+            or First.Z + FirstDepth - 1 + BroadPhaseMargin
+            < Second.Z - BroadPhaseMargin
+            or Second.Z + SecondDepth - 1 + BroadPhaseMargin
+            < First.Z - BroadPhaseMargin
+        ):
+            return False
         Key = (ConflictKey(First), ConflictKey(Second))
         Cached = ConflictCache.get(Key)
         if Cached is None:
@@ -9773,12 +10007,23 @@ def _BuildPinAlignedPackedClusterStates(
             )
         )
         Signals = tuple(sorted(AccessPositionsBySignal))
-        ElectricalExclusionsBySignal = {
-            Signal: DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+        ElectricalExclusionsBySignal = {}
+        for Signal in Signals:
+            PhysicalPositions = frozenset(
                 AccessPositionsBySignal[Signal]
             )
-            for Signal in Signals
-        }
+            ElectricalExclusions = ElectricalExclusionCache.get(
+                PhysicalPositions
+            )
+            if ElectricalExclusions is None:
+                ElectricalExclusions = frozenset(
+                    DefaultRedstoneRoutingTechnology
+                    .BuildElectricalExclusions(set(PhysicalPositions))
+                )
+                ElectricalExclusionCache[PhysicalPositions] = (
+                    ElectricalExclusions
+                )
+            ElectricalExclusionsBySignal[Signal] = ElectricalExclusions
         AccessConflictPenalty = sum(
             1
             for FirstIndex, FirstSignal in enumerate(Signals)
@@ -9862,8 +10107,8 @@ def _BuildPinAlignedPackedClusterStates(
             for ExistingPin, PinKind, PinIndex in Connections:
                 for Rotation in (0, 90, 180, 270):
                     for MirrorX in (False, True):
-                        Origin = BuildPlacedGate(
-                            GateValue, 0, 1, 0, Rotation, MirrorX
+                        Origin = BuildCachedPlacedGate(
+                            Name, 0, 1, 0, Rotation, MirrorX
                         )
                         LocalPin = (
                             Origin.InputPins[PinIndex]
@@ -9890,8 +10135,8 @@ def _BuildPinAlignedPackedClusterStates(
                         "CompletedCandidates": CandidateKeyIndex,
                         "TotalCandidates": len(OrderedCandidateKeys),
                     })
-                Candidate = BuildPlacedGate(
-                    GateValue, X, 1, Z, Rotation, MirrorX
+                Candidate = BuildCachedPlacedGate(
+                    Name, X, 1, Z, Rotation, MirrorX
                 )
                 if any(
                     CachedPcbGatesConflict(Candidate, Existing)
@@ -9902,7 +10147,15 @@ def _BuildPinAlignedPackedClusterStates(
                 CandidateState[Name] = Candidate
                 NextBeam.append((Score(CandidateState), CandidateState))
         if not NextBeam:
-            return None
+            # The bounded graph beam has a complete empty retained domain for
+            # this core.  Return the canonical tuple contract so portfolio
+            # callers can preserve the row-beam incumbent without treating
+            # an absent graph alternative as a Python exception.
+            EmptyPortfolio: tuple[PinAlignedPackedClusterState, ...] = ()
+            _PinAlignedPackedClusterPortfolioCache[PortfolioKey] = (
+                EmptyPortfolio
+            )
+            return EmptyPortfolio
         NextBeam.sort(key=lambda Value: Value[0])
         Beam = [State for _Key, State in NextBeam[:BeamWidth]]
         PlacedNames.add(Name)
@@ -10156,6 +10409,9 @@ def AddPcbRoutingGuides(
         DerivedPerimeterSlotAssignment=(
             Placed.DerivedPerimeterSlotAssignment
         ),
+        DerivedPerimeterInterfaceTemplateDomain=(
+            Placed.DerivedPerimeterInterfaceTemplateDomain
+        ),
     )
     return PcbPlacement(
         Placed=Guided,
@@ -10165,6 +10421,9 @@ def AddPcbRoutingGuides(
         DerivedPerimeterSlotDomain=Guided.DerivedPerimeterSlotDomain,
         DerivedPerimeterSlotAssignment=(
             Guided.DerivedPerimeterSlotAssignment
+        ),
+        DerivedPerimeterInterfaceTemplateDomain=(
+            Guided.DerivedPerimeterInterfaceTemplateDomain
         ),
     )
 
@@ -12791,6 +13050,7 @@ def PlacePcbGraph(
     DerivedPerimeterSlotAssignmentValue: (
         DerivedPerimeterSlotAssignment | None
     ) = None
+    DerivedPerimeterInterfaceTemplateDomainValue: Any | None = None
     def PlaceTerminalBank(
         Gates: list[Any],
         BankZ: int,
@@ -12933,6 +13193,7 @@ def PlacePcbGraph(
         """Place packed-mode I/O on the exterior shell of the NAND fabric."""
         nonlocal DerivedPerimeterSlotDomainValue
         nonlocal DerivedPerimeterSlotAssignmentValue
+        nonlocal DerivedPerimeterInterfaceTemplateDomainValue
         PlacedMinimumX = min(Gate.X for Gate in PlacedGates)
         PlacedMaximumX = max(
             Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
@@ -13001,6 +13262,16 @@ def PlacePcbGraph(
                     WorkCheck=CheckWork,
                 )
             )
+            DerivedPerimeterInterfaceTemplateDomainValue = (
+                BuildDerivedPerimeterInterfaceTemplateDomain(
+                    DerivedPerimeterSlotDomainValue,
+                    TerminalPlacementPolicy
+                    .MaximumTerminalAssignmentExpansions,
+                    WorkCheck=CheckWork,
+                )
+            )
+            if not DerivedPerimeterInterfaceTemplateDomainValue.Complete:
+                return None
             if not DerivedPerimeterSlotAssignmentValue.Success:
                 return None
             TerminalGateByName = {Gate.Name: Gate for Gate in Gates}
@@ -14189,6 +14460,9 @@ def PlacePcbGraph(
         DerivedPerimeterSlotDomain=DerivedPerimeterSlotDomainValue,
         DerivedPerimeterSlotAssignment=(
             DerivedPerimeterSlotAssignmentValue
+        ),
+        DerivedPerimeterInterfaceTemplateDomain=(
+            DerivedPerimeterInterfaceTemplateDomainValue
         ),
     )
     if PackedMode:
@@ -15548,6 +15822,9 @@ def PlacePcbGraph(
             DerivedPerimeterSlotAssignment=(
                 Guided.Placed.DerivedPerimeterSlotAssignment
             ),
+            DerivedPerimeterInterfaceTemplateDomain=(
+                Guided.Placed.DerivedPerimeterInterfaceTemplateDomain
+            ),
             ClusterBoundaryLeaseRequests=BoundaryLeaseRequests,
             CompleteClusterInterfaceAccess=(
                 EnableClusterInterfacePlacementFeasibility
@@ -15568,6 +15845,9 @@ def PlacePcbGraph(
         ),
         DerivedPerimeterSlotAssignment=(
             Guided.Placed.DerivedPerimeterSlotAssignment
+        ),
+        DerivedPerimeterInterfaceTemplateDomain=(
+            Guided.Placed.DerivedPerimeterInterfaceTemplateDomain
         ),
         ComponentGraph=LogicalComponentGraph,
     )

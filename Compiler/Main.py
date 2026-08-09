@@ -83,15 +83,18 @@ class CpuRunTelemetry:
     def ReadOsThreadCount() -> int:
         """Return Linux process thread count without requiring psutil."""
         try:
-            for Line in Path("/proc/self/status").read_text().splitlines():
-                if Line.startswith("Threads:"):
-                    return max(1, int(Line.split(":", 1)[1].strip()))
-        except (OSError, ValueError):
+            return max(1, len(os.listdir("/proc/self/task")))
+        except OSError:
             pass
         return 1
 
     def Sample(self) -> None:
-        while not self.StopEvent.wait(0.1):
+        # Thread-count sampling is observational and must not contend with
+        # the bounded Python placement/factor orchestration at 10 Hz.  Native
+        # routing pools live long enough for a 2 Hz sample to retain useful
+        # peak telemetry without consuming a material share of an 8-second
+        # compile budget.
+        while not self.StopEvent.wait(0.5):
             self.LastOsThreads = self.ReadOsThreadCount()
             self.LastPythonThreads = active_count()
             self.PeakOsThreads = max(self.PeakOsThreads, self.LastOsThreads)

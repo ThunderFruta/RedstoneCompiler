@@ -69,11 +69,15 @@ def test_closed_region_portals_replace_discovery_domain_before_consumers():
 def test_single_component_selection_freezes_raw_tracks_before_route():
     """A compact portfolio has one raw selector and no post-selection solve."""
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    GuideDomain = Source.index(
+        "GuideDomain = PrepareRawRouteGuideFactorDomain("
+    )
     RawDomain = Source.index(
-        "RawDomain = PrepareRawTrackAssignmentDomain("
+        "RawDomain = ComposeRawTrackAssignmentFactorDomains(",
+        GuideDomain,
     )
     Selection = Source.index(
-        "SolveRawTrackAssignmentPortfolioWithContext(",
+        "SolveRawTrackAssignmentProblemWithContext(",
         RawDomain,
     )
     FrozenPreparation = Source.index(
@@ -83,27 +87,29 @@ def test_single_component_selection_freezes_raw_tracks_before_route():
     MultiComponentPreparation = Source.index(
         "Preparation = PrepareTrackAssignment("
     )
-    LegacyPreparation = Source.index(
-        "SelectedTrackPreparation = PrepareTrackAssignment(",
+    MissingFrozenWitness = Source.index(
+        "Stage=\"FrozenPreRouteFactorHandoff\"",
         FrozenPreparation,
     )
-    FirstRoute = Source.index("RoutePcbDesign(", LegacyPreparation)
+    FirstRoute = Source.index("RoutePcbDesign(", MissingFrozenWitness)
 
-    # Each fixed candidate exports its raw native values, then one aggregate
-    # selector supplies the selected frozen witness.  The remaining ordinary
-    # preparation belongs only to the legacy multi-component compatibility
-    # path; it cannot run on the single packed component path.  The first
-    # call prepares a legacy candidate before selection, and the second is a
-    # defensive fallback guarded by a missing frozen witness.
-    assert Source.count("PrepareRawTrackAssignmentDomain(") == 1
-    assert Source.count("SolveRawTrackAssignmentPortfolioWithContext(") == 1
-    assert Source.count("PrepareTrackAssignment(") == 2
-    assert RawDomain < Selection < FrozenPreparation < LegacyPreparation
+    # Each fixed candidate exports compact access and guide values, then one
+    # aggregate selector supplies the selected frozen witness.  The remaining ordinary
+    # preparation belongs only to pre-selection multi-component domain
+    # construction; it cannot run on the single packed component path and a
+    # missing selected witness is a typed incomplete handoff, not a retry.
+    assert Source.count("PrepareRawRouteGuideFactorDomain(") == 1
+    assert Source.count("ComposeRawTrackAssignmentFactorDomains(") == 1
+    assert Source.count("SolveRawTrackAssignmentProblemWithContext(") == 1
+    assert Source.count("PrepareTrackAssignment(") == 1
+    assert GuideDomain < RawDomain < Selection < FrozenPreparation
+    assert FrozenPreparation < MissingFrozenWitness
     assert MultiComponentPreparation < Selection
     assert "if SelectedTrackPreparation is None:" in Source[
-        FrozenPreparation:LegacyPreparation
+        FrozenPreparation:MissingFrozenWitness
     ]
-    assert LegacyPreparation < FirstRoute
+    assert "SelectedTrackPreparation = PrepareTrackAssignment(" not in Source
+    assert MissingFrozenWitness < FirstRoute
 
 
 def test_multi_component_missing_access_assignment_uses_frozen_track_witness():
@@ -148,15 +154,22 @@ def test_single_component_defers_derived_fabric_until_raw_materialization():
     )
     Materializer = Source.index("def MaterializeRawTemplate(")
     Fabric = Source.index("Fabric = BuildPlacementAccessFabric(", Materializer)
-    RawDomain = Source.index("RawDomain = PrepareRawTrackAssignmentDomain(")
+    GuideDomain = Source.index(
+        "GuideDomain = PrepareRawRouteGuideFactorDomain(",
+        Materializer,
+    )
+    RawDomain = Source.index(
+        "RawDomain = ComposeRawTrackAssignmentFactorDomains(",
+        GuideDomain,
+    )
     Attached = Source.index(
         "AttachedPlacement = AttachPlacementAccessFabric(",
         Materializer,
     )
 
     assert Shell < Descriptor < DeferredCandidate < Materializer
-    assert Materializer < Fabric < Attached < RawDomain
-    assert "Shell=FabricDescriptor.Shell" in Source[Fabric:RawDomain]
+    assert Materializer < Fabric < GuideDomain < Attached < RawDomain
+    assert "Shell=FabricDescriptor.Shell" in Source[Fabric:GuideDomain]
 
 
 def test_single_component_selected_contract_cannot_reenter_legacy_portfolio():

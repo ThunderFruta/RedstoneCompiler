@@ -594,6 +594,35 @@ class TrackAssignmentPreparation:
     # templates; it must not treat a locally solved candidate as a resource-
     # free witness merely because its access-fabric assignment was deferred.
     SelectedCapacityResourceIds: tuple[str, ...] = ()
+    # Preserve the logical owner of the exact compact claims selected before
+    # detailed routing.  The selected-world tree builder uses peer ownership
+    # as immutable blockers while allowing a signal to reuse its own access
+    # stub and guide resources.
+    SelectedCapacityClaimsByOwner: tuple[
+        tuple[str, RoutingResourceClaims], ...
+    ] = ()
+    # A nonempty key is the one immutable conditional interface geometry
+    # selected by the exact raw assignment.  It is published explicitly so
+    # placement can materialize only that geometry after the solve.
+    SelectedConditionalTemplateKey: str = ""
+    # The complete named pre-route contract selected by the capacity solver.
+    # It includes core, interface, and layer requirements when applicable.
+    SelectedContractRequirements: tuple[tuple[str, str], ...] = ()
+    # Selected non-routable contract values (for example, access stubs) are
+    # retained separately so placement can reconstruct its frozen geometry
+    # handoff without exposing them as detailed-route candidate IDs.
+    SelectedContractClaimChoiceIds: tuple[tuple[str, str], ...] = ()
+    # A route-guide factor fixes the portal tuple, layer, axis, lane, and
+    # finite corridor used by the later detailed-tree materialization.  It is
+    # selected in the one pre-route capacity solve but is not itself a routed
+    # tree candidate.
+    SelectedRouteGuideFactorChoiceIds: tuple[tuple[str, str], ...] = ()
+    # Lossless selected-world handoff for the immutable guide shape.  The
+    # descriptor is owned by AuthoritativePlanner to avoid duplicating the
+    # portal model here; it is excluded from equality and summarized below.
+    SelectedRouteGuideFactorDescriptors: tuple[
+        tuple[str, str, Any], ...
+    ] = field(default=(), compare=False, repr=False)
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -614,6 +643,46 @@ class TrackAssignmentPreparation:
             "SelectedCapacityResourceIds": list(
                 self.SelectedCapacityResourceIds
             ),
+            "SelectedCapacityClaimsByOwner": {
+                Signal: sorted(map(str, Claims.ResourceIds))
+                for Signal, Claims in self.SelectedCapacityClaimsByOwner
+            },
+            "SelectedConditionalTemplateKey": (
+                self.SelectedConditionalTemplateKey
+            ),
+            "SelectedContractRequirements": [
+                list(Value) for Value in self.SelectedContractRequirements
+            ],
+            "SelectedContractClaimChoiceIds": [
+                list(Value) for Value in self.SelectedContractClaimChoiceIds
+            ],
+            "SelectedRouteGuideFactorChoiceIds": [
+                list(Value)
+                for Value in self.SelectedRouteGuideFactorChoiceIds
+            ],
+            "SelectedRouteGuideFactorDescriptors": [
+                {
+                    "Signal": Signal,
+                    "FactorId": FactorId,
+                    "Layer": int(Descriptor.Layer),
+                    "Axis": str(Descriptor.Axis),
+                    "Lane": int(Descriptor.Lane),
+                    "Guide": [
+                        list(Value) for Value in sorted(Descriptor.Guide)
+                    ],
+                    "GuideExpansion": int(Descriptor.GuideExpansion),
+                    "RoutingY": int(Descriptor.RoutingY),
+                    "SourcePortalId": str(
+                        Descriptor.SourcePortal.PortalId
+                    ),
+                    "TargetPortalIds": [
+                        str(Value.PortalId)
+                        for Value in Descriptor.TargetPortals
+                    ],
+                }
+                for Signal, FactorId, Descriptor
+                in self.SelectedRouteGuideFactorDescriptors
+            ],
         }
 
 
@@ -669,11 +738,17 @@ class PlacementAccessTerminalDomain:
     EscapeStubs: tuple[PlacementAccessEscapeStub, ...]
     Complete: bool
     IncompleteReason: str = ""
+    # A compact pre-route aggregate cannot use the transient transformed
+    # terminal coordinate as its variable identity: every core/template
+    # member has different physical coordinates for the same logical pin.
+    # This role is stable within a signal profile (root or ordered target).
+    LogicalKey: str = ""
 
     def ToDictionary(self) -> dict[str, object]:
         return {
             "Signal": self.Signal,
             "Terminal": list(self.Terminal),
+            "LogicalKey": self.LogicalKey,
             "EscapeStubs": [
                 Value.ToDictionary() for Value in self.EscapeStubs
             ],
@@ -888,6 +963,73 @@ class DetailedRoutingBounds:
 
 
 @dataclass(frozen=True)
+class FrozenPerFaceRoutingEnvelope:
+    """One selected derived-access canvas consumed verbatim by routing.
+
+    The derived compact path decides this finite physical contract before the
+    authoritative capacity solve.  It records the actual horizontal canvas,
+    the usable vertical interval, the selected logical layers, and how much
+    perimeter material belongs to each face.  It is intentionally separate
+    from the older ``AccessRingTrackCount`` scalar: that scalar remains a
+    compatibility summary, while this type is the route-stage authority.
+
+    Bounds use inclusive coordinates, matching the resource graph and the
+    existing placement-access contracts.
+    """
+
+    RoutingRegionBounds: tuple[int, int, int, int]
+    CanvasBounds: tuple[int, int, int, int]
+    YBounds: tuple[int, int]
+    PermittedLayers: tuple[int, ...]
+    PerimeterFaceTrackCounts: tuple[tuple[str, int], ...]
+    EnvelopeFingerprint: str
+
+    def __post_init__(self) -> None:
+        MinimumX, MinimumZ, MaximumX, MaximumZ = self.RoutingRegionBounds
+        CanvasMinimumX, CanvasMinimumZ, CanvasMaximumX, CanvasMaximumZ = (
+            self.CanvasBounds
+        )
+        MinimumY, MaximumY = self.YBounds
+        if MinimumX > MaximumX or MinimumZ > MaximumZ:
+            raise ValueError("frozen routing region bounds are inverted")
+        if (
+            CanvasMinimumX > MinimumX
+            or CanvasMinimumZ > MinimumZ
+            or CanvasMaximumX < MaximumX
+            or CanvasMaximumZ < MaximumZ
+        ):
+            raise ValueError(
+                "frozen routing canvas must enclose its routing region"
+            )
+        if MinimumY > MaximumY:
+            raise ValueError("frozen routing Y bounds are inverted")
+        if not self.PermittedLayers or self.PermittedLayers != tuple(
+            range(len(self.PermittedLayers))
+        ):
+            raise ValueError("frozen routing layers must be contiguous")
+        FaceNames = tuple(Face for Face, _Count in self.PerimeterFaceTrackCounts)
+        if FaceNames != ("north", "south", "west", "east"):
+            raise ValueError("frozen routing face tracks are not canonical")
+        if any(Count < 0 for _Face, Count in self.PerimeterFaceTrackCounts):
+            raise ValueError("frozen routing face tracks are invalid")
+        if not self.EnvelopeFingerprint:
+            raise ValueError("frozen routing envelope requires a fingerprint")
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "RoutingRegionBounds": list(self.RoutingRegionBounds),
+            "CanvasBounds": list(self.CanvasBounds),
+            "YBounds": list(self.YBounds),
+            "PermittedLayers": list(self.PermittedLayers),
+            "PerimeterFaceTrackCounts": {
+                Face: Count
+                for Face, Count in self.PerimeterFaceTrackCounts
+            },
+            "EnvelopeFingerprint": self.EnvelopeFingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class PlacementAccessFabric:
     """Immutable placement-wide routing fabric built before capacity solve."""
 
@@ -909,6 +1051,7 @@ class PlacementAccessFabric:
     OuterBounds: tuple[int, int, int, int] | None = None
     ActiveFaces: tuple[str, ...] = ()
     PerimeterSlotAssignmentFingerprint: str = ""
+    FrozenRoutingEnvelope: FrozenPerFaceRoutingEnvelope | None = None
     # Bounded legal escape construction is pre-route proof work.  These
     # counters make an incomplete factor auditable without treating its cap
     # as a topology or routing retry.
@@ -916,6 +1059,12 @@ class PlacementAccessFabric:
     LegalEscapeExpansionLimit: int | None = None
     LegalEscapeWorkLimitKind: str = ""
     LegalEscapeDirectionStateUpperBound: int | None = None
+    NativeEscapeKernelUsed: bool = False
+    NativeEscapeKernelCallCount: int = 0
+    NativeEscapeKernelExpansionCount: int = 0
+    NativeEscapeKernelComplete: bool = True
+    NativeEscapeKernelElapsedSeconds: float = 0.0
+    NativeEscapeFallbackUsed: bool = False
     IncompleteReason: str = ""
     Technology: Any = field(default=None, compare=False, repr=False)
 
@@ -959,12 +1108,29 @@ class PlacementAccessFabric:
             "PerimeterSlotAssignmentFingerprint": (
                 self.PerimeterSlotAssignmentFingerprint
             ),
+            "FrozenRoutingEnvelope": (
+                self.FrozenRoutingEnvelope.ToDictionary()
+                if self.FrozenRoutingEnvelope is not None
+                else None
+            ),
             "LegalEscapeExpansionCount": self.LegalEscapeExpansionCount,
             "LegalEscapeExpansionLimit": self.LegalEscapeExpansionLimit,
             "LegalEscapeWorkLimitKind": self.LegalEscapeWorkLimitKind,
             "LegalEscapeDirectionStateUpperBound": (
                 self.LegalEscapeDirectionStateUpperBound
             ),
+            "NativeEscapeKernelUsed": self.NativeEscapeKernelUsed,
+            "NativeEscapeKernelCallCount": (
+                self.NativeEscapeKernelCallCount
+            ),
+            "NativeEscapeKernelExpansionCount": (
+                self.NativeEscapeKernelExpansionCount
+            ),
+            "NativeEscapeKernelComplete": self.NativeEscapeKernelComplete,
+            "NativeEscapeKernelElapsedSeconds": (
+                self.NativeEscapeKernelElapsedSeconds
+            ),
+            "NativeEscapeFallbackUsed": self.NativeEscapeFallbackUsed,
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
         }
@@ -3143,6 +3309,17 @@ class RoutingResources:
     )
     FrozenInterfaceGlobalCandidateMetadata: Any = field(
         default=None,
+        compare=False,
+        repr=False,
+    )
+    # A one-shot pre-route compact selection materializes an exact finite
+    # route-candidate domain before it selects one member.  The selected
+    # member must hand those *same* candidate objects to detailed routing;
+    # regenerating a smaller request window would silently replace the proof
+    # with a different domain.  Entries are keyed by the domain fingerprint
+    # and retain both candidates and their deterministic lane metadata.
+    FrozenRawTrackAssignmentCandidateCaches: dict[str, Any] = field(
+        default_factory=dict,
         compare=False,
         repr=False,
     )

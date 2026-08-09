@@ -5,19 +5,30 @@ from types import SimpleNamespace
 
 import pytest
 
+import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
+import Compiler.Routing.TemplateAssignment as TemplateAssignment
+
 from Compiler.Routing.AuthoritativePlanner import (
+    AttachRawTrackAssignmentContractRequirements,
+    BuildConditionalRawTrackAssignmentDomain,
+    BuildPlacementAccessStubFactorDomain,
+    BuildRawRouteGuideFactorDomain,
+    BuildTrackAssignmentPreparationFromRawDomain,
+    ComposeRawTrackAssignmentFactorDomains,
+    PromoteRawTrackAssignmentBaseClaims,
+    RawTrackAssignmentBaseClaim,
     RawTrackAssignmentDomain,
     RawTrackAssignmentValue,
+    SelectDiverseRouteGuideFactorShapes,
 )
-from Compiler.Routing.ResourceGraph import RoutingResourceClaims
+from Compiler.Routing.ResourceGraph import (
+    IndexedRoutingResourceGraph,
+    RoutingResourceClaims,
+)
 from Compiler.Routing.Reliability import RoutingDeadline
 from Compiler.Routing.TemplateAssignment import (
-    RawTrackAssignmentMaterialization,
-    RawTrackAssignmentPortfolio,
-    RawTrackAssignmentPortfolioTemplate,
     RawTrackAssignmentProblem,
     RawTrackAssignmentTemplate,
-    SolveRawTrackAssignmentPortfolio,
     SolveRawTrackAssignmentProblem,
     SolveRawTrackAssignmentProblemWithContext,
 )
@@ -92,6 +103,251 @@ def NativeResult(
     )
 
 
+def test_compose_access_and_guide_factors_preserves_physical_identity():
+    GuidePosition = (1, 3, 1)
+    AccessPosition = (2, 3, 1)
+    UnclaimedGuidePosition = (3, 3, 1)
+    Guide = RawTrackAssignmentDomain(
+        ResourcePositions=(GuidePosition, UnclaimedGuidePosition),
+        Values=(RawTrackAssignmentValue(
+            Signal="Signal",
+            CandidateId="guide",
+            Claims=RoutingResourceClaims(
+                WireCells=frozenset({GuidePosition}),
+            ),
+            MaterialCost=1,
+            FootprintGrowth=1,
+            Length=1,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="guide-factor",
+        ),),
+        BaseClaims=(),
+        CandidateCounts=(("Signal", 1),),
+        CandidateDomainFingerprint="physical-guide-domain",
+        LocalClaimDomainFingerprint="",
+        PlacementFingerprint="placement",
+        ResourceGraphFingerprint="resources",
+        PortalDomainFingerprint="portals",
+        Complete=True,
+        MaximumAssignmentExpansions=16,
+    )
+    Access = replace(
+        Guide,
+        ResourcePositions=(AccessPosition,),
+        Values=(RawTrackAssignmentValue(
+            Signal="__access_terminal__:Signal:root",
+            OwnerSignal="Signal",
+            CandidateId="stub",
+            Claims=RoutingResourceClaims(
+                WireCells=frozenset({AccessPosition}),
+            ),
+            MaterialCost=1,
+            FootprintGrowth=1,
+            Length=1,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="contract-claim",
+        ),),
+        CandidateCounts=(("__access_terminal__:Signal:root", 1),),
+        CandidateDomainFingerprint="access-domain",
+        PortalDomainFingerprint="access-portals",
+    )
+
+    Composed = ComposeRawTrackAssignmentFactorDomains(
+        Guide,
+        Access,
+        MaximumAssignmentExpansions=16,
+    )
+
+    assert Composed.ResourcePositions == (GuidePosition, AccessPosition)
+    assert Composed.CandidateDomainFingerprint == "physical-guide-domain"
+    assert Composed.CandidateCounts == (
+        ("Signal", 1),
+        ("__access_terminal__:Signal:root", 1),
+    )
+    assert dict(Composed.Diagnostics)["ComposedAccessGuideFactors"] is True
+
+
+def test_raw_value_rejects_two_values_for_one_contract_dimension():
+    with pytest.raises(
+        ValueError,
+        match="requirement names must select exactly one value",
+    ):
+        RawTrackAssignmentValue(
+            Signal="Signal",
+            CandidateId="contradictory-guide",
+            Claims=RoutingResourceClaims(),
+            MaterialCost=0,
+            FootprintGrowth=0,
+            Length=0,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="guide-factor",
+            ContractRequirements=(
+                ("access-stub:Signal:target-0", "0"),
+                ("access-stub:Signal:target-0", "1"),
+            ),
+        )
+
+
+def test_route_guide_factor_frontier_round_robins_layers_and_axes(
+    monkeypatch,
+):
+    Shapes = tuple(
+        SimpleNamespace(Id=f"{Layer}:{Axis}:{Index}", Layer=Layer, Axis=Axis)
+        for Layer in range(3)
+        for Axis in ("X", "Z")
+        for Index in range(3)
+    )
+    monkeypatch.setattr(
+        AuthoritativePlanner,
+        "RouteGuideFactorCandidateId",
+        lambda Shape: Shape.Id,
+    )
+
+    Selected = SelectDiverseRouteGuideFactorShapes(Shapes, 8)
+
+    assert tuple((Value.Layer, Value.Axis) for Value in Selected[:6]) == (
+        (0, "X"),
+        (0, "Z"),
+        (1, "X"),
+        (1, "Z"),
+        (2, "X"),
+        (2, "Z"),
+    )
+    assert {Value.Layer for Value in Selected} == {0, 1, 2}
+    assert {Value.Axis for Value in Selected} == {"X", "Z"}
+
+
+def test_frozen_preparation_retains_selected_claims_by_logical_owner():
+    First = (1, 3, 1)
+    Second = (2, 3, 1)
+    Domain = RawTrackAssignmentDomain(
+        ResourcePositions=(First, Second),
+        Values=(
+            RawTrackAssignmentValue(
+                Signal="Signal",
+                CandidateId="guide",
+                Claims=RoutingResourceClaims(
+                    WireCells=frozenset({First}),
+                ),
+                MaterialCost=1,
+                FootprintGrowth=1,
+                Length=1,
+                BendCount=0,
+                ViaCount=0,
+                ValueKind="guide-factor",
+            ),
+            RawTrackAssignmentValue(
+                Signal="__access_terminal__:Signal:root",
+                OwnerSignal="Signal",
+                CandidateId="stub",
+                Claims=RoutingResourceClaims(
+                    RequiredAirCells=frozenset({Second}),
+                ),
+                MaterialCost=1,
+                FootprintGrowth=1,
+                Length=1,
+                BendCount=0,
+                ViaCount=0,
+                ValueKind="contract-claim",
+            ),
+        ),
+        BaseClaims=(),
+        CandidateCounts=(
+            ("Signal", 1),
+            ("__access_terminal__:Signal:root", 1),
+        ),
+        CandidateDomainFingerprint="physical-guide-domain",
+        LocalClaimDomainFingerprint="",
+        PlacementFingerprint="placement",
+        ResourceGraphFingerprint="resources",
+        PortalDomainFingerprint="portals",
+        Complete=True,
+        MaximumAssignmentExpansions=16,
+    )
+    Result = SimpleNamespace(
+        Success=True,
+        SelectedCandidateIds=(
+            ("Signal", "guide"),
+            ("__access_terminal__:Signal:root", "stub"),
+        ),
+        ExpansionCount=2,
+        BudgetExhausted=False,
+        DeadlineExceeded=False,
+        ConflictSignals=(),
+        ConflictResourceIndices=(),
+    )
+
+    Preparation = BuildTrackAssignmentPreparationFromRawDomain(
+        Domain,
+        Result,
+    )
+
+    ClaimsByOwner = dict(Preparation.SelectedCapacityClaimsByOwner)
+    assert tuple(ClaimsByOwner) == ("Signal",)
+    assert ClaimsByOwner["Signal"].WireCells == frozenset({First})
+    assert ClaimsByOwner["Signal"].RequiredAirCells == frozenset({Second})
+
+
+def test_route_guide_factor_is_selected_separately_from_route_candidates():
+    Position = (3, 2, 4)
+    Descriptor = SimpleNamespace(
+        Layer=1,
+        Axis="X",
+        Lane=4,
+        Guide=frozenset({(3, 4)}),
+        GuideExpansion=2,
+        RoutingY=2,
+        SourcePortal=SimpleNamespace(PortalId="source"),
+        TargetPortals=(SimpleNamespace(PortalId="target"),),
+    )
+    Factor = RawTrackAssignmentValue(
+        Signal="Signal",
+        CandidateId="guide-factor",
+        SourceCandidateId="guide-factor",
+        Claims=RoutingResourceClaims(WireCells=frozenset({Position})),
+        MaterialCost=1,
+        FootprintGrowth=1,
+        Length=1,
+        BendCount=0,
+        ViaCount=0,
+        ValueKind="guide-factor",
+        RouteGuideFactorDescriptor=Descriptor,
+    )
+    Domain = BuildRawRouteGuideFactorDomain(
+        ValuesBySignal={"Signal": (Factor,)},
+        AssignmentIndexed=IndexedRoutingResourceGraph(
+            ResourcePositions=(),
+            PositionIndices={},
+        ),
+        PlacementFingerprint="placement",
+        ResourceGraphFingerprint="resources",
+        PortalDomainFingerprint="portals",
+        Complete=True,
+        IncompleteReason="",
+        MaximumAssignmentExpansions=8,
+    )
+
+    Selected = BuildTrackAssignmentPreparationFromRawDomain(
+        Domain,
+        NativeResult(
+            Success=True,
+            ExpansionCount=1,
+            CandidateId="guide-factor",
+        ),
+    )
+
+    assert Selected.SelectedCandidateIds == ()
+    assert Selected.SelectedRouteGuideFactorChoiceIds == (
+        ("Signal", "guide-factor"),
+    )
+    assert Selected.SelectedRouteGuideFactorDescriptors == (
+        ("Signal", "guide-factor", Descriptor),
+    )
+
+
 def test_complete_core_advances_inside_one_shared_template_selection():
     Compact = BuildTemplate("compact", (4, 8))
     Separated = BuildTemplate("separated", (5, 7))
@@ -133,256 +389,6 @@ def test_complete_core_advances_inside_one_shared_template_selection():
         ("Signal", "separated-candidate"),
     )
     assert Result.FirstConflictSignals == ("A", "B")
-
-
-def test_fixed_portfolio_materializes_only_through_first_witness():
-    Descriptors = tuple(
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId=TemplateId,
-            Objective=(Index,),
-            MaterializationInputFingerprint=f"input-{TemplateId}",
-        )
-        for Index, TemplateId in enumerate(("compact", "incumbent", "worse"))
-    )
-    Materialized: list[str] = []
-    NativeCalls: list[tuple[str, int]] = []
-
-    def Materialize(Descriptor):
-        Materialized.append(Descriptor.TemplateId)
-        return RawTrackAssignmentMaterialization(
-            TemplateId=Descriptor.TemplateId,
-            Domain=BuildDomain(Descriptor.TemplateId),
-            Complete=True,
-        )
-
-    def Solve(Domain, Remaining):
-        NativeCalls.append((Domain.PlacementFingerprint, Remaining))
-        if Domain.PlacementFingerprint == "placement-compact":
-            return NativeResult(
-                Success=False,
-                ExpansionCount=3,
-                ConflictSignals=("A", "B"),
-            )
-        return NativeResult(
-            Success=True,
-            ExpansionCount=4,
-            CandidateId="incumbent-candidate",
-        )
-
-    Result = SolveRawTrackAssignmentPortfolio(
-        RawTrackAssignmentPortfolio(
-            Templates=Descriptors,
-            MaximumAssignmentExpansions=16,
-        ),
-        Materialize,
-        Solve,
-    )
-
-    assert Materialized == ["compact", "incumbent"]
-    assert NativeCalls == [
-        ("placement-compact", 16),
-        ("placement-incumbent", 13),
-    ]
-    assert Result.Success is True
-    assert Result.SelectedTemplateId == "incumbent"
-    assert Result.MaterializedTemplateCount == 2
-    assert Result.SkippedDominatedTemplateCount == 1
-
-
-def test_incomplete_portfolio_materialization_is_terminal():
-    Descriptors = tuple(
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId=TemplateId,
-            Objective=(Index,),
-            MaterializationInputFingerprint=f"input-{TemplateId}",
-        )
-        for Index, TemplateId in enumerate(("compact", "incumbent"))
-    )
-    Materialized: list[str] = []
-
-    def Materialize(Descriptor):
-        Materialized.append(Descriptor.TemplateId)
-        return RawTrackAssignmentMaterialization(
-            TemplateId=Descriptor.TemplateId,
-            Domain=None,
-            Complete=False,
-            IncompleteReason="fixed-domain-work-cap",
-        )
-
-    Result = SolveRawTrackAssignmentPortfolio(
-        RawTrackAssignmentPortfolio(
-            Templates=Descriptors,
-            MaximumAssignmentExpansions=16,
-        ),
-        Materialize,
-        lambda _Domain, _Remaining: (_ for _ in ()).throw(
-            AssertionError("incomplete materialization must not reach native")
-        ),
-    )
-
-    assert Materialized == ["compact"]
-    assert Result.Success is False
-    assert Result.Complete is False
-    assert Result.Unsatisfiable is False
-    assert Result.IncompleteReason == "incomplete-template-domain"
-    assert Result.MaterializedTemplateCount == 1
-    assert Result.SkippedDominatedTemplateCount == 1
-
-
-def test_equal_objective_incomplete_member_prevents_early_commit():
-    """A tied partial member cannot be hidden behind an earlier witness."""
-    Descriptors = (
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="compact",
-            Objective=(4, 8),
-            MaterializationInputFingerprint="input-compact",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="compact-tie",
-            Objective=(4, 8),
-            MaterializationInputFingerprint="input-compact-tie",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="worse",
-            Objective=(5, 7),
-            MaterializationInputFingerprint="input-worse",
-        ),
-    )
-    Materialized: list[str] = []
-    NativeCalls: list[str] = []
-
-    def Materialize(Descriptor):
-        Materialized.append(Descriptor.TemplateId)
-        if Descriptor.TemplateId == "compact-tie":
-            return RawTrackAssignmentMaterialization(
-                TemplateId=Descriptor.TemplateId,
-                Domain=None,
-                Complete=False,
-                IncompleteReason="fixed-domain-work-cap",
-            )
-        return RawTrackAssignmentMaterialization(
-            TemplateId=Descriptor.TemplateId,
-            Domain=BuildDomain(Descriptor.TemplateId),
-            Complete=True,
-        )
-
-    def Solve(Domain, _Remaining):
-        NativeCalls.append(Domain.PlacementFingerprint)
-        return NativeResult(
-            Success=True,
-            ExpansionCount=1,
-            CandidateId="compact-candidate",
-        )
-
-    Result = SolveRawTrackAssignmentPortfolio(
-        RawTrackAssignmentPortfolio(
-            Templates=Descriptors,
-            MaximumAssignmentExpansions=16,
-        ),
-        Materialize,
-        Solve,
-    )
-
-    assert Materialized == ["compact", "compact-tie"]
-    assert NativeCalls == ["placement-compact"]
-    assert Result.Success is False
-    assert Result.Complete is False
-    assert Result.Unsatisfiable is False
-    assert Result.IncompleteReason == "incomplete-template-domain"
-    assert Result.MaterializedTemplateCount == 2
-    assert Result.SkippedDominatedTemplateCount == 1
-
-
-def test_equal_prefix_uses_resolved_material_access_objective():
-    """Geometry/layer ties resolve only after every fixed factor is built."""
-    Descriptors = (
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="more-access-material",
-            Objective=(4, 8, 2),
-            MaterializationInputFingerprint="input-more-access-material",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="less-access-material",
-            Objective=(4, 8, 2),
-            MaterializationInputFingerprint="input-less-access-material",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="worse-footprint",
-            Objective=(5, 7, 1),
-            MaterializationInputFingerprint="input-worse-footprint",
-        ),
-    )
-    Materialized: list[str] = []
-
-    def Materialize(Descriptor):
-        Materialized.append(Descriptor.TemplateId)
-        AccessMaterial = (
-            9
-            if Descriptor.TemplateId == "more-access-material"
-            else 4
-        )
-        return RawTrackAssignmentMaterialization(
-            TemplateId=Descriptor.TemplateId,
-            Domain=BuildDomain(Descriptor.TemplateId),
-            Complete=True,
-            ResolvedObjective=(4, 8, 2, AccessMaterial, 3, 0),
-        )
-
-    def Solve(Domain, _Remaining):
-        return NativeResult(
-            Success=True,
-            ExpansionCount=1,
-            CandidateId=(
-                f"{Domain.PlacementFingerprint.removeprefix('placement-')}"
-                "-candidate"
-            ),
-        )
-
-    Result = SolveRawTrackAssignmentPortfolio(
-        RawTrackAssignmentPortfolio(
-            Templates=Descriptors,
-            MaximumAssignmentExpansions=16,
-        ),
-        Materialize,
-        Solve,
-    )
-
-    assert Materialized == [
-        "less-access-material",
-        "more-access-material",
-    ]
-    assert Result.Success is True
-    assert Result.SelectedTemplateId == "less-access-material"
-    assert Result.SelectedObjective == (4, 8, 2, 4, 3, 0)
-    assert Result.MaterializedTemplateCount == 2
-    assert Result.SkippedDominatedTemplateCount == 1
-
-
-def test_resolved_objective_cannot_change_declared_selection_prefix():
-    Descriptor = RawTrackAssignmentPortfolioTemplate(
-        TemplateId="compact",
-        Objective=(4, 8, 2),
-        MaterializationInputFingerprint="input-compact",
-    )
-
-    with pytest.raises(ValueError, match="retain its declared selection prefix"):
-        SolveRawTrackAssignmentPortfolio(
-            RawTrackAssignmentPortfolio(
-                Templates=(Descriptor,),
-                MaximumAssignmentExpansions=16,
-            ),
-            lambda Value: RawTrackAssignmentMaterialization(
-                TemplateId=Value.TemplateId,
-                Domain=BuildDomain(Value.TemplateId),
-                Complete=True,
-                ResolvedObjective=(3, 8, 2, 0),
-            ),
-            lambda _Domain, _Remaining: NativeResult(
-                Success=True,
-                ExpansionCount=1,
-                CandidateId="compact-candidate",
-            ),
-        )
 
 
 def test_work_exhaustion_is_terminal_and_does_not_try_a_sibling():
@@ -452,6 +458,25 @@ def test_exhaustive_complete_empty_domain_retains_unsatisfiable_contract():
     assert Result.FirstConflictSignals == ("Signal",)
 
 
+def test_nonexhaustive_complete_cores_are_terminal_incomplete():
+    """A finite compact portfolio is not an exhaustive UNSAT proof."""
+    Result = SolveRawTrackAssignmentProblem(
+        RawTrackAssignmentProblem(
+            Templates=(BuildTemplate("only", (1,), Empty=True),),
+            MaximumAssignmentExpansions=16,
+            NonExhaustiveTemplateDomain=True,
+        ),
+        lambda _Domain, _Remaining: (_ for _ in ()).throw(
+            AssertionError("complete empty domain must not call native")
+        ),
+    )
+
+    assert Result.Success is False
+    assert Result.Complete is False
+    assert Result.Unsatisfiable is False
+    assert Result.IncompleteReason == "non-exhaustive-template-domain"
+
+
 def test_excluded_primary_request_shapes_require_nonexhaustive_portfolio():
     Template = BuildTemplate("only", (1,))
     Template = replace(
@@ -519,6 +544,536 @@ def test_existing_native_context_binding_receives_global_remainder():
     assert all(Value[2] > 0 for Value in ContextValue.Calls)
     assert Result.Success is True
     assert Result.SelectedTemplateId == "second"
+
+
+def test_native_template_binding_selects_one_fixed_domain_with_one_call(
+    monkeypatch,
+):
+    """The immutable placement choice is one native capacity operation."""
+    Compact = BuildTemplate("compact", (4, 8))
+    Separated = BuildTemplate("separated", (4, 8))
+    Calls: list[tuple[object, ...]] = []
+
+    def Solve(Templates, MaximumExpansions, RemainingMilliseconds, NonExhaustive):
+        Calls.append((
+            Templates,
+            MaximumExpansions,
+            RemainingMilliseconds,
+            NonExhaustive,
+        ))
+        return SimpleNamespace(
+            Status="Feasible",
+            Success=True,
+            Complete=True,
+            Unsatisfiable=False,
+            IncompleteReason="",
+            SelectedTemplateId="separated",
+            SelectedCandidateIds=(("Signal", "separated-candidate"),),
+            ExpansionCount=7,
+            BudgetExhausted=False,
+            DeadlineExceeded=False,
+            ConflictSignals=("A", "B"),
+            ConflictResourceIndices=(0,),
+            AttemptedTemplateIds=("compact", "separated"),
+        )
+
+    monkeypatch.setattr(
+        TemplateAssignment,
+        "_SolveTemplateAssignmentDomainsBounded",
+        Solve,
+    )
+    Result = SolveRawTrackAssignmentProblemWithContext(
+        RawTrackAssignmentProblem(
+            Templates=(Separated, Compact),
+            MaximumAssignmentExpansions=16,
+        ),
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+
+    assert len(Calls) == 1
+    Payload, MaximumExpansions, RemainingMilliseconds, NonExhaustive = Calls[0]
+    assert [Value[0] for Value in Payload] == ["compact", "separated"]
+    assert MaximumExpansions == 16
+    assert RemainingMilliseconds > 0
+    assert NonExhaustive is True
+    assert Result.Success is True
+    assert Result.SelectedTemplateId == "separated"
+    assert Result.Preparation is not None
+    assert Result.Preparation.SelectedCandidateIds == (
+        ("Signal", "separated-candidate"),
+    )
+    assert Result.ExpansionCount == 7
+
+
+def test_one_native_call_selects_l2_when_cheaper_l1_conflicts(
+    monkeypatch,
+):
+    """Layer objectives rank feasible worlds; they never prune capacity."""
+    if TemplateAssignment._SolveTemplateAssignmentDomainsBounded is None:
+        pytest.skip("native template assignment binding is unavailable")
+    L1 = BuildTemplate("fixed-l1", (100, 20, 1))
+    L1Position = L1.Domain.ResourcePositions[0]
+    L1 = replace(
+        L1,
+        Domain=replace(
+            L1.Domain,
+            Values=(replace(
+                L1.Domain.Values[0],
+                Claims=RoutingResourceClaims(
+                    WireCells=frozenset({L1Position}),
+                    ElectricalCells=frozenset({L1Position}),
+                ),
+            ),),
+            BaseClaims=(RawTrackAssignmentBaseClaim(
+                Signal="Existing",
+                ClaimId="existing-l1",
+                Claims=RoutingResourceClaims(
+                    WireCells=frozenset({L1Position}),
+                    ElectricalCells=frozenset({L1Position}),
+                ),
+            ),),
+        ),
+    )
+    L2 = BuildTemplate("fixed-l2", (100, 20, 2))
+    NativeSolve = TemplateAssignment._SolveTemplateAssignmentDomainsBounded
+    Calls: list[tuple[object, ...]] = []
+
+    def Solve(*Arguments):
+        Calls.append(Arguments)
+        return NativeSolve(*Arguments)
+
+    monkeypatch.setattr(
+        TemplateAssignment,
+        "_SolveTemplateAssignmentDomainsBounded",
+        Solve,
+    )
+
+    Result = SolveRawTrackAssignmentProblemWithContext(
+        RawTrackAssignmentProblem(
+            Templates=(L1, L2),
+            MaximumAssignmentExpansions=16,
+        ),
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+
+    assert len(Calls) == 1
+    assert [Value[0] for Value in Calls[0][0]] == [
+        "fixed-l1",
+        "fixed-l2",
+    ]
+    assert Result.Success is True
+    assert Result.Complete is True
+    assert Result.SelectedTemplateId == "fixed-l2"
+    assert Result.Preparation is not None
+    assert Result.Preparation.SelectedCandidateIds == (
+        ("Signal", "fixed-l2-candidate"),
+    )
+
+
+def test_raw_value_encodes_an_optional_conditional_template_key():
+    Domain = BuildDomain("template-key")
+    Value = replace(Domain.Values[0], TemplateKey="compact-interface")
+    Domain = replace(Domain, Values=(Value,))
+
+    Encoded = Domain.NativeCandidateValues()
+
+    assert Encoded[0][-2] == "template=compact-interface"
+    assert Encoded[0][-1] == "Signal"
+    assert Domain.Values[0].ToDictionary()["TemplateKey"] == (
+        "compact-interface"
+    )
+
+
+def test_conditional_raw_domain_selects_one_coherent_interface_member():
+    def Member(TemplateId: str, SecondPosition: tuple[int, int, int]):
+        FirstPosition = (1, 1, 1)
+        Values = (
+            RawTrackAssignmentValue(
+                Signal="A",
+                CandidateId="A",
+                Claims=RoutingResourceClaims(
+                    WireCells=frozenset({FirstPosition}),
+                ),
+                MaterialCost=1,
+                FootprintGrowth=1,
+                Length=1,
+                BendCount=0,
+                ViaCount=0,
+            ),
+            RawTrackAssignmentValue(
+                Signal="B",
+                CandidateId="B",
+                Claims=RoutingResourceClaims(
+                    ElectricalCells=frozenset({SecondPosition}),
+                ),
+                MaterialCost=1,
+                FootprintGrowth=1,
+                Length=1,
+                BendCount=0,
+                ViaCount=0,
+            ),
+        )
+        return RawTrackAssignmentDomain(
+            ResourcePositions=tuple(sorted({FirstPosition, SecondPosition})),
+            Values=Values,
+            BaseClaims=(),
+            CandidateCounts=(("A", 1), ("B", 1)),
+            CandidateDomainFingerprint=f"candidates-{TemplateId}",
+            LocalClaimDomainFingerprint=f"local-{TemplateId}",
+            PlacementFingerprint=f"placement-{TemplateId}",
+            ResourceGraphFingerprint=f"resources-{TemplateId}",
+            PortalDomainFingerprint=f"portals-{TemplateId}",
+            Complete=True,
+            MaximumAssignmentExpansions=16,
+        )
+
+    # The compact member has A/B on one capacity-one cell; the access
+    # separated member has a disjoint B claim.  Mixing A from one template
+    # with B from another would falsely succeed without TemplateKey.
+    Domain = BuildConditionalRawTrackAssignmentDomain(
+        (
+            ("compact", Member("compact", (1, 1, 1))),
+            ("separated", Member("separated", (2, 1, 1))),
+        ),
+        MaximumAssignmentExpansions=16,
+    )
+    Result = SolveRawTrackAssignmentProblemWithContext(
+        RawTrackAssignmentProblem(
+            Templates=(RawTrackAssignmentTemplate(
+                TemplateId="conditional-interface",
+                Objective=(1,),
+                Domain=Domain,
+            ),),
+            MaximumAssignmentExpansions=16,
+        ),
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+
+    assert Result.Success is True
+    assert Result.Preparation is not None
+    assert Result.Preparation.SelectedCandidateIds == (
+        ("A", "A"),
+        ("B", "B"),
+    )
+    assert Result.Preparation.SelectedConditionalTemplateKey == "separated"
+    assert [
+        Value.ToDictionary()["SourceCandidateId"]
+        for Value in Domain.Values
+        if (
+            Value.TemplateKey == "separated"
+            and Value.ValueKind == "ordinary"
+        )
+    ] == ["A", "B"]
+    assert {Value.TemplateKey for Value in Domain.Values} == {
+        "compact", "separated",
+    }
+
+
+def test_conditional_raw_domain_models_missing_terminal_factor_as_absent_claim():
+    """A terminal interior to one world is not an incomplete world."""
+    def Member(
+        TemplateId: str,
+        Signal: str,
+    ) -> RawTrackAssignmentDomain:
+        return RawTrackAssignmentDomain(
+            ResourcePositions=(),
+            Values=(RawTrackAssignmentValue(
+                Signal=Signal,
+                CandidateId=f"{TemplateId}-{Signal}",
+                Claims=RoutingResourceClaims(),
+                MaterialCost=0,
+                FootprintGrowth=0,
+                Length=0,
+                BendCount=0,
+                ViaCount=0,
+                ValueKind="contract-claim",
+            ),),
+            BaseClaims=(),
+            CandidateCounts=((Signal, 1),),
+            CandidateDomainFingerprint=f"domain-{TemplateId}",
+            LocalClaimDomainFingerprint="",
+            PlacementFingerprint=TemplateId,
+            ResourceGraphFingerprint="",
+            PortalDomainFingerprint="",
+            Complete=True,
+            MaximumAssignmentExpansions=16,
+        )
+
+    Aggregate = BuildConditionalRawTrackAssignmentDomain(
+        (("north", Member("north", "A")),
+         ("south", Member("south", "B"))),
+        MaximumAssignmentExpansions=16,
+        ContractRequirementsByTemplateId={
+            "north": (("member", "north"),),
+            "south": (("member", "south"),),
+        },
+    )
+
+    assert Aggregate.CandidateCounts == (("A", 2), ("B", 2), (
+        "__pre_route_contract__:member", 2,
+    ))
+    assert {
+        (Value.TemplateKey, Value.Signal, Value.SourceCandidateId)
+        for Value in Aggregate.Values
+        if Value.SourceCandidateId.startswith("__absent__:")
+    } == {
+        ("north", "B", "__absent__:B"),
+        ("south", "A", "__absent__:A"),
+    }
+
+
+def test_named_contract_requirements_allow_factored_core_and_interface_values():
+    """Values share only the constraints their physical claims depend on."""
+    First = RawTrackAssignmentValue(
+        Signal="Core",
+        CandidateId="core-a",
+        Claims=RoutingResourceClaims(),
+        MaterialCost=0,
+        FootprintGrowth=0,
+        Length=0,
+        BendCount=0,
+        ViaCount=0,
+        ValueKind="contract-claim",
+        ContractRequirements=(("core", "a"),),
+    )
+    Compatible = replace(
+        First,
+        Signal="Interface",
+        CandidateId="interface-north",
+        ContractRequirements=(("interface", "north"),),
+    )
+    assert First.EncodedContractRequirements == "core=a"
+    assert Compatible.EncodedContractRequirements == "interface=north"
+    assert First.ToDictionary()["ValueKind"] == "contract-claim"
+
+
+def test_native_assignment_accepts_independent_named_contract_dimensions():
+    """A core and an interface are compatible unless they constrain one name."""
+    Values = (
+        RawTrackAssignmentValue(
+            Signal="__contract_core__",
+            CandidateId="core-a",
+            Claims=RoutingResourceClaims(),
+            MaterialCost=0,
+            FootprintGrowth=0,
+            Length=0,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="contract-claim",
+            ContractRequirements=(("core", "a"),),
+        ),
+        RawTrackAssignmentValue(
+            Signal="__contract_interface__",
+            CandidateId="north",
+            Claims=RoutingResourceClaims(),
+            MaterialCost=0,
+            FootprintGrowth=0,
+            Length=0,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="contract-claim",
+            ContractRequirements=(("interface", "north"),),
+        ),
+    )
+    Domain = RawTrackAssignmentDomain(
+        ResourcePositions=((0, 0, 0),),
+        Values=Values,
+        BaseClaims=(),
+        CandidateCounts=(
+            ("__contract_core__", 1),
+            ("__contract_interface__", 1),
+        ),
+        CandidateDomainFingerprint="named-contracts",
+        LocalClaimDomainFingerprint="",
+        PlacementFingerprint="",
+        ResourceGraphFingerprint="",
+        PortalDomainFingerprint="",
+        Complete=True,
+        MaximumAssignmentExpansions=16,
+    )
+
+    Result = SolveRawTrackAssignmentProblemWithContext(
+        RawTrackAssignmentProblem(
+            Templates=(RawTrackAssignmentTemplate(
+                TemplateId="factored",
+                Objective=(0,),
+                Domain=Domain,
+            ),),
+            MaximumAssignmentExpansions=16,
+        ),
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+
+    assert Result.Success is True
+    assert Result.Preparation is not None
+    assert Result.Preparation.SelectedCandidateIds == ()
+    assert Result.Preparation.SelectedContractRequirements == (
+        ("core", "a"),
+        ("interface", "north"),
+    )
+
+
+def test_base_claim_promotion_makes_member_geometry_conditional():
+    Position = (3, 1, 2)
+    Domain = RawTrackAssignmentDomain(
+        ResourcePositions=(Position,),
+        Values=(),
+        BaseClaims=(RawTrackAssignmentBaseClaim(
+            Signal="Local",
+            ClaimId="local",
+            Claims=RoutingResourceClaims(WireCells=frozenset({Position})),
+        ),),
+        CandidateCounts=(),
+        CandidateDomainFingerprint="base",
+        LocalClaimDomainFingerprint="base",
+        PlacementFingerprint="base",
+        ResourceGraphFingerprint="base",
+        PortalDomainFingerprint="base",
+        Complete=True,
+        MaximumAssignmentExpansions=16,
+    )
+
+    Promoted = PromoteRawTrackAssignmentBaseClaims(
+        Domain,
+        ContractRequirements=(("core", "compact"),),
+    )
+
+    assert Promoted.BaseClaims == ()
+    assert Promoted.CandidateCounts == (("Local", 1),)
+    assert Promoted.Values[0].ValueKind == "contract-claim"
+    assert Promoted.Values[0].Claims.WireCells == frozenset({Position})
+    assert Promoted.Values[0].ContractRequirementItems == (
+        ("core", "compact"),
+    )
+
+
+def test_contract_decoration_preserves_route_candidate_identity():
+    """Named selector contracts cannot invalidate a frozen route cache."""
+    Domain = BuildDomain("compact")
+
+    Decorated = AttachRawTrackAssignmentContractRequirements(
+        Domain,
+        ContractRequirements=(
+            ("core", "compact"),
+            ("interface", "perimeter"),
+            ("layers", "1"),
+            ("member", "compact-l1"),
+        ),
+    )
+
+    assert Decorated.CandidateDomainFingerprint == (
+        Domain.CandidateDomainFingerprint
+    )
+    assert Decorated.DomainFingerprint != Domain.DomainFingerprint
+    ContractValues = [
+        Value for Value in Decorated.Values
+        if Value.ValueKind == "contract-claim"
+    ]
+    assert len(ContractValues) == 1
+    assert ContractValues[0].ContractRequirementItems == (
+        ("core", "compact"),
+        ("interface", "perimeter"),
+        ("layers", "1"),
+        ("member", "compact-l1"),
+    )
+
+
+def test_conditional_domain_preserves_named_member_contract_dimensions():
+    Domain = RawTrackAssignmentDomain(
+        ResourcePositions=((0, 0, 0),),
+        Values=(RawTrackAssignmentValue(
+            Signal="Signal",
+            CandidateId="route",
+            Claims=RoutingResourceClaims(),
+            MaterialCost=0,
+            FootprintGrowth=0,
+            Length=0,
+            BendCount=0,
+            ViaCount=0,
+        ),),
+        BaseClaims=(),
+        CandidateCounts=(("Signal", 1),),
+        CandidateDomainFingerprint="member",
+        LocalClaimDomainFingerprint="",
+        PlacementFingerprint="",
+        ResourceGraphFingerprint="",
+        PortalDomainFingerprint="",
+        Complete=True,
+        MaximumAssignmentExpansions=16,
+    )
+    Aggregate = BuildConditionalRawTrackAssignmentDomain(
+        (("member-a", Domain),),
+        MaximumAssignmentExpansions=16,
+        ContractRequirementsByTemplateId={
+            "member-a": (
+                ("member", "member-a"),
+                ("core", "core-a"),
+                ("interface", "north"),
+                ("layers", "3"),
+            ),
+        },
+    )
+
+    assert Aggregate.Values[0].ContractRequirementItems == (
+        ("core", "core-a"),
+        ("interface", "north"),
+        ("layers", "3"),
+        ("member", "member-a"),
+    )
+
+
+def test_access_stub_factor_uses_one_required_value_per_terminal():
+    First = (1, 1, 1)
+    Second = (2, 1, 1)
+    Fabric = SimpleNamespace(
+        Complete=True,
+        IncompleteReason="",
+        FabricFingerprint="fabric",
+        TerminalDomains=(
+            SimpleNamespace(
+                Signal="A",
+                Terminal=First,
+                Complete=True,
+                EscapeStubs=(
+                    SimpleNamespace(
+                        PhysicalClaims=RoutingResourceClaims(
+                            WireCells=frozenset({First}),
+                        ),
+                        Path=(First,),
+                    ),
+                    SimpleNamespace(
+                        PhysicalClaims=RoutingResourceClaims(
+                            WireCells=frozenset({Second}),
+                        ),
+                        Path=(First, Second),
+                    ),
+                ),
+            ),
+        ),
+    )
+    Domain = BuildPlacementAccessStubFactorDomain(
+        Fabric,
+        ContractRequirements=(("core", "a"), ("layers", "2")),
+        MaximumAssignmentExpansions=16,
+    )
+
+    assert Domain.Complete is True
+    assert Domain.CandidateCounts == (("__access_terminal__:0:A", 2),)
+    assert all(Value.ValueKind == "contract-claim" for Value in Domain.Values)
+    assert tuple(
+        Value.ContractRequirementItems for Value in Domain.Values
+    ) == (
+        (
+            ("access-stub:0:A", "0"),
+            ("core", "a"),
+            ("layers", "2"),
+        ),
+        (
+            ("access-stub:0:A", "1"),
+            ("core", "a"),
+            ("layers", "2"),
+        ),
+    )
 
 
 def test_extracted_domain_context_overrides_fixture_fallback_context():

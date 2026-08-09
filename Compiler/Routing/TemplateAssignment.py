@@ -26,6 +26,18 @@ from .AuthoritativePlanner import (
 from .Models import TrackAssignmentPreparation
 from .Reliability import BuildStableFingerprint, RoutingDeadline
 
+try:
+    from ..RustRouting import (
+        SolveTemplateAssignmentDomainsBounded as _SolveTemplateAssignmentDomainsBounded,
+    )
+except ImportError:
+    try:
+        from RedstoneCompiler.RustRouting import (
+            SolveTemplateAssignmentDomainsBounded as _SolveTemplateAssignmentDomainsBounded,
+        )
+    except Exception:
+        _SolveTemplateAssignmentDomainsBounded = None
+
 
 @dataclass(frozen=True)
 class RawTrackAssignmentTemplate:
@@ -128,8 +140,8 @@ class RawTrackAssignmentProblem:
 
 
 @dataclass(frozen=True)
-class RawTrackAssignmentPortfolioTemplate:
-    """A fixed raw-template input whose domain is materialized on demand.
+class PredeclaredRawTrackAssignmentMember:
+    """A fixed raw-template member declared before materialization.
 
     ``Objective`` is an immutable selection prefix known before materializing
     the raw domain.  Most callers provide the complete objective.  A
@@ -145,14 +157,14 @@ class RawTrackAssignmentPortfolioTemplate:
 
     def __post_init__(self) -> None:
         if not self.TemplateId:
-            raise ValueError("raw track-assignment portfolio requires an id")
+            raise ValueError("predeclared raw member requires an id")
         if any(Value < 0 for Value in self.Objective):
             raise ValueError(
-                "raw track-assignment portfolio objective cannot be negative"
+                "predeclared raw member objective cannot be negative"
             )
         if not self.MaterializationInputFingerprint:
             raise ValueError(
-                "raw track-assignment portfolio requires an input fingerprint"
+                "predeclared raw member requires an input fingerprint"
             )
 
     def ToDictionary(self) -> dict[str, object]:
@@ -166,62 +178,7 @@ class RawTrackAssignmentPortfolioTemplate:
 
 
 @dataclass(frozen=True)
-class RawTrackAssignmentPortfolio:
-    """One fixed, lazily materialized authoritative template portfolio.
-
-    Laziness is limited to deterministic construction of already-declared
-    members.  It never adds geometry, changes a policy, or schedules a new
-    routing attempt.  A selected member proves that all unmaterialized
-    members sort strictly after it by their immutable objective.
-    """
-
-    Templates: tuple[RawTrackAssignmentPortfolioTemplate, ...]
-    MaximumAssignmentExpansions: int
-    NonExhaustiveTemplateDomain: bool = True
-
-    def __post_init__(self) -> None:
-        if self.MaximumAssignmentExpansions < 1:
-            raise ValueError(
-                "raw template portfolio requires a positive work cap"
-            )
-        TemplateIds = tuple(Value.TemplateId for Value in self.Templates)
-        if len(TemplateIds) != len(set(TemplateIds)):
-            raise ValueError("raw template portfolio repeats a template id")
-
-    @property
-    def ProblemFingerprint(self) -> str:
-        return BuildStableFingerprint({
-            "Kind": "raw-template-track-assignment-portfolio-v1",
-            "Templates": [
-                Value.ToDictionary()
-                for Value in sorted(
-                    self.Templates,
-                    key=lambda Value: (Value.Objective, Value.TemplateId),
-                )
-            ],
-            "MaximumAssignmentExpansions": (
-                self.MaximumAssignmentExpansions
-            ),
-            "NonExhaustiveTemplateDomain": (
-                self.NonExhaustiveTemplateDomain
-            ),
-        })
-
-    def ToDictionary(self) -> dict[str, object]:
-        return {
-            "ProblemFingerprint": self.ProblemFingerprint,
-            "TemplateCount": len(self.Templates),
-            "MaximumAssignmentExpansions": (
-                self.MaximumAssignmentExpansions
-            ),
-            "NonExhaustiveTemplateDomain": (
-                self.NonExhaustiveTemplateDomain
-            ),
-        }
-
-
-@dataclass(frozen=True)
-class RawTrackAssignmentMaterialization:
+class RawTrackAssignmentMemberMaterialization:
     """Typed result of constructing one predeclared raw template domain."""
 
     TemplateId: str
@@ -275,6 +232,7 @@ class RawTrackAssignmentAttempt:
     CumulativeExpansionCount: int
     ConflictSignals: tuple[str, ...] = ()
     ConflictResourceIndices: tuple[int, ...] = ()
+    PairwiseIncompatibleSignals: tuple[tuple[str, str], ...] = ()
     IncompleteReason: str = ""
 
     def ToDictionary(self) -> dict[str, object]:
@@ -287,6 +245,9 @@ class RawTrackAssignmentAttempt:
             "CumulativeExpansionCount": self.CumulativeExpansionCount,
             "ConflictSignals": list(self.ConflictSignals),
             "ConflictResourceIndices": list(self.ConflictResourceIndices),
+            "PairwiseIncompatibleSignals": [
+                list(Value) for Value in self.PairwiseIncompatibleSignals
+            ],
             "IncompleteReason": self.IncompleteReason,
         }
 
@@ -308,6 +269,7 @@ class RawTrackAssignmentSelection:
     IncompleteReason: str = ""
     FirstConflictSignals: tuple[str, ...] = ()
     FirstConflictResourceIndices: tuple[int, ...] = ()
+    FirstPairwiseIncompatibleSignals: tuple[tuple[str, str], ...] = ()
     MaterializedTemplateCount: int = 0
     SkippedDominatedTemplateCount: int = 0
 
@@ -332,6 +294,10 @@ class RawTrackAssignmentSelection:
             "FirstConflictResourceIndices": list(
                 self.FirstConflictResourceIndices
             ),
+            "FirstPairwiseIncompatibleSignals": [
+                list(Value)
+                for Value in self.FirstPairwiseIncompatibleSignals
+            ],
             "MaterializedTemplateCount": self.MaterializedTemplateCount,
             "SkippedDominatedTemplateCount": (
                 self.SkippedDominatedTemplateCount
@@ -341,14 +307,8 @@ class RawTrackAssignmentSelection:
 
 NativeRawAssignmentSolver = Callable[[RawTrackAssignmentDomain, int], Any]
 WorkCheck = Callable[[dict[str, object]], None]
-RawTrackAssignmentMaterializer = Callable[
-    [RawTrackAssignmentPortfolioTemplate],
-    RawTrackAssignmentMaterialization,
-]
-
-
 def _BuildSelection(
-    Problem: RawTrackAssignmentProblem | RawTrackAssignmentPortfolio,
+    Problem: RawTrackAssignmentProblem,
     *,
     Attempts: Iterable[RawTrackAssignmentAttempt],
     ExpansionCount: int,
@@ -360,6 +320,7 @@ def _BuildSelection(
     IncompleteReason: str = "",
     FirstConflictSignals: tuple[str, ...] = (),
     FirstConflictResourceIndices: tuple[int, ...] = (),
+    FirstPairwiseIncompatibleSignals: tuple[tuple[str, str], ...] = (),
     MaterializedTemplateCount: int = 0,
     SkippedDominatedTemplateCount: int = 0,
 ) -> RawTrackAssignmentSelection:
@@ -403,6 +364,9 @@ def _BuildSelection(
         IncompleteReason=IncompleteReason,
         FirstConflictSignals=FirstConflictSignals,
         FirstConflictResourceIndices=FirstConflictResourceIndices,
+        FirstPairwiseIncompatibleSignals=(
+            FirstPairwiseIncompatibleSignals
+        ),
         MaterializedTemplateCount=MaterializedTemplateCount,
         SkippedDominatedTemplateCount=SkippedDominatedTemplateCount,
     )
@@ -594,14 +558,13 @@ def SolveRawTrackAssignmentProblem(
                 FirstConflictResourceIndices=FirstConflictResourceIndices,
             )
 
-    Complete = True
     Unsatisfiable = not Problem.NonExhaustiveTemplateDomain
     return _BuildSelection(
         Problem,
         Attempts=Attempts,
         ExpansionCount=Spent,
         Success=False,
-        Complete=Complete,
+        Complete=Unsatisfiable,
         Unsatisfiable=Unsatisfiable,
         IncompleteReason=(
             "complete-capacity-core"
@@ -610,277 +573,6 @@ def SolveRawTrackAssignmentProblem(
         ),
         FirstConflictSignals=FirstConflictSignals,
         FirstConflictResourceIndices=FirstConflictResourceIndices,
-    )
-
-
-def SolveRawTrackAssignmentPortfolio(
-    Portfolio: RawTrackAssignmentPortfolio,
-    Materialize: RawTrackAssignmentMaterializer,
-    NativeSolve: NativeRawAssignmentSolver,
-    *,
-    WorkCheck: WorkCheck | None = None,
-) -> RawTrackAssignmentSelection:
-    """Select from fixed descriptors without eagerly building worse domains.
-
-    A descriptor's selection prefix is immutable before raw-domain
-    construction.  Consequently, once a prefix group has a witness, every
-    descriptor after that group is strictly worse and is intentionally never
-    materialized.  All equal-prefix descriptors are still materialized before
-    committing the group: an incomplete tied member must remain a terminal
-    incomplete result rather than being hidden by an earlier tie.  A typed
-    materialization may append material/access tie-break terms, but may never
-    change its declared prefix.  Materializing a member is pre-route
-    candidate construction, not a routing retry.
-    """
-    OrderedDescriptors = tuple(sorted(
-        Portfolio.Templates,
-        key=lambda Value: (Value.Objective, Value.TemplateId),
-    ))
-    Attempts: list[RawTrackAssignmentAttempt] = []
-    Spent = 0
-    FirstConflictSignals: tuple[str, ...] = ()
-    FirstConflictResourceIndices: tuple[int, ...] = ()
-
-    TemplateIndex = 0
-    while TemplateIndex < len(OrderedDescriptors):
-        Objective = OrderedDescriptors[TemplateIndex].Objective
-        SuccessfulMembers: list[tuple[RawTrackAssignmentTemplate, Any]] = []
-        while (
-            TemplateIndex < len(OrderedDescriptors)
-            and OrderedDescriptors[TemplateIndex].Objective == Objective
-        ):
-            Descriptor = OrderedDescriptors[TemplateIndex]
-            if WorkCheck is not None:
-                WorkCheck({
-                    "Phase": "raw-template-domain-materialization",
-                    "TemplateIndex": TemplateIndex,
-                    "TemplateCount": len(OrderedDescriptors),
-                    "TemplateId": Descriptor.TemplateId,
-                    "ExpansionCount": Spent,
-                    "MaximumAssignmentExpansions": (
-                        Portfolio.MaximumAssignmentExpansions
-                    ),
-                })
-            Materialization = Materialize(Descriptor)
-            if Materialization.TemplateId != Descriptor.TemplateId:
-                raise ValueError(
-                    "raw template materializer returned a mismatched "
-                    "template id"
-                )
-            if (
-                not Materialization.Complete
-                or Materialization.Domain is None
-            ):
-                Attempts.append(RawTrackAssignmentAttempt(
-                    TemplateId=Descriptor.TemplateId,
-                    Objective=Descriptor.Objective,
-                    Success=False,
-                    Complete=False,
-                    ExpansionCount=0,
-                    CumulativeExpansionCount=Spent,
-                    IncompleteReason=Materialization.IncompleteReason,
-                ))
-                return _BuildSelection(
-                    Portfolio,
-                    Attempts=Attempts,
-                    ExpansionCount=Spent,
-                    Success=False,
-                    Complete=False,
-                    Unsatisfiable=False,
-                    IncompleteReason="incomplete-template-domain",
-                    FirstConflictSignals=FirstConflictSignals,
-                    FirstConflictResourceIndices=(
-                        FirstConflictResourceIndices
-                    ),
-                    MaterializedTemplateCount=TemplateIndex + 1,
-                    SkippedDominatedTemplateCount=(
-                        len(OrderedDescriptors) - TemplateIndex - 1
-                    ),
-                )
-            ResolvedObjective = (
-                Materialization.ResolvedObjective
-                or Descriptor.Objective
-            )
-            if (
-                ResolvedObjective[:len(Descriptor.Objective)]
-                != Descriptor.Objective
-            ):
-                raise ValueError(
-                    "raw template resolved objective must retain its "
-                    "declared selection prefix: "
-                    + Descriptor.TemplateId
-                )
-            Domain = Materialization.Domain
-            if (
-                Domain.MaximumAssignmentExpansions
-                != Portfolio.MaximumAssignmentExpansions
-            ):
-                raise ValueError(
-                    "raw portfolio members must share one work cap: "
-                    + Descriptor.TemplateId
-                )
-            if (
-                not Portfolio.NonExhaustiveTemplateDomain
-                and bool(dict(Domain.Diagnostics).get(
-                    "ExcludedConfiguredRequestCounts",
-                    (),
-                ))
-            ):
-                raise ValueError(
-                    "a raw portfolio member with excluded configured "
-                    "request shapes cannot be declared exhaustive: "
-                    + Descriptor.TemplateId
-                )
-            Template = RawTrackAssignmentTemplate(
-                TemplateId=Descriptor.TemplateId,
-                Objective=ResolvedObjective,
-                Domain=Domain,
-            )
-            EmptyDomain = _EmptyDomainAttempt(Template, Spent)
-            if EmptyDomain is not None:
-                Attempts.append(EmptyDomain)
-                if not FirstConflictSignals:
-                    FirstConflictSignals = EmptyDomain.ConflictSignals
-                TemplateIndex += 1
-                continue
-
-            Remaining = Portfolio.MaximumAssignmentExpansions - Spent
-            if Remaining < 1:
-                return _BuildSelection(
-                    Portfolio,
-                    Attempts=Attempts,
-                    ExpansionCount=Spent,
-                    Success=False,
-                    Complete=False,
-                    Unsatisfiable=False,
-                    IncompleteReason="assignment-work-cap",
-                    FirstConflictSignals=FirstConflictSignals,
-                    FirstConflictResourceIndices=(
-                        FirstConflictResourceIndices
-                    ),
-                    MaterializedTemplateCount=TemplateIndex + 1,
-                    SkippedDominatedTemplateCount=(
-                        len(OrderedDescriptors) - TemplateIndex - 1
-                    ),
-                )
-            NativeResult = NativeSolve(Domain, Remaining)
-            ResultExpansionCount = max(
-                0,
-                int(getattr(NativeResult, "ExpansionCount", 0)),
-            )
-            Spent = min(
-                Portfolio.MaximumAssignmentExpansions,
-                Spent + ResultExpansionCount,
-            )
-            DeadlineExceeded = bool(
-                getattr(NativeResult, "DeadlineExceeded", False)
-            )
-            BudgetExhausted = bool(
-                getattr(NativeResult, "BudgetExhausted", False)
-            )
-            ResultSuccess = bool(getattr(NativeResult, "Success", False))
-            ConflictSignals = tuple(sorted(map(
-                str,
-                getattr(NativeResult, "ConflictSignals", ()),
-            )))
-            ConflictResourceIndices = tuple(sorted(map(
-                int,
-                getattr(NativeResult, "ConflictResourceIndices", ()),
-            )))
-            ResultComplete = not DeadlineExceeded and not BudgetExhausted
-            IncompleteReason = (
-                "assignment-deadline"
-                if DeadlineExceeded
-                else "assignment-work-cap"
-                if BudgetExhausted
-                else ""
-            )
-            Attempts.append(RawTrackAssignmentAttempt(
-                TemplateId=Template.TemplateId,
-                Objective=Template.Objective,
-                Success=ResultSuccess and ResultComplete,
-                Complete=ResultComplete,
-                ExpansionCount=ResultExpansionCount,
-                CumulativeExpansionCount=Spent,
-                ConflictSignals=ConflictSignals,
-                ConflictResourceIndices=ConflictResourceIndices,
-                IncompleteReason=IncompleteReason,
-            ))
-            if not FirstConflictSignals and ConflictSignals:
-                FirstConflictSignals = ConflictSignals
-                FirstConflictResourceIndices = ConflictResourceIndices
-            if not ResultComplete:
-                return _BuildSelection(
-                    Portfolio,
-                    Attempts=Attempts,
-                    ExpansionCount=Spent,
-                    Success=False,
-                    Complete=False,
-                    Unsatisfiable=False,
-                    IncompleteReason=IncompleteReason,
-                    FirstConflictSignals=FirstConflictSignals,
-                    FirstConflictResourceIndices=(
-                        FirstConflictResourceIndices
-                    ),
-                    MaterializedTemplateCount=TemplateIndex + 1,
-                    SkippedDominatedTemplateCount=(
-                        len(OrderedDescriptors) - TemplateIndex - 1
-                    ),
-                )
-            if ResultSuccess:
-                SuccessfulMembers.append((Template, NativeResult))
-            TemplateIndex += 1
-
-        if SuccessfulMembers:
-            Winner, WinnerResult = min(
-                SuccessfulMembers,
-                key=lambda Value: (
-                    Value[0].Objective,
-                    Value[0].TemplateId,
-                ),
-            )
-            Preparation = BuildTrackAssignmentPreparationFromRawDomain(
-                Winner.Domain,
-                WinnerResult,
-            )
-            if not Preparation.Success or not Preparation.Complete:
-                raise RuntimeError(
-                    "complete native raw assignment did not produce a "
-                    "complete frozen track witness"
-                )
-            return _BuildSelection(
-                Portfolio,
-                Attempts=Attempts,
-                ExpansionCount=Spent,
-                Success=True,
-                Complete=True,
-                Unsatisfiable=False,
-                SelectedTemplate=Winner,
-                Preparation=Preparation,
-                FirstConflictSignals=FirstConflictSignals,
-                FirstConflictResourceIndices=FirstConflictResourceIndices,
-                MaterializedTemplateCount=TemplateIndex,
-                SkippedDominatedTemplateCount=(
-                    len(OrderedDescriptors) - TemplateIndex
-                ),
-            )
-
-    Unsatisfiable = not Portfolio.NonExhaustiveTemplateDomain
-    return _BuildSelection(
-        Portfolio,
-        Attempts=Attempts,
-        ExpansionCount=Spent,
-        Success=False,
-        Complete=True,
-        Unsatisfiable=Unsatisfiable,
-        IncompleteReason=(
-            "complete-capacity-core"
-            if Unsatisfiable
-            else "non-exhaustive-template-domain"
-        ),
-        FirstConflictSignals=FirstConflictSignals,
-        FirstConflictResourceIndices=FirstConflictResourceIndices,
-        MaterializedTemplateCount=len(OrderedDescriptors),
     )
 
 
@@ -917,7 +609,7 @@ def _BuildContextNativeRawAssignmentSolver(
         BaseValues = Domain.NativeBaseValues()
         Arguments = (
             CandidateValues,
-            len(Domain.ResourcePositions),
+            Domain.NativeResourceCount,
             MaximumExpansions,
             RemainingMilliseconds,
         )
@@ -925,13 +617,195 @@ def _BuildContextNativeRawAssignmentSolver(
             return ActiveContext.PlanAuthoritativeRoutesWithBaseBounded(
                 CandidateValues,
                 BaseValues,
-                len(Domain.ResourcePositions),
+                Domain.NativeResourceCount,
                 MaximumExpansions,
                 RemainingMilliseconds,
             )
         return ActiveContext.PlanAuthoritativeRoutesBounded(*Arguments)
 
     return NativeSolve
+
+
+def _BuildNativeTemplateDomainPayload(
+    Problem: RawTrackAssignmentProblem,
+) -> list[tuple[object, ...]]:
+    """Encode mutually exclusive raw domains for one native selection call."""
+    return [
+        (
+            Template.TemplateId,
+            list(Template.Objective),
+            Template.Domain.NativeResourceCount,
+            [Signal for Signal, _Count in Template.Domain.CandidateCounts],
+            Template.Domain.NativeCandidateValues(),
+            Template.Domain.NativeBaseValues(),
+        )
+        for Template in sorted(
+            Problem.Templates,
+            key=lambda Value: (Value.Objective, Value.TemplateId),
+        )
+    ]
+
+
+def _BuildNativeTemplateSelection(
+    Problem: RawTrackAssignmentProblem,
+    NativeResult: Any,
+) -> RawTrackAssignmentSelection:
+    """Adapt the immutable Rust portfolio result to the existing handoff."""
+    TemplateById = {
+        Template.TemplateId: Template
+        for Template in Problem.Templates
+    }
+    AttemptedIds = tuple(map(
+        str,
+        getattr(NativeResult, "AttemptedTemplateIds", ()),
+    ))
+    SelectedTemplateId = str(getattr(
+        NativeResult,
+        "SelectedTemplateId",
+        "",
+    ) or "")
+    SelectedTemplate = TemplateById.get(SelectedTemplateId)
+    Success = bool(getattr(NativeResult, "Success", False))
+    Complete = bool(getattr(NativeResult, "Complete", False))
+    if Success and (SelectedTemplate is None or not Complete):
+        raise RuntimeError(
+            "native template assignment returned an invalid frozen witness"
+        )
+    ExpansionCount = max(0, int(getattr(
+        NativeResult,
+        "ExpansionCount",
+        0,
+    )))
+    ConflictSignals = tuple(sorted(map(
+        str,
+        getattr(NativeResult, "ConflictSignals", ()),
+    )))
+    ConflictResourceIndices = tuple(sorted(map(
+        int,
+        getattr(NativeResult, "ConflictResourceIndices", ()),
+    )))
+    PairwiseIncompatibleSignals = tuple(sorted(
+        tuple(map(str, Value))
+        for Value in getattr(
+            NativeResult,
+            "PairwiseIncompatibleSignals",
+            (),
+        )
+    ))
+    AttemptPairwiseIncompatibleSignals = {
+        str(TemplateId): tuple(sorted(
+            tuple(map(str, Pair)) for Pair in Values
+        ))
+        for TemplateId, Values in getattr(
+            NativeResult,
+            "AttemptPairwiseIncompatibleSignals",
+            (),
+        )
+    }
+    Attempts = tuple(
+        RawTrackAssignmentAttempt(
+            TemplateId=TemplateId,
+            Objective=TemplateById[TemplateId].Objective,
+            Success=Success and TemplateId == SelectedTemplateId,
+            # Rust proves every attempted non-winning member complete before
+            # it advances.  A terminal cap/deadline is attributed to the
+            # final attempted member only.
+            Complete=(
+                Complete
+                or TemplateIndex + 1 < len(AttemptedIds)
+            ),
+            ExpansionCount=(
+                ExpansionCount
+                if TemplateIndex + 1 == len(AttemptedIds)
+                else 0
+            ),
+            CumulativeExpansionCount=(
+                ExpansionCount
+                if TemplateIndex + 1 == len(AttemptedIds)
+                else 0
+            ),
+            ConflictSignals=(
+                ConflictSignals
+                if TemplateIndex == 0 and not Success
+                else ()
+            ),
+            ConflictResourceIndices=(
+                ConflictResourceIndices
+                if TemplateIndex == 0 and not Success
+                else ()
+            ),
+            PairwiseIncompatibleSignals=(
+                AttemptPairwiseIncompatibleSignals.get(TemplateId, ())
+            ),
+            IncompleteReason=(
+                str(getattr(NativeResult, "IncompleteReason", ""))
+                if TemplateIndex + 1 == len(AttemptedIds) and not Complete
+                else ""
+            ),
+        )
+        for TemplateIndex, TemplateId in enumerate(AttemptedIds)
+        if TemplateId in TemplateById
+    )
+    Preparation = (
+        BuildTrackAssignmentPreparationFromRawDomain(
+            SelectedTemplate.Domain,
+            NativeResult,
+        )
+        if Success and SelectedTemplate is not None
+        else None
+    )
+    if Preparation is not None and (
+        not Preparation.Success or not Preparation.Complete
+    ):
+        raise RuntimeError(
+            "native template assignment did not produce a complete witness"
+        )
+    return _BuildSelection(
+        Problem,
+        Attempts=Attempts,
+        ExpansionCount=ExpansionCount,
+        Success=Success,
+        Complete=Complete,
+        Unsatisfiable=bool(getattr(NativeResult, "Unsatisfiable", False)),
+        SelectedTemplate=SelectedTemplate if Success else None,
+        Preparation=Preparation,
+        IncompleteReason=str(getattr(NativeResult, "IncompleteReason", "")),
+        FirstConflictSignals=ConflictSignals,
+        FirstConflictResourceIndices=ConflictResourceIndices,
+        FirstPairwiseIncompatibleSignals=PairwiseIncompatibleSignals,
+        MaterializedTemplateCount=len(AttemptedIds),
+    )
+
+
+def _TrySolveRawTrackAssignmentProblemNatively(
+    Problem: RawTrackAssignmentProblem,
+    Deadline: RoutingDeadline,
+    Context: Any | None,
+) -> RawTrackAssignmentSelection | None:
+    """Use the one-call native template selector when the binding is present."""
+    if _SolveTemplateAssignmentDomainsBounded is None:
+        return None
+    # Preserve explicit fixture/executor injection.  The production template
+    # portfolio will opt into this binding only after all predeclared members
+    # are materialized; this raw-problem adapter must not bypass a caller's
+    # supplied context during that migration.
+    if Context is not None:
+        return None
+    # The Rust input is intentionally complete-only.  The established Python
+    # path publishes a richer typed reason for an incomplete member without
+    # serializing it as if it were a capacity core.
+    if any(not Template.Domain.Complete for Template in Problem.Templates):
+        return None
+    RemainingMilliseconds = Deadline.RemainingMilliseconds()
+    if RemainingMilliseconds < 1:
+        return None
+    NativeResult = _SolveTemplateAssignmentDomainsBounded(
+        _BuildNativeTemplateDomainPayload(Problem),
+        Problem.MaximumAssignmentExpansions,
+        RemainingMilliseconds,
+        Problem.NonExhaustiveTemplateDomain,
+    )
+    return _BuildNativeTemplateSelection(Problem, NativeResult)
 
 
 def SolveRawTrackAssignmentProblemWithContext(
@@ -950,25 +824,15 @@ def SolveRawTrackAssignmentProblemWithContext(
     milliseconds, so the outer selector has one work cap and one deadline
     even though template resource indices are local.
     """
+    NativeSelection = _TrySolveRawTrackAssignmentProblemNatively(
+        Problem,
+        Deadline,
+        Context,
+    )
+    if NativeSelection is not None:
+        return NativeSelection
     return SolveRawTrackAssignmentProblem(
         Problem,
-        _BuildContextNativeRawAssignmentSolver(Context, Deadline),
-        WorkCheck=WorkCheck,
-    )
-
-
-def SolveRawTrackAssignmentPortfolioWithContext(
-    Portfolio: RawTrackAssignmentPortfolio,
-    Materialize: RawTrackAssignmentMaterializer,
-    *,
-    Context: Any | None = None,
-    Deadline: RoutingDeadline,
-    WorkCheck: WorkCheck | None = None,
-) -> RawTrackAssignmentSelection:
-    """Run one lazy fixed portfolio through the existing native binding."""
-    return SolveRawTrackAssignmentPortfolio(
-        Portfolio,
-        Materialize,
         _BuildContextNativeRawAssignmentSolver(Context, Deadline),
         WorkCheck=WorkCheck,
     )

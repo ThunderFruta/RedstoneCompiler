@@ -8,6 +8,7 @@ from Compiler.Routing.AuthoritativePlanner import (
 )
 from Compiler.Routing.Models import (
     DetailedRoutingBounds,
+    FrozenPerFaceRoutingEnvelope,
     PlacementAccessEscapeStub,
     PlacementAccessFabric,
     PlacementAccessTerminalDomain,
@@ -99,6 +100,36 @@ def test_access_contract_bounds_enclose_every_materialized_fixed_band_member():
     assert Fabric.ToDictionary()["AccessContractBounds"] == (
         Bounds.ToDictionary()
     )
+
+
+def test_frozen_per_face_routing_envelope_requires_one_complete_canvas():
+    Envelope = FrozenPerFaceRoutingEnvelope(
+        RoutingRegionBounds=(1, 2, 8, 9),
+        CanvasBounds=(0, 1, 9, 10),
+        YBounds=(0, 5),
+        PermittedLayers=(0, 1, 2),
+        PerimeterFaceTrackCounts=(
+            ("north", 1),
+            ("south", 0),
+            ("west", 2),
+            ("east", 0),
+        ),
+        EnvelopeFingerprint="frozen-per-face-contract",
+    )
+
+    assert Envelope.ToDictionary() == {
+        "RoutingRegionBounds": [1, 2, 8, 9],
+        "CanvasBounds": [0, 1, 9, 10],
+        "YBounds": [0, 5],
+        "PermittedLayers": [0, 1, 2],
+        "PerimeterFaceTrackCounts": {
+            "north": 1,
+            "south": 0,
+            "west": 2,
+            "east": 0,
+        },
+        "EnvelopeFingerprint": "frozen-per-face-contract",
+    }
 
 
 def test_detailed_routing_bounds_match_the_authoritative_region_then_margin():

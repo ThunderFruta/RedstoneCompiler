@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from itertools import combinations, islice
-from math import isfinite, prod
+from math import ceil, isfinite, prod
 import os
 from time import monotonic
 import traceback
@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from ..Cells.Library import GetCellMacro
 from ..Routing.Pcb import (
     PrepareClusterInterfaceAssignment,
+    PrepareRawRouteGuideFactorDomain,
     PrepareRawTrackAssignmentDomain,
     PrepareTrackAssignment,
     PreparePhysicalComponentEligibility,
@@ -47,6 +48,13 @@ from ..Routing.ComponentPipeline import (
     SelectPhysicalComponentResourceRelevantSignalPairs,
 )
 from ..Routing.AuthoritativePlanner import (
+    AttachRawTrackAssignmentContractRequirements,
+    BuildPlacementAccessStubFactorDomain,
+    BuildConditionalRawTrackAssignmentDomain,
+    ComposeRawTrackAssignmentFactorDomains,
+    BuildRawPortalPlacementGeometryFingerprint,
+    BuildRawPortalResourceGeometryFingerprint,
+    RawTrackAssignmentDomain,
     BuildFrozenPostClosurePortalHandoffTelemetry,
     BuildPhysicalGlobalPlanYieldDeadline,
     BuildPhysicalGlobalPlanContinuationState,
@@ -54,12 +62,14 @@ from ..Routing.AuthoritativePlanner import (
     SelectNextRetainedPhysicalGlobalPlan,
     ShouldScheduleRetainedPhysicalGlobalPlan,
 )
+from ..Routing.ChannelPlanner import BuildNetRoutingProfiles
 from ..Routing.TemplateAssignment import (
-    RawTrackAssignmentMaterialization,
-    RawTrackAssignmentPortfolio,
-    RawTrackAssignmentPortfolioTemplate,
+    PredeclaredRawTrackAssignmentMember,
+    RawTrackAssignmentProblem,
+    RawTrackAssignmentMemberMaterialization,
     RawTrackAssignmentSelection,
-    SolveRawTrackAssignmentPortfolioWithContext,
+    RawTrackAssignmentTemplate,
+    SolveRawTrackAssignmentProblemWithContext,
 )
 from ..Routing.Models import (
     ClusterInterfaceAssignment,
@@ -107,6 +117,7 @@ from ..Routing.Technology import (
     RedstoneRoutingTechnology,
 )
 from .Pcb import (
+    ApplyDerivedPerimeterInterfaceTemplate,
     BuildPinAlignedPackedClusterPortfolio,
     BuildBoundedInterClusterRoutingChannel,
     BuildBoundedInterClusterRoutingDeck,
@@ -119,12 +130,15 @@ from .Pcb import (
     PlacePcbGraph,
 )
 from .AccessFabric import (
+    AttachPlacementAccessAssignment,
     AttachPlacementAccessFabric,
     BuildDerivedPerimeterFabricShell,
+    BuildPlacementAccessAssignmentFromStubFactor,
     BuildPlacementAccessFabric,
     DerivedPerimeterFabricShell,
     MeasureDerivedPerimeterInterfaceDemand,
     MeasureDerivedPerimeterInterfaceLaunchDemandByFace,
+    ResolveFixedAccessFabricLayerCount,
 )
 from .PreRouteInterface import (
     DerivedPlacementCandidate,
@@ -5271,6 +5285,67 @@ def BuildDerivedPinAlignedEnvelopeLowerBoundObjective(
     )
 
 
+def SelectDiversePinAlignedEnvelopeStates(
+    States: Iterable[Any],
+    MaximumCount: int,
+) -> tuple[Any, ...]:
+    """Retain bounded physical-envelope diversity without dominance cuts."""
+    Limit = max(0, int(MaximumCount))
+    Ordered = tuple(sorted(
+        States,
+        key=BuildDerivedPinAlignedEnvelopeLowerBoundObjective,
+    ))
+    if Limit == 0:
+        return ()
+    if len(Ordered) <= Limit:
+        return Ordered
+    Selected: list[Any] = []
+    SeenFingerprints: set[str] = set()
+
+    def Add(State: Any) -> None:
+        Fingerprint = str(getattr(State, "Fingerprint", ""))
+        if Fingerprint in SeenFingerprints or len(Selected) >= Limit:
+            return
+        SeenFingerprints.add(Fingerprint)
+        Selected.append(State)
+
+    # Keep both compactness extrema: least shell area and shortest maximum
+    # side.  The latter is the wider/shorter tradeoff that an area-only
+    # prefix used to discard before exact perimeter construction.
+    Add(Ordered[0])
+    Add(min(
+        Ordered,
+        key=lambda State: (
+            BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[1],
+            BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[0],
+            BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[2:],
+        ),
+    ))
+    for State in Ordered[1:2]:
+        # Preserve the exact transform-distinct counterpart at the compact
+        # minimum when the bounded frontier has another slot. Whether it
+        # later collapses to the same physical factor domain is decided only
+        # by exact domain fingerprints, not by this lower-bound objective.
+        Add(State)
+    SeenEnvelopeShapes = {
+        BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[:2]
+        for State in Selected
+    }
+    for State in Ordered:
+        Shape = BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[:2]
+        if Shape in SeenEnvelopeShapes:
+            continue
+        Add(State)
+        SeenEnvelopeShapes.add(Shape)
+        if len(Selected) >= Limit:
+            return tuple(Selected)
+    for State in Ordered:
+        Add(State)
+        if len(Selected) >= Limit:
+            break
+    return tuple(Selected)
+
+
 def SelectDerivedPrimaryPlacementRequests(
     GenerationPlan: PlacementGenerationPlan,
     SinglePackedComponent: bool,
@@ -5281,7 +5356,7 @@ def SelectDerivedPrimaryPlacementRequests(
 ) -> tuple[PlacementGenerationRequest, ...]:
     """Build the finite single-component geometry domain before routing.
 
-    The row-beam incumbent and every retained non-dominated pin-aligned state
+    The row-beam incumbent and every retained pin-aligned state
     are fixed members of one placement problem.  The graph beam derives
     origins from transformed connected pins and exact macro legality before
     any capacity selection or routing begins; it never schedules a later
@@ -5337,8 +5412,8 @@ def SelectDerivedPrimaryPlacementRequests(
             GraphRequest.PackingPolicy.BeamWidth,
             WorkCheck=WorkCheck,
         )
-        # The graph portfolio is already a finite, non-dominated core
-        # frontier.  Do not collapse that frontier to its smallest NAND-only
+        # The graph portfolio is already a finite retained core frontier.
+        # Do not collapse that frontier to its smallest NAND-only
         # rectangle: a slightly wider/shorter core can have the smaller
         # physical access ring once terminal slots and real keep-outs are
         # materialized.  Retain a deterministic prefix ranked by the minimum
@@ -5348,17 +5423,15 @@ def SelectDerivedPrimaryPlacementRequests(
         MaximumDerivedMemberCount = max(
             0,
             int(GraphRequest.PackingPolicy.RetainedPlacementCandidates)
-            - len(Primary),
+            - len(Primary)
         )
         MaximumGraphCoreMemberCount = max(
             0,
-            MaximumDerivedMemberCount - 1,
+            MaximumDerivedMemberCount,
         )
-        States = tuple(
-            sorted(
-                Portfolio.States,
-                key=BuildDerivedPinAlignedEnvelopeLowerBoundObjective,
-            )[:MaximumGraphCoreMemberCount]
+        States = SelectDiversePinAlignedEnvelopeStates(
+            Portfolio.States,
+            MaximumGraphCoreMemberCount,
         )
         # The incumbent is a certified comparison point.  Every derived
         # geometry below is a pre-route member, including the row-beam core
@@ -5368,27 +5441,21 @@ def SelectDerivedPrimaryPlacementRequests(
         # member.  Do not multiply geometry recipes by arbitrary terminal
         # layout indexes here: that would turn a fixed slot problem into an
         # implicit portfolio of duplicate placement attempts.
-        DerivedGeometryRequests = (
+        DerivedGeometryRequests = tuple(
             replace(
-                Primary[0],
-                SourceGenerator="derived-perimeter-row-beam",
-            ),
-            *(
-                replace(
-                    GraphRequest,
-                    GraphCoreCandidateIndex=State.CandidateIndex,
-                )
-                for State in States
-            ),
+                GraphRequest,
+                GraphCoreCandidateIndex=State.CandidateIndex,
+            )
+            for State in States
         )
         DerivedRequests = tuple(
             replace(Request, TerminalLayoutVariantIndex=0)
             for Request in DerivedGeometryRequests
         )
-        return (
-            *Primary,
-            *DerivedRequests,
-        )
+        # The fixed row-beam incumbent is retained by the caller before these
+        # requests are generated.  Do not add a second row-beam alias here;
+        # every returned request is a distinct pin-aligned graph-core member.
+        return DerivedRequests
     AccessSeparated = tuple(
         Request
         for Request in GenerationPlan.DeferredRequests
@@ -5424,17 +5491,66 @@ def UsesDerivedPerimeterTerminals(
     }
 
 
+def SelectDiverseDerivedPerimeterInterfaceTemplates(
+    Templates: Iterable[Any],
+    ExistingFaceSignatures: Iterable[tuple[int, int, int, int]],
+    MaximumCount: int,
+) -> tuple[Any, ...]:
+    """Fill unused retained geometry slots by physical face diversity.
+
+    The retained-placement cap is fixed before routing.  When the graph-core
+    beam produces fewer members than that cap, already-declared perimeter
+    templates may fill the unused slots.  Selection maximizes the minimum
+    Manhattan distance from every retained face signature; NAND-only area or
+    another routing-blind objective is never used as a feasibility proxy.
+    """
+    Remaining = {
+        str(Template.TemplateId): Template
+        for Template in Templates
+    }
+    Selected: list[Any] = []
+    Signatures = {
+        tuple(map(int, Signature))
+        for Signature in ExistingFaceSignatures
+    }
+    while Remaining and len(Selected) < max(0, int(MaximumCount)):
+        def Diversity(Template: Any) -> int:
+            Signature = tuple(map(int, Template.FaceSignature))
+            return min(
+                (
+                    sum(abs(First - Second) for First, Second in zip(
+                        Signature,
+                        Existing,
+                    ))
+                    for Existing in Signatures
+                ),
+                default=sum(Signature),
+            )
+
+        Template = min(
+            Remaining.values(),
+            key=lambda Value: (
+                -Diversity(Value),
+                str(Value.TemplateId),
+            ),
+        )
+        Selected.append(Template)
+        Signatures.add(tuple(map(int, Template.FaceSignature)))
+        Remaining.pop(str(Template.TemplateId))
+    return tuple(Selected)
+
+
 def PrepareDerivedPlacementForFrozenAccessContract(
     Placement: PcbPlacement,
 ) -> PcbPlacement:
     """Transfer small-design local access ownership to the ring contract.
 
-    Packed placement can opportunistically freeze short local routes before
-    the perimeter factor is built.  Those routes were selected without the
-    complete capacity problem and can obstruct a different signal's only
-    legal escape.  A derived candidate therefore publishes macro geometry
-    and terminals only; the selected access-fabric witness becomes the sole
-    immutable local-access owner.
+    Preserve only routes placement already certified complete. Partial local
+    fragments were selected without the complete capacity problem and can
+    obstruct a different signal's only legal escape, so those remain
+    released. A complete signal tree, however, is an immutable physical
+    witness; discarding it would turn a routed internal net into a spurious
+    global terminal-access requirement.
     """
     Source = Placement.Placed
     Diagnostics = dict(Source.LocalRouteDiagnostics or {})
@@ -5452,14 +5568,29 @@ def PrepareDerivedPlacementForFrozenAccessContract(
         for Claim in (Source.LocalRouteClaims or ())
         if str(Claim.Signal) in (Source.FrozenNetWires or {})
     )
+    CompleteLocalSignals = frozenset(
+        str(Claim.Signal) for Claim in OptionalClaims
+    )
     return replace(
         Placement,
         Placed=replace(
             Source,
-            FrozenNetWires={},
-            LocalNetBranches={},
-            LocalNetTargets={},
-            LocalRouteClaims=(),
+            FrozenNetWires={
+                Signal: Value
+                for Signal, Value in (Source.FrozenNetWires or {}).items()
+                if str(Signal) in CompleteLocalSignals
+            },
+            LocalNetBranches={
+                Signal: Value
+                for Signal, Value in (Source.LocalNetBranches or {}).items()
+                if str(Signal) in CompleteLocalSignals
+            },
+            LocalNetTargets={
+                Signal: Value
+                for Signal, Value in (Source.LocalNetTargets or {}).items()
+                if str(Signal) in CompleteLocalSignals
+            },
+            LocalRouteClaims=OptionalClaims,
             LocalRouteDiagnostics=Diagnostics,
             DerivedLocalRouteClaims=OptionalClaims,
         ),
@@ -5578,6 +5709,59 @@ def BuildPlacementAccessDemand(
         ActivePerimeterFaces=ActivePerimeterFaces,
         PerimeterFaceLaunchDemand=PerimeterFaceLaunchDemand,
     )
+
+
+def BuildDerivedPerimeterTrackCountsFromDemand(
+    Demand: PlacementAccessDemand,
+    RoutingLayerCount: int,
+    AccessRingTrackCount: int,
+) -> tuple[tuple[str, int], ...]:
+    """Derive immutable per-face perimeter tracks from measured launch demand.
+
+    The pre-route selector chooses `AccessRingTrackCount` from aggregate demand.
+    This helper computes each face's explicit track requirement using the exact
+    same physical contract and prevents later capacity stages from rebalancing
+    that per-face envelope.
+    """
+    if RoutingLayerCount < 1:
+        raise ValueError("derived perimeter tracks require positive layers")
+    if AccessRingTrackCount < 1:
+        raise ValueError("derived perimeter tracks require a positive ring")
+    CanonicalFaces = ("north", "south", "west", "east")
+    LaunchDemandByFace = {
+        str(Face): int(LaunchDemand)
+        for Face, LaunchDemand in Demand.PerimeterFaceLaunchDemand
+    }
+    if (
+        len(LaunchDemandByFace) != len(Demand.PerimeterFaceLaunchDemand)
+        or any(Face not in CanonicalFaces for Face in LaunchDemandByFace)
+        or any(Value < 0 for Value in LaunchDemandByFace.values())
+    ):
+        raise ValueError("derived perimeter launch demand is not canonical")
+    ActiveFaces = frozenset(map(str, Demand.ActivePerimeterFaces))
+    if not ActiveFaces <= frozenset(CanonicalFaces):
+        raise ValueError("derived perimeter active faces are not canonical")
+    Counts = tuple(
+        (
+            Face,
+            (
+                max(
+                    1,
+                    ceil(LaunchDemandByFace[Face] / RoutingLayerCount),
+                )
+                if Face in LaunchDemandByFace
+                else AccessRingTrackCount
+                if not LaunchDemandByFace and Face in ActiveFaces
+                else 0
+            ),
+        )
+        for Face in CanonicalFaces
+    )
+    if any(Count > AccessRingTrackCount for _Face, Count in Counts):
+        raise ValueError(
+            "derived perimeter face track count exceeds ring tracks"
+        )
+    return Counts
 
 
 def BuildDerivedPlacementCandidate(
@@ -5772,6 +5956,36 @@ def SummarizePreRouteAccessFabric(
             ) is not None
             else None
         ),
+        "NativeEscapeKernelUsed": bool(getattr(
+            Fabric,
+            "NativeEscapeKernelUsed",
+            False,
+        )),
+        "NativeEscapeKernelCallCount": int(getattr(
+            Fabric,
+            "NativeEscapeKernelCallCount",
+            0,
+        )),
+        "NativeEscapeKernelExpansionCount": int(getattr(
+            Fabric,
+            "NativeEscapeKernelExpansionCount",
+            0,
+        )),
+        "NativeEscapeKernelComplete": bool(getattr(
+            Fabric,
+            "NativeEscapeKernelComplete",
+            True,
+        )),
+        "NativeEscapeKernelElapsedSeconds": float(getattr(
+            Fabric,
+            "NativeEscapeKernelElapsedSeconds",
+            0.0,
+        )),
+        "NativeEscapeFallbackUsed": bool(getattr(
+            Fabric,
+            "NativeEscapeFallbackUsed",
+            False,
+        )),
         "PhysicalClaimCounts": {
             "WireCells": len(getattr(PhysicalClaims, "WireCells", ())),
             "SupportCells": len(getattr(PhysicalClaims, "SupportCells", ())),
@@ -11971,7 +12185,12 @@ def _PlaceAndRoutePcbWithPolicy(
             else None
         ),
     )
-    for Request in DerivedPrimaryRequests[len(IncumbentRequests):]:
+    DerivedRequestsToMaterialize = (
+        DerivedPrimaryRequests
+        if SinglePackedComponent
+        else DerivedPrimaryRequests[len(IncumbentRequests):]
+    )
+    for Request in DerivedRequestsToMaterialize:
         if Deadline.IsExpired():
             break
         _TryPlacement(
@@ -12648,6 +12867,130 @@ def _PlaceAndRoutePcbWithPolicy(
         return True
 
     CandidateRecords = _BuildCandidateRecords()
+    # A single compact design owns one fixed retained geometry budget.  Graph
+    # cores consume it first because each changes NAND macro geometry.  If
+    # that finite beam is smaller (for example, a tied-input topology has no
+    # legal pin-aligned state), fill only the unused slots with physically
+    # distinct terminal-face templates already declared by placement.  This
+    # keeps the same six-geometry maximum and introduces no feedback attempt.
+    if SinglePackedComponent:
+        MaximumGeometryCount = max(
+            1,
+            int(Policy.NandPacking.RetainedPlacementCandidates),
+        )
+        ExpandedCandidateRecords = list(CandidateRecords)
+        ExistingPhysicalFingerprints = {
+            BuildPlacementFingerprint(
+                Candidate.Placement,
+                IncludeLocalClaims=False,
+            )
+            for Candidate in CandidateRecords
+        }
+        ExistingFaceSignatures: set[tuple[int, int, int, int]] = set()
+        for Candidate in CandidateRecords:
+            Assignment = (
+                Candidate.Placement.DerivedPerimeterSlotAssignment
+                or Candidate.Placement.Placed
+                .DerivedPerimeterSlotAssignment
+            )
+            if Assignment is None:
+                continue
+            ExistingFaceSignatures.add(tuple(
+                sum(Slot.Face == Face for Slot in Assignment.SelectedSlots)
+                for Face in ("north", "south", "west", "east")
+            ))
+        RemainingGeometrySlots = max(
+            0,
+            MaximumGeometryCount - len(ExpandedCandidateRecords),
+        )
+        if any(
+            Candidate.SourceGenerator == "derived-pin-aligned-core"
+            for Candidate in ExpandedCandidateRecords
+        ):
+            # Interface-template fill is only the typed empty-graph fallback.
+            # A nonempty retained graph frontier already owns its complete
+            # bounded geometry budget; backfilling the removed fixed-band
+            # compatibility slot would silently widen that portfolio.
+            RemainingGeometrySlots = 0
+        for Candidate in tuple(CandidateRecords):
+            if RemainingGeometrySlots < 1:
+                break
+            if not IsDerivedSingleComponentPlacementSource(
+                Candidate.SourceGenerator
+            ):
+                continue
+            InterfaceDomain = (
+                Candidate.Placement.DerivedPerimeterInterfaceTemplateDomain
+                or Candidate.Placement.Placed
+                .DerivedPerimeterInterfaceTemplateDomain
+            )
+            if InterfaceDomain is None or not InterfaceDomain.Complete:
+                continue
+            CurrentAssignment = (
+                Candidate.Placement.DerivedPerimeterSlotAssignment
+                or Candidate.Placement.Placed
+                .DerivedPerimeterSlotAssignment
+            )
+            CurrentAssignmentFingerprint = str(getattr(
+                CurrentAssignment,
+                "AssignmentFingerprint",
+                "",
+            ))
+            Alternatives = tuple(
+                Template
+                for Template in InterfaceDomain.Templates
+                if (
+                    Template.SlotAssignment.AssignmentFingerprint
+                    != CurrentAssignmentFingerprint
+                )
+            )
+            for InterfaceTemplate in (
+                SelectDiverseDerivedPerimeterInterfaceTemplates(
+                    Alternatives,
+                    ExistingFaceSignatures,
+                    RemainingGeometrySlots,
+                )
+            ):
+                InterfacePlacement = (
+                    ApplyDerivedPerimeterInterfaceTemplate(
+                        Candidate.Placement,
+                        InterfaceTemplate,
+                    )
+                )
+                PhysicalFingerprint = BuildPlacementFingerprint(
+                    InterfacePlacement,
+                    IncludeLocalClaims=False,
+                )
+                if PhysicalFingerprint in ExistingPhysicalFingerprints:
+                    continue
+                ExistingPhysicalFingerprints.add(PhysicalFingerprint)
+                ExistingFaceSignatures.add(tuple(map(
+                    int,
+                    InterfaceTemplate.FaceSignature,
+                )))
+                ExpandedCandidateRecords.append(replace(
+                    Candidate,
+                    CandidateId=(
+                        f"{Candidate.CandidateId}:"
+                        f"{InterfaceTemplate.TemplateId}"
+                    ),
+                    Placement=InterfacePlacement,
+                    PlacementFingerprint=PhysicalFingerprint,
+                    InterfaceTopologyFingerprint=BuildStableFingerprint({
+                        "Source": Candidate.InterfaceTopologyFingerprint,
+                        "InterfaceTemplate": (
+                            InterfaceTemplate.TemplateId
+                        ),
+                        "SlotAssignment": (
+                            InterfaceTemplate.SlotAssignment
+                            .AssignmentFingerprint
+                        ),
+                    }),
+                ))
+                RemainingGeometrySlots -= 1
+                if RemainingGeometrySlots < 1:
+                    break
+        CandidateRecords = ExpandedCandidateRecords
     FabricCandidateRecords: list[PcbPlacementCandidate] = []
     PreRouteFabricDescriptorsByCandidateId: dict[
         str,
@@ -12787,12 +13130,24 @@ def _PlaceAndRoutePcbWithPolicy(
                         and bool(getattr(SlotAssignment, "Success", False))
                         and bool(getattr(SlotAssignment, "Complete", False))
                     ):
+                        PerimeterFaceTrackCounts = (
+                            BuildDerivedPerimeterTrackCountsFromDemand(
+                                Demand,
+                                Envelope.RoutingLayerCount,
+                                RingTrackCount,
+                            )
+                        )
                         Shell = BuildDerivedPerimeterFabricShell(
                             AccessFabricPlacement,
                             Resources=StaticAccessResources,
                             Technology=Technology,
                             AccessRingTrackCount=RingTrackCount,
                             AccessLength=Envelope.AccessLength,
+                            PerimeterFaceTrackCounts=(
+                                PerimeterFaceTrackCounts
+                                if PerimeterFaceTrackCounts
+                                else None
+                            ),
                         )
                 PrefixBounds = (
                     Shell.OuterBounds
@@ -13372,7 +13727,7 @@ def _PlaceAndRoutePcbWithPolicy(
     RawTrackAssignmentResult: RawTrackAssignmentSelection | None = None
     RawTrackAssignmentMaterializations: dict[
         str,
-        RawTrackAssignmentMaterialization,
+        RawTrackAssignmentMemberMaterialization,
     ] = {}
     if SinglePackedComponent:
         # Do not let an incomplete lower-level access domain disappear just
@@ -13408,8 +13763,48 @@ def _PlaceAndRoutePcbWithPolicy(
                 for Index, Candidate in enumerate(CandidateRecords)
             }
             RawPortfolioTemplates: list[
-                RawTrackAssignmentPortfolioTemplate
+                PredeclaredRawTrackAssignmentMember
             ] = []
+            ExactPhysicalAccessFabricMaterializations: dict[
+                str, tuple[Any, Any]
+            ] = {}
+            ExactPhysicalGuideDomainMaterializations: dict[str, Any] = {}
+            PlacementGeometryFingerprintsByIdentity: dict[int, str] = {}
+            ResourceGeometryFingerprintsByIdentity: dict[
+                tuple[int, int], str
+            ] = {}
+
+            def CachedPlacementGeometryFingerprint(Placed: Any) -> str:
+                Identity = id(Placed)
+                Fingerprint = PlacementGeometryFingerprintsByIdentity.get(
+                    Identity
+                )
+                if Fingerprint is None:
+                    Fingerprint = BuildRawPortalPlacementGeometryFingerprint(
+                        Placed
+                    )
+                    PlacementGeometryFingerprintsByIdentity[Identity] = (
+                        Fingerprint
+                    )
+                return Fingerprint
+
+            def CachedResourceGeometryFingerprint(Resources: Any) -> str:
+                Identity = (
+                    id(getattr(Resources, "StaticGeometry", None)),
+                    id(getattr(Resources, "ResourceGraph", None)),
+                )
+                Fingerprint = ResourceGeometryFingerprintsByIdentity.get(
+                    Identity
+                )
+                if Fingerprint is None:
+                    Fingerprint = BuildRawPortalResourceGeometryFingerprint(
+                        Resources
+                    )
+                    ResourceGeometryFingerprintsByIdentity[Identity] = (
+                        Fingerprint
+                    )
+                return Fingerprint
+
             for Candidate in CandidateRecords:
                 FabricDescriptor = PreRouteFabricDescriptorsByCandidateId.get(
                     Candidate.CandidateId
@@ -13420,7 +13815,7 @@ def _PlaceAndRoutePcbWithPolicy(
                         "descriptor"
                     )
                 RawPortfolioTemplates.append(
-                    RawTrackAssignmentPortfolioTemplate(
+                    PredeclaredRawTrackAssignmentMember(
                         TemplateId=Candidate.CandidateId,
                         Objective=FabricDescriptor.ObjectivePrefix,
                         MaterializationInputFingerprint=(
@@ -13438,9 +13833,36 @@ def _PlaceAndRoutePcbWithPolicy(
                     )
                 )
 
+            def MemberContractForTemplate(
+                TemplateId: str,
+            ) -> tuple[tuple[str, str], ...]:
+                Candidate = CandidateById[TemplateId]
+                if Candidate.RoutingEnvelope is None:
+                    raise RuntimeError(
+                        "compact member is missing its routing envelope"
+                    )
+                return (
+                    ("member", TemplateId),
+                    ("core", Candidate.PlacementFingerprint),
+                    (
+                        "interface",
+                        str(getattr(
+                            Candidate.Placement
+                            .DerivedPerimeterSlotAssignment,
+                            "AssignmentFingerprint",
+                            Candidate.PlacementFingerprint,
+                        )),
+                    ),
+                    (
+                        "layers",
+                        str(Candidate.RoutingEnvelope.RoutingLayerCount),
+                    ),
+                )
+
             def MaterializeRawTemplate(
-                Descriptor: RawTrackAssignmentPortfolioTemplate,
-            ) -> RawTrackAssignmentMaterialization:
+                Descriptor: PredeclaredRawTrackAssignmentMember,
+            ) -> RawTrackAssignmentMemberMaterialization:
+                MaterializationStartedAt = monotonic()
                 Candidate = CandidateById.get(Descriptor.TemplateId)
                 if Candidate is None:
                     raise RuntimeError(
@@ -13464,59 +13886,285 @@ def _PlaceAndRoutePcbWithPolicy(
                         FabricDescriptor.StaticResources
                     )
                 )
+                Shell = FabricDescriptor.Shell
+                FixedAccessLayerCount = (
+                    ResolveFixedAccessFabricLayerCount(
+                        BuildNetRoutingProfiles(
+                            Candidate.Placement.Placed,
+                            AccessLength=(
+                                Candidate.RoutingEnvelope.AccessLength
+                            ),
+                        ),
+                        int(Candidate.RoutingEnvelope.RoutingLayerCount),
+                    )
+                    if FabricDescriptor.TopologyKind
+                    == "fixed-access-band-v1"
+                    else int(Candidate.RoutingEnvelope.RoutingLayerCount)
+                )
+                ExactAccessFabricIdentity = BuildStableFingerprint({
+                    "Kind": "compact-access-fabric-input-v1",
+                    # A derived shell already contains every placement fact
+                    # consumed by access construction.  For the fixed-band
+                    # path, which has no shell, retain the whole placed
+                    # geometry in the identity.
+                    "PlacementGeometry": (
+                        CachedPlacementGeometryFingerprint(
+                            Candidate.Placement.Placed
+                        )
+                        if Shell is None
+                        else "derived-shell-owned"
+                    ),
+                    "ResourceGeometry": (
+                        CachedResourceGeometryFingerprint(
+                            CandidateResources
+                        )
+                    ),
+                    "PhysicalAccessLayerCount": FixedAccessLayerCount,
+                    "DeclaredRoutingLayerCount": int(
+                        Candidate.RoutingEnvelope.RoutingLayerCount
+                    ),
+                    "AccessLength": int(
+                        Candidate.RoutingEnvelope.AccessLength
+                    ),
+                    "TopologyKind": FabricDescriptor.TopologyKind,
+                    "AccessRingTrackCount": (
+                        FabricDescriptor.AccessRingTrackCount
+                    ),
+                    "Shell": (
+                        None
+                        if Shell is None
+                        else (
+                            Shell.AccessRingTrackCount,
+                            Shell.AccessLength,
+                            Shell.TechnologyFingerprint,
+                            Shell.Profiles,
+                            Shell.TerminalPaths,
+                            Shell.SlotFaceItems,
+                            Shell.PerimeterDrivenRootFaceItems,
+                            Shell.RingBounds,
+                            Shell.Bounds,
+                            Shell.ActiveFaces,
+                            Shell.PerimeterFaceTrackCounts,
+                            Shell.FabricLayers,
+                            Shell.FabricYs,
+                        )
+                    ),
+                })
+                ReusedAccessFabricMaterialization = (
+                    ExactPhysicalAccessFabricMaterializations.get(
+                        ExactAccessFabricIdentity
+                    )
+                )
+                AccessFabricStartedAt = monotonic()
                 try:
-                    Fabric = BuildPlacementAccessFabric(
+                    if ReusedAccessFabricMaterialization is not None:
+                        (
+                            Fabric,
+                            CandidateResources,
+                        ) = ReusedAccessFabricMaterialization
+                    else:
+                        Fabric = BuildPlacementAccessFabric(
+                            Candidate.Placement,
+                            Resources=CandidateResources,
+                            Technology=Technology,
+                            AccessLength=(
+                                Candidate.RoutingEnvelope.AccessLength
+                                if Candidate.RoutingEnvelope is not None
+                                else None
+                            ),
+                            TopologyKind=FabricDescriptor.TopologyKind,
+                            AccessRingTrackCount=(
+                                FabricDescriptor.AccessRingTrackCount
+                            ),
+                            Shell=FabricDescriptor.Shell,
+                            BoundarySignals=None,
+                            # The immutable fabric publishes terminal escape
+                            # alternatives only.  The aggregate raw selector owns
+                            # the one complete portal/track witness.
+                            CompleteRouteSignals=frozenset(),
+                            DeriveLegalEscapeWorkLimit=(
+                                FabricDescriptor.DeriveLegalEscapeWorkLimit
+                            ),
+                            # Retain one representative ingress per exact
+                            # layer/track/face factor in the compact domain.
+                            RestrictDerivedIngressToRepresentatives=(
+                                FabricDescriptor.TopologyKind
+                                == "derived-perimeter-access-v1"
+                            ),
+                            NativeEscapeRemainingMilliseconds=(
+                                Deadline.RemainingMilliseconds
+                            ),
+                            WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                                "PrePlacementAccessFabric",
+                                Diagnostics,
+                            ),
+                        )
+                        ExactPhysicalAccessFabricMaterializations[
+                            ExactAccessFabricIdentity
+                        ] = (Fabric, CandidateResources)
+                    AccessFabricElapsedSeconds = (
+                        monotonic() - AccessFabricStartedAt
+                    )
+                    AttachedForGuide = AttachPlacementAccessFabric(
                         Candidate.Placement,
-                        Resources=CandidateResources,
-                        Technology=Technology,
-                        AccessLength=(
-                            Candidate.RoutingEnvelope.AccessLength
-                            if Candidate.RoutingEnvelope is not None
-                            else None
+                        Fabric,
+                    )
+                    CandidatePolicy = (
+                        BuildFrozenEnvelopeRoutingPolicy(
+                            Policy,
+                            Candidate.RoutingEnvelope,
+                        )
+                        if Candidate.RoutingEnvelope is not None
+                        else Policy
+                    )
+                    ExactGuideDomainIdentity = BuildStableFingerprint({
+                        "Kind": "compact-guide-factor-input-v1",
+                        "RoutingProfiles": (
+                            Shell.Profiles
+                            if Shell is not None
+                            else
+                            CachedPlacementGeometryFingerprint(
+                                Candidate.Placement.Placed
+                            )
                         ),
-                        TopologyKind=FabricDescriptor.TopologyKind,
-                        AccessRingTrackCount=(
-                            FabricDescriptor.AccessRingTrackCount
+                        "ResourceGeometry": (
+                            CachedResourceGeometryFingerprint(
+                                CandidateResources
+                            )
                         ),
-                        Shell=FabricDescriptor.Shell,
-                        # The immutable fabric publishes terminal escape
-                        # alternatives only.  The aggregate raw selector owns
-                        # the one complete portal/track witness.
-                        CompleteRouteSignals=frozenset(),
-                        DeriveLegalEscapeWorkLimit=(
-                            FabricDescriptor.DeriveLegalEscapeWorkLimit
+                        "FabricFingerprint": Fabric.FabricFingerprint,
+                        "LayerCount": int(
+                            Candidate.RoutingEnvelope.RoutingLayerCount
                         ),
-                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
-                            "PrePlacementAccessFabric",
-                            Diagnostics,
+                        "FrozenPolicy": repr(CandidatePolicy),
+                        "TrackAssignmentExpansionCap": (
+                            Policy.TrackAssignment
+                            .MaximumAssignmentExpansions
                         ),
+                    })
+                    GuideDomain = (
+                        ExactPhysicalGuideDomainMaterializations.get(
+                            ExactGuideDomainIdentity
+                        )
+                    )
+                    GuideDomainStartedAt = monotonic()
+                    if GuideDomain is None:
+                        GuideDomain = PrepareRawRouteGuideFactorDomain(
+                            AttachedForGuide,
+                            Resources=CandidateResources,
+                            Policy=CandidatePolicy,
+                            Deadline=Deadline,
+                        )
+                        ExactPhysicalGuideDomainMaterializations[
+                            ExactGuideDomainIdentity
+                        ] = GuideDomain
+                    else:
+                        # The physical values and their candidate-domain
+                        # fingerprint are shared.  Placement identity is a
+                        # handoff guard for this logical member, so decorate
+                        # only that guard with the current exact geometry.
+                        GuideDomain = replace(
+                            GuideDomain,
+                            PlacementFingerprint=(
+                                CachedPlacementGeometryFingerprint(
+                                    Candidate.Placement.Placed
+                                )
+                            ),
+                        )
+                    GuideDomainElapsedSeconds = (
+                        monotonic() - GuideDomainStartedAt
                     )
                 except RoutingStageError as Error:
-                    Result = RawTrackAssignmentMaterialization(
-                        TemplateId=Descriptor.TemplateId,
-                        Domain=None,
-                        Complete=False,
-                        IncompleteReason=(
-                            Error.Failure.Reason.value
-                            if hasattr(Error.Failure.Reason, "value")
-                            else str(Error.Failure.Reason)
-                        ),
-                        Diagnostics=(
-                            ("Candidate", Candidate.ToDictionary()),
-                            (
-                                "PlacementAccessFabricFailure",
-                                Error.Failure.ToDictionary(),
-                            ),
-                            (
-                                "FabricDescriptor",
-                                FabricDescriptor.ToDictionary(),
-                            ),
-                        ),
+                    FailureDiagnostics = Error.Failure.Diagnostics
+                    MandatoryAccessProof = (
+                        FailureDiagnostics.get("MandatoryAccessProof", {})
+                        if isinstance(FailureDiagnostics, dict)
+                        else {}
                     )
-                    RawTrackAssignmentMaterializations[
-                        Descriptor.TemplateId
-                    ] = Result
-                    return Result
+                    CompleteEmptyGuideFactor = bool(
+                        Error.Failure.Reason
+                        == RoutingFailureReason.TrackAssignmentConflict
+                        and MandatoryAccessProof.get("Complete") is True
+                        and MandatoryAccessProof.get(
+                            "PortalTupleDomainComplete"
+                        ) is True
+                        and Error.Failure.AffectedNets
+                    )
+                    if CompleteEmptyGuideFactor:
+                        GuideDomain = RawTrackAssignmentDomain(
+                            ResourcePositions=(),
+                            Values=(),
+                            BaseClaims=(),
+                            CandidateCounts=tuple(
+                                (str(Signal), 0)
+                                for Signal in sorted(
+                                    Error.Failure.AffectedNets
+                                )
+                            ),
+                            CandidateDomainFingerprint=(
+                                BuildStableFingerprint({
+                                    "Kind": (
+                                        "complete-empty-guide-factor-v1"
+                                    ),
+                                    "Candidate": Candidate.CandidateId,
+                                    "Failure": Error.Failure.ToDictionary(),
+                                })
+                            ),
+                            LocalClaimDomainFingerprint="",
+                            PlacementFingerprint=(
+                                BuildRawPortalPlacementGeometryFingerprint(
+                                    Candidate.Placement.Placed
+                                )
+                            ),
+                            ResourceGraphFingerprint=(
+                                CachedResourceGeometryFingerprint(
+                                    CandidateResources
+                                )
+                            ),
+                            PortalDomainFingerprint=BuildStableFingerprint({
+                                "Kind": "complete-empty-portal-core-v1",
+                                "MandatoryAccessProof": MandatoryAccessProof,
+                            }),
+                            Complete=True,
+                            IncompleteReason="",
+                            MaximumAssignmentExpansions=(
+                                Policy.TrackAssignment
+                                .MaximumAssignmentExpansions
+                            ),
+                            Diagnostics=((
+                                "CompleteEmptyGuideFactor",
+                                Error.Failure.ToDictionary(),
+                            ),),
+                        )
+                        GuideDomainElapsedSeconds = (
+                            monotonic() - GuideDomainStartedAt
+                        )
+                    else:
+                        Result = RawTrackAssignmentMemberMaterialization(
+                            TemplateId=Descriptor.TemplateId,
+                            Domain=None,
+                            Complete=False,
+                            IncompleteReason=(
+                                Error.Failure.Reason.value
+                                if hasattr(Error.Failure.Reason, "value")
+                                else str(Error.Failure.Reason)
+                            ),
+                            Diagnostics=(
+                                ("Candidate", Candidate.ToDictionary()),
+                                (
+                                    "PlacementAccessFabricFailure",
+                                    Error.Failure.ToDictionary(),
+                                ),
+                                (
+                                    "FabricDescriptor",
+                                    FabricDescriptor.ToDictionary(),
+                                ),
+                            ),
+                        )
+                        RawTrackAssignmentMaterializations[
+                            Descriptor.TemplateId
+                        ] = Result
+                        return Result
                 AttachedPlacement = AttachPlacementAccessFabric(
                     Candidate.Placement,
                     Fabric,
@@ -13552,11 +14200,26 @@ def _PlaceAndRoutePcbWithPolicy(
                         SummarizePreRouteAccessFabric(Fabric)
                     ),
                     "FabricDescriptor": FabricDescriptor.ToDictionary(),
+                    "AccessFabricElapsedSeconds": round(
+                        AccessFabricElapsedSeconds,
+                        6,
+                    ),
+                    "GuideDomainElapsedSeconds": round(
+                        GuideDomainElapsedSeconds,
+                        6,
+                    ),
+                    "GuideCandidateCounts": [
+                        list(Value)
+                        for Value in GuideDomain.CandidateCounts
+                    ],
+                    "GuideDomainDiagnostics": dict(
+                        GuideDomain.Diagnostics
+                    ),
                 })
                 Template = PublishPreRouteTemplate(Candidate, Fabric, None)
                 TemplateById[Candidate.CandidateId] = Template
                 if Fabric is None or not Fabric.Complete:
-                    Result = RawTrackAssignmentMaterialization(
+                    Result = RawTrackAssignmentMemberMaterialization(
                         TemplateId=Descriptor.TemplateId,
                         Domain=None,
                         Complete=False,
@@ -13583,23 +14246,65 @@ def _PlaceAndRoutePcbWithPolicy(
                         Descriptor.TemplateId
                     ] = Result
                     return Result
-                CandidatePolicy = (
-                    BuildFrozenEnvelopeRoutingPolicy(
-                        Policy,
-                        Candidate.RoutingEnvelope,
+                if not GuideDomain.Complete:
+                    Result = RawTrackAssignmentMemberMaterialization(
+                        TemplateId=Descriptor.TemplateId,
+                        Domain=None,
+                        Complete=False,
+                        IncompleteReason=(
+                            GuideDomain.IncompleteReason
+                            or "incomplete-route-guide-factor-domain"
+                        ),
+                        Diagnostics=((
+                            "PlacementAccessFabric",
+                            SummarizePreRouteAccessFabric(Fabric),
+                        ), (
+                            "RouteGuideFactorDomain",
+                            GuideDomain.ToDictionary(),
+                        ), (
+                            "FabricDescriptor",
+                            FabricDescriptor.ToDictionary(),
+                        )),
+                        ResolvedObjective=(
+                            Template.Witnesses[0].Objective
+                            if Template.Witnesses else ()
+                        ),
                     )
-                    if Candidate.RoutingEnvelope is not None
-                    else Policy
-                )
+                    RawTrackAssignmentMaterializations[
+                        Descriptor.TemplateId
+                    ] = Result
+                    return Result
                 try:
-                    RawDomain = PrepareRawTrackAssignmentDomain(
-                        Candidate.Placement,
-                        Resources=CandidateResources,
-                        Policy=CandidatePolicy,
-                        Deadline=Deadline,
+                    ContractRequirements = MemberContractForTemplate(
+                        Candidate.CandidateId
+                    )
+                    AccessDomain = BuildPlacementAccessStubFactorDomain(
+                        Fabric,
+                        ContractRequirements=ContractRequirements,
+                        MaximumAssignmentExpansions=(
+                            Policy.TrackAssignment
+                            .MaximumAssignmentExpansions
+                        ),
+                        PlacementFingerprint=(
+                            GuideDomain.PlacementFingerprint
+                        ),
+                        ResourceGraphFingerprint=(
+                            GuideDomain.ResourceGraphFingerprint
+                        ),
+                        NativeAssignmentContext=(
+                            GuideDomain.NativeAssignmentContext
+                        ),
+                    )
+                    RawDomain = ComposeRawTrackAssignmentFactorDomains(
+                        GuideDomain,
+                        AccessDomain,
+                        MaximumAssignmentExpansions=(
+                            Policy.TrackAssignment
+                            .MaximumAssignmentExpansions
+                        ),
                     )
                 except RoutingStageError as Error:
-                    Result = RawTrackAssignmentMaterialization(
+                    Result = RawTrackAssignmentMemberMaterialization(
                         TemplateId=Descriptor.TemplateId,
                         Domain=None,
                         Complete=False,
@@ -13611,7 +14316,7 @@ def _PlaceAndRoutePcbWithPolicy(
                         Diagnostics=(
                             ("Candidate", Candidate.ToDictionary()),
                             (
-                                "RawDomainFailure",
+                                "RawFactorDomainFailure",
                                 Error.Failure.ToDictionary(),
                             ),
                             (
@@ -13626,7 +14331,7 @@ def _PlaceAndRoutePcbWithPolicy(
                         Descriptor.TemplateId
                     ] = Result
                     return Result
-                Result = RawTrackAssignmentMaterialization(
+                Result = RawTrackAssignmentMemberMaterialization(
                     TemplateId=Descriptor.TemplateId,
                     Domain=RawDomain,
                     Complete=RawDomain.Complete,
@@ -13634,7 +14339,19 @@ def _PlaceAndRoutePcbWithPolicy(
                     Diagnostics=((
                         "PlacementAccessFabric",
                         SummarizePreRouteAccessFabric(Fabric),
-                    ),),
+                    ), (
+                        "ExactPhysicalFactorMaterializationReused",
+                        ReusedAccessFabricMaterialization is not None,
+                    ), (
+                        "MaterializationElapsedSeconds",
+                        round(monotonic() - MaterializationStartedAt, 6),
+                    ), (
+                        "AccessFabricElapsedSeconds",
+                        round(AccessFabricElapsedSeconds, 6),
+                    ), (
+                        "GuideDomainElapsedSeconds",
+                        round(GuideDomainElapsedSeconds, 6),
+                    )),
                     ResolvedObjective=Template.Witnesses[0].Objective
                     if Template.Witnesses else (),
                 )
@@ -13642,69 +14359,206 @@ def _PlaceAndRoutePcbWithPolicy(
                     Descriptor.TemplateId
                 ] = Result
                 return Result
-            RawTrackAssignmentResult = (
-                SolveRawTrackAssignmentPortfolioWithContext(
-                    RawTrackAssignmentPortfolio(
-                        Templates=tuple(RawPortfolioTemplates),
-                        MaximumAssignmentExpansions=(
-                            Policy.TrackAssignment
-                            .MaximumAssignmentExpansions
+            # Every declared geometry/layer world is a distinct feasibility
+            # contract.  Objective order ranks feasible witnesses inside the
+            # one native solve; it cannot prove that a resource-distinct
+            # member is dominated.  In particular, a cheaper one-layer world
+            # may conflict while a same-footprint two-layer world succeeds.
+            # Physical construction may be shared only after an exact domain
+            # identity match, never by topology, layer count, or objective.
+            SelectableRawPortfolioTemplates = tuple(sorted(
+                RawPortfolioTemplates,
+                key=lambda Value: (Value.Objective, Value.TemplateId),
+            ))
+            # Materialize only access-stub and route-guide factor domains,
+            # then invoke the native template selector once.  Detailed route
+            # trees are generated only for its selected physical world.
+            MaterializedMembers = tuple(
+                MaterializeRawTemplate(Descriptor)
+                for Descriptor in SelectableRawPortfolioTemplates
+            )
+            IncompleteMember = next((
+                Value for Value in MaterializedMembers
+                if not Value.Complete or Value.Domain is None
+            ), None)
+            if IncompleteMember is not None:
+                PreRouteInterfaceResult = PreRouteInterfaceSelection(
+                    ProblemFingerprint=BuildStableFingerprint((
+                        "pre-route-compact-incomplete-member-v1",
+                        tuple(Value.TemplateId for Value in MaterializedMembers),
+                    )),
+                    SelectionFingerprint="",
+                    SelectedTemplateIds=(),
+                    SelectedWitnessIds=(),
+                    Objective=(),
+                    ExpansionCount=0,
+                    Success=False,
+                    Complete=False,
+                    Unsatisfiable=False,
+                    IncompleteReason=(
+                        IncompleteMember.IncompleteReason
+                        or "incomplete-template-domain"
+                    ),
+                )
+            else:
+                def CompactMemberObjective(
+                    TemplateId: str,
+                ) -> tuple[int, int, int, int, int]:
+                    """Return the fixed 3D objective of one declared world.
+
+                    The access-factor values prove capacity, while this
+                    synthetic member value keeps geometric selection explicit
+                    and lexicographic in that same native solve.  No route
+                    material is generated here.
+                    """
+                    Template = TemplateById[TemplateId]
+                    Derived = Template.DerivedPlacement
+                    if Derived is None:
+                        raise RuntimeError(
+                            "compact member is missing its derived geometry"
+                        )
+                    Fabric, _Assignment = (
+                        PlacementAccessEvidenceByCandidateId[TemplateId]
+                    )
+                    FrozenEnvelope = getattr(
+                        Fabric,
+                        "FrozenRoutingEnvelope",
+                        None,
+                    )
+                    Height = (
+                        int(FrozenEnvelope.YBounds[1])
+                        - int(FrozenEnvelope.YBounds[0])
+                        + 1
+                        if FrozenEnvelope is not None
+                        else 2 * int(
+                            Derived.RoutingEnvelope.RoutingLayerCount
+                        ) + 2
+                    )
+                    Footprint = int(Derived.XzFootprint)
+                    FabricDescriptor = (
+                        PreRouteFabricDescriptorsByCandidateId[TemplateId]
+                    )
+                    CertifiedIncumbentRank = int(
+                        FabricDescriptor.TopologyKind
+                        != "fixed-access-band-v1"
+                    )
+                    return (
+                        CertifiedIncumbentRank,
+                        Footprint * Height,
+                        Footprint,
+                        max(int(Derived.Width), int(Derived.Depth)),
+                        int(Derived.RoutingEnvelope.RoutingLayerCount),
+                    )
+
+                MemberContracts = {
+                    Value.TemplateId: MemberContractForTemplate(
+                        Value.TemplateId
+                    )
+                    for Value in MaterializedMembers
+                }
+                RawTrackAssignmentResult = (
+                    SolveRawTrackAssignmentProblemWithContext(
+                        RawTrackAssignmentProblem(
+                            Templates=tuple(
+                                RawTrackAssignmentTemplate(
+                                    TemplateId=Value.TemplateId,
+                                    Objective=CompactMemberObjective(
+                                        Value.TemplateId
+                                    ),
+                                    Domain=(
+                                        AttachRawTrackAssignmentContractRequirements(
+                                            Value.Domain,
+                                            ContractRequirements=(
+                                                MemberContracts[
+                                                    Value.TemplateId
+                                                ]
+                                            ),
+                                        )
+                                    ),
+                                )
+                                for Value in MaterializedMembers
+                                if Value.Domain is not None
+                            ),
+                            MaximumAssignmentExpansions=(
+                                Policy.TrackAssignment
+                                .MaximumAssignmentExpansions
+                            ),
+                            NonExhaustiveTemplateDomain=True,
                         ),
-                        # This compact geometry portfolio is deliberately
-                        # finite but not exhaustive over every legal
-                        # placement.  Complete member cores therefore do
-                        # not license an UNSAT classification.
-                        NonExhaustiveTemplateDomain=True,
-                    ),
-                    MaterializeRawTemplate,
-                    Deadline=Deadline,
-                    WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
-                        "PreRouteInterfaceSelection",
-                        Diagnostics,
-                    ),
+                        Deadline=Deadline,
+                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                            "PreRouteInterfaceSelection",
+                            Diagnostics,
+                        ),
+                    )
                 )
-            )
-            SelectedTemplate = TemplateById.get(
-                RawTrackAssignmentResult.SelectedTemplateId
-            )
-            SelectedWitness = (
-                SelectedTemplate.Witnesses[0]
+                SelectedTemplateId = (
+                    RawTrackAssignmentResult.SelectedTemplateId
+                )
                 if (
-                    SelectedTemplate is not None
-                    and len(SelectedTemplate.Witnesses) == 1
+                    RawTrackAssignmentResult.Preparation is not None
+                    and SelectedTemplateId in MemberContracts
+                ):
+                    RawTrackAssignmentResult = replace(
+                        RawTrackAssignmentResult,
+                        Preparation=replace(
+                            RawTrackAssignmentResult.Preparation,
+                            SelectedConditionalTemplateKey=(
+                                SelectedTemplateId
+                            ),
+                            SelectedContractRequirements=(
+                                MemberContracts[SelectedTemplateId]
+                            ),
+                        ),
+                    )
+                SelectedContracts = dict(
+                    RawTrackAssignmentResult.Preparation
+                    .SelectedContractRequirements
+                    if RawTrackAssignmentResult.Preparation is not None
+                    else ()
                 )
-                else None
-            )
-            PreRouteInterfaceResult = PreRouteInterfaceSelection(
-                ProblemFingerprint=RawTrackAssignmentResult.ProblemFingerprint,
-                SelectionFingerprint=(
-                    RawTrackAssignmentResult.SelectionFingerprint
-                ),
-                SelectedTemplateIds=(
-                    (("__placement__", SelectedTemplate.TemplateId),)
-                    if RawTrackAssignmentResult.Success
-                    and SelectedTemplate is not None
-                    else ()
-                ),
-                SelectedWitnessIds=(
-                    (("__placement__", SelectedWitness.WitnessId),)
-                    if RawTrackAssignmentResult.Success
-                    and SelectedWitness is not None
-                    else ()
-                ),
-                Objective=RawTrackAssignmentResult.SelectedObjective,
-                ExpansionCount=RawTrackAssignmentResult.ExpansionCount,
-                Success=RawTrackAssignmentResult.Success,
-                Complete=RawTrackAssignmentResult.Complete,
-                Unsatisfiable=RawTrackAssignmentResult.Unsatisfiable,
-                IncompleteReason=(
-                    RawTrackAssignmentResult.IncompleteReason
-                ),
-                FirstConflictResourceIds=tuple(map(
-                    str,
-                    RawTrackAssignmentResult.FirstConflictResourceIndices,
-                )),
-            )
+                SelectedTemplate = TemplateById.get(
+                    SelectedContracts.get(
+                        "member",
+                        SelectedTemplateId,
+                    )
+                )
+                SelectedWitness = (
+                    SelectedTemplate.Witnesses[0]
+                    if (
+                        SelectedTemplate is not None
+                        and len(SelectedTemplate.Witnesses) == 1
+                    )
+                    else None
+                )
+                PreRouteInterfaceResult = PreRouteInterfaceSelection(
+                    ProblemFingerprint=RawTrackAssignmentResult.ProblemFingerprint,
+                    SelectionFingerprint=(
+                        RawTrackAssignmentResult.SelectionFingerprint
+                    ),
+                    SelectedTemplateIds=(
+                        (("__placement__", SelectedTemplate.TemplateId),)
+                        if RawTrackAssignmentResult.Success
+                        and SelectedTemplate is not None
+                        else ()
+                    ),
+                    SelectedWitnessIds=(
+                        (("__placement__", SelectedWitness.WitnessId),)
+                        if RawTrackAssignmentResult.Success
+                        and SelectedWitness is not None
+                        else ()
+                    ),
+                    Objective=RawTrackAssignmentResult.SelectedObjective,
+                    ExpansionCount=RawTrackAssignmentResult.ExpansionCount,
+                    Success=RawTrackAssignmentResult.Success,
+                    Complete=RawTrackAssignmentResult.Complete,
+                    Unsatisfiable=RawTrackAssignmentResult.Unsatisfiable,
+                    IncompleteReason=RawTrackAssignmentResult.IncompleteReason,
+                    FirstConflictResourceIds=tuple(map(
+                        str,
+                        RawTrackAssignmentResult.FirstConflictResourceIndices,
+                    )),
+                )
     else:
         PreRouteInterfaceResult = SolvePreRouteInterfaceProblem(
             PreRouteInterfaceProblem(
@@ -13767,6 +14621,14 @@ def _PlaceAndRoutePcbWithPolicy(
                         PreRouteFabricDescriptorsByCandidateId.items()
                     )
                 ],
+                "SelectablePreRouteTemplateIds": [
+                    Descriptor.TemplateId
+                    for Descriptor in (
+                        SelectableRawPortfolioTemplates
+                        if SinglePackedComponent and CandidateRecords
+                        else ()
+                    )
+                ],
             },
         ))
     SelectedPreRouteCandidate = SelectedPreRouteCandidates[0]
@@ -13797,11 +14659,11 @@ def _PlaceAndRoutePcbWithPolicy(
         else Policy
     )
     if SinglePackedComponent:
-        # The aggregate raw selector has already performed the only native
-        # capacity assignment over this selected candidate's complete portal
-        # domain.  Routing consumes that immutable preparation directly;
-        # invoking PrepareTrackAssignment here would silently run a second
-        # global proof after selection.
+        # The aggregate raw selector contains both the fixed access values
+        # and the ordinary authoritative portal/track values.  Its frozen
+        # preparation is therefore the sole capacity witness permitted to
+        # reach routing; preparing this placement again would be a forbidden
+        # second assignment solve.
         if (
             RawTrackAssignmentResult is None
             or RawTrackAssignmentResult.Preparation is None
@@ -13818,44 +14680,31 @@ def _PlaceAndRoutePcbWithPolicy(
             )
         )
         if SelectedTrackPreparation is None:
-            # Defensive compatibility for an external caller that supplied a
-            # complete component template without a prepared local witness.
-            # Normal multi-component flow always takes the preparation above,
-            # so this branch is not a same-placement retry.
-            try:
-                SelectedTrackPreparation = PrepareTrackAssignment(
-                    SelectedPreRouteCandidate.Placement,
-                    Resources=SelectedCandidateResources,
-                    Policy=SelectedPreparationPolicy,
-                    Deadline=Deadline,
-                )
-            except RoutingStageError as Error:
-                raise RoutingStageError(RoutingFailure(
-                    Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
-                    Stage="SelectedPreRouteTrackPreparation",
-                    AffectedNets=Error.Failure.AffectedNets,
-                    Resources=Error.Failure.Resources,
-                    Detail=(
-                        "the selected fixed local-access contract could not build "
-                        "one complete authoritative portal/track domain"
+            raise RoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                Stage="FrozenPreRouteFactorHandoff",
+                AffectedNets=(),
+                Resources=(),
+                Detail=(
+                    "the selected component member has no frozen pre-route "
+                    "track-assignment witness; reopening assignment after "
+                    "selection is forbidden"
+                ),
+                RepairActions=(),
+                Diagnostics={
+                    "PreRouteInterfaceSelection": (
+                        PreRouteInterfaceResult.ToDictionary()
                     ),
-                    RepairActions=(),
-                    Diagnostics={
-                        "PreRouteInterfaceSelection": (
-                            PreRouteInterfaceResult.ToDictionary()
-                        ),
-                        "SelectedCandidate": (
-                            SelectedPreRouteCandidate.ToDictionary()
-                        ),
-                        "AuthoritativePreparationFailure": (
-                            Error.Failure.ToDictionary()
-                        ),
-                        "PrePlacementTrackPreparations": (
-                            PrePlacementTrackPreparations
-                        ),
-                        "PlacementDomainComplete": False,
-                    },
-                )) from Error
+                    "SelectedCandidate": (
+                        SelectedPreRouteCandidate.ToDictionary()
+                    ),
+                    "PrePlacementTrackPreparations": (
+                        PrePlacementTrackPreparations
+                    ),
+                    "PlacementDomainComplete": False,
+                    "SecondAssignmentInvocation": False,
+                },
+            ))
     if (
         not SelectedTrackPreparation.Success
         or not SelectedTrackPreparation.Complete
@@ -13892,6 +14741,68 @@ def _PlaceAndRoutePcbWithPolicy(
                 "PlacementDomainComplete": False,
             },
         ))
+    if SinglePackedComponent:
+        SelectedFabric, _SelectedAccessAssignment = (
+            PlacementAccessEvidenceByCandidateId.get(
+                SelectedPreRouteCandidate.CandidateId,
+                (None, None),
+            )
+        )
+        if SelectedFabric is None:
+            raise RuntimeError(
+                "selected compact member is missing its access fabric"
+            )
+        try:
+            SelectedAccessAssignment = (
+                BuildPlacementAccessAssignmentFromStubFactor(
+                    SelectedFabric,
+                    SelectedTrackPreparation
+                    .SelectedContractClaimChoiceIds,
+                    ExpansionCount=(
+                        SelectedTrackPreparation.ExpansionCount
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as Error:
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                ),
+                Stage="FrozenPreRouteFactorHandoff",
+                Detail=(
+                    "the selected compact access factors could not be "
+                    "reconstructed as one exact placement assignment"
+                ),
+                RepairActions=(),
+                Diagnostics={
+                    "SelectedCandidate": (
+                        SelectedPreRouteCandidate.ToDictionary()
+                    ),
+                    "SelectedContractClaimChoiceIds": [
+                        list(Value)
+                        for Value in SelectedTrackPreparation
+                        .SelectedContractClaimChoiceIds
+                    ],
+                    "Error": str(Error),
+                },
+            )) from Error
+        SelectedPlacement = AttachPlacementAccessAssignment(
+            SelectedPreRouteCandidate.Placement,
+            SelectedAccessAssignment,
+        )
+        SelectedPreRouteCandidate = replace(
+            SelectedPreRouteCandidate,
+            Placement=SelectedPlacement,
+        )
+        CandidateById[SelectedPreRouteCandidate.CandidateId] = (
+            SelectedPreRouteCandidate
+        )
+        CandidateRecords[
+            CandidateIndexById[SelectedPreRouteCandidate.CandidateId]
+        ] = SelectedPreRouteCandidate
+        PlacementAccessEvidenceByCandidateId[
+            SelectedPreRouteCandidate.CandidateId
+        ] = (SelectedFabric, SelectedAccessAssignment)
     PrePlacementTrackPreparationWitnesses[
         SelectedPreRouteCandidate.CandidateId
     ] = SelectedTrackPreparation
@@ -23232,8 +24143,17 @@ def _PlaceAndRoutePcbWithPolicy(
             )
 
         try:
+            # The one-packed pre-route selector already materialized this
+            # exact placement, access fabric, and route-candidate domain.
+            # Rebuilding local routing here can produce an identity-equivalent
+            # placement with a fresh RoutingResources instance, which loses
+            # the frozen candidate objects selected by the native proof.
+            # Consume the selected object directly; this is a handoff, not a
+            # second placement materialization.
             CandidatePlacement = (
-                MaterializeSelectedJointPlacementLocalRouting(
+                CandidateRecord.Placement
+                if SinglePackedComponent
+                else MaterializeSelectedJointPlacementLocalRouting(
                     CandidateRecord,
                     CheckCandidateValidation,
                 )
@@ -23298,6 +24218,25 @@ def _PlaceAndRoutePcbWithPolicy(
                         FrozenTrackAssignmentPreparation
                     ),
                 )
+            if SinglePackedComponent:
+                _SelectedFabric, SelectedAccessAssignment = (
+                    PlacementAccessEvidenceByCandidateId.get(
+                        CandidateRecord.CandidateId,
+                        (None, None),
+                    )
+                )
+                if SelectedAccessAssignment is not None:
+                    CandidatePlacement = (
+                        AttachPlacementAccessAssignment(
+                            CandidatePlacement,
+                            SelectedAccessAssignment,
+                        )
+                    )
+                    CandidateRecord = replace(
+                        CandidateRecord,
+                        Placement=CandidatePlacement,
+                    )
+                    Placement = CandidatePlacement
             CapturePortableRawPortalGeometryCaches(
                 CandidateResources
             )
@@ -24507,6 +25446,34 @@ def _PlaceAndRoutePcbWithPolicy(
         "EnvelopeDomainSize": len(CandidateRecords),
         "CapacitySolveCount": 1,
         "RouteAttemptCount": 1,
+        "DeclaredMemberCount": len(
+            PreRouteFabricDescriptorsByCandidateId
+        ),
+        "CompactMaterializedMemberCount": len(
+            RawTrackAssignmentMaterializations
+        ),
+        "DetailedMaterializedMemberCount": int(
+            SinglePackedComponent
+        ),
+        "NativeTemplateSelectionCallCount": int(
+            RawTrackAssignmentResult is not None
+        ),
+        "DetailedRoutingPassCount": 1,
+        "FallbackOccurred": False,
+        "RetryOccurred": False,
+        "SecondAssignmentInvocationOccurred": False,
+        "SelectedContractRequirements": [
+            list(Value)
+            for Value in (
+                RawTrackAssignmentResult.Preparation
+                .SelectedContractRequirements
+                if (
+                    RawTrackAssignmentResult is not None
+                    and RawTrackAssignmentResult.Preparation is not None
+                )
+                else ()
+            )
+        ],
         "SelectedCandidateId": (
             SelectedCandidate.CandidateId
             if SelectedCandidate is not None

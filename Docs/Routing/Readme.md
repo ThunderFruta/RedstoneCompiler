@@ -5,7 +5,7 @@ Contains routing architecture, failure diagnostics, active operations, and histo
 Current verdict (2026-07-23): **NOT ACCEPTED**. The negotiated route-tree
 implementation is active, and deterministic policy selection is profile-driven
 instead of circuit-keyed. Strict acceptance remains FA/RCA4/RCA8 only; CLA4 is
-run only when `--compatibility-mode` is enabled.
+run only when `--include-cla4` is supplied.
 
 ## Active routing docs
 
@@ -41,7 +41,7 @@ run only when `--compatibility-mode` is enabled.
   canonical sequential strict matrix, immutable per-circuit wall ceilings,
   explicit publication reserve, incremental
   `router-acceptance-manifest-v2`, artifact hashes, deterministic
-  repeated-run comparison, and optional compatibility-mode checkpoints.
+  repeated-run comparison, and explicit optional CLA4 checkpoints.
 - [`Tests/test_router_acceptance_harness.py`](../../Tests/test_router_acceptance_harness.py)
   -- focused dry-run, sequencing, rejection-shape, determinism,
   publication-reserve, and immutable-ceiling coverage.
@@ -58,8 +58,8 @@ python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
 The physical form of that command, without `--dry-run`, must be run only after
 the lightweight gates pass.
 
-To run compatibility checks explicitly (including `CarryLookaheadAdder4` exact-proof
-evidence), add `--compatibility-mode`.
+To append the `CarryLookaheadAdder4` runs and exact-interface proof evidence,
+add `--include-cla4`.
 
 ## Historical design record
 

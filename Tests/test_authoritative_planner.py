@@ -158,6 +158,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     FilterPhysicalCandidatesToCurrentPortalDomain,
     ClassifyEmptyPhysicalCandidateDomains,
     ApplyPhysicalComponentAssemblyPortalDomains,
+    ApplyPlacementAccessAssignmentPortalDomains,
     ApplyPlacementAccessFabricPortalDomains,
     SelectGenericPortalTerminalPaths,
     GetPersistentPhysicalComponentPortCspState,
@@ -313,6 +314,7 @@ from Compiler.Routing.Models import (
     RoutingResources,
     RoutingStaticGeometry,
     PlacementAccessEscapeStub,
+    PlacementAccessAssignment,
     PlacementAccessFabric,
     PlacementAccessTerminalDomain,
 )
@@ -15236,6 +15238,28 @@ class AuthoritativePlannerTests(unittest.TestCase):
             if Portal.Signal == "Signal"
         ))
 
+        Assigned = ApplyPlacementAccessAssignmentPortalDomains(
+            GenericPortals,
+            Fabric,
+            PlacementAccessAssignment(
+                FabricFingerprint=Fabric.FabricFingerprint,
+                AssignmentFingerprint="selected-assignment",
+                SelectedStubIndices=(("Signal", Terminal, 0),),
+                CapacityResourceIds=(),
+                ExpansionCount=1,
+                Success=True,
+                Complete=True,
+            ),
+            Graph,
+            DefaultRedstoneRoutingTechnology,
+            0,
+            2,
+        )
+        self.assertEqual(
+            Assigned[("Signal", Terminal, 0)][0].PortalId,
+            First[("Signal", Terminal, 0)][0].PortalId,
+        )
+
     def testUnassignedPlacementAccessFabricDomainReachesTrackPreparation(
         self,
     ) -> None:
@@ -15525,6 +15549,11 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertTrue(dict(Domain.Diagnostics)[
             "ExcludedConfiguredRequestCounts"
         ])
+        # The cache is an optimization, not part of the frozen physical
+        # contract.  The selected world must deterministically regenerate
+        # and fingerprint its detailed candidates when no pre-existing cache
+        # record survives the compact solve.
+        Resources.FrozenRawTrackAssignmentCandidateCaches.clear()
         Routed = RoutePcbDesign(
             Placement,
             Resources=Resources,

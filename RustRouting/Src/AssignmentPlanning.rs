@@ -31,6 +31,8 @@ pub(crate) type AssignmentCandidateValue = (
     i32,
     i32,
     i32,
+    String,
+    String,
 );
 pub(crate) type BaseAssignmentValue = (String, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>);
 /// One immutable, complete routing-template assignment domain supplied by
@@ -102,6 +104,8 @@ fn BuildCandidateGroups(
             Length,
             BendCount,
             ViaCount,
+            TemplateKey,
+            OwnerSignal,
         ),
     ) in CandidateValues.into_iter().enumerate()
     {
@@ -147,6 +151,8 @@ fn BuildCandidateGroups(
         };
         Groups.entry(Signal).or_default().push(AssignmentCandidate {
             CandidateId,
+            TemplateKey,
+            OwnerSignal,
             Claims,
             MaterialCost,
             FootprintGrowth,
@@ -263,10 +269,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithInitialExpansionAndDeadline(
             "resource count must be positive",
         ));
     }
-    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(
-        1,
-        MAXIMUM_EXPANSIONS,
-    );
+    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS);
     if InitialExpansionCount >= EffectiveMaximumExpansionCount {
         return Ok(BudgetExceededAssignmentResult(InitialExpansionCount));
     }
@@ -379,10 +382,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
             "resource count must be positive",
         ));
     }
-    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(
-        1,
-        MAXIMUM_EXPANSIONS,
-    );
+    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS);
     if InitialExpansionCount >= EffectiveMaximumExpansionCount {
         return Ok(BudgetExceededAssignmentResult(InitialExpansionCount));
     }
@@ -402,9 +402,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
         ) {
             Ok(Value) => Value,
             Err(ClaimMaskBuildError::DeadlineExceeded) => {
-                return Ok(DeadlineExceededAssignmentResult(
-                    InitialExpansionCount,
-                ));
+                return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
             }
             Err(ClaimMaskBuildError::IndexOutOfRange) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -414,9 +412,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
         };
         if let Some(Existing) = BaseBySignal.get_mut(&Signal) {
             if !Existing.UnionWithDeadline(&Claims, &Deadline) {
-                return Ok(DeadlineExceededAssignmentResult(
-                    InitialExpansionCount,
-                ));
+                return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
             }
         } else {
             BaseBySignal.insert(Signal, Claims);
@@ -428,9 +424,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
     let mut BaseSignals = Vec::with_capacity(BaseBySignal.len());
     for (Index, Signal) in BaseBySignal.keys().enumerate() {
         if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
-            return Ok(DeadlineExceededAssignmentResult(
-                InitialExpansionCount,
-            ));
+            return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
         }
         BaseSignals.push(Signal.clone());
     }
@@ -446,17 +440,13 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
             let Conflicts =
                 match Claims.ConflictsWithDeadline(&BaseBySignal[OtherSignal], &Deadline) {
                     Some(Value) => Value,
-                    None => return Ok(DeadlineExceededAssignmentResult(
-                        InitialExpansionCount,
-                    )),
+                    None => return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount)),
                 };
             if Conflicts {
                 let Some(ConflictResourceIndices) =
                     Claims.ConflictIndicesWithDeadline(&BaseBySignal[OtherSignal], &Deadline)
                 else {
-                    return Ok(DeadlineExceededAssignmentResult(
-                        InitialExpansionCount,
-                    ));
+                    return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
                 };
                 return Ok(RoutingAssignmentResult {
                     Success: false,
@@ -538,6 +528,229 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
     })
 }
 
+/// Solve one fixed set of mutually exclusive physical assignment domains.
+///
+/// Each member owns a local resource index, so their masks must never be
+/// flattened into one capacity problem.  The *choice* between them is still
+/// one bounded decision: this function orders the immutable objectives,
+/// spends one shared expansion counter and deadline, and returns the first
+/// successful objective group.  A complete core in one member permits the
+/// next predeclared member; it is not a regenerated route attempt.
+pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
+    mut Domains: Vec<TemplateAssignmentDomainValue>,
+    MaximumExpansionCount: usize,
+    Deadline: RuntimeDeadline,
+    NonExhaustiveTemplateDomain: bool,
+) -> PyResult<TemplateRoutingAssignmentResult> {
+    Domains.sort_by(|First, Second| First.1.cmp(&Second.1).then_with(|| First.0.cmp(&Second.0)));
+    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS);
+    let mut ExpansionCount = 0usize;
+    let mut AttemptedTemplateIds = Vec::new();
+    let mut FirstConflictSignals = Vec::new();
+    let mut FirstConflictResourceIndices = Vec::new();
+    let mut FirstPairwiseIncompatibleSignals = Vec::new();
+    let mut AttemptPairwiseIncompatibleSignals = Vec::new();
+    let mut Index = 0usize;
+
+    while Index < Domains.len() {
+        if Deadline.Check() {
+            return Ok(TemplateRoutingAssignmentResult {
+                Status: "Incomplete".to_string(),
+                Success: false,
+                Complete: false,
+                Unsatisfiable: false,
+                IncompleteReason: "assignment-deadline".to_string(),
+                SelectedTemplateId: None,
+                SelectedTemplateObjective: Vec::new(),
+                SelectedCandidateIds: Vec::new(),
+                ExpansionCount,
+                BudgetExhausted: false,
+                DeadlineExceeded: true,
+                CompletedWork: ExpansionCount,
+                FailureNet: None,
+                ConflictSignals: FirstConflictSignals,
+                ConflictResourceIndices: FirstConflictResourceIndices,
+                PairwiseIncompatibleSignals: FirstPairwiseIncompatibleSignals,
+                PairwiseCompatibilityComplete: false,
+                AttemptedTemplateIds,
+                AttemptPairwiseIncompatibleSignals,
+                NonExhaustiveTemplateDomain,
+            });
+        }
+        let Objective = Domains[Index].1.clone();
+        let mut SuccessfulMembers: Vec<(String, Vec<i64>, RoutingAssignmentResult)> = Vec::new();
+        while Index < Domains.len() && Domains[Index].1 == Objective {
+            let (
+                TemplateId,
+                TemplateObjective,
+                ResourceCount,
+                RequiredSignals,
+                CandidateValues,
+                BaseValues,
+            ) = Domains[Index].clone();
+            AttemptedTemplateIds.push(TemplateId.clone());
+            if ResourceCount == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "template assignment resource count must be positive",
+                ));
+            }
+            let CandidateSignals: BTreeSet<String> = CandidateValues
+                .iter()
+                .map(|Value| Value.0.clone())
+                .collect();
+            let MissingSignals: Vec<String> = RequiredSignals
+                .iter()
+                .filter(|Signal| !CandidateSignals.contains(*Signal))
+                .cloned()
+                .collect();
+            let Result = if let Some(FailureNet) = MissingSignals.first() {
+                RoutingAssignmentResult {
+                    Success: false,
+                    SelectedCandidateIds: Vec::new(),
+                    ExpansionCount,
+                    BudgetExhausted: false,
+                    DeadlineExceeded: false,
+                    CompletedWork: ExpansionCount,
+                    FailureNet: Some(FailureNet.clone()),
+                    ConflictSignals: MissingSignals,
+                    ConflictResourceIndices: Vec::new(),
+                    PairwiseIncompatibleSignals: Vec::new(),
+                    PairwiseCompatibilityComplete: true,
+                }
+            } else if BaseValues.is_empty() {
+                PlanAuthoritativeRoutesWithInitialExpansionAndDeadline(
+                    CandidateValues,
+                    ResourceCount,
+                    ExpansionCount,
+                    EffectiveMaximumExpansionCount,
+                    Deadline.clone(),
+                )?
+            } else {
+                PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
+                    CandidateValues,
+                    BaseValues,
+                    ResourceCount,
+                    ExpansionCount,
+                    EffectiveMaximumExpansionCount,
+                    Deadline.clone(),
+                )?
+            };
+            ExpansionCount = ExpansionCount
+                .max(Result.ExpansionCount)
+                .min(EffectiveMaximumExpansionCount);
+            if FirstConflictSignals.is_empty() && !Result.ConflictSignals.is_empty() {
+                FirstConflictSignals = Result.ConflictSignals.clone();
+                FirstConflictResourceIndices = Result.ConflictResourceIndices.clone();
+            }
+            if FirstPairwiseIncompatibleSignals.is_empty()
+                && !Result.PairwiseIncompatibleSignals.is_empty()
+            {
+                FirstPairwiseIncompatibleSignals = Result.PairwiseIncompatibleSignals.clone();
+            }
+            AttemptPairwiseIncompatibleSignals.push((
+                TemplateId.clone(),
+                Result.PairwiseIncompatibleSignals.clone(),
+            ));
+            if Result.DeadlineExceeded || Result.BudgetExhausted {
+                return Ok(TemplateRoutingAssignmentResult {
+                    Status: "Incomplete".to_string(),
+                    Success: false,
+                    Complete: false,
+                    Unsatisfiable: false,
+                    IncompleteReason: if Result.DeadlineExceeded {
+                        "assignment-deadline".to_string()
+                    } else {
+                        "assignment-work-cap".to_string()
+                    },
+                    SelectedTemplateId: None,
+                    SelectedTemplateObjective: Vec::new(),
+                    SelectedCandidateIds: Vec::new(),
+                    ExpansionCount,
+                    BudgetExhausted: Result.BudgetExhausted,
+                    DeadlineExceeded: Result.DeadlineExceeded,
+                    CompletedWork: ExpansionCount,
+                    FailureNet: Result.FailureNet,
+                    ConflictSignals: FirstConflictSignals,
+                    ConflictResourceIndices: FirstConflictResourceIndices,
+                    PairwiseIncompatibleSignals: if Result.PairwiseIncompatibleSignals.is_empty() {
+                        FirstPairwiseIncompatibleSignals
+                    } else {
+                        Result.PairwiseIncompatibleSignals
+                    },
+                    PairwiseCompatibilityComplete: Result.PairwiseCompatibilityComplete,
+                    AttemptedTemplateIds,
+                    AttemptPairwiseIncompatibleSignals,
+                    NonExhaustiveTemplateDomain,
+                });
+            }
+            if Result.Success {
+                SuccessfulMembers.push((TemplateId, TemplateObjective, Result));
+            }
+            Index += 1;
+        }
+        if let Some((TemplateId, TemplateObjective, Result)) = SuccessfulMembers
+            .into_iter()
+            .min_by(|First, Second| First.0.cmp(&Second.0))
+        {
+            return Ok(TemplateRoutingAssignmentResult {
+                Status: "Feasible".to_string(),
+                Success: true,
+                Complete: true,
+                Unsatisfiable: false,
+                IncompleteReason: String::new(),
+                SelectedTemplateId: Some(TemplateId),
+                SelectedTemplateObjective: TemplateObjective,
+                SelectedCandidateIds: Result.SelectedCandidateIds,
+                ExpansionCount,
+                BudgetExhausted: false,
+                DeadlineExceeded: false,
+                CompletedWork: ExpansionCount,
+                FailureNet: None,
+                ConflictSignals: Vec::new(),
+                ConflictResourceIndices: Vec::new(),
+                PairwiseIncompatibleSignals: Vec::new(),
+                PairwiseCompatibilityComplete: true,
+                AttemptedTemplateIds,
+                AttemptPairwiseIncompatibleSignals,
+                NonExhaustiveTemplateDomain,
+            });
+        }
+    }
+
+    let Unsatisfiable = !NonExhaustiveTemplateDomain;
+    Ok(TemplateRoutingAssignmentResult {
+        Status: if Unsatisfiable {
+            "Unsatisfiable"
+        } else {
+            "Incomplete"
+        }
+        .to_string(),
+        Success: false,
+        Complete: Unsatisfiable,
+        Unsatisfiable,
+        IncompleteReason: if Unsatisfiable {
+            "complete-capacity-core".to_string()
+        } else {
+            "non-exhaustive-template-domain".to_string()
+        },
+        SelectedTemplateId: None,
+        SelectedTemplateObjective: Vec::new(),
+        SelectedCandidateIds: Vec::new(),
+        ExpansionCount,
+        BudgetExhausted: false,
+        DeadlineExceeded: false,
+        CompletedWork: ExpansionCount,
+        FailureNet: None,
+        ConflictSignals: FirstConflictSignals,
+        ConflictResourceIndices: FirstConflictResourceIndices,
+        PairwiseIncompatibleSignals: FirstPairwiseIncompatibleSignals,
+        PairwiseCompatibilityComplete: true,
+        AttemptedTemplateIds,
+        AttemptPairwiseIncompatibleSignals,
+        NonExhaustiveTemplateDomain,
+    })
+}
+
 #[cfg(test)]
 mod Tests {
     use super::*;
@@ -555,6 +768,8 @@ mod Tests {
             1,
             0,
             0,
+            String::new(),
+            "Signal".to_string(),
         )
     }
 
@@ -585,6 +800,111 @@ mod Tests {
     }
 
     #[test]
+    fn TemplateDomainsShareOneNativeSelectionAndChooseTheFirstWitness() {
+        let Result = SolveTemplateAssignmentDomainsWithDeadline(
+            vec![
+                (
+                    "compact".to_string(),
+                    vec![1],
+                    4,
+                    vec!["Signal".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                (
+                    "access-separated".to_string(),
+                    vec![1],
+                    4,
+                    vec!["Signal".to_string()],
+                    vec![CandidateValue()],
+                    Vec::new(),
+                ),
+            ],
+            64,
+            RuntimeDeadline::FromMilliseconds(Some(1_000)).unwrap(),
+            true,
+        )
+        .expect("template selection should produce a typed result");
+
+        assert!(Result.Success);
+        assert!(Result.Complete);
+        assert_eq!(
+            Result.SelectedTemplateId,
+            Some("access-separated".to_string())
+        );
+        assert_eq!(
+            Result.AttemptedTemplateIds,
+            vec!["access-separated".to_string(), "compact".to_string()]
+        );
+        assert_eq!(Result.SelectedCandidateIds.len(), 1);
+    }
+
+    #[test]
+    fn NonExhaustiveTemplateCoresStayIncomplete() {
+        let Result = SolveTemplateAssignmentDomainsWithDeadline(
+            vec![(
+                "compact".to_string(),
+                vec![1],
+                4,
+                vec!["Signal".to_string()],
+                Vec::new(),
+                Vec::new(),
+            )],
+            64,
+            RuntimeDeadline::FromMilliseconds(Some(1_000)).unwrap(),
+            true,
+        )
+        .expect("non-exhaustive failure should be typed");
+
+        assert!(!Result.Success);
+        assert!(!Result.Complete);
+        assert!(!Result.Unsatisfiable);
+        assert_eq!(Result.Status, "Incomplete");
+        assert_eq!(Result.IncompleteReason, "non-exhaustive-template-domain");
+    }
+
+    #[test]
+    fn ConditionalTemplateKeysRequireOneSharedInterfaceChoice() {
+        let Candidate = |Signal: &str, CandidateId: &str, TemplateKey: &str| {
+            (
+                Signal.to_string(),
+                CandidateId.to_string(),
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                1,
+                1,
+                1,
+                0,
+                0,
+                TemplateKey.to_string(),
+                Signal.to_string(),
+            )
+        };
+        let Result = PlanAuthoritativeRoutesBoundedNative(
+            vec![
+                Candidate("A", "A-compact", "compact"),
+                Candidate("A", "A-separated", "separated"),
+                Candidate("B", "B-separated", "separated"),
+            ],
+            4,
+            64,
+            1_000,
+        )
+        .expect("conditional template selection should return a result");
+
+        assert!(Result.Success);
+        assert_eq!(
+            Result.SelectedCandidateIds,
+            vec![
+                ("A".to_string(), "A-separated".to_string()),
+                ("B".to_string(), "B-separated".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn HigherOrderFailureReportsSelectedStackAndEmptyDomainPairDeterministically() {
         let Candidate = |Signal: &str,
                          CandidateId: &str,
@@ -603,6 +923,8 @@ mod Tests {
                 1,
                 0,
                 0,
+                String::new(),
+                Signal.to_string(),
             )
         };
         // Every signal pair has at least one compatible combination, but no
@@ -663,6 +985,8 @@ mod Tests {
                 1,
                 0,
                 0,
+                String::new(),
+                "A".to_string(),
             ),
             (
                 "A".to_string(),
@@ -676,6 +1000,8 @@ mod Tests {
                 1,
                 0,
                 0,
+                String::new(),
+                "A".to_string(),
             ),
             (
                 "B".to_string(),
@@ -689,6 +1015,8 @@ mod Tests {
                 1,
                 0,
                 0,
+                String::new(),
+                "B".to_string(),
             ),
             (
                 "B".to_string(),
@@ -702,6 +1030,8 @@ mod Tests {
                 1,
                 0,
                 0,
+                String::new(),
+                "B".to_string(),
             ),
         ];
         let Result = PlanAuthoritativeRoutesBoundedNative(CandidateValues, 8, 128, 1_000)
@@ -709,6 +1039,49 @@ mod Tests {
 
         assert!(Result.Success);
         assert!(Result.ConflictSignals.is_empty());
+    }
+
+    #[test]
+    fn SyntheticFactorsWithOnePhysicalOwnerMayShareClaims() {
+        let Candidate = |Signal: &str, CandidateId: &str| -> AssignmentCandidateValue {
+            (
+                Signal.to_string(),
+                CandidateId.to_string(),
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                vec![1],
+                1,
+                1,
+                1,
+                0,
+                0,
+                String::new(),
+                "LogicalSignal".to_string(),
+            )
+        };
+        let Result = PlanAuthoritativeRoutesBoundedNative(
+            vec![
+                Candidate("LogicalSignal", "guide"),
+                Candidate("__access_terminal__:LogicalSignal:root", "stub"),
+            ],
+            2,
+            16,
+            1_000,
+        )
+        .expect("same-owner factors should produce one coherent witness");
+
+        assert!(Result.Success);
+        assert_eq!(
+            Result.SelectedCandidateIds,
+            vec![
+                ("LogicalSignal".to_string(), "guide".to_string(),),
+                (
+                    "__access_terminal__:LogicalSignal:root".to_string(),
+                    "stub".to_string(),
+                ),
+            ],
+        );
     }
 
     #[test]

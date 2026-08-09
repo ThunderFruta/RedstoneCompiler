@@ -33,7 +33,7 @@ from Scripts.RunRouterAcceptance import (
     BuildSubprocessTimeoutSeconds,
     BuildTruthTableSemanticEvidence,
     CalculateRuntimeStatistics,
-    CompatibilityCaseNames,
+    ExtendedCaseNames,
     CandidatePolicyVersion,
     CanonicalArithmeticDigests,
     CompareCompatibility,
@@ -318,7 +318,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertEqual(Result["Outcome"], "exact-proof")
         self.assertEqual(
             Result["ProofFingerprint"],
-            "3f11c5e51405355b",
+            "674e1555d5ec3935",
         )
         self.assertFalse(Result["FallbackOrThrashingObserved"])
 
@@ -389,7 +389,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertEqual(Result["Outcome"], "exact-proof")
         self.assertEqual(
             Result["ProofFingerprint"],
-            "3f11c5e51405355b",
+            "674e1555d5ec3935",
         )
         self.assertEqual(Result["Failures"], [])
 
@@ -439,7 +439,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         BaselineMode: str | None = None,
         BaselinePath: Path | None = None,
         ExpectedPolicyVersion: str | None = None,
-        CompatibilityMode: bool = False,
+        IncludeCla4: bool = False,
     ) -> AcceptanceConfiguration:
         if ExpectedPolicyVersion is None:
             ExpectedPolicyVersion = (
@@ -461,7 +461,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             BaselineMode=BaselineMode,
             BaselinePath=BaselinePath,
             ExpectedPolicyVersion=ExpectedPolicyVersion,
-            CompatibilityMode=CompatibilityMode,
+            IncludeCla4=IncludeCla4,
         )
 
     def SyntheticRunner(
@@ -557,6 +557,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 Root / "first-candidate",
                 BaselineMode="compare",
                 BaselinePath=BaselinePath,
+                IncludeCla4=True,
             ),
             CommandRunner=self.SyntheticRunner(
                 PolicyVersion=CandidatePolicyVersion,
@@ -685,7 +686,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
             self.assertTrue(Configuration.ManifestPath.is_file())
 
-    def testDryRunWithCompatibilityModeIncludesCompatibilityCase(self) -> None:
+    def testDryRunWithIncludeCla4IncludesExtendedCase(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             Calls = []
@@ -698,7 +699,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 self.Configuration(
                     Root,
                     DryRun=True,
-                    CompatibilityMode=True,
+                    IncludeCla4=True,
                 ),
                 CommandRunner=FailIfCalled,
                 SourceStateProvider=lambda _Root: {
@@ -772,6 +773,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(len(Calls), 11)
             ExpectedTimeouts = [
                 Case.RuntimeCeilingSeconds
+                + SubprocessFinalizationGraceSeconds
                 for Case in AcceptanceCases
                 if Case.Name in RegressionCaseNames
                 for _RunIndex in range(Case.RequiredRuns)
@@ -2597,7 +2599,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
             )
             self.assertTrue(FirstManifest["Accepted"])
-            self.assertEqual(len(FirstCalls), 14)
+            self.assertEqual(len(FirstCalls), 12)
             ManifestBytes = Configuration.ManifestPath.read_bytes()
             FirstRunArtifact = next(
                 Path(Run["Evaluation"]["Artifacts"]["Schematic"]["Path"])
@@ -2714,7 +2716,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     CompatibilityRuns = [
                         Run
                         for Run in Manifest["Runs"]
-                        if Run["Circuit"] in CompatibilityCaseNames
+                        if Run["Circuit"] in ExtendedCaseNames
                     ]
                     self.assertTrue(all(
                         Run["Status"] == "SKIPPED"
@@ -2742,6 +2744,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 BaselineMode="compare",
                 BaselinePath=BaselinePath,
                 ExpectedPolicyVersion=CandidatePolicyVersion,
+                IncludeCla4=True,
             )
             BoundaryManifest = RunAcceptance(
                 BoundaryConfiguration,
@@ -2831,6 +2834,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 BaselineMode="compare",
                 BaselinePath=BaselinePath,
                 ExpectedPolicyVersion=CandidatePolicyVersion,
+                IncludeCla4=True,
             )
             AboveManifest = RunAcceptance(
                 AboveConfiguration,
@@ -3044,6 +3048,20 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 RoutingThreads=8,
                 BaselineMode="capture",
                 BaselinePath=Path("/baseline.json"),
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "--include-cla4 cannot be combined with baseline capture",
+        ):
+            AcceptanceConfiguration(
+                RepositoryRoot=Path("/repo"),
+                OutputRoot=Path("/output"),
+                DateLabel="2026-07-25",
+                PythonExecutable=Path("/python"),
+                RoutingThreads=RequiredRegressionRoutingThreads,
+                BaselineMode="capture",
+                BaselinePath=Path("/baseline.json"),
+                IncludeCla4=True,
             )
 
     def testDefaultPythonExecutablePreservesVenvLauncherPath(self) -> None:
@@ -3467,6 +3485,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     Root / "candidate",
                     BaselineMode="compare",
                     BaselinePath=BaselinePath,
+                    IncludeCla4=True,
                 ),
                 CommandRunner=self.SyntheticRunner(
                     PolicyVersion=CandidatePolicyVersion,
@@ -3496,7 +3515,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 Comparison["CompatibilityCandidateBaseline"]["Promotable"]
             )
             self.assertIn(
-                "source/native/policy provenance changed during compatibility",
+                "source/native/policy provenance changed during extended",
                 Comparison["Failure"],
             )
             self.assertEqual(BaselinePath.read_bytes(), BaselineBytes)
@@ -3519,6 +3538,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     Root / "candidate",
                     BaselineMode="compare",
                     BaselinePath=BaselinePath,
+                    IncludeCla4=True,
                 ),
                 CommandRunner=self.SyntheticRunner(
                     PolicyVersion=CandidatePolicyVersion,
@@ -3594,6 +3614,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     Root / "candidate",
                     BaselineMode="compare",
                     BaselinePath=BaselinePath,
+                    IncludeCla4=True,
                 ),
                 CommandRunner=self.SyntheticRunner(
                     PolicyVersion=CandidatePolicyVersion,
@@ -3642,6 +3663,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     Root / "candidate",
                     BaselineMode="compare",
                     BaselinePath=BaselinePath,
+                    IncludeCla4=True,
                 ),
                 CommandRunner=self.SyntheticRunner(
                     PolicyVersion=CandidatePolicyVersion,
@@ -3693,6 +3715,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     Root / "candidate",
                     BaselineMode="compare",
                     BaselinePath=BaselinePath,
+                    IncludeCla4=True,
                 ),
                 CommandRunner=self.SyntheticRunner(
                     PolicyVersion=CandidatePolicyVersion,
@@ -3756,6 +3779,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     Root / "second-candidate",
                     BaselineMode="compare",
                     BaselinePath=BaselinePath,
+                    IncludeCla4=True,
                 ),
                 CommandRunner=self.SyntheticRunner(
                     PolicyVersion=CandidatePolicyVersion,
@@ -3845,6 +3869,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                             Root / f"candidate-{Name}",
                             BaselineMode="compare",
                             BaselinePath=BaselinePath,
+                            IncludeCla4=True,
                         ),
                         CommandRunner=self.SyntheticRunner(
                             PolicyVersion=CandidatePolicyVersion,

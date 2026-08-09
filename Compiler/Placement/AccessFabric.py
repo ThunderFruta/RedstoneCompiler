@@ -8,12 +8,14 @@ from dataclasses import dataclass, is_dataclass, replace
 from hashlib import sha256
 from heapq import heappop, heappush
 from math import ceil
+from time import monotonic
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Iterable
 
 from ..Routing.Actions.Geometry import BuildRoutingResources
 from ..Routing.ChannelPlanner import BuildNetRoutingProfiles
 from ..Routing.Models import (
+    FrozenPerFaceRoutingEnvelope,
     PlacementAccessAssignment,
     PlacementAccessEscapeStub,
     PlacementAccessFabric,
@@ -29,6 +31,18 @@ from ..Routing.Technology import (
     RedstoneRoutingTechnology,
 )
 from .Rotation import RotatedCellSize
+
+try:
+    from ..RustRouting import (
+        BuildDerivedEscapeStatePathsBounded as _BuildDerivedEscapeStatePathsBounded,
+    )
+except ImportError:
+    try:
+        from RedstoneCompiler.RustRouting import (
+            BuildDerivedEscapeStatePathsBounded as _BuildDerivedEscapeStatePathsBounded,
+        )
+    except Exception:
+        _BuildDerivedEscapeStatePathsBounded = None
 
 
 _PerimeterFaceDirections: dict[str, Position3] = {
@@ -597,11 +611,13 @@ def _BuildDerivedPerimeterRingBounds(
         tuple[str, Position3],
         str,
     ] | None = None,
+    PerimeterFaceTrackCounts: tuple[tuple[str, int], ...] | None = None,
 ) -> tuple[
     tuple[tuple[int, int, int, int], ...],
     tuple[int, int, int, int],
     tuple[str, ...],
     dict[tuple[str, Position3], str],
+    tuple[tuple[str, int], ...],
 ]:
     """Derive asymmetric ring planes from frozen slots and physical claims.
 
@@ -759,21 +775,76 @@ def _BuildDerivedPerimeterRingBounds(
         ExtendOutward(Face, int(Landing[NormalIndex]))
 
     TrackPitch = int(Technology.TrackPitch)
-    RingBounds = tuple(
-        (
-            InnermostCoordinate["west"] - TrackPitch * (TrackIndex - 1),
-            InnermostCoordinate["east"] + TrackPitch * (TrackIndex - 1),
-            InnermostCoordinate["north"] - TrackPitch * (TrackIndex - 1),
-            InnermostCoordinate["south"] + TrackPitch * (TrackIndex - 1),
-        )
-        for TrackIndex in range(1, AccessRingTrackCount + 1)
-    )
     ActiveFaces = tuple(
         Face for Face in _PerimeterFaceDirections
         if Face in {
             *ReservedFaces,
             *TerminalFaceByIdentity.values(),
         }
+    )
+    FaceTrackByName = {
+        str(Face): int(TrackCount)
+        for Face, TrackCount in (
+            PerimeterFaceTrackCounts
+            if PerimeterFaceTrackCounts is not None
+            else (
+                (Face, AccessRingTrackCount)
+                if Face in ActiveFaces
+                else (Face, 0)
+                for Face in _PerimeterFaceDirections
+            )
+        )
+    }
+    if len(FaceTrackByName) != 4:
+        raise ValueError("derived perimeter face tracks are not canonical")
+    if any(
+        Face not in _PerimeterFaceDirections
+        for Face in FaceTrackByName
+    ):
+        raise ValueError("derived perimeter face tracks are invalid")
+    if any(
+        Count < 0 or int(Count) != Count
+        for Count in FaceTrackByName.values()
+    ):
+        raise ValueError("derived perimeter face tracks are invalid")
+    if any(Count > AccessRingTrackCount for Count in FaceTrackByName.values()):
+        raise ValueError("derived perimeter face track count exceeds ring tracks")
+    if any(
+        (Face in ActiveFaces and FaceTrackByName[Face] < 1)
+        for Face in _PerimeterFaceDirections
+    ):
+        raise ValueError("derived perimeter face tracks are invalid")
+    ResolvedFaceTrackCounts = tuple(
+        (Face, FaceTrackByName[Face])
+        for Face in _PerimeterFaceDirections
+    )
+    MaximumTrackCount = max(Track for _, Track in ResolvedFaceTrackCounts)
+    if MaximumTrackCount < 1:
+        raise ValueError("derived perimeter ring requires a track")
+    RingBounds = tuple(
+        (
+            InnermostCoordinate["west"] - TrackPitch * (
+                min(TrackIndex, int(FaceTrackByName["west"])) - 1
+                if FaceTrackByName["west"] > 0
+                else 0
+            ),
+            InnermostCoordinate["east"] + TrackPitch * (
+                min(TrackIndex, int(FaceTrackByName["east"])) - 1
+                if FaceTrackByName["east"] > 0
+                else 0
+            ),
+            InnermostCoordinate["north"] - TrackPitch * (
+                min(TrackIndex, int(FaceTrackByName["north"])) - 1
+                if FaceTrackByName["north"] > 0
+                else 0
+            ),
+            InnermostCoordinate["south"] + TrackPitch * (
+                min(TrackIndex, int(FaceTrackByName["south"])) - 1
+                if FaceTrackByName["south"] > 0
+                else 0
+            ),
+        )
+        for TrackIndex in range(1, MaximumTrackCount + 1)
     )
     return (
         RingBounds,
@@ -784,6 +855,7 @@ def _BuildDerivedPerimeterRingBounds(
         ),
         ActiveFaces,
         SlotFaceByTerminal,
+        ResolvedFaceTrackCounts,
     )
 
 
@@ -869,6 +941,7 @@ class DerivedPerimeterFabricShell:
     RingBounds: tuple[tuple[int, int, int, int], ...]
     Bounds: tuple[int, int, int, int]
     ActiveFaces: tuple[str, ...]
+    PerimeterFaceTrackCounts: tuple[tuple[str, int], ...]
     FabricLayers: tuple[int, ...]
     FabricYs: tuple[int, ...]
 
@@ -893,6 +966,51 @@ class DerivedPerimeterFabricShell:
             Face for Face in _PerimeterFaceDirections if Face in self.ActiveFaces
         ):
             raise ValueError("derived perimeter shell faces are not canonical")
+        PerimeterFaceTrackCountByName = {
+            str(Face): int(Count)
+            for Face, Count in self.PerimeterFaceTrackCounts
+        }
+        if (
+            len(PerimeterFaceTrackCountByName) != len(_PerimeterFaceDirections)
+            or tuple(sorted(PerimeterFaceTrackCountByName)) != (
+                "east",
+                "north",
+                "south",
+                "west",
+            )
+        ):
+            raise ValueError(
+                "derived perimeter shell face-track counts are invalid"
+            )
+        if any(
+            Count < 0 or int(Count) != Count
+            for Count in PerimeterFaceTrackCountByName.values()
+        ):
+            raise ValueError(
+                "derived perimeter shell face-track counts are invalid"
+            )
+        if any(
+            Count > self.AccessRingTrackCount
+            for Count in PerimeterFaceTrackCountByName.values()
+        ):
+            raise ValueError(
+                "derived perimeter shell face-track counts are invalid"
+            )
+        if any(
+            (Face in self.ActiveFaces and Count < 1)
+            or (Face not in self.ActiveFaces and Count != 0)
+            for Face, Count in PerimeterFaceTrackCountByName.items()
+        ):
+            raise ValueError(
+                "derived perimeter shell face-track counts are invalid"
+            )
+        if self.PerimeterFaceTrackCounts != tuple(
+            (Face, PerimeterFaceTrackCountByName[Face])
+            for Face in _PerimeterFaceDirections
+        ):
+            raise ValueError(
+                "derived perimeter shell face-track counts are invalid"
+            )
         if self.SlotFaceItems != tuple(sorted(self.SlotFaceItems)):
             raise ValueError("derived perimeter shell slot faces are not canonical")
         if self.PerimeterDrivenRootFaceItems != tuple(
@@ -1043,6 +1161,7 @@ def _BuildDerivedPerimeterShellInputFingerprint(
     AccessLength: int,
     BoundarySignals: frozenset[str] | None,
     Assignment: Any,
+    PerimeterFaceTrackCounts: tuple[tuple[str, int], ...] | None = None,
 ) -> str:
     """Fingerprint every fixed input consumed before fabric traversal."""
     return sha256(repr((
@@ -1053,6 +1172,9 @@ def _BuildDerivedPerimeterShellInputFingerprint(
         int(AccessRingTrackCount),
         int(AccessLength),
         tuple(sorted(BoundarySignals)) if BoundarySignals is not None else None,
+        tuple(PerimeterFaceTrackCounts)
+        if PerimeterFaceTrackCounts is not None
+        else None,
         str(getattr(Technology, "TechnologyVersion", "")),
         repr(Technology),
     )).encode("utf-8")).hexdigest()[:16]
@@ -1068,6 +1190,7 @@ def BuildDerivedPerimeterFabricShell(
     AccessRingTrackCount: int,
     AccessLength: int | None = None,
     BoundarySignals: frozenset[str] | None = None,
+    PerimeterFaceTrackCounts: tuple[tuple[str, int], ...] | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> DerivedPerimeterFabricShell:
     """Build one immutable pre-fabric perimeter geometry shell.
@@ -1174,11 +1297,13 @@ def BuildDerivedPerimeterFabricShell(
         Bounds,
         ActiveFaces,
         SlotFaceByTerminal,
+        ResolvedPerimeterFaceTrackCounts,
     ) = _BuildDerivedPerimeterRingBounds(
         Assignment,
         Resources=Resources,
         Technology=Technology,
         AccessRingTrackCount=AccessRingTrackCount,
+        PerimeterFaceTrackCounts=PerimeterFaceTrackCounts,
         TerminalPathByIdentity=TerminalPathByIdentity,
         PerimeterDrivenRootFaceByTerminal=(
             PerimeterDrivenRootFaceByTerminal
@@ -1215,6 +1340,7 @@ def BuildDerivedPerimeterFabricShell(
         AccessLength=EffectiveAccessLength,
         BoundarySignals=BoundarySignals,
         Assignment=Assignment,
+        PerimeterFaceTrackCounts=ResolvedPerimeterFaceTrackCounts,
     )
     ShellFingerprint = sha256(repr((
         "derived-perimeter-fabric-shell-v1",
@@ -1226,6 +1352,7 @@ def BuildDerivedPerimeterFabricShell(
         RingBounds,
         Bounds,
         ActiveFaces,
+        ResolvedPerimeterFaceTrackCounts,
         FabricLayers,
         FabricYs,
     )).encode("utf-8")).hexdigest()[:16]
@@ -1250,6 +1377,7 @@ def BuildDerivedPerimeterFabricShell(
         RingBounds=RingBounds,
         Bounds=Bounds,
         ActiveFaces=ActiveFaces,
+        PerimeterFaceTrackCounts=ResolvedPerimeterFaceTrackCounts,
         FabricLayers=FabricLayers,
         FabricYs=FabricYs,
     )
@@ -1265,6 +1393,7 @@ def _ValidateDerivedPerimeterFabricShell(
     AccessLength: int,
     BoundarySignals: frozenset[str] | None,
     Assignment: Any,
+    PerimeterFaceTrackCounts: tuple[tuple[str, int], ...] | None = None,
 ) -> None:
     """Reject a shell whose immutable inputs differ from this request."""
     if Shell.AccessRingTrackCount != AccessRingTrackCount:
@@ -1295,6 +1424,11 @@ def _ValidateDerivedPerimeterFabricShell(
         AccessLength=AccessLength,
         BoundarySignals=BoundarySignals,
         Assignment=Assignment,
+        PerimeterFaceTrackCounts=(
+            PerimeterFaceTrackCounts
+            if PerimeterFaceTrackCounts is not None
+            else Shell.PerimeterFaceTrackCounts
+        ),
     )
     if Shell.InputFingerprint != ExpectedInputFingerprint:
         raise ValueError("derived perimeter shell input identity does not match")
@@ -1675,6 +1809,8 @@ def _BuildBoundedLegalDerivedEscapePaths(
     WorkBudget: _AccessFabricWorkBudget | None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
     Adjacency: dict[Position3, tuple[Position3, ...]] | None = None,
+    RemainingMilliseconds: Callable[[], int] | None = None,
+    NativeDiagnostics: dict[str, object] | None = None,
 ) -> tuple[tuple[tuple[Position3, ...], ...], bool]:
     """Build a finite legal escape domain with one state search per terminal.
 
@@ -1708,6 +1844,118 @@ def _BuildBoundedLegalDerivedEscapePaths(
     InitialClaims = ResourceGraph.BuildRouteClaims(FixedPrefix)
     if FindSelfClaimConflicts({"PlacementAccess": InitialClaims}):
         return (), not (WorkBudget is not None and WorkBudget.Exhausted)
+
+    if _BuildDerivedEscapeStatePathsBounded is not None:
+        if NativeDiagnostics is not None:
+            NativeDiagnostics["Used"] = True
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "placement-access-native-legal-escape",
+                "SignalTerminalStart": list(Start),
+                "RemainingIngressCount": len(OrderedIngresses),
+            })
+        ReachedPaths: dict[Position3, tuple[Position3, ...]] = {}
+        RemainingExpansionCount = (
+            max(
+                0,
+                WorkBudget.MaximumExpansions
+                - WorkBudget.ExpansionCount,
+            )
+            if WorkBudget is not None
+            else max(
+                1,
+                1 + sum(len(Value) for Value in Adjacency.values()),
+            )
+        )
+        if RemainingExpansionCount < 1:
+            if WorkBudget is not None:
+                WorkBudget.Exhausted = True
+            return (), False
+        NativeRemainingMilliseconds = max(
+            1,
+            int(
+                RemainingMilliseconds()
+                if RemainingMilliseconds is not None
+                else 60_000
+            ),
+        )
+        NativeStartedAt = monotonic()
+        (
+            NativeStatus,
+            NativeRequests,
+            NativeExpansionCount,
+            NativeWorkCapExceeded,
+            NativeDeadlineExceeded,
+        ) = _BuildDerivedEscapeStatePathsBounded(
+            tuple(sorted(Adjacency.items())),
+            ((
+                "escape",
+                Start,
+                OrderedIngresses,
+                (),
+                tuple(FixedPrefix),
+                tuple(sorted(Adjacency)),
+            ),),
+            4,
+            RemainingExpansionCount,
+            NativeRemainingMilliseconds,
+        )
+        if NativeDiagnostics is not None:
+            NativeDiagnostics["CallCount"] = int(
+                NativeDiagnostics.get("CallCount", 0)
+            ) + 1
+            NativeDiagnostics["ExpansionCount"] = int(
+                NativeDiagnostics.get("ExpansionCount", 0)
+            ) + int(NativeExpansionCount)
+            NativeDiagnostics["ElapsedSeconds"] = float(
+                NativeDiagnostics.get("ElapsedSeconds", 0.0)
+            ) + (monotonic() - NativeStartedAt)
+            NativeDiagnostics["Complete"] = bool(
+                NativeDiagnostics.get("Complete", True)
+                and not NativeWorkCapExceeded
+                and not NativeDeadlineExceeded
+            )
+        if WorkBudget is not None:
+            WorkBudget.ExpansionCount += int(NativeExpansionCount)
+            WorkBudget.Exhausted = bool(NativeWorkCapExceeded)
+        if NativeDeadlineExceeded and WorkCheck is not None:
+            WorkCheck({
+                "Phase": "placement-access-native-legal-escape-complete",
+                "NativeStatus": str(NativeStatus),
+                "ExpansionCount": int(NativeExpansionCount),
+            })
+        NativeComplete = not (
+            NativeWorkCapExceeded or NativeDeadlineExceeded
+        )
+        NativeCandidates = (
+            tuple(NativeRequests[0][1]) if NativeRequests else ()
+        )
+        for Ingress, _PriorDirection, PathValue in NativeCandidates:
+            Ingress = tuple(Ingress)
+            if Ingress in ReachedPaths:
+                continue
+            Path = tuple(map(tuple, PathValue))
+            CompletePath = _ErasePlacementAccessPathLoops((
+                *FixedPrefix,
+                *Path[1:],
+            ))
+            if not FindSelfClaimConflicts({
+                "PlacementAccess": ResourceGraph.BuildRouteClaims(
+                    CompletePath
+                )
+            }):
+                ReachedPaths[Ingress] = Path
+        return (
+            tuple(
+                ReachedPaths[Ingress]
+                for Ingress in OrderedIngresses
+                if Ingress in ReachedPaths
+            ),
+            NativeComplete,
+        )
+
+    if NativeDiagnostics is not None:
+        NativeDiagnostics["FallbackUsed"] = True
 
     RemainingIngresses = set(OrderedIngresses)
     InitialDirection = (0, 0, 0)
@@ -1848,6 +2096,9 @@ def _BuildSharedLegalFabricEscapePaths(
     Queue = deque((Start,))
     Parent: dict[Position3, Position3 | None] = {Start: None}
     CompletePathByNode = {Start: tuple(FixedPrefix)}
+    ClaimsByNode = {
+        Start: ResourceGraph.BuildRouteClaims(FixedPrefix)
+    }
     ReachedPaths: dict[Position3, tuple[Position3, ...]] = {}
     while Queue and RemainingIngresses:
         Current = Queue.popleft()
@@ -1866,11 +2117,52 @@ def _BuildSharedLegalFabricEscapePaths(
                 *CompletePathByNode[Current],
                 Next,
             ))
-            CandidateClaims = ResourceGraph.BuildRouteClaims(CandidatePath)
+            CurrentClaims = ClaimsByNode[Current]
+            # Extending one simple BFS path changes claims only at the new
+            # wire node and at graph primitives joining it to already-owned
+            # wire cells.  Build that exact additive delta instead of
+            # rebuilding the increasingly long path at every visited node.
+            # If loop erasure changed the prefix, fall back to the canonical
+            # builder because claims must also be removed in that rare case.
+            if len(CandidatePath) != len(CompletePathByNode[Current]) + 1:
+                CandidateClaims = ResourceGraph.BuildRouteClaims(
+                    CandidatePath
+                )
+            else:
+                WireCells = CurrentClaims.WireCells | frozenset((Next,))
+                RequiredAirCells = set(
+                    CurrentClaims.RequiredAirCells
+                )
+                for Neighbor in ResourceGraph.Technology.NeighborPositions(
+                    Next
+                ):
+                    if Neighbor not in CurrentClaims.WireCells:
+                        continue
+                    Primitive = ResourceGraph.BuildPrimitive(Next, Neighbor)
+                    if Primitive is not None:
+                        RequiredAirCells.update(
+                            Primitive.Claims.RequiredAirCells
+                        )
+                CandidateClaims = RoutingResourceClaims(
+                    WireCells=WireCells,
+                    SupportCells=(
+                        CurrentClaims.SupportCells
+                        | frozenset(((Next[0], Next[1] - 1, Next[2]),))
+                    ),
+                    RequiredAirCells=frozenset(RequiredAirCells),
+                    ElectricalCells=(
+                        CurrentClaims.ElectricalCells
+                        | frozenset((Next,))
+                        | frozenset(
+                            ResourceGraph.Technology.NeighborPositions(Next)
+                        )
+                    ),
+                )
             if FindSelfClaimConflicts({"PlacementAccess": CandidateClaims}):
                 continue
             Parent[Next] = Current
             CompletePathByNode[Next] = CandidatePath
+            ClaimsByNode[Next] = CandidateClaims
             Queue.append(Next)
     return tuple(
         ReachedPaths[Ingress]
@@ -1897,6 +2189,23 @@ def _ErasePlacementAccessPathLoops(
     return tuple(Result)
 
 
+def ResolveFixedAccessFabricLayerCount(
+    Profiles: Mapping[str, Any],
+    DeclaredRoutingLayerCount: int,
+) -> int:
+    """Return the one physical access band owned by a fixed layer world.
+
+    The band is placed on the declared world's highest routing deck below.
+    Adjacent full bands cannot coexist at the technology's two-block pitch:
+    the higher support plane occupies lower-deck headroom.  Layer identity is
+    therefore expressed by band elevation, not by stacking speculative bands.
+    """
+    if DeclaredRoutingLayerCount < 1:
+        raise ValueError("declared routing layer count must be positive")
+    _ = Profiles
+    return 1
+
+
 def BuildPlacementAccessFabric(
     Placement: Any,
     *,
@@ -1911,9 +2220,14 @@ def BuildPlacementAccessFabric(
     AccessRingTrackCount: int = 0,
     Shell: DerivedPerimeterFabricShell | None = None,
     BoundarySignals: frozenset[str] | None = None,
+    BoundaryTerminalKeys: frozenset[
+        tuple[str, Position3]
+    ] | None = None,
     CompleteRouteSignals: frozenset[str] = frozenset(),
     MaximumLegalEscapeExpansions: int | None = None,
     DeriveLegalEscapeWorkLimit: bool = False,
+    RestrictDerivedIngressToRepresentatives: bool = False,
+    NativeEscapeRemainingMilliseconds: Callable[[], int] | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PlacementAccessFabric:
     """Construct one fixed access fabric from placement and technology."""
@@ -1921,14 +2235,10 @@ def BuildPlacementAccessFabric(
         raise ValueError("placement access fabric requires a positive lane count")
     if TopologyKind not in {
         "fixed-access-band-v1",
-        "perimeter-access-ring-v1",
         "derived-perimeter-access-v1",
     }:
         raise ValueError("unsupported placement access topology")
-    IsPerimeterTopology = TopologyKind in {
-        "perimeter-access-ring-v1",
-        "derived-perimeter-access-v1",
-    }
+    IsPerimeterTopology = TopologyKind == "derived-perimeter-access-v1"
     if IsPerimeterTopology:
         if AccessRingTrackCount < 1:
             raise ValueError("access ring requires a positive track count")
@@ -1951,8 +2261,20 @@ def BuildPlacementAccessFabric(
         raise ValueError("placement access fabric requires legal escape work")
     if not isinstance(DeriveLegalEscapeWorkLimit, bool):
         raise TypeError("DeriveLegalEscapeWorkLimit must be bool")
+    if not isinstance(RestrictDerivedIngressToRepresentatives, bool):
+        raise TypeError(
+            "RestrictDerivedIngressToRepresentatives must be bool"
+        )
     Placed = Placement.Placed
     Resources = Resources or BuildRoutingResources(Placed, WorkCheck=WorkCheck)
+    NativeEscapeDiagnostics: dict[str, object] = {
+        "Used": False,
+        "CallCount": 0,
+        "ExpansionCount": 0,
+        "Complete": True,
+        "ElapsedSeconds": 0.0,
+        "FallbackUsed": False,
+    }
     EffectiveAccessLength = (
         int(Technology.AccessLength)
         if AccessLength is None
@@ -2071,6 +2393,7 @@ def BuildPlacementAccessFabric(
                 AccessLength=EffectiveAccessLength,
                 BoundarySignals=BoundarySignals,
                 Assignment=DerivedSlotAssignment,
+                PerimeterFaceTrackCounts=Shell.PerimeterFaceTrackCounts,
             )
     elif Shell is not None:
         raise ValueError("derived perimeter shell requires a slot assignment")
@@ -2101,20 +2424,27 @@ def BuildPlacementAccessFabric(
         for Gate in Gates
     )
     BaseY = min(Gate.Y for Gate in Gates)
+    # Legacy/no-slot perimeter construction has no frozen face ownership.
+    # Keep that fact explicit before deriving its canonical four-face track
+    # tuple; a later complete shell replaces it with the selected faces.
+    ActiveFaces: tuple[str, ...] = ()
     if Shell is not None:
         FabricLayers = Shell.FabricLayers
         FabricYs = Shell.FabricYs
         FabricLayerCount = len(FabricLayers)
         TerminalPathByIdentity = Shell.TerminalPathByIdentity
         TerminalPaths = Shell.TerminalPaths
+        PerimeterFaceTrackCountsForRouting: tuple[tuple[str, int], ...] = (
+            Shell.PerimeterFaceTrackCounts
+        )
     else:
         MaximumFabricLayer = max(0, int(Placement.LayerCount) - 1)
         # The certified incumbent retains its historic access-band witness.
         # New derived perimeter contracts use the selected envelope exactly.
         FabricLayerCount = (
-            min(
-                max(1, int(Placement.LayerCount)),
-                max(1, ceil(len(Profiles) / 6)),
+            ResolveFixedAccessFabricLayerCount(
+                Profiles,
+                int(Placement.LayerCount),
             )
             if TopologyKind == "fixed-access-band-v1"
             else max(1, int(Placement.LayerCount))
@@ -2139,6 +2469,45 @@ def BuildPlacementAccessFabric(
             (Signal, Terminal, TerminalPathByIdentity[(Signal, Terminal)])
             for Signal, Terminal in sorted(TerminalPathByIdentity)
         )
+        if BoundaryTerminalKeys is not None:
+            NormalizedBoundaryTerminalKeys = frozenset(
+                (str(Signal), tuple(Terminal))
+                for Signal, Terminal in BoundaryTerminalKeys
+            )
+            TerminalPaths = tuple(
+                Value
+                for Value in TerminalPaths
+                if (str(Value[0]), tuple(Value[1]))
+                in NormalizedBoundaryTerminalKeys
+            )
+            TerminalPathByIdentity = {
+                (str(Signal), tuple(Terminal)): tuple(Path)
+                for Signal, Terminal, Path in TerminalPaths
+            }
+        PerimeterFaceTrackCountsForRouting = (
+            ()
+            if TopologyKind == "fixed-access-band-v1"
+            else tuple(
+                (
+                    Face,
+                    AccessRingTrackCount if Face in ActiveFaces else 0,
+                )
+                for Face in _PerimeterFaceDirections
+            )
+        )
+        if TopologyKind == "fixed-access-band-v1":
+            PerimeterFaceTrackCountsForRouting = tuple(
+                (Face, 0) for Face in _PerimeterFaceDirections
+            )
+    TerminalLogicalKeyByIdentity = {
+        (str(Signal), tuple(Profile.Root)): f"{Signal}:root"
+        for Signal, Profile in Profiles.items()
+    }
+    TerminalLogicalKeyByIdentity.update({
+        (str(Signal), tuple(Terminal)): f"{Signal}:target-{TargetIndex}"
+        for Signal, Profile in Profiles.items()
+        for TargetIndex, Terminal in enumerate(Profile.Targets)
+    })
     Margin = TrackPitch * (
         AccessRingTrackCount
         if IsPerimeterTopology
@@ -2146,7 +2515,6 @@ def BuildPlacementAccessFabric(
     )
     RingBounds: tuple[tuple[int, int, int, int], ...] = ()
     OuterBounds: tuple[int, int, int, int] | None = None
-    ActiveFaces: tuple[str, ...] = ()
     SlotFaceByTerminal: dict[tuple[str, Position3], str] = {}
     PerimeterDrivenRootFaceByTerminal: dict[
         tuple[str, Position3],
@@ -2179,7 +2547,15 @@ def BuildPlacementAccessFabric(
             # explicit envelope alternatives in the enclosing pre-route
             # problem; multiplying identical side choices by every layer
             # repeats geometry rather than adding a new perimeter choice.
-            4 * AccessRingTrackCount
+            (
+                sum(
+                    TrackCount
+                    for Face, TrackCount in PerimeterFaceTrackCountsForRouting
+                    if Face in ActiveFaces
+                )
+                if TopologyKind == "derived-perimeter-access-v1"
+                else 4 * AccessRingTrackCount
+            )
             if IsPerimeterTopology
             else min(
                 max(3, ceil(4 / FabricLayerCount)),
@@ -2229,10 +2605,6 @@ def BuildPlacementAccessFabric(
                 )
                 for TrackIndex in range(1, AccessRingTrackCount + 1)
             )
-        CenterX = (MinimumX + MaximumX) // 2
-        CenterZ = (MinimumZ + MaximumZ) // 2
-        Outermost = RingBounds[-1]
-
         def RingFacesForPosition(Position: Position3) -> frozenset[str]:
             """Return every perimeter face touching one ring node.
 
@@ -2287,18 +2659,6 @@ def BuildPlacementAccessFabric(
                         RingMinimumZ,
                         RingMaximumZ,
                     ) in RingBounds
-                )
-                or (
-                    TopologyKind == "perimeter-access-ring-v1"
-                    and
-                    Position[0] == CenterX
-                    and Outermost[2] <= Position[2] <= Outermost[3]
-                )
-                or (
-                    TopologyKind == "perimeter-access-ring-v1"
-                    and
-                    Position[2] == CenterZ
-                    and Outermost[0] <= Position[0] <= Outermost[1]
                 )
             )
             and (
@@ -2406,16 +2766,6 @@ def BuildPlacementAccessFabric(
                             (Y, TrackIndex, Face),
                             [],
                         ).append(Position)
-        if TopologyKind == "perimeter-access-ring-v1":
-            for Position in FabricNodes:
-                X, Y, Z = Position
-                if X == CenterX and Outermost[2] < Z < Outermost[3]:
-                    Face = "north-aperture" if Z <= CenterZ else "south-aperture"
-                elif Z == CenterZ and Outermost[0] < X < Outermost[1]:
-                    Face = "west-aperture" if X <= CenterX else "east-aperture"
-                else:
-                    continue
-                RingIngressGroups.setdefault((Y, 0, Face), []).append(Position)
         RingIngressGroups = {
             Identity: sorted(Positions)
             for Identity, Positions in sorted(RingIngressGroups.items())
@@ -2439,7 +2789,7 @@ def BuildPlacementAccessFabric(
     LegalEscapeWorkLimitKind = ""
     LegalEscapeDirectionStateUpperBound: int | None = None
     RegionNodeSet = frozenset(Region.Nodes)
-    if TopologyKind == "derived-perimeter-access-v1":
+    if Region.Nodes:
         MutableRegionAdjacency: dict[Position3, list[Position3]] = {}
         for First, Second in Region.Edges:
             MutableRegionAdjacency.setdefault(First, []).append(Second)
@@ -2448,7 +2798,10 @@ def BuildPlacementAccessFabric(
             Position: tuple(sorted(Values))
             for Position, Values in MutableRegionAdjacency.items()
         }
-        if DeriveLegalEscapeWorkLimit:
+        if (
+            TopologyKind == "derived-perimeter-access-v1"
+            and DeriveLegalEscapeWorkLimit
+        ):
             LegalEscapeDirectionStateUpperBound = (
                 _DeriveLegalEscapeDirectionStateUpperBound(
                     TerminalPaths,
@@ -2465,7 +2818,10 @@ def BuildPlacementAccessFabric(
         # derived traversal bound.  This keeps incomplete-domain fixtures
         # meaningful while production callers can bind termination directly
         # to the immutable physical state graph.
-        if MaximumLegalEscapeExpansions is not None:
+        if (
+            TopologyKind == "derived-perimeter-access-v1"
+            and MaximumLegalEscapeExpansions is not None
+        ):
             LegalEscapeWorkLimitKind = "explicit"
             LegalEscapeWorkBudget = _AccessFabricWorkBudget(
                 MaximumExpansions=int(MaximumLegalEscapeExpansions),
@@ -2478,6 +2834,437 @@ def BuildPlacementAccessFabric(
             LegalEscapeWorkBudget = _AccessFabricWorkBudget(
                 MaximumExpansions=LegalEscapeDirectionStateUpperBound,
             )
+    BatchedDerivedEscapePaths: dict[
+        tuple[str, Position3, tuple[Position3, ...]],
+        tuple[tuple[tuple[Position3, ...], ...], bool],
+    ] | None = None
+    RestrictedAdjacencyByFacePlane: dict[
+        tuple[str, int],
+        dict[Position3, tuple[Position3, ...]],
+    ] = {}
+    RestrictedNodeMasksByFacePlane: dict[
+        tuple[str, int],
+        tuple[Position3, ...],
+    ] = {}
+
+    def RestrictedAdjacencyForFacePlane(
+        Face: str,
+        Start: Position3,
+    ) -> tuple[
+        dict[Position3, tuple[Position3, ...]],
+        tuple[Position3, ...],
+    ]:
+        Direction = _PerimeterFaceDirections.get(Face)
+        if Direction is None:
+            raise ValueError("derived perimeter slot has an unknown face")
+        Axis = next(
+            Index for Index, Value in enumerate(Direction) if Value
+        )
+        Key = (Face, int(Start[Axis]))
+        CachedAdjacency = RestrictedAdjacencyByFacePlane.get(Key)
+        if CachedAdjacency is None:
+            if RegionAdjacency is None:
+                raise RuntimeError(
+                    "derived perimeter restriction requires adjacency"
+                )
+            CachedAdjacency = (
+                _RestrictDerivedPerimeterSlotEscapeAdjacency(
+                    RegionAdjacency,
+                    Face=Face,
+                    Start=Start,
+                )
+            )
+            RestrictedAdjacencyByFacePlane[Key] = CachedAdjacency
+            RestrictedNodeMasksByFacePlane[Key] = tuple(sorted(
+                CachedAdjacency
+            ))
+        return (
+            CachedAdjacency,
+            RestrictedNodeMasksByFacePlane[Key],
+        )
+
+    if (
+        TopologyKind == "derived-perimeter-access-v1"
+        and _BuildDerivedEscapeStatePathsBounded is not None
+        and RegionAdjacency is not None
+    ):
+        NativeRequests: list[tuple[object, ...]] = []
+        RequestInputs: dict[
+            str,
+            tuple[str, Position3, tuple[Position3, ...]],
+        ] = {}
+        for TerminalIndex, (Signal, Terminal, AccessPath) in enumerate(
+            TerminalPaths
+        ):
+            PrefixDomain = _BuildDerivedPerimeterAccessPrefixDomain(
+                AccessPath,
+                RegionNodeSet=RegionNodeSet,
+            )
+            if not PrefixDomain:
+                continue
+            Starts = tuple(Prefix[-1] for Prefix in PrefixDomain)
+
+            def BatchedIngressDistance(Position: Position3) -> int:
+                return min(
+                    abs(Position[0] - Start[0])
+                    + abs(Position[1] - Start[1])
+                    + abs(Position[2] - Start[2])
+                    for Start in Starts
+                )
+
+            TerminalKey = (str(Signal), tuple(Terminal))
+            SelectedFace = (
+                SlotFaceByTerminal.get(TerminalKey)
+                or PerimeterDrivenRootFaceByTerminal.get(TerminalKey)
+            )
+            EligibleGroups = {
+                Identity: Positions
+                for Identity, Positions in RingIngressGroups.items()
+                if SelectedFace is None or Identity[2] == SelectedFace
+            }
+            GroupRepresentatives = {
+                Identity: min(
+                    Positions,
+                    key=lambda Value: (
+                        BatchedIngressDistance(Value),
+                        Value,
+                    ),
+                )
+                for Identity, Positions in EligibleGroups.items()
+            }
+            AnchorIngressNodes = tuple(sorted(
+                GroupRepresentatives.values(),
+                key=lambda Position: (
+                    BatchedIngressDistance(Position),
+                    Position,
+                ),
+            ))
+            for PrefixIndex, Prefix in enumerate(PrefixDomain):
+                Start = Prefix[-1]
+                AllowedAdjacency = RegionAdjacency
+                AllowedNodeMask = tuple(sorted(AllowedAdjacency))
+                if SelectedFace is not None:
+                    AllowedAdjacency, AllowedNodeMask = (
+                        RestrictedAdjacencyForFacePlane(
+                            SelectedFace,
+                            Start,
+                        )
+                    )
+                RequestId = f"{TerminalIndex}:{PrefixIndex}"
+                RequestKey = (str(Signal), tuple(Terminal), Prefix)
+                RequestInputs[RequestId] = RequestKey
+                NativeRequests.append((
+                    RequestId,
+                    Start,
+                    AnchorIngressNodes,
+                    (),
+                    Prefix,
+                    AllowedNodeMask,
+                ))
+        if NativeRequests:
+            RemainingExpansionCount = (
+                max(
+                    0,
+                    LegalEscapeWorkBudget.MaximumExpansions
+                    - LegalEscapeWorkBudget.ExpansionCount,
+                )
+                if LegalEscapeWorkBudget is not None
+                else max(
+                    1,
+                    len(NativeRequests)
+                    * (
+                        1
+                        + sum(
+                            len(Value)
+                            for Value in RegionAdjacency.values()
+                        )
+                    ),
+                )
+            )
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "placement-access-native-legal-escape-batch",
+                    "RequestCount": len(NativeRequests),
+                })
+            NativeRemainingMilliseconds = max(
+                1,
+                int(
+                    NativeEscapeRemainingMilliseconds()
+                    if NativeEscapeRemainingMilliseconds is not None
+                    else 60_000
+                ),
+            )
+            NativeStartedAt = monotonic()
+            (
+                NativeStatus,
+                NativeResults,
+                NativeExpansionCount,
+                NativeWorkCapExceeded,
+                NativeDeadlineExceeded,
+            ) = _BuildDerivedEscapeStatePathsBounded(
+                tuple(sorted(RegionAdjacency.items())),
+                tuple(NativeRequests),
+                4,
+                RemainingExpansionCount,
+                NativeRemainingMilliseconds,
+            )
+            NativeEscapeDiagnostics.update({
+                "Used": True,
+                "CallCount": 1,
+                "ExpansionCount": int(NativeExpansionCount),
+                "Complete": not (
+                    NativeWorkCapExceeded or NativeDeadlineExceeded
+                ),
+                "ElapsedSeconds": monotonic() - NativeStartedAt,
+            })
+            if LegalEscapeWorkBudget is not None:
+                LegalEscapeWorkBudget.ExpansionCount += int(
+                    NativeExpansionCount
+                )
+                LegalEscapeWorkBudget.Exhausted = bool(
+                    NativeWorkCapExceeded
+                )
+            if NativeDeadlineExceeded and WorkCheck is not None:
+                WorkCheck({
+                    "Phase": (
+                        "placement-access-native-legal-escape-batch-complete"
+                    ),
+                    "NativeStatus": str(NativeStatus),
+                    "ExpansionCount": int(NativeExpansionCount),
+                })
+            BatchedDerivedEscapePaths = {}
+            NativeResultById = {
+                str(RequestId): (
+                    tuple(Candidates),
+                    bool(RequestComplete),
+                )
+                for (
+                    RequestId,
+                    Candidates,
+                    _RequestExpansionCount,
+                    RequestComplete,
+                ) in NativeResults
+            }
+            for RequestId, RequestKey in RequestInputs.items():
+                Candidates, RequestComplete = NativeResultById.get(
+                    RequestId,
+                    ((), False),
+                )
+                _Signal, _Terminal, Prefix = RequestKey
+                ReachedPaths: dict[
+                    Position3, tuple[Position3, ...]
+                ] = {}
+                for Ingress, _PriorDirection, PathValue in Candidates:
+                    Ingress = tuple(Ingress)
+                    if Ingress in ReachedPaths:
+                        continue
+                    Path = tuple(map(tuple, PathValue))
+                    CompletePath = _ErasePlacementAccessPathLoops((
+                        *Prefix,
+                        *Path[1:],
+                    ))
+                    if not FindSelfClaimConflicts({
+                        "PlacementAccess": (
+                            Resources.ResourceGraph.BuildRouteClaims(
+                                CompletePath
+                            )
+                        )
+                    }):
+                        ReachedPaths[Ingress] = Path
+                BatchedDerivedEscapePaths[RequestKey] = (
+                    tuple(
+                        ReachedPaths[Ingress]
+                        for Ingress in tuple(dict.fromkeys(
+                            Candidate[0] for Candidate in Candidates
+                        ))
+                        if Ingress in ReachedPaths
+                    ),
+                    bool(
+                        RequestComplete
+                        and not NativeWorkCapExceeded
+                        and not NativeDeadlineExceeded
+                    ),
+                )
+    BatchedFixedEscapePaths: dict[
+        tuple[str, Position3, tuple[Position3, ...]],
+        tuple[tuple[tuple[Position3, ...], ...], bool],
+    ] | None = None
+    if (
+        TopologyKind == "fixed-access-band-v1"
+        and _BuildDerivedEscapeStatePathsBounded is not None
+        and RegionAdjacency is not None
+    ):
+        FixedNativeRequests: list[tuple[object, ...]] = []
+        FixedRequestInputs: dict[
+            str,
+            tuple[str, Position3, tuple[Position3, ...]],
+        ] = {}
+        for TerminalIndex, (Signal, Terminal, AccessPath) in enumerate(
+            TerminalPaths
+        ):
+            EscapePrefix = list(AccessPath)
+            if len(AccessPath) >= 2:
+                Delta = tuple(
+                    AccessPath[-1][Index] - AccessPath[-2][Index]
+                    for Index in range(3)
+                )
+                for Offset in range(1, TrackPitch + 1):
+                    Extension = tuple(
+                        AccessPath[-1][Index] + Delta[Index] * Offset
+                        for Index in range(3)
+                    )
+                    if Extension not in RegionNodeSet:
+                        break
+                    EscapePrefix.append(Extension)
+            Starts = tuple(
+                Position for Position in reversed(EscapePrefix)
+                if Position in RegionNodeSet
+            )[:1]
+            if not Starts:
+                continue
+            LastAccessibleIndex = max(
+                Index
+                for Index, Position in enumerate(EscapePrefix)
+                if Position == Starts[0]
+            )
+            Prefix = tuple(EscapePrefix[:LastAccessibleIndex + 1])
+
+            def FixedIngressDistance(Position: Position3) -> int:
+                return (
+                    abs(Position[0] - Starts[0][0])
+                    + abs(Position[1] - Starts[0][1])
+                    + abs(Position[2] - Starts[0][2])
+                )
+
+            RankedIngressNodes = tuple(sorted(
+                IngressNodes,
+                key=lambda Position: (
+                    FixedIngressDistance(Position),
+                    Position,
+                ),
+            ))
+            DiverseIngressNodes: list[Position3] = []
+            SeenLaneCoordinates: set[tuple[int, int]] = set()
+            for Ingress in RankedIngressNodes:
+                LaneIdentity = (Ingress[1], Ingress[2])
+                if LaneIdentity in SeenLaneCoordinates:
+                    continue
+                SeenLaneCoordinates.add(LaneIdentity)
+                DiverseIngressNodes.append(Ingress)
+                if len(DiverseIngressNodes) >= EffectiveMaximumEscapeStubs:
+                    break
+            RequestId = str(TerminalIndex)
+            RequestKey = (str(Signal), tuple(Terminal), Prefix)
+            FixedRequestInputs[RequestId] = RequestKey
+            FixedNativeRequests.append((
+                RequestId,
+                Starts[0],
+                tuple(DiverseIngressNodes),
+                (),
+                Prefix,
+                tuple(sorted(RegionAdjacency)),
+            ))
+        if FixedNativeRequests:
+            FixedExpansionLimit = max(
+                1,
+                len(FixedNativeRequests)
+                * (
+                    1
+                    + sum(
+                        len(Neighbors)
+                        for Neighbors in RegionAdjacency.values()
+                    )
+                ),
+            )
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "placement-access-native-fixed-escape-batch",
+                    "RequestCount": len(FixedNativeRequests),
+                })
+            NativeRemainingMilliseconds = max(
+                1,
+                int(
+                    NativeEscapeRemainingMilliseconds()
+                    if NativeEscapeRemainingMilliseconds is not None
+                    else 60_000
+                ),
+            )
+            NativeStartedAt = monotonic()
+            (
+                _NativeStatus,
+                NativeResults,
+                NativeExpansionCount,
+                NativeWorkCapExceeded,
+                NativeDeadlineExceeded,
+            ) = _BuildDerivedEscapeStatePathsBounded(
+                tuple(sorted(RegionAdjacency.items())),
+                tuple(FixedNativeRequests),
+                4,
+                FixedExpansionLimit,
+                NativeRemainingMilliseconds,
+            )
+            NativeEscapeDiagnostics.update({
+                "Used": True,
+                "CallCount": 1,
+                "ExpansionCount": int(NativeExpansionCount),
+                "Complete": not (
+                    NativeWorkCapExceeded or NativeDeadlineExceeded
+                ),
+                "ElapsedSeconds": monotonic() - NativeStartedAt,
+            })
+            NativeResultById = {
+                str(RequestId): (
+                    tuple(Candidates),
+                    bool(RequestComplete),
+                )
+                for (
+                    RequestId,
+                    Candidates,
+                    _RequestExpansionCount,
+                    RequestComplete,
+                ) in NativeResults
+            }
+            BatchedFixedEscapePaths = {}
+            for RequestId, RequestKey in FixedRequestInputs.items():
+                Candidates, RequestComplete = NativeResultById.get(
+                    RequestId,
+                    ((), False),
+                )
+                _Signal, _Terminal, Prefix = RequestKey
+                ReachedPaths: dict[
+                    Position3, tuple[Position3, ...]
+                ] = {}
+                for Ingress, _PriorDirection, PathValue in Candidates:
+                    Ingress = tuple(Ingress)
+                    if Ingress in ReachedPaths:
+                        continue
+                    Path = tuple(map(tuple, PathValue))
+                    CompletePath = _ErasePlacementAccessPathLoops((
+                        *Prefix,
+                        *Path[1:],
+                    ))
+                    if not FindSelfClaimConflicts({
+                        "PlacementAccess": (
+                            Resources.ResourceGraph.BuildRouteClaims(
+                                CompletePath
+                            )
+                        )
+                    }):
+                        ReachedPaths[Ingress] = Path
+                BatchedFixedEscapePaths[RequestKey] = (
+                    tuple(
+                        ReachedPaths[Ingress]
+                        for Ingress in tuple(dict.fromkeys(
+                            Candidate[0] for Candidate in Candidates
+                        ))
+                        if Ingress in ReachedPaths
+                    ),
+                    bool(
+                        RequestComplete
+                        and not NativeWorkCapExceeded
+                        and not NativeDeadlineExceeded
+                    ),
+                )
     TerminalDomains = []
     for TerminalIndex, (Signal, Terminal, AccessPath) in enumerate(
         TerminalPaths
@@ -2499,6 +3286,10 @@ def BuildPlacementAccessFabric(
                 EscapeStubs=(),
                 Complete=False,
                 IncompleteReason="legal-escape-work-cap",
+                LogicalKey=TerminalLogicalKeyByIdentity.get(
+                    (str(Signal), tuple(Terminal)),
+                    f"{Signal}:terminal-{TerminalIndex}",
+                ),
             ))
             continue
         EscapePrefix = list(AccessPath)
@@ -2612,9 +3403,15 @@ def BuildPlacementAccessFabric(
                 # domain; this is geometry construction, not a later repair.
                 RankedIngressNodes = tuple(sorted(
                     (
-                        Position
-                        for Positions in EligibleRingIngressGroups.values()
-                        for Position in Positions
+                        GroupRepresentatives.values()
+                        if RestrictDerivedIngressToRepresentatives
+                        else (
+                            Position
+                            for Positions in (
+                                EligibleRingIngressGroups.values()
+                            )
+                            for Position in Positions
+                        )
                     ),
                     key=lambda Position: (
                         IngressDistance(Position),
@@ -2684,39 +3481,56 @@ def BuildPlacementAccessFabric(
             ] = []
             for Prefix in EscapePrefixDomain:
                 Start = Prefix[-1]
-                EscapeAdjacency = RegionAdjacency
-                if SelectedFace is not None and EscapeAdjacency is not None:
-                    # Both a frozen I/O slot and the paired source endpoint
-                    # of its signal carry an exact outward normal.  Keep the
-                    # full lateral segment on that declared face, but do not
-                    # search the core-side half of the resource region for
-                    # an escape that the immutable endpoint contract cannot
-                    # use.  This is a sound domain reduction: the omitted
-                    # half-space is not a selectable access face, not a
-                    # deferred alternative.
-                    EscapeAdjacency = (
-                        _RestrictDerivedPerimeterSlotEscapeAdjacency(
-                            EscapeAdjacency,
-                            Face=SelectedFace,
-                            Start=Start,
+                BatchedResult = (
+                    BatchedDerivedEscapePaths.get((
+                        str(Signal),
+                        tuple(Terminal),
+                        Prefix,
+                    ))
+                    if BatchedDerivedEscapePaths is not None
+                    else None
+                )
+                if BatchedResult is not None:
+                    AnchorPaths, PrefixSearchComplete = BatchedResult
+                else:
+                    EscapeAdjacency = RegionAdjacency
+                    if (
+                        SelectedFace is not None
+                        and EscapeAdjacency is not None
+                    ):
+                        # Both a frozen I/O slot and the paired source
+                        # endpoint carry an exact outward normal. Reuse the
+                        # immutable face/plane restriction prepared for the
+                        # native batch; the fallback consumes the same graph.
+                        EscapeAdjacency, _AllowedNodeMask = (
+                            RestrictedAdjacencyForFacePlane(
+                                SelectedFace,
+                                Start,
+                            )
+                        )
+                    AnchorPaths, PrefixSearchComplete = (
+                        _BuildBoundedLegalDerivedEscapePaths(
+                            Start,
+                            AnchorIngressNodes,
+                            Region.Edges,
+                            Prefix,
+                            Resources.ResourceGraph,
+                            WorkBudget=LegalEscapeWorkBudget,
+                            WorkCheck=WorkCheck,
+                            Adjacency=EscapeAdjacency,
+                            RemainingMilliseconds=(
+                                NativeEscapeRemainingMilliseconds
+                            ),
+                            NativeDiagnostics=NativeEscapeDiagnostics,
                         )
                     )
-                AnchorPaths, PrefixSearchComplete = (
-                    _BuildBoundedLegalDerivedEscapePaths(
-                        Start,
-                        AnchorIngressNodes,
-                        Region.Edges,
-                        Prefix,
-                        Resources.ResourceGraph,
-                        WorkBudget=LegalEscapeWorkBudget,
-                        WorkCheck=WorkCheck,
-                        Adjacency=EscapeAdjacency,
-                    )
-                )
                 DerivedLegalSearchComplete = (
                     DerivedLegalSearchComplete and PrefixSearchComplete
                 )
-                if IsFrozenSlotTerminal:
+                if (
+                    IsFrozenSlotTerminal
+                    and not RestrictDerivedIngressToRepresentatives
+                ):
                     PathByAnchor = {
                         Path[-1]: Path
                         for Path in AnchorPaths
@@ -2759,19 +3573,45 @@ def BuildPlacementAccessFabric(
                 )
             )
         elif Starts:
-            PathMembers = tuple(
-                (tuple(EscapePrefix), Path)
-                for Path in (
-                    _BuildSharedLegalFabricEscapePaths
-                    if FabricLayerCount == 1
-                    else _BuildShortestLegalFabricEscapePaths
-                )(
+            BatchedResult = (
+                BatchedFixedEscapePaths.get((
+                    str(Signal),
+                    tuple(Terminal),
+                    tuple(EscapePrefix),
+                ))
+                if BatchedFixedEscapePaths is not None
+                else None
+            )
+            if BatchedResult is not None:
+                EscapePaths, DerivedLegalSearchComplete = BatchedResult
+            elif FabricLayerCount == 1:
+                EscapePaths = _BuildSharedLegalFabricEscapePaths(
                     Starts[0],
                     DiverseIngressNodes,
                     Region.Edges,
                     tuple(EscapePrefix),
                     Resources.ResourceGraph,
                 )
+            else:
+                EscapePaths, DerivedLegalSearchComplete = (
+                    _BuildBoundedLegalDerivedEscapePaths(
+                        Starts[0],
+                        DiverseIngressNodes,
+                        Region.Edges,
+                        tuple(EscapePrefix),
+                        Resources.ResourceGraph,
+                        WorkBudget=LegalEscapeWorkBudget,
+                        WorkCheck=WorkCheck,
+                        Adjacency=RegionAdjacency,
+                        RemainingMilliseconds=(
+                            NativeEscapeRemainingMilliseconds
+                        ),
+                        NativeDiagnostics=NativeEscapeDiagnostics,
+                    )
+                )
+            PathMembers = tuple(
+                (tuple(EscapePrefix), Path)
+                for Path in EscapePaths
             )
         else:
             PathMembers = ()
@@ -2853,6 +3693,10 @@ def BuildPlacementAccessFabric(
                 if not DerivedLegalSearchComplete
                 else "no-legal-fabric-escape"
             ),
+            LogicalKey=TerminalLogicalKeyByIdentity.get(
+                (str(Signal), tuple(Terminal)),
+                f"{Signal}:terminal-{TerminalIndex}",
+            ),
         ))
     PhysicalClaims = Resources.ResourceGraph.BuildRouteClaims(FabricNodes)
     Complete = all(Domain.Complete for Domain in TerminalDomains)
@@ -2869,6 +3713,11 @@ def BuildPlacementAccessFabric(
             "",
         )
     )
+    PerimeterFaceTrackCountsForFingerprint = (
+        PerimeterFaceTrackCountsForRouting
+        if TopologyKind == "derived-perimeter-access-v1"
+        else ()
+    )
     CanonicalIdentity = (
         TopologyKind,
         AccessRingTrackCount,
@@ -2884,6 +3733,7 @@ def BuildPlacementAccessFabric(
         FabricLayers,
         FabricNodes,
         FabricEdges,
+        PerimeterFaceTrackCountsForFingerprint,
         tuple(
             (
                 Domain.Signal,
@@ -2904,6 +3754,7 @@ def BuildPlacementAccessFabric(
             AccessRingTrackCount,
             OuterBounds,
             ActiveFaces,
+            PerimeterFaceTrackCountsForFingerprint,
             str(getattr(
                 DerivedSlotAssignment,
                 "AssignmentFingerprint",
@@ -2915,6 +3766,78 @@ def BuildPlacementAccessFabric(
         )).encode("utf-8")).hexdigest()[:16]
         if IsPerimeterTopology
         else ""
+    )
+    def FrozenProfileAccessPaths(Profile: Any) -> tuple[
+        tuple[Position3, ...], ...
+    ]:
+        TargetPaths = Profile.TargetAccessPaths
+        TargetPathValues = (
+            tuple(TargetPaths.values())
+            if hasattr(TargetPaths, "values")
+            else tuple(Path for _Terminal, Path in TargetPaths)
+        )
+        return (tuple(Profile.SourceAccessPath), *TargetPathValues)
+
+    FrozenAccessPositions = tuple(
+        {
+            *FabricNodes,
+            *(
+                Position
+                for Profile in Profiles.values()
+                for Path in FrozenProfileAccessPaths(Profile)
+                for Position in Path
+            ),
+            *(
+                Position
+                for Domain in TerminalDomains
+                for Stub in Domain.EscapeStubs
+                for Position in Stub.Path
+            ),
+        }
+    )
+    FrozenMinimumY = min(
+        BaseY,
+        *(Position[1] for Position in FrozenAccessPositions),
+    )
+    FrozenMaximumY = max(
+        max(FabricYs) + 1,
+        max(
+            (Position[1] + 1 for Position in FrozenAccessPositions),
+            default=BaseY,
+        ),
+    ) + 1
+    FrozenRoutingEnvelope = (
+        FrozenPerFaceRoutingEnvelope(
+            RoutingRegionBounds=OuterBounds,
+            # This first migration freezes the current conservative canvas
+            # before routing rather than shrinking it after a capacity or
+            # route result.  The next template-selection increment can make
+            # the per-face counts physically asymmetric without reopening
+            # detailed-routing geometry.
+            CanvasBounds=(
+                OuterBounds[0] - Margin,
+                OuterBounds[1] - Margin,
+                OuterBounds[2] + Margin,
+                OuterBounds[3] + Margin,
+            ),
+            YBounds=(FrozenMinimumY, FrozenMaximumY),
+            PermittedLayers=FabricLayers,
+            PerimeterFaceTrackCounts=(
+                PerimeterFaceTrackCountsForRouting
+            ),
+            EnvelopeFingerprint=sha256(repr((
+                "frozen-per-face-routing-envelope-v1",
+                OuterBounds,
+                Margin,
+                FrozenMinimumY,
+                FrozenMaximumY,
+                FabricLayers,
+                ActiveFaces,
+                PerimeterFaceTrackCountsForRouting,
+            )).encode("utf-8")).hexdigest()[:16],
+        )
+        if IsPerimeterTopology and OuterBounds is not None and FabricLayers
+        else None
     )
     return PlacementAccessFabric(
         FabricFingerprint=sha256(repr(CanonicalIdentity).encode("utf-8")).hexdigest()[:16],
@@ -2935,6 +3858,7 @@ def BuildPlacementAccessFabric(
             "AssignmentFingerprint",
             "",
         )),
+        FrozenRoutingEnvelope=FrozenRoutingEnvelope,
         LegalEscapeExpansionCount=(
             LegalEscapeWorkBudget.ExpansionCount
             if LegalEscapeWorkBudget is not None
@@ -2948,6 +3872,25 @@ def BuildPlacementAccessFabric(
         LegalEscapeWorkLimitKind=LegalEscapeWorkLimitKind,
         LegalEscapeDirectionStateUpperBound=(
             LegalEscapeDirectionStateUpperBound
+        ),
+        NativeEscapeKernelUsed=bool(
+            NativeEscapeDiagnostics["Used"]
+        ),
+        NativeEscapeKernelCallCount=int(
+            NativeEscapeDiagnostics["CallCount"]
+        ),
+        NativeEscapeKernelExpansionCount=int(
+            NativeEscapeDiagnostics["ExpansionCount"]
+        ),
+        NativeEscapeKernelComplete=bool(
+            NativeEscapeDiagnostics["Complete"]
+        ),
+        NativeEscapeKernelElapsedSeconds=round(
+            float(NativeEscapeDiagnostics["ElapsedSeconds"]),
+            6,
+        ),
+        NativeEscapeFallbackUsed=bool(
+            NativeEscapeDiagnostics["FallbackUsed"]
         ),
         IncompleteReason=("" if Complete else IncompleteReason),
         Technology=Technology,
@@ -3710,44 +4653,6 @@ def SolvePlacementAccessFabricCapacity(
                 RetainRouteNodes(set(Nodes))
             return tuple(Results)
 
-        if Fabric.TopologyKind == "perimeter-access-ring-v1":
-            Adjacency: dict[Position3, list[Position3]] = {}
-            for First, Second in Fabric.Edges:
-                Adjacency.setdefault(First, []).append(Second)
-                Adjacency.setdefault(Second, []).append(First)
-            for Values in Adjacency.values():
-                Values.sort()
-            for Root in Ingresses:
-                Tree = {Root}
-                Remaining = set(Ingresses) - Tree
-                while Remaining:
-                    Queue = deque(sorted(Tree))
-                    Parent: dict[Position3, Position3 | None] = {
-                        Position: None for Position in Tree
-                    }
-                    Reached = None
-                    while Queue and Reached is None:
-                        Current = Queue.popleft()
-                        if Current in Remaining:
-                            Reached = Current
-                            break
-                        for Next in Adjacency.get(Current, ()):
-                            if Next in Parent:
-                                continue
-                            Parent[Next] = Current
-                            Queue.append(Next)
-                    if Reached is None:
-                        Tree.clear()
-                        break
-                    Cursor: Position3 | None = Reached
-                    while Cursor is not None:
-                        Tree.add(Cursor)
-                        Cursor = Parent[Cursor]
-                    Remaining.remove(Reached)
-                if Tree:
-                    RetainRouteNodes(Tree)
-            return tuple(Results)
-
         for TrunkX in TrunkCoordinatesByY.get(FabricY, ()):
             Nodes = {
                 (TrunkX, FabricY, Z)
@@ -4168,6 +5073,72 @@ def SolvePlacementAccessFabricCapacity(
         SelectedLocalRouteSignals=(
             tuple(sorted(SelectedLocalRouteSignals)) if Success else ()
         ),
+    )
+
+
+def BuildPlacementAccessAssignmentFromStubFactor(
+    Fabric: PlacementAccessFabric,
+    SelectedContractClaimChoiceIds: Iterable[tuple[str, str]],
+    *,
+    ExpansionCount: int,
+) -> PlacementAccessAssignment:
+    """Reconstruct one frozen fabric assignment from raw stub-factor values."""
+    DomainIndexByLogicalKey = {
+        str(Domain.LogicalKey or f"{Index}:{Domain.Signal}"): Index
+        for Index, Domain in enumerate(Fabric.TerminalDomains)
+    }
+    if len(DomainIndexByLogicalKey) != len(Fabric.TerminalDomains):
+        raise ValueError("access fabric terminal factor roles are not unique")
+    SelectedByDomain: dict[int, int] = {}
+    for SyntheticSignal, CandidateId in SelectedContractClaimChoiceIds:
+        LogicalKey = str(SyntheticSignal).removeprefix(
+            "__access_terminal__:"
+        )
+        CandidateParts = str(CandidateId).split(":")
+        if (
+            not str(SyntheticSignal).startswith("__access_terminal__:")
+            or len(CandidateParts) != 3
+            or CandidateParts[0] != "stub"
+        ):
+            continue
+        DomainIndex = DomainIndexByLogicalKey.get(LogicalKey)
+        if DomainIndex is None:
+            raise ValueError("stub factor selection has an unknown terminal role")
+        StubDomainIndex = int(CandidateParts[1])
+        StubIndex = int(CandidateParts[2])
+        if DomainIndex != StubDomainIndex or DomainIndex in SelectedByDomain:
+            raise ValueError("stub factor selection has an invalid domain value")
+        SelectedByDomain[DomainIndex] = StubIndex
+    if len(SelectedByDomain) != len(Fabric.TerminalDomains):
+        raise ValueError("stub factor selection omitted a terminal domain")
+    Selected = tuple(
+        (
+            Domain.Signal,
+            Domain.Terminal,
+            SelectedByDomain[Index],
+        )
+        for Index, Domain in enumerate(Fabric.TerminalDomains)
+    )
+    if any(
+        StubIndex < 0 or StubIndex >= len(Fabric.TerminalDomains[Index].EscapeStubs)
+        for Index, StubIndex in SelectedByDomain.items()
+    ):
+        raise ValueError("stub factor selection references an unknown stub")
+    CapacityResourceIds = tuple(sorted({
+        Resource
+        for Index, StubIndex in SelectedByDomain.items()
+        for Resource in Fabric.TerminalDomains[Index].EscapeStubs[StubIndex]
+        .PhysicalClaims.ResourceIds
+    }, key=str))
+    Fingerprint = sha256(repr((Fabric.FabricFingerprint, Selected)).encode("utf-8")).hexdigest()[:16]
+    return PlacementAccessAssignment(
+        FabricFingerprint=Fabric.FabricFingerprint,
+        AssignmentFingerprint=Fingerprint,
+        SelectedStubIndices=Selected,
+        CapacityResourceIds=CapacityResourceIds,
+        ExpansionCount=max(0, int(ExpansionCount)),
+        Success=True,
+        Complete=True,
     )
 
 

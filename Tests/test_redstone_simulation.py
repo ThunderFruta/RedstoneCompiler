@@ -26,20 +26,25 @@ class RedstoneSimulationTests(unittest.TestCase):
             self.skipTest("authoritative routing requires Rust router")
 
         StageCalls: list[str] = []
-        RealPrepareRawTrackDomain = PcbFlow.PrepareRawTrackAssignmentDomain
-        RealSolveRawTrackPortfolio = (
-            PcbFlow.SolveRawTrackAssignmentPortfolioWithContext
+        RealPrepareRouteGuideFactors = (
+            PcbFlow.PrepareRawRouteGuideFactorDomain
+        )
+        RealSolveRawTrackProblem = (
+            PcbFlow.SolveRawTrackAssignmentProblemWithContext
         )
         RealPrepareTrackAssignment = PcbFlow.PrepareTrackAssignment
         RealRoutePcbDesign = PcbFlow.RoutePcbDesign
 
-        def PrepareRawTrackDomain(*Arguments, **KeywordArguments):
-            StageCalls.append("raw-track-domain")
-            return RealPrepareRawTrackDomain(*Arguments, **KeywordArguments)
+        def PrepareRouteGuideFactors(*Arguments, **KeywordArguments):
+            StageCalls.append("route-guide-factors")
+            return RealPrepareRouteGuideFactors(
+                *Arguments,
+                **KeywordArguments,
+            )
 
         def SelectRawTrackProblem(*Arguments, **KeywordArguments):
             StageCalls.append("pre-route-interface-selection")
-            return RealSolveRawTrackPortfolio(*Arguments, **KeywordArguments)
+            return RealSolveRawTrackProblem(*Arguments, **KeywordArguments)
 
         def PrepareSelectedTrackAssignment(*Arguments, **KeywordArguments):
             StageCalls.append("selected-track-preparation")
@@ -61,12 +66,12 @@ class RedstoneSimulationTests(unittest.TestCase):
             with (
                 patch.object(
                     PcbFlow,
-                    "PrepareRawTrackAssignmentDomain",
-                    side_effect=PrepareRawTrackDomain,
-                ) as PrepareRawDomains,
+                    "PrepareRawRouteGuideFactorDomain",
+                    side_effect=PrepareRouteGuideFactors,
+                ) as PrepareGuideFactors,
                 patch.object(
                     PcbFlow,
-                    "SolveRawTrackAssignmentPortfolioWithContext",
+                    "SolveRawTrackAssignmentProblemWithContext",
                     side_effect=SelectRawTrackProblem,
                 ) as SelectInterface,
                 patch.object(
@@ -133,19 +138,18 @@ class RedstoneSimulationTests(unittest.TestCase):
         # first exports its immutable raw domain, then exactly one aggregate
         # authoritative selector freezes the winner before exactly one route.
         self.assertEqual(SelectInterface.call_count, 1)
-        self.assertGreaterEqual(PrepareRawDomains.call_count, 1)
+        self.assertGreaterEqual(PrepareGuideFactors.call_count, 1)
         self.assertEqual(PrepareTracks.call_count, 0)
         self.assertEqual(RouteDesign.call_count, 1)
-        # Raw domains are materialized lazily *inside* the one aggregate
-        # selection call.  That keeps dominated fixed candidates from paying
-        # detailed-domain construction, while ensuring no domain is created
-        # after the selected frozen contract begins its route.
-        self.assertEqual(StageCalls[0], "pre-route-interface-selection")
+        # Every declared compact member publishes only route-guide factors
+        # before the one aggregate native selection.  No domain is created
+        # after that selected frozen contract begins its route.
+        self.assertEqual(StageCalls[-2], "pre-route-interface-selection")
         self.assertEqual(StageCalls[-1], "route")
         self.assertTrue(
             all(
-                Stage == "raw-track-domain"
-                for Stage in StageCalls[1:-1]
+                Stage == "route-guide-factors"
+                for Stage in StageCalls[:-2]
             )
         )
         self.assertEqual(CapacitySelection["CapacitySolveCount"], 1)

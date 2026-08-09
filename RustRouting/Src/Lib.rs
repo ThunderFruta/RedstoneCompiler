@@ -4,6 +4,7 @@ mod Assignment;
 mod AssignmentPlanning;
 mod Bindings;
 mod Deadline;
+mod EscapePlanning;
 mod Generation;
 mod LeasePlanning;
 mod Models;
@@ -847,6 +848,8 @@ mod Tests {
     fn MrvAssignmentSelectsAZeroConflictAlternative() {
         let Candidate = |Id: &str, Wire: usize, Electrical: &[usize]| AssignmentCandidate {
             CandidateId: Id.to_string(),
+            OwnerSignal: Id[..1].to_string(),
+            TemplateKey: String::new(),
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
             ),
@@ -896,6 +899,8 @@ mod Tests {
     fn AssignmentBudgetHardFails() {
         let Candidate = AssignmentCandidate {
             CandidateId: "A0".to_string(),
+            OwnerSignal: "A".to_string(),
+            TemplateKey: String::new(),
             Claims: std::sync::Arc::new(ClaimMask::FromIndices(4, &[0], &[], &[], &[0]).unwrap()),
             MaterialCost: 1,
             FootprintGrowth: 1,
@@ -934,6 +939,8 @@ mod Tests {
     fn ExhaustiveAssignmentFailureIsNotABudgetFailure() {
         let Candidate = |Id: &str| AssignmentCandidate {
             CandidateId: Id.to_string(),
+            OwnerSignal: Id[..1].to_string(),
+            TemplateKey: String::new(),
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(4, &[1], &[], &[], &[0, 1, 2]).unwrap(),
             ),
@@ -980,6 +987,8 @@ mod Tests {
     fn AssignmentRespectsPreOwnedBaseClaims() {
         let Candidate = |Id: &str, Wire: usize, Electrical: &[usize]| AssignmentCandidate {
             CandidateId: Id.to_string(),
+            OwnerSignal: "Extension".to_string(),
+            TemplateKey: String::new(),
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
             ),
@@ -1030,6 +1039,8 @@ mod Tests {
     fn AssignmentMergesSameSignalBaseClaims() {
         let Candidate = AssignmentCandidate {
             CandidateId: "extension".to_string(),
+            OwnerSignal: "Signal".to_string(),
+            TemplateKey: String::new(),
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(16, &[3], &[], &[], &[2, 3, 4]).unwrap(),
             ),

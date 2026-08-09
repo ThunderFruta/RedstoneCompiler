@@ -20,10 +20,10 @@ from Compiler.Placement.Pcb import (
     PcbPlacement,
     PlacePcbGraph,
 )
-from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Placement.PcbFlow import (
     BuildDerivedPinAlignedEnvelopeLowerBoundObjective,
     BuildPlacementGenerationPlan,
+    SelectDiversePinAlignedEnvelopeStates,
     SelectDerivedPrimaryPlacementRequests,
 )
 from Compiler.Placement.PreRouteInterface import (
@@ -44,7 +44,6 @@ from Compiler.Routing.ResourceGraph import (
     RoutingResourceId,
     RoutingResourceKind,
 )
-from Compiler.Routing.Actions.Geometry import BuildRoutingResources
 from Compiler.Routing.AuthoritativePlanner import (
     ResolvePlacementAccessFabricRegionContract,
 )
@@ -691,29 +690,26 @@ def test_scale_primary_domain_is_fixed_before_routing():
         LocalFirstPhysicalDesignPolicy.NandPacking.BeamWidth,
     )
     # A single-component domain is fully materialized before capacity
-    # selection: the incumbent is a domain member, and each derived row-beam
-    # or graph-core layout publishes one immutable, physically-derived
+    # selection: both legacy row-beam variants are absent, and each retained
+    # graph-core layout publishes one immutable, physically-derived
     # terminal-slot domain rather than multiplying the same geometry by
     # arbitrary terminal-layout indexes.
     assert len(Small) >= 2
-    assert Small[0].SourceGenerator == "row-beam"
+    assert Small[0].SourceGenerator == "derived-pin-aligned-core"
     MaximumDerivedMembers = (
         LocalFirstPhysicalDesignPolicy.NandPacking.RetainedPlacementCandidates
         - 1
     )
     ExpectedGraphCoreIndexes = [
         State.CandidateIndex
-        for State in sorted(
+        for State in SelectDiversePinAlignedEnvelopeStates(
             Portfolio.States,
-            key=BuildDerivedPinAlignedEnvelopeLowerBoundObjective,
-        )[:max(0, MaximumDerivedMembers - 1)]
+            MaximumDerivedMembers,
+        )
     ]
     ExpectedGeometry = [
-        ("derived-perimeter-row-beam", None),
-        *(
-            ("derived-pin-aligned-core", CandidateIndex)
-            for CandidateIndex in ExpectedGraphCoreIndexes
-        ),
+        ("derived-pin-aligned-core", CandidateIndex)
+        for CandidateIndex in ExpectedGraphCoreIndexes
     ]
     ExpectedDerived = tuple(
         (SourceGenerator, CandidateIndex, 0)
@@ -725,7 +721,7 @@ def test_scale_primary_domain_is_fixed_before_routing():
             Value.GraphCoreCandidateIndex,
             Value.TerminalLayoutVariantIndex,
         )
-        for Value in Small[1:]
+        for Value in Small
     ) == ExpectedDerived
     assert len(Small) <= (
         LocalFirstPhysicalDesignPolicy.NandPacking.RetainedPlacementCandidates
@@ -864,69 +860,3 @@ def test_full_adder_access_fabric_is_complete_and_deterministic():
     assert {Signal for Signal, _Nodes in FirstAssignment.SignalRoutes} == {
         Domain.Signal for Domain in First.TerminalDomains
     }
-
-
-def test_full_adder_perimeter_ring_has_four_faces_and_frozen_identity():
-    with tempfile.TemporaryDirectory() as Directory:
-        Netlist = ToNandOnly(OptimizeLogic(Sv.ParseSvToNetlist(
-            InputPath=Path("Examples/FullAdder.sv"),
-            TopModule="FullAdder",
-            Workdir=Path(Directory),
-        )))
-    Placement = PlacePcbGraph(
-        Netlist,
-        RoutingSpacing=4,
-        PlacementPolicy=replace(
-            LocalFirstPhysicalDesignPolicy.Placement,
-            RoutingSpacing=4,
-            MaximumRoutingLayers=3,
-        ),
-        PackingPolicy=replace(
-            LocalFirstPhysicalDesignPolicy.NandPacking,
-            GraphBeamEnabled=False,
-            MaximumLocalRouteLength=(
-                LocalFirstPhysicalDesignPolicy
-                .NandPacking.DirectConnectMaximumLength
-            ),
-        ),
-    )
-    First = BuildPlacementAccessFabric(
-        Placement,
-        TopologyKind="perimeter-access-ring-v1",
-        AccessRingTrackCount=1,
-    )
-    Second = BuildPlacementAccessFabric(
-        Placement,
-        TopologyKind="perimeter-access-ring-v1",
-        AccessRingTrackCount=1,
-    )
-    Wide = BuildPlacementAccessFabric(
-        Placement,
-        TopologyKind="perimeter-access-ring-v1",
-        AccessRingTrackCount=2,
-    )
-    Resources = BuildRoutingResources(Placement.Placed)
-    MinimumX = min(Gate.X for Gate in Placement.Placed.PlacedGates) - 3
-    MaximumX = max(
-        Gate.X + RotatedCellSize(Gate.Kind, Gate.Rotation)[0] - 1
-        for Gate in Placement.Placed.PlacedGates
-    ) + 3
-    MinimumZ = min(Gate.Z for Gate in Placement.Placed.PlacedGates) - 3
-    MaximumZ = max(
-        Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1] - 1
-        for Gate in Placement.Placed.PlacedGates
-    ) + 3
-
-    assert First.TopologyKind == "perimeter-access-ring-v1"
-    assert First.AccessRingTrackCount == 1
-    assert First.AccessRingFingerprint
-    assert First.AccessRingFingerprint == Second.AccessRingFingerprint
-    assert Wide.AccessRingTrackCount == 2
-    assert Wide.AccessRingFingerprint != First.AccessRingFingerprint
-    assert len(Wide.Nodes) > len(First.Nodes)
-    assert First.Nodes == Second.Nodes
-    assert First.PhysicalClaims.WireCells.isdisjoint(
-        Resources.ResourceGraph.ActualBlocks
-    )
-    assert {MinimumX, MaximumX}.issubset({Node[0] for Node in First.Nodes})
-    assert {MinimumZ, MaximumZ}.issubset({Node[2] for Node in First.Nodes})

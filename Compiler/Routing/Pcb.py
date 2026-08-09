@@ -669,6 +669,7 @@ def RoutePcbAttempt(
     Deadline: RoutingDeadline | None = None,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
+    PrepareRawRouteGuideFactorDomainOnly: bool = False,
     PrepareRawTrackAssignmentDomainOnly: bool = False,
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
@@ -751,6 +752,21 @@ def RoutePcbAttempt(
         )
     CompletedRoutingPasses = 0
     MaximumRoutingHeight = 2 * Placement.LayerCount + 2
+    FrozenRoutingEnvelope = (
+        getattr(PlacementAccessFabric, "FrozenRoutingEnvelope", None)
+        if PlacementAccessFabric is not None
+        and getattr(
+            PlacementAccessFabric,
+            "TopologyKind",
+            "",
+        ) == "derived-perimeter-access-v1"
+        else None
+    )
+    if FrozenRoutingEnvelope is not None:
+        MaximumRoutingHeight = (
+            int(FrozenRoutingEnvelope.YBounds[1])
+            - int(FrozenRoutingEnvelope.YBounds[0])
+        )
     RouteLayers = Placement.Placed.RouteLayers or {}
     OriginalIndex = {
         Signal: Index
@@ -855,12 +871,16 @@ def RoutePcbAttempt(
                 ReservationVariant=LeaseReservationVariant,
                 PreparePortalGeometryOnly=PreparePortalGeometryOnly,
                 PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
+                PrepareRawRouteGuideFactorDomainOnly=(
+                    PrepareRawRouteGuideFactorDomainOnly
+                ),
                 PrepareRawTrackAssignmentDomainOnly=(
                     PrepareRawTrackAssignmentDomainOnly
                 ),
                 FrozenTrackAssignmentPreparation=(
                     FrozenTrackAssignmentPreparation
                 ),
+                FrozenRoutingEnvelope=FrozenRoutingEnvelope,
                 ValidateClusterInterfaceForeignAccessOnly=(
                     ValidateClusterInterfaceForeignAccessOnly
                 ),
@@ -1127,6 +1147,11 @@ def RoutePcbAttempt(
         Routed.RoutingControlEffectiveness["DetailedRoutingBounds"] = (
             DetailedBounds.ToDictionary()
             if DetailedBounds is not None
+            else None
+        )
+        Routed.RoutingControlEffectiveness["FrozenPerFaceRoutingEnvelope"] = (
+            FrozenRoutingEnvelope.ToDictionary()
+            if FrozenRoutingEnvelope is not None
             else None
         )
     if Deadline is not None:
@@ -1397,6 +1422,31 @@ def PrepareRawTrackAssignmentDomain(
         return Prepared.Domain
     raise RuntimeError(
         "raw track-assignment preparation returned without a domain"
+    )
+
+
+def PrepareRawRouteGuideFactorDomain(
+    Placement: PcbPlacement,
+    *,
+    Resources: Any,
+    Policy: PhysicalDesignPolicy,
+    Deadline: RoutingDeadline,
+) -> RawTrackAssignmentDomain:
+    """Freeze portal/guide capacity factors before detailed tree expansion."""
+    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
+    try:
+        RoutePcbAttempt(
+            Placement,
+            Configuration,
+            Resources=Resources,
+            Policy=Policy,
+            Deadline=Deadline,
+            PrepareRawRouteGuideFactorDomainOnly=True,
+        )
+    except RawTrackAssignmentDomainPrepared as Prepared:
+        return Prepared.Domain
+    raise RuntimeError(
+        "raw route guide factor preparation returned without a domain"
     )
 
 
