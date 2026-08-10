@@ -67,18 +67,18 @@ def test_closed_region_portals_replace_discovery_domain_before_consumers():
 
 
 def test_single_component_selection_freezes_raw_tracks_before_route():
-    """A compact portfolio has one raw selector and no post-selection solve."""
+    """A compact portfolio has one catalog selector and no later solve."""
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
     GuideDomain = Source.index(
         "GuideDomain = PrepareRawRouteGuideFactorDomain("
     )
-    RawDomain = Source.index(
-        "RawDomain = ComposeRawTrackAssignmentFactorDomains(",
+    Catalog = Source.index(
+        "CompactFactorCatalogResult = BuildCompactFactorCatalog(",
         GuideDomain,
     )
     Selection = Source.index(
-        "SolveRawTrackAssignmentProblemWithContext(",
-        RawDomain,
+        "SolveCompactFactorCatalogWithContext(",
+        Catalog,
     )
     FrozenPreparation = Source.index(
         "SelectedTrackPreparation = RawTrackAssignmentResult.Preparation",
@@ -93,16 +93,18 @@ def test_single_component_selection_freezes_raw_tracks_before_route():
     )
     FirstRoute = Source.index("RoutePcbDesign(", MissingFrozenWitness)
 
-    # Each fixed candidate exports compact access and guide values, then one
-    # aggregate selector supplies the selected frozen witness.  The remaining ordinary
-    # preparation belongs only to pre-selection multi-component domain
+    # Each fixed candidate exports compact access and guide references, then
+    # one catalog selector supplies the selected frozen witness.  The
+    # remaining ordinary preparation belongs only to pre-selection multi-component domain
     # construction; it cannot run on the single packed component path and a
     # missing selected witness is a typed incomplete handoff, not a retry.
     assert Source.count("PrepareRawRouteGuideFactorDomain(") == 1
-    assert Source.count("ComposeRawTrackAssignmentFactorDomains(") == 1
-    assert Source.count("SolveRawTrackAssignmentProblemWithContext(") == 1
+    assert Source.count("BuildCompactFactorCatalog(") == 1
+    assert Source.count("SolveCompactFactorCatalogWithContext(") == 1
+    assert "ComposeRawTrackAssignmentFactorDomains(" not in Source
+    assert "SolveRawTrackAssignmentProblemWithContext(" not in Source
     assert Source.count("PrepareTrackAssignment(") == 1
-    assert GuideDomain < RawDomain < Selection < FrozenPreparation
+    assert GuideDomain < Catalog < Selection < FrozenPreparation
     assert FrozenPreparation < MissingFrozenWitness
     assert MultiComponentPreparation < Selection
     assert "if SelectedTrackPreparation is None:" in Source[
@@ -158,8 +160,8 @@ def test_single_component_defers_derived_fabric_until_raw_materialization():
         "GuideDomain = PrepareRawRouteGuideFactorDomain(",
         Materializer,
     )
-    RawDomain = Source.index(
-        "RawDomain = ComposeRawTrackAssignmentFactorDomains(",
+    Catalog = Source.index(
+        "CompactFactorCatalogResult = BuildCompactFactorCatalog(",
         GuideDomain,
     )
     Attached = Source.index(
@@ -168,8 +170,9 @@ def test_single_component_defers_derived_fabric_until_raw_materialization():
     )
 
     assert Shell < Descriptor < DeferredCandidate < Materializer
-    assert Materializer < Fabric < GuideDomain < Attached < RawDomain
+    assert Materializer < Fabric < GuideDomain < Attached < Catalog
     assert "Shell=FabricDescriptor.Shell" in Source[Fabric:GuideDomain]
+    assert "ComposeRawTrackAssignmentFactorDomains(" not in Source
 
 
 def test_single_component_selected_contract_cannot_reenter_legacy_portfolio():

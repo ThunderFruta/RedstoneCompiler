@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from math import ceil
 from typing import Any, Callable, Iterable
 
@@ -263,6 +264,42 @@ class DerivedRoutingEnvelope:
 
 
 @dataclass(frozen=True)
+class TerminalAttachmentContract:
+    """Declared terminal ownership independent of internal connectivity."""
+
+    TerminalName: str
+    Signal: str
+    ServedPins: tuple[tuple[int, int, int], ...]
+    ConnectionRequired: bool
+
+    def __post_init__(self) -> None:
+        if not self.TerminalName or not self.Signal:
+            raise ValueError("terminal attachment requires stable identities")
+        if self.ConnectionRequired and not self.ServedPins:
+            raise ValueError("connected terminal attachment requires served pins")
+        if self.ServedPins != tuple(sorted(set(self.ServedPins))):
+            raise ValueError("terminal attachment served pins must be canonical")
+
+    @cached_property
+    def AttachmentFingerprint(self) -> str:
+        return BuildStableFingerprint({
+            "TerminalName": self.TerminalName,
+            "Signal": self.Signal,
+            "ServedPins": self.ServedPins,
+            "ConnectionRequired": self.ConnectionRequired,
+        })
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "TerminalName": self.TerminalName,
+            "Signal": self.Signal,
+            "ServedPins": [list(Value) for Value in self.ServedPins],
+            "ConnectionRequired": self.ConnectionRequired,
+            "AttachmentFingerprint": self.AttachmentFingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class DerivedPerimeterTerminalSlot:
     """One outward-facing terminal placement on a packed-core perimeter.
 
@@ -282,6 +319,7 @@ class DerivedPerimeterTerminalSlot:
     ConnectionPin: tuple[int, int, int]
     ConnectionDirection: tuple[int, int, int]
     InteriorSpan: int
+    Attachment: TerminalAttachmentContract | None = None
 
     def __post_init__(self) -> None:
         if self.Face not in {"north", "south", "west", "east"}:
@@ -301,6 +339,28 @@ class DerivedPerimeterTerminalSlot:
             raise ValueError("perimeter slot bounds are inverted")
         if self.InteriorSpan < 0:
             raise ValueError("perimeter slot interior span cannot be negative")
+        if (
+            self.Attachment is not None
+            and self.Attachment.TerminalName != self.TerminalName
+        ):
+            raise ValueError("perimeter slot terminal attachment drifted")
+        if (
+            self.Attachment is not None
+            and self.Attachment.Signal != self.Signal
+        ):
+            raise ValueError("perimeter slot signal attachment drifted")
+        if (
+            self.Attachment is not None
+            and not self.Attachment.ConnectionRequired
+            and self.InteriorSpan != 0
+        ):
+            raise ValueError("unused terminal slot must have zero interior span")
+
+    @property
+    def ConnectionRequired(self) -> bool:
+        return bool(
+            self.Attachment is None or self.Attachment.ConnectionRequired
+        )
 
     @property
     def Width(self) -> int:
@@ -323,6 +383,11 @@ class DerivedPerimeterTerminalSlot:
             "ConnectionPin": list(self.ConnectionPin),
             "ConnectionDirection": list(self.ConnectionDirection),
             "InteriorSpan": self.InteriorSpan,
+            "Attachment": (
+                self.Attachment.ToDictionary()
+                if self.Attachment is not None
+                else None
+            ),
         }
 
 
@@ -422,6 +487,12 @@ class DerivedPerimeterSlotDomain:
                             ),
                             Slot.ConnectionDirection,
                             Slot.InteriorSpan,
+                            Slot.ConnectionRequired,
+                            (
+                                Slot.Attachment.AttachmentFingerprint
+                                if Slot.Attachment is not None
+                                else ""
+                            ),
                         )
                         for Slot in Slots
                     ),
@@ -783,7 +854,7 @@ def SolveDerivedPerimeterSlotDomain(
         raise ValueError("perimeter slot solve requires a positive work cap")
 
     Incompatible = frozenset(Domain.IncompatibleSlotPairs)
-    OrderedDomains = tuple(
+    AllOrderedDomains = tuple(
         (Name, tuple(sorted(Slots, key=lambda Slot: (
             Slot.InteriorSpan,
             Slot.Face,
@@ -793,6 +864,16 @@ def SolveDerivedPerimeterSlotDomain(
             Slot.SlotId,
         ))))
         for Name, Slots in sorted(Domain.TerminalSlots)
+    )
+    OrderedDomains = tuple(
+        (Name, Slots)
+        for Name, Slots in AllOrderedDomains
+        if any(Slot.ConnectionRequired for Slot in Slots)
+    )
+    UnusedInputDomains = tuple(
+        (Name, Slots)
+        for Name, Slots in AllOrderedDomains
+        if Slots and all(not Slot.ConnectionRequired for Slot in Slots)
     )
     ExpansionCount = 0
     ExhaustedWork = False
@@ -992,6 +1073,30 @@ def SolveDerivedPerimeterSlotDomain(
                 return
 
     Search(0, (), Domain.CoreBounds, (0, 0, 0, 0), 0)
+    if BestSlots is not None and not ExhaustedWork:
+        AttachedSlots = list(BestSlots)
+        for TerminalName, Slots in UnusedInputDomains:
+            SelectedUnusedSlot = None
+            for Slot in Slots:
+                if ExpansionCount >= MaximumExpansions:
+                    ExhaustedWork = True
+                    break
+                ExpansionCount += 1
+                if WorkCheck is not None:
+                    WorkCheck({
+                        "Phase": "derived-perimeter-unused-input-attachment",
+                        "ExpansionCount": ExpansionCount,
+                        "TerminalName": TerminalName,
+                    })
+                if PairIsCompatible(Slot, tuple(AttachedSlots)):
+                    SelectedUnusedSlot = Slot
+                    break
+            if ExhaustedWork or SelectedUnusedSlot is None:
+                BestSlots = None
+                break
+            AttachedSlots.append(SelectedUnusedSlot)
+        if BestSlots is not None:
+            BestSlots = tuple(AttachedSlots)
     if BestSlots is not None and not ExhaustedWork:
         OrderedSlots = tuple(sorted(BestSlots, key=lambda Slot: Slot.TerminalName))
         Bounds = BoundsFor(OrderedSlots)

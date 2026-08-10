@@ -1,8 +1,8 @@
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::Models::{
-    DetailedRouteTreeRequest, PortalCandidate, PortalCandidateBatchResult, Position,
-    RouteTreeBatchResult, RouteTreeDetailedBatchResult, RouteTreeSearchResult, RoutingContext,
-    SearchState,
+    ClaimAwareDetailedRouteTreeRequest, DetailedRouteTreeRequest, PortalCandidate,
+    PortalCandidateBatchResult, Position, RouteTreeBatchResult, RouteTreeDetailedBatchResult,
+    RouteTreeSearchResult, RoutingContext, SearchState,
 };
 use crate::PathRouting::{
     BuildPortalCandidate, FindPathFromStatesDetailedWithDeadline, FindPathWithDeadline,
@@ -12,6 +12,7 @@ use crate::RoutingThreadPool;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 fn DetailedRouteTreeBudgetExpiredResult() -> RouteTreeSearchResult {
     RouteTreeSearchResult {
@@ -24,6 +25,10 @@ fn DetailedRouteTreeBudgetExpiredResult() -> RouteTreeSearchResult {
         ExpansionCount: 0,
         RepeaterRejectedCount: 0,
         RepeaterConstraintFailureCount: 0,
+        ConflictResources: Vec::new(),
+        RejectedPathCount: 0,
+        NoGoodCount: 0,
+        ElapsedMilliseconds: 0,
         IsRouted: false,
         IsBudgetExpired: true,
     }
@@ -104,6 +109,280 @@ fn RepeaterFacing(Current: Position, Next: Position) -> Option<String> {
 }
 
 impl RoutingContext {
+    fn CertifyRouteFactorConnectivityWithDeadline(
+        &self,
+        AllowedColumns: Vec<(i32, i32)>,
+        RequiredAllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        ConnectivityRequiredNodeValues: Vec<Position>,
+        Start: Position,
+        MaximumExpansionCount: usize,
+        Deadline: &RuntimeDeadline,
+    ) -> (bool, bool, usize) {
+        let mut AllowedNodes = HashSet::new();
+        for (Index, Column) in AllowedColumns.into_iter().enumerate() {
+            if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return (false, false, 0);
+            }
+            if let Some(Values) = self.NodesByColumn.get(&Column) {
+                AllowedNodes.extend(Values.iter().copied());
+            }
+        }
+        AllowedNodes.extend(RequiredAllowedNodeValues);
+        let mut BlockedNodes = HashSet::with_capacity(BlockedNodeValues.len());
+        for (Index, Value) in BlockedNodeValues.into_iter().enumerate() {
+            if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return (false, false, 0);
+            }
+            BlockedNodes.insert(Value);
+        }
+        let RequiredNodes: HashSet<_> = ConnectivityRequiredNodeValues.into_iter().collect();
+        if !AllowedNodes.contains(&Start)
+            || BlockedNodes.contains(&Start)
+            || RequiredNodes.is_empty()
+            || RequiredNodes
+                .iter()
+                .any(|Value| !AllowedNodes.contains(Value) || BlockedNodes.contains(Value))
+        {
+            return (true, false, 0);
+        }
+        let ExpansionLimit = MaximumExpansionCount.max(1);
+        let mut Reached = HashSet::from([Start]);
+        let mut RemainingRequired = RequiredNodes;
+        RemainingRequired.remove(&Start);
+        if RemainingRequired.is_empty() {
+            return (true, true, 0);
+        }
+        let mut Pending = vec![Start];
+        let mut ExpansionCount = 0usize;
+        while let Some(Current) = Pending.pop() {
+            if ExpansionCount % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return (false, false, ExpansionCount);
+            }
+            if ExpansionCount >= ExpansionLimit {
+                return (false, false, ExpansionCount);
+            }
+            ExpansionCount += 1;
+            for Neighbor in self.Adjacency.get(&Current).into_iter().flatten() {
+                if AllowedNodes.contains(Neighbor)
+                    && !BlockedNodes.contains(Neighbor)
+                    && Reached.insert(*Neighbor)
+                {
+                    RemainingRequired.remove(Neighbor);
+                    if RemainingRequired.is_empty() {
+                        return (true, true, ExpansionCount);
+                    }
+                    Pending.push(*Neighbor);
+                }
+            }
+        }
+        if Deadline.Check() {
+            return (false, false, ExpansionCount);
+        }
+        (true, RemainingRequired.is_empty(), ExpansionCount)
+    }
+
+    pub(crate) fn CertifyRouteFactorConnectivityNative(
+        &self,
+        AllowedColumns: Vec<(i32, i32)>,
+        RequiredAllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        ConnectivityRequiredNodeValues: Vec<Position>,
+        Start: Position,
+        MaximumExpansionCount: usize,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> (bool, bool, usize) {
+        let Ok(Deadline) = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        else {
+            return (false, false, 0);
+        };
+        self.CertifyRouteFactorConnectivityWithDeadline(
+            AllowedColumns,
+            RequiredAllowedNodeValues,
+            BlockedNodeValues,
+            ConnectivityRequiredNodeValues,
+            Start,
+            MaximumExpansionCount,
+            &Deadline,
+        )
+    }
+
+    pub(crate) fn CertifyRouteFactorConnectivityBatchNative(
+        &self,
+        Requests: Vec<(
+            Vec<(i32, i32)>,
+            i32,
+            Vec<Position>,
+            Vec<Position>,
+            Vec<Position>,
+            Position,
+            usize,
+        )>,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> Vec<(bool, bool, usize)> {
+        let Ok(Deadline) = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        else {
+            return vec![(false, false, 0); Requests.len()];
+        };
+        let RequestCount = Requests.len();
+        let mut IndexedPositions: Vec<Position> = self.Adjacency.keys().copied().collect();
+        IndexedPositions.sort_unstable();
+        let PositionIndex: HashMap<Position, usize> = IndexedPositions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(Index, PositionValue)| (PositionValue, Index))
+            .collect();
+        let IndexedAdjacency: Vec<Vec<usize>> = IndexedPositions
+            .iter()
+            .map(|PositionValue| {
+                self.Adjacency
+                    .get(PositionValue)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|Neighbor| PositionIndex.get(Neighbor).copied())
+                    .collect()
+            })
+            .collect();
+        let IndexedNodesByColumn: HashMap<(i32, i32), Vec<usize>> = self
+            .NodesByColumn
+            .iter()
+            .map(|(Column, Positions)| {
+                (
+                    *Column,
+                    Positions
+                        .iter()
+                        .filter_map(|PositionValue| PositionIndex.get(PositionValue).copied())
+                        .collect(),
+                )
+            })
+            .collect();
+        if Deadline.Check() {
+            return vec![(false, false, 0); RequestCount];
+        }
+        RoutingThreadPool().install(|| {
+            Requests
+                .into_par_iter()
+                .map(
+                    |(
+                        GuideColumns,
+                        GuideExpansion,
+                        RequiredAllowedNodeValues,
+                        BlockedNodeValues,
+                        ConnectivityRequiredNodeValues,
+                        Start,
+                        MaximumExpansionCount,
+                    )| {
+                        if Deadline.Check() {
+                            return (false, false, 0);
+                        }
+                        if GuideExpansion < 0 {
+                            return (true, false, 0);
+                        }
+                        let mut AllowedNodes = vec![false; IndexedPositions.len()];
+                        let mut PreparedColumnCount = 0usize;
+                        for (GuideX, GuideZ) in GuideColumns {
+                            for DeltaX in -GuideExpansion..=GuideExpansion {
+                                for DeltaZ in -GuideExpansion..=GuideExpansion {
+                                    if DeltaX.abs() + DeltaZ.abs() <= GuideExpansion {
+                                        if PreparedColumnCount % DEADLINE_CHECK_INTERVAL == 0
+                                            && Deadline.Check()
+                                        {
+                                            return (false, false, 0);
+                                        }
+                                        if let Some(Indices) = IndexedNodesByColumn
+                                            .get(&(GuideX + DeltaX, GuideZ + DeltaZ))
+                                        {
+                                            for Index in Indices {
+                                                AllowedNodes[*Index] = true;
+                                            }
+                                        }
+                                        PreparedColumnCount += 1;
+                                    }
+                                }
+                            }
+                        }
+                        for PositionValue in RequiredAllowedNodeValues {
+                            if let Some(Index) = PositionIndex.get(&PositionValue) {
+                                AllowedNodes[*Index] = true;
+                            }
+                        }
+                        let mut BlockedNodes = vec![false; IndexedPositions.len()];
+                        for PositionValue in BlockedNodeValues {
+                            if let Some(Index) = PositionIndex.get(&PositionValue) {
+                                BlockedNodes[*Index] = true;
+                            }
+                        }
+                        let Some(StartIndex) = PositionIndex.get(&Start).copied() else {
+                            return (true, false, 0);
+                        };
+                        let mut RequiredNodes = vec![false; IndexedPositions.len()];
+                        let mut RemainingRequiredCount = 0usize;
+                        for PositionValue in ConnectivityRequiredNodeValues {
+                            let Some(Index) = PositionIndex.get(&PositionValue).copied() else {
+                                return (true, false, 0);
+                            };
+                            if !RequiredNodes[Index] {
+                                RequiredNodes[Index] = true;
+                                RemainingRequiredCount += 1;
+                            }
+                        }
+                        if !AllowedNodes[StartIndex]
+                            || BlockedNodes[StartIndex]
+                            || RemainingRequiredCount == 0
+                            || RequiredNodes.iter().enumerate().any(|(Index, Required)| {
+                                *Required && (!AllowedNodes[Index] || BlockedNodes[Index])
+                            })
+                        {
+                            return (true, false, 0);
+                        }
+                        if RequiredNodes[StartIndex] {
+                            RequiredNodes[StartIndex] = false;
+                            RemainingRequiredCount -= 1;
+                        }
+                        if RemainingRequiredCount == 0 {
+                            return (true, true, 0);
+                        }
+                        let ExpansionLimit = MaximumExpansionCount.max(1);
+                        let mut Reached = vec![false; IndexedPositions.len()];
+                        Reached[StartIndex] = true;
+                        let mut Pending = vec![StartIndex];
+                        let mut ExpansionCount = 0usize;
+                        while let Some(CurrentIndex) = Pending.pop() {
+                            if ExpansionCount % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                                return (false, false, ExpansionCount);
+                            }
+                            if ExpansionCount >= ExpansionLimit {
+                                return (false, false, ExpansionCount);
+                            }
+                            ExpansionCount += 1;
+                            for NeighborIndex in &IndexedAdjacency[CurrentIndex] {
+                                if AllowedNodes[*NeighborIndex]
+                                    && !BlockedNodes[*NeighborIndex]
+                                    && !Reached[*NeighborIndex]
+                                {
+                                    Reached[*NeighborIndex] = true;
+                                    if RequiredNodes[*NeighborIndex] {
+                                        RequiredNodes[*NeighborIndex] = false;
+                                        RemainingRequiredCount -= 1;
+                                        if RemainingRequiredCount == 0 {
+                                            return (true, true, ExpansionCount);
+                                        }
+                                    }
+                                    Pending.push(*NeighborIndex);
+                                }
+                            }
+                        }
+                        if Deadline.Check() {
+                            return (false, false, ExpansionCount);
+                        }
+                        (true, RemainingRequiredCount == 0, ExpansionCount)
+                    },
+                )
+                .collect()
+        })
+    }
+
     pub(crate) fn GeneratePortalCandidatesNative(
         &self,
         Starts: Vec<Position>,
@@ -643,6 +922,10 @@ impl RoutingContext {
                 ExpansionCount,
                 RepeaterRejectedCount,
                 RepeaterConstraintFailureCount,
+                ConflictResources: Vec::new(),
+                RejectedPathCount: 0,
+                NoGoodCount: 0,
+                ElapsedMilliseconds: 0,
                 IsRouted: false,
                 IsBudgetExpired: Expired,
             }
@@ -720,7 +1003,15 @@ impl RoutingContext {
                 &Deadline,
             )?;
             DynamicBlocked.remove(&Target);
-            let mut StartStates: Vec<_> = States.values().copied().collect();
+            let mut StartStates: Vec<_> = if EnforceSignalStrength {
+                States.values().copied().collect()
+            } else {
+                TreeValue
+                    .iter()
+                    .copied()
+                    .map(|Value| (Value, (0, 0, 0), MAXIMUM_UNREFRESHED_DUST_LENGTH))
+                    .collect()
+            };
             StartStates.sort_unstable();
             FindPathFromStatesDetailedWithDeadline(
                 &self.Adjacency,
@@ -786,8 +1077,28 @@ impl RoutingContext {
         }
 
         let mut TargetPaths = Vec::new();
-        let OrderedBranches = TargetBranches;
-        for Branch in OrderedBranches {
+        let mut RemainingBranches = TargetBranches;
+        while !RemainingBranches.is_empty() {
+            let Some(SelectedIndex) = RemainingBranches
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, Branch)| {
+                    let Terminal = Branch
+                        .last()
+                        .copied()
+                        .unwrap_or((i32::MAX, i32::MAX, i32::MAX));
+                    let Distance = Tree
+                        .iter()
+                        .map(|Start| ManhattanDistance(*Start, Terminal))
+                        .min()
+                        .unwrap_or(i32::MAX);
+                    (Distance, Terminal, Branch.len())
+                })
+                .map(|(Index, _)| Index)
+            else {
+                return Failure("NoPath", "NoPathGeometry", 0, 0, ExpansionCount);
+            };
+            let Branch = RemainingBranches.remove(SelectedIndex);
             let PortalTarget = Branch[0];
             let ReservedNodes: HashSet<_> = Branch.iter().copied().collect();
             if !Tree.contains(&PortalTarget) {
@@ -906,9 +1217,281 @@ impl RoutingContext {
             ExpansionCount,
             RepeaterRejectedCount: 0,
             RepeaterConstraintFailureCount: 0,
+            ConflictResources: Vec::new(),
+            RejectedPathCount: 0,
+            NoGoodCount: 0,
+            ElapsedMilliseconds: 0,
             IsRouted: true,
             IsBudgetExpired: false,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn GenerateRouteTreeClaimAwareDetailedNative(
+        &self,
+        Starts: Vec<Position>,
+        TargetBranches: Vec<Vec<Position>>,
+        AllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        PreferredColumns: Vec<(i32, i32)>,
+        ExternalNodeCostValues: Vec<(Position, i32)>,
+        PreferredRoutingY: i32,
+        GuidePenalty: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        EnforceSignalStrength: bool,
+        MaximumExpansionCount: usize,
+        MaximumRuntimeMilliseconds: u64,
+        MandatoryWireValues: Vec<Position>,
+        MandatorySupportValues: Vec<Position>,
+        MandatoryAirValues: Vec<Position>,
+        MandatoryElectricalValues: Vec<Position>,
+    ) -> RouteTreeSearchResult {
+        let Started = Instant::now();
+        let Ok(Deadline) =
+            RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds.max(1)))
+        else {
+            return DetailedRouteTreeBudgetExpiredResult();
+        };
+        let MandatoryWire: HashSet<_> = MandatoryWireValues.into_iter().collect();
+        let MandatorySupport: HashSet<_> = MandatorySupportValues.into_iter().collect();
+        let MandatoryAir: HashSet<_> = MandatoryAirValues.into_iter().collect();
+        // Same-owner electrical proximity is legal.  Retain the parameter in
+        // the exact interface because its identity participates in Python's
+        // certificate, while support/air/wire contradictions are the static
+        // self-legality rules enforced by the routing claim model.
+        let _MandatoryElectrical: HashSet<_> = MandatoryElectricalValues.into_iter().collect();
+        let MandatoryNodes: HashSet<_> = MandatoryWire
+            .iter()
+            .chain(MandatoryAir.iter())
+            .copied()
+            .collect();
+        let mut SearchBlocked: HashSet<_> = BlockedNodeValues.into_iter().collect();
+        let mut TotalExpansions = 0usize;
+        let mut RejectedPathCount = 0usize;
+        let mut NoGoodCount = 0usize;
+        let mut LastConflictResources = Vec::new();
+
+        loop {
+            if Deadline.Check() || TotalExpansions >= MaximumExpansionCount {
+                let mut Result = DetailedRouteTreeBudgetExpiredResult();
+                Result.ExpansionCount = TotalExpansions;
+                Result.ConflictResources = LastConflictResources;
+                Result.RejectedPathCount = RejectedPathCount;
+                Result.NoGoodCount = NoGoodCount;
+                Result.ElapsedMilliseconds = Started.elapsed().as_millis() as u64;
+                return Result;
+            }
+            let mut Result = self.GenerateRouteTreeDetailedWithDeadlineNative(
+                Starts.clone(),
+                TargetBranches.clone(),
+                AllowedNodeValues.clone(),
+                SearchBlocked.iter().copied().collect(),
+                PreferredColumns.clone(),
+                ExternalNodeCostValues.clone(),
+                PreferredRoutingY,
+                GuidePenalty,
+                BendPenalty,
+                ViaPenalty,
+                EnforceSignalStrength,
+                MaximumExpansionCount - TotalExpansions,
+                &Deadline,
+            );
+            TotalExpansions += Result.ExpansionCount;
+            Result.ExpansionCount = TotalExpansions;
+            Result.RejectedPathCount = RejectedPathCount;
+            Result.NoGoodCount = NoGoodCount;
+            Result.ElapsedMilliseconds = Started.elapsed().as_millis() as u64;
+            if Result.Status != "Routed" {
+                if RejectedPathCount > 0 && !LastConflictResources.is_empty() {
+                    Result.NoPathReason = "SelfClaimConflict".to_string();
+                }
+                Result.ConflictResources = LastConflictResources;
+                return Result;
+            }
+
+            let RouteWire: HashSet<_> = Result.Nodes.iter().copied().collect();
+            let RouteSupport: HashSet<_> = RouteWire
+                .iter()
+                .map(|Value| (Value.0, Value.1 - 1, Value.2))
+                .collect();
+            let mut RouteAir = HashSet::new();
+            for First in &RouteWire {
+                for (DeltaX, DeltaZ) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    for DeltaY in [-1, 1] {
+                        let Second = (First.0 + DeltaX, First.1 + DeltaY, First.2 + DeltaZ);
+                        if Second <= *First || !RouteWire.contains(&Second) {
+                            continue;
+                        }
+                        let Lower = if First.1 < Second.1 { *First } else { Second };
+                        RouteAir.insert((Lower.0, Lower.1 + 1, Lower.2));
+                    }
+                }
+            }
+            let CombinedWire: HashSet<_> = MandatoryWire.union(&RouteWire).copied().collect();
+            let CombinedSupport: HashSet<_> =
+                MandatorySupport.union(&RouteSupport).copied().collect();
+            let CombinedAir: HashSet<_> = MandatoryAir.union(&RouteAir).copied().collect();
+            let WireOrAir: HashSet<_> = CombinedWire.union(&CombinedAir).copied().collect();
+            let SupportConflicts: HashSet<_> =
+                CombinedSupport.intersection(&WireOrAir).copied().collect();
+            let AirConflicts: HashSet<_> =
+                CombinedAir.intersection(&CombinedWire).copied().collect();
+            if SupportConflicts.is_empty() && AirConflicts.is_empty() {
+                Result.ConflictResources.clear();
+                Result.RejectedPathCount = RejectedPathCount;
+                Result.NoGoodCount = NoGoodCount;
+                Result.ElapsedMilliseconds = Started.elapsed().as_millis() as u64;
+                return Result;
+            }
+
+            LastConflictResources = SupportConflicts
+                .iter()
+                .map(|Value| ("Support".to_string(), *Value))
+                .chain(AirConflicts.iter().map(|Value| ("Air".to_string(), *Value)))
+                .collect();
+            LastConflictResources.sort_unstable();
+            LastConflictResources.dedup();
+
+            let mut CutNodes = HashSet::new();
+            let AddAirContributorCutNodes =
+                |AirPosition: Position, Values: &mut HashSet<Position>| {
+                    for First in &RouteWire {
+                        for (DeltaX, DeltaZ) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                            for DeltaY in [-1, 1] {
+                                let Second = (First.0 + DeltaX, First.1 + DeltaY, First.2 + DeltaZ);
+                                if Second <= *First || !RouteWire.contains(&Second) {
+                                    continue;
+                                }
+                                let Lower = if First.1 < Second.1 { *First } else { Second };
+                                if (Lower.0, Lower.1 + 1, Lower.2) == AirPosition {
+                                    Values.insert(*First);
+                                    Values.insert(Second);
+                                }
+                            }
+                        }
+                    }
+                };
+            for PositionValue in &SupportConflicts {
+                if RouteWire.contains(PositionValue) {
+                    CutNodes.insert(*PositionValue);
+                }
+                let SupportedNode = (PositionValue.0, PositionValue.1 + 1, PositionValue.2);
+                if RouteSupport.contains(PositionValue) {
+                    CutNodes.insert(SupportedNode);
+                }
+                if RouteAir.contains(PositionValue) {
+                    AddAirContributorCutNodes(*PositionValue, &mut CutNodes);
+                }
+            }
+            for PositionValue in &AirConflicts {
+                if RouteWire.contains(PositionValue) {
+                    CutNodes.insert(*PositionValue);
+                }
+                if RouteAir.contains(PositionValue) {
+                    AddAirContributorCutNodes(*PositionValue, &mut CutNodes);
+                }
+            }
+            CutNodes.retain(|Value| !MandatoryNodes.contains(Value));
+            CutNodes.retain(|Value| !SearchBlocked.contains(Value));
+            RejectedPathCount += 1;
+            if CutNodes.is_empty() {
+                Result.Status = "NoPath".to_string();
+                Result.NoPathReason = "SelfClaimConflict".to_string();
+                Result.Nodes.clear();
+                Result.TargetPaths.clear();
+                Result.RepeaterReservations.clear();
+                Result.IsRouted = false;
+                Result.ConflictResources = LastConflictResources;
+                Result.RejectedPathCount = RejectedPathCount;
+                Result.NoGoodCount = NoGoodCount;
+                Result.ElapsedMilliseconds = Started.elapsed().as_millis() as u64;
+                return Result;
+            }
+            SearchBlocked.extend(CutNodes);
+            NoGoodCount += 1;
+            if NoGoodCount >= 64 {
+                Result.Status = "NoPath".to_string();
+                Result.NoPathReason = "SelfClaimConflict".to_string();
+                Result.Nodes.clear();
+                Result.TargetPaths.clear();
+                Result.RepeaterReservations.clear();
+                Result.IsRouted = false;
+                Result.ConflictResources = LastConflictResources;
+                Result.RejectedPathCount = RejectedPathCount;
+                Result.NoGoodCount = NoGoodCount;
+                Result.ElapsedMilliseconds = Started.elapsed().as_millis() as u64;
+                return Result;
+            }
+        }
+    }
+}
+
+pub(crate) fn GenerateRouteTreeClaimAwareDetailedBatchNative(
+    Context: &RoutingContext,
+    Requests: Vec<ClaimAwareDetailedRouteTreeRequest>,
+    MaximumRuntimeMilliseconds: u64,
+) -> RouteTreeDetailedBatchResult {
+    let Started = Instant::now();
+    let SearchResults: Vec<RouteTreeSearchResult> = RoutingThreadPool().install(|| {
+        Requests
+            .into_par_iter()
+            .map(
+                |(
+                    (
+                        Starts,
+                        TargetBranches,
+                        AllowedNodes,
+                        BlockedNodes,
+                        PreferredColumns,
+                        NodeCosts,
+                        PreferredRoutingY,
+                        GuidePenalty,
+                        BendPenalty,
+                        ViaPenalty,
+                        EnforceSignalStrength,
+                        MaximumExpansionCount,
+                    ),
+                    (MandatoryWire, MandatorySupport, MandatoryAir, MandatoryElectrical),
+                )| {
+                    let Elapsed = Started.elapsed().as_millis() as u64;
+                    let Remaining = MaximumRuntimeMilliseconds.saturating_sub(Elapsed);
+                    if Remaining == 0 {
+                        return DetailedRouteTreeBudgetExpiredResult();
+                    }
+                    Context.GenerateRouteTreeClaimAwareDetailedNative(
+                        Starts,
+                        TargetBranches,
+                        AllowedNodes,
+                        BlockedNodes,
+                        PreferredColumns,
+                        NodeCosts,
+                        PreferredRoutingY,
+                        GuidePenalty,
+                        BendPenalty,
+                        ViaPenalty,
+                        EnforceSignalStrength,
+                        MaximumExpansionCount,
+                        Remaining,
+                        MandatoryWire,
+                        MandatorySupport,
+                        MandatoryAir,
+                        MandatoryElectrical,
+                    )
+                },
+            )
+            .collect()
+    });
+    let CompletionMask: Vec<_> = SearchResults
+        .iter()
+        .map(|Value| !Value.IsBudgetExpired)
+        .collect();
+    let CompletedWork = CompletionMask.iter().filter(|Value| **Value).count();
+    RouteTreeDetailedBatchResult {
+        DeadlineExceeded: CompletionMask.iter().any(|Value| !*Value),
+        CompletedWork,
+        TotalWork: CompletionMask.len(),
+        SearchResults,
     }
 }
 
@@ -1181,6 +1764,56 @@ mod Tests {
     }
 
     #[test]
+    fn CompactConnectivityBatchReportsReachableAndBlockedProofs() {
+        let A = (0, 0, 0);
+        let B = (1, 0, 0);
+        let Results = LinearContext().CertifyRouteFactorConnectivityBatchNative(
+            vec![
+                (
+                    vec![(0, 0), (1, 0)],
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![B],
+                    A,
+                    2,
+                ),
+                (vec![(0, 0), (1, 0)], 0, Vec::new(), vec![B], vec![B], A, 2),
+            ],
+            1_000,
+        );
+        assert_eq!(Results, vec![(true, true, 1), (true, false, 0)]);
+    }
+
+    #[test]
+    fn CompactConnectivityBatchKeepsWorkAndDeadlineExhaustionIncomplete() {
+        let A = (0, 0, 0);
+        let B = (1, 0, 0);
+        let C = (2, 0, 0);
+        let Context = RoutingContext {
+            Adjacency: HashMap::from([(A, vec![B]), (B, vec![A, C]), (C, vec![B])]),
+            NodesByColumn: HashMap::from([((0, 0), vec![A]), ((1, 0), vec![B]), ((2, 0), vec![C])]),
+        };
+        let Request = (
+            vec![(0, 0), (1, 0), (2, 0)],
+            0,
+            Vec::new(),
+            Vec::new(),
+            vec![C],
+            A,
+            1,
+        );
+        assert_eq!(
+            Context.CertifyRouteFactorConnectivityBatchNative(vec![Request.clone()], 1_000,),
+            vec![(false, false, 1)],
+        );
+        assert_eq!(
+            Context.CertifyRouteFactorConnectivityBatchNative(vec![Request], 0,),
+            vec![(false, false, 0)],
+        );
+    }
+
+    #[test]
     fn RouteTreeBatchReportsImmediateDeadlineAndNoCompletedWork() {
         let Result = GenerateRouteTreesNative(
             &LinearContext(),
@@ -1411,5 +2044,77 @@ mod Tests {
             .get(&Values[0])
             .map(|Neighbors| Neighbors.contains(&Values[1]))
             .unwrap_or(false)));
+    }
+
+    #[test]
+    fn ClaimAwareTreeRejectsCheapestSelfConflictAndKeepsLaterPath() {
+        let A = (0, 0, 0);
+        let B = (1, 0, 0);
+        let C = (0, 0, 1);
+        let D = (1, 0, 1);
+        let Context = RoutingContext {
+            Adjacency: HashMap::from([
+                (A, vec![B, C]),
+                (B, vec![A, D]),
+                (C, vec![A, D]),
+                (D, vec![B, C]),
+            ]),
+            NodesByColumn: HashMap::new(),
+        };
+        let Result = Context.GenerateRouteTreeClaimAwareDetailedNative(
+            vec![A],
+            vec![vec![D]],
+            vec![A, B, C, D],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            false,
+            128,
+            1_000,
+            Vec::new(),
+            vec![B],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(Result.IsRouted);
+        assert_eq!(Result.Nodes, vec![A, C, D]);
+        assert_eq!(Result.RejectedPathCount, 1);
+        assert_eq!(Result.NoGoodCount, 1);
+        assert!(Result.ConflictResources.is_empty());
+    }
+
+    #[test]
+    fn ClaimAwareTreeReportsCompleteStaticSelfConflict() {
+        let A = (0, 0, 0);
+        let B = (1, 0, 0);
+        let Result = LinearContext().GenerateRouteTreeClaimAwareDetailedNative(
+            vec![A],
+            vec![vec![B]],
+            vec![A, B],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            false,
+            128,
+            1_000,
+            Vec::new(),
+            vec![B],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(Result.Status, "NoPath");
+        assert_eq!(Result.NoPathReason, "SelfClaimConflict");
+        assert_eq!(Result.RejectedPathCount, 1);
+        assert!(!Result.ConflictResources.is_empty());
     }
 }

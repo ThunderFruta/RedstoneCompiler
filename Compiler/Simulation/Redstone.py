@@ -50,6 +50,7 @@ class RedstoneSimulationReport:
     Rows: tuple[RedstoneTruthTableRow, ...]
     Backend: str = "python"
     RuntimeSeconds: float = 0.0
+    Diagnostics: dict[str, Any] | None = None
 
     @property
     def Passed(self) -> bool:
@@ -58,6 +59,341 @@ class RedstoneSimulationReport:
     @property
     def FailedRows(self) -> tuple[RedstoneTruthTableRow, ...]:
         return tuple(Row for Row in self.Rows if not Row.Passed)
+
+
+# Java Edition redstone subset used by the emitted cell library.  It is kept
+# deliberately small and explicit: opaque blocks, dust, redstone torches,
+# repeaters, levers, and lamps.  This is the first verifier in the pipeline
+# that evaluates cross-net power through rendered blocks; the older routed-net
+# delivery analysis below remains a useful logical cross-check.
+_MinecraftDirections: dict[str, Position] = {
+    "north": (0, 0, -1), "south": (0, 0, 1),
+    "east": (1, 0, 0), "west": (-1, 0, 0),
+    "up": (0, 1, 0), "down": (0, -1, 0),
+}
+_HorizontalDirections = ("north", "south", "east", "west")
+_OppositeHorizontalDirection = {
+    "north": "south",
+    "south": "north",
+    "east": "west",
+    "west": "east",
+}
+_NonConductors = frozenset({
+    "minecraft:air", "minecraft:redstone_wire", "minecraft:redstone_torch",
+    "minecraft:redstone_wall_torch", "minecraft:repeater", "minecraft:lever",
+    "minecraft:oak_sign", "minecraft:redstone_lamp",
+})
+
+
+def _MinecraftOffset(PositionValue: Position, Direction: str) -> Position:
+    Delta = _MinecraftDirections[Direction]
+    return tuple(PositionValue[Axis] + Delta[Axis] for Axis in range(3))
+
+
+def _MinecraftIsConductor(State: dict[str, Any] | None) -> bool:
+    return State is not None and State.get("Name") not in _NonConductors
+
+
+def _MinecraftBlockProperties(State: dict[str, Any]) -> dict[str, str]:
+    return {str(Key): str(Value) for Key, Value in State.get("Properties", {}).items()}
+
+
+def _MinecraftWireNeighbors(
+    PositionValue: Position,
+    State: dict[str, Any],
+) -> tuple[Position, ...]:
+    Properties = _MinecraftBlockProperties(State)
+    Result: list[Position] = []
+    for Direction in _HorizontalDirections:
+        Shape = Properties.get(Direction, "none")
+        if Shape == "none":
+            continue
+        Neighbor = _MinecraftOffset(PositionValue, Direction)
+        if Shape == "up":
+            Neighbor = _MinecraftOffset(Neighbor, "up")
+        Result.append(Neighbor)
+    return tuple(Result)
+
+
+def _BuildMinecraftWireAdjacency(
+    Blocks: dict[Position, dict[str, Any]],
+) -> dict[Position, tuple[Position, ...]]:
+    """Build the undirected connection graph declared by dust block states.
+
+    A lower stair cell names the upper dust with an ``up`` connection, while
+    the upper cell names only its same-height horizontal neighbor.  The block
+    states therefore describe the two ends asymmetrically even though redstone
+    power crosses the connection in both directions.
+    """
+    WirePositions = {
+        PositionValue
+        for PositionValue, State in Blocks.items()
+        if State["Name"] == "minecraft:redstone_wire"
+    }
+    Mutable = {PositionValue: set() for PositionValue in WirePositions}
+    for PositionValue in sorted(WirePositions):
+        for Neighbor in _MinecraftWireNeighbors(
+            PositionValue,
+            Blocks[PositionValue],
+        ):
+            if Neighbor not in WirePositions:
+                continue
+            Mutable[PositionValue].add(Neighbor)
+            Mutable[Neighbor].add(PositionValue)
+    return {
+        PositionValue: tuple(sorted(Neighbors))
+        for PositionValue, Neighbors in Mutable.items()
+    }
+
+
+@dataclass(frozen=True)
+class MinecraftRedstoneBlockMapResult:
+    """Settled Java-redstone subset state for one rendered block map."""
+
+    DustPower: dict[Position, int]
+    TorchLit: dict[Position, bool]
+    RepeaterPowered: dict[Position, bool]
+    LampLit: dict[Position, bool]
+    Stable: bool
+    CycleDetected: bool
+    Ticks: int
+
+
+def SimulateMinecraftRedstoneBlockMap(
+    Blocks: dict[Position, dict[str, Any]],
+    LeverPower: dict[Position, bool],
+    MaximumTicks: int = 64,
+) -> MinecraftRedstoneBlockMapResult:
+    """Settle the emitted Java-edition redstone subset.
+
+    The model follows the power distinctions important to the compiler: a lit
+    torch powers the opaque block above it, dust can be powered through the
+    opaque block beneath it, and a repeater emits only from its front.  State
+    transitions are synchronous game-tick steps with deterministic cycle
+    detection, which makes torch feedback a verifier failure rather than an
+    invisible same-net routing detail.
+    """
+    Dust = tuple(sorted(P for P, S in Blocks.items() if S["Name"] == "minecraft:redstone_wire"))
+    Torches = tuple(sorted(P for P, S in Blocks.items() if S["Name"] in ("minecraft:redstone_torch", "minecraft:redstone_wall_torch")))
+    Repeaters = tuple(sorted(P for P, S in Blocks.items() if S["Name"] == "minecraft:repeater"))
+    Lamps = tuple(sorted(P for P, S in Blocks.items() if S["Name"] == "minecraft:redstone_lamp"))
+    DustPower = {P: 0 for P in Dust}
+    WireAdjacency = _BuildMinecraftWireAdjacency(Blocks)
+    TorchLit = {P: _MinecraftBlockProperties(Blocks[P]).get("lit", "true") == "true" for P in Torches}
+    RepeaterPowered = {P: _MinecraftBlockProperties(Blocks[P]).get("powered", "false") == "true" for P in Repeaters}
+    Seen: set[tuple[Any, ...]] = set()
+
+    def Emissions() -> dict[Position, int]:
+        Powered: dict[Position, int] = {}
+        def Emit(Target: Position, Strength: int) -> None:
+            Powered[Target] = max(Powered.get(Target, 0), Strength)
+        for PositionValue, On in LeverPower.items():
+            if On:
+                for Direction in _MinecraftDirections:
+                    Emit(_MinecraftOffset(PositionValue, Direction), 15)
+        for PositionValue, Lit in TorchLit.items():
+            if not Lit:
+                continue
+            State = Blocks[PositionValue]
+            Properties = _MinecraftBlockProperties(State)
+            Attached = _MinecraftOffset(PositionValue, {
+                "north": "south", "south": "north", "east": "west", "west": "east",
+            }.get(Properties.get("facing", "down"), "down"))
+            for Direction in _MinecraftDirections:
+                Target = _MinecraftOffset(PositionValue, Direction)
+                if Target != Attached:
+                    # A torch activates adjacent components, but (unlike a
+                    # lever) only strongly powers an opaque block above it.
+                    # This distinction is exactly why the block-over-torch
+                    # stack is electrically significant.
+                    if _MinecraftIsConductor(Blocks.get(Target)) and Direction != "up":
+                        continue
+                    Emit(Target, 15)
+        for PositionValue, On in RepeaterPowered.items():
+            if On:
+                Facing = _MinecraftBlockProperties(Blocks[PositionValue]).get(
+                    "facing",
+                    "north",
+                )
+                Emit(_MinecraftOffset(PositionValue, Facing), 15)
+        return Powered
+
+    for Tick in range(MaximumTicks):
+        BasePower = Emissions()
+        BlockPower = {
+            PositionValue: BasePower.get(PositionValue, 0)
+            for PositionValue, State in Blocks.items()
+            if _MinecraftIsConductor(State)
+        }
+        NextDust = dict(DustPower)
+        # Dust updates are immediate in-game; reach its fixed point within the
+        # current game tick, rather than accidentally inserting a wire delay.
+        for _ in range(max(1, len(Dust))):
+            Changed = False
+            for PositionValue in Dust:
+                State = Blocks[PositionValue]
+                Strength = max(
+                    BasePower.get(PositionValue, 0),
+                    BlockPower.get(_MinecraftOffset(PositionValue, "down"), 0),
+                )
+                for Neighbor in WireAdjacency[PositionValue]:
+                    Strength = max(Strength, max(0, NextDust.get(Neighbor, 0) - 1))
+                Strength = min(15, Strength)
+                if NextDust[PositionValue] != Strength:
+                    NextDust[PositionValue] = Strength
+                    Changed = True
+            if not Changed:
+                break
+        NextTorch = {}
+        for PositionValue in Torches:
+            Properties = _MinecraftBlockProperties(Blocks[PositionValue])
+            Attached = _MinecraftOffset(PositionValue, {
+                "north": "south", "south": "north", "east": "west", "west": "east",
+            }.get(Properties.get("facing", "down"), "down"))
+            NextTorch[PositionValue] = BlockPower.get(Attached, 0) == 0
+        NextRepeater = dict(RepeaterPowered)
+        for PositionValue in Repeaters:
+            Properties = _MinecraftBlockProperties(Blocks[PositionValue])
+            Facing = Properties.get("facing", "north")
+            Opposite = _OppositeHorizontalDirection[Facing]
+            Rear = _MinecraftOffset(PositionValue, Opposite)
+            SideDirections = tuple(Direction for Direction in _HorizontalDirections if Direction not in (Facing, Opposite))
+            Locked = any(
+                SidePosition in RepeaterPowered
+                and RepeaterPowered[SidePosition]
+                and _MinecraftOffset(
+                    SidePosition,
+                    _MinecraftBlockProperties(Blocks[SidePosition]).get(
+                        "facing",
+                        "north",
+                    ),
+                ) == PositionValue
+                for SidePosition in (
+                    _MinecraftOffset(PositionValue, Direction)
+                    for Direction in SideDirections
+                )
+            )
+            InputPower = max(BasePower.get(Rear, 0), NextDust.get(Rear, 0), BlockPower.get(Rear, 0)) > 0
+            if not Locked:
+                # Truth-table acceptance asks for the settled combinational
+                # state.  A repeater's configured delay changes only when the
+                # transition occurs, not that state, so applying its observed
+                # input on the next synchronous iteration avoids mistaking an
+                # in-flight transition for a stable result.
+                NextRepeater[PositionValue] = InputPower
+        Signature = (tuple(sorted(NextDust.items())), tuple(sorted(NextTorch.items())), tuple(sorted(NextRepeater.items())))
+        if NextDust == DustPower and NextTorch == TorchLit and NextRepeater == RepeaterPowered:
+            FinalPower = Emissions()
+            LampLit = {
+                PositionValue: FinalPower.get(PositionValue, 0) > 0 or any(
+                    FinalPower.get(_MinecraftOffset(PositionValue, Direction), 0) > 0
+                    or BlockPower.get(_MinecraftOffset(PositionValue, Direction), 0) > 0
+                    or NextDust.get(_MinecraftOffset(PositionValue, Direction), 0) > 0
+                    for Direction in _MinecraftDirections
+                )
+                for PositionValue in Lamps
+            }
+            return MinecraftRedstoneBlockMapResult(NextDust, NextTorch, NextRepeater, LampLit, True, False, Tick + 1)
+        if Signature in Seen:
+            return MinecraftRedstoneBlockMapResult(NextDust, NextTorch, NextRepeater, {}, False, True, Tick + 1)
+        Seen.add(Signature)
+        DustPower, TorchLit, RepeaterPowered = NextDust, NextTorch, NextRepeater
+    return MinecraftRedstoneBlockMapResult(DustPower, TorchLit, RepeaterPowered, {}, False, False, MaximumTicks)
+
+
+def _RenderedGateBlockPositions(RoutedDesign: Any) -> dict[str, tuple[Position, ...]]:
+    """Recover rendered component positions without guessing from colors."""
+    from SchemEncoder.Writer262 import LoadTemplate
+    from Compiler.Placement.Rotation import TransformLocalPosition
+    from Templates import LitematicTemplates
+
+    Result: dict[str, tuple[Position, ...]] = {}
+    Templates = {
+        str(Name).upper(): PathValue
+        for Name, PathValue in LitematicTemplates.items()
+    }
+    for Gate in RoutedDesign.PlacedGates:
+        Template = LoadTemplate(Templates[Gate.Kind.upper()])
+        Positions = []
+        for LocalPosition in Template.Blocks:
+            Transformed = TransformLocalPosition(
+                LocalPosition,
+                (Template.Size[0], Template.Size[2]),
+                Gate.Rotation,
+                Gate.MirrorX,
+            )
+            Positions.append((
+                Gate.X + Transformed[0],
+                Gate.Y + LocalPosition[1],
+                Gate.Z + Transformed[2],
+            ))
+        Result[Gate.Name] = tuple(Positions)
+    return Result
+
+
+def SimulateRenderedMinecraftTruthTable(
+    RoutedDesign: Any,
+    ReferenceModule: Any | None = None,
+) -> RedstoneSimulationReport:
+    """Verify truth-table rows by settling the exact emitted block layout."""
+    from SchemEncoder.Writer262 import BuildLitematicBlockMap
+
+    Started = monotonic()
+    ReferenceModule = ReferenceModule or RoutedDesign.Module
+    InputNames = tuple(ReferenceModule.Inputs)
+    OutputNames = tuple(ReferenceModule.Outputs)
+    Build = BuildLitematicBlockMap(RoutedDesign)
+    GatePositions = _RenderedGateBlockPositions(RoutedDesign)
+    InputLevers: dict[str, Position] = {}
+    OutputLamps: dict[str, Position] = {}
+    for Gate in RoutedDesign.PlacedGates:
+        Positions = GatePositions[Gate.Name]
+        if Gate.Kind == "INPUT":
+            Levers = [PositionValue for PositionValue in Positions if Build.Blocks.get(PositionValue, {}).get("Name") == "minecraft:lever"]
+            if len(Levers) != 1 or not Gate.Outputs:
+                raise ValueError(f"Rendered INPUT cell {Gate.Name} has no unique lever")
+            InputLevers[Gate.Outputs[0]] = Levers[0]
+        elif Gate.Kind == "OUTPUT":
+            Lamps = [PositionValue for PositionValue in Positions if Build.Blocks.get(PositionValue, {}).get("Name") == "minecraft:redstone_lamp"]
+            if len(Lamps) != 1 or not Gate.Inputs:
+                raise ValueError(f"Rendered OUTPUT cell {Gate.Name} has no unique lamp")
+            OutputLamps[Gate.Inputs[0]] = Lamps[0]
+    MissingInputs = set(InputNames) - set(InputLevers)
+    MissingOutputs = set(OutputNames) - set(OutputLamps)
+    if MissingInputs or MissingOutputs:
+        raise ValueError(f"Rendered I/O map is incomplete: inputs={sorted(MissingInputs)}, outputs={sorted(MissingOutputs)}")
+    Rows = []
+    StableRows = 0
+    CycleRows = 0
+    MaximumTicks = 0
+    for Bits in product((False, True), repeat=len(InputNames)):
+        Assignment = dict(zip(InputNames, Bits))
+        Expected = EvaluateLogicModule(ReferenceModule, Assignment)
+        Result = SimulateMinecraftRedstoneBlockMap(
+            Build.Blocks,
+            {InputLevers[Name]: Assignment[Name] for Name in InputNames},
+        )
+        MaximumTicks = max(MaximumTicks, Result.Ticks)
+        StableRows += int(Result.Stable)
+        CycleRows += int(Result.CycleDetected)
+        Outputs = tuple(Result.LampLit.get(OutputLamps[Name], False) for Name in OutputNames)
+        Rows.append(RedstoneTruthTableRow(Bits, tuple(Expected[Name] for Name in OutputNames), Outputs))
+    return RedstoneSimulationReport(
+        ModuleName=ReferenceModule.Name,
+        InputNames=InputNames,
+        OutputNames=OutputNames,
+        Rows=tuple(Rows),
+        Backend="minecraft-java-subset",
+        RuntimeSeconds=round(monotonic() - Started, 6),
+        Diagnostics={
+            "Model": "java-redstone-subset-v1",
+            "StableRows": StableRows,
+            "CycleRows": CycleRows,
+            "MaximumTicks": MaximumTicks,
+            "RenderedBlockCount": len(Build.Blocks),
+            "LogicalCrossCheckAvailable": True,
+        },
+    )
 
 
 def EvaluateLogicModule(
@@ -122,6 +458,12 @@ def BuildPhysicalDeliveryMap(
     RoutedDesign: Any,
 ) -> dict[str, set[tuple[str, int]]]:
     """Return consumer inputs reached when each routed source is powered."""
+    CachedDelivery = getattr(RoutedDesign, "PhysicalDeliveryMap", None)
+    if CachedDelivery:
+        return {
+            str(Signal): set(Owners)
+            for Signal, Owners in CachedDelivery.items()
+        }
     PlacedGates = RoutedDesign.PlacedGates
     Producers = {
         Signal: Gate
@@ -145,38 +487,60 @@ def BuildPhysicalDeliveryMap(
         Signal: set(Positions)
         for Signal, Positions in RoutedDesign.NetWires.items()
     }
-    Conflicts, ConflictCounts = FindFlatRouteConflicts(NetWires)
-    if Conflicts:
-        raise ValueError(
-            "Redstone simulation found cross-net shorts: "
-            f"{ConflictCounts.most_common(5)}"
+    AuthoritativeValidationComplete = bool(
+        getattr(RoutedDesign, "ZeroResourceConflicts", False)
+    )
+    if not AuthoritativeValidationComplete:
+        Conflicts, ConflictCounts = FindFlatRouteConflicts(NetWires)
+        if Conflicts:
+            raise ValueError(
+                "Redstone simulation found cross-net shorts: "
+                f"{ConflictCounts.most_common(5)}"
+            )
+    ActualBlocks = frozenset(getattr(
+        RoutedDesign,
+        "SimulationActualBlocks",
+        (),
+    ))
+    ElectricalBlocks = frozenset(getattr(
+        RoutedDesign,
+        "SimulationElectricalBlocks",
+        (),
+    ))
+    SolidBlocks = frozenset(getattr(
+        RoutedDesign,
+        "SimulationSolidBlocks",
+        (),
+    ))
+    if not ActualBlocks:
+        Resources = BuildRoutingResources(
+            type(
+                "SimulationPlacement",
+                (),
+                {"PlacedGates": PlacedGates},
+            )()
         )
-    Resources = BuildRoutingResources(
-        type(
-            "SimulationPlacement",
-            (),
-            {"PlacedGates": PlacedGates},
-        )()
-    )
-    ActualBlocks = Resources.StaticGeometry.ActualBlocks
-    ElectricalBlocks = Resources.StaticGeometry.ElectricalBlocks
-    SolidBlocks = Resources.StaticGeometry.SolidBlocks
-    ValidateTemplateIsolation(
-        NetWires,
-        ActualBlocks,
-        ElectricalBlocks,
-        SolidBlocks,
-        Producers,
-        Targets,
-        getattr(RoutedDesign, "TemplateAccessBySignal", None) or None,
-    )
+        ActualBlocks = Resources.StaticGeometry.ActualBlocks
+        ElectricalBlocks = Resources.StaticGeometry.ElectricalBlocks
+        SolidBlocks = Resources.StaticGeometry.SolidBlocks
+    if not AuthoritativeValidationComplete:
+        ValidateTemplateIsolation(
+            NetWires,
+            ActualBlocks,
+            ElectricalBlocks,
+            SolidBlocks,
+            Producers,
+            Targets,
+            getattr(RoutedDesign, "TemplateAccessBySignal", None) or None,
+        )
     Graphs = BuildPhysicalGraphs(
         NetWires,
         set(ActualBlocks),
         set(RoutedDesign.Supports),
         set(SolidBlocks),
     )
-    ValidatePhysicalRoutes(Graphs, Producers, Targets)
+    if not AuthoritativeValidationComplete:
+        ValidatePhysicalRoutes(Graphs, Producers, Targets)
 
     Delivered: dict[str, set[tuple[str, int]]] = {}
     for Signal, Graph in Graphs.items():

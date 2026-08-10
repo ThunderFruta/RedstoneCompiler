@@ -623,6 +623,9 @@ class TrackAssignmentPreparation:
     SelectedRouteGuideFactorDescriptors: tuple[
         tuple[str, str, Any], ...
     ] = field(default=(), compare=False, repr=False)
+    SelectedRouteGuideFactorCertificates: tuple[
+        tuple[str, str, Any], ...
+    ] = field(default=(), compare=False, repr=False)
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -682,6 +685,15 @@ class TrackAssignmentPreparation:
                 }
                 for Signal, FactorId, Descriptor
                 in self.SelectedRouteGuideFactorDescriptors
+            ],
+            "SelectedRouteGuideFactorCertificates": [
+                {
+                    "Signal": Signal,
+                    "FactorId": FactorId,
+                    **Certificate.ToDictionary(),
+                }
+                for Signal, FactorId, Certificate
+                in self.SelectedRouteGuideFactorCertificates
             ],
         }
 
@@ -1065,6 +1077,10 @@ class PlacementAccessFabric:
     NativeEscapeKernelComplete: bool = True
     NativeEscapeKernelElapsedSeconds: float = 0.0
     NativeEscapeFallbackUsed: bool = False
+    NativeClaimBatchWorkItems: int = 0
+    NativeClaimBatchWorkerCount: int = 0
+    NativeClaimBatchElapsedSeconds: float = 0.0
+    DominatedEscapeStubCount: int = 0
     IncompleteReason: str = ""
     Technology: Any = field(default=None, compare=False, repr=False)
 
@@ -1131,6 +1147,12 @@ class PlacementAccessFabric:
                 self.NativeEscapeKernelElapsedSeconds
             ),
             "NativeEscapeFallbackUsed": self.NativeEscapeFallbackUsed,
+            "NativeClaimBatchWorkItems": self.NativeClaimBatchWorkItems,
+            "NativeClaimBatchWorkerCount": self.NativeClaimBatchWorkerCount,
+            "NativeClaimBatchElapsedSeconds": (
+                self.NativeClaimBatchElapsedSeconds
+            ),
+            "DominatedEscapeStubCount": self.DominatedEscapeStubCount,
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
         }
@@ -2455,6 +2477,16 @@ class RoutedDesign:
     FrozenNetSignals: tuple[str, ...] = ()
     NegotiatedRoutingDiagnostics: dict[str, object] = field(default_factory=dict)
     RoutingFootprintDiagnostics: dict[str, object] = field(default_factory=dict)
+    # Reuse the exact immutable placement geometry during the one physical
+    # truth-table simulation. Rebuilding routing resources after the routed
+    # design has already passed authoritative validation duplicates a costly
+    # geometry proof inside the same absolute deadline.
+    SimulationActualBlocks: frozenset[Position3] = frozenset()
+    SimulationElectricalBlocks: frozenset[Position3] = frozenset()
+    SimulationSolidBlocks: frozenset[Position3] = frozenset()
+    PhysicalDeliveryMap: dict[str, frozenset[tuple[str, int]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -2463,6 +2495,10 @@ class RoutingStaticGeometry:
     ElectricalBlocks: frozenset[Position3]
     SolidBlocks: frozenset[Position3] = frozenset()
     TemplateElectricalBlocks: frozenset[Position3] = frozenset()
+    # An opaque block directly above a redstone torch is strongly powered in
+    # Java Edition.  It cannot be silently created as support for unrelated
+    # routed dust.
+    TorchPoweredSupportBlocks: frozenset[Position3] = frozenset()
 
 
 @dataclass(frozen=True)

@@ -326,6 +326,14 @@ pub(crate) struct RouteTreeSearchResult {
     #[pyo3(get)]
     pub(crate) RepeaterConstraintFailureCount: usize,
     #[pyo3(get)]
+    pub(crate) ConflictResources: Vec<(String, Position)>,
+    #[pyo3(get)]
+    pub(crate) RejectedPathCount: usize,
+    #[pyo3(get)]
+    pub(crate) NoGoodCount: usize,
+    #[pyo3(get)]
+    pub(crate) ElapsedMilliseconds: u64,
+    #[pyo3(get)]
     pub(crate) IsRouted: bool,
     #[pyo3(get)]
     pub(crate) IsBudgetExpired: bool,
@@ -347,6 +355,13 @@ pub(crate) type DetailedRouteTreeRequest = (
     i32,
     bool,
     usize,
+);
+
+/// One detailed request plus the immutable fixed claims that must coexist
+/// with its newly generated tree.
+pub(crate) type ClaimAwareDetailedRouteTreeRequest = (
+    DetailedRouteTreeRequest,
+    (Vec<Position>, Vec<Position>, Vec<Position>, Vec<Position>),
 );
 
 #[pyclass]
@@ -450,6 +465,12 @@ pub(crate) struct TemplateRoutingAssignmentResult {
     pub(crate) AttemptedTemplateIds: Vec<String>,
     #[pyo3(get)]
     pub(crate) AttemptPairwiseIncompatibleSignals: Vec<(String, Vec<(String, String)>)>,
+    #[pyo3(get)]
+    pub(crate) AttemptFailureNets: Vec<(String, Option<String>)>,
+    #[pyo3(get)]
+    pub(crate) AttemptExpansionCounts: Vec<(String, usize)>,
+    #[pyo3(get)]
+    pub(crate) AttemptPartialCandidateIds: Vec<(String, Vec<(String, String)>)>,
     #[pyo3(get)]
     pub(crate) NonExhaustiveTemplateDomain: bool,
 }

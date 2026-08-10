@@ -163,6 +163,51 @@ class RoutingStageMetrics:
     AccessOverflowCells: int = 0
 
 
+def SelectAttachedLocalRouteClaims(
+    Placed: Any,
+) -> tuple[LocalRouteClaim, ...]:
+    """Keep only local claims attached to the current placed terminals."""
+    ProducerRoots = {
+        Signal: tuple(Gate.OutputPin)
+        for Gate in Placed.PlacedGates
+        if Gate.OutputPin is not None
+        for Signal in Gate.Outputs
+    }
+    TargetsBySignal: dict[str, set[Position3]] = defaultdict(set)
+    for Gate in Placed.PlacedGates:
+        for InputIndex, Signal in enumerate(Gate.Inputs):
+            Pin, _Direction = GetGateInputAccess(Gate, InputIndex)
+            TargetsBySignal[Signal].add(tuple(Pin))
+    Result = []
+    for Claim in getattr(Placed, "LocalRouteClaims", ()) or ():
+        if int(getattr(Claim, "ClusterId", 0)) < 0:
+            Result.append(Claim)
+            continue
+        Root = ProducerRoots.get(str(Claim.Signal))
+        Nodes = set(Claim.Nodes)
+        if Root is None or tuple(Claim.Root) != Root or Root not in Nodes:
+            continue
+        RootComponent = {Root}
+        Pending = deque((Root,))
+        while Pending:
+            Current = Pending.popleft()
+            for Neighbor in (
+                DefaultRedstoneRoutingTechnology.NeighborPositions(Current)
+            ):
+                if Neighbor not in Nodes or Neighbor in RootComponent:
+                    continue
+                RootComponent.add(Neighbor)
+                Pending.append(Neighbor)
+        DeclaredTargets = set(map(tuple, Claim.ConnectedTargets))
+        if (
+            not DeclaredTargets <= TargetsBySignal.get(Claim.Signal, set())
+            or not DeclaredTargets <= RootComponent
+        ):
+            continue
+        Result.append(Claim)
+    return tuple(Result)
+
+
 def BuildNetRoutingProfiles(
     Placed: Any,
     RetryCounts: dict[str, int] | None = None,
@@ -199,10 +244,8 @@ def BuildNetRoutingProfiles(
             )
 
     ClaimsBySignal: dict[str, list[LocalRouteClaim]] = defaultdict(list)
-    for Claim in getattr(Placed, "LocalRouteClaims", ()) or ():
+    for Claim in SelectAttachedLocalRouteClaims(Placed):
         ClaimsBySignal[Claim.Signal].append(Claim)
-    LegacyTargets = getattr(Placed, "LocalNetTargets", None) or {}
-    FrozenSignals = set((getattr(Placed, "FrozenNetWires", None) or {}).keys())
     RawProfiles: dict[str, NetRoutingProfile] = {}
     for Signal in sorted(Targets):
         Producer = ProducerGates.get(Signal)
@@ -219,18 +262,33 @@ def BuildNetRoutingProfiles(
         )
         UniqueTargets = tuple(sorted(set(Targets[Signal])))
         SignalClaims = tuple(ClaimsBySignal.get(Signal, ()))
-        ConnectedTargets = {
-            Target
-            for Claim in SignalClaims
-            for Target in Claim.ConnectedTargets
-        }
-        if not SignalClaims:
-            ConnectedTargets.update(LegacyTargets.get(Signal, ()))
+        ConnectedTargets: set[Position3] = set()
+        if SignalClaims:
+            for Claim in SignalClaims:
+                LocalClaimNodes = set(Claim.Nodes)
+                if Root not in LocalClaimNodes:
+                    continue
+                RootComponent = {Root}
+                Pending = deque((Root,))
+                while Pending:
+                    Current = Pending.popleft()
+                    for Neighbor in (
+                        DefaultRedstoneRoutingTechnology
+                        .NeighborPositions(Current)
+                    ):
+                        if (
+                            Neighbor not in LocalClaimNodes
+                            or Neighbor in RootComponent
+                        ):
+                            continue
+                        RootComponent.add(Neighbor)
+                        Pending.append(Neighbor)
+                ConnectedTargets.update(
+                    set(Claim.ConnectedTargets) & RootComponent
+                )
         UnresolvedTargets = tuple(
             Target for Target in UniqueTargets if Target not in ConnectedTargets
         )
-        if Signal in FrozenSignals and not SignalClaims:
-            continue
         if not UnresolvedTargets:
             continue
         ContinuationNodes = tuple(sorted({

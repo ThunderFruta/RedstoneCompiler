@@ -708,6 +708,75 @@ def TemplateRepeaterPinRoles(CellKind: str) -> dict[tuple[int, int, int], str]:
     return Roles
 
 
+def TemplateRepeaterPinDirections(
+    CellKind: str,
+) -> dict[tuple[int, int, int], tuple[int, int, int]]:
+    """Return the local Minecraft output direction of each pin repeater.
+
+    Java repeater ``facing`` points toward the driven block.  A macro input
+    bridge therefore points opposite the outward pin direction, while a macro
+    output bridge points along its declared output direction.
+    """
+    Macro = CellMacros[CellKind.upper()]
+    Directions = {
+        tuple(Pin[Axis] - Direction[Axis] for Axis in range(3)): tuple(
+            -Value for Value in Direction
+        )
+        for Pin, Direction in zip(Macro.InputPins, Macro.InputDirections)
+    }
+    if Macro.OutputPin is not None and Macro.OutputDirection is not None:
+        Directions[
+            tuple(
+                Macro.OutputPin[Axis] - Macro.OutputDirection[Axis]
+                for Axis in range(3)
+            )
+        ] = tuple(Macro.OutputDirection)
+    return Directions
+
+
+def ApplyTemplateRepeaterPinDirection(
+    CellKind: str,
+    LocalPosition: tuple[int, int, int],
+    State: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply an unrotated macro bridge direction to one template state."""
+    if State["Name"] != "minecraft:repeater":
+        return State
+    Direction = TemplateRepeaterPinDirections(CellKind).get(LocalPosition)
+    if Direction is None:
+        return State
+    FacingByDirection = {
+        (0, 0, -1): "north",
+        (1, 0, 0): "east",
+        (0, 0, 1): "south",
+        (-1, 0, 0): "west",
+    }
+    Facing = FacingByDirection.get(Direction)
+    if Facing is None:
+        raise ValueError(
+            f"Template repeater pin direction must be horizontal: {Direction}"
+        )
+    Result = {"Name": State["Name"]}
+    Properties = dict(State.get("Properties", {}))
+    Properties["facing"] = Facing
+    Result["Properties"] = Properties
+    return Result
+
+
+def MinecraftRepeaterFacingForReservation(Facing: str) -> str:
+    """Convert the router's input side to Java's output-facing blockstate."""
+    if Facing not in ("north", "south", "east", "west"):
+        raise ValueError(
+            f"Routing repeater facing must be horizontal: {Facing}"
+        )
+    return {
+        "north": "south",
+        "south": "north",
+        "east": "west",
+        "west": "east",
+    }[Facing]
+
+
 def BuildLitematicBlockMap(
     RoutedDesign: Any,
     TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
@@ -759,6 +828,11 @@ def BuildLitematicBlockMap(
                 TemplateRepeaterAudit["Roles"][Role] = (
                     TemplateRepeaterAudit["Roles"].get(Role, 0) + 1
                 )
+            State = ApplyTemplateRepeaterPinDirection(
+                Gate.Kind,
+                (X, Y, Z),
+                State,
+            )
             State = PoweredCellState(
                 State,
                 Gate,
@@ -856,7 +930,7 @@ def BuildLitematicBlockMap(
             "Name": "minecraft:repeater",
             "Properties": {
                 "powered": str(SignalValues.get(Signal, False)).lower(),
-                "facing": Facing,
+                "facing": MinecraftRepeaterFacingForReservation(Facing),
                 "locked": "false",
                 "delay": "1",
             },

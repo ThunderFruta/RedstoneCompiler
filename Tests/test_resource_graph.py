@@ -19,12 +19,19 @@ from Compiler.Placement.Pcb import (
 
 
 class RoutingResourceGraphTests(unittest.TestCase):
-    def BuildGraph(self, *, Actual=(), Electrical=(), Solid=()):
+    def BuildGraph(self, *, Actual=(), Electrical=(), Solid=(), TorchPowered=()):
         return RoutingResourceGraph(
             ActualBlocks=frozenset(Actual),
             ElectricalBlocks=frozenset(Electrical),
             SolidBlocks=frozenset(Solid),
+            TorchPoweredSupportBlocks=frozenset(TorchPowered),
         )
+
+    def testTorchPoweredSupportCannotBackRoutedDust(self) -> None:
+        Graph = self.BuildGraph(TorchPowered=((4, 1, 7),))
+        self.assertFalse(Graph.IsLegalNode((4, 2, 7)))
+        with self.assertRaisesRegex(ValueError, "torch-powered support"):
+            Graph.BuildRouteClaims(((4, 2, 7),))
 
     def BuildMandatoryOutput(
         self,

@@ -27,6 +27,7 @@ from .Actions import (
     BuildRoutingResources,
     FindFlatRouteConflicts,
     MaterializeReservedRepeaters,
+    PropagateRoutePower,
     ValidatePhysicalRoutes,
     ValidateTemplateIsolation,
 )
@@ -132,12 +133,17 @@ def CompactRoutedTrees(
         for Signal in Gate.Outputs
     }
     Targets: dict[str, list[tuple[int, int, int]]] = {}
+    TargetOwners: dict[str, list[tuple[str, int]]] = {}
     for Gate in Placed.PlacedGates:
         for InputIndex, Signal in enumerate(Gate.Inputs):
             Pin, _Direction = GetGateInputAccess(Gate, InputIndex)
             Targets.setdefault(Signal, []).append(
                 Pin
             )
+            TargetOwners.setdefault(Signal, []).append((
+                Gate.Name,
+                InputIndex,
+            ))
     AccessBySignal: dict[str, set[tuple[int, int, int]]] = {
         Signal: set()
         for Signal in Producers
@@ -171,6 +177,10 @@ def CompactRoutedTrees(
         Signal: set(Positions)
         for Signal, Positions in Routed.NetWires.items()
     }
+    for Signal, Positions in NetWires.items():
+        AccessBySignal.setdefault(Signal, set()).intersection_update(
+            Positions
+        )
 
     def BuildFootprintDiagnostics(
         WireBySignal: dict[str, set[tuple[int, int, int]]],
@@ -253,21 +263,9 @@ def CompactRoutedTrees(
                 BestPathCost[Neighbor] = CandidateCost
                 heappush(Pending, (*CandidateCost, Neighbor))
         Required = {Root}
-        PinAccessPositions = (
-            (
-                *Routed.GlobalPlan.Profiles[Signal].SourceAccessPath,
-                *(
-                    Position
-                    for Path in Routed.GlobalPlan.Profiles[
-                        Signal
-                    ].TargetAccessPaths.values()
-                    for Position in Path
-                ),
-            )
-            if Routed.GlobalPlan is not None
-            and Signal in Routed.GlobalPlan.Profiles
-            else ()
-        )
+        PinAccessPositions = tuple(sorted(
+            AccessBySignal.get(Signal, set()) & set(Graph)
+        ))
         RequiredTargets = tuple(Targets.get(Signal, ()))
         for TargetIndex, Target in enumerate((
             *RequiredTargets,
@@ -416,6 +414,25 @@ def CompactRoutedTrees(
         WorkCheck=CheckWork("repeater-materialization"),
         PruningDiagnostics=RepeaterPruningDiagnostics,
     )
+    PhysicalDeliveryMap = {}
+    for Signal, Graph in PhysicalGraphs.items():
+        Powers = PropagateRoutePower(
+            Producers[Signal].OutputPin,
+            Graph,
+            {
+                Position: Facing
+                for Position, Facing in Repeaters.items()
+                if Position in Graph
+            },
+        )
+        PhysicalDeliveryMap[Signal] = frozenset(
+            Owner
+            for Owner, Target in zip(
+                TargetOwners.get(Signal, ()),
+                Targets.get(Signal, ()),
+            )
+            if Powers.get(Target, 0) > 0
+        )
     MaterializedTracks = {}
     for Signal, Track in TrackAssignmentValue.Tracks.items():
         ExistingReservations = {
@@ -588,6 +605,10 @@ def CompactRoutedTrees(
         RoutingControlEffectiveness=Routed.RoutingControlEffectiveness,
         NegotiatedRoutingDiagnostics=Routed.NegotiatedRoutingDiagnostics,
         RoutingFootprintDiagnostics=RoutingFootprintDiagnostics,
+        SimulationActualBlocks=Routed.SimulationActualBlocks,
+        SimulationElectricalBlocks=Routed.SimulationElectricalBlocks,
+        SimulationSolidBlocks=Routed.SimulationSolidBlocks,
+        PhysicalDeliveryMap=PhysicalDeliveryMap,
     )
 
 

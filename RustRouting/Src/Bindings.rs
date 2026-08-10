@@ -1,6 +1,8 @@
 use crate::AssignmentPlanning::{
-    AssignmentCandidateValue, BaseAssignmentValue, DeadlineExceededAssignmentResult,
+    AssignmentCandidateValue, BaseAssignmentValue, CompactClaimPrimitiveValue,
+    CompactFactorMemberValue, DeadlineExceededAssignmentResult,
     PlanAuthoritativeRoutesWithBaseAndDeadline, PlanAuthoritativeRoutesWithDeadline,
+    SolveCompactTemplateFactorCatalogWithDeadline as SolveCompactTemplateFactorCatalogNative,
     SolveTemplateAssignmentDomainsWithDeadline as SolveTemplateAssignmentDomainsNative,
     TemplateAssignmentDomainValue,
 };
@@ -9,8 +11,8 @@ use crate::EscapePlanning::{
     BuildDerivedEscapeStatePathsWithDeadline, EscapeRequest, EscapeRequestResult,
 };
 use crate::Generation::{
-    GeneratePortalCandidateBatchesNative, GenerateRouteTreeDetailedBatchNative,
-    GenerateRouteTreesNative,
+    GeneratePortalCandidateBatchesNative, GenerateRouteTreeClaimAwareDetailedBatchNative,
+    GenerateRouteTreeDetailedBatchNative, GenerateRouteTreesNative,
 };
 use crate::LeasePlanning::{
     LeaseCandidate, LeaseDomain, LeaseSolveStatus, SolveLeaseDomainsWithDeadline,
@@ -282,6 +284,10 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
         SolveTemplateAssignmentDomainsBounded,
         Module
     )?)?;
+    Module.add_function(wrap_pyfunction!(
+        SolveCompactTemplateFactorCatalogBounded,
+        Module
+    )?)?;
     Ok(())
 }
 
@@ -351,12 +357,44 @@ fn SolveTemplateAssignmentDomainsBounded<'py>(
             PairwiseCompatibilityComplete: false,
             AttemptedTemplateIds: Vec::new(),
             AttemptPairwiseIncompatibleSignals: Vec::new(),
+            AttemptFailureNets: Vec::new(),
+            AttemptExpansionCounts: Vec::new(),
+            AttemptPartialCandidateIds: Vec::new(),
             NonExhaustiveTemplateDomain,
         });
     };
     PythonValue.allow_threads(move || {
         SolveTemplateAssignmentDomainsNative(
             Domains,
+            MaximumExpansionCount,
+            Deadline,
+            NonExhaustiveTemplateDomain,
+        )
+    })
+}
+
+/// Select one exact interned compact-factor catalog.  Claim primitives are
+/// decoded once; candidate masks are composed lazily for attempted members.
+#[pyfunction]
+#[pyo3(signature=(ResourcePositions, PrimitiveValues, FactorValues, MemberValues, MaximumExpansionCount, MaximumRuntimeMilliseconds, NonExhaustiveTemplateDomain=true))]
+fn SolveCompactTemplateFactorCatalogBounded(
+    PythonValue: Python<'_>,
+    ResourcePositions: Vec<Position>,
+    PrimitiveValues: Vec<CompactClaimPrimitiveValue>,
+    FactorValues: Vec<crate::AssignmentPlanning::CompactFactorValue>,
+    MemberValues: Vec<CompactFactorMemberValue>,
+    MaximumExpansionCount: usize,
+    MaximumRuntimeMilliseconds: u64,
+    NonExhaustiveTemplateDomain: bool,
+) -> PyResult<TemplateRoutingAssignmentResult> {
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    PythonValue.allow_threads(move || {
+        SolveCompactTemplateFactorCatalogNative(
+            ResourcePositions,
+            PrimitiveValues,
+            FactorValues,
+            MemberValues,
             MaximumExpansionCount,
             Deadline,
             NonExhaustiveTemplateDomain,
@@ -494,6 +532,51 @@ impl RoutingContext {
             Values.dedup();
         }
         Ok((self.NodeCount(), self.EdgeCount()))
+    }
+
+    #[pyo3(signature=(AllowedColumns, RequiredAllowedNodeValues, BlockedNodeValues, ConnectivityRequiredNodeValues, Start, MaximumExpansionCount, MaximumRuntimeMilliseconds))]
+    fn CertifyRouteFactorConnectivityBounded(
+        &self,
+        PythonValue: Python<'_>,
+        AllowedColumns: Vec<(i32, i32)>,
+        RequiredAllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        ConnectivityRequiredNodeValues: Vec<Position>,
+        Start: Position,
+        MaximumExpansionCount: usize,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> (bool, bool, usize) {
+        PythonValue.allow_threads(|| {
+            self.CertifyRouteFactorConnectivityNative(
+                AllowedColumns,
+                RequiredAllowedNodeValues,
+                BlockedNodeValues,
+                ConnectivityRequiredNodeValues,
+                Start,
+                MaximumExpansionCount,
+                MaximumRuntimeMilliseconds,
+            )
+        })
+    }
+
+    #[pyo3(signature=(Requests, MaximumRuntimeMilliseconds))]
+    fn CertifyRouteFactorConnectivityBatchBounded(
+        &self,
+        PythonValue: Python<'_>,
+        Requests: Vec<(
+            Vec<(i32, i32)>,
+            i32,
+            Vec<Position>,
+            Vec<Position>,
+            Vec<Position>,
+            Position,
+            usize,
+        )>,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> Vec<(bool, bool, usize)> {
+        PythonValue.allow_threads(|| {
+            self.CertifyRouteFactorConnectivityBatchNative(Requests, MaximumRuntimeMilliseconds)
+        })
     }
 
     #[pyo3(signature=(Starts, PortalTargets, AllowedNodeValues, PreferredRoutingY, MaximumPortalCount, MaximumExpansionCount, MaximumRuntimeSeconds=None))]
@@ -657,6 +740,51 @@ impl RoutingContext {
         })
     }
 
+    #[pyo3(signature=(Starts, TargetBranches, AllowedNodeValues, BlockedNodeValues, PreferredColumns, NodeCostValues, PreferredRoutingY, GuidePenalty, BendPenalty, ViaPenalty, EnforceSignalStrength, MaximumExpansionCount, MaximumRuntimeMilliseconds, MandatoryWireValues, MandatorySupportValues, MandatoryAirValues, MandatoryElectricalValues))]
+    fn GenerateRouteTreeClaimAwareDetailedBounded(
+        &self,
+        PythonValue: Python<'_>,
+        Starts: Vec<Position>,
+        TargetBranches: Vec<Vec<Position>>,
+        AllowedNodeValues: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        PreferredColumns: Vec<(i32, i32)>,
+        NodeCostValues: Vec<(Position, i32)>,
+        PreferredRoutingY: i32,
+        GuidePenalty: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        EnforceSignalStrength: bool,
+        MaximumExpansionCount: usize,
+        MaximumRuntimeMilliseconds: u64,
+        MandatoryWireValues: Vec<Position>,
+        MandatorySupportValues: Vec<Position>,
+        MandatoryAirValues: Vec<Position>,
+        MandatoryElectricalValues: Vec<Position>,
+    ) -> RouteTreeSearchResult {
+        PythonValue.allow_threads(|| {
+            self.GenerateRouteTreeClaimAwareDetailedNative(
+                Starts,
+                TargetBranches,
+                AllowedNodeValues,
+                BlockedNodeValues,
+                PreferredColumns,
+                NodeCostValues,
+                PreferredRoutingY,
+                GuidePenalty,
+                BendPenalty,
+                ViaPenalty,
+                EnforceSignalStrength,
+                MaximumExpansionCount,
+                MaximumRuntimeMilliseconds,
+                MandatoryWireValues,
+                MandatorySupportValues,
+                MandatoryAirValues,
+                MandatoryElectricalValues,
+            )
+        })
+    }
+
     /// Runs independent detailed route-tree searches against a frozen routing
     /// context.  `MaximumRuntimeMilliseconds` is one absolute deadline for
     /// the whole batch, not a new budget per request.
@@ -683,6 +811,23 @@ impl RoutingContext {
     ) -> RouteTreeDetailedBatchResult {
         PythonValue.allow_threads(|| {
             GenerateRouteTreeDetailedBatchNative(self, Requests, MaximumRuntimeMilliseconds)
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature=(Requests, MaximumRuntimeMilliseconds))]
+    fn GenerateRouteTreeClaimAwareDetailedBatchBounded(
+        &self,
+        PythonValue: Python<'_>,
+        Requests: Vec<ClaimAwareDetailedRouteTreeRequest>,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> RouteTreeDetailedBatchResult {
+        PythonValue.allow_threads(|| {
+            GenerateRouteTreeClaimAwareDetailedBatchNative(
+                self,
+                Requests,
+                MaximumRuntimeMilliseconds,
+            )
         })
     }
 

@@ -26,7 +26,11 @@ from .Placement.PcbFlow import (
 )
 from SchemEncoder import Writer262
 from SchemEncoder.Writer262 import BlockCompositionMetrics
-from .Simulation.Redstone import SimulateRoutedTruthTable, WriteTruthTable
+from .Simulation.Redstone import (
+    SimulateRenderedMinecraftTruthTable,
+    SimulateRoutedTruthTable,
+    WriteTruthTable,
+)
 from .Routing.ChannelPlanner import RoutingStageMetrics
 from .Routing.Failures import (
     RoutingFailure,
@@ -756,6 +760,23 @@ def CompileSvToLitematic(
         print("[debug] pipeline: block map built", flush=True)
     Composition = Rendered.Composition
 
+    # The routed-net check above is an inexpensive candidate filter.  The
+    # final acceptance decision must instead come from the exact rendered
+    # Minecraft block layout, where torches, opaque support blocks, and dust
+    # can couple otherwise distinct logical nets.
+    Simulation = SimulateRenderedMinecraftTruthTable(
+        Routed,
+        ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
+    )
+    if not Simulation.Passed:
+        Failed = Simulation.FailedRows[0]
+        raise ValueError(
+            "Rendered Minecraft redstone truth table failed: "
+            f"inputs={tuple(int(Value) for Value in Failed.Inputs)}, "
+            f"expected={tuple(int(Value) for Value in Failed.ExpectedOutputs)}, "
+            f"simulated={tuple(int(Value) for Value in Failed.SimulatedOutputs)}"
+        )
+
     GlobalPlan = Routed.GlobalPlan
     Metrics = Routed.RoutingMetrics
     PerNetLengths = {
@@ -900,6 +921,7 @@ def CompileSvToLitematic(
             "TruthTableRows": len(Simulation.Rows),
             "SimulationBackend": Simulation.Backend,
             "SimulationRuntimeSeconds": Simulation.RuntimeSeconds,
+            "SimulationDiagnostics": Simulation.Diagnostics,
         },
         "BlockComposition": Composition.ToDictionary(),
         "NormalizedQuality": NormalizedQuality,

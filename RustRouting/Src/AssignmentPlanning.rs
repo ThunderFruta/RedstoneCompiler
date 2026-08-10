@@ -1,7 +1,7 @@
 use crate::Assignment::{AssignCandidates, SortCandidatesWithDeadline};
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::Models::{
-    AssignmentCandidate, ClaimMask, ClaimMaskBuildError, RoutingAssignmentResult,
+    AssignmentCandidate, ClaimMask, ClaimMaskBuildError, Position, RoutingAssignmentResult,
     TemplateRoutingAssignmentResult,
 };
 use pyo3::prelude::*;
@@ -51,6 +51,26 @@ pub(crate) type TemplateAssignmentDomainValue = (
     Vec<AssignmentCandidateValue>,
     Vec<BaseAssignmentValue>,
 );
+pub(crate) type CompactClaimPrimitiveValue = (
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Position>,
+);
+pub(crate) type CompactFactorValue = (
+    String,
+    String,
+    Vec<usize>,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    String,
+    String,
+);
+pub(crate) type CompactFactorMemberValue = (String, Vec<i64>, Vec<String>, Vec<usize>);
 
 pub(crate) fn DeadlineExceededAssignmentResult(CompletedWork: usize) -> RoutingAssignmentResult {
     RoutingAssignmentResult {
@@ -276,10 +296,26 @@ pub(crate) fn PlanAuthoritativeRoutesWithInitialExpansionAndDeadline(
     let Some(mut Groups) = BuildCandidateGroups(CandidateValues, ResourceCount, &Deadline)? else {
         return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
-    if !SortCandidateGroups(&mut Groups, &Deadline) {
+    PlanAuthoritativeCandidateGroupsWithInitialExpansionAndDeadline(
+        &mut Groups,
+        ResourceCount,
+        InitialExpansionCount,
+        EffectiveMaximumExpansionCount,
+        Deadline,
+    )
+}
+
+fn PlanAuthoritativeCandidateGroupsWithInitialExpansionAndDeadline(
+    Groups: &mut BTreeMap<String, Vec<AssignmentCandidate>>,
+    ResourceCount: usize,
+    InitialExpansionCount: usize,
+    EffectiveMaximumExpansionCount: usize,
+    Deadline: RuntimeDeadline,
+) -> PyResult<RoutingAssignmentResult> {
+    if !SortCandidateGroups(Groups, &Deadline) {
         return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     }
-    let Some(Remaining) = BuildRemainingSignals(&Groups, &Deadline) else {
+    let Some(Remaining) = BuildRemainingSignals(Groups, &Deadline) else {
         return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
     };
     let Some(Owned) = ClaimMask::NewWithDeadline(ResourceCount, &Deadline) else {
@@ -294,7 +330,7 @@ pub(crate) fn PlanAuthoritativeRoutesWithInitialExpansionAndDeadline(
     let mut PairwiseIncompatibleSignals = Vec::new();
     let mut PairwiseCompatibilityComplete = false;
     let Success = AssignCandidates(
-        &Groups,
+        Groups,
         &Remaining,
         &Owned,
         &BTreeMap::new(),
@@ -550,6 +586,9 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
     let mut FirstConflictResourceIndices = Vec::new();
     let mut FirstPairwiseIncompatibleSignals = Vec::new();
     let mut AttemptPairwiseIncompatibleSignals = Vec::new();
+    let mut AttemptFailureNets = Vec::new();
+    let mut AttemptExpansionCounts = Vec::new();
+    let mut AttemptPartialCandidateIds = Vec::new();
     let mut Index = 0usize;
 
     while Index < Domains.len() {
@@ -574,6 +613,9 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
                 PairwiseCompatibilityComplete: false,
                 AttemptedTemplateIds,
                 AttemptPairwiseIncompatibleSignals,
+                AttemptFailureNets,
+                AttemptExpansionCounts,
+                AttemptPartialCandidateIds,
                 NonExhaustiveTemplateDomain,
             });
         }
@@ -635,9 +677,17 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
                     Deadline.clone(),
                 )?
             };
+            let InitialMemberExpansionCount = ExpansionCount;
             ExpansionCount = ExpansionCount
                 .max(Result.ExpansionCount)
                 .min(EffectiveMaximumExpansionCount);
+            AttemptFailureNets.push((TemplateId.clone(), Result.FailureNet.clone()));
+            AttemptExpansionCounts.push((
+                TemplateId.clone(),
+                ExpansionCount.saturating_sub(InitialMemberExpansionCount),
+            ));
+            AttemptPartialCandidateIds
+                .push((TemplateId.clone(), Result.SelectedCandidateIds.clone()));
             if FirstConflictSignals.is_empty() && !Result.ConflictSignals.is_empty() {
                 FirstConflictSignals = Result.ConflictSignals.clone();
                 FirstConflictResourceIndices = Result.ConflictResourceIndices.clone();
@@ -680,6 +730,9 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
                     PairwiseCompatibilityComplete: Result.PairwiseCompatibilityComplete,
                     AttemptedTemplateIds,
                     AttemptPairwiseIncompatibleSignals,
+                    AttemptFailureNets,
+                    AttemptExpansionCounts,
+                    AttemptPartialCandidateIds,
                     NonExhaustiveTemplateDomain,
                 });
             }
@@ -712,6 +765,9 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
                 PairwiseCompatibilityComplete: true,
                 AttemptedTemplateIds,
                 AttemptPairwiseIncompatibleSignals,
+                AttemptFailureNets,
+                AttemptExpansionCounts,
+                AttemptPartialCandidateIds,
                 NonExhaustiveTemplateDomain,
             });
         }
@@ -747,6 +803,518 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
         PairwiseCompatibilityComplete: true,
         AttemptedTemplateIds,
         AttemptPairwiseIncompatibleSignals,
+        AttemptFailureNets,
+        AttemptExpansionCounts,
+        AttemptPartialCandidateIds,
+        NonExhaustiveTemplateDomain,
+    })
+}
+
+fn ValidateCompactPrimitiveValues(
+    PrimitiveValues: Vec<CompactClaimPrimitiveValue>,
+    ResourcePositions: &[Position],
+    Deadline: &RuntimeDeadline,
+) -> PyResult<Option<Vec<CompactClaimPrimitiveValue>>> {
+    let ResourceSet = ResourcePositions.iter().copied().collect::<BTreeSet<_>>();
+    if ResourceSet.len() != ResourcePositions.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "compact resource vocabulary contains duplicates",
+        ));
+    }
+    for (Index, (Wire, Support, Air, Electrical, DeferredGuide)) in
+        PrimitiveValues.iter().enumerate()
+    {
+        if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+            return Ok(None);
+        }
+        if !DeferredGuide.is_empty()
+            && (!Wire.is_empty() || !Support.is_empty() || !Electrical.is_empty())
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "deferred compact route primitive also contains expanded claims",
+            ));
+        }
+        if Air.iter().any(|Value| !ResourceSet.contains(Value))
+            || (DeferredGuide.is_empty()
+                && Wire
+                    .iter()
+                    .chain(Support)
+                    .chain(Electrical)
+                    .any(|Value| !ResourceSet.contains(Value)))
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "compact primitive references a resource outside the vocabulary",
+            ));
+        }
+    }
+    Ok(Some(PrimitiveValues))
+}
+
+fn BuildCompactFactorGroups(
+    Values: Vec<CompactFactorValue>,
+    PrimitiveValues: &[CompactClaimPrimitiveValue],
+    Deadline: &RuntimeDeadline,
+) -> PyResult<Option<(BTreeMap<String, Vec<AssignmentCandidate>>, usize)>> {
+    let ReferencedPrimitiveIds = Values
+        .iter()
+        .flat_map(|Value| Value.2.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut ExpandedPrimitiveValues = BTreeMap::new();
+    let mut ReferencedGlobalResources: BTreeSet<Position> = BTreeSet::new();
+    for PrimitiveId in &ReferencedPrimitiveIds {
+        let Some((Wire, Support, Air, Electrical, DeferredGuide)) =
+            PrimitiveValues.get(*PrimitiveId)
+        else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "compact factor references an unknown primitive",
+            ));
+        };
+        let (Wire, Support, Air, Electrical) = if DeferredGuide.is_empty() {
+            (
+                Wire.clone(),
+                Support.clone(),
+                Air.clone(),
+                Electrical.clone(),
+            )
+        } else {
+            let Wire = DeferredGuide.clone();
+            let Support = Wire
+                .iter()
+                .map(|(X, Y, Z)| (*X, Y.saturating_sub(1), *Z))
+                .collect::<Vec<_>>();
+            let mut Electrical = Wire.clone();
+            for (X, Y, Z) in &Wire {
+                Electrical.extend([
+                    (X.saturating_add(1), *Y, *Z),
+                    (X.saturating_sub(1), *Y, *Z),
+                    (*X, *Y, Z.saturating_add(1)),
+                    (*X, *Y, Z.saturating_sub(1)),
+                    (X.saturating_add(1), Y.saturating_add(1), *Z),
+                    (X.saturating_add(1), Y.saturating_sub(1), *Z),
+                    (X.saturating_sub(1), Y.saturating_add(1), *Z),
+                    (X.saturating_sub(1), Y.saturating_sub(1), *Z),
+                    (*X, Y.saturating_add(1), Z.saturating_add(1)),
+                    (*X, Y.saturating_sub(1), Z.saturating_add(1)),
+                    (*X, Y.saturating_add(1), Z.saturating_sub(1)),
+                    (*X, Y.saturating_sub(1), Z.saturating_sub(1)),
+                ]);
+            }
+            (Wire, Support, Air.clone(), Electrical)
+        };
+        ReferencedGlobalResources.extend(Wire.iter().copied());
+        ReferencedGlobalResources.extend(Support.iter().copied());
+        ReferencedGlobalResources.extend(Air.iter().copied());
+        ReferencedGlobalResources.extend(Electrical.iter().copied());
+        ExpandedPrimitiveValues.insert(*PrimitiveId, (Wire, Support, Air, Electrical));
+    }
+    let LocalIndexByGlobal = ReferencedGlobalResources
+        .into_iter()
+        .enumerate()
+        .map(|(LocalIndex, GlobalIndex)| (GlobalIndex, LocalIndex))
+        .collect::<HashMap<_, _>>();
+    let ResourceCount = LocalIndexByGlobal.len().max(1);
+    let Remap = |Values: &[Position]| -> Vec<usize> {
+        Values
+            .iter()
+            .map(|Value| LocalIndexByGlobal[Value])
+            .collect()
+    };
+    let LocalPrimitiveValues = ReferencedPrimitiveIds
+        .into_iter()
+        .map(|PrimitiveId| {
+            let (Wire, Support, Air, Electrical) = &ExpandedPrimitiveValues[&PrimitiveId];
+            (
+                PrimitiveId,
+                (Remap(Wire), Remap(Support), Remap(Air), Remap(Electrical)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut PrimitiveMasks = BTreeMap::new();
+    let mut Groups: BTreeMap<String, Vec<AssignmentCandidate>> = BTreeMap::new();
+    let mut Identities = BTreeSet::new();
+    for (
+        Index,
+        (
+            Signal,
+            CandidateId,
+            PrimitiveIds,
+            MaterialCost,
+            FootprintGrowth,
+            Length,
+            BendCount,
+            ViaCount,
+            ContractRequirements,
+            OwnerSignal,
+        ),
+    ) in Values.into_iter().enumerate()
+    {
+        if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+            return Ok(None);
+        }
+        if Signal.is_empty()
+            || CandidateId.is_empty()
+            || OwnerSignal.is_empty()
+            || !Identities.insert((Signal.clone(), CandidateId.clone()))
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "compact factor identities must be nonempty and unique",
+            ));
+        }
+        let Some(mut Claims) = ClaimMask::NewWithDeadline(ResourceCount, Deadline) else {
+            return Ok(None);
+        };
+        let mut SeenPrimitiveIds = BTreeSet::new();
+        for PrimitiveId in PrimitiveIds {
+            if !SeenPrimitiveIds.insert(PrimitiveId) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "compact factor repeats a primitive reference",
+                ));
+            }
+            if !PrimitiveMasks.contains_key(&PrimitiveId) {
+                let Some((Wire, Support, Air, Electrical)) = LocalPrimitiveValues.get(&PrimitiveId)
+                else {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "compact factor references an unknown primitive",
+                    ));
+                };
+                let Primitive = match ClaimMask::FromIndicesWithDeadline(
+                    ResourceCount,
+                    Wire,
+                    Support,
+                    Air,
+                    Electrical,
+                    Deadline,
+                ) {
+                    Ok(Value) => Arc::new(Value),
+                    Err(ClaimMaskBuildError::DeadlineExceeded) => return Ok(None),
+                    Err(ClaimMaskBuildError::IndexOutOfRange) => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "compact primitive references a resource outside the vocabulary",
+                        ));
+                    }
+                };
+                PrimitiveMasks.insert(PrimitiveId, Primitive);
+            }
+            let Some(Primitive) = PrimitiveMasks.get(&PrimitiveId) else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "compact factor references an unknown primitive",
+                ));
+            };
+            if !Claims.UnionWithDeadline(Primitive, Deadline) {
+                return Ok(None);
+            }
+        }
+        Groups.entry(Signal).or_default().push(AssignmentCandidate {
+            CandidateId,
+            TemplateKey: ContractRequirements,
+            OwnerSignal,
+            Claims: Arc::new(Claims),
+            MaterialCost,
+            FootprintGrowth,
+            Length,
+            BendCount,
+            ViaCount,
+        });
+    }
+    Ok(Some((Groups, ResourceCount)))
+}
+
+/// Select one compact portfolio while constructing each candidate mask only
+/// when its member is attempted.  Primitive masks are built once globally.
+pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
+    ResourcePositions: Vec<Position>,
+    PrimitiveValues: Vec<CompactClaimPrimitiveValue>,
+    FactorValues: Vec<CompactFactorValue>,
+    mut Members: Vec<CompactFactorMemberValue>,
+    MaximumExpansionCount: usize,
+    Deadline: RuntimeDeadline,
+    NonExhaustiveTemplateDomain: bool,
+) -> PyResult<TemplateRoutingAssignmentResult> {
+    let Some(PrimitiveValues) =
+        ValidateCompactPrimitiveValues(PrimitiveValues, &ResourcePositions, &Deadline)?
+    else {
+        return Ok(TemplateRoutingAssignmentResult {
+            Status: "Incomplete".to_string(),
+            Success: false,
+            Complete: false,
+            Unsatisfiable: false,
+            IncompleteReason: "assignment-deadline".to_string(),
+            SelectedTemplateId: None,
+            SelectedTemplateObjective: Vec::new(),
+            SelectedCandidateIds: Vec::new(),
+            ExpansionCount: 0,
+            BudgetExhausted: false,
+            DeadlineExceeded: true,
+            CompletedWork: 0,
+            FailureNet: None,
+            ConflictSignals: Vec::new(),
+            ConflictResourceIndices: Vec::new(),
+            PairwiseIncompatibleSignals: Vec::new(),
+            PairwiseCompatibilityComplete: false,
+            AttemptedTemplateIds: Vec::new(),
+            AttemptPairwiseIncompatibleSignals: Vec::new(),
+            AttemptFailureNets: Vec::new(),
+            AttemptExpansionCounts: Vec::new(),
+            AttemptPartialCandidateIds: Vec::new(),
+            NonExhaustiveTemplateDomain,
+        });
+    };
+    Members.sort_by(|First, Second| First.1.cmp(&Second.1).then_with(|| First.0.cmp(&Second.0)));
+    let MemberIds = Members
+        .iter()
+        .map(|Value| Value.0.clone())
+        .collect::<Vec<_>>();
+    if MemberIds.iter().any(|Value| Value.is_empty())
+        || MemberIds.iter().collect::<BTreeSet<_>>().len() != MemberIds.len()
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "compact catalog member ids must be nonempty and unique",
+        ));
+    }
+    let EffectiveMaximumExpansionCount = MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS);
+    let mut ExpansionCount = 0usize;
+    let mut AttemptedTemplateIds = Vec::new();
+    let mut FirstConflictSignals = Vec::new();
+    let mut FirstConflictResourceIndices = Vec::new();
+    let mut FirstPairwiseIncompatibleSignals = Vec::new();
+    let mut AttemptPairwiseIncompatibleSignals = Vec::new();
+    let mut AttemptFailureNets = Vec::new();
+    let mut AttemptExpansionCounts = Vec::new();
+    let mut AttemptPartialCandidateIds = Vec::new();
+    let mut Index = 0usize;
+    while Index < Members.len() {
+        if Deadline.Check() {
+            return Ok(TemplateRoutingAssignmentResult {
+                Status: "Incomplete".to_string(),
+                Success: false,
+                Complete: false,
+                Unsatisfiable: false,
+                IncompleteReason: "assignment-deadline".to_string(),
+                SelectedTemplateId: None,
+                SelectedTemplateObjective: Vec::new(),
+                SelectedCandidateIds: Vec::new(),
+                ExpansionCount,
+                BudgetExhausted: false,
+                DeadlineExceeded: true,
+                CompletedWork: ExpansionCount,
+                FailureNet: None,
+                ConflictSignals: FirstConflictSignals,
+                ConflictResourceIndices: FirstConflictResourceIndices,
+                PairwiseIncompatibleSignals: FirstPairwiseIncompatibleSignals,
+                PairwiseCompatibilityComplete: false,
+                AttemptedTemplateIds,
+                AttemptPairwiseIncompatibleSignals,
+                AttemptFailureNets,
+                AttemptExpansionCounts,
+                AttemptPartialCandidateIds,
+                NonExhaustiveTemplateDomain,
+            });
+        }
+        let Objective = Members[Index].1.clone();
+        let mut SuccessfulMembers = Vec::new();
+        while Index < Members.len() && Members[Index].1 == Objective {
+            let (TemplateId, TemplateObjective, RequiredSignals, FactorIndexes) =
+                Members[Index].clone();
+            AttemptedTemplateIds.push(TemplateId.clone());
+            let MemberFactorValues = FactorIndexes
+                .iter()
+                .map(|FactorIndex| {
+                    FactorValues.get(*FactorIndex).cloned().ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "compact member references an unknown factor",
+                        )
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let CandidateSignals = MemberFactorValues
+                .iter()
+                .map(|Value| Value.0.clone())
+                .collect::<BTreeSet<_>>();
+            let MissingSignals = RequiredSignals
+                .iter()
+                .filter(|Signal| !CandidateSignals.contains(*Signal))
+                .cloned()
+                .collect::<Vec<_>>();
+            let Result = if let Some(FailureNet) = MissingSignals.first() {
+                RoutingAssignmentResult {
+                    Success: false,
+                    SelectedCandidateIds: Vec::new(),
+                    ExpansionCount,
+                    BudgetExhausted: false,
+                    DeadlineExceeded: false,
+                    CompletedWork: ExpansionCount,
+                    FailureNet: Some(FailureNet.clone()),
+                    ConflictSignals: MissingSignals,
+                    ConflictResourceIndices: Vec::new(),
+                    PairwiseIncompatibleSignals: Vec::new(),
+                    PairwiseCompatibilityComplete: true,
+                }
+            } else {
+                let Some((mut Groups, MemberResourceCount)) =
+                    BuildCompactFactorGroups(MemberFactorValues, &PrimitiveValues, &Deadline)?
+                else {
+                    return Ok(TemplateRoutingAssignmentResult {
+                        Status: "Incomplete".to_string(),
+                        Success: false,
+                        Complete: false,
+                        Unsatisfiable: false,
+                        IncompleteReason: "assignment-deadline".to_string(),
+                        SelectedTemplateId: None,
+                        SelectedTemplateObjective: Vec::new(),
+                        SelectedCandidateIds: Vec::new(),
+                        ExpansionCount,
+                        BudgetExhausted: false,
+                        DeadlineExceeded: true,
+                        CompletedWork: ExpansionCount,
+                        FailureNet: None,
+                        ConflictSignals: FirstConflictSignals,
+                        ConflictResourceIndices: FirstConflictResourceIndices,
+                        PairwiseIncompatibleSignals: FirstPairwiseIncompatibleSignals,
+                        PairwiseCompatibilityComplete: false,
+                        AttemptedTemplateIds,
+                        AttemptPairwiseIncompatibleSignals,
+                        AttemptFailureNets,
+                        AttemptExpansionCounts,
+                        AttemptPartialCandidateIds,
+                        NonExhaustiveTemplateDomain,
+                    });
+                };
+                PlanAuthoritativeCandidateGroupsWithInitialExpansionAndDeadline(
+                    &mut Groups,
+                    MemberResourceCount,
+                    ExpansionCount,
+                    EffectiveMaximumExpansionCount,
+                    Deadline.clone(),
+                )?
+            };
+            let InitialMemberExpansionCount = ExpansionCount;
+            ExpansionCount = ExpansionCount
+                .max(Result.ExpansionCount)
+                .min(EffectiveMaximumExpansionCount);
+            AttemptFailureNets.push((TemplateId.clone(), Result.FailureNet.clone()));
+            AttemptExpansionCounts.push((
+                TemplateId.clone(),
+                ExpansionCount.saturating_sub(InitialMemberExpansionCount),
+            ));
+            AttemptPartialCandidateIds
+                .push((TemplateId.clone(), Result.SelectedCandidateIds.clone()));
+            if FirstConflictSignals.is_empty() && !Result.ConflictSignals.is_empty() {
+                FirstConflictSignals = Result.ConflictSignals.clone();
+                FirstConflictResourceIndices = Result.ConflictResourceIndices.clone();
+            }
+            if FirstPairwiseIncompatibleSignals.is_empty()
+                && !Result.PairwiseIncompatibleSignals.is_empty()
+            {
+                FirstPairwiseIncompatibleSignals = Result.PairwiseIncompatibleSignals.clone();
+            }
+            AttemptPairwiseIncompatibleSignals.push((
+                TemplateId.clone(),
+                Result.PairwiseIncompatibleSignals.clone(),
+            ));
+            if Result.DeadlineExceeded || Result.BudgetExhausted {
+                return Ok(TemplateRoutingAssignmentResult {
+                    Status: "Incomplete".to_string(),
+                    Success: false,
+                    Complete: false,
+                    Unsatisfiable: false,
+                    IncompleteReason: if Result.DeadlineExceeded {
+                        "assignment-deadline".to_string()
+                    } else {
+                        "assignment-work-cap".to_string()
+                    },
+                    SelectedTemplateId: None,
+                    SelectedTemplateObjective: Vec::new(),
+                    SelectedCandidateIds: Vec::new(),
+                    ExpansionCount,
+                    BudgetExhausted: Result.BudgetExhausted,
+                    DeadlineExceeded: Result.DeadlineExceeded,
+                    CompletedWork: ExpansionCount,
+                    FailureNet: Result.FailureNet,
+                    ConflictSignals: FirstConflictSignals,
+                    ConflictResourceIndices: FirstConflictResourceIndices,
+                    PairwiseIncompatibleSignals: if Result.PairwiseIncompatibleSignals.is_empty() {
+                        FirstPairwiseIncompatibleSignals
+                    } else {
+                        Result.PairwiseIncompatibleSignals
+                    },
+                    PairwiseCompatibilityComplete: Result.PairwiseCompatibilityComplete,
+                    AttemptedTemplateIds,
+                    AttemptPairwiseIncompatibleSignals,
+                    AttemptFailureNets,
+                    AttemptExpansionCounts,
+                    AttemptPartialCandidateIds,
+                    NonExhaustiveTemplateDomain,
+                });
+            }
+            if Result.Success {
+                SuccessfulMembers.push((TemplateId, TemplateObjective, Result));
+            }
+            Index += 1;
+        }
+        if let Some((TemplateId, TemplateObjective, Result)) = SuccessfulMembers
+            .into_iter()
+            .min_by(|First, Second| First.0.cmp(&Second.0))
+        {
+            return Ok(TemplateRoutingAssignmentResult {
+                Status: "Feasible".to_string(),
+                Success: true,
+                Complete: true,
+                Unsatisfiable: false,
+                IncompleteReason: String::new(),
+                SelectedTemplateId: Some(TemplateId),
+                SelectedTemplateObjective: TemplateObjective,
+                SelectedCandidateIds: Result.SelectedCandidateIds,
+                ExpansionCount,
+                BudgetExhausted: false,
+                DeadlineExceeded: false,
+                CompletedWork: ExpansionCount,
+                FailureNet: None,
+                ConflictSignals: Vec::new(),
+                ConflictResourceIndices: Vec::new(),
+                PairwiseIncompatibleSignals: Vec::new(),
+                PairwiseCompatibilityComplete: true,
+                AttemptedTemplateIds,
+                AttemptPairwiseIncompatibleSignals,
+                AttemptFailureNets,
+                AttemptExpansionCounts,
+                AttemptPartialCandidateIds,
+                NonExhaustiveTemplateDomain,
+            });
+        }
+    }
+    let Unsatisfiable = !NonExhaustiveTemplateDomain;
+    Ok(TemplateRoutingAssignmentResult {
+        Status: if Unsatisfiable {
+            "Unsatisfiable"
+        } else {
+            "Incomplete"
+        }
+        .to_string(),
+        Success: false,
+        Complete: Unsatisfiable,
+        Unsatisfiable,
+        IncompleteReason: if Unsatisfiable {
+            "complete-capacity-core".to_string()
+        } else {
+            "non-exhaustive-template-domain".to_string()
+        },
+        SelectedTemplateId: None,
+        SelectedTemplateObjective: Vec::new(),
+        SelectedCandidateIds: Vec::new(),
+        ExpansionCount,
+        BudgetExhausted: false,
+        DeadlineExceeded: false,
+        CompletedWork: ExpansionCount,
+        FailureNet: None,
+        ConflictSignals: FirstConflictSignals,
+        ConflictResourceIndices: FirstConflictResourceIndices,
+        PairwiseIncompatibleSignals: FirstPairwiseIncompatibleSignals,
+        PairwiseCompatibilityComplete: true,
+        AttemptedTemplateIds,
+        AttemptPairwiseIncompatibleSignals,
+        AttemptFailureNets,
+        AttemptExpansionCounts,
+        AttemptPartialCandidateIds,
         NonExhaustiveTemplateDomain,
     })
 }
@@ -1082,6 +1650,223 @@ mod Tests {
                 ),
             ],
         );
+    }
+
+    fn CompactFactor(
+        Variable: &str,
+        FactorId: &str,
+        PrimitiveIndex: usize,
+        Contract: &str,
+        Owner: &str,
+    ) -> CompactFactorValue {
+        (
+            Variable.to_string(),
+            FactorId.to_string(),
+            vec![PrimitiveIndex],
+            1,
+            1,
+            1,
+            0,
+            0,
+            Contract.to_string(),
+            Owner.to_string(),
+        )
+    }
+
+    #[test]
+    fn CompactCatalogSkipsAConflictingL1AndSelectsL2() {
+        let Primitives = vec![
+            (
+                vec![(0, 0, 0)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![(0, 0, 0)],
+                Vec::new(),
+            ),
+            (
+                vec![(1, 0, 0)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            (
+                vec![(2, 0, 0)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+        let Factors = vec![
+            CompactFactor("A", "a-l2", 2, "member=l2", "A"),
+            CompactFactor("B", "b-l2", 3, "member=l2", "B"),
+            CompactFactor("A", "a-l1", 0, "member=l1", "A"),
+            CompactFactor("B", "b-l1", 1, "member=l1", "B"),
+        ];
+        let Members = vec![
+            (
+                "l2".to_string(),
+                vec![2],
+                vec!["A".to_string(), "B".to_string()],
+                vec![0, 1],
+            ),
+            (
+                "l1".to_string(),
+                vec![1],
+                vec!["A".to_string(), "B".to_string()],
+                vec![2, 3],
+            ),
+        ];
+
+        let Result = SolveCompactTemplateFactorCatalogWithDeadline(
+            vec![(0, 0, 0), (1, 0, 0), (2, 0, 0)],
+            Primitives,
+            Factors,
+            Members,
+            64,
+            RuntimeDeadline::FromMilliseconds(Some(1_000)).unwrap(),
+            true,
+        )
+        .expect("the compact catalog should produce a typed witness");
+
+        assert!(Result.Success);
+        assert!(Result.Complete);
+        assert!(!Result.Unsatisfiable);
+        assert_eq!(Result.SelectedTemplateId, Some("l2".to_string()));
+        assert_eq!(
+            Result.SelectedCandidateIds,
+            vec![
+                ("A".to_string(), "a-l2".to_string()),
+                ("B".to_string(), "b-l2".to_string()),
+            ],
+        );
+        assert_eq!(
+            Result.AttemptedTemplateIds,
+            vec!["l1".to_string(), "l2".to_string()],
+        );
+    }
+
+    #[test]
+    fn CompactCatalogAllowsSameOwnerAccessAndGuideOverlap() {
+        let Result = SolveCompactTemplateFactorCatalogWithDeadline(
+            vec![(0, 0, 0)],
+            vec![(
+                vec![(0, 0, 0)],
+                Vec::new(),
+                Vec::new(),
+                vec![(0, 0, 0)],
+                Vec::new(),
+            )],
+            vec![
+                CompactFactor("A", "guide", 0, "access-stub:A=0;member=member", "A"),
+                CompactFactor(
+                    "__access_terminal__:A",
+                    "stub",
+                    0,
+                    "access-stub:A=0;member=member",
+                    "A",
+                ),
+            ],
+            vec![(
+                "member".to_string(),
+                vec![1],
+                vec!["A".to_string(), "__access_terminal__:A".to_string()],
+                vec![0, 1],
+            )],
+            16,
+            RuntimeDeadline::FromMilliseconds(Some(1_000)).unwrap(),
+            true,
+        )
+        .expect("same-owner compact factors should be legal");
+
+        assert!(Result.Success);
+        assert_eq!(Result.SelectedTemplateId, Some("member".to_string()));
+    }
+
+    #[test]
+    fn CompactNonExhaustiveFailureIsIncompleteAndWorkCapIsShared() {
+        let ConflictFactors = vec![
+            CompactFactor("A", "a", 0, "member=conflict", "A"),
+            CompactFactor("B", "b", 1, "member=conflict", "B"),
+        ];
+        let Member = (
+            "conflict".to_string(),
+            vec![1],
+            vec!["A".to_string(), "B".to_string()],
+            vec![0, 1],
+        );
+        let Primitives = vec![
+            (
+                vec![(0, 0, 0)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![(0, 0, 0)],
+                Vec::new(),
+            ),
+            (
+                vec![(1, 0, 0)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+        let CompleteFailure = SolveCompactTemplateFactorCatalogWithDeadline(
+            vec![(0, 0, 0), (1, 0, 0)],
+            Primitives.clone(),
+            ConflictFactors,
+            vec![Member.clone()],
+            16,
+            RuntimeDeadline::FromMilliseconds(Some(1_000)).unwrap(),
+            true,
+        )
+        .expect("a non-exhaustive failure should be typed");
+        assert!(!CompleteFailure.Success);
+        assert!(!CompleteFailure.Complete);
+        assert!(!CompleteFailure.Unsatisfiable);
+        assert_eq!(
+            CompleteFailure.IncompleteReason,
+            "non-exhaustive-template-domain"
+        );
+
+        let WorkLimited = SolveCompactTemplateFactorCatalogWithDeadline(
+            vec![(0, 0, 0), (1, 0, 0)],
+            Primitives,
+            vec![
+                CompactFactor("A", "a", 0, "member=feasible", "A"),
+                CompactFactor("B", "b", 2, "member=feasible", "B"),
+            ],
+            vec![(
+                "feasible".to_string(),
+                vec![1],
+                vec!["A".to_string(), "B".to_string()],
+                vec![0, 1],
+            )],
+            1,
+            RuntimeDeadline::FromMilliseconds(Some(1_000)).unwrap(),
+            true,
+        )
+        .expect("the shared work cap should return incomplete");
+        assert!(!WorkLimited.Success);
+        assert!(!WorkLimited.Complete);
+        assert!(!WorkLimited.Unsatisfiable);
+        assert_eq!(WorkLimited.IncompleteReason, "assignment-work-cap");
+        assert_eq!(WorkLimited.ExpansionCount, 1);
     }
 
     #[test]

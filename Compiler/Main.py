@@ -83,7 +83,14 @@ class CpuRunTelemetry:
     def ReadOsThreadCount() -> int:
         """Return Linux process thread count without requiring psutil."""
         try:
-            return max(1, len(os.listdir("/proc/self/task")))
+            with open(
+                "/proc/self/status",
+                "r",
+                encoding="utf-8",
+            ) as StatusFile:
+                for Line in StatusFile:
+                    if Line.startswith("Threads:"):
+                        return max(1, int(Line.split(":", 1)[1]))
         except OSError:
             pass
         return 1

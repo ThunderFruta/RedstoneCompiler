@@ -19,6 +19,7 @@ from Compiler.Placement.PreRouteInterface import (
     PreRouteInterfaceTemplate,
     PreRouteInterfaceWitness,
     SolvePreRouteInterfaceProblem,
+    TerminalAttachmentContract,
 )
 
 
@@ -48,6 +49,43 @@ def test_unused_geometry_slots_are_filled_by_face_diversity_not_objective():
     )
 
     assert tuple(Value.TemplateId for Value in Selected) == ("a", "b")
+
+
+def test_unused_terminal_attachment_is_complete_without_served_pins():
+    Attachment = TerminalAttachmentContract(
+        TerminalName="InputUnused",
+        Signal="Unused",
+        ServedPins=(),
+        ConnectionRequired=False,
+    )
+    Slot = DerivedPerimeterTerminalSlot(
+        SlotId="unused-north",
+        TerminalName="InputUnused",
+        Signal="Unused",
+        Face="north",
+        Origin=(0, 1, -2),
+        Rotation=0,
+        MirrorX=False,
+        MacroBounds=(0, -2, 1, -1),
+        ConnectionPin=(0, 1, -2),
+        ConnectionDirection=(0, 0, -1),
+        InteriorSpan=0,
+        Attachment=Attachment,
+    )
+
+    assert Slot.ConnectionRequired is False
+    assert Slot.ToDictionary()["Attachment"]["ServedPins"] == []
+    assert Attachment.AttachmentFingerprint
+
+
+def test_connected_terminal_attachment_requires_a_served_pin():
+    with pytest.raises(ValueError, match="requires served pins"):
+        TerminalAttachmentContract(
+            TerminalName="InputConnected",
+            Signal="Connected",
+            ServedPins=(),
+            ConnectionRequired=True,
+        )
 
 
 def _Slot(

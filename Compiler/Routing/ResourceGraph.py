@@ -288,6 +288,7 @@ class RoutingResourceGraph:
     ActualBlocks: frozenset[Position3]
     ElectricalBlocks: frozenset[Position3]
     SolidBlocks: frozenset[Position3]
+    TorchPoweredSupportBlocks: frozenset[Position3] = frozenset()
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology
     GraphVersion: str = "routing-resource-graph-v1"
     _RegionCache: dict[
@@ -334,9 +335,11 @@ class RoutingResourceGraph:
         Position: Position3,
         AllowedAccess: frozenset[Position3] = frozenset(),
     ) -> bool:
+        Support = (Position[0], Position[1] - 1, Position[2])
+        if Support in self.TorchPoweredSupportBlocks:
+            return False
         if Position in AllowedAccess:
             return Position not in self.ActualBlocks
-        Support = (Position[0], Position[1] - 1, Position[2])
         return (
             Position not in self.ActualBlocks
             and Support not in self.ActualBlocks
@@ -580,19 +583,32 @@ class RoutingResourceGraph:
         for PositionIndex, First in enumerate(WireCells, start=1):
             X, Y, Z = First
             SupportCells.add((X, Y - 1, Z))
-            ElectricalCells.update(self.Technology.NeighborPositions(First))
+            if (X, Y - 1, Z) in self.TorchPoweredSupportBlocks:
+                raise ValueError(
+                    "Route dust would use a torch-powered support block at "
+                    f"{(X, Y - 1, Z)}"
+                )
+            Neighbors = self.Technology.NeighborPositions(First)
+            ElectricalCells.update(Neighbors)
             if WorkCheck is not None and PositionIndex % 256 == 0:
                 WorkCheck({
                     "Phase": "expand-route-claims",
                     "ProcessedPositions": PositionIndex,
                     "WireCellCount": len(WireCells),
                 })
-            for Second in self.Technology.NeighborPositions(First):
+            for Second in Neighbors:
                 if Second not in WireCells or Second <= First:
                     continue
-                Primitive = self.BuildPrimitive(First, Second)
-                if Primitive is not None:
-                    RequiredAirCells.update(Primitive.Claims.RequiredAirCells)
+                if (
+                    First[1] != Second[1]
+                    and self.CanBuildNeighborPrimitive(First, Second)
+                ):
+                    Lower = First if First[1] < Second[1] else Second
+                    RequiredAirCells.add((
+                        Lower[0],
+                        Lower[1] + 1,
+                        Lower[2],
+                    ))
         Result = RoutingResourceClaims(
             WireCells=WireCells,
             SupportCells=frozenset(SupportCells),

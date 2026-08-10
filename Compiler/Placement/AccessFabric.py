@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Mapping
 from dataclasses import dataclass, is_dataclass, replace
 from hashlib import sha256
@@ -25,6 +25,8 @@ from ..Routing.Models import (
 from ..Routing.ResourceGraph import (
     FindSelfClaimConflicts,
     RoutingResourceClaims,
+    RoutingResourceId,
+    RoutingResourceKind,
 )
 from ..Routing.Technology import (
     DefaultRedstoneRoutingTechnology,
@@ -35,14 +37,17 @@ from .Rotation import RotatedCellSize
 try:
     from ..RustRouting import (
         BuildDerivedEscapeStatePathsBounded as _BuildDerivedEscapeStatePathsBounded,
+        BuildRouteClaimsBatchWithTelemetry as _BuildRouteClaimsBatchWithTelemetry,
     )
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import (
             BuildDerivedEscapeStatePathsBounded as _BuildDerivedEscapeStatePathsBounded,
+            BuildRouteClaimsBatchWithTelemetry as _BuildRouteClaimsBatchWithTelemetry,
         )
     except Exception:
         _BuildDerivedEscapeStatePathsBounded = None
+        _BuildRouteClaimsBatchWithTelemetry = None
 
 
 _PerimeterFaceDirections: dict[str, Position3] = {
@@ -1143,13 +1148,29 @@ def _BuildDerivedPerimeterShellResourceIdentity(
 ) -> tuple[object, ...]:
     """Return static physical inputs which can affect a ring plane."""
     ResourceGraph = Resources.ResourceGraph
-    return (
+    Cached = getattr(
+        ResourceGraph,
+        "_DerivedPerimeterShellResourceIdentity",
+        None,
+    )
+    if Cached is not None:
+        return Cached
+    Identity = (
         str(getattr(ResourceGraph, "GraphVersion", "")),
         tuple(sorted(getattr(ResourceGraph, "ActualBlocks", ()))),
         tuple(sorted(getattr(ResourceGraph, "ElectricalBlocks", ()))),
         tuple(sorted(getattr(ResourceGraph, "SolidBlocks", ()))),
         tuple(sorted(ResourceGraph.StaticKeepOut)),
     )
+    # Resource graphs are immutable after construction.  Store this exact
+    # sorted identity on the graph itself so every layer/interface shell does
+    # not repeatedly sort the same large physical sets.
+    setattr(
+        ResourceGraph,
+        "_DerivedPerimeterShellResourceIdentity",
+        Identity,
+    )
+    return Identity
 
 
 def _BuildDerivedPerimeterShellInputFingerprint(
@@ -1378,6 +1399,70 @@ def BuildDerivedPerimeterFabricShell(
         Bounds=Bounds,
         ActiveFaces=ActiveFaces,
         PerimeterFaceTrackCounts=ResolvedPerimeterFaceTrackCounts,
+        FabricLayers=FabricLayers,
+        FabricYs=FabricYs,
+    )
+
+
+def ProjectDerivedPerimeterFabricShellLayers(
+    Source: DerivedPerimeterFabricShell,
+    Placement: Any,
+    *,
+    Resources: Any,
+    Technology: RedstoneRoutingTechnology,
+    LayerCount: int,
+    PerimeterFaceTrackCounts: tuple[tuple[str, int], ...],
+) -> DerivedPerimeterFabricShell:
+    """Project one exact shell to fewer routing decks without rebuilding it."""
+    if LayerCount < 1 or int(getattr(Placement, "LayerCount", 0)) != LayerCount:
+        raise ValueError("projected perimeter shell layer contract is invalid")
+    if tuple(PerimeterFaceTrackCounts) != Source.PerimeterFaceTrackCounts:
+        raise ValueError(
+            "projected perimeter shell requires identical per-face tracks"
+        )
+    Assignment = _GetDerivedPerimeterSlotAssignment(Placement)
+    if Assignment is None or str(getattr(
+        Assignment,
+        "AssignmentFingerprint",
+        "",
+    )) != Source.PerimeterSlotAssignmentFingerprint:
+        raise ValueError(
+            "projected perimeter shell requires the identical slot assignment"
+        )
+    BaseY = min(int(Gate.Y) for Gate in Placement.Placed.PlacedGates)
+    FabricLayers = tuple(range(LayerCount))
+    FabricYs = tuple(
+        Technology.RoutingY(BaseY, Layer)
+        for Layer in FabricLayers
+    )
+    InputFingerprint = _BuildDerivedPerimeterShellInputFingerprint(
+        Placement,
+        Resources=Resources,
+        Technology=Technology,
+        AccessRingTrackCount=Source.AccessRingTrackCount,
+        AccessLength=Source.AccessLength,
+        BoundarySignals=None,
+        Assignment=Assignment,
+        PerimeterFaceTrackCounts=PerimeterFaceTrackCounts,
+    )
+    ShellFingerprint = sha256(repr((
+        "derived-perimeter-fabric-shell-v1",
+        InputFingerprint,
+        Source.Profiles,
+        Source.TerminalPaths,
+        Source.SlotFaceItems,
+        Source.PerimeterDrivenRootFaceItems,
+        Source.RingBounds,
+        Source.Bounds,
+        Source.ActiveFaces,
+        Source.PerimeterFaceTrackCounts,
+        FabricLayers,
+        FabricYs,
+    )).encode("utf-8")).hexdigest()[:16]
+    return replace(
+        Source,
+        InputFingerprint=InputFingerprint,
+        ShellFingerprint=ShellFingerprint,
         FabricLayers=FabricLayers,
         FabricYs=FabricYs,
     )
@@ -1895,6 +1980,7 @@ def _BuildBoundedLegalDerivedEscapePaths(
                 (),
                 tuple(FixedPrefix),
                 tuple(sorted(Adjacency)),
+                True,
             ),),
             4,
             RemainingExpansionCount,
@@ -2227,6 +2313,7 @@ def BuildPlacementAccessFabric(
     MaximumLegalEscapeExpansions: int | None = None,
     DeriveLegalEscapeWorkLimit: bool = False,
     RestrictDerivedIngressToRepresentatives: bool = False,
+    DeferEscapeStubCapacityResourceIds: bool = False,
     NativeEscapeRemainingMilliseconds: Callable[[], int] | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> PlacementAccessFabric:
@@ -2265,6 +2352,8 @@ def BuildPlacementAccessFabric(
         raise TypeError(
             "RestrictDerivedIngressToRepresentatives must be bool"
         )
+    if not isinstance(DeferEscapeStubCapacityResourceIds, bool):
+        raise TypeError("DeferEscapeStubCapacityResourceIds must be bool")
     Placed = Placement.Placed
     Resources = Resources or BuildRoutingResources(Placed, WorkCheck=WorkCheck)
     NativeEscapeDiagnostics: dict[str, object] = {
@@ -2274,6 +2363,10 @@ def BuildPlacementAccessFabric(
         "Complete": True,
         "ElapsedSeconds": 0.0,
         "FallbackUsed": False,
+        "ClaimBatchWorkItems": 0,
+        "ClaimBatchWorkerCount": 0,
+        "ClaimBatchElapsedSeconds": 0.0,
+        "DominatedEscapeStubCount": 0,
     }
     EffectiveAccessLength = (
         int(Technology.AccessLength)
@@ -2889,6 +2982,7 @@ def BuildPlacementAccessFabric(
         and RegionAdjacency is not None
     ):
         NativeRequests: list[tuple[object, ...]] = []
+        FullRegionNodeMask = tuple(sorted(RegionAdjacency))
         RequestInputs: dict[
             str,
             tuple[str, Position3, tuple[Position3, ...]],
@@ -2941,10 +3035,9 @@ def BuildPlacementAccessFabric(
             ))
             for PrefixIndex, Prefix in enumerate(PrefixDomain):
                 Start = Prefix[-1]
-                AllowedAdjacency = RegionAdjacency
-                AllowedNodeMask = tuple(sorted(AllowedAdjacency))
+                AllowedNodeMask = FullRegionNodeMask
                 if SelectedFace is not None:
-                    AllowedAdjacency, AllowedNodeMask = (
+                    _AllowedAdjacency, AllowedNodeMask = (
                         RestrictedAdjacencyForFacePlane(
                             SelectedFace,
                             Start,
@@ -2960,6 +3053,7 @@ def BuildPlacementAccessFabric(
                     (),
                     Prefix,
                     AllowedNodeMask,
+                    True,
                 ))
         if NativeRequests:
             RemainingExpansionCount = (
@@ -3050,7 +3144,7 @@ def BuildPlacementAccessFabric(
                     RequestId,
                     ((), False),
                 )
-                _Signal, _Terminal, Prefix = RequestKey
+                _Signal, _Terminal, _Prefix = RequestKey
                 ReachedPaths: dict[
                     Position3, tuple[Position3, ...]
                 ] = {}
@@ -3058,19 +3152,13 @@ def BuildPlacementAccessFabric(
                     Ingress = tuple(Ingress)
                     if Ingress in ReachedPaths:
                         continue
-                    Path = tuple(map(tuple, PathValue))
-                    CompletePath = _ErasePlacementAccessPathLoops((
-                        *Prefix,
-                        *Path[1:],
-                    ))
-                    if not FindSelfClaimConflicts({
-                        "PlacementAccess": (
-                            Resources.ResourceGraph.BuildRouteClaims(
-                                CompletePath
-                            )
-                        )
-                    }):
-                        ReachedPaths[Ingress] = Path
+                    # Decode the immutable native path only. BuildStubs below
+                    # erases loops, builds the authoritative graph claims,
+                    # and applies FindSelfClaimConflicts exactly once for the
+                    # terminal that consumes it. Eagerly repeating that work
+                    # for the entire unselected layer portfolio dominated
+                    # access-fabric materialization.
+                    ReachedPaths[Ingress] = tuple(map(tuple, PathValue))
                 BatchedDerivedEscapePaths[RequestKey] = (
                     tuple(
                         ReachedPaths[Ingress]
@@ -3163,6 +3251,7 @@ def BuildPlacementAccessFabric(
                 (),
                 Prefix,
                 tuple(sorted(RegionAdjacency)),
+                False,
             ))
         if FixedNativeRequests:
             FixedExpansionLimit = max(
@@ -3230,7 +3319,7 @@ def BuildPlacementAccessFabric(
                     RequestId,
                     ((), False),
                 )
-                _Signal, _Terminal, Prefix = RequestKey
+                _Signal, _Terminal, _Prefix = RequestKey
                 ReachedPaths: dict[
                     Position3, tuple[Position3, ...]
                 ] = {}
@@ -3238,19 +3327,7 @@ def BuildPlacementAccessFabric(
                     Ingress = tuple(Ingress)
                     if Ingress in ReachedPaths:
                         continue
-                    Path = tuple(map(tuple, PathValue))
-                    CompletePath = _ErasePlacementAccessPathLoops((
-                        *Prefix,
-                        *Path[1:],
-                    ))
-                    if not FindSelfClaimConflicts({
-                        "PlacementAccess": (
-                            Resources.ResourceGraph.BuildRouteClaims(
-                                CompletePath
-                            )
-                        )
-                    }):
-                        ReachedPaths[Ingress] = Path
+                    ReachedPaths[Ingress] = tuple(map(tuple, PathValue))
                 BatchedFixedEscapePaths[RequestKey] = (
                     tuple(
                         ReachedPaths[Ingress]
@@ -3265,6 +3342,118 @@ def BuildPlacementAccessFabric(
                         and not NativeDeadlineExceeded
                     ),
                 )
+    NativeAccessClaimsByWireCells: dict[
+        frozenset[Position3], RoutingResourceClaims
+    ] = {}
+    if (
+        _BuildRouteClaimsBatchWithTelemetry is not None
+        and Technology == DefaultRedstoneRoutingTechnology
+    ):
+        CandidateWireCellsByTerminalIngress: dict[
+            tuple[str, Position3, Position3],
+            set[frozenset[Position3]],
+        ] = defaultdict(set)
+        for BatchedPaths in (
+            BatchedDerivedEscapePaths,
+            BatchedFixedEscapePaths,
+        ):
+            if BatchedPaths is None:
+                continue
+            for (Signal, Terminal, Prefix), (Paths, _Complete) in (
+                BatchedPaths.items()
+            ):
+                for Path in Paths:
+                    StubPath = _ErasePlacementAccessPathLoops((
+                        *Prefix,
+                        *Path[1:],
+                    ))
+                    if not StubPath:
+                        continue
+                    CandidateWireCellsByTerminalIngress[
+                        (str(Signal), tuple(Terminal), tuple(Path[-1]))
+                    ].add(frozenset(StubPath))
+        CandidateWireCells: set[frozenset[Position3]] = set()
+        for WireCellValues in (
+            CandidateWireCellsByTerminalIngress.values()
+        ):
+            NonDominatedWireCells: list[frozenset[Position3]] = []
+            for WireCells in sorted(
+                WireCellValues,
+                key=lambda Value: (len(Value), repr(Value)),
+            ):
+                if any(
+                    Existing <= WireCells
+                    for Existing in NonDominatedWireCells
+                ):
+                    NativeEscapeDiagnostics["DominatedEscapeStubCount"] = (
+                        int(NativeEscapeDiagnostics[
+                            "DominatedEscapeStubCount"
+                        ]) + 1
+                    )
+                    continue
+                NonDominatedWireCells.append(WireCells)
+                CandidateWireCells.add(WireCells)
+        OrderedCandidateWireCells = tuple(sorted(
+            CandidateWireCells,
+            key=repr,
+        ))
+        if len(OrderedCandidateWireCells) > 1:
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "placement-access-native-claim-batch",
+                    "ClaimBatchWorkItems": len(
+                        OrderedCandidateWireCells
+                    ),
+                })
+            ClaimBatchStartedAt = monotonic()
+            NativeClaimValues, ActiveWorkerCount = (
+                _BuildRouteClaimsBatchWithTelemetry(
+                    [tuple(sorted(Values)) for Values in (
+                        OrderedCandidateWireCells
+                    )],
+                    tuple(sorted(Resources.ResourceGraph.ActualBlocks)),
+                    tuple(sorted(Resources.ResourceGraph.SolidBlocks)),
+                )
+            )
+            NativeEscapeDiagnostics.update({
+                "ClaimBatchWorkItems": len(OrderedCandidateWireCells),
+                "ClaimBatchWorkerCount": int(ActiveWorkerCount),
+                "ClaimBatchElapsedSeconds": (
+                    monotonic() - ClaimBatchStartedAt
+                ),
+            })
+            for WireCells, (
+                Wire,
+                Support,
+                Air,
+                Electrical,
+            ) in zip(
+                OrderedCandidateWireCells,
+                NativeClaimValues,
+                strict=True,
+            ):
+                NativeAccessClaimsByWireCells[WireCells] = (
+                    RoutingResourceClaims(
+                        WireCells=frozenset(Wire),
+                        SupportCells=frozenset(Support),
+                        RequiredAirCells=frozenset(Air),
+                        ElectricalCells=frozenset(Electrical),
+                    )
+                )
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": (
+                        "placement-access-native-claim-batch-complete"
+                    ),
+                    "ClaimBatchWorkItems": len(
+                        OrderedCandidateWireCells
+                    ),
+                    "ClaimBatchWorkerCount": int(ActiveWorkerCount),
+                    "ClaimBatchElapsedSeconds": round(
+                        monotonic() - ClaimBatchStartedAt,
+                        6,
+                    ),
+                })
     TerminalDomains = []
     for TerminalIndex, (Signal, Terminal, AccessPath) in enumerate(
         TerminalPaths
@@ -3275,6 +3464,30 @@ def BuildPlacementAccessFabric(
                 "CompletedTerminalCount": TerminalIndex,
                 "TerminalCount": len(TerminalPaths),
                 "Signal": Signal,
+                "NativeEscapeKernelUsed": bool(
+                    NativeEscapeDiagnostics["Used"]
+                ),
+                "NativeEscapeKernelExpansionCount": int(
+                    NativeEscapeDiagnostics["ExpansionCount"]
+                ),
+                "NativeEscapeKernelElapsedSeconds": round(
+                    float(NativeEscapeDiagnostics["ElapsedSeconds"]),
+                    6,
+                ),
+                "NativeClaimBatchWorkItems": int(
+                    NativeEscapeDiagnostics["ClaimBatchWorkItems"]
+                ),
+                "NativeClaimBatchWorkerCount": int(
+                    NativeEscapeDiagnostics["ClaimBatchWorkerCount"]
+                ),
+                "NativeClaimBatchElapsedSeconds": round(
+                    float(
+                        NativeEscapeDiagnostics[
+                            "ClaimBatchElapsedSeconds"
+                        ]
+                    ),
+                    6,
+                ),
             })
         if (
             LegalEscapeWorkBudget is not None
@@ -3622,6 +3835,7 @@ def BuildPlacementAccessFabric(
         ) -> list[PlacementAccessEscapeStub]:
             Results = []
             SeenStubPaths = set()
+            PathRecords = []
             for Prefix, Path in CandidatePaths:
                 StubPath = _ErasePlacementAccessPathLoops((
                     *Prefix,
@@ -3629,28 +3843,136 @@ def BuildPlacementAccessFabric(
                 ))
                 if not StubPath or StubPath in SeenStubPaths:
                     continue
-                Claims = Resources.ResourceGraph.BuildRouteClaims(StubPath)
+                WireCells = frozenset(StubPath)
+                SeenStubPaths.add(StubPath)
+                PathRecords.append((
+                    tuple(Path[-1]),
+                    WireCells,
+                    StubPath,
+                ))
+            NonDominatedPathRecords = []
+            for Ingress, WireCells, StubPath in sorted(
+                PathRecords,
+                key=lambda Value: (
+                    Value[0],
+                    len(Value[1]),
+                    Value[2],
+                ),
+            ):
+                if any(
+                    ExistingIngress == Ingress
+                    and ExistingWireCells <= WireCells
+                    for ExistingIngress, ExistingWireCells, _ExistingPath
+                    in NonDominatedPathRecords
+                ):
+                    continue
+                NonDominatedPathRecords.append((
+                    Ingress,
+                    WireCells,
+                    StubPath,
+                ))
+            for Ingress, WireCells, StubPath in NonDominatedPathRecords:
+                Claims = NativeAccessClaimsByWireCells.get(WireCells)
+                if Claims is None:
+                    Claims = Resources.ResourceGraph.BuildRouteClaims(
+                        StubPath
+                    )
                 if FindSelfClaimConflicts({Signal: Claims}):
                     continue
-                SeenStubPaths.add(StubPath)
                 Results.append(PlacementAccessEscapeStub(
                     Terminal=Terminal,
-                    Ingress=Path[-1],
+                    Ingress=Ingress,
                     Path=StubPath,
                     PhysicalClaims=Claims,
-                    CapacityResourceIds=tuple(sorted(
-                        Claims.ResourceIds,
-                        key=str,
-                    )),
+                    CapacityResourceIds=() if (
+                        DeferEscapeStubCapacityResourceIds
+                    ) else tuple(
+                        RoutingResourceId(Kind, Position)
+                        for Kind, Positions in (
+                            (
+                                RoutingResourceKind.Air,
+                                Claims.RequiredAirCells,
+                            ),
+                            (
+                                RoutingResourceKind.Electrical,
+                                Claims.ElectricalCells,
+                            ),
+                            (
+                                RoutingResourceKind.Support,
+                                Claims.SupportCells,
+                            ),
+                            (
+                                RoutingResourceKind.Wire,
+                                Claims.WireCells,
+                            ),
+                        )
+                        for Position in sorted(Positions)
+                    ),
                     Complete=True,
                 ))
             if TopologyKind == "derived-perimeter-access-v1":
+                if DeferEscapeStubCapacityResourceIds:
+                    # These values own the same terminal variable and the
+                    # same physical ingress. A value whose complete claim
+                    # vocabulary is a superset of an already-retained value
+                    # cannot satisfy any capacity or named-contract witness
+                    # that the retained value cannot also satisfy. This is
+                    # exact physical-domain dominance, not objective-, layer-
+                    # or circuit-based pruning.
+                    Results.sort(key=lambda Stub: (
+                        sum((
+                            len(Stub.PhysicalClaims.WireCells),
+                            len(Stub.PhysicalClaims.SupportCells),
+                            len(Stub.PhysicalClaims.RequiredAirCells),
+                            len(Stub.PhysicalClaims.ElectricalCells),
+                        )),
+                        len(Stub.Path),
+                        Stub.Ingress,
+                        Stub.Path,
+                    ))
+                    NonDominatedResults: list[
+                        PlacementAccessEscapeStub
+                    ] = []
+                    for Stub in Results:
+                        Claims = Stub.PhysicalClaims
+                        Dominated = any(
+                            Existing.Ingress == Stub.Ingress
+                            and Existing.PhysicalClaims.WireCells
+                            <= Claims.WireCells
+                            and Existing.PhysicalClaims.SupportCells
+                            <= Claims.SupportCells
+                            and Existing.PhysicalClaims.RequiredAirCells
+                            <= Claims.RequiredAirCells
+                            and Existing.PhysicalClaims.ElectricalCells
+                            <= Claims.ElectricalCells
+                            for Existing in NonDominatedResults
+                        )
+                        if Dominated:
+                            NativeEscapeDiagnostics[
+                                "DominatedEscapeStubCount"
+                            ] = int(
+                                NativeEscapeDiagnostics[
+                                    "DominatedEscapeStubCount"
+                                ]
+                            ) + 1
+                            continue
+                        NonDominatedResults.append(Stub)
+                    Results = NonDominatedResults
                 # The terminal capacity solver preserves option order.  Put
                 # smaller realized material first so its one fixed solve has
                 # the same deterministic compactness objective as the
                 # enclosing pre-route selector.
                 Results.sort(key=lambda Stub: (
-                    len(Stub.PhysicalClaims.ResourceIds),
+                    (
+                        sum((
+                            len(Stub.PhysicalClaims.WireCells),
+                            len(Stub.PhysicalClaims.SupportCells),
+                            len(Stub.PhysicalClaims.RequiredAirCells),
+                            len(Stub.PhysicalClaims.ElectricalCells),
+                        ))
+                        if DeferEscapeStubCapacityResourceIds
+                        else len(Stub.CapacityResourceIds)
+                    ),
                     len(Stub.Path),
                     Stub.Path,
                     Stub.Ingress,
@@ -3739,7 +4061,12 @@ def BuildPlacementAccessFabric(
                 Domain.Signal,
                 Domain.Terminal,
                 tuple(
-                    (Stub.Ingress, Stub.Path, Stub.CapacityResourceIds)
+                    # Claims are a deterministic function of this exact path,
+                    # the resource graph and the technology identities that
+                    # already precede the terminal domains in this canonical
+                    # value. Repeating four large claim sets per stub made
+                    # fingerprinting quadratic in representation size.
+                    (Stub.Ingress, Stub.Path)
                     for Stub in Domain.EscapeStubs
                 ),
                 Domain.Complete,
@@ -3891,6 +4218,19 @@ def BuildPlacementAccessFabric(
         ),
         NativeEscapeFallbackUsed=bool(
             NativeEscapeDiagnostics["FallbackUsed"]
+        ),
+        NativeClaimBatchWorkItems=int(
+            NativeEscapeDiagnostics["ClaimBatchWorkItems"]
+        ),
+        NativeClaimBatchWorkerCount=int(
+            NativeEscapeDiagnostics["ClaimBatchWorkerCount"]
+        ),
+        NativeClaimBatchElapsedSeconds=round(
+            float(NativeEscapeDiagnostics["ClaimBatchElapsedSeconds"]),
+            6,
+        ),
+        DominatedEscapeStubCount=int(
+            NativeEscapeDiagnostics["DominatedEscapeStubCount"]
         ),
         IncompleteReason=("" if Complete else IncompleteReason),
         Technology=Technology,

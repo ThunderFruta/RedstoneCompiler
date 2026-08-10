@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 
 from Compiler.Cells.Library import CellMacros
@@ -14,18 +15,88 @@ from Compiler.Routing.Actions import (
 from Compiler.Routing.Actions.Repeaters import PruneRedundantRepeaterReservations
 from Compiler.Routing.Actions.Geometry import ValidatePlacedCellElectricalIsolation
 from Compiler.Routing.Workers.DetailedRouting import RustRoutingContext
+from Compiler.Simulation.Redstone import SimulateMinecraftRedstoneBlockMap
 from SchemEncoder.Writer262 import (
+    ApplyTemplateRepeaterPinDirection,
     BlockProvenance,
     BuildLitematicBlockMap,
     BuildWireState,
     LoadTemplate,
+    MinecraftRepeaterFacingForReservation,
     TemplateRepeaterPinRoles,
+    OrientCellState,
+    PoweredCellState,
     _PlaceIoSigns,
 )
 from Templates import LitematicTemplates
 
 
 class PhysicalCellTests(unittest.TestCase):
+    def testNandTemplateExecutesItsPhysicalTruthTable(self) -> None:
+        """Prove the real template, rather than painted gate state, is NAND."""
+        Template = LoadTemplate(LitematicTemplates["Nand"])
+        for Inputs in product((False, True), repeat=2):
+            Blocks = {
+                Position: ApplyTemplateRepeaterPinDirection(
+                    "NAND", Position, State
+                )
+                for Position, State in Template.Blocks.items()
+            }
+            for Position, State in tuple(Blocks.items()):
+                if State["Name"] in (
+                    "minecraft:repeater",
+                    "minecraft:redstone_wire",
+                ):
+                    Blocks[(Position[0], Position[1] - 1, Position[2])] = {
+                        "Name": "minecraft:smooth_stone"
+                    }
+            Blocks[(1, 0, 4)] = {"Name": "minecraft:redstone_lamp"}
+            LeverPower = {
+                (0, 0, -2): Inputs[0],
+                (2, 0, -2): Inputs[1],
+            }
+            Blocks.update({
+                Position: {"Name": "minecraft:lever"}
+                for Position in LeverPower
+            })
+            Result = SimulateMinecraftRedstoneBlockMap(Blocks, LeverPower)
+            self.assertTrue(Result.Stable)
+            self.assertEqual(
+                Result.LampLit[(1, 0, 4)],
+                not all(Inputs),
+            )
+
+    def testOutputTemplateDrivesItsLampFromItsDeclaredInput(self) -> None:
+        Template = LoadTemplate(LitematicTemplates["Output"])
+        for Value in (False, True):
+            Blocks = {
+                Position: ApplyTemplateRepeaterPinDirection(
+                    "OUTPUT", Position, State
+                )
+                for Position, State in Template.Blocks.items()
+            }
+            Blocks[(0, -1, 0)] = {"Name": "minecraft:smooth_stone"}
+            Blocks[(0, 0, -1)] = {"Name": "minecraft:redstone_wire"}
+            Blocks[(0, -1, -1)] = {"Name": "minecraft:smooth_stone"}
+            LeverPosition = (0, 0, -2)
+            Blocks[LeverPosition] = {"Name": "minecraft:lever"}
+            Result = SimulateMinecraftRedstoneBlockMap(
+                Blocks,
+                {LeverPosition: Value},
+            )
+            self.assertTrue(Result.Stable)
+            self.assertEqual(Result.LampLit[(0, 0, 1)], Value)
+
+    def testInputTemplateRetainsItsLampIndicator(self) -> None:
+        State = PoweredCellState(
+            {"Name": "minecraft:redstone_lamp", "Properties": {"lit": "false"}},
+            SimpleNamespace(Kind="INPUT", Outputs=["A"], Inputs=[]),
+            (0, 0, 1),
+            {"A": True},
+        )
+        self.assertEqual(State["Name"], "minecraft:redstone_lamp")
+        self.assertEqual(State["Properties"]["lit"], "true")
+
     def testPackedCellsRejectActualTemplateElectricalAdjacency(self) -> None:
         Input = BuildPlacedGate(
             Gate("InputA", GateKind.INPUT, ["A"], []),
@@ -217,6 +288,28 @@ class PhysicalCellTests(unittest.TestCase):
                     set(TemplateRepeaterPinRoles(Name)),
                 )
 
+    def testRenderedPinRepeatersFollowRotatedMacroDirection(self) -> None:
+        ExpectedByRotation = {
+            0: "south",
+            90: "west",
+            180: "north",
+            270: "east",
+        }
+        Template = LoadTemplate(LitematicTemplates["Input"])
+        State = Template.Blocks[(0, 0, 2)]
+        for Rotation, ExpectedFacing in ExpectedByRotation.items():
+            with self.subTest(Rotation=Rotation):
+                Canonical = ApplyTemplateRepeaterPinDirection(
+                    "INPUT",
+                    (0, 0, 2),
+                    State,
+                )
+                Rendered = OrientCellState(Canonical, Rotation)
+                self.assertEqual(
+                    Rendered["Properties"]["facing"],
+                    ExpectedFacing,
+                )
+
     def testMacroSizesMatchTemplates(self) -> None:
         for Name, PathValue in LitematicTemplates.items():
             with self.subTest(Name=Name):
@@ -293,6 +386,26 @@ class PhysicalCellTests(unittest.TestCase):
             "minecraft:light_gray_concrete",
         )
         self.assertEqual(Build.Blocks[(2, 0, 0)]["Name"], "minecraft:yellow_concrete")
+
+    def testRenderedRouteRepeaterUsesMinecraftOutputFacing(self) -> None:
+        RoutedDesign = SimpleNamespace(
+            Module=SimpleNamespace(Gates=()),
+            PlacedGates=(),
+            Wires=[(0, 1, 0), (1, 1, 0), (2, 1, 0)],
+            Supports=[(0, 0, 0), (1, 0, 0), (2, 0, 0)],
+            Repeaters={(1, 1, 0): "west"},
+            NetWires={"Signal": [(0, 1, 0), (1, 1, 0), (2, 1, 0)]},
+            SupportBlock="minecraft:light_gray_concrete",
+        )
+        Build = BuildLitematicBlockMap(RoutedDesign)
+        self.assertEqual(
+            MinecraftRepeaterFacingForReservation("west"),
+            "east",
+        )
+        self.assertEqual(
+            Build.Blocks[(1, 1, 0)]["Properties"]["facing"],
+            "east",
+        )
 
     def testRouteSupportsUseCustomTracePalette(self) -> None:
         RoutedDesign = SimpleNamespace(

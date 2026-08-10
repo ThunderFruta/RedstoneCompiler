@@ -33,6 +33,7 @@ from .PreRouteInterface import (
     DerivedPerimeterSlotDomain,
     DerivedPerimeterTerminalSlot,
     SolveDerivedPerimeterSlotDomain,
+    TerminalAttachmentContract,
 )
 from ..Routing.Technology import DefaultRedstoneRoutingTechnology
 from ..Routing.Reliability import BuildStableFingerprint
@@ -113,6 +114,11 @@ _ClusterLocalRouteTemplateCache: dict[
     tuple[object, ...],
     "ClusterLocalRouteTemplateCacheEntry",
 ] = {}
+_MandatoryAccessClaimBuilder = RoutingResourceGraph(
+    ActualBlocks=frozenset(),
+    ElectricalBlocks=frozenset(),
+    SolidBlocks=frozenset(),
+)
 
 
 @dataclass(frozen=True)
@@ -2953,9 +2959,61 @@ def ApplyDerivedPerimeterInterfaceTemplate(
         for Second in PlacedGates[Index + 1 :]
     ):
         raise ValueError("derived perimeter template overlaps placed geometry")
+    PlacedByName = {str(Gate.Name): Gate for Gate in PlacedGates}
+    InvalidatedTerminalSignals: set[str] = set()
+    for TerminalName in SlotsByTerminal:
+        Existing = ExistingByName[TerminalName]
+        Materialized = PlacedByName[TerminalName]
+        Kind = str(getattr(Existing.Kind, "value", Existing.Kind))
+        ExistingPins = (
+            (Existing.OutputPin,)
+            if Kind == "INPUT"
+            else tuple(Existing.InputPins)
+        )
+        MaterializedPins = (
+            (Materialized.OutputPin,)
+            if Kind == "INPUT"
+            else tuple(Materialized.InputPins)
+        )
+        if ExistingPins == MaterializedPins:
+            continue
+        InvalidatedTerminalSignals.update(
+            map(str, Existing.Outputs if Kind == "INPUT" else Existing.Inputs)
+        )
+
+    def WithoutInvalidatedSignals(
+        Values: Any,
+    ) -> dict[str, Any] | None:
+        if Values is None:
+            return None
+        return {
+            str(Signal): Value
+            for Signal, Value in Values.items()
+            if str(Signal) not in InvalidatedTerminalSignals
+        }
+
     Placed = replace(
         Source.Placed,
         PlacedGates=PlacedGates,
+        FrozenNetWires=WithoutInvalidatedSignals(
+            Source.Placed.FrozenNetWires
+        ),
+        LocalNetBranches=WithoutInvalidatedSignals(
+            Source.Placed.LocalNetBranches
+        ),
+        LocalNetTargets=WithoutInvalidatedSignals(
+            Source.Placed.LocalNetTargets
+        ),
+        LocalRouteClaims=tuple(
+            Claim
+            for Claim in (Source.Placed.LocalRouteClaims or ())
+            if str(Claim.Signal) not in InvalidatedTerminalSignals
+        ),
+        DerivedLocalRouteClaims=tuple(
+            Claim
+            for Claim in (Source.Placed.DerivedLocalRouteClaims or ())
+            if str(Claim.Signal) not in InvalidatedTerminalSignals
+        ),
         PlacementAccessFabric=None,
         PlacementAccessAssignment=None,
         DerivedPerimeterSlotAssignment=Assignment,
@@ -2967,6 +3025,11 @@ def ApplyDerivedPerimeterInterfaceTemplate(
     return replace(
         Source,
         Placed=Placed,
+        DerivedLocalRouteClaims=tuple(
+            Claim
+            for Claim in (Source.DerivedLocalRouteClaims or ())
+            if str(Claim.Signal) not in InvalidatedTerminalSignals
+        ),
         PlacementAccessFabric=None,
         PlacementAccessAssignment=None,
         DerivedPerimeterSlotAssignment=Assignment,
@@ -7371,6 +7434,55 @@ def _PhysicalGateLocalElectricalExclusions(
     )
 
 
+@lru_cache(maxsize=1024)
+def _PhysicalGateForbiddenRelativeDisplacements(
+    FirstKind: str,
+    FirstRotation: int,
+    FirstMirrorX: bool,
+    SecondKind: str,
+    SecondRotation: int,
+    SecondMirrorX: bool,
+) -> frozenset[tuple[int, int, int]]:
+    """Compile exact electrical collisions into relative origins."""
+    FirstActual, _FirstElectrical = _PhysicalGateLocalGeometry(
+        FirstKind,
+        FirstRotation,
+        FirstMirrorX,
+    )
+    SecondActual, _SecondElectrical = _PhysicalGateLocalGeometry(
+        SecondKind,
+        SecondRotation,
+        SecondMirrorX,
+    )
+    FirstExclusions = _PhysicalGateLocalElectricalExclusions(
+        FirstKind,
+        FirstRotation,
+        FirstMirrorX,
+    )
+    SecondExclusions = _PhysicalGateLocalElectricalExclusions(
+        SecondKind,
+        SecondRotation,
+        SecondMirrorX,
+    )
+    return frozenset({
+        (
+            FirstPosition[0] - SecondPosition[0],
+            FirstPosition[1] - SecondPosition[1],
+            FirstPosition[2] - SecondPosition[2],
+        )
+        for FirstPosition in FirstExclusions
+        for SecondPosition in SecondActual
+    } | {
+        (
+            FirstPosition[0] - SecondPosition[0],
+            FirstPosition[1] - SecondPosition[1],
+            FirstPosition[2] - SecondPosition[2],
+        )
+        for FirstPosition in FirstActual
+        for SecondPosition in SecondExclusions
+    })
+
+
 @lru_cache(maxsize=65536)
 def _PhysicalGateElectricalExclusions(
     Kind: str,
@@ -7397,31 +7509,21 @@ def _PhysicalGateElectricalExclusions(
     )
 
 
-def PcbGatesConflict(First: Any, Second: Any) -> bool:
-    """Reject footprint, pin-access, and template electrical conflicts."""
-
-    def AccessSignals(Gate: Any) -> list[tuple[tuple[int, int, int], str]]:
-        Values = []
-        if Gate.OutputPin is not None and Gate.OutputDirection is not None:
-            X, Y, Z = Gate.OutputPin
-            DeltaX, DeltaY, DeltaZ = Gate.OutputDirection
-            for Signal in Gate.Outputs:
-                Values.extend(
-                    (
-                        (
-                            X + DeltaX * Offset,
-                            Y + DeltaY * Offset,
-                            Z + DeltaZ * Offset,
-                        ),
-                        Signal,
-                    )
-                    for Offset in range(
-                        DefaultRedstoneRoutingTechnology.AccessLength
-                    )
-                )
-        for Signal, Pin, Direction in zip(Gate.Inputs, Gate.InputPins, Gate.InputDirections):
-            X, Y, Z = Pin
-            DeltaX, DeltaY, DeltaZ = Direction
+@lru_cache(maxsize=131_072)
+def _BuildPlacedGateAccessSignals(
+    OutputPin: tuple[int, int, int] | None,
+    OutputDirection: tuple[int, int, int] | None,
+    Outputs: tuple[str, ...],
+    Inputs: tuple[str, ...],
+    InputPins: tuple[tuple[int, int, int], ...],
+    InputDirections: tuple[tuple[int, int, int], ...],
+) -> tuple[tuple[tuple[int, int, int], str], ...]:
+    """Cache exact transformed access cells reused by placement beams."""
+    Values: list[tuple[tuple[int, int, int], str]] = []
+    if OutputPin is not None and OutputDirection is not None:
+        X, Y, Z = OutputPin
+        DeltaX, DeltaY, DeltaZ = OutputDirection
+        for Signal in Outputs:
             Values.extend(
                 (
                     (
@@ -7435,7 +7537,27 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
                     DefaultRedstoneRoutingTechnology.AccessLength
                 )
             )
-        return Values
+    for Signal, Pin, Direction in zip(Inputs, InputPins, InputDirections):
+        X, Y, Z = Pin
+        DeltaX, DeltaY, DeltaZ = Direction
+        Values.extend(
+            (
+                (
+                    X + DeltaX * Offset,
+                    Y + DeltaY * Offset,
+                    Z + DeltaZ * Offset,
+                ),
+                Signal,
+            )
+            for Offset in range(
+                DefaultRedstoneRoutingTechnology.AccessLength
+            )
+        )
+    return tuple(Values)
+
+
+def PcbGatesConflict(First: Any, Second: Any) -> bool:
+    """Reject footprint, pin-access, and template electrical conflicts."""
 
     if RectanglesOverlap(First, Second):
         return True
@@ -7457,50 +7579,40 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         < First.Z - BroadPhaseMargin
     ):
         return False
-    FirstActual, _FirstElectrical = _PhysicalGateGeometry(
+    RelativeDisplacement = (
+        int(Second.X) - int(First.X),
+        int(Second.Y) - int(First.Y),
+        int(Second.Z) - int(First.Z),
+    )
+    if RelativeDisplacement in _PhysicalGateForbiddenRelativeDisplacements(
         First.Kind,
-        First.X,
-        First.Y,
-        First.Z,
         First.Rotation,
         First.MirrorX,
-    )
-    SecondActual, _SecondElectrical = _PhysicalGateGeometry(
         Second.Kind,
-        Second.X,
-        Second.Y,
-        Second.Z,
         Second.Rotation,
         Second.MirrorX,
-    )
-    if (
-        _PhysicalGateElectricalExclusions(
-            First.Kind,
-            First.X,
-            First.Y,
-            First.Z,
-            First.Rotation,
-            First.MirrorX,
-        )
-        & SecondActual
-    ) or (
-        _PhysicalGateElectricalExclusions(
-            Second.Kind,
-            Second.X,
-            Second.Y,
-            Second.Z,
-            Second.Rotation,
-            Second.MirrorX,
-        )
-        & FirstActual
     ):
         return True
     if abs(First.Y - Second.Y) >= 3:
         return False
     FirstWidth, FirstDepth = RotatedCellSize(First.Kind, First.Rotation)
     SecondWidth, SecondDepth = RotatedCellSize(Second.Kind, Second.Rotation)
-    FirstAccess = AccessSignals(First)
-    SecondAccess = AccessSignals(Second)
+    FirstAccess = _BuildPlacedGateAccessSignals(
+        First.OutputPin,
+        First.OutputDirection,
+        tuple(First.Outputs),
+        tuple(First.Inputs),
+        tuple(First.InputPins),
+        tuple(First.InputDirections),
+    )
+    SecondAccess = _BuildPlacedGateAccessSignals(
+        Second.OutputPin,
+        Second.OutputDirection,
+        tuple(Second.Outputs),
+        tuple(Second.Inputs),
+        tuple(Second.InputPins),
+        tuple(Second.InputDirections),
+    )
     FirstSignalsByPosition: dict[tuple[int, int, int], set[str]] = {}
     SecondSignalsByPosition: dict[tuple[int, int, int], set[str]] = {}
     for Position, Signal in FirstAccess:
@@ -7525,7 +7637,6 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         for Position in SecondSignalsByPosition
     ):
         return True
-
     for FirstPosition, FirstSignal in FirstAccess:
         for SecondPosition, SecondSignal in SecondAccess:
             if FirstSignal == SecondSignal:
@@ -7673,12 +7784,50 @@ def BuildDerivedPerimeterTerminalSlotDomain(
                 FaceReach[Face] = max(FaceReach[Face], Reach)
         PrototypesByTerminal[Gate.Name] = TerminalPrototypes
 
+    ElectricalNeighborRadius = max(
+        abs(Position[0]) + abs(Position[2])
+        for Position in (
+            (0, 0, 0),
+            *DefaultRedstoneRoutingTechnology.NeighborPositions(
+                (0, 0, 0)
+            ),
+        )
+        if Position[1] == 0
+    )
+    ElectricalShellClearance = ElectricalNeighborRadius + 1
     FaceNormalCoordinate = {
-        "north": MinimumZ - FaceReach["north"],
-        "south": MaximumZ + FaceReach["south"],
-        "west": MinimumX - FaceReach["west"],
-        "east": MaximumX + FaceReach["east"],
+        "north": (
+            MinimumZ - FaceReach["north"] - ElectricalShellClearance
+        ),
+        "south": (
+            MaximumZ + FaceReach["south"] + ElectricalShellClearance
+        ),
+        "west": (
+            MinimumX - FaceReach["west"] - ElectricalShellClearance
+        ),
+        "east": (
+            MaximumX + FaceReach["east"] + ElectricalShellClearance
+        ),
     }
+    TerminalByName = {Gate.Name: Gate for Gate in Terminals}
+    UnusedInputTerminalNames = tuple(
+        Gate.Name
+        for Gate in Terminals
+        if (
+            TerminalKind(Gate) == "INPUT"
+            and not tuple(DesiredPinsByTerminal.get(Gate.Name, ()))
+        )
+    )
+    UnusedInputIndexByName = {
+        Name: Index for Index, Name in enumerate(UnusedInputTerminalNames)
+    }
+    UnusedInputNorthPitch = 1 + max((
+        Width
+        for Name in UnusedInputTerminalNames
+        for _Gate, Face, _Rotation, _MirrorX, _Pin, _Direction, Width, _Depth
+        in PrototypesByTerminal.get(Name, ())
+        if Face == "north"
+    ), default=1)
 
     def TangentialOrigins(
         Face: str,
@@ -7713,8 +7862,18 @@ def BuildDerivedPerimeterTerminalSlotDomain(
         Targets = tuple(sorted(
             DesiredPinsByTerminal.get(TerminalName, ())
         ))
+        Gate = TerminalByName[TerminalName]
+        ConnectionRequired = bool(
+            TerminalKind(Gate) != "INPUT" or Targets
+        )
+        Attachment = TerminalAttachmentContract(
+            TerminalName=TerminalName,
+            Signal=TerminalSignal(Gate),
+            ServedPins=Targets,
+            ConnectionRequired=ConnectionRequired,
+        )
         Slots = []
-        if not Targets:
+        if not Targets and ConnectionRequired:
             Complete = False
             IncompleteReason = (
                 IncompleteReason
@@ -7730,13 +7889,24 @@ def BuildDerivedPerimeterTerminalSlotDomain(
             Width,
             Depth,
         ) in Prototypes:
-            for TangentialOrigin in TangentialOrigins(
-                Face,
-                LocalPin,
-                Width,
-                Depth,
-                Targets,
-            ) if Targets else ():
+            if not ConnectionRequired and Face != "north":
+                continue
+            TangentialOriginValues = (
+                TangentialOrigins(
+                    Face,
+                    LocalPin,
+                    Width,
+                    Depth,
+                    Targets,
+                )
+                if ConnectionRequired
+                else (
+                    MinimumX
+                    + UnusedInputIndexByName[TerminalName]
+                    * UnusedInputNorthPitch,
+                )
+            )
+            for TangentialOrigin in TangentialOriginValues:
                 WorkCount += 1
                 if WorkCheck is not None:
                     WorkCheck({
@@ -7796,6 +7966,10 @@ def BuildDerivedPerimeterTerminalSlotDomain(
                     "MirrorX": Candidate.MirrorX,
                     "ConnectionPin": ConnectionPin,
                     "ConnectionDirection": ConnectionDirection,
+                    "ConnectionRequired": ConnectionRequired,
+                    "AttachmentFingerprint": (
+                        Attachment.AttachmentFingerprint
+                    ),
                 })
                 Slots.append(DerivedPerimeterTerminalSlot(
                     SlotId=SlotId,
@@ -7814,6 +7988,7 @@ def BuildDerivedPerimeterTerminalSlotDomain(
                     ConnectionPin=ConnectionPin,
                     ConnectionDirection=ConnectionDirection,
                     InteriorSpan=InteriorSpan,
+                    Attachment=Attachment,
                 ))
         Slots = sorted(
             Slots,
@@ -8138,6 +8313,11 @@ def BuildMandatoryAccessClaims(
         else tuple(PlacedGates)
     )
     RequiredSignals = frozenset(Signals)
+    ConsumedSignals = frozenset(
+        str(Signal)
+        for Gate in Gates
+        for Signal in Gate.Inputs
+    )
     if WorkCheck is not None:
         WorkCheck({
             "Phase": "mandatory-access-claims-start",
@@ -8158,6 +8338,15 @@ def BuildMandatoryAccessClaims(
         if Gate.OutputPin is not None and Gate.OutputDirection is not None:
             for Signal in Gate.Outputs:
                 if Signal not in RequiredSignals:
+                    continue
+                if (
+                    getattr(Gate.Kind, "value", Gate.Kind) == "INPUT"
+                    and str(Signal) not in ConsumedSignals
+                ):
+                    # A declared input with no internal consumers is a real
+                    # exterior macro but not a routed net. Its attachment
+                    # contract deliberately owns no access stub or track
+                    # demand.
                     continue
                 NodesBySignal[Signal].update(
                     (
@@ -8183,11 +8372,6 @@ def BuildMandatoryAccessClaims(
                     DefaultRedstoneRoutingTechnology.AccessLength
                 )
             )
-    ClaimBuilder = RoutingResourceGraph(
-        ActualBlocks=frozenset(),
-        ElectricalBlocks=frozenset(),
-        SolidBlocks=frozenset(),
-    )
     Claims: dict[str, RoutingResourceClaims] = {}
     NonEmptySignals = tuple(
         (Signal, Nodes)
@@ -8208,7 +8392,9 @@ def BuildMandatoryAccessClaims(
                 "SignalCount": len(NonEmptySignals),
             })
         if WorkCheck is None:
-            Claims[Signal] = ClaimBuilder.BuildRouteClaims(Nodes)
+            Claims[Signal] = _MandatoryAccessClaimBuilder.BuildRouteClaims(
+                Nodes
+            )
             continue
 
         def CheckRouteClaims(
@@ -8228,7 +8414,7 @@ def BuildMandatoryAccessClaims(
                     },
                 })
 
-        Claims[Signal] = ClaimBuilder.BuildRouteClaims(
+        Claims[Signal] = _MandatoryAccessClaimBuilder.BuildRouteClaims(
             Nodes,
             WorkCheck=CheckRouteClaims,
         )
@@ -9945,7 +10131,119 @@ def _BuildPinAlignedPackedClusterStates(
             ),
         )
 
-    def Score(State: dict[str, Any]) -> tuple[Any, ...]:
+    GateScorePayloadCache: dict[
+        tuple[str, int, int, int, int, bool],
+        tuple[
+            tuple[tuple[str, tuple[int, int]], ...],
+            tuple[tuple[tuple[int, int, int], str], ...],
+            tuple[tuple[str, frozenset[tuple[int, int, int]]], ...],
+            tuple[int, int, int, int],
+        ],
+    ] = {}
+
+    def BuildGateScorePayload(Gate: Any) -> tuple[
+        tuple[tuple[str, tuple[int, int]], ...],
+        tuple[tuple[tuple[int, int, int], str], ...],
+        tuple[tuple[str, frozenset[tuple[int, int, int]]], ...],
+        tuple[int, int, int, int],
+    ]:
+        """Return immutable score contributions for one transformed gate."""
+        Key = ConflictKey(Gate)
+        Cached = GateScorePayloadCache.get(Key)
+        if Cached is not None:
+            return Cached
+        Endpoints: list[tuple[str, tuple[int, int]]] = []
+        PinOwners: list[tuple[tuple[int, int, int], str]] = []
+        AccessPositionsBySignal: dict[
+            str,
+            set[tuple[int, int, int]],
+        ] = {}
+        if Gate.OutputPin is not None:
+            for SignalValue in Gate.Outputs:
+                Signal = str(SignalValue)
+                Endpoints.append((
+                    Signal,
+                    (Gate.OutputPin[0], Gate.OutputPin[2]),
+                ))
+                PinOwners.append((Gate.OutputPin, Signal))
+                if Gate.OutputDirection is not None:
+                    AccessPositionsBySignal.setdefault(Signal, set()).update(
+                        (
+                            Gate.OutputPin[0]
+                            + Gate.OutputDirection[0] * Offset,
+                            Gate.OutputPin[1]
+                            + Gate.OutputDirection[1] * Offset,
+                            Gate.OutputPin[2]
+                            + Gate.OutputDirection[2] * Offset,
+                        )
+                        for Offset in range(
+                            DefaultRedstoneRoutingTechnology.AccessLength
+                        )
+                    )
+        for InputIndex, SignalValue in enumerate(Gate.Inputs):
+            Signal = str(SignalValue)
+            Pin = Gate.InputPins[InputIndex]
+            Endpoints.append((Signal, (Pin[0], Pin[2])))
+            PinOwners.append((Pin, Signal))
+            Direction = Gate.InputDirections[InputIndex]
+            AccessPositionsBySignal.setdefault(Signal, set()).update(
+                (
+                    Pin[0] + Direction[0] * Offset,
+                    Pin[1] + Direction[1] * Offset,
+                    Pin[2] + Direction[2] * Offset,
+                )
+                for Offset in range(
+                    DefaultRedstoneRoutingTechnology.AccessLength
+                )
+            )
+        SizeKey = (str(Gate.Kind), int(Gate.Rotation))
+        Size = GateSizeCache.get(SizeKey)
+        if Size is None:
+            Size = RotatedCellSize(Gate.Kind, Gate.Rotation)
+            GateSizeCache[SizeKey] = Size
+        Width, Depth = Size
+        Result = (
+            tuple(Endpoints),
+            tuple(PinOwners),
+            tuple(sorted(
+                (Signal, frozenset(Positions))
+                for Signal, Positions in AccessPositionsBySignal.items()
+            )),
+            (
+                int(Gate.X),
+                int(Gate.Z),
+                int(Gate.X) + int(Width),
+                int(Gate.Z) + int(Depth),
+            ),
+        )
+        GateScorePayloadCache[Key] = Result
+        return Result
+
+    def BuildElectricalExclusionsCached(
+        Positions: frozenset[tuple[int, int, int]],
+    ) -> frozenset[tuple[int, int, int]]:
+        ElectricalExclusions = ElectricalExclusionCache.get(Positions)
+        if ElectricalExclusions is None:
+            ElectricalExclusions = frozenset(
+                DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
+                    set(Positions)
+                )
+            )
+            ElectricalExclusionCache[Positions] = ElectricalExclusions
+        return ElectricalExclusions
+
+    def AccessSignalsConflict(
+        FirstPositions: frozenset[tuple[int, int, int]],
+        SecondPositions: frozenset[tuple[int, int, int]],
+    ) -> bool:
+        return bool(
+            FirstPositions
+            & BuildElectricalExclusionsCached(SecondPositions)
+            or SecondPositions
+            & BuildElectricalExclusionsCached(FirstPositions)
+        )
+
+    def BuildStateScorePayload(State: dict[str, Any]) -> dict[str, Any]:
         Endpoints: dict[str, list[tuple[int, int]]] = {}
         PinOwners: list[tuple[tuple[int, int, int], str]] = []
         AccessPositionsBySignal: dict[
@@ -9953,46 +10251,18 @@ def _BuildPinAlignedPackedClusterStates(
             set[tuple[int, int, int]],
         ] = {}
         for Gate in State.values():
-            if Gate.OutputPin is not None:
-                for Signal in Gate.Outputs:
-                    Endpoints.setdefault(Signal, []).append(
-                        (Gate.OutputPin[0], Gate.OutputPin[2])
-                    )
-                    PinOwners.append((Gate.OutputPin, Signal))
-                    if Gate.OutputDirection is not None:
-                        AccessPositionsBySignal.setdefault(
-                            str(Signal),
-                            set(),
-                        ).update(
-                            (
-                                Gate.OutputPin[0]
-                                + Gate.OutputDirection[0] * Offset,
-                                Gate.OutputPin[1]
-                                + Gate.OutputDirection[1] * Offset,
-                                Gate.OutputPin[2]
-                                + Gate.OutputDirection[2] * Offset,
-                            )
-                            for Offset in range(
-                                DefaultRedstoneRoutingTechnology.AccessLength
-                            )
-                        )
-            for InputIndex, Signal in enumerate(Gate.Inputs):
-                Pin = Gate.InputPins[InputIndex]
-                Endpoints.setdefault(Signal, []).append((Pin[0], Pin[2]))
-                PinOwners.append((Pin, Signal))
-                Direction = Gate.InputDirections[InputIndex]
-                AccessPositionsBySignal.setdefault(
-                    str(Signal),
-                    set(),
-                ).update(
-                    (
-                        Pin[0] + Direction[0] * Offset,
-                        Pin[1] + Direction[1] * Offset,
-                        Pin[2] + Direction[2] * Offset,
-                    )
-                    for Offset in range(
-                        DefaultRedstoneRoutingTechnology.AccessLength
-                    )
+            (
+                GateEndpoints,
+                GatePinOwners,
+                GateAccessPositions,
+                _GateBounds,
+            ) = BuildGateScorePayload(Gate)
+            for Signal, Position in GateEndpoints:
+                Endpoints.setdefault(Signal, []).append(Position)
+            PinOwners.extend(GatePinOwners)
+            for Signal, Positions in GateAccessPositions:
+                AccessPositionsBySignal.setdefault(Signal, set()).update(
+                    Positions
                 )
         CrossElectricalPenalty = sum(
             1
@@ -10000,51 +10270,33 @@ def _BuildPinAlignedPackedClusterStates(
             for SecondPin, SecondSignal in PinOwners[Index + 1 :]
             if FirstSignal != SecondSignal
             and abs(FirstPin[1] - SecondPin[1]) <= 1
-            and (
-                abs(FirstPin[0] - SecondPin[0])
-                + abs(FirstPin[2] - SecondPin[2])
-                <= 1
-            )
+            and abs(FirstPin[0] - SecondPin[0])
+            + abs(FirstPin[2] - SecondPin[2]) <= 1
         )
         Signals = tuple(sorted(AccessPositionsBySignal))
-        ElectricalExclusionsBySignal = {}
-        for Signal in Signals:
-            PhysicalPositions = frozenset(
-                AccessPositionsBySignal[Signal]
-            )
-            ElectricalExclusions = ElectricalExclusionCache.get(
-                PhysicalPositions
-            )
-            if ElectricalExclusions is None:
-                ElectricalExclusions = frozenset(
-                    DefaultRedstoneRoutingTechnology
-                    .BuildElectricalExclusions(set(PhysicalPositions))
-                )
-                ElectricalExclusionCache[PhysicalPositions] = (
-                    ElectricalExclusions
-                )
-            ElectricalExclusionsBySignal[Signal] = ElectricalExclusions
-        AccessConflictPenalty = sum(
-            1
+        FrozenAccessPositionsBySignal = {
+            Signal: frozenset(AccessPositionsBySignal[Signal])
+            for Signal in Signals
+        }
+        AccessConflictPairs = frozenset(
+            (FirstSignal, SecondSignal)
             for FirstIndex, FirstSignal in enumerate(Signals)
             for SecondSignal in Signals[FirstIndex + 1 :]
-            if (
-                AccessPositionsBySignal[FirstSignal]
-                & ElectricalExclusionsBySignal[SecondSignal]
-            )
-            or (
-                AccessPositionsBySignal[SecondSignal]
-                & ElectricalExclusionsBySignal[FirstSignal]
+            if AccessSignalsConflict(
+                FrozenAccessPositionsBySignal[FirstSignal],
+                FrozenAccessPositionsBySignal[SecondSignal],
             )
         )
-        Hpwl = sum(
-            max(X for X, _Z in Values)
-            - min(X for X, _Z in Values)
-            + max(Z for _X, Z in Values)
-            - min(Z for _X, Z in Values)
-            for Values in Endpoints.values()
-            if len(Values) > 1
-        )
+        EndpointBoundsBySignal = {
+            Signal: (
+                min(X for X, _Z in Values),
+                max(X for X, _Z in Values),
+                min(Z for _X, Z in Values),
+                max(Z for _X, Z in Values),
+                len(Values),
+            )
+            for Signal, Values in Endpoints.items()
+        }
         MinimumX = min(Gate.X for Gate in State.values())
         MinimumZ = min(Gate.Z for Gate in State.values())
         MaximumX = max(
@@ -10055,20 +10307,156 @@ def _BuildPinAlignedPackedClusterStates(
             Gate.Z + RotatedCellSize(Gate.Kind, Gate.Rotation)[1]
             for Gate in State.values()
         )
+        return {
+            "PinOwners": tuple(PinOwners),
+            "AccessPositionsBySignal": FrozenAccessPositionsBySignal,
+            "AccessConflictPairs": AccessConflictPairs,
+            "CrossElectricalPenalty": CrossElectricalPenalty,
+            "EndpointBoundsBySignal": EndpointBoundsBySignal,
+            "Bounds": (MinimumX, MinimumZ, MaximumX, MaximumZ),
+            "Stable": tuple(
+                (
+                    Name,
+                    State[Name].X,
+                    State[Name].Z,
+                    State[Name].Rotation,
+                    State[Name].MirrorX,
+                )
+                for Name in sorted(State)
+            ),
+        }
+
+    def ScoreFromPayload(
+        Payload: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        MinimumX, MinimumZ, MaximumX, MaximumZ = Payload["Bounds"]
         Width = MaximumX - MinimumX
         Depth = MaximumZ - MinimumZ
-        Stable = tuple(
-            (Name, State[Name].X, State[Name].Z, State[Name].Rotation, State[Name].MirrorX)
-            for Name in sorted(State)
-        )
         return (
-            AccessConflictPenalty,
-            CrossElectricalPenalty,
+            len(Payload["AccessConflictPairs"]),
+            int(Payload["CrossElectricalPenalty"]),
             Width * Depth,
             max(Width, Depth),
-            Hpwl,
-            Stable,
+            sum(
+                MaximumXValue - MinimumXValue
+                + MaximumZValue - MinimumZValue
+                for (
+                    MinimumXValue,
+                    MaximumXValue,
+                    MinimumZValue,
+                    MaximumZValue,
+                    Count,
+                ) in Payload["EndpointBoundsBySignal"].values()
+                if Count > 1
+            ),
+            Payload["Stable"],
         )
+
+    def Score(State: dict[str, Any]) -> tuple[Any, ...]:
+        return ScoreFromPayload(BuildStateScorePayload(State))
+
+    def ScoreExtendedState(
+        Candidate: Any,
+        ParentPayload: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        """Score one child by updating only candidate-owned contributions."""
+        (
+            CandidateEndpoints,
+            CandidatePinOwners,
+            CandidateAccessItems,
+            CandidateBounds,
+        ) = BuildGateScorePayload(Candidate)
+        CandidateAccess = dict(CandidateAccessItems)
+        ModifiedSignals = frozenset(CandidateAccess)
+        ParentAccess = ParentPayload["AccessPositionsBySignal"]
+        AccessPositionsBySignal = dict(ParentAccess)
+        for Signal, Positions in CandidateAccess.items():
+            AccessPositionsBySignal[Signal] = frozenset({
+                *ParentAccess.get(Signal, frozenset()),
+                *Positions,
+            })
+        ParentConflictPairs = ParentPayload["AccessConflictPairs"]
+        AccessConflictPairs = {
+            Pair for Pair in ParentConflictPairs
+            if not (frozenset(Pair) & ModifiedSignals)
+        }
+        Signals = tuple(sorted(AccessPositionsBySignal))
+        for FirstIndex, FirstSignal in enumerate(Signals):
+            for SecondSignal in Signals[FirstIndex + 1 :]:
+                if (
+                    FirstSignal not in ModifiedSignals
+                    and SecondSignal not in ModifiedSignals
+                ):
+                    continue
+                if AccessSignalsConflict(
+                    AccessPositionsBySignal[FirstSignal],
+                    AccessPositionsBySignal[SecondSignal],
+                ):
+                    AccessConflictPairs.add((FirstSignal, SecondSignal))
+        CrossElectricalPenalty = int(
+            ParentPayload["CrossElectricalPenalty"]
+        ) + sum(
+            1
+            for Index, (FirstPin, FirstSignal) in enumerate(
+                CandidatePinOwners
+            )
+            for SecondPin, SecondSignal in CandidatePinOwners[Index + 1 :]
+            if FirstSignal != SecondSignal
+            and abs(FirstPin[1] - SecondPin[1]) <= 1
+            and abs(FirstPin[0] - SecondPin[0])
+            + abs(FirstPin[2] - SecondPin[2]) <= 1
+        ) + sum(
+            1
+            for FirstPin, FirstSignal in ParentPayload["PinOwners"]
+            for SecondPin, SecondSignal in CandidatePinOwners
+            if FirstSignal != SecondSignal
+            and abs(FirstPin[1] - SecondPin[1]) <= 1
+            and abs(FirstPin[0] - SecondPin[0])
+            + abs(FirstPin[2] - SecondPin[2]) <= 1
+        )
+        EndpointBoundsBySignal = dict(
+            ParentPayload["EndpointBoundsBySignal"]
+        )
+        for Signal, Position in CandidateEndpoints:
+            X, Z = Position
+            ExistingBounds = EndpointBoundsBySignal.get(Signal)
+            EndpointBoundsBySignal[Signal] = (
+                (X, X, Z, Z, 1)
+                if ExistingBounds is None
+                else (
+                    min(ExistingBounds[0], X),
+                    max(ExistingBounds[1], X),
+                    min(ExistingBounds[2], Z),
+                    max(ExistingBounds[3], Z),
+                    ExistingBounds[4] + 1,
+                )
+            )
+        MinimumX, MinimumZ, MaximumX, MaximumZ = ParentPayload["Bounds"]
+        CandidateMinimumX, CandidateMinimumZ, CandidateMaximumX, (
+            CandidateMaximumZ
+        ) = CandidateBounds
+        CandidateStable = (
+            str(Candidate.Name),
+            int(Candidate.X),
+            int(Candidate.Z),
+            int(Candidate.Rotation),
+            bool(Candidate.MirrorX),
+        )
+        return ScoreFromPayload({
+            "AccessConflictPairs": frozenset(AccessConflictPairs),
+            "CrossElectricalPenalty": CrossElectricalPenalty,
+            "EndpointBoundsBySignal": EndpointBoundsBySignal,
+            "Bounds": (
+                min(MinimumX, CandidateMinimumX),
+                min(MinimumZ, CandidateMinimumZ),
+                max(MaximumX, CandidateMaximumX),
+                max(MaximumZ, CandidateMaximumZ),
+            ),
+            "Stable": tuple(sorted((
+                *ParentPayload["Stable"],
+                CandidateStable,
+            ))),
+        })
 
     while PlacedNames != NameSet:
         Name = ChooseNext()
@@ -10082,6 +10470,7 @@ def _BuildPinAlignedPackedClusterStates(
             })
         NextBeam = []
         for StateIndex, State in enumerate(Beam):
+            ParentScorePayload = BuildStateScorePayload(State)
             if WorkCheck is not None:
                 WorkCheck({
                     "Phase": "graph-beam-state",
@@ -10145,7 +10534,13 @@ def _BuildPinAlignedPackedClusterStates(
                     continue
                 CandidateState = dict(State)
                 CandidateState[Name] = Candidate
-                NextBeam.append((Score(CandidateState), CandidateState))
+                NextBeam.append((
+                    ScoreExtendedState(
+                        Candidate,
+                        ParentScorePayload,
+                    ),
+                    CandidateState,
+                ))
         if not NextBeam:
             # The bounded graph beam has a complete empty retained domain for
             # this core.  Return the canonical tuple contract so portfolio
@@ -13402,6 +13797,9 @@ def PlacePcbGraph(
                 if TerminalKind(Gate) == "INPUT"
                 else [Producers[Signal].OutputPin]
             )
+            ConnectionRequired = bool(
+                TerminalKind(Gate) != "INPUT" or DesiredPins
+            )
             # A high-fanout terminal must not be pinned beside an arbitrary
             # consumer.  In particular, a signal which crosses packed-cluster
             # boundaries needs a balanced escape location: limiting candidates
@@ -13409,15 +13807,30 @@ def PlacePcbGraph(
             # edge and unnecessarily consumes a tall global routing layer.
             # Keep the search bounded, but include a median anchor for every
             # multi-target terminal so the choice generalizes to any topology.
-            TargetXs = sorted(Pin[0] for Pin in DesiredPins)
-            TargetZs = sorted(Pin[2] for Pin in DesiredPins)
-            TargetMiddle = len(DesiredPins) // 2
-            MedianAnchor = (
-                (TargetXs[(len(TargetXs) - 1) // 2] + TargetXs[TargetMiddle]) // 2,
-                DesiredPins[0][1],
-                (TargetZs[(len(TargetZs) - 1) // 2] + TargetZs[TargetMiddle]) // 2,
-            )
-            if UseDerivedSingleComponentPlacement:
+            MedianAnchor = None
+            if DesiredPins:
+                TargetXs = sorted(Pin[0] for Pin in DesiredPins)
+                TargetZs = sorted(Pin[2] for Pin in DesiredPins)
+                TargetMiddle = len(DesiredPins) // 2
+                MedianAnchor = (
+                    (
+                        TargetXs[(len(TargetXs) - 1) // 2]
+                        + TargetXs[TargetMiddle]
+                    ) // 2,
+                    DesiredPins[0][1],
+                    (
+                        TargetZs[(len(TargetZs) - 1) // 2]
+                        + TargetZs[TargetMiddle]
+                    ) // 2,
+                )
+            if not ConnectionRequired:
+                CandidatePinPositions = {(
+                    InternalMinimumX + 3 * PortIndexes[Signal],
+                    min(Existing.Y for Existing in PlacedGates),
+                    InternalMinimumZ
+                    - TerminalPlacementPolicy.TerminalShellClearance,
+                )}
+            elif UseDerivedSingleComponentPlacement:
                 PinY = DesiredPins[0][1]
                 CandidatePinPositions = {
                     *(
@@ -13448,6 +13861,7 @@ def PlacePcbGraph(
                     for DeltaX, DeltaZ in BuildDerivedPinAlignmentOffsets()
                 }
             if len(DesiredPins) > 1 and not UseDerivedSingleComponentPlacement:
+                assert MedianAnchor is not None
                 CandidatePinPositions.update(
                     (
                         MedianAnchor[0] + DeltaX,
@@ -13464,7 +13878,8 @@ def PlacePcbGraph(
             # serve.  This avoids four-sided horizontal sprawl while ensuring
             # every terminal is visible and approachable at the edge of an
             # arbitrary packed graph.
-            if not UseDerivedSingleComponentPlacement:
+            if not UseDerivedSingleComponentPlacement and ConnectionRequired:
+                assert MedianAnchor is not None
                 ShellAnchors = (*DesiredPins, MedianAnchor)
                 ShellClearance = (
                     TerminalPlacementPolicy.TerminalShellClearance
@@ -13551,11 +13966,11 @@ def PlacePcbGraph(
                         + abs(CandidatePin[2] - Pin[2])
                         for Pin in DesiredPins
                     )
-                    MaximumDistance = max(
+                    MaximumDistance = max((
                         abs(CandidatePin[0] - Pin[0])
                         + abs(CandidatePin[2] - Pin[2])
                         for Pin in DesiredPins
-                    )
+                    ), default=0)
                     CandidateWidth, CandidateDepth = RotatedCellSize(
                         Candidate.Kind,
                         Candidate.Rotation,
@@ -13618,6 +14033,16 @@ def PlacePcbGraph(
                     Value[0][4:],
                 ),
             )
+
+            if not ConnectionRequired:
+                # An unused declared input owns one deterministic exterior
+                # macro, not a routing attachment domain.  Its bank position
+                # was fixed above from the core bounds and declared port
+                # order; retain only the canonical legal orientation so it
+                # cannot multiply the connected-terminal assignment search.
+                # Macro overlap remains enforced by the ordinary joint
+                # terminal conflict checks below.
+                OrderedOptions = OrderedOptions[:1]
 
             def ExteriorFace(Option: tuple[tuple[Any, ...], Any]) -> str:
                 return CandidateExteriorFace(Option[1])
@@ -13793,6 +14218,10 @@ def PlacePcbGraph(
             )
             for Candidate in TerminalCandidates
         }
+        TerminalCandidateIndexByIdentity = {
+            id(Candidate): Index
+            for Index, Candidate in enumerate(TerminalCandidates)
+        }
         TerminalConflictCache: dict[tuple[int, int], bool] = {}
         MinimumRemainingRoutingCosts: list[tuple[int, int]] = [
             (0, 0)
@@ -13915,17 +14344,78 @@ def PlacePcbGraph(
             for Signal, Positions
             in InternalAccessPositionsBySignal.items()
         }
-        TerminalInternalAccessConflictCountByIdentity = {
-            id(Candidate): sum(
-                1
+        InternalPhysicalGeometry = tuple(
+            (
+                Existing,
+                *_PhysicalGateGeometry(
+                    Existing.Kind,
+                    Existing.X,
+                    Existing.Y,
+                    Existing.Z,
+                    Existing.Rotation,
+                    Existing.MirrorX,
+                ),
+            )
+            for Existing in PlacedGates
+        )
+
+        def TerminalMacroAccessConflictCount(Candidate: Any) -> int:
+            Signal = str(TerminalSignal(Candidate))
+            CandidateActual, CandidateElectrical = (
+                _PhysicalGateGeometry(
+                    Candidate.Kind,
+                    Candidate.X,
+                    Candidate.Y,
+                    Candidate.Z,
+                    Candidate.Rotation,
+                    Candidate.MirrorX,
+                )
+            )
+            CandidateAccess = TerminalAccessPositionsByIdentity[
+                id(Candidate)
+            ]
+            CandidateAccessExclusions = (
+                TerminalAccessExclusionsByIdentity[id(Candidate)]
+            )
+            AccessConflicts = sum(
+                bool(
+                    CandidateActual & OtherPositions
+                    or CandidateElectrical & (
+                        InternalAccessExclusionsBySignal[OtherSignal]
+                    )
+                )
                 for OtherSignal, OtherPositions
                 in InternalAccessPositionsBySignal.items()
-                if TerminalSignal(Candidate) != OtherSignal
-                and (
-                    TerminalAccessPositionsByIdentity[id(Candidate)]
-                    & InternalAccessExclusionsBySignal[OtherSignal]
-                    or OtherPositions
-                    & TerminalAccessExclusionsByIdentity[id(Candidate)]
+                if Signal != OtherSignal
+            )
+            MacroConflicts = sum(
+                bool(
+                    CandidateAccess & ExistingActual
+                    or CandidateAccessExclusions & ExistingElectrical
+                )
+                for Existing, ExistingActual, ExistingElectrical
+                in InternalPhysicalGeometry
+                if Signal not in frozenset((
+                    *Existing.Inputs,
+                    *Existing.Outputs,
+                ))
+            )
+            return AccessConflicts + MacroConflicts
+
+        TerminalInternalAccessConflictCountByIdentity = {
+            id(Candidate): (
+                TerminalMacroAccessConflictCount(Candidate)
+                + sum(
+                    1
+                    for OtherSignal, OtherPositions
+                    in InternalAccessPositionsBySignal.items()
+                    if TerminalSignal(Candidate) != OtherSignal
+                    and (
+                        TerminalAccessPositionsByIdentity[id(Candidate)]
+                        & InternalAccessExclusionsBySignal[OtherSignal]
+                        or OtherPositions
+                        & TerminalAccessExclusionsByIdentity[id(Candidate)]
+                    )
                 )
             )
             for Candidate in TerminalCandidates
@@ -14004,6 +14494,8 @@ def PlacePcbGraph(
             Selected: tuple[tuple[tuple[Any, ...], Any], ...],
         ) -> None:
             """Retain the best fixed representatives without a retry queue."""
+            if SelectionAccessConflictCount(Selected):
+                return
             Identity = SelectionAccessIdentity(Selected)
             Score = SelectionScore(Selected)
             Existing = RetainedTerminalSelections.get(Identity)
@@ -14071,11 +14563,7 @@ def PlacePcbGraph(
                 else (*AreaScore, *RoutingScore)
             )
             return (
-                (
-                    (SelectionAccessConflictCount(Selected), *BaseScore)
-                    if UseDerivedSingleComponentPlacement
-                    else BaseScore
-                )
+                (SelectionAccessConflictCount(Selected), *BaseScore)
                 + (
                 tuple(
                     (Candidate.Name, Candidate.X, Candidate.Z, Candidate.Rotation)
@@ -14126,9 +14614,8 @@ def PlacePcbGraph(
                     *AreaScore,
                 )
                 return (
-                    (SelectionAccessConflictCount(Selected), *BaseLowerBound)
-                    if UseDerivedSingleComponentPlacement
-                    else BaseLowerBound
+                    SelectionAccessConflictCount(Selected),
+                    *BaseLowerBound,
                 )
             RemainingMaximumDistance, RemainingTotalDistance = (
                 MinimumRemainingRoutingCosts[Index]
@@ -14145,23 +14632,101 @@ def PlacePcbGraph(
                 else (*AreaScore, *RoutingScore)
             )
             return (
-                (SelectionAccessConflictCount(Selected), *BaseLowerBound)
-                if UseDerivedSingleComponentPlacement
-                else BaseLowerBound
+                SelectionAccessConflictCount(Selected),
+                *BaseLowerBound,
             )
 
         PrunedAssignmentExpansions = 0
 
+        # Terminal assignment used to re-walk the selected prefix to rebuild
+        # aggregate bounds and scores at every node.  Keep pair legality lazy
+        # (most of the finite domain is never compared), but cache its complete
+        # exact rule and carry the monotone score state incrementally.
+        TerminalAssignmentConflictStates = tuple(
+            bytearray(len(TerminalCandidates))
+            for _Candidate in TerminalCandidates
+        )
+
+        def TerminalAssignmentCandidatesConflict(
+            First: Any,
+            Second: Any,
+        ) -> bool:
+            FirstIndex = TerminalCandidateIndexByIdentity[id(First)]
+            SecondIndex = TerminalCandidateIndexByIdentity[id(Second)]
+            FirstPin = TerminalPinByIdentity[id(First)]
+            SecondPin = TerminalPinByIdentity[id(Second)]
+            FirstSignal = TerminalSignal(First)
+            SecondSignal = TerminalSignal(Second)
+            Conflict = TerminalCandidatesConflict(First, Second)
+            if (
+                not Conflict
+                and MinimumTerminalPinSpacing > 0
+                and abs(FirstPin[0] - SecondPin[0])
+                + abs(FirstPin[2] - SecondPin[2])
+                < MinimumTerminalPinSpacing
+            ):
+                Conflict = True
+            if (
+                not Conflict
+                and CutScopedTerminalPinSpacing > 0
+                and tuple(sorted((FirstSignal, SecondSignal)))
+                in CutScopedTerminalPinPairs
+                and abs(FirstPin[0] - SecondPin[0])
+                + abs(FirstPin[2] - SecondPin[2])
+                < CutScopedTerminalPinSpacing
+            ):
+                Conflict = True
+            return Conflict
+
+        InitialMinimumX = PlacedMinimumX
+        InitialMaximumX = PlacedMaximumX
+        InitialMinimumZ = PlacedMinimumZ
+        InitialMaximumZ = PlacedMaximumZ
+
         def SearchTerminalAssignments(
             Index: int,
             Selected: tuple[tuple[tuple[Any, ...], Any], ...],
+            SelectedCandidateIndexes: tuple[int, ...] = (),
+            MinimumX: int = InitialMinimumX,
+            MaximumX: int = InitialMaximumX,
+            MinimumZ: int = InitialMinimumZ,
+            MaximumZ: int = InitialMaximumZ,
+            SelectedMaximumDistance: int = 0,
+            SelectedTotalDistance: int = 0,
+            FaceCounts: tuple[int, int, int, int] = (0, 0, 0, 0),
         ) -> None:
             nonlocal AssignmentExpansions
             nonlocal PrunedAssignmentExpansions
             if AssignmentExpansions >= TerminalAssignmentExpansionLimit:
                 return
             AssignmentExpansions += 1
-            LowerBound = SelectionLowerBound(Index, Selected)
+            if AssignmentExpansions & 1023 == 0:
+                CheckWork(
+                    "localized-terminal-search",
+                    AssignmentExpansions=AssignmentExpansions,
+                )
+            Width = MaximumX - MinimumX
+            Depth = MaximumZ - MinimumZ
+            AreaScore = (Width * Depth, max(Width, Depth))
+            if PreferAccessRingTerminals:
+                LowerBound = (
+                    max(FaceCounts, default=0),
+                    sum(Count * Count for Count in FaceCounts),
+                    *AreaScore,
+                )
+            else:
+                RemainingMaximumDistance, RemainingTotalDistance = (
+                    MinimumRemainingRoutingCosts[Index]
+                )
+                RoutingScore = (
+                    SelectedMaximumDistance + RemainingMaximumDistance,
+                    SelectedTotalDistance + RemainingTotalDistance,
+                )
+                LowerBound = (
+                    (*RoutingScore, *AreaScore)
+                    if PreferTerminalRoutingCost
+                    else (*AreaScore, *RoutingScore)
+                )
             WorstScore = WorstRetainedTerminalScore()
             if (
                 WorstScore is not None
@@ -14175,25 +14740,33 @@ def PlacePcbGraph(
             _GateName, Options = OptionsByGate[Index]
             for Option in Options:
                 _Key, Candidate = Option
-                if any(
-                    TerminalCandidatesConflict(Candidate, Existing)
-                    for _SelectedKey, Existing in Selected
-                ):
+                CandidateIndex = TerminalCandidateIndexByIdentity[id(Candidate)]
+                CandidateConflictStates = TerminalAssignmentConflictStates[
+                    CandidateIndex
+                ]
+                PairConflict = False
+                for ExistingIndex in SelectedCandidateIndexes:
+                    ConflictState = CandidateConflictStates[ExistingIndex]
+                    if ConflictState == 0:
+                        Existing = TerminalCandidates[ExistingIndex]
+                        ConflictState = (
+                            2
+                            if TerminalAssignmentCandidatesConflict(
+                                Candidate,
+                                Existing,
+                            )
+                            else 1
+                        )
+                        CandidateConflictStates[ExistingIndex] = ConflictState
+                        TerminalAssignmentConflictStates[ExistingIndex][
+                            CandidateIndex
+                        ] = ConflictState
+                    if ConflictState == 2:
+                        PairConflict = True
+                        break
+                if PairConflict:
                     continue
                 CandidatePin = TerminalPinByIdentity[id(Candidate)]
-                if (
-                    MinimumTerminalPinSpacing > 0
-                    and any(
-                        abs(CandidatePin[0] - SelectedPin[0])
-                        + abs(CandidatePin[2] - SelectedPin[2])
-                        < MinimumTerminalPinSpacing
-                        for SelectedPin in (
-                            TerminalPinByIdentity[id(Existing)]
-                            for _SelectedKey, Existing in Selected
-                        )
-                    )
-                ):
-                    continue
                 CandidateSignal = TerminalSignal(Candidate)
                 if (
                     CutScopedTerminalPinSpacing > 0
@@ -14213,29 +14786,27 @@ def PlacePcbGraph(
                     )
                 ):
                     continue
-                if (
-                    CutScopedTerminalPinSpacing > 0
-                    and any(
-                        tuple(sorted((
-                            CandidateSignal,
-                            TerminalSignal(Existing),
-                        ))) in CutScopedTerminalPinPairs
-                        and (
-                            abs(
-                                CandidatePin[0]
-                                - TerminalPinByIdentity[id(Existing)][0]
-                            )
-                            + abs(
-                                CandidatePin[2]
-                                - TerminalPinByIdentity[id(Existing)][2]
-                            )
-                            < CutScopedTerminalPinSpacing
-                        )
-                        for _SelectedKey, Existing in Selected
-                    )
-                ):
-                    continue
-                SearchTerminalAssignments(Index + 1, (*Selected, Option))
+                Bounds = TerminalBoundsByIdentity[id(Candidate)]
+                FaceIndex = {
+                    "north": 0,
+                    "south": 1,
+                    "east": 2,
+                    "west": 3,
+                }[CandidateExteriorFace(Candidate)]
+                NextFaceCounts = list(FaceCounts)
+                NextFaceCounts[FaceIndex] += 1
+                SearchTerminalAssignments(
+                    Index + 1,
+                    (*Selected, Option),
+                    (*SelectedCandidateIndexes, CandidateIndex),
+                    min(MinimumX, Bounds[0]),
+                    max(MaximumX, Bounds[1]),
+                    min(MinimumZ, Bounds[2]),
+                    max(MaximumZ, Bounds[3]),
+                    SelectedMaximumDistance + _Key[0],
+                    SelectedTotalDistance + _Key[1],
+                    tuple(NextFaceCounts),
+                )
                 if (
                     StopAfterFirstLegalTerminalAssignment
                     and RetainedTerminalSelections
@@ -14362,7 +14933,11 @@ def PlacePcbGraph(
     )
     if UseDerivedSingleComponentPlacement and PlannedTerminals is None:
         raise ValueError(
-            "derived single-component terminal domain has no legal assignment"
+            "derived single-component terminal domain has no legal assignment: "
+            f"complete={getattr(DerivedPerimeterSlotDomainValue, 'Complete', None)} "
+            f"reason={getattr(DerivedPerimeterSlotDomainValue, 'IncompleteReason', '')} "
+            f"slot-counts={tuple((Name, len(Slots)) for Name, Slots in getattr(DerivedPerimeterSlotDomainValue, 'TerminalSlots', ()))} "
+            f"solve={getattr(DerivedPerimeterSlotAssignmentValue, 'IncompleteReason', '')}"
         )
     if PlannedTerminals is not None:
         CandidatePlacement = BasePlacement + PlannedTerminals
@@ -14665,7 +15240,10 @@ def PlacePcbGraph(
                         continue
                     if Neighbor in Blocked and Neighbor != Target:
                         continue
-                    if LocalResourceGraph.BuildPrimitive(Current, Neighbor) is None:
+                    if not LocalResourceGraph.CanBuildNeighborPrimitive(
+                        Current,
+                        Neighbor,
+                    ):
                         continue
                     Support = (Neighbor[0], Neighbor[1] - 1, Neighbor[2])
                     if Support in ActualBlocks and Neighbor != Target:
@@ -15805,6 +16383,24 @@ def PlacePcbGraph(
             Guided.Placed.LocalRouteDiagnostics.setdefault(
                 "__ClusterLocalRouteTemplates__", {}
             )["CacheEntryCount"] = len(_ClusterLocalRouteTemplateCache)
+    UnconnectedExternalInputs = tuple(
+        str(Signal)
+        for Signal in Module.Inputs
+        if not any(
+            Signal in Gate.Inputs
+            for Gate in Module.Gates
+        )
+    )
+    if UnconnectedExternalInputs:
+        Guided.Placed.LocalRouteDiagnostics[
+            "__UnconnectedExternalInputs__"
+        ] = {
+            "Signals": list(UnconnectedExternalInputs),
+            "ConnectionRequired": False,
+            "AccessStubVariableCount": 0,
+            "GuideFactorCount": 0,
+            "TrackDemand": 0,
+        }
     return PcbPlacement(
         Placed=PlacedDesign(
             Module=Guided.Placed.Module,

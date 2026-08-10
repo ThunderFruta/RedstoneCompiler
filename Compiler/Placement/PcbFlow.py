@@ -48,10 +48,7 @@ from ..Routing.ComponentPipeline import (
     SelectPhysicalComponentResourceRelevantSignalPairs,
 )
 from ..Routing.AuthoritativePlanner import (
-    AttachRawTrackAssignmentContractRequirements,
-    BuildPlacementAccessStubFactorDomain,
     BuildConditionalRawTrackAssignmentDomain,
-    ComposeRawTrackAssignmentFactorDomains,
     BuildRawPortalPlacementGeometryFingerprint,
     BuildRawPortalResourceGeometryFingerprint,
     RawTrackAssignmentDomain,
@@ -64,11 +61,14 @@ from ..Routing.AuthoritativePlanner import (
 )
 from ..Routing.ChannelPlanner import BuildNetRoutingProfiles
 from ..Routing.TemplateAssignment import (
+    BuildCompactFactorCatalog,
+    CompactFactorMemberSource,
     PredeclaredRawTrackAssignmentMember,
     RawTrackAssignmentProblem,
     RawTrackAssignmentMemberMaterialization,
     RawTrackAssignmentSelection,
     RawTrackAssignmentTemplate,
+    SolveCompactFactorCatalogWithContext,
     SolveRawTrackAssignmentProblemWithContext,
 )
 from ..Routing.Models import (
@@ -80,6 +80,8 @@ from ..Routing.Models import (
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceStateProof,
     ComponentRoutabilityCore,
+    FrozenPerFaceRoutingEnvelope,
+    PlacementAccessFabric,
     RoutedComponentTemplate,
     RoutedDesign,
     TrackAssignmentPreparation,
@@ -138,6 +140,7 @@ from .AccessFabric import (
     DerivedPerimeterFabricShell,
     MeasureDerivedPerimeterInterfaceDemand,
     MeasureDerivedPerimeterInterfaceLaunchDemandByFace,
+    ProjectDerivedPerimeterFabricShellLayers,
     ResolveFixedAccessFabricLayerCount,
 )
 from .PreRouteInterface import (
@@ -5986,6 +5989,26 @@ def SummarizePreRouteAccessFabric(
             "NativeEscapeFallbackUsed",
             False,
         )),
+        "NativeClaimBatchWorkItems": int(getattr(
+            Fabric,
+            "NativeClaimBatchWorkItems",
+            0,
+        )),
+        "NativeClaimBatchWorkerCount": int(getattr(
+            Fabric,
+            "NativeClaimBatchWorkerCount",
+            0,
+        )),
+        "NativeClaimBatchElapsedSeconds": float(getattr(
+            Fabric,
+            "NativeClaimBatchElapsedSeconds",
+            0.0,
+        )),
+        "DominatedEscapeStubCount": int(getattr(
+            Fabric,
+            "DominatedEscapeStubCount",
+            0,
+        )),
         "PhysicalClaimCounts": {
             "WireCells": len(getattr(PhysicalClaims, "WireCells", ())),
             "SupportCells": len(getattr(PhysicalClaims, "SupportCells", ())),
@@ -9536,11 +9559,6 @@ def _PlaceAndRoutePcbWithPolicy(
                 "FixedCoordinatedCandidateDiversificationSignals must be "
                 "a frozenset"
             )
-        EnableCurrentClusterLocalRouteReuse = bool(
-            PlacementClusterPinBankRepairSignals
-        ) and PlacementClusterPinBankRepairSignals.issubset(
-            EffectiveCoordinatedCandidateDiversificationSignals
-        )
         Request = ApplyJointPlacementPortfolioTrigger(
             Request,
             JointPortfolioTriggered,
@@ -9761,6 +9779,10 @@ def _PlaceAndRoutePcbWithPolicy(
             else Request.RoutingSpacing + RelocationSpacingLevel
         )
         CandidatePacking = Request.PackingPolicy
+        EnableCurrentClusterLocalRouteReuse = bool(
+            CandidatePacking.Enabled
+            and CandidatePacking.EnableJointClusterOrientation
+        )
         CandidatePlacementPolicy = Policy.Placement
         JointPortfolioState = PendingJointPlacementState(
             Request=Request,
@@ -9943,6 +9965,9 @@ def _PlaceAndRoutePcbWithPolicy(
             ):
                 print(
                     "[debug] placement phase "
+                    f"source={SourceGenerator} "
+                    f"joint_index={JointPlacementCandidateIndex} "
+                    f"relocation_variant={RelocationVariant} "
                     f"previous={DebugPlacementPhase[0]} "
                     f"elapsed={Current - DebugPlacementPhaseStarted[0]:.6f}s "
                     f"next={Phase} diagnostics={Diagnostics}",
@@ -12157,7 +12182,7 @@ def _PlaceAndRoutePcbWithPolicy(
             break
         _TryPlacement(Request)
 
-    SinglePackedComponent = bool(UniquePlacements) and all(
+    DeriveSinglePackedComponent = bool(UniquePlacements) and all(
         len(Placement.Clusters) == 1
         for _Source, _Spacing, Placement in UniquePlacements.values()
     )
@@ -12166,12 +12191,12 @@ def _PlaceAndRoutePcbWithPolicy(
             Placement
             for _Source, _Spacing, Placement in UniquePlacements.values()
         )
-        if SinglePackedComponent and IncumbentRequests
+        if DeriveSinglePackedComponent and IncumbentRequests
         else None
     )
     DerivedPrimaryRequests = SelectDerivedPrimaryPlacementRequests(
         GenerationPlan,
-        SinglePackedComponent,
+        DeriveSinglePackedComponent,
         Incumbent=IncumbentPlacement,
         Module=(Module if IncumbentPlacement is not None else None),
         WorkCheck=(
@@ -12186,8 +12211,13 @@ def _PlaceAndRoutePcbWithPolicy(
         ),
     )
     DerivedRequestsToMaterialize = (
-        DerivedPrimaryRequests
-        if SinglePackedComponent
+        ()
+        if (
+            not UniquePlacements
+            and ProactiveRelocationRequested
+        )
+        else DerivedPrimaryRequests
+        if DeriveSinglePackedComponent
         else DerivedPrimaryRequests[len(IncumbentRequests):]
     )
     for Request in DerivedRequestsToMaterialize:
@@ -12203,6 +12233,72 @@ def _PlaceAndRoutePcbWithPolicy(
             CountPlacementGenerationAttempt=False,
             QueueRetainedJointPortfolioStates=False,
         )
+
+    if not UniquePlacements and ProactiveRelocationRequested:
+        ProactiveRelocationRequested = False
+        # Pending joint siblings published by the failed incumbent belong to
+        # that legacy primary portfolio.  Once its typed exact-relocation
+        # condition is active, only siblings published by the relocation
+        # request are members of the replacement portfolio.
+        PendingJointPlacementStates.clear()
+        ExactRelocationRequest = _TakeNextDeferredRequest(
+            PreferRelocation=True,
+        )
+        if ExactRelocationRequest is not None and not Deadline.IsExpired():
+            PlacementGenerationDecisions.append({
+                "Result": "materialize-proactive-exact-relocation",
+                "SourceGenerator": ExactRelocationRequest.SourceGenerator,
+                "RelocationSignals": sorted(PlacementRelocationSignals),
+                "ExecutableLegacyRepairCascade": False,
+            })
+            GeneratedExactRelocation = _TryPlacement(
+                ExactRelocationRequest
+            )
+            while (
+                not GeneratedExactRelocation
+                and PendingJointPlacementStates
+                and not Deadline.IsExpired()
+            ):
+                JointState = PendingJointPlacementStates.pop(0)
+                JointPlacementStateEvents.append({
+                    "CandidateIndex": JointState.CandidateIndex,
+                    "Status": (
+                        "materializing-initial-exact-relocation-sibling"
+                    ),
+                    "SourceGenerator": JointState.Request.SourceGenerator,
+                    "RoutingSpacing": JointState.RoutingSpacing,
+                })
+                GeneratedExactRelocation = _TryPlacement(
+                    JointState.Request,
+                    JointPlacementCandidateIndex=(
+                        JointState.CandidateIndex
+                    ),
+                    FixedRelocationVariant=(
+                        JointState.RelocationVariant
+                    ),
+                    FixedCandidateSpacing=JointState.RoutingSpacing,
+                    FixedRelocationSignals=(
+                        JointState.RelocationSignals
+                    ),
+                    FixedRelocationPrioritySignals=(
+                        JointState.RelocationPrioritySignals
+                    ),
+                    FixedRequiredRelocationSignals=(
+                        JointState.RequiredRelocationSignals
+                    ),
+                    FixedAssignmentCut=JointState.AssignmentCut,
+                    FixedAssignmentConstraints=(
+                        JointState.AssignmentConstraints
+                    ),
+                    FixedCoordinatedCandidateDiversificationSignals=(
+                        JointState
+                        .CoordinatedCandidateDiversificationSignals
+                    ),
+                    FixedTopologyCutFrontier=(
+                        JointState.TopologyCutFrontier
+                    ),
+                    MaterializeRoutingResources=False,
+                )
 
     if not UniquePlacements:
         BaseFailure = LastStructuredPlacementFailure or RoutingFailure(
@@ -12229,6 +12325,13 @@ def _PlaceAndRoutePcbWithPolicy(
                 Diagnostics=FailureDiagnostics,
             )
         )
+
+    # The compact catalog consumes a complete immutable placement; it does
+    # not require that placement to contain only one cluster.  Keep the
+    # stricter one-cluster predicate above solely for deriving graph-core
+    # sibling placements, then admit an exact relocated multi-cluster world
+    # to the same factorized selection and frozen handoff.
+    SinglePackedComponent = bool(UniquePlacements)
 
     def _BuildCandidateRecords() -> list[PcbPlacementCandidate]:
         def JointExactScore(Candidate: PcbPlacement) -> tuple[int, ...]:
@@ -12878,6 +12981,128 @@ def _PlaceAndRoutePcbWithPolicy(
             1,
             int(Policy.NandPacking.RetainedPlacementCandidates),
         )
+        # A retained graph core and its declared perimeter interface are one
+        # physical geometry world.  Reusing the slot solver's cheapest face
+        # assignment for every core made the portfolio interface-identical:
+        # an external terminal bank could obstruct the same internal launch
+        # in every otherwise-distinct placement.  Select one already-declared
+        # face-diverse interface per graph core without adding a member or
+        # changing the bounded graph beam.
+        CurrentDerivedFaceSignatures = {
+            tuple(
+                sum(
+                    Slot.Face == Face
+                    for Slot in Assignment.SelectedSlots
+                )
+                for Face in ("north", "south", "west", "east")
+            )
+            for Candidate in CandidateRecords
+            if Candidate.SourceGenerator == "derived-pin-aligned-core"
+            for Assignment in (
+                Candidate.Placement.DerivedPerimeterSlotAssignment
+                or Candidate.Placement.Placed
+                .DerivedPerimeterSlotAssignment,
+            )
+            if Assignment is not None
+        }
+        DiversifiedFaceSignatures = set(CurrentDerivedFaceSignatures)
+        DiversifiedCandidateRecords: list[PcbPlacementCandidate] = []
+        InterfaceDiversificationOrder = (
+            *(
+                Candidate
+                for Candidate in CandidateRecords
+                if Candidate.SourceGenerator != "derived-pin-aligned-core"
+            ),
+            *sorted(
+                (
+                    Candidate
+                    for Candidate in CandidateRecords
+                    if Candidate.SourceGenerator == "derived-pin-aligned-core"
+                ),
+                key=lambda Value: (
+                    Value.FeedbackScore,
+                    Value.CandidateId,
+                ),
+            ),
+        )
+        for Candidate in InterfaceDiversificationOrder:
+            if Candidate.SourceGenerator != "derived-pin-aligned-core":
+                DiversifiedCandidateRecords.append(Candidate)
+                continue
+            InterfaceDomain = (
+                Candidate.Placement.DerivedPerimeterInterfaceTemplateDomain
+                or Candidate.Placement.Placed
+                .DerivedPerimeterInterfaceTemplateDomain
+            )
+            CurrentAssignment = (
+                Candidate.Placement.DerivedPerimeterSlotAssignment
+                or Candidate.Placement.Placed
+                .DerivedPerimeterSlotAssignment
+            )
+            CurrentAssignmentFingerprint = str(getattr(
+                CurrentAssignment,
+                "AssignmentFingerprint",
+                "",
+            ))
+            Alternatives = tuple(
+                Template
+                for Template in (
+                    InterfaceDomain.Templates
+                    if InterfaceDomain is not None
+                    and InterfaceDomain.Complete
+                    else ()
+                )
+                if (
+                    Template.SlotAssignment.AssignmentFingerprint
+                    != CurrentAssignmentFingerprint
+                )
+            )
+            SelectedInterfaces = (
+                SelectDiverseDerivedPerimeterInterfaceTemplates(
+                    Alternatives,
+                    DiversifiedFaceSignatures,
+                    1,
+                )
+            )
+            if not SelectedInterfaces:
+                DiversifiedCandidateRecords.append(Candidate)
+                continue
+            SelectedInterface = SelectedInterfaces[0]
+            InterfacePlacement = ApplyDerivedPerimeterInterfaceTemplate(
+                Candidate.Placement,
+                SelectedInterface,
+            )
+            PhysicalFingerprint = BuildPlacementFingerprint(
+                InterfacePlacement,
+                IncludeLocalClaims=False,
+            )
+            DiversifiedFaceSignatures.add(tuple(map(
+                int,
+                SelectedInterface.FaceSignature,
+            )))
+            DiversifiedCandidateRecords.append(replace(
+                Candidate,
+                Placement=InterfacePlacement,
+                PlacementFingerprint=PhysicalFingerprint,
+                InterfaceTopologyFingerprint=BuildStableFingerprint({
+                    "Source": Candidate.InterfaceTopologyFingerprint,
+                    "InterfaceTemplate": SelectedInterface.TemplateId,
+                    "SlotAssignment": (
+                        SelectedInterface.SlotAssignment
+                        .AssignmentFingerprint
+                    ),
+                }),
+            ))
+            PlacementGenerationDecisions.append({
+                "Result": "retained-interface-diversified",
+                "CandidateId": Candidate.CandidateId,
+                "InterfaceTemplate": SelectedInterface.TemplateId,
+                "FaceSignature": list(
+                    SelectedInterface.FaceSignature
+                ),
+                "PlacementFingerprint": PhysicalFingerprint,
+            })
+        CandidateRecords = DiversifiedCandidateRecords
         ExpandedCandidateRecords = list(CandidateRecords)
         ExistingPhysicalFingerprints = {
             BuildPlacementFingerprint(
@@ -12903,15 +13128,6 @@ def _PlaceAndRoutePcbWithPolicy(
             0,
             MaximumGeometryCount - len(ExpandedCandidateRecords),
         )
-        if any(
-            Candidate.SourceGenerator == "derived-pin-aligned-core"
-            for Candidate in ExpandedCandidateRecords
-        ):
-            # Interface-template fill is only the typed empty-graph fallback.
-            # A nonempty retained graph frontier already owns its complete
-            # bounded geometry budget; backfilling the removed fixed-band
-            # compatibility slot would silently widen that portfolio.
-            RemainingGeometrySlots = 0
         for Candidate in tuple(CandidateRecords):
             if RemainingGeometrySlots < 1:
                 break
@@ -13025,23 +13241,6 @@ def _PlaceAndRoutePcbWithPolicy(
         )
         CandidateEnvelopeDomains.append((Candidate, Demand, Envelopes))
     for Candidate, Demand, Envelopes in CandidateEnvelopeDomains:
-        if len(Candidate.Placement.Clusters) != 1:
-            ExistingLayerCount = max(
-                Demand.MinimumRoutingLayerCount,
-                min(
-                    Demand.MaximumRoutingLayerCount,
-                    int(Candidate.Placement.LayerCount),
-                ),
-            )
-            Envelope = next(
-                Value for Value in Envelopes
-                if Value.RoutingLayerCount == ExistingLayerCount
-            )
-            FabricCandidateRecords.append(replace(
-                Candidate,
-                RoutingEnvelope=Envelope,
-            ))
-            continue
         CandidateResources = RoutingResourcesByFingerprint.get(
             Candidate.PlacementFingerprint
         )
@@ -13074,6 +13273,10 @@ def _PlaceAndRoutePcbWithPolicy(
         # one-deck witness cannot be reused for a two- or three-deck contract
         # even when their perimeter track counts happen to match.
         AccessByEnvelopeIdentity: dict[tuple[int, int, str], Any] = {}
+        ShellByPhysicalRingIdentity: dict[
+            tuple[int, int, tuple[tuple[str, int], ...]],
+            DerivedPerimeterFabricShell,
+        ] = {}
         for Envelope in Envelopes:
             EnvelopeCandidateId = (
                 f"{Candidate.CandidateId}:layers-"
@@ -13137,18 +13340,45 @@ def _PlaceAndRoutePcbWithPolicy(
                                 RingTrackCount,
                             )
                         )
-                        Shell = BuildDerivedPerimeterFabricShell(
-                            AccessFabricPlacement,
-                            Resources=StaticAccessResources,
-                            Technology=Technology,
-                            AccessRingTrackCount=RingTrackCount,
-                            AccessLength=Envelope.AccessLength,
-                            PerimeterFaceTrackCounts=(
-                                PerimeterFaceTrackCounts
-                                if PerimeterFaceTrackCounts
-                                else None
-                            ),
+                        ShellIdentity = (
+                            int(RingTrackCount),
+                            int(Envelope.AccessLength),
+                            tuple(PerimeterFaceTrackCounts),
                         )
+                        SourceShell = ShellByPhysicalRingIdentity.get(
+                            ShellIdentity
+                        )
+                        if SourceShell is None:
+                            Shell = BuildDerivedPerimeterFabricShell(
+                                AccessFabricPlacement,
+                                Resources=StaticAccessResources,
+                                Technology=Technology,
+                                AccessRingTrackCount=RingTrackCount,
+                                AccessLength=Envelope.AccessLength,
+                                PerimeterFaceTrackCounts=(
+                                    PerimeterFaceTrackCounts
+                                    if PerimeterFaceTrackCounts
+                                    else None
+                                ),
+                            )
+                            ShellByPhysicalRingIdentity[
+                                ShellIdentity
+                            ] = Shell
+                        else:
+                            Shell = (
+                                ProjectDerivedPerimeterFabricShellLayers(
+                                    SourceShell,
+                                    AccessFabricPlacement,
+                                    Resources=StaticAccessResources,
+                                    Technology=Technology,
+                                    LayerCount=(
+                                        Envelope.RoutingLayerCount
+                                    ),
+                                    PerimeterFaceTrackCounts=tuple(
+                                        PerimeterFaceTrackCounts
+                                    ),
+                                )
+                            )
                 PrefixBounds = (
                     Shell.OuterBounds
                     if Shell is not None
@@ -13725,6 +13955,7 @@ def _PlaceAndRoutePcbWithPolicy(
                 ),
             )
     RawTrackAssignmentResult: RawTrackAssignmentSelection | None = None
+    CompactFactorCatalogResult: Any | None = None
     RawTrackAssignmentMaterializations: dict[
         str,
         RawTrackAssignmentMemberMaterialization,
@@ -13772,6 +14003,23 @@ def _PlaceAndRoutePcbWithPolicy(
             PlacementGeometryFingerprintsByIdentity: dict[int, str] = {}
             ResourceGeometryFingerprintsByIdentity: dict[
                 tuple[int, int], str
+            ] = {}
+            MaximumDeclaredLayerCountByPlacementFingerprint: dict[str, int] = {}
+            for Candidate in CandidateRecords:
+                MaximumDeclaredLayerCountByPlacementFingerprint[
+                    Candidate.PlacementFingerprint
+                ] = max(
+                    MaximumDeclaredLayerCountByPlacementFingerprint.get(
+                        Candidate.PlacementFingerprint,
+                        0,
+                    ),
+                    int(Candidate.RoutingEnvelope.RoutingLayerCount),
+                )
+            MaximumLayerGuideDomainByPlacementFingerprint: dict[
+                str, Any
+            ] = {}
+            MaximumLayerAccessFabricByPlacementFingerprint: dict[
+                str, PlacementAccessFabric
             ] = {}
 
             def CachedPlacementGeometryFingerprint(Placed: Any) -> str:
@@ -13856,6 +14104,350 @@ def _PlaceAndRoutePcbWithPolicy(
                     (
                         "layers",
                         str(Candidate.RoutingEnvelope.RoutingLayerCount),
+                    ),
+                )
+
+            def ProjectMaximumLayerGuideDomain(
+                Domain: RawTrackAssignmentDomain,
+                Fabric: Any,
+                LayerCount: int,
+            ) -> RawTrackAssignmentDomain:
+                """Project one exact maximal-layer enumeration downward.
+
+                Routing Y coordinates and portal paths for retained layers
+                are physically invariant.  Validate every named access stub
+                against the lower-layer fabric before publishing the member
+                view; a missing or changed stub removes only that exact shape.
+                """
+                FabricDomainsByLogicalKey = {
+                    str(
+                        FabricDomain.LogicalKey
+                        or f"{Index}:{FabricDomain.Signal}"
+                    ): FabricDomain
+                    for Index, FabricDomain in enumerate(
+                        Fabric.TerminalDomains
+                    )
+                }
+                ProjectedStubIndexesByRequirement = {
+                    f"access-stub:{LogicalKey}": {
+                        (
+                            str(FabricDomain.Signal),
+                            tuple(FabricDomain.Terminal),
+                            tuple(Stub.Path),
+                            int(Stub.Ingress[1]),
+                        ): StubIndex
+                        for StubIndex, Stub in enumerate(
+                            FabricDomain.EscapeStubs
+                        )
+                    }
+                    for LogicalKey, FabricDomain in (
+                        FabricDomainsByLogicalKey.items()
+                    )
+                }
+
+                def ProjectExactFabricStubs(Value: Any) -> Any | None:
+                    Descriptor = Value.RouteGuideFactorDescriptor
+                    if Descriptor is None:
+                        return Value
+                    if int(Descriptor.Layer) >= int(LayerCount):
+                        return None
+                    Requirements = dict(
+                        Value.ContractRequirementItems
+                    )
+                    Portals = (
+                        Descriptor.SourcePortal,
+                        *Descriptor.TargetPortals,
+                    )
+                    for RequirementName in tuple(Requirements):
+                        StubIndexes = (
+                            ProjectedStubIndexesByRequirement.get(
+                                RequirementName
+                            )
+                        )
+                        if StubIndexes is None:
+                            continue
+                        MatchingPortal = next((
+                            Portal
+                            for Portal in Portals
+                            if (
+                                str(Portal.Signal),
+                                tuple(Portal.Terminal),
+                                tuple(Portal.Path),
+                                int(Portal.Path[-1][1]),
+                            ) in StubIndexes
+                        ), None)
+                        if MatchingPortal is None:
+                            return None
+                        ProjectedStubIndex = StubIndexes.get((
+                            str(MatchingPortal.Signal),
+                            tuple(MatchingPortal.Terminal),
+                            tuple(MatchingPortal.Path),
+                            int(MatchingPortal.Path[-1][1]),
+                        ))
+                        if ProjectedStubIndex is None:
+                            return None
+                        Requirements[RequirementName] = str(
+                            ProjectedStubIndex
+                        )
+                    Certificate = (
+                        Value.CompactMaterializabilityCertificate
+                    )
+                    if Certificate is not None:
+                        # Retained paths, claims, guide geometry and graph
+                        # identity were matched exactly above.  The projected
+                        # member nevertheless owns a distinct fabric/shell
+                        # contract, so its frozen certificate must name that
+                        # exact world rather than the maximal-layer source.
+                        Certificate = replace(
+                            Certificate,
+                            FabricFingerprint=str(
+                                Fabric.FabricFingerprint
+                            ),
+                            AccessShellFingerprint=str(
+                                Fabric.AccessRingFingerprint
+                            ),
+                            StaticClaimsFingerprint=BuildStableFingerprint({
+                                "Kind": (
+                                    "projected-compact-static-claims-v1"
+                                ),
+                                "Source": (
+                                    Certificate.StaticClaimsFingerprint
+                                ),
+                                "Fabric": str(Fabric.FabricFingerprint),
+                                "AccessShell": str(
+                                    Fabric.AccessRingFingerprint
+                                ),
+                                "Requirements": tuple(sorted(
+                                    Requirements.items()
+                                )),
+                            }),
+                        )
+                    return replace(
+                        Value,
+                        ContractRequirements=tuple(sorted(
+                            Requirements.items()
+                        )),
+                        CompactMaterializabilityCertificate=Certificate,
+                    )
+
+                Values = tuple(
+                    Projected
+                    for Value in Domain.Values
+                    for Projected in (ProjectExactFabricStubs(Value),)
+                    if Projected is not None
+                )
+                MutableCounts = {
+                    Signal: 0 for Signal, _Count in Domain.CandidateCounts
+                }
+                for Value in Values:
+                    MutableCounts[Value.Signal] = (
+                        MutableCounts.get(Value.Signal, 0) + 1
+                    )
+                Counts = tuple(MutableCounts.items())
+                ProjectedValueIdentity = tuple(
+                    (Value.Signal, Value.CandidateId)
+                    for Value in Values
+                )
+                return replace(
+                    Domain,
+                    Values=Values,
+                    CandidateCounts=Counts,
+                    CandidateDomainFingerprint=BuildStableFingerprint({
+                        "Kind": "projected-maximal-guide-factor-domain-v1",
+                        "Source": Domain.CandidateDomainFingerprint,
+                        "LayerCount": int(LayerCount),
+                        "FabricFingerprint": str(
+                            Fabric.FabricFingerprint
+                        ),
+                        "Values": ProjectedValueIdentity,
+                    }),
+                    PortalDomainFingerprint=BuildStableFingerprint({
+                        "Source": Domain.PortalDomainFingerprint,
+                        "FabricFingerprint": str(
+                            Fabric.FabricFingerprint
+                        ),
+                        "LayerCount": int(LayerCount),
+                    }),
+                    Diagnostics=(
+                        ("RouteGuideFactor", True),
+                        ("ProjectedFromMaximalLayerDomain", True),
+                        ("ProjectedLayerCount", int(LayerCount)),
+                        ("RouteGuideFactorCounts", Counts),
+                        ("RouteGuideFactorDomainComplete", True),
+                    ),
+                    DomainFingerprintOverride=BuildStableFingerprint({
+                        "Kind": "projected-compact-route-guide-domain-v1",
+                        "Source": Domain.DomainFingerprint,
+                        "LayerCount": int(LayerCount),
+                        "FabricFingerprint": str(
+                            Fabric.FabricFingerprint
+                        ),
+                        "Values": ProjectedValueIdentity,
+                    }),
+                )
+
+            def ProjectMaximumLayerAccessFabric(
+                Fabric: PlacementAccessFabric,
+                Shell: DerivedPerimeterFabricShell,
+                Resources: Any,
+                Candidate: PcbPlacementCandidate,
+            ) -> PlacementAccessFabric:
+                """Project a complete derived fabric without rerunning escape search."""
+                LayerCount = int(
+                    Candidate.RoutingEnvelope.RoutingLayerCount
+                )
+                BaseY = min(
+                    int(Gate.Y)
+                    for Gate in Candidate.Placement.Placed.PlacedGates
+                )
+                AllowedYs = frozenset(map(int, Shell.FabricYs))
+                Domains = tuple(
+                    replace(
+                        Domain,
+                        EscapeStubs=tuple(
+                            Stub for Stub in Domain.EscapeStubs
+                            if int(Stub.Ingress[1]) in AllowedYs
+                        ),
+                        Complete=any(
+                            int(Stub.Ingress[1]) in AllowedYs
+                            for Stub in Domain.EscapeStubs
+                        ),
+                        IncompleteReason=(
+                            ""
+                            if any(
+                                int(Stub.Ingress[1]) in AllowedYs
+                                for Stub in Domain.EscapeStubs
+                            )
+                            else "projected-access-stub-domain-empty"
+                        ),
+                    )
+                    for Domain in Fabric.TerminalDomains
+                )
+                Nodes = tuple(
+                    Value for Value in Fabric.Nodes
+                    if int(Value[1]) in AllowedYs
+                )
+                NodeSet = frozenset(Nodes)
+                Edges = tuple(
+                    Value for Value in Fabric.Edges
+                    if Value[0] in NodeSet and Value[1] in NodeSet
+                )
+                IngressNodes = tuple(
+                    Value for Value in Fabric.IngressNodes
+                    if int(Value[1]) in AllowedYs
+                )
+                PhysicalClaims = Resources.ResourceGraph.BuildRouteClaims(
+                    NodeSet
+                )
+                FrozenPositions = tuple({
+                    *Nodes,
+                    *(
+                        Position
+                        for Domain in Domains
+                        for Stub in Domain.EscapeStubs
+                        for Position in Stub.Path
+                    ),
+                })
+                MinimumY = min((
+                    BaseY,
+                    *(Position[1] for Position in FrozenPositions),
+                ))
+                MaximumY = max(
+                    max(AllowedYs) + 1,
+                    max(
+                        (
+                            Position[1] + 1
+                            for Position in FrozenPositions
+                        ),
+                        default=BaseY,
+                    ),
+                ) + 1
+                ExistingEnvelope = Fabric.FrozenRoutingEnvelope
+                ProjectionBounds = Shell.Bounds
+                CanvasBounds = (
+                    (
+                        ProjectionBounds[0] - max(
+                            0,
+                            ExistingEnvelope.RoutingRegionBounds[0]
+                            - ExistingEnvelope.CanvasBounds[0],
+                        ),
+                        ProjectionBounds[1] - max(
+                            0,
+                            ExistingEnvelope.RoutingRegionBounds[1]
+                            - ExistingEnvelope.CanvasBounds[1],
+                        ),
+                        ProjectionBounds[2] + max(
+                            0,
+                            ExistingEnvelope.CanvasBounds[2]
+                            - ExistingEnvelope.RoutingRegionBounds[2],
+                        ),
+                        ProjectionBounds[3] + max(
+                            0,
+                            ExistingEnvelope.CanvasBounds[3]
+                            - ExistingEnvelope.RoutingRegionBounds[3],
+                        ),
+                    )
+                    if ExistingEnvelope is not None
+                    else ProjectionBounds
+                )
+                FrozenEnvelope = FrozenPerFaceRoutingEnvelope(
+                    RoutingRegionBounds=ProjectionBounds,
+                    CanvasBounds=CanvasBounds,
+                    YBounds=(MinimumY, MaximumY),
+                    PermittedLayers=Shell.FabricLayers,
+                    PerimeterFaceTrackCounts=Shell.PerimeterFaceTrackCounts,
+                    EnvelopeFingerprint=BuildStableFingerprint({
+                        "Kind": "projected-frozen-per-face-envelope-v1",
+                        "Shell": Shell.ShellFingerprint,
+                        "YBounds": (MinimumY, MaximumY),
+                        "CanvasBounds": CanvasBounds,
+                    }),
+                )
+                Complete = bool(
+                    Fabric.Complete
+                    and all(Domain.Complete for Domain in Domains)
+                )
+                return replace(
+                    Fabric,
+                    FabricFingerprint=BuildStableFingerprint({
+                        "Kind": "projected-placement-access-fabric-v1",
+                        "Source": Fabric.FabricFingerprint,
+                        "Shell": Shell.ShellFingerprint,
+                        "Domains": tuple(
+                            (
+                                Domain.LogicalKey,
+                                tuple(
+                                    (Stub.Path, Stub.Ingress)
+                                    for Stub in Domain.EscapeStubs
+                                ),
+                            )
+                            for Domain in Domains
+                        ),
+                    }),
+                    Nodes=Nodes,
+                    Edges=Edges,
+                    IngressNodes=IngressNodes,
+                    PhysicalClaims=PhysicalClaims,
+                    CapacityResourceIds=tuple(sorted(
+                        PhysicalClaims.ResourceIds,
+                        key=str,
+                    )),
+                    TerminalDomains=Domains,
+                    AccessRingTrackCount=Shell.AccessRingTrackCount,
+                    AccessRingFingerprint=BuildStableFingerprint({
+                        "Shell": Shell.ShellFingerprint,
+                        "Layers": Shell.FabricLayers,
+                    }),
+                    OuterBounds=Shell.Bounds,
+                    ActiveFaces=Shell.ActiveFaces,
+                    PerimeterSlotAssignmentFingerprint=(
+                        Shell.PerimeterSlotAssignmentFingerprint
+                    ),
+                    FrozenRoutingEnvelope=FrozenEnvelope,
+                    Complete=Complete,
+                    IncompleteReason=(
+                        "" if Complete
+                        else "projected-access-stub-domain-empty"
                     ),
                 )
 
@@ -13957,7 +14549,34 @@ def _PlaceAndRoutePcbWithPolicy(
                 )
                 AccessFabricStartedAt = monotonic()
                 try:
-                    if ReusedAccessFabricMaterialization is not None:
+                    MaximumLayerCount = (
+                        MaximumDeclaredLayerCountByPlacementFingerprint[
+                            Candidate.PlacementFingerprint
+                        ]
+                    )
+                    MaximumLayerAccessFabric = (
+                        MaximumLayerAccessFabricByPlacementFingerprint.get(
+                            Candidate.PlacementFingerprint
+                        )
+                    )
+                    if (
+                        ReusedAccessFabricMaterialization is None
+                        and Shell is not None
+                        and MaximumLayerAccessFabric is not None
+                        and int(Candidate.RoutingEnvelope.RoutingLayerCount)
+                        < MaximumLayerCount
+                    ):
+                        Fabric = ProjectMaximumLayerAccessFabric(
+                            MaximumLayerAccessFabric,
+                            Shell,
+                            CandidateResources,
+                            Candidate,
+                        )
+                        ReusedAccessFabricMaterialization = (
+                            Fabric,
+                            CandidateResources,
+                        )
+                    elif ReusedAccessFabricMaterialization is not None:
                         (
                             Fabric,
                             CandidateResources,
@@ -13991,6 +14610,12 @@ def _PlaceAndRoutePcbWithPolicy(
                                 FabricDescriptor.TopologyKind
                                 == "derived-perimeter-access-v1"
                             ),
+                            # Compact selection consumes the exact immutable
+                            # PhysicalClaims directly. Expanding every
+                            # unselected stub into duplicate resource-id
+                            # objects is deferred until a selected assignment
+                            # actually needs that serialized view.
+                            DeferEscapeStubCapacityResourceIds=True,
                             NativeEscapeRemainingMilliseconds=(
                                 Deadline.RemainingMilliseconds
                             ),
@@ -14002,6 +14627,15 @@ def _PlaceAndRoutePcbWithPolicy(
                         ExactPhysicalAccessFabricMaterializations[
                             ExactAccessFabricIdentity
                         ] = (Fabric, CandidateResources)
+                        if (
+                            Shell is not None
+                            and int(
+                                Candidate.RoutingEnvelope.RoutingLayerCount
+                            ) == MaximumLayerCount
+                        ):
+                            MaximumLayerAccessFabricByPlacementFingerprint[
+                                Candidate.PlacementFingerprint
+                            ] = Fabric
                     AccessFabricElapsedSeconds = (
                         monotonic() - AccessFabricStartedAt
                     )
@@ -14048,7 +14682,25 @@ def _PlaceAndRoutePcbWithPolicy(
                         )
                     )
                     GuideDomainStartedAt = monotonic()
-                    if GuideDomain is None:
+                    MaximumLayerGuideDomain = (
+                        MaximumLayerGuideDomainByPlacementFingerprint.get(
+                            Candidate.PlacementFingerprint
+                        )
+                    )
+                    if (
+                        GuideDomain is None
+                        and MaximumLayerGuideDomain is not None
+                        and int(Candidate.RoutingEnvelope.RoutingLayerCount)
+                        < MaximumLayerCount
+                    ):
+                        GuideDomain = ProjectMaximumLayerGuideDomain(
+                            MaximumLayerGuideDomain,
+                            Fabric,
+                            int(
+                                Candidate.RoutingEnvelope.RoutingLayerCount
+                            ),
+                        )
+                    elif GuideDomain is None:
                         GuideDomain = PrepareRawRouteGuideFactorDomain(
                             AttachedForGuide,
                             Resources=CandidateResources,
@@ -14058,6 +14710,13 @@ def _PlaceAndRoutePcbWithPolicy(
                         ExactPhysicalGuideDomainMaterializations[
                             ExactGuideDomainIdentity
                         ] = GuideDomain
+                        if (
+                            int(Candidate.RoutingEnvelope.RoutingLayerCount)
+                            == MaximumLayerCount
+                        ):
+                            MaximumLayerGuideDomainByPlacementFingerprint[
+                                Candidate.PlacementFingerprint
+                            ] = GuideDomain
                     else:
                         # The physical values and their candidate-domain
                         # fingerprint are shared.  Placement identity is a
@@ -14158,6 +14817,24 @@ def _PlaceAndRoutePcbWithPolicy(
                                 (
                                     "FabricDescriptor",
                                     FabricDescriptor.ToDictionary(),
+                                ),
+                                (
+                                    "AccessFabricElapsedSeconds",
+                                    round(
+                                        float(locals().get(
+                                            "AccessFabricElapsedSeconds",
+                                            0.0,
+                                        )),
+                                        6,
+                                    ),
+                                ),
+                                (
+                                    "PlacementAccessFabric",
+                                    (
+                                        SummarizePreRouteAccessFabric(Fabric)
+                                        if "Fabric" in locals()
+                                        else None
+                                    ),
                                 ),
                             ),
                         )
@@ -14274,63 +14951,10 @@ def _PlaceAndRoutePcbWithPolicy(
                         Descriptor.TemplateId
                     ] = Result
                     return Result
-                try:
-                    ContractRequirements = MemberContractForTemplate(
-                        Candidate.CandidateId
-                    )
-                    AccessDomain = BuildPlacementAccessStubFactorDomain(
-                        Fabric,
-                        ContractRequirements=ContractRequirements,
-                        MaximumAssignmentExpansions=(
-                            Policy.TrackAssignment
-                            .MaximumAssignmentExpansions
-                        ),
-                        PlacementFingerprint=(
-                            GuideDomain.PlacementFingerprint
-                        ),
-                        ResourceGraphFingerprint=(
-                            GuideDomain.ResourceGraphFingerprint
-                        ),
-                        NativeAssignmentContext=(
-                            GuideDomain.NativeAssignmentContext
-                        ),
-                    )
-                    RawDomain = ComposeRawTrackAssignmentFactorDomains(
-                        GuideDomain,
-                        AccessDomain,
-                        MaximumAssignmentExpansions=(
-                            Policy.TrackAssignment
-                            .MaximumAssignmentExpansions
-                        ),
-                    )
-                except RoutingStageError as Error:
-                    Result = RawTrackAssignmentMemberMaterialization(
-                        TemplateId=Descriptor.TemplateId,
-                        Domain=None,
-                        Complete=False,
-                        IncompleteReason=(
-                            Error.Failure.Reason.value
-                            if hasattr(Error.Failure.Reason, "value")
-                            else str(Error.Failure.Reason)
-                        ),
-                        Diagnostics=(
-                            ("Candidate", Candidate.ToDictionary()),
-                            (
-                                "RawFactorDomainFailure",
-                                Error.Failure.ToDictionary(),
-                            ),
-                            (
-                                "FabricDescriptor",
-                                FabricDescriptor.ToDictionary(),
-                            ),
-                        ),
-                        ResolvedObjective=Template.Witnesses[0].Objective
-                        if Template.Witnesses else (),
-                    )
-                    RawTrackAssignmentMaterializations[
-                        Descriptor.TemplateId
-                    ] = Result
-                    return Result
+                # The compact catalog consumes the guide values and access
+                # fabric by reference.  Do not construct an access raw domain
+                # or reindex an expanded composed member here.
+                RawDomain = GuideDomain
                 Result = RawTrackAssignmentMemberMaterialization(
                     TemplateId=Descriptor.TemplateId,
                     Domain=RawDomain,
@@ -14373,9 +14997,23 @@ def _PlaceAndRoutePcbWithPolicy(
             # Materialize only access-stub and route-guide factor domains,
             # then invoke the native template selector once.  Detailed route
             # trees are generated only for its selected physical world.
+            FactorMaterializationTemplates = tuple(sorted(
+                SelectableRawPortfolioTemplates,
+                key=lambda Descriptor: (
+                    CandidateById[
+                        Descriptor.TemplateId
+                    ].PlacementFingerprint,
+                    -int(
+                        CandidateById[Descriptor.TemplateId]
+                        .RoutingEnvelope.RoutingLayerCount
+                    ),
+                    Descriptor.Objective,
+                    Descriptor.TemplateId,
+                ),
+            ))
             MaterializedMembers = tuple(
                 MaterializeRawTemplate(Descriptor)
-                for Descriptor in SelectableRawPortfolioTemplates
+                for Descriptor in FactorMaterializationTemplates
             )
             IncompleteMember = next((
                 Value for Value in MaterializedMembers
@@ -14456,41 +15094,50 @@ def _PlaceAndRoutePcbWithPolicy(
                     )
                     for Value in MaterializedMembers
                 }
+                CatalogInternStartedAt = monotonic()
+                CompactFactorCatalogResult = BuildCompactFactorCatalog(
+                    (
+                        CompactFactorMemberSource(
+                            TemplateId=Value.TemplateId,
+                            Objective=CompactMemberObjective(
+                                Value.TemplateId
+                            ),
+                            ContractRequirements=MemberContracts[
+                                Value.TemplateId
+                            ],
+                            GuideDomain=Value.Domain,
+                            Fabric=(
+                                PlacementAccessEvidenceByCandidateId[
+                                    Value.TemplateId
+                                ][0]
+                            ),
+                            FabricFingerprint=str(getattr(
+                                PlacementAccessEvidenceByCandidateId[
+                                    Value.TemplateId
+                                ][0],
+                                "FabricFingerprint",
+                                "",
+                            )),
+                        )
+                        for Value in MaterializedMembers
+                        if Value.Domain is not None
+                    ),
+                    MaximumAssignmentExpansions=(
+                        Policy.TrackAssignment.MaximumAssignmentExpansions
+                    ),
+                )
+                CatalogInternElapsedSeconds = (
+                    monotonic() - CatalogInternStartedAt
+                )
+                NativeCompactSolveStartedAt = monotonic()
                 RawTrackAssignmentResult = (
-                    SolveRawTrackAssignmentProblemWithContext(
-                        RawTrackAssignmentProblem(
-                            Templates=tuple(
-                                RawTrackAssignmentTemplate(
-                                    TemplateId=Value.TemplateId,
-                                    Objective=CompactMemberObjective(
-                                        Value.TemplateId
-                                    ),
-                                    Domain=(
-                                        AttachRawTrackAssignmentContractRequirements(
-                                            Value.Domain,
-                                            ContractRequirements=(
-                                                MemberContracts[
-                                                    Value.TemplateId
-                                                ]
-                                            ),
-                                        )
-                                    ),
-                                )
-                                for Value in MaterializedMembers
-                                if Value.Domain is not None
-                            ),
-                            MaximumAssignmentExpansions=(
-                                Policy.TrackAssignment
-                                .MaximumAssignmentExpansions
-                            ),
-                            NonExhaustiveTemplateDomain=True,
-                        ),
+                    SolveCompactFactorCatalogWithContext(
+                        CompactFactorCatalogResult,
                         Deadline=Deadline,
-                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
-                            "PreRouteInterfaceSelection",
-                            Diagnostics,
-                        ),
                     )
+                )
+                NativeCompactSolveElapsedSeconds = (
+                    monotonic() - NativeCompactSolveStartedAt
                 )
                 SelectedTemplateId = (
                     RawTrackAssignmentResult.SelectedTemplateId
@@ -14609,8 +15256,26 @@ def _PlaceAndRoutePcbWithPolicy(
                     if RawTrackAssignmentResult is not None
                     else None
                 ),
+                "CompactFactorCatalog": (
+                    {
+                        **CompactFactorCatalogResult.ToDictionary(),
+                        "CatalogInternElapsedSeconds": round(
+                            CatalogInternElapsedSeconds,
+                            6,
+                        ),
+                        "NativeCompactSolveElapsedSeconds": round(
+                            NativeCompactSolveElapsedSeconds,
+                            6,
+                        ),
+                        "NativeCompactSelectionCallCount": 1,
+                        "FallbackInvoked": False,
+                        "SecondAssignmentInvocation": False,
+                    }
+                    if CompactFactorCatalogResult is not None
+                    else None
+                ),
                 "RawTrackAssignmentMaterializations": [
-                    Result.ToDictionary()
+                    Result.ToCompactDictionary()
                     for _CandidateId, Result in sorted(
                         RawTrackAssignmentMaterializations.items()
                     )
@@ -15567,6 +16232,7 @@ def _PlaceAndRoutePcbWithPolicy(
         nonlocal TerminalConstraintEpochPortfolioNeedsMaterialization
         nonlocal TerminalConstraintEpochPrimaryCandidateId
         nonlocal TerminalConstraintEpochPortfolioIdentityFingerprint
+        nonlocal ProactiveRelocationRequested
         AttemptedFingerprints: set[str] = set()
         AttemptedRoutingControlIdentities: set[
             RoutingControlAttemptIdentity
@@ -17159,6 +17825,35 @@ def _PlaceAndRoutePcbWithPolicy(
             if Deadline.IsExpired():
                 return
             if ExactClusterInterfaceSolveEnabled:
+                if ProactiveRelocationRequested:
+                    ProactiveRelocationRequested = False
+                    Request = _TakeNextDeferredRequest(
+                        PreferRelocation=True,
+                    )
+                    if Request is not None:
+                        PlacementGenerationDecisions.append({
+                            "Result": "materialize-proactive-exact-relocation",
+                            "SourceGenerator": Request.SourceGenerator,
+                            "RelocationSignals": sorted(
+                                PlacementRelocationSignals
+                            ),
+                            "ExecutableLegacyRepairCascade": False,
+                        })
+                        try:
+                            _TryPlacement(Request)
+                        except RoutingStageError as Error:
+                            LastRoutingError = Error
+                            LastStructuredRoutingError = Error
+                            return
+                        CandidateRecords = _BuildCandidateRecords()
+                        OrderedPlacements = CandidateRecords[
+                            : RetainedRoutingCandidateLimit(CandidateRecords)
+                        ]
+                        PlacementFeedback[:] = [
+                            Candidate.ToDictionary()
+                            for Candidate in CandidateRecords
+                        ]
+                        continue
                 PlacementGenerationDecisions.append({
                     "Result": "dense-broad-generation-disabled",
                     "ExecutableLegacyRepairCascade": False,
@@ -25455,13 +26150,62 @@ def _PlaceAndRoutePcbWithPolicy(
         "DetailedMaterializedMemberCount": int(
             SinglePackedComponent
         ),
+        "PreSelectionDetailedDomainBuildCount": 0,
+        "PostSelectionDetailedDomainBuildCount": int(
+            SinglePackedComponent
+        ),
+        "DetailedCandidateDomainMaterializationCount": int(
+            SinglePackedComponent
+        ),
         "NativeTemplateSelectionCallCount": int(
             RawTrackAssignmentResult is not None
+        ),
+        "CompactFactorCatalog": (
+            {
+                **CompactFactorCatalogResult.ToDictionary(),
+                "CatalogInternElapsedSeconds": round(
+                    CatalogInternElapsedSeconds,
+                    6,
+                ),
+                "NativeCompactSolveElapsedSeconds": round(
+                    NativeCompactSolveElapsedSeconds,
+                    6,
+                ),
+                "NativeCompactSelectionCallCount": 1,
+                "FallbackInvoked": False,
+            }
+            if CompactFactorCatalogResult is not None
+            else None
         ),
         "DetailedRoutingPassCount": 1,
         "FallbackOccurred": False,
         "RetryOccurred": False,
         "SecondAssignmentInvocationOccurred": False,
+        "SecondRoutingInvocationOccurred": False,
+        "SelectedAccessStubChoiceIds": [
+            list(Value)
+            for Value in (
+                RawTrackAssignmentResult.Preparation
+                .SelectedContractClaimChoiceIds
+                if (
+                    RawTrackAssignmentResult is not None
+                    and RawTrackAssignmentResult.Preparation is not None
+                )
+                else ()
+            )
+        ],
+        "SelectedGuideFactorChoiceIds": [
+            list(Value)
+            for Value in (
+                RawTrackAssignmentResult.Preparation
+                .SelectedRouteGuideFactorChoiceIds
+                if (
+                    RawTrackAssignmentResult is not None
+                    and RawTrackAssignmentResult.Preparation is not None
+                )
+                else ()
+            )
+        ],
         "SelectedContractRequirements": [
             list(Value)
             for Value in (
@@ -25493,7 +26237,7 @@ def _PlaceAndRoutePcbWithPolicy(
             else None
         ),
         "RawTrackAssignmentMaterializations": [
-            Result.ToDictionary()
+            Result.ToCompactDictionary()
             for _CandidateId, Result in sorted(
                 RawTrackAssignmentMaterializations.items()
             )

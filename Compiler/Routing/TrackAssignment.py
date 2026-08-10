@@ -253,4 +253,3 @@ def _RepeaterOpportunities(Guide: frozenset[Position2]) -> frozenset[Position2]:
         if Horizontal != Vertical:
             Result.add((X, Z))
     return frozenset(Result)
-

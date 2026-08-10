@@ -27,11 +27,76 @@ from Compiler.Routing.ResourceGraph import (
 )
 from Compiler.Routing.Reliability import RoutingDeadline
 from Compiler.Routing.TemplateAssignment import (
+    BuildCompactFactorCatalog,
+    CompactFactorMemberSource,
     RawTrackAssignmentProblem,
     RawTrackAssignmentTemplate,
+    SolveCompactFactorCatalogPythonOracleForTests,
+    SolveCompactFactorCatalogWithContext,
     SolveRawTrackAssignmentProblem,
     SolveRawTrackAssignmentProblemWithContext,
 )
+
+
+def BuildCompactSource(
+    TemplateId: str,
+    Objective: tuple[int, ...],
+    Values: tuple[RawTrackAssignmentValue, ...],
+    *,
+    RequiredVariables: tuple[str, ...] = ("A", "B"),
+    ResourceGraphFingerprint: str = "graph",
+    Fabric=None,
+) -> CompactFactorMemberSource:
+    Positions = tuple(sorted({
+        Position
+        for Value in Values
+        for Cells in (
+            Value.Claims.WireCells,
+            Value.Claims.SupportCells,
+            Value.Claims.RequiredAirCells,
+            Value.Claims.ElectricalCells,
+        )
+        for Position in Cells
+    }))
+    Domain = RawTrackAssignmentDomain(
+        ResourcePositions=Positions,
+        Values=Values,
+        BaseClaims=(),
+        CandidateCounts=tuple(
+            (
+                Variable,
+                sum(Value.Signal == Variable for Value in Values),
+            )
+            for Variable in RequiredVariables
+        ),
+        CandidateDomainFingerprint=f"candidate-{TemplateId}",
+        LocalClaimDomainFingerprint=f"local-{TemplateId}",
+        PlacementFingerprint=f"placement-{TemplateId}",
+        ResourceGraphFingerprint=ResourceGraphFingerprint,
+        PortalDomainFingerprint=f"portal-{TemplateId}",
+        Complete=True,
+        MaximumAssignmentExpansions=64,
+    )
+    Fabric = Fabric or SimpleNamespace(
+        Complete=True,
+        IncompleteReason="",
+        FabricFingerprint="fabric",
+        AccessRingFingerprint="shell",
+        TerminalDomains=(),
+    )
+    return CompactFactorMemberSource(
+        TemplateId=TemplateId,
+        Objective=Objective,
+        ContractRequirements=(
+            ("core", f"core-{TemplateId}"),
+            ("interface", f"interface-{TemplateId}"),
+            ("layers", str(Objective[-1])),
+            ("member", TemplateId),
+        ),
+        GuideDomain=Domain,
+        Fabric=Fabric,
+        FabricFingerprint=Fabric.FabricFingerprint,
+    )
 
 
 def BuildDomain(
@@ -1120,3 +1185,269 @@ def test_extracted_domain_context_overrides_fixture_fallback_context():
     assert Result.Success is True
     assert Attached.Calls == 1
     assert Fallback.Calls == 0
+
+
+def test_compact_catalog_interns_only_exact_complete_physical_primitives():
+    Position = (1, 2, 3)
+
+    def Value(CandidateId: str, Claims: RoutingResourceClaims):
+        return RawTrackAssignmentValue(
+            Signal="A",
+            CandidateId=CandidateId,
+            SourceCandidateId="shared-source",
+            Claims=Claims,
+            MaterialCost=1,
+            FootprintGrowth=1,
+            Length=1,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="local-claim",
+        )
+
+    First = BuildCompactSource(
+        "first",
+        (1, 1, 1),
+        (Value("a-first", RoutingResourceClaims(
+            WireCells=frozenset({Position}),
+        )),),
+        RequiredVariables=("A",),
+    )
+    Identical = BuildCompactSource(
+        "identical",
+        (2, 1, 1),
+        (Value("a-identical", RoutingResourceClaims(
+            WireCells=frozenset({Position}),
+        )),),
+        RequiredVariables=("A",),
+    )
+    ChangedCategory = BuildCompactSource(
+        "category",
+        (3, 1, 1),
+        (Value("a-category", RoutingResourceClaims(
+            ElectricalCells=frozenset({Position}),
+        )),),
+        RequiredVariables=("A",),
+    )
+    ChangedGraph = BuildCompactSource(
+        "graph",
+        (4, 1, 1),
+        (Value("a-graph", RoutingResourceClaims(
+            WireCells=frozenset({Position}),
+        )),),
+        RequiredVariables=("A",),
+        ResourceGraphFingerprint="different-graph",
+    )
+
+    Catalog = BuildCompactFactorCatalog(
+        (First, Identical, ChangedCategory, ChangedGraph),
+        MaximumAssignmentExpansions=64,
+    )
+
+    assert len(Catalog.Primitives) == 3
+    assert Catalog.PrimitiveCacheHits == 1
+    assert Catalog.PrimitiveCacheMisses == 3
+    assert len({
+        Primitive.PhysicalFingerprint
+        for Primitive in Catalog.Primitives
+    }) == 3
+    Rebuilt = BuildCompactFactorCatalog(
+        (First, Identical, ChangedCategory, ChangedGraph),
+        MaximumAssignmentExpansions=64,
+    )
+    assert Rebuilt.CatalogFingerprint == Catalog.CatalogFingerprint
+
+
+def test_compact_catalog_native_selection_matches_python_oracle(monkeypatch):
+    Shared = (1, 1, 1)
+    ClearA = (2, 1, 1)
+    ClearB = (4, 1, 1)
+
+    def Candidate(
+        Signal: str,
+        CandidateId: str,
+        Claims: RoutingResourceClaims,
+    ) -> RawTrackAssignmentValue:
+        return RawTrackAssignmentValue(
+            Signal=Signal,
+            CandidateId=CandidateId,
+            Claims=Claims,
+            MaterialCost=1,
+            FootprintGrowth=1,
+            Length=1,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="local-claim",
+        )
+
+    Conflicting = BuildCompactSource(
+        "l1",
+        (10, 10, 1),
+        (
+            Candidate("A", "a-l1", RoutingResourceClaims(
+                WireCells=frozenset({Shared}),
+            )),
+            Candidate("B", "b-l1", RoutingResourceClaims(
+                ElectricalCells=frozenset({Shared}),
+            )),
+        ),
+    )
+    Feasible = BuildCompactSource(
+        "l2",
+        (10, 10, 2),
+        (
+            Candidate("A", "a-l2", RoutingResourceClaims(
+                WireCells=frozenset({ClearA}),
+            )),
+            Candidate("B", "b-l2", RoutingResourceClaims(
+                WireCells=frozenset({ClearB}),
+            )),
+        ),
+    )
+    Catalog = BuildCompactFactorCatalog(
+        (Feasible, Conflicting),
+        MaximumAssignmentExpansions=64,
+    )
+    Oracle = SolveCompactFactorCatalogPythonOracleForTests(Catalog)
+    if TemplateAssignment._SolveCompactTemplateFactorCatalogBounded is None:
+        pytest.skip("native compact catalog binding is unavailable")
+    NativeBinding = (
+        TemplateAssignment._SolveCompactTemplateFactorCatalogBounded
+    )
+    Calls = []
+
+    def Solve(*Arguments):
+        Calls.append(Arguments)
+        return NativeBinding(*Arguments)
+
+    monkeypatch.setattr(
+        TemplateAssignment,
+        "_SolveCompactTemplateFactorCatalogBounded",
+        Solve,
+    )
+    Native = SolveCompactFactorCatalogWithContext(
+        Catalog,
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+
+    assert len(Calls) == 1
+    assert Native.Success is Oracle.Success is True
+    assert Native.Complete is Oracle.Complete is True
+    assert Native.SelectedTemplateId == Oracle.SelectedTemplateId == "l2"
+    assert Native.Preparation is not None
+    assert Native.Preparation.SelectedLocalClaimChoiceIds == (
+        ("A", "a-l2"),
+        ("B", "b-l2"),
+    )
+    assert Oracle.SelectedCandidateIds == (
+        ("A", "a-l2"),
+        ("B", "b-l2"),
+    )
+
+
+def test_compact_catalog_nonexhaustive_failure_is_incomplete_not_unsat():
+    Shared = (1, 1, 1)
+    Values = tuple(
+        RawTrackAssignmentValue(
+            Signal=Signal,
+            CandidateId=f"{Signal}-only",
+            Claims=(
+                RoutingResourceClaims(WireCells=frozenset({Shared}))
+                if Signal == "A"
+                else RoutingResourceClaims(
+                    ElectricalCells=frozenset({Shared}),
+                )
+            ),
+            MaterialCost=1,
+            FootprintGrowth=1,
+            Length=1,
+            BendCount=0,
+            ViaCount=0,
+            ValueKind="local-claim",
+        )
+        for Signal in ("A", "B")
+    )
+    Catalog = BuildCompactFactorCatalog(
+        (BuildCompactSource("conflict", (1,), Values),),
+        MaximumAssignmentExpansions=64,
+    )
+    Oracle = SolveCompactFactorCatalogPythonOracleForTests(Catalog)
+
+    assert Oracle.Success is False
+    assert Oracle.Complete is False
+    assert Oracle.Unsatisfiable is False
+    assert Oracle.IncompleteReason == "non-exhaustive-template-domain"
+    if TemplateAssignment._SolveCompactTemplateFactorCatalogBounded is None:
+        pytest.skip("native compact catalog binding is unavailable")
+    Native = SolveCompactFactorCatalogWithContext(
+        Catalog,
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+    assert Native.Success is False
+    assert Native.Complete is False
+    assert Native.Unsatisfiable is False
+    assert Native.IncompleteReason == "non-exhaustive-template-domain"
+
+
+def test_compact_catalog_same_owner_access_and_route_overlap_is_legal():
+    Position = (3, 2, 3)
+    Stub = SimpleNamespace(
+        PhysicalClaims=RoutingResourceClaims(
+            WireCells=frozenset({Position}),
+            ElectricalCells=frozenset({Position}),
+        ),
+        Path=(Position,),
+        Ingress=Position,
+    )
+    Fabric = SimpleNamespace(
+        Complete=True,
+        IncompleteReason="",
+        FabricFingerprint="same-owner-fabric",
+        AccessRingFingerprint="same-owner-shell",
+        TerminalDomains=(SimpleNamespace(
+            Signal="A",
+            Terminal=Position,
+            LogicalKey="A:root",
+            Complete=True,
+            EscapeStubs=(Stub,),
+        ),),
+    )
+    Guide = RawTrackAssignmentValue(
+        Signal="A",
+        OwnerSignal="A",
+        CandidateId="guide",
+        Claims=Stub.PhysicalClaims,
+        MaterialCost=1,
+        FootprintGrowth=1,
+        Length=1,
+        BendCount=0,
+        ViaCount=0,
+        ValueKind="local-claim",
+        ContractRequirements=(("access-stub:A:root", "0"),),
+    )
+    Catalog = BuildCompactFactorCatalog(
+        (BuildCompactSource(
+            "same-owner",
+            (1,),
+            (Guide,),
+            RequiredVariables=("A",),
+            Fabric=Fabric,
+        ),),
+        MaximumAssignmentExpansions=16,
+    )
+    Oracle = SolveCompactFactorCatalogPythonOracleForTests(Catalog)
+
+    assert Oracle.Success is True
+    if TemplateAssignment._SolveCompactTemplateFactorCatalogBounded is None:
+        pytest.skip("native compact catalog binding is unavailable")
+    Native = SolveCompactFactorCatalogWithContext(
+        Catalog,
+        Deadline=RoutingDeadline.Start(1.0),
+    )
+    assert Native.Success is True
+    assert Native.Preparation is not None
+    assert Native.Preparation.SelectedLocalClaimChoiceIds == (
+        ("A", "guide"),
+    )
+    assert Native.Preparation.SelectedContractClaimChoiceIds == (
+        ("__access_terminal__:A:root", "stub:0:0"),
+    )
