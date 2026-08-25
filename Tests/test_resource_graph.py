@@ -241,6 +241,52 @@ class RoutingResourceGraphTests(unittest.TestCase):
             Second,
         )
 
+    def testLowerLayerRegionReusesExactSupersetByFiltering(self) -> None:
+        Graph = self.BuildGraph()
+        Columns = frozenset({(0, 0), (1, 0), (2, 0)})
+        Graph.BuildRegion(
+            (0, 2, 1, 4, 0, 0),
+            AllowedColumns=Columns,
+        )
+        Diagnostics = []
+
+        Lower = Graph.BuildRegion(
+            (0, 2, 1, 2, 0, 0),
+            AllowedColumns=Columns,
+            WorkCheck=Diagnostics.append,
+        )
+        Exact = self.BuildGraph().BuildRegion(
+            (0, 2, 1, 2, 0, 0),
+            AllowedColumns=Columns,
+        )
+
+        self.assertEqual(Lower.Nodes, Exact.Nodes)
+        self.assertEqual(Lower.Edges, Exact.Edges)
+        self.assertTrue(Diagnostics[-1]["SharedLayerCatalogRegion"])
+        self.assertEqual(Diagnostics[-1]["BuiltNodeCount"], 0)
+        self.assertTrue(all(Position[1] <= 2 for Position in Lower.Nodes))
+
+    def testLowerLayerRegionFiltersSupersetColumnsExactly(self) -> None:
+        Graph = self.BuildGraph()
+        Graph.BuildRegion(
+            (0, 2, 1, 4, 0, 0),
+            AllowedColumns=frozenset({(0, 0), (1, 0), (2, 0)}),
+        )
+        RequestedColumns = frozenset({(0, 0), (2, 0)})
+
+        Lower = Graph.BuildRegion(
+            (0, 2, 1, 2, 0, 0),
+            AllowedColumns=RequestedColumns,
+        )
+        Exact = self.BuildGraph().BuildRegion(
+            (0, 2, 1, 2, 0, 0),
+            AllowedColumns=RequestedColumns,
+        )
+
+        self.assertEqual(Lower.Nodes, Exact.Nodes)
+        self.assertEqual(Lower.Edges, Exact.Edges)
+        self.assertNotIn((1, 1, 0), Lower.Nodes)
+
     def testForeignElectricalClaimsConflictButSameNetClaimsDoNot(self) -> None:
         Graph = self.BuildGraph()
         First = Graph.BuildRouteClaims({(0, 1, 0), (1, 1, 0)})

@@ -207,7 +207,6 @@ def BuildEnvironmentSnapshot() -> dict[str, object]:
         for Name in (
             "RC_ROUTING_THREADS",
             "RCS_DEBUG_AUTHORITATIVE",
-            "RCS_DEBUG_PIPELINE",
             "RC_SOURCE_REVISION",
             "RC_SOURCE_DIRTY",
         )
@@ -722,15 +721,10 @@ def CompileSvToLitematic(
     Stages.append("pcb_routing")
     Stages.append("route_cleanup")
 
-    DebugPipeline = bool(os.environ.get("RCS_DEBUG_PIPELINE"))
-    if DebugPipeline:
-        print("[debug] pipeline: starting simulation", flush=True)
     Simulation = ValidatedSimulation or SimulateRoutedTruthTable(
         Routed,
         ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
     )
-    if DebugPipeline:
-        print(f"[debug] pipeline: simulation complete backend={Simulation.Backend} passed={Simulation.Passed}", flush=True)
     Stages.append("redstone_simulation")
     if not Simulation.Passed:
         Failed = Simulation.FailedRows[0]
@@ -744,11 +738,7 @@ def CompileSvToLitematic(
         )
     TruthTablePath = OutputPath.with_suffix(".TruthTable.txt")
 
-    if DebugPipeline:
-        print("[debug] pipeline: simulation passed", flush=True)
     ValidateNandOnlyDesign(Physical.Placed, NandIR)
-    if DebugPipeline:
-        print("[debug] pipeline: nand validation passed", flush=True)
     Routed.TraceSupportBlocks = (
         tuple(TraceSupportBlocks) if TraceSupportBlocks is not None else ()
     )
@@ -756,8 +746,6 @@ def CompileSvToLitematic(
         Routed,
         TraceSupportBlocks=Routed.TraceSupportBlocks,
     )
-    if DebugPipeline:
-        print("[debug] pipeline: block map built", flush=True)
     Composition = Rendered.Composition
 
     # The routed-net check above is an inexpensive candidate filter.  The

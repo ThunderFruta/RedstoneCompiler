@@ -11,6 +11,7 @@ from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
 from Compiler.Placement.AccessFabric import (
     AttachPlacementAccessFabric,
     BuildPlacementAccessFabric,
+    MaterializeSelectedPlacementAccessStubClaims,
     SolvePlacementAccessFabricCapacity,
     _BuildDerivedPerimeterCycleRouteNodeSets,
     _BuildShortestFabricEscapePaths,
@@ -41,6 +42,7 @@ from Compiler.Routing.Models import (
 )
 from Compiler.Routing.ResourceGraph import (
     RoutingResourceClaims,
+    RoutingResourceGraph,
     RoutingResourceId,
     RoutingResourceKind,
 )
@@ -59,7 +61,6 @@ def BuildTestFabric() -> PlacementAccessFabric:
         RequiredAirCells=frozenset({(1, 5, 1)}),
         ElectricalCells=frozenset({(0, 4, 1), (2, 4, 1)}),
     )
-
     Stub = PlacementAccessEscapeStub(
         Terminal=(1, 1, 1),
         Ingress=(1, 4, 1),
@@ -85,6 +86,122 @@ def BuildTestFabric() -> PlacementAccessFabric:
         TopologyKind="fixed-access-band-v1",
         Complete=True,
     )
+
+
+def test_selected_deferred_access_claims_materialize_without_changing_choice_identity():
+    First = PlacementAccessEscapeStub(
+        Terminal=(0, 1, 0),
+        Ingress=(1, 1, 0),
+        Path=((0, 1, 0), (1, 1, 0)),
+        PhysicalClaims=RoutingResourceClaims(
+            WireCells=frozenset({(0, 1, 0), (1, 1, 0)}),
+        ),
+        CapacityResourceIds=(),
+        Complete=True,
+        PhysicalClaimsDeferred=True,
+    )
+    Second = PlacementAccessEscapeStub(
+        Terminal=(0, 1, 0),
+        Ingress=(0, 1, 1),
+        Path=((0, 1, 0), (0, 1, 1)),
+        PhysicalClaims=RoutingResourceClaims(
+            WireCells=frozenset({(0, 1, 0), (0, 1, 1)}),
+        ),
+        CapacityResourceIds=(),
+        Complete=True,
+        PhysicalClaimsDeferred=True,
+    )
+    Fabric = PlacementAccessFabric(
+        FabricFingerprint="deferred-access-fabric",
+        Nodes=(),
+        Edges=(),
+        IngressNodes=(),
+        PhysicalClaims=RoutingResourceClaims(),
+        CapacityResourceIds=(),
+        TerminalDomains=(PlacementAccessTerminalDomain(
+            Signal="Signal",
+            Terminal=First.Terminal,
+            EscapeStubs=(First, Second),
+            Complete=True,
+            LogicalKey="logical",
+        ),),
+        TopologyKind="derived-perimeter-access-v1",
+        Complete=True,
+    )
+    Graph = RoutingResourceGraph(
+        ActualBlocks=frozenset(),
+        ElectricalBlocks=frozenset(),
+        SolidBlocks=frozenset(),
+    )
+
+    Materialized = MaterializeSelectedPlacementAccessStubClaims(
+        Fabric,
+        (("__access_terminal__:logical", f"stub:{First.ChoiceId}"),),
+        Graph,
+    )
+
+    Selected, Unselected = Materialized.TerminalDomains[0].EscapeStubs
+    assert Selected.ChoiceId == First.ChoiceId
+    assert Selected.PhysicalClaimsFingerprint == First.PhysicalClaimsFingerprint
+    assert Selected.PhysicalClaimsDeferred is False
+    assert Selected.PhysicalClaims == Graph.BuildRouteClaims(First.Path)
+    assert Selected.CapacityResourceIds
+    assert Unselected is Second
+    assert Unselected.PhysicalClaimsDeferred is True
+    assert Unselected.CapacityResourceIds == ()
+
+
+def test_deferred_access_claims_preserve_exact_vertical_air_and_self_legality():
+    Technology = DefaultRedstoneRoutingTechnology
+    LegalPath = ((0, 1, 0), (1, 2, 0), (2, 2, 0))
+    LegalClaims, Legal, _Fingerprint = (
+        AccessFabricModule._BuildDeferredPlacementAccessPathClaims(
+            LegalPath,
+            Technology,
+        )
+    )
+    assert Legal is True
+    assert LegalClaims.WireCells == frozenset(LegalPath)
+    assert LegalClaims.RequiredAirCells == frozenset({(0, 2, 0)})
+
+    ConflictingPath = (*LegalPath, (0, 2, 0))
+    _Claims, Legal, _Fingerprint = (
+        AccessFabricModule._BuildDeferredPlacementAccessPathClaims(
+            ConflictingPath,
+            Technology,
+        )
+    )
+    assert Legal is False
+
+
+def test_native_deferred_claim_batch_matches_python_oracle():
+    NativeBatch = getattr(
+        AccessFabricModule,
+        "_BuildDeferredRouteClaimsBatchWithTelemetry",
+        None,
+    )
+    if NativeBatch is None:
+        pytest.skip("native deferred claim batch is unavailable")
+    Paths = (
+        ((0, 1, 0), (1, 1, 0), (2, 1, 0)),
+        ((0, 1, 0), (1, 2, 0), (2, 2, 0)),
+        ((0, 1, 0), (1, 2, 0), (2, 2, 0), (0, 2, 0)),
+    )
+    NativeValues, WorkerCount = NativeBatch(Paths)
+    assert 1 <= WorkerCount <= len(Paths)
+    for Path, (NativeAir, NativeSelfLegal) in zip(
+        Paths,
+        NativeValues,
+        strict=True,
+    ):
+        Claims, SelfLegal, _Fingerprint = (
+            AccessFabricModule._BuildDeferredPlacementAccessPathClaims(
+                Path,
+                DefaultRedstoneRoutingTechnology,
+            )
+        )
+        assert frozenset(NativeAir) == Claims.RequiredAirCells
+        assert bool(NativeSelfLegal) is SelfLegal
 
 
 def BuildImmutableStubCapacityFactorFixture() -> PlacementAccessFabric:
@@ -832,8 +949,14 @@ def test_full_adder_access_fabric_is_complete_and_deterministic():
         ),
     )
 
-    First = BuildPlacementAccessFabric(Placement)
-    Second = BuildPlacementAccessFabric(Placement)
+    First = BuildPlacementAccessFabric(
+        Placement,
+        DeferEscapeStubCapacityResourceIds=True,
+    )
+    Second = BuildPlacementAccessFabric(
+        Placement,
+        DeferEscapeStubCapacityResourceIds=True,
+    )
 
     assert First.Complete is True
     assert First.FabricFingerprint == Second.FabricFingerprint
@@ -842,12 +965,21 @@ def test_full_adder_access_fabric_is_complete_and_deterministic():
     assert len(First.TerminalDomains) > 1
     assert all(Domain.Complete for Domain in First.TerminalDomains)
     assert all(
-        Stub.CapacityResourceIds
+        Stub.PhysicalClaimsDeferred
         for Domain in First.TerminalDomains
         for Stub in Domain.EscapeStubs
     )
-    FirstAssignment = SolvePlacementAccessFabricCapacity(First)
-    SecondAssignment = SolvePlacementAccessFabricCapacity(Second)
+    # This fixture verifies the immutable terminal factor itself.  Internal
+    # signal-tree construction belongs to the integrated access/guide solve
+    # exercised by the routed acceptance tests below.
+    FirstAssignment = SolvePlacementAccessFabricCapacity(
+        First,
+        RequireCompleteSignalRoutes=False,
+    )
+    SecondAssignment = SolvePlacementAccessFabricCapacity(
+        Second,
+        RequireCompleteSignalRoutes=False,
+    )
     assert FirstAssignment.Success is True
     assert FirstAssignment.Complete is True
     assert FirstAssignment.AssignmentFingerprint == (
@@ -856,7 +988,5 @@ def test_full_adder_access_fabric_is_complete_and_deterministic():
     assert FirstAssignment.SelectedStubIndices == (
         SecondAssignment.SelectedStubIndices
     )
-    assert FirstAssignment.SignalRoutes == SecondAssignment.SignalRoutes
-    assert {Signal for Signal, _Nodes in FirstAssignment.SignalRoutes} == {
-        Domain.Signal for Domain in First.TerminalDomains
-    }
+    assert FirstAssignment.SignalRoutes == ()
+    assert SecondAssignment.SignalRoutes == ()

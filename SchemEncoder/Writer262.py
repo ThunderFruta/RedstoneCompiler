@@ -929,7 +929,13 @@ def BuildLitematicBlockMap(
         Blocks[Position] = {
             "Name": "minecraft:repeater",
             "Properties": {
-                "powered": str(SignalValues.get(Signal, False)).lower(),
+                # Routed refreshers are dynamic circuit state.  Seeding them
+                # from an ideal default logic evaluation can pre-charge a
+                # same-signal feedback path that the physical producer does
+                # not currently drive.  Emit the neutral blockstate and let
+                # the exact redstone network settle every repeater from its
+                # rear input.
+                "powered": "false",
                 "facing": MinecraftRepeaterFacingForReservation(Facing),
                 "locked": "false",
                 "delay": "1",

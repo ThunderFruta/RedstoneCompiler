@@ -56,6 +56,7 @@ def RoutePcbNets(
     PrepareTrackAssignmentOnly: bool = False,
     PrepareRawRouteGuideFactorDomainOnly: bool = False,
     PrepareRawTrackAssignmentDomainOnly: bool = False,
+    FrozenNativeRouteGuideRecipes: tuple[Any, ...] = (),
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     FrozenRoutingEnvelope: Any | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
@@ -135,6 +136,7 @@ def RoutePcbNets(
         PrepareRawTrackAssignmentDomainOnly=(
             PrepareRawTrackAssignmentDomainOnly
         ),
+        FrozenNativeRouteGuideRecipes=FrozenNativeRouteGuideRecipes,
         FrozenTrackAssignmentPreparation=FrozenTrackAssignmentPreparation,
         FrozenRoutingEnvelope=FrozenRoutingEnvelope,
         ValidateClusterInterfaceForeignAccessOnly=(

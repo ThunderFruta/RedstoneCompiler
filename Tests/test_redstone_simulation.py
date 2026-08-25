@@ -56,6 +56,38 @@ class RedstoneSimulationTests(unittest.TestCase):
         self.assertTrue(Result.Stable)
         self.assertTrue(Result.LampLit[(1, 0, 0)])
 
+    def testConsecutiveRepeatersPropagateThroughDirectRearInput(self) -> None:
+        Blocks = {
+            (0, 0, 0): {
+                "Name": "minecraft:repeater",
+                "Properties": {
+                    "facing": "east",
+                    "powered": "false",
+                    "delay": "1",
+                },
+            },
+            (1, 0, 0): {
+                "Name": "minecraft:repeater",
+                "Properties": {
+                    "facing": "east",
+                    "powered": "false",
+                    "delay": "1",
+                },
+            },
+            (2, 0, 0): {"Name": "minecraft:redstone_lamp"},
+            (-2, 0, 0): {"Name": "minecraft:lever"},
+        }
+
+        Result = SimulateMinecraftRedstoneBlockMap(
+            Blocks,
+            {(-2, 0, 0): True},
+        )
+
+        self.assertTrue(Result.Stable)
+        self.assertTrue(Result.RepeaterPowered[(0, 0, 0)])
+        self.assertTrue(Result.RepeaterPowered[(1, 0, 0)])
+        self.assertTrue(Result.LampLit[(2, 0, 0)])
+
     def testRepeaterDelayCannotBeMisreportedAsStable(self) -> None:
         Blocks = {
             (-1, 0, 0): {"Name": "minecraft:lever"},
@@ -131,25 +163,19 @@ class RedstoneSimulationTests(unittest.TestCase):
             self.skipTest("authoritative routing requires Rust router")
 
         StageCalls: list[str] = []
-        RealPrepareRouteGuideFactors = (
-            PcbFlow.PrepareRawRouteGuideFactorDomain
-        )
-        RealSolveCompactCatalog = (
-            PcbFlow.SolveCompactFactorCatalogWithContext
+        RealSolveIntegratedNativeCatalog = (
+            PcbFlow
+            .SolvePlacementAccessNativeEscapeGuideFactorCatalogBounded
         )
         RealPrepareTrackAssignment = PcbFlow.PrepareTrackAssignment
         RealRoutePcbDesign = PcbFlow.RoutePcbDesign
 
-        def PrepareRouteGuideFactors(*Arguments, **KeywordArguments):
-            StageCalls.append("route-guide-factors")
-            return RealPrepareRouteGuideFactors(
+        def SelectIntegratedNativeCatalog(*Arguments, **KeywordArguments):
+            StageCalls.append("integrated-native-catalog-selection")
+            return RealSolveIntegratedNativeCatalog(
                 *Arguments,
                 **KeywordArguments,
             )
-
-        def SelectCompactCatalog(*Arguments, **KeywordArguments):
-            StageCalls.append("compact-catalog-selection")
-            return RealSolveCompactCatalog(*Arguments, **KeywordArguments)
 
         def PrepareSelectedTrackAssignment(*Arguments, **KeywordArguments):
             StageCalls.append("selected-track-preparation")
@@ -171,13 +197,8 @@ class RedstoneSimulationTests(unittest.TestCase):
             with (
                 patch.object(
                     PcbFlow,
-                    "PrepareRawRouteGuideFactorDomain",
-                    side_effect=PrepareRouteGuideFactors,
-                ) as PrepareGuideFactors,
-                patch.object(
-                    PcbFlow,
-                    "SolveCompactFactorCatalogWithContext",
-                    side_effect=SelectCompactCatalog,
+                    "SolvePlacementAccessNativeEscapeGuideFactorCatalogBounded",
+                    side_effect=SelectIntegratedNativeCatalog,
                 ) as SelectInterface,
                 patch.object(
                     PcbFlow,
@@ -239,23 +260,15 @@ class RedstoneSimulationTests(unittest.TestCase):
             CapacitySelection["EnvelopeDomainSize"],
             CapacitySelection["GeometryDomainSize"],
         )
-        # The small-design domain has multiple geometry/layer members.  Each
-        # exports compact factors into one exact catalog, then exactly one
-        # authoritative selector freezes the winner before exactly one route.
+        # The small-design domain has multiple geometry/layer members.  One
+        # integrated native access/guide catalog operation freezes the winner
+        # before exactly one route.
         self.assertEqual(SelectInterface.call_count, 1)
-        self.assertGreaterEqual(PrepareGuideFactors.call_count, 1)
         self.assertEqual(PrepareTracks.call_count, 0)
         self.assertEqual(RouteDesign.call_count, 1)
-        # Every declared compact member publishes only route-guide factors
-        # before the one native catalog selection.  No expanded detailed
-        # domain is created until the selected frozen contract begins routing.
-        self.assertEqual(StageCalls[-2], "compact-catalog-selection")
-        self.assertEqual(StageCalls[-1], "route")
-        self.assertTrue(
-            all(
-                Stage == "route-guide-factors"
-                for Stage in StageCalls[:-2]
-            )
+        self.assertEqual(
+            StageCalls,
+            ["integrated-native-catalog-selection", "route"],
         )
         self.assertEqual(CapacitySelection["CapacitySolveCount"], 1)
         self.assertEqual(CapacitySelection["RouteAttemptCount"], 1)

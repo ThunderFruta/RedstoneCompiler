@@ -430,6 +430,90 @@ class RoutingResourceGraph:
                 and MinimumZ <= Z <= MaximumZ
             )
         )
+        # Compact layer portfolios are materialized from the maximal layer
+        # member downward.  Node and edge legality is independent of the
+        # requested upper Y bound, so an already-complete superset region is
+        # an exact immutable catalog primitive for every lower member.  Only
+        # graph geometry is shared here: access stubs, escape paths, claims,
+        # and feasibility remain member-specific and are rebuilt below the
+        # access-fabric boundary.
+        SupersetRegion: RoutingGraphRegion | None = None
+        SupersetScore: tuple[int, int] | None = None
+        for (
+            CandidateBounds,
+            CandidateAllowedColumns,
+            CandidateAllowedAccess,
+        ), CandidateRegion in self._RegionCache.items():
+            (
+                CandidateMinimumX,
+                CandidateMaximumX,
+                CandidateMinimumY,
+                CandidateMaximumY,
+                CandidateMinimumZ,
+                CandidateMaximumZ,
+            ) = CandidateBounds
+            if (
+                CandidateAllowedAccess != AllowedAccess
+                or CandidateMinimumX != MinimumX
+                or CandidateMaximumX != MaximumX
+                or CandidateMinimumY != MinimumY
+                or CandidateMaximumY < MaximumY
+                or CandidateMinimumZ != MinimumZ
+                or CandidateMaximumZ != MaximumZ
+            ):
+                continue
+            CandidateColumns = (
+                frozenset(
+                    (X, Z)
+                    for X in range(MinimumX, MaximumX + 1)
+                    for Z in range(MinimumZ, MaximumZ + 1)
+                )
+                if CandidateAllowedColumns is None
+                else CandidateAllowedColumns
+            )
+            if not RequestedColumns <= CandidateColumns:
+                continue
+            Score = (
+                CandidateMaximumY - MaximumY,
+                len(CandidateColumns) - len(RequestedColumns),
+            )
+            if SupersetScore is None or Score < SupersetScore:
+                SupersetRegion = CandidateRegion
+                SupersetScore = Score
+        if SupersetRegion is not None:
+            Nodes = frozenset(
+                Position
+                for Position in SupersetRegion.Nodes
+                if MinimumY <= Position[1] <= MaximumY
+                and (
+                    (Position[0], Position[2]) in RequestedColumns
+                    or Position in AllowedAccess
+                )
+            )
+            Edges = frozenset(
+                Edge
+                for Edge in SupersetRegion.Edges
+                if Edge[0] in Nodes and Edge[1] in Nodes
+            )
+            Region = RoutingGraphRegion(Bounds, Nodes, Edges)
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Phase": "complete",
+                    "CacheHit": False,
+                    "ReusedRegion": True,
+                    "SharedLayerCatalogRegion": True,
+                    "ReusedNodeCount": len(Nodes),
+                    "BuiltNodeCount": 0,
+                    "NodeCount": len(Region.Nodes),
+                    "EdgeCount": len(Region.Edges),
+                })
+            self._RegionCache[Key] = Region
+            self._RegionCacheOrder.append(Key)
+            while len(self._RegionCacheOrder) > 8:
+                EvictedKey = self._RegionCacheOrder.pop(0)
+                if EvictedKey != Key:
+                    self._RegionCache.pop(EvictedKey, None)
+            return Region
         BaseRegion: RoutingGraphRegion | None = None
         BaseColumns: frozenset[Position2] = frozenset()
         BaseMaximumY = MinimumY - 1

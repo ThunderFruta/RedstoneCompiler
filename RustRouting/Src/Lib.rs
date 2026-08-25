@@ -96,6 +96,7 @@ fn GetRoutingThreadCount() -> usize {
 }
 
 type RouteClaimValues = (Vec<Position>, Vec<Position>, Vec<Position>, Vec<Position>);
+type DeferredRouteClaimValues = (Vec<Position>, bool);
 type FabricSubtreeValues = Option<(Vec<Position>, Vec<Edge>)>;
 type ExteriorConnectorFieldValues = (
     Vec<Position>,
@@ -589,6 +590,84 @@ fn BuildRouteClaimsBatchNative(
     )
 }
 
+fn BuildDeferredRouteClaimValues(Values: Vec<Position>) -> DeferredRouteClaimValues {
+    let Wire = Values.into_iter().collect::<BTreeSet<_>>();
+    let mut Air = BTreeSet::new();
+    for PositionValue in &Wire {
+        let (_, Y, _) = *PositionValue;
+        for Neighbor in NeighborPositions(*PositionValue) {
+            if Neighbor <= *PositionValue || Neighbor.1 == Y || !Wire.contains(&Neighbor) {
+                continue;
+            }
+            let Lower = if Y < Neighbor.1 {
+                *PositionValue
+            } else {
+                Neighbor
+            };
+            Air.insert((Lower.0, Lower.1 + 1, Lower.2));
+        }
+    }
+    let SelfLegal = Air.is_disjoint(&Wire)
+        && Wire.iter().all(|(X, Y, Z)| {
+            let Support = (*X, Y - 1, *Z);
+            !Wire.contains(&Support) && !Air.contains(&Support)
+        });
+    (Air.into_iter().collect(), SelfLegal)
+}
+
+/// Build only the non-derivable vertical-air part of deferred compact claims.
+/// Wire, support, and electrical claims remain path-derived and are expanded
+/// by the compact solver only for an attempted member.
+fn BuildDeferredRouteClaimsBatchNative(
+    NodeSets: Vec<Vec<Position>>,
+) -> (Vec<DeferredRouteClaimValues>, usize) {
+    let Pool = RoutingThreadPool();
+    let WorkerCount = Pool.current_num_threads().min(NodeSets.len());
+    if WorkerCount < 2 {
+        return (
+            NodeSets
+                .into_iter()
+                .map(BuildDeferredRouteClaimValues)
+                .collect(),
+            WorkerCount,
+        );
+    }
+    let SharedNodes = Arc::new(NodeSets);
+    let Shards = Pool.broadcast(|Context| {
+        let WorkerIndex = Context.index();
+        let WorkerTotal = Context.num_threads();
+        let Values = (WorkerIndex..SharedNodes.len())
+            .step_by(WorkerTotal)
+            .map(|Index| {
+                (
+                    Index,
+                    BuildDeferredRouteClaimValues(SharedNodes[Index].clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        (WorkerIndex, Values)
+    });
+    let mut Ordered = (0..SharedNodes.len())
+        .map(|_| None)
+        .collect::<Vec<Option<DeferredRouteClaimValues>>>();
+    let mut ActiveWorkers = 0usize;
+    for (_WorkerIndex, Values) in Shards {
+        if !Values.is_empty() {
+            ActiveWorkers += 1;
+        }
+        for (Index, Value) in Values {
+            Ordered[Index] = Some(Value);
+        }
+    }
+    (
+        Ordered
+            .into_iter()
+            .map(|Value| Value.expect("every deferred claim batch item needs one worker"))
+            .collect(),
+        ActiveWorkers,
+    )
+}
+
 #[pyfunction]
 fn BuildRouteClaimsBatch(
     PythonValue: Python<'_>,
@@ -611,6 +690,14 @@ fn BuildRouteClaimsBatchWithTelemetry(
     PythonValue.allow_threads(|| {
         BuildRouteClaimsBatchNative(NodeSets, ActualBlockValues, SolidBlockValues)
     })
+}
+
+#[pyfunction]
+fn BuildDeferredRouteClaimsBatchWithTelemetry(
+    PythonValue: Python<'_>,
+    NodeSets: Vec<Vec<Position>>,
+) -> (Vec<DeferredRouteClaimValues>, usize) {
+    PythonValue.allow_threads(|| BuildDeferredRouteClaimsBatchNative(NodeSets))
 }
 
 #[pyfunction]
@@ -849,7 +936,10 @@ mod Tests {
         let Candidate = |Id: &str, Wire: usize, Electrical: &[usize]| AssignmentCandidate {
             CandidateId: Id.to_string(),
             OwnerSignal: Id[..1].to_string(),
-            TemplateKey: String::new(),
+            TemplateRequirements: std::sync::Arc::new(Vec::new()),
+            ForbiddenCandidateIds: std::sync::Arc::new(Vec::new()),
+            OrderedWire: std::sync::Arc::new(Vec::new()),
+            PoweredAccessConstraint: None,
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
             ),
@@ -885,11 +975,15 @@ mod Tests {
             16,
             &mut BudgetExhausted,
             &RuntimeDeadline::Unlimited(),
+            true,
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
             &mut Vec::new(),
             &mut false,
+            true,
+            None,
+            None,
         ));
         assert!(!BudgetExhausted);
         assert!(Selected.contains(&("B".to_string(), "B1".to_string())));
@@ -900,7 +994,10 @@ mod Tests {
         let Candidate = AssignmentCandidate {
             CandidateId: "A0".to_string(),
             OwnerSignal: "A".to_string(),
-            TemplateKey: String::new(),
+            TemplateRequirements: std::sync::Arc::new(Vec::new()),
+            ForbiddenCandidateIds: std::sync::Arc::new(Vec::new()),
+            OrderedWire: std::sync::Arc::new(Vec::new()),
+            PoweredAccessConstraint: None,
             Claims: std::sync::Arc::new(ClaimMask::FromIndices(4, &[0], &[], &[], &[0]).unwrap()),
             MaterialCost: 1,
             FootprintGrowth: 1,
@@ -925,11 +1022,15 @@ mod Tests {
             0,
             &mut BudgetExhausted,
             &RuntimeDeadline::Unlimited(),
+            true,
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
             &mut Vec::new(),
             &mut false,
+            true,
+            None,
+            None,
         ));
         assert!(BudgetExhausted);
         assert_eq!(Failure, Some("A".to_string()));
@@ -940,7 +1041,10 @@ mod Tests {
         let Candidate = |Id: &str| AssignmentCandidate {
             CandidateId: Id.to_string(),
             OwnerSignal: Id[..1].to_string(),
-            TemplateKey: String::new(),
+            TemplateRequirements: std::sync::Arc::new(Vec::new()),
+            ForbiddenCandidateIds: std::sync::Arc::new(Vec::new()),
+            OrderedWire: std::sync::Arc::new(Vec::new()),
+            PoweredAccessConstraint: None,
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(4, &[1], &[], &[], &[0, 1, 2]).unwrap(),
             ),
@@ -970,11 +1074,15 @@ mod Tests {
             128,
             &mut BudgetExhausted,
             &RuntimeDeadline::Unlimited(),
+            true,
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
             &mut Vec::new(),
             &mut false,
+            true,
+            None,
+            None,
         ));
         assert!(!BudgetExhausted);
         assert_eq!(Expansions, 1);
@@ -988,7 +1096,10 @@ mod Tests {
         let Candidate = |Id: &str, Wire: usize, Electrical: &[usize]| AssignmentCandidate {
             CandidateId: Id.to_string(),
             OwnerSignal: "Extension".to_string(),
-            TemplateKey: String::new(),
+            TemplateRequirements: std::sync::Arc::new(Vec::new()),
+            ForbiddenCandidateIds: std::sync::Arc::new(Vec::new()),
+            OrderedWire: std::sync::Arc::new(Vec::new()),
+            PoweredAccessConstraint: None,
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(16, &[Wire], &[], &[], Electrical).unwrap(),
             ),
@@ -1022,11 +1133,15 @@ mod Tests {
             16,
             &mut BudgetExhausted,
             &RuntimeDeadline::Unlimited(),
+            true,
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
             &mut Vec::new(),
             &mut false,
+            true,
+            None,
+            None,
         ));
         assert!(!BudgetExhausted);
         assert_eq!(
@@ -1040,7 +1155,10 @@ mod Tests {
         let Candidate = AssignmentCandidate {
             CandidateId: "extension".to_string(),
             OwnerSignal: "Signal".to_string(),
-            TemplateKey: String::new(),
+            TemplateRequirements: std::sync::Arc::new(Vec::new()),
+            ForbiddenCandidateIds: std::sync::Arc::new(Vec::new()),
+            OrderedWire: std::sync::Arc::new(Vec::new()),
+            PoweredAccessConstraint: None,
             Claims: std::sync::Arc::new(
                 ClaimMask::FromIndices(16, &[3], &[], &[], &[2, 3, 4]).unwrap(),
             ),
@@ -1068,11 +1186,15 @@ mod Tests {
             16,
             &mut BudgetExhausted,
             &RuntimeDeadline::Unlimited(),
+            true,
             &mut Failure,
             &mut ConflictSignals,
             &mut Conflicts,
             &mut Vec::new(),
             &mut false,
+            true,
+            None,
+            None,
         ));
         assert!(!BudgetExhausted);
         assert_eq!(

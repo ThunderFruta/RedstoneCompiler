@@ -81,6 +81,10 @@ impl ClaimMask {
         (!Deadline.Check()).then(Self::default)
     }
 
+    pub(crate) fn IndexSets(&self) -> (&[usize], &[usize], &[usize], &[usize]) {
+        (&self.Wire, &self.Support, &self.Air, &self.Electrical)
+    }
+
     fn Intersects(First: &[usize], Second: &[usize]) -> bool {
         let mut FirstIndex = 0usize;
         let mut SecondIndex = 0usize;
@@ -133,6 +137,15 @@ impl ClaimMask {
             || Self::Intersects(&Other.Air, &self.Wire)
     }
 
+    pub(crate) fn SameOwnerConflicts(&self, Other: &Self) -> bool {
+        Self::Intersects(&self.Support, &Other.Wire)
+            || Self::Intersects(&self.Support, &Other.Air)
+            || Self::Intersects(&Other.Support, &self.Wire)
+            || Self::Intersects(&Other.Support, &self.Air)
+            || Self::Intersects(&self.Air, &Other.Wire)
+            || Self::Intersects(&Other.Air, &self.Wire)
+    }
+
     pub(crate) fn ConflictsWithDeadline(
         &self,
         Other: &Self,
@@ -141,6 +154,32 @@ impl ClaimMask {
         for (First, Second) in [
             (&self.Wire, &Other.Electrical),
             (&Other.Wire, &self.Electrical),
+            (&self.Support, &Other.Wire),
+            (&self.Support, &Other.Air),
+            (&Other.Support, &self.Wire),
+            (&Other.Support, &self.Air),
+            (&self.Air, &Other.Wire),
+            (&Other.Air, &self.Wire),
+        ] {
+            match Self::IntersectsWithDeadline(First, Second, Deadline) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        Some(false)
+    }
+
+    /// Return only contradictions that remain illegal when both claim sets
+    /// belong to the same logical signal. Electrical proximity and shared
+    /// wire are legal merges; wire/support/air occupancy contradictions are
+    /// not.
+    pub(crate) fn SameOwnerConflictsWithDeadline(
+        &self,
+        Other: &Self,
+        Deadline: &RuntimeDeadline,
+    ) -> Option<bool> {
+        for (First, Second) in [
             (&self.Support, &Other.Wire),
             (&self.Support, &Other.Air),
             (&Other.Support, &self.Wire),
@@ -295,9 +334,47 @@ pub(crate) struct RouteTreeBatchResult {
     #[pyo3(get)]
     pub(crate) RouteTrees: Vec<Option<Vec<Position>>>,
     #[pyo3(get)]
+    pub(crate) RepeaterReservations: Vec<Vec<(Position, String)>>,
+    #[pyo3(get)]
     pub(crate) CompletionMask: Vec<bool>,
     #[pyo3(get)]
     pub(crate) DeadlineExceeded: bool,
+    #[pyo3(get)]
+    pub(crate) CompletedWork: usize,
+    #[pyo3(get)]
+    pub(crate) TotalWork: usize,
+}
+
+/// Result of the one selected-world detailed generation/assignment batch.
+/// Only trees named by `SelectedRequestIndices` are returned; unattempted
+/// request shapes remain explicit incomplete work rather than being confused
+/// with proved-unroutable shapes.
+#[pyclass]
+pub(crate) struct FactorizedRouteTreeSelectionResult {
+    #[pyo3(get)]
+    pub(crate) RouteTrees: Vec<Option<Vec<Position>>>,
+    #[pyo3(get)]
+    pub(crate) RepeaterReservations: Vec<Vec<(Position, String)>>,
+    #[pyo3(get)]
+    pub(crate) CompletionMask: Vec<bool>,
+    #[pyo3(get)]
+    pub(crate) SelectedRequestIndices: Vec<usize>,
+    #[pyo3(get)]
+    pub(crate) Success: bool,
+    #[pyo3(get)]
+    pub(crate) Complete: bool,
+    #[pyo3(get)]
+    pub(crate) DeadlineExceeded: bool,
+    #[pyo3(get)]
+    pub(crate) WorkCapExceeded: bool,
+    #[pyo3(get)]
+    pub(crate) AssignmentExpansionCount: usize,
+    #[pyo3(get)]
+    pub(crate) GeneratedRequestCount: usize,
+    #[pyo3(get)]
+    pub(crate) GeneratedRequestCountsBySignal: Vec<(String, usize)>,
+    #[pyo3(get)]
+    pub(crate) CandidateCountsBySignal: Vec<(String, usize)>,
     #[pyo3(get)]
     pub(crate) CompletedWork: usize,
     #[pyo3(get)]
@@ -357,6 +434,31 @@ pub(crate) type DetailedRouteTreeRequest = (
     usize,
 );
 
+/// Exact request components interned by Python before crossing the native
+/// boundary.  Access payloads are shared by portal tuples and guide payloads
+/// by corridor geometry; each request retains only the two table indices and
+/// its scalar search policy.
+pub(crate) type FactorizedRouteTreeAccessPayload = (
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Vec<Position>>,
+    Vec<Vec<Position>>,
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Position>,
+    Vec<Position>,
+);
+pub(crate) type FactorizedRouteTreeGuidePayload = (
+    Vec<(i32, i32)>,
+    Vec<(i32, i32)>,
+    Vec<Position>,
+    Vec<Vec<Position>>,
+    Vec<(Position, String)>,
+);
+pub(crate) type FactorizedRouteTreeRequest = (usize, usize, i32, i32, i32, i32, usize);
+
 /// One detailed request plus the immutable fixed claims that must coexist
 /// with its newly generated tree.
 pub(crate) type ClaimAwareDetailedRouteTreeRequest = (
@@ -377,13 +479,31 @@ pub(crate) struct RouteTreeDetailedBatchResult {
 }
 
 #[derive(Clone)]
+pub(crate) struct AssignmentPoweredAccessConstraint {
+    pub(crate) HasPoweredTreeWitness: bool,
+    pub(crate) GraphAdjacency: Arc<HashMap<Position, Vec<Position>>>,
+    pub(crate) TerminalVariables: Arc<Vec<String>>,
+    pub(crate) DetachedSeedAccessPaths: Arc<Vec<Vec<Position>>>,
+    pub(crate) SourceTerminalVariable: Option<String>,
+    pub(crate) SourceDetachedAnchorIndex: Option<usize>,
+    pub(crate) PreferredAccessCandidateTuples: Arc<Vec<Vec<(String, String)>>>,
+}
+
+#[derive(Clone)]
 pub(crate) struct AssignmentCandidate {
     pub(crate) CandidateId: String,
     pub(crate) OwnerSignal: String,
-    /// Empty means this ordinary value has no interface-template coupling.
-    /// Nonempty values may coexist only with the same key, allowing one
-    /// capacity solve to select a coherent conditional physical interface.
-    pub(crate) TemplateKey: String,
+    /// Named interface requirements are parsed once at decode time. Values
+    /// may coexist only when every shared requirement has the same value.
+    pub(crate) TemplateRequirements: Arc<Vec<(String, String)>>,
+    /// Exact candidate pairs forbidden by a compact higher-order physical
+    /// certificate.  Ordinary assignment domains leave this empty.
+    pub(crate) ForbiddenCandidateIds: Arc<Vec<(String, String)>>,
+    /// Ordered physical wire is retained only for compact access/guide
+    /// candidates.  It lets the bounded assignment DFS validate the exact
+    /// selected guide/stub tuple without expanding every Cartesian bundle.
+    pub(crate) OrderedWire: Arc<Vec<Position>>,
+    pub(crate) PoweredAccessConstraint: Option<Arc<AssignmentPoweredAccessConstraint>>,
     pub(crate) Claims: Arc<ClaimMask>,
     pub(crate) MaterialCost: i32,
     pub(crate) FootprintGrowth: i32,
@@ -473,6 +593,8 @@ pub(crate) struct TemplateRoutingAssignmentResult {
     pub(crate) AttemptPartialCandidateIds: Vec<(String, Vec<(String, String)>)>,
     #[pyo3(get)]
     pub(crate) NonExhaustiveTemplateDomain: bool,
+    #[pyo3(get)]
+    pub(crate) CompactMaskTelemetry: Vec<(String, usize)>,
 }
 
 #[pyclass]

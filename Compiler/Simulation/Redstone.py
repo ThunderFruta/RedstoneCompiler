@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from heapq import heappop, heappush
 import os
 from itertools import product
 from pathlib import Path
@@ -225,25 +226,32 @@ def SimulateMinecraftRedstoneBlockMap(
             for PositionValue, State in Blocks.items()
             if _MinecraftIsConductor(State)
         }
-        NextDust = dict(DustPower)
-        # Dust updates are immediate in-game; reach its fixed point within the
-        # current game tick, rather than accidentally inserting a wire delay.
-        for _ in range(max(1, len(Dust))):
-            Changed = False
-            for PositionValue in Dust:
-                State = Blocks[PositionValue]
-                Strength = max(
-                    BasePower.get(PositionValue, 0),
-                    BlockPower.get(_MinecraftOffset(PositionValue, "down"), 0),
-                )
-                for Neighbor in WireAdjacency[PositionValue]:
-                    Strength = max(Strength, max(0, NextDust.get(Neighbor, 0) - 1))
-                Strength = min(15, Strength)
-                if NextDust[PositionValue] != Strength:
-                    NextDust[PositionValue] = Strength
-                    Changed = True
-            if not Changed:
-                break
+        # Dust updates are immediate in-game.  Its settled state is the
+        # maximum decaying strength reachable from any direct power source.
+        # Compute that fixed point with one deterministic strongest-first
+        # traversal instead of repeatedly scanning every dust cell.
+        NextDust = {PositionValue: 0 for PositionValue in Dust}
+        PendingDust: list[tuple[int, Position]] = []
+        for PositionValue in Dust:
+            Strength = min(15, max(
+                BasePower.get(PositionValue, 0),
+                BlockPower.get(_MinecraftOffset(PositionValue, "down"), 0),
+            ))
+            if Strength <= 0:
+                continue
+            NextDust[PositionValue] = Strength
+            heappush(PendingDust, (-Strength, PositionValue))
+        while PendingDust:
+            NegativeStrength, PositionValue = heappop(PendingDust)
+            Strength = -NegativeStrength
+            if NextDust[PositionValue] != Strength or Strength <= 1:
+                continue
+            CandidateStrength = Strength - 1
+            for Neighbor in WireAdjacency[PositionValue]:
+                if CandidateStrength <= NextDust[Neighbor]:
+                    continue
+                NextDust[Neighbor] = CandidateStrength
+                heappush(PendingDust, (-CandidateStrength, Neighbor))
         NextTorch = {}
         for PositionValue in Torches:
             Properties = _MinecraftBlockProperties(Blocks[PositionValue])
@@ -273,7 +281,23 @@ def SimulateMinecraftRedstoneBlockMap(
                     for Direction in SideDirections
                 )
             )
-            InputPower = max(BasePower.get(Rear, 0), NextDust.get(Rear, 0), BlockPower.get(Rear, 0)) > 0
+            DirectRepeaterInput = bool(
+                RepeaterPowered.get(Rear, False)
+                and Rear in Blocks
+                and Blocks[Rear]["Name"] == "minecraft:repeater"
+                and _MinecraftOffset(
+                    Rear,
+                    _MinecraftBlockProperties(Blocks[Rear]).get(
+                        "facing",
+                        "north",
+                    ),
+                ) == PositionValue
+            )
+            InputPower = DirectRepeaterInput or max(
+                BasePower.get(Rear, 0),
+                NextDust.get(Rear, 0),
+                BlockPower.get(Rear, 0),
+            ) > 0
             if not Locked:
                 # Truth-table acceptance asks for the settled combinational
                 # state.  A repeater's configured delay changes only when the
@@ -343,6 +367,17 @@ def SimulateRenderedMinecraftTruthTable(
     InputNames = tuple(ReferenceModule.Inputs)
     OutputNames = tuple(ReferenceModule.Outputs)
     Build = BuildLitematicBlockMap(RoutedDesign)
+    MaximumSettlingTicks = max(
+        64,
+        1 + sum(
+            State["Name"] in (
+                "minecraft:redstone_torch",
+                "minecraft:redstone_wall_torch",
+                "minecraft:repeater",
+            )
+            for State in Build.Blocks.values()
+        ),
+    )
     GatePositions = _RenderedGateBlockPositions(RoutedDesign)
     InputLevers: dict[str, Position] = {}
     OutputLamps: dict[str, Position] = {}
@@ -372,12 +407,20 @@ def SimulateRenderedMinecraftTruthTable(
         Result = SimulateMinecraftRedstoneBlockMap(
             Build.Blocks,
             {InputLevers[Name]: Assignment[Name] for Name in InputNames},
+            MaximumTicks=MaximumSettlingTicks,
         )
         MaximumTicks = max(MaximumTicks, Result.Ticks)
         StableRows += int(Result.Stable)
         CycleRows += int(Result.CycleDetected)
         Outputs = tuple(Result.LampLit.get(OutputLamps[Name], False) for Name in OutputNames)
-        Rows.append(RedstoneTruthTableRow(Bits, tuple(Expected[Name] for Name in OutputNames), Outputs))
+        Row = RedstoneTruthTableRow(
+            Bits,
+            tuple(Expected[Name] for Name in OutputNames),
+            Outputs,
+        )
+        Rows.append(Row)
+        if not Row.Passed:
+            break
     return RedstoneSimulationReport(
         ModuleName=ReferenceModule.Name,
         InputNames=InputNames,
@@ -390,6 +433,7 @@ def SimulateRenderedMinecraftTruthTable(
             "StableRows": StableRows,
             "CycleRows": CycleRows,
             "MaximumTicks": MaximumTicks,
+            "MaximumSettlingTicks": MaximumSettlingTicks,
             "RenderedBlockCount": len(Build.Blocks),
             "LogicalCrossCheckAvailable": True,
         },

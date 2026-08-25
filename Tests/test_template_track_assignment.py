@@ -25,6 +25,7 @@ from Compiler.Routing.ResourceGraph import (
     IndexedRoutingResourceGraph,
     RoutingResourceClaims,
 )
+from Compiler.Routing.Models import BuildPlacementAccessEscapeStubChoiceId
 from Compiler.Routing.Reliability import RoutingDeadline
 from Compiler.Routing.TemplateAssignment import (
     BuildCompactFactorCatalog,
@@ -1125,16 +1126,20 @@ def test_access_stub_factor_uses_one_required_value_per_terminal():
     assert Domain.Complete is True
     assert Domain.CandidateCounts == (("__access_terminal__:0:A", 2),)
     assert all(Value.ValueKind == "contract-claim" for Value in Domain.Values)
+    StubChoiceIds = tuple(
+        BuildPlacementAccessEscapeStubChoiceId(Stub)
+        for Stub in Fabric.TerminalDomains[0].EscapeStubs
+    )
     assert tuple(
         Value.ContractRequirementItems for Value in Domain.Values
     ) == (
         (
-            ("access-stub:0:A", "0"),
+            ("access-stub:0:A", StubChoiceIds[0]),
             ("core", "a"),
             ("layers", "2"),
         ),
         (
-            ("access-stub:0:A", "1"),
+            ("access-stub:0:A", StubChoiceIds[1]),
             ("core", "a"),
             ("layers", "2"),
         ),
@@ -1411,6 +1416,7 @@ def test_compact_catalog_same_owner_access_and_route_overlap_is_legal():
             EscapeStubs=(Stub,),
         ),),
     )
+    StubChoiceId = BuildPlacementAccessEscapeStubChoiceId(Stub)
     Guide = RawTrackAssignmentValue(
         Signal="A",
         OwnerSignal="A",
@@ -1422,7 +1428,7 @@ def test_compact_catalog_same_owner_access_and_route_overlap_is_legal():
         BendCount=0,
         ViaCount=0,
         ValueKind="local-claim",
-        ContractRequirements=(("access-stub:A:root", "0"),),
+        ContractRequirements=(("access-stub:A:root", StubChoiceId),),
     )
     Catalog = BuildCompactFactorCatalog(
         (BuildCompactSource(
@@ -1449,5 +1455,5 @@ def test_compact_catalog_same_owner_access_and_route_overlap_is_legal():
         ("A", "guide"),
     )
     assert Native.Preparation.SelectedContractClaimChoiceIds == (
-        ("__access_terminal__:A:root", "stub:0:0"),
+        ("__access_terminal__:A:root", f"stub:{StubChoiceId}"),
     )

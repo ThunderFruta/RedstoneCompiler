@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from functools import cached_property
 from hashlib import sha256
 from struct import pack
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
 
@@ -30,7 +31,10 @@ from .AuthoritativePlanner import (
     RawTrackAssignmentValue,
 )
 from .Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
-from .Models import TrackAssignmentPreparation
+from .Models import (
+    BuildPlacementAccessEscapeStubChoiceId,
+    TrackAssignmentPreparation,
+)
 from .Reliability import BuildStableFingerprint, RoutingDeadline
 from .ResourceGraph import FindClaimConflicts, RoutingResourceClaims
 
@@ -56,6 +60,7 @@ class CompactPhysicalClaimPrimitive:
 
     PrimitiveId: str
     PhysicalFingerprint: str
+    MaskReuseFingerprint: str
     Kind: str
     Claims: RoutingResourceClaims = field(compare=False, repr=False)
     DeferredGuideWireCells: tuple[tuple[int, int, int], ...] = field(
@@ -68,6 +73,7 @@ class CompactPhysicalClaimPrimitive:
         return {
             "PrimitiveId": self.PrimitiveId,
             "PhysicalFingerprint": self.PhysicalFingerprint,
+            "MaskReuseFingerprint": self.MaskReuseFingerprint,
             "Kind": self.Kind,
             "ResourceCount": sum(map(len, (
                 self.Claims.WireCells,
@@ -87,6 +93,7 @@ class CompactFactorValue:
     OwnerSignal: str
     FactorId: str
     SourceFactorId: str
+    MaskReuseFingerprint: str
     ValueKind: str
     PrimitiveIds: tuple[str, ...]
     Objective: tuple[int, int, int, int, int]
@@ -138,6 +145,7 @@ class CompactFactorValue:
             "OwnerSignal": self.OwnerSignal,
             "FactorId": self.FactorId,
             "SourceFactorId": self.SourceFactorId,
+            "MaskReuseFingerprint": self.MaskReuseFingerprint,
             "ValueKind": self.ValueKind,
             "PrimitiveIds": list(self.PrimitiveIds),
             "Objective": list(self.Objective),
@@ -162,6 +170,7 @@ class CompactFactorMemberSource:
     GuideDomain: RawTrackAssignmentDomain
     Fabric: Any = field(compare=False, repr=False)
     FabricFingerprint: str = ""
+    IncludeGuideFactors: bool = True
 
 
 @dataclass(frozen=True)
@@ -181,6 +190,7 @@ class CompactFactorMember:
     PortalDomainFingerprint: str
     MaximumAssignmentExpansions: int
     Complete: bool
+    GuideFactorsIncluded: bool = True
     IncompleteReason: str = ""
     GuideDomainDiagnostics: tuple[tuple[str, object], ...] = ()
 
@@ -200,6 +210,7 @@ class CompactFactorMember:
             "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
             "FabricFingerprint": self.FabricFingerprint,
             "CandidateDomainFingerprint": self.CandidateDomainFingerprint,
+            "GuideFactorsIncluded": self.GuideFactorsIncluded,
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
         }
@@ -256,6 +267,43 @@ class CompactFactorCatalog:
             "PrimitiveCacheHits": self.PrimitiveCacheHits,
             "PrimitiveCacheMisses": self.PrimitiveCacheMisses,
             "Members": [Value.ToDictionary() for Value in self.Members],
+        }
+
+
+@dataclass(frozen=True)
+class LayeredAccessFactorCatalogSummary:
+    """Compact diagnostics for the exact shared access-only portfolio."""
+
+    CatalogFingerprint: str
+    DeclaredMemberCount: int
+    CatalogCompleteMemberCount: int
+    SharedPhysicalCatalogCount: int
+    PrimitiveCount: int
+    FactorCount: int
+    FactorReferenceCount: int
+    PayloadBuildElapsedSeconds: float
+    NativeSolveElapsedSeconds: float
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "CatalogFingerprint": self.CatalogFingerprint,
+            "DeclaredMemberCount": self.DeclaredMemberCount,
+            "CatalogCompleteMemberCount": (
+                self.CatalogCompleteMemberCount
+            ),
+            "SharedPhysicalCatalogCount": self.SharedPhysicalCatalogCount,
+            "PrimitiveCount": self.PrimitiveCount,
+            "FactorCount": self.FactorCount,
+            "FactorReferenceCount": self.FactorReferenceCount,
+            "PayloadBuildElapsedSeconds": round(
+                self.PayloadBuildElapsedSeconds,
+                6,
+            ),
+            "NativeSolveElapsedSeconds": round(
+                self.NativeSolveElapsedSeconds,
+                6,
+            ),
+            "GuideFactorsIncluded": False,
         }
 
 
@@ -317,6 +365,9 @@ def BuildCompactFactorCatalog(
         str,
     ] = {}
     ClaimFingerprintByClaims: dict[RoutingResourceClaims, str] = {}
+    ClaimFingerprintByLiveIdentity: dict[
+        int, tuple[RoutingResourceClaims, str]
+    ] = {}
     PrimitiveIdByLiveIdentity: dict[tuple[object, ...], str] = {}
     PhysicalInputByFingerprint: dict[
         str,
@@ -329,15 +380,26 @@ def BuildCompactFactorCatalog(
     ] = {}
     Members: list[CompactFactorMember] = []
     ResourcePositions: set[tuple[int, int, int]] = set()
+    AccessFactorByPhysicalIdentity: dict[
+        tuple[str, str, str, str], CompactFactorValue
+    ] = {}
     CacheHits = 0
     CacheMisses = 0
     ExpandedReferences = 0
 
     def ClaimsFingerprintCached(Claims: RoutingResourceClaims) -> str:
+        LiveIdentity = id(Claims)
+        LiveCached = ClaimFingerprintByLiveIdentity.get(LiveIdentity)
+        if LiveCached is not None and LiveCached[0] is Claims:
+            return LiveCached[1]
         Fingerprint = ClaimFingerprintByClaims.get(Claims, "")
         if not Fingerprint:
             Fingerprint = _CompactClaimsFingerprint(Claims)
             ClaimFingerprintByClaims[Claims] = Fingerprint
+        ClaimFingerprintByLiveIdentity[LiveIdentity] = (
+            Claims,
+            Fingerprint,
+        )
         return Fingerprint
 
     def InternPrimitive(
@@ -350,12 +412,19 @@ def BuildCompactFactorCatalog(
         ] = (),
         LiveIdentity: tuple[object, ...] = (),
         IdentityFingerprintOverride: str = "",
+        MaskReuseFingerprintOverride: str = "",
     ) -> str:
         nonlocal CacheHits, CacheMisses, ExpandedReferences
         IdentityItems = tuple(sorted(Identity.items()))
         DeferredGuideWireCells = tuple(sorted(set(
             DeferredGuideWireCells
         )))
+        if LiveIdentity:
+            ExistingLiveId = PrimitiveIdByLiveIdentity.get(LiveIdentity)
+            if ExistingLiveId is not None:
+                CacheHits += 1
+                ExpandedReferences += 1
+                return ExistingLiveId
         ClaimsFingerprint = str(ClaimsFingerprintOverride)
         if IdentityFingerprintOverride:
             if not ClaimsFingerprint:
@@ -396,6 +465,9 @@ def BuildCompactFactorCatalog(
             Primitive = CompactPhysicalClaimPrimitive(
                 PrimitiveId=Fingerprint,
                 PhysicalFingerprint=Fingerprint,
+                MaskReuseFingerprint=str(
+                    MaskReuseFingerprintOverride
+                ),
                 Kind=Kind,
                 Claims=Claims,
                 DeferredGuideWireCells=DeferredGuideWireCells,
@@ -462,6 +534,7 @@ def BuildCompactFactorCatalog(
         Primitive = CompactPhysicalClaimPrimitive(
             PrimitiveId=Fingerprint,
             PhysicalFingerprint=Fingerprint,
+            MaskReuseFingerprint=str(MaskReuseFingerprintOverride),
             Kind=Kind,
             Claims=Claims,
             DeferredGuideWireCells=DeferredGuideWireCells,
@@ -490,11 +563,30 @@ def BuildCompactFactorCatalog(
     for Source in OrderedSources:
         Domain = Source.GuideDomain
         Requirements = tuple(sorted(set(Source.ContractRequirements)))
+        PhysicalAccessShellIdentity = str(getattr(
+            Source.Fabric,
+            "PerimeterSlotAssignmentFingerprint",
+            "",
+        ))
+        if (
+            not PhysicalAccessShellIdentity
+            and getattr(Source.Fabric, "FrozenRoutingEnvelope", None)
+            is not None
+        ):
+            PhysicalAccessShellIdentity = str(getattr(
+                Source.Fabric,
+                "AccessRingFingerprint",
+                "",
+            ))
         Values: list[CompactFactorValue] = []
-        RequiredVariables = {
-            str(Signal) for Signal, _Count in Domain.CandidateCounts
-        }
-        for Value in Domain.Values:
+        RequiredVariables = (
+            {
+                str(Signal) for Signal, _Count in Domain.CandidateCounts
+            }
+            if Source.IncludeGuideFactors
+            else set()
+        )
+        for Value in Domain.Values if Source.IncludeGuideFactors else ():
             Descriptor = Value.RouteGuideFactorDescriptor
             PrimitiveIds: list[str] = []
             if Descriptor is not None:
@@ -513,7 +605,7 @@ def BuildCompactFactorCatalog(
                     DeferredPortalClaims,
                     {
                         "ResourceGraph": Domain.ResourceGraphFingerprint,
-                        "Fabric": Source.FabricFingerprint,
+                        "AccessShell": PhysicalAccessShellIdentity,
                         "Layer": int(Descriptor.Layer),
                         "RoutingY": int(Descriptor.RoutingY),
                         "PortalPaths": tuple(
@@ -529,6 +621,11 @@ def BuildCompactFactorCatalog(
                     },
                     DeferredGuideWireCells=tuple(
                         PortalClaims.WireCells
+                    ),
+                    MaskReuseFingerprintOverride=(
+                        f"guide-portal-factor:"
+                        f"{Domain.PlacementFingerprint}:"
+                        f"{Value.SourceCandidateId or Value.CandidateId}"
                     ),
                 ))
                 PrimitiveIds.append(InternPrimitive(
@@ -560,6 +657,9 @@ def BuildCompactFactorCatalog(
                     IdentityFingerprintOverride=(
                         f"spine:{int(Descriptor.Layer)}:"
                         f"{Value.CompactGuideSpineClaimsFingerprint}"
+                    ),
+                    MaskReuseFingerprintOverride=(
+                        Value.CompactGuideSpineClaimsFingerprint
                     ),
                 ))
                 JunctionClaims = (
@@ -598,6 +698,13 @@ def BuildCompactFactorCatalog(
                 SourceFactorId=(
                     Value.SourceCandidateId or Value.CandidateId
                 ),
+                MaskReuseFingerprint=(
+                    f"guide-factor-mask:"
+                    f"{Domain.PlacementFingerprint}:"
+                    f"{Value.SourceCandidateId or Value.CandidateId}"
+                    if Descriptor is not None
+                    else ""
+                ),
                 ValueKind=Value.ValueKind,
                 PrimitiveIds=tuple(sorted(set(PrimitiveIds))),
                 Objective=(
@@ -607,10 +714,9 @@ def BuildCompactFactorCatalog(
                     int(Value.BendCount),
                     int(Value.ViaCount),
                 ),
-                ContractRequirements=tuple(sorted({
-                    *Value.ContractRequirementItems,
-                    *Requirements,
-                })),
+                ContractRequirements=tuple(sorted(
+                    Value.ContractRequirementItems
+                )),
                 RouteGuideFactorDescriptor=Descriptor,
                 MaterializabilityCertificate=(
                     Value.CompactMaterializabilityCertificate
@@ -629,7 +735,27 @@ def BuildCompactFactorCatalog(
             ) or f"{DomainIndex}:{FabricDomain.Signal}")
             Variable = f"__access_terminal__:{LogicalKey}"
             RequiredVariables.add(Variable)
-            for StubIndex, Stub in enumerate(FabricDomain.EscapeStubs):
+            for Stub in FabricDomain.EscapeStubs:
+                StubChoiceId = BuildPlacementAccessEscapeStubChoiceId(Stub)
+                StubPhysicalFingerprint = str(getattr(
+                    Stub,
+                    "PhysicalClaimsFingerprint",
+                    "",
+                ))
+                AccessFactorIdentity = (
+                    Variable,
+                    str(FabricDomain.Signal),
+                    StubChoiceId,
+                    StubPhysicalFingerprint,
+                )
+                ExistingAccessFactor = AccessFactorByPhysicalIdentity.get(
+                    AccessFactorIdentity
+                )
+                if ExistingAccessFactor is not None:
+                    Values.append(ExistingAccessFactor)
+                    CacheHits += 1
+                    ExpandedReferences += 1
+                    continue
                 StubClaims = Stub.PhysicalClaims
                 PrimitiveId = InternPrimitive(
                     "access-stub",
@@ -638,41 +764,43 @@ def BuildCompactFactorCatalog(
                     ),
                     {
                         "ResourceGraph": Domain.ResourceGraphFingerprint,
-                        "Fabric": Source.FabricFingerprint,
-                        "Shell": str(getattr(
-                            Source.Fabric,
-                            "AccessRingFingerprint",
-                            "",
-                        )),
+                        "AccessShell": PhysicalAccessShellIdentity,
+                        "Shell": PhysicalAccessShellIdentity,
                         "LogicalKey": LogicalKey,
                         "Path": tuple(Stub.Path),
                         "WireCells": tuple(sorted(
                             StubClaims.WireCells
                         )),
                     },
-                    ClaimsFingerprintCached(StubClaims),
+                    StubPhysicalFingerprint
+                    or ClaimsFingerprintCached(StubClaims),
                     DeferredGuideWireCells=tuple(StubClaims.WireCells),
+                    MaskReuseFingerprintOverride=str(getattr(
+                        Stub,
+                        "PhysicalClaimsFingerprint",
+                        "",
+                    )),
                     LiveIdentity=(
                         "access-stub-live-v1",
                         Domain.ResourceGraphFingerprint,
-                        Source.FabricFingerprint,
-                        str(getattr(
-                            Source.Fabric,
-                            "AccessRingFingerprint",
-                            "",
-                        )),
+                        PhysicalAccessShellIdentity,
                         LogicalKey,
                         id(Stub),
                         id(Stub.PhysicalClaims),
                     ),
                 )
-                FactorId = f"stub:{DomainIndex}:{StubIndex}"
+                FactorId = f"stub:{StubChoiceId}"
                 Claims = StubClaims
-                Values.append(CompactFactorValue(
+                AccessFactor = CompactFactorValue(
                     Variable=Variable,
                     OwnerSignal=str(FabricDomain.Signal),
                     FactorId=FactorId,
                     SourceFactorId=FactorId,
+                    MaskReuseFingerprint=(
+                        f"access-factor-mask:"
+                        f"{Domain.PlacementFingerprint}:"
+                        f"{LogicalKey}:{StubChoiceId}"
+                    ),
                     ValueKind="contract-claim",
                     PrimitiveIds=(PrimitiveId,),
                     Objective=(
@@ -688,17 +816,42 @@ def BuildCompactFactorCatalog(
                         0,
                         max(0, len({Node[1] for Node in Stub.Path}) - 1),
                     ),
-                    ContractRequirements=tuple(sorted({
-                        *Requirements,
-                        (
-                            PlacementAccessStubContractRequirementName(
-                                LogicalKey
-                            ),
-                            str(StubIndex),
+                    ContractRequirements=((
+                        PlacementAccessStubContractRequirementName(
+                            LogicalKey
                         ),
-                    })),
-                ))
-        Complete = bool(Domain.Complete and FabricComplete)
+                        StubChoiceId,
+                    ),),
+                )
+                AccessFactorByPhysicalIdentity[
+                    AccessFactorIdentity
+                ] = AccessFactor
+                Values.append(AccessFactor)
+        Complete = bool(
+            FabricComplete
+            and (Domain.Complete or not Source.IncludeGuideFactors)
+        )
+        CandidateDomainFingerprint = (
+            Domain.CandidateDomainFingerprint
+            if Source.IncludeGuideFactors
+            else BuildStableFingerprint({
+                "Kind": "exact-access-factor-member-v1",
+                "Template": Source.TemplateId,
+                "Placement": Domain.PlacementFingerprint,
+                "ResourceGraph": Domain.ResourceGraphFingerprint,
+                "Fabric": Source.FabricFingerprint,
+                "TerminalDomains": tuple(
+                    (
+                        str(getattr(FabricDomain, "LogicalKey", "")),
+                        tuple(
+                            BuildPlacementAccessEscapeStubChoiceId(Stub)
+                            for Stub in FabricDomain.EscapeStubs
+                        ),
+                    )
+                    for FabricDomain in FabricDomains
+                ),
+            })
+        )
         Members.append(CompactFactorMember(
             TemplateId=Source.TemplateId,
             Objective=Source.Objective,
@@ -712,14 +865,15 @@ def BuildCompactFactorCatalog(
             PlacementFingerprint=Domain.PlacementFingerprint,
             ResourceGraphFingerprint=Domain.ResourceGraphFingerprint,
             FabricFingerprint=Source.FabricFingerprint,
-            CandidateDomainFingerprint=Domain.CandidateDomainFingerprint,
+            CandidateDomainFingerprint=CandidateDomainFingerprint,
             LocalClaimDomainFingerprint=Domain.LocalClaimDomainFingerprint,
             PortalDomainFingerprint=Domain.PortalDomainFingerprint,
             MaximumAssignmentExpansions=MaximumAssignmentExpansions,
             Complete=Complete,
+            GuideFactorsIncluded=Source.IncludeGuideFactors,
             IncompleteReason=(
                 Domain.IncompleteReason
-                if not Domain.Complete
+                if Source.IncludeGuideFactors and not Domain.Complete
                 else str(getattr(Source.Fabric, "IncompleteReason", ""))
                 or "incomplete-access-stub-domain"
                 if not FabricComplete
@@ -963,6 +1117,7 @@ def _BuildCompactCatalogNativePayload(
     }
     PrimitivePayload = [
         (
+            Primitive.MaskReuseFingerprint,
             list(Primitive.Claims.WireCells),
             list(Primitive.Claims.SupportCells),
             list(Primitive.Claims.RequiredAirCells),
@@ -986,6 +1141,7 @@ def _BuildCompactCatalogNativePayload(
             Payload = (
                 Value.Variable,
                 Value.FactorId,
+                Value.MaskReuseFingerprint,
                 tuple(
                     PrimitiveIndex[PrimitiveId]
                     for PrimitiveId in Value.PrimitiveIds
@@ -1010,6 +1166,418 @@ def _BuildCompactCatalogNativePayload(
             FactorIndexes,
         ))
     return PrimitivePayload, FactorPayload, MemberPayload
+
+
+def SolveLayeredAccessFactorCatalogWithContext(
+    Sources: Iterable[CompactFactorMemberSource],
+    *,
+    MaximumAssignmentExpansions: int,
+    Deadline: RoutingDeadline,
+) -> tuple[RawTrackAssignmentSelection, LayeredAccessFactorCatalogSummary]:
+    """Select one exact layered access member without expanded guide factors.
+
+    One exact physical pool per placement owns the union of every retained-layer
+    stub primitive.  Member views reference only values present in their own
+    fabric.  This preserves every path value without assuming that one layer is
+    a physical superset of another.
+    """
+    if _SolveCompactTemplateFactorCatalogBounded is None:
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="PreRouteCompactCatalogUnavailable",
+            Detail="the native compact access catalog binding is unavailable",
+            RepairActions=(),
+        ))
+    OrderedSources = tuple(sorted(
+        Sources,
+        key=lambda Value: (Value.Objective, Value.TemplateId),
+    ))
+    if not OrderedSources:
+        raise ValueError("layered access catalog requires declared members")
+    if any(Source.IncludeGuideFactors for Source in OrderedSources):
+        raise ValueError("layered access catalog accepts access-only members")
+    if MaximumAssignmentExpansions < 1:
+        raise ValueError("layered access catalog requires a positive work cap")
+
+    BuildStartedAt = monotonic()
+    SourcesByPhysicalCatalog: dict[
+        tuple[str, str], list[CompactFactorMemberSource]
+    ] = {}
+    for Source in OrderedSources:
+        Requirements = dict(Source.ContractRequirements)
+        PhysicalCatalogKey = (
+            str(Requirements.get("core", Source.GuideDomain.PlacementFingerprint)),
+            str(getattr(Source.Fabric, "TopologyKind", "")),
+        )
+        SourcesByPhysicalCatalog.setdefault(
+            PhysicalCatalogKey,
+            [],
+        ).append(Source)
+
+    ResourcePositions: set[tuple[int, int, int]] = set()
+    PrimitivePayload: list[tuple[object, ...]] = []
+    FactorPayload: list[tuple[object, ...]] = []
+    FactorIndexByCatalogIdentity: dict[
+        tuple[tuple[str, str], str, str], int
+    ] = {}
+    MemberPayload: list[tuple[object, ...]] = []
+    CompleteMemberCount = 0
+    FactorReferenceCount = 0
+
+    for CatalogKey, CatalogSources in sorted(
+        SourcesByPhysicalCatalog.items()
+    ):
+        # Projection can retain a lower-layer path that is physically absent
+        # from a different maximal member because each exact face mask has a
+        # distinct settled path.  The shared pool is therefore the exact
+        # union of member values, not an assumed max-layer superset.
+        for PoolMemberSource in CatalogSources:
+            PoolDomains = tuple(getattr(
+                PoolMemberSource.Fabric,
+                "TerminalDomains",
+                (),
+            ))
+            for DomainIndex, Domain in enumerate(PoolDomains):
+                LogicalKey = str(
+                    getattr(Domain, "LogicalKey", "")
+                    or f"{DomainIndex}:{Domain.Signal}"
+                )
+                Variable = f"__access_terminal__:{LogicalKey}"
+                for Stub in Domain.EscapeStubs:
+                    ChoiceId = BuildPlacementAccessEscapeStubChoiceId(Stub)
+                    Identity = (CatalogKey, Variable, ChoiceId)
+                    if Identity in FactorIndexByCatalogIdentity:
+                        continue
+                    Claims = Stub.PhysicalClaims
+                    PrimitiveIndex = len(PrimitivePayload)
+                    PhysicalFingerprint = str(getattr(
+                        Stub,
+                        "PhysicalClaimsFingerprint",
+                        "",
+                    ))
+                    PrimitivePayload.append((
+                        PhysicalFingerprint,
+                        [],
+                        [],
+                        list(Claims.RequiredAirCells),
+                        [],
+                        list(Stub.Path),
+                    ))
+                    ResourcePositions.update(Claims.RequiredAirCells)
+                    FactorIndex = len(FactorPayload)
+                    FactorIndexByCatalogIdentity[Identity] = FactorIndex
+                    FactorPayload.append((
+                        Variable,
+                        f"stub:{ChoiceId}",
+                        (
+                            f"access-factor-mask:{CatalogKey[0]}:"
+                            f"{LogicalKey}:{ChoiceId}"
+                        ),
+                        (PrimitiveIndex,),
+                        0,
+                        0,
+                        len(Stub.Path),
+                        0,
+                        0,
+                        (
+                            f"{PlacementAccessStubContractRequirementName(LogicalKey)}"
+                            f"={ChoiceId}"
+                        ),
+                        str(Domain.Signal),
+                    ))
+
+        for Source in CatalogSources:
+            FabricDomains = tuple(getattr(
+                Source.Fabric,
+                "TerminalDomains",
+                (),
+            ))
+            RequiredVariables: list[str] = []
+            FactorIndexes: list[int] = []
+            FabricComplete = bool(getattr(
+                Source.Fabric,
+                "Complete",
+                False,
+            ))
+            for DomainIndex, Domain in enumerate(FabricDomains):
+                LogicalKey = str(
+                    getattr(Domain, "LogicalKey", "")
+                    or f"{DomainIndex}:{Domain.Signal}"
+                )
+                Variable = f"__access_terminal__:{LogicalKey}"
+                RequiredVariables.append(Variable)
+                FabricComplete = bool(
+                    FabricComplete
+                    and getattr(Domain, "Complete", False)
+                    and Domain.EscapeStubs
+                )
+                for Stub in Domain.EscapeStubs:
+                    ChoiceId = BuildPlacementAccessEscapeStubChoiceId(Stub)
+                    FactorIndex = FactorIndexByCatalogIdentity.get((
+                        CatalogKey,
+                        Variable,
+                        ChoiceId,
+                    ))
+                    if FactorIndex is None:
+                        raise ValueError(
+                            "layered member references a stub outside its "
+                            "exact physical catalog"
+                        )
+                    FactorIndexes.append(FactorIndex)
+            if FabricComplete:
+                CompleteMemberCount += 1
+            FactorReferenceCount += len(FactorIndexes)
+            MemberPayload.append((
+                Source.TemplateId,
+                list(Source.Objective),
+                sorted(set(RequiredVariables)),
+                FactorIndexes,
+            ))
+
+    CatalogFingerprint = BuildStableFingerprint({
+        "Kind": "exact-shared-layered-access-factor-catalog-v1",
+        "Members": tuple(
+            (
+                Source.TemplateId,
+                Source.Objective,
+                Source.ContractRequirements,
+                Source.GuideDomain.CandidateDomainFingerprint,
+                str(getattr(Source.Fabric, "FabricFingerprint", "")),
+            )
+            for Source in OrderedSources
+        ),
+        "MaximumAssignmentExpansions": MaximumAssignmentExpansions,
+    })
+    BuildElapsedSeconds = monotonic() - BuildStartedAt
+    RemainingMilliseconds = Deadline.RemainingMilliseconds()
+    if RemainingMilliseconds < 1 or CompleteMemberCount != len(OrderedSources):
+        Selection = RawTrackAssignmentSelection(
+            ProblemFingerprint=CatalogFingerprint,
+            SelectionFingerprint="",
+            SelectedTemplateId="",
+            SelectedObjective=(),
+            Preparation=None,
+            Attempts=(),
+            ExpansionCount=0,
+            Success=False,
+            Complete=False,
+            Unsatisfiable=False,
+            IncompleteReason=(
+                "assignment-deadline"
+                if RemainingMilliseconds < 1
+                else "incomplete-access-catalog-member"
+            ),
+            MaterializedTemplateCount=len(OrderedSources),
+        )
+        return Selection, LayeredAccessFactorCatalogSummary(
+            CatalogFingerprint=CatalogFingerprint,
+            DeclaredMemberCount=len(OrderedSources),
+            CatalogCompleteMemberCount=CompleteMemberCount,
+            SharedPhysicalCatalogCount=len(SourcesByPhysicalCatalog),
+            PrimitiveCount=len(PrimitivePayload),
+            FactorCount=len(FactorPayload),
+            FactorReferenceCount=FactorReferenceCount,
+            PayloadBuildElapsedSeconds=BuildElapsedSeconds,
+            NativeSolveElapsedSeconds=0.0,
+        )
+
+    NativeStartedAt = monotonic()
+    NativeResult = _SolveCompactTemplateFactorCatalogBounded(
+        list(sorted(ResourcePositions)),
+        PrimitivePayload,
+        FactorPayload,
+        MemberPayload,
+        MaximumAssignmentExpansions,
+        RemainingMilliseconds,
+        True,
+    )
+    NativeElapsedSeconds = monotonic() - NativeStartedAt
+    SelectedTemplateId = str(getattr(
+        NativeResult,
+        "SelectedTemplateId",
+        "",
+    ) or "")
+    Success = bool(getattr(NativeResult, "Success", False))
+    Complete = bool(getattr(NativeResult, "Complete", False))
+    ExpansionCount = max(0, int(getattr(
+        NativeResult,
+        "ExpansionCount",
+        0,
+    )))
+    SourceById = {
+        Source.TemplateId: Source for Source in OrderedSources
+    }
+    SelectedSource = SourceById.get(SelectedTemplateId)
+    SelectedIds = tuple(
+        (str(Variable), str(CandidateId))
+        for Variable, CandidateId in getattr(
+            NativeResult,
+            "SelectedCandidateIds",
+            (),
+        )
+    )
+    Preparation = None
+    if Success and Complete and SelectedSource is not None:
+        CandidateCounts = tuple(
+            (
+                str(getattr(Domain, "LogicalKey", "") or Domain.Signal),
+                len(Domain.EscapeStubs),
+            )
+            for Domain in getattr(
+                SelectedSource.Fabric,
+                "TerminalDomains",
+                (),
+            )
+        )
+        Preparation = TrackAssignmentPreparation(
+            Success=True,
+            SelectedCandidateIds=(),
+            CandidateCounts=CandidateCounts,
+            ConflictSignals=(),
+            ConflictResourceIndices=(),
+            ExpansionCount=ExpansionCount,
+            Complete=True,
+            Diagnostics=(
+                ("CompactFactorCatalog", True),
+                ("CompactAccessOnlyCatalog", True),
+                ("SharedLayeredAccessCatalog", True),
+            ),
+            CandidateDomainFingerprint=CatalogFingerprint,
+            SelectedConditionalTemplateKey=SelectedTemplateId,
+            SelectedContractRequirements=(
+                SelectedSource.ContractRequirements
+            ),
+            SelectedContractClaimChoiceIds=SelectedIds,
+        )
+    AttemptedIds = tuple(map(str, getattr(
+        NativeResult,
+        "AttemptedTemplateIds",
+        (),
+    )))
+    AttemptExpansionCounts = {
+        str(TemplateId): int(Count)
+        for TemplateId, Count in getattr(
+            NativeResult,
+            "AttemptExpansionCounts",
+            (),
+        )
+    }
+    AttemptFailureNets = {
+        str(TemplateId): str(FailureNet or "")
+        for TemplateId, FailureNet in getattr(
+            NativeResult,
+            "AttemptFailureNets",
+            (),
+        )
+    }
+    AttemptPartialIds = {
+        str(TemplateId): tuple(
+            (str(Variable), str(CandidateId))
+            for Variable, CandidateId in Values
+        )
+        for TemplateId, Values in getattr(
+            NativeResult,
+            "AttemptPartialCandidateIds",
+            (),
+        )
+    }
+    AttemptPairs = {
+        str(TemplateId): tuple(
+            (str(First), str(Second)) for First, Second in Values
+        )
+        for TemplateId, Values in getattr(
+            NativeResult,
+            "AttemptPairwiseIncompatibleSignals",
+            (),
+        )
+    }
+    Cumulative = 0
+    Attempts = []
+    for Index, TemplateId in enumerate(AttemptedIds):
+        Count = max(0, AttemptExpansionCounts.get(TemplateId, 0))
+        Cumulative += Count
+        Attempts.append(RawTrackAssignmentAttempt(
+            TemplateId=TemplateId,
+            Objective=SourceById[TemplateId].Objective,
+            Success=Success and TemplateId == SelectedTemplateId,
+            Complete=(Complete or Index + 1 < len(AttemptedIds)),
+            ExpansionCount=Count,
+            CumulativeExpansionCount=Cumulative,
+            FailureNet=AttemptFailureNets.get(TemplateId, ""),
+            PartialCandidateIds=AttemptPartialIds.get(TemplateId, ()),
+            PairwiseIncompatibleSignals=AttemptPairs.get(TemplateId, ()),
+        ))
+    SelectionFingerprint = (
+        BuildStableFingerprint((
+            CatalogFingerprint,
+            SelectedTemplateId,
+            SelectedIds,
+        ))
+        if Success else ""
+    )
+    Selection = RawTrackAssignmentSelection(
+        ProblemFingerprint=CatalogFingerprint,
+        SelectionFingerprint=SelectionFingerprint,
+        SelectedTemplateId=SelectedTemplateId,
+        SelectedObjective=(
+            SelectedSource.Objective
+            if SelectedSource is not None else ()
+        ),
+        Preparation=Preparation,
+        Attempts=tuple(Attempts),
+        ExpansionCount=ExpansionCount,
+        Success=Success,
+        Complete=Complete,
+        Unsatisfiable=bool(getattr(
+            NativeResult,
+            "Unsatisfiable",
+            False,
+        )),
+        IncompleteReason=str(getattr(
+            NativeResult,
+            "IncompleteReason",
+            "",
+        )),
+        FirstConflictSignals=tuple(map(str, getattr(
+            NativeResult,
+            "ConflictSignals",
+            (),
+        ))),
+        FirstConflictResourceIndices=tuple(map(int, getattr(
+            NativeResult,
+            "ConflictResourceIndices",
+            (),
+        ))),
+        FirstPairwiseIncompatibleSignals=tuple(
+            (str(First), str(Second))
+            for First, Second in getattr(
+                NativeResult,
+                "PairwiseIncompatibleSignals",
+                (),
+            )
+        ),
+        MaterializedTemplateCount=len(OrderedSources),
+        CompactMaskTelemetry=tuple(
+            (str(Name), int(Value))
+            for Name, Value in getattr(
+                NativeResult,
+                "CompactMaskTelemetry",
+                (),
+            )
+        ),
+    )
+    Summary = LayeredAccessFactorCatalogSummary(
+        CatalogFingerprint=CatalogFingerprint,
+        DeclaredMemberCount=len(OrderedSources),
+        CatalogCompleteMemberCount=CompleteMemberCount,
+        SharedPhysicalCatalogCount=len(SourcesByPhysicalCatalog),
+        PrimitiveCount=len(PrimitivePayload),
+        FactorCount=len(FactorPayload),
+        FactorReferenceCount=FactorReferenceCount,
+        PayloadBuildElapsedSeconds=BuildElapsedSeconds,
+        NativeSolveElapsedSeconds=NativeElapsedSeconds,
+    )
+    return Selection, Summary
 
 
 def MaterializeSelectedCompactFactorDomain(
@@ -1086,6 +1654,7 @@ def MaterializeSelectedCompactFactorDomain(
         MaximumAssignmentExpansions=Member.MaximumAssignmentExpansions,
         Diagnostics=(
             ("CompactFactorCatalog", True),
+            ("CompactAccessOnlyCatalog", not Member.GuideFactorsIncluded),
             ("CompactFactorCatalogFingerprint", Catalog.CatalogFingerprint),
             ("CompactFactorCatalogSummary", Catalog.ToDictionary()),
             ("SelectedCompactMember", Member.ToDictionary()),
@@ -1161,11 +1730,15 @@ def SolveCompactFactorCatalogWithContext(
             IncompleteReason="assignment-deadline",
             MaterializedTemplateCount=len(Catalog.Members),
         )
+    PayloadEncodeStartedAt = monotonic()
     (
         PrimitivePayload,
         FactorPayload,
         MemberPayload,
     ) = _BuildCompactCatalogNativePayload(Catalog)
+    PayloadEncodeElapsedMilliseconds = int(
+        (monotonic() - PayloadEncodeStartedAt) * 1000
+    )
     # Payload encoding is part of the same absolute pre-route budget. Do not
     # hand Rust the stale pre-encoding remainder and accidentally extend the
     # solve beyond the compiler deadline.
@@ -1185,6 +1758,7 @@ def SolveCompactFactorCatalogWithContext(
             IncompleteReason="assignment-deadline",
             MaterializedTemplateCount=len(Catalog.Members),
         )
+    NativeCallStartedAt = monotonic()
     NativeResult = _SolveCompactTemplateFactorCatalogBounded(
         list(Catalog.ResourcePositions),
         PrimitivePayload,
@@ -1193,6 +1767,9 @@ def SolveCompactFactorCatalogWithContext(
         Catalog.MaximumAssignmentExpansions,
         RemainingMilliseconds,
         Catalog.NonExhaustiveTemplateDomain,
+    )
+    NativeCallElapsedMilliseconds = int(
+        (monotonic() - NativeCallStartedAt) * 1000
     )
     MemberById = {Value.TemplateId: Value for Value in Catalog.Members}
     AttemptedIds = tuple(map(str, getattr(
@@ -1508,6 +2085,23 @@ def SolveCompactFactorCatalogWithContext(
             )
         )),
         MaterializedTemplateCount=len(Catalog.Members),
+        CompactMaskTelemetry=tuple(
+            (str(Name), max(0, int(Value)))
+            for Name, Value in getattr(
+                NativeResult,
+                "CompactMaskTelemetry",
+                (),
+            )
+        ) + (
+            (
+                "PayloadEncodeElapsedMilliseconds",
+                PayloadEncodeElapsedMilliseconds,
+            ),
+            (
+                "NativeCallElapsedMilliseconds",
+                NativeCallElapsedMilliseconds,
+            ),
+        ),
     )
 
 
@@ -1803,6 +2397,7 @@ class RawTrackAssignmentSelection:
     FirstPairwiseIncompatibleSignals: tuple[tuple[str, str], ...] = ()
     MaterializedTemplateCount: int = 0
     SkippedDominatedTemplateCount: int = 0
+    CompactMaskTelemetry: tuple[tuple[str, int], ...] = ()
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -1833,6 +2428,7 @@ class RawTrackAssignmentSelection:
             "SkippedDominatedTemplateCount": (
                 self.SkippedDominatedTemplateCount
             ),
+            "CompactMaskTelemetry": dict(self.CompactMaskTelemetry),
         }
 
 

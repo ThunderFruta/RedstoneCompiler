@@ -8,8 +8,9 @@ const MAXIMUM_EXPANSIONS: usize = 2_000_000;
 const HEURISTIC_WEIGHT: i32 = 4;
 pub(crate) const MAXIMUM_UNREFRESHED_DUST_LENGTH: u8 = 15;
 const REPEATER_SEARCH_PENALTY: i32 = 24;
-// Preserve the proven three-unit refresh window so straight routes place the
-// minimum required repeaters while retaining room for a legal final refresh.
+// Retain the three-unit value for bounded local repair radii.  The complete
+// path search itself must consider an earlier legal refresh because a turny
+// suffix can have no repeater site inside this final window.
 pub(crate) const REPEATER_TURN_HEADROOM: u8 = 3;
 pub(crate) const BLOCKED_EDGE_COST: i32 = 1_000_000_000;
 
@@ -23,6 +24,19 @@ pub(crate) fn NormalizeEdge(First: Position, Second: Position) -> Edge {
 
 pub(crate) fn ManhattanDistance(First: Position, Second: Position) -> i32 {
     (First.0 - Second.0).abs() + (First.1 - Second.1).abs() + (First.2 - Second.2).abs()
+}
+
+fn RepeaterCostLowerBound(
+    PositionValue: Position,
+    Target: Position,
+    RemainingStrength: u8,
+) -> i32 {
+    let Distance = ManhattanDistance(PositionValue, Target);
+    let ReachWithoutRefresh = i32::from(RemainingStrength.saturating_sub(1));
+    let UncoveredDistance = (Distance - ReachWithoutRefresh).max(0);
+    let RefreshReach = i32::from(MAXIMUM_UNREFRESHED_DUST_LENGTH - 1);
+    let RequiredRefreshCount = (UncoveredDistance + RefreshReach - 1) / RefreshReach;
+    RequiredRefreshCount * REPEATER_SEARCH_PENALTY
 }
 
 fn PhysicalNeighbors(PositionValue: Position) -> Vec<Position> {
@@ -256,36 +270,43 @@ pub(crate) fn FindPathDetailedWithDeadline(
         .collect();
     FindPathFromStatesDetailedWithDeadline(
         Adjacency,
+        None,
+        None,
         &StartStates,
         Target,
         PreferredRoutingY,
         BlockedNodes,
         NodeCosts,
+        &HashMap::new(),
+        &HashMap::new(),
         EdgeCosts,
         BendPenalty,
         ViaPenalty,
         ProgressPenalty,
         MaximumExpansionCount,
         EnforceSignalStrength,
+        &HashSet::new(),
         &[],
         0,
         Deadline,
     )
 }
 
-fn CanTraverseTargetContinuation(
+fn BuildTargetContinuationRepeaterReservations(
     StartState: SearchState,
     Continuation: &[Position],
     EnforceSignalStrength: bool,
-) -> bool {
+    ForbiddenRepeaterPositions: &HashSet<Position>,
+) -> Option<Vec<(Position, String)>> {
     if Continuation.is_empty() {
-        return true;
+        return Some(Vec::new());
     }
     if Continuation[0] != StartState.0 {
-        return false;
+        return None;
     }
     let StartDirection = (0, 0, 0);
     let mut CurrentState = StartState;
+    let mut RepeaterReservations = Vec::new();
     for Next in Continuation.iter().skip(1) {
         let Direction = (
             Next.0 - CurrentState.0 .0,
@@ -296,35 +317,49 @@ fn CanTraverseTargetContinuation(
             && CurrentState.1 == Direction
             && Direction.1 == 0
             && CurrentState.0 .1 == Next.1
-            && CurrentState.2 <= REPEATER_TURN_HEADROOM;
+            && CurrentState.2 < MAXIMUM_UNREFRESHED_DUST_LENGTH - 1
+            && !ForbiddenRepeaterPositions.contains(&CurrentState.0);
         let RemainingStrength = if !EnforceSignalStrength {
             MAXIMUM_UNREFRESHED_DUST_LENGTH
         } else if CanPlaceRepeater {
+            let Facing = match (Direction.0, Direction.2) {
+                (1, 0) => "west",
+                (-1, 0) => "east",
+                (0, 1) => "north",
+                (0, -1) => "south",
+                _ => return None,
+            };
+            RepeaterReservations.push((CurrentState.0, Facing.to_string()));
             MAXIMUM_UNREFRESHED_DUST_LENGTH - 1
         } else if CurrentState.2 > 1 {
             CurrentState.2 - 1
         } else {
-            return false;
+            return None;
         };
         CurrentState = (*Next, Direction, RemainingStrength);
     }
-    true
+    Some(RepeaterReservations)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn FindPathFromStatesDetailedWithDeadline(
     Adjacency: &HashMap<Position, Vec<Position>>,
+    AllowedColumns: Option<&HashSet<(i32, i32)>>,
+    AdditionalAllowedNodes: Option<&HashSet<Position>>,
     StartStates: &[SearchState],
     Target: Position,
     PreferredRoutingY: i32,
     BlockedNodes: &HashSet<Position>,
     NodeCosts: &HashMap<Position, i32>,
+    AdditionalNodeCosts: &HashMap<Position, i32>,
+    ColumnCosts: &HashMap<(i32, i32), i32>,
     EdgeCosts: &HashMap<Edge, i32>,
     BendPenalty: i32,
     ViaPenalty: i32,
     ProgressPenalty: i32,
     MaximumExpansionCount: usize,
     EnforceSignalStrength: bool,
+    ForbiddenRepeaterPositions: &HashSet<Position>,
     TargetContinuation: &[Position],
     RejectedCountHint: usize,
     Deadline: &RuntimeDeadline,
@@ -365,7 +400,6 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
         .filter(|Value| Adjacency.contains_key(&Value.0))
         .collect();
     let StartStateSet: HashSet<SearchState> = StartStates.iter().copied().collect();
-    let StartSet: HashSet<Position> = StartStates.iter().map(|Value| Value.0).collect();
     if StartStates.is_empty() || !Adjacency.contains_key(&Target) {
         return Some(Failure(
             "NoPath",
@@ -381,18 +415,25 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
         .min()
         .copied()
     {
-        return Some(PathSearchResult {
-            Status: "Routed".to_string(),
-            NoPathReason: String::new(),
-            Path: vec![Target],
-            RepeaterConstraintFailures,
-            RepeaterReservations: Vec::new(),
-            ExpansionCount: 0,
-            StatePath: vec![StartState],
-            RepeaterRejectedCount,
-            IsRouted: true,
-            IsBudgetExpired: false,
-        });
+        if let Some(RepeaterReservations) = BuildTargetContinuationRepeaterReservations(
+            StartState,
+            TargetContinuation,
+            EnforceSignalStrength,
+            ForbiddenRepeaterPositions,
+        ) {
+            return Some(PathSearchResult {
+                Status: "Routed".to_string(),
+                NoPathReason: String::new(),
+                Path: vec![Target],
+                RepeaterConstraintFailures,
+                RepeaterReservations,
+                ExpansionCount: 0,
+                StatePath: vec![StartState],
+                RepeaterRejectedCount,
+                IsRouted: true,
+                IsBudgetExpired: false,
+            });
+        }
     }
     let mut LastNoPathReason = "NoPathGeometry";
     let RequiresStrengthState = EnforceSignalStrength;
@@ -417,7 +458,8 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
             }),
         );
         Heap.push(QueueItem {
-            EstimatedCost: ManhattanDistance(Start, Target) * HEURISTIC_WEIGHT,
+            EstimatedCost: ManhattanDistance(Start, Target) * HEURISTIC_WEIGHT
+                + RepeaterCostLowerBound(Start, Target, StartState.2),
             Cost: 0,
             Sequence,
             PositionValue: Start,
@@ -443,7 +485,7 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
             continue;
         }
         Expanded += 1;
-        if Expanded > MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS) {
+        if Expanded >= MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS) {
             return Some(Failure(
                 "NoPath",
                 "SearchLimitReached",
@@ -453,14 +495,17 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
             ));
         }
         if Current == Target {
-            if !CanTraverseTargetContinuation(
+            let Some(TargetContinuationRepeaters) =
+                BuildTargetContinuationRepeaterReservations(
                 CurrentState,
                 TargetContinuation,
                 EnforceSignalStrength,
-            ) {
+                ForbiddenRepeaterPositions,
+            )
+            else {
                 LastNoPathReason = "NoPathContinuation";
                 continue;
-            }
+            };
             let mut States = vec![CurrentState];
             let mut Cursor = CurrentState;
             while !StartStateSet.contains(&Cursor) {
@@ -497,6 +542,9 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
                 };
                 RepeaterReservations.push((PositionValue, Facing.to_string()));
             }
+            RepeaterReservations.extend(TargetContinuationRepeaters);
+            RepeaterReservations.sort_unstable();
+            RepeaterReservations.dedup();
             return Some(PathSearchResult {
                 Status: "Routed".to_string(),
                 NoPathReason: String::new(),
@@ -512,7 +560,17 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
         }
 
         for Neighbor in Adjacency.get(&Current).into_iter().flatten() {
-            if BlockedNodes.contains(Neighbor) && !StartSet.contains(Neighbor) {
+            if AllowedColumns.is_some_and(|Columns| {
+                !Columns.contains(&(Neighbor.0, Neighbor.2))
+                    && !AdditionalAllowedNodes.is_some_and(|Values| Values.contains(Neighbor))
+            }) {
+                continue;
+            }
+            // A blocked start is a legal launch state, but it is not a legal
+            // interior node for a path launched from another start.  Entering
+            // it would replace its authoritative incoming direction and can
+            // orient a repeater against the physical path that powers it.
+            if BlockedNodes.contains(Neighbor) {
                 continue;
             }
             if EdgeCosts
@@ -559,6 +617,11 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
                 + LayerCost
                 + ProgressCost
                 + NodeCosts.get(Neighbor).copied().unwrap_or(0)
+                + AdditionalNodeCosts.get(Neighbor).copied().unwrap_or(0)
+                + ColumnCosts
+                    .get(&(Neighbor.0, Neighbor.2))
+                    .copied()
+                    .unwrap_or(0)
                 + EdgeCosts
                     .get(&NormalizeEdge(Current, *Neighbor))
                     .copied()
@@ -567,34 +630,69 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
                 && Item.IncomingDirection == OutgoingDirection
                 && Item.IncomingDirection.1 == 0
                 && Current.1 == Neighbor.1
-                && Item.RemainingStrength <= REPEATER_TURN_HEADROOM;
+                && !ForbiddenRepeaterPositions.contains(&Current)
+                && Item.RemainingStrength < MAXIMUM_UNREFRESHED_DUST_LENGTH - 1;
             let mut StrengthOptions = Vec::with_capacity(2);
             if !RequiresStrengthState {
                 StrengthOptions.push((MAXIMUM_UNREFRESHED_DUST_LENGTH, 0));
-            } else if CanPlaceRepeater {
-                // Commit the first legal site in the final three strength
-                // units; retaining both successors multiplies equivalent A*
-                // states without improving straight-route legality.
-                StrengthOptions
-                    .push((MAXIMUM_UNREFRESHED_DUST_LENGTH - 1, REPEATER_SEARCH_PENALTY));
-            } else if Item.RemainingStrength > 1 {
-                StrengthOptions.push((Item.RemainingStrength - 1, 0));
             } else {
-                RepeaterConstraintFailures += 1;
-                RepeaterRejectedCount += 1;
+                if Item.RemainingStrength > 1 {
+                    StrengthOptions.push((Item.RemainingStrength - 1, 0));
+                }
+                if CanPlaceRepeater {
+                    StrengthOptions
+                        .push((MAXIMUM_UNREFRESHED_DUST_LENGTH - 1, REPEATER_SEARCH_PENALTY));
+                }
+                if StrengthOptions.is_empty() {
+                    RepeaterConstraintFailures += 1;
+                    RepeaterRejectedCount += 1;
+                }
             }
             for (RemainingStrength, RepeaterCost) in StrengthOptions {
                 let NewCost = BaseCost + RepeaterCost;
                 let NeighborState = (*Neighbor, OutgoingDirection, RemainingStrength);
-                if NewCost >= Costs.get(&NeighborState).copied().unwrap_or(i32::MAX) {
+                // Below the freshly repeated strength, a no-more-costly state
+                // at the same position/direction with more remaining power
+                // can perform every future dust or repeater transition of a
+                // weaker state.  Strength fourteen is deliberately excluded:
+                // a weaker state may place a repeater at this exact cell,
+                // while the current representation records a refresh only
+                // when strength increases.
+                let DominanceCeiling = if RemainingStrength
+                    < MAXIMUM_UNREFRESHED_DUST_LENGTH - 1
+                {
+                    MAXIMUM_UNREFRESHED_DUST_LENGTH - 2
+                } else {
+                    RemainingStrength
+                };
+                let Dominated = (RemainingStrength..=DominanceCeiling)
+                    .any(|CandidateStrength| {
+                        Costs
+                            .get(&(*Neighbor, OutgoingDirection, CandidateStrength))
+                            .is_some_and(|Cost| *Cost <= NewCost)
+                    });
+                if Dominated {
                     continue;
+                }
+                if RemainingStrength < MAXIMUM_UNREFRESHED_DUST_LENGTH - 1 {
+                    for CandidateStrength in 1..=RemainingStrength {
+                        let CandidateState =
+                            (*Neighbor, OutgoingDirection, CandidateStrength);
+                        if Costs
+                            .get(&CandidateState)
+                            .is_some_and(|Cost| *Cost >= NewCost)
+                        {
+                            Costs.remove(&CandidateState);
+                        }
+                    }
                 }
                 Costs.insert(NeighborState, NewCost);
                 Previous.insert(NeighborState, CurrentState);
                 Claims.insert(NeighborState, Rc::clone(&NextClaims));
                 Heap.push(QueueItem {
                     EstimatedCost: NewCost
-                        + ManhattanDistance(*Neighbor, Target) * HEURISTIC_WEIGHT,
+                        + ManhattanDistance(*Neighbor, Target) * HEURISTIC_WEIGHT
+                        + RepeaterCostLowerBound(*Neighbor, Target, RemainingStrength),
                     Cost: NewCost,
                     Sequence,
                     PositionValue: *Neighbor,

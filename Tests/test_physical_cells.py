@@ -12,7 +12,10 @@ from Compiler.Routing.Actions import (
     BuildPhysicalGraphs,
     NeighborPositions,
 )
-from Compiler.Routing.Actions.Repeaters import PruneRedundantRepeaterReservations
+from Compiler.Routing.Actions.Repeaters import (
+    FindSelfExcitingRepeaterCycles,
+    PruneRedundantRepeaterReservations,
+)
 from Compiler.Routing.Actions.Geometry import ValidatePlacedCellElectricalIsolation
 from Compiler.Routing.Workers.DetailedRouting import RustRoutingContext
 from Compiler.Simulation.Redstone import SimulateMinecraftRedstoneBlockMap
@@ -273,6 +276,31 @@ class PhysicalCellTests(unittest.TestCase):
             Reservations,
         )
         self.assertEqual([Value.Position for Value in Retained], [(14, 0, 0)])
+
+    def testRepeaterFeedbackUsesFinalDustGeometry(self) -> None:
+        Repeater = (0, 0, 0)
+        Nodes = (
+            Repeater,
+            (-1, 0, 0),
+            (-1, 0, 1),
+            (0, 0, 1),
+            (1, 0, 1),
+            (1, 0, 0),
+        )
+        Graph = {Position: [] for Position in Nodes}
+        for First, Second in zip(Nodes, (*Nodes[1:], Nodes[0])):
+            Graph[First].append(Second)
+            Graph[Second].append(First)
+
+        Cycles = FindSelfExcitingRepeaterCycles(
+            Graph,
+            {Repeater: "west"},
+        )
+
+        self.assertEqual(len(Cycles), 1)
+        self.assertEqual(Cycles[0][0], Repeater)
+        self.assertEqual(Cycles[0][1][0], (1, 0, 0))
+        self.assertEqual(Cycles[0][1][-1], (-1, 0, 0))
 
     def testTemplateRepeatersAllBridgeDeclaredMacroPins(self) -> None:
         for Name, PathValue in LitematicTemplates.items():

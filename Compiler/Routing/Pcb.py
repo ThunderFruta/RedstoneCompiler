@@ -692,6 +692,7 @@ def RoutePcbAttempt(
     PrepareTrackAssignmentOnly: bool = False,
     PrepareRawRouteGuideFactorDomainOnly: bool = False,
     PrepareRawTrackAssignmentDomainOnly: bool = False,
+    FrozenNativeRouteGuideRecipes: tuple[Any, ...] = (),
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
@@ -898,6 +899,9 @@ def RoutePcbAttempt(
                 PrepareRawTrackAssignmentDomainOnly=(
                     PrepareRawTrackAssignmentDomainOnly
                 ),
+                FrozenNativeRouteGuideRecipes=(
+                    FrozenNativeRouteGuideRecipes
+                ),
                 FrozenTrackAssignmentPreparation=(
                     FrozenTrackAssignmentPreparation
                 ),
@@ -989,18 +993,37 @@ def RoutePcbAttempt(
         if (Placement.Placed.LocalRouteClaims or ())
         else AccessLength
     )
-    ReportStatus(f"compacting access length {CompactionAccessLength}")
-    if Deadline is not None:
-        Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "before"})
-    Routed = CompactRoutedTrees(
-        Placement,
-        Routed,
-        AccessLength=CompactionAccessLength,
-        Resources=Resources,
-        Deadline=Deadline,
+    PreserveFrozenDetailedWitness = bool(
+        FrozenTrackAssignmentPreparation is not None
+        and FrozenTrackAssignmentPreparation.Success
+        and FrozenTrackAssignmentPreparation.Complete
     )
-    if Deadline is not None:
-        Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "after"})
+    if PreserveFrozenDetailedWitness:
+        # A complete pre-route witness selects one exact detailed physical
+        # world.  CompactRoutedTrees chooses fresh shortest geometric paths;
+        # doing so here can discard the selected repeater topology and is a
+        # second route-shape decision after the frozen handoff.  Preserve the
+        # route that already passed claim, connectivity, and power checks.
+        ReportStatus("preserving frozen selected-world route")
+        Routed.RoutingControlEffectiveness[
+            "FrozenSelectedWorldCompaction"
+        ] = {
+            "Skipped": True,
+            "Reason": "frozen-detailed-witness-is-final-authority",
+        }
+    else:
+        ReportStatus(f"compacting access length {CompactionAccessLength}")
+        if Deadline is not None:
+            Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "before"})
+        Routed = CompactRoutedTrees(
+            Placement,
+            Routed,
+            AccessLength=CompactionAccessLength,
+            Resources=Resources,
+            Deadline=Deadline,
+        )
+        if Deadline is not None:
+            Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "after"})
     if FrozenNetWires:
         NetWires = {}
         for Signal, Positions in Routed.NetWires.items():
@@ -1452,6 +1475,10 @@ def PrepareRawRouteGuideFactorDomain(
     Resources: Any,
     Policy: PhysicalDesignPolicy,
     Deadline: RoutingDeadline,
+    FrozenNativeRouteGuideRecipes: tuple[Any, ...] = (),
+    FrozenTrackAssignmentPreparation: (
+        TrackAssignmentPreparation | None
+    ) = None,
 ) -> RawTrackAssignmentDomain:
     """Freeze portal/guide capacity factors before detailed tree expansion."""
     Configuration = BuildPcbRoutingConfigurations(Placement)[0]
@@ -1463,6 +1490,10 @@ def PrepareRawRouteGuideFactorDomain(
             Policy=Policy,
             Deadline=Deadline,
             PrepareRawRouteGuideFactorDomainOnly=True,
+            FrozenNativeRouteGuideRecipes=FrozenNativeRouteGuideRecipes,
+            FrozenTrackAssignmentPreparation=(
+                FrozenTrackAssignmentPreparation
+            ),
         )
     except RawTrackAssignmentDomainPrepared as Prepared:
         return Prepared.Domain

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Any
 
 from .ChannelPlanner import ChannelPlan, RoutingStageMetrics
@@ -717,6 +718,32 @@ class PlacementAccessEscapeStub:
     CapacityResourceIds: tuple[RoutingResourceId, ...]
     Complete: bool
     IncompleteReason: str = ""
+    ChoiceId: str = ""
+    PhysicalClaimsFingerprint: str = ""
+    PhysicalClaimsDeferred: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.ChoiceId:
+            object.__setattr__(
+                self,
+                "ChoiceId",
+                BuildPlacementAccessEscapeStubChoiceId(self),
+            )
+        if not self.PhysicalClaimsFingerprint:
+            object.__setattr__(
+                self,
+                "PhysicalClaimsFingerprint",
+                BuildPlacementAccessEscapeStubClaimsFingerprint(self),
+            )
+        if self.PhysicalClaimsDeferred and (
+            self.PhysicalClaims.WireCells != frozenset(self.Path)
+            or self.PhysicalClaims.SupportCells
+            or self.PhysicalClaims.ElectricalCells
+        ):
+            raise ValueError(
+                "deferred access claims must retain only their exact path "
+                "and required-air cells"
+            )
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -738,7 +765,41 @@ class PlacementAccessEscapeStub:
             ],
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
+            "ChoiceId": self.ChoiceId,
+            "PhysicalClaimsFingerprint": self.PhysicalClaimsFingerprint,
+            "PhysicalClaimsDeferred": self.PhysicalClaimsDeferred,
         }
+
+
+def BuildPlacementAccessEscapeStubChoiceId(
+    Stub: PlacementAccessEscapeStub,
+) -> str:
+    """Return the stable exact-physical choice id for one access stub."""
+    ExistingChoiceId = str(getattr(Stub, "ChoiceId", ""))
+    if ExistingChoiceId:
+        return ExistingChoiceId
+    Path = tuple(Stub.Path)
+    Terminal = tuple(getattr(Stub, "Terminal", Path[0]))
+    Ingress = tuple(getattr(Stub, "Ingress", Path[-1]))
+    return sha256(repr((
+        "placement-access-escape-stub-choice-v1",
+        Terminal,
+        Ingress,
+        Path,
+    )).encode("utf-8")).hexdigest()[:16]
+
+
+def BuildPlacementAccessEscapeStubClaimsFingerprint(
+    Stub: PlacementAccessEscapeStub,
+) -> str:
+    Claims = Stub.PhysicalClaims
+    return sha256(repr((
+        "placement-access-escape-stub-claims-v1",
+        tuple(sorted(Claims.WireCells)),
+        tuple(sorted(Claims.SupportCells)),
+        tuple(sorted(Claims.RequiredAirCells)),
+        tuple(sorted(Claims.ElectricalCells)),
+    )).encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -1076,6 +1137,8 @@ class PlacementAccessFabric:
     NativeEscapeKernelExpansionCount: int = 0
     NativeEscapeKernelComplete: bool = True
     NativeEscapeKernelElapsedSeconds: float = 0.0
+    NativeEscapeSharedBatchUsed: bool = False
+    NativeEscapeSharedBatchElapsedSeconds: float = 0.0
     NativeEscapeFallbackUsed: bool = False
     NativeClaimBatchWorkItems: int = 0
     NativeClaimBatchWorkerCount: int = 0
@@ -1145,6 +1208,12 @@ class PlacementAccessFabric:
             "NativeEscapeKernelComplete": self.NativeEscapeKernelComplete,
             "NativeEscapeKernelElapsedSeconds": (
                 self.NativeEscapeKernelElapsedSeconds
+            ),
+            "NativeEscapeSharedBatchUsed": (
+                self.NativeEscapeSharedBatchUsed
+            ),
+            "NativeEscapeSharedBatchElapsedSeconds": (
+                self.NativeEscapeSharedBatchElapsedSeconds
             ),
             "NativeEscapeFallbackUsed": self.NativeEscapeFallbackUsed,
             "NativeClaimBatchWorkItems": self.NativeClaimBatchWorkItems,

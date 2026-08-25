@@ -54,6 +54,7 @@ from .ChannelPlanner import (
 )
 from .Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from .Models import (
+    BuildPlacementAccessEscapeStubChoiceId,
     CertifiedPhysicalComponentApertureDomain,
     ClusterInterfaceAssignment,
     ClusterInterfaceAssignmentPrepared,
@@ -172,6 +173,7 @@ from .TrackAssignment import AssignedTrack, TrackAssignment
 from .Actions.Geometry import BuildPlacedOmnidirectionalControlSourcesBySignal
 from .LocalFirst import (
     BuildCapacityAwareGuidePlan,
+    CoarseGuidePlan,
     DeriveRoutingBudget,
     EstimateRoutingDemand,
 )
@@ -3216,6 +3218,48 @@ def BuildGeneratedFixedPortalDomainExhaustionProof(
             "ConflictPairCount": int(ConflictPairCount),
         }),
     }
+
+
+def FindCompleteEmptyPortalEndpointDomains(
+    Profiles: dict[str, Any],
+    Portals: dict[
+        tuple[str, Position3, int],
+        tuple[PinAccessPortal, ...],
+    ],
+    CompletePortalDomainKeys: Iterable[tuple[str, Position3, int]],
+    LayerCount: int,
+) -> tuple[tuple[str, str, Position3], ...]:
+    """Return endpoints whose exact per-layer portal domain is proven empty.
+
+    A single required source or target endpoint with no portal on any routing
+    layer makes the member assignment empty.  The result is reported only
+    when every constituent layer key is present in the immutable completion
+    set; a bounded or expired portal search is therefore never promoted to an
+    infeasibility proof.
+    """
+    CompleteKeys = frozenset(CompletePortalDomainKeys)
+    EmptyEndpoints: list[tuple[str, str, Position3]] = []
+    for Signal, Profile in sorted(Profiles.items()):
+        Endpoints = (
+            ("source", Profile.Root),
+            *(("target", Target) for Target in Profile.Targets),
+        )
+        for EndpointKind, Terminal in Endpoints:
+            LayerKeys = tuple(
+                (Signal, Terminal, Layer)
+                for Layer in range(LayerCount)
+            )
+            if (
+                LayerKeys
+                and all(Key in CompleteKeys for Key in LayerKeys)
+                and not any(Portals.get(Key, ()) for Key in LayerKeys)
+            ):
+                EmptyEndpoints.append((
+                    str(Signal),
+                    str(EndpointKind),
+                    tuple(int(Value) for Value in Terminal),
+                ))
+    return tuple(EmptyEndpoints)
 
 
 def PortalTupleFeasibilityDomainIsComplete(
@@ -7143,10 +7187,22 @@ class CandidateRequestShapeDescriptor:
     GuideExpansion: int
     InitiallyDeferred: bool
     Priority: tuple[object, ...]
+    PhysicalGuide: frozenset[Position2] | None = None
+    AccessRamps: tuple[tuple[Position3, ...], ...] = ()
+    DetailedHintPaths: tuple[tuple[Position3, ...], ...] = ()
+    CertifiedRepeaters: tuple[tuple[Position3, str], ...] = ()
 
     @cached_property
     def SortedGuide(self) -> tuple[Position2, ...]:
         return tuple(sorted(self.Guide))
+
+    @cached_property
+    def SortedPhysicalGuide(self) -> tuple[Position2, ...]:
+        return tuple(sorted(
+            self.PhysicalGuide
+            if self.PhysicalGuide is not None
+            else self.Guide
+        ))
 
     @cached_property
     def FactorId(self) -> str:
@@ -7166,6 +7222,10 @@ class CandidateRequestShapeDescriptor:
             self.GuideExpansion,
             self.InitiallyDeferred,
             self.Priority,
+            self.SortedPhysicalGuide,
+            self.AccessRamps,
+            self.DetailedHintPaths,
+            self.CertifiedRepeaters,
         )
 
     @cached_property
@@ -7433,20 +7493,104 @@ def BuildCompactGuideSpineClaims(
     )
 
 
+@dataclass(frozen=True)
+class FactorizedCandidateRouteRequest:
+    """One detailed request over interned access and guide payloads.
+
+    Python keeps the exact finite request ordering, while the native batch
+    receives each repeated access/guide payload once and lightweight index
+    references for the Cartesian request domain.
+    """
+
+    AccessPayload: tuple[
+        tuple[Position3, ...],
+        tuple[Position3, ...],
+        tuple[tuple[Position3, ...], ...],
+        tuple[tuple[Position3, ...], ...],
+        tuple[Position3, ...],
+        tuple[Position3, ...],
+        tuple[Position3, ...],
+        tuple[Position3, ...],
+        tuple[Position3, ...],
+        tuple[Position3, ...],
+    ]
+    GuidePayload: tuple[
+        tuple[Position2, ...],
+        tuple[Position2, ...],
+        tuple[Position3, ...],
+        tuple[tuple[Position3, ...], ...],
+        tuple[tuple[Position3, str], ...],
+    ]
+    PreferredRoutingY: int
+    GuidePenalty: int
+    BendPenalty: int
+    ViaPenalty: int
+    MaximumExpansionCount: int
+
+    def ToExpandedRequest(self) -> tuple[Any, ...]:
+        Starts = self.AccessPayload[0]
+        TargetBranches = self.AccessPayload[2]
+        RequiredNodes = self.AccessPayload[4]
+        BlockedNodes = self.AccessPayload[5]
+        AllowedColumns, PreferredColumns, _ExactHintNodes, *_Certificate = (
+            self.GuidePayload
+        )
+        return (
+            Starts,
+            TargetBranches,
+            AllowedColumns,
+            RequiredNodes,
+            BlockedNodes,
+            PreferredColumns,
+            self.PreferredRoutingY,
+            self.GuidePenalty,
+            self.BendPenalty,
+            self.ViaPenalty,
+            self.MaximumExpansionCount,
+        )
+
+    @cached_property
+    def RequestFingerprint(self) -> str:
+        return BuildStableFingerprint((
+            "factorized-candidate-route-request-v1",
+            self.ToExpandedRequest(),
+        ))
+
+    def __str__(self) -> str:
+        return self.RequestFingerprint
+
+    def __len__(self) -> int:
+        return 11
+
+    def __iter__(self):
+        return iter(self.ToExpandedRequest())
+
+    def __getitem__(self, Index: int) -> Any:
+        return self.ToExpandedRequest()[Index]
+
+
+@dataclass(frozen=True)
+class FactorizedNativeRouteTreeResult:
+    """Native tree nodes paired with their proved repeater reservations."""
+
+    Nodes: tuple[Position3, ...]
+    RepeaterReservations: tuple[tuple[Position3, str], ...]
+
+
 @dataclass
 class LazyCandidateRouteRequest:
     """Materialize an ordinary physical-global request only when executed."""
 
     Shape: CandidateRequestShapeDescriptor
-    Builder: Callable[[], tuple[Any, ...] | None] = field(repr=False)
-    _Materialized: tuple[Any, ...] | None = field(
+    Builder: Callable[[], Any | None] = field(repr=False)
+    _Materialized: Any | None = field(
         default=None,
         init=False,
         repr=False,
     )
     _WasMaterialized: bool = field(default=False, init=False, repr=False)
 
-    def Materialize(self) -> tuple[Any, ...] | None:
+    def Materialize(self) -> Any | None:
         if not self._WasMaterialized:
             self._Materialized = self.Builder()
             self._WasMaterialized = True
@@ -17492,6 +17636,7 @@ def BuildPlacementAccessStubFactorDomain(
         Stubs = tuple(getattr(Domain, "EscapeStubs", ()))
         CandidateCounts.append((Signal, len(Stubs)))
         for StubIndex, Stub in enumerate(Stubs):
+            StubChoiceId = BuildPlacementAccessEscapeStubChoiceId(Stub)
             Claims = Stub.PhysicalClaims
             ResourcePositions.update(Claims.WireCells)
             ResourcePositions.update(Claims.SupportCells)
@@ -17500,8 +17645,8 @@ def BuildPlacementAccessStubFactorDomain(
             Values.append(RawTrackAssignmentValue(
                 Signal=Signal,
                 OwnerSignal=str(Domain.Signal),
-                CandidateId=f"stub:{DomainIndex}:{StubIndex}",
-                SourceCandidateId=f"stub:{DomainIndex}:{StubIndex}",
+                CandidateId=f"stub:{StubChoiceId}",
+                SourceCandidateId=f"stub:{StubChoiceId}",
                 Claims=Claims,
                 MaterialCost=len(Claims.WireCells),
                 FootprintGrowth=len({
@@ -17521,7 +17666,7 @@ def BuildPlacementAccessStubFactorDomain(
                         PlacementAccessStubContractRequirementName(
                             LogicalKey
                         ),
-                        str(StubIndex),
+                            StubChoiceId,
                     ),
                 })),
             ))
@@ -20022,14 +20167,6 @@ def _MaterializeCandidate(
     Claims = Resources.ResourceGraph.BuildRouteClaims(Nodes)
     SelfClaimConflicts = FindSelfClaimConflicts({Signal: Claims})
     if SelfClaimConflicts:
-        if os.environ.get("RCS_DEBUG_MATERIALIZE") == Signal:
-            print(
-                "[debug] authoritative: self-claim conflicts "
-                f"signal={Signal} conflicts="
-                f"{tuple(sorted(SelfClaimConflicts, key=str))} "
-                f"tree={tuple(RoutedTree)}",
-                flush=True,
-            )
         if RejectionCounts is not None:
             RejectionCounts["SelfClaimConflict"] += 1
         RecordMaterialization(
@@ -20044,51 +20181,6 @@ def _MaterializeCandidate(
         if Target not in RootComponent
     ]
     MissingSeedNodes = sorted(SeedNodes - RootComponent)
-    if os.environ.get("RCS_DEBUG_MATERIALIZE") and (
-        MissingPaths or MissingSeedNodes
-    ):
-        import os as _os_debug
-        if _os_debug.environ.get("RCS_DEBUG_MATERIALIZE") == Signal:
-            Starts = tuple(dict.fromkeys((*Profile.SourceAccessPath, *SourcePortal.Path)))
-            Component = _FindComponentNodes(Graph, Profile.Root)
-            MinX = min(Position[0] for Position in RoutedTree) if RoutedTree else None
-            MaxX = max(Position[0] for Position in RoutedTree) if RoutedTree else None
-            print(
-                "[debug] authoritative: materialization connectivity failure "
-                f"signal={Signal} root={Profile.Root} missing={tuple(MissingPaths)} "
-                f"nodes={len(Nodes)} tree={len(RoutedTree)}",
-                flush=True,
-            )
-            print(
-                "[debug] authoritative: materialization bounds "
-                f"x=({MinX},{MaxX}) y=({min(Position[1] for Position in RoutedTree)},"
-                f"{max(Position[1] for Position in RoutedTree)}) "
-                f"rootInTree={Profile.Root in Nodes} "
-                f"rootComponent={len(Component)} startCount={len(Starts)}",
-                flush=True,
-            )
-            print(
-                f"[debug] authoritative: materialization starts={Starts}",
-                flush=True,
-            )
-            print(
-                "[debug] authoritative: materialization targetPaths=" +
-                str({
-                    Target: Profile.TargetAccessPaths[Target]
-                    for Target in Profile.Targets
-                }),
-                flush=True,
-            )
-            print(
-                "[debug] authoritative: materialization sourcePath=" +
-                str(Profile.SourceAccessPath),
-                flush=True,
-            )
-            print(
-                "[debug] authoritative: routedTreePrefix="
-                f"{tuple(sorted(RoutedTree))[:32]}",
-                flush=True,
-            )
     if MissingPaths or MissingSeedNodes:
         if RejectionCounts is not None:
             RejectionCounts["Disconnected"] += 1
@@ -20115,8 +20207,6 @@ def _MaterializeCandidate(
         Position: Position3,
         Facing: str,
     ) -> bool:
-        if len(Graph.get(Position, ())) != 2:
-            return False
         FlatNeighbors = tuple(
             Neighbor
             for Neighbor in Graph.get(Position, ())
@@ -20260,6 +20350,15 @@ def _MaterializeCandidate(
             FallbackUsed=RepeaterSource != "native",
             PoweredTargetCount=PoweredTargetCount,
             TargetCount=len(Profile.Targets),
+            TargetPathLengths={
+                str(Target): len(Path)
+                for Target, Path in sorted(TargetPaths.items())
+            },
+            TargetPathPrefixes={
+                str(Target): [list(Position) for Position in Path[:20]]
+                for Target, Path in sorted(TargetPaths.items())
+            },
+            RoutedNodeCount=len(Nodes),
         )
         return None
     Edges = frozenset(
@@ -20384,6 +20483,27 @@ def ShouldRetryNegotiatedExactAssignment(
     )
 
 
+def BuildExactPortalAccessPrefix(
+    Profile: Any,
+    Terminal: Position3,
+    Portal: PinAccessPortal,
+) -> tuple[Position3, ...]:
+    """Resolve the ordinary terminal path ending at a portal start."""
+    AccessPath = (
+        Profile.SourceAccessPath
+        if tuple(Terminal) == tuple(Profile.Root)
+        else Profile.TargetAccessPaths[tuple(Terminal)]
+    )
+    if not Portal.Path:
+        return tuple(AccessPath)
+    Start = tuple(Portal.Path[0])
+    try:
+        StartIndex = tuple(AccessPath).index(Start)
+    except ValueError:
+        return tuple(AccessPath)
+    return tuple(AccessPath[:StartIndex + 1])
+
+
 def PlanNegotiatedRouteTrees(
     Context: Any,
     Profiles: dict[str, Any],
@@ -20404,9 +20524,17 @@ def PlanNegotiatedRouteTrees(
     RequestHigherLayerOnExactCut: bool = False,
     AdvancePlacementOnExhaustedExactCut: bool = False,
     CompleteSeedDomain: bool = False,
+    ForeignControlBlockedNodesForSignal: (
+        Callable[[str], frozenset[Position3]] | None
+    ) = None,
 ) -> NegotiatedRoutePlan:
     """Route one tree per net and negotiate exact Redstone claim conflicts."""
     Negotiated = Policy.NegotiatedRouting
+    EffectiveForeignControlBlockedNodes = (
+        ForeignControlBlockedNodesForSignal
+        if ForeignControlBlockedNodesForSignal is not None
+        else lambda _Signal: frozenset()
+    )
     TileSize = 4 * Technology.TrackPitch
     SignalOrder = tuple(sorted(
         Profiles,
@@ -21777,7 +21905,7 @@ def PlanNegotiatedRouteTrees(
             )
         SearchBlockedNodes = {
             *BlockedNodeValues,
-            *ForeignControlBlockedNodes(Signal),
+            *EffectiveForeignControlBlockedNodes(Signal),
         }
         RequiredNodeSet = set(RequiredNodes)
         if IsPartialSeedCompletion:
@@ -22115,7 +22243,7 @@ def PlanNegotiatedRouteTrees(
                 sorted(AllowedNodes),
                 sorted({
                     *BlockedNodeValues,
-                    *ForeignControlBlockedNodes(Signal),
+                    *EffectiveForeignControlBlockedNodes(Signal),
                 }),
                 sorted(PreferredColumns),
                 list(NodeCosts or ()),
@@ -35711,6 +35839,7 @@ def RouteAuthoritativeResources(
     PrepareTrackAssignmentOnly: bool = False,
     PrepareRawRouteGuideFactorDomainOnly: bool = False,
     PrepareRawTrackAssignmentDomainOnly: bool = False,
+    FrozenNativeRouteGuideRecipes: tuple[Any, ...] = (),
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     FrozenRoutingEnvelope: Any | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
@@ -35886,11 +36015,58 @@ def RouteAuthoritativeResources(
             *RegenerateSignals,
             *CachedComponentSignals,
         ))
+    FrozenAccessOnlyCatalog = bool(
+        FrozenTrackAssignmentPreparation is not None
+        and dict(FrozenTrackAssignmentPreparation.Diagnostics).get(
+            "CompactAccessOnlyCatalog",
+            False,
+        )
+    )
+    FrozenContractLayerCount: int | None = None
+    if FrozenTrackAssignmentPreparation is not None:
+        FrozenContractValues = dict(
+            FrozenTrackAssignmentPreparation.SelectedContractRequirements
+        )
+        FrozenLayerValue = FrozenContractValues.get("layers")
+        if FrozenLayerValue is not None:
+            try:
+                FrozenContractLayerCount = int(FrozenLayerValue)
+            except (TypeError, ValueError) as Error:
+                raise RoutingStageError(RoutingFailure(
+                    Reason=(
+                        RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                    ),
+                    Stage="FrozenPreRouteFactorHandoff",
+                    Detail=(
+                        "the selected pre-route contract has an invalid "
+                        "routing-layer count"
+                    ),
+                    Diagnostics={
+                        "SelectedContractRequirements": [
+                            list(Value)
+                            for Value in (
+                                FrozenTrackAssignmentPreparation
+                                .SelectedContractRequirements
+                            )
+                        ],
+                    },
+                )) from Error
+            if FrozenContractLayerCount < 1:
+                raise RoutingStageError(RoutingFailure(
+                    Reason=(
+                        RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                    ),
+                    Stage="FrozenPreRouteFactorHandoff",
+                    Detail=(
+                        "the selected pre-route contract has a nonpositive "
+                        "routing-layer count"
+                    ),
+                ))
     if FrozenTrackAssignmentPreparation is not None:
         FrozenCandidateDomainFingerprint = str(
             FrozenTrackAssignmentPreparation.CandidateDomainFingerprint
         )
-        if FrozenCandidateDomainFingerprint:
+        if FrozenCandidateDomainFingerprint and not FrozenAccessOnlyCatalog:
             FrozenCandidateCacheRecord = (
                 Resources.FrozenRawTrackAssignmentCandidateCaches.get(
                     FrozenCandidateDomainFingerprint
@@ -36423,6 +36599,10 @@ def RouteAuthoritativeResources(
         **KeywordArguments: object,
     ) -> NegotiatedRoutePlan:
         """Preserve planner telemetry when a nested negotiated pass fails."""
+        KeywordArguments.setdefault(
+            "ForeignControlBlockedNodesForSignal",
+            ForeignControlBlockedNodes,
+        )
         try:
             return PlanNegotiatedRouteTrees(
                 *Arguments,
@@ -37403,6 +37583,20 @@ def RouteAuthoritativeResources(
         # ordinary routable resources on the recursive attempt.
         Position for Claim in AllLocalClaims for Position in Claim.Nodes
     )
+    ReservedAccess = frozenset((
+        *ReservedAccess,
+        *(
+            Position
+            for _Signal, _CandidateId, Shape in (
+                FrozenTrackAssignmentPreparation
+                .SelectedRouteGuideFactorDescriptors
+                if FrozenTrackAssignmentPreparation is not None
+                else ()
+            )
+            for Portal in (Shape.SourcePortal, *Shape.TargetPortals)
+            for Position in Portal.Path
+        ),
+    ))
     if PlacementAccessFabric is not None:
         ReservedAccess = frozenset((
             *ReservedAccess,
@@ -37516,6 +37710,26 @@ def RouteAuthoritativeResources(
             EffectiveMaximumLayerCount,
             int(InterfaceDeckLayer) + 1,
         )
+    if (
+        FrozenContractLayerCount is not None
+        and FrozenContractLayerCount > EffectiveMaximumLayerCount
+    ):
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="FrozenPreRouteFactorHandoff",
+            Detail=(
+                "the selected pre-route layer contract is outside the "
+                "authoritative routing envelope"
+            ),
+            Diagnostics={
+                "SelectedLayerCount": FrozenContractLayerCount,
+                "EffectiveMaximumLayerCount": (
+                    EffectiveMaximumLayerCount
+                ),
+                "HeightCapacity": HeightCapacity,
+                "PolicyMaximumLayerCount": MaximumLayerCount,
+            },
+        ))
     NegotiatedLayerFloor = (
         ceil(
             Demand.TerminalCount
@@ -37548,6 +37762,11 @@ def RouteAuthoritativeResources(
             Policy.Placement.ForceMaximumRoutingLayersAfterPlacementRelocation
         ),
     )
+    if FrozenContractLayerCount is not None:
+        # This value was selected as part of the immutable member contract.
+        # Reopening the adaptive layer ladder here would route a different
+        # world and can make exact fabric ingresses disappear.
+        LayerCount = FrozenContractLayerCount
     if InterfaceDeckLayer is not None:
         LayerCount = max(
             LayerCount,
@@ -37732,6 +37951,65 @@ def RouteAuthoritativeResources(
         CachedGuideInputFingerprint
         and CachedGuideInputFingerprint == GuideInputFingerprint
     )
+    FrozenSelectedGuideDescriptors = {
+        str(Signal): (str(CandidateId), Descriptor)
+        for Signal, CandidateId, Descriptor in (
+            FrozenTrackAssignmentPreparation
+            .SelectedRouteGuideFactorDescriptors
+            if FrozenTrackAssignmentPreparation is not None
+            else ()
+        )
+    }
+    FrozenSelectedGuidePlan = None
+    if (
+        FrozenSelectedGuideDescriptors
+        and set(FrozenSelectedGuideDescriptors) == set(Profiles)
+    ):
+        FrozenGuideUsage = Counter(
+            (
+                int(Descriptor.Layer),
+                int(Position[0]),
+                int(Position[1]),
+            )
+            for _CandidateId, Descriptor
+            in FrozenSelectedGuideDescriptors.values()
+            for Position in Descriptor.Guide
+        )
+        FrozenSelectedGuidePlan = CoarseGuidePlan(
+            Guides={
+                Signal: frozenset(Descriptor.Guide)
+                for Signal, (_CandidateId, Descriptor)
+                in FrozenSelectedGuideDescriptors.items()
+            },
+            Layers={
+                Signal: int(Descriptor.Layer)
+                for Signal, (_CandidateId, Descriptor)
+                in FrozenSelectedGuideDescriptors.items()
+            },
+            Axes={
+                Signal: str(Descriptor.Axis)
+                for Signal, (_CandidateId, Descriptor)
+                in FrozenSelectedGuideDescriptors.items()
+            },
+            Lanes={
+                Signal: int(Descriptor.Lane)
+                for Signal, (_CandidateId, Descriptor)
+                in FrozenSelectedGuideDescriptors.items()
+            },
+            Usage=dict(FrozenGuideUsage),
+            Overflow={
+                Resource: Count - Policy.GlobalRouting.CorridorCapacity
+                for Resource, Count in FrozenGuideUsage.items()
+                if Count > Policy.GlobalRouting.CorridorCapacity
+            },
+            LocalSignals=frozenset(),
+            Iterations=(),
+            LocalInputFingerprintsBySignal={
+                Signal: CandidateId
+                for Signal, (CandidateId, _Descriptor)
+                in FrozenSelectedGuideDescriptors.items()
+            },
+        )
     GuidePlanningStarted = monotonic()
     # Logical component preparation may see only the cut-local profile set.
     # Physical assembly preparation is different: it freezes the complete
@@ -37890,7 +38168,9 @@ def RouteAuthoritativeResources(
             (),
         )
     )
-    if ReuseFrozenPhysicalPortGuidePlan:
+    if FrozenSelectedGuidePlan is not None:
+        CoarsePlan = FrozenSelectedGuidePlan
+    elif ReuseFrozenPhysicalPortGuidePlan:
         CoarsePlan = FrozenPhysicalComponentGuidePlan
     elif ReuseCachedGuidePlan:
         assert RawPortalCache is not None
@@ -38084,7 +38364,12 @@ def RouteAuthoritativeResources(
         else ""
     )
     WorkTelemetry["GlobalGuidePlanCacheHit"] = bool(
-        ReuseCachedGuidePlan or ReuseFrozenPhysicalPortGuidePlan
+        ReuseCachedGuidePlan
+        or ReuseFrozenPhysicalPortGuidePlan
+        or FrozenSelectedGuidePlan is not None
+    )
+    WorkTelemetry["FrozenSelectedGuidePlanReused"] = bool(
+        FrozenSelectedGuidePlan is not None
     )
     WorkTelemetry["FrozenPhysicalPortGuidePlanReused"] = bool(
         ReuseFrozenPhysicalPortGuidePlan
@@ -38384,19 +38669,56 @@ def RouteAuthoritativeResources(
     ResourceGraphStarted = monotonic()
     if FrozenPostClosurePortalHandoffApplied:
         assert RawPortalCache is not None
-        Bounds = tuple(RawPortalCache.Region.Bounds)
+        CachedBounds = tuple(RawPortalCache.Region.Bounds)
+        Bounds = (
+            min(
+                int(CachedBounds[0]),
+                *(Position[0] for Position in ReservedAccess),
+            ),
+            max(
+                int(CachedBounds[1]),
+                *(Position[0] for Position in ReservedAccess),
+            ),
+            min(
+                int(CachedBounds[2]),
+                *(Position[1] for Position in ReservedAccess),
+            ),
+            max(
+                int(CachedBounds[3]),
+                *(Position[1] for Position in ReservedAccess),
+            ),
+            min(
+                int(CachedBounds[4]),
+                *(Position[2] for Position in ReservedAccess),
+            ),
+            max(
+                int(CachedBounds[5]),
+                *(Position[2] for Position in ReservedAccess),
+            ),
+        )
         EffectiveAssignedColumns = RawPortalCache.AssignedColumns
-        ReservedAccess = RawPortalCache.ReservedAccess
+        ReservedAccess = frozenset((
+            *ReservedAccess,
+            *RawPortalCache.ReservedAccess,
+        ))
     else:
         EffectiveAssignedColumns = frozenset(AssignedColumns)
     ReuseCachedRegion = bool(
-        FrozenPostClosurePortalHandoffApplied
-        or (
-            RawPortalCache is not None
-            and RawPortalCache.MatchesPlacementResources(Placed, Resources)
-            and RawPortalCache.AssignedColumns == EffectiveAssignedColumns
-            and RawPortalCache.ReservedAccess == ReservedAccess
-            and getattr(RawPortalCache.Region, "Bounds", None) == Bounds
+        RawPortalCache is not None
+        and (
+            (
+                FrozenPostClosurePortalHandoffApplied
+                and RawPortalCache.ReservedAccess == ReservedAccess
+                and getattr(RawPortalCache.Region, "Bounds", None) == Bounds
+            )
+            or (
+                RawPortalCache.MatchesPlacementResources(Placed, Resources)
+                and RawPortalCache.AssignedColumns
+                == EffectiveAssignedColumns
+                and RawPortalCache.ReservedAccess == ReservedAccess
+                and getattr(RawPortalCache.Region, "Bounds", None)
+                == Bounds
+            )
         )
     )
     Region = (
@@ -38415,6 +38737,7 @@ def RouteAuthoritativeResources(
     PhysicalExteriorRegionFingerprint = (
         RawPortalCache.ExteriorRegionFingerprint
         if FrozenPostClosurePortalHandoffApplied
+        and ReuseCachedRegion
         and RawPortalCache is not None
         else BuildStableFingerprint((
             "physical-exterior-routing-region-v1",
@@ -40938,6 +41261,25 @@ def RouteAuthoritativeResources(
                 for Key, Values in Portals.items()
                 if (Key[0], Key[1]) in BoundaryLeaseTerminalPairs
             }
+            if (
+                PlacementAccessFabric is not None
+                and PlacementAccessAssignment is not None
+            ):
+                # The frozen access assignment is the authoritative
+                # terminal-to-ingress portal domain.  Lease validation must
+                # consume it before checking for empty terminal domains;
+                # applying it only after the lease solve made a selected
+                # fabric stub appear portal-starved even though that exact
+                # stub was already a complete physical portal.
+                LeasePortals = ApplyPlacementAccessAssignmentPortalDomains(
+                    LeasePortals,
+                    PlacementAccessFabric,
+                    PlacementAccessAssignment,
+                    Resources.ResourceGraph,
+                    Technology,
+                    MinimumY,
+                    LayerCount,
+                )
             # Dense interfaces need access-distinct exact ownership states,
             # not one prematurely frozen layer choice.  Materialize a fixed
             # bounded portfolio; every member is capacity-one legal and the
@@ -41954,6 +42296,8 @@ def RouteAuthoritativeResources(
     CandidateStarted = monotonic()
     CandidateRequestCount = 0
     RouteTreeNativeDeadlineExceeded = False
+    NativeDetailedSelectionResult: Any | None = None
+    NativeDetailedOriginalRequestIndices: tuple[int, ...] | None = None
     PhysicalDescriptorOwnerByRequestId: dict[int, tuple[str, str]] = {}
     CompletedPhysicalDescriptorFingerprintsBySignal: dict[
         str, set[str]
@@ -41967,8 +42311,12 @@ def RouteAuthoritativeResources(
 
     def GenerateRouteTreesWithDeadline(
         Requests: list[tuple[Any, ...]],
+        SignalRequestIndices: tuple[
+            tuple[str, tuple[int, ...]], ...
+        ] | None = None,
     ) -> list[Any]:
         nonlocal RouteTreeNativeDeadlineExceeded
+        nonlocal NativeDetailedSelectionResult
         if RouteTreeNativeDeadlineExceeded:
             return [None] * len(Requests)
         if not RouteTreeNativeDeadlineExceeded:
@@ -42111,9 +42459,272 @@ def RouteAuthoritativeResources(
             else MaterializedRequests
         )
         NativeCompletionMask: tuple[bool, ...]
-        if hasattr(Context, "GenerateRouteTreesBounded"):
+        FactorizedNativeRequestDomain = bool(
+            NativeRequests
+            and all(
+                isinstance(Request, FactorizedCandidateRouteRequest)
+                for Request in NativeRequests
+            )
+        )
+        if (
+            FactorizedNativeRequestDomain
+            and hasattr(Context, "GenerateRouteTreesFactorizedBounded")
+        ):
+            AccessPayloadIndexByValue: dict[tuple[Any, ...], int] = {}
+            GuidePayloadIndexByValue: dict[tuple[Any, ...], int] = {}
+            AccessPayloads: list[tuple[Any, ...]] = []
+            GuidePayloads: list[tuple[Any, ...]] = []
+            FactorizedRequestReferences = []
+            for Request in NativeRequests:
+                assert isinstance(
+                    Request,
+                    FactorizedCandidateRouteRequest,
+                )
+                AccessPayloadIndex = AccessPayloadIndexByValue.get(
+                    Request.AccessPayload
+                )
+                if AccessPayloadIndex is None:
+                    AccessPayloadIndex = len(AccessPayloads)
+                    AccessPayloadIndexByValue[Request.AccessPayload] = (
+                        AccessPayloadIndex
+                    )
+                    AccessPayloads.append(Request.AccessPayload)
+                GuidePayloadIndex = GuidePayloadIndexByValue.get(
+                    Request.GuidePayload
+                )
+                if GuidePayloadIndex is None:
+                    GuidePayloadIndex = len(GuidePayloads)
+                    GuidePayloadIndexByValue[Request.GuidePayload] = (
+                        GuidePayloadIndex
+                    )
+                    GuidePayloads.append(Request.GuidePayload)
+                FactorizedRequestReferences.append((
+                    AccessPayloadIndex,
+                    GuidePayloadIndex,
+                    Request.PreferredRoutingY,
+                    Request.GuidePenalty,
+                    Request.BendPenalty,
+                    Request.ViaPenalty,
+                    Request.MaximumExpansionCount,
+                ))
+            UseNativeSelectedWorldAssignment = bool(
+                FrozenAccessOnlyCatalog
+                and SignalRequestIndices
+                and PhysicalRequestCache is None
+                and len(MaterializedRequests) == len(Requests)
+                and hasattr(
+                    Context,
+                    "GenerateAndAssignRouteTreesFactorizedBounded",
+                )
+            )
+            if UseNativeSelectedWorldAssignment:
+                UniqueFactorizedRequestReferences = list(
+                    FactorizedRequestReferences
+                )
+                OriginalToUniqueRequestIndex = list(range(
+                    len(FactorizedRequestReferences)
+                ))
+            else:
+                UniqueRequestIndexByReference: dict[
+                    tuple[int, ...], int
+                ] = {}
+                UniqueFactorizedRequestReferences = []
+                OriginalToUniqueRequestIndex = []
+                for Reference in FactorizedRequestReferences:
+                    UniqueRequestIndex = UniqueRequestIndexByReference.get(
+                        Reference
+                    )
+                    if UniqueRequestIndex is None:
+                        UniqueRequestIndex = len(
+                            UniqueFactorizedRequestReferences
+                        )
+                        UniqueRequestIndexByReference[Reference] = (
+                            UniqueRequestIndex
+                        )
+                        UniqueFactorizedRequestReferences.append(Reference)
+                    OriginalToUniqueRequestIndex.append(UniqueRequestIndex)
+            WorkTelemetry["FactorizedDetailedRouteTreeBatch"] = {
+                "Used": True,
+                "Fallback": False,
+                "RequestCount": len(FactorizedRequestReferences),
+                "UniqueRequestCount": len(
+                    UniqueFactorizedRequestReferences
+                ),
+                "ExactRequestReuseCount": (
+                    len(FactorizedRequestReferences)
+                    - len(UniqueFactorizedRequestReferences)
+                ),
+                "AccessPayloadCount": len(AccessPayloads),
+                "GuidePayloadCount": len(GuidePayloads),
+                "NativeGenerationAssignment": (
+                    UseNativeSelectedWorldAssignment
+                ),
+            }
+            if UseNativeSelectedWorldAssignment:
+                BatchResult = (
+                    Context
+                    .GenerateAndAssignRouteTreesFactorizedBounded(
+                        AccessPayloads,
+                        GuidePayloads,
+                        UniqueFactorizedRequestReferences,
+                        SignalRequestIndices,
+                        Policy.TrackAssignment.MaximumAssignmentExpansions,
+                        RemainingRoutingRuntimeMilliseconds(
+                            Deadline,
+                            AdaptiveExpiresAt,
+                        ),
+                    )
+                )
+                NativeDetailedSelectionResult = BatchResult
+                WorkTelemetry[
+                    "NativeSelectedWorldGenerationAssignment"
+                ] = {
+                    "Used": True,
+                    "CallCount": 1,
+                    "Success": bool(BatchResult.Success),
+                    "Complete": bool(BatchResult.Complete),
+                    "DeadlineExceeded": bool(
+                        BatchResult.DeadlineExceeded
+                    ),
+                    "WorkCapExceeded": bool(
+                        BatchResult.WorkCapExceeded
+                    ),
+                    "GeneratedRequestCount": int(
+                        BatchResult.GeneratedRequestCount
+                    ),
+                    "DeclaredRequestCount": len(
+                        FactorizedRequestReferences
+                    ),
+                    "AssignmentExpansionCount": int(
+                        BatchResult.AssignmentExpansionCount
+                    ),
+                    "SelectedRequestIndices": list(
+                        BatchResult.SelectedRequestIndices
+                    ),
+                    "SecondAssignmentInvocation": False,
+                }
+                if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
+                    print(
+                        "[debug] authoritative: native selected-world "
+                        "generation-assignment "
+                        f"success={bool(BatchResult.Success)} "
+                        f"complete={bool(BatchResult.Complete)} "
+                        f"generated={int(BatchResult.GeneratedRequestCount)} "
+                        f"completed={int(BatchResult.CompletedWork)} "
+                        f"assignment_expansions="
+                        f"{int(BatchResult.AssignmentExpansionCount)} "
+                        f"empty_signals="
+                        f"{[Signal for Signal, Count in BatchResult.CandidateCountsBySignal if int(Count) == 0]} "
+                        f"deadline={bool(BatchResult.DeadlineExceeded)} "
+                        f"work_cap={bool(BatchResult.WorkCapExceeded)}",
+                        flush=True,
+                    )
+            else:
+                BatchResult = Context.GenerateRouteTreesFactorizedBounded(
+                    AccessPayloads,
+                    GuidePayloads,
+                    UniqueFactorizedRequestReferences,
+                    RemainingRoutingRuntimeMilliseconds(
+                        Deadline,
+                        AdaptiveExpiresAt,
+                    ),
+                )
+            UniqueCompletionMask = ReadRouteTreeBatchCompletionMask(
+                BatchResult,
+                len(UniqueFactorizedRequestReferences),
+            )
+            UniqueRouteTrees = list(BatchResult.RouteTrees)
+            UniqueRepeaterReservations = list(
+                BatchResult.RepeaterReservations
+            )
+            if len(UniqueRepeaterReservations) != len(UniqueRouteTrees):
+                raise ValueError(
+                    "factorized route-tree batch returned an unexpected "
+                    "repeater-reservation count"
+                )
+            UniqueNativeValues = [
+                (
+                    FactorizedNativeRouteTreeResult(
+                        Nodes=tuple(RouteTree),
+                        RepeaterReservations=tuple(
+                            (tuple(Position), str(Facing))
+                            for Position, Facing in Repeaters
+                        ),
+                    )
+                    if RouteTree is not None
+                    else None
+                )
+                for RouteTree, Repeaters in zip(
+                    UniqueRouteTrees,
+                    UniqueRepeaterReservations,
+                )
+            ]
+            CompletionMask = tuple(
+                UniqueCompletionMask[UniqueIndex]
+                for UniqueIndex in OriginalToUniqueRequestIndex
+            )
+            NativeValues = [
+                UniqueNativeValues[UniqueIndex]
+                for UniqueIndex in OriginalToUniqueRequestIndex
+            ]
+            WorkTelemetry["RouteTreeCompletedWork"] = (
+                int(WorkTelemetry.get("RouteTreeCompletedWork", 0))
+                + sum(CompletionMask)
+            )
+            NativeCompletionMask = CompletionMask
+            if BatchResult.DeadlineExceeded:
+                RouteTreeNativeDeadlineExceeded = True
+                WorkTelemetry["RouteTreeCompletionMask"] = {
+                    "RequestCount": len(CompletionMask),
+                    "CompletedRequestIndices": [
+                        Index
+                        for Index, Completed in enumerate(CompletionMask)
+                        if Completed
+                    ],
+                    "Exact": hasattr(BatchResult, "CompletionMask"),
+                }
+                if PhysicalRequestCache is not None:
+                    CompletedNativeValuesByKey = tuple(
+                        (Key, Value)
+                        for Key, Value, Completed in zip(
+                            MissingByKey,
+                            NativeValues,
+                            CompletionMask,
+                        )
+                        if Completed
+                    )
+                    EvictedCount = RetainPhysicalGlobalRouteTreeResults(
+                        PhysicalRequestCache,
+                        CompletedNativeValuesByKey,
+                    )
+                    WorkTelemetry[
+                        "PhysicalGlobalRouteTreeResultCache"
+                    ].update({
+                        "DeadlineRetainedResultCount": len(
+                            CompletedNativeValuesByKey
+                        ),
+                        "DeadlineRetentionEvictedCount": EvictedCount,
+                        "StoredResultCountAfterDeadlineRetention": len(
+                            PhysicalRequestCache
+                        ),
+                    })
+        elif hasattr(Context, "GenerateRouteTreesBounded"):
+            ExpandedNativeRequests = [
+                Request.ToExpandedRequest()
+                if isinstance(Request, FactorizedCandidateRouteRequest)
+                else Request
+                for Request in NativeRequests
+            ]
+            if FactorizedNativeRequestDomain:
+                WorkTelemetry["FactorizedDetailedRouteTreeBatch"] = {
+                    "Used": False,
+                    "Fallback": True,
+                    "RequestCount": len(NativeRequests),
+                    "AccessPayloadCount": 0,
+                    "GuidePayloadCount": 0,
+                }
             BatchResult = Context.GenerateRouteTreesBounded(
-                NativeRequests,
+                ExpandedNativeRequests,
                 RemainingRoutingRuntimeMilliseconds(
                     Deadline,
                     AdaptiveExpiresAt,
@@ -42166,7 +42777,12 @@ def RouteAuthoritativeResources(
                         ),
                     })
         else:
-            NativeValues = Context.GenerateRouteTrees(NativeRequests)
+            NativeValues = Context.GenerateRouteTrees([
+                Request.ToExpandedRequest()
+                if isinstance(Request, FactorizedCandidateRouteRequest)
+                else Request
+                for Request in NativeRequests
+            ])
             NativeCompletionMask = (True,) * len(NativeRequests)
         if PhysicalRequestCache is not None:
             NativeValuesByKey = {
@@ -42921,6 +43537,17 @@ def RouteAuthoritativeResources(
                 for Existing in Selected
             )
 
+        def UsesOnePortalPerPhysicalEndpoint(
+            CandidatePortals: tuple[PinAccessPortal, ...],
+        ) -> bool:
+            return all(
+                not RepeatsEndpointWithDifferentPortal(
+                    CandidatePortals[:PortalIndex],
+                    Portal,
+                )
+                for PortalIndex, Portal in enumerate(CandidatePortals)
+            )
+
         def MergeExactPortalClaims(
             CandidatePortals: tuple[PinAccessPortal, ...],
         ) -> RoutingResourceClaims:
@@ -43352,18 +43979,47 @@ def RouteAuthoritativeResources(
                 RoutePortalVariantCounts[Profile.Signal],
                 max(len(Domain) for Domain in Domains),
             )
+            def BuildCoherentDiagonalCandidate(
+                Variant: int,
+            ) -> tuple[PinAccessPortal, ...]:
+                Selected: list[PinAccessPortal] = []
+                for DomainIndex, Domain in enumerate(Domains):
+                    RepeatedTerminalIndex = next((
+                        PreviousIndex
+                        for PreviousIndex in range(DomainIndex)
+                        if Terminals[PreviousIndex] == Terminals[DomainIndex]
+                    ), None)
+                    if RepeatedTerminalIndex is None:
+                        Selected.append(Domain[
+                            (Variant + DomainIndex) % len(Domain)
+                        ])
+                        continue
+                    PreviousPortal = Selected[RepeatedTerminalIndex]
+                    MatchingPortal = next((
+                        Portal for Portal in Domain
+                        if Portal.PortalId == PreviousPortal.PortalId
+                    ), None)
+                    if MatchingPortal is None:
+                        return ()
+                    Selected.append(MatchingPortal)
+                return tuple(Selected)
+
             DiagonalCandidates = tuple(
-                tuple(
-                    Domain[(Variant + DomainIndex) % len(Domain)]
-                    for DomainIndex, Domain in enumerate(Domains)
-                )
+                Candidate
                 for Variant in range(VariantCount)
+                for Candidate in (BuildCoherentDiagonalCandidate(Variant),)
+                if Candidate
             )
             if len(Profile.Targets) < 4:
                 LegalTuples = tuple(
                     CandidatePortals
                     for CandidatePortals in DiagonalCandidates
-                    if IsSelfLegal(CandidatePortals)
+                    if (
+                        UsesOnePortalPerPhysicalEndpoint(
+                            CandidatePortals
+                        )
+                        and IsSelfLegal(CandidatePortals)
+                    )
                 )
                 return LegalTuples, {
                     "CompletePortalTupleCount": CompletePortalTupleCount,
@@ -43404,6 +44060,9 @@ def RouteAuthoritativeResources(
                 if (
                     len(CandidateTuples) >= MaximumTupleCount
                     or PortalIds in SeenPortalTuples
+                    or not UsesOnePortalPerPhysicalEndpoint(
+                        CandidatePortals
+                    )
                     or not IsSelfLegal(CandidatePortals)
                 ):
                     return
@@ -43677,6 +44336,74 @@ def RouteAuthoritativeResources(
         ))
         PortalDomainForTrunkLayerCache[CacheKey] = Result
         return Result
+
+    if PrepareRawRouteGuideFactorDomainOnly:
+        CompleteEmptyPortalEndpoints = (
+            FindCompleteEmptyPortalEndpointDomains(
+                Profiles,
+                Portals,
+                CompletePortalDomainKeys,
+                LayerCount,
+            )
+        )
+        if CompleteEmptyPortalEndpoints:
+            EmptySignals = tuple(sorted({
+                Signal
+                for Signal, _EndpointKind, _Terminal
+                in CompleteEmptyPortalEndpoints
+            }))
+            Proof = {
+                "Kind": "complete-empty-endpoint-portal-domain",
+                "Complete": True,
+                "PortalTupleDomainComplete": True,
+                "ProofScope": "complete-endpoint-layer-domain",
+                "BudgetExhausted": False,
+                "DeadlineExceeded": False,
+                "LayerCount": int(LayerCount),
+                "EmptyEndpoints": [
+                    {
+                        "Signal": Signal,
+                        "EndpointKind": EndpointKind,
+                        "Terminal": list(Terminal),
+                    }
+                    for Signal, EndpointKind, Terminal
+                    in CompleteEmptyPortalEndpoints
+                ],
+                "PortalDomainFingerprint": (
+                    BuildRawTrackAssignmentPortalDomainFingerprint(
+                        Portals,
+                        BoundaryLeaseReservations,
+                    )
+                ),
+                "ProofFingerprint": BuildStableFingerprint((
+                    "complete-empty-endpoint-portal-domain-v1",
+                    int(LayerCount),
+                    CompleteEmptyPortalEndpoints,
+                    tuple(sorted(CompletePortalDomainKeys)),
+                )),
+            }
+            raise RoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.TrackAssignmentConflict,
+                Stage="InitialCandidateAssignment",
+                AffectedNets=EmptySignals,
+                Locations=tuple(
+                    Terminal
+                    for _Signal, _EndpointKind, Terminal
+                    in CompleteEmptyPortalEndpoints
+                )[:32],
+                RepairActions=("RelocateAffectedClusters",),
+                Detail=(
+                    "a required endpoint has a complete empty portal "
+                    "domain on every routing layer"
+                ),
+                Diagnostics={
+                    "MandatoryAccessProof": Proof,
+                    "CompleteAssignmentCutProof": True,
+                    "IndependentEmptyCandidateDomainSignals": list(
+                        EmptySignals
+                    ),
+                },
+            ))
 
     ExactPhysicalPortalDomainCertificatesBySignal: dict[
         str, dict[str, object]
@@ -44688,6 +45415,9 @@ def RouteAuthoritativeResources(
         "AccessPayloadCacheHits": 0,
         "AccessPayloadCacheMisses": 0,
         "SelfConflictCacheHits": 0,
+        "SelfConflictRejections": 0,
+        "FrozenComponentConflictRejections": 0,
+        "SiblingApertureConflictRejections": 0,
         "GuidePayloadCacheHits": 0,
         "GuidePayloadCacheMisses": 0,
         "ConnectivityFactorChecks": 0,
@@ -44773,6 +45503,13 @@ def RouteAuthoritativeResources(
     ] = {}
     CompactCertificateGuideColumnsFingerprintCache: dict[
         tuple[int, tuple[frozenset[Position2], int]], str
+    ] = {}
+    CompactCertificateRegionNodes = frozenset(Region.Nodes)
+    CompactCertificateRequiredAllowedNodesCache: dict[
+        tuple[str, ...], tuple[Position3, ...]
+    ] = {}
+    CompactCertificateConnectivityRequiredNodesCache: dict[
+        tuple[str, ...], tuple[Position3, ...]
     ] = {}
     CompactGuideFactorRejectionsBySignal: dict[
         str, Counter[str]
@@ -45074,6 +45811,13 @@ def RouteAuthoritativeResources(
             tuple[str, ...],
             frozenset[Position3],
         ] = {}
+        ExactPortalAccessPrefixesByPortalTuple: dict[
+            tuple[str, ...],
+            tuple[
+                tuple[Position3, ...],
+                tuple[tuple[Position3, ...], ...],
+            ],
+        ] = {}
         PortalForeignAccessOverlapByPortalTuple: dict[
             tuple[str, ...],
             bool,
@@ -45085,8 +45829,16 @@ def RouteAuthoritativeResources(
         SeenCompactGuideFactorIds: set[str] = set()
         SelfConflictingPortalTuples: set[tuple[str, ...]] = set()
         GuidePayloadByGeometry: dict[
-            tuple[frozenset[Position2], int],
-            tuple[tuple[Position2, ...], tuple[Position2, ...]],
+            tuple[object, ...],
+            tuple[
+                tuple[Position2, ...],
+                tuple[Position2, ...],
+                tuple[Position3, ...],
+            ],
+        ] = {}
+        FactorizedAccessPayloadByIdentity: dict[
+            tuple[object, ...],
+            tuple[object, ...],
         ] = {}
         GuideByTerminalLaneIdentity: dict[
             tuple[
@@ -45451,6 +46203,39 @@ def RouteAuthoritativeResources(
                                 *TargetPortals,
                             )
                         )
+                        ExactPortalAccessPrefixes = (
+                            ExactPortalAccessPrefixesByPortalTuple.get(
+                                PortalTupleKey
+                            )
+                        )
+                        if ExactPortalAccessPrefixes is None:
+                            ExactPortalAccessPrefixes = (
+                                (
+                                    ()
+                                    if PrepareRawRouteGuideFactorDomainOnly
+                                    else BuildExactPortalAccessPrefix(
+                                        Profile,
+                                        Profile.Root,
+                                        SourcePortal,
+                                    )
+                                ),
+                                tuple(
+                                    ()
+                                    if PrepareRawRouteGuideFactorDomainOnly
+                                    else BuildExactPortalAccessPrefix(
+                                        Profile,
+                                        Target,
+                                        Portal,
+                                    )
+                                    for Target, Portal in zip(
+                                        Profile.Targets,
+                                        TargetPortals,
+                                    )
+                                ),
+                            )
+                            ExactPortalAccessPrefixesByPortalTuple[
+                                PortalTupleKey
+                            ] = ExactPortalAccessPrefixes
                         PortalNodes = PortalNodesByPortalTuple.get(
                             PortalTupleKey
                         )
@@ -45667,12 +46452,38 @@ def RouteAuthoritativeResources(
                             ),
                             Priority=RequestPriority,
                         )
+                        if FrozenShapeDescriptor is not None:
+                            # The native compact catalog already selected one
+                            # exact physical guide spine.  Preserve the whole
+                            # descriptor instead of rebuilding an identity-
+                            # adjacent value with locally recomputed priority
+                            # metadata.
+                            ShapeDescriptor = FrozenShapeDescriptor
                         FrozenGuideFactorIds = (
                             FrozenRouteGuideFactorIdsBySignal.get(Signal)
                         )
-                        GuideFactorId = RouteGuideFactorCandidateId(
-                            ShapeDescriptor
-                        )
+                        if FrozenGuideFactorIds is not None:
+                            if len(FrozenGuideFactorIds) != 1:
+                                raise RoutingStageError(RoutingFailure(
+                                    Reason=(
+                                        RoutingFailureReason
+                                        .ClusterInterfaceSolveIncomplete
+                                    ),
+                                    Stage="FrozenPreRouteFactorHandoff",
+                                    AffectedNets=(Signal,),
+                                    RepairActions=(),
+                                    Detail=(
+                                        "the frozen selected world must own "
+                                        "one exact guide factor per signal"
+                                    ),
+                                ))
+                            GuideFactorId = next(iter(
+                                FrozenGuideFactorIds
+                            ))
+                        else:
+                            GuideFactorId = RouteGuideFactorCandidateId(
+                                ShapeDescriptor
+                            )
                         if PrepareRawRouteGuideFactorDomainOnly:
                             if GuideFactorId in SeenCompactGuideFactorIds:
                                 CompactGuideShapeEnumerationBySignal[
@@ -45726,19 +46537,10 @@ def RouteAuthoritativeResources(
                             EffectiveBlockedNodesCache=(
                                 EffectiveBlockedNodesByPortalTuple
                             ),
+                            PortalTupleKeyValue=PortalTupleKey,
                         ) -> CompactGuideMaterializabilityRequest:
-                            GuidePayloadKey = (
-                                Shape.Guide,
-                                Shape.GuideExpansion,
-                            )
                             SortedGuide = Shape.SortedGuide
-                            PortalTupleKey = tuple(
-                                Portal.PortalId
-                                for Portal in (
-                                    Shape.SourcePortal,
-                                    *Shape.TargetPortals,
-                                )
-                            )
+                            PortalTupleKey = PortalTupleKeyValue
                             NodePayload = AccessPayloadCache.get(
                                 PortalTupleKey
                             )
@@ -45760,6 +46562,17 @@ def RouteAuthoritativeResources(
                                 InvariantRequestPayloadCacheDiagnostics[
                                     "AccessPayloadCacheHits"
                                 ] += 1
+                            SortedRequiredAllowedNodes = (
+                                CompactCertificateRequiredAllowedNodesCache
+                                .get(PortalTupleKey)
+                            )
+                            if SortedRequiredAllowedNodes is None:
+                                SortedRequiredAllowedNodes = tuple(sorted(
+                                    NodePayload.RequiredNodeSet
+                                ))
+                                CompactCertificateRequiredAllowedNodesCache[
+                                    PortalTupleKey
+                                ] = SortedRequiredAllowedNodes
                             EffectiveBlockedNodes = (
                                 EffectiveBlockedNodesCache.get(
                                     PortalTupleKey
@@ -45776,6 +46589,21 @@ def RouteAuthoritativeResources(
                                 EffectiveBlockedNodesCache[
                                     PortalTupleKey
                                 ] = EffectiveBlockedNodes
+                            GraphRequiredNodes = frozenset(
+                                ConnectivityRequiredNodesValue
+                                & CompactCertificateRegionNodes
+                            )
+                            SortedConnectivityRequiredNodes = (
+                                CompactCertificateConnectivityRequiredNodesCache
+                                .get(PortalTupleKey)
+                            )
+                            if SortedConnectivityRequiredNodes is None:
+                                SortedConnectivityRequiredNodes = tuple(sorted(
+                                    GraphRequiredNodes
+                                ))
+                                CompactCertificateConnectivityRequiredNodesCache[
+                                    PortalTupleKey
+                                ] = SortedConnectivityRequiredNodes
                             ConnectivityKey = (
                                 PortalTupleKey,
                                 (
@@ -45785,14 +46613,8 @@ def RouteAuthoritativeResources(
                                     SortedGuide,
                                     int(Shape.GuideExpansion),
                                     EffectiveBlockedNodes,
-                                    tuple(sorted(
-                                        ConnectivityRequiredNodesValue
-                                    )),
+                                    SortedConnectivityRequiredNodes,
                                 ),
-                            )
-                            GraphRequiredNodes = frozenset(
-                                ConnectivityRequiredNodesValue
-                                & frozenset(Region.Nodes)
                             )
                             SourceNode = (
                                 Shape.SourcePortal.Path[-1]
@@ -45816,55 +46638,6 @@ def RouteAuthoritativeResources(
                             # invoking this builder.  The exact guide/stub
                             # combination check remains below after the
                             # connectivity proof and guide-spine construction.
-                            StaticSelfLegal = True
-                            RequiredNodesFingerprint = (
-                                CompactCertificateRequiredNodesFingerprintCache
-                                .get(PortalTupleKey)
-                            )
-                            if RequiredNodesFingerprint is None:
-                                RequiredNodesFingerprint = (
-                                    _BuildCompactClosedTupleFingerprint(
-                                        "compact-required-nodes-v1",
-                                        tuple(sorted(
-                                            NodePayload.RequiredNodeSet
-                                        )),
-                                    )
-                                )
-                                CompactCertificateRequiredNodesFingerprintCache[
-                                    PortalTupleKey
-                                ] = RequiredNodesFingerprint
-                            BlockedNodesFingerprint = (
-                                CompactCertificateBlockedNodesFingerprintCache
-                                .get(EffectiveBlockedNodes)
-                            )
-                            if BlockedNodesFingerprint is None:
-                                BlockedNodesFingerprint = (
-                                    _BuildCompactClosedTupleFingerprint(
-                                        "compact-blocked-nodes-v1",
-                                        EffectiveBlockedNodes,
-                                    )
-                                )
-                                CompactCertificateBlockedNodesFingerprintCache[
-                                    EffectiveBlockedNodes
-                                ] = BlockedNodesFingerprint
-                            GuideColumnsFingerprint = (
-                                CompactCertificateGuideColumnsFingerprintCache
-                                .get((int(Shape.RoutingY), GuidePayloadKey))
-                            )
-                            if GuideColumnsFingerprint is None:
-                                GuideColumnsFingerprint = (
-                                    _BuildCompactClosedTupleFingerprint(
-                                        "compact-guide-columns-v1",
-                                        (
-                                            int(Shape.RoutingY),
-                                            Shape.SortedGuide,
-                                            int(Shape.GuideExpansion),
-                                        ),
-                                    )
-                                )
-                                CompactCertificateGuideColumnsFingerprintCache[
-                                    (int(Shape.RoutingY), GuidePayloadKey)
-                                ] = GuideColumnsFingerprint
                             return CompactGuideMaterializabilityRequest(
                                 FactorId=FactorIdValue,
                                 PlacementFingerprint=(
@@ -45882,38 +46655,25 @@ def RouteAuthoritativeResources(
                                 AccessShellFingerprint=(
                                     CompactCertificateAccessShellFingerprint
                                 ),
-                                RequiredNodesFingerprint=(
-                                    RequiredNodesFingerprint
-                                ),
-                                BlockedNodesFingerprint=(
-                                    BlockedNodesFingerprint
-                                ),
-                                GuideColumnsFingerprint=(
-                                    GuideColumnsFingerprint
-                                ),
-                                StaticClaimsFingerprint=(
-                                    _BuildCompactClosedTupleFingerprint(
-                                        "compact-static-self-claims-v2",
-                                        (
-                                            FactorIdValue,
-                                            CompactCertificateResourceFingerprint,
-                                            CompactCertificateTechnologyFingerprint,
-                                            CompactCertificateFabricFingerprint,
-                                            CompactCertificateAccessShellFingerprint,
-                                        ),
-                                    )
-                                ),
-                                StaticSelfLegal=StaticSelfLegal,
+                                # These fields are certificate identities,
+                                # not inputs to the necessary-connectivity
+                                # proof. Populate them only for a connected
+                                # factor that can enter the compact catalog.
+                                RequiredNodesFingerprint="",
+                                BlockedNodesFingerprint="",
+                                GuideColumnsFingerprint="",
+                                StaticClaimsFingerprint="",
+                                StaticSelfLegal=True,
                                 ConnectivityKey=ConnectivityKey,
                                 GuideColumns=SortedGuide,
                                 GuideExpansion=int(Shape.GuideExpansion),
-                                RequiredAllowedNodes=tuple(sorted(
-                                    NodePayload.RequiredNodeSet
-                                )),
+                                RequiredAllowedNodes=(
+                                    SortedRequiredAllowedNodes
+                                ),
                                 BlockedNodes=EffectiveBlockedNodes,
-                                ConnectivityRequiredNodes=tuple(sorted(
-                                    GraphRequiredNodes
-                                )),
+                                ConnectivityRequiredNodes=(
+                                    SortedConnectivityRequiredNodes
+                                ),
                                 Start=SourceNode,
                                 MaximumExpansionCount=max(
                                     1,
@@ -45937,28 +46697,10 @@ def RouteAuthoritativeResources(
                             SeedStartsValue=tuple(SeedStarts),
                             SeedNodeSetValue=SeedNodeSet,
                             SourceAccessPathValue=(
-                                ()
-                                if PrepareRawRouteGuideFactorDomainOnly
-                                else BuildExactPortalAccessPrefix(
-                                    Profile,
-                                    Profile.Root,
-                                    SourcePortal,
-                                )
+                                ExactPortalAccessPrefixes[0]
                             ),
-                            TargetAccessPathsValue=tuple(
-                                ()
-                                if PrepareRawRouteGuideFactorDomainOnly
-                                else (
-                                    BuildExactPortalAccessPrefix(
-                                        Profile,
-                                        Target,
-                                        Portal,
-                                    )
-                                    for Target, Portal in zip(
-                                        Profile.Targets,
-                                        TargetPortals,
-                                    )
-                                )
+                            TargetAccessPathsValue=(
+                                ExactPortalAccessPrefixes[1]
                             ),
                             DetachedSeedAnchorsValue=DetachedSeedAnchors,
                             FixedRequiredNodesValue=FixedRequiredNodes,
@@ -45971,11 +46713,89 @@ def RouteAuthoritativeResources(
                             ),
                             GuidePayloadCache=GuidePayloadByGeometry,
                             AccessPayloadCache=AccessPayloadByPortalTuple,
+                            EffectiveBlockedNodesCache=(
+                                EffectiveBlockedNodesByPortalTuple
+                            ),
                             SelfConflictCache=SelfConflictingPortalTuples,
-                        ) -> tuple[Any, ...] | None:
+                            FrozenShapeDescriptorValue=(
+                                FrozenShapeDescriptor
+                            ),
+                        ) -> FactorizedCandidateRouteRequest | None:
+                            if (
+                                os.environ.get(
+                                    "RCS_DEBUG_CERTIFIED_PAYLOAD_SIGNAL"
+                                )
+                                == SignalValue
+                            ):
+                                print(
+                                    "selected certified payload"
+                                    f" signal={SignalValue}"
+                                    f" factor={RouteGuideFactorCandidateId(Shape)}"
+                                    f" paths={len(Shape.DetailedHintPaths)}"
+                                    f" path_lengths={tuple(map(len, Shape.DetailedHintPaths))}"
+                                    f" repeaters={len(Shape.CertifiedRepeaters)}",
+                                )
+                            FrozenAccessRampColumns = (
+                                frozenset(
+                                    (int(X), int(Z))
+                                    for Ramp in Shape.AccessRamps
+                                    for X, _Y, Z in Ramp
+                                )
+                                if FrozenShapeDescriptorValue is not None
+                                else frozenset()
+                            )
+                            FrozenExactHintNodes = frozenset({
+                                *(
+                                    (int(X), int(Shape.RoutingY), int(Z))
+                                    for X, Z in Shape.SortedPhysicalGuide
+                                ),
+                                *(
+                                    tuple(map(int, Position))
+                                    for Ramp in Shape.AccessRamps
+                                    for Position in Ramp
+                                ),
+                                *(
+                                    tuple(map(int, Position))
+                                    for Path in Shape.DetailedHintPaths
+                                    for Position in Path
+                                ),
+                            })
+                            FrozenFixedAccessColumns = (
+                                frozenset(
+                                    (int(X), int(Z))
+                                    for Portal in (
+                                        Shape.SourcePortal,
+                                        *Shape.TargetPortals,
+                                    )
+                                    if str(Portal.PortalId).endswith(
+                                        "FixedAccessPath"
+                                    )
+                                    for X, _Y, Z in Portal.Path
+                                )
+                                if FrozenShapeDescriptorValue is not None
+                                else frozenset()
+                            )
+                            # PhysicalGuide is the graph-filtered witness used
+                            # by compact certification.  It may omit one exact
+                            # blocked spine node, but that omission must not
+                            # erase the neighboring columns made available by
+                            # GuideExpansion during selected-world routing.
+                            # Preserve the selected factor's declared guide as
+                            # the corridor identity; exact blocked nodes remain
+                            # authoritative in the access payload below.
+                            FrozenGuideColumns = Shape.Guide
+                            FrozenPreferredColumns = frozenset({
+                                *FrozenGuideColumns,
+                                *FrozenAccessRampColumns,
+                            })
                             GuidePayloadKey = (
-                                Shape.Guide,
+                                FrozenGuideColumns,
                                 Shape.GuideExpansion,
+                                FrozenFixedAccessColumns,
+                                FrozenAccessRampColumns,
+                                FrozenExactHintNodes,
+                                Shape.DetailedHintPaths,
+                                Shape.CertifiedRepeaters,
                             )
                             GuidePayload = GuidePayloadCache.get(
                                 GuidePayloadKey
@@ -45984,11 +46804,24 @@ def RouteAuthoritativeResources(
                                 InvariantRequestPayloadCacheDiagnostics[
                                     "GuidePayloadCacheMisses"
                                 ] += 1
-                                GuidePayload = (
+                                CandidateColumns, _ExpandedPreferred = (
                                     BuildInvariantRouteRequestGuidePayload(
-                                        Shape.Guide,
+                                        frozenset({
+                                            *FrozenGuideColumns,
+                                            *FrozenFixedAccessColumns,
+                                            *FrozenAccessRampColumns,
+                                        }),
                                         Shape.GuideExpansion,
                                     )
+                                )
+                                GuidePayload = (
+                                    CandidateColumns,
+                                    tuple(sorted(
+                                        FrozenPreferredColumns
+                                    )),
+                                    tuple(sorted(FrozenExactHintNodes)),
+                                    Shape.DetailedHintPaths,
+                                    Shape.CertifiedRepeaters,
                                 )
                                 GuidePayloadCache[
                                     GuidePayloadKey
@@ -45997,7 +46830,13 @@ def RouteAuthoritativeResources(
                                 InvariantRequestPayloadCacheDiagnostics[
                                     "GuidePayloadCacheHits"
                                 ] += 1
-                            CandidateColumns, SortedGuide = GuidePayload
+                            (
+                                CandidateColumns,
+                                SortedGuide,
+                                _ExactHintNodes,
+                                _CertifiedPaths,
+                                _CertifiedRepeaters,
+                            ) = GuidePayload
                             PortalTupleKey = tuple(
                                 Portal.PortalId
                                 for Portal in (
@@ -46046,6 +46885,9 @@ def RouteAuthoritativeResources(
                                     SignalValue: RequiredClaims,
                                 }):
                                     SelfConflictCache.add(PortalTupleKey)
+                                    InvariantRequestPayloadCacheDiagnostics[
+                                        "SelfConflictRejections"
+                                    ] += 1
                                     if PrepareRawRouteGuideFactorDomainOnly:
                                         CompactGuideFactorRejectionsBySignal[
                                             SignalValue
@@ -46061,6 +46903,9 @@ def RouteAuthoritativeResources(
                                 ):
                                     FrozenComponentPortalConflictBySignal[
                                         SignalValue
+                                    ] += 1
+                                    InvariantRequestPayloadCacheDiagnostics[
+                                        "FrozenComponentConflictRejections"
                                     ] += 1
                                     if PrepareRawRouteGuideFactorDomainOnly:
                                         CompactGuideFactorRejectionsBySignal[
@@ -46080,6 +46925,9 @@ def RouteAuthoritativeResources(
                                     SiblingApertureRequiredClaimConflictsBySignal[
                                         SignalValue
                                     ] += 1
+                                    InvariantRequestPayloadCacheDiagnostics[
+                                        "SiblingApertureConflictRejections"
+                                    ] += 1
                                     if PrepareRawRouteGuideFactorDomainOnly:
                                         CompactGuideFactorRejectionsBySignal[
                                             SignalValue
@@ -46092,18 +46940,28 @@ def RouteAuthoritativeResources(
                                 InvariantRequestPayloadCacheDiagnostics[
                                     "AccessPayloadCacheHits"
                                 ] += 1
-                            ImmutableRequiredClaims = (
-                                Resources.ResourceGraph.BuildRouteClaims(
-                                    NodePayload.RequiredNodeSet
+                            EffectiveBlockedNodes = (
+                                EffectiveBlockedNodesCache.get(
+                                    PortalTupleKey
                                 )
                             )
-                            EffectiveBlockedNodes = tuple(sorted({
-                                *NodePayload.BlockedNodes,
-                                *BuildStaticSelfConflictBlockedNodes(
-                                    ImmutableRequiredClaims,
-                                    NodePayload.RequiredNodeSet,
-                                ),
-                            }))
+                            if EffectiveBlockedNodes is None:
+                                ImmutableRequiredClaims = (
+                                    Resources.ResourceGraph
+                                    .BuildRouteClaims(
+                                        NodePayload.RequiredNodeSet
+                                    )
+                                )
+                                EffectiveBlockedNodes = tuple(sorted({
+                                    *NodePayload.BlockedNodes,
+                                    *BuildStaticSelfConflictBlockedNodes(
+                                        ImmutableRequiredClaims,
+                                        NodePayload.RequiredNodeSet,
+                                    ),
+                                }))
+                                EffectiveBlockedNodesCache[
+                                    PortalTupleKey
+                                ] = EffectiveBlockedNodes
                             ConnectivityKey = (
                                 PortalTupleKey,
                                 (
@@ -46159,80 +47017,149 @@ def RouteAuthoritativeResources(
                                         SignalValue
                                     ]["necessary-connectivity"] += 1
                                 return None
-                            TargetBranches = list(
-                                _BuildTargetPortalBranches(
-                                    Shape.TargetPortals,
-                                    TargetAccessPathsValue,
-                                )
-                            )
-                            TargetBranches.extend(
-                                [Anchor]
-                                for Anchor in DetachedSeedAnchorsValue
-                            )
-                            TargetBranches = list(
-                                FilterSourceConnectedTargetBranches(
-                                    ProfileValue.Root,
-                                    (
-                                        *SeedStartsValue,
-                                        *SourceAccessPathValue,
-                                        *Shape.SourcePortal.Path,
-                                    ),
-                                    TargetBranches,
-                                    Resources.ResourceGraph,
-                                )
-                            )
-                            if len(TargetBranches) > 1:
-                                SourcePosition = (
-                                    Shape.SourcePortal.Path[-1]
-                                )
-                                TargetBranches.sort(
-                                    key=lambda Branch: (
-                                        -(
-                                            abs(
-                                                Branch[0][0]
-                                                - SourcePosition[0]
-                                            )
-                                            + abs(
-                                                Branch[0][1]
-                                                - SourcePosition[1]
-                                            )
-                                            + abs(
-                                                Branch[0][2]
-                                                - SourcePosition[2]
-                                            )
-                                        ),
-                                        Branch[-1],
-                                        len(Branch),
-                                    )
-                                )
-                                BranchOffset = (
-                                    Shape.PortalShapeRank
-                                    % len(TargetBranches)
-                                )
-                                TargetBranches = (
-                                    TargetBranches[BranchOffset:]
-                                    + TargetBranches[:BranchOffset]
-                                )
                             InvariantRequestPayloadCacheDiagnostics[
                                 "MaterializedRequestCount"
                             ] += 1
-                            return (
-                                list(dict.fromkeys((
-                                    *SeedStartsValue,
-                                    *sorted(SeedNodeSetValue),
-                                    *SourceAccessPathValue,
-                                    *Shape.SourcePortal.Path,
-                                ))),
-                                TargetBranches,
-                                list(CandidateColumns),
-                                list(NodePayload.RequiredNodes),
-                                list(EffectiveBlockedNodes),
-                                list(SortedGuide),
-                                Shape.RoutingY,
-                                Policy.DetailedRouting.MinimumGuidePenalty,
-                                Policy.DetailedRouting.StrictBendPenalty,
-                                Policy.DetailedRouting.StrictViaPenalty,
-                                CandidateExpansionLimitValue,
+                            AccessPayloadIdentity = (
+                                PortalTupleKey,
+                                int(Shape.PortalShapeRank),
+                            )
+                            FactorizedAccessPayload = (
+                                FactorizedAccessPayloadByIdentity.get(
+                                    AccessPayloadIdentity
+                                )
+                            )
+                            if FactorizedAccessPayload is None:
+                                FrozenTargetBranches = list(
+                                    _BuildTargetPortalBranches(
+                                        Shape.TargetPortals,
+                                        TargetAccessPathsValue,
+                                    )
+                                )
+                                FrozenTargetBranches.extend(
+                                    [Anchor]
+                                    for Anchor in DetachedSeedAnchorsValue
+                                )
+                                TargetBranches = list(
+                                    FilterSourceConnectedTargetBranches(
+                                        ProfileValue.Root,
+                                        (
+                                            *SeedStartsValue,
+                                            *SourceAccessPathValue,
+                                            *Shape.SourcePortal.Path,
+                                        ),
+                                        FrozenTargetBranches,
+                                        Resources.ResourceGraph,
+                                    )
+                                )
+                                if len(TargetBranches) > 1:
+                                    SourcePosition = (
+                                        Shape.SourcePortal.Path[-1]
+                                    )
+                                    TargetBranches.sort(
+                                        key=lambda Branch: (
+                                            -(
+                                                abs(
+                                                    Branch[0][0]
+                                                    - SourcePosition[0]
+                                                )
+                                                + abs(
+                                                    Branch[0][1]
+                                                    - SourcePosition[1]
+                                                )
+                                                + abs(
+                                                    Branch[0][2]
+                                                    - SourcePosition[2]
+                                                )
+                                            ),
+                                            Branch[-1],
+                                            len(Branch),
+                                        )
+                                    )
+                                    BranchOffset = (
+                                        Shape.PortalShapeRank
+                                        % len(TargetBranches)
+                                    )
+                                    TargetBranches = (
+                                        TargetBranches[BranchOffset:]
+                                        + TargetBranches[:BranchOffset]
+                                    )
+                                FactorizedRequiredClaims = (
+                                    Resources.ResourceGraph.BuildRouteClaims(
+                                        NodePayload.RequiredNodeSet
+                                    )
+                                )
+                                FactorizedAccessPayload = (
+                                    tuple(dict.fromkeys((
+                                        *SeedStartsValue,
+                                        *sorted(SeedNodeSetValue),
+                                        *SourceAccessPathValue,
+                                        *Shape.SourcePortal.Path,
+                                    ))),
+                                    tuple(dict.fromkeys((
+                                        *SourceAccessPathValue,
+                                        *Shape.SourcePortal.Path,
+                                    ))),
+                                    tuple(
+                                        tuple(Branch)
+                                        for Branch in TargetBranches
+                                    ),
+                                    tuple(
+                                        tuple(Branch)
+                                        for Branch in FrozenTargetBranches
+                                    ),
+                                    NodePayload.RequiredNodes,
+                                    EffectiveBlockedNodes,
+                                    tuple(sorted(
+                                        FactorizedRequiredClaims.WireCells
+                                    )),
+                                    tuple(sorted(
+                                        FactorizedRequiredClaims.SupportCells
+                                    )),
+                                    tuple(sorted(
+                                        FactorizedRequiredClaims
+                                        .RequiredAirCells
+                                    )),
+                                    tuple(sorted(
+                                        FactorizedRequiredClaims
+                                        .ElectricalCells
+                                    )),
+                                )
+                                FactorizedAccessPayloadByIdentity[
+                                    AccessPayloadIdentity
+                                ] = FactorizedAccessPayload
+                            return FactorizedCandidateRouteRequest(
+                                AccessPayload=FactorizedAccessPayload,
+                                GuidePayload=(
+                                    CandidateColumns,
+                                    SortedGuide,
+                                    GuidePayload[2],
+                                    GuidePayload[3],
+                                    GuidePayload[4],
+                                ),
+                                PreferredRoutingY=Shape.RoutingY,
+                                GuidePenalty=(
+                                    Policy.DetailedRouting
+                                    .MinimumGuidePenalty
+                                    * (
+                                        Policy.DetailedRouting
+                                        .StrictGuideMultiplier
+                                        * Policy.DetailedRouting
+                                        .LengthPenalty
+                                        if FrozenShapeDescriptor
+                                        is not None
+                                        else 1
+                                    )
+                                ),
+                                BendPenalty=(
+                                    Policy.DetailedRouting.StrictBendPenalty
+                                ),
+                                ViaPenalty=(
+                                    Policy.DetailedRouting.StrictViaPenalty
+                                ),
+                                MaximumExpansionCount=(
+                                    CandidateExpansionLimitValue
+                                ),
                             )
 
                         if not PrepareRawRouteGuideFactorDomainOnly:
@@ -46558,12 +47485,49 @@ def RouteAuthoritativeResources(
         # signal-owned pre-route value.
         CompactFactorExtractionStartedAt = monotonic()
         GuideSpineConstructionElapsedSeconds = 0.0
+        CompactConnectivityElapsedSeconds = 0.0
+        CompactStaticCertificationElapsedSeconds = 0.0
+        CompactCertificateRequestBuildElapsedSeconds = 0.0
         GuideSpineCacheHits = 0
         GuideSpineCacheMisses = 0
         CompactMaterializabilityCertificateByFactorId: dict[
             str, CompactGuideMaterializabilityCertificate
         ] = {}
+        CompactMaterializabilityCompleteCount = 0
+        CompactMaterializabilitySupportedCount = 0
+        CompactMaterializabilityRejectedDisconnectedCount = 0
+        CompactMaterializabilityRejectedStaticSelfConflictCount = 0
+        CompactMaterializabilityWorkCount = 0
         CompactMaterializabilityComplete = True
+        FrozenNativeGuideRecipesBySignal: dict[str, tuple[Any, ...]] = {}
+        FrozenNativeGuideMismatchExamplesBySignal: dict[
+            str,
+            tuple[
+                tuple[tuple[str, str], ...],
+                tuple[tuple[str, str], ...],
+            ],
+        ] = {}
+        if FrozenNativeRouteGuideRecipes:
+            MutableFrozenNativeGuideRecipesBySignal: dict[
+                str, list[Any]
+            ] = defaultdict(list)
+            for Recipe in FrozenNativeRouteGuideRecipes:
+                RecipeSignal = str(
+                    getattr(Recipe, "Variable", "")
+                ).removeprefix("__route_guide__:")
+                if not RecipeSignal:
+                    raise ValueError(
+                        "frozen native guide recipe is missing its signal"
+                    )
+                MutableFrozenNativeGuideRecipesBySignal[
+                    RecipeSignal
+                ].append(Recipe)
+            FrozenNativeGuideRecipesBySignal = {
+                Signal: tuple(Recipes)
+                for Signal, Recipes in (
+                    MutableFrozenNativeGuideRecipesBySignal.items()
+                )
+            }
         SelectedGuideShapesBySignal: dict[
             str, tuple[CandidateRequestShapeDescriptor, ...]
         ] = {}
@@ -46583,47 +47547,54 @@ def RouteAuthoritativeResources(
         GuideSpineDescriptorIdentities: set[
             tuple[int, frozenset[Position2]]
         ] = set()
-        StaticSelfLegalByClaims: dict[RoutingResourceClaims, bool] = {}
-        StaticSameOwnerCompatibleByClaimsPair: dict[
-            tuple[RoutingResourceClaims, RoutingResourceClaims], bool
+        StaticSelfLegalByIdentity: dict[tuple[object, ...], bool] = {}
+        StaticSameOwnerCompatibleByIdentityPair: dict[
+            tuple[tuple[object, ...], tuple[object, ...]], bool
         ] = {}
         StaticClaimCacheHits = 0
         StaticClaimCacheMisses = 0
         def ClaimsAreStaticallySelfLegal(
+            Identity: tuple[object, ...],
             Claims: RoutingResourceClaims,
         ) -> bool:
             nonlocal StaticClaimCacheHits, StaticClaimCacheMisses
-            Cached = StaticSelfLegalByClaims.get(Claims)
+            Cached = StaticSelfLegalByIdentity.get(Identity)
             if Cached is not None:
                 StaticClaimCacheHits += 1
                 return Cached
             Result = not FindSelfClaimConflicts({"compact": Claims})
-            StaticSelfLegalByClaims[Claims] = Result
+            StaticSelfLegalByIdentity[Identity] = Result
             StaticClaimCacheMisses += 1
             return Result
 
         def ClaimsAreStaticallySameOwnerCompatible(
+            FirstIdentity: tuple[object, ...],
             First: RoutingResourceClaims,
+            SecondIdentity: tuple[object, ...],
             Second: RoutingResourceClaims,
         ) -> bool:
             nonlocal StaticClaimCacheHits, StaticClaimCacheMisses
-            Pair = (First, Second)
-            Cached = StaticSameOwnerCompatibleByClaimsPair.get(Pair)
+            Pair = (FirstIdentity, SecondIdentity)
+            Cached = StaticSameOwnerCompatibleByIdentityPair.get(Pair)
             if Cached is None:
-                Cached = StaticSameOwnerCompatibleByClaimsPair.get(
-                    (Second, First)
+                Cached = StaticSameOwnerCompatibleByIdentityPair.get(
+                    (SecondIdentity, FirstIdentity)
                 )
             if Cached is not None:
                 StaticClaimCacheHits += 1
                 return Cached
             Result = CompactSameOwnerClaimsAreCompatible(First, Second)
-            StaticSameOwnerCompatibleByClaimsPair[Pair] = Result
+            StaticSameOwnerCompatibleByIdentityPair[Pair] = Result
             StaticClaimCacheMisses += 1
             return Result
 
         PortalClaimsByIdentity: dict[
             tuple[object, ...],
             RoutingResourceClaims,
+        ] = {}
+        PortalPhysicalIdentityByIds: dict[
+            tuple[str, tuple[str, ...]],
+            tuple[tuple[str, tuple[Position3, ...]], ...],
         ] = {}
         PortalClaimsFingerprintByIdentity: dict[
             tuple[object, ...], str
@@ -46645,6 +47616,9 @@ def RouteAuthoritativeResources(
             tuple[str, ...],
             tuple[tuple[str, str], ...],
         ] = {}
+        ContradictoryAccessRequirementExamples: dict[
+            str, list[tuple[tuple[str, tuple[str, str] | None], ...]]
+        ] = defaultdict(list)
         if PlacementAccessFabric is not None:
             FabricFingerprint = str(
                 PlacementAccessFabric.FabricFingerprint
@@ -46660,6 +47634,9 @@ def RouteAuthoritativeResources(
                     PlacementAccessStubContractRequirementName(LogicalKey)
                 )
                 for StubIndex, Stub in enumerate(Domain.EscapeStubs):
+                    StubChoiceId = BuildPlacementAccessEscapeStubChoiceId(
+                        Stub
+                    )
                     Layer = next((
                         CandidateLayer
                         for CandidateLayer in range(LayerCount)
@@ -46677,17 +47654,20 @@ def RouteAuthoritativeResources(
                     )
                     AccessStubRequirementByPortalId[PortalId] = (
                         RequirementName,
-                        str(StubIndex),
+                        StubChoiceId,
                     )
                     AccessStubClaimsByRequirement[
-                        (RequirementName, str(StubIndex))
+                        (RequirementName, StubChoiceId)
                     ] = Stub.PhysicalClaims
         OrderedCompactSignals = tuple(sorted(Profiles))
+        NativeCertifiedSelectedFactorIds: set[str] = set()
         AllPendingGuideFactors: list[tuple[
             str,
             CompactGuideMaterializabilityRequest,
             CandidateRequestShapeDescriptor,
             RoutingResourceClaims,
+            str,
+            str,
             tuple[tuple[str, str], ...],
         ]] = []
         for Signal in OrderedCompactSignals:
@@ -46707,10 +47687,180 @@ def RouteAuthoritativeResources(
                 CompactGuideMaterializabilityRequest,
                 CandidateRequestShapeDescriptor,
                 RoutingResourceClaims,
+                str,
+                str,
                 tuple[tuple[str, str], ...],
             ]] = []
             for Shape in SelectedGuideShapesBySignal.get(Signal, ()):
-                FactorId = RouteGuideFactorCandidateId(Shape)
+                PortalIds = tuple(
+                    str(Portal.PortalId)
+                    for Portal in (
+                        Shape.SourcePortal,
+                        *Shape.TargetPortals,
+                    )
+                )
+                FrozenNativeRecipes = (
+                    FrozenNativeGuideRecipesBySignal.get(Signal)
+                )
+                MatchingNativeRecipes: tuple[Any, ...] = ()
+                if FrozenNativeRecipes is not None:
+                    ShapeAccessRequirements = tuple(sorted(
+                        AccessStubRequirementByPortalId[PortalId]
+                        for PortalId in PortalIds
+                        if PortalId in AccessStubRequirementByPortalId
+                    ))
+                    MatchingNativeRecipes = tuple(
+                        Recipe
+                        for Recipe in FrozenNativeRecipes
+                        if (
+                            int(getattr(Recipe, "RoutingY"))
+                            == int(Shape.RoutingY)
+                            and str(getattr(Recipe, "Axis"))
+                            == str(Shape.Axis)
+                            and int(getattr(Recipe, "Lane"))
+                            == int(Shape.Lane)
+                            and frozenset(
+                                (int(X), int(Z))
+                                for X, _Y, Z in getattr(
+                                    Recipe,
+                                    "Guide",
+                                )
+                            ) == frozenset(Shape.Guide)
+                            and frozenset(
+                                (int(X), int(Z))
+                                for X, _Y, Z in getattr(
+                                    Recipe,
+                                    "PhysicalGuide",
+                                    getattr(Recipe, "Guide"),
+                                )
+                            ) == frozenset(
+                                Shape.PhysicalGuide
+                                if Shape.PhysicalGuide is not None
+                                else Shape.Guide
+                            )
+                            and tuple(sorted(
+                                (
+                                    "access-stub:"
+                                    + str(Variable).removeprefix(
+                                        "__access_terminal__:"
+                                    ),
+                                    str(CandidateId),
+                                )
+                                for Variable, CandidateId in getattr(
+                                    Recipe,
+                                    "AccessCandidateIds",
+                                )
+                            )) == ShapeAccessRequirements
+                        )
+                    )
+                    if not MatchingNativeRecipes:
+                        MatchStage = "routing-plane"
+                        PlaneMatches = tuple(
+                            Recipe
+                            for Recipe in FrozenNativeRecipes
+                            if int(getattr(Recipe, "RoutingY"))
+                            == int(Shape.RoutingY)
+                        )
+                        AxisLaneMatches = tuple(
+                            Recipe
+                            for Recipe in PlaneMatches
+                            if (
+                                str(getattr(Recipe, "Axis"))
+                                == str(Shape.Axis)
+                                and int(getattr(Recipe, "Lane"))
+                                == int(Shape.Lane)
+                            )
+                        )
+                        GuideMatches = tuple(
+                            Recipe
+                            for Recipe in AxisLaneMatches
+                            if frozenset(
+                                (int(X), int(Z))
+                                for X, _Y, Z
+                                in getattr(
+                                    Recipe,
+                                    "Guide",
+                                )
+                            ) == frozenset(Shape.Guide)
+                        )
+                        if PlaneMatches:
+                            MatchStage = "axis-lane"
+                        if AxisLaneMatches:
+                            MatchStage = "guide"
+                        if GuideMatches:
+                            MatchStage = "access-requirements"
+                            FrozenNativeGuideMismatchExamplesBySignal.setdefault(
+                                Signal,
+                                (
+                                    ShapeAccessRequirements,
+                                    tuple(sorted(
+                                        (
+                                            "access-stub:"
+                                            + str(Variable).removeprefix(
+                                                "__access_terminal__:"
+                                            ),
+                                            str(CandidateId),
+                                        )
+                                        for Variable, CandidateId
+                                        in getattr(
+                                            GuideMatches[0],
+                                            "AccessCandidateIds",
+                                        )
+                                    )),
+                                ),
+                            )
+                        CompactGuideShapeEnumerationBySignal[Signal][
+                            f"frozen-native-mismatch-{MatchStage}"
+                        ] += 1
+                        continue
+                FactorId = (
+                    str(MatchingNativeRecipes[0].CandidateId)
+                    if MatchingNativeRecipes
+                    else RouteGuideFactorCandidateId(Shape)
+                )
+                if MatchingNativeRecipes:
+                    Shape = replace(
+                        Shape,
+                        AccessRamps=tuple(
+                            tuple(
+                                tuple(map(int, Position))
+                                for Position in Ramp
+                            )
+                            for Ramp in getattr(
+                                MatchingNativeRecipes[0],
+                                "AccessRamps",
+                            )
+                        ),
+                        DetailedHintPaths=tuple(
+                            tuple(
+                                tuple(map(int, Position))
+                                for Position in Path
+                            )
+                            for Path in getattr(
+                                MatchingNativeRecipes[0],
+                                "DetailedHintPaths",
+                                (),
+                            )
+                        ),
+                        CertifiedRepeaters=tuple(
+                            (
+                                tuple(map(int, Position)),
+                                str(Facing),
+                            )
+                            for Position, Facing in getattr(
+                                MatchingNativeRecipes[0],
+                                "CertifiedRepeaters",
+                                (),
+                            )
+                        ),
+                    )
+                    # The selected native recipe is emitted only after its
+                    # exact graph, portal, guide, access-ramp, required-node,
+                    # and blocked-node bundle completed the bounded native
+                    # connectivity proof.  Re-running the older Python
+                    # necessary-condition oracle here applies a different
+                    # allowed-node model and can reject that exact witness.
+                    NativeCertifiedSelectedFactorIds.add(FactorId)
                 if FactorId in SeenGuideFactors:
                     continue
                 SeenGuideFactors.add(FactorId)
@@ -46746,25 +47896,30 @@ def RouteAuthoritativeResources(
                             *Shape.TargetPortals,
                         ),
                     )
-                PortalClaimsIdentity = (
-                    Signal,
-                    tuple(
-                        (
-                            Portal.PortalId,
-                            tuple(Portal.Path),
-                        )
-                        for Portal in (
-                            Shape.SourcePortal,
-                            *Shape.TargetPortals,
-                        )
-                    ),
-                )
-                PortalIds = tuple(
-                    Portal.PortalId
+                PortalPhysicalIdentity = tuple(
+                    (str(Portal.PortalId), tuple(Portal.Path))
                     for Portal in (
                         Shape.SourcePortal,
                         *Shape.TargetPortals,
                     )
+                )
+                PortalClaimsIdentity = (Signal, PortalIds)
+                ExistingPortalPhysicalIdentity = (
+                    PortalPhysicalIdentityByIds.get(
+                        PortalClaimsIdentity
+                    )
+                )
+                if (
+                    ExistingPortalPhysicalIdentity is not None
+                    and ExistingPortalPhysicalIdentity
+                    != PortalPhysicalIdentity
+                ):
+                    raise RuntimeError(
+                        "portal ids alias different exact physical paths"
+                    )
+                PortalPhysicalIdentityByIds.setdefault(
+                    PortalClaimsIdentity,
+                    PortalPhysicalIdentity,
                 )
                 PortalClaims = PortalClaimsByIdentity.get(
                     PortalClaimsIdentity
@@ -46837,9 +47992,24 @@ def RouteAuthoritativeResources(
                     )
                 )
                 if not PrimitiveRejectionKnown:
+                    PortalSelfConflicts = FindSelfClaimConflicts({
+                        Signal: PortalClaims,
+                    })
+                    if (
+                        PortalSelfConflicts
+                        and os.environ.get("RCS_DEBUG_NATIVE_ACCESS_GUIDE")
+                    ):
+                        print(
+                            "native layered portal self-conflict",
+                            f"signal={Signal}",
+                            f"portals={PortalIds}",
+                            f"conflicts={tuple(sorted(map(str, PortalSelfConflicts)))[:8]}",
+                            f"wires={tuple(sorted(PortalClaims.WireCells))}",
+                            f"air={tuple(sorted(PortalClaims.RequiredAirCells))}",
+                        )
                     PrimitiveRejection = (
                         "primitive-self-conflict"
-                        if FindSelfClaimConflicts({Signal: PortalClaims})
+                        if PortalSelfConflicts
                         else "foreign-control-source-conflict"
                         if any(
                             bool(PortalClaims.WireCells & KeepOut)
@@ -46863,9 +48033,13 @@ def RouteAuthoritativeResources(
                         PrimitiveRejection
                     ] += 1
                     continue
+                CompactCertificateRequestBuildStartedAt = monotonic()
                 CertificateRequest = CertificateBuilder(
                     PortalClaims,
                     RoutingResourceClaims(),
+                )
+                CompactCertificateRequestBuildElapsedSeconds += (
+                    monotonic() - CompactCertificateRequestBuildStartedAt
                 )
                 AccessStubRequirements = (
                     AccessStubRequirementsByPortalIds.get(PortalIds)
@@ -46888,6 +48062,23 @@ def RouteAuthoritativeResources(
                 if len({
                     Name for Name, _Value in AccessStubRequirements
                 }) != len(AccessStubRequirements):
+                    if len(
+                        ContradictoryAccessRequirementExamples[Signal]
+                    ) < 4:
+                        ContradictoryAccessRequirementExamples[
+                            Signal
+                        ].append(tuple(
+                            (
+                                str(Portal.PortalId),
+                                AccessStubRequirementByPortalId.get(
+                                    Portal.PortalId
+                                ),
+                            )
+                            for Portal in (
+                                Shape.SourcePortal,
+                                *Shape.TargetPortals,
+                            )
+                        ))
                     # One route shape cannot simultaneously select two
                     # different stubs for the same physical terminal.  Such
                     # a tuple is an internally contradictory factor, not a
@@ -46900,6 +48091,8 @@ def RouteAuthoritativeResources(
                     CertificateRequest,
                     Shape,
                     PortalClaims,
+                    PortalClaimsFingerprint,
+                    PortalIdentityFingerprint,
                     AccessStubRequirements,
                 ))
 
@@ -46939,6 +48132,14 @@ def RouteAuthoritativeResources(
                     CertificateRequest,
                     *_Rest,
                 ) in AllPendingGuideFactors:
+                    if (
+                        CertificateRequest.FactorId
+                        in NativeCertifiedSelectedFactorIds
+                    ):
+                        ConnectivityResultsByKey[
+                            CertificateRequest.ConnectivityKey
+                        ] = (True, True, 0)
+                        continue
                     CachedConnectivity = (
                         PhysicalRouteFactorConnectivityCache.get(
                             CertificateRequest.ConnectivityKey
@@ -46967,6 +48168,7 @@ def RouteAuthoritativeResources(
                     InvariantRequestPayloadCacheDiagnostics[
                         "ConnectivityFactorChecks"
                     ] += len(UncachedRequests)
+                    CompactConnectivityStartedAt = monotonic()
                     NativeConnectivityResults = tuple(
                         Context.CertifyRouteFactorConnectivityBatchBounded(
                             tuple(
@@ -46978,6 +48180,9 @@ def RouteAuthoritativeResources(
                                 AdaptiveExpiresAt,
                             ),
                         )
+                    )
+                    CompactConnectivityElapsedSeconds += (
+                        monotonic() - CompactConnectivityStartedAt
                     )
                     if len(NativeConnectivityResults) != len(
                         UncachedRequests
@@ -47015,11 +48220,14 @@ def RouteAuthoritativeResources(
                                 int(WorkCount),
                             )
 
+            CompactStaticCertificationStartedAt = monotonic()
             for (
                 PendingSignal,
                 CertificateRequest,
                 Shape,
                 PortalClaims,
+                PortalClaimsFingerprint,
+                PortalIdentityFingerprint,
                 AccessStubRequirements,
             ) in AllPendingGuideFactors:
                 Complete, Supported, WorkCount = (
@@ -47029,36 +48237,28 @@ def RouteAuthoritativeResources(
                     )
                 )
                 FactorId = CertificateRequest.FactorId
+                CompactMaterializabilityWorkCount += int(WorkCount)
                 if not Complete:
-                    Certificate = CertificateRequest.BuildCertificate(
-                        Complete=False,
-                        NecessaryConnectivity=False,
-                        WorkCount=WorkCount,
-                    )
-                    CompactMaterializabilityCertificateByFactorId[
-                        FactorId
-                    ] = Certificate
                     CompactMaterializabilityComplete = False
                     CompactGuideFactorRejectionsBySignal[PendingSignal][
                         "materializability-incomplete"
                     ] += 1
                     continue
+                CompactMaterializabilityCompleteCount += 1
                 if not Supported:
-                    Certificate = CertificateRequest.BuildCertificate(
-                        Complete=True,
-                        NecessaryConnectivity=False,
-                        WorkCount=WorkCount,
-                    )
-                    CompactMaterializabilityCertificateByFactorId[
-                        FactorId
-                    ] = Certificate
+                    CompactMaterializabilityRejectedDisconnectedCount += 1
                     CompactGuideFactorRejectionsBySignal[PendingSignal][
                         "necessary-connectivity"
                     ] += 1
                     continue
+                PhysicalGuideColumns = (
+                    Shape.PhysicalGuide
+                    if Shape.PhysicalGuide is not None
+                    else Shape.Guide
+                )
                 GuideSpineIdentity = (
                     int(Shape.RoutingY),
-                    frozenset(Shape.Guide),
+                    frozenset(PhysicalGuideColumns),
                 )
                 if GuideSpineIdentity in GuideSpineDescriptorIdentities:
                     GuideSpineCacheHits += 1
@@ -47070,7 +48270,7 @@ def RouteAuthoritativeResources(
                 GuideSpineStartedAt = monotonic()
                 GuideWireCells = frozenset(
                     (int(X), int(Shape.RoutingY), int(Z))
-                    for X, Z in Shape.Guide
+                    for X, Z in PhysicalGuideColumns
                 )
                 GuideSupportCells = frozenset(
                     (X, Y - 1, Z) for X, Y, Z in GuideWireCells
@@ -47079,24 +48279,45 @@ def RouteAuthoritativeResources(
                     monotonic() - GuideSpineStartedAt
                 )
                 StaticClaimPrimitives = (
-                    PortalClaims,
+                    (
+                        ("portal", PortalIdentityFingerprint),
+                        PortalClaims,
+                    ),
                     *(
-                        AccessStubClaimsByRequirement[Requirement]
+                        (
+                            ("access-stub", *Requirement),
+                            AccessStubClaimsByRequirement[Requirement],
+                        )
                         for Requirement in AccessStubRequirements
                         if Requirement in AccessStubClaimsByRequirement
                     ),
                 )
+                # Portal primitive self-legality was already proved and
+                # cached above alongside the frozen-component checks.
+                StaticSelfLegalByIdentity[
+                    ("portal", PortalIdentityFingerprint)
+                ] = True
                 StaticSelfLegal = bool(
                     all(
-                        ClaimsAreStaticallySelfLegal(Claims)
-                        for Claims in StaticClaimPrimitives
+                        ClaimsAreStaticallySelfLegal(Identity, Claims)
+                        for Identity, Claims in StaticClaimPrimitives
                     )
                     and all(
-                        ClaimsAreStaticallySameOwnerCompatible(First, Second)
-                        for FirstIndex, First in enumerate(
+                        ClaimsAreStaticallySameOwnerCompatible(
+                            FirstIdentity,
+                            First,
+                            SecondIdentity,
+                            Second,
+                        )
+                        for FirstIndex, (
+                            FirstIdentity,
+                            First,
+                        ) in enumerate(
                             StaticClaimPrimitives
                         )
-                        for Second in StaticClaimPrimitives[FirstIndex + 1 :]
+                        for SecondIdentity, Second in (
+                            StaticClaimPrimitives[FirstIndex + 1 :]
+                        )
                     )
                     and all(
                         not (
@@ -47108,23 +48329,103 @@ def RouteAuthoritativeResources(
                             or Claims.SupportCells & GuideWireCells
                             or Claims.RequiredAirCells & GuideWireCells
                         )
-                        for Claims in StaticClaimPrimitives
+                        for _Identity, Claims in StaticClaimPrimitives
                     )
+                )
+                if not StaticSelfLegal:
+                    CompactMaterializabilityRejectedStaticSelfConflictCount += 1
+                    CompactGuideFactorRejectionsBySignal[PendingSignal][
+                        "static-self-conflict"
+                    ] += 1
+                    continue
+                PortalTupleKey = CertificateRequest.ConnectivityKey[0]
+                RequiredNodesFingerprint = (
+                    CompactCertificateRequiredNodesFingerprintCache.get(
+                        PortalTupleKey
+                    )
+                )
+                if RequiredNodesFingerprint is None:
+                    RequiredNodesFingerprint = (
+                        _BuildCompactClosedTupleFingerprint(
+                            "compact-required-nodes-v1",
+                            CertificateRequest.RequiredAllowedNodes,
+                        )
+                    )
+                    CompactCertificateRequiredNodesFingerprintCache[
+                        PortalTupleKey
+                    ] = RequiredNodesFingerprint
+                BlockedNodesFingerprint = (
+                    CompactCertificateBlockedNodesFingerprintCache.get(
+                        CertificateRequest.BlockedNodes
+                    )
+                )
+                if BlockedNodesFingerprint is None:
+                    BlockedNodesFingerprint = (
+                        _BuildCompactClosedTupleFingerprint(
+                            "compact-blocked-nodes-v1",
+                            CertificateRequest.BlockedNodes,
+                        )
+                    )
+                    CompactCertificateBlockedNodesFingerprintCache[
+                        CertificateRequest.BlockedNodes
+                    ] = BlockedNodesFingerprint
+                GuidePayloadKey = (
+                    Shape.Guide,
+                    frozenset(PhysicalGuideColumns),
+                    Shape.GuideExpansion,
+                )
+                GuideColumnsCacheKey = (
+                    int(Shape.RoutingY),
+                    GuidePayloadKey,
+                )
+                GuideColumnsFingerprint = (
+                    CompactCertificateGuideColumnsFingerprintCache.get(
+                        GuideColumnsCacheKey
+                    )
+                )
+                if GuideColumnsFingerprint is None:
+                    GuideColumnsFingerprint = (
+                        _BuildCompactClosedTupleFingerprint(
+                            "compact-guide-columns-v1",
+                            (
+                                int(Shape.RoutingY),
+                                Shape.SortedGuide,
+                                Shape.SortedPhysicalGuide,
+                                int(Shape.GuideExpansion),
+                            ),
+                        )
+                    )
+                    CompactCertificateGuideColumnsFingerprintCache[
+                        GuideColumnsCacheKey
+                    ] = GuideColumnsFingerprint
+                CertificateRequest = replace(
+                    CertificateRequest,
+                    RequiredNodesFingerprint=RequiredNodesFingerprint,
+                    BlockedNodesFingerprint=BlockedNodesFingerprint,
+                    GuideColumnsFingerprint=GuideColumnsFingerprint,
+                    StaticClaimsFingerprint=(
+                        _BuildCompactClosedTupleFingerprint(
+                            "compact-static-self-claims-v2",
+                            (
+                                FactorId,
+                                CompactCertificateResourceFingerprint,
+                                CompactCertificateTechnologyFingerprint,
+                                CompactCertificateFabricFingerprint,
+                                CompactCertificateAccessShellFingerprint,
+                            ),
+                        )
+                    ),
                 )
                 Certificate = CertificateRequest.BuildCertificate(
                     Complete=True,
                     NecessaryConnectivity=True,
                     WorkCount=WorkCount,
-                    StaticSelfLegal=StaticSelfLegal,
+                    StaticSelfLegal=True,
                 )
                 CompactMaterializabilityCertificateByFactorId[
                     FactorId
                 ] = Certificate
-                if not Certificate.StaticSelfLegal:
-                    CompactGuideFactorRejectionsBySignal[PendingSignal][
-                        "static-self-conflict"
-                    ] += 1
-                    continue
+                CompactMaterializabilitySupportedCount += 1
                 RouteGuideFactorValuesBySignal[PendingSignal].append(
                     RawTrackAssignmentValue(
                         Signal=PendingSignal,
@@ -47170,6 +48471,9 @@ def RouteAuthoritativeResources(
                         ContractRequirements=AccessStubRequirements,
                     )
                 )
+            CompactStaticCertificationElapsedSeconds += (
+                monotonic() - CompactStaticCertificationStartedAt
+            )
             for LocalSignal in OrderedCompactSignals:
                 for Choice in PreRouteLocalClaimChoicesBySignal.get(
                     LocalSignal,
@@ -47250,43 +48554,19 @@ def RouteAuthoritativeResources(
                     (
                         "CompactMaterializabilityCertificates",
                         {
-                            "CompleteCount": sum(
-                                Value.Complete
-                                for Value in (
-                                    CompactMaterializabilityCertificateByFactorId
-                                    .values()
-                                )
+                            "CompleteCount": (
+                                CompactMaterializabilityCompleteCount
                             ),
-                            "SupportedCount": sum(
-                                Value.Supported
-                                for Value in (
-                                    CompactMaterializabilityCertificateByFactorId
-                                    .values()
-                                )
+                            "SupportedCount": (
+                                CompactMaterializabilitySupportedCount
                             ),
-                            "RejectedDisconnectedCount": sum(
-                                Value.Complete
-                                and not Value.NecessaryConnectivity
-                                for Value in (
-                                    CompactMaterializabilityCertificateByFactorId
-                                    .values()
-                                )
+                            "RejectedDisconnectedCount": (
+                                CompactMaterializabilityRejectedDisconnectedCount
                             ),
-                            "RejectedStaticSelfConflictCount": sum(
-                                Value.Complete
-                                and not Value.StaticSelfLegal
-                                for Value in (
-                                    CompactMaterializabilityCertificateByFactorId
-                                    .values()
-                                )
+                            "RejectedStaticSelfConflictCount": (
+                                CompactMaterializabilityRejectedStaticSelfConflictCount
                             ),
-                            "WorkCount": sum(
-                                Value.WorkCount
-                                for Value in (
-                                    CompactMaterializabilityCertificateByFactorId
-                                    .values()
-                                )
-                            ),
+                            "WorkCount": CompactMaterializabilityWorkCount,
                         },
                     ),
                     (
@@ -47297,10 +48577,41 @@ def RouteAuthoritativeResources(
                         "GuideSpineConstructionElapsedSeconds",
                         round(GuideSpineConstructionElapsedSeconds, 6),
                     ),
+                    (
+                        "CompactConnectivityElapsedSeconds",
+                        round(CompactConnectivityElapsedSeconds, 6),
+                    ),
+                    (
+                        "CompactStaticCertificationElapsedSeconds",
+                        round(
+                            CompactStaticCertificationElapsedSeconds,
+                            6,
+                        ),
+                    ),
+                    (
+                        "CompactCertificateRequestBuildElapsedSeconds",
+                        round(
+                            CompactCertificateRequestBuildElapsedSeconds,
+                            6,
+                        ),
+                    ),
                     ("GuideSpineCacheHits", GuideSpineCacheHits),
                     ("GuideSpineCacheMisses", GuideSpineCacheMisses),
                     ("StaticClaimCacheHits", StaticClaimCacheHits),
                     ("StaticClaimCacheMisses", StaticClaimCacheMisses),
+                    (
+                        "ContradictoryAccessRequirementExamples",
+                        tuple(sorted(
+                            (
+                                Signal,
+                                tuple(Examples),
+                            )
+                            for Signal, Examples in (
+                                ContradictoryAccessRequirementExamples
+                                .items()
+                            )
+                        )),
+                    ),
                     ("RouteGuideFactorRejections", tuple(sorted(
                         (
                             Signal,
@@ -47317,6 +48628,12 @@ def RouteAuthoritativeResources(
                         for Signal, Counts
                         in CompactGuideShapeEnumerationBySignal.items()
                     ))),
+                    (
+                        "FrozenNativeGuideMismatchExamples",
+                        tuple(sorted(
+                            FrozenNativeGuideMismatchExamplesBySignal.items()
+                        )),
+                    ),
                     (
                         "CompactFactorExtractionElapsedSeconds",
                         round(
@@ -48234,13 +49551,14 @@ def RouteAuthoritativeResources(
         # A frozen compact witness fixes one guide request per logical
         # signal. Materialize those exact shapes in one selected-world pass.
         # The compact solve already chose the member and capacity factors;
-        # each signal gets one deterministic native call, and settled exact
-        # claims become immutable blockers for the remaining selected factors.
-        # No blocker-radius variant, factor retry, or second assignment solve
-        # is permitted.
+        # all signals enter one deterministic native generation/assignment
+        # call.  The selected access and guide claims are immutable blockers;
+        # optional detailed paths are alternatives in the shared assignment,
+        # never ordering-dependent blockers for later signals.  No
+        # blocker-radius variant, factor retry, or second assignment solve is
+        # permitted.
         BatchedInitialTrees = [None] * len(BatchedInitialRequests)
         RouteTreeBatchCount = 0
-        FrozenDetailedBlockedNodes: set[Position3] = set()
         FrozenClaimAwareRejectedPathCount = 0
         FrozenClaimAwareNoGoodCount = 0
         FrozenPortalConflictResourceCountsBySignal = {
@@ -48305,229 +49623,308 @@ def RouteAuthoritativeResources(
 
         FrozenMaterializationSignalOrder = tuple(sorted(
             CandidateSignalOrder,
-            key=FrozenMaterializationOrderKey,
+            key=lambda Signal: (
+                0
+                if Signal == os.environ.get(
+                    "RCS_DEBUG_FROZEN_PRIORITY_SIGNAL"
+                ) else 1,
+                FrozenMaterializationOrderKey(Signal),
+            ),
         ))
 
-        def BuildFrozenMandatoryAccessClaims(
-            Signal: str,
-        ) -> RoutingResourceClaims:
-            Profile = Profiles[Signal]
-            Descriptor = FrozenRouteGuideFactorDescriptorsBySignal[Signal]
-            PortalNodes = frozenset(
-                Position
-                for Portal in (
-                    Descriptor.SourcePortal,
-                    *Descriptor.TargetPortals,
-                )
-                for Position in Portal.Path
-            ) | BuildExactPortalTupleAccessNodes(
-                Profile,
-                (
-                    Descriptor.SourcePortal,
-                    *Descriptor.TargetPortals,
-                ),
-            )
-            FixedSeedNodes = frozenset(
-                Position
-                for Claim in (
-                    Profile.Seed.LocalClaims
-                    if Profile.Seed is not None
-                    else ()
-                )
-                for Position in Claim.Nodes
-            )
-            return Resources.ResourceGraph.BuildRouteClaims(
-                PortalNodes
-                | BuildExactFixedAccessNodes(Profile)
-                | FixedSeedNodes
-            )
-
-        FrozenMandatoryAccessClaimsBySignal = {
-            Signal: BuildFrozenMandatoryAccessClaims(Signal)
+        SelectedWorldRequests: list[FactorizedCandidateRouteRequest] = []
+        SelectedWorldOriginalRequestIndices: list[int] = []
+        SelectedWorldSignalRequestIndices: list[
+            tuple[str, list[int]]
+        ] = []
+        FrozenSelectedWorldSignals = tuple(
+            Signal
             for Signal in FrozenMaterializationSignalOrder
-        }
-        FrozenMandatoryBlockedNodesBySignal = {
-            Signal: frozenset({
-                *Claims.ElectricalCells,
-                *Claims.SupportCells,
-                *Claims.RequiredAirCells,
-                *(
-                    (X, Y + 1, Z)
-                    for X, Y, Z in (
-                        Claims.WireCells | Claims.RequiredAirCells
-                    )
-                ),
-            })
-            for Signal, Claims in (
-                FrozenMandatoryAccessClaimsBySignal.items()
+            if InitialResultSlices.get(Signal, (0, 0))[0]
+            < InitialResultSlices.get(Signal, (0, 0))[1]
+        )
+        FrozenSelectedWorldLongAccessSignals = frozenset(
+            Signal
+            for Signal in FrozenSelectedWorldSignals
+            if (
+                len(BatchedInitialRequests[
+                    InitialResultSlices[Signal][0]
+                ].AccessPayload[1])
+                + sum(
+                    len(Branch)
+                    for Branch in BatchedInitialRequests[
+                        InitialResultSlices[Signal][0]
+                    ].AccessPayload[2]
+                )
+                >= 32
+                or max(
+                    (
+                        len(Branch)
+                        for Branch in BatchedInitialRequests[
+                            InitialResultSlices[Signal][0]
+                        ].AccessPayload[2]
+                    ),
+                    default=0,
+                )
+                >= 15
             )
+        )
+        FrozenSelectedWorldShortAccessSignals = frozenset(
+            set(FrozenSelectedWorldSignals)
+            - FrozenSelectedWorldLongAccessSignals
+        )
+        FrozenSelectedWorldGlobalExpansionLimit = (
+            Policy.AdaptiveRouting.MaximumCandidateGenerationExpansions
+        )
+        FrozenSelectedWorldReservedShortExpansions = (
+            Policy.DetailedRouting.MinimumCandidateExpansionLimit
+            * len(FrozenSelectedWorldShortAccessSignals)
+        )
+        FrozenSelectedWorldLongExpansionLimit = min(
+            Policy.DetailedRouting.StrictMaximumExpansions,
+            max(
+                Policy.DetailedRouting.MinimumCandidateExpansionLimit,
+                (
+                    FrozenSelectedWorldGlobalExpansionLimit
+                    - FrozenSelectedWorldReservedShortExpansions
+                )
+                // max(1, len(FrozenSelectedWorldLongAccessSignals)),
+            ),
+        )
+        FrozenSelectedWorldRemainingExpansions = max(
+            0,
+            FrozenSelectedWorldGlobalExpansionLimit
+            - (
+                FrozenSelectedWorldLongExpansionLimit
+                * len(FrozenSelectedWorldLongAccessSignals)
+            ),
+        )
+        FrozenSelectedWorldShortExpansionLimit = min(
+            Policy.DetailedRouting.StrictMaximumExpansions,
+            max(
+                Policy.DetailedRouting.MinimumCandidateExpansionLimit,
+                FrozenSelectedWorldRemainingExpansions
+                // max(1, len(FrozenSelectedWorldShortAccessSignals)),
+            ),
+        )
+        FrozenSelectedWorldExpansionLimits = {
+            Signal: (
+                FrozenSelectedWorldLongExpansionLimit
+                if Signal in FrozenSelectedWorldLongAccessSignals
+                else FrozenSelectedWorldShortExpansionLimit
+            )
+            for Signal in FrozenSelectedWorldSignals
         }
-        def BuildFrozenCompleteTreeClaims(
-            Signal: str,
-            Tree: Iterable[Position3],
-        ) -> RoutingResourceClaims:
-            Profile = Profiles[Signal]
-            Descriptor = FrozenRouteGuideFactorDescriptorsBySignal[Signal]
-            Nodes = {
-                *Tree,
-                *BuildExactPortalAccessPrefix(
-                    Profile,
-                    tuple(Profile.Root),
-                    Descriptor.SourcePortal,
-                ),
-                *Descriptor.SourcePortal.Path,
-                *(
-                    Position
-                    for Target, Portal in zip(
-                        Profile.Targets,
-                        Descriptor.TargetPortals,
-                    )
-                    for Position in BuildExactPortalAccessPrefix(
-                        Profile,
-                        tuple(Target),
-                        Portal,
-                    )
-                ),
-                *(
-                    Position
-                    for Portal in Descriptor.TargetPortals
-                    for Position in Portal.Path
-                ),
-                *(
-                    Position
-                    for Claim in (
-                        Profile.Seed.LocalClaims
-                        if Profile.Seed is not None else ()
-                    )
-                    for Position in Claim.Nodes
-                ),
-            }
-            return Resources.ResourceGraph.BuildRouteClaims(Nodes)
-
         for Signal in FrozenMaterializationSignalOrder:
             ResultStart, ResultEnd = InitialResultSlices.get(Signal, (0, 0))
             if ResultStart >= ResultEnd:
                 continue
-            ForeignMandatoryBlockedNodes = {
-                Position
-                for OtherSignal, Positions in (
-                    FrozenMandatoryBlockedNodesBySignal.items()
+            SignalRequestIndices: list[int] = []
+            for OriginalRequestIndex in range(ResultStart, ResultEnd):
+                Request = BatchedInitialRequests[OriginalRequestIndex]
+                if not isinstance(
+                    Request,
+                    FactorizedCandidateRouteRequest,
+                ):
+                    raise ValueError(
+                        "frozen compact materialization requires an exact "
+                        "factorized route request"
+                    )
+                AccessPayloadValues = list(Request.AccessPayload)
+                AccessPayloadValues[4] = tuple(sorted({
+                    *AccessPayloadValues[4],
+                }))
+                AccessPayloadValues[5] = tuple(sorted({
+                    *AccessPayloadValues[5],
+                }))
+                SignalRequestIndices.append(len(SelectedWorldRequests))
+                SelectedWorldOriginalRequestIndices.append(
+                    OriginalRequestIndex
                 )
-                if OtherSignal != Signal
-                for Position in Positions
-            }
-            SignalRequests = []
-            for Request in BatchedInitialRequests[ResultStart:ResultEnd]:
-                RequestValues = list(Request)
-                RequestValues[4] = sorted({
-                    *RequestValues[4],
-                    *FrozenDetailedBlockedNodes,
-                    *ForeignMandatoryBlockedNodes,
-                })
-                (
-                    Starts,
-                    TargetBranches,
-                    AllowedColumns,
-                    RequiredNodes,
-                    BlockedNodes,
-                    PreferredColumns,
-                    PreferredRoutingY,
-                    GuidePenalty,
-                    BendPenalty,
-                    ViaPenalty,
-                    MaximumExpansionCount,
-                ) = RequestValues
-                AllowedNodes = {
-                    Position
-                    for Column in AllowedColumns
-                    for Position in NodesByColumn.get(tuple(Column), ())
-                }
-                AllowedNodes.update(tuple(Position) for Position in RequiredNodes)
-                SignalRequests.append((
-                    Starts,
-                    TargetBranches,
-                    sorted(AllowedNodes),
-                    BlockedNodes,
-                    PreferredColumns,
-                    [],
-                    PreferredRoutingY,
-                    GuidePenalty,
-                    BendPenalty,
-                    ViaPenalty,
-                    False,
-                    MaximumExpansionCount,
+                SelectedWorldRequests.append(FactorizedCandidateRouteRequest(
+                    AccessPayload=tuple(AccessPayloadValues),
+                    GuidePayload=Request.GuidePayload,
+                    PreferredRoutingY=Request.PreferredRoutingY,
+                    GuidePenalty=Request.GuidePenalty,
+                    BendPenalty=Request.BendPenalty,
+                    ViaPenalty=Request.ViaPenalty,
+                    MaximumExpansionCount=(
+                        FrozenSelectedWorldExpansionLimits[Signal]
+                    ),
                 ))
-            MandatoryClaims = FrozenMandatoryAccessClaimsBySignal[Signal]
-            MandatoryClaimPayload = (
-                sorted(MandatoryClaims.WireCells),
-                sorted(MandatoryClaims.SupportCells),
-                sorted(MandatoryClaims.RequiredAirCells),
-                sorted(MandatoryClaims.ElectricalCells),
+            SelectedWorldSignalRequestIndices.append((
+                Signal,
+                SignalRequestIndices,
+            ))
+        if not hasattr(
+            Context,
+            "GenerateAndAssignRouteTreesFactorizedBounded",
+        ):
+            raise ValueError(
+                "frozen selected-world materialization requires the one "
+                "bounded factorized generation/assignment Rust API"
             )
-            if not hasattr(
-                Context,
-                "GenerateRouteTreeClaimAwareDetailedBatchBounded",
-            ):
-                raise ValueError(
-                    "frozen selected-world materialization requires the "
-                    "claim-aware Rust routing API"
-                )
-            ClaimAwareBatch = (
-                Context.GenerateRouteTreeClaimAwareDetailedBatchBounded(
-                    [
-                        (Request, MandatoryClaimPayload)
-                        for Request in SignalRequests
-                    ],
-                    RemainingRoutingRuntimeMilliseconds(
-                        Deadline,
-                        AdaptiveExpiresAt,
+        AccessPayloads: list[tuple[Any, ...]] = []
+        GuidePayloads: list[tuple[Any, ...]] = []
+        AccessPayloadIndexByValue: dict[tuple[Any, ...], int] = {}
+        GuidePayloadIndexByValue: dict[tuple[Any, ...], int] = {}
+        FactorizedRequestReferences = []
+        for Request in SelectedWorldRequests:
+            AccessIndex = AccessPayloadIndexByValue.setdefault(
+                Request.AccessPayload,
+                len(AccessPayloads),
+            )
+            if AccessIndex == len(AccessPayloads):
+                AccessPayloads.append(Request.AccessPayload)
+            GuideIndex = GuidePayloadIndexByValue.setdefault(
+                Request.GuidePayload,
+                len(GuidePayloads),
+            )
+            if GuideIndex == len(GuidePayloads):
+                GuidePayloads.append(Request.GuidePayload)
+            FactorizedRequestReferences.append((
+                AccessIndex,
+                GuideIndex,
+                Request.PreferredRoutingY,
+                Request.GuidePenalty,
+                Request.BendPenalty,
+                Request.ViaPenalty,
+                Request.MaximumExpansionCount,
+            ))
+        SelectedWorldNativeRuntimeMilliseconds = (
+            RemainingRoutingRuntimeMilliseconds(
+                Deadline,
+                AdaptiveExpiresAt,
+            )
+        )
+        ClaimAwareBatch = (
+            Context.GenerateAndAssignRouteTreesFactorizedBounded(
+                AccessPayloads,
+                GuidePayloads,
+                FactorizedRequestReferences,
+                SelectedWorldSignalRequestIndices,
+                Policy.TrackAssignment.MaximumAssignmentExpansions,
+                SelectedWorldNativeRuntimeMilliseconds,
+            )
+        )
+        NativeDetailedSelectionResult = ClaimAwareBatch
+        NativeDetailedOriginalRequestIndices = tuple(
+            SelectedWorldOriginalRequestIndices
+        )
+        RouteTreeBatchCount = 1 if SelectedWorldRequests else 0
+        WorkTelemetry["NativeSelectedWorldGenerationAssignment"] = {
+            "Used": True,
+            "CallCount": RouteTreeBatchCount,
+            "Success": bool(ClaimAwareBatch.Success),
+            "Complete": bool(ClaimAwareBatch.Complete),
+            "DeadlineExceeded": bool(
+                ClaimAwareBatch.DeadlineExceeded
+            ),
+            "WorkCapExceeded": bool(
+                ClaimAwareBatch.WorkCapExceeded
+            ),
+            "GeneratedRequestCount": int(
+                ClaimAwareBatch.GeneratedRequestCount
+            ),
+            "DeclaredRequestCount": len(SelectedWorldRequests),
+            "AssignmentExpansionCount": int(
+                ClaimAwareBatch.AssignmentExpansionCount
+            ),
+            "SelectedRequestIndices": list(
+                ClaimAwareBatch.SelectedRequestIndices
+            ),
+        }
+        RouteTreeNativeDeadlineExceeded |= bool(
+            ClaimAwareBatch.DeadlineExceeded
+        )
+        ClaimAwareTrees = list(ClaimAwareBatch.RouteTrees)
+        ClaimAwareRepeaters = list(
+            ClaimAwareBatch.RepeaterReservations
+        )
+        if (
+            len(ClaimAwareTrees) != len(SelectedWorldRequests)
+            or len(ClaimAwareRepeaters) != len(SelectedWorldRequests)
+        ):
+            raise ValueError(
+                "frozen selected-world route-tree batch returned an "
+                "unexpected result count"
+            )
+        for (
+            OriginalRequestIndex,
+            Tree,
+            Repeaters,
+        ) in zip(
+            SelectedWorldOriginalRequestIndices,
+            ClaimAwareTrees,
+            ClaimAwareRepeaters,
+            strict=True,
+        ):
+            BatchedInitialTrees[OriginalRequestIndex] = (
+                FactorizedNativeRouteTreeResult(
+                    Nodes=tuple(Tree),
+                    RepeaterReservations=tuple(
+                        (tuple(Position), str(Facing))
+                        for Position, Facing in Repeaters
                     ),
                 )
-            )
-            ClaimAwareResults = list(ClaimAwareBatch.SearchResults)
-            if len(ClaimAwareResults) != len(SignalRequests):
-                raise ValueError(
-                    "frozen claim-aware route-tree batch returned an "
-                    "unexpected result count"
-                )
-            FrozenClaimAwareRejectedPathCount += sum(
-                int(Result.RejectedPathCount)
-                for Result in ClaimAwareResults
-            )
-            FrozenClaimAwareNoGoodCount += sum(
-                int(Result.NoGoodCount)
-                for Result in ClaimAwareResults
-            )
-            SignalTrees = [
-                list(Result.Nodes)
-                if Result.Status == "Routed"
+                if Tree is not None
                 else None
-                for Result in ClaimAwareResults
-            ]
-            RouteTreeBatchCount += 1
-            BatchedInitialTrees[ResultStart:ResultEnd] = SignalTrees
-            SettledTree = next(
-                (Tree for Tree in SignalTrees if Tree is not None),
-                None,
             )
-            if SettledTree is not None:
-                SettledClaims = BuildFrozenCompleteTreeClaims(
-                    Signal,
-                    SettledTree,
-                )
-                FrozenDetailedBlockedNodes.update(
-                    SettledClaims.SupportCells
-                )
-                FrozenDetailedBlockedNodes.update(
-                    SettledClaims.RequiredAirCells
-                )
-                FrozenDetailedBlockedNodes.update(
-                    SettledClaims.ElectricalCells
-                )
+        WorkTelemetry["RouteTreeCompletedWork"] = (
+            int(WorkTelemetry.get("RouteTreeCompletedWork", 0))
+            + int(ClaimAwareBatch.CompletedWork)
+        )
         WorkTelemetry["FrozenPreRouteDetailedMaterialization"] = {
             "Applied": True,
             "SignalCount": len(FrozenRouteGuideFactorIdsBySignal),
             "NativeBatchCount": RouteTreeBatchCount,
+            "NativeGenerationAssignment": True,
+            "NativeGenerationAssignmentSuccess": bool(
+                ClaimAwareBatch.Success
+            ),
+            "NativeGenerationAssignmentComplete": bool(
+                ClaimAwareBatch.Complete
+            ),
+            "NativeGenerationDeadlineExceeded": bool(
+                ClaimAwareBatch.DeadlineExceeded
+            ),
+            "NativeGenerationWorkCapExceeded": bool(
+                ClaimAwareBatch.WorkCapExceeded
+            ),
+            "NativeAssignmentExpansionCount": int(
+                ClaimAwareBatch.AssignmentExpansionCount
+            ),
+            "NativeGeneratedRequestCount": int(
+                ClaimAwareBatch.GeneratedRequestCount
+            ),
+            "NativeRuntimeMilliseconds": int(
+                SelectedWorldNativeRuntimeMilliseconds
+            ),
+            "SelectedWorldCandidateGenerationExpansionCap": int(
+                Policy.AdaptiveRouting
+                .MaximumCandidateGenerationExpansions
+            ),
+            "SelectedWorldCandidateGenerationAllocatedExpansions": sum(
+                FrozenSelectedWorldExpansionLimits.values()
+            ),
+            "SelectedWorldCandidateExpansionLimits": dict(sorted(
+                FrozenSelectedWorldExpansionLimits.items()
+            )),
+            "NativeGeneratedRequestCountsBySignal": [
+                [str(Signal), int(Count)]
+                for Signal, Count in (
+                    ClaimAwareBatch.GeneratedRequestCountsBySignal
+                )
+            ],
+            "NativeCandidateCountsBySignal": [
+                [str(Signal), int(Count)]
+                for Signal, Count in (
+                    ClaimAwareBatch.CandidateCountsBySignal
+                )
+            ],
+            "SelectedRequestIndices": list(
+                ClaimAwareBatch.SelectedRequestIndices
+            ),
             "ClaimAwareRejectedPathCount": (
                 FrozenClaimAwareRejectedPathCount
             ),
@@ -48672,7 +50069,19 @@ def RouteAuthoritativeResources(
         )
     else:
         BatchedInitialTrees = (
-            GenerateRouteTreesWithDeadline(BatchedInitialRequests)
+            GenerateRouteTreesWithDeadline(
+                BatchedInitialRequests,
+                tuple(
+                    (
+                        Signal,
+                        tuple(range(StartIndex, EndIndex)),
+                    )
+                    for Signal, (StartIndex, EndIndex) in (
+                        InitialResultSlices.items()
+                    )
+                    if EndIndex > StartIndex
+                ),
+            )
             if BatchedInitialRequests
             else []
         )
@@ -48998,6 +50407,7 @@ def RouteAuthoritativeResources(
     CandidateSignalRank = {
         Signal: Index for Index, Signal in enumerate(CandidateSignalOrder)
     }
+    MaterializedCandidateIdByRequestIdentity: dict[int, str] = {}
 
     def InitialRoutedTreeCount(Signal: str) -> int:
         if CandidatesBySignal.get(Signal):
@@ -49135,13 +50545,82 @@ def RouteAuthoritativeResources(
         def MaterializeBatch(
             Trees: list[Any],
             MetadataValues: list[tuple[Any, ...]],
+            RequestValues: list[Any] | None = None,
             *,
             SignalValue: str = Signal,
             ProfileValue: Any = Profile,
             RejectionCountsValue: Counter[str] = RejectionCounts,
         ) -> None:
-            for RoutedTree, Metadata in zip(Trees, MetadataValues):
+            if RequestValues is None:
+                RequestValues = [None] * len(Trees)
+            for RoutedTree, Metadata, RequestValue in zip(
+                Trees,
+                MetadataValues,
+                RequestValues,
+                strict=True,
+            ):
+                NativeRepeaterReservations = ()
+                if isinstance(
+                    RoutedTree,
+                    FactorizedNativeRouteTreeResult,
+                ):
+                    NativeRepeaterReservations = (
+                        RoutedTree.RepeaterReservations
+                    )
+                    RoutedTree = list(RoutedTree.Nodes)
                 SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant = Metadata
+                MaterializationDiagnostics: dict[str, object] = {}
+                if (
+                    RoutedTree is None
+                    and isinstance(
+                        RequestValue,
+                        FactorizedCandidateRouteRequest,
+                    )
+                ):
+                    RequestStarts = RequestValue.AccessPayload[0]
+                    RequestTargetBranches = RequestValue.AccessPayload[2]
+                    RequestRequiredNodes = RequestValue.AccessPayload[4]
+                    RequestBlockedNodes = RequestValue.AccessPayload[5]
+                    if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")):
+                        print(
+                            "[debug] frozen materialization miss "
+                            f"signal={SignalValue} "
+                            f"required={RequestRequiredNodes} "
+                            f"blocked={RequestBlockedNodes}",
+                            flush=True,
+                        )
+                    (
+                        RequestAllowedColumns,
+                        RequestPreferredColumns,
+                        _RequestExactHintNodes,
+                        _RequestCertifiedPaths,
+                        _RequestCertifiedRepeaters,
+                    ) = RequestValue.GuidePayload
+                    MaterializationDiagnostics.update({
+                        "RequestStarts": [
+                            list(Position) for Position in RequestStarts
+                        ],
+                        "RequestTargetBranches": [
+                            [list(Position) for Position in Branch]
+                            for Branch in RequestTargetBranches
+                        ],
+                        "RequestRequiredNodeCount": len(
+                            RequestRequiredNodes
+                        ),
+                        "RequestBlockedNodeCount": len(
+                            RequestBlockedNodes
+                        ),
+                        "RequestAllowedColumnCount": len(
+                            RequestAllowedColumns
+                        ),
+                        "RequestPreferredColumns": [
+                            list(Position)
+                            for Position in RequestPreferredColumns
+                        ],
+                        "RequestPreferredRoutingY": int(
+                            RequestValue.PreferredRoutingY
+                        ),
+                    })
                 Candidate = _MaterializeCandidate(
                     SignalValue,
                     ProfileValue,
@@ -49173,7 +50652,13 @@ def RouteAuthoritativeResources(
                         ) * Policy.GlobalRouting.ExistingGuideHintWeight
                     ),
                     Policy.DetailedRouting.RepeaterPenalty,
+                    NativeRepeaterReservations=(
+                        NativeRepeaterReservations
+                    ),
                     RejectionCounts=RejectionCountsValue,
+                    MaterializationDiagnostics=(
+                        MaterializationDiagnostics
+                    ),
                     SourceAccessPrefix=BuildExactPortalAccessPrefix(
                         ProfileValue,
                         tuple(ProfileValue.Root),
@@ -49191,6 +50676,21 @@ def RouteAuthoritativeResources(
                         )
                     },
                 )
+                if Candidate is None:
+                    FailureExamples = CandidateDiagnostics[
+                        SignalValue
+                    ].setdefault(
+                        "MaterializationFailureExamples",
+                        [],
+                    )
+                    if len(FailureExamples) < 4:
+                        FailureExamples.append({
+                            "Layer": int(Layer),
+                            "Axis": str(Axis),
+                            "Lane": int(Lane),
+                            "Variant": int(Variant),
+                            **MaterializationDiagnostics,
+                        })
                 if Candidate is not None:
                     CandidatePortalTuple = (
                         Candidate.SourcePortalId,
@@ -49199,8 +50699,13 @@ def RouteAuthoritativeResources(
                             for Target in ProfileValue.Targets
                         ),
                     )
-                    MatchingGuideFactorIds = frozenset(
-                        RouteGuideFactorCandidateId(Shape)
+                    FrozenGuideFactorIds = (
+                        FrozenRouteGuideFactorIdsBySignal.get(
+                            SignalValue
+                        )
+                    )
+                    MatchingShapes = tuple(
+                        Shape
                         for Shape in (
                             PhysicalCandidateRequestShapesBySignal.get(
                                 SignalValue,
@@ -49222,9 +50727,13 @@ def RouteAuthoritativeResources(
                             and Shape.Guide == Candidate.Guide
                         )
                     )
-                    FrozenGuideFactorIds = (
-                        FrozenRouteGuideFactorIdsBySignal.get(
-                            SignalValue
+                    MatchingGuideFactorIds = (
+                        frozenset(FrozenGuideFactorIds)
+                        if FrozenGuideFactorIds is not None
+                        and MatchingShapes
+                        else frozenset(
+                            RouteGuideFactorCandidateId(Shape)
+                            for Shape in MatchingShapes
                         )
                     )
                     if (
@@ -49294,6 +50803,10 @@ def RouteAuthoritativeResources(
                         })
                         continue
                     CandidatesBySignal[SignalValue].append(Candidate)
+                    if RequestValue is not None:
+                        MaterializedCandidateIdByRequestIdentity[
+                            id(RequestValue)
+                        ] = str(Candidate.CandidateId)
                     CandidateDiagnostics[SignalValue]["Materialized"] += 1
                     CandidateAxisLaneBySignal.setdefault(
                         SignalValue,
@@ -49313,7 +50826,12 @@ def RouteAuthoritativeResources(
                 RouteRequestsValue: list[Any] = RouteRequests,
                 RouteMetadataValue: list[tuple[Any, ...]] = RouteMetadata,
                 MaterializeBatchValue: Callable[
-                    [list[Any], list[tuple[Any, ...]]], None
+                    [
+                        list[Any],
+                        list[tuple[Any, ...]],
+                        list[Any] | None,
+                    ],
+                    None,
                 ] = MaterializeBatch,
                 RejectionCountsValue: Counter[str] = RejectionCounts,
             ) -> dict[str, object]:
@@ -49334,7 +50852,11 @@ def RouteAuthoritativeResources(
                     Trees = GenerateRouteTreesWithDeadline(Requests)
                     RouteTreeBatchCount += 1
                     CandidateRequestCount += len(Requests)
-                    MaterializeBatchValue(Trees, MetadataValues)
+                    MaterializeBatchValue(
+                        Trees,
+                        MetadataValues,
+                        Requests,
+                    )
                     Diagnostics["Requests"] = EndIndex
                     Diagnostics["RoutedTrees"] = int(
                         Diagnostics["RoutedTrees"]
@@ -49445,7 +50967,11 @@ def RouteAuthoritativeResources(
                 ConsumePhysicalGlobalCandidateSuffix
             )
 
-        MaterializeBatch(RoutedTrees, InitialRouteMetadata)
+        MaterializeBatch(
+            RoutedTrees,
+            InitialRouteMetadata,
+            InitialRouteRequests,
+        )
         PriorValues = tuple((PriorCandidateCache or {}).get(Signal, ()))
         if PriorValues:
             IncompletePreSiblingDomainSignals.add(Signal)
@@ -49544,6 +51070,7 @@ def RouteAuthoritativeResources(
                 MaterializeBatch(
                     ContinuationTrees,
                     ContinuationMetadata,
+                    ContinuationRequests,
                 )
                 CandidateDiagnostics[Signal]["Requests"] += len(
                     ContinuationRequests
@@ -49646,6 +51173,7 @@ def RouteAuthoritativeResources(
                 MaterializeBatch(
                     ContinuationTrees,
                     ContinuationMetadata,
+                    ContinuationRequests,
                 )
                 CandidateDiagnostics[Signal]["Requests"] += len(
                     ContinuationRequests
@@ -52155,6 +53683,14 @@ def RouteAuthoritativeResources(
                     "CandidateExtractionIncompleteReasons",
                     IncompleteReasons,
                 ),
+                (
+                    "CandidateDiagnostics",
+                    tuple(
+                        (str(Signal), dict(Diagnostics))
+                        for Signal, Diagnostics
+                        in sorted(CandidateDiagnostics.items())
+                    ),
+                ),
             ),
             NativeAssignmentContext=EffectiveRawPortalCache.Context,
         )
@@ -52180,6 +53716,173 @@ def RouteAuthoritativeResources(
         raise RawTrackAssignmentDomainPrepared(RawDomain)
     LayerCappedAssignmentAttempts: list[dict[str, int | bool]] = []
     Result = None
+    if NativeDetailedSelectionResult is not None:
+        if not bool(NativeDetailedSelectionResult.Success):
+            raise StructuredRoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                ),
+                Stage="FrozenPreRouteFactorMaterialization",
+                AffectedNets=tuple(sorted(
+                    Signal
+                    for Signal, (StartIndex, EndIndex) in (
+                        InitialResultSlices.items()
+                    )
+                    if EndIndex > StartIndex
+                )),
+                RepairActions=(),
+                Detail=(
+                    "the one bounded native selected-world generation and "
+                    "assignment operation produced no complete witness"
+                ),
+                Diagnostics={
+                    "Complete": bool(
+                        NativeDetailedSelectionResult.Complete
+                    ),
+                    "DeadlineExceeded": bool(
+                        NativeDetailedSelectionResult.DeadlineExceeded
+                    ),
+                    "WorkCapExceeded": bool(
+                        NativeDetailedSelectionResult.WorkCapExceeded
+                    ),
+                    "GeneratedRequestCount": int(
+                        NativeDetailedSelectionResult.GeneratedRequestCount
+                    ),
+                    "DeclaredRequestCount": len(BatchedInitialRequests),
+                    "AssignmentExpansionCount": int(
+                        NativeDetailedSelectionResult
+                        .AssignmentExpansionCount
+                    ),
+                    "SecondAssignmentInvocation": False,
+                },
+            ))
+        SignalByOriginalRequestIndex = {
+            RequestIndex: Signal
+            for Signal, (StartIndex, EndIndex) in (
+                InitialResultSlices.items()
+            )
+            for RequestIndex in range(StartIndex, EndIndex)
+        }
+        NativeSelectedOriginalRequestIndices = tuple(
+            (
+                NativeDetailedOriginalRequestIndices[int(RequestIndex)]
+                if NativeDetailedOriginalRequestIndices is not None
+                else int(RequestIndex)
+            )
+            for RequestIndex in (
+                NativeDetailedSelectionResult.SelectedRequestIndices
+            )
+        )
+        NativeSelectedCandidateIds = tuple(
+            (
+                SignalByOriginalRequestIndex[OriginalRequestIndex],
+                MaterializedCandidateIdByRequestIdentity.get(
+                    id(BatchedInitialRequests[OriginalRequestIndex]),
+                    "",
+                ),
+            )
+            for OriginalRequestIndex in (
+                NativeSelectedOriginalRequestIndices
+            )
+        )
+        MissingNativeDetailedMaterializations = tuple(
+            (Signal, CandidateId)
+            for Signal, CandidateId in NativeSelectedCandidateIds
+            if not CandidateId
+        )
+        if (
+            MissingNativeDetailedMaterializations
+            or len(NativeSelectedCandidateIds)
+            != len(set(SignalByOriginalRequestIndex.values()))
+            or len({Signal for Signal, _Id in NativeSelectedCandidateIds})
+            != len(NativeSelectedCandidateIds)
+        ):
+            raise StructuredRoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                ),
+                Stage="FrozenPreRouteFactorMaterialization",
+                AffectedNets=tuple(sorted({
+                    Signal
+                    for Signal, _CandidateId in (
+                        MissingNativeDetailedMaterializations
+                    )
+                })),
+                RepairActions=(),
+                Detail=(
+                    "a native-selected detailed tree did not survive exact "
+                    "Python candidate materialization"
+                ),
+                Diagnostics={
+                    "SelectedRequestIndices": list(
+                        NativeDetailedSelectionResult
+                        .SelectedRequestIndices
+                    ),
+                    "SelectedCandidateIds": [
+                        list(Value)
+                        for Value in NativeSelectedCandidateIds
+                    ],
+                    "MissingMaterializations": [
+                        list(Value)
+                        for Value in MissingNativeDetailedMaterializations
+                    ],
+                    "SecondAssignmentInvocation": False,
+                },
+            ))
+        NativeSelectedClaims = {
+            Signal: CandidateLookup[CandidateId].Claims
+            for Signal, CandidateId in NativeSelectedCandidateIds
+        }
+        NativeSelectedConflicts = FindClaimConflicts(
+            NativeSelectedClaims
+        )
+        if NativeSelectedConflicts:
+            FirstConflict = min(NativeSelectedConflicts, key=str)
+            raise StructuredRoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                ),
+                Stage="FrozenPreRouteFactorMaterialization",
+                AffectedNets=NativeSelectedConflicts[FirstConflict],
+                Resources=(str(FirstConflict),),
+                Locations=(FirstConflict.Position,),
+                RepairActions=(),
+                Detail=(
+                    "the native selected-world witness failed the exact "
+                    "Python physical-claim authority"
+                ),
+                Diagnostics={
+                    "SelectedCandidateIds": [
+                        list(Value)
+                        for Value in NativeSelectedCandidateIds
+                    ],
+                    "FirstConflictResource": str(FirstConflict),
+                    "FirstConflictSignals": list(
+                        NativeSelectedConflicts[FirstConflict]
+                    ),
+                    "SecondAssignmentInvocation": False,
+                },
+            ))
+        Result = SimpleNamespace(
+            Success=True,
+            SelectedCandidateIds=NativeSelectedCandidateIds,
+            ExpansionCount=int(
+                NativeDetailedSelectionResult.AssignmentExpansionCount
+            ),
+            ConflictSignals=(),
+            ConflictResourceIndices=(),
+            BudgetExhausted=False,
+            DeadlineExceeded=False,
+        )
+        WorkTelemetry[
+            "NativeSelectedWorldGenerationAssignment"
+        ].update({
+            "MaterializedCandidateIds": [
+                list(Value) for Value in NativeSelectedCandidateIds
+            ],
+            "PythonClaimValidation": True,
+            "SecondAssignmentInvocation": False,
+        })
     if FrozenTrackAssignmentPreparation is not None:
         FrozenSelections = tuple(
             (str(Signal), str(CandidateId))
@@ -52362,7 +54065,7 @@ def RouteAuthoritativeResources(
                 }
             )
         ))
-        if Result is None and (
+        if Result is None and not FrozenAccessOnlyCatalog and (
             FrozenSignals != frozenset(CandidatesBySignal)
             or len(FrozenSignals) != (
                 len(FrozenSelections) + len(FrozenLocalSelections)
@@ -52424,7 +54127,7 @@ def RouteAuthoritativeResources(
                     ),
                 },
             ))
-        if Result is None:
+        if Result is None and not FrozenAccessOnlyCatalog:
             Result = SimpleNamespace(
                 Success=True,
                 SelectedCandidateIds=(
@@ -53906,15 +55609,92 @@ def RouteAuthoritativeResources(
         )
     ))
     if ConflictingFrozenPortalIds:
-        raise StructuredRoutingStageError(RoutingFailure(
-            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
-            Stage="FrozenPreRouteFactorHandoff",
-            Detail=(
-                "a selected frozen guide portal conflicts with the exact "
-                "selected-world portal identity"
-            ),
-            Resources=ConflictingFrozenPortalIds,
-        ))
+        FrozenPortalFieldDifferences = {
+            PortalId: {
+                FieldName: {
+                    "SelectedWorld": BuildStableFingerprint(
+                        getattr(PortalLookup[PortalId], FieldName)
+                    ),
+                    "Frozen": BuildStableFingerprint(
+                        getattr(FrozenPortalLookup[PortalId], FieldName)
+                    ),
+                }
+                for FieldName in PortalLookup[
+                    PortalId
+                ].__dataclass_fields__
+                if getattr(
+                    PortalLookup[PortalId], FieldName
+                ) != getattr(FrozenPortalLookup[PortalId], FieldName)
+            }
+            for PortalId in ConflictingFrozenPortalIds[:8]
+        }
+        FrozenPortalClaimDifferences = {
+            PortalId: {
+                ClaimName: {
+                    "SelectedWorldCount": len(
+                        getattr(PortalLookup[PortalId].Claims, ClaimName)
+                    ),
+                    "FrozenCount": len(
+                        getattr(
+                            FrozenPortalLookup[PortalId].Claims,
+                            ClaimName,
+                        )
+                    ),
+                    "SelectedWorldOnly": [
+                        list(Position)
+                        for Position in sorted(
+                            getattr(
+                                PortalLookup[PortalId].Claims,
+                                ClaimName,
+                            )
+                            - getattr(
+                                FrozenPortalLookup[PortalId].Claims,
+                                ClaimName,
+                            )
+                        )[:8]
+                    ],
+                    "FrozenOnly": [
+                        list(Position)
+                        for Position in sorted(
+                            getattr(
+                                FrozenPortalLookup[PortalId].Claims,
+                                ClaimName,
+                            )
+                            - getattr(
+                                PortalLookup[PortalId].Claims,
+                                ClaimName,
+                            )
+                        )[:8]
+                    ],
+                }
+                for ClaimName in (
+                    "WireCells",
+                    "SupportCells",
+                    "RequiredAirCells",
+                    "ElectricalCells",
+                )
+                if getattr(
+                    PortalLookup[PortalId].Claims, ClaimName
+                ) != getattr(
+                    FrozenPortalLookup[PortalId].Claims, ClaimName
+                )
+            }
+            for PortalId in ConflictingFrozenPortalIds[:8]
+        }
+        # The compact selector carries the original portal objects from the
+        # already-built access fabric.  Ordinary detailed portal enumeration
+        # can assign the same ordinal PortalId to a different later path; that
+        # regenerated object is not authoritative for a frozen selected
+        # world.  Detailed candidate generation above consumed the frozen
+        # descriptor itself and Python claim validation has already checked
+        # the resulting physical tree.  Preserve the selected object and make
+        # the shadowed ordinary-domain collision explicit in diagnostics.
+        WorkTelemetry["FrozenPortalOrdinaryDomainShadowed"] = {
+            "Count": len(ConflictingFrozenPortalIds),
+            "PortalIds": list(ConflictingFrozenPortalIds[:8]),
+            "PortalFieldDifferences": FrozenPortalFieldDifferences,
+            "PortalClaimDifferences": FrozenPortalClaimDifferences,
+        }
     # A compact selection carries exact portal objects from the already-built
     # fabric.  Preserve them through materialization even when the ordinary
     # regenerated portal frontier omits an identity-equivalent alternative.

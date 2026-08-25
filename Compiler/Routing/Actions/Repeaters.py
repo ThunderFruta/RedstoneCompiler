@@ -227,6 +227,69 @@ def PropagateRoutePower(
     return Powers
 
 
+def FindSelfExcitingRepeaterCycles(
+    Graph: dict[Position3, list[Position3]],
+    Repeaters: dict[Position3, str],
+) -> tuple[tuple[Position3, tuple[Position3, ...]], ...]:
+    """Return repeaters whose output can feed their own input through dust."""
+
+    def DirectedNeighbors(Current: Position3) -> tuple[Position3, ...]:
+        CurrentFacing = Repeaters.get(Current)
+        if CurrentFacing is not None:
+            Delta = _RepeaterOutputDelta(CurrentFacing)
+            Output = tuple(
+                Current[Index] + Delta[Index] for Index in range(3)
+            )
+            return (Output,) if Output in Graph.get(Current, ()) else ()
+        Values = []
+        for Neighbor in Graph.get(Current, ()):
+            NeighborFacing = Repeaters.get(Neighbor)
+            if NeighborFacing is not None:
+                Delta = _RepeaterOutputDelta(NeighborFacing)
+                InputPosition = tuple(
+                    Neighbor[Index] - Delta[Index] for Index in range(3)
+                )
+                if Current != InputPosition:
+                    continue
+            Values.append(Neighbor)
+        return tuple(sorted(Values))
+
+    Cycles = []
+    for Repeater, Facing in sorted(Repeaters.items()):
+        Delta = _RepeaterOutputDelta(Facing)
+        InputPosition = tuple(
+            Repeater[Index] - Delta[Index] for Index in range(3)
+        )
+        OutputPosition = tuple(
+            Repeater[Index] + Delta[Index] for Index in range(3)
+        )
+        if (
+            InputPosition not in Graph.get(Repeater, ())
+            or OutputPosition not in Graph.get(Repeater, ())
+        ):
+            continue
+        Parents: dict[Position3, Position3 | None] = {
+            OutputPosition: None
+        }
+        Pending = deque((OutputPosition,))
+        while Pending and InputPosition not in Parents:
+            Current = Pending.popleft()
+            for Neighbor in DirectedNeighbors(Current):
+                if Neighbor == Repeater or Neighbor in Parents:
+                    continue
+                Parents[Neighbor] = Current
+                Pending.append(Neighbor)
+        if InputPosition not in Parents:
+            continue
+        Path = []
+        Current: Position3 | None = InputPosition
+        while Current is not None:
+            Path.append(Current)
+            Current = Parents[Current]
+        Cycles.append((Repeater, tuple(reversed(Path))))
+    return tuple(Cycles)
+
+
 def PruneUnneededMaterializedRepeaters(
     Root: Position3,
     Targets: tuple[Position3, ...],
@@ -240,8 +303,8 @@ def PruneUnneededMaterializedRepeaters(
     This deliberately runs after detailed routing and fallback insertion, not
     while candidates are being generated.  Each trial uses the exact directed
     power model, so branches retain a refresher whenever any downstream target
-    still needs it.  Removing repeaters can only reduce available power, which
-    means a single deterministic pass is sufficient.
+    still needs it. Removing a repeater turns that cell back into bidirectional
+    dust, so a removal must also preserve the absence of directed feedback.
     """
     Original = dict(Repeaters)
     Diagnostics: dict[str, object] = {
@@ -300,6 +363,8 @@ def PruneUnneededMaterializedRepeaters(
             })
         Trial = dict(Retained)
         Trial.pop(Position, None)
+        if FindSelfExcitingRepeaterCycles(Graph, Trial):
+            continue
         Powers = PropagateRoutePower(
             Root,
             Graph,

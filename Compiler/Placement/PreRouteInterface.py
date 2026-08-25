@@ -913,33 +913,10 @@ def SolveDerivedPerimeterSlotDomain(
             tuple(Slot.SlotId for Slot in Slots),
         )
 
-    SuffixRequiredMaximumX = [-(1 << 60)] * (len(OrderedDomains) + 1)
-    SuffixRequiredMaximumZ = [-(1 << 60)] * (len(OrderedDomains) + 1)
-    SuffixRequiredMinimumX = [1 << 60] * (len(OrderedDomains) + 1)
-    SuffixRequiredMinimumZ = [1 << 60] * (len(OrderedDomains) + 1)
-    for DomainIndex in range(len(OrderedDomains) - 1, -1, -1):
-        _TerminalName, Slots = OrderedDomains[DomainIndex]
-        if not Slots:
-            continue
-        SuffixRequiredMaximumX[DomainIndex] = max(
-            min(Slot.MacroBounds[2] for Slot in Slots),
-            SuffixRequiredMaximumX[DomainIndex + 1],
-        )
-        SuffixRequiredMaximumZ[DomainIndex] = max(
-            min(Slot.MacroBounds[3] for Slot in Slots),
-            SuffixRequiredMaximumZ[DomainIndex + 1],
-        )
-        SuffixRequiredMinimumX[DomainIndex] = min(
-            max(Slot.MacroBounds[0] for Slot in Slots),
-            SuffixRequiredMinimumX[DomainIndex + 1],
-        )
-        SuffixRequiredMinimumZ[DomainIndex] = min(
-            max(Slot.MacroBounds[1] for Slot in Slots),
-            SuffixRequiredMinimumZ[DomainIndex + 1],
-        )
-
     def BoundsLowerBound(
-        Index: int,
+        RemainingDomains: tuple[
+            tuple[str, tuple[DerivedPerimeterTerminalSlot, ...]], ...
+        ],
         Bounds: tuple[int, int, int, int],
     ) -> tuple[int, int]:
         """Return an admissible final hull prefix for this partial branch.
@@ -950,13 +927,26 @@ def SolveDerivedPerimeterSlotDomain(
         result is deliberately weak rather than heuristic: it is safe to use
         as a proof-pruning bound for the lexicographic footprint objective.
         """
-        if any(not Slots for _TerminalName, Slots in OrderedDomains[Index:]):
+        if any(not Slots for _TerminalName, Slots in RemainingDomains):
             return (1 << 60, 1 << 60)
         MinimumX, MinimumZ, MaximumX, MaximumZ = Bounds
-        MaximumX = max(MaximumX, SuffixRequiredMaximumX[Index])
-        MaximumZ = max(MaximumZ, SuffixRequiredMaximumZ[Index])
-        MinimumX = min(MinimumX, SuffixRequiredMinimumX[Index])
-        MinimumZ = min(MinimumZ, SuffixRequiredMinimumZ[Index])
+        for _TerminalName, Slots in RemainingDomains:
+            MaximumX = max(
+                MaximumX,
+                min(Slot.MacroBounds[2] for Slot in Slots),
+            )
+            MaximumZ = max(
+                MaximumZ,
+                min(Slot.MacroBounds[3] for Slot in Slots),
+            )
+            MinimumX = min(
+                MinimumX,
+                max(Slot.MacroBounds[0] for Slot in Slots),
+            )
+            MinimumZ = min(
+                MinimumZ,
+                max(Slot.MacroBounds[1] for Slot in Slots),
+            )
         Width = MaximumX - MinimumX + 1
         Depth = MaximumZ - MinimumZ + 1
         return (Width * Depth, max(Width, Depth))
@@ -971,7 +961,9 @@ def SolveDerivedPerimeterSlotDomain(
         )
 
     def Search(
-        Index: int,
+        RemainingDomains: tuple[
+            tuple[str, tuple[DerivedPerimeterTerminalSlot, ...]], ...
+        ],
         Selected: tuple[DerivedPerimeterTerminalSlot, ...],
         Bounds: tuple[int, int, int, int],
         FaceCounts: tuple[int, int, int, int],
@@ -980,7 +972,11 @@ def SolveDerivedPerimeterSlotDomain(
         nonlocal BestSlots, BestObjective, ExpansionCount, ExhaustedWork
         if ExhaustedWork:
             return
-        if Index == len(OrderedDomains):
+        if not RemainingDomains:
+            OrderedSelected = tuple(sorted(
+                Selected,
+                key=lambda Slot: Slot.TerminalName,
+            ))
             MinimumX, MinimumZ, MaximumX, MaximumZ = Bounds
             Width = MaximumX - MinimumX + 1
             Depth = MaximumZ - MinimumZ + 1
@@ -990,18 +986,83 @@ def SolveDerivedPerimeterSlotDomain(
                 max(FaceCounts, default=0),
                 sum(Count * Count for Count in FaceCounts),
                 InteriorSpan,
-                tuple(Slot.SlotId for Slot in Selected),
+                tuple(Slot.SlotId for Slot in OrderedSelected),
             )
             if BestObjective is None or Objective < BestObjective:
                 BestObjective = Objective
-                BestSlots = Selected
+                BestSlots = OrderedSelected
             return
+
+        CompatibleDomains = tuple(
+            (
+                TerminalName,
+                tuple(
+                    Slot for Slot in Slots
+                    if PairIsCompatible(Slot, Selected)
+                ),
+            )
+            for TerminalName, Slots in RemainingDomains
+        )
+        if any(not Slots for _TerminalName, Slots in CompatibleDomains):
+            return
+
+        BoundPrefix = BoundsLowerBound(CompatibleDomains, Bounds)
+        FaceCountStates = {FaceCounts}
+        for _TerminalName, Slots in CompatibleDomains:
+            FaceIndexes = {
+                ("north", "south", "west", "east").index(Slot.Face)
+                for Slot in Slots
+            }
+            FaceCountStates = {
+                tuple(
+                    Count + int(Index == FaceIndex)
+                    for Index, Count in enumerate(State)
+                )
+                for State in FaceCountStates
+                for FaceIndex in FaceIndexes
+            }
+        FaceLowerBound = min(
+            (
+                max(State, default=0),
+                sum(Count * Count for Count in State),
+            )
+            for State in FaceCountStates
+        )
+        MinimumInteriorSpan = InteriorSpan + sum(
+            min(Slot.InteriorSpan for Slot in Slots)
+            for _TerminalName, Slots in CompatibleDomains
+        )
+        MinimumSlotIdByTerminal = {
+            Slot.TerminalName: Slot.SlotId for Slot in Selected
+        }
+        MinimumSlotIdByTerminal.update({
+            TerminalName: min(Slot.SlotId for Slot in Slots)
+            for TerminalName, Slots in CompatibleDomains
+        })
+        ObjectiveLowerBound = (
+            *BoundPrefix,
+            *FaceLowerBound,
+            MinimumInteriorSpan,
+            tuple(
+                MinimumSlotIdByTerminal[TerminalName]
+                for TerminalName in sorted(MinimumSlotIdByTerminal)
+            ),
+        )
         if (
             BestObjective is not None
-            and BoundsLowerBound(Index, Bounds) > BestObjective[:2]
+            and ObjectiveLowerBound >= BestObjective
         ):
             return
-        _TerminalName, Slots = OrderedDomains[Index]
+
+        _TerminalName, Slots = min(
+            CompatibleDomains,
+            key=lambda Value: (len(Value[1]), Value[0]),
+        )
+        NextRemainingDomains = tuple(
+            Value for Value in CompatibleDomains
+            if Value[0] != _TerminalName
+        )
+
         def SlotSearchKey(
             Slot: DerivedPerimeterTerminalSlot,
         ) -> tuple[Any, ...]:
@@ -1028,7 +1089,7 @@ def SolveDerivedPerimeterSlotDomain(
                 InteriorSpan + Slot.InteriorSpan,
             )
             CandidateLowerBound = BoundsLowerBound(
-                Index + 1,
+                NextRemainingDomains,
                 CandidateBounds,
             )
             return (
@@ -1047,8 +1108,6 @@ def SolveDerivedPerimeterSlotDomain(
                     "ExpansionCount": ExpansionCount,
                     "TerminalName": Slot.TerminalName,
                 })
-            if not PairIsCompatible(Slot, Selected):
-                continue
             CandidateBounds = (
                 min(Bounds[0], Slot.MacroBounds[0]),
                 min(Bounds[1], Slot.MacroBounds[1]),
@@ -1063,7 +1122,7 @@ def SolveDerivedPerimeterSlotDomain(
                 for ValueIndex, Count in enumerate(FaceCounts)
             )
             Search(
-                Index + 1,
+                NextRemainingDomains,
                 (*Selected, Slot),
                 CandidateBounds,
                 CandidateFaceCounts,
@@ -1072,7 +1131,7 @@ def SolveDerivedPerimeterSlotDomain(
             if ExhaustedWork:
                 return
 
-    Search(0, (), Domain.CoreBounds, (0, 0, 0, 0), 0)
+    Search(OrderedDomains, (), Domain.CoreBounds, (0, 0, 0, 0), 0)
     if BestSlots is not None and not ExhaustedWork:
         AttachedSlots = list(BestSlots)
         for TerminalName, Slots in UnusedInputDomains:

@@ -8,11 +8,20 @@ use crate::AssignmentPlanning::{
 };
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::EscapePlanning::{
-    BuildDerivedEscapeStatePathsWithDeadline, EscapeRequest, EscapeRequestResult,
+    AccessRegionGraphRecipeValue, AccessRegionGraphResultValue,
+    BuildAccessRegionGraphCatalogWithDeadline, BuildDerivedEscapeStatePathsWithDeadline,
+    BuildLayeredAccessEscapeViewCatalogWithDeadline,
+    BuildLayeredEscapeStatePathCatalogWithDeadline, EscapeRequest, EscapeRequestResult,
+    LayeredAccessEscapeGraphValue, LayeredAccessEscapeMemberValue,
+    LayeredAccessEscapeSelectionResult, LayeredAccessGuideMemberValue,
+    LayeredAccessGuideSelectionResult, LayeredEscapeMemberRequest, LayeredEscapeMemberResult,
+    SolveLayeredAccessEscapeFactorCatalogWithDeadline,
+    SolveLayeredAccessGuideFactorCatalogWithDeadline,
 };
 use crate::Generation::{
-    GeneratePortalCandidateBatchesNative, GenerateRouteTreeClaimAwareDetailedBatchNative,
-    GenerateRouteTreeDetailedBatchNative, GenerateRouteTreesNative,
+    GenerateAndAssignRouteTreesFactorizedNative, GeneratePortalCandidateBatchesNative,
+    GenerateRouteTreeClaimAwareDetailedBatchNative, GenerateRouteTreeDetailedBatchNative,
+    GenerateRouteTreesFactorizedNative, GenerateRouteTreesNative,
 };
 use crate::LeasePlanning::{
     LeaseCandidate, LeaseDomain, LeaseSolveStatus, SolveLeaseDomainsWithDeadline,
@@ -20,9 +29,10 @@ use crate::LeasePlanning::{
 use crate::Models::*;
 use crate::PathRouting::FindPath;
 use crate::{
-    BuildFabricSubtreesBatchWithTelemetry, BuildRouteClaimsBatch,
-    BuildRouteClaimsBatchWithTelemetry, EvaluateLogicPrograms, GenerateRectilinearTopology,
-    GetRoutingThreadCount, RoutingThreadPool, SearchExteriorConnectorsBatchWithTelemetry,
+    BuildDeferredRouteClaimsBatchWithTelemetry, BuildFabricSubtreesBatchWithTelemetry,
+    BuildRouteClaimsBatch, BuildRouteClaimsBatchWithTelemetry, EvaluateLogicPrograms,
+    GenerateRectilinearTopology, GetRoutingThreadCount, RoutingThreadPool,
+    SearchExteriorConnectorsBatchWithTelemetry,
 };
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -255,6 +265,7 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_class::<PortalCandidate>()?;
     Module.add_class::<PortalCandidateBatchResult>()?;
     Module.add_class::<RouteTreeBatchResult>()?;
+    Module.add_class::<FactorizedRouteTreeSelectionResult>()?;
     Module.add_class::<RouteTreeSearchResult>()?;
     Module.add_class::<RouteTreeDetailedBatchResult>()?;
     Module.add_class::<RoutingAssignmentResult>()?;
@@ -263,6 +274,10 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_function(wrap_pyfunction!(BuildRouteClaimsBatch, Module)?)?;
     Module.add_function(wrap_pyfunction!(
         BuildRouteClaimsBatchWithTelemetry,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        BuildDeferredRouteClaimsBatchWithTelemetry,
         Module
     )?)?;
     Module.add_function(wrap_pyfunction!(
@@ -277,7 +292,27 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
     Module.add_function(wrap_pyfunction!(EvaluateLogicPrograms, Module)?)?;
     Module.add_function(wrap_pyfunction!(SolveLeaseDomainsBounded, Module)?)?;
     Module.add_function(wrap_pyfunction!(
+        BuildAccessRegionGraphCatalogBounded,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
         BuildDerivedEscapeStatePathsBounded,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        BuildLayeredEscapeStatePathCatalogBounded,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        BuildLayeredAccessEscapeViewCatalogBounded,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        SolveLayeredAccessEscapeFactorCatalogBounded,
+        Module
+    )?)?;
+    Module.add_function(wrap_pyfunction!(
+        SolveLayeredAccessGuideFactorCatalogBounded,
         Module
     )?)?;
     Module.add_function(wrap_pyfunction!(
@@ -289,6 +324,27 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
         Module
     )?)?;
     Ok(())
+}
+
+/// Build every exact immutable access-region graph in one native batch.
+/// Geometry construction is finite and bounded only by the shared absolute
+/// deadline; an incomplete graph is never interpreted as infeasible.
+#[pyfunction]
+#[pyo3(signature=(Recipes, MaximumRuntimeMilliseconds))]
+fn BuildAccessRegionGraphCatalogBounded(
+    PythonValue: Python<'_>,
+    Recipes: Vec<AccessRegionGraphRecipeValue>,
+    MaximumRuntimeMilliseconds: u64,
+) -> PyResult<(Vec<AccessRegionGraphResultValue>, bool)> {
+    if Recipes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "access-region graph catalog requires recipes",
+        ));
+    }
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(PythonValue
+        .allow_threads(move || BuildAccessRegionGraphCatalogWithDeadline(Recipes, Deadline)))
 }
 
 /// Enumerate bounded directional escape candidates; Python validates exact
@@ -319,6 +375,144 @@ fn BuildDerivedEscapeStatePathsBounded(
             Deadline,
         )
     }))
+}
+
+/// Build all exact layer/member escape domains under one native call and one
+/// absolute deadline.  Each member supplies its own graph and finite cap;
+/// the shared cap must cover their sum so parallel scheduling cannot change
+/// completeness or steal work between members.
+#[pyfunction]
+#[pyo3(signature=(Members, BendPenalty, MaximumExpansionCount, MaximumRuntimeMilliseconds))]
+fn BuildLayeredEscapeStatePathCatalogBounded(
+    PythonValue: Python<'_>,
+    Members: Vec<LayeredEscapeMemberRequest>,
+    BendPenalty: usize,
+    MaximumExpansionCount: usize,
+    MaximumRuntimeMilliseconds: u64,
+) -> PyResult<(String, Vec<LayeredEscapeMemberResult>, usize, bool, bool)> {
+    if Members.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "layered escape catalog requires at least one member",
+        ));
+    }
+    if MaximumExpansionCount < 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "maximum layered escape expansions must be positive",
+        ));
+    }
+    if Members
+        .iter()
+        .any(|Member| Member.0.is_empty() || Member.3 < 1)
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "layered escape catalog members require identities and positive caps",
+        ));
+    }
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(PythonValue.allow_threads(move || {
+        BuildLayeredEscapeStatePathCatalogWithDeadline(
+            Members,
+            BendPenalty,
+            MaximumExpansionCount,
+            Deadline,
+        )
+    }))
+}
+
+/// Build every exact layer view over shared source graphs in one bounded
+/// native call.  The operation returns path catalogs only; it performs no
+/// feasibility inference and cannot report UNSAT.
+#[pyfunction]
+#[pyo3(signature=(Graphs, Members, BendPenalty, MaximumExpansionCount, MaximumRuntimeMilliseconds))]
+fn BuildLayeredAccessEscapeViewCatalogBounded(
+    PythonValue: Python<'_>,
+    Graphs: Vec<LayeredAccessEscapeGraphValue>,
+    Members: Vec<LayeredAccessEscapeMemberValue>,
+    BendPenalty: usize,
+    MaximumExpansionCount: usize,
+    MaximumRuntimeMilliseconds: u64,
+) -> PyResult<(String, Vec<LayeredEscapeMemberResult>, usize, bool, bool)> {
+    if MaximumExpansionCount < 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "maximum layered access view expansions must be positive",
+        ));
+    }
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    PythonValue.allow_threads(move || {
+        BuildLayeredAccessEscapeViewCatalogWithDeadline(
+            Graphs,
+            Members,
+            BendPenalty,
+            MaximumExpansionCount,
+            Deadline,
+        )
+    })
+}
+
+/// Traverse exact layer-member escape domains and solve their access capacity
+/// inside one bounded native operation.  Python declares geometry and member
+/// contracts; Rust returns the selected member's exact path catalog so only
+/// that continuation needs physical object materialization.
+#[pyfunction]
+#[pyo3(signature=(Graphs, Members, BendPenalty, MaximumAssignmentExpansionCount, MaximumRuntimeMilliseconds))]
+fn SolveLayeredAccessEscapeFactorCatalogBounded(
+    PythonValue: Python<'_>,
+    Graphs: Vec<LayeredAccessEscapeGraphValue>,
+    Members: Vec<LayeredAccessEscapeMemberValue>,
+    BendPenalty: usize,
+    MaximumAssignmentExpansionCount: usize,
+    MaximumRuntimeMilliseconds: u64,
+) -> PyResult<LayeredAccessEscapeSelectionResult> {
+    if MaximumAssignmentExpansionCount < 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "maximum layered access assignment expansions must be positive",
+        ));
+    }
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    PythonValue.allow_threads(move || {
+        SolveLayeredAccessEscapeFactorCatalogWithDeadline(
+            Graphs,
+            Members,
+            BendPenalty,
+            MaximumAssignmentExpansionCount,
+            Deadline,
+        )
+    })
+}
+
+/// Select exact access stubs and canonical guide spines together.  The
+/// complete layered portfolio is traversed and tested inside this one call;
+/// only the winning member's path catalog and guide recipes cross back into
+/// Python for physical materialization.
+#[pyfunction]
+#[pyo3(signature=(Graphs, Members, BendPenalty, MaximumAssignmentExpansionCount, MaximumRuntimeMilliseconds))]
+fn SolveLayeredAccessGuideFactorCatalogBounded(
+    PythonValue: Python<'_>,
+    Graphs: Vec<LayeredAccessEscapeGraphValue>,
+    Members: Vec<LayeredAccessGuideMemberValue>,
+    BendPenalty: usize,
+    MaximumAssignmentExpansionCount: usize,
+    MaximumRuntimeMilliseconds: u64,
+) -> PyResult<LayeredAccessGuideSelectionResult> {
+    if MaximumAssignmentExpansionCount < 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "maximum layered access-guide assignment expansions must be positive",
+        ));
+    }
+    let Deadline = RuntimeDeadline::FromMilliseconds(Some(MaximumRuntimeMilliseconds))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    PythonValue.allow_threads(move || {
+        SolveLayeredAccessGuideFactorCatalogWithDeadline(
+            Graphs,
+            Members,
+            BendPenalty,
+            MaximumAssignmentExpansionCount,
+            Deadline,
+        )
+    })
 }
 
 /// Select one fixed assignment template portfolio in Rust.  Each domain has
@@ -361,6 +555,7 @@ fn SolveTemplateAssignmentDomainsBounded<'py>(
             AttemptExpansionCounts: Vec::new(),
             AttemptPartialCandidateIds: Vec::new(),
             NonExhaustiveTemplateDomain,
+            CompactMaskTelemetry: Vec::new(),
         });
     };
     PythonValue.allow_threads(move || {
@@ -877,6 +1072,50 @@ impl RoutingContext {
     ) -> PyResult<RouteTreeBatchResult> {
         PythonValue.allow_threads(|| {
             GenerateRouteTreesNative(self, Requests, Some(MaximumRuntimeMilliseconds))
+        })
+    }
+
+    #[pyo3(signature=(AccessPayloads, GuidePayloads, Requests, MaximumRuntimeMilliseconds))]
+    fn GenerateRouteTreesFactorizedBounded(
+        &self,
+        PythonValue: Python<'_>,
+        AccessPayloads: Vec<FactorizedRouteTreeAccessPayload>,
+        GuidePayloads: Vec<FactorizedRouteTreeGuidePayload>,
+        Requests: Vec<FactorizedRouteTreeRequest>,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> PyResult<RouteTreeBatchResult> {
+        PythonValue.allow_threads(|| {
+            GenerateRouteTreesFactorizedNative(
+                self,
+                AccessPayloads,
+                GuidePayloads,
+                Requests,
+                MaximumRuntimeMilliseconds,
+            )
+        })
+    }
+
+    #[pyo3(signature=(AccessPayloads, GuidePayloads, Requests, SignalRequestIndices, MaximumAssignmentExpansionCount, MaximumRuntimeMilliseconds))]
+    fn GenerateAndAssignRouteTreesFactorizedBounded(
+        &self,
+        PythonValue: Python<'_>,
+        AccessPayloads: Vec<FactorizedRouteTreeAccessPayload>,
+        GuidePayloads: Vec<FactorizedRouteTreeGuidePayload>,
+        Requests: Vec<FactorizedRouteTreeRequest>,
+        SignalRequestIndices: Vec<(String, Vec<usize>)>,
+        MaximumAssignmentExpansionCount: usize,
+        MaximumRuntimeMilliseconds: u64,
+    ) -> PyResult<FactorizedRouteTreeSelectionResult> {
+        PythonValue.allow_threads(|| {
+            GenerateAndAssignRouteTreesFactorizedNative(
+                self,
+                AccessPayloads,
+                GuidePayloads,
+                Requests,
+                SignalRequestIndices,
+                MaximumAssignmentExpansionCount,
+                MaximumRuntimeMilliseconds,
+            )
         })
     }
     #[pyo3(signature=(CandidateValues, ResourceCount, MaximumExpansionCount, MaximumRuntimeSeconds=None))]

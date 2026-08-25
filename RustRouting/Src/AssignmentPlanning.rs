@@ -1,4 +1,4 @@
-use crate::Assignment::{AssignCandidates, SortCandidatesWithDeadline};
+use crate::Assignment::{AssignCandidates, ParseContractRequirements, SortCandidatesWithDeadline};
 use crate::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::Models::{
     AssignmentCandidate, ClaimMask, ClaimMaskBuildError, Position, RoutingAssignmentResult,
@@ -8,7 +8,9 @@ use pyo3::prelude::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 const MAXIMUM_EXPANSIONS: usize = 1_000_000;
 const MAXIMUM_CACHED_CLAIM_MASKS: usize = 100_000;
@@ -52,6 +54,7 @@ pub(crate) type TemplateAssignmentDomainValue = (
     Vec<BaseAssignmentValue>,
 );
 pub(crate) type CompactClaimPrimitiveValue = (
+    String,
     Vec<Position>,
     Vec<Position>,
     Vec<Position>,
@@ -59,6 +62,7 @@ pub(crate) type CompactClaimPrimitiveValue = (
     Vec<Position>,
 );
 pub(crate) type CompactFactorValue = (
+    String,
     String,
     String,
     Vec<usize>,
@@ -171,7 +175,10 @@ fn BuildCandidateGroups(
         };
         Groups.entry(Signal).or_default().push(AssignmentCandidate {
             CandidateId,
-            TemplateKey,
+            TemplateRequirements: ParseContractRequirements(&TemplateKey),
+            ForbiddenCandidateIds: Arc::new(Vec::new()),
+            OrderedWire: Arc::new(Vec::new()),
+            PoweredAccessConstraint: None,
             OwnerSignal,
             Claims,
             MaterialCost,
@@ -302,15 +309,46 @@ pub(crate) fn PlanAuthoritativeRoutesWithInitialExpansionAndDeadline(
         InitialExpansionCount,
         EffectiveMaximumExpansionCount,
         Deadline,
+        true,
+        true,
+        None,
     )
 }
 
-fn PlanAuthoritativeCandidateGroupsWithInitialExpansionAndDeadline(
+pub(crate) fn PlanAuthoritativeCandidateGroupsWithInitialExpansionAndDeadline(
     Groups: &mut BTreeMap<String, Vec<AssignmentCandidate>>,
     ResourceCount: usize,
     InitialExpansionCount: usize,
     EffectiveMaximumExpansionCount: usize,
     Deadline: RuntimeDeadline,
+    UsePairwiseCompatibilityIndex: bool,
+    CollectConflictResources: bool,
+    SharedExpansionCount: Option<&AtomicUsize>,
+) -> PyResult<RoutingAssignmentResult> {
+    PlanAuthoritativeCandidateGroupsWithInitialExpansionDeadlineAndCrossAir(
+        Groups,
+        ResourceCount,
+        InitialExpansionCount,
+        EffectiveMaximumExpansionCount,
+        Deadline,
+        UsePairwiseCompatibilityIndex,
+        CollectConflictResources,
+        SharedExpansionCount,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn PlanAuthoritativeCandidateGroupsWithInitialExpansionDeadlineAndCrossAir(
+    Groups: &mut BTreeMap<String, Vec<AssignmentCandidate>>,
+    ResourceCount: usize,
+    InitialExpansionCount: usize,
+    EffectiveMaximumExpansionCount: usize,
+    Deadline: RuntimeDeadline,
+    UsePairwiseCompatibilityIndex: bool,
+    CollectConflictResources: bool,
+    SharedExpansionCount: Option<&AtomicUsize>,
+    CrossAirByWire: Option<&[Vec<(usize, usize)>]>,
 ) -> PyResult<RoutingAssignmentResult> {
     if !SortCandidateGroups(Groups, &Deadline) {
         return Ok(DeadlineExceededAssignmentResult(InitialExpansionCount));
@@ -329,22 +367,49 @@ fn PlanAuthoritativeCandidateGroupsWithInitialExpansionAndDeadline(
     let mut ConflictResources = Vec::new();
     let mut PairwiseIncompatibleSignals = Vec::new();
     let mut PairwiseCompatibilityComplete = false;
-    let Success = AssignCandidates(
-        Groups,
-        &Remaining,
-        &Owned,
-        &BTreeMap::new(),
-        &mut Selected,
-        &mut ExpansionCount,
-        EffectiveMaximumExpansionCount,
-        &mut BudgetExhausted,
-        &Deadline,
-        &mut FailureNet,
-        &mut ConflictSignals,
-        &mut ConflictResources,
-        &mut PairwiseIncompatibleSignals,
-        &mut PairwiseCompatibilityComplete,
-    );
+    let Success = if UsePairwiseCompatibilityIndex {
+        AssignCandidates(
+            Groups,
+            &Remaining,
+            &Owned,
+            &BTreeMap::new(),
+            &mut Selected,
+            &mut ExpansionCount,
+            EffectiveMaximumExpansionCount,
+            &mut BudgetExhausted,
+            &Deadline,
+            true,
+            &mut FailureNet,
+            &mut ConflictSignals,
+            &mut ConflictResources,
+            &mut PairwiseIncompatibleSignals,
+            &mut PairwiseCompatibilityComplete,
+            CollectConflictResources,
+            SharedExpansionCount,
+            CrossAirByWire,
+        )
+    } else {
+        AssignCandidates(
+            Groups,
+            &Remaining,
+            &Owned,
+            &BTreeMap::new(),
+            &mut Selected,
+            &mut ExpansionCount,
+            EffectiveMaximumExpansionCount,
+            &mut BudgetExhausted,
+            &Deadline,
+            false,
+            &mut FailureNet,
+            &mut ConflictSignals,
+            &mut ConflictResources,
+            &mut PairwiseIncompatibleSignals,
+            &mut PairwiseCompatibilityComplete,
+            CollectConflictResources,
+            SharedExpansionCount,
+            CrossAirByWire,
+        )
+    };
     if Deadline.WasExceeded() {
         return Ok(DeadlineExceededAssignmentResult(ExpansionCount));
     }
@@ -537,11 +602,15 @@ pub(crate) fn PlanAuthoritativeRoutesWithBaseAndInitialExpansionAndDeadline(
         EffectiveMaximumExpansionCount,
         &mut BudgetExhausted,
         &Deadline,
+        true,
         &mut FailureNet,
         &mut ConflictSignals,
         &mut ConflictResources,
         &mut PairwiseIncompatibleSignals,
         &mut PairwiseCompatibilityComplete,
+        true,
+        None,
+        None,
     );
     if Deadline.WasExceeded() {
         return Ok(DeadlineExceededAssignmentResult(ExpansionCount));
@@ -617,6 +686,7 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
                 AttemptExpansionCounts,
                 AttemptPartialCandidateIds,
                 NonExhaustiveTemplateDomain,
+                CompactMaskTelemetry: Vec::new(),
             });
         }
         let Objective = Domains[Index].1.clone();
@@ -734,6 +804,7 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
                     AttemptExpansionCounts,
                     AttemptPartialCandidateIds,
                     NonExhaustiveTemplateDomain,
+                    CompactMaskTelemetry: Vec::new(),
                 });
             }
             if Result.Success {
@@ -769,6 +840,7 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
                 AttemptExpansionCounts,
                 AttemptPartialCandidateIds,
                 NonExhaustiveTemplateDomain,
+                CompactMaskTelemetry: Vec::new(),
             });
         }
     }
@@ -807,6 +879,7 @@ pub(crate) fn SolveTemplateAssignmentDomainsWithDeadline(
         AttemptExpansionCounts,
         AttemptPartialCandidateIds,
         NonExhaustiveTemplateDomain,
+        CompactMaskTelemetry: Vec::new(),
     })
 }
 
@@ -821,7 +894,7 @@ fn ValidateCompactPrimitiveValues(
             "compact resource vocabulary contains duplicates",
         ));
     }
-    for (Index, (Wire, Support, Air, Electrical, DeferredGuide)) in
+    for (Index, (_MaskReuseFingerprint, Wire, Support, Air, Electrical, DeferredGuide)) in
         PrimitiveValues.iter().enumerate()
     {
         if Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
@@ -850,25 +923,99 @@ fn ValidateCompactPrimitiveValues(
     Ok(Some(PrimitiveValues))
 }
 
+fn SameCompactClaimPrimitivePayload(
+    First: &CompactClaimPrimitiveValue,
+    Second: &CompactClaimPrimitiveValue,
+) -> bool {
+    let (_, FirstWire, FirstSupport, FirstAir, FirstElectrical, FirstDeferred) = First;
+    let (_, SecondWire, SecondSupport, SecondAir, SecondElectrical, SecondDeferred) = Second;
+    [
+        (FirstWire, SecondWire),
+        (FirstSupport, SecondSupport),
+        (FirstAir, SecondAir),
+        (FirstElectrical, SecondElectrical),
+        (FirstDeferred, SecondDeferred),
+    ]
+    .into_iter()
+    .all(|(FirstValues, SecondValues)| {
+        FirstValues.iter().copied().collect::<BTreeSet<_>>()
+            == SecondValues.iter().copied().collect::<BTreeSet<_>>()
+    })
+}
+
+#[derive(Default)]
+struct CompactMaskBuildTelemetry {
+    PrimitiveCacheHits: usize,
+    PrimitiveCacheMisses: usize,
+    FactorCacheHits: usize,
+    FactorCacheMisses: usize,
+    ElapsedMilliseconds: usize,
+}
+
+impl CompactMaskBuildTelemetry {
+    fn ToValues(&self, SolveElapsedMilliseconds: usize) -> Vec<(String, usize)> {
+        vec![
+            ("PrimitiveCacheHits".to_string(), self.PrimitiveCacheHits),
+            (
+                "PrimitiveCacheMisses".to_string(),
+                self.PrimitiveCacheMisses,
+            ),
+            ("FactorCacheHits".to_string(), self.FactorCacheHits),
+            ("FactorCacheMisses".to_string(), self.FactorCacheMisses),
+            ("ElapsedMilliseconds".to_string(), self.ElapsedMilliseconds),
+            (
+                "SolveElapsedMilliseconds".to_string(),
+                SolveElapsedMilliseconds,
+            ),
+        ]
+    }
+}
+
 fn BuildCompactFactorGroups(
     Values: Vec<CompactFactorValue>,
     PrimitiveValues: &[CompactClaimPrimitiveValue],
+    GlobalIndexByPosition: &mut HashMap<Position, usize>,
+    PrimitiveMasks: &mut BTreeMap<usize, Arc<ClaimMask>>,
+    PhysicalMasksByFingerprint: &mut HashMap<String, Vec<(usize, Arc<ClaimMask>)>>,
+    FactorMasksByFingerprint: &mut HashMap<String, (Vec<String>, Arc<ClaimMask>)>,
+    Telemetry: &mut CompactMaskBuildTelemetry,
     Deadline: &RuntimeDeadline,
 ) -> PyResult<Option<(BTreeMap<String, Vec<AssignmentCandidate>>, usize)>> {
     let ReferencedPrimitiveIds = Values
         .iter()
-        .flat_map(|Value| Value.2.iter().copied())
+        .flat_map(|Value| Value.3.iter().copied())
         .collect::<BTreeSet<_>>();
-    let mut ExpandedPrimitiveValues = BTreeMap::new();
-    let mut ReferencedGlobalResources: BTreeSet<Position> = BTreeSet::new();
     for PrimitiveId in &ReferencedPrimitiveIds {
-        let Some((Wire, Support, Air, Electrical, DeferredGuide)) =
-            PrimitiveValues.get(*PrimitiveId)
-        else {
+        if PrimitiveMasks.contains_key(PrimitiveId) {
+            Telemetry.PrimitiveCacheHits += 1;
+            continue;
+        }
+        let Some(PrimitiveValue) = PrimitiveValues.get(*PrimitiveId) else {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "compact factor references an unknown primitive",
             ));
         };
+        let (MaskReuseFingerprint, Wire, Support, Air, Electrical, DeferredGuide) = PrimitiveValue;
+        if !MaskReuseFingerprint.is_empty() {
+            if let Some(ExistingValues) = PhysicalMasksByFingerprint.get(MaskReuseFingerprint) {
+                if let Some((_ExistingId, ExistingMask)) =
+                    ExistingValues.iter().find(|(ExistingId, _Mask)| {
+                        SameCompactClaimPrimitivePayload(
+                            &PrimitiveValues[*ExistingId],
+                            PrimitiveValue,
+                        )
+                    })
+                {
+                    PrimitiveMasks.insert(*PrimitiveId, Arc::clone(ExistingMask));
+                    Telemetry.PrimitiveCacheHits += 1;
+                    continue;
+                }
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "compact mask reuse fingerprint collision: key={} existing={} current={}",
+                    MaskReuseFingerprint, ExistingValues[0].0, PrimitiveId,
+                )));
+            }
+        }
         let (Wire, Support, Air, Electrical) = if DeferredGuide.is_empty() {
             (
                 Wire.clone(),
@@ -901,35 +1048,50 @@ fn BuildCompactFactorGroups(
             }
             (Wire, Support, Air.clone(), Electrical)
         };
-        ReferencedGlobalResources.extend(Wire.iter().copied());
-        ReferencedGlobalResources.extend(Support.iter().copied());
-        ReferencedGlobalResources.extend(Air.iter().copied());
-        ReferencedGlobalResources.extend(Electrical.iter().copied());
-        ExpandedPrimitiveValues.insert(*PrimitiveId, (Wire, Support, Air, Electrical));
+        let mut Remap = |Values: &[Position]| -> Vec<usize> {
+            Values
+                .iter()
+                .map(|Value| {
+                    if let Some(Index) = GlobalIndexByPosition.get(Value) {
+                        *Index
+                    } else {
+                        let Index = GlobalIndexByPosition.len();
+                        GlobalIndexByPosition.insert(*Value, Index);
+                        Index
+                    }
+                })
+                .collect()
+        };
+        let Wire = Remap(&Wire);
+        let Support = Remap(&Support);
+        let Air = Remap(&Air);
+        let Electrical = Remap(&Electrical);
+        let Primitive = match ClaimMask::FromIndicesWithDeadline(
+            GlobalIndexByPosition.len().max(1),
+            &Wire,
+            &Support,
+            &Air,
+            &Electrical,
+            Deadline,
+        ) {
+            Ok(Value) => Arc::new(Value),
+            Err(ClaimMaskBuildError::DeadlineExceeded) => return Ok(None),
+            Err(ClaimMaskBuildError::IndexOutOfRange) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "compact primitive references a resource outside the vocabulary",
+                ));
+            }
+        };
+        PrimitiveMasks.insert(*PrimitiveId, Arc::clone(&Primitive));
+        Telemetry.PrimitiveCacheMisses += 1;
+        if !MaskReuseFingerprint.is_empty() {
+            PhysicalMasksByFingerprint
+                .entry(MaskReuseFingerprint.clone())
+                .or_default()
+                .push((*PrimitiveId, Primitive));
+        }
     }
-    let LocalIndexByGlobal = ReferencedGlobalResources
-        .into_iter()
-        .enumerate()
-        .map(|(LocalIndex, GlobalIndex)| (GlobalIndex, LocalIndex))
-        .collect::<HashMap<_, _>>();
-    let ResourceCount = LocalIndexByGlobal.len().max(1);
-    let Remap = |Values: &[Position]| -> Vec<usize> {
-        Values
-            .iter()
-            .map(|Value| LocalIndexByGlobal[Value])
-            .collect()
-    };
-    let LocalPrimitiveValues = ReferencedPrimitiveIds
-        .into_iter()
-        .map(|PrimitiveId| {
-            let (Wire, Support, Air, Electrical) = &ExpandedPrimitiveValues[&PrimitiveId];
-            (
-                PrimitiveId,
-                (Remap(Wire), Remap(Support), Remap(Air), Remap(Electrical)),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut PrimitiveMasks = BTreeMap::new();
+    let ResourceCount = GlobalIndexByPosition.len().max(1);
     let mut Groups: BTreeMap<String, Vec<AssignmentCandidate>> = BTreeMap::new();
     let mut Identities = BTreeSet::new();
     for (
@@ -937,6 +1099,7 @@ fn BuildCompactFactorGroups(
         (
             Signal,
             CandidateId,
+            FactorMaskReuseFingerprint,
             PrimitiveIds,
             MaterialCost,
             FootprintGrowth,
@@ -960,55 +1123,73 @@ fn BuildCompactFactorGroups(
                 "compact factor identities must be nonempty and unique",
             ));
         }
-        let Some(mut Claims) = ClaimMask::NewWithDeadline(ResourceCount, Deadline) else {
-            return Ok(None);
-        };
         let mut SeenPrimitiveIds = BTreeSet::new();
-        for PrimitiveId in PrimitiveIds {
-            if !SeenPrimitiveIds.insert(PrimitiveId) {
+        let mut PrimitiveMaskReuseFingerprints = Vec::new();
+        for PrimitiveId in &PrimitiveIds {
+            if !SeenPrimitiveIds.insert(*PrimitiveId) {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "compact factor repeats a primitive reference",
                 ));
             }
-            if !PrimitiveMasks.contains_key(&PrimitiveId) {
-                let Some((Wire, Support, Air, Electrical)) = LocalPrimitiveValues.get(&PrimitiveId)
-                else {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "compact factor references an unknown primitive",
-                    ));
-                };
-                let Primitive = match ClaimMask::FromIndicesWithDeadline(
-                    ResourceCount,
-                    Wire,
-                    Support,
-                    Air,
-                    Electrical,
-                    Deadline,
-                ) {
-                    Ok(Value) => Arc::new(Value),
-                    Err(ClaimMaskBuildError::DeadlineExceeded) => return Ok(None),
-                    Err(ClaimMaskBuildError::IndexOutOfRange) => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "compact primitive references a resource outside the vocabulary",
-                        ));
-                    }
-                };
-                PrimitiveMasks.insert(PrimitiveId, Primitive);
-            }
-            let Some(Primitive) = PrimitiveMasks.get(&PrimitiveId) else {
+            if !PrimitiveMasks.contains_key(PrimitiveId) {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "compact factor references an unknown primitive",
                 ));
-            };
-            if !Claims.UnionWithDeadline(Primitive, Deadline) {
-                return Ok(None);
             }
+            PrimitiveMaskReuseFingerprints.push(PrimitiveValues[*PrimitiveId].0.clone());
         }
+        let ReusableFactorMask = !FactorMaskReuseFingerprint.is_empty()
+            && PrimitiveMaskReuseFingerprints
+                .iter()
+                .all(|Value| !Value.is_empty());
+        let Claims = if ReusableFactorMask {
+            if let Some((ExistingPrimitiveFingerprints, ExistingMask)) =
+                FactorMasksByFingerprint.get(&FactorMaskReuseFingerprint)
+            {
+                if *ExistingPrimitiveFingerprints != PrimitiveMaskReuseFingerprints {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "compact factor mask reuse fingerprint collision",
+                    ));
+                }
+                Telemetry.FactorCacheHits += 1;
+                Arc::clone(ExistingMask)
+            } else {
+                let Some(mut Claims) = ClaimMask::NewWithDeadline(ResourceCount, Deadline) else {
+                    return Ok(None);
+                };
+                for PrimitiveId in PrimitiveIds {
+                    if !Claims.UnionWithDeadline(&PrimitiveMasks[&PrimitiveId], Deadline) {
+                        return Ok(None);
+                    }
+                }
+                let Claims = Arc::new(Claims);
+                FactorMasksByFingerprint.insert(
+                    FactorMaskReuseFingerprint,
+                    (PrimitiveMaskReuseFingerprints, Arc::clone(&Claims)),
+                );
+                Telemetry.FactorCacheMisses += 1;
+                Claims
+            }
+        } else {
+            let Some(mut Claims) = ClaimMask::NewWithDeadline(ResourceCount, Deadline) else {
+                return Ok(None);
+            };
+            for PrimitiveId in PrimitiveIds {
+                if !Claims.UnionWithDeadline(&PrimitiveMasks[&PrimitiveId], Deadline) {
+                    return Ok(None);
+                }
+            }
+            Telemetry.FactorCacheMisses += 1;
+            Arc::new(Claims)
+        };
         Groups.entry(Signal).or_default().push(AssignmentCandidate {
             CandidateId,
-            TemplateKey: ContractRequirements,
+            TemplateRequirements: ParseContractRequirements(&ContractRequirements),
+            ForbiddenCandidateIds: Arc::new(Vec::new()),
+            OrderedWire: Arc::new(Vec::new()),
+            PoweredAccessConstraint: None,
             OwnerSignal,
-            Claims: Arc::new(Claims),
+            Claims,
             MaterialCost,
             FootprintGrowth,
             Length,
@@ -1020,7 +1201,7 @@ fn BuildCompactFactorGroups(
 }
 
 /// Select one compact portfolio while constructing each candidate mask only
-/// when its member is attempted.  Primitive masks are built once globally.
+/// when its member is attempted.
 pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
     ResourcePositions: Vec<Position>,
     PrimitiveValues: Vec<CompactClaimPrimitiveValue>,
@@ -1030,6 +1211,7 @@ pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
     Deadline: RuntimeDeadline,
     NonExhaustiveTemplateDomain: bool,
 ) -> PyResult<TemplateRoutingAssignmentResult> {
+    let SolveStartedAt = Instant::now();
     let Some(PrimitiveValues) =
         ValidateCompactPrimitiveValues(PrimitiveValues, &ResourcePositions, &Deadline)?
     else {
@@ -1057,8 +1239,21 @@ pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
             AttemptExpansionCounts: Vec::new(),
             AttemptPartialCandidateIds: Vec::new(),
             NonExhaustiveTemplateDomain,
+            CompactMaskTelemetry: Vec::new(),
         });
     };
+    let mut GlobalIndexByPosition = ResourcePositions
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(Index, PositionValue)| (PositionValue, Index))
+        .collect::<HashMap<_, _>>();
+    let mut PrimitiveMasks: BTreeMap<usize, Arc<ClaimMask>> = BTreeMap::new();
+    let mut PhysicalMasksByFingerprint: HashMap<String, Vec<(usize, Arc<ClaimMask>)>> =
+        HashMap::new();
+    let mut FactorMasksByFingerprint: HashMap<String, (Vec<String>, Arc<ClaimMask>)> =
+        HashMap::new();
+    let mut CompactMaskTelemetry = CompactMaskBuildTelemetry::default();
     Members.sort_by(|First, Second| First.1.cmp(&Second.1).then_with(|| First.0.cmp(&Second.0)));
     let MemberIds = Members
         .iter()
@@ -1108,10 +1303,11 @@ pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
                 AttemptExpansionCounts,
                 AttemptPartialCandidateIds,
                 NonExhaustiveTemplateDomain,
+                CompactMaskTelemetry: CompactMaskTelemetry
+                    .ToValues(SolveStartedAt.elapsed().as_millis() as usize),
             });
         }
         let Objective = Members[Index].1.clone();
-        let mut SuccessfulMembers = Vec::new();
         while Index < Members.len() && Members[Index].1 == Objective {
             let (TemplateId, TemplateObjective, RequiredSignals, FactorIndexes) =
                 Members[Index].clone();
@@ -1150,9 +1346,21 @@ pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
                     PairwiseCompatibilityComplete: true,
                 }
             } else {
-                let Some((mut Groups, MemberResourceCount)) =
-                    BuildCompactFactorGroups(MemberFactorValues, &PrimitiveValues, &Deadline)?
-                else {
+                let MaskBuildStartedAt = Instant::now();
+                let BuiltGroups = BuildCompactFactorGroups(
+                    MemberFactorValues,
+                    &PrimitiveValues,
+                    &mut GlobalIndexByPosition,
+                    &mut PrimitiveMasks,
+                    &mut PhysicalMasksByFingerprint,
+                    &mut FactorMasksByFingerprint,
+                    &mut CompactMaskTelemetry,
+                    &Deadline,
+                )?;
+                CompactMaskTelemetry.ElapsedMilliseconds = CompactMaskTelemetry
+                    .ElapsedMilliseconds
+                    .saturating_add(MaskBuildStartedAt.elapsed().as_millis() as usize);
+                let Some((mut Groups, MemberResourceCount)) = BuiltGroups else {
                     return Ok(TemplateRoutingAssignmentResult {
                         Status: "Incomplete".to_string(),
                         Success: false,
@@ -1177,14 +1385,22 @@ pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
                         AttemptExpansionCounts,
                         AttemptPartialCandidateIds,
                         NonExhaustiveTemplateDomain,
+                        CompactMaskTelemetry: CompactMaskTelemetry
+                            .ToValues(SolveStartedAt.elapsed().as_millis() as usize),
                     });
                 };
+                let AccessOnlyFactorDomain = Groups
+                    .keys()
+                    .all(|Signal| Signal.starts_with("__access_terminal__:"));
                 PlanAuthoritativeCandidateGroupsWithInitialExpansionAndDeadline(
                     &mut Groups,
                     MemberResourceCount,
                     ExpansionCount,
                     EffectiveMaximumExpansionCount,
                     Deadline.clone(),
+                    AccessOnlyFactorDomain,
+                    true,
+                    None,
                 )?
             };
             let InitialMemberExpansionCount = ExpansionCount;
@@ -1244,42 +1460,40 @@ pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
                     AttemptExpansionCounts,
                     AttemptPartialCandidateIds,
                     NonExhaustiveTemplateDomain,
+                    CompactMaskTelemetry: CompactMaskTelemetry
+                        .ToValues(SolveStartedAt.elapsed().as_millis() as usize),
                 });
             }
             if Result.Success {
-                SuccessfulMembers.push((TemplateId, TemplateObjective, Result));
+                return Ok(TemplateRoutingAssignmentResult {
+                    Status: "Feasible".to_string(),
+                    Success: true,
+                    Complete: true,
+                    Unsatisfiable: false,
+                    IncompleteReason: String::new(),
+                    SelectedTemplateId: Some(TemplateId),
+                    SelectedTemplateObjective: TemplateObjective,
+                    SelectedCandidateIds: Result.SelectedCandidateIds,
+                    ExpansionCount,
+                    BudgetExhausted: false,
+                    DeadlineExceeded: false,
+                    CompletedWork: ExpansionCount,
+                    FailureNet: None,
+                    ConflictSignals: Vec::new(),
+                    ConflictResourceIndices: Vec::new(),
+                    PairwiseIncompatibleSignals: Vec::new(),
+                    PairwiseCompatibilityComplete: true,
+                    AttemptedTemplateIds,
+                    AttemptPairwiseIncompatibleSignals,
+                    AttemptFailureNets,
+                    AttemptExpansionCounts,
+                    AttemptPartialCandidateIds,
+                    NonExhaustiveTemplateDomain,
+                    CompactMaskTelemetry: CompactMaskTelemetry
+                        .ToValues(SolveStartedAt.elapsed().as_millis() as usize),
+                });
             }
             Index += 1;
-        }
-        if let Some((TemplateId, TemplateObjective, Result)) = SuccessfulMembers
-            .into_iter()
-            .min_by(|First, Second| First.0.cmp(&Second.0))
-        {
-            return Ok(TemplateRoutingAssignmentResult {
-                Status: "Feasible".to_string(),
-                Success: true,
-                Complete: true,
-                Unsatisfiable: false,
-                IncompleteReason: String::new(),
-                SelectedTemplateId: Some(TemplateId),
-                SelectedTemplateObjective: TemplateObjective,
-                SelectedCandidateIds: Result.SelectedCandidateIds,
-                ExpansionCount,
-                BudgetExhausted: false,
-                DeadlineExceeded: false,
-                CompletedWork: ExpansionCount,
-                FailureNet: None,
-                ConflictSignals: Vec::new(),
-                ConflictResourceIndices: Vec::new(),
-                PairwiseIncompatibleSignals: Vec::new(),
-                PairwiseCompatibilityComplete: true,
-                AttemptedTemplateIds,
-                AttemptPairwiseIncompatibleSignals,
-                AttemptFailureNets,
-                AttemptExpansionCounts,
-                AttemptPartialCandidateIds,
-                NonExhaustiveTemplateDomain,
-            });
         }
     }
     let Unsatisfiable = !NonExhaustiveTemplateDomain;
@@ -1316,6 +1530,8 @@ pub(crate) fn SolveCompactTemplateFactorCatalogWithDeadline(
         AttemptExpansionCounts,
         AttemptPartialCandidateIds,
         NonExhaustiveTemplateDomain,
+        CompactMaskTelemetry: CompactMaskTelemetry
+            .ToValues(SolveStartedAt.elapsed().as_millis() as usize),
     })
 }
 
@@ -1652,6 +1868,68 @@ mod Tests {
         );
     }
 
+    #[test]
+    fn SyntheticFactorsWithOneOwnerRejectStaticSupportWireContradictions() {
+        let CandidateValues = vec![
+            (
+                "factor-a".to_string(),
+                "support".to_string(),
+                Vec::new(),
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                1,
+                1,
+                1,
+                0,
+                0,
+                String::new(),
+                "LogicalSignal".to_string(),
+            ),
+            (
+                "factor-b".to_string(),
+                "conflicting-wire".to_string(),
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                1,
+                1,
+                1,
+                0,
+                0,
+                String::new(),
+                "LogicalSignal".to_string(),
+            ),
+            (
+                "factor-b".to_string(),
+                "clear-wire".to_string(),
+                vec![2],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                2,
+                1,
+                1,
+                0,
+                0,
+                String::new(),
+                "LogicalSignal".to_string(),
+            ),
+        ];
+        let Result = PlanAuthoritativeRoutesBoundedNative(CandidateValues, 3, 32, 1_000)
+            .expect("same-owner static no-good should retain the clear value");
+
+        assert!(Result.Success);
+        assert_eq!(
+            Result.SelectedCandidateIds,
+            vec![
+                ("factor-a".to_string(), "support".to_string()),
+                ("factor-b".to_string(), "clear-wire".to_string()),
+            ],
+        );
+    }
+
     fn CompactFactor(
         Variable: &str,
         FactorId: &str,
@@ -1662,6 +1940,7 @@ mod Tests {
         (
             Variable.to_string(),
             FactorId.to_string(),
+            String::new(),
             vec![PrimitiveIndex],
             1,
             1,
@@ -1677,6 +1956,7 @@ mod Tests {
     fn CompactCatalogSkipsAConflictingL1AndSelectsL2() {
         let Primitives = vec![
             (
+                String::new(),
                 vec![(0, 0, 0)],
                 Vec::new(),
                 Vec::new(),
@@ -1684,6 +1964,7 @@ mod Tests {
                 Vec::new(),
             ),
             (
+                String::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -1691,6 +1972,7 @@ mod Tests {
                 Vec::new(),
             ),
             (
+                String::new(),
                 vec![(1, 0, 0)],
                 Vec::new(),
                 Vec::new(),
@@ -1698,6 +1980,7 @@ mod Tests {
                 Vec::new(),
             ),
             (
+                String::new(),
                 vec![(2, 0, 0)],
                 Vec::new(),
                 Vec::new(),
@@ -1759,6 +2042,7 @@ mod Tests {
         let Result = SolveCompactTemplateFactorCatalogWithDeadline(
             vec![(0, 0, 0)],
             vec![(
+                String::new(),
                 vec![(0, 0, 0)],
                 Vec::new(),
                 Vec::new(),
@@ -1805,6 +2089,7 @@ mod Tests {
         );
         let Primitives = vec![
             (
+                String::new(),
                 vec![(0, 0, 0)],
                 Vec::new(),
                 Vec::new(),
@@ -1812,6 +2097,7 @@ mod Tests {
                 Vec::new(),
             ),
             (
+                String::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -1819,6 +2105,7 @@ mod Tests {
                 Vec::new(),
             ),
             (
+                String::new(),
                 vec![(1, 0, 0)],
                 Vec::new(),
                 Vec::new(),

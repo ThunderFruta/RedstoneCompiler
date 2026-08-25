@@ -42,6 +42,7 @@ from Compiler.Routing.AuthoritativePlanner import (
     BuildForeignElectricalExclusionsBySignal,
     BuildDetachedLocalClaimObstacleNodes,
     PartitionLocalClaimSeedComponents,
+    FindCompleteEmptyPortalEndpointDomains,
     PortalTupleFeasibilityDomainIsComplete,
     PortalTupleEmptyProofDomainIsComplete,
     ReadPortalBatchCandidatesAndCompletionMask,
@@ -5178,6 +5179,48 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 "EvaluatedPortalTupleCount": 16,
             },
         )))
+
+    def testCompleteEmptyPortalEndpointNeedsEveryLayerCertificate(self) -> None:
+        Profile = SimpleNamespace(
+            Root=(1, 2, 3),
+            Targets=((4, 5, 6),),
+        )
+        CompleteKeys = {
+            ("Signal", Profile.Root, 0),
+            ("Signal", Profile.Root, 1),
+            ("Signal", Profile.Targets[0], 0),
+            ("Signal", Profile.Targets[0], 1),
+        }
+        self.assertEqual(
+            FindCompleteEmptyPortalEndpointDomains(
+                {"Signal": Profile},
+                {},
+                CompleteKeys,
+                2,
+            ),
+            (
+                ("Signal", "source", Profile.Root),
+                ("Signal", "target", Profile.Targets[0]),
+            ),
+        )
+        self.assertEqual(
+            FindCompleteEmptyPortalEndpointDomains(
+                {"Signal": Profile},
+                {},
+                CompleteKeys - {("Signal", Profile.Root, 1)},
+                2,
+            ),
+            (("Signal", "target", Profile.Targets[0]),),
+        )
+        self.assertEqual(
+            FindCompleteEmptyPortalEndpointDomains(
+                {"Signal": Profile},
+                {("Signal", Profile.Root, 0): (object(),)},
+                CompleteKeys,
+                2,
+            ),
+            (("Signal", "target", Profile.Targets[0]),),
+        )
 
     def testPortalTupleCompletenessRequiresEveryEligibleLayer(self) -> None:
         CompleteLayer = {
