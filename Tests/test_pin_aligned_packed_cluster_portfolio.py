@@ -6,12 +6,10 @@ import unittest
 
 from Compiler.Ir.Models import Gate, GateKind
 from Compiler.Placement.Pcb import (
-    BuildDerivedPinAlignmentOffsets,
     BuildPinAlignedPackedCluster,
     BuildPinAlignedPackedClusterPortfolio,
     CountPinAlignedPackedClusterPortfolio,
 )
-from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
 
 
 class PinAlignedPackedClusterPortfolioTests(unittest.TestCase):
@@ -25,25 +23,7 @@ class PinAlignedPackedClusterPortfolioTests(unittest.TestCase):
         InternalByName = {GateValue.Name: GateValue for GateValue in Gates}
         return tuple(InternalByName), InternalByName
 
-    def testAlignmentOffsetsIncludeTechnologyClearanceLandingShell(self) -> None:
-        Distance = (
-            DefaultRedstoneRoutingTechnology.TrackPitch
-            + max(
-                1,
-                DefaultRedstoneRoutingTechnology.TrackPitch - 1,
-            )
-        )
-
-        Offsets = BuildDerivedPinAlignmentOffsets()
-
-        self.assertTrue({
-            (-Distance, 0),
-            (Distance, 0),
-            (0, -Distance),
-            (0, Distance),
-        } <= set(Offsets))
-
-    def testPortfolioStatesAreStableCompleteAndMaterializable(self) -> None:
+    def testPortfolioStatesAreStableNondominatedAndMaterializable(self) -> None:
         Names, InternalByName = self.BuildFixture()
 
         First = BuildPinAlignedPackedClusterPortfolio(
@@ -59,7 +39,7 @@ class PinAlignedPackedClusterPortfolioTests(unittest.TestCase):
 
         self.assertGreater(First.CandidateCount, 0)
         self.assertEqual(First, Second)
-        self.assertEqual(First.RawCandidateCount, First.CandidateCount)
+        self.assertGreaterEqual(First.RawCandidateCount, First.CandidateCount)
         self.assertEqual(
             CountPinAlignedPackedClusterPortfolio(
                 Names,
@@ -73,6 +53,24 @@ class PinAlignedPackedClusterPortfolioTests(unittest.TestCase):
             First.CandidateCount,
         )
         for State in First.States:
+            self.assertFalse(any(
+                all(
+                    OtherValue <= StateValue
+                    for OtherValue, StateValue in zip(
+                        Other.Objective,
+                        State.Objective,
+                    )
+                )
+                and any(
+                    OtherValue < StateValue
+                    for OtherValue, StateValue in zip(
+                        Other.Objective,
+                        State.Objective,
+                    )
+                )
+                for Other in First.States
+                if Other is not State
+            ))
             Candidate = BuildPinAlignedPackedCluster(
                 Names,
                 InternalByName,
@@ -110,40 +108,6 @@ class PinAlignedPackedClusterPortfolioTests(unittest.TestCase):
                 BeamWidth=8,
                 CandidateIndex=Portfolio.RawCandidateCount,
             )
-
-    def testEmptyGraphBeamProducesAnEmptyPortfolio(self) -> None:
-        """A core with no pin-aligned continuation is not a Python failure."""
-        Gates = (
-            Gate("N0", GateKind.NAND, ["S0"], ["A", "B"]),
-            Gate("N1", GateKind.NAND, ["S1"], ["C", "D"]),
-        )
-        InternalByName = {GateValue.Name: GateValue for GateValue in Gates}
-        Names = tuple(InternalByName)
-
-        Portfolio = BuildPinAlignedPackedClusterPortfolio(
-            Names,
-            InternalByName,
-            BeamWidth=8,
-        )
-
-        self.assertEqual(Portfolio.States, ())
-        self.assertEqual(Portfolio.RawCandidateCount, 0)
-        self.assertEqual(Portfolio.CandidateCount, 0)
-        self.assertEqual(
-            CountPinAlignedPackedClusterPortfolio(
-                Names,
-                InternalByName,
-                BeamWidth=8,
-            ),
-            0,
-        )
-        self.assertIsNone(
-            BuildPinAlignedPackedCluster(
-                Names,
-                InternalByName,
-                BeamWidth=8,
-            )
-        )
 
 
 if __name__ == "__main__":

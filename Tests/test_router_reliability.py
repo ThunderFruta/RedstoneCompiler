@@ -137,6 +137,12 @@ from Compiler.Routing.Reliability import (
 from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
 
 
+RetiredAutomaticRelaunchTest = unittest.skip(
+    "automatic placement relaunch is retained only on "
+    "experimental/compact-layered-routing"
+)
+
+
 class RouterReliabilityTests(unittest.TestCase):
     @staticmethod
     def BuildReconvergentTopologyModule():
@@ -1935,6 +1941,7 @@ class RouterReliabilityTests(unittest.TestCase):
             frozenset({"OwnedB"}),
         )
 
+    @RetiredAutomaticRelaunchTest
     def testPlacementAdvanceFailureSkipsSameCandidateLocalClaimRecovery(self) -> None:
         RouteOrder = []
         OwnedClaim = SimpleNamespace(Signal="Owned", ClusterId=0, Nodes=())
@@ -2059,6 +2066,7 @@ class RouterReliabilityTests(unittest.TestCase):
             OpenedEpochs=(Epoch,),
         ))
 
+    @RetiredAutomaticRelaunchTest
     def testPermittedLocalClaimRecoveryUsesRemainingAdaptiveSlice(self) -> None:
         RouteOrder = []
         RecoveryBudgets = []
@@ -2102,6 +2110,7 @@ class RouterReliabilityTests(unittest.TestCase):
             Attempt["AdaptiveAttemptExpiresAt"],
         )
 
+    @RetiredAutomaticRelaunchTest
     def testSlowDeferredGeneratorCannotConsumeRoutingReserve(self) -> None:
         RouteOrder = []
         PlacementOrder = []
@@ -2491,6 +2500,7 @@ class RouterReliabilityTests(unittest.TestCase):
             frozenset(),
         )
 
+    @RetiredAutomaticRelaunchTest
     def testLargeTopologyDoesNotOverrideFeedbackRoundPolicy(
         self,
     ) -> None:
@@ -2518,6 +2528,7 @@ class RouterReliabilityTests(unittest.TestCase):
             1,
         )
 
+    @RetiredAutomaticRelaunchTest
     def testRetainedCandidateStartsWithPositiveDeadlineRemainder(self) -> None:
         RouteOrder = []
 
@@ -2544,6 +2555,7 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertEqual(RouteOrder, [0, 10])
         self.assertIs(Result.Routed, SuccessfulRoutes[10])
 
+    @RetiredAutomaticRelaunchTest
     def testHigherOrderConflictFeedsDeferredPlacementRelocation(self) -> None:
         Policy = LocalFirstPhysicalDesignPolicy
         Plan = PlacementGenerationPlan(
@@ -2656,6 +2668,7 @@ class RouterReliabilityTests(unittest.TestCase):
             frozenset({"A", "B", "C"}),
         )
 
+    @RetiredAutomaticRelaunchTest
     def testExactRowBeamCutPrioritizesRelocationBeforeDirectOnly(self) -> None:
         Policy = LocalFirstPhysicalDesignPolicy
         Plan = PlacementGenerationPlan(
@@ -2801,6 +2814,7 @@ class RouterReliabilityTests(unittest.TestCase):
             for Decision in Decisions
         ))
 
+    @RetiredAutomaticRelaunchTest
     def testFeedbackFailureCannotPublishPartialPlacementCandidate(self) -> None:
         RouteOrder = []
         FeedbackCalls = []
@@ -3940,6 +3954,7 @@ class RouterReliabilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ApplyRemainingExactLegalJointStateCount(Placement, 0)
 
+    @RetiredAutomaticRelaunchTest
     def testRepeatedAccessDistinctCutRetriesSamePlacementBeforeGeneration(
         self,
     ) -> None:
@@ -5050,6 +5065,7 @@ class RouterReliabilityTests(unittest.TestCase):
             "candidate-fingerprint",
         )
 
+    @RetiredAutomaticRelaunchTest
     def testSecondRetainedPlacementRunsAfterFirstRoutingFailure(self) -> None:
         RouteOrder = []
 
@@ -5078,6 +5094,7 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertEqual(len(Attempts), 2)
         self.assertEqual(Attempts[-1]["Result"], "routed")
 
+    @RetiredAutomaticRelaunchTest
     def testValidationFailureAdvancesToSecondPlacement(self) -> None:
         RouteOrder = []
         ValidationOrder = []
@@ -5103,6 +5120,7 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertIs(Result.Routed, SuccessfulRoutes[10])
         self.assertEqual(len(set(DeadlineIdentities)), 2)
 
+    @RetiredAutomaticRelaunchTest
     def testCandidateCompletionRemainsPendingUntilValidationPasses(self) -> None:
         ProgressEvents = []
 
@@ -5148,6 +5166,7 @@ class RouterReliabilityTests(unittest.TestCase):
             for Progress in ProgressEvents
         ))
 
+    @RetiredAutomaticRelaunchTest
     def testDeadlineIsCheckedImmediatelyBeforeRoutedValidation(self) -> None:
         Events = []
 
@@ -5177,6 +5196,7 @@ class RouterReliabilityTests(unittest.TestCase):
             ("deadline", "RoutedValidation", "before"),
         )
 
+    @RetiredAutomaticRelaunchTest
     def testFirstFullyValidPlacementStopsLaterCandidates(self) -> None:
         RouteOrder = []
         ValidationOrder = []
@@ -5194,6 +5214,7 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertIs(Result.Routed, SuccessfulRoutes[0])
         self.assertEqual(len(set(DeadlineIdentities)), 1)
 
+    @RetiredAutomaticRelaunchTest
     def testTypedAdaptiveTimeoutAdvancesWithClockRemaining(self) -> None:
         RouteOrder = []
 
@@ -5217,6 +5238,7 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertIs(Result.Routed, SuccessfulRoutes[10])
         self.assertEqual(len(set(DeadlineIdentities)), 2)
 
+    @RetiredAutomaticRelaunchTest
     def testCompletedExactCutPreemptsRetainedUnpackedPlacement(self) -> None:
         Policy = LocalFirstPhysicalDesignPolicy
         Plan = PlacementGenerationPlan(
@@ -5346,6 +5368,7 @@ class RouterReliabilityTests(unittest.TestCase):
                     ExactCut,
                 )
 
+    @RetiredAutomaticRelaunchTest
     def testStructuredCutRelocationPreemptsRetainedJointAndBroadStates(
         self,
     ) -> None:
@@ -5574,6 +5597,7 @@ class RouterReliabilityTests(unittest.TestCase):
         ]
         self.assertEqual(History[0], RelocationCut.ToDictionary())
 
+    @RetiredAutomaticRelaunchTest
     def testCompletedAssignmentCutSurvivesLaterBareTimeout(self) -> None:
         Policy = LocalFirstPhysicalDesignPolicy
         Plan = PlacementGenerationPlan(
@@ -5660,6 +5684,7 @@ class RouterReliabilityTests(unittest.TestCase):
             },
         )
 
+    @RetiredAutomaticRelaunchTest
     def testTinyDeadlineStopsAfterRouteWithoutLaterWork(self) -> None:
         RouteOrder = []
         ValidationOrder = []
@@ -5690,6 +5715,7 @@ class RouterReliabilityTests(unittest.TestCase):
         self.assertEqual(ValidationOrder, [])
         self.assertLess(Elapsed, 1.0)
 
+    @RetiredAutomaticRelaunchTest
     def testTinyDeadlineStopsAfterValidationWithoutLaterCandidate(self) -> None:
         RouteOrder = []
         ValidationOrder = []
@@ -5745,6 +5771,7 @@ class RouterReliabilityTests(unittest.TestCase):
             BuildPlacementFingerprint(Value(0, MirrorX=True)),
         )
 
+    @RetiredAutomaticRelaunchTest
     def testTranslatedPlacementIsNotRetainedAsAnotherCandidate(
         self,
     ) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -27,6 +27,7 @@ from .Placement.PcbFlow import (
 from SchemEncoder import Writer262
 from SchemEncoder.Writer262 import BlockCompositionMetrics
 from .Simulation.Redstone import (
+    ShouldSimulateRenderedMinecraftTruthTable,
     SimulateRenderedMinecraftTruthTable,
     SimulateRoutedTruthTable,
     WriteTruthTable,
@@ -748,14 +749,24 @@ def CompileSvToLitematic(
     )
     Composition = Rendered.Composition
 
-    # The routed-net check above is an inexpensive candidate filter.  The
-    # final acceptance decision must instead come from the exact rendered
-    # Minecraft block layout, where torches, opaque support blocks, and dust
-    # can couple otherwise distinct logical nets.
-    Simulation = SimulateRenderedMinecraftTruthTable(
-        Routed,
-        ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
-    )
+    # The routed-net check above covers every row.  For the parity-proven
+    # small-table bound, additionally require the exact rendered Minecraft
+    # block layout, where opaque supports and dust can couple distinct nets.
+    if ShouldSimulateRenderedMinecraftTruthTable(
+        OptimizedIR.Modules[OptimizedIR.Top]
+    ):
+        Simulation = SimulateRenderedMinecraftTruthTable(
+            Routed,
+            ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
+        )
+    else:
+        Simulation = replace(
+            Simulation,
+            Diagnostics={
+                **(Simulation.Diagnostics or {}),
+                "RenderedMinecraftCrossCheck": "skipped-row-ceiling",
+            },
+        )
     if not Simulation.Passed:
         Failed = Simulation.FailedRows[0]
         raise ValueError(

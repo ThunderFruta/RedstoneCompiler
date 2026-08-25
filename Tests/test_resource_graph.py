@@ -19,19 +19,12 @@ from Compiler.Placement.Pcb import (
 
 
 class RoutingResourceGraphTests(unittest.TestCase):
-    def BuildGraph(self, *, Actual=(), Electrical=(), Solid=(), TorchPowered=()):
+    def BuildGraph(self, *, Actual=(), Electrical=(), Solid=()):
         return RoutingResourceGraph(
             ActualBlocks=frozenset(Actual),
             ElectricalBlocks=frozenset(Electrical),
             SolidBlocks=frozenset(Solid),
-            TorchPoweredSupportBlocks=frozenset(TorchPowered),
         )
-
-    def testTorchPoweredSupportCannotBackRoutedDust(self) -> None:
-        Graph = self.BuildGraph(TorchPowered=((4, 1, 7),))
-        self.assertFalse(Graph.IsLegalNode((4, 2, 7)))
-        with self.assertRaisesRegex(ValueError, "torch-powered support"):
-            Graph.BuildRouteClaims(((4, 2, 7),))
 
     def BuildMandatoryOutput(
         self,
@@ -240,52 +233,6 @@ class RoutingResourceGraphTests(unittest.TestCase):
             ),
             Second,
         )
-
-    def testLowerLayerRegionReusesExactSupersetByFiltering(self) -> None:
-        Graph = self.BuildGraph()
-        Columns = frozenset({(0, 0), (1, 0), (2, 0)})
-        Graph.BuildRegion(
-            (0, 2, 1, 4, 0, 0),
-            AllowedColumns=Columns,
-        )
-        Diagnostics = []
-
-        Lower = Graph.BuildRegion(
-            (0, 2, 1, 2, 0, 0),
-            AllowedColumns=Columns,
-            WorkCheck=Diagnostics.append,
-        )
-        Exact = self.BuildGraph().BuildRegion(
-            (0, 2, 1, 2, 0, 0),
-            AllowedColumns=Columns,
-        )
-
-        self.assertEqual(Lower.Nodes, Exact.Nodes)
-        self.assertEqual(Lower.Edges, Exact.Edges)
-        self.assertTrue(Diagnostics[-1]["SharedLayerCatalogRegion"])
-        self.assertEqual(Diagnostics[-1]["BuiltNodeCount"], 0)
-        self.assertTrue(all(Position[1] <= 2 for Position in Lower.Nodes))
-
-    def testLowerLayerRegionFiltersSupersetColumnsExactly(self) -> None:
-        Graph = self.BuildGraph()
-        Graph.BuildRegion(
-            (0, 2, 1, 4, 0, 0),
-            AllowedColumns=frozenset({(0, 0), (1, 0), (2, 0)}),
-        )
-        RequestedColumns = frozenset({(0, 0), (2, 0)})
-
-        Lower = Graph.BuildRegion(
-            (0, 2, 1, 2, 0, 0),
-            AllowedColumns=RequestedColumns,
-        )
-        Exact = self.BuildGraph().BuildRegion(
-            (0, 2, 1, 2, 0, 0),
-            AllowedColumns=RequestedColumns,
-        )
-
-        self.assertEqual(Lower.Nodes, Exact.Nodes)
-        self.assertEqual(Lower.Edges, Exact.Edges)
-        self.assertNotIn((1, 1, 0), Lower.Nodes)
 
     def testForeignElectricalClaimsConflictButSameNetClaimsDoNot(self) -> None:
         Graph = self.BuildGraph()

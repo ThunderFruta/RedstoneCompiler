@@ -38,11 +38,9 @@ from Compiler.Routing.AuthoritativePlanner import (
     BuildCompleteMandatoryClaimCutCoverage,
     BuildInvariantRouteRequestGuidePayload,
     BuildInvariantRouteRequestNodePayload,
-    BuildStaticSelfConflictBlockedNodes,
     BuildForeignElectricalExclusionsBySignal,
     BuildDetachedLocalClaimObstacleNodes,
     PartitionLocalClaimSeedComponents,
-    FindCompleteEmptyPortalEndpointDomains,
     PortalTupleFeasibilityDomainIsComplete,
     PortalTupleEmptyProofDomainIsComplete,
     ReadPortalBatchCandidatesAndCompletionMask,
@@ -113,8 +111,6 @@ from Compiler.Routing.AuthoritativePlanner import (
     CandidatePortalShapeRank,
     CandidatePortalTupleIndex,
     CandidateRequestShapeDescriptor,
-    BuildCompactGuideSpineClaims,
-    MergeRoutingResourceClaims,
     CandidateRequestWindowOffset,
     ClusterLeaseCandidateRealizabilityNogood,
     ClaimConflictPositions,
@@ -162,7 +158,6 @@ from Compiler.Routing.AuthoritativePlanner import (
     FilterPhysicalCandidatesToCurrentPortalDomain,
     ClassifyEmptyPhysicalCandidateDomains,
     ApplyPhysicalComponentAssemblyPortalDomains,
-    ApplyPlacementAccessAssignmentPortalDomains,
     ApplyPlacementAccessFabricPortalDomains,
     SelectGenericPortalTerminalPaths,
     GetPersistentPhysicalComponentPortCspState,
@@ -318,7 +313,6 @@ from Compiler.Routing.Models import (
     RoutingResources,
     RoutingStaticGeometry,
     PlacementAccessEscapeStub,
-    PlacementAccessAssignment,
     PlacementAccessFabric,
     PlacementAccessTerminalDomain,
 )
@@ -338,7 +332,6 @@ from Compiler.Routing.Policy import (
 )
 from Compiler.Routing.Reliability import RoutingDeadline
 from Compiler.Routing.ResourceGraph import (
-    FindClaimConflicts,
     IndexedRoutingResourceGraph,
     LocalRouteClaim,
     NetRouteCandidate,
@@ -376,78 +369,6 @@ def _LocalPairProofRecords(
 
 
 class AuthoritativePlannerTests(unittest.TestCase):
-    def testCompactGuideSpineIgnoresExpandedSearchCorridor(self) -> None:
-        Graph = RoutingResourceGraph(
-            ActualBlocks=frozenset(),
-            ElectricalBlocks=frozenset(),
-            SolidBlocks=frozenset(),
-        )
-        Portal = SimpleNamespace(PortalId="portal")
-        First = CandidateRequestShapeDescriptor(
-            SourcePortal=Portal,
-            TargetPortals=(),
-            Guide=frozenset({(0, 0), (1, 0)}),
-            Layer=1,
-            Axis="x",
-            Lane=0,
-            Variant=0,
-            PortalShapeRank=0,
-            RoutingY=3,
-            GuideExpansion=1,
-            InitiallyDeferred=False,
-            Priority=(),
-        )
-        Expanded = replace(First, GuideExpansion=8)
-        Disjoint = replace(
-            First,
-            Guide=frozenset({(0, 2), (1, 2)}),
-        )
-
-        FirstClaims = BuildCompactGuideSpineClaims(Graph, First)
-        ExpandedClaims = BuildCompactGuideSpineClaims(Graph, Expanded)
-        DisjointClaims = BuildCompactGuideSpineClaims(Graph, Disjoint)
-
-        self.assertEqual(FirstClaims, ExpandedClaims)
-        self.assertFalse(FindClaimConflicts({
-            "First": FirstClaims,
-            "Disjoint": DisjointClaims,
-        }))
-
-    def testCompactGuideSpineUsesExactSharedClaimVocabulary(self) -> None:
-        Graph = RoutingResourceGraph(
-            ActualBlocks=frozenset(),
-            ElectricalBlocks=frozenset(),
-            SolidBlocks=frozenset(),
-        )
-        Portal = SimpleNamespace(PortalId="portal")
-        Shape = CandidateRequestShapeDescriptor(
-            SourcePortal=Portal,
-            TargetPortals=(),
-            Guide=frozenset({(0, 0), (1, 0)}),
-            Layer=1,
-            Axis="x",
-            Lane=0,
-            Variant=0,
-            PortalShapeRank=0,
-            RoutingY=3,
-            GuideExpansion=2,
-            InitiallyDeferred=False,
-            Priority=(),
-        )
-        GuideClaims = BuildCompactGuideSpineClaims(Graph, Shape)
-        AccessClaims = Graph.BuildRouteClaims({(1, 3, 0)})
-
-        self.assertTrue(FindClaimConflicts({
-            "GuideOwner": GuideClaims,
-            "AccessOwner": AccessClaims,
-        }))
-        self.assertFalse(FindClaimConflicts({
-            "SameOwner": MergeRoutingResourceClaims((
-                GuideClaims,
-                AccessClaims,
-            )),
-        }))
-
     def testExactPortalConstraintFactorsCaptureCrossVariableAirTernary(
         self,
     ) -> None:
@@ -916,15 +837,6 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 frozenset(),
             )
         )
-        self.assertFalse(
-            PhysicalRouteRequestFactorHasNecessaryConnectivity(
-                Adjacency,
-                Nodes,
-                frozenset((*Required, (9, 2, 9))),
-                frozenset(((1, 2, 0),)),
-                frozenset(((1, 0),)),
-            )
-        )
 
     def testRoutedComponentNoTreeEvidenceRequiresCompletedWindows(
         self,
@@ -1176,29 +1088,6 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertEqual(
             SecondNativeBlockedNodes,
             list(Second.BlockedNodes),
-        )
-
-    def testStaticSelfConflictBlockedNodesProtectImmutableSupportAndAir(
-        self,
-    ) -> None:
-        Claims = RoutingResourceClaims(
-            WireCells=frozenset({(0, 2, 4)}),
-            SupportCells=frozenset({(0, 1, 4)}),
-            RequiredAirCells=frozenset({(1, 2, 4)}),
-            ElectricalCells=frozenset(),
-        )
-
-        self.assertEqual(
-            BuildStaticSelfConflictBlockedNodes(
-                Claims,
-                frozenset({(0, 2, 4)}),
-            ),
-            frozenset({
-                (0, 1, 4),
-                (0, 3, 4),
-                (1, 2, 4),
-                (1, 3, 4),
-            }),
         )
 
     def testInvariantRouteRequestGuidePayloadMatchesEagerExpansion(
@@ -5179,48 +5068,6 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 "EvaluatedPortalTupleCount": 16,
             },
         )))
-
-    def testCompleteEmptyPortalEndpointNeedsEveryLayerCertificate(self) -> None:
-        Profile = SimpleNamespace(
-            Root=(1, 2, 3),
-            Targets=((4, 5, 6),),
-        )
-        CompleteKeys = {
-            ("Signal", Profile.Root, 0),
-            ("Signal", Profile.Root, 1),
-            ("Signal", Profile.Targets[0], 0),
-            ("Signal", Profile.Targets[0], 1),
-        }
-        self.assertEqual(
-            FindCompleteEmptyPortalEndpointDomains(
-                {"Signal": Profile},
-                {},
-                CompleteKeys,
-                2,
-            ),
-            (
-                ("Signal", "source", Profile.Root),
-                ("Signal", "target", Profile.Targets[0]),
-            ),
-        )
-        self.assertEqual(
-            FindCompleteEmptyPortalEndpointDomains(
-                {"Signal": Profile},
-                {},
-                CompleteKeys - {("Signal", Profile.Root, 1)},
-                2,
-            ),
-            (("Signal", "target", Profile.Targets[0]),),
-        )
-        self.assertEqual(
-            FindCompleteEmptyPortalEndpointDomains(
-                {"Signal": Profile},
-                {("Signal", Profile.Root, 0): (object(),)},
-                CompleteKeys,
-                2,
-            ),
-            (("Signal", "target", Profile.Targets[0]),),
-        )
 
     def testPortalTupleCompletenessRequiresEveryEligibleLayer(self) -> None:
         CompleteLayer = {
@@ -15389,28 +15236,6 @@ class AuthoritativePlannerTests(unittest.TestCase):
             if Portal.Signal == "Signal"
         ))
 
-        Assigned = ApplyPlacementAccessAssignmentPortalDomains(
-            GenericPortals,
-            Fabric,
-            PlacementAccessAssignment(
-                FabricFingerprint=Fabric.FabricFingerprint,
-                AssignmentFingerprint="selected-assignment",
-                SelectedStubIndices=(("Signal", Terminal, 0),),
-                CapacityResourceIds=(),
-                ExpansionCount=1,
-                Success=True,
-                Complete=True,
-            ),
-            Graph,
-            DefaultRedstoneRoutingTechnology,
-            0,
-            2,
-        )
-        self.assertEqual(
-            Assigned[("Signal", Terminal, 0)][0].PortalId,
-            First[("Signal", Terminal, 0)][0].PortalId,
-        )
-
     def testUnassignedPlacementAccessFabricDomainReachesTrackPreparation(
         self,
     ) -> None:
@@ -15700,11 +15525,6 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertTrue(dict(Domain.Diagnostics)[
             "ExcludedConfiguredRequestCounts"
         ])
-        # The cache is an optimization, not part of the frozen physical
-        # contract.  The selected world must deterministically regenerate
-        # and fingerprint its detailed candidates when no pre-existing cache
-        # record survives the compact solve.
-        Resources.FrozenRawTrackAssignmentCandidateCaches.clear()
         Routed = RoutePcbDesign(
             Placement,
             Resources=Resources,
@@ -16609,7 +16429,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             def __getattr__(self, Name):
                 return getattr(self.Context, Name)
 
-            def GenerateRouteTreeClaimAwareDetailedBatchBounded(
+            def GenerateRouteTreeDetailedBatchBounded(
                 self,
                 Requests,
                 MaximumRuntimeMilliseconds,
@@ -16619,10 +16439,9 @@ class AuthoritativePlannerTests(unittest.TestCase):
                     MaximumRuntimeMilliseconds,
                 ))
                 return DetailedBatchResult([
-                    self.Context.GenerateRouteTreeClaimAwareDetailedBounded(
-                        *Request[0],
+                    self.Context.GenerateRouteTreeDetailedBounded(
+                        *Request,
                         MaximumRuntimeMilliseconds,
-                        *Request[1],
                     )
                     for Request in Requests
                 ])

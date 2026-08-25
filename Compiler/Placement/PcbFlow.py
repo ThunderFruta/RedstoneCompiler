@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from itertools import combinations, islice
-from math import ceil, isfinite, prod
+from math import isfinite, prod
 import os
 from time import monotonic
 import traceback
@@ -13,7 +13,6 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from ..Cells.Library import GetCellMacro
 from ..Routing.Pcb import (
     PrepareClusterInterfaceAssignment,
-    PrepareRawRouteGuideFactorDomain,
     PrepareRawTrackAssignmentDomain,
     PrepareTrackAssignment,
     PreparePhysicalComponentEligibility,
@@ -48,42 +47,21 @@ from ..Routing.ComponentPipeline import (
     SelectPhysicalComponentResourceRelevantSignalPairs,
 )
 from ..Routing.AuthoritativePlanner import (
-    BuildRawRouteGuideFactorDomain,
-    BuildConditionalRawTrackAssignmentDomain,
-    BuildRawPortalPlacementGeometryFingerprint,
-    BuildRawPortalResourceGeometryFingerprint,
-    CandidateRequestShapeDescriptor,
-    CompactGuideMaterializabilityCertificate,
-    RawTrackAssignmentDomain,
-    RawTrackAssignmentValue,
     BuildFrozenPostClosurePortalHandoffTelemetry,
     BuildPhysicalGlobalPlanYieldDeadline,
     BuildPhysicalGlobalPlanContinuationState,
-    PartitionLocalClaimSeedComponents,
     RetainIncompletePhysicalGlobalPlan,
     SelectNextRetainedPhysicalGlobalPlan,
     ShouldScheduleRetainedPhysicalGlobalPlan,
 )
-from ..Routing.ChannelPlanner import (
-    BuildNetRoutingProfiles,
-    SelectAttachedLocalRouteClaims,
-)
 from ..Routing.TemplateAssignment import (
-    BuildCompactFactorCatalog,
-    CompactFactorMemberSource,
-    LayeredAccessFactorCatalogSummary,
-    PredeclaredRawTrackAssignmentMember,
-    RawTrackAssignmentProblem,
-    RawTrackAssignmentMemberMaterialization,
-    RawTrackAssignmentAttempt,
+    RawTrackAssignmentMaterialization,
+    RawTrackAssignmentPortfolio,
+    RawTrackAssignmentPortfolioTemplate,
     RawTrackAssignmentSelection,
-    RawTrackAssignmentTemplate,
-    SolveLayeredAccessFactorCatalogWithContext,
-    SolveCompactFactorCatalogWithContext,
-    SolveRawTrackAssignmentProblemWithContext,
+    SolveRawTrackAssignmentPortfolioWithContext,
 )
 from ..Routing.Models import (
-    BuildPlacementAccessEscapeStubChoiceId,
     ClusterInterfaceAssignment,
     ClusterInterfacePortfolioAssignment,
     ClusterInterfacePortfolioProblem,
@@ -92,8 +70,6 @@ from ..Routing.Models import (
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceStateProof,
     ComponentRoutabilityCore,
-    FrozenPerFaceRoutingEnvelope,
-    PlacementAccessFabric,
     RoutedComponentTemplate,
     RoutedDesign,
     TrackAssignmentPreparation,
@@ -114,17 +90,9 @@ from ..Routing.LocalFirst import (
     MeasurePlacementRoutingFeedback,
 )
 from ..Routing.Reliability import BuildStableFingerprint, RoutingDeadline
-from ..Routing.ResourceGraph import (
-    FindClaimConflicts,
-    FindSelfClaimConflicts,
-    LocalRouteClaim,
-    NormalizeRoutingEdge,
-    PinAccessPortal,
-    RoutingResourceClaims,
-)
+from ..Routing.ResourceGraph import LocalRouteClaim
 from ..Routing.Actions import ValidatePlacedCellElectricalIsolation
 from ..Routing.Actions.Geometry import (
-    BuildPlacedOmnidirectionalControlSourcesBySignal,
     BuildRoutingResources,
     ForkRoutingResourcesWithSharedStaticGeometry,
 )
@@ -139,7 +107,6 @@ from ..Routing.Technology import (
     RedstoneRoutingTechnology,
 )
 from .Pcb import (
-    ApplyDerivedPerimeterInterfaceTemplate,
     BuildPinAlignedPackedClusterPortfolio,
     BuildBoundedInterClusterRoutingChannel,
     BuildBoundedInterClusterRoutingDeck,
@@ -152,32 +119,12 @@ from .Pcb import (
     PlacePcbGraph,
 )
 from .AccessFabric import (
-    BuildPlacementAccessNativeRegionCatalogBounded,
-    BuildPlacementAccessNativeRegionRecipe,
-    BuildPlacementAccessNativeEscapeViewCatalogBounded,
-    AttachPlacementAccessAssignment,
     AttachPlacementAccessFabric,
     BuildDerivedPerimeterFabricShell,
-    BuildPlacementAccessAssignmentFromStubFactor,
     BuildPlacementAccessFabric,
-    BuildPlacementAccessNativeEscapeStubPathsByTerminal,
-    BuildPlacementAccessNativeSelectedStubFactorIds,
-    CompletePlacementAccessNativeEscapePreparation,
     DerivedPerimeterFabricShell,
-    MaterializeSelectedPlacementAccessStubClaims,
     MeasureDerivedPerimeterInterfaceDemand,
     MeasureDerivedPerimeterInterfaceLaunchDemandByFace,
-    MergePlacementAccessNativeEscapeMemberResults,
-    PlacementAccessNativeEscapeMemberResult,
-    PlacementAccessNativeEscapeMemberView,
-    PlacementAccessNativeEscapeGuideMemberView,
-    PlacementAccessNativeGuideSignal,
-    PlacementAccessNativeEscapePreparationRequested,
-    ProjectDerivedPerimeterFabricShellLayers,
-    ResolveFixedAccessFabricLayerCount,
-    SolvePlacementAccessNativeEscapeCatalogBounded,
-    SolvePlacementAccessNativeEscapeFactorCatalogBounded,
-    SolvePlacementAccessNativeEscapeGuideFactorCatalogBounded,
 )
 from .PreRouteInterface import (
     DerivedPlacementCandidate,
@@ -5324,67 +5271,6 @@ def BuildDerivedPinAlignedEnvelopeLowerBoundObjective(
     )
 
 
-def SelectDiversePinAlignedEnvelopeStates(
-    States: Iterable[Any],
-    MaximumCount: int,
-) -> tuple[Any, ...]:
-    """Retain bounded physical-envelope diversity without dominance cuts."""
-    Limit = max(0, int(MaximumCount))
-    Ordered = tuple(sorted(
-        States,
-        key=BuildDerivedPinAlignedEnvelopeLowerBoundObjective,
-    ))
-    if Limit == 0:
-        return ()
-    if len(Ordered) <= Limit:
-        return Ordered
-    Selected: list[Any] = []
-    SeenFingerprints: set[str] = set()
-
-    def Add(State: Any) -> None:
-        Fingerprint = str(getattr(State, "Fingerprint", ""))
-        if Fingerprint in SeenFingerprints or len(Selected) >= Limit:
-            return
-        SeenFingerprints.add(Fingerprint)
-        Selected.append(State)
-
-    # Keep both compactness extrema: least shell area and shortest maximum
-    # side.  The latter is the wider/shorter tradeoff that an area-only
-    # prefix used to discard before exact perimeter construction.
-    Add(Ordered[0])
-    Add(min(
-        Ordered,
-        key=lambda State: (
-            BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[1],
-            BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[0],
-            BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[2:],
-        ),
-    ))
-    for State in Ordered[1:2]:
-        # Preserve the exact transform-distinct counterpart at the compact
-        # minimum when the bounded frontier has another slot. Whether it
-        # later collapses to the same physical factor domain is decided only
-        # by exact domain fingerprints, not by this lower-bound objective.
-        Add(State)
-    SeenEnvelopeShapes = {
-        BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[:2]
-        for State in Selected
-    }
-    for State in Ordered:
-        Shape = BuildDerivedPinAlignedEnvelopeLowerBoundObjective(State)[:2]
-        if Shape in SeenEnvelopeShapes:
-            continue
-        Add(State)
-        SeenEnvelopeShapes.add(Shape)
-        if len(Selected) >= Limit:
-            return tuple(Selected)
-    for State in Ordered:
-        Add(State)
-        if len(Selected) >= Limit:
-            break
-    return tuple(Selected)
-
-
 def SelectDerivedPrimaryPlacementRequests(
     GenerationPlan: PlacementGenerationPlan,
     SinglePackedComponent: bool,
@@ -5395,7 +5281,7 @@ def SelectDerivedPrimaryPlacementRequests(
 ) -> tuple[PlacementGenerationRequest, ...]:
     """Build the finite single-component geometry domain before routing.
 
-    The row-beam incumbent and every retained pin-aligned state
+    The row-beam incumbent and every retained non-dominated pin-aligned state
     are fixed members of one placement problem.  The graph beam derives
     origins from transformed connected pins and exact macro legality before
     any capacity selection or routing begins; it never schedules a later
@@ -5451,8 +5337,8 @@ def SelectDerivedPrimaryPlacementRequests(
             GraphRequest.PackingPolicy.BeamWidth,
             WorkCheck=WorkCheck,
         )
-        # The graph portfolio is already a finite retained core frontier.
-        # Do not collapse that frontier to its smallest NAND-only
+        # The graph portfolio is already a finite, non-dominated core
+        # frontier.  Do not collapse that frontier to its smallest NAND-only
         # rectangle: a slightly wider/shorter core can have the smaller
         # physical access ring once terminal slots and real keep-outs are
         # materialized.  Retain a deterministic prefix ranked by the minimum
@@ -5462,15 +5348,17 @@ def SelectDerivedPrimaryPlacementRequests(
         MaximumDerivedMemberCount = max(
             0,
             int(GraphRequest.PackingPolicy.RetainedPlacementCandidates)
-            - len(Primary)
+            - len(Primary),
         )
         MaximumGraphCoreMemberCount = max(
             0,
-            MaximumDerivedMemberCount,
+            MaximumDerivedMemberCount - 1,
         )
-        States = SelectDiversePinAlignedEnvelopeStates(
-            Portfolio.States,
-            MaximumGraphCoreMemberCount,
+        States = tuple(
+            sorted(
+                Portfolio.States,
+                key=BuildDerivedPinAlignedEnvelopeLowerBoundObjective,
+            )[:MaximumGraphCoreMemberCount]
         )
         # The incumbent is a certified comparison point.  Every derived
         # geometry below is a pre-route member, including the row-beam core
@@ -5480,21 +5368,27 @@ def SelectDerivedPrimaryPlacementRequests(
         # member.  Do not multiply geometry recipes by arbitrary terminal
         # layout indexes here: that would turn a fixed slot problem into an
         # implicit portfolio of duplicate placement attempts.
-        DerivedGeometryRequests = tuple(
+        DerivedGeometryRequests = (
             replace(
-                GraphRequest,
-                GraphCoreCandidateIndex=State.CandidateIndex,
-            )
-            for State in States
+                Primary[0],
+                SourceGenerator="derived-perimeter-row-beam",
+            ),
+            *(
+                replace(
+                    GraphRequest,
+                    GraphCoreCandidateIndex=State.CandidateIndex,
+                )
+                for State in States
+            ),
         )
         DerivedRequests = tuple(
             replace(Request, TerminalLayoutVariantIndex=0)
             for Request in DerivedGeometryRequests
         )
-        # The fixed row-beam incumbent is retained by the caller before these
-        # requests are generated.  Do not add a second row-beam alias here;
-        # every returned request is a distinct pin-aligned graph-core member.
-        return DerivedRequests
+        return (
+            *Primary,
+            *DerivedRequests,
+        )
     AccessSeparated = tuple(
         Request
         for Request in GenerationPlan.DeferredRequests
@@ -5530,66 +5424,17 @@ def UsesDerivedPerimeterTerminals(
     }
 
 
-def SelectDiverseDerivedPerimeterInterfaceTemplates(
-    Templates: Iterable[Any],
-    ExistingFaceSignatures: Iterable[tuple[int, int, int, int]],
-    MaximumCount: int,
-) -> tuple[Any, ...]:
-    """Fill unused retained geometry slots by physical face diversity.
-
-    The retained-placement cap is fixed before routing.  When the graph-core
-    beam produces fewer members than that cap, already-declared perimeter
-    templates may fill the unused slots.  Selection maximizes the minimum
-    Manhattan distance from every retained face signature; NAND-only area or
-    another routing-blind objective is never used as a feasibility proxy.
-    """
-    Remaining = {
-        str(Template.TemplateId): Template
-        for Template in Templates
-    }
-    Selected: list[Any] = []
-    Signatures = {
-        tuple(map(int, Signature))
-        for Signature in ExistingFaceSignatures
-    }
-    while Remaining and len(Selected) < max(0, int(MaximumCount)):
-        def Diversity(Template: Any) -> int:
-            Signature = tuple(map(int, Template.FaceSignature))
-            return min(
-                (
-                    sum(abs(First - Second) for First, Second in zip(
-                        Signature,
-                        Existing,
-                    ))
-                    for Existing in Signatures
-                ),
-                default=sum(Signature),
-            )
-
-        Template = min(
-            Remaining.values(),
-            key=lambda Value: (
-                -Diversity(Value),
-                str(Value.TemplateId),
-            ),
-        )
-        Selected.append(Template)
-        Signatures.add(tuple(map(int, Template.FaceSignature)))
-        Remaining.pop(str(Template.TemplateId))
-    return tuple(Selected)
-
-
 def PrepareDerivedPlacementForFrozenAccessContract(
     Placement: PcbPlacement,
 ) -> PcbPlacement:
     """Transfer small-design local access ownership to the ring contract.
 
-    Preserve only routes placement already certified complete. Partial local
-    fragments were selected without the complete capacity problem and can
-    obstruct a different signal's only legal escape, so those remain
-    released. A complete signal tree, however, is an immutable physical
-    witness; discarding it would turn a routed internal net into a spurious
-    global terminal-access requirement.
+    Packed placement can opportunistically freeze short local routes before
+    the perimeter factor is built.  Those routes were selected without the
+    complete capacity problem and can obstruct a different signal's only
+    legal escape.  A derived candidate therefore publishes macro geometry
+    and terminals only; the selected access-fabric witness becomes the sole
+    immutable local-access owner.
     """
     Source = Placement.Placed
     Diagnostics = dict(Source.LocalRouteDiagnostics or {})
@@ -5607,29 +5452,14 @@ def PrepareDerivedPlacementForFrozenAccessContract(
         for Claim in (Source.LocalRouteClaims or ())
         if str(Claim.Signal) in (Source.FrozenNetWires or {})
     )
-    CompleteLocalSignals = frozenset(
-        str(Claim.Signal) for Claim in OptionalClaims
-    )
     return replace(
         Placement,
         Placed=replace(
             Source,
-            FrozenNetWires={
-                Signal: Value
-                for Signal, Value in (Source.FrozenNetWires or {}).items()
-                if str(Signal) in CompleteLocalSignals
-            },
-            LocalNetBranches={
-                Signal: Value
-                for Signal, Value in (Source.LocalNetBranches or {}).items()
-                if str(Signal) in CompleteLocalSignals
-            },
-            LocalNetTargets={
-                Signal: Value
-                for Signal, Value in (Source.LocalNetTargets or {}).items()
-                if str(Signal) in CompleteLocalSignals
-            },
-            LocalRouteClaims=OptionalClaims,
+            FrozenNetWires={},
+            LocalNetBranches={},
+            LocalNetTargets={},
+            LocalRouteClaims=(),
             LocalRouteDiagnostics=Diagnostics,
             DerivedLocalRouteClaims=OptionalClaims,
         ),
@@ -5748,59 +5578,6 @@ def BuildPlacementAccessDemand(
         ActivePerimeterFaces=ActivePerimeterFaces,
         PerimeterFaceLaunchDemand=PerimeterFaceLaunchDemand,
     )
-
-
-def BuildDerivedPerimeterTrackCountsFromDemand(
-    Demand: PlacementAccessDemand,
-    RoutingLayerCount: int,
-    AccessRingTrackCount: int,
-) -> tuple[tuple[str, int], ...]:
-    """Derive immutable per-face perimeter tracks from measured launch demand.
-
-    The pre-route selector chooses `AccessRingTrackCount` from aggregate demand.
-    This helper computes each face's explicit track requirement using the exact
-    same physical contract and prevents later capacity stages from rebalancing
-    that per-face envelope.
-    """
-    if RoutingLayerCount < 1:
-        raise ValueError("derived perimeter tracks require positive layers")
-    if AccessRingTrackCount < 1:
-        raise ValueError("derived perimeter tracks require a positive ring")
-    CanonicalFaces = ("north", "south", "west", "east")
-    LaunchDemandByFace = {
-        str(Face): int(LaunchDemand)
-        for Face, LaunchDemand in Demand.PerimeterFaceLaunchDemand
-    }
-    if (
-        len(LaunchDemandByFace) != len(Demand.PerimeterFaceLaunchDemand)
-        or any(Face not in CanonicalFaces for Face in LaunchDemandByFace)
-        or any(Value < 0 for Value in LaunchDemandByFace.values())
-    ):
-        raise ValueError("derived perimeter launch demand is not canonical")
-    ActiveFaces = frozenset(map(str, Demand.ActivePerimeterFaces))
-    if not ActiveFaces <= frozenset(CanonicalFaces):
-        raise ValueError("derived perimeter active faces are not canonical")
-    Counts = tuple(
-        (
-            Face,
-            (
-                max(
-                    1,
-                    ceil(LaunchDemandByFace[Face] / RoutingLayerCount),
-                )
-                if Face in LaunchDemandByFace
-                else AccessRingTrackCount
-                if not LaunchDemandByFace and Face in ActiveFaces
-                else 0
-            ),
-        )
-        for Face in CanonicalFaces
-    )
-    if any(Count > AccessRingTrackCount for _Face, Count in Counts):
-        raise ValueError(
-            "derived perimeter face track count exceeds ring tracks"
-        )
-    return Counts
 
 
 def BuildDerivedPlacementCandidate(
@@ -5995,66 +5772,6 @@ def SummarizePreRouteAccessFabric(
             ) is not None
             else None
         ),
-        "NativeEscapeKernelUsed": bool(getattr(
-            Fabric,
-            "NativeEscapeKernelUsed",
-            False,
-        )),
-        "NativeEscapeKernelCallCount": int(getattr(
-            Fabric,
-            "NativeEscapeKernelCallCount",
-            0,
-        )),
-        "NativeEscapeKernelExpansionCount": int(getattr(
-            Fabric,
-            "NativeEscapeKernelExpansionCount",
-            0,
-        )),
-        "NativeEscapeKernelComplete": bool(getattr(
-            Fabric,
-            "NativeEscapeKernelComplete",
-            True,
-        )),
-        "NativeEscapeKernelElapsedSeconds": float(getattr(
-            Fabric,
-            "NativeEscapeKernelElapsedSeconds",
-            0.0,
-        )),
-        "NativeEscapeSharedBatchUsed": bool(getattr(
-            Fabric,
-            "NativeEscapeSharedBatchUsed",
-            False,
-        )),
-        "NativeEscapeSharedBatchElapsedSeconds": float(getattr(
-            Fabric,
-            "NativeEscapeSharedBatchElapsedSeconds",
-            0.0,
-        )),
-        "NativeEscapeFallbackUsed": bool(getattr(
-            Fabric,
-            "NativeEscapeFallbackUsed",
-            False,
-        )),
-        "NativeClaimBatchWorkItems": int(getattr(
-            Fabric,
-            "NativeClaimBatchWorkItems",
-            0,
-        )),
-        "NativeClaimBatchWorkerCount": int(getattr(
-            Fabric,
-            "NativeClaimBatchWorkerCount",
-            0,
-        )),
-        "NativeClaimBatchElapsedSeconds": float(getattr(
-            Fabric,
-            "NativeClaimBatchElapsedSeconds",
-            0.0,
-        )),
-        "DominatedEscapeStubCount": int(getattr(
-            Fabric,
-            "DominatedEscapeStubCount",
-            0,
-        )),
         "PhysicalClaimCounts": {
             "WireCells": len(getattr(PhysicalClaims, "WireCells", ())),
             "SupportCells": len(getattr(PhysicalClaims, "SupportCells", ())),
@@ -8349,14 +8066,12 @@ def _PlaceAndRoutePcbWithPolicy(
         EnableInitialJointOrientation=(
             TopologyDemand.EnableInitialJointOrientation
         ),
-        # The compact selector consumes one finite geometry portfolio before
-        # routing.  Preserve the configured joint-orientation domain for its
-        # direct-only member even when the topology pressure heuristic is
-        # quiet; collapsing an ordinary ripple graph to candidate zero is an
-        # objective-based compatibility shortcut, not an exact physical-domain
-        # deduction.
-        EnableCompactDirectOnlyOrientation=True,
-        PreserveDirectOnlyJointPortfolio=True,
+        # The compact ripple recovery is intentionally a direct-only recipe,
+        # not a second orientation portfolio.  Its historical geometry keeps
+        # the seven-layer footprint; topology-triggered designs receive their
+        # bounded joint portfolio through the separate demand predicate.
+        EnableCompactDirectOnlyOrientation=False,
+        PreserveDirectOnlyJointPortfolio=TopologyDemand.RequiresJointPortfolio,
     )
     if GenerationPlan.PrimaryRequests:
         ConfiguredRoutingSpacing = (
@@ -9607,6 +9322,11 @@ def _PlaceAndRoutePcbWithPolicy(
                 "FixedCoordinatedCandidateDiversificationSignals must be "
                 "a frozenset"
             )
+        EnableCurrentClusterLocalRouteReuse = bool(
+            PlacementClusterPinBankRepairSignals
+        ) and PlacementClusterPinBankRepairSignals.issubset(
+            EffectiveCoordinatedCandidateDiversificationSignals
+        )
         Request = ApplyJointPlacementPortfolioTrigger(
             Request,
             JointPortfolioTriggered,
@@ -9827,10 +9547,6 @@ def _PlaceAndRoutePcbWithPolicy(
             else Request.RoutingSpacing + RelocationSpacingLevel
         )
         CandidatePacking = Request.PackingPolicy
-        EnableCurrentClusterLocalRouteReuse = bool(
-            CandidatePacking.Enabled
-            and CandidatePacking.EnableJointClusterOrientation
-        )
         CandidatePlacementPolicy = Policy.Placement
         JointPortfolioState = PendingJointPlacementState(
             Request=Request,
@@ -10013,9 +9729,6 @@ def _PlaceAndRoutePcbWithPolicy(
             ):
                 print(
                     "[debug] placement phase "
-                    f"source={SourceGenerator} "
-                    f"joint_index={JointPlacementCandidateIndex} "
-                    f"relocation_variant={RelocationVariant} "
                     f"previous={DebugPlacementPhase[0]} "
                     f"elapsed={Current - DebugPlacementPhaseStarted[0]:.6f}s "
                     f"next={Phase} diagnostics={Diagnostics}",
@@ -12230,7 +11943,7 @@ def _PlaceAndRoutePcbWithPolicy(
             break
         _TryPlacement(Request)
 
-    DeriveSinglePackedComponent = bool(UniquePlacements) and all(
+    SinglePackedComponent = bool(UniquePlacements) and all(
         len(Placement.Clusters) == 1
         for _Source, _Spacing, Placement in UniquePlacements.values()
     )
@@ -12239,12 +11952,12 @@ def _PlaceAndRoutePcbWithPolicy(
             Placement
             for _Source, _Spacing, Placement in UniquePlacements.values()
         )
-        if DeriveSinglePackedComponent and IncumbentRequests
+        if SinglePackedComponent and IncumbentRequests
         else None
     )
     DerivedPrimaryRequests = SelectDerivedPrimaryPlacementRequests(
         GenerationPlan,
-        DeriveSinglePackedComponent,
+        SinglePackedComponent,
         Incumbent=IncumbentPlacement,
         Module=(Module if IncumbentPlacement is not None else None),
         WorkCheck=(
@@ -12258,17 +11971,7 @@ def _PlaceAndRoutePcbWithPolicy(
             else None
         ),
     )
-    DerivedRequestsToMaterialize = (
-        ()
-        if (
-            not UniquePlacements
-            and ProactiveRelocationRequested
-        )
-        else DerivedPrimaryRequests
-        if DeriveSinglePackedComponent
-        else DerivedPrimaryRequests[len(IncumbentRequests):]
-    )
-    for Request in DerivedRequestsToMaterialize:
+    for Request in DerivedPrimaryRequests[len(IncumbentRequests):]:
         if Deadline.IsExpired():
             break
         _TryPlacement(
@@ -12279,107 +11982,8 @@ def _PlaceAndRoutePcbWithPolicy(
             # They also do not consume the legacy generator-attempt counter:
             # their finite count was fixed above from the retention bound.
             CountPlacementGenerationAttempt=False,
-            QueueRetainedJointPortfolioStates=(
-                not DeriveSinglePackedComponent
-            ),
+            QueueRetainedJointPortfolioStates=False,
         )
-
-    if not DeriveSinglePackedComponent:
-        # Joint siblings published by the fixed direct-only recipe are members
-        # of the same pre-route geometry domain.  Materialize them now so the
-        # one compact catalog solve compares every configured geometry; do not
-        # defer them as routing-feedback attempts after a selected world fails.
-        while PendingJointPlacementStates and not Deadline.IsExpired():
-            JointState = PendingJointPlacementStates.pop(0)
-            _TryPlacement(
-                JointState.Request,
-                JointPlacementCandidateIndex=JointState.CandidateIndex,
-                FixedRelocationVariant=JointState.RelocationVariant,
-                FixedCandidateSpacing=JointState.RoutingSpacing,
-                FixedRelocationSignals=JointState.RelocationSignals,
-                FixedRelocationPrioritySignals=(
-                    JointState.RelocationPrioritySignals
-                ),
-                FixedRequiredRelocationSignals=(
-                    JointState.RequiredRelocationSignals
-                ),
-                FixedAssignmentCut=JointState.AssignmentCut,
-                FixedAssignmentConstraints=(
-                    JointState.AssignmentConstraints
-                ),
-                FixedCoordinatedCandidateDiversificationSignals=(
-                    JointState.CoordinatedCandidateDiversificationSignals
-                ),
-                FixedTopologyCutFrontier=JointState.TopologyCutFrontier,
-                CountPlacementGenerationAttempt=False,
-                QueueRetainedJointPortfolioStates=False,
-            )
-
-    if not UniquePlacements and ProactiveRelocationRequested:
-        ProactiveRelocationRequested = False
-        # Pending joint siblings published by the failed incumbent belong to
-        # that legacy primary portfolio.  Once its typed exact-relocation
-        # condition is active, only siblings published by the relocation
-        # request are members of the replacement portfolio.
-        PendingJointPlacementStates.clear()
-        ExactRelocationRequest = _TakeNextDeferredRequest(
-            PreferRelocation=True,
-        )
-        if ExactRelocationRequest is not None and not Deadline.IsExpired():
-            PlacementGenerationDecisions.append({
-                "Result": "materialize-proactive-exact-relocation",
-                "SourceGenerator": ExactRelocationRequest.SourceGenerator,
-                "RelocationSignals": sorted(PlacementRelocationSignals),
-                "ExecutableLegacyRepairCascade": False,
-            })
-            GeneratedExactRelocation = _TryPlacement(
-                ExactRelocationRequest
-            )
-            while (
-                not GeneratedExactRelocation
-                and PendingJointPlacementStates
-                and not Deadline.IsExpired()
-            ):
-                JointState = PendingJointPlacementStates.pop(0)
-                JointPlacementStateEvents.append({
-                    "CandidateIndex": JointState.CandidateIndex,
-                    "Status": (
-                        "materializing-initial-exact-relocation-sibling"
-                    ),
-                    "SourceGenerator": JointState.Request.SourceGenerator,
-                    "RoutingSpacing": JointState.RoutingSpacing,
-                })
-                GeneratedExactRelocation = _TryPlacement(
-                    JointState.Request,
-                    JointPlacementCandidateIndex=(
-                        JointState.CandidateIndex
-                    ),
-                    FixedRelocationVariant=(
-                        JointState.RelocationVariant
-                    ),
-                    FixedCandidateSpacing=JointState.RoutingSpacing,
-                    FixedRelocationSignals=(
-                        JointState.RelocationSignals
-                    ),
-                    FixedRelocationPrioritySignals=(
-                        JointState.RelocationPrioritySignals
-                    ),
-                    FixedRequiredRelocationSignals=(
-                        JointState.RequiredRelocationSignals
-                    ),
-                    FixedAssignmentCut=JointState.AssignmentCut,
-                    FixedAssignmentConstraints=(
-                        JointState.AssignmentConstraints
-                    ),
-                    FixedCoordinatedCandidateDiversificationSignals=(
-                        JointState
-                        .CoordinatedCandidateDiversificationSignals
-                    ),
-                    FixedTopologyCutFrontier=(
-                        JointState.TopologyCutFrontier
-                    ),
-                    MaterializeRoutingResources=False,
-                )
 
     if not UniquePlacements:
         BaseFailure = LastStructuredPlacementFailure or RoutingFailure(
@@ -12406,13 +12010,6 @@ def _PlaceAndRoutePcbWithPolicy(
                 Diagnostics=FailureDiagnostics,
             )
         )
-
-    # The compact catalog consumes a complete immutable placement; it does
-    # not require that placement to contain only one cluster.  Keep the
-    # stricter one-cluster predicate above solely for deriving graph-core
-    # sibling placements, then admit an exact relocated multi-cluster world
-    # to the same factorized selection and frozen handoff.
-    SinglePackedComponent = bool(UniquePlacements)
 
     def _BuildCandidateRecords() -> list[PcbPlacementCandidate]:
         def JointExactScore(Candidate: PcbPlacement) -> tuple[int, ...]:
@@ -13051,243 +12648,6 @@ def _PlaceAndRoutePcbWithPolicy(
         return True
 
     CandidateRecords = _BuildCandidateRecords()
-    # A single compact design owns one fixed retained geometry budget.  Graph
-    # cores consume it first because each changes NAND macro geometry.  If
-    # that finite beam is smaller (for example, a tied-input topology has no
-    # legal pin-aligned state), fill only the unused slots with physically
-    # distinct terminal-face templates already declared by placement.  This
-    # keeps the same six-geometry maximum and introduces no feedback attempt.
-    if SinglePackedComponent:
-        MaximumGeometryCount = max(
-            1,
-            int(Policy.NandPacking.RetainedPlacementCandidates),
-        )
-        # A retained graph core and its declared perimeter interface are one
-        # physical geometry world.  Reusing the slot solver's cheapest face
-        # assignment for every core made the portfolio interface-identical:
-        # an external terminal bank could obstruct the same internal launch
-        # in every otherwise-distinct placement.  Select one already-declared
-        # face-diverse interface per graph core without adding a member or
-        # changing the bounded graph beam.
-        CurrentDerivedFaceSignatures = {
-            tuple(
-                sum(
-                    Slot.Face == Face
-                    for Slot in Assignment.SelectedSlots
-                )
-                for Face in ("north", "south", "west", "east")
-            )
-            for Candidate in CandidateRecords
-            if Candidate.SourceGenerator == "derived-pin-aligned-core"
-            for Assignment in (
-                Candidate.Placement.DerivedPerimeterSlotAssignment
-                or Candidate.Placement.Placed
-                .DerivedPerimeterSlotAssignment,
-            )
-            if Assignment is not None
-        }
-        DiversifiedFaceSignatures = set(CurrentDerivedFaceSignatures)
-        DiversifiedCandidateRecords: list[PcbPlacementCandidate] = []
-        InterfaceDiversificationOrder = (
-            *(
-                Candidate
-                for Candidate in CandidateRecords
-                if Candidate.SourceGenerator != "derived-pin-aligned-core"
-            ),
-            *sorted(
-                (
-                    Candidate
-                    for Candidate in CandidateRecords
-                    if Candidate.SourceGenerator == "derived-pin-aligned-core"
-                ),
-                key=lambda Value: (
-                    Value.FeedbackScore,
-                    Value.CandidateId,
-                ),
-            ),
-        )
-        for Candidate in InterfaceDiversificationOrder:
-            if Candidate.SourceGenerator != "derived-pin-aligned-core":
-                DiversifiedCandidateRecords.append(Candidate)
-                continue
-            InterfaceDomain = (
-                Candidate.Placement.DerivedPerimeterInterfaceTemplateDomain
-                or Candidate.Placement.Placed
-                .DerivedPerimeterInterfaceTemplateDomain
-            )
-            CurrentAssignment = (
-                Candidate.Placement.DerivedPerimeterSlotAssignment
-                or Candidate.Placement.Placed
-                .DerivedPerimeterSlotAssignment
-            )
-            CurrentAssignmentFingerprint = str(getattr(
-                CurrentAssignment,
-                "AssignmentFingerprint",
-                "",
-            ))
-            Alternatives = tuple(
-                Template
-                for Template in (
-                    InterfaceDomain.Templates
-                    if InterfaceDomain is not None
-                    and InterfaceDomain.Complete
-                    else ()
-                )
-                if (
-                    Template.SlotAssignment.AssignmentFingerprint
-                    != CurrentAssignmentFingerprint
-                )
-            )
-            SelectedInterfaces = (
-                SelectDiverseDerivedPerimeterInterfaceTemplates(
-                    Alternatives,
-                    DiversifiedFaceSignatures,
-                    1,
-                )
-            )
-            if not SelectedInterfaces:
-                DiversifiedCandidateRecords.append(Candidate)
-                continue
-            SelectedInterface = SelectedInterfaces[0]
-            InterfacePlacement = ApplyDerivedPerimeterInterfaceTemplate(
-                Candidate.Placement,
-                SelectedInterface,
-            )
-            PhysicalFingerprint = BuildPlacementFingerprint(
-                InterfacePlacement,
-                IncludeLocalClaims=False,
-            )
-            DiversifiedFaceSignatures.add(tuple(map(
-                int,
-                SelectedInterface.FaceSignature,
-            )))
-            DiversifiedCandidateRecords.append(replace(
-                Candidate,
-                Placement=InterfacePlacement,
-                PlacementFingerprint=PhysicalFingerprint,
-                InterfaceTopologyFingerprint=BuildStableFingerprint({
-                    "Source": Candidate.InterfaceTopologyFingerprint,
-                    "InterfaceTemplate": SelectedInterface.TemplateId,
-                    "SlotAssignment": (
-                        SelectedInterface.SlotAssignment
-                        .AssignmentFingerprint
-                    ),
-                }),
-            ))
-            PlacementGenerationDecisions.append({
-                "Result": "retained-interface-diversified",
-                "CandidateId": Candidate.CandidateId,
-                "InterfaceTemplate": SelectedInterface.TemplateId,
-                "FaceSignature": list(
-                    SelectedInterface.FaceSignature
-                ),
-                "PlacementFingerprint": PhysicalFingerprint,
-            })
-        CandidateRecords = DiversifiedCandidateRecords
-        ExpandedCandidateRecords = list(CandidateRecords)
-        ExistingPhysicalFingerprints = {
-            BuildPlacementFingerprint(
-                Candidate.Placement,
-                IncludeLocalClaims=False,
-            )
-            for Candidate in CandidateRecords
-        }
-        ExistingFaceSignatures: set[tuple[int, int, int, int]] = set()
-        for Candidate in CandidateRecords:
-            Assignment = (
-                Candidate.Placement.DerivedPerimeterSlotAssignment
-                or Candidate.Placement.Placed
-                .DerivedPerimeterSlotAssignment
-            )
-            if Assignment is None:
-                continue
-            ExistingFaceSignatures.add(tuple(
-                sum(Slot.Face == Face for Slot in Assignment.SelectedSlots)
-                for Face in ("north", "south", "west", "east")
-            ))
-        RemainingGeometrySlots = max(
-            0,
-            MaximumGeometryCount - len(ExpandedCandidateRecords),
-        )
-        for Candidate in tuple(CandidateRecords):
-            if RemainingGeometrySlots < 1:
-                break
-            if not IsDerivedSingleComponentPlacementSource(
-                Candidate.SourceGenerator
-            ):
-                continue
-            InterfaceDomain = (
-                Candidate.Placement.DerivedPerimeterInterfaceTemplateDomain
-                or Candidate.Placement.Placed
-                .DerivedPerimeterInterfaceTemplateDomain
-            )
-            if InterfaceDomain is None or not InterfaceDomain.Complete:
-                continue
-            CurrentAssignment = (
-                Candidate.Placement.DerivedPerimeterSlotAssignment
-                or Candidate.Placement.Placed
-                .DerivedPerimeterSlotAssignment
-            )
-            CurrentAssignmentFingerprint = str(getattr(
-                CurrentAssignment,
-                "AssignmentFingerprint",
-                "",
-            ))
-            Alternatives = tuple(
-                Template
-                for Template in InterfaceDomain.Templates
-                if (
-                    Template.SlotAssignment.AssignmentFingerprint
-                    != CurrentAssignmentFingerprint
-                )
-            )
-            for InterfaceTemplate in (
-                SelectDiverseDerivedPerimeterInterfaceTemplates(
-                    Alternatives,
-                    ExistingFaceSignatures,
-                    RemainingGeometrySlots,
-                )
-            ):
-                InterfacePlacement = (
-                    ApplyDerivedPerimeterInterfaceTemplate(
-                        Candidate.Placement,
-                        InterfaceTemplate,
-                    )
-                )
-                PhysicalFingerprint = BuildPlacementFingerprint(
-                    InterfacePlacement,
-                    IncludeLocalClaims=False,
-                )
-                if PhysicalFingerprint in ExistingPhysicalFingerprints:
-                    continue
-                ExistingPhysicalFingerprints.add(PhysicalFingerprint)
-                ExistingFaceSignatures.add(tuple(map(
-                    int,
-                    InterfaceTemplate.FaceSignature,
-                )))
-                ExpandedCandidateRecords.append(replace(
-                    Candidate,
-                    CandidateId=(
-                        f"{Candidate.CandidateId}:"
-                        f"{InterfaceTemplate.TemplateId}"
-                    ),
-                    Placement=InterfacePlacement,
-                    PlacementFingerprint=PhysicalFingerprint,
-                    InterfaceTopologyFingerprint=BuildStableFingerprint({
-                        "Source": Candidate.InterfaceTopologyFingerprint,
-                        "InterfaceTemplate": (
-                            InterfaceTemplate.TemplateId
-                        ),
-                        "SlotAssignment": (
-                            InterfaceTemplate.SlotAssignment
-                            .AssignmentFingerprint
-                        ),
-                    }),
-                ))
-                RemainingGeometrySlots -= 1
-                if RemainingGeometrySlots < 1:
-                    break
-        CandidateRecords = ExpandedCandidateRecords
     FabricCandidateRecords: list[PcbPlacementCandidate] = []
     PreRouteFabricDescriptorsByCandidateId: dict[
         str,
@@ -13322,10 +12682,27 @@ def _PlaceAndRoutePcbWithPolicy(
         )
         CandidateEnvelopeDomains.append((Candidate, Demand, Envelopes))
     for Candidate, Demand, Envelopes in CandidateEnvelopeDomains:
+        if len(Candidate.Placement.Clusters) != 1:
+            ExistingLayerCount = max(
+                Demand.MinimumRoutingLayerCount,
+                min(
+                    Demand.MaximumRoutingLayerCount,
+                    int(Candidate.Placement.LayerCount),
+                ),
+            )
+            Envelope = next(
+                Value for Value in Envelopes
+                if Value.RoutingLayerCount == ExistingLayerCount
+            )
+            FabricCandidateRecords.append(replace(
+                Candidate,
+                RoutingEnvelope=Envelope,
+            ))
+            continue
         CandidateResources = RoutingResourcesByFingerprint.get(
             Candidate.PlacementFingerprint
         )
-        if CandidateResources is None and not SinglePackedComponent:
+        if CandidateResources is None:
             CandidateResources = BuildRoutingResources(
                 Candidate.Placement.Placed
             )
@@ -13347,33 +12724,13 @@ def _PlaceAndRoutePcbWithPolicy(
             if IsDerivedPerimeterCandidate
             else Candidate.Placement
         )
-        StaticAccessResources = (
-            CandidateResources
-            if (
-                CandidateResources is not None
-                # BuildRoutingResources consumes placed gate geometry and
-                # FrozenNetWires only.  The derived access view also changes
-                # local-route metadata, but when these two physical inputs
-                # are identical its already-built substrate is the exact
-                # same resource graph, not merely an equivalent heuristic
-                # cache entry.
-                and StaticAccessPlacement.Placed.PlacedGates
-                == Candidate.Placement.Placed.PlacedGates
-                and StaticAccessPlacement.Placed.FrozenNetWires
-                == Candidate.Placement.Placed.FrozenNetWires
-            )
-            else BuildRoutingResources(
-                StaticAccessPlacement.Placed,
-            )
+        StaticAccessResources = BuildRoutingResources(
+            StaticAccessPlacement.Placed,
         )
         # Access geometry includes its concrete routing elevations.  A
         # one-deck witness cannot be reused for a two- or three-deck contract
         # even when their perimeter track counts happen to match.
         AccessByEnvelopeIdentity: dict[tuple[int, int, str], Any] = {}
-        ShellByPhysicalRingIdentity: dict[
-            tuple[int, int, tuple[tuple[str, int], ...]],
-            DerivedPerimeterFabricShell,
-        ] = {}
         for Envelope in Envelopes:
             EnvelopeCandidateId = (
                 f"{Candidate.CandidateId}:layers-"
@@ -13430,52 +12787,13 @@ def _PlaceAndRoutePcbWithPolicy(
                         and bool(getattr(SlotAssignment, "Success", False))
                         and bool(getattr(SlotAssignment, "Complete", False))
                     ):
-                        PerimeterFaceTrackCounts = (
-                            BuildDerivedPerimeterTrackCountsFromDemand(
-                                Demand,
-                                Envelope.RoutingLayerCount,
-                                RingTrackCount,
-                            )
+                        Shell = BuildDerivedPerimeterFabricShell(
+                            AccessFabricPlacement,
+                            Resources=StaticAccessResources,
+                            Technology=Technology,
+                            AccessRingTrackCount=RingTrackCount,
+                            AccessLength=Envelope.AccessLength,
                         )
-                        ShellIdentity = (
-                            int(RingTrackCount),
-                            int(Envelope.AccessLength),
-                            tuple(PerimeterFaceTrackCounts),
-                        )
-                        SourceShell = ShellByPhysicalRingIdentity.get(
-                            ShellIdentity
-                        )
-                        if SourceShell is None:
-                            Shell = BuildDerivedPerimeterFabricShell(
-                                AccessFabricPlacement,
-                                Resources=StaticAccessResources,
-                                Technology=Technology,
-                                AccessRingTrackCount=RingTrackCount,
-                                AccessLength=Envelope.AccessLength,
-                                PerimeterFaceTrackCounts=(
-                                    PerimeterFaceTrackCounts
-                                    if PerimeterFaceTrackCounts
-                                    else None
-                                ),
-                            )
-                            ShellByPhysicalRingIdentity[
-                                ShellIdentity
-                            ] = Shell
-                        else:
-                            Shell = (
-                                ProjectDerivedPerimeterFabricShellLayers(
-                                    SourceShell,
-                                    AccessFabricPlacement,
-                                    Resources=StaticAccessResources,
-                                    Technology=Technology,
-                                    LayerCount=(
-                                        Envelope.RoutingLayerCount
-                                    ),
-                                    PerimeterFaceTrackCounts=tuple(
-                                        PerimeterFaceTrackCounts
-                                    ),
-                                )
-                            )
                 PrefixBounds = (
                     Shell.OuterBounds
                     if Shell is not None
@@ -13608,10 +12926,9 @@ def _PlaceAndRoutePcbWithPolicy(
             RoutingResourcesByCandidateId[EnvelopeCandidateId] = (
                 EnvelopeResources
             )
-        if CandidateResources is not None:
-            RoutingResourcesByFingerprint[
-                Candidate.PlacementFingerprint
-            ] = CandidateResources
+        RoutingResourcesByFingerprint[
+            Candidate.PlacementFingerprint
+        ] = CandidateResources
     CandidateRecords = FabricCandidateRecords
 
     def SolvePrePlacementCapacityProblem(
@@ -14053,10 +13370,9 @@ def _PlaceAndRoutePcbWithPolicy(
                 ),
             )
     RawTrackAssignmentResult: RawTrackAssignmentSelection | None = None
-    CompactFactorCatalogResult: Any | None = None
     RawTrackAssignmentMaterializations: dict[
         str,
-        RawTrackAssignmentMemberMaterialization,
+        RawTrackAssignmentMaterialization,
     ] = {}
     if SinglePackedComponent:
         # Do not let an incomplete lower-level access domain disappear just
@@ -14092,153 +13408,8 @@ def _PlaceAndRoutePcbWithPolicy(
                 for Index, Candidate in enumerate(CandidateRecords)
             }
             RawPortfolioTemplates: list[
-                PredeclaredRawTrackAssignmentMember
+                RawTrackAssignmentPortfolioTemplate
             ] = []
-            ExactPhysicalAccessFabricMaterializations: dict[
-                str, tuple[Any, Any]
-            ] = {}
-            ExactPhysicalGuideDomainMaterializations: dict[str, Any] = {}
-            PlacementGeometryFingerprintsByIdentity: dict[int, str] = {}
-            ResourceGeometryFingerprintsByIdentity: dict[
-                tuple[int, int], str
-            ] = {}
-            MaximumDeclaredLayerCountByPlacementFingerprint: dict[str, int] = {}
-            DeclaredFixedAccessLayersByPlacementFingerprint: dict[
-                str, tuple[int, ...]
-            ] = {}
-            for Candidate in CandidateRecords:
-                MaximumDeclaredLayerCountByPlacementFingerprint[
-                    Candidate.PlacementFingerprint
-                ] = max(
-                    MaximumDeclaredLayerCountByPlacementFingerprint.get(
-                        Candidate.PlacementFingerprint,
-                        0,
-                    ),
-                    int(Candidate.RoutingEnvelope.RoutingLayerCount),
-                )
-            for PlacementFingerprint in (
-                MaximumDeclaredLayerCountByPlacementFingerprint
-            ):
-                DeclaredFixedAccessLayersByPlacementFingerprint[
-                    PlacementFingerprint
-                ] = tuple(sorted({
-                    int(Candidate.RoutingEnvelope.RoutingLayerCount) - 1
-                    for Candidate in CandidateRecords
-                    if (
-                        Candidate.PlacementFingerprint
-                        == PlacementFingerprint
-                        and PreRouteFabricDescriptorsByCandidateId[
-                            Candidate.CandidateId
-                        ].TopologyKind == "fixed-access-band-v1"
-                    )
-                }))
-            MaximumLayerGuideDomainByPlacementFingerprint: dict[
-                str, Any
-            ] = {}
-            MaximumLayerAccessFabricByPlacementFingerprint: dict[
-                str, PlacementAccessFabric
-            ] = {}
-            SharedFixedLayerAccessFabricByPlacementFingerprint: dict[
-                str, PlacementAccessFabric
-            ] = {}
-            MaximumFixedLayerCandidateByPlacementFingerprint: dict[
-                str, PcbPlacementCandidate
-            ] = {}
-            SharedResourceSubstrateByExactStaticIdentity: dict[
-                tuple[object, object], Any
-            ] = {}
-            CandidateResourcesById: dict[str, Any] = {}
-            for Candidate in CandidateRecords:
-                StaticResources = PreRouteFabricDescriptorsByCandidateId[
-                    Candidate.CandidateId
-                ].StaticResources
-                StaticIdentity = (
-                    StaticResources.StaticGeometry,
-                    getattr(
-                        StaticResources.ResourceGraph,
-                        "Technology",
-                        None,
-                    ),
-                )
-                SharedSubstrate = (
-                    SharedResourceSubstrateByExactStaticIdentity.get(
-                        StaticIdentity
-                    )
-                )
-                if SharedSubstrate is None:
-                    SharedSubstrate = (
-                        ForkRoutingResourcesWithSharedStaticGeometry(
-                            StaticResources
-                        )
-                    )
-                    SharedResourceSubstrateByExactStaticIdentity[
-                        StaticIdentity
-                    ] = SharedSubstrate
-                CandidateResourcesById[Candidate.CandidateId] = (
-                    ForkRoutingResourcesWithSharedStaticGeometry(
-                        SharedSubstrate
-                    )
-                )
-            NativeEscapeBatchResultsByCandidateId: dict[str, Any] = {}
-            NativeEscapeContinuationsByCandidateId: dict[str, Any] = {}
-            PreparedAccessFabricsByCandidateId: dict[
-                str, PlacementAccessFabric
-            ] = {}
-            NativeSelectedGuideRecipesByCandidateId: dict[
-                str, tuple[Any, ...]
-            ] = {}
-            NativeSelectedGuideDescriptorsByCandidateId: dict[
-                str, tuple[tuple[str, str, Any], ...]
-            ] = {}
-            NativeSelectedGuideDomainsByCandidateId: dict[
-                str, RawTrackAssignmentDomain
-            ] = {}
-            NativeSelectedStubFactorIdsByCandidateId: dict[
-                str, tuple[tuple[str, str], ...]
-            ] = {}
-            NativeFixedLayerCatalogFabricByPlacementFingerprint: dict[
-                str, PlacementAccessFabric
-            ] = {}
-            NativeEscapeBatchDiagnostics: dict[str, object] = {
-                "Used": False,
-                "CallCount": 0,
-                "MemberCount": 0,
-                "ExpansionCount": 0,
-                "Complete": True,
-                "ElapsedSeconds": 0.0,
-            }
-
-            def CachedPlacementGeometryFingerprint(Placed: Any) -> str:
-                Identity = id(Placed)
-                Fingerprint = PlacementGeometryFingerprintsByIdentity.get(
-                    Identity
-                )
-                if Fingerprint is None:
-                    Fingerprint = BuildRawPortalPlacementGeometryFingerprint(
-                        Placed
-                    )
-                    PlacementGeometryFingerprintsByIdentity[Identity] = (
-                        Fingerprint
-                    )
-                return Fingerprint
-
-            def CachedResourceGeometryFingerprint(Resources: Any) -> str:
-                Identity = (
-                    id(getattr(Resources, "StaticGeometry", None)),
-                    id(getattr(Resources, "ResourceGraph", None)),
-                )
-                Fingerprint = ResourceGeometryFingerprintsByIdentity.get(
-                    Identity
-                )
-                if Fingerprint is None:
-                    Fingerprint = BuildRawPortalResourceGeometryFingerprint(
-                        Resources
-                    )
-                    ResourceGeometryFingerprintsByIdentity[Identity] = (
-                        Fingerprint
-                    )
-                return Fingerprint
-
             for Candidate in CandidateRecords:
                 FabricDescriptor = PreRouteFabricDescriptorsByCandidateId.get(
                     Candidate.CandidateId
@@ -14249,7 +13420,7 @@ def _PlaceAndRoutePcbWithPolicy(
                         "descriptor"
                     )
                 RawPortfolioTemplates.append(
-                    PredeclaredRawTrackAssignmentMember(
+                    RawTrackAssignmentPortfolioTemplate(
                         TemplateId=Candidate.CandidateId,
                         Objective=FabricDescriptor.ObjectivePrefix,
                         MaterializationInputFingerprint=(
@@ -14267,492 +13438,9 @@ def _PlaceAndRoutePcbWithPolicy(
                     )
                 )
 
-            def MemberContractForTemplate(
-                TemplateId: str,
-            ) -> tuple[tuple[str, str], ...]:
-                Candidate = CandidateById[TemplateId]
-                if Candidate.RoutingEnvelope is None:
-                    raise RuntimeError(
-                        "compact member is missing its routing envelope"
-                    )
-                return (
-                    ("member", TemplateId),
-                    ("core", Candidate.PlacementFingerprint),
-                    (
-                        "interface",
-                        str(getattr(
-                            Candidate.Placement
-                            .DerivedPerimeterSlotAssignment,
-                            "AssignmentFingerprint",
-                            Candidate.PlacementFingerprint,
-                        )),
-                    ),
-                    (
-                        "layers",
-                        str(Candidate.RoutingEnvelope.RoutingLayerCount),
-                    ),
-                )
-
-            def ProjectMaximumLayerGuideDomain(
-                Domain: RawTrackAssignmentDomain,
-                Fabric: Any,
-                LayerCount: int,
-            ) -> RawTrackAssignmentDomain:
-                """Project one exact maximal-layer enumeration downward.
-
-                Routing Y coordinates and portal paths for retained layers
-                are physically invariant.  Validate every named access stub
-                against the lower-layer fabric before publishing the member
-                view; a missing or changed stub removes only that exact shape.
-                """
-                FabricDomainsByLogicalKey = {
-                    str(
-                        FabricDomain.LogicalKey
-                        or f"{Index}:{FabricDomain.Signal}"
-                    ): FabricDomain
-                    for Index, FabricDomain in enumerate(
-                        Fabric.TerminalDomains
-                    )
-                }
-                ProjectedStubIndexesByRequirement = {
-                    f"access-stub:{LogicalKey}": {
-                        (
-                            str(FabricDomain.Signal),
-                            tuple(FabricDomain.Terminal),
-                            tuple(Stub.Path),
-                            int(Stub.Ingress[1]),
-                        ): BuildPlacementAccessEscapeStubChoiceId(Stub)
-                        for Stub in (
-                            FabricDomain.EscapeStubs
-                        )
-                    }
-                    for LogicalKey, FabricDomain in (
-                        FabricDomainsByLogicalKey.items()
-                    )
-                }
-
-                def ProjectExactFabricStubs(Value: Any) -> Any | None:
-                    Descriptor = Value.RouteGuideFactorDescriptor
-                    if Descriptor is None:
-                        return Value
-                    if int(Descriptor.Layer) >= int(LayerCount):
-                        return None
-                    Requirements = dict(
-                        Value.ContractRequirementItems
-                    )
-                    Portals = (
-                        Descriptor.SourcePortal,
-                        *Descriptor.TargetPortals,
-                    )
-                    for RequirementName in tuple(Requirements):
-                        StubIndexes = (
-                            ProjectedStubIndexesByRequirement.get(
-                                RequirementName
-                            )
-                        )
-                        if StubIndexes is None:
-                            continue
-                        MatchingPortal = next((
-                            Portal
-                            for Portal in Portals
-                            if (
-                                str(Portal.Signal),
-                                tuple(Portal.Terminal),
-                                tuple(Portal.Path),
-                                int(Portal.Path[-1][1]),
-                            ) in StubIndexes
-                        ), None)
-                        if MatchingPortal is None:
-                            return None
-                        ProjectedStubChoiceId = StubIndexes.get((
-                            str(MatchingPortal.Signal),
-                            tuple(MatchingPortal.Terminal),
-                            tuple(MatchingPortal.Path),
-                            int(MatchingPortal.Path[-1][1]),
-                        ))
-                        if ProjectedStubChoiceId is None:
-                            return None
-                        Requirements[RequirementName] = str(
-                            ProjectedStubChoiceId
-                        )
-                    Certificate = (
-                        Value.CompactMaterializabilityCertificate
-                    )
-                    if Certificate is not None:
-                        # Retained paths, claims, guide geometry and graph
-                        # identity were matched exactly above.  The projected
-                        # member nevertheless owns a distinct fabric/shell
-                        # contract, so its frozen certificate must name that
-                        # exact world rather than the maximal-layer source.
-                        Certificate = replace(
-                            Certificate,
-                            FabricFingerprint=str(
-                                Fabric.FabricFingerprint
-                            ),
-                            AccessShellFingerprint=str(
-                                Fabric.AccessRingFingerprint
-                            ),
-                            StaticClaimsFingerprint=BuildStableFingerprint({
-                                "Kind": (
-                                    "projected-compact-static-claims-v1"
-                                ),
-                                "Source": (
-                                    Certificate.StaticClaimsFingerprint
-                                ),
-                                "Fabric": str(Fabric.FabricFingerprint),
-                                "AccessShell": str(
-                                    Fabric.AccessRingFingerprint
-                                ),
-                                "Requirements": tuple(sorted(
-                                    Requirements.items()
-                                )),
-                            }),
-                        )
-                    return replace(
-                        Value,
-                        ContractRequirements=tuple(sorted(
-                            Requirements.items()
-                        )),
-                        CompactMaterializabilityCertificate=Certificate,
-                    )
-
-                Values = tuple(
-                    Projected
-                    for Value in Domain.Values
-                    for Projected in (ProjectExactFabricStubs(Value),)
-                    if Projected is not None
-                )
-                MutableCounts = {
-                    Signal: 0 for Signal, _Count in Domain.CandidateCounts
-                }
-                for Value in Values:
-                    MutableCounts[Value.Signal] = (
-                        MutableCounts.get(Value.Signal, 0) + 1
-                    )
-                Counts = tuple(MutableCounts.items())
-                ProjectedValueIdentity = tuple(
-                    (Value.Signal, Value.CandidateId)
-                    for Value in Values
-                )
-                return replace(
-                    Domain,
-                    Values=Values,
-                    CandidateCounts=Counts,
-                    CandidateDomainFingerprint=BuildStableFingerprint({
-                        "Kind": "projected-maximal-guide-factor-domain-v1",
-                        "Source": Domain.CandidateDomainFingerprint,
-                        "LayerCount": int(LayerCount),
-                        "FabricFingerprint": str(
-                            Fabric.FabricFingerprint
-                        ),
-                        "Values": ProjectedValueIdentity,
-                    }),
-                    PortalDomainFingerprint=BuildStableFingerprint({
-                        "Source": Domain.PortalDomainFingerprint,
-                        "FabricFingerprint": str(
-                            Fabric.FabricFingerprint
-                        ),
-                        "LayerCount": int(LayerCount),
-                    }),
-                    Diagnostics=(
-                        ("RouteGuideFactor", True),
-                        ("ProjectedFromMaximalLayerDomain", True),
-                        ("ProjectedLayerCount", int(LayerCount)),
-                        ("RouteGuideFactorCounts", Counts),
-                        ("RouteGuideFactorDomainComplete", True),
-                    ),
-                    DomainFingerprintOverride=BuildStableFingerprint({
-                        "Kind": "projected-compact-route-guide-domain-v1",
-                        "Source": Domain.DomainFingerprint,
-                        "LayerCount": int(LayerCount),
-                        "FabricFingerprint": str(
-                            Fabric.FabricFingerprint
-                        ),
-                        "Values": ProjectedValueIdentity,
-                    }),
-                )
-
-            def ProjectMaximumLayerAccessFabric(
-                Fabric: PlacementAccessFabric,
-                Shell: DerivedPerimeterFabricShell | None,
-                Resources: Any,
-                Candidate: PcbPlacementCandidate,
-            ) -> PlacementAccessFabric:
-                """Retain the exact lower-layer subset of one maximal fabric."""
-                LayerCount = int(
-                    Candidate.RoutingEnvelope.RoutingLayerCount
-                )
-                BaseY = min(
-                    int(Gate.Y)
-                    for Gate in Candidate.Placement.Placed.PlacedGates
-                )
-                AllowedLayers = (
-                    tuple(map(int, Shell.FabricLayers))
-                    if Shell is not None
-                    else (
-                        (LayerCount - 1,)
-                        if Fabric.TopologyKind
-                        == "fixed-access-band-v1"
-                        else tuple(range(LayerCount))
-                    )
-                )
-                AllowedYs = frozenset(
-                    map(int, Shell.FabricYs)
-                    if Shell is not None
-                    else (
-                        Technology.RoutingY(BaseY, Layer)
-                        for Layer in AllowedLayers
-                    )
-                )
-                Domains = tuple(
-                    replace(
-                        Domain,
-                        EscapeStubs=tuple(
-                            Stub for Stub in Domain.EscapeStubs
-                            if int(Stub.Ingress[1]) in AllowedYs
-                        ),
-                        Complete=any(
-                            int(Stub.Ingress[1]) in AllowedYs
-                            for Stub in Domain.EscapeStubs
-                        ),
-                        IncompleteReason=(
-                            ""
-                            if any(
-                                int(Stub.Ingress[1]) in AllowedYs
-                                for Stub in Domain.EscapeStubs
-                            )
-                            else "projected-access-stub-domain-empty"
-                        ),
-                    )
-                    for Domain in Fabric.TerminalDomains
-                )
-                Nodes = tuple(
-                    Value for Value in Fabric.Nodes
-                    if int(Value[1]) in AllowedYs
-                )
-                NodeSet = frozenset(Nodes)
-                Edges = tuple(
-                    Value for Value in Fabric.Edges
-                    if Value[0] in NodeSet and Value[1] in NodeSet
-                )
-                IngressNodes = tuple(
-                    Value for Value in Fabric.IngressNodes
-                    if int(Value[1]) in AllowedYs
-                )
-                PhysicalClaims = Resources.ResourceGraph.BuildRouteClaims(
-                    NodeSet
-                )
-                FrozenPositions = tuple({
-                    *Nodes,
-                    *(
-                        Position
-                        for Domain in Domains
-                        for Stub in Domain.EscapeStubs
-                        for Position in Stub.Path
-                    ),
-                })
-                MinimumY = min((
-                    BaseY,
-                    *(Position[1] for Position in FrozenPositions),
-                ))
-                MaximumY = max(
-                    max(AllowedYs) + 1,
-                    max(
-                        (
-                            Position[1] + 1
-                            for Position in FrozenPositions
-                        ),
-                        default=BaseY,
-                    ),
-                ) + 1
-                ExistingEnvelope = Fabric.FrozenRoutingEnvelope
-                ProjectionBounds = (
-                    Shell.Bounds if Shell is not None else Fabric.OuterBounds
-                )
-                CanvasBounds = (
-                    (
-                        ProjectionBounds[0] - max(
-                            0,
-                            ExistingEnvelope.RoutingRegionBounds[0]
-                            - ExistingEnvelope.CanvasBounds[0],
-                        ),
-                        ProjectionBounds[1] - max(
-                            0,
-                            ExistingEnvelope.RoutingRegionBounds[1]
-                            - ExistingEnvelope.CanvasBounds[1],
-                        ),
-                        ProjectionBounds[2] + max(
-                            0,
-                            ExistingEnvelope.CanvasBounds[2]
-                            - ExistingEnvelope.RoutingRegionBounds[2],
-                        ),
-                        ProjectionBounds[3] + max(
-                            0,
-                            ExistingEnvelope.CanvasBounds[3]
-                            - ExistingEnvelope.RoutingRegionBounds[3],
-                        ),
-                    )
-                    if (
-                        ExistingEnvelope is not None
-                        and ProjectionBounds is not None
-                    )
-                    else ProjectionBounds
-                )
-                FrozenEnvelope = (
-                    FrozenPerFaceRoutingEnvelope(
-                        RoutingRegionBounds=ProjectionBounds,
-                        CanvasBounds=CanvasBounds,
-                        YBounds=(MinimumY, MaximumY),
-                        PermittedLayers=AllowedLayers,
-                        PerimeterFaceTrackCounts=(
-                            Shell.PerimeterFaceTrackCounts
-                        ),
-                        EnvelopeFingerprint=BuildStableFingerprint({
-                            "Kind": (
-                                "projected-frozen-per-face-envelope-v1"
-                            ),
-                            "Shell": Shell.ShellFingerprint,
-                            "YBounds": (MinimumY, MaximumY),
-                            "CanvasBounds": CanvasBounds,
-                        }),
-                    )
-                    if (
-                        Shell is not None
-                        and ProjectionBounds is not None
-                        and CanvasBounds is not None
-                    )
-                    else None
-                )
-                ShellFingerprint = (
-                    Shell.ShellFingerprint
-                    if Shell is not None
-                    else BuildStableFingerprint({
-                        "Kind": "layered-legacy-ring-subset-v1",
-                        "SourceFabric": Fabric.FabricFingerprint,
-                        "Layers": AllowedLayers,
-                        "Ys": tuple(sorted(AllowedYs)),
-                    })
-                )
-                Complete = bool(
-                    Fabric.Complete
-                    and all(Domain.Complete for Domain in Domains)
-                )
-                return replace(
-                    Fabric,
-                    FabricFingerprint=BuildStableFingerprint({
-                        "Kind": "projected-placement-access-fabric-v1",
-                        "Source": Fabric.FabricFingerprint,
-                        "Shell": ShellFingerprint,
-                        "Domains": tuple(
-                            (
-                                Domain.LogicalKey,
-                                tuple(
-                                    (Stub.Path, Stub.Ingress)
-                                    for Stub in Domain.EscapeStubs
-                                ),
-                            )
-                            for Domain in Domains
-                        ),
-                    }),
-                    Nodes=Nodes,
-                    Edges=Edges,
-                    IngressNodes=IngressNodes,
-                    PhysicalClaims=PhysicalClaims,
-                    # This retained-layer view exists only inside compact
-                    # pre-selection. Its exact PhysicalClaims remain frozen;
-                    # typed resource-id expansion is selected-world work.
-                    CapacityResourceIds=(),
-                    TerminalDomains=Domains,
-                    AccessRingTrackCount=(
-                        Shell.AccessRingTrackCount
-                        if Shell is not None
-                        else Fabric.AccessRingTrackCount
-                    ),
-                    AccessRingFingerprint=BuildStableFingerprint({
-                        "Shell": ShellFingerprint,
-                        "Layers": AllowedLayers,
-                    }),
-                    OuterBounds=(
-                        Shell.Bounds if Shell is not None
-                        else Fabric.OuterBounds
-                    ),
-                    ActiveFaces=(
-                        Shell.ActiveFaces if Shell is not None
-                        else Fabric.ActiveFaces
-                    ),
-                    PerimeterSlotAssignmentFingerprint=(
-                        Shell.PerimeterSlotAssignmentFingerprint
-                        if Shell is not None
-                        else Fabric.PerimeterSlotAssignmentFingerprint
-                    ),
-                    FrozenRoutingEnvelope=FrozenEnvelope,
-                    Complete=Complete,
-                    IncompleteReason=(
-                        "" if Complete
-                        else "projected-access-stub-domain-empty"
-                    ),
-                )
-
-            def BuildCompleteEmptyGuideAccessProof(
-                Candidate: PcbPlacementCandidate,
-                Resources: Any,
-                MaximumGuideDomain: RawTrackAssignmentDomain,
-                TopologyKind: str,
-                AccessRingTrackCount: int,
-            ) -> PlacementAccessFabric:
-                """Represent a declared member disproven by an empty guide.
-
-                One required guide variable with a complete zero-value domain
-                makes the member infeasible independently of every access
-                choice.  Keep the member in the native catalog while omitting
-                access factors that cannot participate in any witness.
-                """
-                EmptySignals = tuple(
-                    str(Signal)
-                    for Signal, Count in MaximumGuideDomain.CandidateCounts
-                    if int(Count) == 0
-                )
-                if (
-                    not MaximumGuideDomain.Complete
-                    or not EmptySignals
-                ):
-                    raise ValueError(
-                        "empty-guide access proof requires a complete empty "
-                        "required variable"
-                    )
-                return PlacementAccessFabric(
-                    FabricFingerprint=BuildStableFingerprint({
-                        "Kind": "complete-empty-guide-access-proof-v1",
-                        "Candidate": Candidate.CandidateId,
-                        "Placement": Candidate.PlacementFingerprint,
-                        "LayerCount": int(
-                            Candidate.RoutingEnvelope.RoutingLayerCount
-                        ),
-                        "MaximumGuideDomain": (
-                            MaximumGuideDomain.CandidateDomainFingerprint
-                        ),
-                        "EmptySignals": EmptySignals,
-                        "TopologyKind": TopologyKind,
-                    }),
-                    Nodes=(),
-                    Edges=(),
-                    IngressNodes=(),
-                    PhysicalClaims=(
-                        Resources.ResourceGraph.BuildRouteClaims(())
-                    ),
-                    CapacityResourceIds=(),
-                    TerminalDomains=(),
-                    TopologyKind=TopologyKind,
-                    Complete=True,
-                    AccessRingTrackCount=AccessRingTrackCount,
-                    IncompleteReason="",
-                    Technology=Technology,
-                )
-
             def MaterializeRawTemplate(
-                Descriptor: PredeclaredRawTrackAssignmentMember,
-            ) -> RawTrackAssignmentMemberMaterialization:
-                MaterializationStartedAt = monotonic()
+                Descriptor: RawTrackAssignmentPortfolioTemplate,
+            ) -> RawTrackAssignmentMaterialization:
                 Candidate = CandidateById.get(Descriptor.TemplateId)
                 if Candidate is None:
                     raise RuntimeError(
@@ -14771,472 +13459,64 @@ def _PlaceAndRoutePcbWithPolicy(
                         "raw pre-route portfolio is missing its fixed fabric "
                         "descriptor"
                     )
-                CandidateResources = CandidateResourcesById[
-                    Candidate.CandidateId
-                ]
-                Shell = FabricDescriptor.Shell
-                FixedAccessLayerCount = (
-                    ResolveFixedAccessFabricLayerCount(
-                        BuildNetRoutingProfiles(
-                            Candidate.Placement.Placed,
-                            AccessLength=(
-                                Candidate.RoutingEnvelope.AccessLength
-                            ),
-                        ),
-                        int(Candidate.RoutingEnvelope.RoutingLayerCount),
-                    )
-                    if FabricDescriptor.TopologyKind
-                    == "fixed-access-band-v1"
-                    else int(Candidate.RoutingEnvelope.RoutingLayerCount)
-                )
-                ExactAccessFabricIdentity = BuildStableFingerprint({
-                    "Kind": "compact-access-fabric-input-v1",
-                    # A derived shell already contains every placement fact
-                    # consumed by access construction.  For the fixed-band
-                    # path, which has no shell, retain the whole placed
-                    # geometry in the identity.
-                    "PlacementGeometry": (
-                        CachedPlacementGeometryFingerprint(
-                            Candidate.Placement.Placed
-                        )
-                        if Shell is None
-                        else "derived-shell-owned"
-                    ),
-                    "ResourceGeometry": (
-                        CachedResourceGeometryFingerprint(
-                            CandidateResources
-                        )
-                    ),
-                    "PhysicalAccessLayerCount": FixedAccessLayerCount,
-                    "DeclaredRoutingLayerCount": int(
-                        Candidate.RoutingEnvelope.RoutingLayerCount
-                    ),
-                    "AccessLength": int(
-                        Candidate.RoutingEnvelope.AccessLength
-                    ),
-                    "TopologyKind": FabricDescriptor.TopologyKind,
-                    "AccessRingTrackCount": (
-                        FabricDescriptor.AccessRingTrackCount
-                    ),
-                    "Shell": (
-                        None
-                        if Shell is None
-                        else (
-                            Shell.AccessRingTrackCount,
-                            Shell.AccessLength,
-                            Shell.TechnologyFingerprint,
-                            Shell.Profiles,
-                            Shell.TerminalPaths,
-                            Shell.SlotFaceItems,
-                            Shell.PerimeterDrivenRootFaceItems,
-                            Shell.RingBounds,
-                            Shell.Bounds,
-                            Shell.ActiveFaces,
-                            Shell.PerimeterFaceTrackCounts,
-                            Shell.FabricLayers,
-                            Shell.FabricYs,
-                        )
-                    ),
-                })
-                ReusedAccessFabricMaterialization = (
-                    ExactPhysicalAccessFabricMaterializations.get(
-                        ExactAccessFabricIdentity
+                CandidateResources = (
+                    ForkRoutingResourcesWithSharedStaticGeometry(
+                        FabricDescriptor.StaticResources
                     )
                 )
-                AccessFabricStartedAt = monotonic()
                 try:
-                    MaximumLayerCount = (
-                        MaximumDeclaredLayerCountByPlacementFingerprint[
-                            Candidate.PlacementFingerprint
-                        ]
-                    )
-                    MaximumLayerAccessFabric = (
-                        MaximumLayerAccessFabricByPlacementFingerprint.get(
-                            Candidate.PlacementFingerprint
-                        )
-                    )
-                    MaximumLayerGuideDomainForAccessProof = (
-                        MaximumLayerGuideDomainByPlacementFingerprint.get(
-                            Candidate.PlacementFingerprint
-                        )
-                    )
-                    HasCompleteEmptyGuideProof = bool(
-                        MaximumLayerGuideDomainForAccessProof is not None
-                        and MaximumLayerGuideDomainForAccessProof.Complete
-                        and any(
-                            int(Count) == 0
-                            for _Signal, Count in (
-                                MaximumLayerGuideDomainForAccessProof
-                                .CandidateCounts
-                            )
-                        )
-                        and int(
-                            Candidate.RoutingEnvelope.RoutingLayerCount
-                        ) < MaximumLayerCount
-                    )
-                    PreparedAccessFabric = (
-                        PreparedAccessFabricsByCandidateId.get(
-                            Candidate.CandidateId
-                        )
-                    )
-                    if HasCompleteEmptyGuideProof:
-                        Fabric = BuildCompleteEmptyGuideAccessProof(
-                            Candidate,
-                            CandidateResources,
-                            MaximumLayerGuideDomainForAccessProof,
-                            FabricDescriptor.TopologyKind,
-                            FabricDescriptor.AccessRingTrackCount,
-                        )
-                        ReusedAccessFabricMaterialization = (
-                            Fabric,
-                            CandidateResources,
-                        )
-                    elif PreparedAccessFabric is not None:
-                        Fabric = PreparedAccessFabric
-                        ReusedAccessFabricMaterialization = (
-                            Fabric,
-                            CandidateResources,
-                        )
-                        ExactPhysicalAccessFabricMaterializations[
-                            ExactAccessFabricIdentity
-                        ] = (Fabric, CandidateResources)
-                        if (
-                            FabricDescriptor.TopologyKind
-                            == "derived-perimeter-access-v1"
-                            and int(
-                                Candidate.RoutingEnvelope
-                                .RoutingLayerCount
-                            ) == MaximumLayerCount
-                        ):
-                            MaximumLayerAccessFabricByPlacementFingerprint[
-                                Candidate.PlacementFingerprint
-                            ] = Fabric
-                    elif (
-                        ReusedAccessFabricMaterialization is None
-                        and FabricDescriptor.TopologyKind
-                        == "derived-perimeter-access-v1"
-                        and MaximumLayerAccessFabric is not None
-                        and int(Candidate.RoutingEnvelope.RoutingLayerCount)
-                        < MaximumLayerCount
-                    ):
-                        Fabric = ProjectMaximumLayerAccessFabric(
-                            MaximumLayerAccessFabric,
-                            Shell,
-                            CandidateResources,
-                            Candidate,
-                        )
-                        ReusedAccessFabricMaterialization = (
-                            Fabric,
-                            CandidateResources,
-                        )
-                    elif ReusedAccessFabricMaterialization is not None:
-                        (
-                            Fabric,
-                            CandidateResources,
-                        ) = ReusedAccessFabricMaterialization
-                    elif int(
-                        Candidate.RoutingEnvelope.RoutingLayerCount
-                    ) < MaximumLayerCount:
-                        raise RoutingStageError(RoutingFailure(
-                            Reason=(
-                                RoutingFailureReason
-                                .ClusterInterfaceSolveIncomplete
-                            ),
-                            Stage="PreRouteLayeredAccessCatalogIncomplete",
-                            Detail=(
-                                "the maximal access member provided neither "
-                                "an exact retained-layer view nor a complete "
-                                "empty-guide proof for this declared member"
-                            ),
-                            Diagnostics={
-                                "CandidateId": Candidate.CandidateId,
-                                "MaximumLayerCount": MaximumLayerCount,
-                                "TopologyKind": (
-                                    FabricDescriptor.TopologyKind
-                                ),
-                                "SecondNativeEscapeCallForbidden": True,
-                            },
-                        ))
-                    else:
-                        Fabric = BuildPlacementAccessFabric(
-                            Candidate.Placement,
-                            Resources=CandidateResources,
-                            Technology=Technology,
-                            AccessLength=(
-                                Candidate.RoutingEnvelope.AccessLength
-                                if Candidate.RoutingEnvelope is not None
-                                else None
-                            ),
-                            TopologyKind=FabricDescriptor.TopologyKind,
-                            AccessRingTrackCount=(
-                                FabricDescriptor.AccessRingTrackCount
-                            ),
-                            Shell=FabricDescriptor.Shell,
-                            BoundarySignals=None,
-                            # The immutable fabric publishes terminal escape
-                            # alternatives only.  The aggregate raw selector owns
-                            # the one complete portal/track witness.
-                            CompleteRouteSignals=frozenset(),
-                            DeriveLegalEscapeWorkLimit=(
-                                FabricDescriptor.DeriveLegalEscapeWorkLimit
-                            ),
-                            # Retain one representative ingress per exact
-                            # layer/track/face factor in the compact domain.
-                            RestrictDerivedIngressToRepresentatives=(
-                                FabricDescriptor.TopologyKind
-                                == "derived-perimeter-access-v1"
-                            ),
-                            # Compact selection consumes the exact immutable
-                            # PhysicalClaims directly. Expanding every
-                            # unselected stub into duplicate resource-id
-                            # objects is deferred until a selected assignment
-                            # actually needs that serialized view.
-                            DeferEscapeStubCapacityResourceIds=True,
-                            NativeEscapeRemainingMilliseconds=(
-                                Deadline.RemainingMilliseconds
-                            ),
-                            NativeEscapeBatchMemberId=(
-                                Candidate.CandidateId
-                            ),
-                            NativeEscapeBatchPhysicalIdentity=(
-                                FabricDescriptor
-                                .MaterializationInputFingerprint
-                            ),
-                            NativeEscapeBatchResult=(
-                                NativeEscapeBatchResultsByCandidateId.get(
-                                    Candidate.CandidateId
-                                )
-                            ),
-                            WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
-                                "PrePlacementAccessFabric",
-                                Diagnostics,
-                            ),
-                        )
-                        ExactPhysicalAccessFabricMaterializations[
-                            ExactAccessFabricIdentity
-                        ] = (Fabric, CandidateResources)
-                        if (
-                            FabricDescriptor.TopologyKind
-                            == "derived-perimeter-access-v1"
-                            and int(
-                                Candidate.RoutingEnvelope.RoutingLayerCount
-                            ) == MaximumLayerCount
-                        ):
-                            MaximumLayerAccessFabricByPlacementFingerprint[
-                                Candidate.PlacementFingerprint
-                            ] = Fabric
-                    AccessFabricElapsedSeconds = (
-                        monotonic() - AccessFabricStartedAt
-                    )
-                    AttachedForGuide = AttachPlacementAccessFabric(
+                    Fabric = BuildPlacementAccessFabric(
                         Candidate.Placement,
-                        Fabric,
-                    )
-                    CandidatePolicy = (
-                        BuildFrozenEnvelopeRoutingPolicy(
-                            Policy,
-                            Candidate.RoutingEnvelope,
-                        )
-                        if Candidate.RoutingEnvelope is not None
-                        else Policy
-                    )
-                    ExactGuideDomainIdentity = BuildStableFingerprint({
-                        "Kind": "compact-guide-factor-input-v1",
-                        "RoutingProfiles": (
-                            Shell.Profiles
-                            if Shell is not None
-                            else CachedPlacementGeometryFingerprint(
-                                Candidate.Placement.Placed
-                            )
+                        Resources=CandidateResources,
+                        Technology=Technology,
+                        AccessLength=(
+                            Candidate.RoutingEnvelope.AccessLength
+                            if Candidate.RoutingEnvelope is not None
+                            else None
                         ),
-                        "ResourceGeometry": (
-                            CachedResourceGeometryFingerprint(
-                                CandidateResources
-                            )
+                        TopologyKind=FabricDescriptor.TopologyKind,
+                        AccessRingTrackCount=(
+                            FabricDescriptor.AccessRingTrackCount
                         ),
-                        "FabricFingerprint": Fabric.FabricFingerprint,
-                        "LayerCount": int(
-                            Candidate.RoutingEnvelope.RoutingLayerCount
+                        Shell=FabricDescriptor.Shell,
+                        # The immutable fabric publishes terminal escape
+                        # alternatives only.  The aggregate raw selector owns
+                        # the one complete portal/track witness.
+                        CompleteRouteSignals=frozenset(),
+                        DeriveLegalEscapeWorkLimit=(
+                            FabricDescriptor.DeriveLegalEscapeWorkLimit
                         ),
-                        "FrozenPolicy": repr(CandidatePolicy),
-                        "TrackAssignmentExpansionCap": (
-                            Policy.TrackAssignment.MaximumAssignmentExpansions
+                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                            "PrePlacementAccessFabric",
+                            Diagnostics,
                         ),
-                    })
-                    GuideDomainStartedAt = monotonic()
-                    GuideDomain = (
-                        NativeSelectedGuideDomainsByCandidateId.get(
-                            Candidate.CandidateId
-                        )
-                    )
-                    if GuideDomain is None:
-                        GuideDomain = PrepareRawRouteGuideFactorDomain(
-                            AttachedForGuide,
-                            Resources=CandidateResources,
-                            Policy=CandidatePolicy,
-                            Deadline=Deadline,
-                            FrozenNativeRouteGuideRecipes=(
-                                NativeSelectedGuideRecipesByCandidateId.get(
-                                    Candidate.CandidateId,
-                                    (),
-                                )
-                            ),
-                            FrozenTrackAssignmentPreparation=(
-                                TrackAssignmentPreparation(
-                                    Success=True,
-                                    SelectedCandidateIds=(),
-                                    CandidateCounts=(),
-                                    ConflictSignals=(),
-                                    ConflictResourceIndices=(),
-                                    ExpansionCount=0,
-                                    Complete=True,
-                                    SelectedRouteGuideFactorChoiceIds=tuple(
-                                        (Signal, FactorId)
-                                        for Signal, FactorId, _Descriptor
-                                        in NativeSelectedGuideDescriptorsByCandidateId.get(
-                                            Candidate.CandidateId,
-                                            (),
-                                        )
-                                    ),
-                                    SelectedRouteGuideFactorDescriptors=(
-                                        NativeSelectedGuideDescriptorsByCandidateId.get(
-                                            Candidate.CandidateId,
-                                            (),
-                                        )
-                                    ),
-                                )
-                                if Candidate.CandidateId
-                                in NativeSelectedGuideDescriptorsByCandidateId
-                                else None
-                            ),
-                        )
-                    ExactPhysicalGuideDomainMaterializations[
-                        ExactGuideDomainIdentity
-                    ] = GuideDomain
-                    GuideDomainElapsedSeconds = (
-                        monotonic() - GuideDomainStartedAt
                     )
                 except RoutingStageError as Error:
-                    FailureDiagnostics = Error.Failure.Diagnostics
-                    MandatoryAccessProof = (
-                        FailureDiagnostics.get("MandatoryAccessProof", {})
-                        if isinstance(FailureDiagnostics, dict)
-                        else {}
-                    )
-                    CompleteEmptyGuideFactor = bool(
-                        Error.Failure.Reason
-                        == RoutingFailureReason.TrackAssignmentConflict
-                        and MandatoryAccessProof.get("Complete") is True
-                        and MandatoryAccessProof.get(
-                            "PortalTupleDomainComplete"
-                        ) is True
-                        and Error.Failure.AffectedNets
-                    )
-                    if CompleteEmptyGuideFactor:
-                        GuideDomain = RawTrackAssignmentDomain(
-                            ResourcePositions=(),
-                            Values=(),
-                            BaseClaims=(),
-                            CandidateCounts=tuple(
-                                (str(Signal), 0)
-                                for Signal in sorted(
-                                    Error.Failure.AffectedNets
-                                )
-                            ),
-                            CandidateDomainFingerprint=(
-                                BuildStableFingerprint({
-                                    "Kind": (
-                                        "complete-empty-guide-factor-v1"
-                                    ),
-                                    "Candidate": Candidate.CandidateId,
-                                    "Failure": Error.Failure.ToDictionary(),
-                                })
-                            ),
-                            LocalClaimDomainFingerprint="",
-                            PlacementFingerprint=(
-                                BuildRawPortalPlacementGeometryFingerprint(
-                                    Candidate.Placement.Placed
-                                )
-                            ),
-                            ResourceGraphFingerprint=(
-                                CachedResourceGeometryFingerprint(
-                                    CandidateResources
-                                )
-                            ),
-                            PortalDomainFingerprint=BuildStableFingerprint({
-                                "Kind": "complete-empty-portal-core-v1",
-                                "MandatoryAccessProof": MandatoryAccessProof,
-                            }),
-                            Complete=True,
-                            IncompleteReason="",
-                            MaximumAssignmentExpansions=(
-                                Policy.TrackAssignment
-                                .MaximumAssignmentExpansions
-                            ),
-                            Diagnostics=((
-                                "CompleteEmptyGuideFactor",
+                    Result = RawTrackAssignmentMaterialization(
+                        TemplateId=Descriptor.TemplateId,
+                        Domain=None,
+                        Complete=False,
+                        IncompleteReason=(
+                            Error.Failure.Reason.value
+                            if hasattr(Error.Failure.Reason, "value")
+                            else str(Error.Failure.Reason)
+                        ),
+                        Diagnostics=(
+                            ("Candidate", Candidate.ToDictionary()),
+                            (
+                                "PlacementAccessFabricFailure",
                                 Error.Failure.ToDictionary(),
-                            ),),
-                        )
-                        ExactPhysicalGuideDomainMaterializations[
-                            ExactGuideDomainIdentity
-                        ] = GuideDomain
-                        if (
-                            int(
-                                Candidate.RoutingEnvelope.RoutingLayerCount
-                            )
-                            == MaximumLayerCount
-                        ):
-                            MaximumLayerGuideDomainByPlacementFingerprint[
-                                Candidate.PlacementFingerprint
-                            ] = GuideDomain
-                        GuideDomainElapsedSeconds = (
-                            monotonic() - GuideDomainStartedAt
-                        )
-                    else:
-                        Result = RawTrackAssignmentMemberMaterialization(
-                            TemplateId=Descriptor.TemplateId,
-                            Domain=None,
-                            Complete=False,
-                            IncompleteReason=(
-                                Error.Failure.Reason.value
-                                if hasattr(Error.Failure.Reason, "value")
-                                else str(Error.Failure.Reason)
                             ),
-                            Diagnostics=(
-                                ("Candidate", Candidate.ToDictionary()),
-                                (
-                                    "PlacementAccessFabricFailure",
-                                    Error.Failure.ToDictionary(),
-                                ),
-                                (
-                                    "FabricDescriptor",
-                                    FabricDescriptor.ToDictionary(),
-                                ),
-                                (
-                                    "AccessFabricElapsedSeconds",
-                                    round(
-                                        float(locals().get(
-                                            "AccessFabricElapsedSeconds",
-                                            0.0,
-                                        )),
-                                        6,
-                                    ),
-                                ),
-                                (
-                                    "PlacementAccessFabric",
-                                    (
-                                        SummarizePreRouteAccessFabric(Fabric)
-                                        if "Fabric" in locals()
-                                        else None
-                                    ),
-                                ),
+                            (
+                                "FabricDescriptor",
+                                FabricDescriptor.ToDictionary(),
                             ),
-                        )
-                        RawTrackAssignmentMaterializations[
-                            Descriptor.TemplateId
-                        ] = Result
-                        return Result
+                        ),
+                    )
+                    RawTrackAssignmentMaterializations[
+                        Descriptor.TemplateId
+                    ] = Result
+                    return Result
                 AttachedPlacement = AttachPlacementAccessFabric(
                     Candidate.Placement,
                     Fabric,
@@ -15272,26 +13552,11 @@ def _PlaceAndRoutePcbWithPolicy(
                         SummarizePreRouteAccessFabric(Fabric)
                     ),
                     "FabricDescriptor": FabricDescriptor.ToDictionary(),
-                    "AccessFabricElapsedSeconds": round(
-                        AccessFabricElapsedSeconds,
-                        6,
-                    ),
-                    "GuideDomainElapsedSeconds": round(
-                        GuideDomainElapsedSeconds,
-                        6,
-                    ),
-                    "GuideCandidateCounts": [
-                        list(Value)
-                        for Value in GuideDomain.CandidateCounts
-                    ],
-                    "GuideDomainDiagnostics": dict(
-                        GuideDomain.Diagnostics
-                    ),
                 })
                 Template = PublishPreRouteTemplate(Candidate, Fabric, None)
                 TemplateById[Candidate.CandidateId] = Template
                 if Fabric is None or not Fabric.Complete:
-                    Result = RawTrackAssignmentMemberMaterialization(
+                    Result = RawTrackAssignmentMaterialization(
                         TemplateId=Descriptor.TemplateId,
                         Domain=None,
                         Complete=False,
@@ -15318,39 +13583,50 @@ def _PlaceAndRoutePcbWithPolicy(
                         Descriptor.TemplateId
                     ] = Result
                     return Result
-                if not GuideDomain.Complete:
-                    Result = RawTrackAssignmentMemberMaterialization(
+                CandidatePolicy = (
+                    BuildFrozenEnvelopeRoutingPolicy(
+                        Policy,
+                        Candidate.RoutingEnvelope,
+                    )
+                    if Candidate.RoutingEnvelope is not None
+                    else Policy
+                )
+                try:
+                    RawDomain = PrepareRawTrackAssignmentDomain(
+                        Candidate.Placement,
+                        Resources=CandidateResources,
+                        Policy=CandidatePolicy,
+                        Deadline=Deadline,
+                    )
+                except RoutingStageError as Error:
+                    Result = RawTrackAssignmentMaterialization(
                         TemplateId=Descriptor.TemplateId,
                         Domain=None,
                         Complete=False,
                         IncompleteReason=(
-                            GuideDomain.IncompleteReason
-                            or "incomplete-route-guide-factor-domain"
+                            Error.Failure.Reason.value
+                            if hasattr(Error.Failure.Reason, "value")
+                            else str(Error.Failure.Reason)
                         ),
-                        Diagnostics=((
-                            "PlacementAccessFabric",
-                            SummarizePreRouteAccessFabric(Fabric),
-                        ), (
-                            "RouteGuideFactorDomain",
-                            GuideDomain.ToDictionary(),
-                        ), (
-                            "FabricDescriptor",
-                            FabricDescriptor.ToDictionary(),
-                        )),
-                        ResolvedObjective=(
-                            Template.Witnesses[0].Objective
-                            if Template.Witnesses else ()
+                        Diagnostics=(
+                            ("Candidate", Candidate.ToDictionary()),
+                            (
+                                "RawDomainFailure",
+                                Error.Failure.ToDictionary(),
+                            ),
+                            (
+                                "FabricDescriptor",
+                                FabricDescriptor.ToDictionary(),
+                            ),
                         ),
+                        ResolvedObjective=Template.Witnesses[0].Objective
+                        if Template.Witnesses else (),
                     )
                     RawTrackAssignmentMaterializations[
                         Descriptor.TemplateId
                     ] = Result
                     return Result
-                # The compact catalog consumes the guide values and access
-                # fabric by reference.  Do not construct an access raw domain
-                # or reindex an expanded composed member here.
-                RawDomain = GuideDomain
-                Result = RawTrackAssignmentMemberMaterialization(
+                Result = RawTrackAssignmentMaterialization(
                     TemplateId=Descriptor.TemplateId,
                     Domain=RawDomain,
                     Complete=RawDomain.Complete,
@@ -15358,19 +13634,7 @@ def _PlaceAndRoutePcbWithPolicy(
                     Diagnostics=((
                         "PlacementAccessFabric",
                         SummarizePreRouteAccessFabric(Fabric),
-                    ), (
-                        "ExactPhysicalFactorMaterializationReused",
-                        ReusedAccessFabricMaterialization is not None,
-                    ), (
-                        "MaterializationElapsedSeconds",
-                        round(monotonic() - MaterializationStartedAt, 6),
-                    ), (
-                        "AccessFabricElapsedSeconds",
-                        round(AccessFabricElapsedSeconds, 6),
-                    ), (
-                        "GuideDomainElapsedSeconds",
-                        round(GuideDomainElapsedSeconds, 6),
-                    )),
+                    ),),
                     ResolvedObjective=Template.Witnesses[0].Objective
                     if Template.Witnesses else (),
                 )
@@ -15378,2602 +13642,69 @@ def _PlaceAndRoutePcbWithPolicy(
                     Descriptor.TemplateId
                 ] = Result
                 return Result
-            # Every declared geometry/layer world is a distinct feasibility
-            # contract.  Objective order ranks feasible witnesses inside the
-            # one native solve; it cannot prove that a resource-distinct
-            # member is dominated.  In particular, a cheaper one-layer world
-            # may conflict while a same-footprint two-layer world succeeds.
-            # Physical construction may be shared only after an exact domain
-            # identity match, never by topology, layer count, or objective.
-            SelectableRawPortfolioTemplates = tuple(sorted(
-                RawPortfolioTemplates,
-                key=lambda Value: (Value.Objective, Value.TemplateId),
-            ))
-            # Materialize only access-stub and route-guide factor domains,
-            # then invoke the native template selector once.  Detailed route
-            # trees are generated only for its selected physical world.
-            FactorMaterializationTemplates = tuple(sorted(
-                SelectableRawPortfolioTemplates,
-                key=lambda Descriptor: (
-                    CandidateById[
-                        Descriptor.TemplateId
-                    ].PlacementFingerprint,
-                    -int(
-                        CandidateById[Descriptor.TemplateId]
-                        .RoutingEnvelope.RoutingLayerCount
-                    ),
-                    Descriptor.Objective,
-                    Descriptor.TemplateId,
-                ),
-            ))
-            # Build every immutable native escape request before any member
-            # consumes a result.  The Rust catalog receives each member's
-            # exact graph, masks, and finite cap in one operation; the second
-            # pass below only materializes Python claims and guide factors.
-            NativeEscapePreparations = []
-            NativeEscapePreparationStartedAt = monotonic()
-            NativeEscapeSourcePreparationTimes: list[
-                tuple[str, float]
-            ] = []
-            NativeEscapeSourceDescriptors = tuple(
-                Descriptor
-                for Descriptor in FactorMaterializationTemplates
-                if int(
-                    CandidateById[Descriptor.TemplateId]
-                    .RoutingEnvelope.RoutingLayerCount
-                ) == MaximumDeclaredLayerCountByPlacementFingerprint[
-                    CandidateById[Descriptor.TemplateId]
-                    .PlacementFingerprint
-                ]
-            )
-            NativeRegionRecipes = tuple(
-                BuildPlacementAccessNativeRegionRecipe(
-                    CandidateById[Descriptor.TemplateId].Placement,
-                    Resources=CandidateResourcesById[
-                        Descriptor.TemplateId
-                    ],
-                    Shell=PreRouteFabricDescriptorsByCandidateId[
-                        Descriptor.TemplateId
-                    ].Shell,
-                    TopologyKind=(
-                        PreRouteFabricDescriptorsByCandidateId[
-                            Descriptor.TemplateId
-                        ].TopologyKind
-                    ),
-                    AccessRingTrackCount=(
-                        PreRouteFabricDescriptorsByCandidateId[
-                            Descriptor.TemplateId
-                        ].AccessRingTrackCount
-                    ),
-                    AccessLength=(
-                        CandidateById[Descriptor.TemplateId]
-                        .RoutingEnvelope.AccessLength
-                    ),
-                    FixedAccessFabricLayers=(
-                        DeclaredFixedAccessLayersByPlacementFingerprint[
-                            CandidateById[Descriptor.TemplateId]
-                            .PlacementFingerprint
-                        ]
-                        if PreRouteFabricDescriptorsByCandidateId[
-                            Descriptor.TemplateId
-                        ].TopologyKind == "fixed-access-band-v1"
-                        else None
-                    ),
-                    Technology=Technology,
-                    MemberId=Descriptor.TemplateId,
-                )
-                for Descriptor in NativeEscapeSourceDescriptors
-            )
-            (
-                PreparedNativeRegionAdjacencyByCandidateId,
-                NativeRegionGraphDiagnostics,
-            ) = BuildPlacementAccessNativeRegionCatalogBounded(
-                NativeRegionRecipes,
-                RemainingMilliseconds=Deadline.RemainingMilliseconds(),
-            )
-            for Descriptor in NativeEscapeSourceDescriptors:
-                Candidate = CandidateById[Descriptor.TemplateId]
-                FabricDescriptor = (
-                    PreRouteFabricDescriptorsByCandidateId[
-                        Descriptor.TemplateId
-                    ]
-                )
-                NativeEscapeSourcePreparationStartedAt = monotonic()
-                try:
-                    BuildPlacementAccessFabric(
-                        Candidate.Placement,
-                        Resources=CandidateResourcesById[
-                            Candidate.CandidateId
-                        ],
-                        Technology=Technology,
-                        AccessLength=(
-                            Candidate.RoutingEnvelope.AccessLength
-                            if Candidate.RoutingEnvelope is not None
-                            else None
-                        ),
-                        TopologyKind=FabricDescriptor.TopologyKind,
-                        AccessRingTrackCount=(
-                            FabricDescriptor.AccessRingTrackCount
-                        ),
-                        Shell=FabricDescriptor.Shell,
-                        BoundarySignals=None,
-                        CompleteRouteSignals=frozenset(),
-                        DeriveLegalEscapeWorkLimit=(
-                            FabricDescriptor.DeriveLegalEscapeWorkLimit
-                        ),
-                        RestrictDerivedIngressToRepresentatives=(
-                            FabricDescriptor.TopologyKind
-                            == "derived-perimeter-access-v1"
-                        ),
-                        DeferEscapeStubCapacityResourceIds=True,
-                        FixedAccessFabricLayers=(
-                            DeclaredFixedAccessLayersByPlacementFingerprint[
-                                Candidate.PlacementFingerprint
-                            ]
-                            if FabricDescriptor.TopologyKind
-                            == "fixed-access-band-v1"
-                            else None
-                        ),
-                        NativeEscapeRemainingMilliseconds=(
-                            Deadline.RemainingMilliseconds
-                        ),
-                        NativeEscapeBatchMemberId=(
-                            Candidate.CandidateId
-                        ),
-                        NativeEscapeBatchPhysicalIdentity=(
-                            BuildStableFingerprint({
-                                "Descriptor": (
-                                    FabricDescriptor
-                                    .MaterializationInputFingerprint
-                                ),
-                                "FixedAccessFabricLayers": (
-                                    DeclaredFixedAccessLayersByPlacementFingerprint[
-                                        Candidate.PlacementFingerprint
-                                    ]
-                                    if FabricDescriptor.TopologyKind
-                                    == "fixed-access-band-v1"
-                                    else None
-                                ),
-                            })
-                        ),
-                        PreparedNativeRegionAdjacencyValues=(
-                            PreparedNativeRegionAdjacencyByCandidateId.get(
-                                Candidate.CandidateId
-                            )
-                        ),
-                        PrepareNativeEscapeBatchOnly=True,
-                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
-                            "PrePlacementAccessFabricBatchPreparation",
-                            {
-                                "CandidateId": Candidate.CandidateId,
-                                "NativeEscapeBatchDiagnostics": dict(
-                                    NativeEscapeBatchDiagnostics
-                                ),
-                                **Diagnostics,
-                            },
-                        ),
-                    )
-                except PlacementAccessNativeEscapePreparationRequested as Prepared:
-                    NativeEscapeSourcePreparationTimes.append((
-                        Candidate.CandidateId,
-                        round(
-                            monotonic()
-                            - NativeEscapeSourcePreparationStartedAt,
-                            6,
-                        ),
-                    ))
-                    NativeEscapePreparations.append(
-                        Prepared.Preparation
-                    )
-                    NativeEscapeContinuationsByCandidateId[
-                        Candidate.CandidateId
-                    ] = Prepared
-            NativeEscapePreparationById = {
-                Value.MemberId: Value
-                for Value in NativeEscapePreparations
-            }
-            NativeEscapeSourceCandidateIdByIdentity = {
-                (
-                    CandidateById[CandidateId].PlacementFingerprint,
-                    PreRouteFabricDescriptorsByCandidateId[
-                        CandidateId
-                    ].TopologyKind,
-                ): CandidateId
-                for CandidateId in NativeEscapeContinuationsByCandidateId
-            }
-
-            def NativeAccessMemberObjective(
-                Candidate: PcbPlacementCandidate,
-            ) -> tuple[int, int, int, int, int]:
-                Envelope = Candidate.RoutingEnvelope
-                if Envelope is None:
-                    raise RuntimeError(
-                        "native access member is missing its envelope"
-                    )
-                Descriptor = PreRouteFabricDescriptorsByCandidateId[
-                    Candidate.CandidateId
-                ]
-                LayerCount = int(Envelope.RoutingLayerCount)
-                LayerSlack = (
-                    MaximumDeclaredLayerCountByPlacementFingerprint[
-                        Candidate.PlacementFingerprint
-                    ] - LayerCount
-                )
-                PrefixFootprint, PrefixMaximumSpan, _Layer = (
-                    Descriptor.ObjectivePrefix
-                )
-                Height = 2 * LayerCount + 2
-                return (
-                    # Topology labels are representation identities, not a
-                    # physical optimization objective.  Giving the legacy
-                    # fixed band an unconditional rank advantage forced all
-                    # of its layer worlds ahead of an equal-size exact
-                    # perimeter member.  Retain every member and let the
-                    # measured geometry plus stable template id order them.
-                    0,
-                    LayerSlack,
-                    int(PrefixFootprint) * Height,
-                    int(PrefixFootprint),
-                    int(PrefixMaximumSpan),
-                )
-
-            NativeEscapeViews: list[
-                PlacementAccessNativeEscapeGuideMemberView
-            ] = []
-            NativeGuidePlacementMetadataByIdentity = {}
-            for Descriptor in FactorMaterializationTemplates:
-                Candidate = CandidateById[Descriptor.TemplateId]
-                FabricDescriptor = (
-                    PreRouteFabricDescriptorsByCandidateId[
-                        Candidate.CandidateId
-                    ]
-                )
-                SourceCandidateId = (
-                    NativeEscapeSourceCandidateIdByIdentity.get((
-                        Candidate.PlacementFingerprint,
-                        FabricDescriptor.TopologyKind,
-                    ))
-                )
-                if SourceCandidateId is None:
-                    raise RuntimeError(
-                        "native layered access member has no shared graph"
-                    )
-                SourcePreparation = NativeEscapePreparationById[
-                    SourceCandidateId
-                ]
-                PlacementMetadataIdentity = (
-                    Candidate.PlacementFingerprint,
-                    int(Candidate.RoutingEnvelope.AccessLength),
-                )
-                PlacementMetadata = (
-                    NativeGuidePlacementMetadataByIdentity.get(
-                        PlacementMetadataIdentity
-                    )
-                )
-                if PlacementMetadata is None:
-                    BaseY = min(
-                        int(Gate.Y)
-                        for Gate in Candidate.Placement.Placed.PlacedGates
-                    )
-                    Profiles = BuildNetRoutingProfiles(
-                        Candidate.Placement.Placed,
-                        AccessLength=(
-                            Candidate.RoutingEnvelope.AccessLength
-                        ),
-                    )
-                    RegionProfiles = BuildNetRoutingProfiles(
-                        Candidate.Placement.Placed,
-                        AccessLength=int(
-                            Policy.Placement.PinEscapeLength
-                        ),
-                    )
-                    RegionTerminalColumnsBySignal = {
-                        str(Signal): tuple(dict.fromkeys((
-                            *(
-                                (
-                                    int(Position[0]),
-                                    int(Position[2]),
-                                )
-                                for Position in (
-                                    Profile.Seed.ContinuationNodes
-                                    if Profile.Seed is not None
-                                    else ()
-                                )
-                            ),
-                            *(
-                                (
-                                    int(Path[-1][0]),
-                                    int(Path[-1][2]),
-                                )
-                                for Path in (
-                                    Profile.SourceAccessPath,
-                                    *Profile.TargetAccessPaths.values(),
-                                )
-                            ),
-                        )))
-                        for Signal, Profile in RegionProfiles.items()
-                    }
-                    RegionProtectedClaims = tuple(
-                        (
-                            str(Signal),
-                            tuple(sorted(Claims.WireCells)),
-                            tuple(sorted(Claims.SupportCells)),
-                            tuple(sorted(Claims.RequiredAirCells)),
-                            tuple(sorted(Claims.ElectricalCells)),
-                        )
-                        for Signal, Profile in sorted(
-                            RegionProfiles.items()
-                        )
-                        for Claims in (
-                            CandidateResourcesById[
-                                Candidate.CandidateId
-                            ].ResourceGraph.BuildRouteClaims({
-                                *Profile.SourceAccessPath,
-                                *(
-                                    Position
-                                    for Path in (
-                                        Profile.TargetAccessPaths.values()
-                                    )
-                                    for Position in Path
-                                ),
-                            }),
-                        )
-                    )
-                    MinimumGuideX = min(
-                        int(Gate.X)
-                        for Gate in Candidate.Placement.Placed.PlacedGates
-                    )
-                    MinimumGuideZ = min(
-                        int(Gate.Z)
-                        for Gate in Candidate.Placement.Placed.PlacedGates
-                    )
-                    AttachedBaseClaims = tuple(
-                        (
-                            str(Claim.Signal),
-                            tuple(sorted(Claim.Claims.WireCells)),
-                            tuple(sorted(Claim.Claims.SupportCells)),
-                            tuple(sorted(
-                                Claim.Claims.RequiredAirCells
-                            )),
-                            tuple(sorted(
-                                Claim.Claims.ElectricalCells
-                            )),
-                        )
-                        for Claim in SelectAttachedLocalRouteClaims(
-                            Candidate.Placement.Placed
-                        )
-                    )
-                    ControlSourceClaims = tuple(
-                        (
-                            str(Signal),
-                            (),
-                            (),
-                            (),
-                            tuple(sorted(
-                                Technology.BuildElectricalExclusions(
-                                    set(Positions)
-                                )
-                            )),
-                        )
-                        for Signal, Positions in sorted(
-                            BuildPlacedOmnidirectionalControlSourcesBySignal(
-                                Candidate.Placement.Placed
-                            ).items()
-                        )
-                    )
-                    BaseClaimPartsByOwner: dict[
-                        str,
-                        tuple[set[tuple[int, int, int]], ...],
-                    ] = {}
-                    for (
-                        ClaimSignal,
-                        ClaimWire,
-                        ClaimSupport,
-                        ClaimAir,
-                        ClaimElectrical,
-                    ) in (
-                        *AttachedBaseClaims,
-                        *RegionProtectedClaims,
-                        *ControlSourceClaims,
-                    ):
-                        ClaimParts = BaseClaimPartsByOwner.setdefault(
-                            str(ClaimSignal),
-                            (set(), set(), set(), set()),
-                        )
-                        for Target, Values in zip(
-                            ClaimParts,
-                            (
-                                ClaimWire,
-                                ClaimSupport,
-                                ClaimAir,
-                                ClaimElectrical,
-                            ),
-                            strict=True,
-                        ):
-                            Target.update(Values)
-                    BaseClaims = tuple(
-                        (
-                            Signal,
-                            tuple(sorted(Parts[0])),
-                            tuple(sorted(Parts[1])),
-                            tuple(sorted(Parts[2])),
-                            tuple(sorted(Parts[3])),
-                        )
-                        for Signal, Parts in sorted(
-                            BaseClaimPartsByOwner.items()
-                        )
-                    )
-                    DetachedSeedAnchors = tuple(
-                        (
-                            str(Signal),
-                            tuple(
-                                (tuple(Anchor),)
-                                for Anchor in (
-                                    PartitionLocalClaimSeedComponents(
-                                        Profile,
-                                        CandidateResourcesById[
-                                            Candidate.CandidateId
-                                        ].ResourceGraph,
-                                    )[1]
-                                )
-                            ),
-                        )
-                        for Signal, Profile in sorted(Profiles.items())
-                        if Profile.Seed is not None
-                    )
-                    PlacementMetadata = (
-                        BaseY,
-                        Profiles,
-                        MinimumGuideX,
-                        MinimumGuideZ,
-                        BaseClaims,
-                        DetachedSeedAnchors,
-                        RegionTerminalColumnsBySignal,
-                    )
-                    NativeGuidePlacementMetadataByIdentity[
-                        PlacementMetadataIdentity
-                    ] = PlacementMetadata
-                (
-                    BaseY,
-                    Profiles,
-                    MinimumGuideX,
-                    MinimumGuideZ,
-                    BaseClaims,
-                    DetachedSeedAnchors,
-                    RegionTerminalColumnsBySignal,
-                ) = PlacementMetadata
-                MaximumY = Technology.RoutingY(
-                    BaseY,
-                    int(
-                        Candidate.RoutingEnvelope.RoutingLayerCount
-                    ) - 1,
-                )
-                # Every layer view retains the complete terminal-variable
-                # catalog.  The bounded native operation filters each
-                # request's ingress domain by MaximumY; dropping a request
-                # here would erase the terminal variable instead of proving
-                # that this particular layer has an empty domain.
-                Requests = tuple(SourcePreparation.Requests)
-                RequestInputById = dict(
-                    SourcePreparation.RequestInputs
-                )
-                RequestMetadata = tuple(
-                    (
-                        str(Request[0]),
-                        (
-                            "__access_terminal__:"
-                            f"{RequestInputById[str(Request[0])][0]}@"
-                            + ",".join(map(
-                                str,
-                                RequestInputById[
-                                    str(Request[0])
-                                ][1],
-                            ))
-                        ),
-                        str(RequestInputById[str(Request[0])][0]),
-                    )
-                    for Request in Requests
-                )
-                VariableBySignalTerminal = {
-                    (
-                        str(RequestInputById[str(Request[0])][0]),
-                        tuple(RequestInputById[str(Request[0])][1]),
-                    ): str(Metadata[1])
-                    for Request, Metadata in zip(
-                        Requests,
-                        RequestMetadata,
-                    )
-                }
-                EffectiveBaseClaims = list(BaseClaims)
-                DetachedSeedAnchorsBySignal = {
-                    str(Signal): list(Anchors)
-                    for Signal, Anchors in DetachedSeedAnchors
-                }
-                for Signal, Profile in sorted(Profiles.items()):
-                    Signal = str(Signal)
-                    for Terminal, AccessPath in (
-                        (Profile.Root, Profile.SourceAccessPath),
-                        *tuple(sorted(Profile.TargetAccessPaths.items())),
-                    ):
-                        Identity = (Signal, tuple(Terminal))
-                        if Identity in VariableBySignalTerminal:
-                            continue
-                        FixedPath = tuple(map(tuple, AccessPath))
-                        if not FixedPath:
-                            continue
-                        FixedClaims = CandidateResourcesById[
-                            Candidate.CandidateId
-                        ].ResourceGraph.BuildRouteClaims(FixedPath)
-                        EffectiveBaseClaims.append((
-                            Signal,
-                            tuple(sorted(FixedClaims.WireCells)),
-                            tuple(sorted(FixedClaims.SupportCells)),
-                            tuple(sorted(
-                                FixedClaims.RequiredAirCells
-                            )),
-                            tuple(sorted(FixedClaims.ElectricalCells)),
-                        ))
-                        DetachedSeedAnchorsBySignal.setdefault(
-                            Signal,
-                            [],
-                        ).append(FixedPath)
-                EffectiveDetachedSeedAnchors = tuple(
-                    (
-                        Signal,
-                        tuple(dict.fromkeys(Anchors)),
-                    )
-                    for Signal, Anchors
-                    in sorted(DetachedSeedAnchorsBySignal.items())
-                )
-                BaseClaimSignals = frozenset(
-                    str(Claim[0]) for Claim in EffectiveBaseClaims
-                )
-                GuideSignals = []
-                MissingSignals = []
-                for Signal, Profile in sorted(Profiles.items()):
-                    Signal = str(Signal)
-                    TerminalVariables = tuple(
-                        VariableBySignalTerminal[(
-                            Signal,
-                            tuple(Terminal),
-                        )]
-                        for Terminal in (
-                            Profile.Root,
-                            *Profile.Targets,
-                        )
-                        if (
-                            Signal,
-                            tuple(Terminal),
-                        ) in VariableBySignalTerminal
-                    )
-                    PhysicalTerminalCount = (
-                        len(TerminalVariables)
-                        + len(DetachedSeedAnchorsBySignal.get(
-                            Signal,
-                            (),
-                        ))
-                    )
-                    if PhysicalTerminalCount >= 2:
-                        SourceTerminalVariable = (
-                            VariableBySignalTerminal.get((
-                                Signal,
-                                tuple(Profile.Root),
-                            ))
-                        )
-                        SourceDetachedAnchorIndex = None
-                        if SourceTerminalVariable is None:
-                            SourcePath = tuple(map(
-                                tuple,
-                                Profile.SourceAccessPath,
-                            ))
-                            SourceAnchors = tuple(
-                                DetachedSeedAnchorsBySignal.get(
-                                    Signal,
-                                    (),
-                                )
-                            )
-                            try:
-                                SourceDetachedAnchorIndex = (
-                                    SourceAnchors.index(SourcePath)
-                                )
-                            except ValueError as Error:
-                                raise RuntimeError(
-                                    "native layered guide metadata omitted "
-                                    f"the source anchor for {Signal}"
-                                ) from Error
-                        GuideSignals.append(
-                            PlacementAccessNativeGuideSignal(
-                                Signal=Signal,
-                                TerminalVariables=TerminalVariables,
-                                PortalVariantCount=int(
-                                    Policy.TrackAssignment
-                                    .MaximumPortalsPerTerminal
-                                ),
-                                RegionTerminalColumns=(
-                                    RegionTerminalColumnsBySignal[Signal]
-                                ),
-                                SourceTerminalVariable=(
-                                    SourceTerminalVariable
-                                ),
-                                SourceDetachedAnchorIndex=(
-                                    SourceDetachedAnchorIndex
-                                ),
-                            )
-                        )
-                    elif Signal in BaseClaimSignals:
-                        # The attached local claim is already a complete
-                        # physical route for this signal; it remains a base
-                        # capacity factor and needs no global guide variable.
-                        continue
-                    else:
-                        MissingSignals.append(Signal)
-                GuideSignals = tuple(GuideSignals)
-                if MissingSignals:
-                    raise RuntimeError(
-                        "native layered guide metadata is missing access "
-                        "or detached local terminals for "
-                        f"{tuple(sorted(MissingSignals))!r}"
-                    )
-                if FabricDescriptor.Shell is not None:
-                    ActiveFaceSet = frozenset(
-                        FabricDescriptor.Shell.ActiveFaces
-                    )
-                    FabricNodeCandidates = frozenset(
-                        (X, Y, Z)
-                        for (
-                            RingMinimumX,
-                            RingMaximumX,
-                            RingMinimumZ,
-                            RingMaximumZ,
-                        ) in FabricDescriptor.Shell.RingBounds
-                        for Y in FabricDescriptor.Shell.FabricYs
-                        for X, Z, Face in (
-                            *((X, RingMinimumZ, "north") for X in range(
-                                RingMinimumX,
-                                RingMaximumX + 1,
-                            )),
-                            *((X, RingMaximumZ, "south") for X in range(
-                                RingMinimumX,
-                                RingMaximumX + 1,
-                            )),
-                            *((RingMinimumX, Z, "west") for Z in range(
-                                RingMinimumZ,
-                                RingMaximumZ + 1,
-                            )),
-                            *((RingMaximumX, Z, "east") for Z in range(
-                                RingMinimumZ,
-                                RingMaximumZ + 1,
-                            )),
-                        )
-                        if Face in ActiveFaceSet
-                    )
-                else:
-                    TrackPitch = int(Technology.TrackPitch)
-                    Margin = TrackPitch * 2
-                    GateMinimumX = min(
-                        int(Gate.X)
-                        for Gate in Candidate.Placement.Placed.PlacedGates
-                    )
-                    GateMaximumX = max(
-                        int(Gate.X)
-                        + RotatedCellSize(Gate.Kind, Gate.Rotation)[0]
-                        - 1
-                        for Gate in Candidate.Placement.Placed.PlacedGates
-                    )
-                    GateMinimumZ = min(
-                        int(Gate.Z)
-                        for Gate in Candidate.Placement.Placed.PlacedGates
-                    )
-                    EffectiveLaneCount = min(
-                        16,
-                        max(4, sum(
-                            1 + len(Profile.Targets)
-                            for Profile in Profiles.values()
-                        )),
-                    )
-                    LaneCoordinates = tuple(
-                        GateMinimumZ - Margin + TrackPitch * Index
-                        for Index in range(EffectiveLaneCount)
-                    )
-                    SpineCoordinates = tuple(range(
-                        GateMinimumX - Margin,
-                        GateMaximumX + Margin + 1,
-                        TrackPitch,
-                    ))
-                    FixedFabricYs = tuple(
-                        int(Technology.RoutingY(BaseY, Layer))
-                        for Layer in (
-                            DeclaredFixedAccessLayersByPlacementFingerprint[
-                                Candidate.PlacementFingerprint
-                            ]
-                        )
-                    )
-                    FabricNodeCandidates = frozenset(
-                        (X, Y, Z)
-                        for X in range(
-                            GateMinimumX - Margin,
-                            GateMaximumX + Margin + 1,
-                        )
-                        for Z in range(
-                            min(LaneCoordinates),
-                            max(LaneCoordinates) + 1,
-                        )
-                        for Y in FixedFabricYs
-                        if (
-                            Z in LaneCoordinates
-                            or X in SpineCoordinates
-                        )
-                    )
-                NativeEscapeViews.append(
-                    PlacementAccessNativeEscapeGuideMemberView(
-                        MemberId=Candidate.CandidateId,
-                        Objective=NativeAccessMemberObjective(Candidate),
-                        SourceMemberId=SourceCandidateId,
-                        Requests=Requests,
-                        RequestMetadata=RequestMetadata,
-                        MaximumY=MaximumY,
-                        MaximumExpansionCount=int(
-                            SourcePreparation.MaximumExpansionCount
-                        ),
-                        RoutingYs=tuple(
-                            int(Technology.RoutingY(BaseY, Layer))
-                            for Layer in range(int(
-                                Candidate.RoutingEnvelope
-                                .RoutingLayerCount
-                            ))
-                        ),
-                        MinimumX=MinimumGuideX,
-                        MinimumZ=MinimumGuideZ,
-                        TrackPitch=int(Technology.TrackPitch),
-                        LaneCount=int(
-                            Policy.GlobalRouting.CandidateLaneCount
-                        ),
-                        MaximumShapesPerSignal=int(
+            RawTrackAssignmentResult = (
+                SolveRawTrackAssignmentPortfolioWithContext(
+                    RawTrackAssignmentPortfolio(
+                        Templates=tuple(RawPortfolioTemplates),
+                        MaximumAssignmentExpansions=(
                             Policy.TrackAssignment
-                            .MaximumRouteCandidatesPerNet
+                            .MaximumAssignmentExpansions
                         ),
-                        GuideExpansion=(
-                            max(
-                                int(
-                                    Policy.DetailedRouting.GuideExpansion
-                                ),
-                                int(
-                                    FabricDescriptor
-                                    .AccessRingTrackCount
-                                ) * int(Technology.TrackPitch),
-                            )
-                            if FabricDescriptor.TopologyKind
-                            == "derived-perimeter-access-v1"
-                            else int(
-                                Policy.GlobalRouting
-                                .IntraClusterEnvelope
-                            )
-                        ),
-                        RegionExpansion=int(
-                            Policy.DetailedRouting.GuideExpansion
-                        ),
-                        FabricNodeCandidates=tuple(sorted(
-                            FabricNodeCandidates
-                        )),
-                        GuideSignals=GuideSignals,
-                        BaseClaims=tuple(EffectiveBaseClaims),
-                        DetachedSeedAnchors=(
-                            EffectiveDetachedSeedAnchors
-                        ),
-                    )
-                )
-            (
-                IntegratedNativeAccessSelection,
-                IntegratedNativeSelectedMemberResult,
-                IntegratedNativeSelectedGuides,
-                NativeEscapeBatchDiagnostics,
-            ) = SolvePlacementAccessNativeEscapeGuideFactorCatalogBounded(
-                    NativeEscapePreparations,
-                    NativeEscapeViews,
-                    MaximumAssignmentExpansionCount=(
-                        Policy.TrackAssignment.MaximumAssignmentExpansions
+                        # This compact geometry portfolio is deliberately
+                        # finite but not exhaustive over every legal
+                        # placement.  Complete member cores therefore do
+                        # not license an UNSAT classification.
+                        NonExhaustiveTemplateDomain=True,
                     ),
-                    RemainingMilliseconds=Deadline.RemainingMilliseconds(),
+                    MaterializeRawTemplate,
+                    Deadline=Deadline,
+                    WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                        "PreRouteInterfaceSelection",
+                        Diagnostics,
+                    ),
                 )
-            IntegratedSelectedCandidateId = str(getattr(
-                IntegratedNativeAccessSelection,
-                "SelectedTemplateId",
-                "",
-            ) or "")
-            SelectedSourceCandidateId = ""
-            SelectedSourcePreparation = None
-            if IntegratedSelectedCandidateId:
-                SelectedCandidateForSource = CandidateById[
-                    IntegratedSelectedCandidateId
-                ]
-                SelectedSourceCandidateId = str(
-                    NativeEscapeSourceCandidateIdByIdentity.get((
-                        SelectedCandidateForSource.PlacementFingerprint,
-                        PreRouteFabricDescriptorsByCandidateId[
-                            IntegratedSelectedCandidateId
-                        ].TopologyKind,
-                    ), "")
-                )
-                SelectedSourcePreparation = (
-                    NativeEscapeContinuationsByCandidateId.get(
-                        SelectedSourceCandidateId
-                    )
-                )
-            NativeEscapeBatchResultsByCandidateId = {}
-            NativeEscapeContinuationsByCandidateId = {}
-            if IntegratedSelectedCandidateId:
-                SelectedNativeCandidate = CandidateById[
-                    IntegratedSelectedCandidateId
-                ]
-                SelectedFabricDescriptor = (
-                    PreRouteFabricDescriptorsByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ]
-                )
+            )
+            SelectedTemplate = TemplateById.get(
+                RawTrackAssignmentResult.SelectedTemplateId
+            )
+            SelectedWitness = (
+                SelectedTemplate.Witnesses[0]
                 if (
-                    SelectedSourceCandidateId
-                    == IntegratedSelectedCandidateId
-                    and SelectedSourcePreparation is not None
-                ):
-                    if IntegratedNativeSelectedMemberResult is None:
-                        raise RuntimeError(
-                            "native layered access selection omitted its "
-                            "selected path catalog"
-                        )
-                    NativeEscapeContinuationsByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ] = SelectedSourcePreparation
-                    NativeEscapeBatchResultsByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ] = replace(
-                        IntegratedNativeSelectedMemberResult,
-                        MemberId=IntegratedSelectedCandidateId,
-                        PreparationFingerprint=(
-                            SelectedSourcePreparation.Preparation
-                            .PreparationFingerprint
-                        ),
-                    )
-                    NativeEscapeBatchDiagnostics.update({
-                        "SelectedPreparationElapsedSeconds": 0.0,
-                        "SelectedPreparationReused": True,
-                    })
-                    SelectedNativeCandidate = None
-                else:
-                    NativeEscapeBatchDiagnostics[
-                        "SelectedPreparationReused"
-                    ] = False
-                if SelectedNativeCandidate is None:
-                    pass
-                else:
-                    NativeEscapeSelectedPreparationStartedAt = monotonic()
-                    try:
-                        BuildPlacementAccessFabric(
-                        SelectedNativeCandidate.Placement,
-                        Resources=CandidateResourcesById[
-                            IntegratedSelectedCandidateId
-                        ],
-                        Technology=Technology,
-                        AccessLength=(
-                            SelectedNativeCandidate.RoutingEnvelope.AccessLength
-                        ),
-                        TopologyKind=(
-                            SelectedFabricDescriptor.TopologyKind
-                        ),
-                        AccessRingTrackCount=(
-                            SelectedFabricDescriptor.AccessRingTrackCount
-                        ),
-                        Shell=SelectedFabricDescriptor.Shell,
-                        BoundarySignals=None,
-                        CompleteRouteSignals=frozenset(),
-                        DeriveLegalEscapeWorkLimit=(
-                            SelectedFabricDescriptor
-                            .DeriveLegalEscapeWorkLimit
-                        ),
-                        RestrictDerivedIngressToRepresentatives=(
-                            SelectedFabricDescriptor.TopologyKind
-                            == "derived-perimeter-access-v1"
-                        ),
-                        DeferEscapeStubCapacityResourceIds=True,
-                        FixedAccessFabricLayers=(
-                            tuple(
-                                Layer
-                                for Layer in (
-                                    DeclaredFixedAccessLayersByPlacementFingerprint[
-                                        SelectedNativeCandidate
-                                        .PlacementFingerprint
-                                    ]
-                                )
-                                if Layer < int(
-                                    SelectedNativeCandidate
-                                    .RoutingEnvelope.RoutingLayerCount
-                                )
-                            )
-                            if SelectedFabricDescriptor.TopologyKind
-                            == "fixed-access-band-v1"
-                            else None
-                        ),
-                        NativeEscapeRemainingMilliseconds=(
-                            Deadline.RemainingMilliseconds
-                        ),
-                        NativeEscapeBatchMemberId=(
-                            IntegratedSelectedCandidateId
-                        ),
-                        NativeEscapeBatchPhysicalIdentity=(
-                            BuildStableFingerprint({
-                                "Descriptor": (
-                                    SelectedFabricDescriptor
-                                    .MaterializationInputFingerprint
-                                ),
-                                "ExactSelectedLayer": int(
-                                    SelectedNativeCandidate
-                                    .RoutingEnvelope.RoutingLayerCount
-                                ),
-                            })
-                        ),
-                        PrepareNativeEscapeBatchOnly=True,
-                        WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
-                            "SelectedPlacementAccessFabricPreparation",
-                            Diagnostics,
-                        ),
-                        )
-                    except PlacementAccessNativeEscapePreparationRequested as Prepared:
-                        NativeEscapeBatchDiagnostics[
-                            "SelectedPreparationElapsedSeconds"
-                        ] = round(
-                            monotonic()
-                            - NativeEscapeSelectedPreparationStartedAt,
-                            6,
-                        )
-                        if IntegratedNativeSelectedMemberResult is None:
-                            raise RuntimeError(
-                                "native layered access selection omitted "
-                                "its selected path catalog"
-                            )
-                        ExactNativeResult = replace(
-                            IntegratedNativeSelectedMemberResult,
-                            MemberId=IntegratedSelectedCandidateId,
-                            PreparationFingerprint=(
-                                Prepared.Preparation.PreparationFingerprint
-                            ),
-                        )
-                        NativeEscapeContinuationsByCandidateId[
-                            IntegratedSelectedCandidateId
-                        ] = Prepared
-                        NativeEscapeBatchResultsByCandidateId[
-                            IntegratedSelectedCandidateId
-                        ] = ExactNativeResult
-            NativeEscapeBatchDiagnostics[
-                "PreparationElapsedSeconds"
-            ] = round(
-                monotonic()
-                - NativeEscapePreparationStartedAt
-                - float(NativeEscapeBatchDiagnostics.get(
-                    "ElapsedSeconds",
-                    0.0,
-                )),
-                6,
+                    SelectedTemplate is not None
+                    and len(SelectedTemplate.Witnesses) == 1
+                )
+                else None
             )
-            NativeEscapeBatchDiagnostics[
-                "SourcePreparationTimes"
-            ] = tuple(NativeEscapeSourcePreparationTimes)
-            NativeEscapeBatchDiagnostics[
-                "NativeRegionGraphCatalog"
-            ] = dict(NativeRegionGraphDiagnostics)
-            Deadline.RaiseIfExpired(
-                "PrePlacementAccessFabricNativeBatch",
-                NativeEscapeBatchDiagnostics,
-            )
-            NativeEscapeMaterializationStartedAt = monotonic()
-            NativeEscapeMemberMaterializationTimes: list[
-                tuple[str, float]
-            ] = []
-            for CandidateId, Prepared in (
-                NativeEscapeContinuationsByCandidateId.items()
-            ):
-                NativeResult = (
-                    NativeEscapeBatchResultsByCandidateId.get(CandidateId)
-                )
-                if NativeResult is None:
-                    raise RuntimeError(
-                        "native layered access catalog omitted prepared "
-                        f"member {CandidateId!r}"
-                    )
-                NativeEscapeMemberMaterializationStartedAt = monotonic()
-                PreparedAccessFabricsByCandidateId[CandidateId] = (
-                    CompletePlacementAccessNativeEscapePreparation(
-                        Prepared,
-                        NativeResult,
-                    )
-                )
-                NativeEscapeMemberMaterializationTimes.append((
-                    CandidateId,
-                    round(
-                        monotonic()
-                        - NativeEscapeMemberMaterializationStartedAt,
-                        6,
-                    ),
-                ))
-            FixedLayerProjectionStartedAt = monotonic()
-            FixedLayerProjectionCount = 0
-            NativeEscapeBatchDiagnostics[
-                "MaterializationElapsedSeconds"
-            ] = round(
-                monotonic() - NativeEscapeMaterializationStartedAt,
-                6,
-            )
-            NativeEscapeBatchDiagnostics.update({
-                "MemberMaterializationElapsedSeconds": tuple(
-                    NativeEscapeMemberMaterializationTimes
+            PreRouteInterfaceResult = PreRouteInterfaceSelection(
+                ProblemFingerprint=RawTrackAssignmentResult.ProblemFingerprint,
+                SelectionFingerprint=(
+                    RawTrackAssignmentResult.SelectionFingerprint
                 ),
-                "FixedLayerProjectionCount": FixedLayerProjectionCount,
-                "FixedLayerProjectionElapsedSeconds": round(
-                    monotonic() - FixedLayerProjectionStartedAt,
-                    6,
-                ),
-            })
-            FixedCandidatesByPlacementFingerprint: dict[
-                str, list[PcbPlacementCandidate]
-            ] = {}
-            SharedFixedLayerCatalogStartedAt = monotonic()
-            for Candidate in CandidateRecords:
-                FabricDescriptor = PreRouteFabricDescriptorsByCandidateId[
-                    Candidate.CandidateId
-                ]
-                if FabricDescriptor.TopologyKind != "fixed-access-band-v1":
-                    continue
-                if Candidate.CandidateId not in PreparedAccessFabricsByCandidateId:
-                    continue
-                FixedCandidatesByPlacementFingerprint.setdefault(
-                    Candidate.PlacementFingerprint,
-                    [],
-                ).append(Candidate)
-            for PlacementFingerprint, FixedCandidates in (
-                FixedCandidatesByPlacementFingerprint.items()
-            ):
-                OrderedFixedCandidates = tuple(sorted(
-                    FixedCandidates,
-                    key=lambda Value: int(
-                        Value.RoutingEnvelope.RoutingLayerCount
-                    ),
-                ))
-                ExpectedLayerCounts = tuple(range(
-                    min(
-                        int(Value.RoutingEnvelope.RoutingLayerCount)
-                        for Value in OrderedFixedCandidates
-                    ),
-                    max(
-                        int(Value.RoutingEnvelope.RoutingLayerCount)
-                        for Value in OrderedFixedCandidates
-                    ) + 1,
-                ))
-                ActualLayerCounts = tuple(
-                    int(Value.RoutingEnvelope.RoutingLayerCount)
-                    for Value in OrderedFixedCandidates
-                )
-                if ActualLayerCounts != ExpectedLayerCounts:
-                    raise RoutingStageError(RoutingFailure(
-                        Reason=(
-                            RoutingFailureReason
-                            .ClusterInterfaceSolveIncomplete
-                        ),
-                        Stage="PreRouteLayeredAccessCatalogIncomplete",
-                        Detail=(
-                            "the fixed access catalog is missing a declared "
-                            "exact layer member"
-                        ),
-                        Diagnostics={
-                            "PlacementFingerprint": PlacementFingerprint,
-                            "ExpectedLayerCounts": ExpectedLayerCounts,
-                            "ActualLayerCounts": ActualLayerCounts,
-                        },
-                    ))
-                LayerFabrics = tuple(
-                    PreparedAccessFabricsByCandidateId[Value.CandidateId]
-                    for Value in OrderedFixedCandidates
-                )
-                MaximumCandidate = OrderedFixedCandidates[-1]
-                MaximumFixedLayerCandidateByPlacementFingerprint[
-                    PlacementFingerprint
-                ] = MaximumCandidate
-                MaximumFabric = LayerFabrics[-1]
-                DomainsByLogicalKey: dict[str, list[Any]] = {}
-                for LayerFabric in LayerFabrics:
-                    for DomainIndex, Domain in enumerate(
-                        LayerFabric.TerminalDomains
-                    ):
-                        LogicalKey = str(
-                            Domain.LogicalKey
-                            or f"{DomainIndex}:{Domain.Signal}"
-                        )
-                        DomainsByLogicalKey.setdefault(
-                            LogicalKey,
-                            [],
-                        ).append(Domain)
-                LayeredDomains = []
-                for LogicalKey, Domains in sorted(
-                    DomainsByLogicalKey.items()
-                ):
-                    Reference = Domains[0]
-                    if any(
-                        Domain.Signal != Reference.Signal
-                        or Domain.Terminal != Reference.Terminal
-                        for Domain in Domains
-                    ):
-                        raise RuntimeError(
-                            "fixed layered access domains disagree on "
-                            f"terminal ownership for {LogicalKey!r}"
-                        )
-                    StubsByPhysicalIdentity = {
-                        (
-                            tuple(Stub.Path),
-                            tuple(Stub.Ingress),
-                            Stub.ChoiceId,
-                        ): Stub
-                        for Domain in Domains
-                        for Stub in Domain.EscapeStubs
-                    }
-                    LayeredDomains.append(replace(
-                        Reference,
-                        EscapeStubs=tuple(
-                            StubsByPhysicalIdentity[Identity]
-                            for Identity in sorted(
-                                StubsByPhysicalIdentity
-                            )
-                        ),
-                        Complete=all(Domain.Complete for Domain in Domains),
-                        IncompleteReason=(
-                            ""
-                            if all(Domain.Complete for Domain in Domains)
-                            else "incomplete-fixed-layer-access-domain"
-                        ),
-                    ))
-                LayeredNodes = tuple(sorted({
-                    Position
-                    for LayerFabric in LayerFabrics
-                    for Position in LayerFabric.Nodes
-                }))
-                LayeredNodeSet = frozenset(LayeredNodes)
-                LayeredEdges = tuple(sorted({
-                    Edge
-                    for LayerFabric in LayerFabrics
-                    for Edge in LayerFabric.Edges
-                    if Edge[0] in LayeredNodeSet
-                    and Edge[1] in LayeredNodeSet
-                }))
-                LayeredIngresses = tuple(sorted({
-                    Position
-                    for LayerFabric in LayerFabrics
-                    for Position in LayerFabric.IngressNodes
-                }))
-                LayeredClaims = CandidateResourcesById[
-                    MaximumCandidate.CandidateId
-                ].ResourceGraph.BuildRouteClaims(LayeredNodeSet)
-                SourceFabricFingerprints = tuple(
-                    Value.FabricFingerprint for Value in LayerFabrics
-                )
-                SharedLayerFabric = replace(
-                    MaximumFabric,
-                    FabricFingerprint=BuildStableFingerprint({
-                        "Kind": "exact-fixed-layer-access-catalog-v1",
-                        "Placement": PlacementFingerprint,
-                        "Layers": ActualLayerCounts,
-                        "SourceFabrics": SourceFabricFingerprints,
-                        "Domains": tuple(
-                            (
-                                Domain.LogicalKey,
-                                tuple(
-                                    (Stub.Path, Stub.Ingress, Stub.ChoiceId)
-                                    for Stub in Domain.EscapeStubs
-                                ),
-                            )
-                            for Domain in LayeredDomains
-                        ),
-                    }),
-                    Nodes=LayeredNodes,
-                    Edges=LayeredEdges,
-                    IngressNodes=LayeredIngresses,
-                    PhysicalClaims=LayeredClaims,
-                    CapacityResourceIds=(),
-                    TerminalDomains=tuple(LayeredDomains),
-                    AccessRingFingerprint=BuildStableFingerprint({
-                        "Kind": "exact-fixed-layer-access-ring-catalog-v1",
-                        "Placement": PlacementFingerprint,
-                        "Layers": ActualLayerCounts,
-                        "SourceFabrics": SourceFabricFingerprints,
-                    }),
-                    Complete=all(
-                        Value.Complete for Value in LayerFabrics
-                    ),
-                    IncompleteReason=(
-                        ""
-                        if all(Value.Complete for Value in LayerFabrics)
-                        else "incomplete-fixed-layer-access-catalog"
-                    ),
-                )
-                SharedFixedLayerAccessFabricByPlacementFingerprint[
-                    PlacementFingerprint
-                ] = SharedLayerFabric
-            NativeEscapeBatchDiagnostics.update({
-                "SharedFixedLayerCatalogCount": len(
-                    SharedFixedLayerAccessFabricByPlacementFingerprint
-                ),
-                "SharedFixedLayerGuideCatalogElapsedSeconds": 0.0,
-                "SharedFixedLayerCatalogElapsedSeconds": round(
-                    monotonic() - SharedFixedLayerCatalogStartedAt,
-                    6,
-                ),
-            })
-            if IntegratedSelectedCandidateId:
-                SelectedFabricForNativeRecipeHandoff = (
-                    PreparedAccessFabricsByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ]
-                )
-                (
-                    SelectedFabricForNativeRecipeHandoff,
-                    SelectedNativeStubFactorIds,
-                ) = (
-                    BuildPlacementAccessNativeSelectedStubFactorIds(
-                        SelectedFabricForNativeRecipeHandoff,
-                        NativeEscapeContinuationsByCandidateId[
-                            IntegratedSelectedCandidateId
-                        ].Preparation,
-                        NativeEscapeBatchResultsByCandidateId[
-                            IntegratedSelectedCandidateId
-                        ],
-                        tuple(getattr(
-                            IntegratedNativeAccessSelection,
-                            "SelectedCandidateIds",
-                            (),
-                        )),
-                    )
-                )
-                PreparedAccessFabricsByCandidateId[
-                    IntegratedSelectedCandidateId
-                ] = SelectedFabricForNativeRecipeHandoff
-                PlacementAccessEvidenceByCandidateId[
-                    IntegratedSelectedCandidateId
-                ] = (SelectedFabricForNativeRecipeHandoff, None)
-                NativeSelectedStubFactorIdsByCandidateId[
-                    IntegratedSelectedCandidateId
-                ] = SelectedNativeStubFactorIds
-                StableStubChoiceIdByVariable = dict(
-                    (
-                        str(Variable),
-                        str(FactorId).removeprefix("stub:"),
-                    )
-                    for Variable, FactorId
-                    in SelectedNativeStubFactorIds
-                )
-                StableVariableByNativeVariable = {
-                    (
-                        "__access_terminal__:"
-                        f"{Domain.Signal}@"
-                        + ",".join(map(str, Domain.Terminal))
-                    ): (
-                        "__access_terminal__:"
-                        + str(
-                            Domain.LogicalKey
-                            or f"{DomainIndex}:{Domain.Signal}"
-                        )
-                    )
-                    for DomainIndex, Domain in enumerate(
-                        SelectedFabricForNativeRecipeHandoff
-                        .TerminalDomains
-                    )
-                }
-                AdaptedNativeGuides = tuple(
-                    replace(
-                        Guide,
-                        AccessCandidateIds=tuple(
-                            (
-                                StableVariableByNativeVariable[
-                                    str(Variable)
-                                ],
-                                StableStubChoiceIdByVariable[
-                                    StableVariableByNativeVariable[
-                                        str(Variable)
-                                    ]
-                                ],
-                            )
-                            for Variable, _NativeCandidateId
-                            in Guide.AccessCandidateIds
-                        ),
-                    )
-                    for Guide in IntegratedNativeSelectedGuides
-                )
-                NativeSelectedGuideRecipesByCandidateId[
-                    IntegratedSelectedCandidateId
-                ] = AdaptedNativeGuides
-                DomainByLogicalKey = {
-                    str(
-                        Domain.LogicalKey
-                        or f"{DomainIndex}:{Domain.Signal}"
-                    ): Domain
-                    for DomainIndex, Domain in enumerate(
-                        SelectedFabricForNativeRecipeHandoff
-                        .TerminalDomains
-                    )
-                }
-                SelectedCandidateForNativeGuide = CandidateById[
-                    IntegratedSelectedCandidateId
-                ]
-                SelectedGuideBaseY = min(
-                    int(Gate.Y)
-                    for Gate in (
-                        SelectedCandidateForNativeGuide
-                        .Placement.Placed.PlacedGates
-                    )
-                )
-                SelectedGuideLayerCount = int(
-                    SelectedCandidateForNativeGuide
-                    .RoutingEnvelope.RoutingLayerCount
-                )
-                SelectedGuideRoutingYs = tuple(
-                    int(Technology.RoutingY(SelectedGuideBaseY, Layer))
-                    for Layer in range(SelectedGuideLayerCount)
-                )
-
-                def CountNativeGuidePortalBends(
-                    Path: tuple[tuple[int, int, int], ...],
-                ) -> int:
-                    Directions = tuple(
-                        (
-                            Second[0] - First[0],
-                            Second[1] - First[1],
-                            Second[2] - First[2],
-                        )
-                        for First, Second in zip(Path, Path[1:])
-                    )
-                    return sum(
-                        First != Second
-                        for First, Second
-                        in zip(Directions, Directions[1:])
-                    )
-
-                def MergeFixedAccessPathAndRamp(
-                    FixedPath: tuple[tuple[int, int, int], ...],
-                    Ramp: tuple[tuple[int, int, int], ...],
-                ) -> tuple[tuple[int, int, int], ...]:
-                    """Join an exact fixed path and ramp by erasing loops.
-
-                    A shortest ramp may legally backtrack over the tail of a
-                    same-owner fixed access path before leaving through an
-                    earlier junction.  Set-style deduplication preserves the
-                    wrong endpoints around that loop and invents a non-edge.
-                    Ordered loop erasure retains the exact terminal-to-guide
-                    walk; the complete fixed path remains in mandatory local
-                    claims independently of this portal traversal.
-                    """
-                    Merged: list[tuple[int, int, int]] = []
-                    IndexByPosition: dict[
-                        tuple[int, int, int], int
-                    ] = {}
-                    for Position in (*FixedPath, *Ramp[1:]):
-                        ExistingIndex = IndexByPosition.get(Position)
-                        if ExistingIndex is not None:
-                            for Removed in Merged[ExistingIndex + 1 :]:
-                                IndexByPosition.pop(Removed, None)
-                            del Merged[ExistingIndex + 1 :]
-                            continue
-                        IndexByPosition[Position] = len(Merged)
-                        Merged.append(Position)
-                    return tuple(Merged)
-
-                def MergeNativeGuideClaims(
-                    Values: Iterable[RoutingResourceClaims],
-                ) -> RoutingResourceClaims:
-                    Values = tuple(Values)
-                    return RoutingResourceClaims(
-                        WireCells=frozenset().union(*(
-                            Value.WireCells for Value in Values
-                        )),
-                        SupportCells=frozenset().union(*(
-                            Value.SupportCells for Value in Values
-                        )),
-                        RequiredAirCells=frozenset().union(*(
-                            Value.RequiredAirCells for Value in Values
-                        )),
-                        ElectricalCells=frozenset().union(*(
-                            Value.ElectricalCells for Value in Values
-                        )),
-                    )
-
-                SelectedGuideLocalClaimsBySignal: dict[
-                    str, RoutingResourceClaims
-                ] = {}
-                for Claim in SelectAttachedLocalRouteClaims(
-                    SelectedCandidateForNativeGuide.Placement.Placed
-                ):
-                    SelectedGuideLocalClaimsBySignal[str(Claim.Signal)] = (
-                        MergeNativeGuideClaims((
-                            *(
-                                (SelectedGuideLocalClaimsBySignal[
-                                    str(Claim.Signal)
-                                ],)
-                                if str(Claim.Signal)
-                                in SelectedGuideLocalClaimsBySignal
-                                else ()
-                            ),
-                            Claim.Claims,
-                        ))
-                    )
-
-                def ExtendFixedAccessPathToGuideIngress(
-                    Signal: str,
-                    Path: tuple[tuple[int, int, int], ...],
-                    *,
-                    GuideColumns: frozenset[tuple[int, int]],
-                    GuideExpansion: int,
-                    AllowTruncation: bool,
-                ) -> tuple[tuple[int, int, int], ...]:
-                    """Expose one fixed pin path to a legal detailed ingress.
-
-                    A placement-local access path ends at the edge of its cell,
-                    not necessarily at a routing-graph ingress.  The compact
-                    guide owns a finite expansion corridor, so extend the path
-                    monotonically along its declared outward direction only
-                    until one exact conflict-free graph neighbor can attach.
-                    This is selected-world portal materialization, not another
-                    placement, guide, or assignment choice.
-                    """
-                    if len(Path) < 2:
-                        return Path
-                    ResourceGraph = CandidateResourcesById[
-                        IntegratedSelectedCandidateId
-                    ].ResourceGraph
-                    BaseClaimsBySignal = dict(
-                        SelectedGuideLocalClaimsBySignal
-                    )
-
-                    def IsWithinGuideCorridor(
-                        Position: tuple[int, int, int],
-                    ) -> bool:
-                        return min(
-                            abs(Position[0] - X)
-                            + abs(Position[2] - Z)
-                            for X, Z in GuideColumns
-                        ) <= GuideExpansion
-
-                    def ClaimsRemainLegal(
-                        CandidatePath: tuple[
-                            tuple[int, int, int], ...
-                        ],
-                    ) -> bool:
-                        CandidateClaims = ResourceGraph.BuildRouteClaims(
-                            CandidatePath
-                        )
-                        ClaimsBySignal = dict(BaseClaimsBySignal)
-                        ClaimsBySignal[Signal] = MergeNativeGuideClaims((
-                            *(
-                                (ClaimsBySignal[Signal],)
-                                if Signal in ClaimsBySignal
-                                else ()
-                            ),
-                            CandidateClaims,
-                        ))
-                        return (
-                            not FindSelfClaimConflicts(ClaimsBySignal)
-                            and not FindClaimConflicts(ClaimsBySignal)
-                        )
-
-                    def HasLegalIngressNeighbor(
-                        CandidatePath: tuple[
-                            tuple[int, int, int], ...
-                        ],
-                    ) -> tuple[int, int, int] | None:
-                        Endpoint = CandidatePath[-1]
-                        for Neighbor in sorted(
-                            Technology.NeighborPositions(Endpoint)
-                        ):
-                            Neighbor = tuple(Neighbor)
-                            if (
-                                Neighbor in Path
-                                or Neighbor[1] < SelectedGuideBaseY
-                                or Neighbor[1] > max(
-                                    SelectedGuideRoutingYs
-                                )
-                                or not IsWithinGuideCorridor(Neighbor)
-                                or not ResourceGraph.IsLegalNode(Neighbor)
-                                or ResourceGraph.BuildPrimitive(
-                                    Endpoint,
-                                    Neighbor,
-                                ) is None
-                            ):
-                                continue
-                            if ClaimsRemainLegal((
-                                *CandidatePath,
-                                Neighbor,
-                            )):
-                                return Neighbor
-                        return None
-
-                    Extended = tuple(Path)
-                    Direction = tuple(
-                        Extended[-1][Index] - Extended[-2][Index]
-                        for Index in range(3)
-                    )
-                    if (
-                        Direction[1] != 0
-                        or abs(Direction[0]) + abs(Direction[2]) != 1
-                    ):
-                        return Extended
-                    InitialIngressNeighbor = HasLegalIngressNeighbor(
-                        Extended
-                    )
-                    if InitialIngressNeighbor is not None:
-                        return Extended
-                    if AllowTruncation:
-                        for PrefixLength in range(
-                            len(Extended) - 1,
-                            0,
-                            -1,
-                        ):
-                            Prefix = Extended[:PrefixLength]
-                            IngressNeighbor = HasLegalIngressNeighbor(Prefix)
-                            if IngressNeighbor is not None:
-                                return Prefix
-                    for _Offset in range(GuideExpansion + 1):
-                        IngressNeighbor = HasLegalIngressNeighbor(Extended)
-                        if IngressNeighbor is not None:
-                            return Extended
-                        Next = tuple(
-                            Extended[-1][Index] + Direction[Index]
-                            for Index in range(3)
-                        )
-                        NextWithinGuide = IsWithinGuideCorridor(Next)
-                        NextLegalNode = ResourceGraph.IsLegalNode(Next)
-                        NextPrimitive = ResourceGraph.BuildPrimitive(
-                            Extended[-1],
-                            Next,
-                        )
-                        NextClaimsLegal = ClaimsRemainLegal((
-                            *Extended,
-                            Next,
-                        ))
-                        if (
-                            not NextWithinGuide
-                            or not NextLegalNode
-                            or NextPrimitive is None
-                            or not NextClaimsLegal
-                        ):
-                            break
-                        Extended = (*Extended, Next)
-                    return Extended
-
-                SelectedGuideDescriptors = []
-                SelectedGuideProfiles = BuildNetRoutingProfiles(
-                    SelectedCandidateForNativeGuide.Placement.Placed,
-                    AccessLength=(
-                        SelectedCandidateForNativeGuide
-                        .RoutingEnvelope.AccessLength
-                    ),
-                )
-                for ProfileSignal, ProfileValue in (
-                    SelectedGuideProfiles.items()
-                ):
-                    ProfileClaims = CandidateResourcesById[
-                        IntegratedSelectedCandidateId
-                    ].ResourceGraph.BuildRouteClaims(frozenset({
-                        *ProfileValue.SourceAccessPath,
-                        *(
-                            Position
-                            for AccessPath in (
-                                ProfileValue.TargetAccessPaths.values()
-                            )
-                            for Position in AccessPath
-                        ),
-                    }))
-                    SelectedGuideLocalClaimsBySignal[
-                        str(ProfileSignal)
-                    ] = MergeNativeGuideClaims((
-                        *(
-                            (SelectedGuideLocalClaimsBySignal[
-                                str(ProfileSignal)
-                            ],)
-                            if str(ProfileSignal)
-                            in SelectedGuideLocalClaimsBySignal
-                            else ()
-                        ),
-                        ProfileClaims,
-                    ))
-                for AdaptedGuide in AdaptedNativeGuides:
-                    Signal = str(AdaptedGuide.Variable).removeprefix(
-                        "__route_guide__:"
-                    )
-                    Profile = SelectedGuideProfiles.get(Signal)
-                    if Profile is None:
-                        raise RuntimeError(
-                            "selected native guide has no routing profile"
-                        )
-                    GuideLayer = SelectedGuideRoutingYs.index(
-                        int(AdaptedGuide.RoutingY)
-                    )
-                    GuideExpansion = (
-                        max(
-                            int(Policy.DetailedRouting.GuideExpansion),
-                            int(
-                                SelectedFabricForNativeRecipeHandoff
-                                .AccessRingTrackCount
-                            ) * int(Technology.TrackPitch),
-                        )
-                        if (
-                            SelectedFabricForNativeRecipeHandoff.TopologyKind
-                            == "derived-perimeter-access-v1"
-                        )
-                        else int(
-                            Policy.GlobalRouting.IntraClusterEnvelope
-                        )
-                    )
-                    NativeLogicalGuideColumns = frozenset(
-                        (int(X), int(Z))
-                        for X, _Y, Z in AdaptedGuide.Guide
-                    )
-                    NativePhysicalGuideColumns = frozenset(
-                        (int(X), int(Z))
-                        for X, _Y, Z in AdaptedGuide.PhysicalGuide
-                    )
-                    PortalByTerminal = {}
-                    for StableVariable, StubChoiceId in (
-                        AdaptedGuide.AccessCandidateIds
-                    ):
-                        LogicalKey = str(StableVariable).removeprefix(
-                            "__access_terminal__:"
-                        )
-                        Domain = DomainByLogicalKey[LogicalKey]
-                        MatchingStubIndexes = tuple(
-                            StubIndex
-                            for StubIndex, Stub in enumerate(
-                                Domain.EscapeStubs
-                            )
-                            if BuildPlacementAccessEscapeStubChoiceId(Stub)
-                            == str(StubChoiceId)
-                        )
-                        if len(MatchingStubIndexes) != 1:
-                            raise RuntimeError(
-                                "selected native guide requirement did not "
-                                "map to one exact access stub"
-                            )
-                        StubIndex = MatchingStubIndexes[0]
-                        Stub = Domain.EscapeStubs[StubIndex]
-                        PortalLayer = next((
-                            Layer
-                            for Layer, RoutingY in enumerate(
-                                SelectedGuideRoutingYs
-                            )
-                            if int(Stub.Ingress[1]) == RoutingY
-                        ), None)
-                        if PortalLayer is None:
-                            raise RuntimeError(
-                                "selected native guide access stub is "
-                                "outside its layer contract"
-                            )
-                        Path = tuple(Stub.Path)
-                        MatchingAccessRamps = tuple(
-                            Ramp
-                            for Ramp in AdaptedGuide.AccessRamps
-                            if Ramp and tuple(Ramp[0]) == tuple(Path[-1])
-                        )
-                        if len(MatchingAccessRamps) != 1:
-                            raise RuntimeError(
-                                "selected native guide did not preserve one "
-                                "exact layered access ramp for selected stub "
-                                f"{Signal}:{tuple(Domain.Terminal)}"
-                            )
-                        Path = MergeFixedAccessPathAndRamp(
-                            Path,
-                            MatchingAccessRamps[0],
-                        )
-                        PortalByTerminal[tuple(Domain.Terminal)] = (
-                            PinAccessPortal(
-                                PortalId=(
-                                    f"{Signal}:{tuple(Domain.Terminal)}:"
-                                    f"{PortalLayer}:AccessFabricDomain:"
-                                    f"{SelectedFabricForNativeRecipeHandoff.FabricFingerprint}:"
-                                    f"{StubIndex}"
-                                ),
-                                Signal=Signal,
-                                Terminal=tuple(Domain.Terminal),
-                                Layer=PortalLayer,
-                                Path=Path,
-                                Edges=frozenset(
-                                    NormalizeRoutingEdge(First, Second)
-                                    for First, Second
-                                    in zip(Path, Path[1:])
-                                ),
-                                # Compact catalog stubs deliberately defer
-                                # full claims until this selected handoff.
-                                Claims=(
-                                    CandidateResourcesById[
-                                        IntegratedSelectedCandidateId
-                                    ].ResourceGraph.BuildRouteClaims(Path)
-                                ),
-                                Length=len(Path),
-                                BendCount=CountNativeGuidePortalBends(Path),
-                                ViaCount=sum(
-                                    First[1] != Second[1]
-                                    for First, Second
-                                    in zip(Path, Path[1:])
-                                ),
-                                Cost=len(Path),
-                            )
-                        )
-                    FixedPathByTerminal = {
-                        tuple(Profile.Root): tuple(Profile.SourceAccessPath),
-                        **{
-                            tuple(Terminal): tuple(Path)
-                            for Terminal, Path
-                            in Profile.TargetAccessPaths.items()
-                        },
-                    }
-                    for Terminal in (
-                        tuple(Profile.Root),
-                        *tuple(map(tuple, Profile.Targets)),
-                    ):
-                        if Terminal in PortalByTerminal:
-                            continue
-                        Path = FixedPathByTerminal.get(Terminal, ())
-                        if not Path:
-                            raise RuntimeError(
-                                "selected native guide omitted an exact "
-                                "fixed access path"
-                            )
-                        MatchingAccessRamps = tuple(
-                            Ramp
-                            for Ramp in AdaptedGuide.AccessRamps
-                            if Ramp and tuple(Ramp[0]) == tuple(Path[-1])
-                        )
-                        if len(MatchingAccessRamps) != 1:
-                            raise RuntimeError(
-                                "selected native guide did not preserve one "
-                                "exact layered access ramp for fixed terminal "
-                                f"{Signal}:{Terminal}"
-                            )
-                        Path = MergeFixedAccessPathAndRamp(
-                            Path,
-                            MatchingAccessRamps[0],
-                        )
-                        PortalByTerminal[Terminal] = PinAccessPortal(
-                            PortalId=(
-                                f"{Signal}:{Terminal}:{GuideLayer}:"
-                                "FixedAccessPath"
-                            ),
-                            Signal=Signal,
-                            Terminal=Terminal,
-                            Layer=GuideLayer,
-                            Path=Path,
-                            Edges=frozenset(
-                                NormalizeRoutingEdge(First, Second)
-                                for First, Second in zip(Path, Path[1:])
-                            ),
-                            Claims=(
-                                CandidateResourcesById[
-                                    IntegratedSelectedCandidateId
-                                ].ResourceGraph.BuildRouteClaims(Path)
-                            ),
-                            Length=len(Path),
-                            BendCount=CountNativeGuidePortalBends(Path),
-                            ViaCount=sum(
-                                First[1] != Second[1]
-                                for First, Second in zip(Path, Path[1:])
-                            ),
-                            Cost=len(Path),
-                        )
-                    Portals = tuple(
-                        PortalByTerminal[Terminal]
-                        for Terminal in (
-                            tuple(Profile.Root),
-                            *tuple(map(tuple, Profile.Targets)),
-                        )
-                    )
-                    if len(Portals) < 2:
-                        raise RuntimeError(
-                            "selected native guide omitted a route terminal"
-                        )
-                    Shape = CandidateRequestShapeDescriptor(
-                        SourcePortal=Portals[0],
-                        TargetPortals=tuple(Portals[1:]),
-                        Guide=NativeLogicalGuideColumns,
-                        Layer=GuideLayer,
-                        Axis=str(AdaptedGuide.Axis),
-                        Lane=int(AdaptedGuide.Lane),
-                        Variant=0,
-                        PortalShapeRank=0,
-                        RoutingY=int(AdaptedGuide.RoutingY),
-                        GuideExpansion=GuideExpansion,
-                        InitiallyDeferred=False,
-                        Priority=(
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            str(AdaptedGuide.Axis),
-                            int(AdaptedGuide.Lane),
-                        ),
-                        PhysicalGuide=NativePhysicalGuideColumns,
-                    )
-                    SelectedGuideDescriptors.append((
-                        Signal,
-                        str(AdaptedGuide.CandidateId),
-                        Shape,
-                    ))
-                NativeSelectedGuideDescriptorsByCandidateId[
-                    IntegratedSelectedCandidateId
-                ] = tuple(SelectedGuideDescriptors)
-                SelectedGuideValuesBySignal: dict[
-                    str, list[RawTrackAssignmentValue]
-                ] = {}
-                SelectedPlacementFingerprint = (
-                    BuildRawPortalPlacementGeometryFingerprint(
-                        SelectedCandidateForNativeGuide.Placement.Placed
-                    )
-                )
-                SelectedResourceFingerprint = (
-                    CachedResourceGeometryFingerprint(
-                        CandidateResourcesById[
-                            IntegratedSelectedCandidateId
-                        ]
-                    )
-                )
-                SelectedTechnologyFingerprint = BuildStableFingerprint((
-                    "compact-guide-technology-v1",
-                    getattr(Technology, "TechnologyVersion", ""),
-                    repr(Technology),
-                ))
-                for Signal, FactorId, Shape in SelectedGuideDescriptors:
-                    NativeGuide = next(
-                        Value
-                        for Value in AdaptedNativeGuides
-                        if (
-                            str(Value.Variable).removeprefix(
-                                "__route_guide__:"
-                            ) == Signal
-                            and str(Value.CandidateId) == FactorId
-                        )
-                    )
-                    AccessRequirements = tuple(sorted({
-                        (
-                            "access-stub:"
-                            + str(Variable).removeprefix(
-                                "__access_terminal__:"
-                            ),
-                            str(CandidateId).removeprefix("stub:"),
-                        )
-                        for Variable, CandidateId
-                        in NativeGuide.AccessCandidateIds
-                    }))
-                    CertificateIdentity = (
-                        FactorId,
-                        tuple(
-                            tuple(Portal.Path)
-                            for Portal in (
-                                Shape.SourcePortal,
-                                *Shape.TargetPortals,
-                            )
-                        ),
-                        tuple(NativeGuide.AccessRamps),
-                        tuple(sorted(Shape.Guide)),
-                        tuple(sorted(
-                            Shape.PhysicalGuide
-                            if Shape.PhysicalGuide is not None
-                            else Shape.Guide
-                        )),
-                        int(Shape.RoutingY),
-                        AccessRequirements,
-                    )
-                    Certificate = CompactGuideMaterializabilityCertificate(
-                        FactorId=FactorId,
-                        PlacementFingerprint=SelectedPlacementFingerprint,
-                        ResourceGraphFingerprint=(
-                            SelectedResourceFingerprint
-                        ),
-                        TechnologyFingerprint=(
-                            SelectedTechnologyFingerprint
-                        ),
-                        FabricFingerprint=str(
-                            SelectedFabricForNativeRecipeHandoff
-                            .FabricFingerprint
-                        ),
-                        AccessShellFingerprint=str(
-                            SelectedFabricForNativeRecipeHandoff
-                            .AccessRingFingerprint
-                        ),
-                        RequiredNodesFingerprint=BuildStableFingerprint((
-                            "native-selected-required-nodes-v1",
-                            CertificateIdentity,
-                        )),
-                        BlockedNodesFingerprint=BuildStableFingerprint((
-                            "native-selected-blocked-nodes-v1",
-                            FactorId,
-                            SelectedResourceFingerprint,
-                        )),
-                        GuideColumnsFingerprint=BuildStableFingerprint((
-                            "native-selected-guide-columns-v1",
-                            int(Shape.RoutingY),
-                            tuple(sorted(Shape.Guide)),
-                            tuple(sorted(
-                                Shape.PhysicalGuide
-                                if Shape.PhysicalGuide is not None
-                                else Shape.Guide
-                            )),
-                            int(Shape.GuideExpansion),
-                        )),
-                        StaticClaimsFingerprint=BuildStableFingerprint((
-                            "native-selected-static-claims-v1",
-                            CertificateIdentity,
-                        )),
-                        NecessaryConnectivity=True,
-                        StaticSelfLegal=True,
-                        Complete=True,
-                        WorkCount=0,
-                    )
-                    SelectedGuideValuesBySignal.setdefault(
-                        Signal,
-                        [],
-                    ).append(RawTrackAssignmentValue(
-                        Signal=Signal,
-                        CandidateId=FactorId,
-                        SourceCandidateId=FactorId,
-                        Claims=RoutingResourceClaims(),
-                        MaterialCost=int(Shape.Layer),
-                        FootprintGrowth=int(Shape.Priority[0]),
-                        Length=len(Shape.Guide),
-                        BendCount=int(Shape.Priority[3]),
-                        ViaCount=int(Shape.Priority[4]),
-                        ValueKind="guide-factor",
-                        OwnerSignal=Signal,
-                        RouteGuideFactorDescriptor=Shape,
-                        CompactMaterializabilityCertificate=Certificate,
-                        ContractRequirements=AccessRequirements,
-                    ))
-                NativeSelectedGuideDomainsByCandidateId[
-                    IntegratedSelectedCandidateId
-                ] = BuildRawRouteGuideFactorDomain(
-                    ValuesBySignal=SelectedGuideValuesBySignal,
-                    AssignmentIndexed=None,
-                    PlacementFingerprint=SelectedPlacementFingerprint,
-                    ResourceGraphFingerprint=SelectedResourceFingerprint,
-                    PortalDomainFingerprint=BuildStableFingerprint((
-                        "native-selected-portal-domain-v1",
-                        tuple(
-                            (
-                                Signal,
-                                FactorId,
-                                Shape.DomainFingerprint,
-                            )
-                            for Signal, FactorId, Shape
-                            in SelectedGuideDescriptors
-                        ),
-                    )),
-                    Complete=True,
-                    IncompleteReason="",
-                    MaximumAssignmentExpansions=(
-                        Policy.TrackAssignment.MaximumAssignmentExpansions
-                    ),
-                    Diagnostics=(
-                        ("CompactFactorCatalog", True),
-                        ("NativeSelectedGuideDomain", True),
-                        ("NativeSelectedGuideCount", len(
-                            SelectedGuideDescriptors
-                        )),
-                    ),
-                )
-            MaterializedMembers = tuple(
-                MaterializeRawTemplate(Descriptor)
-                for Descriptor in FactorMaterializationTemplates
-                if Descriptor.TemplateId == IntegratedSelectedCandidateId
-            )
-            IncompleteMember = next((
-                Value for Value in MaterializedMembers
-                if not Value.Complete or Value.Domain is None
-            ), None)
-            if not bool(getattr(
-                IntegratedNativeAccessSelection,
-                "Success",
-                False,
-            )):
-                PreRouteInterfaceResult = PreRouteInterfaceSelection(
-                    ProblemFingerprint=BuildStableFingerprint((
-                        "native-layered-access-selection-v1",
-                        tuple(
-                            (Value.MemberId, Value.Objective)
-                            for Value in NativeEscapeViews
-                        ),
-                    )),
-                    SelectionFingerprint="",
-                    SelectedTemplateIds=(),
-                    SelectedWitnessIds=(),
-                    Objective=(),
-                    ExpansionCount=int(getattr(
-                        IntegratedNativeAccessSelection,
-                        "ExpansionCount",
-                        0,
-                    )),
-                    Success=False,
-                    Complete=bool(getattr(
-                        IntegratedNativeAccessSelection,
-                        "Complete",
-                        False,
-                    )),
-                    Unsatisfiable=False,
-                    IncompleteReason=str(getattr(
-                        IntegratedNativeAccessSelection,
-                        "IncompleteReason",
-                        "native-layered-access-incomplete",
-                    )),
-                )
-            elif IncompleteMember is not None:
-                PreRouteInterfaceResult = PreRouteInterfaceSelection(
-                    ProblemFingerprint=BuildStableFingerprint((
-                        "pre-route-compact-incomplete-member-v1",
-                        tuple(Value.TemplateId for Value in MaterializedMembers),
-                    )),
-                    SelectionFingerprint="",
-                    SelectedTemplateIds=(),
-                    SelectedWitnessIds=(),
-                    Objective=(),
-                    ExpansionCount=0,
-                    Success=False,
-                    Complete=False,
-                    Unsatisfiable=False,
-                    IncompleteReason=(
-                        IncompleteMember.IncompleteReason
-                        or "incomplete-template-domain"
-                    ),
-                )
-            else:
-                def CompactMemberObjective(
-                    TemplateId: str,
-                ) -> tuple[int, int, int, int, int]:
-                    """Return the fixed 3D objective of one declared world.
-
-                    The access-factor values prove capacity, while this
-                    synthetic member value keeps geometric selection explicit
-                    and lexicographic in that same native solve.  No route
-                    material is generated here.
-                    """
-                    Template = TemplateById[TemplateId]
-                    Derived = Template.DerivedPlacement
-                    if Derived is None:
-                        raise RuntimeError(
-                            "compact member is missing its derived geometry"
-                        )
-                    Fabric, _Assignment = (
-                        PlacementAccessEvidenceByCandidateId[TemplateId]
-                    )
-                    FrozenEnvelope = getattr(
-                        Fabric,
-                        "FrozenRoutingEnvelope",
-                        None,
-                    )
-                    Height = (
-                        int(FrozenEnvelope.YBounds[1])
-                        - int(FrozenEnvelope.YBounds[0])
-                        + 1
-                        if FrozenEnvelope is not None
-                        else 2 * int(
-                            Derived.RoutingEnvelope.RoutingLayerCount
-                        ) + 2
-                    )
-                    Footprint = int(Derived.XzFootprint)
-                    FabricDescriptor = (
-                        PreRouteFabricDescriptorsByCandidateId[TemplateId]
-                    )
-                    CertifiedIncumbentRank = 0
-                    LayerCount = int(
-                        Derived.RoutingEnvelope.RoutingLayerCount
-                    )
-                    LayerSlack = (
-                        MaximumDeclaredLayerCountByPlacementFingerprint[
-                            CandidateById[TemplateId].PlacementFingerprint
-                        ]
-                        - LayerCount
-                    )
-                    return (
-                        CertifiedIncumbentRank,
-                        LayerSlack,
-                        Footprint * Height,
-                        Footprint,
-                        max(int(Derived.Width), int(Derived.Depth)),
-                    )
-
-                MemberContracts = {
-                    Value.TemplateId: MemberContractForTemplate(
-                        Value.TemplateId
-                    )
-                    for Value in MaterializedMembers
-                }
-                LayeredAccessSources = tuple(
-                        CompactFactorMemberSource(
-                            TemplateId=Value.TemplateId,
-                            Objective=CompactMemberObjective(
-                                Value.TemplateId
-                            ),
-                            ContractRequirements=MemberContracts[
-                                Value.TemplateId
-                            ],
-                            GuideDomain=Value.Domain,
-                            Fabric=(
-                                PlacementAccessEvidenceByCandidateId[
-                                    Value.TemplateId
-                                ][0]
-                            ),
-                            FabricFingerprint=str(getattr(
-                                PlacementAccessEvidenceByCandidateId[
-                                    Value.TemplateId
-                                ][0],
-                                "FabricFingerprint",
-                                "",
-                            )),
-                            IncludeGuideFactors=False,
-                        )
-                        for Value in MaterializedMembers
-                        if Value.Domain is not None
-                )
-                SelectedPreparedContinuation = (
-                    NativeEscapeContinuationsByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ]
-                )
-                SelectedExactNativeResult = (
-                    NativeEscapeBatchResultsByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ]
-                )
-                SelectedFabricForFactorIds = (
-                    PlacementAccessEvidenceByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ][0]
-                )
-                SelectedFactorIds = (
-                    NativeSelectedStubFactorIdsByCandidateId[
-                        IntegratedSelectedCandidateId
-                    ]
-                )
-                SelectedAccessRequirements = {
-                    (
-                        "access-stub:"
-                        + str(Variable).removeprefix(
-                            "__access_terminal__:"
-                        )
-                    ): str(CandidateId)
-                    .removeprefix("stub:")
-                    for Variable, CandidateId in SelectedFactorIds
-                }
-                SelectedGuideValuesList: list[Any] = []
-                SelectedMaterializedMember = next(
-                    (
-                        Value
-                        for Value in MaterializedMembers
-                        if Value.TemplateId
-                        == IntegratedSelectedCandidateId
-                    ),
-                    None,
-                )
-                if SelectedMaterializedMember is None:
-                    raise RuntimeError(
-                        "selected native access-guide member was not "
-                        "materialized"
-                    )
-                SelectedGuideDomain = SelectedMaterializedMember.Domain
-                if SelectedGuideDomain is None:
-                    raise RuntimeError(
-                        "selected native access-guide member has no guide "
-                        "factor domain"
-                    )
-                for NativeGuide in IntegratedNativeSelectedGuides:
-                    Signal = str(NativeGuide.Variable).removeprefix(
-                        "__route_guide__:"
-                    )
-                    NativeLogicalGuideColumns = frozenset(
-                        (int(X), int(Z))
-                        for X, _Y, Z in NativeGuide.Guide
-                    )
-                    NativePhysicalGuideColumns = frozenset(
-                        (int(X), int(Z))
-                        for X, _Y, Z in NativeGuide.PhysicalGuide
-                    )
-                    Matches = tuple(
-                        Value
-                        for Value in SelectedGuideDomain.Values
-                        for Descriptor in (
-                            Value.RouteGuideFactorDescriptor,
-                        )
-                        if (
-                            Descriptor is not None
-                            and str(Value.Signal) == Signal
-                            and str(Value.CandidateId)
-                            == str(NativeGuide.CandidateId)
-                            and int(Descriptor.RoutingY)
-                            == int(NativeGuide.RoutingY)
-                            and str(Descriptor.Axis)
-                            == str(NativeGuide.Axis)
-                            and int(Descriptor.Lane)
-                            == int(NativeGuide.Lane)
-                            and frozenset(Descriptor.Guide)
-                            == NativeLogicalGuideColumns
-                            and frozenset(
-                                Descriptor.PhysicalGuide
-                                if Descriptor.PhysicalGuide is not None
-                                else Descriptor.Guide
-                            ) == NativePhysicalGuideColumns
-                            and all(
-                                dict(Value.ContractRequirementItems).get(
-                                    RequirementName
-                                ) == RequirementValue
-                                for RequirementName, RequirementValue
-                                in SelectedAccessRequirements.items()
-                                if RequirementName
-                                in dict(Value.ContractRequirementItems)
-                            )
-                        )
-                    )
-                    if len(Matches) != 1:
-                        raise RoutingStageError(RoutingFailure(
-                            Reason=(
-                                RoutingFailureReason
-                                .ClusterInterfaceSolveIncomplete
-                            ),
-                            Stage="FrozenPreRouteFactorHandoff",
-                            AffectedNets=(Signal,),
-                            RepairActions=(),
-                            Detail=(
-                                "the selected native guide recipe did not "
-                                "map to one exact selected-world factor"
-                            ),
-                            Diagnostics={
-                                "NativeGuideCandidateId": (
-                                    NativeGuide.CandidateId
-                                ),
-                                "RoutingY": NativeGuide.RoutingY,
-                                "Axis": NativeGuide.Axis,
-                                "Lane": NativeGuide.Lane,
-                                "Guide": tuple(sorted(
-                                    NativeLogicalGuideColumns
-                                )),
-                                "MatchCount": len(Matches),
-                                "SelectedWorldSignalFactorCount": sum(
-                                    1
-                                    for Value in SelectedGuideDomain.Values
-                                    if str(Value.Signal) == Signal
-                                ),
-                                "SelectedWorldSignalFactorShapes": tuple(
-                                    (
-                                        str(Value.CandidateId),
-                                        int(
-                                            Value
-                                            .RouteGuideFactorDescriptor
-                                            .RoutingY
-                                        ),
-                                        str(
-                                            Value
-                                            .RouteGuideFactorDescriptor.Axis
-                                        ),
-                                        int(
-                                            Value
-                                            .RouteGuideFactorDescriptor.Lane
-                                        ),
-                                        tuple(sorted(
-                                            Value
-                                            .RouteGuideFactorDescriptor.Guide
-                                        )),
-                                        tuple(
-                                            Value.ContractRequirementItems
-                                        ),
-                                    )
-                                    for Value in SelectedGuideDomain.Values
-                                    if (
-                                        str(Value.Signal) == Signal
-                                        and Value.RouteGuideFactorDescriptor
-                                        is not None
-                                    )
-                                ),
-                                "SelectedWorldGuideDiagnostics": {
-                                    Name: Value
-                                    for Name, Value
-                                    in SelectedGuideDomain.Diagnostics
-                                    if Name in {
-                                        "RouteGuideFactorCounts",
-                                        "RouteGuideFactorRejections",
-                                        "RouteGuideShapeEnumeration",
-                                        "FrozenNativeGuideMismatchExamples",
-                                        "CompactMaterializabilityCertificates",
-                                    }
-                                },
-                            },
-                        ))
-                    SelectedGuideValuesList.append(Matches[0])
-                SelectedGuideValues = tuple(SelectedGuideValuesList)
-                if len(SelectedGuideValues) != len(
-                    IntegratedNativeSelectedGuides
-                ):
-                    raise RuntimeError(
-                        "selected native guide handoff is incomplete"
-                    )
-                SelectedTemplateId = IntegratedSelectedCandidateId
-                SelectedContract = MemberContracts[SelectedTemplateId]
-                SelectedPreparation = TrackAssignmentPreparation(
-                    Success=True,
-                    SelectedCandidateIds=(),
-                    CandidateCounts=tuple(
-                        (
-                            str(
-                                Domain.LogicalKey
-                                or f"{Index}:{Domain.Signal}"
-                            ),
-                            len(Domain.EscapeStubs),
-                        )
-                        for Index, Domain in enumerate(
-                            SelectedFabricForFactorIds.TerminalDomains
-                        )
-                    ),
-                    ConflictSignals=(),
-                    ConflictResourceIndices=(),
-                    ExpansionCount=int(getattr(
-                        IntegratedNativeAccessSelection,
-                        "ExpansionCount",
-                        0,
-                    )),
-                    Complete=True,
-                    Diagnostics=(
-                        ("CompactFactorCatalog", True),
-                        ("CompactAccessOnlyCatalog", False),
-                        ("SharedLayeredAccessCatalog", True),
-                        ("NativeAccessGuideCatalog", True),
-                        ("NativeEscapeAndSelectionBatch", True),
-                        ("NativeSelectedWorldGenerationAssignment", True),
-                    ),
-                    CandidateDomainFingerprint=BuildStableFingerprint({
-                        "Kind": "native-layered-access-selection-v1",
-                        "Members": tuple(
-                            (Value.MemberId, Value.Objective)
-                            for Value in NativeEscapeViews
-                        ),
-                        "Selected": SelectedTemplateId,
-                    }),
-                    SelectedConditionalTemplateKey=SelectedTemplateId,
-                    SelectedContractRequirements=SelectedContract,
-                    SelectedContractClaimChoiceIds=SelectedFactorIds,
-                    SelectedRouteGuideFactorChoiceIds=tuple(
-                        (str(Value.Signal), str(Value.CandidateId))
-                        for Value in SelectedGuideValues
-                    ),
-                    SelectedRouteGuideFactorDescriptors=tuple(
-                        (
-                            str(Value.Signal),
-                            str(Value.CandidateId),
-                            Value.RouteGuideFactorDescriptor,
-                        )
-                        for Value in SelectedGuideValues
-                    ),
-                    SelectedRouteGuideFactorCertificates=tuple(
-                        (
-                            str(Value.Signal),
-                            str(Value.CandidateId),
-                            Value.CompactMaterializabilityCertificate,
-                        )
-                        for Value in SelectedGuideValues
-                    ),
-                )
-                AttemptExpansionCountById = {
-                    str(TemplateId): int(Count)
-                    for TemplateId, Count in getattr(
-                        IntegratedNativeAccessSelection,
-                        "AttemptExpansionCounts",
-                        (),
-                    )
-                }
-                AttemptFailureNetById = {
-                    str(TemplateId): str(FailureNet or "")
-                    for TemplateId, FailureNet in getattr(
-                        IntegratedNativeAccessSelection,
-                        "AttemptFailureNets",
-                        (),
-                    )
-                }
-                AttemptPartialIdsById = {
-                    str(TemplateId): tuple(
-                        (str(Variable), str(CandidateId))
-                        for Variable, CandidateId in Values
-                    )
-                    for TemplateId, Values in getattr(
-                        IntegratedNativeAccessSelection,
-                        "AttemptPartialCandidateIds",
-                        (),
-                    )
-                }
-                AttemptPairwiseById = {
-                    str(TemplateId): tuple(
-                        (str(First), str(Second))
-                        for First, Second in Values
-                    )
-                    for TemplateId, Values in getattr(
-                        IntegratedNativeAccessSelection,
-                        "AttemptPairwiseIncompatibleSignals",
-                        (),
-                    )
-                }
-                ObjectiveByMemberId = {
-                    Value.MemberId: Value.Objective
-                    for Value in NativeEscapeViews
-                }
-                CumulativeAttemptExpansions = 0
-                RawAttempts = []
-                for AttemptedTemplateId in tuple(map(
-                    str,
-                    getattr(
-                        IntegratedNativeAccessSelection,
-                        "AttemptedTemplateIds",
-                        (),
-                    ),
-                )):
-                    AttemptExpansionCount = (
-                        AttemptExpansionCountById.get(
-                            AttemptedTemplateId,
-                            0,
-                        )
-                    )
-                    CumulativeAttemptExpansions += AttemptExpansionCount
-                    RawAttempts.append(RawTrackAssignmentAttempt(
-                        TemplateId=AttemptedTemplateId,
-                        Objective=ObjectiveByMemberId[
-                            AttemptedTemplateId
-                        ],
-                        Success=(
-                            AttemptedTemplateId == SelectedTemplateId
-                        ),
-                        Complete=True,
-                        ExpansionCount=AttemptExpansionCount,
-                        CumulativeExpansionCount=(
-                            CumulativeAttemptExpansions
-                        ),
-                        FailureNet=AttemptFailureNetById.get(
-                            AttemptedTemplateId,
-                            "",
-                        ),
-                        PartialCandidateIds=AttemptPartialIdsById.get(
-                            AttemptedTemplateId,
-                            (),
-                        ),
-                        PairwiseIncompatibleSignals=(
-                            AttemptPairwiseById.get(
-                                AttemptedTemplateId,
-                                (),
-                            )
-                        ),
-                    ))
-                ProblemFingerprint = (
-                    SelectedPreparation.CandidateDomainFingerprint
-                )
-                RawTrackAssignmentResult = RawTrackAssignmentSelection(
-                    ProblemFingerprint=ProblemFingerprint,
-                    SelectionFingerprint=BuildStableFingerprint({
-                        "Problem": ProblemFingerprint,
-                        "Selected": SelectedTemplateId,
-                        "Claims": SelectedFactorIds,
-                    }),
-                    SelectedTemplateId=SelectedTemplateId,
-                    SelectedObjective=tuple(map(
-                        int,
-                        getattr(
-                            IntegratedNativeAccessSelection,
-                            "SelectedTemplateObjective",
-                            (),
-                        ),
-                    )),
-                    Preparation=SelectedPreparation,
-                    Attempts=tuple(RawAttempts),
-                    ExpansionCount=int(getattr(
-                        IntegratedNativeAccessSelection,
-                        "ExpansionCount",
-                        0,
-                    )),
-                    Success=True,
-                    Complete=True,
-                    Unsatisfiable=False,
-                    MaterializedTemplateCount=1,
-                    CompactMaskTelemetry=tuple(
-                        (str(Name), int(Value))
-                        for Name, Value in getattr(
-                            IntegratedNativeAccessSelection,
-                            "CompactMaskTelemetry",
-                            (),
-                        )
-                    ),
-                )
-                CompactFactorCatalogResult = (
-                    LayeredAccessFactorCatalogSummary(
-                        CatalogFingerprint=ProblemFingerprint,
-                        DeclaredMemberCount=len(NativeEscapeViews),
-                        CatalogCompleteMemberCount=len(
-                            NativeEscapeViews
-                        ),
-                        SharedPhysicalCatalogCount=len(
-                            NativeEscapePreparations
-                        ),
-                        PrimitiveCount=0,
-                        FactorCount=sum(
-                            len(Value.Requests)
-                            for Value in NativeEscapeViews
-                        ),
-                        FactorReferenceCount=sum(
-                            len(Value.RequestMetadata)
-                            for Value in NativeEscapeViews
-                        ),
-                        PayloadBuildElapsedSeconds=float(
-                            NativeEscapeBatchDiagnostics.get(
-                                "PreparationElapsedSeconds",
-                                0.0,
-                            )
-                        ),
-                        NativeSolveElapsedSeconds=float(
-                            NativeEscapeBatchDiagnostics.get(
-                                "ElapsedSeconds",
-                                0.0,
-                            )
-                        ),
-                    )
-                )
-                # The one bounded native member/access/guide selection above
-                # is authoritative.  Python has materialized only that
-                # selected world and mapped its physical guide recipes to
-                # stable factor identities; no second assignment is legal.
-                CatalogInternElapsedSeconds = (
-                    CompactFactorCatalogResult
-                    .PayloadBuildElapsedSeconds
-                )
-                NativeCompactSolveElapsedSeconds = (
-                    CompactFactorCatalogResult.NativeSolveElapsedSeconds
-                )
-                SelectedContracts = dict(
-                    RawTrackAssignmentResult.Preparation
-                    .SelectedContractRequirements
-                    if RawTrackAssignmentResult.Preparation is not None
+                SelectedTemplateIds=(
+                    (("__placement__", SelectedTemplate.TemplateId),)
+                    if RawTrackAssignmentResult.Success
+                    and SelectedTemplate is not None
                     else ()
-                )
-                SelectedTemplate = TemplateById.get(
-                    SelectedContracts.get(
-                        "member",
-                        SelectedTemplateId,
-                    )
-                )
-                SelectedWitness = (
-                    SelectedTemplate.Witnesses[0]
-                    if (
-                        SelectedTemplate is not None
-                        and len(SelectedTemplate.Witnesses) == 1
-                    )
-                    else None
-                )
-                PreRouteInterfaceResult = PreRouteInterfaceSelection(
-                    ProblemFingerprint=RawTrackAssignmentResult.ProblemFingerprint,
-                    SelectionFingerprint=(
-                        RawTrackAssignmentResult.SelectionFingerprint
-                    ),
-                    SelectedTemplateIds=(
-                        (("__placement__", SelectedTemplate.TemplateId),)
-                        if RawTrackAssignmentResult.Success
-                        and SelectedTemplate is not None
-                        else ()
-                    ),
-                    SelectedWitnessIds=(
-                        (("__placement__", SelectedWitness.WitnessId),)
-                        if RawTrackAssignmentResult.Success
-                        and SelectedWitness is not None
-                        else ()
-                    ),
-                    Objective=RawTrackAssignmentResult.SelectedObjective,
-                    ExpansionCount=RawTrackAssignmentResult.ExpansionCount,
-                    Success=RawTrackAssignmentResult.Success,
-                    Complete=RawTrackAssignmentResult.Complete,
-                    Unsatisfiable=RawTrackAssignmentResult.Unsatisfiable,
-                    IncompleteReason=RawTrackAssignmentResult.IncompleteReason,
-                    FirstConflictResourceIds=tuple(map(
-                        str,
-                        RawTrackAssignmentResult.FirstConflictResourceIndices,
-                    )),
-                )
+                ),
+                SelectedWitnessIds=(
+                    (("__placement__", SelectedWitness.WitnessId),)
+                    if RawTrackAssignmentResult.Success
+                    and SelectedWitness is not None
+                    else ()
+                ),
+                Objective=RawTrackAssignmentResult.SelectedObjective,
+                ExpansionCount=RawTrackAssignmentResult.ExpansionCount,
+                Success=RawTrackAssignmentResult.Success,
+                Complete=RawTrackAssignmentResult.Complete,
+                Unsatisfiable=RawTrackAssignmentResult.Unsatisfiable,
+                IncompleteReason=(
+                    RawTrackAssignmentResult.IncompleteReason
+                ),
+                FirstConflictResourceIds=tuple(map(
+                    str,
+                    RawTrackAssignmentResult.FirstConflictResourceIndices,
+                )),
+            )
     else:
         PreRouteInterfaceResult = SolvePreRouteInterfaceProblem(
             PreRouteInterfaceProblem(
@@ -18015,11 +13746,6 @@ def _PlaceAndRoutePcbWithPolicy(
             RepairActions=(),
             Diagnostics={
                 "PrePlacementTrackPreparations": PrePlacementTrackPreparations,
-                "NativeEscapeBatchDiagnostics": (
-                    NativeEscapeBatchDiagnostics
-                    if SinglePackedComponent
-                    else None
-                ),
                 "PlacementDomainComplete": False,
                 "PreRouteInterfaceSelection": (
                     PreRouteInterfaceResult.ToDictionary()
@@ -18029,26 +13755,8 @@ def _PlaceAndRoutePcbWithPolicy(
                     if RawTrackAssignmentResult is not None
                     else None
                 ),
-                "CompactFactorCatalog": (
-                    {
-                        **CompactFactorCatalogResult.ToDictionary(),
-                        "CatalogInternElapsedSeconds": round(
-                            CatalogInternElapsedSeconds,
-                            6,
-                        ),
-                        "NativeCompactSolveElapsedSeconds": round(
-                            NativeCompactSolveElapsedSeconds,
-                            6,
-                        ),
-                        "NativeCompactSelectionCallCount": 1,
-                        "FallbackInvoked": False,
-                        "SecondAssignmentInvocation": False,
-                    }
-                    if CompactFactorCatalogResult is not None
-                    else None
-                ),
                 "RawTrackAssignmentMaterializations": [
-                    Result.ToCompactDictionary()
+                    Result.ToDictionary()
                     for _CandidateId, Result in sorted(
                         RawTrackAssignmentMaterializations.items()
                     )
@@ -18057,14 +13765,6 @@ def _PlaceAndRoutePcbWithPolicy(
                     Descriptor.ToDictionary()
                     for _CandidateId, Descriptor in sorted(
                         PreRouteFabricDescriptorsByCandidateId.items()
-                    )
-                ],
-                "SelectablePreRouteTemplateIds": [
-                    Descriptor.TemplateId
-                    for Descriptor in (
-                        SelectableRawPortfolioTemplates
-                        if SinglePackedComponent and CandidateRecords
-                        else ()
                     )
                 ],
             },
@@ -18092,16 +13792,16 @@ def _PlaceAndRoutePcbWithPolicy(
         )
         if (
             SelectedPreRouteCandidate.RoutingEnvelope is not None
-            and SinglePackedComponent
+            and len(SelectedPreRouteCandidate.Placement.Clusters) == 1
         )
         else Policy
     )
     if SinglePackedComponent:
-        # The aggregate raw selector contains both the fixed access values
-        # and the ordinary authoritative portal/track values.  Its frozen
-        # preparation is therefore the sole capacity witness permitted to
-        # reach routing; preparing this placement again would be a forbidden
-        # second assignment solve.
+        # The aggregate raw selector has already performed the only native
+        # capacity assignment over this selected candidate's complete portal
+        # domain.  Routing consumes that immutable preparation directly;
+        # invoking PrepareTrackAssignment here would silently run a second
+        # global proof after selection.
         if (
             RawTrackAssignmentResult is None
             or RawTrackAssignmentResult.Preparation is None
@@ -18118,31 +13818,44 @@ def _PlaceAndRoutePcbWithPolicy(
             )
         )
         if SelectedTrackPreparation is None:
-            raise RoutingStageError(RoutingFailure(
-                Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
-                Stage="FrozenPreRouteFactorHandoff",
-                AffectedNets=(),
-                Resources=(),
-                Detail=(
-                    "the selected component member has no frozen pre-route "
-                    "track-assignment witness; reopening assignment after "
-                    "selection is forbidden"
-                ),
-                RepairActions=(),
-                Diagnostics={
-                    "PreRouteInterfaceSelection": (
-                        PreRouteInterfaceResult.ToDictionary()
+            # Defensive compatibility for an external caller that supplied a
+            # complete component template without a prepared local witness.
+            # Normal multi-component flow always takes the preparation above,
+            # so this branch is not a same-placement retry.
+            try:
+                SelectedTrackPreparation = PrepareTrackAssignment(
+                    SelectedPreRouteCandidate.Placement,
+                    Resources=SelectedCandidateResources,
+                    Policy=SelectedPreparationPolicy,
+                    Deadline=Deadline,
+                )
+            except RoutingStageError as Error:
+                raise RoutingStageError(RoutingFailure(
+                    Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                    Stage="SelectedPreRouteTrackPreparation",
+                    AffectedNets=Error.Failure.AffectedNets,
+                    Resources=Error.Failure.Resources,
+                    Detail=(
+                        "the selected fixed local-access contract could not build "
+                        "one complete authoritative portal/track domain"
                     ),
-                    "SelectedCandidate": (
-                        SelectedPreRouteCandidate.ToDictionary()
-                    ),
-                    "PrePlacementTrackPreparations": (
-                        PrePlacementTrackPreparations
-                    ),
-                    "PlacementDomainComplete": False,
-                    "SecondAssignmentInvocation": False,
-                },
-            ))
+                    RepairActions=(),
+                    Diagnostics={
+                        "PreRouteInterfaceSelection": (
+                            PreRouteInterfaceResult.ToDictionary()
+                        ),
+                        "SelectedCandidate": (
+                            SelectedPreRouteCandidate.ToDictionary()
+                        ),
+                        "AuthoritativePreparationFailure": (
+                            Error.Failure.ToDictionary()
+                        ),
+                        "PrePlacementTrackPreparations": (
+                            PrePlacementTrackPreparations
+                        ),
+                        "PlacementDomainComplete": False,
+                    },
+                )) from Error
     if (
         not SelectedTrackPreparation.Success
         or not SelectedTrackPreparation.Complete
@@ -18179,89 +13892,6 @@ def _PlaceAndRoutePcbWithPolicy(
                 "PlacementDomainComplete": False,
             },
         ))
-    if SinglePackedComponent:
-        SelectedFabric, _SelectedAccessAssignment = (
-            PlacementAccessEvidenceByCandidateId.get(
-                SelectedPreRouteCandidate.CandidateId,
-                (None, None),
-            )
-        )
-        if SelectedFabric is None:
-            raise RuntimeError(
-                "selected compact member is missing its access fabric"
-            )
-        try:
-            SelectedFabric = MaterializeSelectedPlacementAccessStubClaims(
-                SelectedFabric,
-                SelectedTrackPreparation.SelectedContractClaimChoiceIds,
-                RoutingResourcesByCandidateId[
-                    SelectedPreRouteCandidate.CandidateId
-                ].ResourceGraph,
-            )
-            if not SelectedFabric.CapacityResourceIds:
-                SelectedFabric = replace(
-                    SelectedFabric,
-                    CapacityResourceIds=tuple(sorted(
-                        SelectedFabric.PhysicalClaims.ResourceIds,
-                        key=str,
-                    )),
-                )
-            SelectedAccessAssignment = (
-                BuildPlacementAccessAssignmentFromStubFactor(
-                    SelectedFabric,
-                    SelectedTrackPreparation
-                    .SelectedContractClaimChoiceIds,
-                    ExpansionCount=(
-                        SelectedTrackPreparation.ExpansionCount
-                    ),
-                )
-            )
-        except (TypeError, ValueError) as Error:
-            raise RoutingStageError(RoutingFailure(
-                Reason=(
-                    RoutingFailureReason.ClusterInterfaceSolveIncomplete
-                ),
-                Stage="FrozenPreRouteFactorHandoff",
-                Detail=(
-                    "the selected compact access factors could not be "
-                    "reconstructed as one exact placement assignment"
-                ),
-                RepairActions=(),
-                Diagnostics={
-                    "SelectedCandidate": (
-                        SelectedPreRouteCandidate.ToDictionary()
-                    ),
-                    "SelectedContractClaimChoiceIds": [
-                        list(Value)
-                        for Value in SelectedTrackPreparation
-                        .SelectedContractClaimChoiceIds
-                    ],
-                    "Error": str(Error),
-                },
-            )) from Error
-        SelectedPlacement = AttachPlacementAccessAssignment(
-            AttachPlacementAccessFabric(
-                SelectedPreRouteCandidate.Placement,
-                SelectedFabric,
-            ),
-            SelectedAccessAssignment,
-        )
-        PlacementAccessEvidenceByCandidateId[
-            SelectedPreRouteCandidate.CandidateId
-        ] = (SelectedFabric, SelectedAccessAssignment)
-        SelectedPreRouteCandidate = replace(
-            SelectedPreRouteCandidate,
-            Placement=SelectedPlacement,
-        )
-        CandidateById[SelectedPreRouteCandidate.CandidateId] = (
-            SelectedPreRouteCandidate
-        )
-        CandidateRecords[
-            CandidateIndexById[SelectedPreRouteCandidate.CandidateId]
-        ] = SelectedPreRouteCandidate
-        PlacementAccessEvidenceByCandidateId[
-            SelectedPreRouteCandidate.CandidateId
-        ] = (SelectedFabric, SelectedAccessAssignment)
     PrePlacementTrackPreparationWitnesses[
         SelectedPreRouteCandidate.CandidateId
     ] = SelectedTrackPreparation
@@ -19026,7 +14656,6 @@ def _PlaceAndRoutePcbWithPolicy(
         nonlocal TerminalConstraintEpochPortfolioNeedsMaterialization
         nonlocal TerminalConstraintEpochPrimaryCandidateId
         nonlocal TerminalConstraintEpochPortfolioIdentityFingerprint
-        nonlocal ProactiveRelocationRequested
         AttemptedFingerprints: set[str] = set()
         AttemptedRoutingControlIdentities: set[
             RoutingControlAttemptIdentity
@@ -20619,35 +16248,6 @@ def _PlaceAndRoutePcbWithPolicy(
             if Deadline.IsExpired():
                 return
             if ExactClusterInterfaceSolveEnabled:
-                if ProactiveRelocationRequested:
-                    ProactiveRelocationRequested = False
-                    Request = _TakeNextDeferredRequest(
-                        PreferRelocation=True,
-                    )
-                    if Request is not None:
-                        PlacementGenerationDecisions.append({
-                            "Result": "materialize-proactive-exact-relocation",
-                            "SourceGenerator": Request.SourceGenerator,
-                            "RelocationSignals": sorted(
-                                PlacementRelocationSignals
-                            ),
-                            "ExecutableLegacyRepairCascade": False,
-                        })
-                        try:
-                            _TryPlacement(Request)
-                        except RoutingStageError as Error:
-                            LastRoutingError = Error
-                            LastStructuredRoutingError = Error
-                            return
-                        CandidateRecords = _BuildCandidateRecords()
-                        OrderedPlacements = CandidateRecords[
-                            : RetainedRoutingCandidateLimit(CandidateRecords)
-                        ]
-                        PlacementFeedback[:] = [
-                            Candidate.ToDictionary()
-                            for Candidate in CandidateRecords
-                        ]
-                        continue
                 PlacementGenerationDecisions.append({
                     "Result": "dense-broad-generation-disabled",
                     "ExecutableLegacyRepairCascade": False,
@@ -27589,7 +23189,7 @@ def _PlaceAndRoutePcbWithPolicy(
         # three-layer floor or escalating after a failed route.
         if (
             CandidateRecord.RoutingEnvelope is not None
-            and SinglePackedComponent
+            and len(CandidateRecord.Placement.Clusters) == 1
         ):
             AttemptPolicy = BuildFrozenEnvelopeRoutingPolicy(
                 AttemptPolicy,
@@ -27632,17 +23232,8 @@ def _PlaceAndRoutePcbWithPolicy(
             )
 
         try:
-            # The one-packed pre-route selector already materialized this
-            # exact placement, access fabric, and route-candidate domain.
-            # Rebuilding local routing here can produce an identity-equivalent
-            # placement with a fresh RoutingResources instance, which loses
-            # the frozen candidate objects selected by the native proof.
-            # Consume the selected object directly; this is a handoff, not a
-            # second placement materialization.
             CandidatePlacement = (
-                CandidateRecord.Placement
-                if SinglePackedComponent
-                else MaterializeSelectedJointPlacementLocalRouting(
+                MaterializeSelectedJointPlacementLocalRouting(
                     CandidateRecord,
                     CheckCandidateValidation,
                 )
@@ -27707,25 +23298,6 @@ def _PlaceAndRoutePcbWithPolicy(
                         FrozenTrackAssignmentPreparation
                     ),
                 )
-            if SinglePackedComponent:
-                _SelectedFabric, SelectedAccessAssignment = (
-                    PlacementAccessEvidenceByCandidateId.get(
-                        CandidateRecord.CandidateId,
-                        (None, None),
-                    )
-                )
-                if SelectedAccessAssignment is not None:
-                    CandidatePlacement = (
-                        AttachPlacementAccessAssignment(
-                            CandidatePlacement,
-                            SelectedAccessAssignment,
-                        )
-                    )
-                    CandidateRecord = replace(
-                        CandidateRecord,
-                        Placement=CandidatePlacement,
-                    )
-                    Placement = CandidatePlacement
             CapturePortableRawPortalGeometryCaches(
                 CandidateResources
             )
@@ -28857,47 +24429,6 @@ def _PlaceAndRoutePcbWithPolicy(
             )
         FailureDiagnostics = dict(BaseFailure.Diagnostics or {})
         FailureDiagnostics.update({
-            "NativeEscapeBatchDiagnostics": (
-                dict(NativeEscapeBatchDiagnostics)
-                if SinglePackedComponent
-                else None
-            ),
-            "SelectedPreRouteCandidate": (
-                SelectedPreRouteCandidate.ToDictionary()
-                if SinglePackedComponent
-                else None
-            ),
-            "SelectedPreRouteContract": (
-                {
-                    "TemplateIds": [
-                        list(Value)
-                        for Value in (
-                            PreRouteInterfaceResult.SelectedTemplateIds
-                        )
-                    ],
-                    "WitnessIds": [
-                        list(Value)
-                        for Value in (
-                            PreRouteInterfaceResult.SelectedWitnessIds
-                        )
-                    ],
-                    "ContractClaimChoiceIds": [
-                        list(Value)
-                        for Value in (
-                            SelectedTrackPreparation
-                            .SelectedContractClaimChoiceIds
-                        )
-                    ],
-                }
-                if SinglePackedComponent
-                else None
-            ),
-            "RawTrackAssignmentSelection": (
-                RawTrackAssignmentResult.ToDictionary()
-                if SinglePackedComponent
-                and RawTrackAssignmentResult is not None
-                else None
-            ),
             "PlacementCandidates": PlacementFeedback,
             "PlacementGenerationFailures": PlacementGenerationFailures,
             "PlacementGenerationDecisions": PlacementGenerationDecisions,
@@ -28976,83 +24507,6 @@ def _PlaceAndRoutePcbWithPolicy(
         "EnvelopeDomainSize": len(CandidateRecords),
         "CapacitySolveCount": 1,
         "RouteAttemptCount": 1,
-        "DeclaredMemberCount": len(
-            PreRouteFabricDescriptorsByCandidateId
-        ),
-        "CompactMaterializedMemberCount": len(
-            RawTrackAssignmentMaterializations
-        ),
-        "DetailedMaterializedMemberCount": int(
-            SinglePackedComponent
-        ),
-        "PreSelectionDetailedDomainBuildCount": 0,
-        "PostSelectionDetailedDomainBuildCount": int(
-            SinglePackedComponent
-        ),
-        "DetailedCandidateDomainMaterializationCount": int(
-            SinglePackedComponent
-        ),
-        "NativeTemplateSelectionCallCount": int(
-            RawTrackAssignmentResult is not None
-        ),
-        "CompactFactorCatalog": (
-            {
-                **CompactFactorCatalogResult.ToDictionary(),
-                "CatalogInternElapsedSeconds": round(
-                    CatalogInternElapsedSeconds,
-                    6,
-                ),
-                "NativeCompactSolveElapsedSeconds": round(
-                    NativeCompactSolveElapsedSeconds,
-                    6,
-                ),
-                "NativeCompactSelectionCallCount": 1,
-                "FallbackInvoked": False,
-            }
-            if CompactFactorCatalogResult is not None
-            else None
-        ),
-        "DetailedRoutingPassCount": 1,
-        "FallbackOccurred": False,
-        "RetryOccurred": False,
-        "SecondAssignmentInvocationOccurred": False,
-        "SecondRoutingInvocationOccurred": False,
-        "SelectedAccessStubChoiceIds": [
-            list(Value)
-            for Value in (
-                RawTrackAssignmentResult.Preparation
-                .SelectedContractClaimChoiceIds
-                if (
-                    RawTrackAssignmentResult is not None
-                    and RawTrackAssignmentResult.Preparation is not None
-                )
-                else ()
-            )
-        ],
-        "SelectedGuideFactorChoiceIds": [
-            list(Value)
-            for Value in (
-                RawTrackAssignmentResult.Preparation
-                .SelectedRouteGuideFactorChoiceIds
-                if (
-                    RawTrackAssignmentResult is not None
-                    and RawTrackAssignmentResult.Preparation is not None
-                )
-                else ()
-            )
-        ],
-        "SelectedContractRequirements": [
-            list(Value)
-            for Value in (
-                RawTrackAssignmentResult.Preparation
-                .SelectedContractRequirements
-                if (
-                    RawTrackAssignmentResult is not None
-                    and RawTrackAssignmentResult.Preparation is not None
-                )
-                else ()
-            )
-        ],
         "SelectedCandidateId": (
             SelectedCandidate.CandidateId
             if SelectedCandidate is not None
@@ -29072,7 +24526,7 @@ def _PlaceAndRoutePcbWithPolicy(
             else None
         ),
         "RawTrackAssignmentMaterializations": [
-            Result.ToCompactDictionary()
+            Result.ToDictionary()
             for _CandidateId, Result in sorted(
                 RawTrackAssignmentMaterializations.items()
             )
@@ -29116,6 +24570,18 @@ def _PlaceAndRoutePcbWithPolicy(
     )
     Routed.RoutingControlEffectiveness["PreRouteInterfaceSelection"] = (
         PreRouteInterfaceSelectionArtifact
+    )
+    CandidateFingerprint = (
+        RawTrackAssignmentResult.SelectionFingerprint
+        if RawTrackAssignmentResult is not None
+        else PreRouteInterfaceResult.SelectionFingerprint
+    )
+    if not CandidateFingerprint:
+        raise ValueError(
+            "authoritative pre-route selection has no deterministic fingerprint"
+        )
+    Routed.RoutingControlEffectiveness["CandidateFingerprint"] = (
+        CandidateFingerprint
     )
     if RawTrackAssignmentResult is not None:
         Routed.RoutingControlEffectiveness[

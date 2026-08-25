@@ -199,6 +199,11 @@ DeterministicEvidenceFields = (
     "TruthTableArithmeticSha256",
     "TruthTableSimulationSha256",
 )
+AuthoritativeSimulationBackends = frozenset({
+    "minecraft-java-subset",
+    "native-parallel",
+    "python",
+})
 PerfBlockSchemaVersion = "router-performance-v1"
 # Baseline capture remains pinned to the frozen pre-change policy. Ordinary
 # acceptance and comparison target the current implementation policy.
@@ -1852,10 +1857,7 @@ def EvaluateRun(
                 f"{RunSummary.get('TruthTableRows')!r} != {Case.TruthTableRows}"
             )
         RawSimulationBackend = RunSummary.get("SimulationBackend")
-        if RawSimulationBackend not in {
-            "python",
-            "native-parallel",
-        }:
+        if RawSimulationBackend not in AuthoritativeSimulationBackends:
             Failures.append("simulation backend is missing or non-authoritative")
         else:
             SimulationBackend = str(RawSimulationBackend)
@@ -2715,10 +2717,9 @@ def ValidateFirstValidCaseSummary(
             f"first-valid baseline case {Case.Name} has invalid "
             "EffectiveWorkFingerprint"
         )
-    if Summary.get("SimulationBackend") not in {
-        "python",
-        "native-parallel",
-    }:
+    if Summary.get("SimulationBackend") not in (
+        AuthoritativeSimulationBackends
+    ):
         raise ValueError(
             f"first-valid baseline case {Case.Name} has invalid "
             "SimulationBackend"
@@ -3180,10 +3181,9 @@ def ReadBaselineReference(PathValue: Path) -> dict[str, object]:
                     f"baseline case {Case.Name} has invalid "
                     "EffectiveWorkFingerprint"
                 )
-            if Summary.get("SimulationBackend") not in {
-                "python",
-                "native-parallel",
-            }:
+            if Summary.get("SimulationBackend") not in (
+                AuthoritativeSimulationBackends
+            ):
                 raise ValueError(
                     f"baseline case {Case.Name} has invalid "
                     "SimulationBackend"

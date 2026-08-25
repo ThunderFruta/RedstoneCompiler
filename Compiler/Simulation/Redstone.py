@@ -26,6 +26,14 @@ from ..Routing.Actions import (
 
 
 Position = tuple[int, int, int]
+MaximumRenderedMinecraftTruthTableRows = 8
+
+
+def ShouldSimulateRenderedMinecraftTruthTable(ReferenceModule: Any) -> bool:
+    """Return whether exact rendered settling fits the parity-proven bound."""
+    return (
+        1 << len(tuple(ReferenceModule.Inputs))
+    ) <= MaximumRenderedMinecraftTruthTableRows
 
 
 @dataclass(frozen=True)

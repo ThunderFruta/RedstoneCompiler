@@ -22,7 +22,6 @@ from Compiler.Placement.Pcb import (
     BuildInterClusterBoundaryDemand,
     BuildInterClusterGapPlan,
     BuildJointPortfolioBaseRelocationControls,
-    BuildMandatoryAccessClaims,
     BuildRelocationClusterSet,
     BuildLegalBoundaryEscapeSlots,
     BuildPinAlignedPackedCluster,
@@ -81,36 +80,6 @@ from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
 
 
 class PlacementBoundaryFeasibilityTests(unittest.TestCase):
-    def testUnusedInputDoesNotCreateMandatoryAccessClaims(self) -> None:
-        Module = ModuleIR(
-            Name="UnusedInputClaims",
-            Inputs=["Unused", "Connected"],
-            Gates=[
-                Gate("InputUnused", GateKind.INPUT, ["Unused"], []),
-                Gate("InputConnected", GateKind.INPUT, ["Connected"], []),
-                Gate(
-                    "Consumer",
-                    GateKind.NAND,
-                    ["Result"],
-                    ["Connected", "Connected"],
-                ),
-            ],
-        )
-        PlacedGates = [
-            BuildPlacedGate(Module.Gates[0], 0, 1, 0, 0, False),
-            BuildPlacedGate(Module.Gates[1], 8, 1, 0, 0, False),
-            BuildPlacedGate(Module.Gates[2], 16, 1, 0, 0, False),
-        ]
-
-        Claims = BuildMandatoryAccessClaims(
-            PlacedGates,
-            ("Unused", "Connected"),
-        )
-
-        self.assertNotIn("Unused", Claims)
-        self.assertIn("Connected", Claims)
-        self.assertTrue(Claims["Connected"].ResourceIds)
-
     @staticmethod
     def BuildChannelPlacement(
         Coordinates: tuple[tuple[int, int], ...],

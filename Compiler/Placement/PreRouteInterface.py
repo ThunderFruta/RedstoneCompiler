@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import cached_property
 from math import ceil
 from typing import Any, Callable, Iterable
 
@@ -264,42 +263,6 @@ class DerivedRoutingEnvelope:
 
 
 @dataclass(frozen=True)
-class TerminalAttachmentContract:
-    """Declared terminal ownership independent of internal connectivity."""
-
-    TerminalName: str
-    Signal: str
-    ServedPins: tuple[tuple[int, int, int], ...]
-    ConnectionRequired: bool
-
-    def __post_init__(self) -> None:
-        if not self.TerminalName or not self.Signal:
-            raise ValueError("terminal attachment requires stable identities")
-        if self.ConnectionRequired and not self.ServedPins:
-            raise ValueError("connected terminal attachment requires served pins")
-        if self.ServedPins != tuple(sorted(set(self.ServedPins))):
-            raise ValueError("terminal attachment served pins must be canonical")
-
-    @cached_property
-    def AttachmentFingerprint(self) -> str:
-        return BuildStableFingerprint({
-            "TerminalName": self.TerminalName,
-            "Signal": self.Signal,
-            "ServedPins": self.ServedPins,
-            "ConnectionRequired": self.ConnectionRequired,
-        })
-
-    def ToDictionary(self) -> dict[str, object]:
-        return {
-            "TerminalName": self.TerminalName,
-            "Signal": self.Signal,
-            "ServedPins": [list(Value) for Value in self.ServedPins],
-            "ConnectionRequired": self.ConnectionRequired,
-            "AttachmentFingerprint": self.AttachmentFingerprint,
-        }
-
-
-@dataclass(frozen=True)
 class DerivedPerimeterTerminalSlot:
     """One outward-facing terminal placement on a packed-core perimeter.
 
@@ -319,7 +282,6 @@ class DerivedPerimeterTerminalSlot:
     ConnectionPin: tuple[int, int, int]
     ConnectionDirection: tuple[int, int, int]
     InteriorSpan: int
-    Attachment: TerminalAttachmentContract | None = None
 
     def __post_init__(self) -> None:
         if self.Face not in {"north", "south", "west", "east"}:
@@ -339,28 +301,6 @@ class DerivedPerimeterTerminalSlot:
             raise ValueError("perimeter slot bounds are inverted")
         if self.InteriorSpan < 0:
             raise ValueError("perimeter slot interior span cannot be negative")
-        if (
-            self.Attachment is not None
-            and self.Attachment.TerminalName != self.TerminalName
-        ):
-            raise ValueError("perimeter slot terminal attachment drifted")
-        if (
-            self.Attachment is not None
-            and self.Attachment.Signal != self.Signal
-        ):
-            raise ValueError("perimeter slot signal attachment drifted")
-        if (
-            self.Attachment is not None
-            and not self.Attachment.ConnectionRequired
-            and self.InteriorSpan != 0
-        ):
-            raise ValueError("unused terminal slot must have zero interior span")
-
-    @property
-    def ConnectionRequired(self) -> bool:
-        return bool(
-            self.Attachment is None or self.Attachment.ConnectionRequired
-        )
 
     @property
     def Width(self) -> int:
@@ -383,11 +323,6 @@ class DerivedPerimeterTerminalSlot:
             "ConnectionPin": list(self.ConnectionPin),
             "ConnectionDirection": list(self.ConnectionDirection),
             "InteriorSpan": self.InteriorSpan,
-            "Attachment": (
-                self.Attachment.ToDictionary()
-                if self.Attachment is not None
-                else None
-            ),
         }
 
 
@@ -487,12 +422,6 @@ class DerivedPerimeterSlotDomain:
                             ),
                             Slot.ConnectionDirection,
                             Slot.InteriorSpan,
-                            Slot.ConnectionRequired,
-                            (
-                                Slot.Attachment.AttachmentFingerprint
-                                if Slot.Attachment is not None
-                                else ""
-                            ),
                         )
                         for Slot in Slots
                     ),
@@ -586,83 +515,6 @@ class DerivedPerimeterSlotAssignment:
         }
 
 
-@dataclass(frozen=True)
-class DerivedPerimeterInterfaceTemplate:
-    """One fixed compact I/O geometry member before access materialization."""
-
-    TemplateId: str
-    SlotAssignment: DerivedPerimeterSlotAssignment
-    FaceSignature: tuple[int, int, int, int]
-    Objective: tuple[Any, ...]
-
-    def __post_init__(self) -> None:
-        if not self.TemplateId:
-            raise ValueError("derived interface template requires an id")
-        if not self.SlotAssignment.Success or not self.SlotAssignment.Complete:
-            raise ValueError("derived interface template requires a complete slot assignment")
-        if len(self.FaceSignature) != 4 or any(Value < 0 for Value in self.FaceSignature):
-            raise ValueError("derived interface template face signature is invalid")
-
-    def ToDictionary(self) -> dict[str, object]:
-        return {
-            "TemplateId": self.TemplateId,
-            "SlotAssignmentFingerprint": self.SlotAssignment.AssignmentFingerprint,
-            "FaceSignature": list(self.FaceSignature),
-            "Objective": list(self.Objective),
-            "Bounds": list(self.SlotAssignment.Bounds),
-        }
-
-
-@dataclass(frozen=True)
-class DerivedPerimeterInterfaceTemplateDomain:
-    """A bounded fixed portfolio of compact terminal geometries.
-
-    Members are generated before routing from terminal face-demand profiles.
-    Each profile retains the lexicographically smallest exact legal slot
-    layout.  This removes lateral slot permutations that do not change the
-    bounded profile's ring demand while retaining physically distinct face
-    capacity choices.  The domain is not exhaustive over every lateral slot
-    permutation, so rejecting all of it remains typed ``incomplete`` upstream
-    rather than UNSAT.
-    """
-
-    SlotDomainFingerprint: str
-    Templates: tuple[DerivedPerimeterInterfaceTemplate, ...]
-    ExpansionCount: int
-    Complete: bool
-    IncompleteReason: str = ""
-
-    def __post_init__(self) -> None:
-        TemplateIds = tuple(Value.TemplateId for Value in self.Templates)
-        if len(TemplateIds) != len(set(TemplateIds)):
-            raise ValueError("derived interface template domain repeats an id")
-        if self.ExpansionCount < 0:
-            raise ValueError("derived interface template expansion count is invalid")
-        if self.Complete and self.IncompleteReason:
-            raise ValueError("complete interface template domain has an incomplete reason")
-
-    @property
-    def DomainFingerprint(self) -> str:
-        return BuildStableFingerprint({
-            "Kind": "derived-perimeter-interface-template-domain-v1",
-            "SlotDomainFingerprint": self.SlotDomainFingerprint,
-            "Templates": [Value.ToDictionary() for Value in self.Templates],
-            "Complete": self.Complete,
-        })
-
-    def ToDictionary(self) -> dict[str, object]:
-        return {
-            "DomainFingerprint": self.DomainFingerprint,
-            "SlotDomainFingerprint": self.SlotDomainFingerprint,
-            "TemplateCount": len(self.Templates),
-            "Templates": [Value.ToDictionary() for Value in self.Templates],
-            "ExpansionCount": self.ExpansionCount,
-            "Complete": self.Complete,
-            "IncompleteReason": self.IncompleteReason,
-            "NonExhaustive": True,
-        }
-
-
 def BuildDerivedPerimeterFaceReservations(
     Slots: Iterable[DerivedPerimeterTerminalSlot],
 ) -> tuple[DerivedPerimeterFaceReservation, ...]:
@@ -709,136 +561,6 @@ def BuildDerivedPerimeterFaceReservations(
     return tuple(Reservations)
 
 
-def BuildDerivedPerimeterInterfaceTemplateDomain(
-    Domain: DerivedPerimeterSlotDomain,
-    MaximumExpansions: int,
-    WorkCheck: Callable[[dict[str, object]], None] | None = None,
-) -> DerivedPerimeterInterfaceTemplateDomain:
-    """Build fixed terminal-face representatives before access/routing work."""
-    if MaximumExpansions < 1:
-        raise ValueError("derived interface template domain requires a work cap")
-    Incompatible = frozenset(Domain.IncompatibleSlotPairs)
-    OrderedDomains = tuple(
-        (
-            Name,
-            tuple(
-                min(
-                    (Slot for Slot in Slots if Slot.Face == Face),
-                    key=lambda Slot: (
-                        Slot.InteriorSpan, Slot.MacroBounds,
-                        Slot.Rotation, Slot.MirrorX, Slot.SlotId,
-                    ),
-                )
-                for Face in ("north", "south", "west", "east")
-                if any(Slot.Face == Face for Slot in Slots)
-            ),
-        )
-        for Name, Slots in sorted(Domain.TerminalSlots)
-    )
-    BestByFaceSignature: dict[
-        tuple[int, int, int, int],
-        tuple[tuple[Any, ...], tuple[DerivedPerimeterTerminalSlot, ...]],
-    ] = {}
-    ExpansionCount = 0
-    ExhaustedWork = False
-
-    def BoundsFor(Slots: tuple[DerivedPerimeterTerminalSlot, ...]) -> tuple[int, int, int, int]:
-        MinimumX, MinimumZ, MaximumX, MaximumZ = Domain.CoreBounds
-        for Slot in Slots:
-            MinimumX = min(MinimumX, Slot.MacroBounds[0])
-            MinimumZ = min(MinimumZ, Slot.MacroBounds[1])
-            MaximumX = max(MaximumX, Slot.MacroBounds[2])
-            MaximumZ = max(MaximumZ, Slot.MacroBounds[3])
-        return MinimumX, MinimumZ, MaximumX, MaximumZ
-
-    def ObjectiveFor(Slots: tuple[DerivedPerimeterTerminalSlot, ...]) -> tuple[Any, ...]:
-        MinimumX, MinimumZ, MaximumX, MaximumZ = BoundsFor(Slots)
-        Width = MaximumX - MinimumX + 1
-        Depth = MaximumZ - MinimumZ + 1
-        FaceSignature = tuple(
-            sum(Slot.Face == Face for Slot in Slots)
-            for Face in ("north", "south", "west", "east")
-        )
-        return (
-            Width * Depth,
-            max(Width, Depth),
-            sum(Count * Count for Count in FaceSignature),
-            sum(Slot.InteriorSpan for Slot in Slots),
-            tuple(Slot.SlotId for Slot in Slots),
-        )
-
-    def Search(Index: int, Selected: tuple[DerivedPerimeterTerminalSlot, ...]) -> None:
-        nonlocal ExpansionCount, ExhaustedWork
-        if ExhaustedWork:
-            return
-        if Index == len(OrderedDomains):
-            OrderedSlots = tuple(sorted(Selected, key=lambda Slot: Slot.TerminalName))
-            FaceSignature = tuple(
-                sum(Slot.Face == Face for Slot in OrderedSlots)
-                for Face in ("north", "south", "west", "east")
-            )
-            Objective = ObjectiveFor(OrderedSlots)
-            Existing = BestByFaceSignature.get(FaceSignature)
-            if Existing is None or Objective < Existing[0]:
-                BestByFaceSignature[FaceSignature] = (
-                    Objective,
-                    OrderedSlots,
-                )
-            return
-        _TerminalName, Slots = OrderedDomains[Index]
-        for Slot in Slots:
-            if ExpansionCount >= MaximumExpansions:
-                ExhaustedWork = True
-                return
-            ExpansionCount += 1
-            if WorkCheck is not None:
-                WorkCheck({"Phase": "derived-perimeter-interface-template-domain", "ExpansionCount": ExpansionCount, "TerminalName": Slot.TerminalName})
-            if any(tuple(sorted((Slot.SlotId, Existing.SlotId))) in Incompatible for Existing in Selected):
-                continue
-            Search(Index + 1, (*Selected, Slot))
-            if ExhaustedWork:
-                return
-
-    Search(0, ())
-    Templates = []
-    for Index, (FaceSignature, (Objective, Slots)) in enumerate(sorted(
-        BestByFaceSignature.items(),
-        key=lambda Value: (Value[1][0], Value[0]),
-    )):
-        Bounds = BoundsFor(Slots)
-        Reservations = BuildDerivedPerimeterFaceReservations(Slots)
-        Assignment = DerivedPerimeterSlotAssignment(
-            DomainFingerprint=Domain.DomainFingerprint,
-            AssignmentFingerprint=BuildStableFingerprint({
-                "DomainFingerprint": Domain.DomainFingerprint,
-                "SelectedSlots": tuple(Slot.SlotId for Slot in Slots),
-                "FaceReservations": tuple((Value.Face, Value.NormalCoordinate, Value.LateralMinimum, Value.LateralMaximum, Value.SlotIds) for Value in Reservations),
-            }),
-            CoreBounds=Domain.CoreBounds,
-            SelectedSlots=Slots,
-            FaceReservations=Reservations,
-            Bounds=Bounds,
-            Objective=Objective,
-            ExpansionCount=ExpansionCount,
-            Success=True,
-            Complete=True,
-        )
-        Templates.append(DerivedPerimeterInterfaceTemplate(
-            TemplateId=f"interface-face-{''.join(map(str, FaceSignature))}-{Index}",
-            SlotAssignment=Assignment,
-            FaceSignature=FaceSignature,
-            Objective=Objective,
-        ))
-    Complete = Domain.Complete and not ExhaustedWork
-    return DerivedPerimeterInterfaceTemplateDomain(
-        SlotDomainFingerprint=Domain.DomainFingerprint,
-        Templates=tuple(Templates),
-        ExpansionCount=ExpansionCount,
-        Complete=Complete,
-        IncompleteReason="work-cap" if ExhaustedWork else Domain.IncompleteReason,
-    )
-
-
 def SolveDerivedPerimeterSlotDomain(
     Domain: DerivedPerimeterSlotDomain,
     MaximumExpansions: int,
@@ -854,7 +576,7 @@ def SolveDerivedPerimeterSlotDomain(
         raise ValueError("perimeter slot solve requires a positive work cap")
 
     Incompatible = frozenset(Domain.IncompatibleSlotPairs)
-    AllOrderedDomains = tuple(
+    OrderedDomains = tuple(
         (Name, tuple(sorted(Slots, key=lambda Slot: (
             Slot.InteriorSpan,
             Slot.Face,
@@ -864,16 +586,6 @@ def SolveDerivedPerimeterSlotDomain(
             Slot.SlotId,
         ))))
         for Name, Slots in sorted(Domain.TerminalSlots)
-    )
-    OrderedDomains = tuple(
-        (Name, Slots)
-        for Name, Slots in AllOrderedDomains
-        if any(Slot.ConnectionRequired for Slot in Slots)
-    )
-    UnusedInputDomains = tuple(
-        (Name, Slots)
-        for Name, Slots in AllOrderedDomains
-        if Slots and all(not Slot.ConnectionRequired for Slot in Slots)
     )
     ExpansionCount = 0
     ExhaustedWork = False
@@ -914,10 +626,8 @@ def SolveDerivedPerimeterSlotDomain(
         )
 
     def BoundsLowerBound(
-        RemainingDomains: tuple[
-            tuple[str, tuple[DerivedPerimeterTerminalSlot, ...]], ...
-        ],
-        Bounds: tuple[int, int, int, int],
+        Index: int,
+        Selected: tuple[DerivedPerimeterTerminalSlot, ...],
     ) -> tuple[int, int]:
         """Return an admissible final hull prefix for this partial branch.
 
@@ -927,10 +637,10 @@ def SolveDerivedPerimeterSlotDomain(
         result is deliberately weak rather than heuristic: it is safe to use
         as a proof-pruning bound for the lexicographic footprint objective.
         """
-        if any(not Slots for _TerminalName, Slots in RemainingDomains):
-            return (1 << 60, 1 << 60)
-        MinimumX, MinimumZ, MaximumX, MaximumZ = Bounds
-        for _TerminalName, Slots in RemainingDomains:
+        MinimumX, MinimumZ, MaximumX, MaximumZ = BoundsFor(Selected)
+        for _TerminalName, Slots in OrderedDomains[Index:]:
+            if not Slots:
+                return (1 << 60, 1 << 60)
             MaximumX = max(
                 MaximumX,
                 min(Slot.MacroBounds[2] for Slot in Slots),
@@ -961,136 +671,31 @@ def SolveDerivedPerimeterSlotDomain(
         )
 
     def Search(
-        RemainingDomains: tuple[
-            tuple[str, tuple[DerivedPerimeterTerminalSlot, ...]], ...
-        ],
+        Index: int,
         Selected: tuple[DerivedPerimeterTerminalSlot, ...],
-        Bounds: tuple[int, int, int, int],
-        FaceCounts: tuple[int, int, int, int],
-        InteriorSpan: int,
     ) -> None:
         nonlocal BestSlots, BestObjective, ExpansionCount, ExhaustedWork
         if ExhaustedWork:
             return
-        if not RemainingDomains:
-            OrderedSelected = tuple(sorted(
-                Selected,
-                key=lambda Slot: Slot.TerminalName,
-            ))
-            MinimumX, MinimumZ, MaximumX, MaximumZ = Bounds
-            Width = MaximumX - MinimumX + 1
-            Depth = MaximumZ - MinimumZ + 1
-            Objective = (
-                Width * Depth,
-                max(Width, Depth),
-                max(FaceCounts, default=0),
-                sum(Count * Count for Count in FaceCounts),
-                InteriorSpan,
-                tuple(Slot.SlotId for Slot in OrderedSelected),
-            )
+        if Index == len(OrderedDomains):
+            Objective = ObjectiveFor(Selected)
             if BestObjective is None or Objective < BestObjective:
                 BestObjective = Objective
-                BestSlots = OrderedSelected
+                BestSlots = Selected
             return
-
-        CompatibleDomains = tuple(
-            (
-                TerminalName,
-                tuple(
-                    Slot for Slot in Slots
-                    if PairIsCompatible(Slot, Selected)
-                ),
-            )
-            for TerminalName, Slots in RemainingDomains
-        )
-        if any(not Slots for _TerminalName, Slots in CompatibleDomains):
-            return
-
-        BoundPrefix = BoundsLowerBound(CompatibleDomains, Bounds)
-        FaceCountStates = {FaceCounts}
-        for _TerminalName, Slots in CompatibleDomains:
-            FaceIndexes = {
-                ("north", "south", "west", "east").index(Slot.Face)
-                for Slot in Slots
-            }
-            FaceCountStates = {
-                tuple(
-                    Count + int(Index == FaceIndex)
-                    for Index, Count in enumerate(State)
-                )
-                for State in FaceCountStates
-                for FaceIndex in FaceIndexes
-            }
-        FaceLowerBound = min(
-            (
-                max(State, default=0),
-                sum(Count * Count for Count in State),
-            )
-            for State in FaceCountStates
-        )
-        MinimumInteriorSpan = InteriorSpan + sum(
-            min(Slot.InteriorSpan for Slot in Slots)
-            for _TerminalName, Slots in CompatibleDomains
-        )
-        MinimumSlotIdByTerminal = {
-            Slot.TerminalName: Slot.SlotId for Slot in Selected
-        }
-        MinimumSlotIdByTerminal.update({
-            TerminalName: min(Slot.SlotId for Slot in Slots)
-            for TerminalName, Slots in CompatibleDomains
-        })
-        ObjectiveLowerBound = (
-            *BoundPrefix,
-            *FaceLowerBound,
-            MinimumInteriorSpan,
-            tuple(
-                MinimumSlotIdByTerminal[TerminalName]
-                for TerminalName in sorted(MinimumSlotIdByTerminal)
-            ),
-        )
         if (
             BestObjective is not None
-            and ObjectiveLowerBound >= BestObjective
+            and BoundsLowerBound(Index, Selected) > BestObjective[:2]
         ):
             return
-
-        _TerminalName, Slots = min(
-            CompatibleDomains,
-            key=lambda Value: (len(Value[1]), Value[0]),
-        )
-        NextRemainingDomains = tuple(
-            Value for Value in CompatibleDomains
-            if Value[0] != _TerminalName
-        )
-
+        _TerminalName, Slots = OrderedDomains[Index]
         def SlotSearchKey(
             Slot: DerivedPerimeterTerminalSlot,
         ) -> tuple[Any, ...]:
-            CandidateBounds = (
-                min(Bounds[0], Slot.MacroBounds[0]),
-                min(Bounds[1], Slot.MacroBounds[1]),
-                max(Bounds[2], Slot.MacroBounds[2]),
-                max(Bounds[3], Slot.MacroBounds[3]),
-            )
-            CandidateWidth = CandidateBounds[2] - CandidateBounds[0] + 1
-            CandidateDepth = CandidateBounds[3] - CandidateBounds[1] + 1
-            FaceIndex = ("north", "south", "west", "east").index(
-                Slot.Face
-            )
-            CandidateFaceCounts = tuple(
-                Count + int(ValueIndex == FaceIndex)
-                for ValueIndex, Count in enumerate(FaceCounts)
-            )
-            CandidateObjective = (
-                CandidateWidth * CandidateDepth,
-                max(CandidateWidth, CandidateDepth),
-                max(CandidateFaceCounts, default=0),
-                sum(Count * Count for Count in CandidateFaceCounts),
-                InteriorSpan + Slot.InteriorSpan,
-            )
+            CandidateObjective = ObjectiveFor((*Selected, Slot))
             CandidateLowerBound = BoundsLowerBound(
-                NextRemainingDomains,
-                CandidateBounds,
+                Index + 1,
+                (*Selected, Slot),
             )
             return (
                 CandidateLowerBound,
@@ -1102,60 +707,19 @@ def SolveDerivedPerimeterSlotDomain(
                 ExhaustedWork = True
                 return
             ExpansionCount += 1
-            if WorkCheck is not None and ExpansionCount % 64 == 1:
+            if WorkCheck is not None:
                 WorkCheck({
                     "Phase": "derived-perimeter-slot-assignment",
                     "ExpansionCount": ExpansionCount,
                     "TerminalName": Slot.TerminalName,
                 })
-            CandidateBounds = (
-                min(Bounds[0], Slot.MacroBounds[0]),
-                min(Bounds[1], Slot.MacroBounds[1]),
-                max(Bounds[2], Slot.MacroBounds[2]),
-                max(Bounds[3], Slot.MacroBounds[3]),
-            )
-            FaceIndex = ("north", "south", "west", "east").index(
-                Slot.Face
-            )
-            CandidateFaceCounts = tuple(
-                Count + int(ValueIndex == FaceIndex)
-                for ValueIndex, Count in enumerate(FaceCounts)
-            )
-            Search(
-                NextRemainingDomains,
-                (*Selected, Slot),
-                CandidateBounds,
-                CandidateFaceCounts,
-                InteriorSpan + Slot.InteriorSpan,
-            )
+            if not PairIsCompatible(Slot, Selected):
+                continue
+            Search(Index + 1, (*Selected, Slot))
             if ExhaustedWork:
                 return
 
-    Search(OrderedDomains, (), Domain.CoreBounds, (0, 0, 0, 0), 0)
-    if BestSlots is not None and not ExhaustedWork:
-        AttachedSlots = list(BestSlots)
-        for TerminalName, Slots in UnusedInputDomains:
-            SelectedUnusedSlot = None
-            for Slot in Slots:
-                if ExpansionCount >= MaximumExpansions:
-                    ExhaustedWork = True
-                    break
-                ExpansionCount += 1
-                if WorkCheck is not None:
-                    WorkCheck({
-                        "Phase": "derived-perimeter-unused-input-attachment",
-                        "ExpansionCount": ExpansionCount,
-                        "TerminalName": TerminalName,
-                    })
-                if PairIsCompatible(Slot, tuple(AttachedSlots)):
-                    SelectedUnusedSlot = Slot
-                    break
-            if ExhaustedWork or SelectedUnusedSlot is None:
-                BestSlots = None
-                break
-            AttachedSlots.append(SelectedUnusedSlot)
-        if BestSlots is not None:
-            BestSlots = tuple(AttachedSlots)
+    Search(0, ())
     if BestSlots is not None and not ExhaustedWork:
         OrderedSlots = tuple(sorted(BestSlots, key=lambda Slot: Slot.TerminalName))
         Bounds = BoundsFor(OrderedSlots)

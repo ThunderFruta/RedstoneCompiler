@@ -20,6 +20,7 @@ from Scripts.RunRouterAcceptance import (
     AcceptanceCommandResult,
     AcceptanceConfiguration,
     AcceptedPolicyVersion,
+    AuthoritativeSimulationBackends,
     BaselinePolicyVersion,
     BaselineSchemaVersion,
     BuildBaselineComparison,
@@ -281,6 +282,16 @@ def SourceProvenanceFixture(
 
 
 class RouterAcceptanceHarnessTests(unittest.TestCase):
+    def testAuthoritativeSimulationBackendsIncludeRenderedSubset(self) -> None:
+        self.assertEqual(
+            AuthoritativeSimulationBackends,
+            frozenset({
+                "minecraft-java-subset",
+                "native-parallel",
+                "python",
+            }),
+        )
+
     def test_compatibility_exact_interface_checkpoint_accepts_frozen_proof(self):
         FixturePath = (
             Path(__file__).parent

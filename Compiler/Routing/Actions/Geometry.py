@@ -87,77 +87,6 @@ def BuildPlacedCellGeometry(
     return set(OccupiedOwners), ElectricalBlocks, SolidBlocks
 
 
-def BuildTorchPoweredSupportBlocks(Placed: Any) -> set[Position3]:
-    """Return opaque cells strongly powered above rendered redstone torches.
-
-    The router supplies the block under every routed dust cell.  A support
-    cell directly above a template torch is therefore an electrical source,
-    not neutral geometry; reserving it prevents an unrelated net from being
-    powered through the support block after rendering.
-    """
-    Templates = LoadRoutingTemplates()
-    Result: set[Position3] = set()
-    for Gate in Placed.PlacedGates:
-        Template = Templates[Gate.Kind]
-        for LocalPosition, State in Template.Blocks.items():
-            if State["Name"] not in (
-                "minecraft:redstone_torch",
-                "minecraft:redstone_wall_torch",
-            ):
-                continue
-            Rotated = TransformLocalPosition(
-                LocalPosition,
-                (Template.Size[0], Template.Size[2]),
-                Gate.Rotation,
-                Gate.MirrorX,
-            )
-            Result.add((
-                Gate.X + Rotated[0],
-                Gate.Y + Rotated[1] + 1,
-                Gate.Z + Rotated[2],
-            ))
-    return Result
-
-
-def BuildPlacedOmnidirectionalControlSourcesBySignal(
-    Placed: Any,
-) -> dict[str, frozenset[Position3]]:
-    """Return rendered I/O controls that power every adjacent connection.
-
-    Directional repeaters are deliberately excluded.  A lever is an
-    omnidirectional source owned by its input macro's output signal, so a
-    fixed access cell for another signal may not occupy its electrical
-    neighborhood even though access pins otherwise bypass static keep-out.
-    """
-    Templates = LoadRoutingTemplates()
-    PositionsBySignal: dict[str, set[Position3]] = {}
-    for Gate in Placed.PlacedGates:
-        Signals = tuple(str(Signal) for Signal in Gate.Outputs)
-        if not Signals:
-            continue
-        Template = Templates[Gate.Kind]
-        for LocalPosition, State in Template.Blocks.items():
-            if State["Name"] != "minecraft:lever":
-                continue
-            Rotated = TransformLocalPosition(
-                LocalPosition,
-                (Template.Size[0], Template.Size[2]),
-                Gate.Rotation,
-                Gate.MirrorX,
-            )
-            Position = (
-                Gate.X + Rotated[0],
-                Gate.Y + Rotated[1],
-                Gate.Z + Rotated[2],
-            )
-            for Signal in Signals:
-                PositionsBySignal.setdefault(Signal, set()).add(Position)
-    return {
-        Signal: frozenset(Positions)
-        for Signal, Positions in sorted(PositionsBySignal.items())
-    }
-
-
 def ValidatePlacedCellElectricalIsolation(
     Placed: Any,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
@@ -223,7 +152,6 @@ def BuildRoutingResources(
         Placed,
         WorkCheck=WorkCheck,
     )
-    TorchPoweredSupportBlocks = BuildTorchPoweredSupportBlocks(Placed)
     TemplateElectricalBlocks = frozenset(ElectricalBlocks)
     # Complete local nets are immutable obstacles to every remaining signal.
     # Partial claims are carried inside their signal's route candidates.
@@ -254,7 +182,6 @@ def BuildRoutingResources(
         ElectricalBlocks=frozenset(ElectricalBlocks),
         SolidBlocks=frozenset(SolidBlocks),
         TemplateElectricalBlocks=TemplateElectricalBlocks,
-        TorchPoweredSupportBlocks=frozenset(TorchPoweredSupportBlocks),
     )
     if WorkCheck is not None:
         WorkCheck({
@@ -267,9 +194,6 @@ def BuildRoutingResources(
             ActualBlocks=StaticGeometry.ActualBlocks,
             ElectricalBlocks=StaticGeometry.ElectricalBlocks,
             SolidBlocks=StaticGeometry.SolidBlocks,
-            TorchPoweredSupportBlocks=(
-                StaticGeometry.TorchPoweredSupportBlocks
-            ),
         ),
     )
 

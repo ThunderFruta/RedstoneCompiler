@@ -27,7 +27,6 @@ from .Actions import (
     BuildRoutingResources,
     FindFlatRouteConflicts,
     MaterializeReservedRepeaters,
-    PropagateRoutePower,
     ValidatePhysicalRoutes,
     ValidateTemplateIsolation,
 )
@@ -133,17 +132,12 @@ def CompactRoutedTrees(
         for Signal in Gate.Outputs
     }
     Targets: dict[str, list[tuple[int, int, int]]] = {}
-    TargetOwners: dict[str, list[tuple[str, int]]] = {}
     for Gate in Placed.PlacedGates:
         for InputIndex, Signal in enumerate(Gate.Inputs):
             Pin, _Direction = GetGateInputAccess(Gate, InputIndex)
             Targets.setdefault(Signal, []).append(
                 Pin
             )
-            TargetOwners.setdefault(Signal, []).append((
-                Gate.Name,
-                InputIndex,
-            ))
     AccessBySignal: dict[str, set[tuple[int, int, int]]] = {
         Signal: set()
         for Signal in Producers
@@ -177,10 +171,6 @@ def CompactRoutedTrees(
         Signal: set(Positions)
         for Signal, Positions in Routed.NetWires.items()
     }
-    for Signal, Positions in NetWires.items():
-        AccessBySignal.setdefault(Signal, set()).intersection_update(
-            Positions
-        )
 
     def BuildFootprintDiagnostics(
         WireBySignal: dict[str, set[tuple[int, int, int]]],
@@ -263,9 +253,21 @@ def CompactRoutedTrees(
                 BestPathCost[Neighbor] = CandidateCost
                 heappush(Pending, (*CandidateCost, Neighbor))
         Required = {Root}
-        PinAccessPositions = tuple(sorted(
-            AccessBySignal.get(Signal, set()) & set(Graph)
-        ))
+        PinAccessPositions = (
+            (
+                *Routed.GlobalPlan.Profiles[Signal].SourceAccessPath,
+                *(
+                    Position
+                    for Path in Routed.GlobalPlan.Profiles[
+                        Signal
+                    ].TargetAccessPaths.values()
+                    for Position in Path
+                ),
+            )
+            if Routed.GlobalPlan is not None
+            and Signal in Routed.GlobalPlan.Profiles
+            else ()
+        )
         RequiredTargets = tuple(Targets.get(Signal, ()))
         for TargetIndex, Target in enumerate((
             *RequiredTargets,
@@ -414,25 +416,6 @@ def CompactRoutedTrees(
         WorkCheck=CheckWork("repeater-materialization"),
         PruningDiagnostics=RepeaterPruningDiagnostics,
     )
-    PhysicalDeliveryMap = {}
-    for Signal, Graph in PhysicalGraphs.items():
-        Powers = PropagateRoutePower(
-            Producers[Signal].OutputPin,
-            Graph,
-            {
-                Position: Facing
-                for Position, Facing in Repeaters.items()
-                if Position in Graph
-            },
-        )
-        PhysicalDeliveryMap[Signal] = frozenset(
-            Owner
-            for Owner, Target in zip(
-                TargetOwners.get(Signal, ()),
-                Targets.get(Signal, ()),
-            )
-            if Powers.get(Target, 0) > 0
-        )
     MaterializedTracks = {}
     for Signal, Track in TrackAssignmentValue.Tracks.items():
         ExistingReservations = {
@@ -605,10 +588,6 @@ def CompactRoutedTrees(
         RoutingControlEffectiveness=Routed.RoutingControlEffectiveness,
         NegotiatedRoutingDiagnostics=Routed.NegotiatedRoutingDiagnostics,
         RoutingFootprintDiagnostics=RoutingFootprintDiagnostics,
-        SimulationActualBlocks=Routed.SimulationActualBlocks,
-        SimulationElectricalBlocks=Routed.SimulationElectricalBlocks,
-        SimulationSolidBlocks=Routed.SimulationSolidBlocks,
-        PhysicalDeliveryMap=PhysicalDeliveryMap,
     )
 
 
@@ -690,9 +669,7 @@ def RoutePcbAttempt(
     Deadline: RoutingDeadline | None = None,
     PreparePortalGeometryOnly: bool = False,
     PrepareTrackAssignmentOnly: bool = False,
-    PrepareRawRouteGuideFactorDomainOnly: bool = False,
     PrepareRawTrackAssignmentDomainOnly: bool = False,
-    FrozenNativeRouteGuideRecipes: tuple[Any, ...] = (),
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
     ValidateClusterInterfaceForeignAccessOnly: bool = False,
     ValidatePhysicalComponentForeignPortalSupportOnly: bool = False,
@@ -774,21 +751,6 @@ def RoutePcbAttempt(
         )
     CompletedRoutingPasses = 0
     MaximumRoutingHeight = 2 * Placement.LayerCount + 2
-    FrozenRoutingEnvelope = (
-        getattr(PlacementAccessFabric, "FrozenRoutingEnvelope", None)
-        if PlacementAccessFabric is not None
-        and getattr(
-            PlacementAccessFabric,
-            "TopologyKind",
-            "",
-        ) == "derived-perimeter-access-v1"
-        else None
-    )
-    if FrozenRoutingEnvelope is not None:
-        MaximumRoutingHeight = (
-            int(FrozenRoutingEnvelope.YBounds[1])
-            - int(FrozenRoutingEnvelope.YBounds[0])
-        )
     RouteLayers = Placement.Placed.RouteLayers or {}
     OriginalIndex = {
         Signal: Index
@@ -893,19 +855,12 @@ def RoutePcbAttempt(
                 ReservationVariant=LeaseReservationVariant,
                 PreparePortalGeometryOnly=PreparePortalGeometryOnly,
                 PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly,
-                PrepareRawRouteGuideFactorDomainOnly=(
-                    PrepareRawRouteGuideFactorDomainOnly
-                ),
                 PrepareRawTrackAssignmentDomainOnly=(
                     PrepareRawTrackAssignmentDomainOnly
-                ),
-                FrozenNativeRouteGuideRecipes=(
-                    FrozenNativeRouteGuideRecipes
                 ),
                 FrozenTrackAssignmentPreparation=(
                     FrozenTrackAssignmentPreparation
                 ),
-                FrozenRoutingEnvelope=FrozenRoutingEnvelope,
                 ValidateClusterInterfaceForeignAccessOnly=(
                     ValidateClusterInterfaceForeignAccessOnly
                 ),
@@ -993,37 +948,18 @@ def RoutePcbAttempt(
         if (Placement.Placed.LocalRouteClaims or ())
         else AccessLength
     )
-    PreserveFrozenDetailedWitness = bool(
-        FrozenTrackAssignmentPreparation is not None
-        and FrozenTrackAssignmentPreparation.Success
-        and FrozenTrackAssignmentPreparation.Complete
+    ReportStatus(f"compacting access length {CompactionAccessLength}")
+    if Deadline is not None:
+        Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "before"})
+    Routed = CompactRoutedTrees(
+        Placement,
+        Routed,
+        AccessLength=CompactionAccessLength,
+        Resources=Resources,
+        Deadline=Deadline,
     )
-    if PreserveFrozenDetailedWitness:
-        # A complete pre-route witness selects one exact detailed physical
-        # world.  CompactRoutedTrees chooses fresh shortest geometric paths;
-        # doing so here can discard the selected repeater topology and is a
-        # second route-shape decision after the frozen handoff.  Preserve the
-        # route that already passed claim, connectivity, and power checks.
-        ReportStatus("preserving frozen selected-world route")
-        Routed.RoutingControlEffectiveness[
-            "FrozenSelectedWorldCompaction"
-        ] = {
-            "Skipped": True,
-            "Reason": "frozen-detailed-witness-is-final-authority",
-        }
-    else:
-        ReportStatus(f"compacting access length {CompactionAccessLength}")
-        if Deadline is not None:
-            Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "before"})
-        Routed = CompactRoutedTrees(
-            Placement,
-            Routed,
-            AccessLength=CompactionAccessLength,
-            Resources=Resources,
-            Deadline=Deadline,
-        )
-        if Deadline is not None:
-            Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "after"})
+    if Deadline is not None:
+        Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "after"})
     if FrozenNetWires:
         NetWires = {}
         for Signal, Positions in Routed.NetWires.items():
@@ -1191,11 +1127,6 @@ def RoutePcbAttempt(
         Routed.RoutingControlEffectiveness["DetailedRoutingBounds"] = (
             DetailedBounds.ToDictionary()
             if DetailedBounds is not None
-            else None
-        )
-        Routed.RoutingControlEffectiveness["FrozenPerFaceRoutingEnvelope"] = (
-            FrozenRoutingEnvelope.ToDictionary()
-            if FrozenRoutingEnvelope is not None
             else None
         )
     if Deadline is not None:
@@ -1466,39 +1397,6 @@ def PrepareRawTrackAssignmentDomain(
         return Prepared.Domain
     raise RuntimeError(
         "raw track-assignment preparation returned without a domain"
-    )
-
-
-def PrepareRawRouteGuideFactorDomain(
-    Placement: PcbPlacement,
-    *,
-    Resources: Any,
-    Policy: PhysicalDesignPolicy,
-    Deadline: RoutingDeadline,
-    FrozenNativeRouteGuideRecipes: tuple[Any, ...] = (),
-    FrozenTrackAssignmentPreparation: (
-        TrackAssignmentPreparation | None
-    ) = None,
-) -> RawTrackAssignmentDomain:
-    """Freeze portal/guide capacity factors before detailed tree expansion."""
-    Configuration = BuildPcbRoutingConfigurations(Placement)[0]
-    try:
-        RoutePcbAttempt(
-            Placement,
-            Configuration,
-            Resources=Resources,
-            Policy=Policy,
-            Deadline=Deadline,
-            PrepareRawRouteGuideFactorDomainOnly=True,
-            FrozenNativeRouteGuideRecipes=FrozenNativeRouteGuideRecipes,
-            FrozenTrackAssignmentPreparation=(
-                FrozenTrackAssignmentPreparation
-            ),
-        )
-    except RawTrackAssignmentDomainPrepared as Prepared:
-        return Prepared.Domain
-    raise RuntimeError(
-        "raw route guide factor preparation returned without a domain"
     )
 
 

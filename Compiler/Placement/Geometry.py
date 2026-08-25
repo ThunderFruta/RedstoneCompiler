@@ -53,7 +53,6 @@ class PlacedDesign:
     # backends preserve their historical terminal behavior.
     DerivedPerimeterSlotDomain: Any | None = None
     DerivedPerimeterSlotAssignment: Any | None = None
-    DerivedPerimeterInterfaceTemplateDomain: Any | None = None
     # Complete placement-local trees offered as immutable alternatives to
     # ordinary portal/track candidates in the pre-route capacity problem.
     # They are deliberately distinct from ``LocalRouteClaims``, which are

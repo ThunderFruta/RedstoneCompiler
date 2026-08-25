@@ -67,18 +67,14 @@ def test_closed_region_portals_replace_discovery_domain_before_consumers():
 
 
 def test_single_component_selection_freezes_raw_tracks_before_route():
-    """A compact portfolio has one catalog selector and no later solve."""
+    """A compact portfolio has one raw selector and no post-selection solve."""
     Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    GuideDomain = Source.index(
-        "GuideDomain = PrepareRawRouteGuideFactorDomain("
-    )
-    Catalog = Source.index(
-        "CompactFactorCatalogResult = BuildCompactFactorCatalog(",
-        GuideDomain,
+    RawDomain = Source.index(
+        "RawDomain = PrepareRawTrackAssignmentDomain("
     )
     Selection = Source.index(
-        "SolveCompactFactorCatalogWithContext(",
-        Catalog,
+        "SolveRawTrackAssignmentPortfolioWithContext(",
+        RawDomain,
     )
     FrozenPreparation = Source.index(
         "SelectedTrackPreparation = RawTrackAssignmentResult.Preparation",
@@ -87,31 +83,44 @@ def test_single_component_selection_freezes_raw_tracks_before_route():
     MultiComponentPreparation = Source.index(
         "Preparation = PrepareTrackAssignment("
     )
-    MissingFrozenWitness = Source.index(
-        "Stage=\"FrozenPreRouteFactorHandoff\"",
+    LegacyPreparation = Source.index(
+        "SelectedTrackPreparation = PrepareTrackAssignment(",
         FrozenPreparation,
     )
-    FirstRoute = Source.index("RoutePcbDesign(", MissingFrozenWitness)
+    FirstRoute = Source.index("RoutePcbDesign(", LegacyPreparation)
 
-    # Each fixed candidate exports compact access and guide references, then
-    # one catalog selector supplies the selected frozen witness.  The
-    # remaining ordinary preparation belongs only to pre-selection multi-component domain
-    # construction; it cannot run on the single packed component path and a
-    # missing selected witness is a typed incomplete handoff, not a retry.
-    assert Source.count("PrepareRawRouteGuideFactorDomain(") == 1
-    assert Source.count("BuildCompactFactorCatalog(") == 1
-    assert Source.count("SolveCompactFactorCatalogWithContext(") == 1
-    assert "ComposeRawTrackAssignmentFactorDomains(" not in Source
-    assert "SolveRawTrackAssignmentProblemWithContext(" not in Source
-    assert Source.count("PrepareTrackAssignment(") == 1
-    assert GuideDomain < Catalog < Selection < FrozenPreparation
-    assert FrozenPreparation < MissingFrozenWitness
+    # Each fixed candidate exports its raw native values, then one aggregate
+    # selector supplies the selected frozen witness.  The remaining ordinary
+    # preparation belongs only to the legacy multi-component compatibility
+    # path; it cannot run on the single packed component path.  The first
+    # call prepares a legacy candidate before selection, and the second is a
+    # defensive fallback guarded by a missing frozen witness.
+    assert Source.count("PrepareRawTrackAssignmentDomain(") == 1
+    assert Source.count("SolveRawTrackAssignmentPortfolioWithContext(") == 1
+    assert Source.count("PrepareTrackAssignment(") == 2
+    assert RawDomain < Selection < FrozenPreparation < LegacyPreparation
     assert MultiComponentPreparation < Selection
     assert "if SelectedTrackPreparation is None:" in Source[
-        FrozenPreparation:MissingFrozenWitness
+        FrozenPreparation:LegacyPreparation
     ]
-    assert "SelectedTrackPreparation = PrepareTrackAssignment(" not in Source
-    assert MissingFrozenWitness < FirstRoute
+    assert LegacyPreparation < FirstRoute
+
+
+def test_success_publishes_authoritative_selection_fingerprint():
+    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    RawFingerprint = Source.index(
+        "RawTrackAssignmentResult.SelectionFingerprint"
+    )
+    InterfaceFingerprint = Source.index(
+        "else PreRouteInterfaceResult.SelectionFingerprint",
+        RawFingerprint,
+    )
+    Publication = Source.index(
+        'RoutingControlEffectiveness["CandidateFingerprint"]',
+        InterfaceFingerprint,
+    )
+
+    assert RawFingerprint < InterfaceFingerprint < Publication
 
 
 def test_multi_component_missing_access_assignment_uses_frozen_track_witness():
@@ -156,23 +165,15 @@ def test_single_component_defers_derived_fabric_until_raw_materialization():
     )
     Materializer = Source.index("def MaterializeRawTemplate(")
     Fabric = Source.index("Fabric = BuildPlacementAccessFabric(", Materializer)
-    GuideDomain = Source.index(
-        "GuideDomain = PrepareRawRouteGuideFactorDomain(",
-        Materializer,
-    )
-    Catalog = Source.index(
-        "CompactFactorCatalogResult = BuildCompactFactorCatalog(",
-        GuideDomain,
-    )
+    RawDomain = Source.index("RawDomain = PrepareRawTrackAssignmentDomain(")
     Attached = Source.index(
         "AttachedPlacement = AttachPlacementAccessFabric(",
         Materializer,
     )
 
     assert Shell < Descriptor < DeferredCandidate < Materializer
-    assert Materializer < Fabric < GuideDomain < Attached < Catalog
-    assert "Shell=FabricDescriptor.Shell" in Source[Fabric:GuideDomain]
-    assert "ComposeRawTrackAssignmentFactorDomains(" not in Source
+    assert Materializer < Fabric < Attached < RawDomain
+    assert "Shell=FabricDescriptor.Shell" in Source[Fabric:RawDomain]
 
 
 def test_single_component_selected_contract_cannot_reenter_legacy_portfolio():
