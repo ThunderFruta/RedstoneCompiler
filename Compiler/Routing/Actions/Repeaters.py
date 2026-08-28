@@ -6,7 +6,7 @@ from heapq import heappop, heappush
 from collections import deque
 from typing import Any, Callable
 
-from ..Models import Position3
+from ..Contracts.Core import Position3
 from ..Technology import (
     DefaultRedstoneRoutingTechnology,
     RedstoneRoutingTechnology,

@@ -2,10 +2,10 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from Compiler.Routing.ChannelPlanner import NetRoutingProfile
-from Compiler.Routing.ComponentPipeline import (
+from Compiler.Routing.Components.PhysicalPlanning import (
     ApplyPhysicalComponentAssemblyGlobalProfiles,
 )
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Component import (
     PhysicalComponentAssemblyPlan,
     PhysicalComponentPortReservation,
 )

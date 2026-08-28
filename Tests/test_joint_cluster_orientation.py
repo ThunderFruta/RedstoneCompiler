@@ -8,10 +8,8 @@ import unittest
 
 from SVDecoder import Sv
 from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
-from Compiler.Placement.Pcb import (
-    PlacePcbGraph,
-    TransformPackedClusterLayout,
-)
+from Compiler.Placement.Core.Clustering import TransformPackedClusterLayout
+from Compiler.Placement.Core.Commit import PlacePcbGraph
 from Compiler.Routing.Actions.Geometry import ValidatePlacedCellElectricalIsolation
 from Compiler.Routing.Policy import LocalFirstPhysicalDesignPolicy
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic

@@ -3,67 +3,83 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-import Compiler.Placement.Pcb as PcbModule
+import Compiler.Placement.Core.Channels as ChannelsModule
+import Compiler.Placement.Core.Clusters as ClustersModule
+import Compiler.Placement.Core.MandatoryAccess as MandatoryAccessModule
+import Compiler.Placement.Core.Repair as RepairModule
+import Compiler.Placement.Core.Cache as PlacementCache
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
 from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
-from Compiler.Placement.Pcb import (
+from Compiler.Placement.Core.Channels import (
     AssignBoundaryDemandSides,
     BoundaryEscapeCandidate,
     BoundaryDemandRecord,
     BuildBoundaryCapacityRecords,
-    BuildAssignmentCutHigherOrderSignalSet,
     BuildClusterBoundaryBundles,
     BuildClusterBoundaryLeaseRequests,
     BuildClusterInterfaceTopology,
-    BuildBoundedInterClusterRoutingChannel,
-    BuildBoundedInterClusterRoutingDeck,
-    BuildConnectivityClusters,
-    BuildEffectiveStructuredRelocationFocus,
-    BuildInterClusterBoundaryDemand,
-    BuildInterClusterGapPlan,
-    BuildJointPortfolioBaseRelocationControls,
-    BuildRelocationClusterSet,
     BuildLegalBoundaryEscapeSlots,
-    BuildPinAlignedPackedCluster,
-    BuildTopologicalLevels,
-    BuildTransactionalClusterEndpointRepair,
     ClusterBoundaryCorridorKey,
-    ClusterLayoutVariant,
     CutDrivenClusterRefinementProfile,
     EvaluateCutBoundaryEscapeFeasibility,
     EvaluateHardBoundaryFeasibility,
     HardBoundaryFeasibility,
     InterClusterBoundaryDemand,
-    MandatoryAccessConflictProfile,
-    OptimizeClusterSlots,
-    OptimizeJointClusterPlacement,
-    OrderExactStatesForMandatoryAccessCommit,
-    PackedNandCluster,
-    PcbPlacement,
-    PlacePcbGraph,
-    PrioritizeRelocationClusters,
-    RankTransactionalRepairClusterSelections,
-    SelectTransactionalRepairClusterSelections,
-    RelocateClusterSlots,
-    RepairPackedClusterAccess,
     ScoreClusterBoundaryContracts,
     ScoreClusterInterfacePlacement,
     ScoreClusterInterfaceFacingMismatches,
     ScoreHigherOrderPhysicalBankDemand,
+    ValidateHardBoundaryFeasibility,
+)
+from Compiler.Placement.Core.Clustering import (
+    BuildConnectivityClusters,
+    BuildTopologicalLevels,
+    OptimizeClusterSlots,
+)
+from Compiler.Placement.Core.Clusters import (
+    BuildBoundedInterClusterRoutingChannel,
+    BuildBoundedInterClusterRoutingDeck,
+    ClusterLayoutVariant,
+    PackedNandCluster,
+    PcbPlacement,
+)
+from Compiler.Placement.Core.Commit import PlacePcbGraph
+from Compiler.Placement.Core.Compactness import BuildPinAlignedPackedCluster
+from Compiler.Placement.Core.Constraints import (
+    BuildAssignmentCutHigherOrderSignalSet,
+    BuildEffectiveStructuredRelocationFocus,
+    SelectPlacementConstraintWorkingSet,
+    PlacementAssignmentConstraintSet,
+)
+from Compiler.Placement.Core.Costs import (
+    BuildInterClusterBoundaryDemand,
+    BuildInterClusterGapPlan,
+)
+from Compiler.Placement.Core.MandatoryAccess import (
+    MandatoryAccessConflictProfile,
+    OrderExactStatesForMandatoryAccessCommit,
+    RepairPackedClusterAccess,
+)
+from Compiler.Placement.Core.Repair import (
+    BuildTransactionalClusterEndpointRepair,
+    RankTransactionalRepairClusterSelections,
+    SelectTransactionalRepairClusterSelections,
+)
+from Compiler.Placement.Core.Search import (
+    BuildJointPortfolioBaseRelocationControls,
+    BuildRelocationClusterSet,
+    OptimizeJointClusterPlacement,
+    PrioritizeRelocationClusters,
+    RelocateClusterSlots,
     SelectFocusedConstraintComponentClusters,
     SelectFocusedCutEpochClusters,
     SelectFocusedTopologyFrontierClusters,
     SelectInternalPinBankGeometrySignals,
-    SelectPlacementConstraintWorkingSet,
-    PlacementAssignmentConstraintSet,
     ShouldReleasePartialLocalTreeBeforeSearch,
-    ValidateHardBoundaryFeasibility,
 )
-from Compiler.Placement.PcbFlow import (
-    BuildPlacementFingerprint,
-    BuildPlacementGenerationPlan,
-    ShouldRejectCutBoundaryEscapePlacement,
-)
+from Compiler.Placement.Flow.Demand import BuildPlacementGenerationPlan
+from Compiler.Placement.Flow.Feedback import BuildPlacementFingerprint
+from Compiler.Placement.Flow.Portfolios import ShouldRejectCutBoundaryEscapePlacement
 from Compiler.Routing.Policy import LocalFirstPhysicalDesignPolicy
 from Compiler.Routing.Failures import (
     RoutingAssignmentCut,
@@ -126,7 +142,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             for Index, GateValue in enumerate(Gates)
         )
         Requests = tuple(
-            PcbModule.ClusterBoundaryLeaseRequest(
+            ChannelsModule.ClusterBoundaryLeaseRequest(
                 SourceCluster=Index,
                 TargetCluster=Index + 1,
                 Signal=f"{SignalPrefix}{Index + 1}",
@@ -169,7 +185,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
     ) -> None:
         Source = self.BuildChannelPlacement(((0, 0), (12, 0)))
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -204,7 +220,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
     ) -> None:
         Source = self.BuildChannelPlacement(((0, 0), (12, 0)))
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -248,7 +264,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ((0, 0), (12, 0), (12, 12))
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -281,7 +297,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             SignalPrefix="Wire",
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -306,12 +322,12 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
         }
         with (
             patch.object(
-                PcbModule,
+                ClustersModule,
                 "BuildPlacedCellGeometry",
                 return_value=(Blocked, set(), set()),
             ),
             patch.object(
-                PcbModule,
+                ClustersModule,
                 "ValidatePlacedCellElectricalIsolation",
             ),
             self.assertRaisesRegex(
@@ -328,7 +344,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ((0, 0), (12, 0), (12, 12))
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -395,7 +411,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ((0, 0), (12, 0), (24, 0), (36, 0))
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -430,7 +446,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ((0, 0), (12, 0), (24, 0), (36, 0))
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -465,7 +481,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ((0, 0), (12, 0), (24, 0), (36, 0))
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -509,7 +525,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ((0, 0), (12, 0), (24, 0), (36, 0))
         )
         Requests = (
-            PcbModule.ClusterBoundaryLeaseRequest(
+            ChannelsModule.ClusterBoundaryLeaseRequest(
                 SourceCluster=0,
                 TargetCluster=1,
                 Signal="LearnedCut",
@@ -521,7 +537,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
                 ),
                 CompletePinAccess=True,
             ),
-            PcbModule.ClusterBoundaryLeaseRequest(
+            ChannelsModule.ClusterBoundaryLeaseRequest(
                 SourceCluster=1,
                 TargetCluster=2,
                 Signal="Bridge",
@@ -531,7 +547,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
                 TargetTerminals=(),
                 CompletePinAccess=True,
             ),
-            PcbModule.ClusterBoundaryLeaseRequest(
+            ChannelsModule.ClusterBoundaryLeaseRequest(
                 SourceCluster=2,
                 TargetCluster=3,
                 Signal="LearnedCut",
@@ -551,7 +567,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ClusterBoundaryLeaseRequests=Requests,
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -579,7 +595,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             ((0, 0), (12, 0), (24, 0), (36, 0))
         )
         DenseCutRequests = tuple(
-            PcbModule.ClusterBoundaryLeaseRequest(
+            ChannelsModule.ClusterBoundaryLeaseRequest(
                 SourceCluster=0,
                 TargetCluster=1,
                 Signal=f"DenseCut{Index}",
@@ -631,7 +647,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             )
 
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -679,7 +695,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             SignalPrefix="Wire",
         )
         with patch.object(
-            PcbModule,
+            ClustersModule,
             "BuildPlacedCellGeometry",
             return_value=(set(), set(), set()),
         ):
@@ -2718,9 +2734,9 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
     ) -> None:
         Netlist = self.SyntheticNetlist()
         Policy = LocalFirstPhysicalDesignPolicy
-        PcbModule._JointPlacementExactScreenCache.clear()
-        PcbModule._ExactStatePlacementGeometryCache.clear()
-        PcbModule._PlacementTopologyCache.clear()
+        PlacementCache._JointPlacementExactScreenCache.clear()
+        PlacementCache._ExactStatePlacementGeometryCache.clear()
+        PlacementCache._PlacementTopologyCache.clear()
         Phases = []
         SecondPhases = []
         Arguments = {
@@ -2753,8 +2769,8 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
                 WorkCheck=StopDuringExactScreen,
                 **Arguments,
             )
-        self.assertEqual(PcbModule._JointPlacementExactScreenCache, {})
-        PcbModule._PlacementTopologyCache.clear()
+        self.assertEqual(PlacementCache._JointPlacementExactScreenCache, {})
+        PlacementCache._PlacementTopologyCache.clear()
 
         First = PlacePcbGraph(
             Netlist,
@@ -2775,7 +2791,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
         FirstJoint = FirstDiagnostics["__JointClusterPlacement__"]
         SecondJoint = SecondDiagnostics["__JointClusterPlacement__"]
         ExactScreen = next(iter(
-            PcbModule._JointPlacementExactScreenCache.values()
+            PlacementCache._JointPlacementExactScreenCache.values()
         ))
 
         self.assertFalse(FirstJoint["ExactScreenCacheHit"])
@@ -3013,7 +3029,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             "MaximumEntrancesPerSignal": 2,
         }
         OriginalBuildLegalBoundaryEscapeSlots = (
-            PcbModule.BuildLegalBoundaryEscapeSlots
+            ChannelsModule.BuildLegalBoundaryEscapeSlots
         )
         CapturedFixedPinAccess = []
 
@@ -3039,7 +3055,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             )
 
         with patch(
-            "Compiler.Placement.Pcb.BuildLegalBoundaryEscapeSlots",
+            "Compiler.Placement.Core.CommitRouting.BuildLegalBoundaryEscapeSlots",
             side_effect=CaptureFixedPinAccess,
         ):
             Full = PlacePcbGraph(
@@ -3471,7 +3487,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
         }
 
         with patch(
-            "Compiler.Placement.Pcb.EvaluateHardBoundaryFeasibility",
+            "Compiler.Placement.Core.CommitRouting.EvaluateHardBoundaryFeasibility",
             return_value=Rejected,
         ):
             with self.assertRaisesRegex(ValueError, "NoBoundaryEscape"):
@@ -3552,7 +3568,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
                     "MaximumEntrancesPerSignal": 2,
                 }
                 with patch(
-                    "Compiler.Placement.Pcb.BuildBoundaryCapacityRecords",
+                    "Compiler.Placement.Core.CommitRouting.BuildBoundaryCapacityRecords",
                     side_effect=ValueError("forced transactional rejection"),
                 ):
                     with self.assertRaisesRegex(
@@ -3684,11 +3700,11 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             }
 
         with (
-            patch.object(PcbModule, "RepairPackedClusterAccess", Repair),
-            patch.object(PcbModule, "PcbGatesConflict", return_value=False),
-            patch.object(PcbModule, "BuildPlacedCellGeometry"),
+            patch.object(RepairModule, "RepairPackedClusterAccess", Repair),
+            patch.object(RepairModule, "PcbGatesConflict", return_value=False),
+            patch.object(ClustersModule, "BuildPlacedCellGeometry"),
             patch.object(
-                PcbModule,
+                RepairModule,
                 "MeasureMandatoryAccessConflictProfile",
                 side_effect=(SourceProfile, CandidateProfile),
             ),
@@ -3774,7 +3790,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             }
 
         with patch.object(
-            PcbModule,
+            RepairModule,
             "RepairPackedClusterAccess",
             Repair,
         ):
@@ -3797,16 +3813,16 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
         )
         with (
             patch.object(
-                PcbModule,
+                MandatoryAccessModule,
                 "CountPackedAccessEscapeConflicts",
                 return_value=0,
             ),
             patch.object(
-                PcbModule,
+                MandatoryAccessModule,
                 "CountMandatoryAccessConflicts",
                 return_value=0,
             ),
-            patch.object(PcbModule, "PcbGatesConflict", return_value=False),
+            patch.object(MandatoryAccessModule, "PcbGatesConflict", return_value=False),
         ):
             Positions, Mirrors, Diagnostics = RepairPackedClusterAccess(
                 ("Endpoint",),
@@ -3827,16 +3843,16 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
         self.assertEqual(Diagnostics["FinalConflictCount"], 0)
         with (
             patch.object(
-                PcbModule,
+                MandatoryAccessModule,
                 "CountPackedAccessEscapeConflicts",
                 return_value=0,
             ),
             patch.object(
-                PcbModule,
+                MandatoryAccessModule,
                 "CountMandatoryAccessConflicts",
                 return_value=0,
             ),
-            patch.object(PcbModule, "PcbGatesConflict", return_value=False),
+            patch.object(MandatoryAccessModule, "PcbGatesConflict", return_value=False),
         ):
             AlternatePositions, AlternateMirrors, AlternateDiagnostics = (
                 RepairPackedClusterAccess(
@@ -3926,11 +3942,11 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             replace(SourceProfile, OwnershipFingerprint="candidate-paired"),
         )
         with (
-            patch.object(PcbModule, "RepairPackedClusterAccess", Repair),
-            patch.object(PcbModule, "PcbGatesConflict", return_value=False),
-            patch.object(PcbModule, "BuildPlacedCellGeometry"),
+            patch.object(RepairModule, "RepairPackedClusterAccess", Repair),
+            patch.object(RepairModule, "PcbGatesConflict", return_value=False),
+            patch.object(ClustersModule, "BuildPlacedCellGeometry"),
             patch.object(
-                PcbModule,
+                RepairModule,
                 "MeasureMandatoryAccessConflictProfile",
                 side_effect=CandidateProfiles,
             ),

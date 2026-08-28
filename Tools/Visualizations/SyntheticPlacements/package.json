@@ -1,0 +1,12 @@
+{
+  "name": "redstonecompiler-synthetic-placement-viewer",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "live-server . --host=127.0.0.1 --port=4173 --no-browser --wait=200",
+    "dev": "npm run start"
+  },
+  "devDependencies": {
+    "live-server": "1.2.2"
+  }
+}

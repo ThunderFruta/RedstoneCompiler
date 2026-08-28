@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import unittest
 
-from Compiler.Placement.PcbFlow import ComputeInterfaceStateCountBound, TopologyDemandProfile
+from Compiler.Placement.Flow.Demand import (
+    ComputeInterfaceStateCountBound,
+    TopologyDemandProfile,
+)
 
 
 class RoutingPolicyGenericProfileTests(unittest.TestCase):

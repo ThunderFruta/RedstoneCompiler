@@ -9,8 +9,10 @@ except ImportError:
     RustRoutingContext = None
 
 from SVDecoder.Sv import ParseSvToNetlist
-import Compiler.Placement.PcbFlow as PcbFlow
-from Compiler.Placement.PcbFlow import PlaceAndRoutePcb
+import Compiler.Placement.Flow.Setup as PcbFlow
+import Compiler.Placement.Flow.RoutingAttempts as PcbFlowRaw
+from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
+import Compiler.Placement.Flow.Runner as PcbFlowRunner
 from Compiler.Routing.Policy import LocalFirstPhysicalDesignPolicy
 from Compiler.Simulation.Redstone import (
     SimulateRoutedTruthTable,
@@ -26,12 +28,12 @@ class RedstoneSimulationTests(unittest.TestCase):
             self.skipTest("authoritative routing requires Rust router")
 
         StageCalls: list[str] = []
-        RealPrepareRawTrackDomain = PcbFlow.PrepareRawTrackAssignmentDomain
+        RealPrepareRawTrackDomain = PcbFlowRaw.PrepareRawTrackAssignmentDomain
         RealSolveRawTrackPortfolio = (
             PcbFlow.SolveRawTrackAssignmentPortfolioWithContext
         )
         RealPrepareTrackAssignment = PcbFlow.PrepareTrackAssignment
-        RealRoutePcbDesign = PcbFlow.RoutePcbDesign
+        RealRoutePcbDesign = PcbFlowRunner.RoutePcbDesign
 
         def PrepareRawTrackDomain(*Arguments, **KeywordArguments):
             StageCalls.append("raw-track-domain")
@@ -60,7 +62,7 @@ class RedstoneSimulationTests(unittest.TestCase):
             ProgressEvents = []
             with (
                 patch.object(
-                    PcbFlow,
+                    PcbFlowRaw,
                     "PrepareRawTrackAssignmentDomain",
                     side_effect=PrepareRawTrackDomain,
                 ) as PrepareRawDomains,
@@ -75,7 +77,7 @@ class RedstoneSimulationTests(unittest.TestCase):
                     side_effect=PrepareSelectedTrackAssignment,
                 ) as PrepareTracks,
                 patch.object(
-                    PcbFlow,
+                    PcbFlowRunner,
                     "RoutePcbDesign",
                     side_effect=RouteSelectedPlacement,
                 ) as RouteDesign,

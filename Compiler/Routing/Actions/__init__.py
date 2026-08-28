@@ -1,6 +1,5 @@
 """Small, reusable routing-stage actions."""
 
-from .ConflictRepair import AnalyzeFlatRouteConflicts, FindFlatRouteConflicts
 from .Geometry import (
     AreConnected,
     BuildElectricalExclusions,
@@ -20,7 +19,9 @@ from .Repeaters import (
     RepeaterFacing,
 )
 from .Validation import (
+    AnalyzeFlatRouteConflicts,
     BuildPhysicalGraphs,
+    FindFlatRouteConflicts,
     SimplifyNetTrees,
     ValidatePhysicalRoutes,
     ValidateTemplateIsolation,

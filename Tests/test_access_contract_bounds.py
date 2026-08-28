@@ -2,11 +2,11 @@
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
 from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
-from Compiler.Placement.Pcb import PcbPlacement
-from Compiler.Routing.AuthoritativePlanner import (
+from Compiler.Placement.Core.Clusters import PcbPlacement
+from Compiler.Routing.Authoritative.Portals import (
     ResolvePlacementAccessFabricRegionContract,
 )
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Placement import (
     DetailedRoutingBounds,
     PlacementAccessEscapeStub,
     PlacementAccessFabric,

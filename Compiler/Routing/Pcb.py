@@ -10,7 +10,7 @@ from time import monotonic
 import traceback
 from typing import Any, Callable, Iterable
 
-from ..Placement.Pcb import PcbPlacement
+from Compiler.Placement.Core.Clusters import PcbPlacement
 from ..Placement.Geometry import GetGateInputAccess
 from ..Placement.Rotation import RotatedCellSize
 try:
@@ -31,7 +31,7 @@ from .Actions import (
     ValidateTemplateIsolation,
 )
 from .ChannelPlanner import MeasureRoutingStage
-from .Models import (
+from .Contracts.Placement import (
     AccessContractBounds,
     ClusterInterfaceAssignment,
     ClusterInterfaceAssignmentPrepared,
@@ -39,13 +39,17 @@ from .Models import (
     TrackAssignmentPreparation,
     TrackAssignmentPrepared,
     ClusterInterfaceRealizabilityNogood,
+)
+from .Contracts.Component import (
     ComponentRoutingProblem,
     ComponentRoutingProblemPrepared,
+)
+from .Contracts.PhysicalInterface import (
     PhysicalComponentAssemblyPrepared,
     PreparedPhysicalComponentPortFactorDomain,
     PreparedPhysicalComponentAssembly,
-    RoutedDesign,
 )
+from .Contracts.Results import RoutedDesign
 from .Reliability import RoutingDeadline
 from .Failures import RoutingStageError
 from .Failures import RoutingFailure, RoutingFailureReason
@@ -66,7 +70,7 @@ from .Policy import (
     RoutingAttemptPolicy,
 )
 from .Workers.DetailedRouting import RoutePcbNets
-from .AuthoritativePlanner import (
+from .Authoritative.RunModels import (
     RawTrackAssignmentDomain,
     RawTrackAssignmentDomainPrepared,
 )
@@ -1513,7 +1517,7 @@ def SolvePreparedPhysicalComponentEligibility(
     RequiredBoundaryPorts: tuple[Any, ...] | None = None,
 ) -> PreparedPhysicalComponentAssembly:
     """Solve one identity-validated eligibility domain without rebuilding it."""
-    from .AuthoritativePlanner import (
+    from .Authoritative.PortSolving import (
         SolvePreparedPhysicalComponentPortFactorDomain,
     )
 

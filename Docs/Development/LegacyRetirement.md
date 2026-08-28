@@ -1,5 +1,26 @@
 # Legacy Routing and Shim Retirement
 
+## 2026-08-28 structural clean break
+
+The Python/Rust monolith split retired `Placement/{AccessFabric,Pcb,PcbFlow}.py`,
+`Routing/{Models,AuthoritativePlanner,ComponentAccess,ComponentPlanning,
+ComponentRouter,ComponentPipeline}.py`, and the former flat Rust source files.
+No forwarding modules remain. Repository imports, test patch targets, and
+workers now name their concrete owners under `Placement/{Access,Core,Flow}` and
+`Routing/{Contracts,Interfaces,Components,Authoritative}`; Rust uses nested
+domain directories under `RustRouting/Src/`.
+
+`Routing/Actions/ConflictRepair.py` was consolidated into `Actions/Validation.py`
+without changing the `Actions` exports. The unused `Cells/Nand.py` duplicate was
+deleted rather than copied. This was structural cleanup only: legacy and
+dynamic component solvers both remain because reachability/dead-code parity was
+not established, and routing-aware-placement v17 was not introduced.
+
+The detailed retired-path list and hard structural gates are authoritative in
+[`ProjectTreeDesignDoc.md`](../../ProjectTreeDesignDoc.md) and
+`Tests/test_source_structure.py`. Historical sections below retain their dated
+meaning and are not evidence that a retired path still exists.
+
 > **Historical scope notice (2026-07-22):** In this document, “flat
 > negotiated-routing stack” means the retired candidate/guide/pair-repair
 > implementation described below. It does not mean the active

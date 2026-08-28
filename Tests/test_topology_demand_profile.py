@@ -10,70 +10,76 @@ from unittest.mock import patch
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
 from Compiler.Placement.Geometry import PlacedDesign
-from Compiler.Placement.Pcb import (
+from Compiler.Placement.Core.Clusters import PcbPlacement
+from Compiler.Placement.Core.Constraints import (
     BuildEffectiveAssignmentCutPairwiseEdges,
     BuildJointPlacementSearchCacheKey,
     PlacementAssignmentConstraintSet,
-    MandatoryAccessConflictProfile,
-    PrioritizeRelocationClusters,
-    PcbPlacement,
-    RelocateClusterSlots,
     RequiresStructuredAssignmentCutRelocation,
-    ShouldExpandBoundaryEscapeGeometry,
-    ShouldIncludeNearPortalPackedAccessRepair,
+)
+from Compiler.Placement.Core.MandatoryAccess import (
+    MandatoryAccessConflictProfile,
     SelectExactInterfaceCommitStates,
 )
-from Compiler.Placement.PcbFlow import (
-    AddMandatoryAccessPortfolioPairwiseConstraints,
-    ApplyJointPlacementPortfolioTrigger,
-    BuildMandatoryAccessPairwiseEdges,
-    BuildMandatoryAccessPortfolioExpectedCandidateIndices,
-    BuildMandatoryAccessPortfolioRecipeIdentity,
-    BuildClusterInterfaceUnsatProof,
-    BuildClusterInterfaceComponentStateFingerprint,
+from Compiler.Placement.Core.Repair import ShouldIncludeNearPortalPackedAccessRepair
+from Compiler.Placement.Core.Search import (
+    PrioritizeRelocationClusters,
+    RelocateClusterSlots,
+    ShouldExpandBoundaryEscapeGeometry,
+)
+from Compiler.Placement.Flow.Candidates import (
     BuildComponentAccessFeedbackPlacementScore,
     BuildClusterInterfaceStageSchedule,
     BuildLocalComponentCompilationAdmissionFailure,
+    HasDistinctRetainedPhysicalEligibilityState,
+    SelectRetainedPhysicalPlacementForAccessCore,
+    PcbPlacementCandidate,
+)
+from Compiler.Placement.Flow.Demand import (
+    ApplyJointPlacementPortfolioTrigger,
+    BuildPlacementGenerationPlan,
+    BuildTopologyDemandPressureProfile,
+    BuildTopologyDemandProfile,
+    MeasurePlacementTopologyDemand,
+    ResolveJointPlacementPortfolioTrigger,
+    TopologyDemandProfile,
+)
+from Compiler.Placement.Flow.Feedback import (
+    BuildPlacementFingerprint,
+    BuildStructuralHigherOrderAssignmentCutFingerprint,
+    SelectCumulativeRepeatedAssignmentCutDiversificationSignals,
+    SelectInterfaceDiversePlacementStates,
+    ShouldDeferTopologyCutForMaterializedSibling,
+)
+from Compiler.Placement.Flow.Portfolios import (
+    AddMandatoryAccessPortfolioPairwiseConstraints,
+    BuildMandatoryAccessPairwiseEdges,
+    BuildMandatoryAccessPortfolioExpectedCandidateIndices,
+    BuildMandatoryAccessPortfolioRecipeIdentity,
     BuildPendingJointPlacementPortfolioIdentity,
     BuildPendingJointPlacementPortfolioFingerprint,
     BuildPendingJointPlacementStateKey,
-    BuildPlacementRelocationVariant,
-    BuildPlacementFingerprint,
-    BuildPlacementRetentionFingerprint,
-    BuildPlacementGenerationPlan,
-    BuildStructuralHigherOrderAssignmentCutFingerprint,
-    BuildTopologyDemandPressureProfile,
-    BuildTopologyDemandProfile,
     DeferredActivePortfolioAssignmentCut,
-    DenseRetainedLeaseProofSliceSeconds,
     EvaluateCompleteMandatoryAccessPortfolio,
     ExtractAuthoritativeCutAccessDomainFingerprint,
     HasActiveMaterializedJointPlacementCandidate,
     HasCurrentMaterializedJointPlacementCandidate,
     HasCurrentPendingJointPlacementState,
-    HasDistinctRetainedPhysicalEligibilityState,
-    SelectRetainedPhysicalPlacementForAccessCore,
     MandatoryAccessPortfolioEvidence,
     MandatoryAccessPortfolioEvaluation,
     MandatoryAccessPortfolioIdentity,
     MandatoryAccessPortfolioIdentityMatchesCurrent,
     MandatoryAccessPortfolioRejection,
-    MeasurePlacementTopologyDemand,
     PendingJointPlacementState,
     PendingJointPlacementStateMatchesIdentity,
-    PcbPlacementCandidate,
     PlacementAssignmentConstraintsAreActive,
     PlacementCandidateMatchesConstraintIdentity,
     PlacementCandidateMatchesActiveJointPortfolio,
     PlacementConstraintFingerprintMatchesIdentity,
     PlacementGenerationRequest,
     RebindTerminalJointPlacementConstraintEpoch,
-    RequiresExactClusterInterfaceSolve,
     RetainUnmaterializedJointPlacementStates,
-    ResolveJointPlacementPortfolioTrigger,
-    SelectCumulativeRepeatedAssignmentCutDiversificationSignals,
     SelectNewPendingJointPlacementPortfolioFingerprint,
-    SelectInterfaceDiversePlacementStates,
     SelectTransactionalRepairClusterCount,
     ShouldAdmitPostDiversificationOwnershipRepair,
     TransactionalCutRequiresCoordinatedClusterRepair,
@@ -83,13 +89,19 @@ from Compiler.Placement.PcbFlow import (
     ShouldStopTransactionalRepairVariantGeneration,
     ShouldOpenStrongMandatoryAccessRepair,
     ShouldDeferTopologyCutForRetainedPortfolioSibling,
-    ShouldDeferTopologyCutForMaterializedSibling,
     ShouldUseMandatoryAccessPreScreen,
     TransactionalCutStrictlyNarrowsParentInterface,
     TransactionalCutRevisitsAncestorInterface,
     TransactionalCutMayEscalateRepairClusterCount,
     TransactionalEndpointRepairIdentityIsFresh,
-    TopologyDemandProfile,
+)
+from Compiler.Placement.Flow.Preparation import (
+    BuildClusterInterfaceUnsatProof,
+    BuildClusterInterfaceComponentStateFingerprint,
+    BuildPlacementRelocationVariant,
+    BuildPlacementRetentionFingerprint,
+    DenseRetainedLeaseProofSliceSeconds,
+    RequiresExactClusterInterfaceSolve,
 )
 from Compiler.Routing.Failures import (
     RoutingAssignmentCut,
@@ -99,7 +111,7 @@ from Compiler.Routing.Failures import (
 )
 from Compiler.Routing.Policy import LocalFirstPhysicalDesignPolicy
 from Compiler.Routing.Reliability import RoutingDeadline
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Placement import (
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceStateProof,
 )
@@ -471,7 +483,7 @@ class TopologyDemandProfileTests(unittest.TestCase):
 
         Candidates = tuple(map(Candidate, ("known", "wide", "best")))
         with patch(
-            "Compiler.Placement.PcbFlow."
+            "Compiler.Placement.Flow.Candidates."
             "BuildComponentAccessFeedbackPlacementScore",
             side_effect=lambda CandidateValue, _Signals: {
                 "known": (0,),

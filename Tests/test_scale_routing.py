@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from SVDecoder.Sv import ParseSvToNetlist
-from Compiler.Placement.PcbFlow import PlaceAndRoutePcb
+from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
 from Compiler.Simulation.Redstone import SimulateRoutedTruthTable
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly

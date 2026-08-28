@@ -4,24 +4,24 @@ import tempfile
 
 import pytest
 
-import Compiler.Placement.AccessFabric as AccessFabricModule
+import Compiler.Placement.Access.Capacity as AccessFabricModule
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
 from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
-from Compiler.Placement.AccessFabric import (
-    AttachPlacementAccessFabric,
-    BuildPlacementAccessFabric,
-    SolvePlacementAccessFabricCapacity,
+from Compiler.Placement.Access.Capacity import SolvePlacementAccessFabricCapacity
+from Compiler.Placement.Access.EscapePaths import (
     _BuildDerivedPerimeterCycleRouteNodeSets,
     _BuildShortestFabricEscapePaths,
 )
-from Compiler.Placement.Pcb import (
-    BuildPinAlignedPackedClusterPortfolio,
-    PcbPlacement,
-    PlacePcbGraph,
+from Compiler.Placement.Access.Fabric import (
+    AttachPlacementAccessFabric,
+    BuildPlacementAccessFabric,
 )
+from Compiler.Placement.Core.Clusters import PcbPlacement
+from Compiler.Placement.Core.Commit import PlacePcbGraph
+from Compiler.Placement.Core.Compactness import BuildPinAlignedPackedClusterPortfolio
 from Compiler.Placement.Rotation import RotatedCellSize
-from Compiler.Placement.PcbFlow import (
+from Compiler.Placement.Flow.Demand import (
     BuildDerivedPinAlignedEnvelopeLowerBoundObjective,
     BuildPlacementGenerationPlan,
     SelectDerivedPrimaryPlacementRequests,
@@ -34,7 +34,7 @@ from Compiler.Routing.Policy import LocalFirstPhysicalDesignPolicy
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
 from SVDecoder import Sv
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Placement import (
     PlacementAccessEscapeStub,
     PlacementAccessFabric,
     PlacementAccessTerminalDomain,
@@ -45,7 +45,7 @@ from Compiler.Routing.ResourceGraph import (
     RoutingResourceKind,
 )
 from Compiler.Routing.Actions.Geometry import BuildRoutingResources
-from Compiler.Routing.AuthoritativePlanner import (
+from Compiler.Routing.Authoritative.Portals import (
     ResolvePlacementAccessFabricRegionContract,
 )
 from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology

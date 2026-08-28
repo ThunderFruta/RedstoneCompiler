@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from Compiler.Ir.Models import Gate, GateKind
-from Compiler.Placement.Pcb import (
+from Compiler.Placement.Core.Compactness import (
     BuildPinAlignedPackedCluster,
     BuildPinAlignedPackedClusterPortfolio,
     CountPinAlignedPackedClusterPortfolio,
@@ -108,6 +108,28 @@ class PinAlignedPackedClusterPortfolioTests(unittest.TestCase):
                 BeamWidth=8,
                 CandidateIndex=Portfolio.RawCandidateCount,
             )
+
+    def testPortfolioRepresentsNoLegalGraphContinuationAsEmptyDomain(self) -> None:
+        Gates = (
+            Gate("N0", GateKind.NAND, ["S0"], ["A", "B"]),
+            Gate("N1", GateKind.NAND, ["S1"], ["C", "D"]),
+        )
+        InternalByName = {GateValue.Name: GateValue for GateValue in Gates}
+        Names = tuple(InternalByName)
+
+        Portfolio = BuildPinAlignedPackedClusterPortfolio(
+            Names,
+            InternalByName,
+            BeamWidth=8,
+        )
+
+        self.assertEqual(Portfolio.States, ())
+        self.assertEqual(Portfolio.RawCandidateCount, 0)
+        self.assertIsNone(BuildPinAlignedPackedCluster(
+            Names,
+            InternalByName,
+            BeamWidth=8,
+        ))
 
 
 if __name__ == "__main__":

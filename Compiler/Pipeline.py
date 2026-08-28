@@ -19,11 +19,9 @@ from .Synthesis.Diagram import WriteNandDiagram
 from .Synthesis.LogicOptimization import OptimizeLogic
 from .Synthesis.NandTransform import ToNandOnly
 from .Synthesis.Validation import ValidateNandOnlyDesign
-from .Placement.PcbFlow import (
-    ApplyRoutingRuntimeBudget,
-    PcbProgress,
-    PlaceAndRoutePcb,
-)
+from Compiler.Placement.Flow.Candidates import ApplyRoutingRuntimeBudget
+from Compiler.Placement.Flow.Results import PcbProgress
+from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
 from SchemEncoder import Writer262
 from SchemEncoder.Writer262 import BlockCompositionMetrics
 from .Simulation.Redstone import (

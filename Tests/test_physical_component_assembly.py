@@ -6,72 +6,117 @@ from types import SimpleNamespace
 
 import pytest
 
-import Compiler.Routing.ComponentPipeline as ComponentPipeline
-import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
+import Compiler.Routing.Components.Cache as ComponentCache
+import Compiler.Routing.Components.Certification as ComponentCertification
+import Compiler.Routing.Components.NoGoods as ComponentNoGoods
+import Compiler.Routing.Components.PhysicalPlanning as ComponentPhysicalPlanning
+import Compiler.Routing.Components.Pipeline as ComponentAssemblyPipeline
+import Compiler.Routing.Components.Portfolios as ComponentPortfolios
+import Compiler.Routing.Components.Validation as ComponentValidation
+import Compiler.Routing.Authoritative.PortPreparationFactors as PhysicalPortPreparationFactors
 from Compiler.Placement.Geometry import PlacedDesign
-from Compiler.Placement.PcbFlow import (
-    BuildPhysicalComponentPlacementFeedback,
+from Compiler.Placement.Flow.Candidates import (
     BuildRetainedComponentPlacementSearchDomain,
-    IsComponentKeepoutGlobalFailure,
     ReuseRetainedPlacementRoutingResources,
-    _PlaceAndRoutePcbWithPolicy,
 )
-from Compiler.Routing.AuthoritativePlanner import (
+from Compiler.Placement.Flow.Results import (
+    BuildPhysicalComponentPlacementFeedback,
+    IsComponentKeepoutGlobalFailure,
+)
+from Compiler.Placement.Flow.Runner import _PlaceAndRoutePcbWithPolicy
+from Compiler.Placement.Flow.PhysicalFlow import RunPhysicalComponentFlow
+from Compiler.Routing.Authoritative.ExteriorConnectors import (
     BuildPhysicalBoundaryPortAssignmentFingerprint,
+    BuildPhysicalGlobalApertureSearchKey,
+    BuildPortablePhysicalGlobalApertureContract,
+    IterPhysicalBoundaryPortAssignments,
+    PreparePhysicalGlobalApertureStaticContract,
+    MaterializePhysicalGlobalAperturePath,
+    NormalizePhysicalGlobalAperturePath,
+    RetainPhysicalGlobalAperturePathTemplate,
+    SelectPhysicalFactorBranchSignal,
+    SelectPhysicalBoundaryPortAssignment,
+)
+from Compiler.Routing.Authoritative.PhysicalGuides import (
     BuildComponentKeepoutAvoidingGlobalGuides,
     BuildComponentKeepoutGuideCellsByLayer,
     BuildExplicitPhysicalComponentFeedthrough,
     BuildPhysicalExteriorApertureFabric,
-    BuildPhysicalGlobalApertureSearchKey,
-    BuildPhysicalPortNoGoodKeys,
-    BuildPortablePhysicalGlobalApertureContract,
-    BuildPhysicalComponentAssemblyPlan,
     ExpandPhysicalComponentGuideChannels,
     FindSignalClaimConflicts,
-    IterPhysicalBoundaryPortAssignments,
-    PropagateLaneFactorArcConsistency,
-    PreparePhysicalGlobalApertureStaticContract,
     PreparePhysicalComponentFeedthroughEndpointDomain,
-    PreparePhysicalComponentPortFactorDomain,
-    MaterializePhysicalGlobalAperturePath,
-    NormalizePhysicalGlobalAperturePath,
-    RetainPhysicalGlobalAperturePathTemplate,
     RemoveClosedComponentInternalGuides,
-    SelectPhysicalFactorBranchSignal,
-    SelectPhysicalBoundaryPortAssignment,
-    SolvePreparedPhysicalComponentPortFactorDomain,
+)
+from Compiler.Routing.Authoritative.AssignmentState import (
+    BuildPhysicalPortNoGoodKeys,
+)
+from Compiler.Routing.Authoritative.Materialization import (
+    BuildPhysicalComponentAssemblyPlan,
+)
+from Compiler.Routing.Authoritative.CandidateGuides import (
+    PropagateLaneFactorArcConsistency,
+)
+from Compiler.Routing.Authoritative.PortPreparation import (
+    PreparePhysicalComponentPortFactorDomain,
+)
+from Compiler.Routing.Authoritative.PortPreparationFactors import (
+    BuildPhysicalPortLaneFactors,
+)
+from Compiler.Routing.Authoritative.CandidateCache import (
     TransformPlanarRoutingPosition,
+)
+from Compiler.Routing.Authoritative.PortSolving import (
+    SolvePreparedPhysicalComponentPortFactorDomain,
+)
+from Compiler.Routing.Authoritative.PortSolving.Search import (
+    _SolvePreparedPhysicalComponentPortFactorDomain,
 )
 from Compiler.Routing.ChannelPlanner import ChannelPlan
 from Compiler.Routing.LocalFirst import CoarseGuidePlan
-from Compiler.Routing.ComponentPipeline import (
+from Compiler.Routing.Components.PhysicalPlanning import (
     BindPhysicalComponentAssemblyGlobalChannels,
     BindPhysicalComponentAssemblyLocalPortSupports,
+    MaterializePreparedPhysicalPortOptionDomains,
+)
+from Compiler.Routing.Components.NoGoods import (
     BuildUniversalPromotedFabricPortAssignmentFailure,
+    RecordPhysicalComponentLocalCompilationNoGood,
+)
+from Compiler.Routing.Components.Certification import (
     BuildDirectionalLocalFactorNoGoods,
     BuildPhysicalLocalPortPairSupportCertificate,
     BuildPhysicalLocalPairProofContextFingerprint,
     CertifyDirectionalLocalContractPortfolio,
-    BuildPhysicalPortGlobalContractFingerprint,
+    PromoteCoveredLocalContractNoGoods,
+)
+from Compiler.Routing.Components.Validation import (
     BuildPhysicalPortApertureContractFingerprint,
     BuildPhysicalPortLocalContractFingerprint,
     BuildPhysicalPortSeamContractFingerprint,
-    CompileClosedComponent,
-    FinalizePhysicalComponentChannelReservations,
-    MaterializePreparedPhysicalPortOptionDomains,
-    PromoteCoveredLocalContractNoGoods,
-    RecordPhysicalComponentLocalCompilationNoGood,
     ValidatePhysicalBoundaryPortHandoff,
     ValidatePhysicalExteriorFabricHandoff,
 )
-from Compiler.Routing.ComponentAccess import (
+from Compiler.Routing.Components.Pipeline import (
+    CompileClosedComponent,
+)
+from Compiler.Routing.Components.Reservations import (
+    FinalizePhysicalComponentChannelReservations,
+)
+from Compiler.Routing.Interfaces.BoundaryRelations import (
+    BuildPhysicalPortGlobalContractFingerprint,
+)
+from Compiler.Routing.Components.Access import (
     BuildComponentCutAccessFeasibilityCertificate,
     ValidateComponentAccessCertificateIdentity,
 )
-from Compiler.Routing.ComponentRouter import (
+from Compiler.Routing.Components.Fabric import (
     AugmentComponentRoutingFabric,
-    BuildCompleteComponentNetPortfolioStaticContext,
     BuildComponentRoutingFabric,
+)
+from Compiler.Routing.Components.Core import (
+    BuildCompleteComponentNetPortfolioStaticContext,
+)
+from Compiler.Routing.Components.Portfolios import (
     CompileCompleteComponentNetVariantPortfolio,
     CompileCompleteComponentNetVariantPortfolios,
     GetCachedCompleteComponentNetVariantPortfolio,
@@ -81,7 +126,7 @@ from Compiler.Routing.Failures import (
     RoutingFailureReason,
     RoutingStageError,
 )
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Component import (
     ClosedComponentInterface,
     ComponentFeedthroughContract,
     ComponentInterfacePort,
@@ -91,15 +136,18 @@ from Compiler.Routing.Models import (
     ComponentTerminalAccessDomain,
     PhysicalComponentChannelReservation,
     PhysicalComponentBoundaryPortReservation,
+)
+from Compiler.Routing.Contracts.PhysicalInterface import (
     PhysicalGlobalAperturePathTemplate,
     PhysicalLocalPortPairProofRecord,
-    RoutingResources,
 )
+from Compiler.Routing.Contracts.Results import RoutingResources
 from Compiler.Routing.ResourceGraph import (
     RoutingResourceClaims,
     RoutingResourceId,
     RoutingResourceKind,
 )
+from Compiler.Routing.Reliability import BuildStableFingerprint
 from Compiler.Routing.Pcb import (
     ClassifyPhysicalComponentAssemblyFailure,
     ReplanPhysicalComponentAssembly,
@@ -1423,7 +1471,7 @@ def test_explicit_feedthrough_reports_complete_fixed_candidate_exhaustion():
 
 def test_physical_port_detour_uses_only_external_portal_ownership():
     Source = inspect.getsource(
-        SolvePreparedPhysicalComponentPortFactorDomain
+        _SolvePreparedPhysicalComponentPortFactorDomain
     )
     DetourStart = Source.index(
         "ReservedPortGuideCells = frozenset("
@@ -1441,10 +1489,10 @@ def test_physical_port_detour_uses_only_external_portal_ownership():
 
 def test_feedthrough_endpoint_prescreen_precedes_candidate_detour_search():
     Source = inspect.getsource(
-        SolvePreparedPhysicalComponentPortFactorDomain
+        _SolvePreparedPhysicalComponentPortFactorDomain
     )
     Prescreen = Source.index(
-        '"FeedthroughEndpointPrescreenComplete": True'
+        "'FeedthroughEndpointPrescreenComplete': True"
     )
     Detour = Source.index(
         "BuildComponentKeepoutAvoidingGlobalGuides(",
@@ -1959,7 +2007,7 @@ def test_closed_component_internal_guides_leave_global_plan():
 
 def test_hierarchical_pipeline_has_no_local_portfolio_or_recursive_fallback():
     FunctionTree = ast.parse(textwrap.dedent(
-        inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+        inspect.getsource(RunPhysicalComponentFlow)
     ))
     Calls = tuple(
         Node
@@ -2003,8 +2051,8 @@ def test_hierarchical_pipeline_has_no_local_portfolio_or_recursive_fallback():
             for Keyword in DeckCall.keywords
             if Keyword.arg == "ComponentVariant"
         )
-        assert isinstance(ComponentVariant, ast.Name)
-        assert ComponentVariant.id == "ComponentVariantForState"
+        assert isinstance(ComponentVariant, ast.Attribute)
+        assert ComponentVariant.attr == "EffectiveComponentVariant"
     assert any(
         Keyword.arg == "ForcedAffectedClusters"
         for Keyword in DeckCalls[1].keywords
@@ -2013,17 +2061,17 @@ def test_hierarchical_pipeline_has_no_local_portfolio_or_recursive_fallback():
 
 def test_physical_port_certificate_filter_uses_each_ports_guide_layer():
     FunctionTree = ast.parse(textwrap.dedent(
-        inspect.getsource(PreparePhysicalComponentPortFactorDomain)
+        inspect.getsource(BuildPhysicalPortLaneFactors)
     ))
     PortLoop = next(
         Node
         for Node in ast.walk(FunctionTree)
         if isinstance(Node, ast.For)
-        and isinstance(Node.target, ast.Name)
-        and Node.target.id == "Port"
+        and isinstance(Node.target, ast.Attribute)
+        and Node.target.attr == "Port"
         and any(
-            isinstance(Child, ast.Name)
-            and Child.id == "CertifiedCandidate"
+            isinstance(Child, ast.Attribute)
+            and Child.attr == "CertifiedCandidate"
             for Child in ast.walk(Node)
         )
     )
@@ -2032,8 +2080,8 @@ def test_physical_port_certificate_filter_uses_each_ports_guide_layer():
         for Node in ast.walk(PortLoop)
         if isinstance(Node, ast.Assign)
         and any(
-            isinstance(Target, ast.Name)
-            and Target.id == "PortLayer"
+            isinstance(Target, ast.Attribute)
+            and Target.attr == "PortLayer"
             for Target in Node.targets
         )
     )
@@ -2045,7 +2093,7 @@ def test_physical_port_certificate_filter_uses_each_ports_guide_layer():
         and isinstance(Node.left, ast.Attribute)
         and Node.left.attr == "Layer"
         and any(
-            isinstance(Value, ast.Name) and Value.id == "PortLayer"
+            isinstance(Value, ast.Attribute) and Value.attr == "PortLayer"
             for Value in Node.comparators
         )
     )
@@ -2060,8 +2108,8 @@ def test_physical_port_certificate_filter_uses_each_ports_guide_layer():
     assert RoutingYCalls
     assert all(
         any(
-            isinstance(Argument, ast.Name)
-            and Argument.id == "PortLayer"
+            isinstance(Argument, ast.Attribute)
+            and Argument.attr == "PortLayer"
             for Argument in Call.args
         )
         for Call in RoutingYCalls
@@ -2477,7 +2525,7 @@ def _BindAssemblyForLocalCompilation(Assembly):
 
 
 def _PreparedFactorDomainFixture(DomainFingerprint, **Domains):
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     return {
@@ -2646,7 +2694,7 @@ def test_selected_plan_local_proof_core_has_complete_prepared_factor_domain(
         ),
     )
     monkeypatch.setattr(
-        "Compiler.Routing.AuthoritativePlanner."
+        "Compiler.Routing.Components.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -2810,7 +2858,7 @@ def test_prepared_physical_port_factor_resume_does_not_rebuild_lanes(
         for Event in Events
     )
     monkeypatch.setattr(
-        "Compiler.Routing.AuthoritativePlanner."
+        "Compiler.Routing.Components.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -2947,7 +2995,7 @@ def test_prepared_physical_port_replan_reuses_factorized_domain(
         ),
     )
     monkeypatch.setattr(
-        "Compiler.Routing.AuthoritativePlanner."
+        "Compiler.Routing.Components.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -3042,7 +3090,7 @@ def test_promoted_local_factor_no_good_prunes_prepared_replan_before_seams():
     )
     Port = First.Plan.Ports[0]
     PortSolverCacheKey = (
-        ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+        ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
             Preparation.DomainFingerprint,
         )
     )
@@ -3111,7 +3159,7 @@ def test_promoted_signal_domain_prunes_distinct_local_contracts():
     )
 
     PortSolverCacheKey = (
-        ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+        ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
             Preparation.DomainFingerprint,
         )
     )
@@ -3174,7 +3222,7 @@ def test_proof_neutral_port_assignment_deferral_selects_a_distinct_plan(
         ),
     )
     monkeypatch.setattr(
-        "Compiler.Routing.AuthoritativePlanner."
+        "Compiler.Routing.Components.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -3212,7 +3260,7 @@ def test_fixed_boundary_local_rejections_advance_seams_without_cycling(
         ResourceGraph=Problem.ResourceGraph,
     )
     OriginalDecompose = (
-        AuthoritativePlanner.DecomposePhysicalPortLaneFactors
+        PhysicalPortPreparationFactors.DecomposePhysicalPortLaneFactors
     )
 
     def DecomposeWithAlternateLocalSupport(*Arguments, **Keywords):
@@ -3270,7 +3318,7 @@ def test_fixed_boundary_local_rejections_advance_seams_without_cycling(
         )
 
     monkeypatch.setattr(
-        AuthoritativePlanner,
+        PhysicalPortPreparationFactors,
         "DecomposePhysicalPortLaneFactors",
         DecomposeWithAlternateLocalSupport,
     )
@@ -3286,7 +3334,7 @@ def test_fixed_boundary_local_rejections_advance_seams_without_cycling(
         ),
     )
     monkeypatch.setattr(
-        "Compiler.Routing.AuthoritativePlanner."
+        "Compiler.Routing.Components.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -4006,6 +4054,7 @@ def test_physical_replan_preserves_access_certificate_identity(monkeypatch):
         _ResourcesValue,
         *,
         WorkCheck=None,
+        Deadline=None,
         DeferLocalCompositeSelection=False,
         RequiredBoundaryPorts=None,
     ):
@@ -4016,7 +4065,7 @@ def test_physical_replan_preserves_access_certificate_identity(monkeypatch):
         return ExpectedAssembly
 
     monkeypatch.setattr(
-        "Compiler.Routing.AuthoritativePlanner."
+        "Compiler.Routing.Authoritative.PortSolving."
         "SolvePreparedPhysicalComponentPortFactorDomain",
         Solve,
     )
@@ -4573,7 +4622,7 @@ def test_joint_access_self_conflict_is_owned_by_local_compilation(
         ResourceGraph=Problem.ResourceGraph,
     )
     monkeypatch.setattr(
-        AuthoritativePlanner,
+        PhysicalPortPreparationFactors,
         "BuildComponentEgressPaths",
         lambda *_Arguments, **_Keywords: (_ for _ in ()).throw(
             AssertionError(
@@ -5064,12 +5113,12 @@ def test_component_handoff_identity_error_is_typed(monkeypatch):
         raise ValueError("test fabric identity mismatch")
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentAssemblyPipeline,
         "ValidateRoutedComponentHandoff",
         RejectHandoff,
     )
     with pytest.raises(RoutingStageError) as Error:
-        ComponentPipeline.AssembleClosedComponentForGlobalRouting(
+        ComponentAssemblyPipeline.AssembleClosedComponentForGlobalRouting(
             Placed,
             Result.Template,
             PhysicalAssemblyPlan=Assembly.Plan,
@@ -5144,7 +5193,7 @@ def test_component_compile_rejects_local_feedback_no_goods():
 
 
 def test_completed_physical_template_cache_reuses_renamed_translation():
-    ComponentPipeline._CompletedComponentTemplateCache.clear()
+    ComponentCache._CompletedComponentTemplateCache.clear()
     Original = _BindAssemblyForLocalCompilation(
         _Assembly(_Problem("Original"))
     )
@@ -5448,7 +5497,7 @@ def test_global_relaxed_proof_removes_only_reserved_global_claims(monkeypatch):
         )
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "SolveComponentRoutingProblem",
         Solve,
     )
@@ -5458,7 +5507,7 @@ def test_global_relaxed_proof_removes_only_reserved_global_claims(monkeypatch):
     ClaimsCache = {}
     DiscoveryCache = {}
     Diagnostics = (
-        ComponentPipeline.ProveGlobalRelaxedLocalUnsatisfiability(
+        ComponentCertification.ProveGlobalRelaxedLocalUnsatisfiability(
             Assembly.Problem,
             DeadlineSeconds=1.0,
             VariantPortfolioCache=PortfolioCache,
@@ -5897,17 +5946,17 @@ def test_local_interface_factor_hashes_full_proof_domain_once_per_portfolio(
         return {"Complete": False, "ProofDomainFingerprints": Domains}
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "BuildGlobalRelaxedLocalProofDomainFingerprint",
         FullDomain,
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "CertifyDirectionalLocalContractPortfolio",
         CartesianPortfolio,
     )
 
-    Diagnostics = ComponentPipeline.CertifyLocalInterfaceFactorPortfolio(
+    Diagnostics = ComponentCertification.CertifyLocalInterfaceFactorPortfolio(
         Assembly.Problem,
         Assembly.Plan,
         "Current",
@@ -5951,16 +6000,16 @@ def test_local_interface_factor_reaches_monotonic_proof_fixed_point(
         return {"Complete": True, "Status": "complete"}
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "BuildGlobalRelaxedLocalProofDomainFingerprint",
         lambda _ProblemValue: "full-local-domain",
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "CertifyDirectionalLocalContractPortfolio",
         Portfolio,
     )
-    Diagnostics = ComponentPipeline.CertifyLocalInterfaceFactorPortfolio(
+    Diagnostics = ComponentCertification.CertifyLocalInterfaceFactorPortfolio(
         Assembly.Problem,
         Assembly.Plan,
         "Current",
@@ -5984,7 +6033,7 @@ def test_local_interface_factor_compiles_each_complete_contract_once(
     CompileCalls = []
     ContractDomainBuildCalls = []
     BuildContractDomain = (
-        ComponentPipeline.BuildCompleteOpposingNetAccessContractDomain
+        ComponentPortfolios.BuildCompleteOpposingNetAccessContractDomain
     )
 
     def Option(Signal, X):
@@ -6091,22 +6140,22 @@ def test_local_interface_factor_compiles_each_complete_contract_once(
 
     ProofDomain = ["full-local-domain"]
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "BuildGlobalRelaxedLocalProofDomainFingerprint",
         lambda _ProblemValue: ProofDomain[0],
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "BuildCompleteComponentNetPortfolioStaticContext",
         BuildStaticContext,
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "CompileCompleteComponentNetVariantPortfolios",
         Compile,
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "BuildCompleteOpposingNetAccessContractDomain",
         lambda *Arguments, **Keywords: (
             ContractDomainBuildCalls.append(True),
@@ -6114,12 +6163,12 @@ def test_local_interface_factor_compiles_each_complete_contract_once(
         )[1],
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "EvaluateCompleteOpposingNetAccessContractRow",
         OracleRow,
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "CertifyDirectionalLocalContractPortfolio",
         CartesianPortfolio,
     )
@@ -6132,7 +6181,7 @@ def test_local_interface_factor_compiles_each_complete_contract_once(
         ),
         RejectedPhysicalComponentPortReservationSets=set(),
     )
-    First = ComponentPipeline.CertifyLocalInterfaceFactorPortfolio(
+    First = ComponentCertification.CertifyLocalInterfaceFactorPortfolio(
         Assembly.Problem,
         Assembly.Plan,
         "Current",
@@ -6140,7 +6189,7 @@ def test_local_interface_factor_compiles_each_complete_contract_once(
         Resources,
         DeadlineSeconds=1.0,
     )
-    Second = ComponentPipeline.CertifyLocalInterfaceFactorPortfolio(
+    Second = ComponentCertification.CertifyLocalInterfaceFactorPortfolio(
         Assembly.Problem,
         Assembly.Plan,
         "Current",
@@ -6149,7 +6198,7 @@ def test_local_interface_factor_compiles_each_complete_contract_once(
         DeadlineSeconds=1.0,
     )
     ProofDomain[0] = "changed-full-local-domain"
-    Third = ComponentPipeline.CertifyLocalInterfaceFactorPortfolio(
+    Third = ComponentCertification.CertifyLocalInterfaceFactorPortfolio(
         Assembly.Problem,
         Assembly.Plan,
         "Current",
@@ -6198,17 +6247,17 @@ def test_local_interface_factor_reevaluates_incomplete_bulk_row(monkeypatch):
     BulkCalls = []
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "BuildGlobalRelaxedLocalProofDomainFingerprint",
         lambda _ProblemValue: "full-local-domain",
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "BuildCompleteComponentNetPortfolioStaticContext",
         lambda *_Arguments: object(),
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "CompileCompleteComponentNetVariantPortfolios",
         lambda *_Arguments, **_Keywords: SimpleNamespace(
             Complete=True,
@@ -6273,7 +6322,7 @@ def test_local_interface_factor_reevaluates_incomplete_bulk_row(monkeypatch):
         )
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "EvaluateCompleteOpposingNetAccessContractRow",
         Bulk,
     )
@@ -6304,11 +6353,11 @@ def test_local_interface_factor_reevaluates_incomplete_bulk_row(monkeypatch):
         return {"Complete": True, "Status": "complete"}
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentCertification,
         "CertifyDirectionalLocalContractPortfolio",
         Portfolio,
     )
-    Diagnostics = ComponentPipeline.CertifyLocalInterfaceFactorPortfolio(
+    Diagnostics = ComponentCertification.CertifyLocalInterfaceFactorPortfolio(
         Assembly.Problem,
         Assembly.Plan,
         "Current",
@@ -6333,7 +6382,7 @@ def test_global_relaxed_domain_fingerprint_covers_local_contract_domains():
     Problem = Assembly.Problem
     Plan = Problem.PhysicalAssemblyPlan
     assert Plan is not None
-    Base = ComponentPipeline.BuildGlobalRelaxedLocalProofDomainFingerprint(
+    Base = ComponentCertification.BuildGlobalRelaxedLocalProofDomainFingerprint(
         Problem
     )
     Port = Plan.Ports[0]
@@ -6387,7 +6436,7 @@ def test_global_relaxed_domain_fingerprint_covers_local_contract_domains():
     )
 
     assert all(
-        ComponentPipeline.BuildGlobalRelaxedLocalProofDomainFingerprint(
+        ComponentCertification.BuildGlobalRelaxedLocalProofDomainFingerprint(
             Changed
         ) != Base
         for Changed in ChangedProblems
@@ -6471,7 +6520,7 @@ def test_relaxed_complete_two_port_core_prunes_exact_reservation_pair(
         },
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentNoGoods,
         "BuildGlobalRelaxedLocalProofDomainFingerprint",
         lambda _Problem: "relaxed-domain",
     )
@@ -6502,7 +6551,7 @@ def test_relaxed_complete_two_port_core_prunes_exact_reservation_pair(
     )
     ExpectedReservationKeys = {
         Port.Signal: (
-            ComponentPipeline.BuildPhysicalPortLocalContractFingerprint(Port)
+            ComponentValidation.BuildPhysicalPortLocalContractFingerprint(Port)
         )
         for Port in Plan.Ports
     }
@@ -6595,7 +6644,7 @@ def test_relaxed_owned_tree_frontier_prunes_complete_signal_domain(
         },
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        ComponentNoGoods,
         "BuildGlobalRelaxedLocalProofDomainFingerprint",
         lambda _Problem: "relaxed-domain",
     )
@@ -6609,7 +6658,7 @@ def test_relaxed_owned_tree_frontier_prunes_complete_signal_domain(
     )
 
     PortSolverCacheKey = (
-        ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+        ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
             "prepared-domain"
         )
     )
@@ -6663,7 +6712,7 @@ def test_complete_local_contract_pair_cover_promotes_fabric_pair():
         for Second in SecondOptions
     }
     DomainFingerprint = "complete-factor-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     DirectionalClauses = {
@@ -6739,7 +6788,7 @@ def test_directional_local_factor_no_good_requires_complete_pair_coverage():
     CompleteOptions = (Option("Complete", 3), Option("Complete", 4))
     Plan = SimpleNamespace(Ports=(CurrentOptions[0], CompleteOptions[0]))
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildStableFingerprint((
+    CacheKey = BuildStableFingerprint((
         "physical-component-port-solver-cache-v2",
         DomainFingerprint,
     ))
@@ -6843,7 +6892,7 @@ def test_directional_local_factor_no_good_requires_current_contract_support():
         }
     )
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildStableFingerprint((
+    CacheKey = BuildStableFingerprint((
         "physical-component-port-solver-cache-v2",
         DomainFingerprint,
     ))
@@ -6880,7 +6929,7 @@ def test_local_interface_factor_portfolio_batches_and_reuses_exact_pairs():
     CompleteOptions = (Option("Complete", 3), Option("Complete", 4))
     Plan = SimpleNamespace(Ports=(CurrentOptions[0], CompleteOptions[0]))
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     Resources = SimpleNamespace(
@@ -6971,7 +7020,7 @@ def test_local_interface_factor_portfolio_does_not_lift_incomplete_coverage():
     Complete = Option("Complete", 3)
     Plan = SimpleNamespace(Ports=(CurrentOptions[0], Complete))
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     Resources = SimpleNamespace(
@@ -7093,7 +7142,7 @@ def test_local_interface_factor_portfolio_requires_complete_cartesian_proof():
         Option("Complete", 4, "fabric-complete"),
     )
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     SeedPair = frozenset((
@@ -7216,7 +7265,7 @@ def test_local_interface_factor_portfolio_stops_at_feasible_pair():
     CurrentOptions = (Option("Current", 1), Option("Current", 2))
     CompleteOptions = (Option("Complete", 3), Option("Complete", 4))
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     Resources = SimpleNamespace(
@@ -7280,7 +7329,7 @@ def test_universal_promoted_fabric_clause_builds_direct_port_unsat_failure():
         )
 
     DomainFingerprint = "complete-prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     FirstOptions = (
@@ -7343,7 +7392,7 @@ def test_universal_promoted_fabric_clause_builds_direct_port_unsat_failure():
 
 def test_nonuniversal_promoted_fabric_clause_keeps_global_replan_available():
     DomainFingerprint = "multi-fabric-prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
 
@@ -7412,7 +7461,7 @@ def test_local_interface_factor_portfolio_yields_after_one_complete_row():
     CurrentOptions = (Option("Current", 1), Option("Current", 2))
     CompleteOptions = (Option("Complete", 3), Option("Complete", 4))
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     Resources = SimpleNamespace(
@@ -7499,7 +7548,7 @@ def test_local_interface_factor_portfolio_does_not_cache_incomplete_proof():
     Current = Option("Current", 1)
     Complete = Option("Complete", 2)
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     Resources = SimpleNamespace(
@@ -7580,7 +7629,7 @@ def test_local_interface_factor_defers_incomplete_rows_and_finds_later_witness()
     ))
     FeasibleContract = OrderedCompleteContracts[-1]
     DomainFingerprint = "prepared-domain"
-    CacheKey = ComponentPipeline.BuildPhysicalComponentPortSolverCacheKey(
+    CacheKey = ComponentPhysicalPlanning.BuildPhysicalComponentPortSolverCacheKey(
         DomainFingerprint
     )
     Resources = SimpleNamespace(

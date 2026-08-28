@@ -14,14 +14,16 @@ except ImportError:
         RustRoutingContext = None
 
 from ..Actions import BuildRoutingResources
-from ..AuthoritativePlanner import RouteAuthoritativeResources
+from ..Authoritative.Flow import RouteAuthoritativeResources
 from ..ChannelPlanner import RoutingIterationMetrics
-from ..Models import (
+from ..Contracts.Placement import (
     ClusterInterfaceRealizabilityNogood,
-    ComponentRoutingProblem,
+    TrackAssignmentPreparation,
+)
+from ..Contracts.Component import ComponentRoutingProblem
+from ..Contracts.Results import (
     RoutedDesign,
     RoutingResources,
-    TrackAssignmentPreparation,
 )
 from ..Reliability import RoutingDeadline
 from ..Policy import DefaultPhysicalDesignPolicy, PhysicalDesignPolicy

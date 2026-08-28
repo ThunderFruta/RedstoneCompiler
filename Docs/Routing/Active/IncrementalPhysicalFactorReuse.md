@@ -42,7 +42,8 @@ claims changed. Reusing only independently certified local factors is sound.
 
 ## Data Model
 
-Add these internal immutable records in `Compiler/Routing/Models.py`.
+The internal immutable records below live in the neutral
+`Compiler/Routing/Contracts/PhysicalInterface.py` contract module.
 
 ```text
 PreparedPhysicalSignalLocalFactorDomain

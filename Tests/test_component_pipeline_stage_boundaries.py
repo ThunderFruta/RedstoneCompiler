@@ -4,8 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from Compiler.Placement.PcbFlow import (
+from Compiler.Placement.Flow.Candidates import (
     BuildPhysicalGlobalPlanResumeCursorFromDiagnostics,
+    ClassifyPhysicalGlobalPlanRetentionAdmission,
+)
+from Compiler.Placement.Flow.Preparation import SummarizePreRouteAccessFabric
+from Compiler.Placement.Flow.Results import (
     BuildComponentRoutabilityCore,
     BuildCapacityRepairGeometryFingerprint,
     BuildPhysicalLocalFactorDiversificationCore,
@@ -14,52 +18,84 @@ from Compiler.Placement.PcbFlow import (
     BuildSymbolicCapacityRepairEvidence,
     PreparedEligibilityHasDisjointCapacitySeams,
     BuildPhysicalComponentPlacementFeedback,
-    ClassifyPhysicalGlobalPlanRetentionAdmission,
     IsClusterInterfaceStateIncomplete,
     IsCompletePhysicalAssemblyUnsatisfiable,
-    SummarizePreRouteAccessFabric,
-    _PlaceAndRoutePcbWithPolicy,
 )
-import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
+from Compiler.Placement.Flow.Runner import _PlaceAndRoutePcbWithPolicy
+import Compiler.Placement.Flow.CandidateRouting as PlacementCandidateRouting
+import Compiler.Placement.Flow.PhysicalAssembly as PlacementPhysicalAssembly
+import Compiler.Placement.Flow.PhysicalFlow as PlacementPhysicalFlow
+import Compiler.Placement.Flow.PlacementAttempts as PlacementAttempts
+import Compiler.Placement.Flow.Portfolios as PlacementPortfolios
+import Compiler.Placement.Flow.Results as PlacementPublication
+import Compiler.Placement.Flow.RoutingAttempts as PlacementRoutingAttempts
+import Compiler.Placement.Flow.Setup as PlacementSetup
+import Compiler.Routing.Authoritative.CandidateDomains as AuthoritativeCandidateDomains
+import Compiler.Routing.Authoritative.CandidateGuides as AuthoritativeCandidateGuides
+import Compiler.Routing.Authoritative.Flow as AuthoritativeFlow
+import Compiler.Routing.Authoritative.FlowPhases.AssignmentPreparation as AuthoritativeAssignmentPreparation
+import Compiler.Routing.Authoritative.FlowPhases.GuidePlanning as AuthoritativeGuidePlanning
+import Compiler.Routing.Authoritative.FlowPhases.PortalPreparation as AuthoritativePortalPreparation
+import Compiler.Routing.Authoritative.RunModels as AuthoritativeRunModels
+import Compiler.Routing.Authoritative.PortSolving as PhysicalPortSolving
+import Compiler.Routing.Authoritative.PortSolving.Search as PhysicalPortSearch
 import Compiler.Routing.Pcb as Pcb
-from Compiler.Routing.ComponentPipeline import (
+from Compiler.Routing.Interfaces import BoundaryRelations
+from Compiler.Routing.Components.PhysicalPlanning import (
     BuildPhysicalComponentAssemblyChoiceFingerprint,
     BuildPhysicalComponentAssemblyPlanDomainFingerprint,
     BuildPhysicalAssemblyGlobalReuseFingerprint,
     BuildPhysicalGlobalPlanCutFamilyFingerprint,
     BuildPhysicalGlobalPlanDependencyFingerprint,
-    BuildPhysicalPortApertureContractFingerprint,
-    BuildPhysicalPortGlobalContractFingerprint,
-    BuildPhysicalPortLocalContractFingerprint,
-    BuildPhysicalPortSeamContractFingerprint,
     BuildPhysicalRequestAperturePortNoGood,
     ClassifyPhysicalComponentGlobalPlanningFailure,
-    RecordPhysicalComponentGlobalPlanNoGood,
-    RecordPhysicalComponentSymbolicCapacityEligibilityNoGood,
     PreservePhysicalComponentAssemblyPlanDomainContinuation,
-    ProjectCompletePhysicalPortPairCertificateToApertureClauses,
     PhysicalAssemblyGlobalRouteCanBeRebound,
     PruneRetainedPhysicalGlobalPlansByRejectedApertureClauses,
-    RecordPhysicalComponentDetailedRoutingNoGood,
-    SelectContractIndependentOwnedSignalFrontierUnsatCore,
-    SelectPhysicalComponentGlobalContractRecommendation,
     SelectPhysicalComponentExactGlobalChannelSignals,
 )
+from Compiler.Routing.Components.Validation import (
+    BuildPhysicalPortApertureContractFingerprint,
+    BuildPhysicalPortLocalContractFingerprint,
+    BuildPhysicalPortSeamContractFingerprint,
+    SelectPhysicalComponentGlobalContractRecommendation,
+)
+from Compiler.Routing.Components.GlobalNoGoods import (
+    RecordPhysicalComponentGlobalPlanNoGood,
+)
+from Compiler.Routing.Components.NoGoods import (
+    RecordPhysicalComponentDetailedRoutingNoGood,
+    RecordPhysicalComponentSymbolicCapacityEligibilityNoGood,
+)
+from Compiler.Routing.Components.SymbolicDomains import (
+    ProjectCompletePhysicalPortPairCertificateToApertureClauses,
+)
+from Compiler.Routing.Components.Certification import (
+    SelectContractIndependentOwnedSignalFrontierUnsatCore,
+)
+from Compiler.Routing.Interfaces.BoundaryRelations import (
+    BuildPhysicalPortGlobalContractFingerprint,
+)
+
+
+def _Sources(*Functions):
+    """Join concrete owners in their runtime phase order for source contracts."""
+    return "\n".join(inspect.getsource(Function) for Function in Functions)
 
 
 def test_closed_region_portals_replace_discovery_domain_before_consumers():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativePortalPreparation.RunPortalPreparation
     )
     Publish = Source.index(
-        "RawPortalEntries = EffectiveRawPortalCache.PortalEntries"
+        "RawPortalEntries = State.EffectiveRawPortalCache.PortalEntries"
     )
     Dictionary = Source.index(
-        "RawPortals = EffectiveRawPortalCache.BuildPortalDictionary()",
+        "RawPortals = State.EffectiveRawPortalCache.BuildPortalDictionary()",
         Publish,
     )
     Consumer = Source.index(
-        "if PrepareComponentRoutingProblemOnly:",
+        "if State.PrepareComponentRoutingProblemOnly:",
         Dictionary,
     )
 
@@ -68,7 +104,12 @@ def test_closed_region_portals_replace_discovery_domain_before_consumers():
 
 def test_single_component_selection_freezes_raw_tracks_before_route():
     """A compact portfolio has one raw selector and no post-selection solve."""
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = _Sources(
+        PlacementRoutingAttempts.SolvePrePlacementCapacityProblem,
+        PlacementRoutingAttempts.MaterializeRawTemplate,
+        PlacementSetup.PreparePlacementRouting,
+        PlacementCandidateRouting.RoutePlacementCandidates,
+    )
     RawDomain = Source.index(
         "RawDomain = PrepareRawTrackAssignmentDomain("
     )
@@ -77,17 +118,17 @@ def test_single_component_selection_freezes_raw_tracks_before_route():
         RawDomain,
     )
     FrozenPreparation = Source.index(
-        "SelectedTrackPreparation = RawTrackAssignmentResult.Preparation",
+        "Context.SelectedTrackPreparation = Context.RawTrackAssignmentResult.Preparation",
         Selection,
     )
     MultiComponentPreparation = Source.index(
         "Preparation = PrepareTrackAssignment("
     )
     LegacyPreparation = Source.index(
-        "SelectedTrackPreparation = PrepareTrackAssignment(",
+        "Context.SelectedTrackPreparation = PrepareTrackAssignment(",
         FrozenPreparation,
     )
-    FirstRoute = Source.index("RoutePcbDesign(", LegacyPreparation)
+    FirstRoute = Source.index("Context.Services.RoutePcbDesign(", LegacyPreparation)
 
     # Each fixed candidate exports its raw native values, then one aggregate
     # selector supplies the selected frozen witness.  The remaining ordinary
@@ -100,23 +141,23 @@ def test_single_component_selection_freezes_raw_tracks_before_route():
     assert Source.count("PrepareTrackAssignment(") == 2
     assert RawDomain < Selection < FrozenPreparation < LegacyPreparation
     assert MultiComponentPreparation < Selection
-    assert "if SelectedTrackPreparation is None:" in Source[
+    assert "if Context.SelectedTrackPreparation is None:" in Source[
         FrozenPreparation:LegacyPreparation
     ]
     assert LegacyPreparation < FirstRoute
 
 
 def test_success_publishes_authoritative_selection_fingerprint():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPublication.PublishPlacementFlowResult)
     RawFingerprint = Source.index(
-        "RawTrackAssignmentResult.SelectionFingerprint"
+        "Context.RawTrackAssignmentResult.SelectionFingerprint"
     )
     InterfaceFingerprint = Source.index(
-        "else PreRouteInterfaceResult.SelectionFingerprint",
+        "else Context.PreRouteInterfaceResult.SelectionFingerprint",
         RawFingerprint,
     )
     Publication = Source.index(
-        'RoutingControlEffectiveness["CandidateFingerprint"]',
+        "RoutingControlEffectiveness['CandidateFingerprint']",
         InterfaceFingerprint,
     )
 
@@ -125,26 +166,29 @@ def test_success_publishes_authoritative_selection_fingerprint():
 
 def test_multi_component_missing_access_assignment_uses_frozen_track_witness():
     """Legacy components must not be mislabeled missing small-design fabric."""
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = _Sources(
+        PlacementRoutingAttempts.SolvePrePlacementCapacityProblem,
+        PlacementSetup.PreparePlacementRouting,
+    )
     MissingAssignment = Source.index("if AccessAssignment is None:")
     Preparation = Source.index(
         "Preparation = PrepareTrackAssignment(",
         MissingAssignment,
     )
     StoredWitness = Source.index(
-        "PrePlacementTrackPreparationWitnesses[",
+        "Context.PrePlacementTrackPreparationWitnesses[",
         Preparation,
     )
     PublishedWitness = Source.index(
-        "PrePlacementTrackPreparationWitnesses.get(",
+        "Context.PrePlacementTrackPreparationWitnesses.get(",
         StoredWitness,
     )
     SelectedWitness = Source.index(
-        "SelectedTrackPreparation = (",
+        "Context.SelectedTrackPreparation = Context.PrePlacementTrackPreparationWitnesses.get(",
         PublishedWitness,
     )
     DefensiveFallback = Source.index(
-        "if SelectedTrackPreparation is None:",
+        "if Context.SelectedTrackPreparation is None:",
         SelectedWitness,
     )
 
@@ -157,11 +201,14 @@ def test_multi_component_missing_access_assignment_uses_frozen_track_witness():
 
 def test_single_component_defers_derived_fabric_until_raw_materialization():
     """A declared shell ranks first; its escape search is not eager work."""
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    Shell = Source.index("Shell = BuildDerivedPerimeterFabricShell(")
-    Descriptor = Source.index("PreRouteFabricDescriptorsByCandidateId[")
+    Source = _Sources(
+        PlacementSetup.GeneratePlacementCandidates,
+        PlacementRoutingAttempts.MaterializeRawTemplate,
+    )
+    Shell = Source.index("Context.Shell = BuildDerivedPerimeterFabricShell(")
+    Descriptor = Source.index("Context.PreRouteFabricDescriptorsByCandidateId[")
     DeferredCandidate = Source.index(
-        "FabricCandidateRecords.append(DescriptorCandidate)",
+        "Context.FabricCandidateRecords.append(Context.DescriptorCandidate)",
     )
     Materializer = Source.index("def MaterializeRawTemplate(")
     Fabric = Source.index("Fabric = BuildPlacementAccessFabric(", Materializer)
@@ -178,23 +225,32 @@ def test_single_component_defers_derived_fabric_until_raw_materialization():
 
 def test_single_component_selected_contract_cannot_reenter_legacy_portfolio():
     """One selected packed contract owns the whole remaining route attempt."""
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    ExactGate = Source.index("ExactClusterInterfaceSolveEnabled = (")
+    Source = _Sources(
+        PlacementSetup.PreparePlacementRouting,
+        PlacementCandidateRouting.RoutePlacementCandidates,
+    )
+    ExactGate = Source.index("Context.ExactClusterInterfaceSolveEnabled =")
     DeferredAlternatives = Source.index(
-        "HasRemainingPlacementAlternative = (",
+        "Context.HasRemainingPlacementAlternative =",
         ExactGate,
     )
     SingleAttemptSlots = Source.index(
-        "PlannedRoutingSlots = (",
+        "Context.PlannedRoutingSlots =",
         DeferredAlternatives,
     )
-    Route = Source.index("RoutePcbDesign(", SingleAttemptSlots)
+    Route = Source.index("Context.Services.RoutePcbDesign(", SingleAttemptSlots)
 
     ExactGateSource = Source[ExactGate:DeferredAlternatives]
     RouteBudgetSource = Source[DeferredAlternatives:Route]
-    assert "not SinglePackedComponent" in ExactGateSource
-    assert "False\n            if SinglePackedComponent" in RouteBudgetSource
-    assert "1\n            if SinglePackedComponent" in RouteBudgetSource
+    assert "not Context.SinglePackedComponent" in ExactGateSource
+    assert (
+        "Context.HasRemainingPlacementAlternative = False "
+        "if Context.SinglePackedComponent"
+    ) in RouteBudgetSource
+    assert (
+        "Context.PlannedRoutingSlots = 1 "
+        "if Context.SinglePackedComponent"
+    ) in RouteBudgetSource
 
 
 def test_pre_route_fabric_summary_exposes_frontier_not_all_stub_claims():
@@ -265,11 +321,13 @@ from Compiler.Routing.Failures import (
     RoutingStageError,
 )
 from Compiler.Routing.ResourceGraph import RoutingResourceClaims
-from Compiler.Routing.Models import (
-    ComponentRoutingSolveResult,
+from Compiler.Routing.Contracts.Component import ComponentRoutingSolveResult
+from Compiler.Routing.Contracts.PhysicalInterface import (
     PhysicalGlobalPlanResumeCursor,
     PhysicalPortCorridorDomain,
     PhysicalPortCorridorFactor,
+)
+from Compiler.Routing.Contracts.Placement import (
     TrackAssignmentPreparation,
     TrackAssignmentPrepared,
 )
@@ -317,9 +375,9 @@ def test_prepare_raw_track_assignment_domain_stops_before_assignment(
 ):
     """The portfolio bridge exports values, not a second native solve."""
     Position = (1, 1, 1)
-    Expected = AuthoritativePlanner.RawTrackAssignmentDomain(
+    Expected = AuthoritativeRunModels.RawTrackAssignmentDomain(
         ResourcePositions=(Position,),
-        Values=(AuthoritativePlanner.RawTrackAssignmentValue(
+        Values=(AuthoritativeRunModels.RawTrackAssignmentValue(
             Signal="Signal",
             CandidateId="candidate",
             Claims=RoutingResourceClaims(WireCells=frozenset({Position})),
@@ -343,7 +401,7 @@ def test_prepare_raw_track_assignment_domain_stops_before_assignment(
 
     def Prepare(*_Arguments: object, **KeywordArguments: object) -> None:
         Calls.append(dict(KeywordArguments))
-        raise AuthoritativePlanner.RawTrackAssignmentDomainPrepared(
+        raise AuthoritativeRunModels.RawTrackAssignmentDomainPrepared(
             Expected
         )
 
@@ -452,7 +510,7 @@ def test_pre_global_symbolic_capacity_proof_rejects_only_exact_port_tuple():
 
 def test_seam_domain_cache_identity_includes_every_composite_restriction():
     Source = inspect.getsource(
-        AuthoritativePlanner.SolvePreparedPhysicalComponentPortFactorDomain
+        PhysicalPortSearch._SolvePreparedPhysicalComponentPortFactorDomain
     )
 
     HelperStart = Source.index("def BuildSeamOnlyPortDomainKey")
@@ -467,7 +525,7 @@ def test_seam_domain_cache_identity_includes_every_composite_restriction():
 
 def test_deferred_local_selection_keeps_boundary_csp_port_first():
     Source = inspect.getsource(
-        AuthoritativePlanner.SolvePreparedPhysicalComponentPortFactorDomain
+        PhysicalPortSearch._SolvePreparedPhysicalComponentPortFactorDomain
     )
 
     assert "IncludeLocalCompositeFactors=True" in Source
@@ -752,9 +810,9 @@ def _MixedPhysicalCorridorDomains():
 
 
 def test_local_unsat_rejects_only_the_complete_assembly_plan():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Start = Source.index("ComponentSolve = CompileClosedComponent(")
-    End = Source.index("assert ComponentSolve.Template is not None", Start)
+    End = Source.index("assert Context.ComponentSolve.Template is not None", Start)
     LocalCompilation = Source[Start:End]
 
     assert "RecordPhysicalComponentLocalCompilationNoGood" in (
@@ -771,7 +829,7 @@ def test_local_unsat_rejects_only_the_complete_assembly_plan():
         LocalCompilation
     )
     assert "local-unsat-reject-complete-assembly-plan" in LocalCompilation
-    assert "PerSignalReservationFeedbackUsed\": False" in LocalCompilation
+    assert "'PerSignalReservationFeedbackUsed': False" in LocalCompilation
     assert "ReplanPhysicalAssemblyWithTiming(" in LocalCompilation
 
 
@@ -831,12 +889,12 @@ def test_detailed_failure_rejects_exact_channels_not_port_assignment():
 
 
 def test_detailed_failure_orchestration_has_no_broad_port_rejection():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Start = Source.index(
-        '"detailed-failure-reject-physical-plan"',
+        "'detailed-failure-reject-physical-plan'",
     )
     End = Source.index(
-        "PreparedAssembly = (",
+        "Context.PreparedAssembly =",
         Start,
     )
     Rejection = Source[Start:End]
@@ -849,48 +907,50 @@ def test_detailed_failure_orchestration_has_no_broad_port_rejection():
 
 
 def test_local_compilation_requires_explicit_admission_without_floor():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    Start = Source.index("ActiveComponentDeadline = SharedInterfaceDeadline")
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
+    Start = Source.index(
+        "Context.ActiveComponentDeadline = Context.SharedInterfaceDeadline"
+    )
     Compile = Source.index("ComponentSolve = CompileClosedComponent(", Start)
-    End = Source.index("if not ComponentSolve.Feasible:", Compile)
+    End = Source.index("if not Context.ComponentSolve.Feasible:", Compile)
     Admission = Source[Start:Compile]
     Invocation = Source[Compile:End]
 
     assert "BuildLocalComponentCompilationAdmissionFailure(" in Admission
     assert "ActiveComponentRemainingSeconds <= 0" in Admission
-    assert "DeadlineSeconds=(" in Invocation
+    assert "DeadlineSeconds=Context.ActiveComponentRemainingSeconds" in Invocation
     assert "ActiveComponentRemainingSeconds" in Invocation
     assert "max(" not in Invocation
 
 
 def test_admitted_local_compilation_is_not_reclassified_by_planning_clock():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Compile = Source.index("ComponentSolve = CompileClosedComponent(")
-    Result = Source.index("if not ComponentSolve.Feasible:", Compile)
+    Result = Source.index("if not Context.ComponentSolve.Feasible:", Compile)
     Template = Source.index(
-        "assert ComponentSolve.Template is not None",
+        "assert Context.ComponentSolve.Template is not None",
         Result,
     )
     Classification = Source[Result:Template]
 
     assert "InterfaceDeadline.IsExpired()" not in Classification
-    assert 'Stage=(\n                                    "ClosedComponentCompilationIncomplete"' in Classification
+    assert "Stage='ClosedComponentCompilationIncomplete'" in Classification
     assert "RecordPhysicalComponentLocalCompilationNoGood(" in Classification
 
 
 def test_physical_planning_uses_planning_clock_until_bound_handoff():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Schedule = Source.index("BuildClusterInterfaceStageSchedule(")
     PlanningDeadline = Source.index(
         "SharedInterfacePlanningDeadline = RoutingDeadline(",
         Schedule,
     )
     StateDeadline = Source.index(
-        "InterfaceDeadline = SharedInterfacePlanningDeadline",
+        "Context.InterfaceDeadline = Context.SharedInterfacePlanningDeadline",
         PlanningDeadline,
     )
     Admission = Source.index(
-        "if InterfaceDeadline.IsExpired():",
+        "if Context.InterfaceDeadline.IsExpired():",
         StateDeadline,
     )
     Preparation = Source.index(
@@ -900,13 +960,19 @@ def test_physical_planning_uses_planning_clock_until_bound_handoff():
 
     assert Schedule < PlanningDeadline < StateDeadline < Admission < Preparation
     Selection = Source[StateDeadline:Admission]
-    assert "InterfaceDeadline = SharedInterfacePlanningDeadline" in Selection
-    assert "SharedInterfaceDeadline" not in Selection
-    assert "if RetainedPlacementFingerprint in (" in Selection
+    assert (
+        "Context.InterfaceDeadline = Context.SharedInterfacePlanningDeadline"
+        in Selection
+    )
+    assert "Context.SharedInterfaceDeadline" not in Selection
+    assert "if Context.RetainedPlacementFingerprint in" in Selection
 
 
 def test_stage_specific_incomplete_failures_preserve_handoff_identity():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = _Sources(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels,
+        PlacementPhysicalFlow.RunPhysicalComponentFlow,
+    )
     Compile = Source.index("ComponentSolve = CompileClosedComponent(")
     BeforeCompile = Source[:Compile]
     AfterCompile = Source[Compile:]
@@ -923,7 +989,7 @@ def test_stage_specific_incomplete_failures_preserve_handoff_identity():
     assert "BuildClosedComponentExecutionIncompleteFailure(" not in (
         AfterCompile
     )
-    assert '"ClosedComponentCompilationIncomplete"' in AfterCompile
+    assert "'ClosedComponentCompilationIncomplete'" in AfterCompile
     assert "PhysicalAssemblyPlan.PlanFingerprint" in AfterCompile
 
 
@@ -1012,19 +1078,21 @@ def test_unbound_owned_frontier_core_requires_complete_independence():
 
 def test_unbound_frontier_callback_precedes_port_factor_preparation():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativePortalPreparation.RunPortalPreparation
     )
-    Problem = Source.index("PreparedAccessProblem = BuildComponentRoutingProblem(")
+    Problem = Source.index(
+        "PreparedAccessProblem = Services.BuildComponentRoutingProblem("
+    )
     Callback = Source.index(
-        "UnboundOwnedSignalFrontierProofCallback(",
+        "State.UnboundOwnedSignalFrontierProofCallback(",
         Problem,
     )
     Access = Source.index(
-        "BuildComponentCutAccessFeasibilityCertificate(",
+        "Services.BuildComponentCutAccessFeasibilityCertificate(",
         Callback,
     )
     Factors = Source.index(
-        "Preparation = PreparePhysicalComponentPortFactorDomain(",
+        "Preparation = Services.PreparePhysicalComponentPortFactorDomain(",
         Callback,
     )
 
@@ -1032,40 +1100,36 @@ def test_unbound_frontier_callback_precedes_port_factor_preparation():
 
 
 def test_unbound_frontier_failure_exports_minimal_placement_core():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    Callback = Source.index("def ProveUnboundOwnedSignalFrontier(")
-    Preparation = Source.index(
-        "PreparedEligibility = PreparePhysicalComponentEligibility(",
-        Callback,
+    CallbackSource = inspect.getsource(
+        PlacementPhysicalAssembly.ProveUnboundOwnedSignalFrontier
     )
-    CallbackSource = Source[Callback:Preparation]
 
-    assert '"PortAssignmentUnsatCoreMinimal": True' in CallbackSource
-    assert '"PortAssignmentUnsatCoreSignals": list(' in CallbackSource
-    assert '"PortAssignmentUnsatCoreFingerprint": (' in CallbackSource
+    assert "'PortAssignmentUnsatCoreMinimal': True" in CallbackSource
+    assert "'PortAssignmentUnsatCoreSignals': list(" in CallbackSource
+    assert "'PortAssignmentUnsatCoreFingerprint':" in CallbackSource
 
 
 def test_owned_terminal_portals_precede_unbound_frontier_and_global_portals():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativePortalPreparation.RunPortalPreparation
     )
     OwnedBatch = Source.index(
-        '"PhysicalOwnedTerminalPortalEligibility"',
+        "'PhysicalOwnedTerminalPortalEligibility'",
     )
     OwnedProblem = Source.index(
-        "PreparedAccessProblem = BuildComponentRoutingProblem(",
+        "PreparedAccessProblem = Services.BuildComponentRoutingProblem(",
         OwnedBatch,
     )
     Callback = Source.index(
-        "UnboundOwnedSignalFrontierProofCallback(",
+        "State.UnboundOwnedSignalFrontierProofCallback(",
         OwnedProblem,
     )
     GlobalBatch = Source.index(
-        "GeneratePortalRequestBatch(\n                PortalRequests,",
+        "GeneratePortalRequestBatch(PortalRequests,",
         Callback,
     )
     RawCache = Source.index(
-        "EffectiveRawPortalCache = RawPortalGeometryCache(",
+        "State.EffectiveRawPortalCache = Services.RawPortalGeometryCache(",
         GlobalBatch,
     )
 
@@ -1125,20 +1189,23 @@ def test_component_materialization_unsat_does_not_exhaust_sibling_selections():
         ComponentSolveStatus="",
         ExplicitCompleteUnsatProof=False,
     )
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     assert "duplicate-component-selection-proof-reused" in Source
     assert "and Proof.Exhaustive" in Source
     assert "ExpectedComponentStateFingerprints=tuple(sorted(" in Source
-    assert "PlacementPortfolioDomainComplete=(" in Source
+    assert (
+        "PlacementPortfolioDomainComplete="
+        "Context.PlacementPortfolioDomainComplete"
+    ) in Source
     PortfolioGuard = Source.index(
-        '"ClusterInterfacePlacementPortfolioIncomplete"',
+        "'ClusterInterfacePlacementPortfolioIncomplete'",
     )
     DomainGuard = Source.index(
-        '"ClusterInterfaceComponentStateDomainIncomplete"',
+        "'ClusterInterfaceComponentStateDomainIncomplete'",
         PortfolioGuard,
     )
     assert PortfolioGuard < DomainGuard
-    assert '"ArchitecturalUnsatisfiabilityProven": False' in Source
+    assert "'ArchitecturalUnsatisfiabilityProven': False" in Source
 
 
 def test_explicit_complete_proof_overrides_stale_incomplete_status():
@@ -1153,14 +1220,12 @@ def test_explicit_complete_proof_overrides_stale_incomplete_status():
 
 
 def test_complete_port_assignment_core_advances_placement_after_deadline():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Exhaustive = Source.index(
-        "if (\n"
-        "                    StateExhaustive and not StateIncomplete\n"
-        "                )"
+        "if Context.StateExhaustive and (not Context.StateIncomplete)"
     )
     Advance = Source.index(
-        "if ComponentAccessCoreSignals:",
+        "if Context.ComponentAccessCoreSignals:",
         Exhaustive,
     )
     Reorder = Source.index(
@@ -1619,26 +1684,29 @@ def test_complete_feedthrough_endpoint_domain_lifts_channel_repair_core():
 
 
 def test_capacity_repair_precheck_defers_dense_boundary_lease_only():
-    FlowSource = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    FlowSource = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     PrepareCall = FlowSource.index(
         "PreparedEligibility = PreparePhysicalComponentEligibility("
     )
     PrepareSource = FlowSource[PrepareCall:PrepareCall + 1200]
     PlannerSource = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativePortalPreparation.RunPortalPreparation
     )
     PcbSource = inspect.getsource(Pcb.PreparePhysicalComponentEligibility)
 
-    assert "DeferClusterBoundaryLeaseUntilCapacityPrecheck=(" in PrepareSource
+    assert (
+        "DeferClusterBoundaryLeaseUntilCapacityPrecheck="
+        "Context.CapacityRepairConstraint is not None"
+    ) in PrepareSource
     assert "CapacityRepairConstraint is not None" in PrepareSource
-    assert "and not DeferClusterBoundaryLeaseUntilCapacityPrecheck" in (
+    assert "not State.DeferClusterBoundaryLeaseUntilCapacityPrecheck" in (
         PlannerSource
     )
     assert "deferred-for-capacity-repair-precheck" in PlannerSource
     DeferredLease = PlannerSource.index(
-        '"deferred-for-capacity-repair-precheck"'
+        "'deferred-for-capacity-repair-precheck'"
     )
-    assert "PortalReservations = ()" in PlannerSource[
+    assert "State.PortalReservations = ()" in PlannerSource[
         DeferredLease:DeferredLease + 500
     ]
     assert "DeferClusterBoundaryLeaseUntilCapacityPrecheck=(" in PcbSource
@@ -1714,7 +1782,7 @@ def test_capacity_repair_geometry_includes_pair_pin_positions():
 
 
 def test_complete_capacity_feedback_advances_queued_repair_placement():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     FeedbackStart = Source.index(
         "CompleteSymbolicCapacityPlacementFeedback = bool("
     )
@@ -1726,54 +1794,63 @@ def test_complete_capacity_feedback_advances_queued_repair_placement():
 
     assert "EnqueueOwnedFrontierTopologyRepair(" in Feedback
     assert "or EnqueueProofGuidedPhysicalPlacement(" in Feedback
-    assert "or CompleteSymbolicCapacityPlacementFeedback" in Feedback
-    assert "and PlacementAdvanced" in Feedback
-    assert "and not (\n                            Deadline" in Feedback
+    assert "or Context.CompleteSymbolicCapacityPlacementFeedback" in Feedback
+    assert "and Context.PlacementAdvanced" in Feedback
+    assert "not (Context.Deadline" in Feedback
     assert "GlobalHandoffPlacementAdvanced" in Source
-    assert '"SymbolicCapacityPlacementFeedback"' in Source
+    assert "'SymbolicCapacityPlacementFeedback'" in Source
 
-    DeferredRequestSource = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    assert "AllowCapacityPairRepair=(" in DeferredRequestSource
+    DeferredRequestSource = _Sources(
+        PlacementPhysicalAssembly.EnqueueProofGuidedPhysicalPlacement,
+        PlacementAttempts._TryPlacement,
+        PlacementAttempts._TakeNextDeferredRequest,
+    )
+    assert "AllowCapacityPairRepair=CapacityRepairActive" in DeferredRequestSource
     assert "CapacityRepairActive" in DeferredRequestSource
-    assert "AllowCapacityPairRepair: bool = False" in DeferredRequestSource
-    assert "and not AllowCapacityPairRepair" in DeferredRequestSource
-    assert "AllowCapacityPairRepair\n                or" in DeferredRequestSource
-    assert "AllowCapacityPairRepair=(" in DeferredRequestSource
-    assert "PlacementGenerationNotAfter=(" in DeferredRequestSource
-    assert "Deadline.ExpiresAt\n                            if" in (
+    assert "AllowCapacityPairRepair: bool=False" in DeferredRequestSource
+    assert "not AllowCapacityPairRepair" in DeferredRequestSource
+    assert "AllowCapacityPairRepair or" in DeferredRequestSource
+    assert "PlacementGenerationNotAfter=Context.Deadline.ExpiresAt" in DeferredRequestSource
+    assert "Context.Deadline.ExpiresAt if CapacityRepairActive" in (
         DeferredRequestSource
     )
-    assert 'SourceGenerator="row-beam-conflict-relocation"' in (
+    assert "SourceGenerator='row-beam-conflict-relocation'" in (
         DeferredRequestSource
     )
 
 
 def test_owned_frontier_topology_repair_regenerates_before_eligibility():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    DeferredRequestSource = Source
-    RepairStart = Source.index("def EnqueueOwnedFrontierTopologyRepair(")
-    RepairEnd = Source.index("while (", RepairStart)
-    Repair = Source[RepairStart:RepairEnd]
+    Repair = inspect.getsource(
+        PlacementPhysicalAssembly.EnqueueOwnedFrontierTopologyRepair
+    )
+    Source = _Sources(
+        PlacementPhysicalAssembly.EnqueueOwnedFrontierTopologyRepair,
+        PlacementPhysicalFlow.RunPhysicalComponentFlow,
+    )
 
     assert "PlacePcbGraph(" in Repair
     assert "CutDrivenClusterRefinementSignals=frozenset(Core.Signals)" in Repair
     assert "BuildRoutingResources(" in Repair
     assert "BuildTransactionalClusterEndpointRepair(" not in Repair
-    assert '"prepare-eligibility"' in Repair
+    assert "'prepare-eligibility'" in Repair
     assert "JointPlacementCandidateIndex=TopologyCandidateIndex" in Repair
     assert "TopologyCandidateBaseIndex" in Repair
     assert "TopologyCandidateBaseIndex + TopologyCandidateOffset" in Repair
     assert "owned-frontier-topology-retained-domain-exhausted" in Repair
     assert "RetainedJointPlacementCandidates * 2" in Repair
     assert "EffectiveComponentVariant" in Source
-    assert '"relocate-endpoint-cluster"' in Source
+    assert "'relocate-endpoint-cluster'" in Source
     assert "JointPlacementCandidateIndex=Variant" not in Repair
     assert "GlobalComponentStateDomainExhausted" in Source
 
 
 def test_capacity_repair_requeue_counts_dequeued_channelized_placement():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    DeferredRequestSource = Source
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
+    DeferredRequestSource = _Sources(
+        PlacementPhysicalAssembly.EnqueueProofGuidedPhysicalPlacement,
+        PlacementPortfolios.AddMandatoryAccessPortfolioPairwiseConstraints,
+        PlacementPhysicalFlow.RunPhysicalComponentFlow,
+    )
     RequeueStart = Source.index("AttemptedRepairPlacementFingerprints = {")
     RequeueEnd = Source.index("UnattemptedCapacityRepairCandidates", RequeueStart)
     Requeue = Source[RequeueStart:RequeueEnd]
@@ -1782,46 +1859,58 @@ def test_capacity_repair_requeue_counts_dequeued_channelized_placement():
     assert "bounded-proof-driven-repair-candidate-failed" in Requeue
     assert "DequeuedCapacityRepairPlacementFingerprints" in Source
     assert "capacity-pair-repair-duplicate-dequeue-suppressed" in Source
-    assert 'InterfaceWorkPhase == "prepare-eligibility"' in Source
-    assert "serial solve work item intentionally reuses this" in Source
+    assert "Context.InterfaceWorkPhase == 'prepare-eligibility'" in Source
+    assert (
+        "Context.DequeuedCapacityRepairPlacementFingerprints.add("
+        in Source
+    )
     assert "if CapacityRepairConstraint is not None:" in (
         DeferredRequestSource
     )
-    assert "CapacityRepairPlacementState = (" in DeferredRequestSource
-    assert "and not CapacityRepairPlacementState" in DeferredRequestSource
+    assert "Context.CapacityRepairPlacementState =" in DeferredRequestSource
+    assert "not Context.CapacityRepairPlacementState" in DeferredRequestSource
     assert "PairwiseConflictEdges=(" in DeferredRequestSource
     assert "CapacityRepairConstraint.Signals" in DeferredRequestSource
-    assert "CapacityRepairConstraint is None\n                and InheritedCapacityRepairConstraint is not None" in Source
+    assert (
+        "CapacityRepairConstraint is None and "
+        "InheritedCapacityRepairConstraint is not None"
+    ) in DeferredRequestSource
     assert "ClusterInterfacePlacementMaterialization" in (
         DeferredRequestSource
     )
-    assert "if CapacityRepairConstraint is not None\n                            else InterfaceDeadline" in (
+    assert (
+        "Context.Deadline if Context.CapacityRepairConstraint is not None "
+        "else Context.InterfaceDeadline"
+    ) in (
         DeferredRequestSource
     )
-    assert "in CapacityRepairConstraintByPlacementFingerprint" in (
+    assert "in Context.CapacityRepairConstraintByPlacementFingerprint" in (
         DeferredRequestSource
     )
 
 
 def test_interface_repair_preserves_broad_work_and_records_outcomes():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = _Sources(
+        PlacementPhysicalAssembly.EnqueueProofGuidedPhysicalPlacement,
+        PlacementPhysicalFlow.RunPhysicalComponentFlow,
+    )
 
-    assert '"interface-repair-epoch-started"' in Source
+    assert "'interface-repair-epoch-started'" in Source
     assert "PreemptedCandidateIds" in Source
-    assert "PreemptedCandidateIds\": []" in Source
-    assert '"capacity-pair-repair-generated"' in Source
-    assert '"capacity-pair-repair-dequeued"' in Source
-    assert '"capacity-pair-repair-local-materialized"' in Source
-    assert '"capacity-pair-repair-rejected-overlapping-seams"' in Source
-    assert '"capacity-repair-witness-reserved"' in Source
-    assert '"capacity-repair-csp-admitted"' in Source
-    assert '"bounded-proof-driven-repair-candidate-failed"' in Source
-    assert '"bounded-proof-driven-repair-exhausted"' in Source
-    assert '"PhysicalCapacityRepairPortfolio"' in Source
-    assert '"capacity-repair-portfolio-prefetched"' in Source
-    assert '"split-relocate"' in Source
-    assert '"widen-channel-deck"' in Source
-    assert '"split-channel-endpoints"' in Source
+    assert "'PreemptedCandidateIds': []" in Source
+    assert "'capacity-pair-repair-generated'" in Source
+    assert "'capacity-pair-repair-dequeued'" in Source
+    assert "'capacity-pair-repair-local-materialized'" in Source
+    assert "'capacity-pair-repair-rejected-overlapping-seams'" in Source
+    assert "'capacity-repair-witness-reserved'" in Source
+    assert "'capacity-repair-csp-admitted'" in Source
+    assert "'bounded-proof-driven-repair-candidate-failed'" in Source
+    assert "'bounded-proof-driven-repair-exhausted'" in Source
+    assert "'PhysicalCapacityRepairPortfolio'" in Source
+    assert "'capacity-repair-portfolio-prefetched'" in Source
+    assert "'split-relocate'" in Source
+    assert "'widen-channel-deck'" in Source
+    assert "'split-channel-endpoints'" in Source
 
 
 def test_incomplete_capacity_pair_cannot_build_repair_constraint():
@@ -1922,7 +2011,7 @@ def test_two_assembly_plans_reuse_one_prepared_factor_domain(monkeypatch):
         return (FirstAssembly, SecondAssembly)[len(Calls) - 1]
 
     monkeypatch.setattr(
-        AuthoritativePlanner,
+        PhysicalPortSolving,
         "SolvePreparedPhysicalComponentPortFactorDomain",
         Solve,
     )
@@ -1957,15 +2046,15 @@ def test_two_assembly_plans_reuse_one_prepared_factor_domain(monkeypatch):
 
 
 def test_retained_placement_exhausts_prepared_domain_before_advancing():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    QueueStart = Source.index('"prepare-eligibility",')
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
+    QueueStart = Source.index("'prepare-eligibility',")
     PhaseOrder = Source.index(
-        'if Entry[1][0] == "prepare-eligibility"',
+        "if Context.InterfaceWorkPhase == 'prepare-eligibility':",
         QueueStart,
     )
     SolveMarker = Source.index(
-        'InterfaceCandidateQueue.insert(0, (\n'
-        '                        "solve-prepared-eligibility",',
+        "Context.InterfaceCandidateQueue.insert(0, "
+        "('solve-prepared-eligibility',",
         PhaseOrder,
     )
     SolveCall = Source.index(
@@ -1974,19 +2063,13 @@ def test_retained_placement_exhausts_prepared_domain_before_advancing():
     )
 
     assert QueueStart < PhaseOrder < SolveMarker < SolveCall
-    assert "PreparedEligibilityByState[" in Source[PhaseOrder:SolveMarker]
+    assert "Context.PreparedEligibilityByState[" in Source[PhaseOrder:SolveMarker]
 
 
 def test_complete_global_plan_failure_replans_before_local_compilation():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    ReserveStart = Source.index(
-        "def ReserveAuthoritativeGlobalChannels("
+    Reservation = inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
     )
-    ReserveEnd = Source.index(
-        "PreparedAssembly, GlobalChannelDesign = (",
-        ReserveStart,
-    )
-    Reservation = Source[ReserveStart:ReserveEnd]
 
     Classify = Reservation.index(
         "ClassifyPhysicalComponentGlobalPlanningFailure("
@@ -2009,26 +2092,20 @@ def test_complete_global_plan_failure_replans_before_local_compilation():
     assert "RejectedPhysicalComponentPortAssignmentFingerprints" not in (
         Reservation[Classify:Replan]
     )
-    assert "LocalCompilationEntered\": False" in Reservation
-    assert "LocalTemplateReopened\": False" in Reservation
+    assert "'LocalCompilationEntered': False" in Reservation
+    assert "'LocalTemplateReopened': False" in Reservation
 
 
 def test_incomplete_global_plan_is_retained_without_recording_a_no_good():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    ReserveStart = Source.index(
-        "def ReserveAuthoritativeGlobalChannels("
+    Reservation = inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
     )
-    ReserveEnd = Source.index(
-        "PreparedAssembly, GlobalChannelDesign = (",
-        ReserveStart,
-    )
-    Reservation = Source[ReserveStart:ReserveEnd]
 
     GlobalFailureStart = Reservation.index(
         "except RoutingStageError as GlobalPlanningError:"
     )
     Incomplete = Reservation.index(
-        ".PhysicalComponentAssemblyIncomplete",
+        "RoutingFailureReason.PhysicalComponentAssemblyIncomplete",
         GlobalFailureStart,
     )
     Retain = Reservation.index(
@@ -2045,29 +2122,22 @@ def test_incomplete_global_plan_is_retained_without_recording_a_no_good():
     )
 
     assert Incomplete < Retain < Defer < Replan
-    assert '"NoGoodRecorded": False' in Reservation[Retain:Replan]
-    assert '"CursorResumeAvailable": bool(' in Reservation[Retain:Replan]
+    assert "'NoGoodRecorded': False" in Reservation[Retain:Replan]
+    assert "'CursorResumeAvailable': bool(" in Reservation[Retain:Replan]
     assert "RecordPhysicalComponentGlobalPlanNoGood(" not in (
         Reservation[Incomplete:Replan]
     )
 
 
 def test_incomplete_global_plan_timing_closes_before_next_plan_selection():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    ReserveStart = Source.index(
-        "def ReserveAuthoritativeGlobalChannels("
+    Reservation = inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
     )
-    ReserveEnd = Source.index(
-        "PreparedAssembly, GlobalChannelDesign = (",
-        ReserveStart,
-    )
-    Reservation = Source[ReserveStart:ReserveEnd]
     Incomplete = Reservation.index(
-        ".PhysicalComponentAssemblyIncomplete"
+        "RoutingFailureReason.PhysicalComponentAssemblyIncomplete"
     )
     Retained = Reservation.index(
-        'GlobalPlanningAttemptResult = (\n'
-        '                                    "incomplete-plan-retained"',
+        "GlobalPlanningAttemptResult = 'incomplete-plan-retained'",
         Incomplete,
     )
     Record = Reservation.index(
@@ -2087,18 +2157,16 @@ def test_incomplete_global_plan_timing_closes_before_next_plan_selection():
 
 
 def test_local_structural_caches_span_retained_placement_candidate_loop():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     CandidateLoop = Source.index(
-        "while (\n"
-        "            InterfaceCandidateQueue\n"
-        "            or PendingProofGuidedPlacementByComponentVariant\n"
-        "        ):"
+        "while Context.InterfaceCandidateQueue or "
+        "Context.PendingProofGuidedPlacementByComponentVariant:"
     )
     CacheDeclarations = (
-        "ComponentVariantPortfolioCache: dict[Any, Any] = {}",
-        "ComponentNetVariantConstructionCache: dict[Any, Any] = {}",
-        "ComponentRouteClaimsConstructionCache: dict[Any, Any] = {}",
-        "ComponentNetVariantDiscoveryStateCache: dict[Any, Any] = {}",
+        "Context.ComponentVariantPortfolioCache: dict[Any, Any] = {}",
+        "Context.ComponentNetVariantConstructionCache: dict[Any, Any] = {}",
+        "Context.ComponentRouteClaimsConstructionCache: dict[Any, Any] = {}",
+        "Context.ComponentNetVariantDiscoveryStateCache: dict[Any, Any] = {}",
     )
 
     for Declaration in CacheDeclarations:
@@ -2111,7 +2179,7 @@ def test_local_structural_caches_span_retained_placement_candidate_loop():
         for Declaration in CacheDeclarations
     )
     assert (
-        "RoutingResourcesByRetainedPlacementFingerprint"
+        "Context.RoutingResourcesByRetainedPlacementFingerprint"
         in Source[:CandidateLoop]
     )
 
@@ -2124,7 +2192,7 @@ def test_frontier_retention_requires_complete_aperture_and_progress():
 
     Plan = SimpleNamespace(PlanFingerprint="plan-a", Ports=())
     WithoutCursor = (
-        AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+        AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
             Plan, {}, {}, (), ("aperture-a",), CompletedWork=8,
         )
     )
@@ -2139,7 +2207,7 @@ def test_frontier_retention_requires_complete_aperture_and_progress():
     assert NonResumable["Retained"] is False
     assert NonResumable["Reason"] == "resume-cursor-unavailable"
     with pytest.raises(ValueError, match="requires a resumable cursor"):
-        AuthoritativePlanner.RetainIncompletePhysicalGlobalPlan(
+        AuthoritativeCandidateGuides.RetainIncompletePhysicalGlobalPlan(
             {},
             SimpleNamespace(Plan=Plan),
             WithoutCursor,
@@ -2147,7 +2215,7 @@ def test_frontier_retention_requires_complete_aperture_and_progress():
         )
 
     with pytest.raises(ValueError, match="no resumable progress"):
-        AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+        AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
             Plan, {}, {}, (), ("aperture-a",),
             CompletedWork=8,
             ResumeCursor=PhysicalGlobalPlanResumeCursor(
@@ -2162,7 +2230,7 @@ def test_frontier_retention_requires_complete_aperture_and_progress():
         CompletedWork=8,
         State=object(),
     )
-    Resumable = AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+    Resumable = AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
         Plan, {}, {}, (), ("aperture-a",),
         CompletedWork=8,
         ResumeCursor=Cursor,
@@ -2261,7 +2329,7 @@ def _DescriptorContinuation(Completed, **DiagnosticOverrides):
     )
     assert Cursor is not None
     Plan = SimpleNamespace(PlanFingerprint="plan-a", Ports=())
-    return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+    return AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
         Plan,
         {"SignalA": "request-a"},
         {"SignalA": 3 - len(Completed)},
@@ -2325,7 +2393,7 @@ def test_descriptor_retention_keeps_full_two_signal_universe_across_rollover():
             )
         )
         assert Cursor is not None
-        return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+        return AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
             SimpleNamespace(PlanFingerprint="plan-a", Ports=()),
             {
                 "Alpha": "request-alpha",
@@ -2366,7 +2434,7 @@ def test_portable_conversion_publishes_exact_full_universe_before_retry():
         Payload="translated",
     )
     Alpha, _Advanced = (
-        AuthoritativePlanner
+        AuthoritativeCandidateGuides
         .RetainPhysicalSignalRouteDomainDescriptorProgress(
             Cache,
             PreSiblingDomainFingerprint="pre-alpha",
@@ -2381,7 +2449,7 @@ def test_portable_conversion_publishes_exact_full_universe_before_retry():
         )
     )
     Beta, _Advanced = (
-        AuthoritativePlanner
+        AuthoritativeCandidateGuides
         .RetainPhysicalSignalRouteDomainDescriptorProgress(
             Cache,
             PreSiblingDomainFingerprint="pre-beta",
@@ -2404,7 +2472,7 @@ def test_portable_conversion_publishes_exact_full_universe_before_retry():
     }
 
     ReplayedAlpha = (
-        AuthoritativePlanner
+        AuthoritativeCandidateGuides
         .SelectReplayablePhysicalSignalRouteDomainContinuation(
             Cache,
             "pre-alpha",
@@ -2415,7 +2483,7 @@ def test_portable_conversion_publishes_exact_full_universe_before_retry():
     )
     assert ReplayedAlpha is Alpha
     BetaAdvanced, StrictlyAdvanced = (
-        AuthoritativePlanner
+        AuthoritativeCandidateGuides
         .RetainPhysicalSignalRouteDomainDescriptorProgress(
             Cache,
             PreSiblingDomainFingerprint="pre-beta",
@@ -2447,7 +2515,7 @@ def test_portable_conversion_publishes_exact_full_universe_before_retry():
             )
         )
         assert Cursor is not None
-        return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+        return AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
             SimpleNamespace(PlanFingerprint="plan-a", Ports=()),
             {
                 "Alpha": "request-alpha",
@@ -2616,7 +2684,7 @@ def test_descriptor_retention_two_signal_rollover_requires_zero_seeded_universe(
             )
         )
         assert Cursor is not None
-        return AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+        return AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
             SimpleNamespace(PlanFingerprint="plan-a", Ports=()),
             {"SignalA": "request-a", "SignalB": "request-b"},
             {"SignalA": 1, "SignalB": 1},
@@ -2674,7 +2742,7 @@ def test_retained_plan_resume_preserves_aperture_and_fairness_state():
         "cursor-6", "plan-a", "aperture-a", 6, object(),
     )
     FirstContinuation = (
-        AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+        AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
             Plan,
             {"Signal": "request-a"},
             {"Signal": 4},
@@ -2689,18 +2757,18 @@ def test_retained_plan_resume_preserves_aperture_and_fairness_state():
         Continuation=FirstContinuation,
     )
     assert FreshAdmission["Retained"] is True
-    Frontier = AuthoritativePlanner.RetainIncompletePhysicalGlobalPlan(
+    Frontier = AuthoritativeCandidateGuides.RetainIncompletePhysicalGlobalPlan(
         {},
         Assembly,
         FirstContinuation,
         EnqueuedSequence=0,
     )
-    assert AuthoritativePlanner.ShouldScheduleRetainedPhysicalGlobalPlan(
+    assert AuthoritativeCandidateGuides.ShouldScheduleRetainedPhysicalGlobalPlan(
         Frontier,
         PreviousPlanWasRetained=False,
     )
     Resumed, Frontier = (
-        AuthoritativePlanner.SelectNextRetainedPhysicalGlobalPlan(
+        AuthoritativeCandidateGuides.SelectNextRetainedPhysicalGlobalPlan(
             Frontier,
             ScheduleSequence=1,
         )
@@ -2709,7 +2777,7 @@ def test_retained_plan_resume_preserves_aperture_and_fairness_state():
     RefreshCursor = PhysicalGlobalPlanResumeCursor(
         "cursor-8", "plan-a", "aperture-a", 8, object(),
     )
-    Refresh = AuthoritativePlanner.BuildPhysicalGlobalPlanContinuationState(
+    Refresh = AuthoritativeCandidateGuides.BuildPhysicalGlobalPlanContinuationState(
         Plan,
         {"Signal": "request-a"},
         {"Signal": 2},
@@ -2724,7 +2792,7 @@ def test_retained_plan_resume_preserves_aperture_and_fairness_state():
         ExistingEntry=Resumed,
     )
     assert RefreshAdmission["Retained"] is True
-    Frontier = AuthoritativePlanner.RetainIncompletePhysicalGlobalPlan(
+    Frontier = AuthoritativeCandidateGuides.RetainIncompletePhysicalGlobalPlan(
         Frontier,
         Assembly,
         Refresh,
@@ -2736,14 +2804,16 @@ def test_retained_plan_resume_preserves_aperture_and_fairness_state():
     assert Entry.AccumulatedCompletedWork == 8
     assert Entry.Continuation.RemainingRequestCounts == (("Signal", 2),)
     assert "aperture-a" in Entry.Continuation.CertificateFingerprints
-    assert AuthoritativePlanner.ShouldScheduleRetainedPhysicalGlobalPlan(
+    assert AuthoritativeCandidateGuides.ShouldScheduleRetainedPhysicalGlobalPlan(
         Frontier,
         PreviousPlanWasRetained=True,
     )
 
 
 def test_retained_global_plans_are_serviced_before_another_fresh_plan():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
+    )
     Start = Source.index("def SelectFreshOrRetainedAssembly(")
     End = Source.index("CurrentAssembly = Assembly", Start)
     Selector = Source[Start:End]
@@ -2756,7 +2826,7 @@ def test_retained_global_plans_are_serviced_before_another_fresh_plan():
         Fairness,
     )
     Fresh = Selector.index(
-        "ReplanPhysicalAssemblyWithTiming()",
+        "ReplanPhysicalAssemblyWithTiming(Context)",
         Retained,
     )
 
@@ -2765,11 +2835,16 @@ def test_retained_global_plans_are_serviced_before_another_fresh_plan():
 
 
 def test_physical_component_pipeline_records_explicit_stage_durations():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = _Sources(
+        PlacementPhysicalAssembly.RecordPhysicalComponentStageTiming,
+        PlacementPhysicalAssembly.ReplanPhysicalAssemblyWithTiming,
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels,
+        PlacementPhysicalFlow.RunPhysicalComponentFlow,
+    )
 
-    assert '"DurationSeconds"' in Source
-    assert '"ElapsedSinceRoutingStartSeconds"' in Source
-    assert '"PhysicalComponentStageTimings"' in Source
+    assert "'DurationSeconds'" in Source
+    assert "'ElapsedSinceRoutingStartSeconds'" in Source
+    assert "'PhysicalComponentStageTimings'" in Source
     for Stage in (
         "PhysicalEligibilityPreparation",
         "PhysicalEligibilitySolveAfterUnarySupport",
@@ -2777,12 +2852,12 @@ def test_physical_component_pipeline_records_explicit_stage_durations():
         "PhysicalAssemblyReplan",
         "BoundLocalCompilation",
     ):
-        assert f'"{Stage}"' in Source
+        assert f"'{Stage}'" in Source
 
 
 def test_physical_component_pipeline_compiles_symbolic_unary_support():
     PipelineSource = "\n".join((
-        inspect.getsource(_PlaceAndRoutePcbWithPolicy),
+        inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow),
         inspect.getsource(SolvePreparedPhysicalComponentEligibility),
     ))
     EligibilitySource = inspect.getsource(
@@ -2813,24 +2888,20 @@ def test_physical_component_pipeline_compiles_symbolic_unary_support():
 
 
 def test_successful_global_plan_returns_its_frontier_source_identity():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    ReserveStart = Source.index("def ReserveAuthoritativeGlobalChannels(")
-    ReserveEnd = Source.index(
-        "PhysicalAssemblyPlan = PreparedAssembly.Plan",
-        ReserveStart,
+    Reservation = inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
     )
-    Reservation = Source[ReserveStart:ReserveEnd]
 
-    assert "SuccessfulGlobalPlanWasRetained = (" in Reservation
+    assert "Context.SuccessfulGlobalPlanWasRetained =" in Reservation
     assert "PreviousGlobalPlanWasRetained" in Reservation
-    assert "if SuccessfulGlobalPlanWasRetained" in Source[ReserveStart:]
+    assert "Context.SuccessfulGlobalPlanWasRetained" in Reservation
 
 
 def test_boundary_iterator_identity_excludes_branch_and_preference_hints():
     Source = inspect.getsource(
-        AuthoritativePlanner.SolvePreparedPhysicalComponentPortFactorDomain
+        PhysicalPortSearch._SolvePreparedPhysicalComponentPortFactorDomain
     )
-    IdentityStart = Source.index("BoundaryIteratorCacheKey = (")
+    IdentityStart = Source.index("BoundaryIteratorCacheKey = ")
     IdentityEnd = Source.index(
         "BoundaryAssignmentIterator = None",
         IdentityStart,
@@ -3140,8 +3211,8 @@ def test_generated_empty_portal_domain_needs_exact_assembly_certificate():
             GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
         ),),
     )
-    GeneratedOnly = AuthoritativePlanner.BuildMandatoryPortalTupleSelfConflictFailure((
-        AuthoritativePlanner.MandatoryPortalTupleSelfConflictEvidence(
+    GeneratedOnly = AuthoritativeCandidateDomains.BuildMandatoryPortalTupleSelfConflictFailure((
+        AuthoritativeRunModels.MandatoryPortalTupleSelfConflictEvidence(
             Signal="CarryLike",
             CompletePortalTupleCount=16,
             EvaluatedPortalTupleCount=16,
@@ -3186,8 +3257,8 @@ def test_certified_empty_portal_domain_is_complete_exact_plan_unsat():
             GlobalClaims=SimpleNamespace(ResourceIds=frozenset()),
         )),
     )
-    Certified = AuthoritativePlanner.BuildMandatoryPortalTupleSelfConflictFailure((
-        AuthoritativePlanner.MandatoryPortalTupleSelfConflictEvidence(
+    Certified = AuthoritativeCandidateDomains.BuildMandatoryPortalTupleSelfConflictFailure((
+        AuthoritativeRunModels.MandatoryPortalTupleSelfConflictEvidence(
             Signal="CarryLike",
             CompletePortalTupleCount=64,
             EvaluatedPortalTupleCount=64,
@@ -4254,7 +4325,7 @@ def test_pair_relation_deadline_retains_only_current_exact_pair_clause(
         )
 
     monkeypatch.setattr(
-        AuthoritativePlanner,
+        BoundaryRelations,
         "CompilePhysicalBoundaryMandatoryPortalPairRelation",
         Compile,
     )
@@ -4405,7 +4476,9 @@ def test_new_aperture_clause_purges_matching_retained_global_plan():
 
 
 def test_retained_global_scheduler_prunes_live_clauses_before_selection():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
+    )
     Rebuild = Source.index("def RebuildFrontierDeferrals()")
     Prune = Source.index(
         "PruneRetainedPhysicalGlobalPlansByRejectedApertureClauses(",
@@ -4563,54 +4636,51 @@ def test_complete_global_cut_without_pair_dependency_proof_records_joint_tuple()
 
 
 def test_global_port_replans_route_and_bind_each_exact_corridor_contract():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    ReserveStart = Source.index(
-        "def ReserveAuthoritativeGlobalChannels(",
+    Reservation = inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
     )
-    ReserveEnd = Source.index(
-        "PreparedAssembly, GlobalChannelDesign = (",
-        ReserveStart,
-    )
-    Reservation = Source[ReserveStart:ReserveEnd]
 
     assert "PreparePhysicalComponentGlobalPlanningPlacement(" in Reservation
-    assert "PreparingPhysicalComponentGlobalChannels = True" in Reservation
-    assert "RoutePcbDesign(" in Reservation
+    assert (
+        "Context.InterfaceResources.PreparingPhysicalComponentGlobalChannels = True"
+        in Reservation
+    )
+    assert "Context.Services.RoutePcbDesign(" in Reservation
     assert "BindPhysicalComponentAssemblyGlobalChannels(" in Reservation
     assert "CurrentAssembly" in Reservation
 
 
 def test_authoritative_global_reservation_precedes_closed_component_compile():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
-    ReserveDefinition = Source.index(
-        "def ReserveAuthoritativeGlobalChannels(",
+    Source = _Sources(
+        PlacementPhysicalAssembly.AdmitSymbolicLocalCapacity,
+        PlacementPhysicalFlow.RunPhysicalComponentFlow,
     )
     ReserveCall = Source.index(
-        "ReserveAuthoritativeGlobalChannels(\n"
-        "                        PreparedAssembly",
-        ReserveDefinition,
+        "ReserveAuthoritativeGlobalChannels(Context, Context.PreparedAssembly)"
     )
     Compile = Source.index(
         "ComponentSolve = CompileClosedComponent(",
         ReserveCall,
     )
 
-    assert ReserveDefinition < ReserveCall < Compile
+    assert "def ReserveAuthoritativeGlobalChannels(" in inspect.getsource(
+        PlacementPhysicalAssembly.ReserveAuthoritativeGlobalChannels
+    )
+    assert ReserveCall < Compile
     CapacityProof = Source.index(
         "ProveClosedComponentSymbolicCapacityEligibility("
     )
     assert CapacityProof < ReserveCall < Compile
-    assert 'if Proof.Status == "capacity-feasible"' in Source
+    assert "if Proof.Status == 'capacity-feasible'" in Source
 
 
 def test_foreign_portal_certificates_cover_preencoded_assignments():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativeAssignmentPreparation.RunAssignmentPreparation
     )
     Assignment = Source.index("def PlanAssignment(")
     Publish = Source.index(
-        "PublishPhysicalGlobalForeignPortalCandidateNoGoods(\n"
-        "                CandidatesBySignal",
+        "PublishPhysicalGlobalForeignPortalCandidateNoGoods(State.CandidatesBySignal)",
         Assignment,
     )
     ValuesBranch = Source.index("if Values is None:", Assignment)
@@ -4626,7 +4696,7 @@ def test_foreign_portal_certificates_cover_preencoded_assignments():
         ValuesBranch,
     )
     ExactEmptyReturn = Source.index(
-        '"NativeAssignmentSkipped"] = True',
+        "['NativeAssignmentSkipped'] = True",
         Publish,
     )
     assert Publish < ExactEmptyReturn < NativeAssignment
@@ -4634,17 +4704,17 @@ def test_foreign_portal_certificates_cover_preencoded_assignments():
 
 def test_component_global_domains_close_before_native_assignment():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativeAssignmentPreparation.RunAssignmentPreparation
     )
     Completion = Source.index(
-        '"PhysicalGlobalPreAssignmentDomainCompletion"'
+        "['PhysicalGlobalPreAssignmentDomainCompletion']"
     )
     AssignmentStart = Source.index(
-        'AssignmentStarted = monotonic()',
+        'State.AssignmentStarted = Services.monotonic()',
         Completion,
     )
     InitialAssignment = Source.index(
-        "Result = PlanAssignment(",
+        "State.Result = State.PlanAssignment(",
         AssignmentStart,
     )
 
@@ -4653,7 +4723,7 @@ def test_component_global_domains_close_before_native_assignment():
 
 def test_foreign_portal_unary_empty_core_precedes_binary_certificates():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativeAssignmentPreparation.RunAssignmentPreparation
     )
     EmptyCore = Source.index(
         "if not IndependentEmptyCandidateDomainSignals:"
@@ -4663,7 +4733,7 @@ def test_foreign_portal_unary_empty_core_precedes_binary_certificates():
         EmptyCore,
     )
     Telemetry = Source.index(
-        '"BinaryCompilationSkippedForUnaryEmptyCore"',
+        "'BinaryCompilationSkippedForUnaryEmptyCore'",
         BinaryLoop,
     )
 
@@ -4680,13 +4750,13 @@ def test_pair_certificate_edges_are_scoped_to_component_ports():
 
 
 def test_local_unsat_rejects_exact_plan_before_distinct_global_replan():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Compile = Source.index("CompileClosedComponent(")
     RecordNoGood = Source.index(
         "RecordPhysicalComponentLocalCompilationNoGood(", Compile
     )
     Replan = Source.index(
-        "ReplanPhysicalAssemblyWithTiming()", RecordNoGood
+        "ReplanPhysicalAssemblyWithTiming(Context)", RecordNoGood
     )
     Reserve = Source.index(
         "ReserveAuthoritativeGlobalChannels(", Replan
@@ -4699,23 +4769,23 @@ def test_local_unsat_rejects_exact_plan_before_distinct_global_replan():
         "RejectedPhysicalComponentAssemblyPlanFingerprints"
         in LocalFailure
     )
-    assert '"PerSignalReservationFeedbackUsed": False' in LocalFailure
+    assert "'PerSignalReservationFeedbackUsed': False" in LocalFailure
     assert "ProveGlobalRelaxedLocalUnsatisfiability(" not in LocalFailure
     assert "CertifyLocalInterfaceFactorPortfolio(" not in LocalFailure
     assert "PhysicalAssemblyGlobalRouteCanBeRebound(" not in LocalFailure
 
 
 def test_bound_local_compiles_once_per_physical_assembly_plan():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Guard = Source.index(
-        "CompiledPhysicalAssemblyPlanFingerprints: set[str] = set()"
+        "Context.CompiledPhysicalAssemblyPlanFingerprints: set[str] = set()"
     )
     Duplicate = Source.index(
-        'Stage="DuplicateClosedComponentCompilation"',
+        "Stage='DuplicateClosedComponentCompilation'",
         Guard,
     )
     Add = Source.index(
-        "CompiledPhysicalAssemblyPlanFingerprints.add(",
+        "Context.CompiledPhysicalAssemblyPlanFingerprints.add(",
         Duplicate,
     )
     Compile = Source.index(
@@ -4728,44 +4798,44 @@ def test_bound_local_compiles_once_per_physical_assembly_plan():
 
 
 def test_incomplete_local_compile_stops_before_exact_plan_replan():
-    Source = inspect.getsource(_PlaceAndRoutePcbWithPolicy)
+    Source = inspect.getsource(PlacementPhysicalFlow.RunPhysicalComponentFlow)
     Compile = Source.index("CompileClosedComponent(")
     Incomplete = Source.index(
-        '"ClosedComponentCompilationIncomplete"', Compile
+        "'ClosedComponentCompilationIncomplete'", Compile
     )
     RecordNoGood = Source.index(
         "RecordPhysicalComponentLocalCompilationNoGood(", Incomplete
     )
     Replan = Source.index(
-        "ReplanPhysicalAssemblyWithTiming()", RecordNoGood
+        "ReplanPhysicalAssemblyWithTiming(Context)", RecordNoGood
     )
     Guard = Source[Incomplete:RecordNoGood]
 
     assert Compile < Incomplete < RecordNoGood < Replan
     assert "raise RoutingStageError(RoutingFailure(" in Guard
-    assert '"Complete": False' in Guard
+    assert "'Complete': False" in Guard
     assert "ReplanPhysicalAssemblyWithTiming(" not in Guard
 
 
 def test_physical_guide_overlay_preserves_complete_ordinary_plan_coverage():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativeGuidePlanning.RunGuidePlanning
     )
     OverlayStart = Source.index(
-        "# Rebuild ordinary whole-design guides against the current profile"
+        "FrozenAxes = dict("
     )
     OverlayEnd = Source.index(
-        'WorkTelemetry["GlobalGuidePlanCacheHit"]',
+        "State.WorkTelemetry['GlobalGuidePlanCacheHit']",
         OverlayStart,
     )
     Overlay = Source[OverlayStart:OverlayEnd]
 
-    OrdinaryGuides = Overlay.index("**dict(CoarsePlan.Guides)")
+    OrdinaryGuides = Overlay.index("**dict(State.CoarsePlan.Guides)")
     PhysicalGuides = Overlay.index(
         "Channel.Signal: frozenset(Channel.GuideCells)",
         OrdinaryGuides,
     )
-    OrdinaryLayers = Overlay.index("**dict(CoarsePlan.Layers)")
+    OrdinaryLayers = Overlay.index("**dict(State.CoarsePlan.Layers)")
     PhysicalLayers = Overlay.index(
         "Channel.Signal: int(Channel.Layer)",
         OrdinaryLayers,
@@ -4776,7 +4846,7 @@ def test_physical_guide_overlay_preserves_complete_ordinary_plan_coverage():
     assert Overlay.count(
         "if Channel.Signal in PhysicalAssemblyPortSignalsForGuide"
     ) == 2
-    assert "CoarsePlan = FrozenPhysicalComponentGuidePlan" not in Overlay
+    assert "State.CoarsePlan = FrozenPhysicalComponentGuidePlan" not in Overlay
 
 
 def test_prepared_solve_preserves_typed_deadline_and_domain(monkeypatch):
@@ -4793,7 +4863,7 @@ def test_prepared_solve_preserves_typed_deadline_and_domain(monkeypatch):
         ))
 
     monkeypatch.setattr(
-        AuthoritativePlanner,
+        PhysicalPortSolving,
         "SolvePreparedPhysicalComponentPortFactorDomain",
         Expire,
     )
@@ -5096,7 +5166,7 @@ def test_exact_global_cut_contains_only_ports_and_feedthroughs():
 
 def test_exact_global_preparation_excludes_unowned_corridors_from_base_claims():
     Source = inspect.getsource(
-        AuthoritativePlanner.RouteAuthoritativeResources
+        AuthoritativeAssignmentPreparation.RunAssignmentPreparation
     )
     IndexStart = Source.index(
         "def EnsurePhysicalAssignmentIndexComplete()"
@@ -5116,9 +5186,9 @@ def test_exact_global_preparation_excludes_unowned_corridors_from_base_claims():
         BaseEnd,
     )]
 
-    assert "PhysicalAssemblyPlan.PlanningChannels" not in IndexPreparation
+    assert "State.PhysicalAssemblyPlan.PlanningChannels" not in IndexPreparation
     assert "Channel.Claims" not in IndexPreparation
-    assert "AssignmentIndexed.EncodeClaims(Channel.Claims)" not in (
+    assert "State.AssignmentIndexed.EncodeClaims(Channel.Claims)" not in (
         BasePreparation
     )
     assert "ExactPhysicalSignals" not in BasePreparation

@@ -3,16 +3,18 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-import Compiler.Routing.ComponentPlanning as ComponentPlanning
+import Compiler.Routing.Components.InterfacePlanning as InterfacePlanning
 
-from Compiler.Routing.ComponentPlanning import (
+from Compiler.Routing.Components.InterfacePlanning import (
     BuildComponentCapacityGuide,
     ComponentPlanningStatus,
     IterClosedComponentContracts,
     PlanClosedComponent,
     SolveComponentInterfaceCsp,
 )
-from Compiler.Routing.Models import PhysicalComponentBoundaryPortReservation
+from Compiler.Routing.Contracts.Component import (
+    PhysicalComponentBoundaryPortReservation,
+)
 from Compiler.Routing.ResourceGraph import RoutingResourceClaims
 
 
@@ -146,7 +148,7 @@ def test_native_lease_deadline_and_unavailable_fail_closed(monkeypatch):
     assert NativeDeadline.Status == ComponentPlanningStatus.SearchIncomplete
     assert NativeDeadline.Diagnostics["NativeLeaseDeadlineExceeded"] is True
 
-    monkeypatch.setattr(ComponentPlanning, "_SolveLeaseDomainsBounded", None)
+    monkeypatch.setattr(InterfacePlanning, "_SolveLeaseDomainsBounded", None)
     Unavailable = SolveComponentInterfaceCsp(Guide)
     assert Unavailable.Status == ComponentPlanningStatus.SearchIncomplete
     assert Unavailable.Diagnostics["NativeLeaseUnavailable"] is True
@@ -154,7 +156,7 @@ def test_native_lease_deadline_and_unavailable_fail_closed(monkeypatch):
 
 def test_native_lease_assignment_is_stable_across_rayon_thread_counts():
     Script = """
-from Compiler.Routing.ComponentPlanning import BuildComponentCapacityGuide, SolveComponentInterfaceCsp
+from Compiler.Routing.Components.InterfacePlanning import BuildComponentCapacityGuide, SolveComponentInterfaceCsp
 from Tests.test_component_planning import _Boundary, _Preparation
 Guide = BuildComponentCapacityGuide(_Preparation({
     'Alpha': (_Boundary('Alpha', 0, Fingerprint='a0'), _Boundary('Alpha', 12, Fingerprint='a1')),

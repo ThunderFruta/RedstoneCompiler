@@ -12,7 +12,8 @@
 6. `SchemEncoder/` writes the accepted design as a litematic.
 
 `Compiler/Pipeline.py` owns end-to-end orchestration.
-`Compiler/Placement/PcbFlow.py` owns the placement/routing feedback loop.
+`Compiler/Placement/Flow/` owns the placement/routing feedback loop, with the
+narrow public entrypoint in `Compiler/Placement/Flow/Runner.py`.
 
 ## Publication boundary
 
@@ -26,4 +27,3 @@ a silent compatibility fallback.
 One absolute deadline covers placement generation, routing, validation,
 simulation, and diagnostic publication. Nested stages receive remaining time;
 they do not reset it.
-

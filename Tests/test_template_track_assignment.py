@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from Compiler.Routing.AuthoritativePlanner import (
+from Compiler.Routing.Authoritative.RunModels import (
     RawTrackAssignmentDomain,
     RawTrackAssignmentValue,
 )

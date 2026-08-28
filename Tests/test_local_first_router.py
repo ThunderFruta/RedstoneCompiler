@@ -11,20 +11,29 @@ from typing import Any
 from SVDecoder import Sv
 from Compiler.Main import BuildParser, Main, PrintRoutingFailureSummary
 from Compiler.Pipeline import CompileSvToLitematic
-from Compiler.Placement.PcbFlow import (
-    BuildPlacementGenerationPlan,
+from Compiler.Placement.Flow.Demand import BuildPlacementGenerationPlan
+from Compiler.Placement.Flow.Preparation import PlacementNeedsDemandDiversity
+from Compiler.Placement.Flow.Runner import (
     PlaceAndRoutePcb,
-    PlacementNeedsDemandDiversity,
     _PlaceAndRoutePcbWithPolicy,
 )
-from Compiler.Placement.Pcb import (
+from Compiler.Placement.Flow.Setup import (
+    MaterializeInitialConflictRelocation,
+    MaterializeInitialPendingJointPlacementState,
+)
+from Compiler.Placement.Core.Clustering import (
     BuildTopologicalLevels,
     FindIsomorphicNandClusterMapping,
     OptimizeClusterSlots,
     PcbGatesConflict,
-    PlacePcbGraph,
 )
-from Compiler.Placement.Geometry import BuildPlacedGate
+from Compiler.Placement.Core.Clusters import PcbPlacement
+from Compiler.Placement.Core.Commit import PlacePcbGraph
+from Compiler.Placement.Geometry import (
+    BuildPlacedGate,
+    PlacedDesign,
+    PlacedGate,
+)
 from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
 from Compiler.Routing.LocalFirst import (
@@ -52,7 +61,7 @@ from Compiler.Routing.Failures import (
     RoutingFailureReason,
     RoutingStageError,
 )
-from Compiler.Routing.Models import RoutedDesign
+from Compiler.Routing.Contracts.Results import RoutedDesign
 from Compiler.Routing.Reliability import RoutingDeadline
 from Compiler.Synthesis.Validation import ValidateNandOnlyDesign
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
@@ -61,19 +70,127 @@ from SchemEncoder.Writer262 import LoadTemplate
 
 
 class LocalFirstRouterTests(unittest.TestCase):
+    def testInitialPlacementConsumesOneConflictRelocation(self) -> None:
+        Request = SimpleNamespace(SourceGenerator="row-beam-conflict-relocation")
+        Context = SimpleNamespace(
+            UniquePlacements={},
+            ProactiveRelocationRequested=True,
+            Deadline=SimpleNamespace(IsExpired=lambda: False),
+        )
+
+        with (
+            patch(
+                "Compiler.Placement.Flow.Setup._TakeNextDeferredRequest",
+                return_value=Request,
+            ) as TakeRequest,
+            patch(
+                "Compiler.Placement.Flow.Setup._TryPlacement",
+                return_value=False,
+            ) as TryPlacement,
+        ):
+            self.assertTrue(MaterializeInitialConflictRelocation(Context))
+
+        TakeRequest.assert_called_once_with(Context, PreferRelocation=True)
+        TryPlacement.assert_called_once_with(Context, Request)
+
+    def testInitialPlacementRetargetsOneChangedConflictSet(self) -> None:
+        Request = SimpleNamespace(SourceGenerator="row-beam-conflict-relocation")
+        Context = SimpleNamespace(
+            UniquePlacements={},
+            ProactiveRelocationRequested=True,
+            Deadline=SimpleNamespace(IsExpired=lambda: False),
+            TotalRelocationGenerationCount=1,
+            PlacementRelocationSignals=frozenset({"NandNet0", "NandNet2"}),
+            LastRelocationSignalsUsed=frozenset({"NandNet0", "Propagate0"}),
+            GenerationPlan=SimpleNamespace(DeferredRequests=(Request,)),
+            PlacementGenerationDecisions=[],
+        )
+
+        with (
+            patch(
+                "Compiler.Placement.Flow.Setup._TakeNextDeferredRequest",
+            ) as TakeRequest,
+            patch(
+                "Compiler.Placement.Flow.Setup._TryPlacement",
+                return_value=False,
+            ) as TryPlacement,
+        ):
+            self.assertTrue(MaterializeInitialConflictRelocation(Context))
+
+        TakeRequest.assert_not_called()
+        TryPlacement.assert_called_once_with(Context, Request)
+        self.assertEqual(
+            Context.PlacementGenerationDecisions[-1]["Result"],
+            "initial-conflict-relocation-retargeted",
+        )
+
+    def testInitialPlacementConsumesOneQueuedExactJointState(self) -> None:
+        State = SimpleNamespace(
+            Request=SimpleNamespace(SourceGenerator="row-beam"),
+            CandidateIndex=1,
+            RelocationVariant=0,
+            RoutingSpacing=5,
+            RelocationSignals=frozenset(),
+            RelocationPrioritySignals=frozenset(),
+            RequiredRelocationSignals=frozenset(),
+            AssignmentCut=None,
+            AssignmentConstraints=object(),
+            CoordinatedCandidateDiversificationSignals=frozenset(),
+            TopologyCutFrontier=(),
+        )
+        Context = SimpleNamespace(
+            UniquePlacements={},
+            PendingJointPlacementStates=[State],
+            JointPlacementStateEvents=[],
+            Deadline=SimpleNamespace(IsExpired=lambda: False),
+        )
+
+        with patch(
+            "Compiler.Placement.Flow.Setup._TryPlacement",
+            return_value=True,
+        ) as TryPlacement:
+            self.assertTrue(
+                MaterializeInitialPendingJointPlacementState(Context)
+            )
+
+        self.assertEqual(Context.PendingJointPlacementStates, [])
+        self.assertEqual(
+            Context.JointPlacementStateEvents[0]["Status"],
+            "initial-materializing",
+        )
+        self.assertEqual(
+            TryPlacement.call_args.kwargs["JointPlacementCandidateIndex"],
+            1,
+        )
+
     @staticmethod
     def _BuildPlacementFlowFixture(Label: str) -> Any:
         Module = SimpleNamespace(Gates=[SimpleNamespace(Name="Gate")])
-        Placed = SimpleNamespace(
+        Placed = PlacedDesign(
             Module=Module,
-            PlacedGates=[],
+            PlacedGates=[PlacedGate(
+                Name="Gate",
+                X=0,
+                Y=1,
+                Z=0,
+                Kind="NAND",
+                Outputs=[],
+                Inputs=[],
+                Attrs={},
+                InputPins=[],
+                OutputPin=None,
+                Rotation=0,
+                MirrorX=False,
+                InputDirections=[],
+                OutputDirection=None,
+            )],
             LocalRouteClaims=(),
             LocalRouteDiagnostics={"Fixture": Label},
             FrozenNetWires={},
             LocalNetBranches={},
             LocalNetTargets={},
         )
-        return SimpleNamespace(
+        return PcbPlacement(
             Placed=Placed,
             Clusters=(),
             SignalOrder=(),
@@ -94,6 +211,48 @@ class LocalFirstRouterTests(unittest.TestCase):
             EstimatedGlobalExtensionNets=0,
             PreOwnedNodeCount=0,
         )
+
+    @staticmethod
+    def _PrepareMockedPlacementRouting(Context: Any) -> None:
+        """Freeze the candidate chosen by these placement-flow unit tests."""
+        Selected = Context.CandidateRecords[0]
+        Context.PreRouteTemplates = []
+        Context.PreRouteObjectiveByCandidateId = {}
+        Context.PrePlacementTrackPreparations = []
+        Context.PrePlacementTrackFeasible = [Selected]
+        Context.PreRouteInterfaceResult = SimpleNamespace(
+            SelectionFingerprint="fixture-selection",
+            ToDictionary=lambda: {},
+        )
+        Context.RawTrackAssignmentResult = None
+        Context.RawTrackAssignmentMaterializations = {}
+        Context.SelectedPreRouteTemplateIds = {Selected.CandidateId}
+        Context.SelectedPreRouteCandidates = [Selected]
+        Context.SelectedPreRouteCandidate = Selected
+        Context.SelectedTrackPreparation = SimpleNamespace(
+            Success=True,
+            Complete=True,
+            ToDictionary=lambda: {},
+        )
+        Context.PrePlacementTrackPreparationByCandidateId = {}
+        Context.OrderedPlacements = [Selected]
+        Context.ExactClusterInterfaceSolveEnabled = False
+        Context.PlacementFeedback = [
+            Candidate.ToDictionary()
+            for Candidate in Context.CandidateRecords
+        ]
+        Context.Placement = Selected.Placement
+        Context.RoutingSpacing = Selected.RoutingSpacing
+        Context.Routed = None
+        Context.SelectedCandidate = None
+        Context.LastAttemptedCandidate = None
+        Context.RoutingPercentageSelectionEnabled = bool(
+            Context.Policy.MaterialObjective.OptimizeRoutingPercentage
+            and Context.NandGateCount
+            >= Context.Policy.MaterialObjective
+            .MinimumRoutingPercentageSelectionNandCount
+        )
+        Context.RoutedCandidates = []
 
     def _RunMockedPlacementFlow(
         self,
@@ -116,28 +275,28 @@ class LocalFirstRouterTests(unittest.TestCase):
         EffectiveRouteSideEffect = RouteSideEffect or Routed
         with (
             patch(
-                "Compiler.Placement.PcbFlow.RoutingDeadline.Start",
+                "Compiler.Placement.Flow.Setup.RoutingDeadline.Start",
                 wraps=RoutingDeadline.Start,
             ) as StartDeadline,
             patch(
-                "Compiler.Placement.PcbFlow.PlacePcbGraph",
+                "Compiler.Placement.Flow.Runner.PlacePcbGraph",
                 side_effect=PlaceSideEffect,
             ) as PlaceGraph,
             patch(
-                "Compiler.Placement.PcbFlow.BuildPlacementFingerprint",
+                "Compiler.Placement.Flow.PlacementAttempts.BuildPlacementFingerprint",
                 side_effect=Fingerprints,
             ),
             patch(
-                "Compiler.Placement.PcbFlow.BuildPlacementRetentionFingerprint",
+                "Compiler.Placement.Flow.PlacementAttempts.BuildPlacementRetentionFingerprint",
                 side_effect=Fingerprints,
             ),
             patch(
-                "Compiler.Placement.PcbFlow.MeasurePlacementRoutingFeedback",
+                "Compiler.Placement.Flow.Runner.MeasurePlacementRoutingFeedback",
                 side_effect=FeedbackSideEffect,
                 return_value=self._BuildPlacementFeedbackFixture(),
             ),
             patch(
-                "Compiler.Placement.PcbFlow.RoutePcbDesign",
+                "Compiler.Placement.Flow.Runner.RoutePcbDesign",
                 side_effect=(
                     EffectiveRouteSideEffect
                     if isinstance(EffectiveRouteSideEffect, list)
@@ -150,19 +309,23 @@ class LocalFirstRouterTests(unittest.TestCase):
                 ),
             ) as RouteDesign,
             patch(
-                "Compiler.Placement.PcbFlow.ValidateNandOnlyDesign",
+                "Compiler.Placement.Flow.Runner.ValidateNandOnlyDesign",
             ),
             patch(
-                "Compiler.Placement.PcbFlow.ValidatePlacedCellElectricalIsolation",
+                "Compiler.Placement.Flow.Runner.ValidatePlacedCellElectricalIsolation",
             ),
-            patch("Compiler.Placement.PcbFlow.BuildRoutingResources"),
+            patch("Compiler.Placement.Flow.Runner.BuildRoutingResources"),
             patch(
-                "Compiler.Placement.PcbFlow.MeasurePcbDesign",
+                "Compiler.Placement.Flow.Runner.MeasurePcbDesign",
                 return_value=(1, 1, 1, 1),
             ),
             patch(
-                "Compiler.Placement.PcbFlow.BuildLocalFirstSnapshot",
+                "Compiler.Placement.Flow.Runner.BuildLocalFirstSnapshot",
                 return_value=SimpleNamespace(ToDictionary=lambda: {}),
+            ),
+            patch(
+                "Compiler.Placement.Flow.Runner.PreparePlacementRouting",
+                side_effect=self._PrepareMockedPlacementRouting,
             ),
         ):
             Result = _PlaceAndRoutePcbWithPolicy(
@@ -881,7 +1044,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             None,
         )
 
-        self.assertEqual(PlaceGraph.call_count, 1)
+        self.assertEqual(PlaceGraph.call_count, 2)
         PackingPolicies = [
             Call.kwargs["PackingPolicy"] for Call in PlaceGraph.call_args_list
         ]
@@ -1425,7 +1588,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
     def testRemovedHybridStrategyIsRejectedBeforeRouting(self) -> None:
         with patch(
-            "Compiler.Placement.PcbFlow._PlaceAndRoutePcbWithPolicy",
+            "Compiler.Placement.Flow.Runner._PlaceAndRoutePcbWithPolicy",
         ) as Execute:
             with self.assertRaises(ValueError):
                 PlaceAndRoutePcb(
@@ -1436,7 +1599,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
     def testRemovedCompatibilityStrategyIsRejectedBeforeRouting(self) -> None:
         with patch(
-            "Compiler.Placement.PcbFlow._PlaceAndRoutePcbWithPolicy",
+            "Compiler.Placement.Flow.Runner._PlaceAndRoutePcbWithPolicy",
         ) as Execute:
             with self.assertRaises(ValueError):
                 PlaceAndRoutePcb(
@@ -1450,7 +1613,7 @@ class LocalFirstRouterTests(unittest.TestCase):
     ) -> None:
         Expected = object()
         with patch(
-            "Compiler.Placement.PcbFlow._PlaceAndRoutePcbWithPolicy",
+            "Compiler.Placement.Flow.Runner._PlaceAndRoutePcbWithPolicy",
             return_value=Expected,
         ) as Execute:
             Result = PlaceAndRoutePcb(
@@ -1478,7 +1641,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
     def testNewRouterFirstSurfacesLocalRoutingFailure(self) -> None:
         with patch(
-            "Compiler.Placement.PcbFlow._PlaceAndRoutePcbWithPolicy",
+            "Compiler.Placement.Flow.Runner._PlaceAndRoutePcbWithPolicy",
             side_effect=ValueError("forced local failure"),
         ) as Execute:
             with self.assertRaisesRegex(ValueError, "forced local failure"):

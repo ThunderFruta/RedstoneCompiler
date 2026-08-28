@@ -22,6 +22,8 @@ in this tree instead of being duplicated in the repository root.
 - [Routing]
   - [Readme](Routing/Readme.md)
   - [Current routing design](Routing/Active/RouterReliabilityDesignDoc.md)
+  - [Routing-aware placement and access design](Routing/Active/RoutingAwarePlacementAccessDesign.md)
+  - [Routing-aware placement and access snapshots](Routing/Active/RoutingAwarePlacementAccessSnapshots.md)
   - [Negotiated route-tree router](Routing/Active/NegotiatedRouteTreeRouter.md)
   - [Current routing failures](Routing/Active/CurrentRoutingFailures.md)
   - [Router reliability guide](Routing/Active/RouterReliabilityGuide.md)

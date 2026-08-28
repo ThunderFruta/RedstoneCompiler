@@ -2,17 +2,33 @@
 
 Contains routing architecture, failure diagnostics, active operations, and historical design records.
 
-Current verdict (2026-07-23): **NOT ACCEPTED**. The negotiated route-tree
-implementation is active, and deterministic policy selection is profile-driven
-instead of circuit-keyed. Strict acceptance remains FA/RCA4/RCA8 only; CLA4 is
-run only when `--include-cla4` is supplied.
+Current verdict (2026-08-25 source snapshot): FullAdder, RCA4, and RCA8 pass
+their native artifact/correctness gates, while CLA4 fails before routing at
+`Placement / PlacementOverlap`; the CLA4-inclusive design is **NOT ACCEPTED**.
+The negotiated route-tree implementation is active, deterministic policy
+selection is profile-driven instead of circuit-keyed, and the canonical
+harness runs CLA4 only when `--include-cla4` is supplied.
+
+Structural update (2026-08-28): placement, component routing, authoritative
+routing, and native kernels now use the clean-break domain ownership documented
+in [the project-tree design](../../ProjectTreeDesignDoc.md). This refactor does
+not change the acceptance verdict: CLA4 remains a typed
+`Placement / PlacementOverlap` failure unless a fresh post-refactor matrix
+independently proves otherwise.
 
 ## Active routing docs
 
+- [Routing-aware placement and access design](Active/RoutingAwarePlacementAccessDesign.md)
+  -- proposed routability-by-construction replacement for fixed pin access,
+  including typed contracts, code seams, rollout gates, and acceptance rules.
+- [Routing-aware placement and access snapshots](Active/RoutingAwarePlacementAccessSnapshots.md)
+  -- append-only timestamped source, failure, artifact, and implementation
+  evidence for that proposal.
 - [Negotiated route-tree router](Active/NegotiatedRouteTreeRouter.md) -- current
   architecture, implemented interfaces, known gaps, and acceptance sequence.
-- [Current routing failures](Active/CurrentRoutingFailures.md) -- current RCA4
-  evidence, proven observations, hypotheses, and required fix evidence.
+- [Current routing failures](Active/CurrentRoutingFailures.md) -- dated
+  2026-07-23 RCA4 evidence, proven observations, hypotheses, and required fix
+  evidence; the newer CLA4 baseline is in the snapshot record above.
 - [Router reliability guide](Active/RouterReliabilityGuide.md) -- current
   acceptance verdict, operator commands, evidence requirements, and troubleshooting.
 - [Router reliability design](Active/RouterReliabilityDesignDoc.md) -- normative
@@ -45,8 +61,15 @@ run only when `--include-cla4` is supplied.
 - [`Tests/test_router_acceptance_harness.py`](../../Tests/test_router_acceptance_harness.py)
   -- focused dry-run, sequencing, rejection-shape, determinism,
   publication-reserve, and immutable-ceiling coverage.
+- [`Scripts/CaptureRoutingDesignSnapshot.py`](../../Scripts/CaptureRoutingDesignSnapshot.py)
+  -- explicit timestamped source/artifact capture with separate exact-byte and
+  portable-semantic evidence identities and no implicit latest-artifact
+  discovery.
+- [`Tests/test_routing_design_snapshot.py`](../../Tests/test_routing_design_snapshot.py)
+  -- focused snapshot identity, typed failure, source/runtime consistency,
+  manifest validation, and staged-publication coverage.
 - [`RustRouting/Src/`](../../RustRouting/Src/) -- the native router's exact
-  eight-file responsibility split.
+  implementation-source responsibility split.
 
 Inspecting the matrix is safe and does not launch a physical compile:
 

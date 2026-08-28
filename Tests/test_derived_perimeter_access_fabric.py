@@ -5,18 +5,20 @@ from types import SimpleNamespace
 
 import pytest
 
-import Compiler.Placement.AccessFabric as AccessFabricModule
+import Compiler.Placement.Access.Fabric as AccessFabricModule
+import Compiler.Placement.Access.Geometry as AccessGeometryModule
+from Compiler.Routing.ChannelPlanner import BuildNetRoutingProfiles
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
-from Compiler.Placement.AccessFabric import (
+from Compiler.Placement.Access.Fabric import BuildPlacementAccessFabric
+from Compiler.Placement.Access.Geometry import (
     _DerivePerimeterRootAccessFace,
     BuildDerivedPerimeterFabricShell,
-    BuildPlacementAccessFabric,
     MeasureDerivedPerimeterInterfaceDemand,
     MeasureDerivedPerimeterInterfaceLaunchDemandByFace,
 )
 from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
-from Compiler.Placement.Pcb import PcbPlacement
+from Compiler.Placement.Core.Clusters import PcbPlacement
 from Compiler.Placement.PreRouteInterface import (
     DerivedPerimeterFaceReservation,
     DerivedPerimeterSlotAssignment,
@@ -794,7 +796,7 @@ def test_derived_perimeter_uses_earlier_access_pivot_when_farthest_conflicts(
     )
     Placement = replace(Placement, LayerCount=1)
     Resources = BuildRoutingResources(Placement.Placed)
-    Profiles = AccessFabricModule.BuildNetRoutingProfiles(Placement.Placed)
+    Profiles = BuildNetRoutingProfiles(Placement.Placed)
     Profile = Profiles["Result"]
     TargetAccessPath = (
         (0, 1, 8),
@@ -822,7 +824,7 @@ def test_derived_perimeter_uses_earlier_access_pivot_when_farthest_conflicts(
         TargetAccessPaths={SlotTerminal: TargetAccessPath},
     )
     monkeypatch.setattr(
-        AccessFabricModule,
+        AccessGeometryModule,
         "BuildNetRoutingProfiles",
         lambda *_Arguments, **_Keywords: Profiles,
     )
@@ -830,7 +832,7 @@ def test_derived_perimeter_uses_earlier_access_pivot_when_farthest_conflicts(
     # choosing among finite prefix pivots, not about changing geometry after
     # an access failure.
     monkeypatch.setattr(
-        AccessFabricModule,
+        AccessGeometryModule,
         "_BuildDerivedPerimeterRingBounds",
         lambda *_Arguments, **_Keywords: (
             ((-2, 4, -2, 11),),
@@ -885,7 +887,7 @@ def test_derived_perimeter_retains_all_legal_access_prefix_pivots(
     )
     Placement = replace(Placement, LayerCount=1)
     Resources = BuildRoutingResources(Placement.Placed)
-    Profiles = AccessFabricModule.BuildNetRoutingProfiles(Placement.Placed)
+    Profiles = BuildNetRoutingProfiles(Placement.Placed)
     Profile = Profiles["Result"]
     TargetAccessPath = (
         (0, 1, 8),
@@ -912,12 +914,12 @@ def test_derived_perimeter_retains_all_legal_access_prefix_pivots(
         TargetAccessPaths={SlotTerminal: TargetAccessPath},
     )
     monkeypatch.setattr(
-        AccessFabricModule,
+        AccessGeometryModule,
         "BuildNetRoutingProfiles",
         lambda *_Arguments, **_Keywords: Profiles,
     )
     monkeypatch.setattr(
-        AccessFabricModule,
+        AccessGeometryModule,
         "_BuildDerivedPerimeterRingBounds",
         lambda *_Arguments, **_Keywords: (
             ((-2, 4, -2, 11),),

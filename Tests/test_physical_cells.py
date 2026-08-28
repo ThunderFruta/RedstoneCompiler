@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from Compiler.Cells.Library import CellMacros
 from Compiler.Ir.Models import Gate, GateKind
 from Compiler.Placement.Geometry import BuildPlacedGate
-from Compiler.Placement.Pcb import PcbGatesConflict
+from Compiler.Placement.Core.Clustering import PcbGatesConflict
 from Compiler.Routing.Actions import (
     AreConnected,
     BuildElectricalExclusions,

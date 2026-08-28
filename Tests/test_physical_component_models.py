@@ -3,16 +3,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from Compiler.Routing.ComponentPipeline import (
+from Compiler.Routing.Components.PhysicalPlanning import (
     BuildPhysicalAssemblyGlobalReuseFingerprint,
     SelectPhysicalAssemblyGlobalBoundaryPorts,
 )
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Component import (
     PhysicalComponentAssemblyPlan,
     PhysicalComponentBoundaryPortReservation,
     PhysicalComponentSelectedLocalPortSupport,
-    PreparedPhysicalComponentPortFactorDomain,
 )
+from Compiler.Routing.Contracts.PhysicalInterface import PreparedPhysicalComponentPortFactorDomain
 
 
 def BoundaryPort(**Overrides):

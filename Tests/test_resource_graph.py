@@ -10,11 +10,13 @@ from Compiler.Routing.ResourceGraph import (
     RoutingResourceKind,
     ValidateLocalRouteClaims,
 )
-from Compiler.Placement.Pcb import (
-    FindMandatoryAccessConflictSignals,
+from Compiler.Placement.Core.Channels import (
     LocalClusterRouteCandidate,
-    MeasureMandatoryAccessConflictProfile,
     SelectJointLocalClusterCandidates,
+)
+from Compiler.Placement.Core.MandatoryAccess import (
+    FindMandatoryAccessConflictSignals,
+    MeasureMandatoryAccessConflictProfile,
 )
 
 

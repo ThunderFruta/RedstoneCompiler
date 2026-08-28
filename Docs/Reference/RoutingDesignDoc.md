@@ -11,7 +11,7 @@ Canonical implementation focus remains:
 - resource-ownership-aware inter-region routing,
 - deterministic materialization plus authoritative validation and simulation.
 
-Current implementation note (2026-08-02):
+Current implementation note (2026-08-28):
 
 - `Main.py` / `Compiler/Main.py` drives the authoritative default router.
 - The active default strategy is `default`.
@@ -20,6 +20,29 @@ Current implementation note (2026-08-02):
   no longer keyed to circuit names.
 - Acceptance now includes the full FA/RCA4/RCA8 matrix and compatibility checks
   once regression gates pass.
+- Routing contracts and physical interfaces are neutral packages; component
+  solving and authoritative global routing have separate concrete owners.
+- Placement orchestration uses `PlacementFlowState`/`PlacementFlowServices` and
+  authoritative routing uses
+  `AuthoritativeRoutingState`/`AuthoritativeRoutingServices`.
+- Native kernels live in nested Rust domain folders; `RustRouting/Src/Lib.rs`
+  contains only module registration and the PyO3 entrypoint.
+
+## Current code map
+
+| Responsibility | Owner |
+|---|---|
+| immutable routing schemas | `Compiler/Routing/Contracts/` |
+| portal/claim/boundary relations | `Compiler/Routing/Interfaces/` |
+| component problem, portfolios, solvers, certificates, cache | `Compiler/Routing/Components/` |
+| candidates, leases, negotiated trees, ports, assignment, materialization | `Compiler/Routing/Authoritative/` |
+| placement access, core search/repair/commit, flow | `Compiler/Placement/{Access,Core,Flow}/` |
+| native runtime, geometry, path, assignment, escape, generation, planning, simulation, binding | `RustRouting/Src/*/`; escape candidates/catalogs and generation detailed-tree phases use nested subdomains |
+
+The six supported Python entrypoints and clean-break retirement list are in
+[`ProjectTreeDesignDoc.md`](../../ProjectTreeDesignDoc.md). Historical code
+paths in dated implementation notes describe their original evidence and are
+not current import instructions.
 
 ## Purpose
 

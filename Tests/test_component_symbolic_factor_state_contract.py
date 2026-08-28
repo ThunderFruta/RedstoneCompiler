@@ -4,9 +4,11 @@ import pytest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from Compiler.Routing.ComponentRouter import (
+from Compiler.Routing.Components.SymbolicWorkers import (
     CompilePreparedComponentPhysicalFactorStateBatch,
     CompilePreparedComponentSymbolicNetStates,
+)
+from Compiler.Routing.Components.SymbolicState import (
     PrepareComponentSymbolicNetStateContext,
 )
 from Tests.test_component_router import _Claims, _Problem

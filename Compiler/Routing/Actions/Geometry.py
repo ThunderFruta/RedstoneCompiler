@@ -8,7 +8,11 @@ from typing import Any, Callable
 from ...Placement.Rotation import TransformLocalPosition
 from SchemEncoder.Writer262 import LoadTemplate
 from Templates import LitematicTemplates
-from ..Models import Position3, RoutingResources, RoutingStaticGeometry
+from ..Contracts.Core import (
+    Position3,
+    RoutingStaticGeometry,
+)
+from ..Contracts.Results import RoutingResources
 from ..ResourceGraph import RoutingResourceGraph
 from ..Technology import DefaultRedstoneRoutingTechnology
 

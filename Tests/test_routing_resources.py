@@ -20,7 +20,7 @@ from Compiler.Routing.ResourceGraph import (
 )
 from Compiler.Routing.Pcb import BuildPcbRoutingConfigurations
 from SVDecoder.Sv import ParseSvToNetlist
-from Compiler.Placement.Pcb import PlacePcbGraph
+from Compiler.Placement.Core.Commit import PlacePcbGraph
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
 

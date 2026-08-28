@@ -15,12 +15,12 @@ from threading import Event, Lock, Thread, active_count
 
 if __package__:
     from .Pipeline import CompileSvToLitematic
-    from .Placement.PcbFlow import PcbProgress
+    from Compiler.Placement.Flow.Results import PcbProgress
     from .Routing.Policy import RoutingStrategy
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from Compiler.Pipeline import CompileSvToLitematic
-    from Compiler.Placement.PcbFlow import PcbProgress
+    from Compiler.Placement.Flow.Results import PcbProgress
     from Compiler.Routing.Policy import RoutingStrategy
 
 

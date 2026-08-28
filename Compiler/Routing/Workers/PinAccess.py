@@ -17,7 +17,11 @@ except ImportError:
 from ...Placement.Geometry import GetGateInputAccess
 from ...Placement.Rotation import RotatedCellSize
 from ..Actions.Geometry import BuildRoutingResources
-from ..Models import PinAccessIssue, PinAccessReport, Position3
+from ..Contracts.Results import (
+    PinAccessIssue,
+    PinAccessReport,
+)
+from ..Contracts.Core import Position3
 from ..ResourceGraph import PinAccessSelection
 from ..Technology import (
     DefaultRedstoneRoutingTechnology,

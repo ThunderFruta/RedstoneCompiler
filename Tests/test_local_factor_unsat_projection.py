@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from Compiler.Routing.ComponentPipeline import (
+from Compiler.Routing.Components.Certification import (
     BuildPhysicalComponentLocalFactorProjection,
     BuildPhysicalComponentLocalFactorUnsatCertificate,
     ComparePhysicalComponentLocalFactorProjection,

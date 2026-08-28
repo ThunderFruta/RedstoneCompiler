@@ -3,14 +3,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from Compiler.Routing import ComponentPipeline
-from Compiler.Routing.ComponentPipeline import (
+import Compiler.Routing.Components.Certification as ComponentCertification
+import Compiler.Routing.Components.SymbolicDomains as PhysicalSymbolicDomains
+from Compiler.Routing.Components.SymbolicDomains import (
     CompilePhysicalComponentSymbolicHigherOrderDomain,
     CompilePhysicalComponentSymbolicPortPairDomain,
     ProjectCompletePhysicalHigherOrderCertificateToApertureClauses,
     ValidatePhysicalComponentSymbolicHigherOrderCertificate,
 )
-from Compiler.Routing.Models import PhysicalComponentPortReservation
+from Compiler.Routing.Contracts.Component import PhysicalComponentPortReservation
 from Compiler.Routing.ResourceGraph import RoutingResourceClaims
 
 
@@ -171,12 +172,17 @@ def _Fixture(monkeypatch):
     }
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        PhysicalSymbolicDomains,
         "PrepareComponentSymbolicNetStateContext",
         lambda _Problem, Signal, **_KeywordArgs: Signal,
     )
     monkeypatch.setattr(
-        ComponentPipeline,
+        PhysicalSymbolicDomains,
+        "_BuildPreparedComponentSymbolicNetStateContextFingerprint",
+        lambda _Problem, Signal: Signal,
+    )
+    monkeypatch.setattr(
+        ComponentCertification,
         "_BuildPreparedComponentSymbolicNetStateContextFingerprint",
         lambda _Problem, Signal: Signal,
     )
@@ -187,7 +193,7 @@ def _Fixture(monkeypatch):
                 Complete=True,
                 States=StateDomains[Context],
                 CacheKey=(
-                    ComponentPipeline.BuildComponentSymbolicNetStateCacheKey(
+                    PhysicalSymbolicDomains.BuildComponentSymbolicNetStateCacheKey(
                         VariantProblem,
                         Context,
                         PreparedContextFingerprint=Context,
@@ -198,7 +204,7 @@ def _Fixture(monkeypatch):
         }
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        PhysicalSymbolicDomains,
         "CompilePreparedComponentPhysicalFactorStateBatch",
         CompileBatch,
     )
@@ -258,7 +264,7 @@ def test_pair_complete_relation_deduplicates_access_and_mandatory_states(
 ):
     Problem, FactorDomain, Signals = _Fixture(monkeypatch)
     OriginalCompileBatch = (
-        ComponentPipeline
+        PhysicalSymbolicDomains
         .CompilePreparedComponentPhysicalFactorStateBatch
     )
 
@@ -279,7 +285,7 @@ def test_pair_complete_relation_deduplicates_access_and_mandatory_states(
         }
 
     monkeypatch.setattr(
-        ComponentPipeline,
+        PhysicalSymbolicDomains,
         "CompilePreparedComponentPhysicalFactorStateBatch",
         CompileDuplicateBatch,
     )
@@ -633,7 +639,7 @@ def test_incomplete_higher_order_compilation_emits_no_positive_tuple_proof(
 ):
     Problem, FactorDomain, Signals = _Fixture(monkeypatch)
     monkeypatch.setattr(
-        ComponentPipeline,
+        PhysicalSymbolicDomains,
         "CompilePreparedComponentPhysicalFactorStateBatch",
         lambda Context, Problems, **_KeywordArgs: {
             Access: SimpleNamespace(

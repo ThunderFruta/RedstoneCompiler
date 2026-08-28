@@ -19,11 +19,11 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
-from .AuthoritativePlanner import (
+from .Authoritative.RunModels import RawTrackAssignmentDomain
+from .Authoritative.TrackPortfolio import (
     BuildTrackAssignmentPreparationFromRawDomain,
-    RawTrackAssignmentDomain,
 )
-from .Models import TrackAssignmentPreparation
+from .Contracts.Placement import TrackAssignmentPreparation
 from .Reliability import BuildStableFingerprint, RoutingDeadline
 
 

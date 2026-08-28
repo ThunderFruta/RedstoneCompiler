@@ -11,6 +11,18 @@ routing path. “Must” and “shall” are acceptance requirements. The
 [router reliability guide](RouterReliabilityGuide.md) owns operational commands,
 current measurements, and the acceptance verdict.
 
+The proposed
+[routing-aware placement and access design](RoutingAwarePlacementAccessDesign.md)
+defines a candidate replacement for the fixed straight-pin-ray placement
+contract and an immutable handoff into the negotiated router. It remains a
+proposal until its protected physical gates pass; this reliability design
+continues to control current production invariants. The v10 policy label,
+older matrix/manifest shape, and eight-file native checkpoint below are retained
+as dated implementation history rather than current-source evidence; the live
+acceptance harness and timestamped snapshot control those concrete values. The
+proposal's measurements and source identities are recorded separately in the
+append-only [snapshot log](RoutingAwarePlacementAccessSnapshots.md).
+
 ## Negotiated route-tree amendment
 
 The [negotiated route-tree router](NegotiatedRouteTreeRouter.md) is the current
@@ -113,9 +125,10 @@ NAND IR
   -> first fully valid result, or typed hard failure
 ```
 
-One `RoutingDeadline` begins in `PcbFlow` before placement-candidate work. Every
-placement and routing stage consumes that same absolute deadline. No repair,
-claim-release, recursive call, or next candidate may reset it.
+One `RoutingDeadline` begins in `Compiler/Placement/Flow/Runner.py` before
+placement-candidate work. Every placement and routing stage consumes that same
+absolute deadline. No repair, claim-release, recursive call, or next candidate
+may reset it.
 
 ## RRF-020: legal-by-construction placement
 

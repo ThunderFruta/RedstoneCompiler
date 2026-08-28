@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 
 from SVDecoder import Sv
 
-from Compiler.Placement.Pcb import PlacePcbGraph
+from Compiler.Placement.Core.Commit import PlacePcbGraph
 from Compiler.Placement.PreRouteInterface import (
     SolveDerivedPerimeterSlotDomain,
 )

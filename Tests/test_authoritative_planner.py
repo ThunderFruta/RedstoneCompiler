@@ -6,72 +6,189 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import Compiler.Routing.AuthoritativePlanner as AuthoritativePlanner
+
+from Compiler.Routing.Authoritative import (
+    Flow,
+    Portals,
+    TrackPortfolio,
+)
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
-from Compiler.Placement.AccessFabric import (
+from Compiler.Placement.Access.Fabric import (
     AttachPlacementAccessFabric,
     BuildPlacementAccessFabric,
 )
-from Compiler.Placement.Pcb import (
-    PlacementAssignmentConstraintSet,
-    PlacePcbGraph,
-)
-from Compiler.Routing.AuthoritativePlanner import (
+from Compiler.Placement.Core.Commit import PlacePcbGraph
+from Compiler.Placement.Core.Constraints import PlacementAssignmentConstraintSet
+from Compiler.Routing.Authoritative.AssignmentState import (
     BuildNegotiatedInitialColumns,
-    BuildConfiguredPortalRequestDomainFingerprint,
-    BuildExactPhysicalPortalCertificateIdentityConditions,
-    BuildPhysicalExteriorResourceGraphFingerprint,
-    BuildFrozenPostClosurePortalHandoffTelemetry,
-    ValidateFrozenPhysicalComponentPostClosurePortalHandoff,
     BeginPhysicalAssignmentArcPass,
     BuildNegotiatedInitialTiles,
     BuildNegotiatedFallbackGuideColumns,
-    BuildNegotiatedOffenderHaloEscalation,
     BuildNegotiatedRouteTreeState,
-    BuildOptionalPortalSeedWorkCheck,
+    GetPhysicalGlobalAssignmentArcIndex,
+    IncrementalPhysicalCandidateArcIndex,
+    BuildPhysicalPortNoGoodKeys,
+    BuildPhysicalLocalPortPairUnsupportedIndex,
+    CandidatePortalShapeRank,
+    CandidatePortalTupleIndex,
+    CandidateRequestShapeDescriptor,
+    CandidateRequestWindowOffset,
+    ExpandNegotiatedTiles,
+    FindNegotiatedBoundaryTouches,
+    IsPhysicalCandidateRequestDomainComplete,
+    PhysicalGlobalAssignmentDomainIsComplete,
+    ConflictClassificationSupportsPhysicalPortPairNoGoods,
+    PlanPhysicalGlobalAssignmentAvoidingExactNoGoods,
+    SelectExactNoGoodCspBranch,
+    OrderPhysicalPortOptionsByPreferences,
+    GetPersistentPhysicalComponentPortCspState,
+    FindProofQualifiedCompleteDomainNoGoodCore,
+    FindProofQualifiedUniversalNoGoodCore,
+    PropagateExactNoGoodClauses,
+    SelectBinaryExactNoGoodClauses,
+    NegotiatedColumnsForTiles,
+    ShouldDeferUnreservedCandidateRequestShape,
+    ShouldCompletePhysicalCandidateRequestWindow,
+    LazyCandidateRouteRequest,
+    SelectPhysicalGlobalAssignmentSuffixSignals,
+    SelectPhysicalGlobalPairSupportSuffixSignals,
+    SelectPhysicalGlobalNativePairCutSuffixSignals,
+    SelectCompletedPhysicalGlobalPairNoGoodEdges,
+    SelectOpenPhysicalGlobalCandidateDomainSignals,
+    ShouldGrowAssignmentBudget,
+)
+from Compiler.Routing.Authoritative.BoundaryLeasePlanning import (
+    FindFirstUnavoidableCandidateDomainPairCut,
+    ReserveBoundaryPortals,
+    ReserveNegotiatedBoundaryEscapes,
+    SelectAccessAwareLocalClaimReleases,
+)
+from Compiler.Routing.Authoritative.BoundaryLeases import (
+    ReserveClusterBoundaryLeases,
+)
+from Compiler.Routing.Authoritative.CandidateCache import (
+    BuildConfiguredPortalRequestDomainFingerprint,
+    BuildExactPhysicalPortalCertificateIdentityConditions,
+    BuildFrozenPostClosurePortalHandoffTelemetry,
+    ValidateFrozenPhysicalComponentPostClosurePortalHandoff,
     BuildPinnedOrdinaryPortalReuseColumns,
-    BuildRepeaterReadyPortalDomains,
-    BuildCandidateStarvationClassFingerprint,
-    ClassifySiblingApertureSeamOwnershipConflicts,
-    BuildCandidateRequestGeometryIdentity,
-    BuildPhysicalCandidateRequestShapeDependencyIdentity,
-    BuildCompleteMandatoryClaimCutCoverage,
-    BuildInvariantRouteRequestGuidePayload,
-    BuildInvariantRouteRequestNodePayload,
-    BuildForeignElectricalExclusionsBySignal,
-    BuildDetachedLocalClaimObstacleNodes,
-    PartitionLocalClaimSeedComponents,
-    PortalTupleFeasibilityDomainIsComplete,
-    PortalTupleEmptyProofDomainIsComplete,
     ReadPortalBatchCandidatesAndCompletionMask,
     SelectCompletedPortalBatchEntries,
     MergePartialRawPortalBatchWork,
     MergePostClosurePortalCompletionKeys,
-    MergePhysicalSignalRouteDomainDescriptorProgress,
-    RetainPhysicalSignalRouteDomainDescriptorProgress,
-    SelectPendingPhysicalRouteDescriptorRows,
     SelectMatchingPartialPortalReplaySignals,
-    BuildBoundedPortfolioPortalSliceAdvanceFailure,
-    BuildMandatoryPortalTupleSelfConflictFailure,
-    BuildPhysicalBoundaryMandatoryPortalFactorDomains,
-    ExactPortalConstraintAssignmentSatisfiesFactors,
-    ExactPortalConstraintChoice,
-    ExactPortalConstraintVariableDomain,
-    ExtractExactPortalConstraintFactors,
-    ExtractSparseExactPortalConstraintFactors,
-    GetMandatoryPortalPairFeasibilityCertificate,
-    CompilePhysicalBoundaryMandatoryPortalPairRelation,
-    ProjectExactPortalConstraintFactors,
-    GetPhysicalGlobalAssignmentArcIndex,
-    IncrementalPhysicalCandidateArcIndex,
-    SelectCertifiedMandatoryPortalPairCuts,
-    SolveMandatoryPortalPairFeasibility,
-    PhysicalBoundaryMandatoryPortalFactorDomain,
-    BuildRoutingConflictGraph,
     BuildClusterInterfaceAccessDomainFingerprint,
     BuildClusterInterfaceProblem,
     BuildClusterInterfaceReservationAssignmentFingerprint,
+    ChooseRepeatedWorkTransition,
+    ExtendIndexedRoutingResourceGraph,
+    FindUnindexedClaimPositions,
+    GrowAssignmentExpansionLimit,
+    FilterPhysicalCandidatesToCurrentPortalDomain,
+    ClassifyEmptyPhysicalCandidateDomains,
+    MergeSignalScopedRawPortalEntries,
+    RawPortalGeometryReusePlan,
+    ReadRouteTreeBatchCompletionMask,
+    BuildTranslatedPortablePortalId,
+    MaterializeValidatedPortablePortalPositiveWitness,
+    BuildPhysicalGlobalRouteTreeResultCacheKey,
+    PreparedPortalDomainCache,
+    RetainPreparedPortalDomainCache,
+    RetainPhysicalGlobalRouteTreeResults,
+    RetainRawPortalGeometryCache,
+    SelectAuthoritativeBaseClaims,
+    SelectRawPortalGeometryReusePlan,
+    SelectPreparedPortalDomainCache,
+    TransformPlanarRoutingPosition,
+    TransformPortableCompletePortalDomainKeys,
+    SelectPortablePortalPositiveReusableSignals,
+    SelectPortablePortalProofReusableSignals,
+    PartitionExpectedGenericPortalDomainKeys,
+    PartitionPhysicalOwnedTerminalPortalRequests,
+    TouchPhysicalGlobalRouteTreeResult,
+    ShouldRunShapeOptimization,
+)
+from Compiler.Routing.Authoritative.CandidateDomains import (
+    BuildNegotiatedOffenderHaloEscalation,
+    BuildOptionalPortalSeedWorkCheck,
+    BuildCandidateStarvationClassFingerprint,
+    BuildCompleteMandatoryClaimCutCoverage,
+    PortalTupleFeasibilityDomainIsComplete,
+    PortalTupleEmptyProofDomainIsComplete,
+    BuildBoundedPortfolioPortalSliceAdvanceFailure,
+    BuildMandatoryPortalTupleSelfConflictFailure,
     BuildClusterLeaseSignalPatternFingerprint,
+    BuildTelemetryRoutingStageError,
+    BuildUnavoidableMandatoryClaimCutFailure,
+    CountPriorCandidateFailureFingerprint,
+    CountPriorCandidateRequestDomainFingerprint,
+    CountPriorCandidateStarvationClassFingerprint,
+    CountRoutedComponentGlobalNoTreeAttempts,
+    CountExactLegalRetainedJointStates,
+    CountJointAssignmentConstraintKinds,
+    ExactAssignmentCompletionSignalOrderKey,
+    FindAllUnavoidableMandatoryClaimCuts,
+    FrozenComponentBlockedWireNodes,
+    ImmutableRoutingClaimsBlockedWireNodes,
+    FindPriorCandidateDomainPairExpansion,
+    FindUnavoidableMandatoryClaimCut,
+    GenerateStagedInitialRouteTrees,
+    HasRepeatedExactPairCut,
+    HasCoveredPairCutAfterEndpointExpansion,
+    MayAdvanceStagedCandidateOnExhaustion,
+    RawPortalProfileMatchesRequestedControls,
+    RetainNegotiatedInitialCandidateOption,
+    SelectExactAssignmentCompletionCutWideRequests,
+    SelectPendingExactAssignmentCompletionRequestIndices,
+    SelectExactAssignmentCompletionRequestBatch,
+    SelectExactAssignmentCompletionReserveMilliseconds,
+    ShouldContinueDistinctExactCutFrontier,
+    ShouldRejectRoutedComponentForeignEscape,
+    SelectCandidateRealizabilityProbeSliceSeconds,
+    ShouldContinueUniqueAccessDistinctCandidateRealizabilityProof,
+    ShouldHandoffContinuedCandidateRealizabilityCut,
+    SelectCandidateDomainPairScanSliceSeconds,
+    SelectClusterLeaseOwnershipSignals,
+    SelectCoordinatedCandidateExpansionLimit,
+    SelectEffectiveCoordinatedCandidateDiversityLevel,
+    SelectCoordinatedContinuationRequestWindowLimit,
+    SelectCoordinatedInitialRequestWindowLimit,
+    SelectMaturePortfolioExactInitialRequestFloor,
+    SelectMaturePortfolioPortalLimit,
+    SelectNegotiatedExpandedRequestMinimumExpansionCount,
+    SelectNegotiatedOffenderHaloLaneDiversityLevel,
+    SelectCoordinatedPortalVariantCount,
+    SelectOptionalPortalSeedSliceSeconds,
+    SelectTransactionalLeasePrescreenSignals,
+    SelectJointHigherOrderConstraintSignals,
+    SelectJointPairwiseConstraintSignals,
+    ShouldRetainUnaffectedCandidatesForControl,
+    ShouldPrepareOptionalPortalSeed,
+    ShouldPrepareMandatoryPortalTuples,
+    ShouldLimitRetainedPortfolioPortalDomain,
+    ShouldRetainBoundedPortfolioPortalProfile,
+    ShouldCapMatureCumulativeJointPortfolio,
+    ShouldStageTopologyPressureJointPortfolio,
+    ShouldScanCandidateDomainPairCut,
+    ShouldAdvanceRetainedJointPortfolioOnCandidateStarvation,
+    ShouldAdvanceTopologyCutEpochOnCandidateStarvation,
+    ShouldAdvanceAfterCompleteClusterLeasePortfolio,
+    ShouldDiversifyStarvedCompleteClusterLeaseEndpoint,
+    ShouldContinueCutScopedFixedLegalityWindow,
+    ShouldContinueSoleRetainedCutCandidateStarvation,
+    ShouldExpandNegotiatedOffenderHalo,
+    HasCumulativeJointAssignmentConstraintMaturity,
+    ShouldRetryRelocatedCandidateStarvation,
+    ShouldRetryCompleteClusterLeaseStateBeforePlacement,
+    ShouldRefineCandidateRealizabilityLeaseNogood,
+    ShouldUseNegotiatedRouting,
+    ShouldUseMatureStagedInitialCandidateScheduler,
+)
+from Compiler.Routing.Authoritative.CandidateGuides import (
+    ClassifySiblingApertureSeamOwnershipConflicts,
+    MergePhysicalSignalRouteDomainDescriptorProgress,
+    RetainPhysicalSignalRouteDomainDescriptorProgress,
+    SelectPendingPhysicalRouteDescriptorRows,
     BuildCapacityAwareGuideInputFingerprint,
     BuildPhysicalAssemblyGuideContractFingerprint,
     BuildFactorizedPhysicalGuideIdentity,
@@ -95,202 +212,95 @@ from Compiler.Routing.AuthoritativePlanner import (
     RetainCompletePhysicalSignalRouteDomainContinuations,
     BuildPhysicalPortCorridorArcSupportIndex,
     BuildPhysicalPortCorridorDomain,
-    BuildPhysicalPortNoGoodKeys,
-    BuildPhysicalLocalPortPairUnsupportedIndex,
-    BuildPhysicalPortApertureContractFingerprint,
     CaptureCompletePhysicalPortCorridorDomains,
     BuildPreparedPhysicalExteriorGuideColumnsBySignal,
-    BuildPhysicalExteriorConnectorDistanceField,
-    FrozenPhysicalExteriorConnectorSearchRequest,
     BuildPhysicalPortCorridorFactor,
     BuildPhysicalGlobalPlanContinuationState,
     BuildPhysicalGlobalPlanYieldDeadline,
-    BuildPhysicalComponentGlobalPortalId,
-    BuildTelemetryRoutingStageError,
-    BuildUnavoidableMandatoryClaimCutFailure,
-    CandidatePortalShapeRank,
-    CandidatePortalTupleIndex,
-    CandidateRequestShapeDescriptor,
-    CandidateRequestWindowOffset,
-    ClusterLeaseCandidateRealizabilityNogood,
-    ClaimConflictPositions,
-    ChooseRepeatedWorkTransition,
-    CountPriorCandidateFailureFingerprint,
-    CountPriorCandidateRequestDomainFingerprint,
-    CountPriorCandidateStarvationClassFingerprint,
-    CountRoutedComponentGlobalNoTreeAttempts,
-    CountExactLegalRetainedJointStates,
-    CountJointAssignmentConstraintKinds,
-    ExpandNegotiatedTiles,
-    ExactAssignmentCompletionSignalOrderKey,
-    ExtendIndexedRoutingResourceGraph,
-    FindAllUnavoidableMandatoryClaimCuts,
-    FrozenComponentBlockedWireNodes,
-    ImmutableRoutingClaimsBlockedWireNodes,
-    FindFirstUnavoidableCandidateDomainPairCut,
-    FindPriorCandidateDomainPairExpansion,
-    FindUnindexedClaimPositions,
-    FindUnavoidableMandatoryClaimCut,
-    FindNegotiatedBoundaryTouches,
-    GenerateStagedInitialRouteTrees,
-    GrowAssignmentExpansionLimit,
-    HasRepeatedExactPairCut,
-    HasCoveredPairCutAfterEndpointExpansion,
-    MandatoryPortalTupleSelfConflictEvidence,
-    IsPhysicalCandidateRequestDomainComplete,
-    PhysicalGlobalAssignmentDomainIsComplete,
-    BuildSeamOnlyPhysicalComponentPortReservation,
-    PhysicalPortPathsOwnExclusiveSeam,
-    PhysicalRouteRequestFactorHasNecessaryConnectivity,
-    ConflictClassificationSupportsPhysicalPortPairNoGoods,
-    PlanPhysicalGlobalAssignmentAvoidingExactNoGoods,
     PropagatePhysicalPortCorridorArcConsistency,
     SelectReusablePhysicalPortCorridorCandidates,
     RetainIncompletePhysicalGlobalPlan,
     SelectNextRetainedPhysicalGlobalPlan,
     ShouldScheduleRetainedPhysicalGlobalPlan,
-    SelectExactNoGoodCspBranch,
-    OrderPhysicalPortOptionsByPreferences,
+)
+from Compiler.Routing.Authoritative.ExteriorConnectors import (
+    BuildPhysicalExteriorConnectorDistanceField,
+    FrozenPhysicalExteriorConnectorSearchRequest,
+    SelectPhysicalExteriorConnectorPath,
+    SearchFrozenPhysicalExteriorConnectorBatch,
+)
+from Compiler.Routing.Authoritative.Materialization import (
+    SelectComponentPreparationProfiles,
+)
+from Compiler.Routing.Authoritative.NegotiatedTrees import (
+    PlanNegotiatedRouteTrees,
+)
+from Compiler.Routing.Authoritative.PhysicalGuides import (
+    BuildPhysicalExteriorResourceGraphFingerprint,
     DecomposePhysicalPortLaneFactors,
     PreparePhysicalSignalLocalFactorDomain,
     MaterializeSupportedPhysicalPortReservation,
     MaterializePhysicalPortFactorPair,
-    FilterPhysicalCandidatesToCurrentPortalDomain,
-    ClassifyEmptyPhysicalCandidateDomains,
+    ShouldBuildCapacityAwareGlobalGuidePlan,
+    CanReuseFrozenPhysicalPortGuidePlan,
+)
+from Compiler.Routing.Authoritative.Portals import (
+    BuildRepeaterReadyPortalDomains,
     ApplyPhysicalComponentAssemblyPortalDomains,
     ApplyPlacementAccessFabricPortalDomains,
     SelectGenericPortalTerminalPaths,
-    GetPersistentPhysicalComponentPortCspState,
-    FindProofQualifiedCompleteDomainNoGoodCore,
-    FindProofQualifiedUniversalNoGoodCore,
-    PropagateExactNoGoodClauses,
-    SelectBinaryExactNoGoodClauses,
-    MayAdvanceStagedCandidateOnExhaustion,
-    MandatoryClaimsConflict,
-    InterleavePhysicalPortSeamsByEgressClass,
-    MergeSignalScopedAvoidancePositions,
-    MergeSignalScopedRawPortalEntries,
-    PlanNegotiatedRouteTrees,
-    NegotiatedColumnsForTiles,
-    OptionalPortalSeedSliceExpired,
-    PortalTupleConflictsWithFrozenComponentClaims,
-    RawPortalProfileMatchesRequestedControls,
-    RawPortalGeometryCache,
-    RawPortalGeometryReusePlan,
-    ReadRouteTreeBatchCompletionMask,
-    BuildRawPortalPlacementGeometryFingerprint,
-    BuildRawPortalResourceGeometryFingerprint,
-    BuildTranslatedPortablePortalId,
-    MaterializeValidatedPortablePortalPositiveWitness,
-    BuildPhysicalGlobalRouteTreeResultCacheKey,
-    PreparedPortalDomainCache,
-    RetainPreparedPortalDomainCache,
-    RetainPhysicalGlobalRouteTreeResults,
-    RetainRawPortalGeometryCache,
     RequiredPhysicalAssemblyRoutingLayerCount,
     RequiredRoutingLayerCountForAccess,
-    ReserveBoundaryPortals,
-    ReserveClusterBoundaryLeases,
-    ReserveNegotiatedBoundaryEscapes,
-    RetainPartialAssignmentCandidateCache,
-    RetainNegotiatedInitialCandidateOption,
     SelectEscalatedRoutingLayerCount,
-    SelectAuthoritativeRouteRequestGuide,
-    SelectExactAssignmentCompletionCutWideRequests,
-    SelectPendingExactAssignmentCompletionRequestIndices,
-    SelectExactAssignmentCompletionRequestBatch,
-    SelectExactAssignmentCompletionReserveMilliseconds,
-    ShouldContinueDistinctExactCutFrontier,
-    ShouldBuildCapacityAwareGlobalGuidePlan,
-    CanReuseFrozenPhysicalPortGuidePlan,
-    SelectComponentPreparationProfiles,
-    ShouldDeferUnreservedCandidateRequestShape,
-    ShouldCompletePhysicalCandidateRequestWindow,
-    LazyCandidateRouteRequest,
-    ShouldRejectRoutedComponentForeignEscape,
-    SelectCandidateRegenerationSignals,
-    SelectCandidateRegenerationCoverSignals,
-    SelectCandidateRealizabilityProbeSliceSeconds,
-    ShouldContinueUniqueAccessDistinctCandidateRealizabilityProof,
-    ShouldHandoffContinuedCandidateRealizabilityCut,
-    SelectAnonymousMinimumFailurePairRelocationSignals,
-    BuildAnonymousCandidateDomainFingerprint,
-    SelectPriorityPlacementRelocationSignals,
-    SelectPhysicalGlobalAssignmentSuffixSignals,
-    SelectPhysicalGlobalPairSupportSuffixSignals,
-    SelectPhysicalGlobalNativePairCutSuffixSignals,
-    SelectCompletedPhysicalGlobalPairNoGoodEdges,
-    SelectOpenPhysicalGlobalCandidateDomainSignals,
-    SelectCandidateDomainPairScanSliceSeconds,
-    SelectConflictAvoidancePositions,
-    SelectClusterLeaseOwnershipSignals,
-    SelectCoordinatedCandidateExpansionLimit,
-    SelectEffectiveCoordinatedCandidateDiversityLevel,
-    SelectCoordinatedContinuationRequestWindowLimit,
-    SelectCoordinatedInitialRequestWindowLimit,
-    SelectPartialAssignmentAvoidancePositions,
-    SelectPartialAssignmentBlockerSignals,
-    SelectAuthoritativeBaseClaims,
-    SelectAccessAwareLocalClaimReleases,
     SelectGraphAccessStarts,
     PortalPathRespectsOutwardAccess,
     SelectInitialRoutingLayerCount,
     SelectHierarchicalRoutingMaximumLayerCount,
     ValidatePhysicalAssemblyRoutingLayerLimit,
     ValidatePhysicalComponentExactAttachmentPortals,
-    SelectMaturePortfolioExactInitialRequestFloor,
-    SelectMaturePortfolioPortalLimit,
-    SelectNegotiatedExpandedRequestMinimumExpansionCount,
-    SelectNegotiatedOffenderHaloLaneDiversityLevel,
-    SelectCoordinatedPortalVariantCount,
-    SelectOptionalPortalSeedSliceSeconds,
-    SelectRawPortalGeometryReusePlan,
-    SelectPreparedPortalDomainCache,
-    SelectPhysicalExteriorConnectorPath,
-    SearchFrozenPhysicalExteriorConnectorBatch,
-    SelectTransactionalLeasePrescreenSignals,
-    TransformPlanarRoutingPosition,
-    TransformPortableCompletePortalDomainKeys,
-    SelectPortablePortalPositiveReusableSignals,
-    SelectPortablePortalProofReusableSignals,
-    PartitionExpectedGenericPortalDomainKeys,
-    PartitionPhysicalOwnedTerminalPortalRequests,
-    TouchPhysicalGlobalRouteTreeResult,
-    SelectJointHigherOrderConstraintSignals,
-    SelectJointPairwiseConstraintSignals,
-    ShouldFreezePartialAssignmentForExactCut,
-    ShouldGrowAssignmentBudget,
-    ShouldRegenerateNewExactConflictSignals,
-    ShouldReleaseFrozenPartialAssignment,
-    ShouldRetainUnaffectedCandidatesForControl,
-    ShouldPrepareOptionalPortalSeed,
-    ShouldPrepareMandatoryPortalTuples,
-    ShouldLimitRetainedPortfolioPortalDomain,
-    ShouldRetainBoundedPortfolioPortalProfile,
-    ShouldCapMatureCumulativeJointPortfolio,
-    ShouldStageTopologyPressureJointPortfolio,
-    ShouldScanCandidateDomainPairCut,
-    ShouldAdvanceRetainedJointPortfolioOnCandidateStarvation,
-    ShouldAdvanceTopologyCutEpochOnCandidateStarvation,
-    ShouldAdvanceAfterCompleteClusterLeasePortfolio,
-    ShouldDiversifyStarvedCompleteClusterLeaseEndpoint,
-    ShouldContinueCutScopedFixedLegalityWindow,
-    ShouldContinueSoleRetainedCutCandidateStarvation,
-    ShouldExpandNegotiatedOffenderHalo,
-    HasCumulativeJointAssignmentConstraintMaturity,
-    ShouldRetryRelocatedCandidateStarvation,
-    ShouldRetryCompleteClusterLeaseStateBeforePlacement,
-    ShouldRefineCandidateRealizabilityLeaseNogood,
     ShouldRetryNegotiatedExactAssignment,
-    ShouldUseNegotiatedRouting,
-    ShouldUseMatureStagedInitialCandidateScheduler,
-    ShouldRunShapeOptimization,
     FilterSourceConnectedTargetBranches,
-    _BuildTargetPortalBranches,
     _MaterializeCandidate,
     _ReserveRepeaters,
 )
-from Compiler.Routing.Models import PhysicalGlobalPlanResumeCursor
+from Compiler.Routing.Authoritative.RunModels import (
+    ClusterLeaseCandidateRealizabilityNogood,
+    MandatoryPortalTupleSelfConflictEvidence,
+    OptionalPortalSeedSliceExpired,
+)
+from Compiler.Routing.Authoritative.TrackPortfolio import (
+    BuildCandidateRequestGeometryIdentity,
+    BuildPhysicalCandidateRequestShapeDependencyIdentity,
+    BuildInvariantRouteRequestGuidePayload,
+    BuildInvariantRouteRequestNodePayload,
+    BuildForeignElectricalExclusionsBySignal,
+    BuildDetachedLocalClaimObstacleNodes,
+    PartitionLocalClaimSeedComponents,
+    BuildRoutingConflictGraph,
+    BuildSeamOnlyPhysicalComponentPortReservation,
+    PhysicalPortPathsOwnExclusiveSeam,
+    PhysicalRouteRequestFactorHasNecessaryConnectivity,
+    InterleavePhysicalPortSeamsByEgressClass,
+    MergeSignalScopedAvoidancePositions,
+    RetainPartialAssignmentCandidateCache,
+    SelectAuthoritativeRouteRequestGuide,
+    SelectCandidateRegenerationSignals,
+    SelectCandidateRegenerationCoverSignals,
+    SelectAnonymousMinimumFailurePairRelocationSignals,
+    BuildAnonymousCandidateDomainFingerprint,
+    SelectPriorityPlacementRelocationSignals,
+    SelectConflictAvoidancePositions,
+    SelectPartialAssignmentAvoidancePositions,
+    SelectPartialAssignmentBlockerSignals,
+    ShouldFreezePartialAssignmentForExactCut,
+    ShouldRegenerateNewExactConflictSignals,
+    ShouldReleaseFrozenPartialAssignment,
+    _BuildTargetPortalBranches,
+)
+from Compiler.Routing.Components.Validation import (
+    BuildPhysicalPortApertureContractFingerprint,
+)
+from Compiler.Routing.Contracts.PhysicalInterface import PhysicalGlobalPlanResumeCursor
 from Compiler.Routing.Actions import PropagateRoutePower
 from Compiler.Routing.ChannelPlanner import NetRoutingProfile
 from Compiler.Routing.Failures import (
@@ -299,22 +309,52 @@ from Compiler.Routing.Failures import (
     RoutingFailureReason,
     RoutingStageError,
 )
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Placement import (
     ClusterInterfaceRealizabilityNogood,
     ClusterInterfaceStateProof,
+    PlacementAccessEscapeStub,
+    PlacementAccessFabric,
+    PlacementAccessTerminalDomain,
+)
+from Compiler.Routing.Contracts.Component import (
     PhysicalComponentPortReservation,
     PhysicalComponentBoundaryPortReservation,
     PhysicalComponentChannelReservation,
+)
+from Compiler.Routing.Contracts.PhysicalInterface import (
     PhysicalPortApertureOptionFactor,
     PhysicalLocalPortPairProofRecord,
     PhysicalPortLaneFactor,
     PhysicalPortSeamFactor,
     FrozenPhysicalComponentPostClosurePortalHandoff,
-    RoutingResources,
-    RoutingStaticGeometry,
-    PlacementAccessEscapeStub,
-    PlacementAccessFabric,
-    PlacementAccessTerminalDomain,
+)
+from Compiler.Routing.Contracts.Results import RoutingResources
+from Compiler.Routing.Contracts.Core import RoutingStaticGeometry
+from Compiler.Routing.Interfaces.BoundaryRelations import (
+    BuildPhysicalBoundaryMandatoryPortalFactorDomains,
+    BuildPhysicalComponentGlobalPortalId,
+    BuildPhysicalPortGlobalContractFingerprint,
+    BuildRawPortalPlacementGeometryFingerprint,
+    BuildRawPortalResourceGeometryFingerprint,
+    CompilePhysicalBoundaryMandatoryPortalPairRelation,
+    GetMandatoryPortalPairFeasibilityCertificate,
+    PhysicalBoundaryMandatoryPortalFactorDomain,
+    RawPortalGeometryCache,
+    SelectCertifiedMandatoryPortalPairCuts,
+    SolveMandatoryPortalPairFeasibility,
+)
+from Compiler.Routing.Interfaces.PhysicalClaims import (
+    ClaimConflictPositions,
+    MandatoryClaimsConflict,
+    PortalTupleConflictsWithFrozenComponentClaims,
+)
+from Compiler.Routing.Interfaces.PortalConstraints import (
+    ExactPortalConstraintAssignmentSatisfiesFactors,
+    ExactPortalConstraintChoice,
+    ExactPortalConstraintVariableDomain,
+    ExtractExactPortalConstraintFactors,
+    ExtractSparseExactPortalConstraintFactors,
+    ProjectExactPortalConstraintFactors,
 )
 from Compiler.Routing.Actions.Geometry import BuildRoutingResources
 from Compiler.Routing.Pcb import (
@@ -322,9 +362,8 @@ from Compiler.Routing.Pcb import (
     PrepareTrackAssignment,
     RoutePcbDesign,
 )
-from Compiler.Routing.ComponentPipeline import (
+from Compiler.Routing.Components.Certification import (
     BuildPhysicalLocalPortPairSupportCertificate,
-    BuildPhysicalPortGlobalContractFingerprint,
 )
 from Compiler.Routing.Policy import (
     DefaultPhysicalDesignPolicy,
@@ -3509,7 +3548,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
     ) -> None:
         SharedChecks = []
         with patch(
-            "Compiler.Routing.AuthoritativePlanner.monotonic",
+            'Compiler.Routing.Authoritative.CandidateDomains.monotonic',
             return_value=10.0,
         ):
             WorkCheck = BuildOptionalPortalSeedWorkCheck(
@@ -8796,7 +8835,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self.assertFalse(ScopedClause.issubset(OtherKeys))
 
     @patch(
-        "Compiler.Routing.ComponentPipeline."
+        "Compiler.Routing.Components.Certification."
         "BuildPhysicalLocalPairProofContextFingerprint",
         return_value="local-proof-context",
     )
@@ -8918,7 +8957,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         ))
 
     @patch(
-        "Compiler.Routing.ComponentPipeline."
+        "Compiler.Routing.Components.Certification."
         "BuildPhysicalLocalPairProofContextFingerprint",
         return_value="local-proof-context",
     )
@@ -12486,8 +12525,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         Cache = {}
         Canonicalizer = (
-            "Compiler.Routing.AuthoritativePlanner."
-            "BuildPortablePhysicalSignalRouteDomainIdentity"
+            'Compiler.Routing.Authoritative.CandidateGuides.BuildPortablePhysicalSignalRouteDomainIdentity'
         )
         with patch(Canonicalizer, wraps=(
             BuildPortablePhysicalSignalRouteDomainIdentity
@@ -12816,9 +12854,9 @@ class AuthoritativePlannerTests(unittest.TestCase):
 
         # A complete entry is still unusable under a different structural or
         # technology identity, even if its portable geometry key is supplied.
-        from Compiler.Routing.AuthoritativePlanner import (
-            PortablePhysicalSignalRouteDomainContinuation,
-        )
+        from Compiler.Routing.Authoritative.CandidateGuides import (
+    PortablePhysicalSignalRouteDomainContinuation,
+)
         Cache["portable-route-domain:portable-a"] = (
             PortablePhysicalSignalRouteDomainContinuation(
             PortableDomainFingerprint="portable-a",
@@ -14696,7 +14734,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         Diagnostics = {}
         with patch(
-            "Compiler.Routing.AuthoritativePlanner._ReserveRepeaters",
+            'Compiler.Routing.Authoritative.Portals._ReserveRepeaters',
             return_value=((), {}),
         ):
             Candidate = _MaterializeCandidate(
@@ -14814,7 +14852,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         )
         Diagnostics = {}
         with patch(
-            "Compiler.Routing.AuthoritativePlanner._ReserveRepeaters",
+            'Compiler.Routing.Authoritative.Portals._ReserveRepeaters',
             return_value=((), {}),
         ):
             Candidate = _MaterializeCandidate(
@@ -15299,7 +15337,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         }
         SeenPortalIds: set[str] = set()
         OriginalIdentity = (
-            AuthoritativePlanner.BuildCandidateRequestGeometryIdentity
+            TrackPortfolio.BuildCandidateRequestGeometryIdentity
         )
 
         def RecordCandidateRequestIdentity(
@@ -15318,7 +15356,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             )
 
         with patch.object(
-            AuthoritativePlanner,
+            TrackPortfolio,
             "BuildCandidateRequestGeometryIdentity",
             RecordCandidateRequestIdentity,
         ):
@@ -15346,7 +15384,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self,
     ) -> None:
         """One frozen envelope exports the same values without solving them."""
-        from Compiler.Placement.PcbFlow import (
+        from Compiler.Placement.Flow.Preparation import (
             BuildDerivedRoutingEnvelopeDomain,
             BuildFrozenEnvelopeRoutingPolicy,
             BuildPlacementAccessDemand,
@@ -15386,7 +15424,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             LocalFirstPhysicalDesignPolicy,
             Envelope,
         )
-        NativeContext = AuthoritativePlanner.RustRoutingContext
+        NativeContext = Flow.RustRoutingContext
 
         class RefuseAssignmentContext:
             def __init__(self, *Arguments) -> None:
@@ -15409,7 +15447,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 )
 
         with patch.object(
-            AuthoritativePlanner,
+            Flow,
             "RustRoutingContext",
             RefuseAssignmentContext,
         ):
@@ -15434,7 +15472,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
         self,
     ) -> None:
         """The selected raw witness reaches routing without a second solve."""
-        from Compiler.Placement.PcbFlow import (
+        from Compiler.Placement.Flow.Preparation import (
             BuildDerivedRoutingEnvelopeDomain,
             BuildFrozenEnvelopeRoutingPolicy,
             BuildPlacementAccessDemand,
@@ -15653,7 +15691,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
                 ViaCount=0,
             )
 
-        NativeRoutingContext = AuthoritativePlanner.RustRoutingContext
+        NativeRoutingContext = Flow.RustRoutingContext
 
         class RecordingRoutingContext:
             def __init__(self, *Arguments) -> None:
@@ -15669,11 +15707,11 @@ class AuthoritativePlannerTests(unittest.TestCase):
         # Candidate trees are deliberately controlled, but the assignment
         # call remains the real Rust solver and is instrumented below.
         with patch.object(
-            AuthoritativePlanner,
+            Portals,
             "_MaterializeCandidate",
             MaterializeControlledCandidate,
         ), patch.object(
-            AuthoritativePlanner,
+            Flow,
             "RustRoutingContext",
             RecordingRoutingContext,
         ):
@@ -15787,7 +15825,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             Preparation.CandidateDomainFingerprint,
         )
 
-        OriginalMaterialize = AuthoritativePlanner._MaterializeCandidate
+        OriginalMaterialize = Portals._MaterializeCandidate
 
         def MaterializeWithMutatedClaims(*Arguments, **KeywordArguments):
             Candidate = OriginalMaterialize(*Arguments, **KeywordArguments)
@@ -15805,7 +15843,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             )
 
         with patch.object(
-            AuthoritativePlanner,
+            Portals,
             "_MaterializeCandidate",
             MaterializeWithMutatedClaims,
         ), self.assertRaises(RoutingStageError) as Raised:
@@ -16533,7 +16571,7 @@ class AuthoritativePlannerTests(unittest.TestCase):
             sorted(Region.Edges),
         ))
         with patch(
-            "Compiler.Routing.AuthoritativePlanner.GetRustRoutingThreadCount",
+            'Compiler.Routing.Authoritative.NegotiatedTrees.GetRustRoutingThreadCount',
             return_value=1,
         ):
             Plan = PlanNegotiatedRouteTrees(

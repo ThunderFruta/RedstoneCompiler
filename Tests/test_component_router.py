@@ -5,52 +5,74 @@ from time import monotonic
 from types import SimpleNamespace
 import unittest
 
-from Compiler.Routing.ComponentRouter import (
+from Compiler.Routing.Components.Fabric import (
     ApplyRoutedComponentGlobalProfiles,
     BuildCoalescedComponentAccessCandidates,
     CoalesceOwnedSignalAccessDomains,
     BuildClosedComponentInterface,
-    BuildDeclaredComponentFeedthroughDomains,
-    BuildComponentForeignTransitDomains,
-    BuildComponentRoutingProblem,
     BuildComponentRoutingFabric,
     BuildComponentFabricAdjacency,
+    FilterExternalSourcePoweredSeamCandidateDomains,
+    PruneDominatedComponentAccessCandidates,
+    SelectComponentIncidentSignals,
+)
+from Compiler.Routing.Components.Feedthroughs import (
+    BuildDeclaredComponentFeedthroughDomains,
+)
+from Compiler.Routing.Components.Problem import BuildComponentRoutingProblem
+from Compiler.Routing.Components.Domains import (
+    BuildComponentForeignTransitDomains,
+    FindCompleteComponentNetUnsatSubset,
+)
+from Compiler.Routing.Components.Portfolios import (
     BuildCompleteOpposingNetAccessRowContext,
     BuildCompleteOpposingNetAccessContractDomain,
     BuildOpposingNetEffectiveAccessSignature,
     BuildExactComponentPortRealizabilityContext,
     BuildExactComponentPortRealizabilityFingerprint,
     ClearStructuralPortRealizabilityCache,
-    ComponentClaimsCompatibleForOwners,
-    ComponentClaimsConflict,
     EvaluateCachedCompleteOpposingNetAccessPair,
     EvaluateCompleteOpposingNetAccessPair,
     EvaluateCompleteOpposingNetAccessContractRow,
     EvaluateExactComponentPortRealizability,
-    FilterExternalSourcePoweredSeamCandidateDomains,
-    FindCompleteComponentNetUnsatSubset,
+)
+from Compiler.Routing.Components.Solver import (
     MaterializeRoutedComponentTemplate,
     PreserveRoutedComponentForeignEscapes,
-    PrepareComponentSymbolicNetStateContext,
-    PruneDominatedComponentAccessCandidates,
-    SelectComponentIncidentSignals,
     SolveComponentRoutingProblem,
-    SolveComponentRoutingProblemDynamic,
-    CompilePreparedComponentSymbolicNetStates,
     ValidateRoutedComponentHandoff,
+)
+from Compiler.Routing.Components.SymbolicState import (
+    PrepareComponentSymbolicNetStateContext,
+)
+from Compiler.Routing.Components.DynamicSolver import (
+    SolveComponentRoutingProblemDynamic,
+)
+from Compiler.Routing.Components.SymbolicWorkers import (
+    CompilePreparedComponentSymbolicNetStates,
+)
+from Compiler.Routing.Components.NetPlanning import (
     _BuildCanonicalAccessCombinationKey,
     _BuildNetVariant,
-    _PlanTreeRepeaters,
+)
+from Compiler.Routing.Components.Fabric import _PlanTreeRepeaters
+from Compiler.Routing.Components.LegacySolver import (
     _SolveComponentRoutingProblemLegacy,
 )
-from Compiler.Routing import ComponentRouter as ComponentRouterModule
-from Compiler.Routing import ComponentPipeline as ComponentPipelineModule
-from Compiler.Routing.ComponentPipeline import CompileClosedComponent
-from Compiler.Routing.ComponentPipeline import (
+from Compiler.Routing.Interfaces.PhysicalClaims import (
+    ComponentClaimsCompatibleForOwners,
+    ComponentClaimsConflict,
+)
+import Compiler.Routing.Components.DynamicSolver as DynamicSolverModule
+import Compiler.Routing.Components.SymbolicDomains as SymbolicDomainsModule
+from Compiler.Routing.Components.Pipeline import CompileClosedComponent
+from Compiler.Routing.Components.Validation import (
     BuildPhysicalPortLocalContractFingerprint,
+)
+from Compiler.Routing.Components.SymbolicDomains import (
     CompilePhysicalComponentSymbolicUnaryApertureDomain,
 )
-from Compiler.Routing.Models import (
+from Compiler.Routing.Contracts.Component import (
     ClosedComponentInterface,
     ComponentFeedthroughContract,
     ComponentForeignTransitDomain,
@@ -559,7 +581,7 @@ def test_bulk_opposing_pair_reuses_precomputed_current_contract_domain(
     )
 
     monkeypatch.setattr(
-        "Compiler.Routing.ComponentRouter."
+        "Compiler.Routing.Components.Portfolios."
         "BuildOpposingNetEffectiveAccessSignature",
         lambda *_Arguments, **_Keywords: (_ for _ in ()).throw(
             AssertionError("current access domain was recomputed")
@@ -591,7 +613,7 @@ def test_bulk_opposing_pair_reuses_precomputed_current_contract_domain(
         "_BuildOpposingNetEffectiveAccessSignatureFromDomains",
     ):
         monkeypatch.setattr(
-            "Compiler.Routing.ComponentRouter." + Name,
+            "Compiler.Routing.Components.Portfolios." + Name,
             UnexpectedRevalidation,
         )
     WarmResult = EvaluateCompleteOpposingNetAccessContractRow(
@@ -2746,8 +2768,8 @@ def test_parallel_unary_workers_merge_symbolic_state_cache_into_parent():
                 {f"symbolic-state:{Signal}": Signal},
             ))
 
-    OriginalExecutor = ComponentPipelineModule.ProcessPoolExecutor
-    ComponentPipelineModule.ProcessPoolExecutor = Executor
+    OriginalExecutor = SymbolicDomainsModule.ProcessPoolExecutor
+    SymbolicDomainsModule.ProcessPoolExecutor = Executor
     try:
         NetStateCache = {}
         Clauses, Diagnostics = (
@@ -2760,7 +2782,7 @@ def test_parallel_unary_workers_merge_symbolic_state_cache_into_parent():
             )
         )
     finally:
-        ComponentPipelineModule.ProcessPoolExecutor = OriginalExecutor
+        SymbolicDomainsModule.ProcessPoolExecutor = OriginalExecutor
 
     assert Clauses == frozenset((
         frozenset((("Alpha", "aperture-Alpha"),)),
@@ -2782,7 +2804,7 @@ def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
         DeadlineSeconds=30.0,
     )
     RuntimeSeconds = monotonic() - Started
-    if ComponentRouterModule._BuildRouteClaimsBatchWithTelemetry is not None:
+    if DynamicSolverModule._BuildRouteClaimsBatchWithTelemetry is not None:
         # The captured CLA4 tree frontier has more than eight independent
         # physical claim sets.  Keep the native worker split honest: the
         # bounded pool must execute one deterministic shard on every worker,
