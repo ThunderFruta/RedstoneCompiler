@@ -18,9 +18,9 @@ narrow public entrypoint in `Compiler/Placement/Flow/Runner.py`.
 ## Publication boundary
 
 Routing publication requires exact physical claims, repeater legality, and DRC.
-The current clean-break state marks every published schematic as
-`not-run` for Fabric-server validation; it must not be treated as Minecraft
-behavioral acceptance until the server stage returns an authoritative result.
+Every published schematic without a configured Fabric server is marked
+`infrastructure-failure`; it must not be treated as Minecraft behavioral
+acceptance until the server stage returns an authoritative result.
 Typed routing failures publish diagnostics and exit nonzero.
 
 ## Runtime boundary

@@ -21,7 +21,7 @@ routes were byte-identical and semantically identical for every circuit.
 
 ## Method and comparison boundary
 
-`Scripts/RunFreeroutingBenchmark.py` runs the normal frontend, logic
+`Scripts/Routing/RunFreeroutingBenchmark.py` runs the normal frontend, logic
 optimization, NAND transform, and NAND validation stages. It maps every NAND
 gate to one fixed PCB component and each consumed/routable signal to one
 hyperedge containing its producer pin and all consumer pins. Dangling output
@@ -168,5 +168,5 @@ subtests across the external benchmark and native acceptance harness.
 Reproduce the complete external matrix with:
 
 ```bash
-python3 Scripts/RunFreeroutingBenchmark.py
+python3 Scripts/Routing/RunFreeroutingBenchmark.py
 ```

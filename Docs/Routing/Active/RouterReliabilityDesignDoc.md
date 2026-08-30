@@ -611,7 +611,7 @@ repeater correctness, and passing simulation.
 
 ## RRF-061: deterministic acceptance harness
 
-`Scripts/RunRouterAcceptance.py` owns the executable acceptance matrix. It must
+`Scripts/Routing/RunRouterAcceptance.py` owns the executable acceptance matrix. It must
 launch five FullAdder, two RippleCarryAdder4, and two CarryLookaheadAdder4 runs
 sequentially with `new-router-first` and a fixed seed. Each run receives the
 RRF-073 router deadline produced by subtracting the 2-second publication

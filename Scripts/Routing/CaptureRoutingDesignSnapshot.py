@@ -29,7 +29,7 @@ from typing import Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 
-RepositoryRoot = Path(__file__).resolve().parents[1]
+RepositoryRoot = Path(__file__).resolve().parents[2]
 GeneratorPath = Path(__file__).resolve()
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
@@ -566,7 +566,7 @@ def BuildCurrentRuntimeProvenance(Root: Path) -> dict[str, object]:
         for RelativePath in (
             "RustRouting/Cargo.toml",
             "RustRouting/Cargo.lock",
-            "Scripts/RunRouterAcceptance.py",
+            "Scripts/Routing/RunRouterAcceptance.py",
             "pyproject.toml",
             "Templates/__init__.py",
         )
@@ -1636,7 +1636,17 @@ def ParseTimestamp(Value: str) -> datetime:
 
 def ParseArguments(Arguments: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse one explicit, non-discovering snapshot request."""
-    Parser = argparse.ArgumentParser(description=__doc__)
+    Parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  %(prog)s --cla4-failure Output/Failure.RoutingFailure.json "
+            "--artifact Output/Failure.Nand.json\n\n"
+            "The source artifact is read-only; output is published only to a "
+            "fresh timestamped directory."
+        ),
+    )
     Parser.add_argument(
         "--output-root",
         type=Path,
@@ -1669,9 +1679,39 @@ def ParseArguments(Arguments: Sequence[str] | None = None) -> argparse.Namespace
     return Parser.parse_args(Arguments)
 
 
+def GuidedArguments() -> list[str]:
+    """Collect the explicit evidence inputs required for a snapshot."""
+    print("RedstoneCompiler routing evidence snapshot")
+    Failure = input("CLA4 routing-failure JSON path: ").strip()
+    if not Failure:
+        raise ValueError("a CLA4 routing-failure JSON path is required")
+    OutputRoot = input(
+        f"Output root [{DefaultOutputRoot.relative_to(RepositoryRoot)}]: "
+    ).strip() or str(DefaultOutputRoot.relative_to(RepositoryRoot))
+    Arguments = ["--cla4-failure", Failure, "--output-root", OutputRoot]
+    Manifest = input("Acceptance manifest path (optional): ").strip()
+    if Manifest:
+        Arguments.extend(["--acceptance-manifest", Manifest])
+    while True:
+        Artifact = input("Additional artifact path (blank to finish): ").strip()
+        if not Artifact:
+            break
+        Arguments.extend(["--artifact", Artifact])
+    return Arguments
+
+
 def Main(Arguments: Sequence[str] | None = None) -> int:
     """Capture and publish one timestamped design snapshot."""
-    Parsed = ParseArguments(Arguments)
+    RawArguments = list(sys.argv[1:] if Arguments is None else Arguments)
+    if not RawArguments:
+        try:
+            RawArguments = GuidedArguments()
+        except (EOFError, KeyboardInterrupt):
+            print("No snapshot source selected. Run with --help for explicit commands.")
+            return 2
+        except ValueError as Error:
+            raise SystemExit(str(Error)) from Error
+    Parsed = ParseArguments(RawArguments)
     CapturedAtUtc = Parsed.timestamp or datetime.now(timezone.utc).replace(
         microsecond=0
     )

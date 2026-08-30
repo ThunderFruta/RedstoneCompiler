@@ -20,7 +20,7 @@ deadline, determinism, and validation invariants in the
 [router reliability design](RouterReliabilityDesignDoc.md) remain mandatory.
 Its v10 policy/version checkpoints, older matrix shape, manifest version, and
 native file-count checkpoint are historical for this source. The live
-`Scripts/RunRouterAcceptance.py`, the matrix below, and timestamped source
+`Scripts/Routing/RunRouterAcceptance.py`, the matrix below, and timestamped source
 snapshots control concrete v17 evidence. The existing
 [negotiated route-tree router](NegotiatedRouteTreeRouter.md) remains the target
 global and detailed router. This proposal replaces the placement-to-access
@@ -1450,7 +1450,7 @@ snapshot entry is never edited to make later evidence look current; append a
 correction referencing the earlier timestamp.
 
 The reproducible capture tool is
-`Scripts/CaptureRoutingDesignSnapshot.py`. Each timestamped bundle records:
+`Scripts/Routing/CaptureRoutingDesignSnapshot.py`. Each timestamped bundle records:
 
 - UTC and America/New_York timestamps;
 - branch, full revision, detailed porcelain status, and status digest;

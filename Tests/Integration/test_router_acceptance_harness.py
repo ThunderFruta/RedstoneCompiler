@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from Scripts.RunRouterAcceptance import (
+from Scripts.Routing.RunRouterAcceptance import (
     AcceptanceCase,
     AcceptanceCases,
     AcceptanceCommandResult,
@@ -28,7 +28,6 @@ from Scripts.RunRouterAcceptance import (
     BuildEmittedDesignDigest,
     BuildParser,
     BuildLitematicCompositionEvidence,
-    BuildRepeaterOrientationEvidence,
     BuildRunArtifacts,
     BuildResolvedTemplateInputManifest,
     BuildSourceProvenance,
@@ -1740,7 +1739,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 RepositoryRoot=RepoRoot,
                 OutputRoot=Path(DirectoryValue),
                 DateLabel="2026-07-21",
-                PythonExecutable=RepoRoot / ".venv" / "bin" / "python",
+                PythonExecutable=Path(sys.executable),
                 RoutingThreads=3,
                 ExpectedPolicyVersion=AcceptedPolicyVersion,
             )
@@ -1822,7 +1821,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch(
-                "Scripts.RunRouterAcceptance.platform.processor",
+                "Scripts.Routing.RunRouterAcceptance.platform.processor",
                 return_value="x86_64",
             ):
                 Profile = ReadCpuProfile(CpuInfoPath)

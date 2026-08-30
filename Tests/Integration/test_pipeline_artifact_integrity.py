@@ -249,7 +249,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
 
             Removed = ClearStaleSuccessArtifacts(OutputPath)
 
-            self.assertEqual(len(Removed), 3)
+            self.assertEqual(len(Removed), 4)
             self.assertTrue(DiagramPath.exists())
             self.assertFalse(any(
                 ArtifactPath.exists()

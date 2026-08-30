@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 
 RepositoryRoot = Path(__file__).resolve().parents[2]
-ScriptPath = RepositoryRoot / "Scripts/CaptureRoutingDesignSnapshot.py"
+ScriptPath = RepositoryRoot / "Scripts/Routing/CaptureRoutingDesignSnapshot.py"
 ModuleSpec = importlib.util.spec_from_file_location(
     "CaptureRoutingDesignSnapshot",
     ScriptPath,

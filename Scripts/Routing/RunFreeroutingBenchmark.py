@@ -26,9 +26,9 @@ from time import monotonic
 from typing import Any, Iterable, Sequence
 
 
-RepositoryRoot = Path(__file__).resolve().parents[1]
+RepositoryRoot = Path(__file__).resolve().parents[2]
 AdapterScriptPath = Path(__file__).resolve()
-NativeAcceptanceScriptPath = RepositoryRoot / "Scripts/RunRouterAcceptance.py"
+NativeAcceptanceScriptPath = RepositoryRoot / "Scripts/Routing/RunRouterAcceptance.py"
 UpstreamMetadataPath = (
     RepositoryRoot / "Tools/ExternalRouters/Freerouting/Upstream.json"
 )
@@ -1339,7 +1339,17 @@ def BuildMarkdownReport(Manifest: dict[str, Any]) -> str:
 
 def ParseArguments(Arguments: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse benchmark controls while keeping the official matrix as default."""
-    Parser = argparse.ArgumentParser(description=__doc__)
+    Parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  %(prog)s --case FullAdder --runs 1\n"
+            "  %(prog)s --output-dir Output/Benchmarks/Freerouting/manual\n\n"
+            "This compares abstract PCB routing only; it is not Minecraft or "
+            "Redstone validation."
+        ),
+    )
     Parser.add_argument(
         "--jar",
         type=Path,
@@ -1368,6 +1378,11 @@ def ParseArguments(Arguments: Sequence[str] | None = None) -> argparse.Namespace
         type=int,
         default=MaximumAutoroutePasses,
     )
+    Parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the selected synthetic PCB benchmark plan without running Java",
+    )
     Parsed = Parser.parse_args(Arguments)
     if Parsed.runs is not None and Parsed.runs <= 0:
         Parser.error("--runs must be positive")
@@ -1376,9 +1391,44 @@ def ParseArguments(Arguments: Sequence[str] | None = None) -> argparse.Namespace
     return Parsed
 
 
+def GuidedArguments() -> list[str]:
+    """Guide a no-flag invocation to a non-destructive benchmark preview."""
+    print("RedstoneCompiler Freerouting benchmark")
+    print("1) Preview FullAdder benchmark (recommended)\n2) Run FullAdder once\n3) Choose another case")
+    Choice = input("Choose a mode [1]: ").strip() or "1"
+    if Choice == "1":
+        return ["--case", "FullAdder", "--runs", "1", "--dry-run"]
+    if Choice == "2":
+        return ["--case", "FullAdder", "--runs", "1"]
+    if Choice == "3":
+        Names = ", ".join(Case.Name for Case in BenchmarkCases)
+        Name = input(f"Case ({Names}): ").strip()
+        if not Name:
+            raise ValueError("a benchmark case is required")
+        return ["--case", Name, "--runs", "1", "--dry-run"]
+    raise ValueError("choose 1, 2, or 3")
+
+
 def Main(Arguments: Sequence[str] | None = None) -> int:
     """Run the selected benchmark matrix and publish JSON plus Markdown evidence."""
-    Options = ParseArguments(Arguments)
+    RawArguments = list(sys.argv[1:] if Arguments is None else Arguments)
+    if not RawArguments:
+        try:
+            RawArguments = GuidedArguments()
+        except (EOFError, KeyboardInterrupt):
+            print("No benchmark mode selected. Run with --help for explicit commands.")
+            return 2
+        except ValueError as Error:
+            raise SystemExit(str(Error)) from Error
+    Options = ParseArguments(RawArguments)
+    SelectedNames = set(Options.case or [Case.Name for Case in BenchmarkCases])
+    SelectedCases = [Case for Case in BenchmarkCases if Case.Name in SelectedNames]
+    if Options.dry_run:
+        print("Synthetic PCB benchmark plan (not Redstone validation):")
+        for Case in SelectedCases:
+            print(f"- {Case.Name}: {Options.runs or Case.RequiredRuns} run(s)")
+        print(f"Jar: {Options.jar}")
+        return 0
     JarPath = Options.jar.resolve()
     Router = VerifyFreeroutingInstall(JarPath)
     Timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1395,11 +1445,6 @@ def Main(Arguments: Sequence[str] | None = None) -> int:
             f"{OutputDirectory}"
         )
     OutputDirectory.mkdir(parents=True, exist_ok=True)
-    SelectedNames = set(Options.case or [Case.Name for Case in BenchmarkCases])
-    SelectedCases = [
-        Case for Case in BenchmarkCases if Case.Name in SelectedNames
-    ]
-
     Manifest: dict[str, Any] = {
         "SchemaVersion": SchemaVersion,
         "AdapterVersion": AdapterVersion,

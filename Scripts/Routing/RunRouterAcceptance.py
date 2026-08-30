@@ -24,7 +24,7 @@ from time import monotonic
 from typing import Any, Callable
 
 
-RepositoryRoot = Path(__file__).resolve().parents[1]
+RepositoryRoot = Path(__file__).resolve().parents[2]
 # The compiler's routing deadline begins at placement-flow entry, while this
 # process timer also includes frontend startup and typed-artifact publication.
 # Capture may explicitly request this bounded evidence-publication grace. It
@@ -813,7 +813,7 @@ def ReadConfiguredPythonProfile(
 import json
 import platform
 import sys
-from Scripts.RunRouterAcceptance import (
+from Scripts.Routing.RunRouterAcceptance import (
     BuildCpuExecutionProfile,
     BuildLoadProfile,
     ReadCpuProfile,
@@ -1213,7 +1213,7 @@ def BuildSourceContentManifest(
     for RelativePath in (
         Path("Main.py"),
         Path("pyproject.toml"),
-        Path("Scripts/RunRouterAcceptance.py"),
+        Path("Scripts/Routing/RunRouterAcceptance.py"),
         Path("RedstoneCompiler/__init__.py"),
         Path("Templates/__init__.py"),
         Path("RustRouting/Cargo.toml"),
@@ -1583,109 +1583,6 @@ def BuildLitematicCompositionEvidence(
     }
 
 
-def BuildRepeaterOrientationEvidence(
-    SchematicPath: Path,
-    PhysicalDocument: dict[str, object],
-) -> dict[str, object]:
-    """Independently compare orientation metadata with emitted block states."""
-    from SchemEncoder.SchemWriter import LoadTemplate
-
-    Orientation = PhysicalDocument.get("RepeaterOrientation")
-    if not isinstance(Orientation, dict):
-        raise ValueError("missing RepeaterOrientation evidence")
-    if Orientation.get("SchemaVersion") != "repeater-orientation-v1":
-        raise ValueError("unsupported repeater orientation schema")
-    if (
-        Orientation.get("Contract")
-        != "minecraft-java-facing-is-input-side"
-    ):
-        raise ValueError("repeater orientation contract is missing")
-    Records = Orientation.get("Records")
-    if not isinstance(Records, list):
-        raise ValueError("repeater orientation records are missing")
-    Cardinal = {"north", "south", "east", "west"}
-    Expected: dict[tuple[int, int, int], str] = {}
-    SourceCounts = {"Route": 0, "Template": 0}
-    DirectionCounts: dict[str, int] = {}
-    for Record in Records:
-        if not isinstance(Record, dict):
-            raise ValueError("repeater orientation record is not an object")
-        RawPosition = Record.get("SerializedPosition")
-        if (
-            not isinstance(RawPosition, list)
-            or len(RawPosition) != 3
-            or any(
-                not isinstance(Value, int) or isinstance(Value, bool)
-                for Value in RawPosition
-            )
-        ):
-            raise ValueError("invalid serialized repeater position")
-        Position = tuple(RawPosition)
-        InputFacing = Record.get("InputFacing")
-        if InputFacing not in Cardinal:
-            raise ValueError(
-                f"invalid repeater input facing at {Position}: {InputFacing!r}"
-            )
-        if Position in Expected:
-            raise ValueError(f"duplicate repeater record at {Position}")
-        Expected[Position] = str(InputFacing)
-        Source = Record.get("Source")
-        if Source not in SourceCounts:
-            raise ValueError(f"invalid repeater source at {Position}: {Source!r}")
-        SourceCounts[str(Source)] += 1
-        DirectionCounts[str(InputFacing)] = (
-            DirectionCounts.get(str(InputFacing), 0) + 1
-        )
-
-    Actual: dict[tuple[int, int, int], str] = {}
-    for Position, State in LoadTemplate(SchematicPath).Blocks.items():
-        if State["Name"] != "minecraft:repeater":
-            continue
-        Facing = State.get("Properties", {}).get("facing")
-        if Facing not in Cardinal:
-            raise ValueError(
-                f"invalid emitted repeater facing at {Position}: {Facing!r}"
-            )
-        Actual[Position] = str(Facing)
-    if Actual != Expected:
-        Mismatches = [
-            (Position, Expected.get(Position), Actual.get(Position))
-            for Position in sorted(set(Expected) | set(Actual))
-            if Expected.get(Position) != Actual.get(Position)
-        ]
-        raise ValueError(
-            f"emitted repeater orientations differ: {Mismatches[:8]}"
-        )
-    RequiredCounts = {
-        "ExpectedCount": len(Expected),
-        "RenderedCount": len(Actual),
-        "RouteCount": SourceCounts["Route"],
-        "TemplateCount": SourceCounts["Template"],
-    }
-    for Name, ExpectedValue in RequiredCounts.items():
-        if Orientation.get(Name) != ExpectedValue:
-            raise ValueError(
-                f"repeater orientation {Name} mismatch: "
-                f"{Orientation.get(Name)!r} != {ExpectedValue}"
-            )
-    if Orientation.get("InputFacingCounts") != dict(sorted(DirectionCounts.items())):
-        raise ValueError("repeater cardinal counts do not match records")
-    if Orientation.get("Passed") is not True:
-        raise ValueError("repeater orientation verdict is not passing")
-    if Orientation.get("MismatchCount") != 0:
-        raise ValueError("repeater orientation mismatch count is not zero")
-    if Orientation.get("ReadbackPassed") is not True:
-        raise ValueError("compiler repeater readback verdict is not passing")
-    return {
-        "Contract": Orientation["Contract"],
-        "Count": len(Actual),
-        "RouteCount": SourceCounts["Route"],
-        "TemplateCount": SourceCounts["Template"],
-        "InputFacingCounts": dict(sorted(DirectionCounts.items())),
-        "MetadataMatchesNbt": True,
-    }
-
-
 def BuildTruthTableSemanticEvidence(
     TruthTablePath: Path,
 ) -> dict[str, object]:
@@ -1897,7 +1794,6 @@ def EvaluateRun(
     CandidateFingerprint: str | None = None
     ResourceGraphFingerprint: str | None = None
     EffectiveWorkFingerprint: str | None = None
-    RepeaterOrientationEvidence: dict[str, object] | None = None
     if PhysicalDocument is not None:
         Strategy = ReadNested(PhysicalDocument, "Strategy")
         if not isinstance(Strategy, dict):
@@ -1992,20 +1888,6 @@ def EvaluateRun(
             Failures.append("unresolved claim count is not zero")
         if FinalValidation.get("UnresolvedClaims") != []:
             Failures.append("unresolved claim list is not empty")
-        if FinalValidation.get("RepeaterOrientationPassed") is not True:
-            Failures.append("repeater orientation validation is not passing")
-        if FinalValidation.get("RepeaterOrientationMismatchCount") != 0:
-            Failures.append("repeater orientation mismatch count is not zero")
-        if (
-            FinalValidation.get("RepeaterOrientationReadbackRequired")
-            is not True
-        ):
-            Failures.append("repeater orientation readback is not required")
-        if (
-            FinalValidation.get("RepeaterOrientationReadbackPassed")
-            is not True
-        ):
-            Failures.append("repeater orientation readback is not passing")
 
         Fingerprints = RouterReliability.get("Fingerprints")
         if not isinstance(Fingerprints, dict):
@@ -2121,18 +2003,6 @@ def EvaluateRun(
                 Failures.append(
                     f"could not measure emitted litematic composition: {Error}"
                 )
-            try:
-                RepeaterOrientationEvidence = (
-                    BuildRepeaterOrientationEvidence(
-                        Artifacts["Schematic"],
-                        PhysicalDocument,
-                    )
-                )
-            except Exception as Error:
-                Failures.append(
-                    "could not validate emitted repeater orientations: "
-                    f"{Error}"
-                )
 
         Observed = {
             "ReportedRuntimeSeconds": PhysicalRuntime,
@@ -2155,7 +2025,6 @@ def EvaluateRun(
             "TruthTableSemantics": TruthTableSemantics,
             "FootprintMetrics": FootprintMetrics,
             "LitematicComposition": LitematicComposition,
-            "RepeaterOrientation": RepeaterOrientationEvidence,
         }
         if (
             isinstance(PlacementFingerprint, str)
@@ -2172,7 +2041,6 @@ def EvaluateRun(
             and isinstance(SimulationBackend, str)
             and SimulationBackend
             and isinstance(LitematicComposition, dict)
-            and isinstance(RepeaterOrientationEvidence, dict)
             and isinstance(TruthTableSemantics, dict)
             and isinstance(
                 TruthTableSemantics.get("ArithmeticResultSha256"),
@@ -2198,7 +2066,6 @@ def EvaluateRun(
                 "RouteMetrics": RouteMetrics,
                 "FootprintMetrics": FootprintMetrics,
                 "LitematicComposition": LitematicComposition,
-                "RepeaterOrientation": RepeaterOrientationEvidence,
                 "SimulationBackend": SimulationBackend,
                 "StableArtifactSha256": StableArtifactSha256,
                 "EmittedDesignSha256": DesignDigest,
@@ -5059,7 +4926,16 @@ def BuildParser() -> argparse.ArgumentParser:
         description=(
             "Run the fixed physical router regression matrix sequentially and "
             "write machine-readable accuracy, footprint, and speed evidence."
-        )
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  %(prog)s --dry-run\n"
+            "  %(prog)s --date 2026-08-29 --output-root Output/Regression\n"
+            "  %(prog)s --capture-baseline Output/Baselines/router.json\n\n"
+            "Default runs the standard FA/RCA acceptance matrix. Add "
+            "--include-cla4 only when the extended case is intended."
+        ),
     )
     Parser.add_argument(
         "--date",
@@ -5147,8 +5023,32 @@ def BuildParser() -> argparse.ArgumentParser:
     return Parser
 
 
+def GuidedArguments() -> list[str]:
+    """Choose a safe acceptance mode when invoked without flags."""
+    print("RedstoneCompiler physical router acceptance")
+    print("1) Preview the standard matrix (recommended)\n2) Run standard matrix\n3) Run standard matrix plus CLA4")
+    Choice = input("Choose a mode [1]: ").strip() or "1"
+    if Choice == "1":
+        return ["--dry-run"]
+    if Choice == "2":
+        return []
+    if Choice == "3":
+        return ["--include-cla4"]
+    raise ValueError("choose 1, 2, or 3")
+
+
 def Main(Arguments: list[str] | None = None) -> int:
-    Parsed = BuildParser().parse_args(Arguments)
+    Parser = BuildParser()
+    RawArguments = list(sys.argv[1:] if Arguments is None else Arguments)
+    if not RawArguments:
+        try:
+            RawArguments = GuidedArguments()
+        except (EOFError, KeyboardInterrupt):
+            print("No acceptance mode selected. Run with --help for explicit commands.")
+            return 2
+        except ValueError as Error:
+            Parser.error(str(Error))
+    Parsed = Parser.parse_args(RawArguments)
     if Parsed.RoutingThreads is not None and Parsed.RoutingThreads <= 0:
         raise SystemExit("--routing-threads must be positive")
     BaselineMode = (

@@ -25,9 +25,9 @@ same default routing strategy and no-fallback gate as the default sequence.
 ### Execution commands
 
 - Default sequence:
-  - `python Scripts/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3 --date 2026-08-03 --python .venv/bin/python`
+  - `python Scripts/Routing/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3 --date 2026-08-03 --python .venv/bin/python`
 - Extended sequence with CLA4:
-  - `python Scripts/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3Compat --date 2026-08-03 --python .venv/bin/python --include-cla4`
+  - `python Scripts/Routing/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3Compat --date 2026-08-03 --python .venv/bin/python --include-cla4`
 
 ### Results
 

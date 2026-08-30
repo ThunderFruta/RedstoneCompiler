@@ -22,7 +22,14 @@ from .Synthesis.Validation import ValidateNandOnlyDesign
 from Compiler.Placement.Flow.Candidates import ApplyRoutingRuntimeBudget
 from Compiler.Placement.Flow.Results import PcbProgress
 from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
-from .FabricServer import FabricServerValidationResult
+from .FabricServer import (
+    BuildExpectedVectors,
+    BuildFabricFixture,
+    FabricServerConfiguration,
+    FabricServerSupervisor,
+    FabricServerValidationResult,
+    WriteFabricFixture,
+)
 from SchemEncoder import SchemWriter
 from SchemEncoder.SchemWriter import BlockCompositionMetrics
 from .Routing.ChannelPlanner import RoutingStageMetrics
@@ -160,6 +167,7 @@ def SuccessArtifactPaths(OutputPath: Path) -> dict[str, Path]:
     return {
         "Schematic": OutputPath,
         "PhysicalDesign": OutputPath.with_suffix(".PhysicalDesign.json"),
+        "FabricFixture": OutputPath.with_suffix(".FabricFixture.json"),
     }
 
 
@@ -456,6 +464,7 @@ def PublishSuccessArtifacts(
     Routed: object,
     Rendered: object,
     PhysicalDesignDocument: dict[str, object],
+    FabricFixture: dict[str, object] | None = None,
     OutputPath: Path,
 ) -> Path:
     """Stage all success outputs and publish metadata after the schematic."""
@@ -477,6 +486,11 @@ def PublishSuccessArtifacts(
                 OutputPath=TemporaryOutputPath,
                 Build=Rendered,
             )
+            if FabricFixture is not None:
+                TemporaryFixturePath = (
+                    TemporaryRoot / ArtifactPaths["FabricFixture"].name
+                )
+                WriteFabricFixture(TemporaryFixturePath, FabricFixture)
             RepeaterOrientation = getattr(
                 Rendered,
                 "RepeaterOrientation",
@@ -496,6 +510,8 @@ def PublishSuccessArtifacts(
                 encoding="utf-8",
             )
             TemporaryOutputPath.replace(ArtifactPaths["Schematic"])
+            if FabricFixture is not None:
+                TemporaryFixturePath.replace(ArtifactPaths["FabricFixture"])
             TemporaryPhysicalDesignPath.replace(ArtifactPaths["PhysicalDesign"])
     except Exception:
         ClearStaleSuccessArtifacts(OutputPath)
@@ -689,8 +705,6 @@ def CompileSvToLitematic(
     Routed = Physical.Routed
     Stages.append("pcb_routing")
     Stages.append("route_cleanup")
-    FabricServerValidation = FabricServerValidationResult.NotRun()
-
     ValidateNandOnlyDesign(Physical.Placed, NandIR)
     Routed.TraceSupportBlocks = (
         tuple(TraceSupportBlocks) if TraceSupportBlocks is not None else ()
@@ -700,6 +714,31 @@ def CompileSvToLitematic(
         TraceSupportBlocks=Routed.TraceSupportBlocks,
     )
     Composition = Rendered.Composition
+    NandModule = NandIR.Modules[NandIR.Top]
+    FabricFixture = BuildFabricFixture(
+        RoutedDesign=Routed,
+        Rendered=Rendered,
+        Module=NandModule,
+    )
+    with TemporaryDirectory(
+        dir=OutputPath.parent,
+        prefix=f".{OutputPath.stem}-fabric-validate-",
+    ) as FixtureDirectory:
+        ValidationFixture = WriteFabricFixture(
+            Path(FixtureDirectory) / OutputPath.with_suffix(".FabricFixture.json").name,
+            FabricFixture,
+        )
+        FabricServerValidation = FabricServerSupervisor(
+            FabricServerConfiguration.FromEnvironment(),
+        ).Validate(
+            Fixture=ValidationFixture,
+            Vectors=BuildExpectedVectors(
+                NandModule,
+                (Value["Name"] for Value in FabricFixture["Inputs"]),
+                (Value["Name"] for Value in FabricFixture["Outputs"]),
+            ),
+        )
+    Stages.append("fabric_server_validation")
 
     GlobalPlan = Routed.GlobalPlan
     Metrics = Routed.RoutingMetrics
@@ -842,12 +881,21 @@ def CompileSvToLitematic(
             "PerNetLength": PerNetLengths,
             "MaximumNetLengthShare": round(MaximumNetLengthShare, 6),
             "FabricServerValidation": asdict(FabricServerValidation),
+            "FabricFixture": {
+                "Path": NormalizeArtifactPath(
+                    OutputPath.with_suffix(".FabricFixture.json"),
+                ),
+                "Sha256": ValidationFixture.Sha256,
+                "BlockCount": ValidationFixture.BlockCount,
+                "InputCount": ValidationFixture.InputCount,
+                "OutputCount": ValidationFixture.OutputCount,
+            },
         },
         "BlockComposition": Composition.ToDictionary(),
         "RepeaterOrientation": Rendered.RepeaterOrientation,
         "NormalizedQuality": NormalizedQuality,
         "FinalValidation": {
-            "ValidationMode": "routing-and-rendering-only",
+            "ValidationMode": "fabric-server-authoritative",
             "FabricServerValidationRequired": True,
             "FabricServerValidationStatus": FabricServerValidation.Status,
             "ZeroConflicts": Routed.ZeroResourceConflicts,
@@ -886,6 +934,7 @@ def CompileSvToLitematic(
         Routed=Routed,
         Rendered=Rendered,
         PhysicalDesignDocument=PhysicalDesignDocument,
+        FabricFixture=FabricFixture,
         OutputPath=OutputPath,
     )
     Stages.append("litematic_writer")

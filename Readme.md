@@ -122,9 +122,9 @@ matrix with 8/23/118-second router deadlines reserved inside immutable
 RCA4 and CLA4 routed 0/2:
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3 --dry-run
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 
@@ -171,7 +171,7 @@ success.
 - `RustRouting/Src/` -- eight-file native router split: `Lib.rs`, `Models.rs`,
   `Deadline.rs`, `PathRouting.rs`, `Generation.rs`, `Assignment.rs`,
   `AssignmentPlanning.rs`, and `Bindings.rs`.
-- `Scripts/RunRouterAcceptance.py` -- sequential physical acceptance and
+- `Scripts/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
   evidence-manifest harness.
 - `Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
 - `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.

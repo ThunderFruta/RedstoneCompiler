@@ -43,7 +43,7 @@ does not prove the rebuilt native code was exercised.
 ## Acceptance plan without execution
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py \
+python3 Scripts/Routing/RunRouterAcceptance.py \
   --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
   --python .venv/bin/python \

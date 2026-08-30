@@ -957,6 +957,34 @@ def BuildLitematicBlockMap(
         SupportBlock = "minecraft:light_gray_concrete"
     SupportState = {"Name": SupportBlock}
 
+    # Input ports use a wall-mounted lever.  Litematic placement tolerates a
+    # missing backing block more readily than a live server: Minecraft removes
+    # an unsupported lever before it can drive the input repeater.  Add the
+    # exact wall support to the canonical block map so the exported artifact
+    # and Fabric fixture share the same physically valid port geometry.
+    FacingOffsets = {
+        "north": (0, 0, -1),
+        "south": (0, 0, 1),
+        "east": (1, 0, 0),
+        "west": (-1, 0, 0),
+    }
+    for Position, State in tuple(Blocks.items()):
+        if (
+            State.get("Name") == "minecraft:lever"
+            and State.get("Properties", {}).get("face") == "wall"
+        ):
+            Facing = State["Properties"].get("facing")
+            Offset = FacingOffsets.get(Facing)
+            if Offset is None:
+                raise ValueError(f"wall lever has unsupported facing: {Facing}")
+            SupportPosition = tuple(
+                Position[Axis] + Offset[Axis]
+                for Axis in range(3)
+            )
+            if SupportPosition not in Blocks:
+                Blocks[SupportPosition] = SupportState
+                Provenance[SupportPosition] = BlockProvenance.RouteSupport
+
     # Support only components that require a floor block. Solid template
     # blocks and wall-mounted components do not need a full rectangular slab.
     for Gate in RoutedDesign.PlacedGates:

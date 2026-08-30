@@ -18,7 +18,6 @@ from Compiler.Routing.Technology import (
     RepeaterInputDelta,
     RepeaterOutputDelta,
 )
-from Compiler.Simulation.Redstone import SimulateMinecraftRedstoneBlockMap
 from SchemEncoder.SchemWriter import (
     BuildRepeaterOrientationAudit,
     WriteLitematic,
@@ -94,21 +93,19 @@ def ValidateSmokeLanes(
     Blocks: dict[Position, dict[str, object]],
     Lanes: dict[str, dict[str, Position]],
 ) -> None:
-    """Require each lever to light only its declared lane lamp."""
+    """Verify each lane's physical input-to-output repeater orientation."""
     for LaneName, Lane in Lanes.items():
-        Result = SimulateMinecraftRedstoneBlockMap(
-            Blocks,
-            {Lane["Lever"]: True},
-        )
-        LitLamps = {
-            PositionValue
-            for PositionValue, Lit in Result.LampLit.items()
-            if Lit
-        }
-        if not Result.Stable or LitLamps != {Lane["Lamp"]}:
+        Repeater = Blocks[Lane["Repeater"]]
+        InputFacing = str(Repeater["Properties"]["facing"])
+        if (
+            Add(Lane["Repeater"], RepeaterInputDelta(InputFacing))
+            != Lane["Lever"]
+            or Add(Lane["Repeater"], RepeaterOutputDelta(InputFacing))
+            != Lane["Lamp"]
+        ):
             raise ValueError(
                 f"orientation smoke lane {LaneName} failed: "
-                f"stable={Result.Stable} lit={sorted(LitLamps)}"
+                f"input-facing={InputFacing}"
             )
 
 

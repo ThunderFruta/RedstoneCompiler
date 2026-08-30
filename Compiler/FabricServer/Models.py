@@ -15,12 +15,20 @@ class FabricServerValidationResult:
     RuntimeSeconds: float = 0.0
     Diagnostics: dict[str, Any] = field(default_factory=dict)
 
-    @classmethod
-    def NotRun(cls) -> "FabricServerValidationResult":
-        """Represent a routed artifact that has not reached a server."""
-        return cls(
-            Status="not-run",
-            Diagnostics={
-                "Reason": "fabric-server-integration-not-configured",
-            },
-        )
+
+@dataclass(frozen=True)
+class FabricServerLoadResult:
+    """Outcome from loading a verified fixture into a running Fabric server."""
+
+    Status: str
+    RuntimeSeconds: float = 0.0
+    Diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FabricServerControlResult:
+    """Outcome from one authenticated running-server control operation."""
+
+    Status: str
+    RuntimeSeconds: float = 0.0
+    Diagnostics: dict[str, Any] = field(default_factory=dict)

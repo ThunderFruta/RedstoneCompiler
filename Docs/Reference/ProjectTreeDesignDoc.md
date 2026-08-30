@@ -50,4 +50,4 @@ owners, and physical line/function limits.
 Timestamped evidence is additive. Never edit an existing bundle under
 `Docs/Routing/Snapshots/` or
 `Output/DesignSnapshots/RoutingAwarePlacementAccess/`; publish a fresh UTC
-directory through `Scripts/CaptureRoutingDesignSnapshot.py`.
+directory through `Scripts/Routing/CaptureRoutingDesignSnapshot.py`.

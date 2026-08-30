@@ -12,7 +12,7 @@ import unittest
 
 
 RepositoryRoot = Path(__file__).resolve().parents[2]
-ScriptPath = RepositoryRoot / "Scripts/RunFreeroutingBenchmark.py"
+ScriptPath = RepositoryRoot / "Scripts/Routing/RunFreeroutingBenchmark.py"
 ModuleSpec = importlib.util.spec_from_file_location(
     "RunFreeroutingBenchmark",
     ScriptPath,
@@ -29,7 +29,7 @@ class FreeroutingBenchmarkTests(unittest.TestCase):
 
     def testBenchmarkMatrixMatchesNativeAcceptanceCases(self) -> None:
         NativeNamespace = runpy.run_path(
-            str(RepositoryRoot / "Scripts/RunRouterAcceptance.py")
+            str(RepositoryRoot / "Scripts/Routing/RunRouterAcceptance.py")
         )
         NativeCases = NativeNamespace["AcceptanceCases"]
         NativeShape = [

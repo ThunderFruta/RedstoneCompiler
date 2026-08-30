@@ -17,7 +17,7 @@ Important sections include:
 Routing acceptance requires `FallbackUsed=false`, zero final conflicts, zero
 unresolved claims, and deterministic fingerprints across repeated runs. Full
 behavioral acceptance additionally requires an authoritative Fabric-server
-result; `FabricServerValidation.Status=not-run` is explicitly unvalidated.
+result; only `FabricServerValidation.Status=passed` is functionally accepted.
 Fields may grow with a policy version; readers should ignore unknown fields and
 must not infer server acceptance from file presence alone.
 

@@ -9,6 +9,9 @@ Cache/
 **/*.pyc
 .venv/
 Build/
+FabricServerHarness/.gradle/
+FabricServerHarness/build/
+.runtime/
 Output/
 RustRouting/target/
 RedstoneCompiler/*.so
