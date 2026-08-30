@@ -17,14 +17,14 @@ dynamic component solvers both remain because reachability/dead-code parity was
 not established, and routing-aware-placement v17 was not introduced.
 
 The detailed retired-path list and hard structural gates are authoritative in
-[`ProjectTreeDesignDoc.md`](../../ProjectTreeDesignDoc.md) and
+[`ProjectTreeDesignDoc.md`](../Reference/ProjectTreeDesignDoc.md) and
 `Tests/test_source_structure.py`. Historical sections below retain their dated
 meaning and are not evidence that a retired path still exists.
 
 > **Historical scope notice (2026-07-22):** In this document, “flat
 > negotiated-routing stack” means the retired candidate/guide/pair-repair
 > implementation described below. It does not mean the active
-> [negotiated route-tree router](../Routing/NegotiatedRouteTreeRouter.md), which
+> [negotiated route-tree router](../Routing/Active/NegotiatedRouteTreeRouter.md), which
 > uses persistent per-signal trees, exact Redstone claims, and incremental
 > regions. The deletion list must be re-audited against live callers before any
 > removal; this document is not deletion authorization.

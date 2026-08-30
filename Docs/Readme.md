@@ -6,6 +6,7 @@ in this tree instead of being duplicated in the repository root.
 ## Index
 
 - [Project Tree](Reference/ProjectTree.md)
+- [Ownership and structural gates](Reference/ProjectTreeDesignDoc.md)
 - [Routing design](Reference/RoutingDesignDoc.md)
 - [Architecture]
   - [Readme](Architecture/Readme.md)

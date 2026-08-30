@@ -40,7 +40,7 @@ Current implementation note (2026-08-28):
 | native runtime, geometry, path, assignment, escape, generation, planning, simulation, binding | `RustRouting/Src/*/`; escape candidates/catalogs and generation detailed-tree phases use nested subdomains |
 
 The six supported Python entrypoints and clean-break retirement list are in
-[`ProjectTreeDesignDoc.md`](../../ProjectTreeDesignDoc.md). Historical code
+[`ProjectTreeDesignDoc.md`](ProjectTreeDesignDoc.md). Historical code
 paths in dated implementation notes describe their original evidence and are
 not current import instructions.
 

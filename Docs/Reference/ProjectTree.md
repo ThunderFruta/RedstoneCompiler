@@ -32,7 +32,7 @@ The compiler now uses a stage-aligned runtime layout:
   domains. Escape candidates/catalogs and generated detailed-tree phases are
   further split into their own subdirectories. `Lib.rs` is registration-only.
 - The clean-break retired paths and executable structural limits are listed in
-  [the project-tree design](../../ProjectTreeDesignDoc.md) and enforced by
+  [the project-tree design](ProjectTreeDesignDoc.md) and enforced by
   `Tests/test_source_structure.py`.
 
 ## Documentation ownership
@@ -51,5 +51,6 @@ The compiler now uses a stage-aligned runtime layout:
   records dated implementation checkpoints.
 - `Docs/Testing/` owns test commands, layers, and physical acceptance gates.
 
-`ProjectTreeDesignDoc.md` defines the completed clean-break ownership contract,
+[`ProjectTreeDesignDoc.md`](ProjectTreeDesignDoc.md) defines the completed
+clean-break ownership contract,
 structural gates, and timestamped refactor evidence.

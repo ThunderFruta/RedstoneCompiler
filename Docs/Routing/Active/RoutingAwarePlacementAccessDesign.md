@@ -30,7 +30,7 @@ weaken final validation.
 **Current source ownership:** The behavior and evidence below predate the
 2026-08-28 clean-break monolith split, but the v17 proposal itself is
 unchanged. Current paths in this document follow the domain packages in
-[`ProjectTreeDesignDoc.md`](../../../ProjectTreeDesignDoc.md). Dated snapshot
+[`ProjectTreeDesignDoc.md`](../../Reference/ProjectTreeDesignDoc.md). Dated snapshot
 tables retain their original path/hash provenance and are not current import
 instructions.
 
