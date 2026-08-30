@@ -1,4 +1,6 @@
 .tools/
+.codex/
+.vscode/
 # Migration-generated cache
 Cache/
 .cache/
