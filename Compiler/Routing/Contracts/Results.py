@@ -37,7 +37,7 @@ class RoutedDesign:
     PlacedGates: list[Any]
     Wires: list[Position3]
     Supports: list[Position3]
-    Repeaters: dict[Position3, str]
+    RepeaterInputFacings: dict[Position3, str]
     NetWires: dict[str, list[Position3]]
     SupportBlock: str = "minecraft:light_gray_concrete"
     TraceSupportBlocks: tuple[str, ...] = ()
@@ -82,6 +82,16 @@ class RoutingResources:
         repr=False,
     )
     PhysicalGlobalApertureTemplateCache: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalLocalSeamEligibilityCache: dict[str, bool] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    PhysicalBoundaryPairSupportCache: dict[str, bool] = field(
         default_factory=dict,
         compare=False,
         repr=False,

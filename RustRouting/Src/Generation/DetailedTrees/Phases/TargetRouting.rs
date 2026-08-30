@@ -378,7 +378,7 @@ macro_rules! RoutePreparedDetailedTargets {
                 } else if !$EnforceSignalStrength {
                     MAXIMUM_UNREFRESHED_DUST_LENGTH
                 } else if CanPlaceRepeater {
-                    let Some(Facing) = RepeaterFacing(CurrentState.0, Next) else {
+                    let Some(Facing) = RepeaterInputFacing(CurrentState.0, Next) else {
                         return $Failure("NoPath", "NoPathGeometry", 1, 0, $ExpansionCount);
                     };
                     $Repeaters.entry(CurrentState.0).or_insert(Facing);
@@ -493,7 +493,7 @@ macro_rules! RoutePreparedDetailedTargets {
                         if $Deadline.Check() || $ExpansionCount >= $MaximumExpansionCount {
                             break;
                         }
-                        let Some(Facing) = RepeaterFacing(First, Second) else {
+                        let Some(Facing) = RepeaterInputFacing(First, Second) else {
                             continue;
                         };
                         let SecondState = (Second, LaneDirection, MAXIMUM_UNREFRESHED_DUST_LENGTH);
@@ -566,10 +566,12 @@ macro_rules! RoutePreparedDetailedTargets {
                     $StateByNode.insert(First, FirstState);
                     $StateByNode.insert(Second, SecondState);
                     $Repeaters.insert(First, Facing);
-                    for (PositionValue, RepeaterFacingValue) in &RepairResult.RepeaterReservations {
+                    for (PositionValue, RepeaterInputFacingValue) in
+                        &RepairResult.RepeaterReservations
+                    {
                         $Repeaters
                             .entry(*PositionValue)
-                            .or_insert_with(|| RepeaterFacingValue.clone());
+                            .or_insert_with(|| RepeaterInputFacingValue.clone());
                     }
                     let mut RepairedState = SecondState;
                     for GeometryState in RepairResult.StatePath.iter().skip(1) {

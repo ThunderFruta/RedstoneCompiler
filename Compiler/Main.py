@@ -8,6 +8,7 @@ import json
 from math import isfinite
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import os
 import time
@@ -25,7 +26,7 @@ else:
 
 
 MinecraftSchematicsDirectory = Path(
-    "/home/bananawewe/Documents/curseforge/minecraft/Instances/wee/schematics"
+    "/home/bananawewe/.local/share/PrismLauncher/instances/wee 26.2/minecraft/schematics"
 )
 DefaultsPath = (
     Path.home()
@@ -530,6 +531,17 @@ def PushToMinecraft(
     return DestinationPath
 
 
+def RunPytest() -> int:
+    """Run the repository test suite with the active Python interpreter."""
+    RepositoryRoot = Path(__file__).resolve().parent.parent
+    Result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "Tests"],
+        cwd=RepositoryRoot,
+        check=False,
+    )
+    return Result.returncode
+
+
 def PromptCompile(
     Defaults: dict[str, object],
 ) -> tuple[Path, Path, Path, str | None, Path, bool, tuple[str, ...]]:
@@ -590,7 +602,7 @@ def GuidedMenu(
         print("2. Configure defaults")
         print("3. Show defaults")
         print("4. Push an existing litematic to Minecraft")
-        print("5. Reset defaults")
+        print("5. Run pytest")
         print("6. Exit")
         Choice = input("Select an option [1]: ").strip() or "1"
         if Choice == "1":
@@ -613,10 +625,11 @@ def GuidedMenu(
             print(f"Pushed to Minecraft: {DestinationPath}")
             continue
         if Choice == "5":
-            if PromptBoolean("Reset all defaults", False):
-                Defaults = dict(BuiltInDefaults)
-                SaveDefaults(DefaultsFile, Defaults)
-                print(f"Reset defaults: {DefaultsFile}")
+            ExitCode = RunPytest()
+            if ExitCode == 0:
+                print("Pytest passed.")
+            else:
+                print(f"Pytest failed with exit code {ExitCode}.")
             continue
         if Choice == "6":
             return None, Defaults

@@ -23,8 +23,8 @@ from Compiler.Placement.Flow.Candidates import ApplyRoutingRuntimeBudget
 from Compiler.Placement.Flow.Results import PcbProgress
 from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
 from .FabricServer import FabricServerValidationResult
-from SchemEncoder import Writer262
-from SchemEncoder.Writer262 import BlockCompositionMetrics
+from SchemEncoder import SchemWriter
+from SchemEncoder.SchemWriter import BlockCompositionMetrics
 from .Routing.ChannelPlanner import RoutingStageMetrics
 from .Routing.Failures import (
     RoutingFailure,
@@ -472,7 +472,7 @@ def PublishSuccessArtifacts(
             TemporaryPhysicalDesignPath = (
                 TemporaryRoot / ArtifactPaths["PhysicalDesign"].name
             )
-            Writer262.WriteLitematic(
+            SchemWriter.WriteLitematic(
                 Routed,
                 OutputPath=TemporaryOutputPath,
                 Build=Rendered,
@@ -695,7 +695,7 @@ def CompileSvToLitematic(
     Routed.TraceSupportBlocks = (
         tuple(TraceSupportBlocks) if TraceSupportBlocks is not None else ()
     )
-    Rendered = Writer262.BuildLitematicBlockMap(
+    Rendered = SchemWriter.BuildLitematicBlockMap(
         Routed,
         TraceSupportBlocks=Routed.TraceSupportBlocks,
     )

@@ -179,15 +179,15 @@ current tree:
   acyclic;
 - the six narrow public entrypoints resolve to their concrete owners.
 
-`Tests/test_source_structure.py` enforces these rules. Contract field order,
+`Tests/Structural/test_source_structure.py` enforces these rules. Contract field order,
 defaults, signatures, aliases, and serialization are pinned separately by
-`Tests/test_routing_contract_schema.py`.
+`Tests/Routing/test_routing_contract_schema.py`.
 
 ## Verification commands
 
 ```bash
 python3 -m compileall -q Compiler/Placement Compiler/Routing
-python3 -m pytest -q Tests/test_source_structure.py Tests/test_routing_contract_schema.py
+python3 -m pytest -q Tests/Structural/test_source_structure.py Tests/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 python3 -m pytest -q
 cargo fmt --manifest-path RustRouting/Cargo.toml -- --check

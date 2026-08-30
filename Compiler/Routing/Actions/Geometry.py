@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import Any, Callable
 
 from ...Placement.Rotation import TransformLocalPosition
-from SchemEncoder.Writer262 import LoadTemplate
+from SchemEncoder.SchemWriter import LoadTemplate
 from Templates import LitematicTemplates
 from ..Contracts.Core import (
     Position3,

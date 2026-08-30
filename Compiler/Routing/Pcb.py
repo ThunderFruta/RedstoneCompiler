@@ -11,7 +11,7 @@ import traceback
 from typing import Any, Callable, Iterable
 
 from Compiler.Placement.Core.Clusters import PcbPlacement
-from ..Placement.Geometry import GetGateInputAccess
+from ..Placement.Geometry import BuildPlacementPinAccessWitness
 from ..Placement.Rotation import RotatedCellSize
 try:
     from ..RustRouting import GetRoutingThreadCount
@@ -136,41 +136,24 @@ def CompactRoutedTrees(
         for Signal in Gate.Outputs
     }
     Targets: dict[str, list[tuple[int, int, int]]] = {}
-    for Gate in Placed.PlacedGates:
-        for InputIndex, Signal in enumerate(Gate.Inputs):
-            Pin, _Direction = GetGateInputAccess(Gate, InputIndex)
-            Targets.setdefault(Signal, []).append(
-                Pin
+    PinAccessWitness = BuildPlacementPinAccessWitness(
+        Placed.PlacedGates,
+        AccessLength=AccessLength,
+        RequireCatalogMatch=True,
+    )
+    for Selection in PinAccessWitness.Selections:
+        if Selection.Role == "Target":
+            Targets.setdefault(Selection.Signal, []).append(
+                Selection.Terminal
             )
     AccessBySignal: dict[str, set[tuple[int, int, int]]] = {
         Signal: set()
         for Signal in Producers
     }
-    for Gate in Placed.PlacedGates:
-        if Gate.OutputPin is not None and Gate.OutputDirection is not None:
-            X, Y, Z = Gate.OutputPin
-            DeltaX, DeltaY, DeltaZ = Gate.OutputDirection
-            for Signal in Gate.Outputs:
-                AccessBySignal[Signal].update(
-                    (
-                        X + DeltaX * Offset,
-                        Y + DeltaY * Offset,
-                        Z + DeltaZ * Offset,
-                    )
-                    for Offset in range(AccessLength)
-                )
-        for Index, Signal in enumerate(Gate.Inputs):
-            Pin, Direction = GetGateInputAccess(Gate, Index)
-            X, Y, Z = Pin
-            DeltaX, DeltaY, DeltaZ = Direction
-            AccessBySignal.setdefault(Signal, set()).update(
-                (
-                    X + DeltaX * Offset,
-                    Y + DeltaY * Offset,
-                    Z + DeltaZ * Offset,
-                )
-                for Offset in range(AccessLength)
-            )
+    for Selection in PinAccessWitness.Selections:
+        AccessBySignal.setdefault(Selection.Signal, set()).update(
+            Selection.Path
+        )
     NetWires = {
         Signal: set(Positions)
         for Signal, Positions in Routed.NetWires.items()
@@ -205,7 +188,7 @@ def CompactRoutedTrees(
     BeforeFootprint = BuildFootprintDiagnostics(
         NetWires,
         Routed.Supports,
-        Routed.Repeaters,
+        Routed.RepeaterInputFacings,
     )
     Graphs = BuildPhysicalGraphs(
         NetWires,
@@ -442,7 +425,7 @@ def CompactRoutedTrees(
                     ),
                     Position=Position,
                     Purpose="FallbackRepeater",
-                    Facing=Facing,
+                    InputFacing=Facing,
                 ),
             )
             for Position, Facing in sorted(SignalRepeaters.items())
@@ -533,7 +516,7 @@ def CompactRoutedTrees(
         PlacedGates=Placed.PlacedGates,
         Wires=sorted(Wires),
         Supports=sorted(Supports),
-        Repeaters=Repeaters,
+        RepeaterInputFacings=Repeaters,
         NetWires={Signal: sorted(Positions) for Signal, Positions in NetWires.items()},
         SupportBlock=Routed.SupportBlock,
         TemplateAccessBySignal=AccessBySignal,
@@ -1354,6 +1337,7 @@ def PrepareTrackAssignment(
     Resources: Any,
     Policy: PhysicalDesignPolicy,
     Deadline: RoutingDeadline,
+    DeferClusterBoundaryLeaseUntilCapacityPrecheck: bool = False,
 ) -> TrackAssignmentPreparation:
     """Build portal/track domains and stop before route-tree construction."""
     Configuration = BuildPcbRoutingConfigurations(Placement)[0]
@@ -1365,6 +1349,9 @@ def PrepareTrackAssignment(
             Policy=Policy,
             Deadline=Deadline,
             PrepareTrackAssignmentOnly=True,
+            DeferClusterBoundaryLeaseUntilCapacityPrecheck=(
+                DeferClusterBoundaryLeaseUntilCapacityPrecheck
+            ),
         )
     except TrackAssignmentPrepared as Prepared:
         return Prepared.Preparation
@@ -1462,6 +1449,7 @@ def PreparePhysicalComponentEligibility(
 ) -> PreparedPhysicalComponentPortFactorDomain:
     """Freeze the complete physical port domain before assignment search."""
     Resources.PreparedPhysicalComponentPortFactorDomain = None
+    Resources.PreparedPhysicalComponentCapacityRepairWitness = None
     Resources.PreparedPhysicalComponentAssembly = None
     Resources.PreparedPhysicalComponentUnboundProblem = None
     Resources.PreparedComponentRoutingProblem = None

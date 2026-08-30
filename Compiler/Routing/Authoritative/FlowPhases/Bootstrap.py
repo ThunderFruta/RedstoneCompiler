@@ -125,7 +125,26 @@ def RunBootstrap(State: AuthoritativeRoutingState, Services: AuthoritativeRoutin
     ProfilePlacement = State.Placed
     if State.Resources.PreparingPhysicalComponentGlobalChannels:
         ProfilePlacement = Services.replace(State.Placed, LocalRouteClaims=tuple((Claim for Claim in State.AllLocalClaims if int(getattr(Claim, 'ClusterId', 0)) >= 0)))
-    State.Profiles = Services.BuildNetRoutingProfiles(ProfilePlacement, AccessLength=State.Policy.Placement.PinEscapeLength)
+    ExistingPlacementAccessFabric = getattr(State.Placed, 'PlacementAccessFabric', None)
+    State.PlacementPinAccessWitness = getattr(
+        ExistingPlacementAccessFabric,
+        'PinAccessWitness',
+        None,
+    ) or Services.BuildPlacementPinAccessWitness(
+        ProfilePlacement.PlacedGates,
+        AccessLength=State.Technology.AccessLength,
+        RequireCatalogMatch=True,
+    )
+    State.Profiles = Services.BuildNetRoutingProfiles(
+        ProfilePlacement,
+        AccessLength=State.Policy.Placement.PinEscapeLength,
+        AccessWitness=State.PlacementPinAccessWitness,
+    )
+    State.WorkTelemetry['PlacementPinAccessWitness'] = {
+        **State.PlacementPinAccessWitness.ToDictionary(),
+        'ConsumedAccessLength': State.Policy.Placement.PinEscapeLength,
+        'FrozenBeforeCandidateGeneration': True,
+    }
     State.WholeDesignProfiles = dict(State.Profiles)
     State.PhysicalAssemblyPlan = State.Resources.FrozenPhysicalComponentAssemblyPlan
     State.FrozenPostClosurePortalHandoffApplied = False
@@ -223,5 +242,5 @@ def RunBootstrap(State: AuthoritativeRoutingState, Services: AuthoritativeRoutin
     if State.PreRouteLocalClaimChoices or PreRouteLocalClaimChoiceRejections:
         State.WorkTelemetry['PreRouteLocalClaimChoices'] = {'DomainFingerprint': State.PreRouteLocalClaimDomainFingerprint, 'Choices': [Choice.ToDictionary() for Choice in State.PreRouteLocalClaimChoices], 'Rejections': list(PreRouteLocalClaimChoiceRejections), 'Complete': True}
     if not State.Profiles:
-        return PhaseOutcome(Returned=True, Value=Services.RoutedDesign(Module=State.Placed.Module, PlacedGates=State.Placed.PlacedGates, Wires=[], Supports=[], Repeaters={}, NetWires={}, ZeroResourceConflicts=True))
+        return PhaseOutcome(Returned=True, Value=Services.RoutedDesign(Module=State.Placed.Module, PlacedGates=State.Placed.PlacedGates, Wires=[], Supports=[], RepeaterInputFacings={}, NetWires={}, ZeroResourceConflicts=True))
     return PhaseOutcome()

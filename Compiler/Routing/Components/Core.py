@@ -479,7 +479,7 @@ def _TranslateAndValidateNetPortfolio(
         Claims = _TranslateClaims(Value.Claims, Delta)
         Repeaters = tuple(
             (_TranslatePosition(Position, Delta), Facing)
-            for Position, Facing in Value.Repeaters
+            for Position, Facing in Value.RepeaterInputFacings
         )
         CoveredTerminals = tuple(sorted(
             _TranslatePosition(Position, Delta)
@@ -531,7 +531,7 @@ def _TranslateAndValidateNetPortfolio(
                 Position for Position, _Facing in Repeaters
             ),
             SupportCells=Claims.SupportCells,
-            Repeaters=Repeaters,
+            RepeaterInputFacings=Repeaters,
             Claims=Claims,
             CoveredTerminals=CoveredTerminals,
             ExportedPorts=ExportedPorts,

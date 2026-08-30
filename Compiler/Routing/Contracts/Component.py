@@ -449,6 +449,9 @@ class PhysicalExteriorApertureFabric:
 
     EnvelopeMinimum: Position3
     EnvelopeMaximum: Position3
+    PortalIngressEnvelopeBounds: tuple[
+        tuple[Position3, Position3, Position3], ...
+    ]
     Layer: int
     RoutingY: int
     ExteriorPerimeterColumns: frozenset[Position2]
@@ -479,6 +482,13 @@ class PhysicalExteriorApertureFabric:
             for Index in range(3)
         ):
             raise ValueError("exterior fabric envelope is inverted")
+        if any(
+            Minimum[Index] > Maximum[Index]
+            for _Ingress, Minimum, Maximum
+            in self.PortalIngressEnvelopeBounds
+            for Index in range(3)
+        ):
+            raise ValueError("portal ingress envelope is inverted")
         if any(
             First >= Second
             for First, Second in self.AllowedEdges
@@ -530,9 +540,14 @@ class PhysicalExteriorApertureFabric:
 
     def ToDictionary(self) -> dict[str, object]:
         return {
-            "SchemaVersion": "physical-exterior-aperture-fabric-v2",
+            "SchemaVersion": "physical-exterior-aperture-fabric-v3",
             "EnvelopeMinimum": list(self.EnvelopeMinimum),
             "EnvelopeMaximum": list(self.EnvelopeMaximum),
+            "PortalIngressEnvelopeBounds": [
+                [list(Ingress), list(Minimum), list(Maximum)]
+                for Ingress, Minimum, Maximum
+                in self.PortalIngressEnvelopeBounds
+            ],
             "Layer": self.Layer,
             "RoutingY": self.RoutingY,
             "AllowedColumnCount": len(self.AllowedColumns),
@@ -913,7 +928,7 @@ class RoutedComponentNet:
     Edges: frozenset[tuple[Position3, Position3]]
     WireCells: frozenset[Position3]
     SupportCells: frozenset[Position3]
-    Repeaters: tuple[tuple[Position3, str], ...]
+    RepeaterInputFacings: tuple[tuple[Position3, str], ...]
     Claims: RoutingResourceClaims
     CoveredTerminals: tuple[Position3, ...]
     ExportedPorts: tuple[Position3, ...]

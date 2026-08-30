@@ -410,7 +410,7 @@ def _BuildNetVariant(
         Edges=frozenset(Edges),
         WireCells=WireCells,
         SupportCells=Supports,
-        Repeaters=Repeaters,
+        RepeaterInputFacings=Repeaters,
         Claims=Claims,
         CoveredTerminals=CoveredTerminals,
         ExportedPorts=ExportedPorts,

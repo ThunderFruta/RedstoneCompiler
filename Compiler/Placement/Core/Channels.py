@@ -30,7 +30,6 @@ from Compiler.Routing.Failures import (
 )
 from Compiler.Routing.ResourceGraph import (
     BuildRoutingEnvelope,
-    FindClaimConflicts,
     LocalRouteClaim,
     RoutingResourceClaims,
     RoutingResourceGraph,
@@ -1490,6 +1489,25 @@ def BuildLegalBoundaryEscapeSlots(
     """Enumerate exact one-primitive exits from immutable terminal access."""
     Result: dict[str, set[tuple[int, int, int]]] = {}
     OrderedSignals = sorted(Signals)
+    ForeignFixedClaimsBySignal: dict[str, RoutingResourceClaims] = {}
+    for Signal in OrderedSignals:
+        WireCells: set[tuple[int, int, int]] = set()
+        SupportCells: set[tuple[int, int, int]] = set()
+        RequiredAirCells: set[tuple[int, int, int]] = set()
+        ElectricalCells: set[tuple[int, int, int]] = set()
+        for OtherSignal, OtherClaims in FixedAccessClaimsBySignal.items():
+            if OtherSignal == Signal:
+                continue
+            WireCells.update(OtherClaims.WireCells)
+            SupportCells.update(OtherClaims.SupportCells)
+            RequiredAirCells.update(OtherClaims.RequiredAirCells)
+            ElectricalCells.update(OtherClaims.ElectricalCells)
+        ForeignFixedClaimsBySignal[Signal] = RoutingResourceClaims(
+            WireCells=frozenset(WireCells),
+            SupportCells=frozenset(SupportCells),
+            RequiredAirCells=frozenset(RequiredAirCells),
+            ElectricalCells=frozenset(ElectricalCells),
+        )
     for SignalIndex, Signal in enumerate(OrderedSignals):
         if WorkCheck is not None:
             WorkCheck({
@@ -1521,15 +1539,26 @@ def BuildLegalBoundaryEscapeSlots(
                 CandidateClaims = ResourceGraph.BuildRouteClaims(
                     (Anchor, Neighbor)
                 )
-                if any(
-                    FindClaimConflicts({
-                        Signal: CandidateClaims,
-                        OtherSignal: OtherClaims,
-                    })
-                    for OtherSignal, OtherClaims in (
-                        FixedAccessClaimsBySignal.items()
+                ForeignClaims = ForeignFixedClaimsBySignal[Signal]
+                if (
+                    CandidateClaims.WireCells
+                    & ForeignClaims.ElectricalCells
+                    or ForeignClaims.WireCells
+                    & CandidateClaims.ElectricalCells
+                    or CandidateClaims.SupportCells
+                    & (
+                        ForeignClaims.WireCells
+                        | ForeignClaims.RequiredAirCells
                     )
-                    if OtherSignal != Signal
+                    or ForeignClaims.SupportCells
+                    & (
+                        CandidateClaims.WireCells
+                        | CandidateClaims.RequiredAirCells
+                    )
+                    or CandidateClaims.RequiredAirCells
+                    & ForeignClaims.WireCells
+                    or ForeignClaims.RequiredAirCells
+                    & CandidateClaims.WireCells
                 ):
                     continue
                 LegalSlots.add(Neighbor)

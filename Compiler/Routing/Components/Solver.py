@@ -208,7 +208,7 @@ def MaterializeRoutedComponentTemplate(
             Edges=Net.Edges,
             Claims=Net.Claims,
             ExactRouteSignalBlocks=len(Net.WireCells),
-            ExactRouteRefreshBlocks=len(Net.Repeaters),
+            ExactRouteRefreshBlocks=len(Net.RepeaterInputFacings),
             ExactRouteSupportBlocks=len(Net.SupportCells),
         )
         for Net in Template.Nets
@@ -287,12 +287,12 @@ def MaterializeRoutedComponentTemplate(
                     ),
                     Position=Position,
                     Purpose="Repeater",
-                    Facing=Facing,
+                    InputFacing=Facing,
                 )
-                for Position, Facing in Net.Repeaters
+                for Position, Facing in Net.RepeaterInputFacings
             ),
             ExactRouteSignalBlocks=len(Net.WireCells),
-            ExactRouteRefreshBlocks=len(Net.Repeaters),
+            ExactRouteRefreshBlocks=len(Net.RepeaterInputFacings),
             ExactRouteSupportBlocks=len(Net.SupportCells),
         )
         for Net in Template.ForeignTransitReservations

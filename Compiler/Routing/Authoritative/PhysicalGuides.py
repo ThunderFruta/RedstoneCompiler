@@ -60,9 +60,13 @@ from ..ResourceGraph import LocalRouteClaim
 
 from ..ResourceGraph import RoutingResourceClaims
 
+from ..ResourceGraph import RoutingResourceGraph
+
 from ..ResourceGraph import RoutingResourceId
 
 from ..ResourceGraph import RoutingResourceKind
+
+from ..Technology import DefaultRedstoneRoutingTechnology
 
 from collections import Counter
 
@@ -302,30 +306,104 @@ def BuildComponentKeepoutGuideCellsByLayer(
     MaximumZ = max(Position[2] for Position in ClaimPositions) + 1
     Result: dict[int, frozenset[tuple[int, int]]] = {}
     CheckedCellCount = 0
+    SparseExactProjection = bool(
+        isinstance(ResourceGraph, RoutingResourceGraph)
+        and ResourceGraph.Technology == DefaultRedstoneRoutingTechnology
+    )
+
+    if SparseExactProjection:
+        CandidatePositions = set(KeepoutClaims.ElectricalCells)
+        CandidatePositions.update(KeepoutClaims.SupportCells)
+        CandidatePositions.update(KeepoutClaims.RequiredAirCells)
+        for Position in KeepoutClaims.WireCells:
+            CandidatePositions.add(Position)
+            CandidatePositions.update(ResourceGraph.Technology.NeighborPositions(Position))
+        CandidatePositions.update(
+            (X, Y + 1, Z)
+            for X, Y, Z in (
+                KeepoutClaims.WireCells | KeepoutClaims.RequiredAirCells
+            )
+        )
+        OrderedCandidatePositions = tuple(sorted(CandidatePositions))
+        for Layer in range(max(1, int(LayerCount))):
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Stage": "physical-component-layer-keepout",
+                    "Layer": Layer,
+                    "CheckedCellCount": CheckedCellCount,
+                    "ProjectionCandidateCount": len(OrderedCandidatePositions),
+                    "ProjectionMode": "sparse-exact-default-technology",
+                })
+            RoutingY = ResourceGraph.Technology.RoutingY(
+                MinimumPlacementY,
+                Layer,
+            )
+            BlockedCells = frozenset(
+                (X, Z)
+                for X, Y, Z in OrderedCandidatePositions
+                if Y == RoutingY
+            )
+            CheckedCellCount += len(OrderedCandidatePositions)
+            Result[Layer] = BlockedCells
+        return Result
+
+    def ClaimsConflict(GuideClaims: RoutingResourceClaims) -> bool:
+        return bool(
+            (KeepoutClaims.WireCells & GuideClaims.ElectricalCells)
+            or (GuideClaims.WireCells & KeepoutClaims.ElectricalCells)
+            or (
+                KeepoutClaims.SupportCells
+                & (GuideClaims.WireCells | GuideClaims.RequiredAirCells)
+            )
+            or (
+                GuideClaims.SupportCells
+                & (KeepoutClaims.WireCells | KeepoutClaims.RequiredAirCells)
+            )
+            or (KeepoutClaims.RequiredAirCells & GuideClaims.WireCells)
+            or (GuideClaims.RequiredAirCells & KeepoutClaims.WireCells)
+        )
+
     for Layer in range(max(1, int(LayerCount))):
         RoutingY = ResourceGraph.Technology.RoutingY(
             MinimumPlacementY,
             Layer,
         )
         BlockedCells = set()
-        for X in range(MinimumX, MaximumX + 1):
-            for Z in range(MinimumZ, MaximumZ + 1):
+        Cells = tuple(
+            (X, Z, (X, RoutingY, Z))
+            for X in range(MinimumX, MaximumX + 1)
+            for Z in range(MinimumZ, MaximumZ + 1)
+        )
+        for BatchStart in range(0, len(Cells), 4096):
+            Batch = Cells[BatchStart:BatchStart + 4096]
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Stage": "physical-component-layer-keepout",
+                    "Layer": Layer,
+                    "CheckedCellCount": CheckedCellCount,
+                    "BlockedCellCount": len(BlockedCells),
+                    "ProjectionMode": "exhaustive-custom-technology",
+                })
+            GuideClaimsBatch = tuple(
+                ResourceGraph.BuildRouteClaims((Position,))
+                for _X, _Z, Position in Batch
+            )
+            for (X, Z, _Position), GuideClaims in zip(
+                Batch,
+                GuideClaimsBatch,
+                strict=True,
+            ):
                 CheckedCellCount += 1
-                if WorkCheck is not None and CheckedCellCount % 256 == 0:
-                    WorkCheck({
-                        "Stage": "physical-component-layer-keepout",
-                        "Layer": Layer,
-                        "CheckedCellCount": CheckedCellCount,
-                        "BlockedCellCount": len(BlockedCells),
-                    })
-                GuideClaims = ResourceGraph.BuildRouteClaims((
-                    (X, RoutingY, Z),
-                ))
-                if FindClaimConflicts({
-                    "Component": KeepoutClaims,
-                    "GlobalGuide": GuideClaims,
-                }):
+                if ClaimsConflict(GuideClaims):
                     BlockedCells.add((X, Z))
+            if WorkCheck is not None:
+                WorkCheck({
+                    "Stage": "physical-component-layer-keepout",
+                    "Layer": Layer,
+                    "CheckedCellCount": CheckedCellCount,
+                    "BlockedCellCount": len(BlockedCells),
+                    "ProjectionMode": "exhaustive-custom-technology",
+                })
         Result[Layer] = frozenset(BlockedCells)
     return Result
 
@@ -2371,6 +2449,10 @@ def BuildPhysicalExteriorApertureFabric(
     Layer: int,
     KeepoutColumns: Iterable[Position2] = (),
     KeepoutNodes: Iterable[Position3] = (),
+    DeclaredPortalIngressEnvelopeBoundsByNode: Mapping[
+        Position3,
+        Iterable[tuple[Position3, Position3]],
+    ] | None = None,
     RegionNodes: Iterable[Position3] | None = None,
     RegionEdges: Iterable[tuple[Position3, Position3]] | None = None,
     RegionFingerprint: str = "",
@@ -2381,8 +2463,10 @@ def BuildPhysicalExteriorApertureFabric(
 
     An explicit Region supplies every allowed exterior node and edge; guide
     and ingress geometry binds targets without narrowing that complete graph.
-    Geometry-only callers receive an incomplete ring/guide fixture.  Component
-    envelope nodes remain locally owned and explicit keepouts always win.
+    Geometry-only callers receive an incomplete ring/guide fixture.  An
+    authoritative caller binds each ingress to its connected component
+    envelope and supplies the exact per-layer component keepout projection.
+    Disconnected free space remains exterior-owned.
     """
     EnvelopeMinimum = tuple(map(int, EnvelopeMinimum))
     EnvelopeMaximum = tuple(map(int, EnvelopeMaximum))
@@ -2423,31 +2507,54 @@ def BuildPhysicalExteriorApertureFabric(
         for _GuideColumns, IngressNodes in CanonicalSignalGeometry
         for Node in IngressNodes
     )
-    MinimumX, MaximumX = EnvelopeMinimum[0], EnvelopeMaximum[0]
-    MinimumZ, MaximumZ = EnvelopeMinimum[2], EnvelopeMaximum[2]
-    ExteriorPerimeterColumns = frozenset((
-        *((X, MinimumZ - 1) for X in range(MinimumX - 1, MaximumX + 2)),
-        *((X, MaximumZ + 1) for X in range(MinimumX - 1, MaximumX + 2)),
-        *((MinimumX - 1, Z) for Z in range(MinimumZ, MaximumZ + 1)),
-        *((MaximumX + 1, Z) for Z in range(MinimumZ, MaximumZ + 1)),
-    ))
-    InvalidIngressNodes = tuple(sorted(
-        Node
-        for Node in DeclaredIngressNodes
-        if (
-            Node[1] != RoutingY
-            or (
-                MinimumX <= Node[0] <= MaximumX
-                and MinimumZ <= Node[2] <= MaximumZ
+    ExplicitIngressEnvelopeBounds = (
+        DeclaredPortalIngressEnvelopeBoundsByNode is not None
+    )
+    StableIngressEnvelopeBoundsByNode = {
+        tuple(map(int, Ingress)): tuple(sorted({
+            (
+                tuple(map(int, Minimum)),
+                tuple(map(int, Maximum)),
             )
-        )
+            for Minimum, Maximum in Bounds
+        }))
+        for Ingress, Bounds
+        in (DeclaredPortalIngressEnvelopeBoundsByNode or {}).items()
+    }
+    if ExplicitIngressEnvelopeBounds:
+        MissingIngressEnvelopeBounds = tuple(sorted(
+            DeclaredIngressNodes
+            - StableIngressEnvelopeBoundsByNode.keys()
+        ))
+        ExtraIngressEnvelopeBounds = tuple(sorted(
+            StableIngressEnvelopeBoundsByNode.keys()
+            - DeclaredIngressNodes
+        ))
+        if MissingIngressEnvelopeBounds or ExtraIngressEnvelopeBounds:
+            raise ValueError(
+                "portal ingress envelope bounds must exactly match declared "
+                "ingress nodes: "
+                f"missing={MissingIngressEnvelopeBounds} "
+                f"extra={ExtraIngressEnvelopeBounds}"
+            )
+    else:
+        StableIngressEnvelopeBoundsByNode = {
+            Node: ((EnvelopeMinimum, EnvelopeMaximum),)
+            for Node in DeclaredIngressNodes
+        }
+    CanonicalPortalIngressEnvelopeBounds = tuple(sorted(
+        (Ingress, Minimum, Maximum)
+        for Ingress, Bounds
+        in StableIngressEnvelopeBoundsByNode.items()
+        for Minimum, Maximum in Bounds
     ))
-    if InvalidIngressNodes:
-        raise ValueError(
-            "declared portal ingress must lie outside the closed envelope "
-            f"at routing Y {RoutingY}: {InvalidIngressNodes}"
-        )
-
+    if any(
+        Minimum[Index] > Maximum[Index]
+        for _Ingress, Minimum, Maximum
+        in CanonicalPortalIngressEnvelopeBounds
+        for Index in range(3)
+    ):
+        raise ValueError("portal ingress envelope minimum exceeds maximum")
     StableKeepoutNodes = frozenset(
         tuple(map(int, Node)) for Node in KeepoutNodes
     )
@@ -2459,24 +2566,62 @@ def BuildPhysicalExteriorApertureFabric(
             if Node[1] == RoutingY
         ),
     ))
-    ConflictingIngressNodes = tuple(sorted(
+    PerimeterEnvelopeBounds = tuple(sorted({
+        (Minimum, Maximum)
+        for _Ingress, Minimum, Maximum
+        in CanonicalPortalIngressEnvelopeBounds
+    })) or ((EnvelopeMinimum, EnvelopeMaximum),)
+    ExteriorPerimeterColumns = frozenset(
+        Column
+        for Minimum, Maximum in PerimeterEnvelopeBounds
+        for Column in (
+            *((X, Minimum[2] - 1) for X in range(
+                Minimum[0] - 1,
+                Maximum[0] + 2,
+            )),
+            *((X, Maximum[2] + 1) for X in range(
+                Minimum[0] - 1,
+                Maximum[0] + 2,
+            )),
+            *((Minimum[0] - 1, Z) for Z in range(
+                Minimum[2],
+                Maximum[2] + 1,
+            )),
+            *((Maximum[0] + 1, Z) for Z in range(
+                Minimum[2],
+                Maximum[2] + 1,
+            )),
+        )
+    )
+
+    def IsInsideIngressEnvelope(Node: Position3) -> bool:
+        return any(
+            Minimum[0] <= Node[0] <= Maximum[0]
+            and Minimum[2] <= Node[2] <= Maximum[2]
+            for Minimum, Maximum
+            in StableIngressEnvelopeBoundsByNode[Node]
+        )
+
+    def IsLocallyOwned(Column: Position2) -> bool:
+        if ExplicitIngressEnvelopeBounds:
+            return Column in StableKeepoutColumns
+        return bool(
+            EnvelopeMinimum[0] <= Column[0] <= EnvelopeMaximum[0]
+            and EnvelopeMinimum[2] <= Column[1] <= EnvelopeMaximum[2]
+        )
+
+    InvalidIngressNodes = tuple(sorted(
         Node
         for Node in DeclaredIngressNodes
         if (
-            Node in StableKeepoutNodes
-            or (Node[0], Node[2]) in StableKeepoutColumns
+            Node[1] != RoutingY
+            or IsInsideIngressEnvelope(Node)
         )
     ))
-    if ConflictingIngressNodes:
+    if InvalidIngressNodes:
         raise ValueError(
-            "declared portal ingress intersects an immutable keepout: "
-            f"{ConflictingIngressNodes}"
-        )
-
-    def IsInsideEnvelope(Column: Position2) -> bool:
-        return bool(
-            MinimumX <= Column[0] <= MaximumX
-            and MinimumZ <= Column[1] <= MaximumZ
+            "declared portal ingress must lie outside the closed envelope "
+            f"at routing Y {RoutingY}: {InvalidIngressNodes}"
         )
 
     CompleteGuideColumns = frozenset(
@@ -2487,7 +2632,7 @@ def BuildPhysicalExteriorApertureFabric(
     ExteriorOwnedColumns = frozenset(
         Column
         for Column in (*ExteriorPerimeterColumns, *CompleteGuideColumns)
-        if not IsInsideEnvelope(Column)
+        if not IsLocallyOwned(Column)
         and Column not in StableKeepoutColumns
     )
     ExplicitRegion = RegionNodes is not None and RegionEdges is not None
@@ -2513,9 +2658,14 @@ def BuildPhysicalExteriorApertureFabric(
             Node
             for Node in StableRegionNodes
             if Node[1] == RoutingY
-            and not IsInsideEnvelope((Node[0], Node[2]))
-            and Node not in StableKeepoutNodes
-            and (Node[0], Node[2]) not in StableKeepoutColumns
+            and (
+                Node in DeclaredIngressNodes
+                or (
+                    not IsLocallyOwned((Node[0], Node[2]))
+                    and Node not in StableKeepoutNodes
+                    and (Node[0], Node[2]) not in StableKeepoutColumns
+                )
+            )
         )
         MissingIngressNodes = tuple(sorted(
             DeclaredIngressNodes - AllowedNodes
@@ -2608,9 +2758,10 @@ def BuildPhysicalExteriorApertureFabric(
             "complete exterior fabric requires a resource graph identity"
         )
     FabricFingerprint = BuildStableFingerprint((
-        "physical-exterior-aperture-fabric-v2",
+        "physical-exterior-aperture-fabric-v3",
         EnvelopeMinimum,
         EnvelopeMaximum,
+        CanonicalPortalIngressEnvelopeBounds,
         Layer,
         RoutingY,
         CanonicalSignalGeometry,
@@ -2629,6 +2780,9 @@ def BuildPhysicalExteriorApertureFabric(
     return PhysicalExteriorApertureFabric(
         EnvelopeMinimum=EnvelopeMinimum,
         EnvelopeMaximum=EnvelopeMaximum,
+        PortalIngressEnvelopeBounds=(
+            CanonicalPortalIngressEnvelopeBounds
+        ),
         Layer=Layer,
         RoutingY=RoutingY,
         ExteriorPerimeterColumns=ExteriorPerimeterColumns,

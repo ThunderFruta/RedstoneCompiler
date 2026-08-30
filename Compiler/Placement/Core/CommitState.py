@@ -29,6 +29,7 @@ class PlacementCommitState:
     EnableClusterBoundaryLeases: Any
     EnableClusterInterfacePlacementFeasibility: Any
     CutDrivenClusterRefinementSignals: Any
+    FixedConnectivityClusters: Any
     EnableInternalPinBankGeometryRepair: Any
     InternalPinBankGeometryRepairSignals: Any
     FocusedCutEpochPlacement: Any

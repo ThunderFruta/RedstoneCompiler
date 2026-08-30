@@ -18,7 +18,7 @@ not established, and routing-aware-placement v17 was not introduced.
 
 The detailed retired-path list and hard structural gates are authoritative in
 [`ProjectTreeDesignDoc.md`](../../ProjectTreeDesignDoc.md) and
-`Tests/test_source_structure.py`. Historical sections below retain their dated
+`Tests/Structural/test_source_structure.py`. Historical sections below retain their dated
 meaning and are not evidence that a retired path still exists.
 
 > **Historical scope notice (2026-07-22):** In this document, “flat

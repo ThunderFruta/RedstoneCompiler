@@ -13,6 +13,7 @@ from .Failures import (
 )
 from .Technology import (
     DefaultRedstoneRoutingTechnology,
+    RepeaterInputFacingForStep,
     RedstoneRoutingTechnology,
 )
 from .ResourceGraph import (
@@ -23,13 +24,8 @@ from .ResourceGraph import (
 )
 
 
-def _RepeaterFacing(Current, Next):
-    return {
-        (1, 0): "west",
-        (-1, 0): "east",
-        (0, 1): "north",
-        (0, -1): "south",
-    }[(Next[0] - Current[0], Next[2] - Current[2])]
+def _RepeaterInputFacing(Current, Next):
+    return RepeaterInputFacingForStep(Current, Next)
 
 
 @dataclass(frozen=True)
@@ -111,7 +107,7 @@ def _ReserveRepeaterWaypoints(
             Resource=RoutingResourceId(RoutingResourceKind.Wire, Position),
             Position=Position,
             Purpose="PinAccessRepeater",
-            Facing=_RepeaterFacing(Position, Next),
+            InputFacing=_RepeaterInputFacing(Position, Next),
         )
         for Position, Next in PinReservations
     }
@@ -194,7 +190,7 @@ def _ReserveRepeaterWaypoints(
                     ),
                     Position=Position,
                     Purpose="Repeater",
-                    Facing=_RepeaterFacing(
+                    InputFacing=_RepeaterInputFacing(
                         Position,
                         (
                             Path[Selected + 1][0],

@@ -26,7 +26,11 @@ from ..Failures import RoutingFailureReason
 
 from ..Failures import RoutingStageError
 
-from ..Interfaces.BoundaryRelations import RawPortalGeometryCache
+from ..Interfaces.BoundaryRelations import (
+    BuildRawPortalPlacementGeometryFingerprint,
+    BuildRawPortalResourceGeometryFingerprint,
+    RawPortalGeometryCache,
+)
 
 from ..Reliability import BuildStableFingerprint
 
@@ -744,8 +748,18 @@ def SelectRawPortalGeometryReusePlan(
     CoordinatedSignals: frozenset[str],
     AllowPortableSignalReuse: bool = False,
     PhysicalGlobalKeepoutFingerprint: str = "",
+    PlacementGeometryFingerprint: str | None = None,
+    ResourceGeometryFingerprint: str | None = None,
 ) -> RawPortalGeometryReusePlan | None:
     """Select exact work first, then a coordinated signal-only delta."""
+    if PlacementGeometryFingerprint is None:
+        PlacementGeometryFingerprint = (
+            BuildRawPortalPlacementGeometryFingerprint(Placed)
+        )
+    if ResourceGeometryFingerprint is None:
+        ResourceGeometryFingerprint = (
+            BuildRawPortalResourceGeometryFingerprint(Resources)
+        )
     RequestedSignals = frozenset(PortalVariantCounts)
     PartialPlan: RawPortalGeometryReusePlan | None = None
     PortablePlan: RawPortalGeometryReusePlan | None = None
@@ -845,6 +859,8 @@ def SelectRawPortalGeometryReusePlan(
         SamePlacementResources = Cache.MatchesPlacementResources(
             Placed,
             Resources,
+            PlacementFingerprint=PlacementGeometryFingerprint,
+            ResourceFingerprint=ResourceGeometryFingerprint,
         )
         CommonPolicyMismatch = (
             not Cache.GuidePlanPrepared

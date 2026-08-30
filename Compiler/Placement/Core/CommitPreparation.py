@@ -76,12 +76,25 @@ def InitializePlacementCommit(Context):
     Context.ClusterRefinementSignals = tuple(sorted(Context.CutDrivenClusterRefinementSignals if Context.CutDrivenClusterRefinementSignals is not None else {Signal for Edge in BuildEffectiveAssignmentCutPairwiseEdges(Context.AssignmentCut) for Signal in Edge}))
     Context.ClusterRefinementProfile = CutDrivenClusterRefinementProfile(Signals=Context.ClusterRefinementSignals, EdgeWeight=max(4, Context.AdaptiveClusterSize)) if Context.EnableClusterInterfacePlacementFeasibility and Context.ClusterRefinementSignals else None
     Context.PlacementTopologyCacheKey = (Context.ModuleLayoutFingerprint, Context.PackedMode, Context.AdaptiveClusterSize, repr(Context.ClusterPolicy if Context.PackedMode else None), Context.MaximumBoundaryTerminals if Context.PackedMode else None, Context.ClusterRefinementProfile.Signals if Context.ClusterRefinementProfile is not None else (), Context.ClusterRefinementProfile.EdgeWeight if Context.ClusterRefinementProfile is not None else 0, Context.LogicalComponentGraph.StructuralFingerprint)
-    Context.CachedPlacementTopology = _PlacementTopologyCache.get(Context.PlacementTopologyCacheKey)
-    if Context.CachedPlacementTopology is None:
+    Context.FixedConnectivityClusters = tuple(tuple(map(str, Cluster)) for Cluster in Context.FixedConnectivityClusters)
+    Context.FixedConnectivityClusterNames = tuple(Name for Cluster in Context.FixedConnectivityClusters for Name in Cluster)
+    Context.InternalGateNames = frozenset(Gate.Name for Gate in Context.Module.Gates if Gate.Kind.value == 'NAND')
+    if Context.FixedConnectivityClusters:
+        if len(Context.FixedConnectivityClusterNames) != len(set(Context.FixedConnectivityClusterNames)) or frozenset(Context.FixedConnectivityClusterNames) != Context.InternalGateNames:
+            raise ValueError('fixed connectivity clusters must partition every NAND gate exactly once')
+        if any((not Cluster) or len(Cluster) > Context.AdaptiveClusterSize for Cluster in Context.FixedConnectivityClusters):
+            raise ValueError('fixed connectivity cluster exceeds the active cluster-size contract')
+        Context.Levels = BuildTopologicalLevels(Context.Module, WorkCheck=Context.WorkCheck)
+        Context.Clusters = Context.FixedConnectivityClusters
+        Context.CachedPlacementTopology = None
+        CheckWork(Context, 'fixed-connectivity-clusters', GateCount=len(Context.InternalGateNames), ClusterCount=len(Context.Clusters))
+    else:
+        Context.CachedPlacementTopology = _PlacementTopologyCache.get(Context.PlacementTopologyCacheKey)
+    if not Context.FixedConnectivityClusters and Context.CachedPlacementTopology is None:
         Context.Levels = BuildTopologicalLevels(Context.Module, WorkCheck=Context.WorkCheck)
         Context.Clusters = BuildConnectivityClusters(Context.Module, MaximumClusterSize=Context.AdaptiveClusterSize, Policy=Context.ClusterPolicy if Context.PackedMode else None, MaximumBoundaryTerminals=Context.MaximumBoundaryTerminals if Context.PackedMode else None, RefinementProfile=Context.ClusterRefinementProfile, LogicalComponentByGate=Context.LogicalComponentByGate, WorkCheck=Context.WorkCheck)
         _PlacementTopologyCache[Context.PlacementTopologyCacheKey] = (tuple(sorted(Context.Levels.items())), tuple((tuple(Names) for Names in Context.Clusters)))
-    else:
+    elif not Context.FixedConnectivityClusters:
         Context.CachedLevels, Context.CachedClusters = Context.CachedPlacementTopology
         Context.Levels = dict(Context.CachedLevels)
         Context.Clusters = tuple((tuple(Names) for Names in Context.CachedClusters))

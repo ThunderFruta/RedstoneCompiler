@@ -174,4 +174,4 @@ success.
 - `Scripts/RunRouterAcceptance.py` -- sequential physical acceptance and
   evidence-manifest harness.
 - `Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
-- `SchemEncoder/` -- self-contained Litematica NBT writer.
+- `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.

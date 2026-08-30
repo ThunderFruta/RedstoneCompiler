@@ -795,6 +795,10 @@ class PreparedPhysicalComponentPortFactorDomain:
     LocalFactorRebuiltSignals: tuple[str, ...] = ()
     LocalFactorPreparationElapsedSeconds: float = 0.0
     ExteriorFactorPreparationElapsedSeconds: float = 0.0
+    FactorPreparationTimings: tuple[tuple[str, float], ...] = ()
+    PhysicalLocalSeamEligibilityCacheHitCount: int = 0
+    PhysicalLocalSeamEligibilityCacheMissCount: int = 0
+    PhysicalLocalSeamEligibilityCacheStoreCount: int = 0
     ExteriorFixedClaimCertificates: tuple[
         PhysicalPortExteriorFixedClaimCertificate, ...
     ] = ()

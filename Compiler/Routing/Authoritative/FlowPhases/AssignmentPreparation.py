@@ -429,7 +429,65 @@ def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: Authori
         IncompleteSignals = tuple(sorted({*(Signal for Signal, _Reason in IncompleteReasons), *IncompleteDeferredSignals, *IncompletePhysicalPreSiblingSignals}))
         RawDomainComplete = bool(not State.RouteTreeNativeDeadlineExceeded and (not State.Deadline.IsExpired()) and (not IncompleteSignals))
         RawDomainIncompleteReason = '' if RawDomainComplete else 'candidate-domain-incomplete'
-        raise Services.RawTrackAssignmentDomainPrepared(Services.BuildRawTrackAssignmentDomain(Signals=tuple(sorted(State.Profiles)), CandidatesBySignal=State.CandidatesBySignal, LocalChoicesBySignal=State.PreRouteLocalClaimChoicesBySignal, BaseLocalClaims=BaseLocalClaims, BoundaryLeaseReservations=State.BoundaryLeaseReservations, AssignmentIndexed=State.AssignmentIndexed, CandidateDomainFingerprint=CandidateDomainFingerprint, LocalClaimDomainFingerprint=State.PreRouteLocalClaimDomainFingerprint, PlacementFingerprint=Services.BuildRawPortalPlacementGeometryFingerprint(State.Placed), ResourceGraphFingerprint=Services.BuildRawPortalResourceGeometryFingerprint(State.Resources), PortalDomainFingerprint=Services.BuildRawTrackAssignmentPortalDomainFingerprint(State.Portals, State.BoundaryLeaseReservations), Complete=RawDomainComplete, IncompleteReason=RawDomainIncompleteReason, MaximumAssignmentExpansions=State.AssignmentExpansionLimit, MinimizeMaximumRoutingLayer=State.Policy.TrackAssignment.MinimizeMaximumRoutingLayer, Diagnostics=(('CandidateRequestCount', State.CandidateRequestCount), ('RouteTreeNativeDeadlineExceeded', State.RouteTreeNativeDeadlineExceeded), ('IncompleteSignals', IncompleteSignals), ('ExcludedConfiguredRequestCounts', DeferredRequestCounts), ('DeferredRequestsRequireCompletion', State.Resources.PreparingPhysicalComponentGlobalChannels), ('CandidateExtractionIncompleteReasons', IncompleteReasons)), NativeAssignmentContext=State.EffectiveRawPortalCache.Context))
+        raise Services.RawTrackAssignmentDomainPrepared(
+            Services.BuildRawTrackAssignmentDomain(
+                Signals=tuple(sorted(State.Profiles)),
+                CandidatesBySignal=State.CandidatesBySignal,
+                LocalChoicesBySignal=State.PreRouteLocalClaimChoicesBySignal,
+                BaseLocalClaims=BaseLocalClaims,
+                BoundaryLeaseReservations=State.BoundaryLeaseReservations,
+                AssignmentIndexed=State.AssignmentIndexed,
+                CandidateDomainFingerprint=CandidateDomainFingerprint,
+                LocalClaimDomainFingerprint=(
+                    State.PreRouteLocalClaimDomainFingerprint
+                ),
+                PlacementFingerprint=(
+                    Services.BuildRawPortalPlacementGeometryFingerprint(
+                        State.Placed
+                    )
+                ),
+                ResourceGraphFingerprint=(
+                    Services.BuildRawPortalResourceGeometryFingerprint(
+                        State.Resources
+                    )
+                ),
+                PortalDomainFingerprint=(
+                    Services.BuildRawTrackAssignmentPortalDomainFingerprint(
+                        State.Portals,
+                        State.BoundaryLeaseReservations,
+                    )
+                ),
+                Complete=RawDomainComplete,
+                IncompleteReason=RawDomainIncompleteReason,
+                MaximumAssignmentExpansions=State.AssignmentExpansionLimit,
+                MinimizeMaximumRoutingLayer=(
+                    State.Policy.TrackAssignment.MinimizeMaximumRoutingLayer
+                ),
+                Diagnostics=(
+                    ('CandidateRequestCount', State.CandidateRequestCount),
+                    (
+                        'RouteTreeNativeDeadlineExceeded',
+                        State.RouteTreeNativeDeadlineExceeded,
+                    ),
+                    ('IncompleteSignals', IncompleteSignals),
+                    ('ExcludedConfiguredRequestCounts', DeferredRequestCounts),
+                    (
+                        'DeferredRequestsRequireCompletion',
+                        State.Resources.PreparingPhysicalComponentGlobalChannels,
+                    ),
+                    ('CandidateExtractionIncompleteReasons', IncompleteReasons),
+                    (
+                        'PlacementPinAccessWitnessFingerprint',
+                        State.PlacementPinAccessWitness.WitnessFingerprint,
+                    ),
+                    (
+                        'PlacementPinAccessWitnessAccessLength',
+                        State.PlacementPinAccessWitness.AccessLength,
+                    ),
+                ),
+                NativeAssignmentContext=State.EffectiveRawPortalCache.Context,
+            )
+        )
     State.LayerCappedAssignmentAttempts: list[dict[str, int | bool]] = []
     State.Result = None
     if State.FrozenTrackAssignmentPreparation is not None:
@@ -439,10 +497,38 @@ def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: Authori
         CandidateIdsBySignal = {Signal: frozenset((Candidate.CandidateId for Candidate in Candidates)) for Signal, Candidates in State.CandidatesBySignal.items()}
         MissingFrozenSelections = tuple(sorted(((Signal, CandidateId) for Signal, CandidateId in FrozenSelections if CandidateId not in CandidateIdsBySignal.get(Signal, ()))))
         MissingFrozenLocalSelections = tuple(sorted(((Signal, ChoiceId) for Signal, ChoiceId in FrozenLocalSelections if ChoiceId not in {Choice.ChoiceId for Choice in State.PreRouteLocalClaimChoicesBySignal.get(Signal, ())})))
-        if FrozenSignals != frozenset(State.CandidatesBySignal) or len(FrozenSignals) != len(FrozenSelections) + len(FrozenLocalSelections) or MissingFrozenSelections or MissingFrozenLocalSelections or (bool(State.FrozenTrackAssignmentPreparation.LocalClaimDomainFingerprint) and State.FrozenTrackAssignmentPreparation.LocalClaimDomainFingerprint != State.PreRouteLocalClaimDomainFingerprint) or (bool(State.FrozenTrackAssignmentPreparation.CandidateDomainFingerprint) and State.FrozenTrackAssignmentPreparation.CandidateDomainFingerprint != CandidateDomainFingerprint):
-            raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='FrozenTrackAssignmentHandoff', RepairActions=(), Detail='the authoritative candidate domain no longer contains the pre-placement capacity witness', Diagnostics={'Complete': False, 'FrozenSignalCount': len(FrozenSignals), 'RoutedSignalCount': len(State.CandidatesBySignal), 'MissingFrozenSelections': [list(Value) for Value in MissingFrozenSelections[:16]], 'MissingFrozenLocalSelections': [list(Value) for Value in MissingFrozenLocalSelections[:16]], 'FrozenLocalClaimDomainFingerprint': State.FrozenTrackAssignmentPreparation.LocalClaimDomainFingerprint, 'CurrentLocalClaimDomainFingerprint': State.PreRouteLocalClaimDomainFingerprint, 'FrozenCandidateDomainFingerprint': State.FrozenTrackAssignmentPreparation.CandidateDomainFingerprint, 'CurrentCandidateDomainFingerprint': CandidateDomainFingerprint}))
+        FrozenPreparationDiagnostics = dict(
+            State.FrozenTrackAssignmentPreparation.Diagnostics
+        )
+        FrozenPinAccessWitnessFingerprint = str(
+            FrozenPreparationDiagnostics.get(
+                'PlacementPinAccessWitnessFingerprint',
+                '',
+            )
+        )
+        CurrentPinAccessWitnessFingerprint = (
+            State.PlacementPinAccessWitness.WitnessFingerprint
+        )
+        PinAccessWitnessMismatch = bool(
+            FrozenPinAccessWitnessFingerprint
+            and FrozenPinAccessWitnessFingerprint
+            != CurrentPinAccessWitnessFingerprint
+        )
+        if FrozenSignals != frozenset(State.CandidatesBySignal) or len(FrozenSignals) != len(FrozenSelections) + len(FrozenLocalSelections) or MissingFrozenSelections or MissingFrozenLocalSelections or (bool(State.FrozenTrackAssignmentPreparation.LocalClaimDomainFingerprint) and State.FrozenTrackAssignmentPreparation.LocalClaimDomainFingerprint != State.PreRouteLocalClaimDomainFingerprint) or (bool(State.FrozenTrackAssignmentPreparation.CandidateDomainFingerprint) and State.FrozenTrackAssignmentPreparation.CandidateDomainFingerprint != CandidateDomainFingerprint) or PinAccessWitnessMismatch:
+            raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='FrozenTrackAssignmentHandoff', RepairActions=(), Detail='the authoritative candidate domain no longer contains the pre-placement capacity witness', Diagnostics={'Complete': False, 'FrozenSignalCount': len(FrozenSignals), 'RoutedSignalCount': len(State.CandidatesBySignal), 'MissingFrozenSelections': [list(Value) for Value in MissingFrozenSelections[:16]], 'MissingFrozenLocalSelections': [list(Value) for Value in MissingFrozenLocalSelections[:16]], 'FrozenLocalClaimDomainFingerprint': State.FrozenTrackAssignmentPreparation.LocalClaimDomainFingerprint, 'CurrentLocalClaimDomainFingerprint': State.PreRouteLocalClaimDomainFingerprint, 'FrozenCandidateDomainFingerprint': State.FrozenTrackAssignmentPreparation.CandidateDomainFingerprint, 'CurrentCandidateDomainFingerprint': CandidateDomainFingerprint, 'FrozenPinAccessWitnessFingerprint': FrozenPinAccessWitnessFingerprint, 'CurrentPinAccessWitnessFingerprint': CurrentPinAccessWitnessFingerprint}))
         State.Result = Services.SimpleNamespace(Success=True, SelectedCandidateIds=(*FrozenSelections, *FrozenLocalSelections), ExpansionCount=0, ConflictSignals=(), ConflictResourceIndices=(), BudgetExhausted=False, DeadlineExceeded=False)
-        State.WorkTelemetry['PrePlacementTrackAssignmentHandoff'] = {'Applied': True, 'SelectedSignalCount': len(FrozenSignals), 'SelectedLocalClaimChoiceCount': len(FrozenLocalSelections), 'PrePlacementExpansionCount': State.FrozenTrackAssignmentPreparation.ExpansionCount, 'NativeAssignmentExpansionCount': 0}
+        State.WorkTelemetry['PrePlacementTrackAssignmentHandoff'] = {
+            'Applied': True,
+            'SelectedSignalCount': len(FrozenSignals),
+            'SelectedLocalClaimChoiceCount': len(FrozenLocalSelections),
+            'PrePlacementExpansionCount': (
+                State.FrozenTrackAssignmentPreparation.ExpansionCount
+            ),
+            'NativeAssignmentExpansionCount': 0,
+            'PlacementPinAccessWitness': dict(
+                State.WorkTelemetry['PlacementPinAccessWitness']
+            ),
+        }
     if State.Result is None and State.Policy.TrackAssignment.MinimizeMaximumRoutingLayer and all(State.CandidatesBySignal.values()):
         MinimumFeasibleLayer = max((min((Candidate.Layer for Candidate in Values)) for Values in State.CandidatesBySignal.values()))
         MaximumCandidateLayer = max((Candidate.Layer for Values in State.CandidatesBySignal.values() for Candidate in Values))
@@ -465,5 +551,5 @@ def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: Authori
     if State.PrepareTrackAssignmentOnly:
         SelectedLocalClaimChoiceIds = tuple(sorted(((str(Signal), str(CandidateId)) for Signal, CandidateId in State.Result.SelectedCandidateIds if str(CandidateId) in State.PreRouteLocalClaimChoiceById)))
         SelectedCapacityResourceIds = tuple(sorted({str(ResourceId) for Signal, CandidateId in State.Result.SelectedCandidateIds for ResourceId in (State.PreRouteLocalClaimChoiceById[str(CandidateId)].Claim.Claims.ResourceIds if str(CandidateId) in State.PreRouteLocalClaimChoiceById else State.CandidateLookup[str(CandidateId)].Claims.ResourceIds if str(CandidateId) in State.CandidateLookup else ())}))
-        raise Services.TrackAssignmentPrepared(Services.TrackAssignmentPreparation(Success=bool(State.Result.Success), SelectedCandidateIds=tuple(sorted(((str(Signal), str(CandidateId)) for Signal, CandidateId in State.Result.SelectedCandidateIds if str(CandidateId) not in State.PreRouteLocalClaimChoiceById))), CandidateCounts=tuple(sorted(((str(Signal), len(Candidates) + len(State.PreRouteLocalClaimChoicesBySignal.get(str(Signal), ()))) for Signal, Candidates in State.CandidatesBySignal.items()))), ConflictSignals=tuple(sorted(map(str, getattr(State.Result, 'ConflictSignals', ())))), ConflictResourceIndices=tuple(sorted(map(int, getattr(State.Result, 'ConflictResourceIndices', ())))), ExpansionCount=int(State.Result.ExpansionCount), Complete=not bool(getattr(State.Result, 'BudgetExhausted', False) or getattr(State.Result, 'DeadlineExceeded', False)), SelectedLocalClaimChoiceIds=SelectedLocalClaimChoiceIds, LocalClaimDomainFingerprint=State.PreRouteLocalClaimDomainFingerprint, CandidateDomainFingerprint=CandidateDomainFingerprint, SelectedCapacityResourceIds=SelectedCapacityResourceIds))
+        raise Services.TrackAssignmentPrepared(Services.TrackAssignmentPreparation(Success=bool(State.Result.Success), SelectedCandidateIds=tuple(sorted(((str(Signal), str(CandidateId)) for Signal, CandidateId in State.Result.SelectedCandidateIds if str(CandidateId) not in State.PreRouteLocalClaimChoiceById))), CandidateCounts=tuple(sorted(((str(Signal), len(Candidates) + len(State.PreRouteLocalClaimChoicesBySignal.get(str(Signal), ()))) for Signal, Candidates in State.CandidatesBySignal.items()))), ConflictSignals=tuple(sorted(map(str, getattr(State.Result, 'ConflictSignals', ())))), ConflictResourceIndices=tuple(sorted(map(int, getattr(State.Result, 'ConflictResourceIndices', ())))), ExpansionCount=int(State.Result.ExpansionCount), Complete=not bool(getattr(State.Result, 'BudgetExhausted', False) or getattr(State.Result, 'DeadlineExceeded', False)), Diagnostics=(('PlacementPinAccessWitnessFingerprint', State.PlacementPinAccessWitness.WitnessFingerprint), ('PlacementPinAccessWitnessAccessLength', State.PlacementPinAccessWitness.AccessLength)), SelectedLocalClaimChoiceIds=SelectedLocalClaimChoiceIds, LocalClaimDomainFingerprint=State.PreRouteLocalClaimDomainFingerprint, CandidateDomainFingerprint=CandidateDomainFingerprint, SelectedCapacityResourceIds=SelectedCapacityResourceIds))
     return PhaseOutcome()

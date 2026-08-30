@@ -20,7 +20,7 @@ from .Candidates import PcbPlacementCandidate
 from .Demand import MeasurePlacementTopologyDemand
 from .Feedback import BuildPlacementFingerprint, ExtractCandidateStarvationSignals, ExtractPlacementRelocationSignals, FailurePrefersDirectOnlyPlacement, FailureRequestsPlacementAdvance, RequiresImmediateAssignmentCutRelocation, SelectCutDrivenClusterRefinementSignals, SelectReleasableLocalClaimSignals
 from .Portfolios import ApplyActivePlacementAssignmentConstraints, ApplyCoordinatedCandidateDiversificationProfile, BuildPendingJointPlacementPortfolioFingerprint, BuildPendingJointPlacementPortfolioIdentity, BuildPendingJointPlacementStateKey, BuildSamePlacementRoutingControlRetryState, HasActiveMaterializedJointPlacementCandidate, HasCurrentMaterializedJointPlacementCandidate, HasCurrentPendingJointPlacementState, PendingJointPlacementState, PendingJointPlacementStateMatchesIdentity, PlacementAssignmentConstraintsAreActive, PlacementCandidateMatchesActiveJointPortfolio, PlacementConstraintFingerprintMatchesIdentity, RebindTerminalJointPlacementConstraintEpoch, RetainUnmaterializedJointPlacementStates, RoutingControlAttemptIdentity, SelectNewPendingJointPlacementPortfolioFingerprint, ShouldDeferSamePlacementRoutingControlRetry, ShouldRefreshTerminalActiveJointPlacementConstraintEpoch, ShouldRetrySamePlacementRoutingControl
-from .Preparation import BuildDerivedPlacementCandidate, BuildFrozenEnvelopeRoutingPolicy, BuildPlacementRetentionFingerprint, PlacementCandidateIsExactAccessLegal, PlacementPortfolioGenerationNotAfter, RequiresDenseBoundaryRoutingReserve, ShouldEnableClusterBoundaryLeaseInterface, ShouldGiveRankedJointPortfolioLeadSlice, SummarizePreRouteAccessFabric, TopologyPortfolioRoutingFraction
+from .Preparation import BuildDerivedPlacementCandidate, BuildFrozenEnvelopeRoutingPolicy, BuildPlacementRetentionFingerprint, PlacementCandidateIsExactAccessLegal, PlacementPortfolioGenerationNotAfter, RequiresDenseBoundaryRoutingReserve, RequiresExactClusterInterfaceSolve, ShouldEnableClusterBoundaryLeaseInterface, ShouldGiveRankedJointPortfolioLeadSlice, SummarizePreRouteAccessFabric, TopologyPortfolioRoutingFraction
 from .Results import PcbProgress
 from functools import partial
 from .State import (
@@ -62,13 +62,58 @@ def SolvePrePlacementCapacityProblem(Context, Candidates: Iterable[PcbPlacementC
         if Fabric is not None and (not Fabric.Complete):
             Preparations.append({'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint, 'Success': False, 'SelectedCandidateIds': [], 'CandidateCounts': [], 'ConflictSignals': [], 'ConflictResourceIndices': [], 'ExpansionCount': 0, 'Complete': False, 'IncompleteReason': Fabric.IncompleteReason, 'PlacementAccessFabric': Fabric.ToDictionary()})
             continue
+        DeferToExactClusterInterfaceSolve = (
+            AccessAssignment is None
+            and RequiresExactClusterInterfaceSolve(
+                Candidate.TopologyDemand,
+                Candidate.Placement.Placed,
+                Context.Policy,
+            )
+        )
+        if DeferToExactClusterInterfaceSolve:
+            FabricComplete = PlacementCandidateIsExactAccessLegal(Candidate)
+            Preparations.append({
+                'CandidateId': Candidate.CandidateId,
+                'PlacementFingerprint': Candidate.PlacementFingerprint,
+                'Success': FabricComplete,
+                'SelectedCandidateIds': [],
+                'CandidateCounts': [],
+                'ConflictSignals': [],
+                'ConflictResourceIndices': [],
+                'ExpansionCount': int(
+                    getattr(Fabric, 'LegalEscapeExpansionCount', 0)
+                ),
+                'Complete': FabricComplete,
+                'IncompleteReason': (
+                    '' if FabricComplete else 'missing-access-fabric'
+                ),
+                'DeferredToExactClusterInterfaceSolve': True,
+                'PlacementAccessFabric': (
+                    Fabric.ToDictionary() if Fabric is not None else None
+                ),
+            })
+            if FabricComplete:
+                Feasible.append(Candidate)
+            continue
         if AccessAssignment is None:
             CandidateResources = Context.RoutingResourcesByCandidateId.get(Candidate.CandidateId) or Context.RoutingResourcesByFingerprint.get(Candidate.PlacementFingerprint)
             if CandidateResources is None:
                 CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placement.Placed)
                 Context.RoutingResourcesByFingerprint[Candidate.PlacementFingerprint] = CandidateResources
             try:
-                Preparation = PrepareTrackAssignment(Candidate.Placement, Resources=CandidateResources, Policy=Context.Policy, Deadline=Context.Deadline)
+                Preparation = PrepareTrackAssignment(
+                    Candidate.Placement,
+                    Resources=CandidateResources,
+                    Policy=Context.Policy,
+                    Deadline=Context.Deadline,
+                    DeferClusterBoundaryLeaseUntilCapacityPrecheck=(
+                        RequiresExactClusterInterfaceSolve(
+                            Candidate.TopologyDemand,
+                            Candidate.Placement.Placed,
+                            Context.Policy,
+                        )
+                    ),
+                )
             except RoutingStageError as Error:
                 if not (Error.Failure.Reason == RoutingFailureReason.ClusterInterfaceSolveIncomplete and Error.Failure.Stage == 'LocalClaimReleasePreScreen'):
                     raise
@@ -98,19 +143,67 @@ def PublishPreRouteTemplate(Context, Candidate: PcbPlacementCandidate, Fabric: A
     if Assignment is None:
         Assignment = CachedAssignment
     Preparation = None
-    Complete = bool(Fabric is not None and Fabric.Complete) if Context.SinglePackedComponent else bool(Assignment is not None and Assignment.Complete)
-    Success = Complete if Context.SinglePackedComponent else bool(Assignment is not None and Assignment.Success)
-    CapacityResources = tuple(sorted(map(str, getattr(Fabric, 'CapacityResourceIds', ())))) if Context.SinglePackedComponent else tuple(sorted({*(str(Value) for Value in (getattr(Assignment, 'CapacityResourceIds', getattr(Assignment, 'SelectedCapacityResourceIds', ())) if Assignment is not None else ()))}))
+    DeferredToExactClusterInterfaceSolve = bool(
+        not Context.SinglePackedComponent
+        and Assignment is None
+        and PlacementCandidateIsExactAccessLegal(Candidate)
+        and RequiresExactClusterInterfaceSolve(
+            Candidate.TopologyDemand,
+            Candidate.Placement.Placed,
+            Context.Policy,
+        )
+    )
+    Complete = (
+        bool(Fabric is not None and Fabric.Complete)
+        if Context.SinglePackedComponent
+        else DeferredToExactClusterInterfaceSolve
+        or bool(Assignment is not None and Assignment.Complete)
+    )
+    Success = (
+        Complete
+        if Context.SinglePackedComponent
+        else DeferredToExactClusterInterfaceSolve
+        or bool(Assignment is not None and Assignment.Success)
+    )
+    CapacityResources = (
+        tuple(sorted(map(str, getattr(Fabric, 'CapacityResourceIds', ()))))
+        if Context.SinglePackedComponent
+        or DeferredToExactClusterInterfaceSolve
+        else tuple(sorted({
+            str(Value)
+            for Value in (
+                getattr(
+                    Assignment,
+                    'CapacityResourceIds',
+                    getattr(Assignment, 'SelectedCapacityResourceIds', ()),
+                )
+                if Assignment is not None
+                else ()
+            )
+        }))
+    )
     FrozenOrdinaryCandidateIds: tuple[tuple[str, str], ...] = ()
     FrozenLocalClaimChoiceIds: tuple[tuple[str, str], ...] = ()
     FrozenLocalClaimDomainFingerprint = ''
     OfferedLocalClaims = Candidate.Placement.DerivedLocalRouteClaims or Candidate.Placement.Placed.DerivedLocalRouteClaims or Candidate.Placement.Placed.LocalRouteClaims or ()
-    AccessLength = sum((min((len(Stub.Path) for Stub in Domain.EscapeStubs)) for Domain in getattr(Fabric, 'TerminalDomains', ()) if Domain.EscapeStubs)) if Context.SinglePackedComponent else sum((len(Nodes) for _Signal, Nodes in getattr(Assignment, 'SignalRoutes', ())))
+    AccessLength = (
+        sum(
+            min(len(Stub.Path) for Stub in Domain.EscapeStubs)
+            for Domain in getattr(Fabric, 'TerminalDomains', ())
+            if Domain.EscapeStubs
+        )
+        if Context.SinglePackedComponent
+        or DeferredToExactClusterInterfaceSolve
+        else sum(
+            len(Nodes)
+            for _Signal, Nodes in getattr(Assignment, 'SignalRoutes', ())
+        )
+    )
     AccessMaterial = len(getattr(Fabric.PhysicalClaims, 'WireCells', ())) if Context.SinglePackedComponent and Fabric is not None else len(CapacityResources)
     DerivedPlacement = BuildDerivedPlacementCandidate(Candidate, CandidateEnvelope, Complete=Complete, WorkCount=int(getattr(Fabric, 'LegalEscapeExpansionCount', 0)) if Context.SinglePackedComponent else int(getattr(Assignment, 'ExpansionCount', 0)), IncompleteReason='' if Complete else Fabric.IncompleteReason if Context.SinglePackedComponent and Fabric is not None else Assignment.IncompleteReason if Assignment is not None else 'missing-pre-route-witness', FullEnvelopeBounds=tuple(map(int, Fabric.OuterBounds)) if Fabric is not None and Fabric.OuterBounds is not None else None)
     TemplateObjective = (*DerivedPlacement.ObjectivePrefix, AccessMaterial, AccessLength, int(Candidate.EstimatedGlobalExtensionNodes))
     Context.PreRouteObjectiveByCandidateId[Candidate.CandidateId] = TemplateObjective
-    Witnesses = (PreRouteInterfaceWitness(WitnessId=BuildStableFingerprint((getattr(Fabric, 'FabricFingerprint', '') if Context.SinglePackedComponent else getattr(Assignment, 'AssignmentFingerprint', ''), FrozenOrdinaryCandidateIds, FrozenLocalClaimChoiceIds, CapacityResources)), CapacityResourceIds=CapacityResources, Objective=TemplateObjective, FrozenContract=(Fabric, None) if Context.SinglePackedComponent else (Assignment, Preparation)),) if Success and Complete else ()
+    Witnesses = (PreRouteInterfaceWitness(WitnessId=BuildStableFingerprint((getattr(Fabric, 'FabricFingerprint', '') if Context.SinglePackedComponent else ('deferred-exact-cluster-interface', Candidate.PlacementFingerprint) if DeferredToExactClusterInterfaceSolve else getattr(Assignment, 'AssignmentFingerprint', ''), FrozenOrdinaryCandidateIds, FrozenLocalClaimChoiceIds, CapacityResources)), CapacityResourceIds=CapacityResources, Objective=TemplateObjective, FrozenContract=(Fabric, None) if Context.SinglePackedComponent else (None, None) if DeferredToExactClusterInterfaceSolve else (Assignment, Preparation)),) if Success and Complete else ()
     Template = PreRouteInterfaceTemplate(ComponentId='__placement__', TemplateId=Candidate.CandidateId, GeometryFingerprint=Candidate.PlacementFingerprint, LocalClaimsFingerprint=BuildStableFingerprint((tuple((str(Value) for Value in OfferedLocalClaims)), FrozenLocalClaimDomainFingerprint)), TerminalDomainFingerprint=Fabric.FabricFingerprint if Fabric is not None else '', SeamDomainFingerprint=BuildStableFingerprint((FrozenOrdinaryCandidateIds, FrozenLocalClaimChoiceIds, CapacityResources)), Witnesses=Witnesses, Complete=Complete, DerivedPlacement=DerivedPlacement, RoutingEnvelope=CandidateEnvelope, AccessRingTrackCount=int(getattr(Fabric, 'AccessRingTrackCount', CandidateEnvelope.AccessRingTrackCount)), AccessRingFingerprint=str(getattr(Fabric, 'AccessRingFingerprint', '')), IncompleteReason=Fabric.IncompleteReason if Context.SinglePackedComponent and Fabric is not None else Assignment.IncompleteReason if Assignment is not None else 'missing-pre-route-witness')
     Context.PreRouteTemplates.append(Template)
     return Template
@@ -232,7 +325,7 @@ def _RouteWithFailedLocalClaimsReleased(Context, CandidatePlacement: PcbPlacemen
 
 def RecordRoutedCandidate(Context, Candidate: PcbPlacementCandidate, CandidatePlacement: PcbPlacement, CandidateRouted: RoutedDesign) -> None:
     """Score legal routed placements by final volume, then route share."""
-    from SchemEncoder.Writer262 import BuildLitematicBlockMap
+    from SchemEncoder.SchemWriter import BuildLitematicBlockMap
     Composition = BuildLitematicBlockMap(CandidateRouted).Composition
     Score = (Composition.FullFootprint, Composition.RoutingFunctionalShare, Composition.RoutingOwnedFunctionalBlocks, Composition.Footprint, Composition.NonAirBlocks, Composition.Width, Composition.Depth, Candidate.CandidateId)
     Diagnostics: dict[str, object] = {'CandidateId': Candidate.CandidateId, 'RoutingFunctionalShare': Composition.RoutingFunctionalShare, 'RoutingOwnedFunctionalBlocks': Composition.RoutingOwnedFunctionalBlocks, 'NonAirBlocks': Composition.NonAirBlocks, 'Footprint': Composition.Footprint, 'XYFootprint': Composition.XYFootprint, 'FullFootprint': Composition.FullFootprint, 'Width': Composition.Width, 'Height': Composition.Height, 'Depth': Composition.Depth, 'Score': list(Score[:-1])}
@@ -260,7 +353,23 @@ def MaterializeSelectedJointPlacementLocalRouting(Context, Candidate: PcbPlaceme
     MaterializationStarted = Context.Services.monotonic()
     WorkCheck({'Phase': 'local-routing-materialization-start', 'CandidateId': Candidate.CandidateId})
     PackingPolicy = State.Request.PackingPolicy
-    Materialized = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=State.RoutingSpacing, PlacementPolicy=Context.Policy.Placement, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=PackingPolicy, RelocationSignals=State.RelocationSignals, RelocationPrioritySignals=State.RelocationPrioritySignals, RequiredRelocationSignals=State.RequiredRelocationSignals, RelocationVariant=State.RelocationVariant, JointPlacementCandidateIndex=State.CandidateIndex, AssignmentCut=State.AssignmentCut, AssignmentConstraints=State.AssignmentConstraints, CoordinatedCandidateDiversificationSignals=State.CoordinatedCandidateDiversificationSignals, EnableClusterLocalRouteReuse=State.EnableClusterLocalRouteReuse or bool(ScoringDiagnostics.get('__ClusterPinBankRepair__', {})) or bool(State.AssignmentCut is not None and len(State.AssignmentCut.PairwiseConflictEdges) >= 2 and (Candidate.TopologyDemand is not None) and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)) or bool(Candidate.TopologyDemand is not None and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)), EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio, IsPostPinBankRepairEpoch=State.IsPostPinBankRepairEpoch), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=SelectCutDrivenClusterRefinementSignals(State.AssignmentCut, Context.SignalTopologyFingerprints, Constraints=State.AssignmentConstraints) if Context.TopologyDemand.RequiresJointPortfolio else None, EnableInternalPinBankGeometryRepair=State.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=State.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=State.Request.UseCurrentAssignmentCutRelocationSignals, TopologyCutFrontier=State.TopologyCutFrontier, PlacementScoringOnly=False, WorkCheck=WorkCheck)
+    PhysicalProofCoreFocusedPlacement = bool(State.PhysicalProofCoreSignals)
+    CutDrivenClusterRefinementSignals = (
+        State.PhysicalProofCoreSignals
+        if PhysicalProofCoreFocusedPlacement
+        else SelectCutDrivenClusterRefinementSignals(
+            State.AssignmentCut,
+            Context.SignalTopologyFingerprints,
+            Constraints=State.AssignmentConstraints,
+        )
+        if Context.TopologyDemand.RequiresJointPortfolio
+        else None
+    )
+    FocusedCutEpochPlacement = bool(
+        State.Request.UseCurrentAssignmentCutRelocationSignals
+        or PhysicalProofCoreFocusedPlacement
+    )
+    Materialized = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=State.RoutingSpacing, PlacementPolicy=Context.Policy.Placement, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=PackingPolicy, RelocationSignals=State.RelocationSignals, RelocationPrioritySignals=State.RelocationPrioritySignals, RequiredRelocationSignals=State.RequiredRelocationSignals, RelocationVariant=State.RelocationVariant, JointPlacementCandidateIndex=State.CandidateIndex, AssignmentCut=State.AssignmentCut, AssignmentConstraints=State.AssignmentConstraints, CoordinatedCandidateDiversificationSignals=State.CoordinatedCandidateDiversificationSignals, EnableClusterLocalRouteReuse=State.EnableClusterLocalRouteReuse or bool(ScoringDiagnostics.get('__ClusterPinBankRepair__', {})) or bool(State.AssignmentCut is not None and len(State.AssignmentCut.PairwiseConflictEdges) >= 2 and (Candidate.TopologyDemand is not None) and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)) or bool(Candidate.TopologyDemand is not None and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)), EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio, IsPostPinBankRepairEpoch=State.IsPostPinBankRepairEpoch), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=CutDrivenClusterRefinementSignals, FixedConnectivityClusters=State.FixedConnectivityClusters, EnableInternalPinBankGeometryRepair=State.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=State.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=FocusedCutEpochPlacement, TopologyCutFrontier=State.TopologyCutFrontier, PlacementScoringOnly=False, WorkCheck=WorkCheck)
     ExpectedTopologyDemand = Candidate.TopologyDemand
     if ExpectedTopologyDemand is None:
         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='PlacementLocalRoutingMaterialization', Detail='selected local-route materialization lacked its retained topology proof', Diagnostics={'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint}))
@@ -670,13 +779,13 @@ def _TransactionalEndpointRepairPortfolioFingerprint(Context, SourceCandidate: P
     return BuildStableFingerprint(('transactional-cluster-endpoint-repair', SourceCandidate.PlacementFingerprint, Context.CurrentPlacementAssignmentCut.ConflictFingerprint if Context.CurrentPlacementAssignmentCut is not None else '', Context.PlacementAssignmentConstraints.Fingerprint, tuple(sorted(map(str, RepairSignals))), max(1, RepairClusterCount)))
 
 
-def _PublishTransactionalClusterEndpointRepair(Context, SourceCandidate: PcbPlacementCandidate, RepairSignals: frozenset[str], RepairVariant: int=0, RepairClusterCount: int=1, RepairTerminalPositions: frozenset[tuple[int, int, int]]=frozenset()) -> bool:
+def _PublishTransactionalClusterEndpointRepair(Context, SourceCandidate: PcbPlacementCandidate, RepairSignals: frozenset[str], RepairVariant: int=0, RepairClusterCount: int=1, RepairTerminalPositions: frozenset[tuple[int, int, int]]=frozenset(), RepairEndpointGateNames: frozenset[str]=frozenset(), AllowStableMandatoryAccessOwnership: bool=False) -> bool:
     """Publish one access-distinct local ECO without global replacement."""
     if not RepairSignals or SourceCandidate.TopologyDemand is None or (not SourceCandidate.TopologyDemand.RequiresJointPortfolio):
         return False
     StartedAt = Context.Services.monotonic()
     try:
-        Result = BuildTransactionalClusterEndpointRepair(SourceCandidate.Placement, RepairSignals, BeamWidth=min(16, Context.Policy.NandPacking.BeamWidth), RepairVariant=RepairVariant, RepairClusterCount=RepairClusterCount, RepairTerminalPositions=RepairTerminalPositions, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('TransactionalClusterEndpointRepair', {'CandidateId': SourceCandidate.CandidateId, **Diagnostics}))
+        Result = BuildTransactionalClusterEndpointRepair(SourceCandidate.Placement, RepairSignals, BeamWidth=min(16, Context.Policy.NandPacking.BeamWidth), RepairVariant=RepairVariant, RepairClusterCount=RepairClusterCount, RepairTerminalPositions=RepairTerminalPositions, RepairEndpointGateNames=RepairEndpointGateNames, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('TransactionalClusterEndpointRepair', {'CandidateId': SourceCandidate.CandidateId, **Diagnostics}))
     except RoutingStageError as Error:
         Context.PlacementGenerationDecisions.append({'Result': 'transactional-cluster-endpoint-repair-expired', 'CandidateId': SourceCandidate.CandidateId, 'Signals': sorted(RepairSignals), 'Failure': Error.Failure.ToDictionary(), 'ElapsedSeconds': round(Context.Services.monotonic() - StartedAt, 6)})
         return False
@@ -692,8 +801,9 @@ def _PublishTransactionalClusterEndpointRepair(Context, SourceCandidate: PcbPlac
     for Resource, Owners in (*CandidateProfile.CrossConflicts, *CandidateProfile.SelfConflicts):
         MandatoryConflicts.setdefault(Resource, set()).update(map(str, Owners))
     CandidateTopologyDemand = MeasurePlacementTopologyDemand(Context.TopologyDemand, Candidate, MandatoryConflicts=MandatoryConflicts, MandatoryProfile=CandidateProfile)
-    if MandatoryConflicts or CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint == SourceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint:
-        Context.PlacementGenerationDecisions.append({'Result': 'transactional-cluster-endpoint-repair-rejected', 'CandidateId': SourceCandidate.CandidateId, 'Signals': sorted(RepairSignals), 'Diagnostics': {**Result.Diagnostics, 'Reason': 'mandatory-conflict-or-stagnant-ownership', 'MandatoryConflictResourceCount': len(MandatoryConflicts)}, 'ElapsedSeconds': round(Context.Services.monotonic() - StartedAt, 6)})
+    StableMandatoryAccessOwnership = CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint == SourceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+    if MandatoryConflicts or (StableMandatoryAccessOwnership and (not AllowStableMandatoryAccessOwnership)):
+        Context.PlacementGenerationDecisions.append({'Result': 'transactional-cluster-endpoint-repair-rejected', 'CandidateId': SourceCandidate.CandidateId, 'Signals': sorted(RepairSignals), 'Diagnostics': {**Result.Diagnostics, 'Reason': 'mandatory-conflict-or-stagnant-ownership', 'MandatoryConflictResourceCount': len(MandatoryConflicts), 'StableMandatoryAccessOwnership': StableMandatoryAccessOwnership, 'StableMandatoryAccessOwnershipAllowed': AllowStableMandatoryAccessOwnership}, 'ElapsedSeconds': round(Context.Services.monotonic() - StartedAt, 6)})
         return False
     CandidateDiagnostics = dict(Candidate.Placed.LocalRouteDiagnostics or {})
     PortfolioIdentityFingerprint = _TransactionalEndpointRepairPortfolioFingerprint(Context, SourceCandidate, RepairSignals, RepairClusterCount)
@@ -703,7 +813,7 @@ def _PublishTransactionalClusterEndpointRepair(Context, SourceCandidate: PcbPlac
     if CurrentRepairSignalSet not in TransactionalRepairSignalHistory:
         TransactionalRepairSignalHistory.append(CurrentRepairSignalSet)
     EffectiveRepairClusterCount = int(Result.Diagnostics.get('RepairClusterCount', RepairClusterCount))
-    CandidateDiagnostics['__PlacementRecipe__'] = {**SourceRecipe, 'SourceGenerator': 'transactional-cluster-endpoint-repair', 'AssignmentCutFingerprint': Context.CurrentPlacementAssignmentCut.ConflictFingerprint if Context.CurrentPlacementAssignmentCut is not None else '', 'AssignmentConstraintFingerprint': Context.PlacementAssignmentConstraints.Fingerprint, 'JointPortfolioIdentityFingerprint': PortfolioIdentityFingerprint, 'IsPostPinBankRepairEpoch': True, 'EnableInternalPinBankGeometryRepair': True, 'InternalPinBankGeometryRepairSignals': sorted(RepairSignals), 'TransactionalRepairSignalHistory': TransactionalRepairSignalHistory, 'RequiredDistinctPinBankOwnershipFingerprint': SourceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint, 'ReusedPlacedGeometry': True, 'TransactionalClusterEndpointRepair': True, 'TransactionalRepairClusterCount': EffectiveRepairClusterCount}
+    CandidateDiagnostics['__PlacementRecipe__'] = {**SourceRecipe, 'SourceGenerator': 'transactional-cluster-endpoint-repair', 'AssignmentCutFingerprint': Context.CurrentPlacementAssignmentCut.ConflictFingerprint if Context.CurrentPlacementAssignmentCut is not None else '', 'AssignmentConstraintFingerprint': Context.PlacementAssignmentConstraints.Fingerprint, 'JointPortfolioIdentityFingerprint': PortfolioIdentityFingerprint, 'IsPostPinBankRepairEpoch': True, 'EnableInternalPinBankGeometryRepair': True, 'InternalPinBankGeometryRepairSignals': sorted(RepairSignals), 'TransactionalRepairSignalHistory': TransactionalRepairSignalHistory, 'RequiredDistinctPinBankOwnershipFingerprint': '' if AllowStableMandatoryAccessOwnership else SourceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint, 'ReusedPlacedGeometry': True, 'TransactionalClusterEndpointRepair': True, 'TransactionalRepairClusterCount': EffectiveRepairClusterCount}
     Candidate.Placed.LocalRouteDiagnostics = CandidateDiagnostics
     ApplyActivePlacementAssignmentConstraints(Candidate, Context.PlacementAssignmentConstraints)
     _AppliedProfile, CandidateProfileFingerprint = ApplyCoordinatedCandidateDiversificationProfile(Candidate, RepairSignals)
@@ -730,6 +840,6 @@ def _PublishTransactionalClusterEndpointRepair(Context, SourceCandidate: PcbPlac
     Context.NeedsFeedbackPlacementGeneration = False
     Context.InternalPinBankGeometryRepairActive = False
     Context.RequiredDistinctPinBankOwnershipFingerprint = ''
-    Context.PlacementGenerationDecisions.append({'Result': 'transactional-cluster-endpoint-repair-published', 'CandidateId': f'Placement-{Fingerprint[:12]}', 'SourceCandidateId': SourceCandidate.CandidateId, 'Signals': sorted(RepairSignals), 'RepairVariant': RepairVariant, 'RequestedRepairClusterCount': RepairClusterCount, 'RepairClusterCount': EffectiveRepairClusterCount, 'PlacementFingerprint': Fingerprint, 'PlacementRetentionFingerprint': RetentionFingerprint, 'CandidateProfileFingerprint': CandidateProfileFingerprint, 'JointPortfolioIdentityFingerprint': PortfolioIdentityFingerprint, 'MandatoryAccessOwnershipFingerprint': CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint, 'Diagnostics': Result.Diagnostics, 'ElapsedSeconds': round(Context.Services.monotonic() - StartedAt, 6), 'NextAction': 'route-access-distinct-local-eco'})
+    Context.PlacementGenerationDecisions.append({'Result': 'transactional-cluster-endpoint-repair-published', 'CandidateId': f'Placement-{Fingerprint[:12]}', 'SourceCandidateId': SourceCandidate.CandidateId, 'Signals': sorted(RepairSignals), 'RepairVariant': RepairVariant, 'RequestedRepairClusterCount': RepairClusterCount, 'RepairClusterCount': EffectiveRepairClusterCount, 'PlacementFingerprint': Fingerprint, 'PlacementRetentionFingerprint': RetentionFingerprint, 'CandidateProfileFingerprint': CandidateProfileFingerprint, 'JointPortfolioIdentityFingerprint': PortfolioIdentityFingerprint, 'MandatoryAccessOwnershipFingerprint': CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint, 'StableMandatoryAccessOwnership': StableMandatoryAccessOwnership, 'Diagnostics': Result.Diagnostics, 'ElapsedSeconds': round(Context.Services.monotonic() - StartedAt, 6), 'NextAction': 'route-access-distinct-local-eco'})
     Context.JointPlacementStateEvents.append({'Status': 'transactional-cluster-endpoint-repair-published', 'CandidateId': f'Placement-{Fingerprint[:12]}', 'SourceCandidateId': SourceCandidate.CandidateId, 'RepairVariant': RepairVariant, 'ChangedGateCount': Result.Diagnostics.get('ChangedGateCount', 0), 'InvalidatedSignals': Result.Diagnostics.get('InvalidatedSignals', ()), 'PreservedLocalClaimCount': Result.Diagnostics.get('PreservedLocalClaimCount', 0), 'GlobalEnvelopePreserved': True})
     return True

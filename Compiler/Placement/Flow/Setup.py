@@ -12,7 +12,10 @@ from Compiler.Placement.Geometry import PlacedDesign
 from Compiler.Placement.Core.Clusters import PcbPlacement
 from Compiler.Placement.Core.Constraints import PlacementAssignmentConstraintSet
 from .Demand import BuildPlacementGenerationPlan, BuildTopologyDemandPressureProfile, BuildTopologyDemandProfile, ComputeInterfaceStateCountBound, ExactStatePlacementEvaluation, ResolveJointPlacementPortfolioTrigger
-from .Feedback import BuildSignalTopologyFingerprints
+from .Feedback import (
+    BuildSignalLocalIncidenceFingerprints,
+    BuildSignalTopologyFingerprints,
+)
 from .Portfolios import DeferredActivePortfolioAssignmentCut, MandatoryAccessPortfolioEvidence, MandatoryAccessPortfolioIdentity, PendingJointPlacementState
 from .Preparation import RequiresDenseBoundaryRoutingReserve
 from .Results import PcbResult
@@ -28,6 +31,9 @@ def InitializePlacementFlow(Context):
     Context.NandGateCount = sum(((Context.Kind.value if hasattr(SetPlacementFlowState(Context, 'Kind', getattr(Gate, 'Kind', 'NAND')), 'value') else str(Context.Kind)) == 'NAND' for Gate in Context.Module.Gates))
     Context.TopologyDemand = BuildTopologyDemandProfile(Context.Module)
     Context.SignalTopologyFingerprints = BuildSignalTopologyFingerprints(Context.Module)
+    Context.SignalLocalIncidenceFingerprints = (
+        BuildSignalLocalIncidenceFingerprints(Context.Module)
+    )
     Context.InterfaceStateCountBound = ComputeInterfaceStateCountBound(len(Context.SignalTopologyFingerprints), Context.TopologyDemand, Context.NandGateCount)
     Context.TopologyPressure = BuildTopologyDemandPressureProfile(Context.TopologyDemand, Context.Policy.Organization.MaximumClusterEntrances)
     Context.DenseBoundaryRoutingReserve = RequiresDenseBoundaryRoutingReserve(Context.TopologyDemand, Context.Policy)
@@ -36,7 +42,7 @@ def InitializePlacementFlow(Context):
     Context.Services.ValidateNandOnlyDesign(Context.Netlist)
     if not Context.Module.Gates:
         Context.EmptyPlaced = PlacedDesign(Module=Context.Module, PlacedGates=[])
-        Context.EmptyRouted = RoutedDesign(Module=Context.Module, PlacedGates=[], Wires=[], Supports=[], Repeaters={}, NetWires={})
+        Context.EmptyRouted = RoutedDesign(Module=Context.Module, PlacedGates=[], Wires=[], Supports=[], RepeaterInputFacings={}, NetWires={})
         return PcbResult(Placed=Context.EmptyPlaced, Routed=Context.EmptyRouted, Footprint=0, EstimatedBlocks=0, Width=0, Depth=0, Policy=Context.Policy, Technology=Context.Technology, RequestedStrategy=Context.RequestedStrategy.value, UsedStrategy=Context.UsedStrategy.value)
     Context.RoutingSpacing = Context.Policy.Placement.RoutingSpacing
     Context.ConfiguredRoutingSpacing = Context.RoutingSpacing
@@ -379,6 +385,14 @@ def PreparePlacementRouting(Context):
         Context.RoutingResourcesByCandidateId[Context.SelectedPreRouteCandidate.CandidateId] = Context.SelectedCandidateResources
         Context.RoutingResourcesByFingerprint[Context.SelectedPreRouteCandidate.PlacementFingerprint] = Context.SelectedCandidateResources
     Context.SelectedPreparationPolicy = BuildFrozenEnvelopeRoutingPolicy(Context.Policy, Context.SelectedPreRouteCandidate.RoutingEnvelope) if Context.SelectedPreRouteCandidate.RoutingEnvelope is not None and len(Context.SelectedPreRouteCandidate.Placement.Clusters) == 1 else Context.Policy
+    Context.SelectedRequiresExactClusterInterfaceSolve = bool(
+        not Context.SinglePackedComponent
+        and RequiresExactClusterInterfaceSolve(
+            Context.SelectedPreRouteCandidate.TopologyDemand,
+            Context.SelectedPreRouteCandidate.Placement.Placed,
+            Context.Policy,
+        )
+    )
     if Context.SinglePackedComponent:
         if Context.RawTrackAssignmentResult is None or Context.RawTrackAssignmentResult.Preparation is None:
             raise RuntimeError('selected raw pre-route result is missing its frozen track-assignment witness')
@@ -386,13 +400,29 @@ def PreparePlacementRouting(Context):
     else:
         Context.SelectedTrackPreparation = Context.PrePlacementTrackPreparationWitnesses.get(Context.SelectedPreRouteCandidate.CandidateId)
         if Context.SelectedTrackPreparation is None:
-            try:
-                Context.SelectedTrackPreparation = PrepareTrackAssignment(Context.SelectedPreRouteCandidate.Placement, Resources=Context.SelectedCandidateResources, Policy=Context.SelectedPreparationPolicy, Deadline=Context.Deadline)
-            except RoutingStageError as Error:
-                raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='SelectedPreRouteTrackPreparation', AffectedNets=Error.Failure.AffectedNets, Resources=Error.Failure.Resources, Detail='the selected fixed local-access contract could not build one complete authoritative portal/track domain', RepairActions=(), Diagnostics={'PreRouteInterfaceSelection': Context.PreRouteInterfaceResult.ToDictionary(), 'SelectedCandidate': Context.SelectedPreRouteCandidate.ToDictionary(), 'AuthoritativePreparationFailure': Error.Failure.ToDictionary(), 'PrePlacementTrackPreparations': Context.PrePlacementTrackPreparations, 'PlacementDomainComplete': False})) from Error
-    if not Context.SelectedTrackPreparation.Success or not Context.SelectedTrackPreparation.Complete:
+            if not Context.SelectedRequiresExactClusterInterfaceSolve:
+                try:
+                    Context.SelectedTrackPreparation = PrepareTrackAssignment(
+                        Context.SelectedPreRouteCandidate.Placement,
+                        Resources=Context.SelectedCandidateResources,
+                        Policy=Context.SelectedPreparationPolicy,
+                        Deadline=Context.Deadline,
+                        DeferClusterBoundaryLeaseUntilCapacityPrecheck=False,
+                    )
+                except RoutingStageError as Error:
+                    raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='SelectedPreRouteTrackPreparation', AffectedNets=Error.Failure.AffectedNets, Resources=Error.Failure.Resources, Detail='the selected fixed local-access contract could not build one complete authoritative portal/track domain', RepairActions=(), Diagnostics={'PreRouteInterfaceSelection': Context.PreRouteInterfaceResult.ToDictionary(), 'SelectedCandidate': Context.SelectedPreRouteCandidate.ToDictionary(), 'AuthoritativePreparationFailure': Error.Failure.ToDictionary(), 'PrePlacementTrackPreparations': Context.PrePlacementTrackPreparations, 'PlacementDomainComplete': False})) from Error
+    if (
+        Context.SelectedTrackPreparation is not None
+        and (
+            not Context.SelectedTrackPreparation.Success
+            or not Context.SelectedTrackPreparation.Complete
+        )
+    ):
         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='SelectedPreRouteTrackPreparation', AffectedNets=Context.SelectedTrackPreparation.ConflictSignals, Resources=tuple(map(str, Context.SelectedTrackPreparation.ConflictResourceIndices)), Detail='the selected fixed local-access contract has no complete authoritative portal/track witness', RepairActions=(), Diagnostics={'PreRouteInterfaceSelection': Context.PreRouteInterfaceResult.ToDictionary(), 'RawTrackAssignmentSelection': Context.RawTrackAssignmentResult.ToDictionary() if Context.RawTrackAssignmentResult is not None else None, 'SelectedCandidate': Context.SelectedPreRouteCandidate.ToDictionary(), 'SelectedAuthoritativeTrackPreparation': Context.SelectedTrackPreparation.ToDictionary(), 'PrePlacementTrackPreparations': Context.PrePlacementTrackPreparations, 'PlacementDomainComplete': False}))
-    Context.PrePlacementTrackPreparationWitnesses[Context.SelectedPreRouteCandidate.CandidateId] = Context.SelectedTrackPreparation
+    if Context.SelectedTrackPreparation is not None:
+        Context.PrePlacementTrackPreparationWitnesses[
+            Context.SelectedPreRouteCandidate.CandidateId
+        ] = Context.SelectedTrackPreparation
     Context.PrePlacementTrackFeasible = [Context.SelectedPreRouteCandidate]
     Context.PrePlacementTrackPreparationByCandidateId = Context.PrePlacementTrackPreparationWitnesses
     Context.OrderedPlacements = Context.PrePlacementTrackFeasible[:1]

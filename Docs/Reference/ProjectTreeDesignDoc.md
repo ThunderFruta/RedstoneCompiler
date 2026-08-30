@@ -43,7 +43,7 @@ design.
 
 The former placement, routing-model, authoritative-planner, component-stack,
 flat Rust, duplicate NAND, and conflict-repair paths are retired without
-forwarders. `Tests/test_source_structure.py` is the executable source of truth
+forwarders. `Tests/Structural/test_source_structure.py` is the executable source of truth
 for the deleted-path list, one-way imports, cycle freedom, narrow entrypoint
 owners, and physical line/function limits.
 

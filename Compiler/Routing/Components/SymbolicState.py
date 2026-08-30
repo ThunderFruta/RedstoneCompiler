@@ -84,7 +84,7 @@ class ComponentTreeDpNetState:
     Edges: frozenset[RoutingEdge]
     Claims: RoutingResourceClaims
     Root: Position3
-    Repeaters: tuple[tuple[Position3, str], ...]
+    RepeaterInputFacings: tuple[tuple[Position3, str], ...]
     CoveredTerminals: tuple[Position3, ...]
     ExportedPorts: tuple[Position3, ...]
     NetFingerprint: str

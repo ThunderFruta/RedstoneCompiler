@@ -5,8 +5,8 @@
 ```bash
 python3 -m compileall -q Compiler/Placement Compiler/Routing
 python3 -m pytest -q \
-  Tests/test_source_structure.py \
-  Tests/test_routing_contract_schema.py
+  Tests/Structural/test_source_structure.py \
+  Tests/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 ```
 

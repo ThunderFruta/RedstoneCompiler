@@ -24,7 +24,7 @@ from ..Contracts.Component import (
     RoutedComponentNet,
     RoutedComponentTemplate,
 )
-from ..Contracts.Core import Position3
+from ..Contracts.Core import Position2, Position3
 from ..Interfaces.PhysicalClaims import (
     _MergeClaims,
     ComponentClaimsCompatibleForOwners,
@@ -40,7 +40,10 @@ from ..ResourceGraph import (
     RoutingResourceKind,
     RoutingResourceClaims,
 )
-from ..Technology import DefaultRedstoneRoutingTechnology
+from ..Technology import (
+    DefaultRedstoneRoutingTechnology,
+    RepeaterInputFacingForStep,
+)
 
 try:
     from ...RustRouting import (
@@ -242,8 +245,16 @@ def ApplyRoutedComponentGlobalProfiles(
 def BuildComponentEgressPaths(
     Attachment: Position3,
     TargetY: int | None = None,
+    *,
+    EnvelopeMinimum: Position3 | None = None,
+    EnvelopeMaximum: Position3 | None = None,
+    Directions: Iterable[Position2] | None = None,
 ) -> tuple[tuple[Position3, ...], ...]:
-    """Enumerate legal component-to-assigned-global-layer port paths."""
+    """Enumerate straight component-to-global-layer perimeter contracts."""
+    if (EnvelopeMinimum is None) != (EnvelopeMaximum is None):
+        raise ValueError(
+            "component egress requires both envelope bounds or neither"
+        )
     EffectiveTargetY = (
         Attachment[1]
         - DefaultRedstoneRoutingTechnology.RoutingLayerPitch
@@ -254,6 +265,37 @@ def BuildComponentEgressPaths(
         1 if EffectiveTargetY > Attachment[1] else -1
     )
     VerticalDistance = abs(EffectiveTargetY - Attachment[1])
+
+    def RequiredHorizontalDistance(DeltaX: int, DeltaZ: int) -> int:
+        BaseDistance = (
+            VerticalDistance
+            + DefaultRedstoneRoutingTechnology.TrackPitch
+        )
+        if EnvelopeMinimum is None or EnvelopeMaximum is None:
+            return BaseDistance
+        if DeltaX < 0:
+            PerimeterDistance = Attachment[0] - EnvelopeMinimum[0] + 1
+        elif DeltaX > 0:
+            PerimeterDistance = EnvelopeMaximum[0] - Attachment[0] + 1
+        elif DeltaZ < 0:
+            PerimeterDistance = Attachment[2] - EnvelopeMinimum[2] + 1
+        else:
+            PerimeterDistance = EnvelopeMaximum[2] - Attachment[2] + 1
+        return max(BaseDistance, PerimeterDistance)
+
+    CardinalDirections = (
+        (-1, 0),
+        (0, -1),
+        (0, 1),
+        (1, 0),
+    )
+    EffectiveDirections = (
+        CardinalDirections
+        if Directions is None
+        else tuple(dict.fromkeys(tuple(Direction) for Direction in Directions))
+    )
+    if any(Direction not in CardinalDirections for Direction in EffectiveDirections):
+        raise ValueError("component egress directions must be cardinal")
     return tuple(
         (
             Attachment,
@@ -267,18 +309,34 @@ def BuildComponentEgressPaths(
                 )
                 for Distance in range(
                     1,
-                    VerticalDistance
-                    + 1
-                    + DefaultRedstoneRoutingTechnology.TrackPitch,
+                    RequiredHorizontalDistance(DeltaX, DeltaZ) + 1,
                 )
             ),
         )
-        for DeltaX, DeltaZ in (
-            (-1, 0),
-            (0, -1),
-            (0, 1),
-            (1, 0),
-        )
+        for DeltaX, DeltaZ in EffectiveDirections
+    )
+
+
+def SelectGuideFacingComponentEgressDirections(
+    EnvelopeMinimum: Position3,
+    EnvelopeMaximum: Position3,
+    GuideCells: Iterable[Position2],
+) -> tuple[Position2, ...]:
+    """Return the perimeter sides selected by exterior coarse-guide cells."""
+    Selected: set[Position2] = set()
+    for X, Z in GuideCells:
+        if X < EnvelopeMinimum[0]:
+            Selected.add((-1, 0))
+        if X > EnvelopeMaximum[0]:
+            Selected.add((1, 0))
+        if Z < EnvelopeMinimum[2]:
+            Selected.add((0, -1))
+        if Z > EnvelopeMaximum[2]:
+            Selected.add((0, 1))
+    return tuple(
+        Direction
+        for Direction in ((-1, 0), (0, -1), (0, 1), (1, 0))
+        if Direction in Selected
     )
 
 
@@ -377,6 +435,7 @@ def AugmentComponentRoutingFabric(
     Fabric: ComponentRoutingFabric,
     Attachments: Iterable[Position3],
     ResourceGraph: Any,
+    ProtectedAccessNodes: frozenset[Position3] = frozenset(),
 ) -> ComponentRoutingFabric:
     """Grow the existing lane forest to declared port domains.
 
@@ -392,6 +451,28 @@ def AugmentComponentRoutingFabric(
         return Fabric
     Nodes = set(Fabric.Nodes)
     Edges = set(Fabric.Edges)
+    ProtectedAccessClaims = (
+        ResourceGraph.BuildRouteClaims(ProtectedAccessNodes)
+        if ProtectedAccessNodes
+        else RoutingResourceClaims()
+    )
+    if ProtectedAccessNodes:
+        ProtectedIncompatibleNodes = {
+            Node
+            for Node in Nodes
+            if FindSelfClaimConflicts({
+                "component-access-existing-fabric": _MergeClaims((
+                    ProtectedAccessClaims,
+                    ResourceGraph.BuildRouteClaims((Node,)),
+                )),
+            })
+        }
+        Nodes.difference_update(ProtectedIncompatibleNodes)
+        Edges = {
+            Edge
+            for Edge in Edges
+            if Edge[0] in Nodes and Edge[1] in Nodes
+        }
     Anchors = tuple((*Nodes, *Requested))
     MinimumX = min(Value[0] for Value in Anchors) - 2
     MaximumX = max(Value[0] for Value in Anchors) + 2
@@ -427,6 +508,22 @@ def AugmentComponentRoutingFabric(
                     is None
                 ):
                     continue
+                if ProtectedAccessNodes:
+                    Prefix = [Neighbor, Current]
+                    while Prefix[-1] != Attachment:
+                        Parent = Previous[Prefix[-1]]
+                        assert Parent is not None
+                        Prefix.append(Parent)
+                    PrefixClaims = ResourceGraph.BuildRouteClaims(
+                        frozenset(Prefix)
+                    )
+                    if FindSelfClaimConflicts({
+                        "component-access-augmentation": _MergeClaims((
+                            ProtectedAccessClaims,
+                            PrefixClaims,
+                        )),
+                    }):
+                        continue
                 Previous[Neighbor] = Current
                 if Neighbor in Nodes:
                     Reached = Neighbor
@@ -502,6 +599,8 @@ def BridgeDisconnectedOwnedSignalFabric(
     Fabric: ComponentRoutingFabric,
     Domains: Iterable[ComponentTerminalAccessDomain],
     ResourceGraph: Any,
+    *,
+    ProtectedAccessNodes: frozenset[Position3] = frozenset(),
 ) -> ComponentRoutingFabric:
     """Add a legal channel bridge when one owned net spans forest islands.
 
@@ -579,34 +678,84 @@ def BridgeDisconnectedOwnedSignalFabric(
             for Node, ComponentIndex in ComponentByNode.items()
             if ComponentIndex == TargetComponent
         )
+        SourceComponent = ComponentByNode[Start]
+        SourceNodes = frozenset(
+            Node
+            for Node, ComponentIndex in ComponentByNode.items()
+            if ComponentIndex == SourceComponent
+        )
         Minimum = tuple(min(Value[Index] for Value in (*Nodes, Start, Target)) - 2 for Index in range(3))
         Maximum = tuple(max(Value[Index] for Value in (*Nodes, Start, Target)) + 2 for Index in range(3))
+        # Access domains for different signals are alternatives that the
+        # exact component solver still has to select.  Treating every
+        # protected candidate as one same-signal route can manufacture a
+        # self-conflict before that CSP runs and prevent an otherwise legal
+        # bridge.  The bridge itself only has to coexist with the access
+        # candidates of the owned signal whose disconnected islands it joins.
+        SignalAccessNodes = frozenset(
+            Position
+            for Domain in SignalDomains
+            for Candidate in Domain.Candidates
+            for Position in Candidate.Path
+            if (
+                not ProtectedAccessNodes
+                or Position in ProtectedAccessNodes
+            )
+        )
+        # The source and target fabric components are finite option spaces,
+        # not wires that are all occupied together.  Folding every fabric
+        # node into the bridge claim rejects legal paths whenever unrelated
+        # branches would self-connect.  Exact subtree materialization later
+        # selects and validates the actually energized fabric nodes.
+        BaseClaims = ResourceGraph.BuildRouteClaims(
+            SignalAccessNodes
+        )
+        if FindSelfClaimConflicts({Signal: BaseClaims}):
+            continue
         Pending = deque((Start,))
-        Previous: dict[Position3, Position3 | None] = {Start: None}
+        Paths: dict[Position3, tuple[Position3, ...]] = {Start: (Start,)}
+        ClaimsByNode: dict[Position3, RoutingResourceClaims] = {
+            Start: BaseClaims,
+        }
         Reached: Position3 | None = None
         while Pending and Reached is None:
             Current = Pending.popleft()
             for Neighbor in sorted(ResourceGraph.Technology.NeighborPositions(Current)):
+                Primitive = ResourceGraph.BuildPrimitive(Current, Neighbor)
                 if (
-                    Neighbor in Previous
+                    Neighbor in Paths
                     or any(Neighbor[Index] < Minimum[Index] or Neighbor[Index] > Maximum[Index] for Index in range(3))
                     or (Neighbor in Nodes and Neighbor not in TargetNodes)
-                    or ResourceGraph.BuildPrimitive(Current, Neighbor) is None
+                    or Primitive is None
                 ):
                     continue
-                Previous[Neighbor] = Current
+                CandidatePath = (*Paths[Current], Neighbor)
+                AdjacentPrimitiveClaims = tuple(
+                    AdjacentPrimitive.Claims
+                    for Adjacent in ResourceGraph.Technology.NeighborPositions(Neighbor)
+                    if Adjacent in ClaimsByNode[Current].WireCells
+                    if (
+                        AdjacentPrimitive := ResourceGraph.BuildPrimitive(
+                            Adjacent,
+                            Neighbor,
+                        )
+                    ) is not None
+                )
+                CandidateClaims = _MergeClaims((
+                    ClaimsByNode[Current],
+                    *AdjacentPrimitiveClaims,
+                ))
+                if FindSelfClaimConflicts({Signal: CandidateClaims}):
+                    continue
+                Paths[Neighbor] = CandidatePath
+                ClaimsByNode[Neighbor] = CandidateClaims
                 if Neighbor in TargetNodes:
                     Reached = Neighbor
                     break
                 Pending.append(Neighbor)
         if Reached is None:
             continue
-        Path = [Reached]
-        while Path[-1] != Start:
-            Parent = Previous[Path[-1]]
-            assert Parent is not None
-            Path.append(Parent)
-        Path.reverse()
+        Path = Paths[Reached]
         Nodes.update(Path)
         Edges.update(
             _NormalizedEdge(First, Second)
@@ -739,14 +888,15 @@ def BuildCoalescedComponentAccessCandidates(
             + abs(Terminal[2] - Merge[2]),
             Trunk.CandidateFingerprint,
             MergeIndex,
+            TrunkIndex,
             Trunk,
             Merge,
         )
-        for Trunk in Trunks
+        for TrunkIndex, Trunk in enumerate(Trunks)
         for MergeIndex, Merge in enumerate(Trunk.Path)
         if Merge[1] == Terminal[1]
     )
-    for _Distance, _Fingerprint, MergeIndex, Trunk, Merge in RankedMerges:
+    for _Distance, _Fingerprint, MergeIndex, _TrunkIndex, Trunk, Merge in RankedMerges:
         if len(Results) >= MaximumFlatCandidates:
             break
         for XFirst in (True, False):
@@ -866,13 +1016,14 @@ def BuildCoalescedComponentAccessCandidates(
             ),
             Trunk.CandidateFingerprint,
             MergeIndex,
+            TrunkIndex,
             Trunk,
             Merge,
         )
-        for Trunk in Trunks
+        for TrunkIndex, Trunk in enumerate(Trunks)
         for MergeIndex, Merge in enumerate(Trunk.Path)
     )
-    for _Distance, _Fingerprint, MergeIndex, Trunk, Merge in AllMerges:
+    for _Distance, _Fingerprint, MergeIndex, _TrunkIndex, Trunk, Merge in AllMerges:
         FirstSteps = (None, *sorted(NeighborPositions(Terminal)))
         for FirstStep in FirstSteps:
             Branch = BuildBoundedBranch(Merge, Trunk, FirstStep)
@@ -1171,9 +1322,18 @@ def SelectClosedComponentOwnedTerminalPairs(
         ),
         None,
     )
-    ComponentGateNames = frozenset(
-        getattr(TopologyComponent, "GateNames", ())
-    )
+    ComponentGateNames = frozenset((
+        *getattr(TopologyComponent, "GateNames", ()),
+        *(
+            Name
+            for Cluster in (
+                getattr(Placed, "PackedClusters", ()) or ()
+            )
+            if int(getattr(Cluster, "ClusterId", -1))
+            in SelectedClusterSet
+            for Name in getattr(Cluster, "MemberNands", ())
+        ),
+    ))
     ComponentPairs: set[tuple[str, Position3]] = set()
     for Request in BoundaryRequests:
         Signal = str(Request.Signal)
@@ -1305,11 +1465,78 @@ def BuildUniqueComponentFabricSubtree(
     return _UniqueFabricSubtree(Fabric, Attachments)
 
 
+def BuildClaimsAwareComponentFabricSubtree(
+    Fabric: ComponentRoutingFabric,
+    Attachments: Iterable[Position3],
+    ResourceGraph: Any,
+    *,
+    FixedNodes: Iterable[Position3] = (),
+) -> tuple[frozenset[Position3], frozenset[RoutingEdge]] | None:
+    """Return the first deterministic subtree with self-compatible claims."""
+    Required = tuple(sorted(set(Attachments)))
+    if not Required or ResourceGraph is None:
+        return None
+    Adjacency = _BuildAdjacency(Fabric.Edges)
+    if any(Attachment not in Adjacency for Attachment in Required):
+        return None
+    TreeNodes: set[Position3] = {Required[0]}
+    TreeEdges: set[RoutingEdge] = set()
+    FixedNodeSet = frozenset((*map(tuple, FixedNodes), Required[0]))
+    TreeClaims = ResourceGraph.BuildRouteClaims(FixedNodeSet)
+    if FindSelfClaimConflicts({"__ComponentFabric__": TreeClaims}):
+        return None
+    for Target in Required[1:]:
+        if Target in TreeNodes:
+            continue
+        Pending = deque(sorted(TreeNodes))
+        Paths = {Node: (Node,) for Node in TreeNodes}
+        ClaimsByNode = {Node: TreeClaims for Node in TreeNodes}
+        Reached: Position3 | None = None
+        while Pending and Reached is None:
+            Current = Pending.popleft()
+            for Neighbor in sorted(Adjacency.get(Current, ())):
+                if Neighbor in Paths:
+                    continue
+                AdjacentPrimitiveClaims = tuple(
+                    Primitive.Claims
+                    for Adjacent in ResourceGraph.Technology.NeighborPositions(Neighbor)
+                    if Adjacent in ClaimsByNode[Current].WireCells
+                    if (Primitive := ResourceGraph.BuildPrimitive(Adjacent, Neighbor)) is not None
+                )
+                if not AdjacentPrimitiveClaims:
+                    continue
+                CandidateClaims = _MergeClaims((
+                    ClaimsByNode[Current],
+                    *AdjacentPrimitiveClaims,
+                ))
+                if FindSelfClaimConflicts({"__ComponentFabric__": CandidateClaims}):
+                    continue
+                Paths[Neighbor] = (*Paths[Current], Neighbor)
+                ClaimsByNode[Neighbor] = CandidateClaims
+                if Neighbor == Target:
+                    Reached = Neighbor
+                    break
+                Pending.append(Neighbor)
+        if Reached is None:
+            return None
+        Path = Paths[Reached]
+        TreeNodes.update(Path)
+        TreeEdges.update(
+            _NormalizedEdge(First, Second)
+            for First, Second in zip(Path, Path[1:])
+        )
+        TreeClaims = ClaimsByNode[Reached]
+    return frozenset(TreeNodes), frozenset(TreeEdges)
+
+
 def BuildComponentFabricAdjacency(
     Fabric: ComponentRoutingFabric,
 ) -> dict[Position3, set[Position3]]:
     """Build one reusable adjacency index for component eligibility work."""
     return _BuildAdjacency(Fabric.Edges)
+
+
+MaximumExternalSourcePoweredSeamEligibilityCacheEntries = 32_768
 
 
 def FilterExternalSourcePoweredSeamCandidateDomains(
@@ -1335,6 +1562,9 @@ def FilterExternalSourcePoweredSeamCandidateDomains(
         tuple[tuple[Position3, str], ...] | None,
     ] | None = None,
     TreeRepeaterCacheStatistics: dict[str, int] | None = None,
+    CandidateEligibilityCache: dict[str, bool] | None = None,
+    CandidateEligibilityCacheStatistics: dict[str, int] | None = None,
+    CandidateEligibilityDiagnostics: dict[str, object] | None = None,
 ) -> tuple[tuple[ComponentTerminalAccessCandidate, ...], ...]:
     """Keep terminal candidates individually power-reachable from a seam.
 
@@ -1349,6 +1579,46 @@ def FilterExternalSourcePoweredSeamCandidateDomains(
     )
     if not HasExternalSource or not LocalPath:
         return CandidateDomains
+
+    def RecordEligibilityResult(Key: str) -> None:
+        if CandidateEligibilityDiagnostics is None:
+            return
+        CandidateEligibilityDiagnostics[Key] = (
+            int(CandidateEligibilityDiagnostics.get(Key, 0)) + 1
+        )
+
+    def RecordSelfConflictResources(
+        Conflicts: dict[RoutingResourceId, tuple[str, ...]],
+        Root: Position3,
+    ) -> None:
+        if CandidateEligibilityDiagnostics is None:
+            return
+        Counts = CandidateEligibilityDiagnostics.setdefault(
+            "SelfClaimConflictResourceCounts",
+            {},
+        )
+        Samples = CandidateEligibilityDiagnostics.setdefault(
+            "SelfClaimConflictResourceSamples",
+            [],
+        )
+        assert isinstance(Counts, dict)
+        assert isinstance(Samples, list)
+        for Resource in sorted(
+            Conflicts,
+            key=lambda Value: (Value.Kind.value, Value.Position),
+        ):
+            Kind = Resource.Kind.value
+            Counts[Kind] = int(Counts.get(Kind, 0)) + 1
+            Sample = {
+                "Kind": Kind,
+                "RelativePosition": [
+                    Resource.Position[Index] - Root[Index]
+                    for Index in range(3)
+                ],
+            }
+            if Sample not in Samples and len(Samples) < 16:
+                Samples.append(Sample)
+
     FabricAttachment = LocalPath[0]
     Root = LocalPath[-1]
     LocalClaims = tuple(
@@ -1367,6 +1637,7 @@ def FilterExternalSourcePoweredSeamCandidateDomains(
                 ParentCache=FabricParentCache,
             )
             if Subtree is None:
+                RecordEligibilityResult("DisconnectedFabricSubtreeCount")
                 continue
             FabricNodes, FabricEdges = Subtree
             Nodes = set(FabricNodes)
@@ -1390,6 +1661,47 @@ def FilterExternalSourcePoweredSeamCandidateDomains(
                     _NormalizedEdge(*Edge) for Edge in Claim.Edges
                 )
             FrozenNodes = frozenset(Nodes)
+            Relative = lambda Position: (
+                Position[0] - Root[0],
+                Position[1] - Root[1],
+                Position[2] - Root[2],
+            )
+            Technology = getattr(Problem.ResourceGraph, "Technology", None)
+            CandidateEligibilityFingerprint = _StableFingerprint((
+                "external-source-powered-seam-candidate-eligibility-v1",
+                type(Technology).__qualname__,
+                repr(Technology),
+                int(Problem.MaximumPowerDistance),
+                tuple(sorted(Relative(Position) for Position in FrozenNodes)),
+                tuple(sorted(
+                    _NormalizedEdge(Relative(First), Relative(Second))
+                    for First, Second in Edges
+                )),
+            ))
+            if (
+                CandidateEligibilityCache is not None
+                and CandidateEligibilityFingerprint
+                in CandidateEligibilityCache
+            ):
+                if CandidateEligibilityCacheStatistics is not None:
+                    CandidateEligibilityCacheStatistics["HitCount"] = (
+                        CandidateEligibilityCacheStatistics.get(
+                            "HitCount",
+                            0,
+                        )
+                        + 1
+                    )
+                if CandidateEligibilityCache[CandidateEligibilityFingerprint]:
+                    RecordEligibilityResult("CachedFeasibleCount")
+                    Retained.append(Candidate)
+                else:
+                    RecordEligibilityResult("CachedInfeasibleCount")
+                continue
+            if CandidateEligibilityCacheStatistics is not None:
+                CandidateEligibilityCacheStatistics["MissCount"] = (
+                    CandidateEligibilityCacheStatistics.get("MissCount", 0)
+                    + 1
+                )
             Claims = (
                 RouteClaimsCache.get(FrozenNodes)
                 if RouteClaimsCache is not None
@@ -1401,16 +1713,46 @@ def FilterExternalSourcePoweredSeamCandidateDomains(
                 )
                 if RouteClaimsCache is not None:
                     RouteClaimsCache[FrozenNodes] = Claims
-            if FindSelfClaimConflicts({Signal: Claims}):
-                continue
-            if _PlanTreeRepeaters(
-                FrozenNodes,
-                frozenset(Edges),
-                Root,
-                Problem.MaximumPowerDistance,
-                SubproblemCache=TreeRepeaterSubproblemCache,
-                CacheStatistics=TreeRepeaterCacheStatistics,
-            ) is not None:
+            SelfConflicts = FindSelfClaimConflicts({Signal: Claims})
+            RepeaterPlan = (
+                None
+                if SelfConflicts
+                else _PlanTreeRepeaters(
+                    FrozenNodes,
+                    frozenset(Edges),
+                    Root,
+                    Problem.MaximumPowerDistance,
+                    SubproblemCache=TreeRepeaterSubproblemCache,
+                    CacheStatistics=TreeRepeaterCacheStatistics,
+                )
+            )
+            Feasible = bool(not SelfConflicts and RepeaterPlan is not None)
+            if SelfConflicts:
+                RecordEligibilityResult("SelfClaimConflictCount")
+                RecordSelfConflictResources(SelfConflicts, Root)
+            elif RepeaterPlan is None:
+                RecordEligibilityResult("RepeaterPlanInfeasibleCount")
+            else:
+                RecordEligibilityResult("FeasibleCount")
+            if CandidateEligibilityCache is not None:
+                CandidateEligibilityCache[CandidateEligibilityFingerprint] = (
+                    Feasible
+                )
+                if CandidateEligibilityCacheStatistics is not None:
+                    CandidateEligibilityCacheStatistics["StoreCount"] = (
+                        CandidateEligibilityCacheStatistics.get(
+                            "StoreCount",
+                            0,
+                        )
+                        + 1
+                    )
+                while len(CandidateEligibilityCache) > (
+                    MaximumExternalSourcePoweredSeamEligibilityCacheEntries
+                ):
+                    CandidateEligibilityCache.pop(
+                        next(iter(CandidateEligibilityCache))
+                    )
+            if Feasible:
                 Retained.append(Candidate)
         Result.append(tuple(Retained))
     return tuple(Result)
@@ -1437,17 +1779,14 @@ def _BuildTreeEdges(
     return Parents, Children
 
 
-def _RepeaterFacing(
+def _RepeaterInputFacing(
     Current: Position3,
     Next: Position3,
 ) -> str | None:
-    Delta = (Next[0] - Current[0], Next[2] - Current[2])
-    return {
-        (1, 0): "west",
-        (-1, 0): "east",
-        (0, 1): "north",
-        (0, -1): "south",
-    }.get(Delta)
+    try:
+        return RepeaterInputFacingForStep(Current, Next)
+    except ValueError:
+        return None
 
 
 def _PlanTreeRepeaters(
@@ -1467,59 +1806,80 @@ def _PlanTreeRepeaters(
         return None
     Parents, Children = Tree
     SubtreeFingerprintByNode: dict[Position3, str] = {}
-
-    def SubtreeFingerprint(Node: Position3) -> str:
-        Cached = SubtreeFingerprintByNode.get(Node)
-        if Cached is not None:
-            return Cached
-        Result = _StableFingerprint((
+    TreeOrder = tuple(Parents)
+    for Node in reversed(TreeOrder):
+        SubtreeFingerprintByNode[Node] = _StableFingerprint((
             Node,
             Parents[Node],
             tuple(
-                SubtreeFingerprint(Child)
+                SubtreeFingerprintByNode[Child]
                 for Child in Children.get(Node, ())
             ),
         ))
-        SubtreeFingerprintByNode[Node] = Result
-        return Result
 
     Memo: dict[
         tuple[Position3, int],
         tuple[tuple[Position3, str], ...] | None,
     ] = {}
-
-    def Solve(
-        Node: Position3,
-        Distance: int,
-    ) -> tuple[tuple[Position3, str], ...] | None:
+    Pending: list[tuple[Position3, int, bool]] = [(Root, 0, False)]
+    InProgress: set[tuple[Position3, int]] = set()
+    while Pending:
+        Node, Distance, Finalize = Pending.pop()
         Key = Node, Distance
         if Key in Memo:
-            return Memo[Key]
+            continue
         SharedKey = (
             MaximumDistance,
             Distance,
-            SubtreeFingerprint(Node),
+            SubtreeFingerprintByNode[Node],
         )
-        if (
-            SubproblemCache is not None
-            and SharedKey in SubproblemCache
-        ):
+        if not Finalize:
+            if (
+                SubproblemCache is not None
+                and SharedKey in SubproblemCache
+            ):
+                if CacheStatistics is not None:
+                    CacheStatistics["HitCount"] = (
+                        CacheStatistics.get("HitCount", 0) + 1
+                    )
+                Memo[Key] = SubproblemCache[SharedKey]
+                continue
+            if Key in InProgress:
+                continue
+            InProgress.add(Key)
             if CacheStatistics is not None:
-                CacheStatistics["HitCount"] = (
-                    CacheStatistics.get("HitCount", 0) + 1
+                CacheStatistics["MissCount"] = (
+                    CacheStatistics.get("MissCount", 0) + 1
                 )
-            Result = SubproblemCache[SharedKey]
-            Memo[Key] = Result
-            return Result
-        if CacheStatistics is not None:
-            CacheStatistics["MissCount"] = (
-                CacheStatistics.get("MissCount", 0) + 1
-            )
+            Pending.append((Node, Distance, True))
+            Dependencies: list[tuple[Position3, int, bool]] = []
+            if Distance <= MaximumDistance:
+                Dependencies.extend(
+                    (Child, Distance + 1, False)
+                    for Child in Children.get(Node, ())
+                )
+            Parent = Parents[Node]
+            ChildValues = Children.get(Node, ())
+            if Parent is not None and len(ChildValues) == 1:
+                Child = ChildValues[0]
+                if Parent[1] == Node[1] == Child[1]:
+                    Incoming = (
+                        Node[0] - Parent[0],
+                        Node[2] - Parent[2],
+                    )
+                    Outgoing = (
+                        Child[0] - Node[0],
+                        Child[2] - Node[2],
+                    )
+                    if Incoming == Outgoing and _RepeaterInputFacing(Node, Child) is not None:
+                        Dependencies.append((Child, 1, False))
+            Pending.extend(reversed(Dependencies))
+            continue
         Options: list[tuple[tuple[Position3, str], ...]] = []
         if Distance <= MaximumDistance:
             ChildPlans = []
             for Child in Children.get(Node, ()):
-                Plan = Solve(Child, Distance + 1)
+                Plan = Memo[(Child, Distance + 1)]
                 if Plan is None:
                     break
                 ChildPlans.append(Plan)
@@ -1541,12 +1901,12 @@ def _PlanTreeRepeaters(
                     Child[2] - Node[2],
                 )
                 Facing = (
-                    _RepeaterFacing(Node, Child)
+                    _RepeaterInputFacing(Node, Child)
                     if Incoming == Outgoing
                     else None
                 )
                 if Facing is not None:
-                    ChildPlan = Solve(Child, 1)
+                    ChildPlan = Memo[(Child, 1)]
                     if ChildPlan is not None:
                         Options.append(tuple(sorted((
                             (Node, Facing),
@@ -1558,8 +1918,8 @@ def _PlanTreeRepeaters(
             else None
         )
         Memo[Key] = Result
+        InProgress.discard(Key)
         if SubproblemCache is not None:
             SubproblemCache[SharedKey] = Result
-        return Result
 
-    return Solve(Root, 0)
+    return Memo[(Root, 0)]

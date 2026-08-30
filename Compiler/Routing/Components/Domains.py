@@ -462,7 +462,7 @@ def PruneDominatedComponentNetVariants(
         key=lambda Value: (
             len(Value.Claims.ResourceIds),
             len(Value.Nodes),
-            len(Value.Repeaters),
+            len(Value.RepeaterInputFacings),
             Value.NetFingerprint,
         ),
     ):

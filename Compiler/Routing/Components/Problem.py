@@ -139,6 +139,17 @@ def BuildComponentRoutingProblem(
         getattr(Placed, "LocalRouteClaims", ()) or ()
     )
     ComponentSignals = RoutableComponentSignals
+    ProtectedAccessNodes = frozenset(
+        Position
+        for (
+            Signal,
+            Terminal,
+            _Layer,
+        ), Portals in RawPortals.items()
+        if (Signal, Terminal) in ComponentPairs
+        for Portal in Portals
+        for Position in Portal.Path
+    )
     Fabric = AugmentComponentRoutingFabric(
         Fabric,
         (
@@ -153,6 +164,7 @@ def BuildComponentRoutingProblem(
             if Portal.Path
         ),
         ResourceGraph,
+        ProtectedAccessNodes=ProtectedAccessNodes,
     )
     FabricNodes = frozenset(Fabric.Nodes)
     OwnedDomains = []
@@ -221,6 +233,7 @@ def BuildComponentRoutingProblem(
         Fabric,
         OwnedDomains,
         ResourceGraph,
+        ProtectedAccessNodes=ProtectedAccessNodes,
     )
     ExternalContinuationTerminals = tuple(sorted(
         (
@@ -338,7 +351,7 @@ def BuildComponentRoutingProblem(
                     _RelativeGeometry(
                         Position
                         for Position, _Facing
-                        in Candidate.Repeaters
+                        in Candidate.RepeaterInputFacings
                     ),
                 )
                 for Candidate in Domain.Candidates

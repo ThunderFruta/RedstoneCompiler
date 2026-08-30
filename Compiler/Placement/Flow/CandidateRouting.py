@@ -152,6 +152,47 @@ def RoutePlacementCandidates(Context):
             Context.Routed = None
             if isinstance(Error, RoutingStageError):
                 Context.LastStructuredRoutingError = Error
+            if (
+                Context.ExactClusterInterfaceSolveEnabled
+                and isinstance(Error, RoutingStageError)
+            ):
+                Context.DenseAssignmentCut = _RecordAssignmentCut(
+                    Context,
+                    Error,
+                    Context.CandidateRecord,
+                )
+                if (
+                    Context.PendingSamePlacementRoutingControlRetry is not None
+                    and Context.PendingSamePlacementRoutingControlRetry
+                    .Evidence.ExhaustedRepeaterAccessCut
+                ):
+                    Context.PlacementAttemptFailures.append({
+                        'CandidateId': Context.CandidateRecord.CandidateId,
+                        'PlacementFingerprint': (
+                            Context.CandidateRecord.PlacementFingerprint
+                        ),
+                        'Result': 'dense-route-only-retry',
+                        'Failure': str(Error),
+                        'Diagnostics': Error.Failure.ToDictionary(),
+                        'ElapsedSeconds': round(
+                            Context.Services.monotonic()
+                            - Context.AttemptStarted,
+                            6,
+                        ),
+                    })
+                    Context.PlacementGenerationDecisions.append({
+                        'Result': 'dense-repeater-ready-route-only-retry',
+                        'CandidateId': Context.CandidateRecord.CandidateId,
+                        'AssignmentCutFingerprint': (
+                            Context.DenseAssignmentCut.ConflictFingerprint
+                            if Context.DenseAssignmentCut is not None
+                            else ''
+                        ),
+                        'ReusedPlacedGeometry': True,
+                        'ExecutableLegacyRepairCascade': False,
+                        'BroadFallbackAllowed': False,
+                    })
+                    continue
             Context.PlacementAttemptFailures.append({'CandidateId': Context.CandidateRecord.CandidateId, 'PlacementFingerprint': Context.CandidateRecord.PlacementFingerprint, 'Result': 'terminal-fixed-route-failure', 'Failure': str(Error), 'Diagnostics': Error.Failure.ToDictionary() if isinstance(Error, RoutingStageError) else {}, 'ElapsedSeconds': round(Context.Services.monotonic() - Context.AttemptStarted, 6)})
             break
             if Context.ExactClusterInterfaceSolveEnabled:

@@ -97,13 +97,49 @@ pub(in crate::Generation) fn BuildRootedTreeBlockages(
     Some((BlockedNodes, EdgeCosts))
 }
 
-pub(in crate::Generation) fn RepeaterFacing(Current: Position, Next: Position) -> Option<String> {
+pub(in crate::Generation) fn RepeaterInputFacing(
+    Current: Position,
+    Next: Position,
+) -> Option<String> {
     match (Next.0 - Current.0, Next.2 - Current.2) {
         (1, 0) => Some("west".to_string()),
         (-1, 0) => Some("east".to_string()),
         (0, 1) => Some("north".to_string()),
         (0, -1) => Some("south".to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod RepeaterInputFacingTests {
+    use super::RepeaterInputFacing;
+
+    #[test]
+    fn CardinalStepsReturnJavaInputSide() {
+        let Origin = (0, 0, 0);
+        assert_eq!(
+            RepeaterInputFacing(Origin, (1, 0, 0)).as_deref(),
+            Some("west")
+        );
+        assert_eq!(
+            RepeaterInputFacing(Origin, (-1, 0, 0)).as_deref(),
+            Some("east")
+        );
+        assert_eq!(
+            RepeaterInputFacing(Origin, (0, 0, 1)).as_deref(),
+            Some("north")
+        );
+        assert_eq!(
+            RepeaterInputFacing(Origin, (0, 0, -1)).as_deref(),
+            Some("south")
+        );
+    }
+
+    #[test]
+    fn VerticalAndNonAdjacentStepsHaveNoFacing() {
+        let Origin = (0, 0, 0);
+        assert_eq!(RepeaterInputFacing(Origin, (0, 1, 0)), None);
+        assert_eq!(RepeaterInputFacing(Origin, (2, 0, 0)), None);
     }
 }
 

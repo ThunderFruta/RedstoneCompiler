@@ -72,7 +72,7 @@ except ImportError:
         _GetRoutingThreadCount = None
 
 from .Core import _ClaimsFingerprint, _NormalizedEdge, _RelativeGeometry, _StableFingerprint
-from .Fabric import BuildComponentEgressPaths, _BuildAdjacency, _PlanTreeRepeaters, _UniqueFabricSubtree
+from .Fabric import BuildClaimsAwareComponentFabricSubtree, BuildComponentEgressPaths, _BuildAdjacency, _PlanTreeRepeaters, _UniqueFabricSubtree
 from .SymbolicState import (
     BuildComponentSymbolicNetStateCacheKey,
     ComponentTreeDpNetState,
@@ -203,6 +203,8 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
         return (*ImmutableClaimsBySignal, *tuple(((str(ReservedSignal), Claims) for ReservedSignal, Claims in Problem.ReservedGlobalClaimsBySignal if str(ReservedSignal) != Signal)))
     ReservedGlobalGeometryBlockerSetsBySignal: dict[str, list[frozenset[str]]] = defaultdict(list)
     ReservedGlobalCandidateBlockerSetsBySignalDomain: dict[tuple[str, int], list[frozenset[str]]] = defaultdict(list)
+    GeometryClaimRejectionReasonsBySignal: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    GeometrySelfConflictResourcesBySignal: dict[str, set[str]] = defaultdict(set)
     ReservedGlobalClaimSignals = frozenset((str(Signal) for Signal, _Claims in Problem.ReservedGlobalClaimsBySignal))
     ReservedGlobalWireCellsBySignal: dict[str, frozenset[Position3]] = {Signal: frozenset().union(*(Claims.WireCells for ReservedSignal, Claims in Problem.ReservedGlobalClaimsBySignal if str(ReservedSignal) == Signal)) for Signal in ReservedGlobalClaimSignals}
 
@@ -258,11 +260,18 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
         return (Result, int(ActiveWorkerCount))
 
     def IsGeometryClaimsEligible(Signal: str, Nodes: frozenset[Position3], Claims: RoutingResourceClaims, SameSignalCombinedClaims: RoutingResourceClaims | None=None) -> bool:
-        if FindSelfClaimConflicts({Signal: Claims}):
+        SelfConflicts = FindSelfClaimConflicts({Signal: Claims})
+        if SelfConflicts:
+            GeometryClaimRejectionReasonsBySignal[Signal]['self-geometry'] += 1
+            GeometrySelfConflictResourcesBySignal[Signal].update(
+                map(str, SelfConflicts)
+            )
             return False
         if HasSameSignalReservedSelfConflict(Signal, Nodes, SameSignalCombinedClaims):
+            GeometryClaimRejectionReasonsBySignal[Signal]['same-signal-reserved-route'] += 1
             return False
         if HasBlockingClaimConflict(Signal, Claims):
+            GeometryClaimRejectionReasonsBySignal[Signal]['immutable-owner'] += 1
             return False
         return True
 
@@ -280,6 +289,10 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
         nonlocal PeakFrontierStateCount, DominatedStateCount
         nonlocal IncrementalPhysicalEgressMaterializationCount
         Domains = DomainsBySignal[Signal]
+        FrontierComponentMismatchCount = 0
+        FrontierMissingSubtreeCount = 0
+        FrontierClaimRejectionCount = 0
+        FrontierStateCountsByDepth: list[int] = []
         DefaultPhysicalPort = SelectComponentSymbolicPhysicalPort(Problem, Signal)
         PhysicalPorts = tuple(PreparedPhysicalPortVariants) if PreparedPhysicalPortVariants else (DefaultPhysicalPort,) if DefaultPhysicalPort is not None else ()
         if any((str(Port.Signal) != Signal for Port in PhysicalPorts)):
@@ -365,6 +378,7 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
                         return None
                     ComponentIndex = FabricComponentByNode[Candidate.Attachment]
                     if ComponentIndex != Source[0]:
+                        FrontierComponentMismatchCount += 1
                         continue
                     Selections = tuple(sorted((*Source[1], (DomainIndex, Candidate))))
                     PendingCandidateTransitions.append((ComponentIndex, Selections))
@@ -372,6 +386,7 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
             PendingTransitions: list[tuple[int, tuple[tuple[int, ComponentTerminalAccessCandidate], ...], frozenset[Position3], frozenset[RoutingEdge]]] = []
             for (ComponentIndex, Selections), FabricSubtree in zip(PendingCandidateTransitions, FabricSubtrees, strict=True):
                 if FabricSubtree is None:
+                    FrontierMissingSubtreeCount += 1
                     continue
                 OrderedCandidates = tuple((Value for _Index, Value in Selections))
                 Structure = BuildGeometryStructure(Signal, OrderedCandidates, (), FabricSubtree)
@@ -387,7 +402,33 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
             for ComponentIndex, Selections, Nodes, Edges in PendingTransitions:
                 Claims = ClaimsByNodes[Nodes]
                 SameSignalCombinedClaims = ClaimsByNodes[frozenset((*Nodes, *SameSignalReservedNodes))] if SameSignalReservedNodes else None
+                if FindSelfClaimConflicts({Signal: Claims}) and Problem.ResourceGraph is not None:
+                    OrderedCandidates = tuple((Value for _Index, Value in Selections))
+                    FixedNodes = frozenset((
+                        *(Node for Candidate in OrderedCandidates for Node in Candidate.Path),
+                        *(Node for Claim in LocalClaimsBySignal.get(Signal, ()) for Node in Claim.Nodes),
+                    ))
+                    ClaimsAwareSubtree = BuildClaimsAwareComponentFabricSubtree(
+                        Problem.Fabric,
+                        tuple((Candidate.Attachment for Candidate in OrderedCandidates)),
+                        Problem.ResourceGraph,
+                        FixedNodes=FixedNodes,
+                    )
+                    ClaimsAwareStructure = BuildGeometryStructure(
+                        Signal,
+                        OrderedCandidates,
+                        (),
+                        ClaimsAwareSubtree,
+                    ) if ClaimsAwareSubtree is not None else None
+                    if ClaimsAwareStructure is not None:
+                        Nodes, Edges = ClaimsAwareStructure
+                        Claims = ClaimsForNodes(Nodes)
+                        SameSignalCombinedClaims = ClaimsForNodes(
+                            frozenset((*Nodes, *SameSignalReservedNodes))
+                        ) if SameSignalReservedNodes else None
+                        SolverDiagnostics['ClaimsAwareFabricSubtreeFallbackCount'] = int(SolverDiagnostics.get('ClaimsAwareFabricSubtreeFallbackCount', 0)) + 1
                 if not IsGeometryClaimsEligible(Signal, Nodes, Claims, SameSignalCombinedClaims):
+                    FrontierClaimRejectionCount += 1
                     continue
                 Key = (Depth + 1, ComponentIndex, Nodes, Edges)
                 Value = (ComponentIndex, Selections, Nodes, Edges, Claims)
@@ -400,6 +441,7 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
                         continue
                 NextByKey[Key] = Value
             Frontier = tuple((NextByKey[Key] for Key in sorted(NextByKey, key=repr)))
+            FrontierStateCountsByDepth.append(len(Frontier))
             PeakFrontierStateCount = max(PeakFrontierStateCount, len(Frontier))
             if not Frontier:
                 break
@@ -417,7 +459,7 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
                         break
             ContractIndependent = bool(not CertifiedRejected and (not Problem.ReservedGlobalClaimsBySignal))
             OwnedDomainProjectionFingerprint = _StableFingerprint(('tree-frontier-owned-signal-domain-v1', Problem.Fabric.FabricFingerprint, Signal, tuple(((Domain.TerminalRole, Domain.TerminalFingerprint, tuple(((Candidate.CandidateFingerprint, Candidate.Attachment, Candidate.Path) for Candidate in Domain.Candidates))) for Domain in Domains)), tuple(((Claim.Nodes, Claim.Edges) for Claim in LocalClaimsBySignal.get(Signal, ()))), tuple(((Owner, _ClaimsFingerprint(Claims)) for Owner, Claims in ImmutableClaimsBySignal)), Problem.MaximumPowerDistance, getattr(Problem.ResourceGraph, 'GraphVersion', '')))
-            SignalDiagnostics[Signal] = {'TerminalDomainSizes': [len(FilteredByDomain[Index]) for Index in range(len(Domains))], 'TerminalCoverageCount': len(Domains), 'ImmutableRejectedCandidateCount': ImmutableRejected, 'CertifiedRejectedCandidateCount': CertifiedRejected, 'FinalStateCount': 0, 'EmptyPhase': 'owned-terminal-frontier', 'OwnedSignalDomainContractIndependent': ContractIndependent, 'OwnedSignalDomainProjectionFingerprint': OwnedDomainProjectionFingerprint, 'ReservedGlobalRouteBlockerSetCount': len(BlockerSets), 'ReservedGlobalRouteUnsatCoreSignals': list(MinimumGlobalRouteCore), 'ReservedGlobalRouteUnsatCoreComplete': bool(MinimumGlobalRouteCore), 'ReservedGlobalRouteUnsatCoreFingerprint': _StableFingerprint(('reserved-global-route-frontier-core-v1', Problem.ProblemFingerprint, Signal, tuple(sorted(BlockerSets, key=repr)), MinimumGlobalRouteCore)) if MinimumGlobalRouteCore else '', 'Complete': True, 'TerminalFrontierCacheHit': TerminalFrontierCacheHit}
+            SignalDiagnostics[Signal] = {'TerminalDomainSizes': [len(FilteredByDomain[Index]) for Index in range(len(Domains))], 'TerminalCoverageCount': len(Domains), 'TerminalAttachmentComponents': [[FabricComponentByNode.get(Candidate.Attachment, -1) for Candidate in FilteredByDomain[Index]] for Index in range(len(Domains))], 'TerminalAccessCandidates': [[{'CandidateFingerprint': Candidate.CandidateFingerprint, 'Attachment': list(Candidate.Attachment), 'Path': [list(Node) for Node in Candidate.Path]} for Candidate in FilteredByDomain[Index][:4]] for Index in range(len(Domains))], 'FrontierStateCountsByDepth': FrontierStateCountsByDepth, 'FrontierComponentMismatchCount': FrontierComponentMismatchCount, 'FrontierMissingSubtreeCount': FrontierMissingSubtreeCount, 'FrontierClaimRejectionCount': FrontierClaimRejectionCount, 'FrontierClaimRejectionReasons': dict(sorted(GeometryClaimRejectionReasonsBySignal[Signal].items())), 'FrontierSelfConflictResources': sorted(GeometrySelfConflictResourcesBySignal[Signal]), 'ImmutableRejectedCandidateCount': ImmutableRejected, 'CertifiedRejectedCandidateCount': CertifiedRejected, 'FinalStateCount': 0, 'EmptyPhase': 'owned-terminal-frontier', 'OwnedSignalDomainContractIndependent': ContractIndependent, 'OwnedSignalDomainProjectionFingerprint': OwnedDomainProjectionFingerprint, 'ReservedGlobalRouteBlockerSetCount': len(BlockerSets), 'ReservedGlobalRouteUnsatCoreSignals': list(MinimumGlobalRouteCore), 'ReservedGlobalRouteUnsatCoreComplete': bool(MinimumGlobalRouteCore), 'ReservedGlobalRouteUnsatCoreFingerprint': _StableFingerprint(('reserved-global-route-frontier-core-v1', Problem.ProblemFingerprint, Signal, tuple(sorted(BlockerSets, key=repr)), MinimumGlobalRouteCore)) if MinimumGlobalRouteCore else '', 'Complete': True, 'TerminalFrontierCacheHit': TerminalFrontierCacheHit}
             return ()
         FinalByFingerprint: dict[str, ComponentTreeDpNetState] = {}
         External = tuple((Value for Value in Problem.ExternalContinuationTerminals if Value[0] == Signal))
@@ -471,7 +513,7 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
                 if Problem.ResourceGraph is not None and any((Problem.ResourceGraph.BuildPrimitive(First, Second) is None for First, Second in Edges)):
                     continue
                 NetFingerprint = _StableFingerprint((tuple(sorted(Nodes)), tuple(sorted(Edges)), tuple((Position for Position, _Facing in Repeaters)), tuple(sorted(ExportedPorts)), tuple(sorted(Claims.WireCells)), tuple(sorted(Claims.SupportCells)), tuple(sorted(Claims.RequiredAirCells)), tuple(sorted(Claims.ElectricalCells))))
-                FinalByFingerprint.setdefault(NetFingerprint, ComponentTreeDpNetState(Signal=Signal, Candidates=Candidates, EgressPath=tuple(EgressPath), Nodes=Nodes, Edges=Edges, Claims=Claims, Root=Root, Repeaters=Repeaters, CoveredTerminals=tuple(sorted((Domain.Terminal for Domain in Domains))), ExportedPorts=ExportedPorts, NetFingerprint=NetFingerprint))
+                FinalByFingerprint.setdefault(NetFingerprint, ComponentTreeDpNetState(Signal=Signal, Candidates=Candidates, EgressPath=tuple(EgressPath), Nodes=Nodes, Edges=Edges, Claims=Claims, Root=Root, RepeaterInputFacings=Repeaters, CoveredTerminals=tuple(sorted((Domain.Terminal for Domain in Domains))), ExportedPorts=ExportedPorts, NetFingerprint=NetFingerprint))
         Result = tuple((FinalByFingerprint[Fingerprint] for Fingerprint in sorted(FinalByFingerprint)))
         EgressBlockerSets = tuple(ReservedGlobalGeometryBlockerSetsBySignal.get(Signal, ()))
         MinimumEgressGlobalRouteCore: tuple[str, ...] = ()
@@ -561,6 +603,7 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
 
     def CapacityOptionFingerprint(Kind: str, Value: Any) -> str:
         return str(Value.NetFingerprint if Kind in {'net', 'transit'} else Value.CandidateFingerprint)
+
     for FirstIndex, SecondIndex in combinations(sorted(Domains), 2):
         FirstKind, FirstIdentity, FirstOwner, FirstOptions, FirstClaimsFor = Variables[FirstIndex]
         SecondKind, SecondIdentity, SecondOwner, SecondOptions, SecondClaimsFor = Variables[SecondIndex]
@@ -659,7 +702,7 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
     if StopAfterSymbolicCapacityProof:
         ProofFingerprint = _StableFingerprint((Problem.ProblemFingerprint, 'symbolic-capacity-feasible', SolverDiagnostics.get('SelectedAssignmentFingerprint', '')))
         return ComponentRoutingSolveResult(Status='capacity-feasible', ProofFingerprint=ProofFingerprint, ExpansionCount=ExpansionCount, Detail='the closed component symbolic capacity CSP is feasible', Diagnostics={**FinishDiagnostics(), 'SymbolicCapacityProofComplete': True, 'SymbolicCapacityFeasible': True})
-    Nets = tuple(sorted((RoutedComponentNet(Signal=State.Signal, Root=State.Root, Nodes=State.Nodes, Edges=State.Edges, WireCells=State.Claims.WireCells - frozenset((Position for Position, _Facing in State.Repeaters)), SupportCells=State.Claims.SupportCells, Repeaters=State.Repeaters, Claims=State.Claims, CoveredTerminals=State.CoveredTerminals, ExportedPorts=State.ExportedPorts, NetFingerprint=State.NetFingerprint) for Signal in Problem.ComponentSignals for State in (Selected['net', Signal],)), key=lambda Value: Value.NetFingerprint))
+    Nets = tuple(sorted((RoutedComponentNet(Signal=State.Signal, Root=State.Root, Nodes=State.Nodes, Edges=State.Edges, WireCells=State.Claims.WireCells - frozenset((Position for Position, _InputFacing in State.RepeaterInputFacings)), SupportCells=State.Claims.SupportCells, RepeaterInputFacings=State.RepeaterInputFacings, Claims=State.Claims, CoveredTerminals=State.CoveredTerminals, ExportedPorts=State.ExportedPorts, NetFingerprint=State.NetFingerprint) for Signal in Problem.ComponentSignals for State in (Selected['net', Signal],)), key=lambda Value: Value.NetFingerprint))
     Foreign = tuple(sorted(((Domain.Signal, Domain.Terminal, Selected['foreign', str(DomainIndex)]) for DomainIndex, Domain in enumerate(Problem.ForeignEscapeDomains)), key=lambda Value: (Value[2].CandidateFingerprint, Value[1])))
     ExternalContinuations = tuple(sorted(((Domain.Signal, Domain.Terminal, Selected['continuation', str(DomainIndex)]) for DomainIndex, Domain in enumerate(Problem.ExternalContinuationDomains)), key=lambda Value: (Value[0], Value[1], Value[2].CandidateFingerprint)))
     ForeignTransits = tuple(sorted((Selected['transit', str(DomainIndex)] for DomainIndex, Domain in enumerate(Problem.ForeignTransitDomains) if Domain.Signal in RequiredForeignTransitSignals), key=lambda Value: Value.NetFingerprint))

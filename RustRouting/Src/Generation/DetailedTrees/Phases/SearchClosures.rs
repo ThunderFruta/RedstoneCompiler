@@ -112,7 +112,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
                         }
                         let FirstState = (First, Direction, StartState.2.saturating_sub(1));
                         let SecondState = (Second, Direction, MAXIMUM_UNREFRESHED_DUST_LENGTH);
-                        let Some(Facing) = RepeaterFacing(First, Second) else {
+                        let Some(Facing) = RepeaterInputFacing(First, Second) else {
                             continue;
                         };
                         GeometryStartStates.push(SecondState);
@@ -200,7 +200,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
                                 })
                                 .unwrap_or(false);
                             let RemainingStrength = if CanRefreshCurrent {
-                                let Some(Facing) = RepeaterFacing(CurrentState.0, Next) else {
+                                let Some(Facing) = RepeaterInputFacing(CurrentState.0, Next) else {
                                     GeometryPowerLegal = false;
                                     break;
                                 };
@@ -210,7 +210,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
                                 CurrentState.2 - 1
                             } else if CanRefreshNext {
                                 let After = GeometryResult.StatePath[GeometryIndex + 1].0;
-                                let Some(Facing) = RepeaterFacing(Next, After) else {
+                                let Some(Facing) = RepeaterInputFacing(Next, After) else {
                                     GeometryPowerLegal = false;
                                     break;
                                 };

@@ -4,7 +4,7 @@ The compiler now uses a stage-aligned runtime layout:
 
 - Parsing and elaboration are under `SVDecoder/`.
 - Core compiler behavior is under `Compiler/` by phase.
-- Litematic encoding is under `SchemEncoder/`.
+- Litematic encoding is in `SchemEncoder/SchemWriter.py`.
 - Templates are in `Templates/`.
 - User-visible artifacts are under `Output/`.
 - Disposable runtime state is under `Cache/`.
@@ -14,7 +14,7 @@ The compiler now uses a stage-aligned runtime layout:
 
 - Frontend parsing belongs to `SVDecoder/`.
 - Core compiler behavior belongs to `Compiler/` by phase.
-- Litematic encoding belongs to `SchemEncoder/`.
+- Litematic encoding belongs in `SchemEncoder/SchemWriter.py`.
 - Templates are in `Templates/`.
 - Tests remain in `Tests/` and generated artifacts in `Output/`.
 - Disposables are isolated under `Cache/`.
@@ -33,7 +33,7 @@ The compiler now uses a stage-aligned runtime layout:
   further split into their own subdirectories. `Lib.rs` is registration-only.
 - The clean-break retired paths and executable structural limits are listed in
   [the project-tree design](../../ProjectTreeDesignDoc.md) and enforced by
-  `Tests/test_source_structure.py`.
+  `Tests/Structural/test_source_structure.py`.
 
 ## Documentation ownership
 

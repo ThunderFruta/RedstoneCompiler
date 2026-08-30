@@ -27,7 +27,7 @@ not authorize a dependency on placement search or flow.
 Implementation modules are limited to 3,000 physical lines, orchestrators to
 fewer than 500, and Python/Rust functions to fewer than 1,000. New split
 implementation files must be at least 150 lines unless
-`Tests/test_source_structure.py` records a concrete API, binding, worker,
+`Tests/Structural/test_source_structure.py` records a concrete API, binding, worker,
 state/schema, cache-identity, or phase-contract reason. Prefer merging short
 same-purpose helpers over inventing another module.
 
