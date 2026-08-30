@@ -12,7 +12,7 @@ For negotiated-routing failures inspect, in order:
 4. active tiles, boundary touches, expansions, and cache deltas;
 5. wire, support, required-air, electrical, and repeater claims;
 6. placement feedback rounds and packed-area growth; and
-7. final validation and physical simulation.
+7. final structural validation and Fabric-server status.
 
 `BoundaryEscapeInfeasible` and congestion cuts should return contributing
 clusters to placement. A stable nonzero overflow should expand or repair the

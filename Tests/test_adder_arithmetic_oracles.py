@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from Compiler.Ir.Models import GateKind, ModuleIR
-from Compiler.Simulation.Redstone import EvaluateLogicModule
+from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
 from Compiler.Synthesis.Validation import ValidateNandOnlyDesign

@@ -11,6 +11,7 @@ from Compiler.Pipeline import (
     BuildSuccessRouterReliability,
     ClearStaleSuccessArtifacts,
     CompileSvToLitematic,
+    ObsoleteArtifactPaths,
     PublishSuccessArtifacts,
     SuccessArtifactPaths,
     WriteRoutingFailureArtifact,
@@ -241,6 +242,8 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
             OutputPath = Directory / "Design.litematic"
             for ArtifactPath in SuccessArtifactPaths(OutputPath).values():
                 ArtifactPath.write_text("stale", encoding="utf-8")
+            for ArtifactPath in ObsoleteArtifactPaths(OutputPath):
+                ArtifactPath.write_text("obsolete", encoding="utf-8")
             DiagramPath = Directory / "Design.Nand.json"
             DiagramPath.write_text("partial", encoding="utf-8")
 
@@ -299,7 +302,6 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                     PublishSuccessArtifacts(
                         Routed=object(),
                         Rendered=object(),
-                        Simulation=object(),
                         PhysicalDesignDocument={"Status": "success"},
                         OutputPath=OutputPath,
                     )
@@ -324,32 +326,19 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                 Events.append("schematic")
                 OutputPath.write_text("schematic", encoding="utf-8")
 
-            def WriteSimulation(_Simulation, TruthTablePath):
-                Events.append("truth-table")
-                TruthTablePath.write_text("truth-table", encoding="utf-8")
-                return TruthTablePath
-
-            with (
-                patch(
-                    "Compiler.Pipeline.Writer262.WriteLitematic",
-                    side_effect=WriteSchematic,
-                ),
-                patch(
-                    "Compiler.Pipeline.WriteTruthTable",
-                    side_effect=WriteSimulation,
-                ),
+            with patch(
+                "Compiler.Pipeline.Writer262.WriteLitematic",
+                side_effect=WriteSchematic,
             ):
-                TruthTablePath, PhysicalDesignPath = PublishSuccessArtifacts(
+                PhysicalDesignPath = PublishSuccessArtifacts(
                     Routed=object(),
                     Rendered=SimpleNamespace(),
-                    Simulation=object(),
                     PhysicalDesignDocument={"Status": "success"},
                     OutputPath=OutputPath,
                 )
 
-            self.assertEqual(Events, ["schematic", "truth-table"])
+            self.assertEqual(Events, ["schematic"])
             self.assertTrue(OutputPath.exists())
-            self.assertTrue(TruthTablePath.exists())
             self.assertEqual(
                 json.loads(PhysicalDesignPath.read_text(encoding="utf-8")),
                 {"Status": "success"},

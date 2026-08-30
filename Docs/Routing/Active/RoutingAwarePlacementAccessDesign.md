@@ -301,7 +301,7 @@ For this compiler that means:
    claims; it is not an abstract promise that later routing must realize.
 4. Final validation recomputes physical ownership and connectivity from the
    routed/materialized result rather than trusting the solver's success flag.
-5. Exact truth-table simulation remains mandatory.
+5. Exact behavioral validation belongs to the Fabric server.
 
 ### Solver meaning
 
@@ -478,11 +478,11 @@ The v17 validation chain shall perform:
 1. exact resource-claim conflict detection;
 2. physical graph connectivity and electrical isolation;
 3. repeater and signal-strength legality;
-4. routed truth-table simulation;
-5. exact litematic block-map construction;
-6. rendered Minecraft cross-check where enabled;
+4. exact litematic block-map construction with neutral dynamic state;
+5. authoritative Fabric-server placement, ticking, and readback;
+6. server-produced truth-table comparison;
 7. unresolved-claim and provenance checks;
-8. staged publication of litematic, truth table, and physical design with
+8. staged publication of litematic, server results, and physical design with
    exception cleanup; and
 9. manifest/directory-level finalization before an incumbent-preserving
    compactor may replace an accepted result.
@@ -977,7 +977,7 @@ must not wait for the full shared-boundary implementation.
 | New `Compiler/Placement/Core/HandoffValidation.py` | not present | recompute placed transforms, pin mappings, blocks, and placement-side fingerprint using existing placement geometry |
 | New `Compiler/Routing/Interfaces/HandoffValidation.py` | not present | validate claims, repeater reservations, access coverage, leases, and routing-side fingerprint without importing `Compiler/Placement` |
 | [`Compiler/Routing/Actions/Validation.py`](../../../Compiler/Routing/Actions/Validation.py) | physical connectivity graphs and route validation | retain route connectivity ownership and add only route-level strengthened checks |
-| [`Compiler/Simulation/Redstone.py`](../../../Compiler/Simulation/Redstone.py) | powered delivery and exhaustive truth-table simulation | unchanged authority; add contract provenance to diagnostics only |
+| [`Compiler/FabricServer/`](../../../Compiler/FabricServer/) | authoritative server-validation contract | own server lifecycle, ticking, readback, and result diagnostics without an in-process redstone model |
 | [`Compiler/Pipeline.py`](../../../Compiler/Pipeline.py) | stage orchestration, final validation, failure evidence, staged multi-file replacement with exception cleanup | compose placement-side and routing-side handoff validation, serialize v17 contract/proof telemetry, and add manifest/directory finalization before immutable-incumbent replacement |
 | New `RustRouting/Src/PlacementAccess/` domain | not present | optional production finite solver split into state/domain/search/API modules, with propagation and a typed bounded result |
 

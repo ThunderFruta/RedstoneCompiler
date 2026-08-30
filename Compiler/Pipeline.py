@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -22,14 +22,9 @@ from .Synthesis.Validation import ValidateNandOnlyDesign
 from Compiler.Placement.Flow.Candidates import ApplyRoutingRuntimeBudget
 from Compiler.Placement.Flow.Results import PcbProgress
 from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
+from .FabricServer import FabricServerValidationResult
 from SchemEncoder import Writer262
 from SchemEncoder.Writer262 import BlockCompositionMetrics
-from .Simulation.Redstone import (
-    ShouldSimulateRenderedMinecraftTruthTable,
-    SimulateRenderedMinecraftTruthTable,
-    SimulateRoutedTruthTable,
-    WriteTruthTable,
-)
 from .Routing.ChannelPlanner import RoutingStageMetrics
 from .Routing.Failures import (
     RoutingFailure,
@@ -63,9 +58,7 @@ class CompileResult:
     Depth: int
     OriginalLogicGateCount: int
     OptimizedLogicGateCount: int
-    TruthTablePath: Path
-    TruthTablePassed: bool
-    TruthTableRows: int
+    FabricServerValidation: FabricServerValidationResult
     RoutingMetrics: RoutingStageMetrics | None
     PhysicalDesignPath: Path
     RequestedStrategy: str
@@ -166,15 +159,23 @@ def SuccessArtifactPaths(OutputPath: Path) -> dict[str, Path]:
     """Return every artifact whose presence means a compile was successful."""
     return {
         "Schematic": OutputPath,
-        "TruthTable": OutputPath.with_suffix(".TruthTable.txt"),
         "PhysicalDesign": OutputPath.with_suffix(".PhysicalDesign.json"),
     }
+
+
+def ObsoleteArtifactPaths(OutputPath: Path) -> tuple[Path, ...]:
+    """Return artifacts produced by the removed in-house simulator."""
+    return (OutputPath.with_suffix(".TruthTable.txt"),)
 
 
 def ClearStaleSuccessArtifacts(OutputPath: Path) -> list[str]:
     """Remove prior success artifacts before a new compile can fail."""
     Removed = []
-    for ArtifactPath in SuccessArtifactPaths(OutputPath).values():
+    ArtifactPaths = (
+        *SuccessArtifactPaths(OutputPath).values(),
+        *ObsoleteArtifactPaths(OutputPath),
+    )
+    for ArtifactPath in ArtifactPaths:
         if ArtifactPath.exists():
             ArtifactPath.unlink()
             Removed.append(NormalizeArtifactPath(ArtifactPath))
@@ -394,7 +395,7 @@ def BuildSuccessRouterReliability(
     """Build the successful-run envelope parallel to routing-failure-v1."""
     return {
         "SchemaVersion": "router-reliability-v1",
-        "RunVerdict": "ROUTED_AND_SIMULATED",
+        "RunVerdict": "ROUTED_AWAITING_FABRIC_SERVER_VALIDATION",
         "PlacementCandidates": Evidence.get(
             "PlacementFeedbackCandidates", []
         ),
@@ -454,10 +455,9 @@ def PublishSuccessArtifacts(
     *,
     Routed: object,
     Rendered: object,
-    Simulation: object,
     PhysicalDesignDocument: dict[str, object],
     OutputPath: Path,
-) -> tuple[Path, Path]:
+) -> Path:
     """Stage all success outputs and publish metadata after the schematic."""
     ArtifactPaths = SuccessArtifactPaths(OutputPath)
     OutputPath.parent.mkdir(parents=True, exist_ok=True)
@@ -469,9 +469,6 @@ def PublishSuccessArtifacts(
         ) as TemporaryDirectoryValue:
             TemporaryRoot = Path(TemporaryDirectoryValue)
             TemporaryOutputPath = TemporaryRoot / OutputPath.name
-            TemporaryTruthTablePath = (
-                TemporaryRoot / ArtifactPaths["TruthTable"].name
-            )
             TemporaryPhysicalDesignPath = (
                 TemporaryRoot / ArtifactPaths["PhysicalDesign"].name
             )
@@ -480,7 +477,16 @@ def PublishSuccessArtifacts(
                 OutputPath=TemporaryOutputPath,
                 Build=Rendered,
             )
-            WriteTruthTable(Simulation, TemporaryTruthTablePath)
+            RepeaterOrientation = getattr(
+                Rendered,
+                "RepeaterOrientation",
+                {},
+            )
+            FinalValidation = PhysicalDesignDocument.get("FinalValidation")
+            if isinstance(FinalValidation, dict):
+                FinalValidation["RepeaterOrientationReadbackPassed"] = (
+                    RepeaterOrientation.get("ReadbackPassed") is True
+                )
             TemporaryPhysicalDesignPath.write_text(
                 json.dumps(
                     PhysicalDesignDocument,
@@ -490,12 +496,11 @@ def PublishSuccessArtifacts(
                 encoding="utf-8",
             )
             TemporaryOutputPath.replace(ArtifactPaths["Schematic"])
-            TemporaryTruthTablePath.replace(ArtifactPaths["TruthTable"])
             TemporaryPhysicalDesignPath.replace(ArtifactPaths["PhysicalDesign"])
     except Exception:
         ClearStaleSuccessArtifacts(OutputPath)
         raise
-    return ArtifactPaths["TruthTable"], ArtifactPaths["PhysicalDesign"]
+    return ArtifactPaths["PhysicalDesign"]
 
 
 def WriteRoutingFailureArtifact(
@@ -640,47 +645,12 @@ def CompileSvToLitematic(
     DotPath = WriteNandDiagram(NandIR, DiagramPath)
     Stages.append("nand_diagram")
 
-    ValidatedSimulation = None
-
-    def ValidateRoutedCandidate(RoutedCandidate: object) -> None:
-        nonlocal ValidatedSimulation
-        CandidateSimulation = SimulateRoutedTruthTable(
-            RoutedCandidate,
-            ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
-        )
-        if not CandidateSimulation.Passed:
-            Failed = CandidateSimulation.FailedRows[0]
-            raise RoutingStageError(
-                RoutingFailure(
-                    Reason=RoutingFailureReason.ElectricalConflict,
-                    Stage="PhysicalSimulation",
-                    Detail=(
-                        "routed placement failed physical truth-table validation"
-                    ),
-                    Diagnostics={
-                        "Inputs": [int(Value) for Value in Failed.Inputs],
-                        "ExpectedOutputs": [
-                            int(Value) for Value in Failed.ExpectedOutputs
-                        ],
-                        "SimulatedOutputs": [
-                            int(Value) for Value in Failed.SimulatedOutputs
-                        ],
-                        "SimulationBackend": CandidateSimulation.Backend,
-                        "SimulationRuntimeSeconds": (
-                            CandidateSimulation.RuntimeSeconds
-                        ),
-                    },
-                )
-            )
-        ValidatedSimulation = CandidateSimulation
-
     try:
         Physical = PlaceAndRoutePcb(
             NandIR,
             ProgressCallback=ProgressCallback,
             Strategy=RequestedStrategy,
             Policy=EffectivePolicy,
-            RoutedValidationCallback=ValidateRoutedCandidate,
             RoutingDeadlineSeconds=RoutingDeadlineSeconds,
         )
     except RoutingStageError as Error:
@@ -719,23 +689,7 @@ def CompileSvToLitematic(
     Routed = Physical.Routed
     Stages.append("pcb_routing")
     Stages.append("route_cleanup")
-
-    Simulation = ValidatedSimulation or SimulateRoutedTruthTable(
-        Routed,
-        ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
-    )
-    Stages.append("redstone_simulation")
-    if not Simulation.Passed:
-        Failed = Simulation.FailedRows[0]
-        raise ValueError(
-            "Physical redstone truth table failed: "
-            f"inputs={tuple(int(Value) for Value in Failed.Inputs)}, "
-            "expected="
-            f"{tuple(int(Value) for Value in Failed.ExpectedOutputs)}, "
-            "simulated="
-            f"{tuple(int(Value) for Value in Failed.SimulatedOutputs)}"
-        )
-    TruthTablePath = OutputPath.with_suffix(".TruthTable.txt")
+    FabricServerValidation = FabricServerValidationResult.NotRun()
 
     ValidateNandOnlyDesign(Physical.Placed, NandIR)
     Routed.TraceSupportBlocks = (
@@ -746,33 +700,6 @@ def CompileSvToLitematic(
         TraceSupportBlocks=Routed.TraceSupportBlocks,
     )
     Composition = Rendered.Composition
-
-    # The routed-net check above covers every row.  For the parity-proven
-    # small-table bound, additionally require the exact rendered Minecraft
-    # block layout, where opaque supports and dust can couple distinct nets.
-    if ShouldSimulateRenderedMinecraftTruthTable(
-        OptimizedIR.Modules[OptimizedIR.Top]
-    ):
-        Simulation = SimulateRenderedMinecraftTruthTable(
-            Routed,
-            ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
-        )
-    else:
-        Simulation = replace(
-            Simulation,
-            Diagnostics={
-                **(Simulation.Diagnostics or {}),
-                "RenderedMinecraftCrossCheck": "skipped-row-ceiling",
-            },
-        )
-    if not Simulation.Passed:
-        Failed = Simulation.FailedRows[0]
-        raise ValueError(
-            "Rendered Minecraft redstone truth table failed: "
-            f"inputs={tuple(int(Value) for Value in Failed.Inputs)}, "
-            f"expected={tuple(int(Value) for Value in Failed.ExpectedOutputs)}, "
-            f"simulated={tuple(int(Value) for Value in Failed.SimulatedOutputs)}"
-        )
 
     GlobalPlan = Routed.GlobalPlan
     Metrics = Routed.RoutingMetrics
@@ -914,20 +841,26 @@ def CompileSvToLitematic(
             ),
             "PerNetLength": PerNetLengths,
             "MaximumNetLengthShare": round(MaximumNetLengthShare, 6),
-            "TruthTablePassed": Simulation.Passed,
-            "TruthTableRows": len(Simulation.Rows),
-            "SimulationBackend": Simulation.Backend,
-            "SimulationRuntimeSeconds": Simulation.RuntimeSeconds,
-            "SimulationDiagnostics": Simulation.Diagnostics,
+            "FabricServerValidation": asdict(FabricServerValidation),
         },
         "BlockComposition": Composition.ToDictionary(),
+        "RepeaterOrientation": Rendered.RepeaterOrientation,
         "NormalizedQuality": NormalizedQuality,
         "FinalValidation": {
-            "ValidationMode": "authoritative-exact",
+            "ValidationMode": "routing-and-rendering-only",
+            "FabricServerValidationRequired": True,
+            "FabricServerValidationStatus": FabricServerValidation.Status,
             "ZeroConflicts": Routed.ZeroResourceConflicts,
             "ConflictCount": 0 if Routed.ZeroResourceConflicts else 1,
             "UnresolvedClaims": UnresolvedClaims,
             "UnresolvedClaimCount": len(UnresolvedClaims),
+            "RepeaterOrientationPassed": (
+                Rendered.RepeaterOrientation.get("Passed") is True
+            ),
+            "RepeaterOrientationMismatchCount": int(
+                Rendered.RepeaterOrientation.get("MismatchCount", 0)
+            ),
+            "RepeaterOrientationReadbackRequired": True,
         },
         "RoutingResourceGraph": RoutingResourceGraphDocument,
         "GlobalRouting": (
@@ -949,15 +882,13 @@ def CompileSvToLitematic(
             else None
         ),
     }
-    TruthTablePath, PhysicalDesignPath = PublishSuccessArtifacts(
+    PhysicalDesignPath = PublishSuccessArtifacts(
         Routed=Routed,
         Rendered=Rendered,
-        Simulation=Simulation,
         PhysicalDesignDocument=PhysicalDesignDocument,
         OutputPath=OutputPath,
     )
     Stages.append("litematic_writer")
-    Stages.append("truth_table")
     Stages.append("physical_design_diagnostics")
 
     NandGateCount = sum(
@@ -976,9 +907,7 @@ def CompileSvToLitematic(
         Depth=Composition.Depth,
         OriginalLogicGateCount=OriginalLogicGateCount,
         OptimizedLogicGateCount=OptimizedLogicGateCount,
-        TruthTablePath=TruthTablePath,
-        TruthTablePassed=Simulation.Passed,
-        TruthTableRows=len(Simulation.Rows),
+        FabricServerValidation=FabricServerValidation,
         RoutingMetrics=Routed.RoutingMetrics,
         PhysicalDesignPath=PhysicalDesignPath,
         RequestedStrategy=Physical.RequestedStrategy,

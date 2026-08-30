@@ -199,10 +199,8 @@ DeterministicEvidenceFields = (
     "TruthTableArithmeticSha256",
     "TruthTableSimulationSha256",
 )
-AuthoritativeSimulationBackends = frozenset({
-    "minecraft-java-subset",
-    "native-parallel",
-    "python",
+AuthoritativeServerBackends = frozenset({
+    "fabric-server",
 })
 PerfBlockSchemaVersion = "router-performance-v1"
 # Baseline capture remains pinned to the frozen pre-change policy. Ordinary
@@ -1816,7 +1814,10 @@ def EvaluateRun(
         if not isinstance(RouterReliability, dict):
             Failures.append("missing RouterReliability evidence")
             RouterReliability = {}
-        if RouterReliability.get("RunVerdict") != "ROUTED_AND_SIMULATED":
+        if (
+            RouterReliability.get("RunVerdict")
+            != "ROUTED_AND_FABRIC_SERVER_VALIDATED"
+        ):
             Failures.append("successful router reliability verdict is missing")
 
         PolicySeed = ReadNested(PhysicalDocument, "Policy", "Seed")
@@ -1857,8 +1858,10 @@ def EvaluateRun(
                 f"{RunSummary.get('TruthTableRows')!r} != {Case.TruthTableRows}"
             )
         RawSimulationBackend = RunSummary.get("SimulationBackend")
-        if RawSimulationBackend not in AuthoritativeSimulationBackends:
-            Failures.append("simulation backend is missing or non-authoritative")
+        if RawSimulationBackend not in AuthoritativeServerBackends:
+            Failures.append(
+                "Fabric server backend is missing or non-authoritative"
+            )
         else:
             SimulationBackend = str(RawSimulationBackend)
         if RunSummary.get("Conflicts") != 0:
@@ -2718,7 +2721,7 @@ def ValidateFirstValidCaseSummary(
             "EffectiveWorkFingerprint"
         )
     if Summary.get("SimulationBackend") not in (
-        AuthoritativeSimulationBackends
+        AuthoritativeServerBackends
     ):
         raise ValueError(
             f"first-valid baseline case {Case.Name} has invalid "
@@ -3182,7 +3185,7 @@ def ReadBaselineReference(PathValue: Path) -> dict[str, object]:
                     "EffectiveWorkFingerprint"
                 )
             if Summary.get("SimulationBackend") not in (
-                AuthoritativeSimulationBackends
+                AuthoritativeServerBackends
             ):
                 raise ValueError(
                     f"baseline case {Case.Name} has invalid "

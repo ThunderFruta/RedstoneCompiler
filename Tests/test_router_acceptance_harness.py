@@ -20,7 +20,7 @@ from Scripts.RunRouterAcceptance import (
     AcceptanceCommandResult,
     AcceptanceConfiguration,
     AcceptedPolicyVersion,
-    AuthoritativeSimulationBackends,
+    AuthoritativeServerBackends,
     BaselinePolicyVersion,
     BaselineSchemaVersion,
     BuildBaselineComparison,
@@ -80,7 +80,7 @@ def BuildPhysicalDesign(
     OverflowPeak: int = 0,
     UnresolvedClaims: list[str] | None = None,
     PolicyVersion: str = AcceptedPolicyVersion,
-    SimulationBackend: str = "native-parallel",
+    SimulationBackend: str = "fabric-server",
     ValidationMode: str = "authoritative-exact",
     RouterReliability: dict[str, object] | None = None,
     Width: int = 10,
@@ -106,7 +106,7 @@ def BuildPhysicalDesign(
         },
         "RouterReliability": {
             "SchemaVersion": "router-reliability-v1",
-            "RunVerdict": "ROUTED_AND_SIMULATED",
+            "RunVerdict": "ROUTED_AND_FABRIC_SERVER_VALIDATED",
             "Fingerprints": {
                 "Placement": PlacementFingerprint,
                 "Candidate": CandidateFingerprint,
@@ -282,14 +282,10 @@ def SourceProvenanceFixture(
 
 
 class RouterAcceptanceHarnessTests(unittest.TestCase):
-    def testAuthoritativeSimulationBackendsIncludeRenderedSubset(self) -> None:
+    def testOnlyFabricServerIsAnAuthoritativeSimulationBackend(self) -> None:
         self.assertEqual(
-            AuthoritativeSimulationBackends,
-            frozenset({
-                "minecraft-java-subset",
-                "native-parallel",
-                "python",
-            }),
+            AuthoritativeServerBackends,
+            frozenset({"fabric-server"}),
         )
 
     def test_compatibility_exact_interface_checkpoint_accepts_frozen_proof(self):
@@ -1249,7 +1245,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 {"SimulationBackend": "projected"},
                 AcceptanceCommandResult(0, "", "", 1.0),
                 None,
-                "simulation backend is missing or non-authoritative",
+                "Fabric server backend is missing or non-authoritative",
             ),
             (
                 "relaxed-validation",
@@ -1582,12 +1578,6 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 {"EffectiveWorkFingerprint": "work-changed"},
                 False,
                 "EffectiveWorkFingerprint",
-            ),
-            (
-                "simulation-backend",
-                {"SimulationBackend": "python"},
-                False,
-                "SimulationBackend",
             ),
             (
                 "truth-table-artifact",
@@ -2395,7 +2385,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     ):
                         ReadBaselineReference(CandidatePath)
 
-    def testComparisonRequiresBaselineSimulationBackend(self) -> None:
+    def testComparisonRejectsRemovedSimulationBackend(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             BaselinePath, _Manifest = self.CaptureBaseline(Root)
@@ -2451,8 +2441,8 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 self.assertEqual(
                     Circuit["SimulationBackend"],
                     {
-                        "Baseline": "native-parallel",
-                        "Candidate": "python",
+                        "Baseline": "fabric-server",
+                        "Candidate": None,
                     },
                 )
 

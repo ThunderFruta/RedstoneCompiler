@@ -8,8 +8,8 @@
    local routes.
 4. `Compiler/Routing/` plans coarse capacity, negotiates detailed route trees,
    materializes repeaters, and validates claims.
-5. `Compiler/Simulation/` verifies the materialized circuit truth table.
-6. `SchemEncoder/` writes the accepted design as a litematic.
+5. `SchemEncoder/` writes the routed design as a neutral-state litematic.
+6. `Compiler/FabricServer/` owns the authoritative server-validation contract.
 
 `Compiler/Pipeline.py` owns end-to-end orchestration.
 `Compiler/Placement/Flow/` owns the placement/routing feedback loop, with the
@@ -17,13 +17,14 @@ narrow public entrypoint in `Compiler/Placement/Flow/Runner.py`.
 
 ## Publication boundary
 
-No schematic is accepted before exact physical claims, repeater legality, DRC,
-and truth-table simulation pass. Typed failures publish diagnostics and exit
-nonzero. `new-router-first` is the only production strategy and never invokes
-a silent compatibility fallback.
+Routing publication requires exact physical claims, repeater legality, and DRC.
+The current clean-break state marks every published schematic as
+`not-run` for Fabric-server validation; it must not be treated as Minecraft
+behavioral acceptance until the server stage returns an authoritative result.
+Typed routing failures publish diagnostics and exit nonzero.
 
 ## Runtime boundary
 
-One absolute deadline covers placement generation, routing, validation,
-simulation, and diagnostic publication. Nested stages receive remaining time;
-they do not reset it.
+One absolute deadline covers placement generation, routing, structural
+validation, and diagnostic publication. The Fabric-server stage will own a
+separate server lifecycle and request deadline once connected.

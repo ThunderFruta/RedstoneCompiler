@@ -15,6 +15,8 @@ RustSourceRoot = RepositoryRoot / "RustRouting/Src"
 
 BannedModulePaths = (
     "Compiler/Cells/Nand.py",
+    "Compiler/Simulation/Redstone.py",
+    "Compiler/Simulation/__init__.py",
     "Compiler/Placement/AccessFabric.py",
     "Compiler/Placement/Pcb.py",
     "Compiler/Placement/PcbFlow.py",
@@ -34,9 +36,13 @@ BannedModulePaths = (
     "RustRouting/Src/LeasePlanning.rs",
     "RustRouting/Src/Models.rs",
     "RustRouting/Src/PathRouting.rs",
+    "RustRouting/Src/Simulation/LogicSimulation.rs",
+    "RustRouting/Src/Simulation/mod.rs",
 )
 BannedModuleNames = frozenset({
     "Compiler.Cells.Nand",
+    "Compiler.Simulation",
+    "Compiler.Simulation.Redstone",
     "Compiler.Placement.AccessFabric",
     "Compiler.Placement.Pcb",
     "Compiler.Placement.PcbFlow",

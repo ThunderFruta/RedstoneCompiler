@@ -460,61 +460,22 @@ def OrientCellState(
     return TransformBlockState(State, Rotation, MirrorX)
 
 
-def SimulateDefaultSignals(RoutedDesign: Any) -> dict[str, bool]:
-    """Evaluate the NAND IR with every input lever in its default off state."""
-    SignalValues: dict[str, bool] = {}
-    for Gate in RoutedDesign.Module.Gates:
-        if Gate.Kind.value == "INPUT":
-            SignalValues[Gate.Output] = False
-        elif Gate.Kind.value == "NAND":
-            SignalValues[Gate.Output] = not all(
-                SignalValues[Signal] for Signal in Gate.Inputs
-            )
-        elif Gate.Kind.value == "OUTPUT":
-            SignalValues[Gate.Output] = SignalValues[Gate.Inputs[0]]
-    return SignalValues
-
-
-def PoweredCellState(
+def NeutralDynamicState(
     State: dict[str, Any],
-    Gate: Any,
-    LocalPosition: tuple[int, int, int],
-    SignalValues: dict[str, bool],
 ) -> dict[str, Any]:
-    """Apply the simulated initial logic state to one template block."""
+    """Emit dynamic redstone blocks without predicting server state."""
     Name = State["Name"]
     Properties = dict(State.get("Properties", {}))
-    X, _, Z = LocalPosition
-
-    if Gate.Kind == "INPUT":
-        Value = SignalValues[Gate.Outputs[0]]
-        if Name in ("minecraft:lever", "minecraft:repeater"):
-            Properties["powered"] = str(Value).lower()
-        elif Name == "minecraft:redstone_lamp":
-            Properties["lit"] = str(Value).lower()
-    elif Gate.Kind == "OUTPUT":
-        Value = SignalValues[Gate.Inputs[0]]
-        if Name == "minecraft:repeater":
-            Properties["powered"] = str(Value).lower()
-        elif Name == "minecraft:redstone_lamp":
-            Properties["lit"] = str(Value).lower()
-    elif Gate.Kind == "NAND":
-        OutputValue = SignalValues[Gate.Outputs[0]]
-        if Name == "minecraft:repeater":
-            if Z == 0:
-                InputIndex = 0 if X == 0 else 1
-                Properties["powered"] = str(
-                    SignalValues[Gate.Inputs[InputIndex]]
-                ).lower()
-            else:
-                Properties["powered"] = str(OutputValue).lower()
-        elif Name == "minecraft:redstone_wall_torch":
-            InputIndex = 0 if X == 0 else 1
-            Properties["lit"] = str(
-                not SignalValues[Gate.Inputs[InputIndex]]
-            ).lower()
-        elif Name == "minecraft:redstone_wire":
-            Properties["power"] = "15" if OutputValue else "0"
+    if Name in ("minecraft:lever", "minecraft:repeater"):
+        Properties["powered"] = "false"
+    elif Name in (
+        "minecraft:redstone_lamp",
+        "minecraft:redstone_torch",
+        "minecraft:redstone_wall_torch",
+    ):
+        Properties["lit"] = "false"
+    elif Name == "minecraft:redstone_wire":
+        Properties["power"] = "0"
 
     Result = {"Name": Name}
     if Properties:
@@ -789,7 +750,6 @@ def BuildLitematicBlockMap(
     Blocks: dict[tuple[int, int, int], dict[str, Any]] = {}
     Provenance: dict[tuple[int, int, int], BlockProvenance] = {}
     Signs: list[tuple[tuple[int, int, int], str]] = []
-    SignalValues = SimulateDefaultSignals(RoutedDesign)
     SignalList = sorted(RoutedDesign.NetWires)
     TracePalette = _NormalizeTracePalette(
         TraceSupportBlocks
@@ -833,12 +793,7 @@ def BuildLitematicBlockMap(
                 (X, Y, Z),
                 State,
             )
-            State = PoweredCellState(
-                State,
-                Gate,
-                (X, Y, Z),
-                SignalValues,
-            )
+            State = NeutralDynamicState(State)
             LocalPosition = TransformLocalPosition(
                 (X, Y, Z),
                 (Template.Size[0], Template.Size[2]),
@@ -908,7 +863,6 @@ def BuildLitematicBlockMap(
 
     for Signal, Positions in RoutedDesign.NetWires.items():
         NetCells = set(Positions)
-        Power = 15 if SignalValues.get(Signal, False) else 0
         for Position in NetCells:
             if Position in RoutedDesign.Repeaters:
                 continue
@@ -916,7 +870,7 @@ def BuildLitematicBlockMap(
                 Position,
                 NetCells,
                 Blocks,
-                Power,
+                0,
             )
             Provenance.setdefault(Position, BlockProvenance.RouteSignal)
 

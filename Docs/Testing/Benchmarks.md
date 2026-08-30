@@ -7,9 +7,11 @@
 | RippleCarryAdder8 | 8-bit carry ripple scalability gate | 3 | 131072 | 30 s |
 | CarryLookaheadAdder4 (extended) | Optional exact-interface proof check | 2 | 512 | 120 s |
 
-All successful runs require zero final conflicts, zero unresolved claims,
-authoritative physical simulation, identical repeated fingerprints, and no
-fallback.
+The recorded matrix predates the Fabric-server cutover. New full acceptance
+requires zero final conflicts, zero unresolved claims, identical repeated
+fingerprints, no fallback, and an authoritative Fabric-server result. Until
+that stage is connected, the router-only subset can run but cannot claim
+Minecraft behavioral acceptance.
 
 ## Current checkpoint
 

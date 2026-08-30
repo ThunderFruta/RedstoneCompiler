@@ -191,7 +191,7 @@ After region placement and inter-region track assignment:
 2. materialize reserved inter-region dust, supports, stairs, and repeaters;
 3. rebuild all claims through the authoritative resource graph;
 4. require exactly one owner for every claimed physical resource;
-5. run final DRC and exhaustive physical simulation.
+5. run final DRC and publish the neutral-state server input artifact.
 
 Late materialization is not late legality. The abstract masks and reservations
 are the legality model during planning; final materialization proves that the
@@ -239,5 +239,5 @@ ALU.
   routing work, aside from the linear bus extension.
 - Region composition cannot overlap another region's footprint, keepout, or
   reserved physical resource.
-- Materialized output passes authoritative DRC and physical simulation.
+- Materialized output passes authoritative DRC and Fabric-server validation.
 - Generic glue logic remains local and cannot destroy structured region layout.

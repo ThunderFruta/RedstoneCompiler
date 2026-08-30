@@ -181,7 +181,7 @@ def PropagateRoutePower(
     Repeaters: dict[Position3, str],
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[Position3, int]:
-    """Apply the same directed strength rules as physical simulation."""
+    """Apply directed signal-strength rules for routing legality."""
     Powers = {Root: 15}
     Pending: list[tuple[int, Position3]] = [(-15, Root)]
     ExpandedNodes = 0
@@ -325,7 +325,7 @@ def PruneRedundantRepeaterReservations(
     Reservations: tuple[Any, ...],
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> tuple[Any, ...]:
-    """Prune with one tree walk rather than one full simulation per repeater.
+    """Prune with one tree walk rather than one propagation per repeater.
 
     Reserved repeaters are produced from root-to-sink paths.  On a tree, a
     latest-legal refresh site on each root-to-sink path is sufficient and

@@ -1664,7 +1664,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             )
             Diagnostics = Result.PhysicalDesignPath.read_text(encoding="utf-8")
             EmittedBlockCount = len(LoadTemplate(Result.OutputPath).Blocks)
-        self.assertTrue(Result.TruthTablePassed)
+        self.assertEqual(Result.FabricServerValidation.Status, "not-run")
         self.assertEqual(Result.UsedStrategy, "default")
         self.assertIn('"UnresolvedClaimCount": 0', Diagnostics)
         self.assertIn('"PlanningContracts"', Diagnostics)

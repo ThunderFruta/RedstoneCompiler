@@ -8,7 +8,6 @@ mod Geometry;
 mod Path;
 mod Planning;
 mod Python;
-mod Simulation;
 
 use pyo3::types::PyModule;
 use pyo3::{pymodule, Bound, PyResult};

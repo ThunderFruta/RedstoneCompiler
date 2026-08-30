@@ -997,12 +997,8 @@ def Main(Args: list[str] | None = None) -> int:
     )
     print(f"NAND JSON: {Result.DiagramPath}")
     print(f"NAND DOT:  {Result.DotPath}")
-    print(
-        f"Redstone simulation: "
-        f"{'PASS' if Result.TruthTablePassed else 'FAIL'} "
-        f"({Result.TruthTableRows} truth-table rows)"
-    )
-    print(f"Truth table: {Result.TruthTablePath}")
+    ServerValidation = Result.FabricServerValidation
+    print(f"Fabric server validation: {ServerValidation.Status.upper()}")
     print(f"Litematic: {Result.OutputPath}")
     if DestinationPath is not None:
         print(f"Minecraft: {DestinationPath}")

@@ -5,7 +5,6 @@ import unittest
 
 from SVDecoder.Sv import ParseSvToNetlist
 from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
-from Compiler.Simulation.Redstone import SimulateRoutedTruthTable
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
 from Compiler.Routing.Policy import RoutingStrategy
@@ -24,10 +23,9 @@ RUN_SCALE_TESTS = os.environ.get("RC_RUN_SCALE_TESTS", "").strip().lower() in {
     "set RC_RUN_SCALE_TESTS=1 to run the routed 4-bit acceptance tests",
 )
 class ScaleRoutingTests(unittest.TestCase):
-    def AssertExampleRoutesAndSimulates(
+    def AssertExampleRoutes(
         self,
         ExampleName: str,
-        ExpectedTruthTableRows: int = 512,
     ):
         with tempfile.TemporaryDirectory() as Workdir:
             Netlist = ParseSvToNetlist(
@@ -40,15 +38,9 @@ class ScaleRoutingTests(unittest.TestCase):
                 ToNandOnly(Optimized),
                 Strategy=RoutingStrategy.Default,
             )
-            Report = SimulateRoutedTruthTable(
-                Physical.Routed,
-                ReferenceModule=Optimized.Modules[Optimized.Top],
-            )
 
         self.assertIsNotNone(Physical.Routed.GlobalPlan)
         self.assertFalse(Physical.Routed.GlobalPlan.ResourceOverflow)
-        self.assertEqual(len(Report.Rows), ExpectedTruthTableRows)
-        self.assertTrue(Report.Passed)
         Handoff = Physical.Routed.RoutingControlEffectiveness[
             "PrePlacementTrackAssignmentHandoff"
         ]
@@ -56,17 +48,14 @@ class ScaleRoutingTests(unittest.TestCase):
         self.assertEqual(Handoff["NativeAssignmentExpansionCount"], 0)
         return Physical
 
-    def testRippleCarryAdder4RoutesAndSimulates(self) -> None:
-        self.AssertExampleRoutesAndSimulates("RippleCarryAdder4.sv")
+    def testRippleCarryAdder4Routes(self) -> None:
+        self.AssertExampleRoutes("RippleCarryAdder4.sv")
 
-    def testCarryLookaheadAdder4RoutesAndSimulates(self) -> None:
-        self.AssertExampleRoutesAndSimulates("CarryLookaheadAdder4.sv")
+    def testCarryLookaheadAdder4Routes(self) -> None:
+        self.AssertExampleRoutes("CarryLookaheadAdder4.sv")
 
     def testRippleCarryAdder8SelectsFixedGeometryBeforeRouting(self) -> None:
-        Physical = self.AssertExampleRoutesAndSimulates(
-            "RippleCarryAdder8.sv",
-            ExpectedTruthTableRows=131072,
-        )
+        Physical = self.AssertExampleRoutes("RippleCarryAdder8.sv")
 
         Selection = Physical.Routed.RoutingControlEffectiveness[
             "PrePlacementCapacitySelection"
