@@ -171,21 +171,17 @@ macro_rules! PrepareLayeredCatalogSolverPhase {
             .filter(|Variable| Variable.starts_with("__access_terminal__:"))
             .cloned()
             .collect::<Vec<_>>();
-        let mut $GuideVariables = $Groups
-            .keys()
-            .filter(|Variable| Variable.starts_with("__route_guide__:"))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut $GuideVariables;
         // A caller-provided complete witness may seed exact validation.  The
         // production batch otherwise enters the portal-aware bounded search
         // directly; constructing a member-local all-pairs compatibility matrix
         // duplicates the exact claim checks and dominates portfolio runtime.
-        let mut $WarmSelections = if let Some($ExternalWarmSelections) = $ExternalWarmSelections {
+        let $WarmSelections = if let Some($ExternalWarmSelections) = $ExternalWarmSelections {
             $ExternalWarmSelections.to_vec()
         } else {
             Vec::new()
         };
-        let mut $WarmCandidateIdByVariable =
+        let $WarmCandidateIdByVariable =
             $WarmSelections.iter().cloned().collect::<HashMap<_, _>>();
         for (Variable, Values) in $Groups.iter_mut() {
             let Some(PreferredCandidateId) = $WarmCandidateIdByVariable.get(Variable) else {

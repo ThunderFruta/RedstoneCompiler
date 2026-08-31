@@ -25,7 +25,9 @@ from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
 from .FabricServer import (
     BuildExpectedVectors,
     BuildFabricFixture,
+    CaptureServerUpdatedLitematic,
     FabricServerConfiguration,
+    FabricServerSnapshotArtifact,
     FabricServerSupervisor,
     FabricServerValidationResult,
     WriteFabricFixture,
@@ -109,6 +111,19 @@ RoutingFailureArtifactAggregateDiagnosticKeys = frozenset({
     "PlacementAttempts",
     "RoutingEscalationState",
 })
+
+
+def RequireFabricServerValidation(
+    Result: FabricServerValidationResult,
+) -> None:
+    """Reject an artifact unless the authoritative server observed a pass."""
+    if Result.Status != "passed":
+        Detail = Result.Diagnostics.get("Error") or Result.Diagnostics.get("Reason")
+        raise ValueError(
+            "FabricServerValidation:"
+            f"{Result.Status}"
+            + (f":{Detail}" if Detail else "")
+        )
 
 
 def BuildRoutingFailureArtifactSnapshot(
@@ -459,15 +474,48 @@ def BuildPartialArtifactPaths(
     return dict(sorted(Result.items()))
 
 
+def BuildFabricServerSnapshotDocument(
+    Artifact: FabricServerSnapshotArtifact,
+    OutputPath: Path,
+) -> dict[str, object]:
+    """Describe the authoritative all-zero world state published as output."""
+    return {
+        "Path": NormalizeArtifactPath(OutputPath),
+        "State": "all-inputs-zero-server-updated",
+        "RequestedPositionCount": Artifact.RequestedPositionCount,
+        "ObservedBlockCount": Artifact.ObservedBlockCount,
+        "WorldReadRequests": Artifact.WorldReadRequests,
+        "InputCountSetToZero": Artifact.InputCountSetToZero,
+        "SnapshotReadPasses": Artifact.SnapshotReadPasses,
+        "InputZeroGameTime": Artifact.InputZeroGameTime,
+        "FirstObservedGameTime": Artifact.FirstObservedGameTime,
+        "LastObservedGameTime": Artifact.LastObservedGameTime,
+    }
+
+
 def PublishSuccessArtifacts(
     *,
     Routed: object,
     Rendered: object,
     PhysicalDesignDocument: dict[str, object],
     FabricFixture: dict[str, object] | None = None,
+    FabricServerSnapshotSupervisor: FabricServerSupervisor | None = None,
     OutputPath: Path,
 ) -> Path:
-    """Stage all success outputs and publish metadata after the schematic."""
+    """Stage all success outputs and publish a settled server snapshot.
+
+    A compiler run always supplies both ``FabricFixture`` and
+    ``FabricServerSnapshotSupervisor``.  The static litematic is written only
+    into the private staging directory so the existing compiler-side
+    orientation audit and I/O labels remain authoritative.  Minecraft then
+    supplies the final block-state snapshot after all fixture inputs have been
+    reset to zero.  Direct callers that do not supply a supervisor retain the
+    static writer behavior for narrow unit tests and fixture-only workflows.
+    """
+    if FabricServerSnapshotSupervisor is not None and FabricFixture is None:
+        raise ValueError(
+            "Fabric server snapshot requires a Fabric fixture",
+        )
     ArtifactPaths = SuccessArtifactPaths(OutputPath)
     OutputPath.parent.mkdir(parents=True, exist_ok=True)
     ClearStaleSuccessArtifacts(OutputPath)
@@ -481,11 +529,35 @@ def PublishSuccessArtifacts(
             TemporaryPhysicalDesignPath = (
                 TemporaryRoot / ArtifactPaths["PhysicalDesign"].name
             )
-            SchemWriter.WriteLitematic(
-                Routed,
-                OutputPath=TemporaryOutputPath,
-                Build=Rendered,
-            )
+            if FabricServerSnapshotSupervisor is None:
+                SchemWriter.WriteLitematic(
+                    Routed,
+                    OutputPath=TemporaryOutputPath,
+                    Build=Rendered,
+                )
+            else:
+                TemporaryStaticOutputPath = TemporaryRoot / (
+                    f"{OutputPath.stem}.Static{OutputPath.suffix}"
+                )
+                SchemWriter.WriteLitematic(
+                    Routed,
+                    OutputPath=TemporaryStaticOutputPath,
+                    Build=Rendered,
+                )
+                SnapshotArtifact = CaptureServerUpdatedLitematic(
+                    Supervisor=FabricServerSnapshotSupervisor,
+                    Fixture=FabricFixture,
+                    SourcePath=TemporaryStaticOutputPath,
+                    OutputPath=TemporaryOutputPath,
+                )
+                RunSummary = PhysicalDesignDocument.get("RunSummary")
+                if isinstance(RunSummary, dict):
+                    RunSummary["FabricServerSnapshot"] = (
+                        BuildFabricServerSnapshotDocument(
+                            SnapshotArtifact,
+                            OutputPath,
+                        )
+                    )
             if FabricFixture is not None:
                 TemporaryFixturePath = (
                     TemporaryRoot / ArtifactPaths["FabricFixture"].name
@@ -720,6 +792,9 @@ def CompileSvToLitematic(
         Rendered=Rendered,
         Module=NandModule,
     )
+    ServerSupervisor = FabricServerSupervisor(
+        FabricServerConfiguration.FromEnvironment(),
+    )
     with TemporaryDirectory(
         dir=OutputPath.parent,
         prefix=f".{OutputPath.stem}-fabric-validate-",
@@ -728,9 +803,7 @@ def CompileSvToLitematic(
             Path(FixtureDirectory) / OutputPath.with_suffix(".FabricFixture.json").name,
             FabricFixture,
         )
-        FabricServerValidation = FabricServerSupervisor(
-            FabricServerConfiguration.FromEnvironment(),
-        ).Validate(
+        FabricServerValidation = ServerSupervisor.Validate(
             Fixture=ValidationFixture,
             Vectors=BuildExpectedVectors(
                 NandModule,
@@ -739,6 +812,30 @@ def CompileSvToLitematic(
             ),
         )
     Stages.append("fabric_server_validation")
+    if FabricServerValidation.Status != "passed":
+        TryWriteRoutingFailureArtifact(
+            OutputPath=OutputPath,
+            RequestedStrategy=RequestedStrategy,
+            Failure=RoutingFailure(
+                Reason=RoutingFailureReason.FinalDrcViolation,
+                Stage="FabricServerValidation",
+                Detail=(
+                    "authoritative Fabric validation did not pass: "
+                    f"{FabricServerValidation.Status}"
+                ),
+                Diagnostics={
+                    "FabricServerValidation": asdict(FabricServerValidation),
+                },
+            ),
+            StartedAt=StartedAt,
+            InputPath=InputPath,
+            DiagramPath=DiagramPath,
+            DotPath=DotPath,
+            Workdir=Workdir,
+            TopModule=TopModule,
+            EffectivePolicy=EffectivePolicy,
+        )
+        RequireFabricServerValidation(FabricServerValidation)
 
     GlobalPlan = Routed.GlobalPlan
     Metrics = Routed.RoutingMetrics
@@ -935,8 +1032,10 @@ def CompileSvToLitematic(
         Rendered=Rendered,
         PhysicalDesignDocument=PhysicalDesignDocument,
         FabricFixture=FabricFixture,
+        FabricServerSnapshotSupervisor=ServerSupervisor,
         OutputPath=OutputPath,
     )
+    Stages.append("fabric_server_snapshot")
     Stages.append("litematic_writer")
     Stages.append("physical_design_diagnostics")
 

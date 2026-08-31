@@ -36,6 +36,7 @@ from Compiler.Placement.Geometry import (
 )
 from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
+from Compiler.FabricServer import FabricServerValidationResult
 from Compiler.Routing.LocalFirst import (
     AssignCapacityAwareGuideOptionDomains,
     BuildCapacityAwareGuidePlan,
@@ -1654,19 +1655,44 @@ class LocalFirstRouterTests(unittest.TestCase):
     def testNewRouterFullAdderWritesCompleteDiagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
             Root = Path(Directory)
-            Result = CompileSvToLitematic(
-                InputPath=Path("Examples/FullAdder.sv"),
-                TopModule="FullAdder",
-                OutputPath=Root / "FullAdder.litematic",
-                DiagramPath=Root / "FullAdder.Nand.json",
-                Workdir=Root / "Frontend",
-                RoutingStrategyValue=RoutingStrategy.Default,
-            )
+            def CaptureServerSnapshot(*, SourcePath, OutputPath, **_Options):
+                OutputPath.write_bytes(SourcePath.read_bytes())
+                return SimpleNamespace(
+                    RequestedPositionCount=1,
+                    ObservedBlockCount=1,
+                    WorldReadRequests=1,
+                    InputCountSetToZero=3,
+                    SnapshotReadPasses=2,
+                    InputZeroGameTime=0,
+                    FirstObservedGameTime=50,
+                    LastObservedGameTime=51,
+                )
+
+            with (
+                patch("Compiler.Pipeline.FabricServerSupervisor") as Supervisor,
+                patch(
+                    "Compiler.Pipeline.CaptureServerUpdatedLitematic",
+                    side_effect=CaptureServerSnapshot,
+                ),
+            ):
+                Supervisor.return_value.Validate.return_value = FabricServerValidationResult(
+                    Status="passed",
+                    Backend="fabric-26.2",
+                    RuntimeSeconds=0.0,
+                )
+                Result = CompileSvToLitematic(
+                    InputPath=Path("Examples/FullAdder.sv"),
+                    TopModule="FullAdder",
+                    OutputPath=Root / "FullAdder.litematic",
+                    DiagramPath=Root / "FullAdder.Nand.json",
+                    Workdir=Root / "Frontend",
+                    RoutingStrategyValue=RoutingStrategy.Default,
+                )
             Diagnostics = Result.PhysicalDesignPath.read_text(encoding="utf-8")
             EmittedBlockCount = len(LoadTemplate(Result.OutputPath).Blocks)
         self.assertEqual(
             Result.FabricServerValidation.Status,
-            "infrastructure-failure",
+            "passed",
         )
         self.assertEqual(Result.UsedStrategy, "default")
         self.assertIn('"UnresolvedClaimCount": 0', Diagnostics)

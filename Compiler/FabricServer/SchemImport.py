@@ -10,7 +10,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from SchemEncoder.SchemWriter import LoadTemplate, NbtValue, ReadNbt
+from SchemEncoder.SchemWriter import (
+    CellTemplate,
+    LoadTemplate,
+    NbtValue,
+    NeutralDynamicState,
+    ReadNbt,
+)
 
 
 _AirBlocks = {"minecraft:air", "minecraft:cave_air", "minecraft:void_air"}
@@ -62,6 +68,125 @@ def _DecodeVarints(Data: bytes, Count: int) -> list[int]:
     return Values
 
 
+def ReadLitematicIoLabels(
+    PathValue: Path,
+) -> list[tuple[tuple[int, int, int], str, str]]:
+    """Read compiler I/O annotations without loading sign block entities.
+
+    These labels are only an import-time bridge for a compiler-emitted
+    litematic.  The normal compiler fixture path remains template-derived.
+    """
+    Root = ReadNbt(PathValue)
+    Regions = _Tag(Root, "Regions")
+    if not isinstance(Regions, dict) or not Regions:
+        raise ValueError("litematic has no regions")
+    if len(Regions) != 1:
+        raise ValueError("multi-region litematic files are not supported by the Fabric importer")
+    Region = next(iter(Regions.values())).Value
+    if not isinstance(Region, dict):
+        raise ValueError("litematic region is not a compound")
+    Size = _Tag(Region, "Size")
+    if not isinstance(Size, dict):
+        raise ValueError("litematic region has no compound Size")
+    SignedSize = tuple(int(_Tag(Size, Axis)) for Axis in ("x", "y", "z"))
+    AbsoluteSize = tuple(abs(Value) for Value in SignedSize)
+    TileEntities = Region.get("TileEntities")
+    if TileEntities is None:
+        return []
+    if not isinstance(TileEntities, NbtValue):
+        raise ValueError("litematic TileEntities is not an NBT value")
+    ListType, Values = TileEntities.Value
+    if not isinstance(Values, list):
+        raise ValueError("litematic TileEntities is not a compound list")
+    if not Values:
+        return []
+    if ListType != 10:
+        raise ValueError("litematic TileEntities is not a compound list")
+    Labels: list[tuple[tuple[int, int, int], str, str]] = []
+    for Entity in Values:
+        if not isinstance(Entity, dict):
+            raise ValueError("litematic TileEntities contains a non-compound value")
+        if _Tag(Entity, "id") != "minecraft:sign":
+            continue
+        FrontText = _Tag(Entity, "front_text")
+        if not isinstance(FrontText, dict):
+            raise ValueError("litematic sign front_text is not a compound")
+        Messages = _Tag(FrontText, "messages")
+        if (
+            not isinstance(Messages, tuple)
+            or len(Messages) != 2
+            or Messages[0] != 8
+            or not isinstance(Messages[1], list)
+            or not Messages[1]
+            or not isinstance(Messages[1][0], str)
+        ):
+            raise ValueError("litematic sign has invalid front_text messages")
+        Text = Messages[1][0].strip()
+        Prefix, Separator, Name = Text.partition(" ")
+        if Prefix not in {"IN", "OUT"}:
+            continue
+        if not Separator or not Name.strip():
+            raise ValueError(f"litematic I/O label has no signal name: {Text!r}")
+        RawPosition = tuple(int(_Tag(Entity, Axis)) for Axis in ("x", "y", "z"))
+        Position = tuple(
+            RawPosition[Index]
+            if SignedSize[Index] > 0
+            else AbsoluteSize[Index] - 1 - RawPosition[Index]
+            for Index in range(3)
+        )
+        Labels.append((Position, Prefix, Name.strip()))
+    return Labels
+
+
+def InferLitematicPorts(
+    Template: CellTemplate,
+    Labels: list[tuple[tuple[int, int, int], str, str]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Pair unambiguous compiler I/O labels with the nearest I/O blocks."""
+    Candidates = {
+        "IN": sorted(
+            Position
+            for Position, State in Template.Blocks.items()
+            if State["Name"] == "minecraft:lever"
+        ),
+        "OUT": sorted(
+            Position
+            for Position, State in Template.Blocks.items()
+            if State["Name"] == "minecraft:redstone_lamp"
+        ),
+    }
+    Ports: dict[str, list[dict[str, object]]] = {"IN": [], "OUT": []}
+    UsedPositions: set[tuple[int, int, int]] = set()
+    SeenNames: set[tuple[str, str]] = set()
+    for LabelPosition, Prefix, Name in sorted(Labels, key=lambda Value: (Value[1], Value[2], Value[0])):
+        Key = (Prefix, Name)
+        if Key in SeenNames:
+            raise ValueError(f"litematic has duplicate {Prefix} label for {Name}")
+        SeenNames.add(Key)
+        Distances = sorted(
+            (
+                sum(abs(Left - Right) for Left, Right in zip(LabelPosition, Position)),
+                Position,
+            )
+            for Position in Candidates[Prefix]
+            if Position not in UsedPositions
+        )
+        if not Distances:
+            raise ValueError(f"litematic has no available {Prefix} block for {Name}")
+        Distance, Position = Distances[0]
+        if len(Distances) > 1 and Distances[1][0] == Distance:
+            raise ValueError(f"litematic {Prefix} label for {Name} is ambiguous")
+        UsedPositions.add(Position)
+        Ports[Prefix].append({
+            "Name": Name,
+            "LeverPosition" if Prefix == "IN" else "LampPosition": list(Position),
+        })
+    return (
+        sorted(Ports["IN"], key=lambda Value: str(Value["Name"])),
+        sorted(Ports["OUT"], key=lambda Value: str(Value["Name"])),
+    )
+
+
 def BuildFabricFixtureFromSchem(
     SchemPath: Path,
     *,
@@ -74,21 +199,30 @@ def BuildFabricFixtureFromSchem(
     entities are deliberately rejected: the validation harness has no safe
     generic NBT entity application contract, so silently dropping them would
     make a Sponge import misleading. Litematic block entities are not loaded;
-    compiler circuits use their rendered block states and do not depend on
-    sign text for their I/O contract.
+    compiler circuits use their rendered block states and do not need sign
+    text while compiling. For a post-export test, compiler-created ``IN`` and
+    ``OUT`` sign annotations recover the physical test ports; generic imports
+    without those annotations remain loadable but are not testable.
     """
     PathValue = Path(SchemPath).expanduser().resolve()
     if PathValue.suffix.lower() == ".litematic":
         Template = LoadTemplate(PathValue)
+        Inputs, Outputs = InferLitematicPorts(
+            Template,
+            ReadLitematicIoLabels(PathValue),
+        )
         return {
             "SchemaVersion": 1,
             "TopModule": PathValue.stem,
             "Blocks": [
-                {"Position": list(Position), "State": State}
+                {
+                    "Position": list(Position),
+                    "State": NeutralDynamicState(State),
+                }
                 for Position, State in sorted(Template.Blocks.items())
             ],
-            "Inputs": [],
-            "Outputs": [],
+            "Inputs": Inputs,
+            "Outputs": Outputs,
             "Arena": {
                 "Origin": [int(Value) for Value in Origin],
                 "ResetBeforeLoad": bool(ResetBeforeLoad),
@@ -133,7 +267,10 @@ def BuildFabricFixtureFromSchem(
         X = Index % Width
         Z = (Index // Width) % Length
         Y = Index // (Width * Length)
-        Blocks.append({"Position": [X, Y, Z], "State": State})
+        Blocks.append({
+            "Position": [X, Y, Z],
+            "State": NeutralDynamicState(State),
+        })
     return {
         "SchemaVersion": 1,
         "TopModule": PathValue.stem,

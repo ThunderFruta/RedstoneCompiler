@@ -957,11 +957,11 @@ def BuildLitematicBlockMap(
         SupportBlock = "minecraft:light_gray_concrete"
     SupportState = {"Name": SupportBlock}
 
-    # Input ports use a wall-mounted lever.  Litematic placement tolerates a
-    # missing backing block more readily than a live server: Minecraft removes
-    # an unsupported lever before it can drive the input repeater.  Add the
-    # exact wall support to the canonical block map so the exported artifact
-    # and Fabric fixture share the same physically valid port geometry.
+    # A wall lever's ``facing`` property points away from its backing block.
+    # The Input template already places its redstone lamp on that backing side;
+    # do not add a second, floating support block on the visible lever side.
+    # Keep this general check for any future wall-mounted template components
+    # whose real backing block is absent.
     FacingOffsets = {
         "north": (0, 0, -1),
         "south": (0, 0, 1),
@@ -978,7 +978,7 @@ def BuildLitematicBlockMap(
             if Offset is None:
                 raise ValueError(f"wall lever has unsupported facing: {Facing}")
             SupportPosition = tuple(
-                Position[Axis] + Offset[Axis]
+                Position[Axis] - Offset[Axis]
                 for Axis in range(3)
             )
             if SupportPosition not in Blocks:
@@ -1276,6 +1276,187 @@ def WriteLitematic(
     OutputPath.write_bytes(gzip.compress(Data))
     ValidateSerializedRepeaterOrientations(OutputPath, Build)
     return Build
+
+
+def WriteObservedLitematic(
+    Blocks: dict[tuple[int, int, int], dict[str, Any]],
+    OutputPath: Path,
+    *,
+    Bounds: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None,
+    Signs: list[tuple[tuple[int, int, int], str]] | None = None,
+) -> None:
+    """Write the block states observed in a live Minecraft world.
+
+    This is intentionally separate from :func:`WriteLitematic`.  The normal
+    compiler writer proves the repeater-orientation contract against its
+    routed design.  A server snapshot is authoritative for dynamic block
+    properties such as redstone power and lamp state, so it must preserve
+    those values without reasserting compile-time repeater expectations.
+
+    ``Bounds`` preserves the fixture's full rectangular arena even when a
+    block update removed an outermost block.  Positions are local fixture
+    positions and are normalized to a litematic region during serialization.
+    """
+    AirNames = {"minecraft:air", "minecraft:cave_air", "minecraft:void_air"}
+    NormalizedBlocks: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for RawPosition, RawState in Blocks.items():
+        if (
+            not isinstance(RawPosition, tuple)
+            or len(RawPosition) != 3
+            or not all(isinstance(Value, int) for Value in RawPosition)
+        ):
+            raise ValueError(f"observed litematic block has invalid position: {RawPosition!r}")
+        if not isinstance(RawState, dict):
+            raise ValueError(f"observed litematic block at {RawPosition} has no state compound")
+        Name = RawState.get("Name")
+        if not isinstance(Name, str) or not Name:
+            raise ValueError(f"observed litematic block at {RawPosition} has invalid Name")
+        RawProperties = RawState.get("Properties", {})
+        if not isinstance(RawProperties, dict) or not all(
+            isinstance(Key, str) and isinstance(Value, str)
+            for Key, Value in RawProperties.items()
+        ):
+            raise ValueError(
+                f"observed litematic block at {RawPosition} has invalid Properties",
+            )
+        if Name in AirNames:
+            continue
+        State: dict[str, Any] = {"Name": Name}
+        if RawProperties:
+            State["Properties"] = dict(sorted(RawProperties.items()))
+        NormalizedBlocks[RawPosition] = State
+
+    if Bounds is None:
+        if not NormalizedBlocks:
+            raise ValueError("Cannot write an empty observed litematic without bounds")
+        Minimum = tuple(
+            min(Position[Axis] for Position in NormalizedBlocks)
+            for Axis in range(3)
+        )
+        Maximum = tuple(
+            max(Position[Axis] for Position in NormalizedBlocks)
+            for Axis in range(3)
+        )
+    else:
+        if len(Bounds) != 2:
+            raise ValueError("observed litematic bounds must contain minimum and maximum positions")
+        Minimum, Maximum = Bounds
+        if (
+            len(Minimum) != 3
+            or len(Maximum) != 3
+            or not all(isinstance(Value, int) for Value in (*Minimum, *Maximum))
+            or any(Minimum[Axis] > Maximum[Axis] for Axis in range(3))
+        ):
+            raise ValueError(f"observed litematic bounds are invalid: {Bounds!r}")
+        for Position in NormalizedBlocks:
+            if any(
+                Position[Axis] < Minimum[Axis] or Position[Axis] > Maximum[Axis]
+                for Axis in range(3)
+            ):
+                raise ValueError(
+                    f"observed litematic block {Position} lies outside bounds {Bounds}",
+                )
+
+    MinX, MinY, MinZ = Minimum
+    MaxX, MaxY, MaxZ = Maximum
+    SizeX, SizeY, SizeZ = MaxX - MinX + 1, MaxY - MinY + 1, MaxZ - MinZ + 1
+    AirState = {"Name": "minecraft:air"}
+    Palette = [AirState]
+    PaletteIndexes = {CanonicalState(AirState): 0}
+    for Position in sorted(NormalizedBlocks):
+        State = NormalizedBlocks[Position]
+        Key = CanonicalState(State)
+        if Key not in PaletteIndexes:
+            PaletteIndexes[Key] = len(Palette)
+            Palette.append(State)
+
+    States = [0] * (SizeX * SizeY * SizeZ)
+    for (X, Y, Z), State in NormalizedBlocks.items():
+        Index = (Y - MinY) * SizeZ * SizeX + (Z - MinZ) * SizeX + (X - MinX)
+        States[Index] = PaletteIndexes[CanonicalState(State)]
+
+    TileEntities = []
+    for Position, Text in sorted(Signs or []):
+        if (
+            not isinstance(Position, tuple)
+            or len(Position) != 3
+            or not all(isinstance(Value, int) for Value in Position)
+            or not isinstance(Text, str)
+        ):
+            raise ValueError(f"observed litematic sign is invalid: {(Position, Text)!r}")
+        if any(
+            Position[Axis] < Minimum[Axis] or Position[Axis] > Maximum[Axis]
+            for Axis in range(3)
+        ):
+            raise ValueError(f"observed litematic sign {Position} lies outside bounds {Bounds}")
+        State = NormalizedBlocks.get(Position)
+        if State is None or not str(State["Name"]).endswith("_sign"):
+            continue
+        TileEntities.append(SignBlockEntity(
+            (
+                Position[0] - MinX,
+                Position[1] - MinY,
+                Position[2] - MinZ,
+            ),
+            Text,
+        ))
+
+    EmptyCompoundList = NbtValue(9, (10, []))
+    Region = {
+        "Size": NbtValue(
+            10,
+            {
+                "x": NbtValue(3, SizeX),
+                "y": NbtValue(3, SizeY),
+                "z": NbtValue(3, SizeZ),
+            },
+        ),
+        "Position": NbtValue(
+            10,
+            {"x": NbtValue(3, 0), "y": NbtValue(3, 0), "z": NbtValue(3, 0)},
+        ),
+        "BlockStatePalette": NbtValue(9, (10, [StateTag(State) for State in Palette])),
+        "BlockStates": NbtValue(12, PackStates(States, len(Palette))),
+        "Entities": EmptyCompoundList,
+        "TileEntities": NbtValue(9, (10, TileEntities)),
+        "PendingBlockTicks": EmptyCompoundList,
+        "PendingFluidTicks": EmptyCompoundList,
+    }
+    Timestamp = int(time.time() * 1000)
+    OutputPath = Path(OutputPath)
+    Root = {
+        "Regions": NbtValue(10, {"RedstoneCompilerServerSnapshot": NbtValue(10, Region)}),
+        "SubVersion": NbtValue(3, LITEMATIC_SUBVERSION),
+        "Metadata": NbtValue(
+            10,
+            {
+                "Description": NbtValue(
+                    8,
+                    "Captured from the RedstoneCompiler Fabric server after block updates",
+                ),
+                "TimeModified": NbtValue(4, Timestamp),
+                "TimeCreated": NbtValue(4, Timestamp),
+                "TotalVolume": NbtValue(3, SizeX * SizeY * SizeZ),
+                "Name": NbtValue(8, OutputPath.stem),
+                "Author": NbtValue(8, "RedstoneCompiler Fabric server"),
+                "TotalBlocks": NbtValue(3, len(NormalizedBlocks)),
+                "EnclosingSize": NbtValue(
+                    10,
+                    {
+                        "x": NbtValue(3, SizeX),
+                        "y": NbtValue(3, SizeY),
+                        "z": NbtValue(3, SizeZ),
+                    },
+                ),
+                "RegionCount": NbtValue(3, 1),
+            },
+        ),
+        "Version": NbtValue(3, LITEMATIC_VERSION),
+        "MinecraftDataVersion": NbtValue(3, MINECRAFT_DATA_VERSION),
+    }
+    OutputPath.parent.mkdir(parents=True, exist_ok=True)
+    Data = bytes([10]) + EncodeString("") + EncodePayload(10, Root)
+    OutputPath.write_bytes(gzip.compress(Data))
 
 
 def WriteSchem(RoutedDesign: Any, OutputPath: Path) -> None:

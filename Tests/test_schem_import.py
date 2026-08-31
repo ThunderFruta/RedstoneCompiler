@@ -2,10 +2,12 @@ import gzip
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from Compiler.FabricServer import BuildFabricFixtureFromSchem
+from Compiler.FabricServer.SchemImport import ReadLitematicIoLabels
 from SchemEncoder import SchemWriter
-from SchemEncoder.SchemWriter import EncodePayload, EncodeString, NbtValue
+from SchemEncoder.SchemWriter import CellTemplate, EncodePayload, EncodeString, NbtValue
 
 
 def _WriteSpongeSchem(PathValue: Path, *, BlockData: bytes, BlockEntities: list[dict[str, NbtValue]] | None = None) -> None:
@@ -25,6 +27,12 @@ def _WriteSpongeSchem(PathValue: Path, *, BlockData: bytes, BlockEntities: list[
         "Entities": NbtValue(9, (10, [])),
     }
     PathValue.write_bytes(gzip.compress(bytes([10]) + EncodeString("") + EncodePayload(10, Root)))
+
+
+def _WriteLitematicRoot(PathValue: Path, Root: dict[str, NbtValue]) -> None:
+    PathValue.write_bytes(
+        gzip.compress(bytes([10]) + EncodeString("") + EncodePayload(10, Root)),
+    )
 
 
 class SpongeSchemImportTests(unittest.TestCase):
@@ -77,6 +85,71 @@ class SpongeSchemImportTests(unittest.TestCase):
             [Value - 1 for Value in Template.Size],
         )
         self.assertEqual(len(Fixture["Blocks"]), len(Template.Blocks))
+
+    def testCompilerLitematicPortsAndDynamicStatesAreRecoveredForTesting(self) -> None:
+        Template = CellTemplate(
+            Size=(4, 2, 4),
+            Blocks={
+                (0, 1, 0): {
+                    "Name": "minecraft:lever",
+                    "Properties": {"powered": "true", "face": "wall", "facing": "west"},
+                },
+                (1, 1, 0): {
+                    "Name": "minecraft:redstone_wire",
+                    "Properties": {"power": "15", "east": "side"},
+                },
+                (2, 1, 0): {
+                    "Name": "minecraft:redstone_wall_torch",
+                    "Properties": {"lit": "true", "facing": "south"},
+                },
+                (3, 1, 0): {
+                    "Name": "minecraft:redstone_lamp",
+                    "Properties": {"lit": "true"},
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as TemporaryDirectory:
+            PathValue = Path(TemporaryDirectory) / "Top.litematic"
+            with patch(
+                "Compiler.FabricServer.SchemImport.LoadTemplate",
+                return_value=Template,
+            ), patch(
+                "Compiler.FabricServer.SchemImport.ReadLitematicIoLabels",
+                return_value=[
+                    ((0, 1, 1), "IN", "a"),
+                    ((3, 1, 1), "OUT", "y"),
+                ],
+            ):
+                Fixture = BuildFabricFixtureFromSchem(PathValue)
+
+        States = {
+            tuple(Block["Position"]): Block["State"]
+            for Block in Fixture["Blocks"]
+        }
+        self.assertEqual(
+            Fixture["Inputs"],
+            [{"Name": "a", "LeverPosition": [0, 1, 0]}],
+        )
+        self.assertEqual(
+            Fixture["Outputs"],
+            [{"Name": "y", "LampPosition": [3, 1, 0]}],
+        )
+        self.assertEqual(States[(0, 1, 0)]["Properties"]["powered"], "false")
+        self.assertEqual(States[(1, 1, 0)]["Properties"]["power"], "0")
+        self.assertEqual(States[(2, 1, 0)]["Properties"]["lit"], "false")
+        self.assertEqual(States[(3, 1, 0)]["Properties"]["lit"], "false")
+
+    def testLitematicPortReaderRejectsMultipleRegionsRatherThanTestingOnlyOne(self) -> None:
+        with tempfile.TemporaryDirectory() as TemporaryDirectory:
+            PathValue = Path(TemporaryDirectory) / "MultiRegion.litematic"
+            _WriteLitematicRoot(PathValue, {
+                "Regions": NbtValue(10, {
+                    "First": NbtValue(10, {}),
+                    "Second": NbtValue(10, {}),
+                }),
+            })
+            with self.assertRaisesRegex(ValueError, "multi-region"):
+                ReadLitematicIoLabels(PathValue)
 
 
 if __name__ == "__main__":

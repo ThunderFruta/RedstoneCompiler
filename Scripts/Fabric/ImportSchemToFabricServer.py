@@ -14,8 +14,10 @@ if str(RepositoryRoot) not in sys.path:
 
 from Compiler.FabricServer import (
     BuildFabricFixtureFromSchem,
+    CaptureServerUpdatedLitematic,
     FabricServerConfiguration,
     FabricServerSupervisor,
+    ResolveFabricServerRoot,
     WriteFabricFixture,
 )
 
@@ -27,14 +29,22 @@ def BuildParser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
-            "  %(prog)s build.schem --server-root .runtime/fabric-26.2 "
+            "  %(prog)s build.schem "
             "--origin 0 64 0 --replace\n\n"
             "Repeat the command after saving the schematic to hot-reload it. "
             "Omit --replace to layer blocks over the existing world."
         ),
     )
     Parser.add_argument("Schem", type=Path, help="Sponge v2/v3 .schem or compiler .litematic file to load")
-    Parser.add_argument("--server-root", type=Path, required=True, help="running Fabric server directory")
+    Parser.add_argument(
+        "--server-root",
+        type=Path,
+        default=ResolveFabricServerRoot(),
+        help=(
+            "running Fabric server directory "
+            f"(default: {ResolveFabricServerRoot()})"
+        ),
+    )
     Parser.add_argument(
         "--origin",
         nargs=3,
@@ -44,6 +54,19 @@ def BuildParser() -> argparse.ArgumentParser:
         help="world coordinate for the schematic's minimum corner (default: 0 64 0)",
     )
     Parser.add_argument("--replace", action="store_true", help="clear the schematic bounding box before loading")
+    Parser.add_argument(
+        "--server-updated-output",
+        type=Path,
+        help=(
+            "write the post-update server snapshot here "
+            "(default: <schematic>.ServerUpdated.litematic)"
+        ),
+    )
+    Parser.add_argument(
+        "--no-server-updated-litematic",
+        action="store_true",
+        help="load only; do not capture the server's post-update block states",
+    )
     return Parser
 
 
@@ -53,7 +76,8 @@ def GuidedArguments() -> list[str]:
     Schem = input("Path to the .schem or .litematic file: ").strip().strip("'\"")
     if not Schem:
         raise ValueError("a .schem or .litematic path is required")
-    Root = input("Server root [.runtime/fabric-26.2]: ").strip() or ".runtime/fabric-26.2"
+    DefaultRoot = str(ResolveFabricServerRoot())
+    Root = input(f"Server root [{DefaultRoot}]: ").strip() or DefaultRoot
     Origin = input("Origin X Y Z [0 64 0]: ").strip() or "0 64 0"
     Coordinates = Origin.split()
     if len(Coordinates) != 3:
@@ -77,6 +101,11 @@ def main(Arguments: list[str] | None = None) -> int:
         except ValueError as Error:
             Parser.error(str(Error))
     Arguments = Parser.parse_args(RawArguments)
+    if Arguments.no_server_updated_litematic and Arguments.server_updated_output:
+        Parser.error(
+            "--no-server-updated-litematic cannot be combined with "
+            "--server-updated-output",
+        )
     Fixture = BuildFabricFixtureFromSchem(
         Arguments.Schem,
         Origin=tuple(Arguments.origin),
@@ -84,11 +113,49 @@ def main(Arguments: list[str] | None = None) -> int:
     )
     FixturePath = Arguments.server_root.resolve() / "fixtures" / f"{Arguments.Schem.stem}.FabricFixture.json"
     Artifact = WriteFabricFixture(FixturePath, Fixture)
-    Result = FabricServerSupervisor(
+    Supervisor = FabricServerSupervisor(
         FabricServerConfiguration(Root=Arguments.server_root.resolve()),
-    ).LoadIntoRunningServer(Fixture=Artifact)
-    print({"Status": Result.Status, "Fixture": str(Artifact.Path), "Diagnostics": Result.Diagnostics})
-    return 0 if Result.Status == "loaded" else 1
+    )
+    Result = Supervisor.LoadIntoRunningServer(Fixture=Artifact)
+    Snapshot: dict[str, object] | None = None
+    Status = Result.Status
+    if Result.Status == "loaded" and not Arguments.no_server_updated_litematic:
+        OutputPath = (
+            Arguments.server_updated_output
+            or Arguments.Schem.with_name(
+                f"{Arguments.Schem.stem}.ServerUpdated.litematic",
+            )
+        )
+        try:
+            SnapshotArtifact = CaptureServerUpdatedLitematic(
+                Supervisor=Supervisor,
+                Fixture=Fixture,
+                SourcePath=Arguments.Schem,
+                OutputPath=OutputPath,
+            )
+            Snapshot = {
+                "Path": str(SnapshotArtifact.Path),
+                "RequestedPositionCount": SnapshotArtifact.RequestedPositionCount,
+                "ObservedBlockCount": SnapshotArtifact.ObservedBlockCount,
+                "WorldReadRequests": SnapshotArtifact.WorldReadRequests,
+                "InputCountSetToZero": SnapshotArtifact.InputCountSetToZero,
+                "SnapshotReadPasses": SnapshotArtifact.SnapshotReadPasses,
+                "InputZeroGameTime": SnapshotArtifact.InputZeroGameTime,
+                "FirstObservedGameTime": SnapshotArtifact.FirstObservedGameTime,
+                "LastObservedGameTime": SnapshotArtifact.LastObservedGameTime,
+            }
+        except (OSError, RuntimeError, ValueError) as Error:
+            Status = "snapshot-failure"
+            Snapshot = {"Error": str(Error)}
+    print({
+        "Status": Status,
+        "Fixture": str(Artifact.Path),
+        "Inputs": Artifact.InputCount,
+        "Outputs": Artifact.OutputCount,
+        "ServerUpdatedLitematic": Snapshot,
+        "Diagnostics": Result.Diagnostics,
+    })
+    return 0 if Status == "loaded" else 1
 
 
 if __name__ == "__main__":

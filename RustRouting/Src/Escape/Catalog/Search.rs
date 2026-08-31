@@ -168,6 +168,7 @@ impl LayeredCatalogSelectionState {
     }
 }
 
+#[allow(dead_code)]
 pub(in crate::Escape) struct LayeredCatalogSearchContext<'a> {
     pub(in crate::Escape) Groups: &'a BTreeMap<String, Vec<AssignmentCandidate>>,
     pub(in crate::Escape) CandidateIndexByIdByVariable: &'a HashMap<String, HashMap<String, usize>>,
@@ -412,6 +413,7 @@ pub(in crate::Escape) fn LayeredCatalogVariableIsEligible(
         })
 }
 
+#[allow(dead_code)]
 pub(in crate::Escape) fn SearchLayeredCatalogFactors(
     Context: &mut LayeredCatalogSearchContext,
     State: &mut LayeredCatalogSelectionState,
@@ -783,6 +785,7 @@ pub(in crate::Escape) fn SearchLayeredCatalogPortalChoices(
     false
 }
 
+#[allow(dead_code)]
 pub(in crate::Escape) fn LayeredCatalogPortalChoicesHaveSupport(
     Context: &mut LayeredCatalogSearchContext,
     State: &mut LayeredCatalogSelectionState,
@@ -885,6 +888,7 @@ pub(in crate::Escape) fn LayeredCatalogPortalChoicesHaveSupport(
     false
 }
 
+#[allow(dead_code)]
 pub(in crate::Escape) fn ApplyLayeredCatalogExactStubRequirements(
     Context: &mut LayeredCatalogSearchContext,
     State: &mut LayeredCatalogSelectionState,
@@ -957,6 +961,7 @@ pub(in crate::Escape) fn ApplyLayeredCatalogCertifiedAccessTuple(
     true
 }
 
+#[allow(dead_code)]
 pub(in crate::Escape) fn LayeredCatalogSelectedGuideUsesCertifiedTuple(
     Context: &LayeredCatalogSearchContext,
     State: &LayeredCatalogSelectionState,
@@ -1280,6 +1285,7 @@ pub(in crate::Escape) fn TryLayeredCatalogGuideCandidate(
 /// catalog factorized.  The retained tuples are a sufficient witness basis,
 /// not an exhaustive relation, so a failed search is only a seed failure and
 /// must fall through to the complete portal search.
+#[allow(dead_code)]
 pub(in crate::Escape) fn SearchLayeredCatalogCertifiedBundleSeed(
     Context: &mut LayeredCatalogSearchContext,
     State: &mut LayeredCatalogSelectionState,

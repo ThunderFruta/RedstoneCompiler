@@ -787,7 +787,6 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                     $StateByNode = CandidateStateByNode;
                     $ParentByNode = CandidateParentByNode;
                     $Repeaters = CandidateRepeaters;
-                    PhysicalNodes = CandidatePhysicalNodes;
                     PhysicalPowers = CandidatePhysicalPowers;
                     RequiredPoweredTargets.insert(Target);
                     if std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {

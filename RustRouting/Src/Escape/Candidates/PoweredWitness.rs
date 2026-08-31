@@ -1,11 +1,13 @@
 use super::*;
 
+#[allow(dead_code)]
 pub(in crate::Escape) struct LayeredAccessClaimOccupancy {
     pub(in crate::Escape) Wire: HashMap<Position, usize>,
     pub(in crate::Escape) Support: HashMap<Position, usize>,
     pub(in crate::Escape) Air: HashMap<Position, usize>,
 }
 
+#[allow(dead_code)]
 impl LayeredAccessClaimOccupancy {
     pub(in crate::Escape) fn New(GuideClaims: &DeferredAccessCandidateValue) -> Self {
         let Count = |Values: &[Position]| {
@@ -66,6 +68,7 @@ impl LayeredAccessClaimOccupancy {
     }
 }
 
+#[allow(dead_code)]
 pub(in crate::Escape) struct LayeredWireForestCheckpoint {
     pub(in crate::Escape) ExistingPositions: Vec<Position>,
     pub(in crate::Escape) NewPositions: Vec<Position>,
@@ -74,6 +77,7 @@ pub(in crate::Escape) struct LayeredWireForestCheckpoint {
     pub(in crate::Escape) CycleCount: usize,
 }
 
+#[allow(dead_code)]
 pub(in crate::Escape) struct LayeredWireForestOccupancy {
     pub(in crate::Escape) ActiveCounts: HashMap<Position, usize>,
     pub(in crate::Escape) ParentByPosition: HashMap<Position, Position>,
@@ -82,6 +86,7 @@ pub(in crate::Escape) struct LayeredWireForestOccupancy {
     pub(in crate::Escape) CycleCount: usize,
 }
 
+#[allow(dead_code)]
 impl LayeredWireForestOccupancy {
     pub(in crate::Escape) fn New(_GraphAdjacency: &HashMap<Position, Vec<Position>>) -> Self {
         Self {

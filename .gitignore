@@ -6,6 +6,7 @@ Cache/
 .cache/
 .pytest_cache/
 **/__pycache__/
+FabricServerHarness/Server/
 **/*.pyc
 .venv/
 Build/

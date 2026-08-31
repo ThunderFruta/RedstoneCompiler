@@ -7,6 +7,7 @@ import com.google.gson.JsonParser;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.permissions.PermissionSet;
@@ -14,6 +15,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.gamerules.GameRules;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.Property;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -30,6 +33,13 @@ import java.util.concurrent.CompletableFuture;
 
 /** Executes only validated compiler fixtures on the main server thread. */
 final class HarnessValidation {
+    private static final int MINIMUM_OUTPUT_SETTLE_TICKS = 50;
+    private static final int MAXIMUM_FORCED_FIXTURE_CHUNKS = 256;
+    private static final Set<ChunkCoordinate> ForcedFixtureChunks = new LinkedHashSet<>();
+
+    private record ChunkCoordinate(int X, int Z) {
+    }
+
     private HarnessValidation() {
     }
 
@@ -38,6 +48,42 @@ final class HarnessValidation {
         JsonObject diagnostics = new JsonObject();
         try {
             String action = request.get("Action").getAsString();
+            if ("WorldReadBlocks".equals(action)) {
+                JsonArray blocks = OnServer(server, () -> readWorldBlocks(
+                        server.overworld(), request.getAsJsonArray("Positions")));
+                response.addProperty("Status", "observed");
+                response.add("Blocks", blocks);
+                diagnostics.addProperty("ObservedBlockCount", blocks.size());
+                diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
+                writeResponse(response, diagnostics, output);
+                return;
+            }
+            if ("WorldSetBlocks".equals(action)) {
+                int updated = OnServer(server, () -> setWorldBlocks(
+                        server, server.overworld(), request.getAsJsonArray("Blocks")));
+                response.addProperty("Status", "updated");
+                diagnostics.addProperty("UpdatedBlockCount", updated);
+                diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
+                writeResponse(response, diagnostics, output);
+                return;
+            }
+            if ("WorldRunCommand".equals(action)) {
+                String command = request.get("Command").getAsString();
+                if (command.isBlank() || command.indexOf('\n') >= 0 || command.indexOf('\r') >= 0) {
+                    throw new IllegalArgumentException("invalid-world-command");
+                }
+                OnServer(server, () -> {
+                    server.getCommands().performPrefixedCommand(
+                            server.createCommandSourceStack().withPermission(PermissionSet.ALL_PERMISSIONS),
+                            command.startsWith("/") ? command.substring(1) : command);
+                    return null;
+                });
+                response.addProperty("Status", "command-complete");
+                diagnostics.addProperty("CommandExecuted", true);
+                diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
+                writeResponse(response, diagnostics, output);
+                return;
+            }
             if ("ClearImportedBlocks".equals(action)) {
                 int cleared = OnServer(server, () -> clearRegions(
                         server.overworld(), request.getAsJsonArray("ClearRegions")));
@@ -87,20 +133,23 @@ final class HarnessValidation {
             }
             JsonObject fixture = JsonParser.parseString(Files.readString(fixturePath)).getAsJsonObject();
             JsonArray origin = fixture.getAsJsonObject("Arena").getAsJsonArray("Origin");
-            OnServer(server, () -> {
+            int forcedFixtureChunkCount = OnServer(server, () -> {
                 CommandSourceStack source = server.createCommandSourceStack().withPermission(PermissionSet.ALL_PERMISSIONS);
                 setTickRate(server, source, configuration.requestedTickRate());
                 ServerLevel level = server.overworld();
+                int forcedChunkCount = forceFixtureChunks(
+                        level, fixture.getAsJsonArray("Blocks"), origin, fixture.getAsJsonObject("Arena"));
                 clearFixture(level, fixture.getAsJsonArray("Blocks"), origin, fixture.getAsJsonObject("Arena"));
                 placeFixture(server, level, fixture.getAsJsonArray("Blocks"), origin);
                 forceBlockUpdates(level, fixture.getAsJsonArray("Blocks"), origin);
-                return null;
+                return forcedChunkCount;
             });
             waitForTicks(server, 2);
             if ("LoadFixture".equals(action)) {
                 response.addProperty("Status", "loaded");
                 diagnostics.addProperty("FixtureSha256", actualDigest);
                 diagnostics.addProperty("LoadedBlocks", fixture.getAsJsonArray("Blocks").size());
+                diagnostics.addProperty("ForcedFixtureChunks", forcedFixtureChunkCount);
                 diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
                 diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
                 writeResponse(response, diagnostics, output);
@@ -112,6 +161,7 @@ final class HarnessValidation {
             response.addProperty("Status", "passed");
             diagnostics.addProperty("FixtureSha256", actualDigest);
             diagnostics.addProperty("TestedVectors", tested);
+            diagnostics.addProperty("ForcedFixtureChunks", forcedFixtureChunkCount);
             diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
             diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
         } catch (Mismatch error) {
@@ -178,6 +228,65 @@ final class HarnessValidation {
         }
     }
 
+    private static int forceFixtureChunks(
+            ServerLevel level, JsonArray blocks, JsonArray origin, JsonObject arena) {
+        Set<ChunkCoordinate> requested = fixtureChunks(blocks, origin, arena);
+        if (requested.size() > MAXIMUM_FORCED_FIXTURE_CHUNKS) {
+            throw new IllegalArgumentException("fixture-spans-too-many-chunks:" + requested.size());
+        }
+        for (ChunkCoordinate coordinate : requested) {
+            if (!ForcedFixtureChunks.contains(coordinate)) {
+                level.setChunkForced(coordinate.X(), coordinate.Z(), true);
+                level.getChunk(coordinate.X(), coordinate.Z());
+            }
+        }
+        for (ChunkCoordinate coordinate : new LinkedHashSet<>(ForcedFixtureChunks)) {
+            if (!requested.contains(coordinate)) {
+                level.setChunkForced(coordinate.X(), coordinate.Z(), false);
+            }
+        }
+        ForcedFixtureChunks.clear();
+        ForcedFixtureChunks.addAll(requested);
+        return requested.size();
+    }
+
+    private static Set<ChunkCoordinate> fixtureChunks(
+            JsonArray blocks, JsonArray origin, JsonObject arena) {
+        int minimumX = Integer.MAX_VALUE, minimumZ = Integer.MAX_VALUE;
+        int maximumX = Integer.MIN_VALUE, maximumZ = Integer.MIN_VALUE;
+        if (arena.has("Bounds")) {
+            JsonObject bounds = arena.getAsJsonObject("Bounds");
+            BlockPos minimum = absolute(bounds.getAsJsonArray("Minimum"), origin);
+            BlockPos maximum = absolute(bounds.getAsJsonArray("Maximum"), origin);
+            minimumX = minimum.getX(); minimumZ = minimum.getZ();
+            maximumX = maximum.getX(); maximumZ = maximum.getZ();
+        }
+        for (JsonElement element : blocks) {
+            BlockPos position = absolute(element.getAsJsonObject().getAsJsonArray("Position"), origin);
+            minimumX = Math.min(minimumX, position.getX());
+            minimumZ = Math.min(minimumZ, position.getZ());
+            maximumX = Math.max(maximumX, position.getX());
+            maximumZ = Math.max(maximumZ, position.getZ());
+        }
+        if (minimumX == Integer.MAX_VALUE) return Set.of();
+        int minimumChunkX = Math.floorDiv(minimumX, 16);
+        int minimumChunkZ = Math.floorDiv(minimumZ, 16);
+        int maximumChunkX = Math.floorDiv(maximumX, 16);
+        int maximumChunkZ = Math.floorDiv(maximumZ, 16);
+        long chunkCount = ((long) maximumChunkX - minimumChunkX + 1)
+                * ((long) maximumChunkZ - minimumChunkZ + 1);
+        if (chunkCount > MAXIMUM_FORCED_FIXTURE_CHUNKS) {
+            throw new IllegalArgumentException("fixture-spans-too-many-chunks:" + chunkCount);
+        }
+        Set<ChunkCoordinate> result = new LinkedHashSet<>();
+        for (int chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX++) {
+            for (int chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ++) {
+                result.add(new ChunkCoordinate(chunkX, chunkZ));
+            }
+        }
+        return result;
+    }
+
     private static void clearFixture(ServerLevel level, JsonArray blocks, JsonArray origin, JsonObject arena) {
         int minimumX = Integer.MAX_VALUE, minimumY = Integer.MAX_VALUE, minimumZ = Integer.MAX_VALUE;
         int maximumX = Integer.MIN_VALUE, maximumY = Integer.MIN_VALUE, maximumZ = Integer.MIN_VALUE;
@@ -211,9 +320,63 @@ final class HarnessValidation {
                 affected.add(position.relative(direction));
             }
         }
+        forceBlockUpdates(level, affected);
+    }
+
+    private static void forceBlockUpdates(ServerLevel level, Set<BlockPos> affected) {
         for (BlockPos position : affected) {
             level.updateNeighborsAt(position, level.getBlockState(position).getBlock());
         }
+    }
+
+    private static JsonArray readWorldBlocks(ServerLevel level, JsonArray positions) {
+        if (positions.size() > 10_000) throw new IllegalArgumentException("too-many-world-positions");
+        JsonArray result = new JsonArray();
+        for (JsonElement element : positions) {
+            JsonArray position = element.getAsJsonArray();
+            if (position.size() != 3) throw new IllegalArgumentException("invalid-world-position");
+            BlockPos blockPosition = new BlockPos(
+                    position.get(0).getAsInt(), position.get(1).getAsInt(), position.get(2).getAsInt());
+            JsonObject block = new JsonObject();
+            block.add("Position", position.deepCopy());
+            block.add("State", serializeState(level.getBlockState(blockPosition)));
+            result.add(block);
+        }
+        return result;
+    }
+
+    private static int setWorldBlocks(MinecraftServer server, ServerLevel level, JsonArray blocks) {
+        if (blocks.size() > 10_000) throw new IllegalArgumentException("too-many-world-blocks");
+        Set<BlockPos> affected = new LinkedHashSet<>();
+        for (JsonElement element : blocks) {
+            JsonObject block = element.getAsJsonObject();
+            JsonArray position = block.getAsJsonArray("Position");
+            if (position.size() != 3) throw new IllegalArgumentException("invalid-world-position");
+            BlockPos blockPosition = new BlockPos(
+                    position.get(0).getAsInt(), position.get(1).getAsInt(), position.get(2).getAsInt());
+            level.setBlock(blockPosition, parseState(server, block.get("State").getAsString()), 3);
+            affected.add(blockPosition);
+            for (net.minecraft.core.Direction direction : net.minecraft.core.Direction.values()) {
+                affected.add(blockPosition.relative(direction));
+            }
+        }
+        forceBlockUpdates(level, affected);
+        return blocks.size();
+    }
+
+    private static JsonObject serializeState(BlockState state) {
+        JsonObject result = new JsonObject();
+        result.addProperty("Name", BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+        JsonObject properties = new JsonObject();
+        for (Property<?> property : state.getProperties()) {
+            properties.addProperty(property.getName(), propertyValue(state, property));
+        }
+        if (properties.size() > 0) result.add("Properties", properties);
+        return result;
+    }
+
+    private static <T extends Comparable<T>> String propertyValue(BlockState state, Property<T> property) {
+        return property.getName(state.getValue(property));
     }
 
     private static int clearRegions(ServerLevel level, JsonArray regions) {
@@ -265,27 +428,42 @@ final class HarnessValidation {
             JsonObject item = vector.getAsJsonObject();
             OnServer(server, () -> {
                 ServerLevel level = server.overworld();
+                Set<BlockPos> affected = new LinkedHashSet<>();
                 for (Map.Entry<String, JsonObject> input : inputs.entrySet()) {
                     JsonObject state = input.getValue().deepCopy();
                     state.getAsJsonObject("Properties").addProperty("powered", item.getAsJsonObject("Inputs").get(input.getKey()).getAsBoolean());
                     String[] position = state.remove("_Position").getAsString().split(" ");
                     BlockPos blockPosition = new BlockPos(Integer.parseInt(position[0]), Integer.parseInt(position[1]), Integer.parseInt(position[2]));
                     level.setBlock(blockPosition, parseState(server, blockState(state)), 3);
-                    level.updateNeighborsAt(blockPosition, level.getBlockState(blockPosition).getBlock());
+                    affected.add(blockPosition);
+                    for (net.minecraft.core.Direction direction : net.minecraft.core.Direction.values()) {
+                        affected.add(blockPosition.relative(direction));
+                    }
                 }
+                forceBlockUpdates(level, affected);
                 return null;
             });
             waitForTicks(server, 1);
             Snapshot previous = snapshot(server, outputs);
             long start = previous.gameTime();
+            long earliestComparison = start + Math.min(
+                    MINIMUM_OUTPUT_SETTLE_TICKS,
+                    timeoutTicks);
             int stableTicks = 0;
             while (previous.gameTime() - start < timeoutTicks) {
                 try { Thread.sleep(1); } catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new Timeout("validation-interrupted"); }
                 Snapshot current = snapshot(server, outputs);
                 if (current.gameTime() == previous.gameTime()) continue;
+                if (current.gameTime() < earliestComparison) {
+                    previous = current;
+                    continue;
+                }
                 if (current.values().equals(previous.values())) stableTicks++; else stableTicks = 0;
                 if (stableTicks >= 2) {
-                    compare(item.getAsJsonObject("Expected"), current.values());
+                    compare(
+                            item.getAsJsonObject("Inputs"),
+                            item.getAsJsonObject("Expected"),
+                            current.values());
                     break;
                 }
                 previous = current;
@@ -325,10 +503,17 @@ final class HarnessValidation {
         return result;
     }
 
-    private static void compare(JsonObject expected, Map<String, Boolean> actual) {
+    private static void compare(
+            JsonObject inputs,
+            JsonObject expected,
+            Map<String, Boolean> actual) {
         for (Map.Entry<String, Boolean> output : actual.entrySet()) {
             if (expected.get(output.getKey()).getAsBoolean() != output.getValue()) {
-                throw new Mismatch("output-mismatch:" + output.getKey());
+                throw new Mismatch(
+                        "output-mismatch:" + output.getKey()
+                                + ":expected=" + expected.get(output.getKey()).getAsBoolean()
+                                + ":actual=" + output.getValue()
+                                + ":inputs=" + inputs);
             }
         }
     }

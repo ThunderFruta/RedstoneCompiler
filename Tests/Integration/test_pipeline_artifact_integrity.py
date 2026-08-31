@@ -344,6 +344,125 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                 {"Status": "success"},
             )
 
+    def testPublicationUsesServerUpdatedLitematicForCanonicalOutput(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            OutputPath = Path(DirectoryValue) / "Design.litematic"
+            Events = []
+
+            def WriteStatic(_Routed, *, OutputPath, Build):
+                self.assertIsNotNone(Build)
+                self.assertEqual(OutputPath.name, "Design.Static.litematic")
+                Events.append("static")
+                OutputPath.write_text("static", encoding="utf-8")
+
+            def Capture(*, Supervisor, Fixture, SourcePath, OutputPath):
+                self.assertIs(Supervisor, SnapshotSupervisor)
+                self.assertEqual(Fixture, {"Fixture": "design"})
+                self.assertTrue(SourcePath.is_file())
+                self.assertEqual(
+                    SourcePath.read_text(encoding="utf-8"),
+                    "static",
+                )
+                self.assertEqual(OutputPath.name, "Design.litematic")
+                Events.append("snapshot")
+                OutputPath.write_text("server-updated", encoding="utf-8")
+                return SimpleNamespace(
+                    RequestedPositionCount=42,
+                    ObservedBlockCount=24,
+                    WorldReadRequests=3,
+                    InputCountSetToZero=2,
+                    SnapshotReadPasses=2,
+                    InputZeroGameTime=100,
+                    FirstObservedGameTime=150,
+                    LastObservedGameTime=151,
+                )
+
+            def WriteFixture(OutputPath, _Fixture):
+                OutputPath.write_text("fixture", encoding="utf-8")
+
+            SnapshotSupervisor = object()
+            PhysicalDesignDocument = {"RunSummary": {}}
+            with (
+                patch(
+                    "Compiler.Pipeline.SchemWriter.WriteLitematic",
+                    side_effect=WriteStatic,
+                ),
+                patch(
+                    "Compiler.Pipeline.CaptureServerUpdatedLitematic",
+                    side_effect=Capture,
+                ),
+                patch(
+                    "Compiler.Pipeline.WriteFabricFixture",
+                    side_effect=WriteFixture,
+                ),
+            ):
+                PhysicalDesignPath = PublishSuccessArtifacts(
+                    Routed=object(),
+                    Rendered=SimpleNamespace(),
+                    PhysicalDesignDocument=PhysicalDesignDocument,
+                    FabricFixture={"Fixture": "design"},
+                    FabricServerSnapshotSupervisor=SnapshotSupervisor,
+                    OutputPath=OutputPath,
+                )
+
+            Document = json.loads(PhysicalDesignPath.read_text(encoding="utf-8"))
+            Snapshot = Document["RunSummary"]["FabricServerSnapshot"]
+            self.assertEqual(Events, ["static", "snapshot"])
+            self.assertEqual(
+                OutputPath.read_text(encoding="utf-8"),
+                "server-updated",
+            )
+            self.assertEqual(
+                Snapshot,
+                {
+                    "Path": str(OutputPath.resolve()),
+                    "State": "all-inputs-zero-server-updated",
+                    "RequestedPositionCount": 42,
+                    "ObservedBlockCount": 24,
+                    "WorldReadRequests": 3,
+                    "InputCountSetToZero": 2,
+                    "SnapshotReadPasses": 2,
+                    "InputZeroGameTime": 100,
+                    "FirstObservedGameTime": 150,
+                    "LastObservedGameTime": 151,
+                },
+            )
+
+    def testFailedServerSnapshotCannotPublishStaticSchematic(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            OutputPath = Path(DirectoryValue) / "Design.litematic"
+            for ArtifactPath in SuccessArtifactPaths(OutputPath).values():
+                ArtifactPath.write_text("stale", encoding="utf-8")
+
+            def WriteStatic(_Routed, *, OutputPath, Build):
+                self.assertIsNotNone(Build)
+                OutputPath.write_text("static", encoding="utf-8")
+
+            with (
+                patch(
+                    "Compiler.Pipeline.SchemWriter.WriteLitematic",
+                    side_effect=WriteStatic,
+                ),
+                patch(
+                    "Compiler.Pipeline.CaptureServerUpdatedLitematic",
+                    side_effect=RuntimeError("server snapshot failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "server snapshot failed"),
+            ):
+                PublishSuccessArtifacts(
+                    Routed=object(),
+                    Rendered=SimpleNamespace(),
+                    PhysicalDesignDocument={"RunSummary": {}},
+                    FabricFixture={"Fixture": "design"},
+                    FabricServerSnapshotSupervisor=object(),
+                    OutputPath=OutputPath,
+                )
+
+            self.assertFalse(any(
+                ArtifactPath.exists()
+                for ArtifactPath in SuccessArtifactPaths(OutputPath).values()
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()
