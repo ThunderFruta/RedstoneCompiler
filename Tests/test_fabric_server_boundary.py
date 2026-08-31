@@ -531,6 +531,59 @@ class FabricServerBoundaryTests(unittest.TestCase):
         self.assertEqual(Trace["FirstFailingBlock"]["FixturePosition"], [2, 0, 0])
         self.assertEqual(Trace["FirstFailingBlock"]["WorldPosition"], [2, 64, 0])
 
+    def testFailureTraceRetainsSettleTimeoutIdentityAndBlockEvidence(self) -> None:
+        Fixture = {
+            "TopModule": "Top",
+            "Trace": {
+                "Circuit": "Top",
+                "Gates": [{
+                    "Name": "OutputY",
+                    "Kind": "OUTPUT",
+                    "CircuitPath": ["Top", "OutputY"],
+                    "Inputs": ["n1"],
+                    "Outputs": ["y"],
+                    "ProbePositions": [[4, 0, 1]],
+                    "OutputProbePosition": [4, 0, 1],
+                }],
+                "Signals": [{
+                    "Name": "y",
+                    "ProducerGate": "OutputY",
+                    "ConsumerGates": [],
+                    "ProbePositions": [[4, 0, 1]],
+                }],
+            },
+        }
+        Diagnostics = {
+            "Timeout": {
+                "Reason": "redstone-network-did-not-settle",
+                "Output": "y",
+                "Expected": True,
+                "Actual": False,
+                "Inputs": {"a": True},
+                "ExpectedSignals": {"n1": True, "y": True},
+                "TestedVectorsBeforeFailure": 3,
+                "ElapsedTicks": 200,
+                "ObservedUnchangedTicks": 0,
+            },
+            "TraceBlocks": [{
+                "Position": [4, 0, 1],
+                "WorldPosition": [4, 64, 1],
+                "State": {
+                    "Name": "minecraft:redstone_lamp",
+                    "Properties": {"lit": "false"},
+                },
+            }],
+        }
+
+        Trace = BuildFabricFailureTrace(Fixture, Diagnostics)
+
+        self.assertEqual(Trace["FailureKind"], "timeout")
+        self.assertEqual(Trace["FailedOutput"], "y")
+        self.assertEqual(Trace["TestedVectorsBeforeFailure"], 3)
+        self.assertEqual(Trace["FirstFailingSubcircuit"]["Gate"], "OutputY")
+        self.assertEqual(Trace["FirstFailingBlock"]["FixturePosition"], [4, 0, 1])
+        self.assertEqual(Trace["FirstFailingBlock"]["WorldPosition"], [4, 64, 1])
+
     def testImportedLitematicLabelsRecoverPhysicalTestPorts(self) -> None:
         Template = CellTemplate(
             Size=(16, 3, 16),

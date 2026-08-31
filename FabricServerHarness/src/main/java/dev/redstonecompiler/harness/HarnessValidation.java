@@ -475,39 +475,34 @@ final class HarnessValidation {
             });
             waitForTicks(server, 1);
             Snapshot Previous = SnapshotCircuit(server, outputs, TraceProbes);
-            long Start = Previous.GameTime();
-            int UnchangedTicks = 0;
-            int LastObservedChangeTick = 0;
-            int UnobservedTickGapCount = 0;
+            TraceQuiescenceTracker Quiescence = new TraceQuiescenceTracker(
+                    REQUIRED_UNCHANGED_TICKS,
+                    timeoutTicks,
+                    Previous.GameTime(),
+                    Previous.TraceBlocks());
             Snapshot Settled = null;
-            while (Previous.GameTime() - Start < timeoutTicks) {
+            while (!Quiescence.Status().TimedOut()) {
                 Snapshot Current = SnapshotCircuit(server, outputs, TraceProbes);
                 if (Current.GameTime() == Previous.GameTime()) {
                     Thread.onSpinWait();
                     continue;
                 }
-                long ElapsedTicks = Current.GameTime() - Start;
-                if (Current.GameTime() != Previous.GameTime() + 1) {
-                    UnchangedTicks = 0;
-                    UnobservedTickGapCount++;
-                } else if (Current.TraceBlocks().equals(Previous.TraceBlocks())) {
-                    UnchangedTicks++;
-                } else {
-                    UnchangedTicks = 0;
-                    LastObservedChangeTick = (int) ElapsedTicks;
-                }
+                TraceQuiescenceTracker.TraceQuiescenceStatus QuiescenceStatus =
+                        Quiescence.Observe(Current.GameTime(), Current.TraceBlocks());
                 Previous = Current;
-                if (UnchangedTicks >= REQUIRED_UNCHANGED_TICKS) {
+                if (QuiescenceStatus.Settled()) {
                     Settled = Current;
                     break;
                 }
             }
+            TraceQuiescenceTracker.TraceQuiescenceStatus QuiescenceStatus =
+                    Quiescence.Status();
             SettlementEvidence Evidence = new SettlementEvidence(
-                    (int) (Previous.GameTime() - Start),
-                    LastObservedChangeTick,
-                    UnchangedTicks,
+                    QuiescenceStatus.ElapsedTicks(),
+                    QuiescenceStatus.LastObservedChangeTick(),
+                    QuiescenceStatus.ObservedUnchangedTicks(),
                     TraceProbes.size(),
-                    UnobservedTickGapCount);
+                    QuiescenceStatus.UnobservedTickGapCount());
             if (Settled == null) {
                 throw BuildTimeout(item, Previous.OutputValues(), tested, Evidence)
                         .WithTraceBlocks(Previous.TraceBlocks());
@@ -518,7 +513,7 @@ final class HarnessValidation {
                 throw error.WithTraceBlocks(Settled.TraceBlocks());
             }
             MaximumSettleTicks = Math.max(MaximumSettleTicks, Evidence.ElapsedTicks());
-            TotalUnobservedTickGaps += UnobservedTickGapCount;
+            TotalUnobservedTickGaps += QuiescenceStatus.UnobservedTickGapCount();
             tested++;
         }
         return new ValidationSummary(
