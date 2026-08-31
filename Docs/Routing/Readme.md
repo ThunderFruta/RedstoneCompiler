@@ -11,7 +11,7 @@ harness runs CLA4 only when `--include-cla4` is supplied.
 
 Structural update (2026-08-28): placement, component routing, authoritative
 routing, and native kernels now use the clean-break domain ownership documented
-in [the project-tree design](../../ProjectTreeDesignDoc.md). This refactor does
+in [the project-tree design](../Reference/ProjectTreeDesignDoc.md). This refactor does
 not change the acceptance verdict: CLA4 remains a typed
 `Placement / PlacementOverlap` failure unless a fresh post-refactor matrix
 independently proves otherwise.

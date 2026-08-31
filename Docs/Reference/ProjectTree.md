@@ -27,12 +27,15 @@ The compiler now uses a stage-aligned runtime layout:
 - `Compiler/Routing/Contracts/` and `Interfaces/` are neutral lower layers.
   `Components/` owns local component solving, and `Authoritative/` owns the
   global physical route.
+- `Compiler/FabricServer/` owns fixtures, live validation, schematic testing,
+  and settled-server snapshots. `FabricServerHarness/` owns the tracked mod
+  source; its `Server/` runtime is local and intentionally ignored.
 - `RustRouting/Src/` is split into nested `Core`, `Geometry`, `Path`,
-  `Assignment`, `Escape`, `Generation`, `Planning`, `Simulation`, and `Python`
+  `Assignment`, `Escape`, `Generation`, `Planning`, and `Python`
   domains. Escape candidates/catalogs and generated detailed-tree phases are
   further split into their own subdirectories. `Lib.rs` is registration-only.
 - The clean-break retired paths and executable structural limits are listed in
-  [the project-tree design](../../ProjectTreeDesignDoc.md) and enforced by
+  [the project-tree design](ProjectTreeDesignDoc.md) and enforced by
   `Tests/Structural/test_source_structure.py`.
 
 ## Documentation ownership
@@ -51,5 +54,6 @@ The compiler now uses a stage-aligned runtime layout:
   records dated implementation checkpoints.
 - `Docs/Testing/` owns test commands, layers, and physical acceptance gates.
 
-`ProjectTreeDesignDoc.md` defines the completed clean-break ownership contract,
+[`ProjectTreeDesignDoc.md`](ProjectTreeDesignDoc.md) defines the completed
+clean-break ownership contract,
 structural gates, and timestamped refactor evidence.

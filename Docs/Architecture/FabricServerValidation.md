@@ -42,6 +42,17 @@ structures. After readiness the harness persists disabled spawning, all mob,
 block, and entity drops, daylight progression, and weather progression using
 the typed 26.2 gamerule API.
 
+## Updating the local harness runtime
+
+`FabricServerHarness/Server/` is not a Git deployment target. When tracked
+Fabric harness Java changes, build `FabricServerHarness` with the available
+Gradle installation, then run `Scripts/Fabric/ControlFabricServer.py start`.
+The manager copies a newer built JAR into the local runtime and only restarts a
+healthy running server when that JAR needs refreshing. The runtime-local
+`PyScripts` modules survive a branch merge on this canonical host, but are not
+synced by Git; a future fresh-host provisioning flow needs a tracked bootstrap
+or template outside `Server/`.
+
 `clear` is a destructive live block operation. It preserves the existing
 `FabricServerHarness/Server/world/` directory, `level.dat`, world identity,
 generator settings, gamerules, and region files. While the managed server

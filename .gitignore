@@ -1,6 +1,6 @@
 .tools/
-.codex/
 .vscode/
+.codex/
 # Migration-generated cache
 Cache/
 .cache/
@@ -16,8 +16,5 @@ FabricServerHarness/build/
 Output/
 RustRouting/target/
 RedstoneCompiler/*.so
-Cache/
 Tools/graphviz/
 /**/*.o
-**/__pycache__/
-**/*.pyc

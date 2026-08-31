@@ -151,27 +151,33 @@ success.
 - `Compiler/Ir/` -- compiler IR definitions.
 - `Compiler/Synthesis/` -- NAND normalization transforms.
 - `Compiler/Cells/` -- authoritative standard-cell macro definitions.
-- `Compiler/Placement/PcbFlow.py` -- sole physical-flow orchestrator.
-- `Compiler/Placement/Pcb.py` -- clustered PCB gate placement.
-- `Compiler/Placement/Geometry.py` -- shared placed-cell geometry.
-- `Compiler/Routing/AuthoritativePlanner.py` -- production portal, route-tree,
+- `Compiler/Placement/Access/`, `Core/`, and `Flow/` -- placement access
+  geometry, search/commit, and the physical-flow orchestrator.
+- `Compiler/Placement/Geometry.py` and `Rotation.py` -- shared placed-cell
+  geometry primitives.
+- `Compiler/Routing/Authoritative/` -- production portal, route-tree,
   base-ownership, exact-assignment, and escalation orchestration.
 - `Compiler/Routing/Reliability.py` -- shared deadline, fingerprint, placement,
   failure, and evidence contracts.
 - `Compiler/Routing/Pcb.py` -- PCB routing search and retries.
-- `Compiler/Routing/Models.py` -- shared routing-stage data contracts.
+- `Compiler/Routing/Contracts/` -- shared immutable routing-stage data
+  contracts.
 - `Compiler/Routing/Actions/` -- focused geometry, validation, cleanup, and
   authoritative repeater operations.
 - `Compiler/Routing/Workers/` -- pin-access and detailed-routing stage
   orchestration.
-- `Compiler/Routing/Core.py` -- compact routing helper facade.
 - `Compiler/Routing/Technology.py` -- authoritative redstone design rules.
 - `Compiler/Routing/Policy.py` -- serializable physical-design policy.
 - `Compiler/Routing/TrackAssignment.py` -- exact global track ownership types.
-- `RustRouting/Src/` -- eight-file native router split: `Lib.rs`, `Models.rs`,
-  `Deadline.rs`, `PathRouting.rs`, `Generation.rs`, `Assignment.rs`,
-  `AssignmentPlanning.rs`, and `Bindings.rs`.
+- `RustRouting/Src/` -- native router domains for runtime, geometry, path
+  search, assignment, escape planning, generation, and Python
+  bindings; `Lib.rs` is the PyO3 registration entrypoint.
 - `Scripts/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
   evidence-manifest harness.
+- `Compiler/FabricServer/` and `FabricServerHarness/` -- live Fabric validation
+  and tracked harness source; `FabricServerHarness/Server/` is the ignored local runtime.
 - `Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
 - `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.
+
+The complete current ownership map, retired-path list, and structural gates are
+in [Docs/Reference/ProjectTreeDesignDoc.md](Docs/Reference/ProjectTreeDesignDoc.md).
