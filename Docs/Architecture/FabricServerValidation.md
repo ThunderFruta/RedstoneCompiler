@@ -86,11 +86,27 @@ pre-paste guard.
 
 The server sets a 1,000 TPS target, force-loads every chunk intersecting the
 fixture arena (up to 256 chunks), places the exact fixture states, drives
-levers, forces updates at each lever and its six direct neighbors, waits for a
-50-tick propagation guard plus two unchanged sampled ticks (up to 200 ticks
-total), and reads output lamps. It returns `passed`, `mismatch`, `timeout`, or
+levers, and forces updates at each lever and its six direct neighbors. It then
+samples every dynamic block listed by the fixture trace. A vector is settled
+only after all traced dust, repeaters, torches, lamps, comparators, and levers
+remain unchanged for 20 consecutive observed game ticks (up to 200 ticks
+total). Only then does the harness compare output lamps. It returns `passed`,
+`mismatch`, `timeout`, or
 `infrastructure-failure`; absence of the configured server is an infrastructure
 failure, never a functional pass.
+
+Skipped game ticks do not count toward the 20-tick proof: the unchanged counter
+resets whenever the harness cannot observe the next consecutive game tick.
+Mismatch traces are serialized from the same atomic snapshot used for output
+comparison, so a continuing server clock cannot move the trace past the failed
+state.
+
+The control client separates server-startup retries from a submitted validation
+request. Connection/readiness failures may retry for the configured startup
+window, but a validation response receives one long-running response deadline
+(900 seconds by default) and is never resubmitted after a response timeout.
+Each vector still fails independently at the server's 200-game-tick settle
+limit.
 
 Validation invokes the manager rather than opening a competing server. A
 healthy authenticated endpoint is reused for the live clear and validation;
@@ -103,6 +119,41 @@ All vectors are exhaustive through 16 inputs. Wider circuits use zero/one,
 one-hot, one-cold, and 4,096 deterministic SHA-256-seeded vectors. Expected
 bits come from the synthesized logic IR only; physical behavior comes solely
 from Fabric.
+
+## Failure traces
+
+Compiler-produced fixtures use schema version 2 and carry a deterministic
+`Trace` map. The map relates the flattened top-level circuit to every placed
+gate subcircuit, every routed signal, and the exact dynamic Minecraft blocks
+that can expose redstone state. Validation vectors retain the ideal value of
+every internal synthesized signal for diagnostics, while the output contract
+remains unchanged.
+
+Every validation path reads those probes to establish trace-wide quiescence,
+but only a mismatch or settle timeout retains the complete serialized snapshot
+as diagnostic evidence. The harness records the failing input vector, output,
+expected and last-observed values from the same game tick. Each probe
+includes both its fixture-relative coordinate and exact world coordinate plus
+the complete live block state. The Python boundary compares wire power and
+powered/lit properties with the ideal internal signals, walks the producer
+graph from the failed output through every contributing gate, and adds a
+`FailureTrace` diagnostic containing:
+
+- `SubcircuitTrace`: the deterministic output-to-input gate and signal path,
+  including every live dynamic block inside each visited gate cell;
+- `FirstFailingSubcircuit`: the earliest causal gate whose inputs match but
+  whose output trace does not;
+- `FirstFailingBlock`: the first producer-to-consumer route probe with the
+  wrong live state, including fixture and world coordinates.
+
+Pipeline failures preserve this under
+`FabricServerValidation.Diagnostics.FailureTrace` in the routing-failure
+artifact. Imported schema-version-1 schematics remain testable, but they do
+not have compiler gate/signal ownership metadata and therefore cannot produce
+this source-linked trace. The current frontend is a flattened scalar
+combinational IR, so `CircuitPath` is expressed as top module plus placed gate;
+future hierarchical IR can extend that path without changing the live probe
+protocol.
 
 ## Importing a Sponge schematic
 

@@ -15,6 +15,7 @@ from time import monotonic, sleep
 from typing import Any, Iterable
 
 from .Fixture import FabricFixtureArtifact
+from .FailureTrace import BuildFabricFailureTrace
 from .Models import (
     FabricServerControlResult,
     FabricServerLoadResult,
@@ -47,6 +48,7 @@ class FabricServerConfiguration:
     Root: Path | None
     JavaExecutable: str = "java"
     StartupTimeoutSeconds: float = 90.0
+    ValidationTimeoutSeconds: float = 900.0
     Port: int = 25566
 
     @classmethod
@@ -55,6 +57,9 @@ class FabricServerConfiguration:
             Root=ResolveFabricServerRoot(),
             JavaExecutable=os.environ.get("RC_FABRIC_JAVA", "java"),
             StartupTimeoutSeconds=float(os.environ.get("RC_FABRIC_STARTUP_TIMEOUT", "90")),
+            ValidationTimeoutSeconds=float(
+                os.environ.get("RC_FABRIC_VALIDATION_TIMEOUT", "900")
+            ),
             Port=int(os.environ.get("RC_FABRIC_CONTROL_PORT", "25566")),
         )
 
@@ -85,20 +90,33 @@ def BuildValidationVectors(InputNames: Iterable[str]) -> list[dict[str, bool]]:
     return [dict(zip(Names, Value)) for Value in sorted(Values)]
 
 
-def BuildExpectedVectors(Module: Any, InputNames: Iterable[str], OutputNames: Iterable[str]) -> list[dict[str, object]]:
+def BuildExpectedVectors(
+    Module: Any,
+    InputNames: Iterable[str],
+    OutputNames: Iterable[str],
+    *,
+    IncludeTraceValues: bool = False,
+) -> list[dict[str, object]]:
     """Pair each requested input assignment with semantic-oracle output bits."""
     InputNames = tuple(str(Name) for Name in InputNames)
     OutputNames = tuple(str(Name) for Name in OutputNames)
-    return [
-        {
+    Vectors = []
+    for Assignment in BuildValidationVectors(InputNames):
+        Values = EvaluateLogicModule(Module, Assignment)
+        Vector = {
             "Inputs": Assignment,
             "Expected": {
-                Name: bool(EvaluateLogicModule(Module, Assignment)[Name])
+                Name: bool(Values[Name])
                 for Name in OutputNames
             },
         }
-        for Assignment in BuildValidationVectors(InputNames)
-    ]
+        if IncludeTraceValues:
+            Vector["ExpectedSignals"] = {
+                str(Name): bool(Value)
+                for Name, Value in sorted(Values.items())
+            }
+        Vectors.append(Vector)
+    return Vectors
 
 
 class FabricServerSupervisor:
@@ -171,13 +189,31 @@ class FabricServerSupervisor:
         Status = str(Response.get("Status", "infrastructure-failure"))
         if Status not in {"passed", "mismatch", "timeout", "infrastructure-failure"}:
             Status = "infrastructure-failure"
+        ResponseDiagnostics = dict(Response.get("Diagnostics", {}))
+        if Status in {"mismatch", "timeout"}:
+            try:
+                FixtureDocument = json.loads(Fixture.Path.read_text(encoding="utf-8"))
+                FailureTrace = BuildFabricFailureTrace(
+                    FixtureDocument,
+                    ResponseDiagnostics,
+                )
+                if FailureTrace is not None:
+                    ResponseDiagnostics["FailureTrace"] = FailureTrace
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as Error:
+                ResponseDiagnostics["FailureTraceError"] = str(Error)
         return FabricServerValidationResult(
             Status=Status,
             Backend="fabric-26.2",
             RuntimeSeconds=RuntimeSeconds,
             Diagnostics={
                 **PrePasteClear,
-                **dict(Response.get("Diagnostics", {})),
+                **ResponseDiagnostics,
                 **(
                     {"ControlError": Response["Error"]}
                     if "Error" in Response
@@ -404,6 +440,9 @@ class FabricServerSupervisor:
         while monotonic() < Deadline:
             try:
                 with socket.create_connection(("127.0.0.1", Port), timeout=2) as Connection:
+                    Connection.settimeout(
+                        self.Configuration.ValidationTimeoutSeconds,
+                    )
                     Stream = Connection.makefile("rwb")
                     Payload = {"Token": Token, **Request}
                     Stream.write(json.dumps(Payload, sort_keys=True).encode("utf-8") + b"\n")
@@ -416,6 +455,11 @@ class FabricServerSupervisor:
                         sleep(0.2)
                         continue
                     return Parsed
+            except socket.timeout as Error:
+                raise RuntimeError(
+                    "Fabric validation request exceeded its response timeout: "
+                    f"{self.Configuration.ValidationTimeoutSeconds:.3f}s",
+                ) from Error
             except (OSError, json.JSONDecodeError) as Error:
                 LastError = Error
                 sleep(0.2)

@@ -6,6 +6,7 @@ from .Models import (
     FabricServerValidationResult,
 )
 from .Fixture import BuildFabricFixture, FabricFixtureArtifact, WriteFabricFixture
+from .FailureTrace import BuildFabricFailureTrace
 from .SchemImport import BuildFabricFixtureFromSchem
 from .ServerSnapshot import (
     CaptureServerUpdatedLitematic,
@@ -27,6 +28,7 @@ from .Validation import (
 
 __all__ = [
     "BuildExpectedVectors",
+    "BuildFabricFailureTrace",
     "BuildFabricFixture",
     "BuildFabricFixtureFromSchem",
     "CaptureServerUpdatedLitematic",

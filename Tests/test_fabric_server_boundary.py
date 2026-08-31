@@ -1,13 +1,15 @@
 import os
+import socket
 import sys
 import unittest
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 from Compiler.FabricServer import (
     BuildExpectedVectors,
+    BuildFabricFailureTrace,
     BuildFabricFixture,
     BuildImportedSchematicVectors,
     BuildValidationVectors,
@@ -49,6 +51,42 @@ class FabricServerBoundaryTests(unittest.TestCase):
 
         self.assertEqual(Configuration.Root, Path(TemporaryDirectoryPath).resolve())
         self.assertEqual(ResolveFabricServerRoot(), DefaultFabricServerRoot())
+
+    def testEnvironmentConfiguresTheLongRunningValidationResponseTimeout(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"RC_FABRIC_VALIDATION_TIMEOUT": "123.5"},
+        ):
+            Configuration = FabricServerConfiguration.FromEnvironment()
+
+        self.assertEqual(Configuration.ValidationTimeoutSeconds, 123.5)
+
+    def testValidationResponseTimeoutDoesNotRetryTheSubmittedRequest(self) -> None:
+        Supervisor = FabricServerSupervisor(FabricServerConfiguration(
+            Root=None,
+            StartupTimeoutSeconds=1.0,
+            ValidationTimeoutSeconds=12.5,
+        ))
+        Connection = MagicMock()
+        Connection.__enter__.return_value = Connection
+        Stream = MagicMock()
+        Stream.readline.side_effect = socket.timeout("response deadline")
+        Connection.makefile.return_value = Stream
+        with patch(
+            "Compiler.FabricServer.Validation.socket.create_connection",
+            return_value=Connection,
+        ) as CreateConnection, self.assertRaisesRegex(
+            RuntimeError,
+            "validation request exceeded its response timeout",
+        ):
+            Supervisor._RequestWhenReady(
+                "token",
+                {"Action": "Validate"},
+                Port=25566,
+            )
+
+        CreateConnection.assert_called_once()
+        Connection.settimeout.assert_called_once_with(12.5)
 
     def testMissingServerIsAnInfrastructureFailure(self) -> None:
         Result = FabricServerSupervisor(
@@ -192,6 +230,52 @@ class FabricServerBoundaryTests(unittest.TestCase):
         Clear.assert_called_once()
         Ready.assert_not_called()
 
+    def testSupervisorAttachesTheSourceLinkedTraceToAMismatch(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            Root = Path(TemporaryDirectoryPath)
+            (Root / "mods").mkdir()
+            (Root / "config").mkdir()
+            (Root / "PyScripts").mkdir()
+            (Root / "fabric-server-launch.jar").write_bytes(b"launcher")
+            (Root / "mods" / "redstonecompiler-harness.jar").write_bytes(b"harness")
+            (Root / "PyScripts" / "Main.py").write_text("", encoding="utf-8")
+            FixturePath = Root / "fixture.FabricFixture.json"
+            FixturePath.write_text(
+                '{"Trace":{"Circuit":"Top","Gates":[],"Signals":[]}}',
+                encoding="utf-8",
+            )
+            Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
+            with patch.object(
+                Supervisor,
+                "_ClearCanonicalSimulationWorld",
+                return_value={},
+            ), patch.object(
+                Supervisor,
+                "_GetRunningControl",
+                return_value=("token", 25566),
+            ), patch.object(
+                Supervisor,
+                "_RequestWhenReady",
+                return_value={
+                    "Status": "mismatch",
+                    "Diagnostics": {"Mismatch": {"Output": "y", "Expected": True}},
+                },
+            ), patch(
+                "Compiler.FabricServer.Validation.BuildFabricFailureTrace",
+                return_value={"FirstFailingBlock": {"WorldPosition": [4, 64, 1]}},
+            ) as BuildTrace:
+                Result = Supervisor.Validate(
+                    Fixture=SimpleNamespace(Path=FixturePath, Sha256="fixture-sha"),
+                    Vectors=[],
+                )
+
+        self.assertEqual(Result.Status, "mismatch")
+        self.assertEqual(
+            Result.Diagnostics["FailureTrace"]["FirstFailingBlock"]["WorldPosition"],
+            [4, 64, 1],
+        )
+        BuildTrace.assert_called_once()
+
     def testValidationRequiresTheRuntimeManagerForAFullWorldClear(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
             Root = Path(TemporaryDirectoryPath)
@@ -292,6 +376,12 @@ class FabricServerBoundaryTests(unittest.TestCase):
 
         self.assertEqual(Fixture["Inputs"][0]["LeverPosition"], [0, 0, 0])
         self.assertEqual(Fixture["Outputs"][0]["LampPosition"], [4, 0, 1])
+        self.assertEqual(Fixture["SchemaVersion"], 2)
+        self.assertEqual(Fixture["Trace"]["Circuit"], "Top")
+        self.assertEqual(
+            [Gate["Name"] for Gate in Fixture["Trace"]["Gates"]],
+            ["InputA", "OutputY"],
+        )
 
     def testExpectedVectorsUseLogicOnlyAsAnOracle(self) -> None:
         Module = ModuleIR(
@@ -326,6 +416,120 @@ class FabricServerBoundaryTests(unittest.TestCase):
             [Vector["Expected"] for Vector in Vectors],
             [{"y$Output": False}, {"y$Output": True}],
         )
+
+    def testExpectedVectorsCanRetainEveryInternalSignalForFailureTracing(self) -> None:
+        Module = ModuleIR(
+            Name="Top",
+            Inputs=["a", "b"],
+            Outputs=["y"],
+            Gates=[
+                Gate("InputA", GateKind.INPUT, ["a"]),
+                Gate("InputB", GateKind.INPUT, ["b"]),
+                Gate("Nand0", GateKind.NAND, ["n1"], ["a", "b"]),
+                Gate("OutputY", GateKind.OUTPUT, ["y"], ["n1"]),
+            ],
+        )
+
+        Vectors = BuildExpectedVectors(
+            Module,
+            ["a", "b"],
+            ["y"],
+            IncludeTraceValues=True,
+        )
+
+        self.assertEqual(
+            Vectors[0]["ExpectedSignals"],
+            {"a": False, "b": False, "n1": True, "y": True},
+        )
+
+    def testFailureTraceFindsTheCausalSubcircuitAndExactWorldBlock(self) -> None:
+        Fixture = {
+            "TopModule": "Top",
+            "Trace": {
+                "Circuit": "Top",
+                "Gates": [
+                    {
+                        "Name": "OutputY",
+                        "Kind": "OUTPUT",
+                        "CircuitPath": ["Top", "OutputY"],
+                        "Inputs": ["n1"],
+                        "Outputs": ["y"],
+                        "OutputProbePosition": [4, 0, 1],
+                    },
+                    {
+                        "Name": "Nand0",
+                        "Kind": "NAND",
+                        "CircuitPath": ["Top", "Nand0"],
+                        "Inputs": ["a", "b"],
+                        "Outputs": ["n1"],
+                        "ProbePositions": [[2, 0, 0]],
+                        "OutputProbePosition": [2, 0, 0],
+                    },
+                ],
+                "Signals": [
+                    {"Name": "a", "ProbePositions": [[0, 0, 0]]},
+                    {"Name": "b", "ProbePositions": [[1, 0, 0]]},
+                    {"Name": "n1", "ProbePositions": [[2, 0, 0], [3, 0, 0]]},
+                ],
+            },
+        }
+        Diagnostics = {
+            "Mismatch": {
+                "Output": "y",
+                "Expected": True,
+                "Actual": False,
+                "Inputs": {"a": False, "b": False},
+                "ExpectedSignals": {
+                    "a": False,
+                    "b": False,
+                    "n1": True,
+                    "y": True,
+                },
+                "TestedVectorsBeforeFailure": 0,
+            },
+            "TraceBlocks": [
+                {
+                    "Position": [0, 0, 0],
+                    "WorldPosition": [0, 64, 0],
+                    "State": {"Name": "minecraft:lever", "Properties": {"powered": "false"}},
+                },
+                {
+                    "Position": [1, 0, 0],
+                    "WorldPosition": [1, 64, 0],
+                    "State": {"Name": "minecraft:lever", "Properties": {"powered": "false"}},
+                },
+                {
+                    "Position": [2, 0, 0],
+                    "WorldPosition": [2, 64, 0],
+                    "State": {"Name": "minecraft:redstone_wire", "Properties": {"power": "0"}},
+                },
+                {
+                    "Position": [3, 0, 0],
+                    "WorldPosition": [3, 64, 0],
+                    "State": {"Name": "minecraft:repeater", "Properties": {"powered": "false"}},
+                },
+                {
+                    "Position": [4, 0, 1],
+                    "WorldPosition": [4, 64, 1],
+                    "State": {"Name": "minecraft:redstone_lamp", "Properties": {"lit": "false"}},
+                },
+            ],
+        }
+
+        Trace = BuildFabricFailureTrace(Fixture, Diagnostics)
+
+        self.assertEqual(
+            [Entry["Gate"] for Entry in Trace["SubcircuitTrace"]],
+            ["OutputY", "Nand0"],
+        )
+        self.assertEqual(Trace["FirstFailingSubcircuit"]["Gate"], "Nand0")
+        self.assertEqual(Trace["FirstFailingSubcircuit"]["Signal"], "n1")
+        self.assertEqual(
+            Trace["SubcircuitTrace"][1]["PhysicalBlocks"][0]["Powered"],
+            False,
+        )
+        self.assertEqual(Trace["FirstFailingBlock"]["FixturePosition"], [2, 0, 0])
+        self.assertEqual(Trace["FirstFailingBlock"]["WorldPosition"], [2, 64, 0])
 
     def testImportedLitematicLabelsRecoverPhysicalTestPorts(self) -> None:
         Template = CellTemplate(

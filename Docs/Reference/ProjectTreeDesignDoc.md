@@ -90,7 +90,7 @@ identity and reset behavior. Process-pool workers remain top-level importable
 functions in their owning worker/boundary module.
 
 `Compiler/FabricServer/` owns fixture creation, authenticated live validation,
-imported-schematic testing, and settled-world snapshots. `FabricServerHarness/`
+source-linked mismatch traces, imported-schematic testing, and settled-world snapshots. `FabricServerHarness/`
 contains the tracked Fabric mod source; its `Server/` subdirectory is the one
 canonical local runtime and is deliberately not versioned.
 

@@ -24,8 +24,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -33,8 +35,9 @@ import java.util.concurrent.CompletableFuture;
 
 /** Executes only validated compiler fixtures on the main server thread. */
 final class HarnessValidation {
-    private static final int MINIMUM_OUTPUT_SETTLE_TICKS = 50;
+    private static final int REQUIRED_UNCHANGED_TICKS = 20;
     private static final int MAXIMUM_FORCED_FIXTURE_CHUNKS = 256;
+    private static final int MAXIMUM_TRACE_PROBES = 10_000;
     private static final Set<ChunkCoordinate> ForcedFixtureChunks = new LinkedHashSet<>();
 
     private record ChunkCoordinate(int X, int Z) {
@@ -157,19 +160,34 @@ final class HarnessValidation {
             }
             Map<String, JsonObject> inputStates = inputStates(fixture.getAsJsonArray("Inputs"), fixture.getAsJsonArray("Blocks"), origin);
             Map<String, BlockPos> outputPositions = outputPositions(fixture.getAsJsonArray("Outputs"), origin);
-            int tested = validateVectors(server, request.getAsJsonArray("Vectors"), inputStates, outputPositions, configuration.settleTimeoutTicks());
+            ValidationSummary summary = validateVectors(
+                    server,
+                    request.getAsJsonArray("Vectors"),
+                    inputStates,
+                    outputPositions,
+                    configuration.settleTimeoutTicks(),
+                    fixture,
+                    origin);
             response.addProperty("Status", "passed");
             diagnostics.addProperty("FixtureSha256", actualDigest);
-            diagnostics.addProperty("TestedVectors", tested);
+            diagnostics.addProperty("TestedVectors", summary.TestedVectors());
+            diagnostics.addProperty("RequiredUnchangedTicks", REQUIRED_UNCHANGED_TICKS);
+            diagnostics.addProperty("TraceProbeCount", summary.TraceProbeCount());
+            diagnostics.addProperty("MaximumSettleTicks", summary.MaximumSettleTicks());
+            diagnostics.addProperty("UnobservedTickGapCount", summary.UnobservedTickGapCount());
             diagnostics.addProperty("ForcedFixtureChunks", forcedFixtureChunkCount);
             diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
             diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
         } catch (Mismatch error) {
             response.addProperty("Status", "mismatch");
             diagnostics.addProperty("Error", error.getMessage());
+            diagnostics.add("Mismatch", error.Details());
+            diagnostics.add("TraceBlocks", error.TraceBlocks());
         } catch (Timeout error) {
             response.addProperty("Status", "timeout");
             diagnostics.addProperty("Error", error.getMessage());
+            if (error.Details() != null) diagnostics.add("Timeout", error.Details());
+            if (error.TraceBlocks() != null) diagnostics.add("TraceBlocks", error.TraceBlocks());
         } catch (Exception error) {
             response.addProperty("Status", "infrastructure-failure");
             diagnostics.addProperty("Error", error.toString());
@@ -421,9 +439,21 @@ final class HarnessValidation {
         return result;
     }
 
-    private static int validateVectors(MinecraftServer server, JsonArray vectors,
-                                       Map<String, JsonObject> inputs, Map<String, BlockPos> outputs, int timeoutTicks) {
+    private static ValidationSummary validateVectors(
+            MinecraftServer server,
+            JsonArray vectors,
+            Map<String, JsonObject> inputs,
+            Map<String, BlockPos> outputs,
+            int timeoutTicks,
+            JsonObject fixture,
+            JsonArray origin) {
+        List<TraceProbe> TraceProbes = BuildTraceProbes(fixture, origin);
+        if (TraceProbes.isEmpty()) {
+            throw new IllegalArgumentException("fixture-has-no-trace-probes");
+        }
         int tested = 0;
+        int MaximumSettleTicks = 0;
+        int TotalUnobservedTickGaps = 0;
         for (JsonElement vector : vectors) {
             JsonObject item = vector.getAsJsonObject();
             OnServer(server, () -> {
@@ -444,40 +474,71 @@ final class HarnessValidation {
                 return null;
             });
             waitForTicks(server, 1);
-            Snapshot previous = snapshot(server, outputs);
-            long start = previous.gameTime();
-            long earliestComparison = start + Math.min(
-                    MINIMUM_OUTPUT_SETTLE_TICKS,
-                    timeoutTicks);
-            int stableTicks = 0;
-            while (previous.gameTime() - start < timeoutTicks) {
-                try { Thread.sleep(1); } catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new Timeout("validation-interrupted"); }
-                Snapshot current = snapshot(server, outputs);
-                if (current.gameTime() == previous.gameTime()) continue;
-                if (current.gameTime() < earliestComparison) {
-                    previous = current;
+            Snapshot Previous = SnapshotCircuit(server, outputs, TraceProbes);
+            long Start = Previous.GameTime();
+            int UnchangedTicks = 0;
+            int LastObservedChangeTick = 0;
+            int UnobservedTickGapCount = 0;
+            Snapshot Settled = null;
+            while (Previous.GameTime() - Start < timeoutTicks) {
+                Snapshot Current = SnapshotCircuit(server, outputs, TraceProbes);
+                if (Current.GameTime() == Previous.GameTime()) {
+                    Thread.onSpinWait();
                     continue;
                 }
-                if (current.values().equals(previous.values())) stableTicks++; else stableTicks = 0;
-                if (stableTicks >= 2) {
-                    compare(
-                            item.getAsJsonObject("Inputs"),
-                            item.getAsJsonObject("Expected"),
-                            current.values());
+                long ElapsedTicks = Current.GameTime() - Start;
+                if (Current.GameTime() != Previous.GameTime() + 1) {
+                    UnchangedTicks = 0;
+                    UnobservedTickGapCount++;
+                } else if (Current.TraceBlocks().equals(Previous.TraceBlocks())) {
+                    UnchangedTicks++;
+                } else {
+                    UnchangedTicks = 0;
+                    LastObservedChangeTick = (int) ElapsedTicks;
+                }
+                Previous = Current;
+                if (UnchangedTicks >= REQUIRED_UNCHANGED_TICKS) {
+                    Settled = Current;
                     break;
                 }
-                previous = current;
             }
-            if (previous.gameTime() - start >= timeoutTicks) {
-                throw new Timeout("redstone-network-did-not-settle");
+            SettlementEvidence Evidence = new SettlementEvidence(
+                    (int) (Previous.GameTime() - Start),
+                    LastObservedChangeTick,
+                    UnchangedTicks,
+                    TraceProbes.size(),
+                    UnobservedTickGapCount);
+            if (Settled == null) {
+                throw BuildTimeout(item, Previous.OutputValues(), tested, Evidence)
+                        .WithTraceBlocks(Previous.TraceBlocks());
             }
+            try {
+                compare(item, Settled.OutputValues(), tested, Evidence);
+            } catch (Mismatch error) {
+                throw error.WithTraceBlocks(Settled.TraceBlocks());
+            }
+            MaximumSettleTicks = Math.max(MaximumSettleTicks, Evidence.ElapsedTicks());
+            TotalUnobservedTickGaps += UnobservedTickGapCount;
             tested++;
         }
-        return tested;
+        return new ValidationSummary(
+                tested,
+                TraceProbes.size(),
+                MaximumSettleTicks,
+                TotalUnobservedTickGaps);
     }
 
-    private static Snapshot snapshot(MinecraftServer server, Map<String, BlockPos> outputs) {
-        return OnServer(server, () -> new Snapshot(server.overworld().getGameTime(), sample(server.overworld(), outputs)));
+    private static Snapshot SnapshotCircuit(
+            MinecraftServer server,
+            Map<String, BlockPos> outputs,
+            List<TraceProbe> TraceProbes) {
+        return OnServer(server, () -> {
+            ServerLevel Level = server.overworld();
+            return new Snapshot(
+                    Level.getGameTime(),
+                    sample(Level, outputs),
+                    ReadTraceBlocks(Level, TraceProbes));
+        });
     }
 
     private static void waitForTicks(MinecraftServer server, int ticks) {
@@ -504,18 +565,112 @@ final class HarnessValidation {
     }
 
     private static void compare(
-            JsonObject inputs,
-            JsonObject expected,
-            Map<String, Boolean> actual) {
+            JsonObject vector,
+            Map<String, Boolean> actual,
+            int testedVectorsBeforeFailure,
+            SettlementEvidence Evidence) {
+        JsonObject inputs = vector.getAsJsonObject("Inputs");
+        JsonObject expected = vector.getAsJsonObject("Expected");
         for (Map.Entry<String, Boolean> output : actual.entrySet()) {
             if (expected.get(output.getKey()).getAsBoolean() != output.getValue()) {
+                boolean expectedValue = expected.get(output.getKey()).getAsBoolean();
+                JsonObject details = new JsonObject();
+                details.addProperty("Output", output.getKey());
+                details.addProperty("Expected", expectedValue);
+                details.addProperty("Actual", output.getValue());
+                details.add("Inputs", inputs.deepCopy());
+                details.addProperty("TestedVectorsBeforeFailure", testedVectorsBeforeFailure);
+                AddSettlementEvidence(details, Evidence);
+                if (vector.has("ExpectedSignals")) {
+                    details.add("ExpectedSignals", vector.getAsJsonObject("ExpectedSignals").deepCopy());
+                }
                 throw new Mismatch(
                         "output-mismatch:" + output.getKey()
-                                + ":expected=" + expected.get(output.getKey()).getAsBoolean()
+                                + ":expected=" + expectedValue
                                 + ":actual=" + output.getValue()
-                                + ":inputs=" + inputs);
+                                + ":inputs=" + inputs,
+                        details,
+                        new JsonArray());
             }
         }
+    }
+
+    private static Timeout BuildTimeout(
+            JsonObject vector,
+            Map<String, Boolean> actual,
+            int testedVectorsBeforeFailure,
+            SettlementEvidence Evidence) {
+        JsonObject expected = vector.getAsJsonObject("Expected");
+        String selectedOutput = null;
+        for (Map.Entry<String, Boolean> output : actual.entrySet()) {
+            selectedOutput = output.getKey();
+            if (expected.get(output.getKey()).getAsBoolean() != output.getValue()) break;
+        }
+        JsonObject details = new JsonObject();
+        details.addProperty("Reason", "redstone-network-did-not-settle");
+        details.add("Inputs", vector.getAsJsonObject("Inputs").deepCopy());
+        details.addProperty("TestedVectorsBeforeFailure", testedVectorsBeforeFailure);
+        AddSettlementEvidence(details, Evidence);
+        if (selectedOutput != null) {
+            details.addProperty("Output", selectedOutput);
+            details.addProperty("Expected", expected.get(selectedOutput).getAsBoolean());
+            details.addProperty("Actual", actual.get(selectedOutput));
+        }
+        if (vector.has("ExpectedSignals")) {
+            details.add("ExpectedSignals", vector.getAsJsonObject("ExpectedSignals").deepCopy());
+        }
+        return new Timeout("redstone-network-did-not-settle", details, new JsonArray());
+    }
+
+    private static void AddSettlementEvidence(
+            JsonObject Details,
+            SettlementEvidence Evidence) {
+        Details.addProperty("RequiredUnchangedTicks", REQUIRED_UNCHANGED_TICKS);
+        Details.addProperty("ElapsedTicks", Evidence.ElapsedTicks());
+        Details.addProperty("LastObservedChangeTick", Evidence.LastObservedChangeTick());
+        Details.addProperty("ObservedUnchangedTicks", Evidence.ObservedUnchangedTicks());
+        Details.addProperty("TraceProbeCount", Evidence.TraceProbeCount());
+        Details.addProperty("UnobservedTickGapCount", Evidence.UnobservedTickGapCount());
+    }
+
+    private static List<TraceProbe> BuildTraceProbes(
+            JsonObject Fixture,
+            JsonArray Origin) {
+        List<TraceProbe> Result = new ArrayList<>();
+        if (!Fixture.has("Trace")) return Result;
+        JsonObject Trace = Fixture.getAsJsonObject("Trace");
+        if (!Trace.has("ProbePositions")) return Result;
+        JsonArray Positions = Trace.getAsJsonArray("ProbePositions");
+        if (Positions.size() > MAXIMUM_TRACE_PROBES) {
+            throw new IllegalArgumentException("too-many-trace-probes:" + Positions.size());
+        }
+        Set<BlockPos> Seen = new LinkedHashSet<>();
+        for (JsonElement Element : Positions) {
+            JsonArray RelativePosition = Element.getAsJsonArray();
+            BlockPos WorldPosition = absolute(RelativePosition, Origin);
+            if (Seen.add(WorldPosition)) {
+                Result.add(new TraceProbe(RelativePosition.deepCopy(), WorldPosition));
+            }
+        }
+        return Result;
+    }
+
+    private static JsonArray ReadTraceBlocks(
+            ServerLevel level,
+            List<TraceProbe> TraceProbes) {
+        JsonArray result = new JsonArray();
+        for (TraceProbe Probe : TraceProbes) {
+            JsonObject block = new JsonObject();
+            block.add("Position", Probe.RelativePosition().deepCopy());
+            JsonArray serializedWorldPosition = new JsonArray();
+            serializedWorldPosition.add(Probe.WorldPosition().getX());
+            serializedWorldPosition.add(Probe.WorldPosition().getY());
+            serializedWorldPosition.add(Probe.WorldPosition().getZ());
+            block.add("WorldPosition", serializedWorldPosition);
+            block.add("State", serializeState(level.getBlockState(Probe.WorldPosition())));
+            result.add(block);
+        }
+        return result;
     }
 
     private static JsonObject findState(JsonArray blocks, JsonArray position) {
@@ -560,7 +715,58 @@ final class HarnessValidation {
         return value.toString();
     }
 
-    private static final class Mismatch extends RuntimeException { Mismatch(String value) { super(value); } }
-    private static final class Timeout extends RuntimeException { Timeout(String value) { super(value); } }
-    private record Snapshot(long gameTime, Map<String, Boolean> values) { }
+    private static final class Mismatch extends RuntimeException {
+        private final JsonObject Details;
+        private final JsonArray TraceBlocks;
+
+        Mismatch(String value, JsonObject details, JsonArray traceBlocks) {
+            super(value);
+            Details = details;
+            TraceBlocks = traceBlocks;
+        }
+
+        JsonObject Details() { return Details; }
+        JsonArray TraceBlocks() { return TraceBlocks; }
+
+        Mismatch WithTraceBlocks(JsonArray traceBlocks) {
+            return new Mismatch(getMessage(), Details, traceBlocks);
+        }
+    }
+    private static final class Timeout extends RuntimeException {
+        private final JsonObject Details;
+        private final JsonArray TraceBlocks;
+
+        Timeout(String value) {
+            this(value, null, null);
+        }
+
+        Timeout(String value, JsonObject details, JsonArray traceBlocks) {
+            super(value);
+            Details = details;
+            TraceBlocks = traceBlocks;
+        }
+
+        JsonObject Details() { return Details; }
+        JsonArray TraceBlocks() { return TraceBlocks; }
+
+        Timeout WithTraceBlocks(JsonArray traceBlocks) {
+            return new Timeout(getMessage(), Details, traceBlocks);
+        }
+    }
+    private record TraceProbe(JsonArray RelativePosition, BlockPos WorldPosition) { }
+    private record Snapshot(
+            long GameTime,
+            Map<String, Boolean> OutputValues,
+            JsonArray TraceBlocks) { }
+    private record SettlementEvidence(
+            int ElapsedTicks,
+            int LastObservedChangeTick,
+            int ObservedUnchangedTicks,
+            int TraceProbeCount,
+            int UnobservedTickGapCount) { }
+    private record ValidationSummary(
+            int TestedVectors,
+            int TraceProbeCount,
+            int MaximumSettleTicks,
+            int UnobservedTickGapCount) { }
 }
