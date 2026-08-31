@@ -28,6 +28,7 @@ from Compiler.Routing.Actions.Geometry import (
 )
 from .Clustering import (
     PcbGatesConflict,
+    TransformPackedClusterLayout,
 )
 from .Clusters import (
     PcbPlacement,
@@ -144,16 +145,20 @@ def BuildTransactionalClusterEndpointRepair(
     RepairTerminalPositions: frozenset[
         tuple[int, int, int]
     ] = frozenset(),
+    RepairEndpointGateNames: frozenset[str] = frozenset(),
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> TransactionalClusterEndpointRepairResult:
     """Repair endpoint access without reopening clustering or global slots.
 
     This is a physical-design ECO transaction.  It may translate or mirror
     only NAND gates touching the reported signals inside their current
-    clusters.  Every unrelated gate, the global XZ envelope, and unaffected
-    local routes remain immutable.  Claims incident to a moved gate are
-    deliberately released so authoritative routing regenerates them against
-    the new pin geometry.
+    clusters.  A typed endpoint failure may instead rigidly rotate the exact
+    endpoint island inside its selected packed cluster.  The transformed
+    island is validated against every stationary cluster member.  Every gate
+    outside an accepted endpoint island, the global XZ envelope, and
+    unaffected local routes remain immutable.  Claims incident to a moved
+    gate are deliberately released so authoritative routing regenerates them
+    against the new pin geometry.
     """
     Signals = frozenset(map(str, RepairSignals))
     Diagnostics: dict[str, object] = {
@@ -175,6 +180,31 @@ def BuildTransactionalClusterEndpointRepair(
         Gate.Name: Gate
         for Gate in Source.Placed.PlacedGates
     }
+    EndpointGateNames = frozenset(
+        str(Name)
+        for Name in RepairEndpointGateNames
+        if str(Name) in SourceGateByName
+    )
+    SemanticRepairTerminalPositions = frozenset(
+        Pin
+        for Name in EndpointGateNames
+        for Gate in (SourceGateByName[Name],)
+        for Signal, Pin in (
+            *((OutputSignal, Gate.OutputPin) for OutputSignal in Gate.Outputs),
+            *zip(Gate.Inputs, Gate.InputPins),
+        )
+        if str(Signal) in Signals and Pin is not None
+    )
+    EffectiveRepairTerminalPositions = (
+        SemanticRepairTerminalPositions
+        if SemanticRepairTerminalPositions
+        else RepairTerminalPositions
+    )
+    Diagnostics['RepairEndpointGateNames'] = sorted(EndpointGateNames)
+    Diagnostics['SemanticRepairTerminalPositions'] = [
+        list(Position)
+        for Position in sorted(SemanticRepairTerminalPositions)
+    ]
     InternalByName = {
         Name: ModuleGateByName[Name]
         for Names in Source.Clusters
@@ -267,11 +297,17 @@ def BuildTransactionalClusterEndpointRepair(
         for ClusterIndex, Names in enumerate(Source.Clusters)
         if any(
             (
-                Gate.OutputPin in RepairTerminalPositions
+                (
+                    Name in EndpointGateNames
+                    or Gate.OutputPin in EffectiveRepairTerminalPositions
+                )
                 and bool(set(Gate.Outputs) & Signals)
             )
             or any(
-                Pin in RepairTerminalPositions
+                (
+                    Name in EndpointGateNames
+                    or Pin in EffectiveRepairTerminalPositions
+                )
                 and Signal in Signals
                 for Signal, Pin in zip(
                     Gate.Inputs,
@@ -331,6 +367,7 @@ def BuildTransactionalClusterEndpointRepair(
         for Name, Gate in SourceGateByName.items()
     }
     RepairByCluster: dict[str, dict[str, object]] = {}
+    RigidMacroGateNames: set[str] = set()
     TouchedClusters: set[int] = set()
     for ClusterIndex, ClusterNames, ClusterSignals in (
         EligibleClusterSignals
@@ -370,7 +407,7 @@ def BuildTransactionalClusterEndpointRepair(
                 NormalizeOrigin=False,
                 RequireAccessDistinctGeometry=True,
                 AccessDistinctVariant=ClusterRepairVariant,
-                PriorityTerminalPositions=RepairTerminalPositions,
+                PriorityTerminalPositions=EffectiveRepairTerminalPositions,
                 WorkCheck=WorkCheck,
             )
         except ValueError as Error:
@@ -389,11 +426,17 @@ def BuildTransactionalClusterEndpointRepair(
             for Gate in (SourceGateByName[Name],)
             if (
                 (
-                    Gate.OutputPin in RepairTerminalPositions
+                    (
+                        Name in EndpointGateNames
+                        or Gate.OutputPin in EffectiveRepairTerminalPositions
+                    )
                     and bool(set(Gate.Outputs) & Signals)
                 )
                 or any(
-                    Pin in RepairTerminalPositions
+                    (
+                        Name in EndpointGateNames
+                        or Pin in EffectiveRepairTerminalPositions
+                    )
                     and Signal in Signals
                     for Signal, Pin in zip(
                         Gate.Inputs,
@@ -409,27 +452,115 @@ def BuildTransactionalClusterEndpointRepair(
             RotationDelta = (90, 180, 270)[
                 ClusterRepairVariant % 3
             ]
-            CandidateRotations = {
+            RigidNames = PriorityEndpointNames
+            RigidOriginX = min(
+                RepairedPositions[Name][0]
+                for Name in RigidNames
+            )
+            RigidOriginZ = min(
+                RepairedPositions[Name][1]
+                for Name in RigidNames
+            )
+            SourceRigidWidth = max(
+                RepairedPositions[Name][0]
+                + RotatedCellSize(
+                    InternalByName[Name].Kind,
+                    LocalRotations[Name],
+                )[0]
+                for Name in RigidNames
+            ) - RigidOriginX
+            SourceRigidDepth = max(
+                RepairedPositions[Name][1]
+                + RotatedCellSize(
+                    InternalByName[Name].Kind,
+                    LocalRotations[Name],
+                )[1]
+                for Name in RigidNames
+            ) - RigidOriginZ
+            RigidVariant = TransformPackedClusterLayout(
+                tuple(RigidNames),
+                {
+                    Name: (
+                        RepairedPositions[Name][0] - RigidOriginX,
+                        RepairedPositions[Name][1] - RigidOriginZ,
+                    )
+                    for Name in RigidNames
+                },
+                {
+                    Name: LocalRotations[Name]
+                    for Name in RigidNames
+                },
+                {
+                    Name: RepairedMirrors[Name]
+                    for Name in RigidNames
+                },
+                RotationDelta,
+                False,
+                GatesByName={
+                    Name: InternalByName[Name]
+                    for Name in RigidNames
+                },
+            )
+            RigidWidthDelta = SourceRigidWidth - RigidVariant.Width
+            RigidDepthDelta = SourceRigidDepth - RigidVariant.Depth
+            RigidAnchorVariant = (ClusterRepairVariant // 3) % 4
+            RigidAnchorOffsetX = (
+                (RigidWidthDelta + 1) // 2
+                if RigidAnchorVariant & 1
+                else RigidWidthDelta // 2
+            )
+            RigidAnchorOffsetZ = (
+                (RigidDepthDelta + 1) // 2
+                if RigidAnchorVariant & 2
+                else RigidDepthDelta // 2
+            )
+            CandidatePositions = {
                 Name: (
-                    (LocalRotations[Name] + RotationDelta) % 360
-                    if Name in PriorityEndpointNames
-                    else LocalRotations[Name]
+                    RigidOriginX
+                    + RigidAnchorOffsetX
+                    + RigidVariant.Positions[Name][0],
+                    RigidOriginZ
+                    + RigidAnchorOffsetZ
+                    + RigidVariant.Positions[Name][1],
                 )
-                for Name in ClusterNames
-            }
+                for Name in RigidNames
+            } if RigidVariant.IsLegal else {}
+            CandidateRotations = {
+                Name: RigidVariant.Rotations[Name]
+                for Name in RigidNames
+            } if RigidVariant.IsLegal else {}
+            CandidateMirrors = {
+                Name: RigidVariant.Mirrors[Name]
+                for Name in RigidNames
+            } if RigidVariant.IsLegal else {}
             CandidateClusterGates = [
                 BuildPlacedGate(
                     InternalByName[Name],
-                    RepairedPositions[Name][0],
+                    (
+                        CandidatePositions[Name][0]
+                        if Name in CandidatePositions
+                        else RepairedPositions[Name][0]
+                    ),
                     SourceGateByName[Name].Y,
-                    RepairedPositions[Name][1],
-                    CandidateRotations[Name],
-                    RepairedMirrors[Name],
+                    (
+                        CandidatePositions[Name][1]
+                        if Name in CandidatePositions
+                        else RepairedPositions[Name][1]
+                    ),
+                    CandidateRotations.get(
+                        Name,
+                        LocalRotations[Name],
+                    ),
+                    CandidateMirrors.get(
+                        Name,
+                        RepairedMirrors[Name],
+                    ),
                 )
                 for Name in ClusterNames
-            ]
-            if (
-                not any(
+            ] if RigidVariant.IsLegal else []
+            RigidRotationAccepted = bool(
+                RigidVariant.IsLegal
+                and not any(
                     PcbGatesConflict(First, Second)
                     for GateIndex, First in enumerate(CandidateClusterGates)
                     for Second in CandidateClusterGates[GateIndex + 1 :]
@@ -438,20 +569,43 @@ def BuildTransactionalClusterEndpointRepair(
                     CandidateClusterGates,
                     ClusterSignals,
                 ) == 0
-            ):
-                for Name in PriorityEndpointNames:
-                    RepairedRotationByName[Name] = (
-                        CandidateRotations[Name]
-                    )
+            )
+            if RigidRotationAccepted:
+                RepairedPositions.update(CandidatePositions)
+                RepairedRotationByName.update(CandidateRotations)
+                RepairedMirrors.update(CandidateMirrors)
+                RigidMacroGateNames.update(RigidNames)
                 ClusterDiagnostics["PriorityEndpointRotationDelta"] = (
                     RotationDelta
                 )
                 ClusterDiagnostics["PriorityEndpointRotationNames"] = (
                     list(PriorityEndpointNames)
                 )
+                ClusterDiagnostics["PriorityEndpointRigidRotation"] = True
+                ClusterDiagnostics["PriorityEndpointRigidRotationSize"] = [
+                    RigidVariant.Width,
+                    RigidVariant.Depth,
+                ]
+                ClusterDiagnostics["PriorityEndpointRigidSourceSize"] = [
+                    SourceRigidWidth,
+                    SourceRigidDepth,
+                ]
+                ClusterDiagnostics["PriorityEndpointRigidAnchorVariant"] = (
+                    RigidAnchorVariant
+                )
+                ClusterDiagnostics["PriorityEndpointRigidAnchorOffset"] = [
+                    RigidAnchorOffsetX,
+                    RigidAnchorOffsetZ,
+                ]
             else:
                 ClusterDiagnostics["PriorityEndpointRotationRejected"] = (
                     True
+                )
+                ClusterDiagnostics[
+                    "PriorityEndpointRotationRejectionReason"
+                ] = (
+                    RigidVariant.RejectionReason
+                    or "rigid-macro-conflict-or-mandatory-access"
                 )
         RepairByCluster[str(ClusterIndex)] = {
             **ClusterDiagnostics,
@@ -497,12 +651,13 @@ def BuildTransactionalClusterEndpointRepair(
             *InternalByName[Name].Inputs,
             *InternalByName[Name].Outputs,
         )) & Signals
-    )
+    ) | frozenset(RigidMacroGateNames)
     UnexpectedChanges = ChangedGateNames - AllowedGateNames
     if UnexpectedChanges:
         Diagnostics.update({
             "Reason": "unrelated-gate-geometry-changed",
             "UnexpectedChangedGateCount": len(UnexpectedChanges),
+            "UnexpectedChangedGateNames": sorted(UnexpectedChanges),
         })
         return TransactionalClusterEndpointRepairResult(None, Diagnostics)
 
@@ -657,6 +812,8 @@ def BuildTransactionalClusterEndpointRepair(
         "Clusters": RepairByCluster,
         "TouchedClusterCount": len(TouchedClusters),
         "ChangedGateCount": len(ChangedGateNames),
+        "RigidMacroGateCount": len(RigidMacroGateNames),
+        "RigidMacroGateNames": sorted(RigidMacroGateNames),
         "InvalidatedSignals": sorted(InvalidatedSignals),
         "SourceEnvelope": list(SourceEnvelope),
         "CandidateEnvelope": list(CandidateEnvelope),

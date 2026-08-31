@@ -5,11 +5,13 @@ from ..Actions import BuildPhysicalGraphs
 from ..Actions import MaterializeReservedRepeaters
 from ..Actions import ValidatePhysicalRoutes
 from ..ChannelPlanner import BuildNetRoutingProfiles
+from ..ChannelPlanner import BuildPlacementPinAccessWitness
 from ..ChannelPlanner import CandidateLanes
 from ..ChannelPlanner import ChannelPlan
 from ..ChannelPlanner import MeasureRoutingStage
 from ..ChannelPlanner import NegotiatedRoutePlan
 from ..ChannelPlanner import RoutingIterationMetrics
+from ..Components.Access import BuildComponentAccessGuideTargetColumns
 from ..Components.Access import BuildComponentCutAccessFeasibilityCertificate
 from ..Components.PhysicalPlanning import ApplyPhysicalComponentAssemblyGlobalProfiles
 from ..Components.PhysicalPlanning import BuildPhysicalComponentPortSolverCacheKey
@@ -88,13 +90,16 @@ from typing import Iterable
 from typing import Mapping
 import os
 try:
+    from ...RustRouting import BuildRouteClaimsBatchWithTelemetry
     from ...RustRouting import GetRoutingThreadCount as GetRustRoutingThreadCount, RoutingContext as RustRoutingContext, SearchExteriorConnectorsBatchWithTelemetry as _SearchExteriorConnectorsBatchWithTelemetry
 except ImportError:
     try:
+        from RedstoneCompiler.RustRouting import BuildRouteClaimsBatchWithTelemetry
         from RedstoneCompiler.RustRouting import GetRoutingThreadCount as GetRustRoutingThreadCount, RoutingContext as RustRoutingContext, SearchExteriorConnectorsBatchWithTelemetry as _SearchExteriorConnectorsBatchWithTelemetry
     except Exception:
         RustRoutingContext = None
         _SearchExteriorConnectorsBatchWithTelemetry = None
+        BuildRouteClaimsBatchWithTelemetry = None
 
         def GetRustRoutingThreadCount() -> int:
             return 1

@@ -10,6 +10,7 @@ from typing import Callable, Iterable
 
 from .Technology import (
     DefaultRedstoneRoutingTechnology,
+    RepeaterInputFacing,
     RedstoneRoutingTechnology,
 )
 
@@ -110,7 +111,7 @@ class RoutingReservation:
     Resource: RoutingResourceId
     Position: Position3
     Purpose: str
-    Facing: str | None = None
+    InputFacing: RepeaterInputFacing | None = None
 
 
 @dataclass(frozen=True)
@@ -445,7 +446,7 @@ class RoutingResourceGraph:
                 CandidateMaximumZ,
             ) = CandidateBounds
             if (
-                CandidateAllowedAccess != AllowedAccess
+                not CandidateAllowedAccess.issubset(AllowedAccess)
                 or CandidateMinimumX != MinimumX
                 or CandidateMaximumX != MaximumX
                 or CandidateMinimumY != MinimumY

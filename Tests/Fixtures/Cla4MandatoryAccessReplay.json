@@ -1,0 +1,132 @@
+{
+  "SchemaVersion": "cla4-mandatory-access-replay-v2",
+  "SourceArtifact": {
+    "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T151609Z/Artifacts/CarryLookaheadAdder4Run1.RoutingFailure.json",
+    "Sha256": "fe859cbfce1e76ee6e81f814ed9523046708ae53cd24c283b9f936e462a6c661",
+    "Revision": "1681514368979f2cca1635b90b7f27062a966e33"
+  },
+  "SourceCandidate": {
+    "SourceGenerator": "row-beam",
+    "Result": "rejected-mandatory-access-conflict",
+    "OwnershipFingerprint": "e6487e0d82da6c09c9eea92a3285f234e77e08134af3c3a9dbef1672bd0713aa",
+    "ConflictFingerprint": "121ac18ef01a5ed1a39d9de2d041b49fe62f8054904807e0f1cdab53cec877ff",
+    "SignalCount": 81,
+    "ClaimCount": 8814,
+    "ConflictResourceCount": 2,
+    "ConflictSignals": [
+      "NandNet0",
+      "Propagate0"
+    ],
+    "CrossConflicts": [
+      {
+        "Kind": "Electrical",
+        "Owners": [
+          "NandNet0",
+          "Propagate0"
+        ],
+        "Position": [
+          16,
+          1,
+          5
+        ]
+      },
+      {
+        "Kind": "Electrical",
+        "Owners": [
+          "NandNet0",
+          "Propagate0"
+        ],
+        "Position": [
+          17,
+          1,
+          5
+        ]
+      }
+    ]
+  },
+  "ReplaySlice": {
+    "MaximumRuntimeSeconds": 5.0,
+    "Signals": [
+      "NandNet0",
+      "Propagate0"
+    ],
+    "Gates": [
+      {
+        "Name": "NandNet0Source",
+        "Signal": "NandNet0",
+        "OutputPin": [
+          14,
+          1,
+          5
+        ],
+        "OutputDirection": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "Name": "Propagate0Source",
+        "Signal": "Propagate0",
+        "OutputPin": [
+          19,
+          1,
+          5
+        ],
+        "OutputDirection": [
+          -1,
+          0,
+          0
+        ]
+      }
+    ],
+    "ExpectedProfile": {
+      "OwnershipFingerprint": "ae1c878cf489c16eed1328f1af5fcf86bf44dbd7e3ca433ad2c08a0c07a23872",
+      "ConflictFingerprint": "4c24ae9f9a4d3a7a7ebb6ba3a7c0596d16d7ee239164e5225d33d6f359598b72",
+      "SignalCount": 2,
+      "ClaimCount": 78,
+      "ClaimCountsBySignal": {
+        "NandNet0": 39,
+        "Propagate0": 39
+      },
+      "CrossConflictCount": 2,
+      "SelfConflictCount": 0,
+      "ExactConflictCount": 2,
+      "ConflictResourceCount": 2,
+      "ConflictSignals": [
+        "NandNet0",
+        "Propagate0"
+      ],
+      "HasConflicts": true,
+      "CrossConflicts": [
+        {
+          "Resource": "Electrical:16,1,5",
+          "Kind": "Electrical",
+          "Position": [
+            16,
+            1,
+            5
+          ],
+          "Owners": [
+            "NandNet0",
+            "Propagate0"
+          ]
+        },
+        {
+          "Resource": "Electrical:17,1,5",
+          "Kind": "Electrical",
+          "Position": [
+            17,
+            1,
+            5
+          ],
+          "Owners": [
+            "NandNet0",
+            "Propagate0"
+          ]
+        }
+      ],
+      "SelfConflicts": []
+    }
+  }
+}

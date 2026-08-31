@@ -53,7 +53,7 @@ actually proved. A snapshot is evidence, not acceptance by itself.
 
 ## Machine-readable bundle
 
-`Scripts/CaptureRoutingDesignSnapshot.py` captures a full timestamped bundle.
+`Scripts/Routing/CaptureRoutingDesignSnapshot.py` captures a full timestamped bundle.
 Its output contains:
 
 ```text
@@ -89,7 +89,7 @@ portable-semantic identity and must not be compared to either one. Per-file
 Suggested capture command for the current baseline:
 
 ```bash
-python3 Scripts/CaptureRoutingDesignSnapshot.py --output-root Docs/Routing/Snapshots/RoutingAwarePlacementAccess --cla4-failure /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.RoutingFailure.json --acceptance-manifest /tmp/redstone-timegraph-20260825-2128/2026-08-25/RouterRegression/StandaloneAcceptance/AcceptanceManifest.json --artifact /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.json --artifact /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.dot
+python3 Scripts/Routing/CaptureRoutingDesignSnapshot.py --output-root Docs/Routing/Snapshots/RoutingAwarePlacementAccess --cla4-failure /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.RoutingFailure.json --acceptance-manifest /tmp/redstone-timegraph-20260825-2128/2026-08-25/RouterRegression/StandaloneAcceptance/AcceptanceManifest.json --artifact /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.json --artifact /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.dot
 ```
 
 Full raw bundles are versioned only when they are named evidence for a design
@@ -155,7 +155,7 @@ existing Freerouting benchmark and synthetic-placement visualization work:
 
 ```text
 ?? Docs/Testing/FreeroutingBenchmark-2026-08-25.md
-?? Scripts/RunFreeroutingBenchmark.py
+?? Scripts/Routing/RunFreeroutingBenchmark.py
 ?? Tests/test_freerouting_benchmark.py
 ?? Tools/ExternalRouters/Freerouting/.gitignore
 ?? Tools/ExternalRouters/Freerouting/LICENSE-GPL-3.0

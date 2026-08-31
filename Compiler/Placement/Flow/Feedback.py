@@ -460,6 +460,54 @@ def BuildSignalTopologyFingerprints(
         SignalColors = NextSignalColors
     return SignalColors
 
+
+def BuildSignalLocalIncidenceFingerprints(
+    Module: Any,
+) -> dict[str, str]:
+    """Color signals by terminal role and one-hop anonymous gate shape."""
+    Gates = tuple(getattr(Module, "Gates", ()))
+    InputSignals = frozenset(map(str, getattr(Module, "Inputs", ())))
+    OutputSignals = frozenset(map(str, getattr(Module, "Outputs", ())))
+    Signals = frozenset((
+        *InputSignals,
+        *OutputSignals,
+        *(
+            str(Signal)
+            for Gate in Gates
+            for Signal in getattr(Gate, "Inputs", ())
+        ),
+        *(
+            str(Signal)
+            for Gate in Gates
+            for Signal in getattr(Gate, "Outputs", ())
+        ),
+    ))
+    ProducerShapesBySignal = {Signal: [] for Signal in Signals}
+    ConsumerShapesBySignal = {Signal: [] for Signal in Signals}
+    for Gate in Gates:
+        GateShape = (
+            str(getattr(
+                getattr(Gate, "Kind", "NAND"),
+                "value",
+                getattr(Gate, "Kind", "NAND"),
+            )),
+            len(getattr(Gate, "Inputs", ())),
+            len(getattr(Gate, "Outputs", ())),
+        )
+        for Signal in map(str, getattr(Gate, "Inputs", ())):
+            ConsumerShapesBySignal[Signal].append(GateShape)
+        for Signal in map(str, getattr(Gate, "Outputs", ())):
+            ProducerShapesBySignal[Signal].append(GateShape)
+    return {
+        Signal: BuildStableFingerprint({
+            "InputTerminal": Signal in InputSignals,
+            "OutputTerminal": Signal in OutputSignals,
+            "ProducerShapes": sorted(ProducerShapesBySignal[Signal]),
+            "ConsumerShapes": sorted(ConsumerShapesBySignal[Signal]),
+        })
+        for Signal in Signals
+    }
+
 def SelectCutDrivenClusterRefinementSignals(
     AssignmentCut: RoutingAssignmentCut | None,
     SignalTopologyFingerprints: Mapping[str, str],
@@ -469,19 +517,31 @@ def SelectCutDrivenClusterRefinementSignals(
     ),
 ) -> frozenset[str]:
     """Select a bounded exact/observed interface neighborhood for reclustering."""
-    if AssignmentCut is None or MaximumSignals < 2:
+    if MaximumSignals < 2:
         return frozenset()
-    RawEdges = AssignmentCut.PairwiseConflictEdges or tuple((
-        *(
-            tuple(map(str, Edge))
-            for Edge in AssignmentCut.ConflictGraph.get(
-                "ObservedPatternConflictEdges",
-                (),
-            )
-            if isinstance(Edge, tuple | list) and len(Edge) == 2
-        ),
-        *Constraints.ActiveObservedInterfaceConflictEdges,
-    ))
+    RawEdges = (
+        AssignmentCut.PairwiseConflictEdges
+        if (
+            AssignmentCut is not None
+            and AssignmentCut.PairwiseConflictEdges
+        )
+        else tuple((
+            *(
+                tuple(map(str, Edge))
+                for Edge in (
+                    AssignmentCut.ConflictGraph.get(
+                        "ObservedPatternConflictEdges",
+                        (),
+                    )
+                    if AssignmentCut is not None
+                    else ()
+                )
+                if isinstance(Edge, tuple | list) and len(Edge) == 2
+            ),
+            *Constraints.PairwiseConflictEdges,
+            *Constraints.ActiveObservedInterfaceConflictEdges,
+        ))
+    )
     Edges = tuple(sorted({
         tuple(sorted((str(First), str(Second))))
         for First, Second in RawEdges

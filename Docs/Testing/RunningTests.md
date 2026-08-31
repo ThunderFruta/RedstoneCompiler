@@ -5,8 +5,8 @@
 ```bash
 python3 -m compileall -q Compiler/Placement Compiler/Routing
 python3 -m pytest -q \
-  Tests/test_source_structure.py \
-  Tests/test_routing_contract_schema.py
+  Tests/Structural/test_source_structure.py \
+  Tests/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 ```
 
@@ -43,7 +43,7 @@ does not prove the rebuilt native code was exercised.
 ## Acceptance plan without execution
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py \
+python3 Scripts/Routing/RunRouterAcceptance.py \
   --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
   --python .venv/bin/python \

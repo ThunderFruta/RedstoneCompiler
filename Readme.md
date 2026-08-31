@@ -122,9 +122,9 @@ matrix with 8/23/118-second router deadlines reserved inside immutable
 RCA4 and CLA4 routed 0/2:
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3 --dry-run
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 
@@ -170,12 +170,14 @@ success.
 - `Compiler/Routing/Policy.py` -- serializable physical-design policy.
 - `Compiler/Routing/TrackAssignment.py` -- exact global track ownership types.
 - `RustRouting/Src/` -- native router domains for runtime, geometry, path
-  search, assignment, escape planning, generation, simulation, and Python
+  search, assignment, escape planning, generation, and Python
   bindings; `Lib.rs` is the PyO3 registration entrypoint.
-- `Scripts/RunRouterAcceptance.py` -- sequential physical acceptance and
+- `Scripts/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
   evidence-manifest harness.
+- `Compiler/FabricServer/` and `FabricServerHarness/` -- live Fabric validation
+  and tracked harness source; `FabricServerHarness/Server/` is the ignored local runtime.
 - `Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
-- `SchemEncoder/` -- self-contained Litematica NBT writer.
+- `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.
 
 The complete current ownership map, retired-path list, and structural gates are
 in [Docs/Reference/ProjectTreeDesignDoc.md](Docs/Reference/ProjectTreeDesignDoc.md).

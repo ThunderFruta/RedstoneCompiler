@@ -1299,21 +1299,23 @@ def _TransformPortableCandidate(
             ElectricalCells=frozenset(map(Position, Value.ElectricalCells)),
         )
 
-    FacingToDelta = {
+    InputFacingToOutputDelta = {
         "west": (1, 0, 0), "east": (-1, 0, 0),
         "north": (0, 0, 1), "south": (0, 0, -1),
     }
-    DeltaToFacing = {Value: Key for Key, Value in FacingToDelta.items()}
-    def Facing(Value: str | None) -> str | None:
-        if Value not in FacingToDelta:
+    OutputDeltaToInputFacing = {
+        Value: Key for Key, Value in InputFacingToOutputDelta.items()
+    }
+    def InputFacing(Value: str | None) -> str | None:
+        if Value not in InputFacingToOutputDelta:
             return Value
         Normalized = TransformPlanarRoutingPosition(
-            FacingToDelta[Value], OldTransform
+            InputFacingToOutputDelta[Value], OldTransform
         )
         Materialized = TransformPlanarRoutingPosition(
             Normalized, InvertPlanarRoutingTransform(NewTransform)
         )
-        return DeltaToFacing[Materialized]
+        return OutputDeltaToInputFacing[Materialized]
 
     Reservations = tuple(
         RoutingReservation(
@@ -1323,7 +1325,7 @@ def _TransformPortableCandidate(
             ),
             Position=Position(Value.Position),
             Purpose=Value.Purpose,
-            Facing=Facing(Value.Facing),
+            InputFacing=InputFacing(Value.InputFacing),
         )
         for Value in Candidate.RepeaterReservations
     )
@@ -1344,7 +1346,7 @@ def _TransformPortableCandidate(
             for Value in Candidate.TargetPortalIds.values()
         )),
         tuple(
-            (Value.Position, Value.Purpose, Value.Facing)
+            (Value.Position, Value.Purpose, Value.InputFacing)
             for Value in Reservations
         ),
         int(Candidate.Layer),

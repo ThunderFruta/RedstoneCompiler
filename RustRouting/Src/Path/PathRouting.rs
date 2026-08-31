@@ -120,6 +120,7 @@ struct PathClaims {
     Parent: Option<Rc<PathClaims>>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct PathSearchResult {
     pub(crate) Status: String,
     pub(crate) NoPathReason: String,

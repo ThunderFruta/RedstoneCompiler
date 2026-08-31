@@ -121,7 +121,7 @@ NAND IR
   -> coarse capacity-aware guides
   -> bounded portal and route-tree generation
   -> exact capacity-one assignment
-  -> authoritative DRC and truth-table simulation
+  -> authoritative DRC and Fabric-server validation
   -> first fully valid result, or typed hard failure
 ```
 
@@ -575,15 +575,15 @@ routing failure.
 
 A successful `.PhysicalDesign.json` records the same placement-attempt,
 escalation, fingerprint, and deadline summaries needed to compare accepted
-runs. These fields are evidence; the routed design, exact DRC, and simulation
-remain authoritative.
+runs. These fields are evidence; the routed design, exact DRC, and Fabric
+server remain authoritative.
 
-At compile start, prior `.litematic`, `.TruthTable.txt`, and
-`.PhysicalDesign.json` success artifacts are removed as one success set. A new
-success set is staged under the output directory, the schematic is committed
-first, and `.PhysicalDesign.json` is committed last. Any ordinary publication
-exception removes the whole success set, so a failed rerun cannot retain old
-success metadata and metadata cannot precede a successfully written schematic.
+At compile start, prior `.litematic` and `.PhysicalDesign.json` artifacts plus
+the obsolete in-house `.TruthTable.txt` artifact are removed together. A new
+routing output set is staged under the output directory, the schematic is
+committed first, and `.PhysicalDesign.json` is committed last. Any ordinary
+publication exception removes the whole set, so a failed rerun cannot retain
+old metadata and metadata cannot precede a successfully written schematic.
 
 ## Strategy and compatibility contract
 
@@ -611,7 +611,7 @@ repeater correctness, and passing simulation.
 
 ## RRF-061: deterministic acceptance harness
 
-`Scripts/RunRouterAcceptance.py` owns the executable acceptance matrix. It must
+`Scripts/Routing/RunRouterAcceptance.py` owns the executable acceptance matrix. It must
 launch five FullAdder, two RippleCarryAdder4, and two CarryLookaheadAdder4 runs
 sequentially with `new-router-first` and a fixed seed. Each run receives the
 RRF-073 router deadline produced by subtracting the 2-second publication

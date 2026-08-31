@@ -45,6 +45,13 @@ from Compiler.Routing.Technology import (
 from Compiler.Placement.Rotation import (
     RotatedCellSize,
 )
+from Compiler.Placement.Geometry import (
+    BuildPlacementPinAccessWitness,
+)
+from .Capacity import (
+    FixedPlacementPinAccessDomain,
+    SolveFixedPlacementPinAccessDomains,
+)
 from .EscapePaths import (
     _BuildBoundedLegalDerivedEscapePaths,
     _BuildFabricIngressSegmentPaths,
@@ -88,6 +95,33 @@ def _RingFacesForPosition(
             if X == RingMaximumX:
                 Faces.add("east")
     return frozenset(Faces)
+
+
+def BuildFixedPlacementPinAccessSolve(
+    PinAccessWitness: Any,
+    ResourceGraph: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> Any:
+    """Decide the complete catalog-selected rays for one fixed placement."""
+    return SolveFixedPlacementPinAccessDomains(
+        (
+            FixedPlacementPinAccessDomain(
+                DomainId=(
+                    f"{Selection.GateName}:"
+                    f"{Selection.Role}:{Selection.PinId}"
+                ),
+                Signal=Selection.Signal,
+                Terminal=Selection.Terminal,
+                Options=(Selection,),
+                Complete=PinAccessWitness.Complete,
+                IncompleteReason=PinAccessWitness.IncompleteReason,
+            )
+            for Selection in PinAccessWitness.Selections
+        ),
+        ResourceGraph=ResourceGraph,
+        MaximumExpansions=max(1, len(PinAccessWitness.Selections) * 2),
+        WorkCheck=WorkCheck,
+    )
 
 
 def _BuildPlacementAccessEscapeStubs(
@@ -218,6 +252,16 @@ def BuildPlacementAccessFabric(
         else None
     )
     Gates = tuple(Placed.PlacedGates)
+    PinAccessWitness = BuildPlacementPinAccessWitness(
+        Gates,
+        AccessLength=EffectiveAccessLength,
+        RequireCatalogMatch=True,
+    )
+    FixedPinAccessSolve = BuildFixedPlacementPinAccessSolve(
+        PinAccessWitness,
+        Resources.ResourceGraph,
+        WorkCheck,
+    )
     if not Gates:
         if Shell is not None:
             raise ValueError("derived perimeter shell requires placed gates")
@@ -240,6 +284,8 @@ def BuildPlacementAccessFabric(
                 if AccessRingTrackCount
                 else ""
             ),
+            PinAccessWitness=PinAccessWitness,
+            FixedPinAccessSolve=FixedPinAccessSolve,
             Technology=Technology,
         )
     if (
@@ -300,6 +346,8 @@ def BuildPlacementAccessFabric(
             ),
             PerimeterSlotAssignmentFingerprint=AssignmentFingerprint,
             IncompleteReason=IncompleteReason,
+            PinAccessWitness=PinAccessWitness,
+            FixedPinAccessSolve=FixedPinAccessSolve,
             Technology=Technology,
         )
     if DerivedSlotAssignment is not None:
@@ -333,6 +381,7 @@ def BuildPlacementAccessFabric(
         Profiles = BuildNetRoutingProfiles(
             Placed,
             AccessLength=EffectiveAccessLength,
+            AccessWitness=PinAccessWitness,
         )
         if BoundarySignals is not None:
             Profiles = {
@@ -1148,6 +1197,8 @@ def BuildPlacementAccessFabric(
             LegalEscapeDirectionStateUpperBound
         ),
         IncompleteReason=("" if Complete else IncompleteReason),
+        PinAccessWitness=PinAccessWitness,
+        FixedPinAccessSolve=FixedPinAccessSolve,
         Technology=Technology,
     )
 

@@ -16,7 +16,7 @@ from .Repeaters import (
     PruneRedundantRepeaterReservations,
     PruneUnneededMaterializedRepeaters,
     PropagateRoutePower,
-    RepeaterFacing,
+    RepeaterInputFacingForRouteStep,
 )
 from .Validation import (
     AnalyzeFlatRouteConflicts,
@@ -44,7 +44,7 @@ __all__ = [
     "LoadRoutingTemplates",
     "NeighborPositions",
     "ValidatePlacedCellElectricalIsolation",
-    "RepeaterFacing",
+    "RepeaterInputFacingForRouteStep",
     "SimplifyNetTrees",
     "ValidatePhysicalRoutes",
     "ValidateTemplateIsolation",

@@ -31,6 +31,7 @@ from Compiler.Placement.Rotation import (
 )
 from Compiler.Placement.Geometry import (
     BuildPlacedGate,
+    BuildPlacementPinAccessWitness,
     RectanglesOverlap,
 )
 from Compiler.Routing.Technology import (
@@ -965,45 +966,80 @@ def _PhysicalGateElectricalExclusions(
         )
     )
 
+
+@lru_cache(maxsize=4096)
+def _PhysicalGateAccessSignals(
+    Kind: str,
+    X: int,
+    Y: int,
+    Z: int,
+    Rotation: int,
+    MirrorX: bool,
+    Outputs: tuple[str, ...],
+    Inputs: tuple[str, ...],
+    InputPins: tuple[tuple[int, int, int], ...],
+    OutputPin: tuple[int, int, int] | None,
+    InputDirections: tuple[tuple[int, int, int], ...],
+    OutputDirection: tuple[int, int, int] | None,
+) -> tuple[tuple[tuple[int, int, int], str], ...]:
+    """Cache catalog-derived access rays for repeated slot comparisons."""
+    Gate = type(
+        "CachedAccessGate",
+        (),
+        {
+            "Name": "CachedAccessGate",
+            "Kind": Kind,
+            "X": X,
+            "Y": Y,
+            "Z": Z,
+            "Outputs": Outputs,
+            "Inputs": Inputs,
+            "InputPins": InputPins,
+            "OutputPin": OutputPin,
+            "Rotation": Rotation,
+            "MirrorX": MirrorX,
+            "InputDirections": InputDirections,
+            "OutputDirection": OutputDirection,
+        },
+    )()
+    Witness = BuildPlacementPinAccessWitness(
+        (Gate,),
+        AccessLength=DefaultRedstoneRoutingTechnology.AccessLength,
+        RequireCatalogMatch=False,
+    )
+    return tuple(
+        (Position, Selection.Signal)
+        for Selection in Witness.Selections
+        for Position in Selection.Path
+    )
+
 def PcbGatesConflict(First: Any, Second: Any) -> bool:
     """Reject footprint, pin-access, and template electrical conflicts."""
 
-    def AccessSignals(Gate: Any) -> list[tuple[tuple[int, int, int], str]]:
-        Values = []
-        if Gate.OutputPin is not None and Gate.OutputDirection is not None:
-            X, Y, Z = Gate.OutputPin
-            DeltaX, DeltaY, DeltaZ = Gate.OutputDirection
-            for Signal in Gate.Outputs:
-                Values.extend(
-                    (
-                        (
-                            X + DeltaX * Offset,
-                            Y + DeltaY * Offset,
-                            Z + DeltaZ * Offset,
-                        ),
-                        Signal,
-                    )
-                    for Offset in range(
-                        DefaultRedstoneRoutingTechnology.AccessLength
-                    )
-                )
-        for Signal, Pin, Direction in zip(Gate.Inputs, Gate.InputPins, Gate.InputDirections):
-            X, Y, Z = Pin
-            DeltaX, DeltaY, DeltaZ = Direction
-            Values.extend(
-                (
-                    (
-                        X + DeltaX * Offset,
-                        Y + DeltaY * Offset,
-                        Z + DeltaZ * Offset,
-                    ),
-                    Signal,
-                )
-                for Offset in range(
-                    DefaultRedstoneRoutingTechnology.AccessLength
-                )
-            )
-        return Values
+    def AccessSignals(
+        Gate: Any,
+    ) -> tuple[tuple[tuple[int, int, int], str], ...]:
+        # Structural fixtures sometimes use minimal synthetic gates; retain
+        # their exact rays while strict production boundaries report catalog
+        # matches. Slot search revisits these immutable transforms heavily.
+        return _PhysicalGateAccessSignals(
+            Gate.Kind,
+            Gate.X,
+            Gate.Y,
+            Gate.Z,
+            Gate.Rotation,
+            Gate.MirrorX,
+            tuple(getattr(Gate, "Outputs", ())),
+            tuple(getattr(Gate, "Inputs", ())),
+            tuple(getattr(Gate, "InputPins", ())),
+            tuple(Gate.OutputPin) if Gate.OutputPin is not None else None,
+            tuple(getattr(Gate, "InputDirections", ())),
+            (
+                tuple(Gate.OutputDirection)
+                if Gate.OutputDirection is not None
+                else None
+            ),
+        )
 
     if RectanglesOverlap(First, Second):
         return True

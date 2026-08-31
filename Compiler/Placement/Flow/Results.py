@@ -168,6 +168,7 @@ class PhysicalInterfaceRepairCore:
     RepairLevel: str
     Signals: tuple[str, ...]
     ClusterIds: tuple[int, ...]
+    ComponentGateNames: tuple[str, ...]
     BoundaryClasses: tuple[str, ...]
     ForcedSeamClasses: tuple[tuple[str, str], ...]
     ProofKind: str
@@ -182,6 +183,7 @@ class PhysicalInterfaceRepairCore:
             "RepairLevel": self.RepairLevel,
             "Signals": list(self.Signals),
             "ClusterIds": list(self.ClusterIds),
+            "ComponentGateNames": list(self.ComponentGateNames),
             "BoundaryClasses": list(self.BoundaryClasses),
             "ForcedSeamClasses": [list(Value) for Value in self.ForcedSeamClasses],
             "ProofKind": self.ProofKind,
@@ -367,23 +369,130 @@ def BuildPhysicalLocalFactorDiversificationCore(
         if isinstance(Failure.Diagnostics, Mapping)
         else {}
     )
+    CompleteTypedAccessFailure = bool(
+        Failure.Stage == "ComponentAccessCertification"
+        and Failure.Reason in {
+            RoutingFailureReason.ComponentTerminalAccessUnsatisfiable,
+            RoutingFailureReason.ComponentPerimeterSeamUnsatisfiable,
+        }
+        and Diagnostics.get("Complete", False)
+    )
+    CompleteSymbolicCapacityFailure = bool(
+        Failure.Stage == "PhysicalSymbolicCapacityPlacementFeedback"
+        and Failure.Reason
+        == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+        and Diagnostics.get("SymbolicCapacityPlacementFeedback", False)
+        and Diagnostics.get("SymbolicCapacityProofComplete", False)
+        and Diagnostics.get("SymbolicCapacityProofFingerprint", "")
+    )
+    PhysicalEligibilitySignals = tuple(sorted(map(
+        str,
+        Failure.AffectedNets,
+    )))
+    PhysicalEligibilityDiagnosticsBySignal = Diagnostics.get(
+        "DomainDiagnosticsBySignal",
+        {},
+    )
+    CompletePhysicalEligibilityFailure = bool(
+        Failure.Stage == "PhysicalComponentEligibility"
+        and Failure.Reason
+        == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+        and Diagnostics.get("Complete", False)
+        and not Diagnostics.get("Feasible", True)
+        and Diagnostics.get("ComponentFabricConstructionComplete", False)
+        and Diagnostics.get("OwnershipSearchComplete", False)
+        and int(Diagnostics.get("ImplicitForeignTransitDomainCount", 0)) == 0
+        and len(PhysicalEligibilitySignals) == 1
+        and isinstance(PhysicalEligibilityDiagnosticsBySignal, Mapping)
+        and isinstance(
+            PhysicalEligibilityDiagnosticsBySignal.get(
+                PhysicalEligibilitySignals[0]
+            ),
+            Mapping,
+        )
+        and PhysicalEligibilityDiagnosticsBySignal[
+            PhysicalEligibilitySignals[0]
+        ].get("Reason")
+        == "complete-certified-domain-empty-after-physical-projection"
+    )
+    PhysicalEligibilityProofFingerprint = (
+        BuildStableFingerprint((
+            "complete-physical-component-eligibility-empty-bank-v1",
+            PhysicalEligibilitySignals,
+            tuple(sorted(map(
+                str,
+                Diagnostics.get("PriorityPreparationSignals", ()),
+            ))),
+            PhysicalEligibilityDiagnosticsBySignal,
+        ))
+        if CompletePhysicalEligibilityFailure
+        else ""
+    )
     Signals = tuple(sorted({
         str(Value)
-        for Value in Diagnostics.get("PortAssignmentUnsatCoreSignals", ())
+        for Value in (
+            Diagnostics.get("AffectedSignals", ())
+            if CompleteTypedAccessFailure
+            else PhysicalEligibilitySignals
+            if CompletePhysicalEligibilityFailure
+            else Diagnostics.get("PlacementInterfacePressureSignals", ())
+            if CompleteSymbolicCapacityFailure
+            else Diagnostics.get("PortAssignmentUnsatCoreSignals", ())
+        )
         if str(Value)
     }))
+    SymbolicSeamSignals = {
+        str(Value[0])
+        for Value in Diagnostics.get("LocalCapacityCoreClause", ())
+        if isinstance(Value, (tuple, list)) and len(Value) == 2
+        and str(Value[0])
+    }
+    CompleteSingletonProof = bool(
+        CompleteTypedAccessFailure
+        or CompletePhysicalEligibilityFailure
+        or (
+            CompleteSymbolicCapacityFailure
+            and SymbolicSeamSignals == set(Signals)
+        )
+        or (
+            Failure.Reason
+            == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+            and Diagnostics.get("PortAssignmentProofComplete", False)
+            and Diagnostics.get("PortAssignmentUnsatCoreMinimal", False)
+        )
+    )
     if not (
-        Failure.Reason == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
-        and Diagnostics.get("PortAssignmentProofComplete", False)
-        and Diagnostics.get("PortAssignmentUnsatCoreMinimal", False)
+        CompleteSingletonProof
         and len(Signals) == 1
     ):
         return None
     Signal = Signals[0]
     ProofFingerprint = str(
-        Diagnostics.get("PortAssignmentUnsatCoreFingerprint", "")
+        Diagnostics.get(
+            "CertificateFingerprint"
+            if CompleteTypedAccessFailure
+            else "PhysicalEligibilityProofFingerprint"
+            if CompletePhysicalEligibilityFailure
+            else "SymbolicCapacityProofFingerprint"
+            if CompleteSymbolicCapacityFailure
+            else "PortAssignmentUnsatCoreFingerprint",
+            "",
+        )
     )
-    DomainFingerprint = str(Diagnostics.get("DomainFingerprint", ""))
+    if CompletePhysicalEligibilityFailure:
+        ProofFingerprint = PhysicalEligibilityProofFingerprint
+    DomainFingerprint = str(Diagnostics.get(
+        "StructuralFingerprint"
+        if CompleteTypedAccessFailure
+        else "PhysicalEligibilityDomainFingerprint"
+        if CompletePhysicalEligibilityFailure
+        else "SymbolicCapacityProofFingerprint"
+        if CompleteSymbolicCapacityFailure
+        else "DomainFingerprint",
+        "",
+    ))
+    if CompletePhysicalEligibilityFailure:
+        DomainFingerprint = PhysicalEligibilityProofFingerprint
     if not ProofFingerprint or not DomainFingerprint:
         return None
     Claims = getattr(SourceCandidate.Placement.Placed, "LocalRouteClaims", ()) or ()
@@ -467,6 +576,105 @@ def BuildCapacityRepairGeometryFingerprint(
         SignalPins,
     ))
 
+def ComposePhysicalInterfaceRepairCores(
+    Inherited: PhysicalInterfaceRepairCore,
+    Fresh: PhysicalInterfaceRepairCore,
+    SourceCandidate: PcbPlacementCandidate,
+) -> PhysicalInterfaceRepairCore:
+    """Conjoin one proven repair core with its proven child core."""
+    Signals = tuple(sorted({*Inherited.Signals, *Fresh.Signals}))
+    ClusterIds = tuple(sorted({*Inherited.ClusterIds, *Fresh.ClusterIds}))
+    ComponentGateNames = tuple(sorted({
+        *Inherited.ComponentGateNames,
+        *Fresh.ComponentGateNames,
+    }))
+    BoundaryClasses = tuple(sorted({
+        *Inherited.BoundaryClasses,
+        *Fresh.BoundaryClasses,
+    }))
+    ForcedSeamClasses = tuple(sorted({
+        *Inherited.ForcedSeamClasses,
+        *Fresh.ForcedSeamClasses,
+    }))
+    SourceProofFingerprint = BuildStableFingerprint((
+        "composed-physical-capacity-proof-v1",
+        tuple(sorted((
+            Inherited.SourceProofFingerprint,
+            Fresh.SourceProofFingerprint,
+        ))),
+        Signals,
+        ClusterIds,
+        ComponentGateNames,
+    ))
+    RepairLevel = (
+        "channel-capacity"
+        if "channel-capacity" in {
+            Inherited.RepairLevel,
+            Fresh.RepairLevel,
+        }
+        else "local-assembly"
+    )
+    EquivalentGeometryFingerprint = BuildCapacityRepairGeometryFingerprint(
+        SourceCandidate,
+        Signals,
+    )
+    return PhysicalInterfaceRepairCore(
+        RepairLevel=RepairLevel,
+        Signals=Signals,
+        ClusterIds=ClusterIds,
+        ComponentGateNames=ComponentGateNames,
+        BoundaryClasses=BoundaryClasses,
+        ForcedSeamClasses=ForcedSeamClasses,
+        ProofKind="composed-complete-capacity-core",
+        SourceProofFingerprint=SourceProofFingerprint,
+        EquivalentGeometryFingerprint=EquivalentGeometryFingerprint,
+        RepairDomainFingerprint=BuildStableFingerprint((
+            "composed-physical-interface-repair-domain-v1",
+            RepairLevel,
+            Signals,
+            ClusterIds,
+            ComponentGateNames,
+            BoundaryClasses,
+            ForcedSeamClasses,
+            SourceProofFingerprint,
+        )),
+    )
+
+def BuildCapacityRepairEndpointClosureClusters(
+    Placement: Any,
+    Constraint: PhysicalInterfaceRepairCore,
+    MaximumClusters: int = 3,
+) -> tuple[int, ...]:
+    """Close a composed repair over every endpoint cluster of its signals."""
+    if Constraint.ProofKind != "composed-complete-capacity-core":
+        return ()
+    SignalSet = frozenset(Constraint.Signals)
+    Requests = tuple(
+        getattr(Placement, "ClusterBoundaryLeaseRequests", ())
+        or getattr(Placement.Placed, "ClusterBoundaryLeaseRequests", ())
+        or ()
+    )
+    EndpointClusters = {
+        int(ClusterId)
+        for Request in Requests
+        if str(getattr(Request, "Signal", "")) in SignalSet
+        for ClusterId in (
+            getattr(Request, "SourceCluster", -1),
+            getattr(Request, "TargetCluster", -1),
+        )
+        if int(ClusterId) >= 0
+    }
+    RequiredGateNames = frozenset(Constraint.ComponentGateNames)
+    EndpointClusters.update(
+        ClusterId
+        for ClusterId, Cluster in enumerate(Placement.Clusters)
+        if RequiredGateNames.intersection(map(str, Cluster))
+    )
+    Closure = tuple(sorted(EndpointClusters))
+    if len(Closure) < 2 or len(Closure) > MaximumClusters:
+        return ()
+    return Closure
+
 def BuildPhysicalInterfaceRepairCore(
     Failure: RoutingFailure,
     SourceCandidate: PcbPlacementCandidate,
@@ -491,13 +699,32 @@ def BuildPhysicalInterfaceRepairCore(
         and Diagnostics.get("OwnershipSearchComplete", False)
         and Diagnostics.get("FeedthroughEndpointPrescreenComplete", True)
     )
-    if not (IsAssemblyCore or IsChannelCore or IsFeedthroughEndpointCore):
+    IsSymbolicCapacityCore = bool(
+        Failure.Reason == RoutingFailureReason.ComponentPortAssignmentUnsatisfiable
+        and Failure.Stage == "PhysicalSymbolicCapacityPlacementFeedback"
+        and Diagnostics.get("SymbolicCapacityPlacementFeedback", False)
+        and Diagnostics.get("SymbolicCapacityProofComplete", False)
+        and Diagnostics.get("SymbolicCapacityProofFingerprint", "")
+    )
+    if not (
+        IsAssemblyCore
+        or IsChannelCore
+        or IsFeedthroughEndpointCore
+        or IsSymbolicCapacityCore
+    ):
         return None
-    RepairLevel = "local-assembly" if IsAssemblyCore else "channel-capacity"
+    RepairLevel = (
+        "local-assembly"
+        if IsAssemblyCore or IsSymbolicCapacityCore
+        else "channel-capacity"
+    )
     Signals = tuple(sorted({
         str(Value) for Value in (
             Diagnostics.get("PortAssignmentUnsatCoreSignals", ())
-            if IsAssemblyCore else Failure.AffectedNets
+            if IsAssemblyCore else (
+                Diagnostics.get("PlacementInterfacePressureSignals", ())
+                if IsSymbolicCapacityCore else Failure.AffectedNets
+            )
         ) if str(Value)
     }))
     if not Signals:
@@ -512,12 +739,20 @@ def BuildPhysicalInterfaceRepairCore(
         if isinstance(Value, (tuple, list)) and len(Value) == 2
         and str(Value[0]) in Signals
     ))
+    if IsSymbolicCapacityCore and (
+        len(Signals) < 2
+        or {Signal for Signal, _Seam in SeamClasses} != set(Signals)
+    ):
+        return None
     # A singleton with any seam choice is a symptom, not a geometry core.
     if IsAssemblyCore and len(Signals) == 1:
         return None
     ProofFingerprint = str(Diagnostics.get(
-        "PortAssignmentUnsatCoreFingerprint" if IsAssemblyCore
-        else "GlobalPlanDependencyFingerprint",
+        "PortAssignmentUnsatCoreFingerprint" if IsAssemblyCore else (
+            "SymbolicCapacityProofFingerprint"
+            if IsSymbolicCapacityCore
+            else "GlobalPlanDependencyFingerprint"
+        ),
         "",
     )) or str(Diagnostics.get(
         "FeedthroughEndpointDomainFingerprint",
@@ -528,11 +763,32 @@ def BuildPhysicalInterfaceRepairCore(
     if not ProofFingerprint:
         return None
     Claims = getattr(SourceCandidate.Placement.Placed, "LocalRouteClaims", ()) or ()
-    ClusterIds = tuple(sorted({
+    ProvenComponentClusterIds = tuple(sorted({
+        int(Value)
+        for Value in Diagnostics.get("SelectedComponentClusters", ())
+        if int(Value) >= 0
+    }))
+    ClusterIds = ProvenComponentClusterIds or tuple(sorted({
         int(getattr(Claim, "ClusterId", -1))
         for Claim in Claims
         if str(getattr(Claim, "Signal", "")) in Signals
         and int(getattr(Claim, "ClusterId", -1)) >= 0
+    }))
+    PlacementClusters = tuple(getattr(SourceCandidate.Placement, "Clusters", ()) or ())
+    GateByName = {
+        str(Gate.Name): Gate
+        for Gate in getattr(SourceCandidate.Placement.Placed, "PlacedGates", ())
+    }
+    ComponentGateNames = tuple(sorted({
+        str(Name)
+        for ClusterId in ProvenComponentClusterIds
+        if ClusterId < len(PlacementClusters)
+        for Name in PlacementClusters[ClusterId]
+        if str(Name) in GateByName
+        and set(map(str, (
+            *getattr(GateByName[str(Name)], "Inputs", ()),
+            *getattr(GateByName[str(Name)], "Outputs", ()),
+        ))).intersection(Signals)
     }))
     BoundaryClasses = tuple(sorted({
         str(Value[1]) for Value in SeamClasses
@@ -541,14 +797,18 @@ def BuildPhysicalInterfaceRepairCore(
         RepairLevel=RepairLevel,
         Signals=Signals,
         ClusterIds=ClusterIds,
+        ComponentGateNames=ComponentGateNames,
         BoundaryClasses=BoundaryClasses,
         ForcedSeamClasses=SeamClasses,
         ProofKind=(
             "complete-port-assignment-unsat-core"
             if IsAssemblyCore else (
+                "complete-symbolic-capacity-core"
+                if IsSymbolicCapacityCore else (
                 "complete-feedthrough-endpoint-domain"
                 if IsFeedthroughEndpointCore
                 else "complete-channel-capacity-core"
+                )
             )
         ),
         SourceProofFingerprint=ProofFingerprint,
@@ -560,6 +820,7 @@ def BuildPhysicalInterfaceRepairCore(
             RepairLevel,
             Signals,
             ClusterIds,
+            ComponentGateNames,
             BoundaryClasses,
             SeamClasses,
             ProofFingerprint,

@@ -99,6 +99,11 @@ class FrozenPhysicalExteriorConnectorSearchRequest:
     Start: Position3
     BlockedLocalNodes: frozenset[Position3]
 
+
+def NativeExteriorConnectorSearchAvailable() -> bool:
+    """Return whether the compiled exterior-connector batch is available."""
+    return _SearchExteriorConnectorsBatchWithTelemetry is not None
+
 def SearchFrozenPhysicalExteriorConnectorBatch(
     Requests: Iterable[FrozenPhysicalExteriorConnectorSearchRequest],
 ) -> tuple[tuple[PhysicalExteriorConnectorPathResult, ...], int]:
@@ -112,7 +117,7 @@ def SearchFrozenPhysicalExteriorConnectorBatch(
     if not Values:
         return (), 0
     if (
-        _SearchExteriorConnectorsBatchWithTelemetry is None
+        not NativeExteriorConnectorSearchAvailable()
         or any(not Request.Field.Complete for Request in Values)
     ):
         return (), 0
@@ -201,14 +206,14 @@ def BuildPhysicalExteriorConnectorDistanceField(
     ExteriorTargets = frozenset(
         Target
         for Target in Targets
-        if not (
-            EnvelopeMinimum[0] <= Target[0] <= EnvelopeMaximum[0]
-            and EnvelopeMinimum[2] <= Target[2] <= EnvelopeMaximum[2]
-        )
-        and (Target[0], Target[2]) not in BlockedGuideCells
+        if (Target[0], Target[2]) not in BlockedGuideCells
         and (
-            ExteriorFabric is None
-            or ExteriorFabric.AllowsNode(Target)
+            ExteriorFabric.AllowsNode(Target)
+            if ExteriorFabric is not None
+            else not (
+                EnvelopeMinimum[0] <= Target[0] <= EnvelopeMaximum[0]
+                and EnvelopeMinimum[2] <= Target[2] <= EnvelopeMaximum[2]
+            )
         )
     )
     if Bounds is not None:
@@ -312,13 +317,10 @@ def SelectPhysicalExteriorConnectorPath(
 
     def NodeIsLegal(Position: Position3) -> bool:
         X, _Y, Z = Position
-        return bool(
-            MinimumX <= X <= MaximumX
-            and MinimumZ <= Z <= MaximumZ
-            and Position not in BlockedLocalNodes
-            and (not Field.Complete or Position in Field.AllowedNodes)
-            and (X, Z) not in Field.BlockedGuideCells
-            and not (
+        ExteriorOwned = (
+            Position in Field.AllowedNodes
+            if Field.ExteriorFabricFingerprint
+            else not (
                 Field.EnvelopeMinimum[0]
                 <= X
                 <= Field.EnvelopeMaximum[0]
@@ -326,6 +328,13 @@ def SelectPhysicalExteriorConnectorPath(
                 <= Z
                 <= Field.EnvelopeMaximum[2]
             )
+        )
+        return bool(
+            MinimumX <= X <= MaximumX
+            and MinimumZ <= Z <= MaximumZ
+            and Position not in BlockedLocalNodes
+            and (X, Z) not in Field.BlockedGuideCells
+            and ExteriorOwned
         )
 
     def EdgeBelongsToSearchDomain(
@@ -377,7 +386,11 @@ def SelectPhysicalExteriorConnectorPath(
                     FallbackExpansionCount=0,
                 )
 
+    UseManhattanTargetHeuristic = len(Field.Targets) <= 16
+
     def TargetDistance(Position: Position3) -> int:
+        if not UseManhattanTargetHeuristic:
+            return 0
         return min(
             (
                 abs(Target[0] - Position[0])
@@ -831,6 +844,46 @@ def BuildPhysicalBoundaryPortAssignmentFingerprint(
         )),
     ))
 
+def BuildCachedPhysicalBoundaryOptionIdentity(
+    Value: PhysicalComponentBoundaryPortReservation,
+    Cache: dict[int, tuple[object, ...]],
+) -> tuple[object, ...]:
+    """Return one cached deterministic identity for a boundary option."""
+    CacheKey = id(Value)
+    Cached = Cache.get(CacheKey)
+    if Cached is not None:
+        return Cached
+    Identity = (
+        str(Value.Direction),
+        int(Value.Capacity),
+        tuple(Value.Attachment),
+        tuple(tuple(Position) for Position in Value.GlobalPath),
+        tuple(sorted(map(str, getattr(Value.GlobalClaims, "ResourceIds", ())))),
+        str(Value.ChannelContractFingerprint),
+        str(Value.GlobalContractFingerprint),
+        str(Value.ApertureContractFingerprint),
+        str(Value.ReservationFingerprint),
+    )
+    Cache[CacheKey] = Identity
+    return Identity
+
+def BuildCachedPhysicalBoundaryNoGoodKeys(
+    Value: PhysicalComponentBoundaryPortReservation,
+    Cache: dict[int, frozenset[tuple[str, str]]],
+) -> frozenset[tuple[str, str]]:
+    """Return cached clause keys exposed by one boundary option."""
+    CacheKey = id(Value)
+    Cached = Cache.get(CacheKey)
+    if Cached is not None:
+        return Cached
+    Keys = frozenset((
+        (Value.Signal, Value.GlobalContractFingerprint),
+        (Value.Signal, Value.ApertureContractFingerprint),
+        (Value.Signal, Value.ReservationFingerprint),
+    ))
+    Cache[CacheKey] = Keys
+    return Keys
+
 def IterPhysicalBoundaryPortAssignments(
     DomainsBySignal: Mapping[
         str, Iterable[PhysicalComponentBoundaryPortReservation]
@@ -861,6 +914,7 @@ def IterPhysicalBoundaryPortAssignments(
     ] | None = None,
     PriorityInnermostSignals: Iterable[str] = (),
     CertifiedNoGoodProjectionOnly: bool = False,
+    PersistentPairSupportCache: dict[str, bool] | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
 ) -> Iterable[tuple[PhysicalComponentBoundaryPortReservation, ...]]:
     """Enumerate capacity-compatible tuples using global ownership only.
@@ -871,24 +925,14 @@ def IterPhysicalBoundaryPortAssignments(
     That witness is existential and discarded: local compilation still owns
     the internal choice after the global boundary has been frozen.
     """
-    def OptionIdentity(
-        Value: PhysicalComponentBoundaryPortReservation,
-    ) -> tuple[object, ...]:
-        return (
-            str(Value.Direction),
-            int(Value.Capacity),
-            tuple(Value.Attachment),
-            tuple(tuple(Position) for Position in Value.GlobalPath),
-            tuple(sorted(map(str, getattr(
-                Value.GlobalClaims,
-                "ResourceIds",
-                (),
-            )))),
-            str(Value.ChannelContractFingerprint),
-            str(Value.GlobalContractFingerprint),
-            str(Value.ApertureContractFingerprint),
-            str(Value.ReservationFingerprint),
-        )
+    BoundaryOptionIdentityCache: dict[int, tuple[object, ...]] = {}
+    BoundaryOptionKeysCache: dict[int, frozenset[tuple[str, str]]] = {}
+    OptionIdentity = lambda Value: BuildCachedPhysicalBoundaryOptionIdentity(
+        Value, BoundaryOptionIdentityCache
+    )
+    BoundaryNoGoodKeys = lambda Value: BuildCachedPhysicalBoundaryNoGoodKeys(
+        Value, BoundaryOptionKeysCache
+    )
 
     PreferredGlobalContracts = {
         str(Signal): str(Fingerprint)
@@ -974,7 +1018,7 @@ def IterPhysicalBoundaryPortAssignments(
     CertifiedLocalNoGoods = tuple(CertifiedLocalNoGoodClauses)
     LearnedLocalNoGoodsSource = LearnedLocalSeamNoGoodClauses
     LocalSupportFeasibilityCache: dict[
-        tuple[tuple[str, tuple[tuple[object, ...], ...]], ...],
+        tuple[object, ...],
         tuple[
             tuple[tuple[tuple[str, str], ...], ...],
             tuple[PhysicalPortLocalAccessFactor, ...] | None,
@@ -984,6 +1028,9 @@ def IterPhysicalBoundaryPortAssignments(
         tuple[object, ...],
         tuple[PhysicalPortLocalAccessFactor, ...] | None,
     ] = {}
+    LocalFactorNoGoodKeysCache: dict[
+        int, frozenset[tuple[str, str]]
+    ] = {}
     LocalFactorIdentityCache: dict[int, tuple[object, ...]] = {}
     LocalFactorDomainIdentityCache: dict[
         tuple[int, ...], tuple[tuple[object, ...], ...]
@@ -991,6 +1038,8 @@ def IterPhysicalBoundaryPortAssignments(
     BoundaryPrefixExpansionCount = 0
     LocalSupportSearchExpansionCount = 0
     BoundaryPairSupportCheckCount = 0
+    PersistentPairSupportCacheHitCount = 0
+    PersistentPairSupportCacheStoreCount = 0
     PrioritySignalRank = {
         str(Signal): Index + 1
         for Index, Signal in enumerate(PriorityInnermostSignals)
@@ -1006,9 +1055,15 @@ def IterPhysicalBoundaryPortAssignments(
         if PortSolverCacheKey
         else frozenset()
     )
-    def CurrentLocalNoGoods() -> tuple[
+    def CurrentLocalNoGoods(
+        GeneralProofNoGoods: tuple[
+            frozenset[tuple[str, str]], ...
+        ] | None = None,
+    ) -> tuple[
         frozenset[tuple[str, str]], ...
     ]:
+        if GeneralProofNoGoods is None:
+            GeneralProofNoGoods = CurrentRejectedApertureClauses()
         LearnedLocalNoGoods = tuple(
             Clause
             for Clause in LearnedLocalNoGoodsSource
@@ -1022,6 +1077,7 @@ def IterPhysicalBoundaryPortAssignments(
         )
         return tuple((
             *CertifiedLocalNoGoods,
+            *GeneralProofNoGoods,
             *LearnedLocalNoGoods,
         ))
 
@@ -1068,14 +1124,29 @@ def IterPhysicalBoundaryPortAssignments(
                 [],
             ).append(Value)
     CompiledLocalNoGoodDomainCache: dict[
-        frozenset[frozenset[tuple[str, str]]],
+        tuple[tuple[tuple[str, str], ...], ...],
+        tuple[
+            dict[str, frozenset[tuple[str, str]]],
+            dict[tuple[str, str], frozenset[tuple[str, str]]],
+            tuple[frozenset[tuple[str, str]], ...],
+            bool,
+        ],
+    ] = {}
+    LocalSupportNoGoodContextCache: dict[
+        tuple[tuple[tuple[str, str], ...], ...],
         tuple[
             dict[str, frozenset[tuple[str, str]]],
             dict[tuple[str, str], frozenset[tuple[str, str]]],
             tuple[frozenset[tuple[str, str]], ...],
             bool,
             tuple[tuple[tuple[str, str], ...], ...],
+            str,
+            frozenset[tuple[str, str]],
         ],
+    ] = {}
+    LiveProjectedLocalDomainCache: dict[
+        tuple[str, tuple[int, ...]],
+        tuple[PhysicalPortLocalAccessFactor, ...],
     ] = {}
 
     def MatchingApertureFingerprint(
@@ -1092,7 +1163,11 @@ def IterPhysicalBoundaryPortAssignments(
     def LocalFactorKeys(
         Value: PhysicalPortLocalAccessFactor,
     ) -> frozenset[tuple[str, str]]:
-        return frozenset((
+        CacheKey = id(Value)
+        Cached = LocalFactorNoGoodKeysCache.get(CacheKey)
+        if Cached is not None:
+            return Cached
+        Keys = frozenset((
             (Value.Signal, Value.LocalContractFingerprint),
             (
                 Value.Signal,
@@ -1114,6 +1189,8 @@ def IterPhysicalBoundaryPortAssignments(
                 "local-signal-domain:" + PortSolverCacheKey,
             ),
         ))
+        LocalFactorNoGoodKeysCache[CacheKey] = Keys
+        return Keys
 
     def LocalFactorIdentity(
         Value: PhysicalPortLocalAccessFactor,
@@ -1146,18 +1223,175 @@ def IterPhysicalBoundaryPortAssignments(
         Cached = LocalFactorDomainIdentityCache.get(CacheKey)
         if Cached is not None:
             return Cached
-        Identity = tuple(sorted(
-            (LocalFactorIdentity(Value) for Value in ValuesTuple),
-            key=repr,
-        ))
+        if CertifiedNoGoodProjectionOnly:
+            # Projection-only boundary support cannot observe local claim
+            # geometry.  Its complete state is the set of proof keys supplied
+            # by each factor, so geometry-distinct factors with the same keys
+            # are one exact CSP value rather than separate search branches.
+            Identity = tuple(sorted(
+                {
+                    ("proof-key-projection", *tuple(sorted(
+                        LocalFactorKeys(Value)
+                    )))
+                    for Value in ValuesTuple
+                },
+                key=repr,
+            ))
+        else:
+            Identity = tuple(sorted(
+                (LocalFactorIdentity(Value) for Value in ValuesTuple),
+                key=repr,
+            ))
         LocalFactorDomainIdentityCache[CacheKey] = Identity
         return Identity
+
+    def CanonicalLocalSupportDomain(
+        Values: Iterable[PhysicalPortLocalAccessFactor],
+    ) -> tuple[PhysicalPortLocalAccessFactor, ...]:
+        """Remove values indistinguishable to the active support contract."""
+        ValuesTuple = tuple(Values)
+        if not CertifiedNoGoodProjectionOnly:
+            return ValuesTuple
+        ByProjection = {}
+        for Value in ValuesTuple:
+            ByProjection.setdefault(
+                tuple(sorted(LocalFactorKeys(Value))),
+                Value,
+            )
+        return tuple(
+            ByProjection[Projection]
+            for Projection in sorted(ByProjection, key=repr)
+        )
+
+    def ProjectLocalSupportDomainToLiveNoGoods(
+        Values: Iterable[PhysicalPortLocalAccessFactor],
+        ReferencedKeys: frozenset[tuple[str, str]],
+    ) -> tuple[PhysicalPortLocalAccessFactor, ...]:
+        """Remove projection-only aliases invisible to every live clause."""
+        ValuesTuple = tuple(Values)
+        if not CertifiedNoGoodProjectionOnly:
+            return ValuesTuple
+        ByProjection = {}
+        for Value in ValuesTuple:
+            Projection = tuple(sorted(
+                LocalFactorKeys(Value) & ReferencedKeys
+            ))
+            ByProjection.setdefault(Projection, Value)
+        return tuple(
+            ByProjection[Projection]
+            for Projection in sorted(ByProjection, key=repr)
+        )
+
+    def CompileLocalSupportNoGoodContext(
+        LocalNoGoods: tuple[
+            frozenset[tuple[str, str]], ...
+        ] | None = None,
+    ) -> tuple[
+        dict[str, frozenset[tuple[str, str]]],
+        dict[tuple[str, str], frozenset[tuple[str, str]]],
+        tuple[frozenset[tuple[str, str]], ...],
+        bool,
+        tuple[tuple[tuple[str, str], ...], ...],
+        str,
+        frozenset[tuple[str, str]],
+    ]:
+        """Compile one immutable local proof context for a support pass."""
+        if LocalNoGoods is None:
+            LocalNoGoods = CurrentLocalNoGoods()
+        LocalNoGoodIdentity = tuple(sorted(
+            tuple(sorted(Clause)) for Clause in LocalNoGoods
+        ))
+        CachedContext = LocalSupportNoGoodContextCache.get(
+            LocalNoGoodIdentity
+        )
+        if CachedContext is not None:
+            return CachedContext
+        Compiled = CompiledLocalNoGoodDomainCache.get(LocalNoGoodIdentity)
+        if Compiled is None:
+            MutableForbiddenLocalKeysBySignal: dict[
+                str, set[tuple[str, str]]
+            ] = {}
+            MutableResidualLocalBinaryByKey: dict[
+                tuple[str, str], set[tuple[str, str]]
+            ] = defaultdict(set)
+            ResidualHigherOrderLocalNoGoods = []
+            ConstantLocalNoGood = False
+            for Clause in LocalNoGoods:
+                Residual = frozenset(Clause - ConstantDomainKeys)
+                if not Residual:
+                    ConstantLocalNoGood = True
+                elif len(Residual) == 1:
+                    Key = next(iter(Residual))
+                    MutableForbiddenLocalKeysBySignal.setdefault(
+                        Key[0],
+                        set(),
+                    ).add(Key)
+                elif len(Residual) == 2:
+                    First, Second = tuple(Residual)
+                    MutableResidualLocalBinaryByKey[First].add(Second)
+                    MutableResidualLocalBinaryByKey[Second].add(First)
+                else:
+                    ResidualHigherOrderLocalNoGoods.append(Residual)
+            Compiled = (
+                {
+                    Signal: frozenset(Values)
+                    for Signal, Values
+                    in MutableForbiddenLocalKeysBySignal.items()
+                },
+                {
+                    Key: frozenset(Values)
+                    for Key, Values
+                    in MutableResidualLocalBinaryByKey.items()
+                },
+                tuple(ResidualHigherOrderLocalNoGoods),
+                ConstantLocalNoGood,
+            )
+            CompiledLocalNoGoodDomainCache[
+                LocalNoGoodIdentity
+            ] = Compiled
+        LocalNoGoodFingerprint = BuildStableFingerprint((
+            "physical-local-support-no-good-context-v1",
+            LocalNoGoodIdentity,
+        ))
+        ReferencedNoGoodKeys = frozenset(
+            Key for Clause in LocalNoGoods for Key in Clause
+        )
+        CachedContext = (
+            *Compiled,
+            LocalNoGoodIdentity,
+            LocalNoGoodFingerprint,
+            ReferencedNoGoodKeys,
+        )
+        LocalSupportNoGoodContextCache[
+            LocalNoGoodIdentity
+        ] = CachedContext
+        return CachedContext
+
+    def ProjectLocalSupportDomainForContext(
+        Values: Iterable[PhysicalPortLocalAccessFactor],
+        LocalNoGoodFingerprint: str,
+        ReferencedNoGoodKeys: frozenset[tuple[str, str]],
+    ) -> tuple[PhysicalPortLocalAccessFactor, ...]:
+        ValuesTuple = tuple(Values)
+        CacheKey = (
+            LocalNoGoodFingerprint,
+            tuple(map(id, ValuesTuple)),
+        )
+        Cached = LiveProjectedLocalDomainCache.get(CacheKey)
+        if Cached is not None:
+            return Cached
+        Cached = ProjectLocalSupportDomainToLiveNoGoods(
+            ValuesTuple,
+            ReferencedNoGoodKeys,
+        )
+        LiveProjectedLocalDomainCache[CacheKey] = Cached
+        return Cached
 
     # Precompute the exact aperture-to-local-access relation.  Learned clauses
     # remain live, so the pair-support memo below includes their current domain
     # identity and never reuses an answer after that monotonic domain changes.
     BoundaryLocalFactorDomains: dict[
-        tuple[str, tuple[object, ...]],
+        tuple[str, int],
         tuple[PhysicalPortLocalAccessFactor, ...],
     ] = {}
     for Signal, BoundaryValues in Domains.items():
@@ -1171,28 +1405,47 @@ def IterPhysicalBoundaryPortAssignments(
                 if ApertureFingerprint
                 else ()
             )
-            ByLocalAccessFingerprint = {}
-            for Fingerprint in SupportedLocalFingerprints:
+            BoundaryLocalFactorDomains[(
+                Signal,
+                id(Boundary),
+            )] = CanonicalLocalSupportDomain(
+                Value
+                for Fingerprint in SupportedLocalFingerprints
                 for Value in LocalFactorsByAccessFingerprint.get(
                     (Signal, Fingerprint),
                     (),
-                ):
-                    ByLocalAccessFingerprint.setdefault(
-                        str(Value.LocalAccessFingerprint),
-                        Value,
-                    )
-            BoundaryLocalFactorDomains[(
-                Signal,
-                OptionIdentity(Boundary),
-            )] = tuple(
-                ByLocalAccessFingerprint[Fingerprint]
-                for Fingerprint in sorted(ByLocalAccessFingerprint)
+                )
             )
+    BoundaryPersistentSupportIdentityCache: dict[
+        tuple[str, int], str
+    ] = {}
+
+    def CompleteBoundaryPersistentSupportIdentity(
+        Boundary: PhysicalComponentBoundaryPortReservation,
+    ) -> str:
+        Key = (str(Boundary.Signal), id(Boundary))
+        Cached = BoundaryPersistentSupportIdentityCache.get(Key)
+        if Cached is not None:
+            return Cached
+        Cached = BuildStableFingerprint((
+            "physical-boundary-local-support-input-v1",
+            str(Boundary.Signal),
+            OptionIdentity(Boundary),
+            LocalFactorDomainIdentity(BoundaryLocalFactorDomains.get(
+                Key,
+                (),
+            )),
+        ))
+        BoundaryPersistentSupportIdentityCache[Key] = Cached
+        return Cached
     DirectBoundaryPairSupportCache: dict[
         tuple[
             tuple[tuple[tuple[str, str], ...], ...],
-            tuple[tuple[str, tuple[object, ...]], ...],
+            tuple[tuple[str, int], ...],
         ], bool
+    ] = {}
+    GlobalBoundaryPairCompatibilityCache: dict[
+        tuple[int, int], bool
     ] = {}
     DirectLocalNoGoodCompilationCache: dict[
         tuple[tuple[tuple[str, str], ...], ...],
@@ -1201,13 +1454,46 @@ def IterPhysicalBoundaryPortAssignments(
             bool,
         ],
     ] = {}
+    DirectLocalNoGoodFingerprintCache: dict[
+        tuple[tuple[tuple[str, str], ...], ...], str
+    ] = {}
+    ProjectedBoundarySupportDataCache: dict[
+        tuple[
+            tuple[tuple[tuple[str, str], ...], ...],
+            str,
+            int,
+        ],
+        tuple[
+            tuple[PhysicalPortLocalAccessFactor, ...],
+            tuple[object, ...],
+            str,
+        ],
+    ] = {}
+    ProjectedDomainMaskCache: dict[
+        tuple[
+            tuple[tuple[tuple[str, str], ...], ...],
+            str,
+        ],
+        tuple[
+            tuple[frozenset[tuple[str, str]], ...],
+            int,
+            dict[tuple[str, str], int],
+        ],
+    ] = {}
+    BoundaryPairLocalSupportEvaluationCount = 0
+    BoundaryPairLocalSupportCacheHitCount = 0
 
-    def CompileDirectLocalNoGoods() -> tuple[
+    def CompileDirectLocalNoGoods(
+        LocalNoGoods: tuple[
+            frozenset[tuple[str, str]], ...
+        ] | None = None,
+    ) -> tuple[
         tuple[frozenset[tuple[str, str]], ...],
         bool,
         tuple[tuple[tuple[str, str], ...], ...],
     ]:
-        LocalNoGoods = CurrentLocalNoGoods()
+        if LocalNoGoods is None:
+            LocalNoGoods = CurrentLocalNoGoods()
         LocalNoGoodIdentity = tuple(sorted(
             tuple(sorted(Clause)) for Clause in LocalNoGoods
         ))
@@ -1233,157 +1519,320 @@ def IterPhysicalBoundaryPortAssignments(
     def BoundaryOptionPairHasDirectLocalSupport(
         First: PhysicalComponentBoundaryPortReservation,
         Second: PhysicalComponentBoundaryPortReservation,
+        DirectLocalContext: tuple[
+            tuple[frozenset[tuple[str, str]], ...],
+            bool,
+            tuple[tuple[tuple[str, str], ...], ...],
+        ] | None = None,
     ) -> bool:
         """Resolve exact two-option support without entering the local DFS."""
+        nonlocal PersistentPairSupportCacheHitCount
+        nonlocal PersistentPairSupportCacheStoreCount
+        nonlocal BoundaryPairLocalSupportEvaluationCount
+        nonlocal BoundaryPairLocalSupportCacheHitCount
         if not UsePreparedLocalSupport:
             return True
         (
             DirectLocalNoGoods,
             DirectLocalDomainUnsatisfiable,
             LocalNoGoodIdentity,
-        ) = CompileDirectLocalNoGoods()
+        ) = (
+            DirectLocalContext
+            if DirectLocalContext is not None
+            else CompileDirectLocalNoGoods()
+        )
         if CertifiedNoGoodProjectionOnly and not LocalNoGoodIdentity:
             return True
-        OptionPairKey = tuple(sorted((
-            (str(First.Signal), OptionIdentity(First)),
-            (str(Second.Signal), OptionIdentity(Second)),
-        ), key=repr))
+        ReferencedDirectLocalKeys = frozenset(
+            Key for Clause in DirectLocalNoGoods for Key in Clause
+        )
+        LocalNoGoodFingerprint = DirectLocalNoGoodFingerprintCache.get(
+            LocalNoGoodIdentity
+        )
+        if LocalNoGoodFingerprint is None:
+            LocalNoGoodFingerprint = BuildStableFingerprint((
+                "physical-boundary-local-no-good-domain-v1",
+                LocalNoGoodIdentity,
+            ))
+            DirectLocalNoGoodFingerprintCache[
+                LocalNoGoodIdentity
+            ] = LocalNoGoodFingerprint
+        if CertifiedNoGoodProjectionOnly:
+            def ProjectedBoundarySupportData(
+                Boundary: PhysicalComponentBoundaryPortReservation,
+            ) -> tuple[
+                tuple[PhysicalPortLocalAccessFactor, ...],
+                tuple[object, ...],
+                str,
+            ]:
+                CacheKey = (
+                    LocalNoGoodIdentity,
+                    str(Boundary.Signal),
+                    id(Boundary),
+                )
+                Cached = ProjectedBoundarySupportDataCache.get(CacheKey)
+                if Cached is not None:
+                    return Cached
+                Domain = ProjectLocalSupportDomainToLiveNoGoods(
+                    BoundaryLocalFactorDomains.get(
+                        (str(Boundary.Signal), id(Boundary)),
+                        (),
+                    ),
+                    ReferencedDirectLocalKeys,
+                )
+                Identity = (
+                    str(Boundary.Signal),
+                    tuple(sorted(
+                        BoundaryNoGoodKeys(Boundary)
+                        & ReferencedDirectLocalKeys
+                    )),
+                    tuple(sorted(
+                        {
+                            tuple(sorted(
+                                LocalFactorKeys(Value)
+                                & ReferencedDirectLocalKeys
+                            ))
+                            for Value in Domain
+                        },
+                        key=repr,
+                    )),
+                )
+                Fingerprint = BuildStableFingerprint((
+                    "physical-boundary-projected-support-option-v1",
+                    LocalNoGoodFingerprint,
+                    Identity,
+                ))
+                Cached = (Domain, Identity, Fingerprint)
+                ProjectedBoundarySupportDataCache[CacheKey] = Cached
+                return Cached
+
+            (
+                FirstDomain,
+                FirstSupportIdentity,
+                FirstSupportFingerprint,
+            ) = ProjectedBoundarySupportData(First)
+            (
+                SecondDomain,
+                SecondSupportIdentity,
+                SecondSupportFingerprint,
+            ) = ProjectedBoundarySupportData(Second)
+            OptionPairKey = tuple(sorted((
+                FirstSupportFingerprint,
+                SecondSupportFingerprint,
+            )))
+        else:
+            FirstDomain = BoundaryLocalFactorDomains.get(
+                (str(First.Signal), id(First)),
+                (),
+            )
+            SecondDomain = BoundaryLocalFactorDomains.get(
+                (str(Second.Signal), id(Second)),
+                (),
+            )
+            FirstSupportIdentity = (
+                CompleteBoundaryPersistentSupportIdentity(First)
+            )
+            SecondSupportIdentity = (
+                CompleteBoundaryPersistentSupportIdentity(Second)
+            )
+            FirstSupportFingerprint = FirstSupportIdentity
+            SecondSupportFingerprint = SecondSupportIdentity
+            OptionPairKey = tuple(sorted((
+                FirstSupportFingerprint,
+                SecondSupportFingerprint,
+            )))
         PairKey = (LocalNoGoodIdentity, OptionPairKey)
         if PairKey in DirectBoundaryPairSupportCache:
+            BoundaryPairLocalSupportCacheHitCount += 1
             return DirectBoundaryPairSupportCache[PairKey]
-        FirstDomain = BoundaryLocalFactorDomains.get(
-            (str(First.Signal), OptionIdentity(First)),
-            (),
+        BoundaryPairLocalSupportEvaluationCount += 1
+        PersistentPairKey = BuildStableFingerprint((
+            "physical-boundary-direct-local-pair-support-v3",
+            LocalNoGoodFingerprint,
+            bool(CertifiedNoGoodProjectionOnly),
+            OptionPairKey,
+        ))
+        PersistentSupported = (
+            PersistentPairSupportCache.get(PersistentPairKey)
+            if PersistentPairSupportCache is not None
+            else None
         )
-        SecondDomain = BoundaryLocalFactorDomains.get(
-            (str(Second.Signal), OptionIdentity(Second)),
-            (),
-        )
-        Supported = bool(
+        if PersistentSupported is not None:
+            PersistentPairSupportCacheHitCount += 1
+            DirectBoundaryPairSupportCache[PairKey] = PersistentSupported
+            return PersistentSupported
+        Supported = False
+        if (
             not DirectLocalDomainUnsatisfiable
             and FirstDomain
             and SecondDomain
-            and any(
-                not any(
-                    Clause <= (
-                        LocalFactorKeys(FirstFactor)
-                        | LocalFactorKeys(SecondFactor)
+        ):
+            if CertifiedNoGoodProjectionOnly:
+                # Projection proofs intentionally ignore local claim geometry,
+                # but they must preserve every complete unary/binary no-good.
+                # Compile the second factor domain to integer key masks so one
+                # exact first-factor check replaces the Cartesian pair scan.
+                # For a residual two-key clause, a second factor is rejected
+                # precisely when it supplies every key not already supplied by
+                # the two boundary options and the selected first factor.
+                if len(FirstDomain) > len(SecondDomain):
+                    FirstDomain, SecondDomain = SecondDomain, FirstDomain
+                    FirstSupportFingerprint, SecondSupportFingerprint = (
+                        SecondSupportFingerprint,
+                        FirstSupportFingerprint,
                     )
-                    for Clause in DirectLocalNoGoods
+                DomainMaskKey = (
+                    LocalNoGoodIdentity,
+                    SecondSupportFingerprint,
                 )
-                and (
-                    CertifiedNoGoodProjectionOnly
-                    or not ComponentClaimsConflict(
+                CompiledSecondDomain = ProjectedDomainMaskCache.get(
+                    DomainMaskKey
+                )
+                if CompiledSecondDomain is None:
+                    SecondFactorKeys = tuple(map(
+                        LocalFactorKeys,
+                        SecondDomain,
+                    ))
+                    SecondDomainMask = (1 << len(SecondDomain)) - 1
+                    SecondMaskByKey: dict[tuple[str, str], int] = {}
+                    for SecondIndex, Keys in enumerate(SecondFactorKeys):
+                        Bit = 1 << SecondIndex
+                        for Key in Keys:
+                            SecondMaskByKey[Key] = (
+                                SecondMaskByKey.get(Key, 0) | Bit
+                            )
+                    CompiledSecondDomain = (
+                        SecondFactorKeys,
+                        SecondDomainMask,
+                        SecondMaskByKey,
+                    )
+                    ProjectedDomainMaskCache[
+                        DomainMaskKey
+                    ] = CompiledSecondDomain
+                (
+                    _SecondFactorKeys,
+                    SecondDomainMask,
+                    SecondMaskByKey,
+                ) = CompiledSecondDomain
+                BoundaryKeys = (
+                    BoundaryNoGoodKeys(First)
+                    | BoundaryNoGoodKeys(Second)
+                )
+                for FirstFactor in FirstDomain:
+                    SelectedKeys = BoundaryKeys | LocalFactorKeys(FirstFactor)
+                    RejectedSecondMask = 0
+                    for Clause in DirectLocalNoGoods:
+                        MissingKeys = Clause - SelectedKeys
+                        if not MissingKeys:
+                            RejectedSecondMask = SecondDomainMask
+                            break
+                        if len(MissingKeys) == 1:
+                            RejectedSecondMask |= SecondMaskByKey.get(
+                                next(iter(MissingKeys)),
+                                0,
+                            )
+                        else:
+                            FirstMissingKey, SecondMissingKey = tuple(
+                                MissingKeys
+                            )
+                            RejectedSecondMask |= (
+                                SecondMaskByKey.get(FirstMissingKey, 0)
+                                & SecondMaskByKey.get(SecondMissingKey, 0)
+                            )
+                        if RejectedSecondMask == SecondDomainMask:
+                            break
+                    if RejectedSecondMask != SecondDomainMask:
+                        Supported = True
+                        break
+            else:
+                Supported = any(
+                    not any(
+                        Clause <= (
+                            BoundaryNoGoodKeys(First)
+                            | BoundaryNoGoodKeys(Second)
+                            | LocalFactorKeys(FirstFactor)
+                            | LocalFactorKeys(SecondFactor)
+                        )
+                        for Clause in DirectLocalNoGoods
+                    )
+                    and not ComponentClaimsConflict(
                         FirstFactor.LocalClaims,
                         SecondFactor.LocalClaims,
                     )
+                    for FirstFactor in FirstDomain
+                    for SecondFactor in SecondDomain
                 )
-                for FirstFactor in FirstDomain
-                for SecondFactor in SecondDomain
-            )
-        )
         DirectBoundaryPairSupportCache[PairKey] = Supported
+        if PersistentPairSupportCache is not None:
+            PersistentPairSupportCache[PersistentPairKey] = Supported
+            PersistentPairSupportCacheStoreCount += 1
         return Supported
+
+    def BoundaryOptionsHaveCompatibleGlobalClaims(
+        First: PhysicalComponentBoundaryPortReservation,
+        Second: PhysicalComponentBoundaryPortReservation,
+    ) -> bool:
+        """Return exact pair compatibility for the global boundary CSP."""
+        PairKey = tuple(sorted((id(First), id(Second))))
+        Cached = GlobalBoundaryPairCompatibilityCache.get(PairKey)
+        if Cached is not None:
+            return Cached
+        Compatible = not ComponentClaimsConflict(
+            First.GlobalClaims,
+            Second.GlobalClaims,
+        )
+        GlobalBoundaryPairCompatibilityCache[PairKey] = Compatible
+        return Compatible
 
     def BoundaryTupleHasLocalSupport(
         Boundaries: tuple[
             PhysicalComponentBoundaryPortReservation, ...
         ],
+        LocalSupportContext: tuple[
+            dict[str, frozenset[tuple[str, str]]],
+            dict[tuple[str, str], frozenset[tuple[str, str]]],
+            tuple[frozenset[tuple[str, str]], ...],
+            bool,
+            tuple[tuple[tuple[str, str], ...], ...],
+            str,
+            frozenset[tuple[str, str]],
+        ] | None = None,
     ) -> bool:
         nonlocal LocalSupportSearchExpansionCount
         if not UsePreparedLocalSupport:
             return True
-        LocalNoGoods = CurrentLocalNoGoods()
-        if CertifiedNoGoodProjectionOnly and not LocalNoGoods:
-            return True
-        DomainsByLocalSignal = {}
-        for Boundary in Boundaries:
-            Signal = str(Boundary.Signal)
-            ApertureFingerprint = MatchingApertureFingerprint(Boundary)
-            if not ApertureFingerprint:
-                return False
-            SupportedLocalFingerprints = (
-                SupportedLocalFingerprintsByAperture.get(
-                    (Signal, ApertureFingerprint),
-                    (),
-                )
-            )
-            Domain = tuple(
-                Value
-                for Fingerprint in SupportedLocalFingerprints
-                for Value in LocalFactorsByAccessFingerprint.get(
-                    (Signal, Fingerprint),
-                    (),
-                )
-            )
-            if not Domain:
-                return False
-            DomainsByLocalSignal[Signal] = Domain
-        if not Boundaries:
-            DomainsByLocalSignal = {
-                str(Signal): tuple(Values)
-                for Signal, Values in LocalFactors.items()
-            }
-            if any(
-                not Values for Values in DomainsByLocalSignal.values()
-            ):
-                return False
-        LocalNoGoodDomainIdentity = frozenset(LocalNoGoods)
-        CompiledLocalNoGoods = CompiledLocalNoGoodDomainCache.get(
-            LocalNoGoodDomainIdentity
-        )
-        if CompiledLocalNoGoods is None:
-            MutableForbiddenLocalKeysBySignal: dict[
-                str, set[tuple[str, str]]
-            ] = {}
-            MutableResidualLocalBinaryByKey: dict[
-                tuple[str, str], set[tuple[str, str]]
-            ] = defaultdict(set)
-            ResidualHigherOrderLocalNoGoods = []
-            ConstantLocalNoGood = False
-            for Clause in LocalNoGoods:
-                Residual = frozenset(Clause - ConstantDomainKeys)
-                if not Residual:
-                    ConstantLocalNoGood = True
-                elif len(Residual) == 1:
-                    Key = next(iter(Residual))
-                    MutableForbiddenLocalKeysBySignal.setdefault(
-                        Key[0],
-                        set(),
-                    ).add(Key)
-                elif len(Residual) == 2:
-                    First, Second = tuple(Residual)
-                    MutableResidualLocalBinaryByKey[First].add(Second)
-                    MutableResidualLocalBinaryByKey[Second].add(First)
-                else:
-                    ResidualHigherOrderLocalNoGoods.append(Residual)
-            CompiledLocalNoGoods = (
-                {
-                    Signal: frozenset(Values)
-                    for Signal, Values
-                    in MutableForbiddenLocalKeysBySignal.items()
-                },
-                {
-                    Key: frozenset(Values)
-                    for Key, Values
-                    in MutableResidualLocalBinaryByKey.items()
-                },
-                tuple(ResidualHigherOrderLocalNoGoods),
-                ConstantLocalNoGood,
-                tuple(sorted(
-                    tuple(sorted(Clause)) for Clause in LocalNoGoods
-                )),
-            )
-            CompiledLocalNoGoodDomainCache[
-                LocalNoGoodDomainIdentity
-            ] = CompiledLocalNoGoods
+        if LocalSupportContext is None:
+            LocalSupportContext = CompileLocalSupportNoGoodContext()
         (
             ForbiddenLocalKeysBySignal,
             ResidualLocalBinaryByKey,
             ResidualHigherOrderLocalNoGoodsTuple,
             ConstantLocalNoGood,
             LocalNoGoodIdentity,
-        ) = CompiledLocalNoGoods
+            LocalNoGoodFingerprint,
+            ReferencedNoGoodKeys,
+        ) = LocalSupportContext
+        if CertifiedNoGoodProjectionOnly and not LocalNoGoodIdentity:
+            return True
+        DomainsByLocalSignal = {}
+        for Boundary in Boundaries:
+            Signal = str(Boundary.Signal)
+            Domain = BoundaryLocalFactorDomains.get(
+                (Signal, id(Boundary)),
+                (),
+            )
+            if not Domain:
+                return False
+            DomainsByLocalSignal[Signal] = Domain
+        if not Boundaries:
+            DomainsByLocalSignal = {
+                str(Signal): CanonicalLocalSupportDomain(Values)
+                for Signal, Values in LocalFactors.items()
+            }
+            if any(
+                not Values for Values in DomainsByLocalSignal.values()
+            ):
+                return False
 
         def ViolatesResidualLocalNoGood(
             Keys: frozenset[tuple[str, str]],
@@ -1399,18 +1848,55 @@ def IterPhysicalBoundaryPortAssignments(
                 Clause <= Keys
                 for Clause in ResidualHigherOrderLocalNoGoodsTuple
             )
+
+        def LocalFactorExtendsWithoutNoGood(
+            FactorKeys: frozenset[tuple[str, str]],
+            SelectedKeys: frozenset[tuple[str, str]],
+        ) -> bool:
+            """Check only clauses whose last key can enter with this factor."""
+            CombinedKeys = SelectedKeys | FactorKeys
+            if any(
+                CombinedKeys.intersection(
+                    ResidualLocalBinaryByKey.get(Key, set())
+                )
+                for Key in FactorKeys
+            ):
+                return False
+            return not any(
+                Clause <= CombinedKeys
+                for Clause in ResidualHigherOrderLocalNoGoodsTuple
+                if Clause.intersection(FactorKeys)
+            )
         if ConstantLocalNoGood:
             return False
         # Aperture names are not local CSP state.  Different global aperture
         # prefixes frequently project to the exact same local factor domains;
         # key the retained proof by that canonical projection so those aliases
         # share one complete existential-support result.
-        StateIdentity = tuple(
-            (
-                Signal,
-                LocalFactorDomainIdentity(DomainsByLocalSignal[Signal]),
+        BoundaryKeys = frozenset(
+            Key for Boundary in Boundaries
+            for Key in BoundaryNoGoodKeys(Boundary)
+        )
+        DomainsByLocalSignal = {
+            Signal: ProjectLocalSupportDomainForContext(
+                Values,
+                LocalNoGoodFingerprint,
+                ReferencedNoGoodKeys,
             )
-            for Signal in sorted(DomainsByLocalSignal)
+            for Signal, Values in DomainsByLocalSignal.items()
+        }
+        RelevantBoundaryKeys = BoundaryKeys & ReferencedNoGoodKeys
+        StateIdentity = (
+            tuple(sorted(RelevantBoundaryKeys)),
+            tuple(
+                (
+                    Signal,
+                    LocalFactorDomainIdentity(
+                        DomainsByLocalSignal[Signal]
+                    ),
+                )
+                for Signal in sorted(DomainsByLocalSignal)
+            ),
         )
         Cached = LocalSupportFeasibilityCache.get(StateIdentity)
         if Cached is not None:
@@ -1452,7 +1938,7 @@ def IterPhysicalBoundaryPortAssignments(
             # across aperture-prefix aliases without weakening complete
             # higher-order clauses or physical claim compatibility.
             SubproblemKey = (
-                LocalNoGoodIdentity,
+                LocalNoGoodFingerprint,
                 tuple(
                     (
                         Signal,
@@ -1462,10 +1948,17 @@ def IterPhysicalBoundaryPortAssignments(
                     )
                     for Signal in sorted(Remaining)
                 ),
-                tuple(sorted(
-                    (LocalFactorIdentity(Value) for Value in Selected),
-                    key=repr,
-                )),
+                (
+                    ()
+                    if CertifiedNoGoodProjectionOnly
+                    else tuple(sorted(
+                        (
+                            LocalFactorIdentity(Value)
+                            for Value in Selected
+                        ),
+                        key=repr,
+                    ))
+                ),
                 tuple(sorted(SelectedKeys)),
                 bool(CertifiedNoGoodProjectionOnly),
             )
@@ -1487,6 +1980,11 @@ def IterPhysicalBoundaryPortAssignments(
                     "LocalSupportStateCount": len(
                         LocalSupportFeasibilityCache
                     ),
+                    "ProjectedLocalSupportDomainCountBySignal": {
+                        Signal: len(Values)
+                        for Signal, Values
+                        in sorted(DomainsByLocalSignal.items())
+                    },
                     "ImplicitForeignTransitDomainCount": 0,
                 })
             if not Remaining:
@@ -1511,8 +2009,9 @@ def IterPhysicalBoundaryPortAssignments(
                             for Existing in Selected
                         )
                     )
-                    and not ViolatesResidualLocalNoGood(
-                        SelectedKeys | LocalFactorKeys(Value)
+                    and LocalFactorExtendsWithoutNoGood(
+                        LocalFactorKeys(Value),
+                        SelectedKeys,
                     )
                 )
                 if not Values:
@@ -1544,7 +2043,7 @@ def IterPhysicalBoundaryPortAssignments(
         Witness = LocalSearch(
             tuple(sorted(DomainsByLocalSignal)),
             (),
-            ConstantDomainKeys,
+            ConstantDomainKeys | RelevantBoundaryKeys,
         )
         LocalSupportFeasibilityCache[StateIdentity] = (
             LocalNoGoodIdentity,
@@ -1611,23 +2110,18 @@ def IterPhysicalBoundaryPortAssignments(
         def OptionKeys(
             Value: PhysicalComponentBoundaryPortReservation,
         ) -> frozenset[tuple[str, str]]:
-            return frozenset((
-                (Value.Signal, Value.GlobalContractFingerprint),
-                (Value.Signal, Value.ApertureContractFingerprint),
-                (Value.Signal, Value.ReservationFingerprint),
-            ))
+            return BoundaryNoGoodKeys(Value)
 
+        CurrentRejectedClauses = CurrentRejectedApertureClauses()
         ResidualClauses = tuple(
             Residual
-            for Clause in CurrentRejectedApertureClauses()
+            for Clause in CurrentRejectedClauses
             for Residual in (frozenset(Clause - BaseKeys),)
             if Residual and len(Residual) <= 2
         )
-        DirectLocalNoGoods, _ConstantUnsat, _Identity = (
-            CompileDirectLocalNoGoods()
+        DirectLocalContext = CompileDirectLocalNoGoods(
+            CurrentLocalNoGoods(CurrentRejectedClauses)
         )
-        if not ResidualClauses and not DirectLocalNoGoods:
-            return CandidateDomains
         MutableDomains = {
             Signal: list(Values)
             for Signal, Values in CandidateDomains.items()
@@ -1660,6 +2154,23 @@ def IterPhysicalBoundaryPortAssignments(
                             "LocalSupportStateCount": len(
                                 LocalSupportFeasibilityCache
                             ),
+                            "PersistentBoundaryPairSupportCacheHitCount": (
+                                PersistentPairSupportCacheHitCount
+                            ),
+                            "PersistentBoundaryPairSupportCacheStoreCount": (
+                                PersistentPairSupportCacheStoreCount
+                            ),
+                            "PersistentBoundaryPairSupportCacheEntryCount": (
+                                len(PersistentPairSupportCache)
+                                if PersistentPairSupportCache is not None
+                                else 0
+                            ),
+                            "BoundaryPairLocalSupportEvaluationCount": (
+                                BoundaryPairLocalSupportEvaluationCount
+                            ),
+                            "BoundaryPairLocalSupportCacheHitCount": (
+                                BoundaryPairLocalSupportCacheHitCount
+                            ),
                             "ImplicitForeignTransitDomainCount": 0,
                         })
                     Keys = OptionKeys(Option)
@@ -1676,11 +2187,16 @@ def IterPhysicalBoundaryPortAssignments(
                                 Clause <= (Keys | OptionKeys(Other))
                                 for Clause in ResidualClauses
                             )
+                            and BoundaryOptionsHaveCompatibleGlobalClaims(
+                                Option,
+                                Other,
+                            )
                             and (
                                 not CertifiedNoGoodProjectionOnly
                                 or BoundaryOptionPairHasDirectLocalSupport(
                                     Option,
                                     Other,
+                                    DirectLocalContext,
                                 )
                             )
                             for Other in MutableDomains[OtherSignal]
@@ -1702,6 +2218,15 @@ def IterPhysicalBoundaryPortAssignments(
     def Search(
         Remaining: tuple[str, ...],
         Selected: tuple[PhysicalComponentBoundaryPortReservation, ...],
+        LocalSupportContext: tuple[
+            dict[str, frozenset[tuple[str, str]]],
+            dict[tuple[str, str], frozenset[tuple[str, str]]],
+            tuple[frozenset[tuple[str, str]], ...],
+            bool,
+            tuple[tuple[tuple[str, str], ...], ...],
+            str,
+            frozenset[tuple[str, str]],
+        ] | None = None,
     ) -> Iterable[tuple[PhysicalComponentBoundaryPortReservation, ...]]:
         nonlocal BoundaryPrefixExpansionCount
         BoundaryPrefixExpansionCount += 1
@@ -1717,9 +2242,14 @@ def IterPhysicalBoundaryPortAssignments(
                 ),
                 "ImplicitForeignTransitDomainCount": 0,
             })
+        if LocalSupportContext is None:
+            LocalSupportContext = CompileLocalSupportNoGoodContext()
         if (
             (Selected or CertifiedNoGoodProjectionOnly)
-            and not BoundaryTupleHasLocalSupport(Selected)
+            and not BoundaryTupleHasLocalSupport(
+                Selected,
+                LocalSupportContext,
+            )
         ):
             return
         if not Remaining:
@@ -1739,7 +2269,7 @@ def IterPhysicalBoundaryPortAssignments(
                     or BoundaryTupleHasLocalSupport(tuple(sorted(
                         (*Selected, Value),
                         key=lambda Candidate: str(Candidate.Signal),
-                    )))
+                    )), LocalSupportContext)
                 )
             )
             for Signal in Remaining
@@ -1780,12 +2310,27 @@ def IterPhysicalBoundaryPortAssignments(
             # currently selected is known instead of waiting for a complete
             # aperture tuple.  This preserves global ownership while pruning
             # whole unsupported subtrees before they become speculative plans.
-            if not BoundaryTupleHasLocalSupport(tuple(sorted(
-                NextSelected,
-                key=lambda Value: str(Value.Signal),
-            ))):
+            if not BoundaryTupleHasLocalSupport(
+                tuple(sorted(
+                    NextSelected,
+                    key=lambda Value: str(Value.Signal),
+                )),
+                LocalSupportContext,
+            ):
                 continue
-            yield from Search(NextRemaining, NextSelected)
+            # No proof source can mutate while an unsatisfiable subtree runs,
+            # so its complete recursive search shares this immutable context.
+            # Once an assignment is yielded, the caller may learn another
+            # monotonic clause before resuming; refresh at every yield boundary
+            # before requesting the next assignment from that child.
+            Child = Search(
+                NextRemaining,
+                NextSelected,
+                LocalSupportContext,
+            )
+            for Assignment in Child:
+                yield Assignment
+                LocalSupportContext = CompileLocalSupportNoGoodContext()
 
     yield from Search(tuple(sorted(Domains)), ())
 

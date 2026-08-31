@@ -18,7 +18,7 @@ from typing import Any
 from .PhysicalGuides import BuildComponentKeepoutAvoidingGlobalGuides, BuildComponentKeepoutGuideCellsByLayer, BuildExplicitPhysicalComponentFeedthrough, ExpandPhysicalComponentGuideChannels, PreparePhysicalComponentFeedthroughEndpointDomain, RemoveClosedComponentInternalGuides
 from functools import partial
 from .PortPreparationState import PortPreparationState, SetPortPreparationState
-from .PortPreparationHelpers import BuildGlobalPathToGuide, DeduplicateCertifiedAccessCandidates
+from .PortPreparationHelpers import BuildGlobalPathToGuide, DeduplicateCertifiedAccessCandidates, PrepareCertifiedPhysicalPortLocalSeams
 from ..Contracts.Component import PhysicalExteriorApertureFabric
 from ..Contracts.Core import Position2
 from ..Contracts.Core import Position3
@@ -151,7 +151,8 @@ def BuildPhysicalPortChannelReservations(Context):
         Context.ChannelIdentity = (Context.Signal, Context.Layer, Context.GuideCells, tuple(map(str, Context.ResourceIds)), tuple(sorted({*getattr(Context.LogicalChannel, 'FeedthroughComponentIds', ()), *Context.DeclaredFeedthroughComponentIds}, key=str)))
         Context.ChannelReservations.append(PhysicalComponentChannelReservation(Signal=Context.Signal, Layer=Context.Layer, GuideCells=Context.GuideCells, ResourceIds=tuple(map(str, Context.ResourceIds)), Claims=Context.CorridorClaims, Capacity=Context.Port.Capacity if Context.Port is not None else 1, FeedthroughComponentIds=tuple(sorted({*getattr(Context.LogicalChannel, 'FeedthroughComponentIds', ()), *Context.DeclaredFeedthroughComponentIds}, key=str)), ReservationFingerprint=BuildStableFingerprint(Context.ChannelIdentity)))
 
-def BuildPhysicalPortExteriorFabrics(Context):
+def BuildPhysicalPortFabricTopology(Context):
+    """Freeze component-local geometry before any exterior construction."""
     Context.ChannelClaimsBySignal = {Value.Signal: Value.Claims for Value in Context.ChannelReservations}
     Context.FabricOrigin = (min((Value[0] for Value in Context.Problem.Fabric.Nodes)), min((Value[1] for Value in Context.Problem.Fabric.Nodes)), min((Value[2] for Value in Context.Problem.Fabric.Nodes))) if Context.Problem.Fabric.Nodes else (0, 0, 0)
     Context.FabricMaximum = (max((Value[0] for Value in Context.Problem.Fabric.Nodes)), max((Value[1] for Value in Context.Problem.Fabric.Nodes)), max((Value[2] for Value in Context.Problem.Fabric.Nodes))) if Context.Problem.Fabric.Nodes else (0, 0, 0)
@@ -162,22 +163,6 @@ def BuildPhysicalPortExteriorFabrics(Context):
     Context.ExteriorFabricSetFingerprint = ''
     Context.ExteriorCapacityLedgerFingerprint = ''
     Context.ResourceGraphFingerprint = BuildPhysicalExteriorResourceGraphFingerprint(Context.ResourceGraph, Context.AuthoritativeRegionFingerprint, Context.AuthoritativeRegion)
-    if Context.AuthoritativeRegion is not None:
-        if not Context.AuthoritativeRegionFingerprint:
-            raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ComponentAssemblyIdentityMismatch, Stage='PhysicalExteriorFabricPreparation', Detail='authoritative exterior region has no stable identity', Diagnostics={'ImplicitForeignTransitDomainCount': 0}))
-        Context.ExteriorFabricValues = []
-        for Context.Layer in sorted({int(Context.CoarsePlan.Layers.get(Port.Signal, 0)) for Port in Context.Problem.Interface.Ports}):
-            Context.LayerSignals = frozenset((Port.Signal for Port in Context.Problem.Interface.Ports if int(Context.CoarsePlan.Layers.get(Port.Signal, 0)) == Context.Layer))
-            Context.GuideCellsBySignal = {Signal: frozenset(Context.CoarsePlan.Guides.get(Signal, ())) for Signal in sorted(Context.LayerSignals)}
-            Context.IngressNodesBySignal = {Signal: tuple(sorted({tuple(Candidate.Attachment) for Candidate in (Context.CertifiedPortDomainBySignal[Signal].Candidates if Signal in Context.CertifiedPortDomainBySignal else ()) if int(Candidate.Layer) == Context.Layer})) for Signal in sorted(Context.LayerSignals)}
-            try:
-                Context.ExteriorFabricValues.append(BuildPhysicalExteriorApertureFabric(Context.ComponentEnvelopeMinimum, Context.ComponentEnvelopeMaximum, Context.GuideCellsBySignal, Context.IngressNodesBySignal, Technology=Context.ResourceGraph.Technology, MinimumPlacementY=Context.MinimumPlacementY, Layer=Context.Layer, KeepoutNodes=Context.ComponentKeepoutNodes, RegionNodes=Context.AuthoritativeRegion.Nodes, RegionEdges=Context.AuthoritativeRegion.Edges, RegionFingerprint=Context.AuthoritativeRegionFingerprint, ResourceGraphFingerprint=Context.ResourceGraphFingerprint, Complete=True))
-            except ValueError as Error:
-                raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PhysicalComponentAssemblyIncomplete, Stage='PhysicalExteriorFabricPreparation', AffectedNets=tuple(sorted(Context.LayerSignals)), Detail=str(Error), Diagnostics={'ExteriorRegionFingerprint': Context.AuthoritativeRegionFingerprint, 'Layer': Context.Layer, 'ImplicitForeignTransitDomainCount': 0})) from Error
-        Context.ExteriorFabrics = tuple(Context.ExteriorFabricValues)
-        Context.ExteriorFabricSetFingerprint = BuildStableFingerprint(('physical-exterior-fabric-set-v1', Context.AuthoritativeRegionFingerprint, tuple((Value.FabricFingerprint for Value in Context.ExteriorFabrics)), tuple((Value.SignalBindingFingerprint for Value in Context.ExteriorFabrics))))
-        Context.ExteriorCapacityLedgerFingerprint = BuildStableFingerprint(('physical-exterior-capacity-ledger-v1', Context.ExteriorFabricSetFingerprint, tuple(((Value.Layer, tuple(sorted(Value.AllowedEdges)), 1) for Value in Context.ExteriorFabrics))))
-    Context.ExteriorFabricByLayer = {Value.Layer: Value for Value in Context.ExteriorFabrics}
     Context.FabricAdjacency: dict[tuple[int, int, int], set[tuple[int, int, int]]] = defaultdict(set)
     for Context.First, Context.Second in Context.Problem.Fabric.Edges:
         Context.FabricAdjacency[tuple(Context.First)].add(tuple(Context.Second))
@@ -196,52 +181,237 @@ def BuildPhysicalPortExteriorFabrics(Context):
                     continue
                 Context.FabricComponentByNode[Context.Neighbor] = Context.ComponentIndex
                 Context.PendingNodes.append(Context.Neighbor)
+    Context.FabricNodesByComponent = {
+        ComponentIndex: frozenset(
+            Node
+            for Node, NodeComponentIndex
+            in Context.FabricComponentByNode.items()
+            if NodeComponentIndex == ComponentIndex
+        )
+        for ComponentIndex in sorted(set(
+            Context.FabricComponentByNode.values()
+        ))
+    }
+    Context.FabricEnvelopeBoundsByComponent = {
+        ComponentIndex: (
+            tuple(
+                min(Node[Index] for Node in ComponentNodes)
+                for Index in range(3)
+            ),
+            tuple(
+                max(Node[Index] for Node in ComponentNodes)
+                for Index in range(3)
+            ),
+        )
+        for ComponentIndex, ComponentNodes
+        in Context.FabricNodesByComponent.items()
+    }
 
-def PreparePhysicalPortConnectorSearch(Context):
-    Context.LaneFactorsBySignal: dict[str, tuple[PhysicalPortLaneFactor, ...]] = {}
-    Context.ExteriorFactorPreparationStartedAt = monotonic()
-    Context.LaneFactorExpansionCount = 0
-    Context.AccessFactorExpansionCount = 0
-    Context.SeamFactorExpansionCount = 0
-    Context.GlobalConnectorSearchCount = 0
-    Context.GlobalConnectorExpansionCount = 0
-    Context.GlobalConnectorCacheHitCount = 0
-    Context.GlobalConnectorPortableCacheHitCount = 0
-    Context.GlobalConnectorPortableCacheValidationRejectCount = 0
-    Context.GlobalConnectorPortableCacheStoreCount = 0
-    Context.GlobalGuideFieldBuildCount = 0
-    Context.GlobalGuideFieldExpansionCount = 0
-    Context.GlobalGuideFieldHitCount = 0
-    Context.GlobalGuideFieldCanonicalPathCount = 0
-    Context.GlobalGuideFieldFallbackCount = 0
-    Context.GlobalApertureTargetContextBuildCount = 0
-    Context.GlobalApertureStaticContractBuildCount = 0
+
+def BuildPhysicalPortExteriorFabrics(Context):
+    if not hasattr(Context, 'FabricComponentByNode'):
+        BuildPhysicalPortFabricTopology(Context)
+    if Context.AuthoritativeRegion is not None:
+        if not Context.AuthoritativeRegionFingerprint:
+            raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ComponentAssemblyIdentityMismatch, Stage='PhysicalExteriorFabricPreparation', Detail='authoritative exterior region has no stable identity', Diagnostics={'ImplicitForeignTransitDomainCount': 0}))
+        RegionNodesByY = defaultdict(set)
+        for NodeIndex, Node in enumerate(
+            Context.AuthoritativeRegion.Nodes,
+            start=1,
+        ):
+            RegionNodesByY[int(Node[1])].add(Node)
+            if Context.WorkCheck is not None and NodeIndex % 16_384 == 0:
+                Context.WorkCheck({
+                    "Stage": "physical-exterior-region-partition",
+                    "Phase": "nodes",
+                    "CompletedNodes": NodeIndex,
+                    "TotalNodes": len(Context.AuthoritativeRegion.Nodes),
+                })
+        RegionEdgesByY = defaultdict(set)
+        for EdgeIndex, (First, Second) in enumerate(
+            Context.AuthoritativeRegion.Edges,
+            start=1,
+        ):
+            if First[1] == Second[1]:
+                RegionEdgesByY[int(First[1])].add((First, Second))
+            if Context.WorkCheck is not None and EdgeIndex % 16_384 == 0:
+                Context.WorkCheck({
+                    "Stage": "physical-exterior-region-partition",
+                    "Phase": "edges",
+                    "CompletedEdges": EdgeIndex,
+                    "TotalEdges": len(Context.AuthoritativeRegion.Edges),
+                })
+        Context.ExteriorFabricValues = []
+        for Context.Layer in sorted({int(Context.CoarsePlan.Layers.get(Port.Signal, 0)) for Port in Context.Problem.Interface.Ports}):
+            Context.LayerSignals = frozenset((Port.Signal for Port in Context.Problem.Interface.Ports if int(Context.CoarsePlan.Layers.get(Port.Signal, 0)) == Context.Layer))
+            Context.GuideCellsBySignal = {Signal: frozenset(Context.CoarsePlan.Guides.get(Signal, ())) for Signal in sorted(Context.LayerSignals)}
+            Context.IngressNodesBySignal = {Signal: tuple(sorted({tuple(Candidate.Attachment) for Candidate in (Context.CertifiedPortDomainBySignal[Signal].Candidates if Signal in Context.CertifiedPortDomainBySignal else ()) if int(Candidate.Layer) == Context.Layer})) for Signal in sorted(Context.LayerSignals)}
+            try:
+                Context.IngressEnvelopeBoundsByNode = defaultdict(set)
+                for Context.Signal in sorted(Context.LayerSignals):
+                    for Context.Candidate in (
+                        Context.CertifiedPortDomainBySignal[
+                            Context.Signal
+                        ].Candidates
+                        if Context.Signal
+                        in Context.CertifiedPortDomainBySignal
+                        else ()
+                    ):
+                        if int(Context.Candidate.Layer) != Context.Layer:
+                            continue
+                        Context.CandidateComponentIndex = (
+                            Context.FabricComponentByNode.get(
+                                tuple(Context.Candidate.FabricAttachment)
+                            )
+                        )
+                        Context.CandidateEnvelopeBounds = (
+                            Context.FabricEnvelopeBoundsByComponent.get(
+                                Context.CandidateComponentIndex
+                            )
+                        )
+                        if Context.CandidateEnvelopeBounds is None:
+                            raise ValueError(
+                                "certified portal ingress has no connected "
+                                "fabric component envelope: "
+                                f"{Context.Candidate.Attachment}"
+                            )
+                        Context.IngressNode = tuple(
+                            Context.Candidate.Attachment
+                        )
+                        Context.IngressEnvelopeBoundsByNode[
+                            Context.IngressNode
+                        ].add(Context.CandidateEnvelopeBounds)
+                RoutingY = Context.ResourceGraph.Technology.RoutingY(
+                    Context.MinimumPlacementY,
+                    Context.Layer,
+                )
+                Context.ExteriorFabricValues.append(BuildPhysicalExteriorApertureFabric(Context.ComponentEnvelopeMinimum, Context.ComponentEnvelopeMaximum, Context.GuideCellsBySignal, Context.IngressNodesBySignal, Technology=Context.ResourceGraph.Technology, MinimumPlacementY=Context.MinimumPlacementY, Layer=Context.Layer, KeepoutColumns=Context.ComponentKeepoutGuideCellsByLayer.get(Context.Layer, frozenset()), KeepoutNodes=Context.ComponentKeepoutNodes, DeclaredPortalIngressEnvelopeBoundsByNode=Context.IngressEnvelopeBoundsByNode, RegionNodes=RegionNodesByY.get(RoutingY, ()), RegionEdges=RegionEdgesByY.get(RoutingY, ()), RegionFingerprint=Context.AuthoritativeRegionFingerprint, ResourceGraphFingerprint=Context.ResourceGraphFingerprint, Complete=True))
+            except ValueError as Error:
+                raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PhysicalComponentAssemblyIncomplete, Stage='PhysicalExteriorFabricPreparation', AffectedNets=tuple(sorted(Context.LayerSignals)), Detail=str(Error), Diagnostics={'ExteriorRegionFingerprint': Context.AuthoritativeRegionFingerprint, 'Layer': Context.Layer, 'ImplicitForeignTransitDomainCount': 0})) from Error
+        Context.ExteriorFabrics = tuple(Context.ExteriorFabricValues)
+        Context.ExteriorFabricSetFingerprint = BuildStableFingerprint(('physical-exterior-fabric-set-v1', Context.AuthoritativeRegionFingerprint, tuple((Value.FabricFingerprint for Value in Context.ExteriorFabrics)), tuple((Value.SignalBindingFingerprint for Value in Context.ExteriorFabrics))))
+        Context.ExteriorCapacityLedgerFingerprint = BuildStableFingerprint(('physical-exterior-capacity-ledger-v2', Context.ExteriorFabricSetFingerprint, tuple(((Value.Layer, Value.FabricFingerprint, len(Value.AllowedEdges), 1) for Value in Context.ExteriorFabrics))))
+    Context.ExteriorFabricByLayer = {Value.Layer: Value for Value in Context.ExteriorFabrics}
+
+def PreparePhysicalPortConnectorSearch(
+    Context,
+    Signals: frozenset[str] | None = None,
+    *,
+    Initialize: bool = True,
+):
+    if Initialize:
+        Context.LaneFactorsBySignal: dict[str, tuple[PhysicalPortLaneFactor, ...]] = {}
+        Context.ExteriorFactorPreparationStartedAt = monotonic()
+        Context.LaneFactorExpansionCount = 0
+        Context.AccessFactorExpansionCount = 0
+        Context.SeamFactorExpansionCount = 0
+        Context.GlobalConnectorSearchCount = 0
+        Context.GlobalConnectorExpansionCount = 0
+        Context.GlobalConnectorCacheHitCount = 0
+        Context.GlobalConnectorPortableCacheHitCount = 0
+        Context.GlobalConnectorPortableCacheValidationRejectCount = 0
+        Context.GlobalConnectorPortableCacheStoreCount = 0
+        Context.GlobalGuideFieldBuildCount = 0
+        Context.GlobalGuideFieldExpansionCount = 0
+        Context.GlobalGuideFieldHitCount = 0
+        Context.GlobalGuideFieldCanonicalPathCount = 0
+        Context.GlobalGuideFieldFallbackCount = 0
+        Context.GlobalApertureTargetContextBuildCount = 0
+        Context.GlobalApertureTargetDiagnosticsBySignal: dict[
+            str,
+            dict[str, object],
+        ] = {}
+        Context.CertifiedStraightExteriorTargetCountBySignal: dict[str, int] = {}
+        Context.GlobalApertureStaticContractBuildCount = 0
+        Context.GlobalPathRejectionCountsBySignal: dict[str, dict[str, int]] = {}
+        Context.NativeConnectorSearchResults: dict[tuple[object, ...], PhysicalExteriorConnectorPathResult] = {}
+        Context.NativeConnectorBatchWorkItems = 0
+        Context.NativeConnectorBatchActiveWorkerCount = 0
+        Context.NativeConnectorResultHitCount = 0
+        Context.NativeConnectorEmptyResultCount = 0
+        Context.NativeConnectorAcceptedPathCount = 0
+        Context.NativeConnectorValidationRejectCount = 0
+        Context.GlobalConnectorCache: dict[tuple[str, tuple[int, int, int], tuple[int, int, int], int, frozenset[tuple[int, int]], str], tuple[tuple[int, int, int], ...]] = {}
+        Context.GlobalGuideFieldCache: dict[tuple[object, ...], PhysicalExteriorConnectorDistanceField] = {}
+        Context.GlobalConnectorForeignClaimsCache: dict[tuple[str, str], RoutingResourceClaims] = {}
+        Context.GlobalConnectorForeignEdgeLegalityCache: dict[tuple[str, str, Position3, Position3], bool] = {}
+        Context.GlobalApertureTargetsCache: dict[tuple[object, ...], frozenset[Position3]] = {}
+        Context.GlobalApertureGuideProjectionCache: dict[
+            tuple[object, ...],
+            tuple[
+                tuple[Position3, ...],
+                tuple[Position3, ...],
+                tuple[Position3, ...],
+            ],
+        ] = {}
+        Context.GlobalApertureStaticContractCache: dict[tuple[str, Position3, int, int, frozenset[Position2], str], PreparedPhysicalGlobalApertureStaticContract] = {}
+        Context.LaneFactorDiagnosticsBySignal: dict[str, dict[str, object]] = {}
+    PrepareCertifiedPhysicalPortLocalSeams(
+        Context,
+        Signals,
+        Initialize=(
+            Initialize
+            and not hasattr(
+                Context,
+                'CertifiedPhysicalPortLocalSeamsByCandidate',
+            )
+        ),
+    )
     Context.NativeConnectorSearchRequests: dict[tuple[object, ...], FrozenPhysicalExteriorConnectorSearchRequest] = {}
-    Context.NativeConnectorSearchResults: dict[tuple[object, ...], PhysicalExteriorConnectorPathResult] = {}
-    Context.NativeConnectorBatchWorkItems = 0
-    Context.NativeConnectorBatchActiveWorkerCount = 0
-    Context.GlobalConnectorCache: dict[tuple[str, tuple[int, int, int], tuple[int, int, int], int, frozenset[tuple[int, int]], str], tuple[tuple[int, int, int], ...]] = {}
-    Context.GlobalGuideFieldCache: dict[tuple[object, ...], PhysicalExteriorConnectorDistanceField] = {}
-    Context.GlobalConnectorForeignClaimsCache: dict[tuple[str, str], RoutingResourceClaims] = {}
-    Context.GlobalConnectorForeignEdgeLegalityCache: dict[tuple[str, str, Position3, Position3], bool] = {}
-    Context.GlobalApertureTargetsCache: dict[tuple[str, int, int, frozenset[Position2]], frozenset[Position3]] = {}
-    Context.GlobalApertureStaticContractCache: dict[tuple[str, Position3, int, int, frozenset[Position2], str], PreparedPhysicalGlobalApertureStaticContract] = {}
-    Context.LaneFactorDiagnosticsBySignal: dict[str, dict[str, object]] = {}
     for Context.Port in Context.Problem.Interface.Ports:
+        if Signals is not None and Context.Port.Signal not in Signals:
+            continue
         Context.CertifiedDomain = Context.CertifiedPortDomainBySignal.get(Context.Port.Signal)
         if Context.CertifiedDomain is None or not Context.CertifiedDomain.Candidates:
             continue
         Context.GuideCells = frozenset(Context.CoarsePlan.Guides.get(Context.Port.Signal, ()))
         Context.PortLayer = int(Context.CoarsePlan.Layers.get(Context.Port.Signal, 0))
         for Context.CertifiedCandidate in Context.CertifiedDomain.Candidates:
+            Context.PreparedCertifiedLocalSeam = (
+                Context.CertifiedPhysicalPortLocalSeamsByCandidate.get((
+                    str(Context.Port.Signal),
+                    str(Context.CertifiedCandidate.CandidateFingerprint),
+                ))
+            )
+            if (
+                Context.PreparedCertifiedLocalSeam is None
+                or not Context.PreparedCertifiedLocalSeam.Complete
+                or not Context.PreparedCertifiedLocalSeam.Feasible
+            ):
+                continue
             if Context.CertifiedCandidate.Layer != Context.PortLayer:
                 continue
             Context.LocalPath = tuple(Context.CertifiedCandidate.LocalPath)
             if len(Context.LocalPath) < 2:
                 continue
-            BuildGlobalPathToGuide(Context, Context.LocalPath[-1], tuple((Context.LocalPath[-1][Index] - Context.LocalPath[-2][Index] for Index in range(3))), Context.GuideCells, Context.Port.Signal, Context.PortLayer, {}, CollectNativeConnectorRequest=True)
+            BuildGlobalPathToGuide(Context, Context.LocalPath[-1], tuple((Context.LocalPath[-1][Index] - Context.LocalPath[-2][Index] for Index in range(3))), Context.GuideCells, Context.Port.Signal, Context.PortLayer, {}, FabricAttachment=Context.CertifiedCandidate.FabricAttachment, CollectNativeConnectorRequest=True)
     if Context.NativeConnectorSearchRequests:
         Context.NativeConnectorKeys = tuple(Context.NativeConnectorSearchRequests)
-        Context.NativeConnectorResults, Context.NativeConnectorBatchActiveWorkerCount = SearchFrozenPhysicalExteriorConnectorBatch((Context.NativeConnectorSearchRequests[Key] for Key in Context.NativeConnectorKeys))
-        Context.NativeConnectorBatchWorkItems = len(Context.NativeConnectorResults)
+        if Context.WorkCheck is not None:
+            Context.NativeConnectorFields = {
+                Request.Field.FieldFingerprint: Request.Field
+                for Request in Context.NativeConnectorSearchRequests.values()
+            }
+            Context.WorkCheck({
+                "Stage": "physical-port-native-connector-batch",
+                "Phase": "start",
+                "NativeConnectorRequestCount": len(
+                    Context.NativeConnectorSearchRequests
+                ),
+                "NativeConnectorFieldCount": len(
+                    Context.NativeConnectorFields
+                ),
+                "MaximumNativeConnectorTargetCount": max(
+                    len(Field.Targets)
+                    for Field in Context.NativeConnectorFields.values()
+                ),
+                "MaximumNativeConnectorAllowedNodeCount": max(
+                    len(Field.AllowedNodes)
+                    for Field in Context.NativeConnectorFields.values()
+                ),
+                "ImplicitForeignTransitDomainCount": 0,
+            })
+        Context.NativeConnectorResults, Context.NativeConnectorBatchCurrentActiveWorkerCount = SearchFrozenPhysicalExteriorConnectorBatch((Context.NativeConnectorSearchRequests[Key] for Key in Context.NativeConnectorKeys))
+        Context.NativeConnectorBatchActiveWorkerCount = max(Context.NativeConnectorBatchActiveWorkerCount, Context.NativeConnectorBatchCurrentActiveWorkerCount)
+        Context.NativeConnectorBatchWorkItems += len(Context.NativeConnectorResults)
         Context.NativeConnectorSearchResults.update(zip(Context.NativeConnectorKeys, Context.NativeConnectorResults))

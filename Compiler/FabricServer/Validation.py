@@ -1,0 +1,442 @@
+"""Local process supervision and vector policy for Fabric validation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from hashlib import sha256
+import itertools
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+from time import monotonic, sleep
+from typing import Any, Iterable
+
+from .Fixture import FabricFixtureArtifact
+from .Models import (
+    FabricServerControlResult,
+    FabricServerLoadResult,
+    FabricServerValidationResult,
+)
+from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
+
+
+ExhaustiveInputLimit = 16
+WideInputSampleCount = 4096
+
+
+def DefaultFabricServerRoot() -> Path:
+    """Return the repository-owned canonical local Fabric runtime directory."""
+    return Path(__file__).resolve().parents[2] / "FabricServerHarness" / "Server"
+
+
+def ResolveFabricServerRoot() -> Path:
+    """Return the canonical runtime root or the explicit environment override."""
+    ConfiguredRoot = os.environ.get("RC_FABRIC_SERVER_ROOT")
+    return (
+        Path(ConfiguredRoot).expanduser().resolve()
+        if ConfiguredRoot
+        else DefaultFabricServerRoot()
+    )
+
+
+@dataclass(frozen=True)
+class FabricServerConfiguration:
+    Root: Path | None
+    JavaExecutable: str = "java"
+    StartupTimeoutSeconds: float = 90.0
+    Port: int = 25566
+
+    @classmethod
+    def FromEnvironment(cls) -> "FabricServerConfiguration":
+        return cls(
+            Root=ResolveFabricServerRoot(),
+            JavaExecutable=os.environ.get("RC_FABRIC_JAVA", "java"),
+            StartupTimeoutSeconds=float(os.environ.get("RC_FABRIC_STARTUP_TIMEOUT", "90")),
+            Port=int(os.environ.get("RC_FABRIC_CONTROL_PORT", "25566")),
+        )
+
+
+def BuildValidationVectors(InputNames: Iterable[str]) -> list[dict[str, bool]]:
+    """Return the committed exhaustive-or-deterministic-wide vector policy."""
+    Names = tuple(sorted(str(Name) for Name in InputNames))
+    if len(Names) <= ExhaustiveInputLimit:
+        return [
+            dict(zip(Names, Values))
+            for Values in itertools.product((False, True), repeat=len(Names))
+        ]
+    Values = {
+        tuple(False for _ in Names),
+        tuple(True for _ in Names),
+    }
+    for Index in range(len(Names)):
+        Values.add(tuple(Index == Other for Other in range(len(Names))))
+        Values.add(tuple(Index != Other for Other in range(len(Names))))
+    Counter = 0
+    while len(Values) < 2 + 2 * len(Names) + WideInputSampleCount:
+        Digest = sha256(f"{Names}:{Counter}".encode("utf-8")).digest()
+        Values.add(tuple(
+            bool(Digest[Index // 8] & (1 << (Index % 8)))
+            for Index in range(len(Names))
+        ))
+        Counter += 1
+    return [dict(zip(Names, Value)) for Value in sorted(Values)]
+
+
+def BuildExpectedVectors(Module: Any, InputNames: Iterable[str], OutputNames: Iterable[str]) -> list[dict[str, object]]:
+    """Pair each requested input assignment with semantic-oracle output bits."""
+    InputNames = tuple(str(Name) for Name in InputNames)
+    OutputNames = tuple(str(Name) for Name in OutputNames)
+    return [
+        {
+            "Inputs": Assignment,
+            "Expected": {
+                Name: bool(EvaluateLogicModule(Module, Assignment)[Name])
+                for Name in OutputNames
+            },
+        }
+        for Assignment in BuildValidationVectors(InputNames)
+    ]
+
+
+class FabricServerSupervisor:
+    """Validate through the managed Fabric runtime after a live full-world clear."""
+
+    def __init__(self, Configuration: FabricServerConfiguration) -> None:
+        self.Configuration = Configuration
+
+    def Validate(
+        self,
+        *,
+        Fixture: FabricFixtureArtifact,
+        Vectors: list[dict[str, object]],
+    ) -> FabricServerValidationResult:
+        StartedAt = monotonic()
+        Root = self.Configuration.Root
+        if Root is None:
+            return self._Failure("server-root-not-configured", StartedAt)
+        Launcher = Root / "fabric-server-launch.jar"
+        Harness = Root / "mods" / "redstonecompiler-harness.jar"
+        Manager = Root / "PyScripts" / "Main.py"
+        BuiltHarness = (
+            Path(__file__).resolve().parents[2]
+            / "FabricServerHarness"
+            / "build"
+            / "libs"
+            / "redstonecompiler-harness-1.0.0.jar"
+        )
+        UsesCanonicalManager = Manager.is_file()
+        HarnessAvailable = Harness.is_file() or (
+            UsesCanonicalManager and BuiltHarness.is_file()
+        )
+        if not Launcher.is_file() or not HarnessAvailable:
+            return self._Failure("fabric-server-or-harness-not-installed", StartedAt, {
+                "ServerRoot": str(Root),
+                "LauncherExists": Launcher.is_file(),
+                "HarnessExists": HarnessAvailable,
+            })
+        if not UsesCanonicalManager:
+            return self._Failure(
+                "full-simulation-world-clear-requires-runtime-manager",
+                StartedAt,
+                {
+                    "ServerRoot": str(Root),
+                    "Manager": str(Manager),
+                },
+            )
+        try:
+            PrePasteClear = self._ClearCanonicalSimulationWorld(Root, Manager)
+            RunningControl = self._GetRunningControl(Root)
+            if RunningControl is None:
+                raise RuntimeError(
+                    "canonical Fabric manager completed without an authenticated "
+                    "control endpoint after the full simulation-world clear",
+                )
+            Token, Port = RunningControl
+            Response = self._RequestWhenReady(Token, {
+                "Action": "Validate",
+                "FixturePath": str(Fixture.Path.resolve()),
+                "FixtureSha256": Fixture.Sha256,
+                "Vectors": Vectors,
+            }, Port=Port)
+        except Exception as Error:
+            return self._Failure(
+                "server-protocol-failure",
+                StartedAt,
+                {"Error": str(Error)},
+            )
+        RuntimeSeconds = monotonic() - StartedAt
+        Status = str(Response.get("Status", "infrastructure-failure"))
+        if Status not in {"passed", "mismatch", "timeout", "infrastructure-failure"}:
+            Status = "infrastructure-failure"
+        return FabricServerValidationResult(
+            Status=Status,
+            Backend="fabric-26.2",
+            RuntimeSeconds=RuntimeSeconds,
+            Diagnostics={
+                **PrePasteClear,
+                **dict(Response.get("Diagnostics", {})),
+                **(
+                    {"ControlError": Response["Error"]}
+                    if "Error" in Response
+                    else {}
+                ),
+            },
+        )
+
+    def LoadIntoRunningServer(self, *, Fixture: FabricFixtureArtifact) -> FabricServerLoadResult:
+        """Load a fixture through an already-running local harness.
+
+        This intentionally does not launch or terminate a server, making it
+        suitable for manually importing a schematic into the local world.
+        """
+        StartedAt = monotonic()
+        Root = self.Configuration.Root
+        if Root is None:
+            return FabricServerLoadResult(
+                Status="infrastructure-failure",
+                RuntimeSeconds=monotonic() - StartedAt,
+                Diagnostics={"Reason": "server-root-not-configured"},
+            )
+        ConfigurationPath = Root / "config" / "redstonecompiler-harness.json"
+        try:
+            Configuration = json.loads(ConfigurationPath.read_text(encoding="utf-8"))
+            Token = str(Configuration["Token"])
+            Port = int(Configuration["Port"])
+            Response = self._Request(Token, Port, {
+                "Action": "LoadFixture",
+                "FixturePath": str(Fixture.Path.resolve()),
+                "FixtureSha256": Fixture.Sha256,
+            })
+        except Exception as Error:
+            return FabricServerLoadResult(
+                Status="infrastructure-failure",
+                RuntimeSeconds=monotonic() - StartedAt,
+                Diagnostics={"Reason": "running-server-control-unavailable", "Error": str(Error)},
+            )
+        Status = str(Response.get("Status", "infrastructure-failure"))
+        if Status != "loaded":
+            Status = "infrastructure-failure"
+        return FabricServerLoadResult(
+            Status=Status,
+            RuntimeSeconds=monotonic() - StartedAt,
+            Diagnostics={
+                **dict(Response.get("Diagnostics", {})),
+                **({"ControlError": Response["Error"]} if "Error" in Response else {}),
+            },
+        )
+
+    def ControlRunningServer(
+        self,
+        *,
+        Action: str,
+        StepTicks: int | None = None,
+        ClearRegions: list[dict[str, object]] | None = None,
+        WorldBlocks: list[dict[str, object]] | None = None,
+        WorldPositions: list[list[int]] | None = None,
+        Command: str | None = None,
+    ) -> FabricServerControlResult:
+        """Configure, pause, resume, or step the running local server."""
+        StartedAt = monotonic()
+        Root = self.Configuration.Root
+        if Root is None:
+            return FabricServerControlResult(
+                Status="infrastructure-failure",
+                RuntimeSeconds=monotonic() - StartedAt,
+                Diagnostics={"Reason": "server-root-not-configured"},
+            )
+        try:
+            Configuration = json.loads((Root / "config" / "redstonecompiler-harness.json").read_text(encoding="utf-8"))
+            Request: dict[str, object] = {"Action": Action}
+            if StepTicks is not None:
+                Request["StepTicks"] = int(StepTicks)
+            if ClearRegions is not None:
+                Request["ClearRegions"] = ClearRegions
+            if WorldBlocks is not None:
+                Request["Blocks"] = WorldBlocks
+            if WorldPositions is not None:
+                Request["Positions"] = WorldPositions
+            if Command is not None:
+                Request["Command"] = Command
+            Response = self._Request(str(Configuration["Token"]), int(Configuration["Port"]), Request)
+        except Exception as Error:
+            return FabricServerControlResult(
+                Status="infrastructure-failure",
+                RuntimeSeconds=monotonic() - StartedAt,
+                Diagnostics={"Reason": "running-server-control-unavailable", "Error": str(Error)},
+            )
+        Status = str(Response.get("Status", "infrastructure-failure"))
+        if Status not in {
+            "configured", "paused", "resumed", "stepped", "cleared",
+            "observed", "updated", "command-complete",
+        }:
+            Status = "infrastructure-failure"
+        Diagnostics = dict(Response.get("Diagnostics", {}))
+        if "Blocks" in Response:
+            Diagnostics["Blocks"] = Response["Blocks"]
+        return FabricServerControlResult(
+            Status=Status,
+            RuntimeSeconds=monotonic() - StartedAt,
+            Diagnostics={
+                **Diagnostics,
+                **({"ControlError": Response["Error"]} if "Error" in Response else {}),
+            },
+        )
+
+    def _GetRunningControl(self, Root: Path) -> tuple[str, int] | None:
+        """Return a reachable manager-created endpoint without changing its state."""
+        ConfigurationPath = Root / "config" / "redstonecompiler-harness.json"
+        try:
+            Configuration = json.loads(ConfigurationPath.read_text(encoding="utf-8"))
+            Token = str(Configuration["Token"])
+            Port = int(Configuration["Port"])
+            Response = self._Request(Token, Port, {
+                "Action": "WorldReadBlocks",
+                "Positions": [],
+            })
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
+            return None
+        Status = str(Response.get("Status", ""))
+        if Status != "observed":
+            Error = str(Response.get("Error", "")).strip()
+            raise RuntimeError(
+                "running Fabric control did not acknowledge WorldReadBlocks: "
+                f"{Status or 'missing-status'}"
+                + (f" ({Error})" if Error else ""),
+            )
+        return Token, Port
+
+    def _ClearCanonicalSimulationWorld(
+        self,
+        Root: Path,
+        Manager: Path,
+    ) -> dict[str, object]:
+        """Live-clear all persisted simulation blocks before one validation paste."""
+        Result = self._RunCanonicalManager(Root, Manager, "clear")
+        if Result.get("Status") != "running" or Result.get("Cleared") is not True:
+            raise RuntimeError(
+                "canonical Fabric manager did not acknowledge the full "
+                f"simulation-world clear: {json.dumps(Result, sort_keys=True)}",
+            )
+        ClearMode = Result.get("ClearMode")
+        if ClearMode != "live-persisted-overworld-blocks":
+            raise RuntimeError(
+                "canonical Fabric manager did not acknowledge a live full-world "
+                f"block clear: {ClearMode!r}",
+            )
+        ClearedChunkCount = Result.get("ClearedChunkCount")
+        ClearedNonAirBlocks = Result.get("ClearedNonAirBlocks")
+        ScannedChunkCount = Result.get("ScannedChunkCount")
+        ScannedRegionFileCount = Result.get("ScannedRegionFileCount")
+        if (
+            type(ClearedChunkCount) is not int
+            or ClearedChunkCount < 0
+            or type(ClearedNonAirBlocks) is not int
+            or ClearedNonAirBlocks < 0
+            or type(ScannedChunkCount) is not int
+            or ScannedChunkCount < 0
+            or type(ScannedRegionFileCount) is not int
+            or ScannedRegionFileCount < 0
+        ):
+            raise RuntimeError(
+                "canonical Fabric manager returned invalid full-world clear "
+                f"diagnostics: {json.dumps(Result, sort_keys=True)}",
+            )
+        return {
+            "PrePasteWorldClearMode": str(ClearMode),
+            "PrePasteWorldClearChunkCount": ClearedChunkCount,
+            "PrePasteWorldClearNonAirBlockCount": ClearedNonAirBlocks,
+            "PrePasteWorldScannedChunkCount": ScannedChunkCount,
+            "PrePasteWorldScannedRegionFileCount": ScannedRegionFileCount,
+        }
+
+    def _RunCanonicalManager(
+        self,
+        Root: Path,
+        Manager: Path,
+        Action: str,
+    ) -> dict[str, object]:
+        """Run one manager action and return its authoritative JSON result."""
+        try:
+            Result = subprocess.run(
+                [sys.executable, str(Manager), Action],
+                cwd=Root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=self.Configuration.StartupTimeoutSeconds + 15.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as Error:
+            raise RuntimeError(
+                f"could not invoke the canonical Fabric manager: {Error}",
+            ) from Error
+        if Result.returncode != 0:
+            Detail = Result.stdout.strip() or "manager returned no diagnostic"
+            raise RuntimeError(
+                f"canonical Fabric manager failed to {Action}: {Detail}",
+            )
+        try:
+            Parsed = json.loads(Result.stdout)
+        except json.JSONDecodeError as Error:
+            raise RuntimeError(
+                "canonical Fabric manager returned non-JSON output for "
+                f"{Action}: {Result.stdout.strip() or 'empty output'}",
+            ) from Error
+        if not isinstance(Parsed, dict):
+            raise RuntimeError(
+                f"canonical Fabric manager returned a non-object result for {Action}",
+            )
+        return Parsed
+
+    def _RequestWhenReady(
+        self,
+        Token: str,
+        Request: dict[str, object],
+        *,
+        Port: int,
+    ) -> dict[str, object]:
+        Deadline = monotonic() + self.Configuration.StartupTimeoutSeconds
+        LastError: OSError | None = None
+        while monotonic() < Deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", Port), timeout=2) as Connection:
+                    Stream = Connection.makefile("rwb")
+                    Payload = {"Token": Token, **Request}
+                    Stream.write(json.dumps(Payload, sort_keys=True).encode("utf-8") + b"\n")
+                    Stream.flush()
+                    Response = Stream.readline()
+                    if not Response:
+                        raise RuntimeError("harness closed the control connection")
+                    Parsed = json.loads(Response.decode("utf-8"))
+                    if Parsed.get("Error") == "minecraft-server-not-ready":
+                        sleep(0.2)
+                        continue
+                    return Parsed
+            except (OSError, json.JSONDecodeError) as Error:
+                LastError = Error
+                sleep(0.2)
+        raise RuntimeError(f"Fabric harness was not ready: {LastError}")
+
+    @staticmethod
+    def _Request(Token: str, Port: int, Request: dict[str, object]) -> dict[str, object]:
+        with socket.create_connection(("127.0.0.1", Port), timeout=10) as Connection:
+            Stream = Connection.makefile("rwb")
+            Stream.write(json.dumps({"Token": Token, **Request}, sort_keys=True).encode("utf-8") + b"\n")
+            Stream.flush()
+            Response = Stream.readline()
+            if not Response:
+                raise RuntimeError("harness closed the control connection")
+            return json.loads(Response.decode("utf-8"))
+
+    @staticmethod
+    def _Failure(Reason: str, StartedAt: float, Extra: dict[str, object] | None = None) -> FabricServerValidationResult:
+        return FabricServerValidationResult(
+            Status="infrastructure-failure",
+            Backend="fabric-26.2",
+            RuntimeSeconds=monotonic() - StartedAt,
+            Diagnostics={"Reason": Reason, **(Extra or {})},
+        )

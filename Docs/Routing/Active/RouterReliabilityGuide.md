@@ -237,7 +237,7 @@ wall ceiling, and the evidence manifest is updated after every run. Inspecting
 the plan does not launch the compiler and does not qualify as evidence:
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3 --dry-run
 ```
 
@@ -245,7 +245,7 @@ After the lightweight gates pass, run the physical matrix once, without other
 scale routing jobs:
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 
@@ -302,7 +302,7 @@ does not replace the exact command above. Only after these lightweight checks
 pass should the physical harness be launched:
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 

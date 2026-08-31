@@ -24,8 +24,6 @@ type ExteriorConnectorResultValues = (Vec<Position>, bool, bool, usize);
 struct FrozenExteriorConnectorField {
     Targets: Vec<Position>,
     TargetSet: HashSet<Position>,
-    EnvelopeMinimum: Position,
-    EnvelopeMaximum: Position,
     BlockedGuideCells: HashSet<(i32, i32)>,
     Bounds: (i32, i32, i32, i32),
     AllowedNodes: HashSet<Position>,
@@ -55,10 +53,6 @@ fn SearchExteriorConnector(
             && !BlockedLocalSet.contains(&PositionValue)
             && Field.AllowedNodes.contains(&PositionValue)
             && !Field.BlockedGuideCells.contains(&(X, Z))
-            && !(Field.EnvelopeMinimum.0 <= X
-                && X <= Field.EnvelopeMaximum.0
-                && Field.EnvelopeMinimum.2 <= Z
-                && Z <= Field.EnvelopeMaximum.2)
     };
     let EdgeIsLegal = |First: Position, Second: Position| {
         Field.AllowedEdges.contains(&NormalizeEdge(First, Second))
@@ -104,7 +98,11 @@ fn SearchExteriorConnector(
             }
         }
     }
+    let UseManhattanTargetHeuristic = Targets.len() <= 16;
     let TargetDistance = |PositionValue: Position| {
+        if !UseManhattanTargetHeuristic {
+            return 0;
+        }
         Targets
             .iter()
             .map(|Target| (Target.0 - PositionValue.0).abs() + (Target.2 - PositionValue.2).abs())
@@ -168,8 +166,8 @@ fn SearchExteriorConnectorsBatchNative(
         .map(
             |(
                 Targets,
-                EnvelopeMinimum,
-                EnvelopeMaximum,
+                _EnvelopeMinimum,
+                _EnvelopeMaximum,
                 BlockedGuideCells,
                 Bounds,
                 AllowedNodes,
@@ -177,8 +175,6 @@ fn SearchExteriorConnectorsBatchNative(
             )| FrozenExteriorConnectorField {
                 TargetSet: Targets.iter().copied().collect(),
                 Targets,
-                EnvelopeMinimum,
-                EnvelopeMaximum,
                 BlockedGuideCells: BlockedGuideCells.into_iter().collect(),
                 Bounds,
                 AllowedNodes: AllowedNodes.into_iter().collect(),

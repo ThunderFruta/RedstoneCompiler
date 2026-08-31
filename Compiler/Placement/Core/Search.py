@@ -80,6 +80,22 @@ def ShouldReleasePartialLocalTreeBeforeSearch(
         and LocalTargetCount != TotalTargetCount
     )
 
+
+def JointPlacementSearchRetentionLimit(
+    *,
+    AvailableStateCount: int,
+    PublishedCandidateCount: int,
+    EnableClusterInterfacePlacementFeasibility: bool,
+) -> int:
+    """Bound exact interface screening relative to published candidates."""
+    RetentionMultiplier = (
+        2 if EnableClusterInterfacePlacementFeasibility else 1
+    )
+    return min(
+        AvailableStateCount,
+        PublishedCandidateCount * RetentionMultiplier,
+    )
+
 def SelectFocusedCutEpochClusters(
     RankedRelocationClusters: Iterable[int],
     Enabled: bool,
@@ -989,12 +1005,11 @@ def OptimizeJointClusterPlacement(
         OrderedBeam = InterfaceFeasibleBeam
     RetainedBeam = [OrderedBeam[0]]
     PendingBeam = list(OrderedBeam[1:])
-    SearchRetentionLimit = min(
-        len(OrderedBeam),
-        (
-            RetainedCandidates * 2
-            if EnableClusterInterfacePlacementFeasibility
-            else RetainedCandidates
+    SearchRetentionLimit = JointPlacementSearchRetentionLimit(
+        AvailableStateCount=len(OrderedBeam),
+        PublishedCandidateCount=RetainedCandidates,
+        EnableClusterInterfacePlacementFeasibility=(
+            EnableClusterInterfacePlacementFeasibility
         ),
     )
 
@@ -1015,15 +1030,26 @@ def OptimizeJointClusterPlacement(
             for ClusterIndex in DiversityClusterIndices
         )
 
+    InterfaceOwnershipByState: dict[
+        tuple[tuple[tuple[int, int], ...], tuple[int, ...]], str
+    ] = {}
+    InterfaceOwnershipEvaluationCount = 0
+
     def InterfaceOwnershipFingerprint(
         State: tuple[
             tuple[object, ...], tuple[tuple[int, int], ...], tuple[int, ...]
         ],
     ) -> str:
+        nonlocal InterfaceOwnershipEvaluationCount
         if ClusterInterfaceTopologyModel is None:
             return ""
         _Score, StateSlots, StateOrientations = State
-        return ScoreClusterInterfacePlacement(
+        StateKey = StateSlots, StateOrientations
+        CachedFingerprint = InterfaceOwnershipByState.get(StateKey)
+        if CachedFingerprint is not None:
+            return CachedFingerprint
+        InterfaceOwnershipEvaluationCount += 1
+        Fingerprint = ScoreClusterInterfacePlacement(
             Module,
             Clusters,
             {
@@ -1040,6 +1066,8 @@ def OptimizeJointClusterPlacement(
             EffectiveHigherOrderConflictSets,
             Topology=ClusterInterfaceTopologyModel,
         ).Pattern.OwnershipFingerprint
+        InterfaceOwnershipByState[StateKey] = Fingerprint
+        return Fingerprint
 
     while (
         PendingBeam
@@ -1123,6 +1151,9 @@ def OptimizeJointClusterPlacement(
         "CandidateCount": CandidateCount,
         "SearchRetentionLimit": SearchRetentionLimit,
         "PublishedRetentionLimit": RetainedCandidates,
+        "InterfaceOwnershipEvaluationCount": (
+            InterfaceOwnershipEvaluationCount
+        ),
         "CutPairClusterEdges": [
             list(Edge) for Edge in CutPairClusterEdges
         ],

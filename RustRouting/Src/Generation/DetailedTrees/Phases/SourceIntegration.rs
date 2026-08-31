@@ -117,7 +117,7 @@ macro_rules! IntegratePreparedDetailedSource {
                     })
                     .unwrap_or(false);
                 let RemainingStrength = if CanRefreshCurrent {
-                    let Some(Facing) = RepeaterFacing(CurrentState.0, Next) else {
+                    let Some(Facing) = RepeaterInputFacing(CurrentState.0, Next) else {
                         return $Failure("NoPath", "NoPathGeometry", 1, 0, $ExpansionCount);
                     };
                     $Repeaters.insert(CurrentState.0, Facing);
@@ -128,7 +128,7 @@ macro_rules! IntegratePreparedDetailedSource {
                     let Some(After) = SourceBranch.get(BranchIndex + 1).copied() else {
                         break;
                     };
-                    let Some(Facing) = RepeaterFacing(Next, After) else {
+                    let Some(Facing) = RepeaterInputFacing(Next, After) else {
                         return $Failure("NoPath", "NoPathGeometry", 1, 0, $ExpansionCount);
                     };
                     $Repeaters.insert(Next, Facing);
@@ -229,7 +229,7 @@ macro_rules! IntegratePreparedDetailedSource {
                     $Tree.insert(Second);
                     $StateByNode.insert(First, FirstState);
                     $StateByNode.insert(Second, SecondState);
-                    let Some(Facing) = RepeaterFacing(First, Second) else {
+                    let Some(Facing) = RepeaterInputFacing(First, Second) else {
                         return $Failure("NoPath", "NoPathGeometry", 1, 0, $ExpansionCount);
                     };
                     $Repeaters.insert(First, Facing);

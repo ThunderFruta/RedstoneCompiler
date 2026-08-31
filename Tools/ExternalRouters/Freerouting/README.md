@@ -8,10 +8,10 @@ repair command.
 Run the complete external matrix from the repository root:
 
 ```bash
-python3 Scripts/RunFreeroutingBenchmark.py
+python3 Scripts/Routing/RunFreeroutingBenchmark.py
 ```
 
-The defaults mirror `Scripts/RunRouterAcceptance.py`: FullAdder 5 times,
+The defaults mirror `Scripts/Routing/RunRouterAcceptance.py`: FullAdder 5 times,
 RippleCarryAdder4 3 times, RippleCarryAdder8 3 times, and
 CarryLookaheadAdder4 2 times. Results are written below
 `Output/Benchmarks/Freerouting/<UTC timestamp>/`. A one-run smoke check can be

@@ -7,7 +7,7 @@ pub(in crate::Escape) fn BuildLayeredAccessGuideCandidateGroups(
     Controls: &LayeredAccessGuideControlsValue,
     GraphAdjacencyValues: &[(Position, Vec<Position>)],
     MemberIndex: usize,
-    GraphIndex: usize,
+    _GraphIndex: usize,
     MaximumY: i32,
     RequirePowerCertifiedAccess: bool,
     SharedAccessRampCache: &LayeredGuideAccessRampCache,
@@ -375,7 +375,7 @@ pub(in crate::Escape) fn BuildLayeredAccessGuideCandidateGroups(
         let mut AccessRampConnectivityRejectionCount = 0usize;
         let mut AccessRampSelfConflictRejectionCount = 0usize;
         let mut AccessRampBaseConflictRejectionCount = 0usize;
-        let mut PoweredTreeRejectionCount = 0usize;
+        let PoweredTreeRejectionCount = 0usize;
         let mut AccessWitnessExpansionCount = 0usize;
         let mut AccessWitnessByPhysicalGuide = HashMap::<
             (usize, String, i32, Vec<Position>),

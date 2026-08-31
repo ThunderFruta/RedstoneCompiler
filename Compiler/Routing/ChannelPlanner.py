@@ -6,7 +6,10 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from ..Placement.Geometry import GetGateInputAccess
+from ..Placement.Geometry import (
+    BuildPlacementPinAccessWitness,
+    PlacementPinAccessWitness,
+)
 from .Policy import GlobalRoutingPolicy
 from .ResourceGraph import (
     FindClaimConflicts,
@@ -167,8 +170,9 @@ def BuildNetRoutingProfiles(
     Placed: Any,
     RetryCounts: dict[str, int] | None = None,
     AccessLength: int | None = None,
+    AccessWitness: PlacementPinAccessWitness | None = None,
 ) -> dict[str, NetRoutingProfile]:
-    """Classify nets by deterministic span, fanout, and retry criticality."""
+    """Classify nets while consuming one catalog-derived access witness."""
     RetryCounts = RetryCounts or {}
     AccessLength = (
         DefaultRedstoneRoutingTechnology.AccessLength
@@ -177,6 +181,21 @@ def BuildNetRoutingProfiles(
     )
     if AccessLength < 1:
         raise ValueError("AccessLength must be positive")
+    HasCatalogTransformMetadata = all(
+        hasattr(Gate, "Rotation") and hasattr(Gate, "MirrorX")
+        for Gate in Placed.PlacedGates
+    )
+    AccessWitness = AccessWitness or BuildPlacementPinAccessWitness(
+        Placed.PlacedGates,
+        AccessLength=AccessLength,
+        RequireCatalogMatch=HasCatalogTransformMetadata,
+    )
+    if not AccessWitness.Complete or (
+        HasCatalogTransformMetadata and not AccessWitness.CatalogMatched
+    ):
+        raise ValueError("routing profiles require a complete catalog witness")
+    if AccessLength > AccessWitness.AccessLength:
+        raise ValueError("routing profile exceeds its frozen access witness")
     ProducerGates = {
         Signal: Gate
         for Gate in Placed.PlacedGates
@@ -187,16 +206,15 @@ def BuildNetRoutingProfiles(
     TargetAccessPaths: dict[str, dict[Position3, tuple[Position3, ...]]] = defaultdict(dict)
     for Gate in Placed.PlacedGates:
         for InputIndex, Signal in enumerate(Gate.Inputs):
-            Pin, Direction = GetGateInputAccess(Gate, InputIndex)
-            Targets[Signal].append(Pin)
-            TargetAccessPaths[Signal][Pin] = tuple(
-                (
-                    Pin[0] + Direction[0] * Offset,
-                    Pin[1] + Direction[1] * Offset,
-                    Pin[2] + Direction[2] * Offset,
-                )
-                for Offset in range(AccessLength)
+            Selection = AccessWitness.FindSelection(
+                str(Signal),
+                str(Gate.Name),
+                "Target",
+                f"Input{InputIndex}",
             )
+            Pin = Selection.Terminal
+            Targets[Signal].append(Pin)
+            TargetAccessPaths[Signal][Pin] = Selection.Path[:AccessLength]
 
     ClaimsBySignal: dict[str, list[LocalRouteClaim]] = defaultdict(list)
     for Claim in getattr(Placed, "LocalRouteClaims", ()) or ():
@@ -208,15 +226,14 @@ def BuildNetRoutingProfiles(
         Producer = ProducerGates.get(Signal)
         if Producer is None:
             continue
-        Root = Producer.OutputPin
-        SourceAccessPath = tuple(
-            (
-                Root[0] + Producer.OutputDirection[0] * Offset,
-                Root[1] + Producer.OutputDirection[1] * Offset,
-                Root[2] + Producer.OutputDirection[2] * Offset,
-            )
-            for Offset in range(AccessLength)
+        SourceSelection = AccessWitness.FindSelection(
+            str(Signal),
+            str(Producer.Name),
+            "Source",
+            "Output0",
         )
+        Root = SourceSelection.Terminal
+        SourceAccessPath = SourceSelection.Path[:AccessLength]
         UniqueTargets = tuple(sorted(set(Targets[Signal])))
         SignalClaims = tuple(ClaimsBySignal.get(Signal, ()))
         ConnectedTargets = {

@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..Components.Fabric import BuildComponentEgressPaths
 from ..Components.Fabric import FilterExternalSourcePoweredSeamCandidateDomains
 from ..Contracts.PhysicalInterface import PhysicalPortLaneFactor
+from ..Contracts.PhysicalInterface import PhysicalPortLocalAccessFactor
 from ..Contracts.PhysicalInterface import PhysicalPortSeamFactor
 from ..Reliability import BuildStableFingerprint
 from ..ResourceGraph import FindSelfClaimConflicts
@@ -17,19 +18,30 @@ from .TrackPortfolio import PhysicalPortPathsOwnExclusiveSeam
 from functools import partial
 from .PortPreparationState import PortPreparationState, SetPortPreparationState
 from .PortPreparationHelpers import BuildGlobalPathToGuide, DeduplicateCertifiedAccessCandidates
-from ..Contracts.PhysicalInterface import PhysicalPortLocalAccessFactor
 from ..Contracts.PhysicalInterface import PhysicalPortLocalApertureSupport
-from ..Contracts.PhysicalInterface import PhysicalSignalLocalFactorReuseEntry
 from ..Contracts.PhysicalInterface import PreparedPhysicalComponentPortFactorDomain
-from ..Contracts.PhysicalInterface import PreparedPhysicalSignalLocalFactorDomain
 from time import monotonic
-from .PhysicalGuides import BuildPhysicalComponentBoundaryPortReservation, PreparePhysicalSignalLocalFactorDomain
-
-def BuildPhysicalPortLaneFactors(Context):
+from .PhysicalGuides import BuildPhysicalComponentBoundaryPortReservation
+def BuildPhysicalPortLaneFactors(
+    Context,
+    Signals: frozenset[str] | None = None,
+):
     for Context.Port in Context.Problem.Interface.Ports:
+        if Signals is not None and Context.Port.Signal not in Signals:
+            continue
         Context.PortLayer = int(Context.CoarsePlan.Layers.get(Context.Port.Signal, 0))
         Context.Domains = tuple(sorted((Domain for Domain in Context.Problem.OwnedTerminalDomains if Domain.Signal == Context.Port.Signal), key=lambda Value: Value.Terminal))
-        Context.SignalLaneDiagnostics: dict[str, object] = {'OwnedTerminalDomainCount': len(Context.Domains), 'EmptyOwnedTerminalCount': sum((1 for Domain in Context.Domains if not Domain.Candidates)), 'CandidateCountByTerminal': [{'Terminal': list(Domain.Terminal), 'CandidateCount': len(Domain.Candidates)} for Domain in Context.Domains], 'CertifiedCandidateCount': 0, 'CertifiedLayerMatchCount': 0, 'CertifiedLayerMismatchCount': 0, 'CertifiedCandidateLayerCounts': {}, 'RequiredPortLayer': Context.PortLayer, 'CertifiedGuideLayerReassignment': Context.CertifiedGuideLayerReassignmentsBySignal.get(Context.Port.Signal), 'CertifiedMissingOwnedCandidateFingerprintCount': 0, 'CertifiedIncompleteCandidateDomainMappingCount': 0, 'CertifiedShortLocalPathCount': 0, 'CertifiedInvalidOutwardPrimitiveCount': 0, 'CertifiedGuideDisconnectedCount': 0, 'CertifiedNonExclusiveSeamPathCount': 0, 'CertifiedSelfClaimConflictCount': 0, 'CertifiedForeignCorridorConflictCount': 0, 'CertifiedUnarySeamInfeasibleCount': 0, 'ForeignCorridorConflictSignals': {}, 'ForeignCorridorConflictResources': [], 'ForeignCorridorConflictSamples': [], 'CertifiedLaneFactorCount': 0, 'CertifiedCandidateDomainProjectionBuildCount': 0, 'CertifiedCandidateDomainProjectionHitCount': 0, 'CommonFabricComponentCount': 0, 'FabricIngressNodeCount': 0, 'EgressPathCount': 0, 'EnvelopeExitPathCount': 0, 'InvalidPrimitivePathCount': 0, 'NonExclusiveSeamPathCount': 0, 'SelfClaimConflictPathCount': 0, 'ForeignCorridorConflictPathCount': 0, 'UnarySeamInfeasiblePathCount': 0, 'GeneratedSeamCount': 0, 'LaneFactorCount': 0, 'NativeConnectorBatchWorkItems': Context.NativeConnectorBatchWorkItems, 'NativeConnectorBatchActiveWorkerCount': Context.NativeConnectorBatchActiveWorkerCount, 'Reason': 'unclassified'}
+        Context.SignalLaneDiagnostics: dict[str, object] = {'OwnedTerminalDomainCount': len(Context.Domains), 'EmptyOwnedTerminalCount': sum((1 for Domain in Context.Domains if not Domain.Candidates)), 'CandidateCountByTerminal': [{'Terminal': list(Domain.Terminal), 'CandidateCount': len(Domain.Candidates)} for Domain in Context.Domains], 'CertifiedCandidateCount': 0, 'CertifiedLayerMatchCount': 0, 'CertifiedLayerMismatchCount': 0, 'CertifiedCandidateLayerCounts': {}, 'RequiredPortLayer': Context.PortLayer, 'CertifiedGuideLayerReassignment': Context.CertifiedGuideLayerReassignmentsBySignal.get(Context.Port.Signal), 'CertifiedMissingOwnedCandidateFingerprintCount': 0, 'CertifiedIncompleteCandidateDomainMappingCount': 0, 'CertifiedShortLocalPathCount': 0, 'CertifiedInvalidOutwardPrimitiveCount': 0, 'CertifiedGuideDisconnectedCount': 0, 'CertifiedNonExclusiveSeamPathCount': 0, 'CertifiedSelfClaimConflictCount': 0, 'CertifiedForeignCorridorConflictCount': 0, 'CertifiedUnarySeamInfeasibleCount': 0, 'CertifiedStraightExteriorTargetCount': Context.CertifiedStraightExteriorTargetCountBySignal.get(Context.Port.Signal, 0), 'ForeignCorridorConflictSignals': {}, 'ForeignCorridorConflictResources': [], 'ForeignCorridorConflictSamples': [], 'CertifiedLaneFactorCount': 0, 'CertifiedCandidateDomainProjectionBuildCount': 0, 'CertifiedCandidateDomainProjectionHitCount': 0, 'CommonFabricComponentCount': 0, 'FabricIngressNodeCount': 0, 'EgressPathCount': 0, 'EnvelopeExitPathCount': 0, 'InvalidPrimitivePathCount': 0, 'NonExclusiveSeamPathCount': 0, 'SelfClaimConflictPathCount': 0, 'ForeignCorridorConflictPathCount': 0, 'UnarySeamInfeasiblePathCount': 0, 'GeneratedSeamCount': 0, 'LaneFactorCount': 0, 'GuideCellCount': len(Context.CoarsePlan.Guides.get(Context.Port.Signal, ())), 'ExteriorFabricLayerAvailable': Context.PortLayer in Context.ExteriorFabricByLayer, 'GlobalPathRejectionCounts': Context.GlobalPathRejectionCountsBySignal.setdefault(Context.Port.Signal, {}), 'GlobalApertureTargetDiagnostics': Context.GlobalApertureTargetDiagnosticsBySignal.setdefault(Context.Port.Signal, {}), 'NativeConnectorBatchWorkItems': Context.NativeConnectorBatchWorkItems, 'NativeConnectorBatchActiveWorkerCount': Context.NativeConnectorBatchActiveWorkerCount, 'Reason': 'unclassified'}
+        Context.UnarySeamEligibilityDiagnostics = (
+            getattr(
+                Context,
+                "PhysicalLocalSeamEligibilityDiagnosticsBySignal",
+                {},
+            ).setdefault(str(Context.Port.Signal), {})
+        )
+        Context.SignalLaneDiagnostics[
+            "CertifiedUnarySeamEligibilityDiagnostics"
+        ] = Context.UnarySeamEligibilityDiagnostics
         Context.LaneFactorDiagnosticsBySignal[Context.Port.Signal] = Context.SignalLaneDiagnostics
         if not Context.Domains or any((not Domain.Candidates for Domain in Context.Domains)):
             Context.LaneFactorsBySignal[Context.Port.Signal] = ()
@@ -73,7 +85,33 @@ def BuildPhysicalPortLaneFactors(Context):
                 if len(Context.LocalPath) < 2:
                     Context.SignalLaneDiagnostics['CertifiedShortLocalPathCount'] = int(Context.SignalLaneDiagnostics['CertifiedShortLocalPathCount']) + 1
                     continue
-                Context.GlobalPath = BuildGlobalPathToGuide(Context, Context.LocalPath[-1], tuple((Context.LocalPath[-1][Index] - Context.LocalPath[-2][Index] for Index in range(3))), Context.GuideCells, Context.Port.Signal, Context.PortLayer, Context.ForeignCorridorClaims)
+                # Prove the component-local powered seam before constructing
+                # its exterior connector.  This filter depends only on the
+                # certified local path and owned terminal domains, so running
+                # it first preserves the exact factor domain while avoiding
+                # global guide searches for locally impossible seams.
+                Context.PreparedCertifiedLocalSeam = getattr(
+                    Context,
+                    'CertifiedPhysicalPortLocalSeamsByCandidate',
+                    {},
+                ).get((
+                    str(Context.Port.Signal),
+                    str(Context.CertifiedCandidate.CandidateFingerprint),
+                ))
+                Context.PoweredCandidateDomains = (
+                    Context.PreparedCertifiedLocalSeam.PoweredCandidateDomains
+                    if Context.PreparedCertifiedLocalSeam is not None
+                    else FilterExternalSourcePoweredSeamCandidateDomains(Context.Problem, Context.Port.Signal, Context.Domains, Context.SelectedCandidateDomains, tuple(Context.LocalPath), FabricAdjacency=Context.PoweredSeamFabricAdjacency, FabricParentCache=Context.PoweredSeamFabricParentCache, RouteClaimsCache=Context.PoweredSeamRouteClaimsCache, TreeRepeaterSubproblemCache=Context.PoweredSeamTreeRepeaterSubproblemCache, TreeRepeaterCacheStatistics=Context.PoweredSeamTreeRepeaterCacheStatistics, CandidateEligibilityDiagnostics=Context.UnarySeamEligibilityDiagnostics)
+                )
+                if any((not Values for Values in Context.PoweredCandidateDomains)):
+                    Context.SignalLaneDiagnostics['CertifiedUnarySeamInfeasibleCount'] = int(Context.SignalLaneDiagnostics['CertifiedUnarySeamInfeasibleCount']) + 1
+                    continue
+                Context.BoundCandidates = (
+                    Context.PreparedCertifiedLocalSeam.BoundCandidates
+                    if Context.PreparedCertifiedLocalSeam is not None
+                    else tuple((Values[0] for Values in Context.PoweredCandidateDomains)) if all((len(Values) == 1 for Values in Context.PoweredCandidateDomains)) else ()
+                )
+                Context.GlobalPath = BuildGlobalPathToGuide(Context, Context.LocalPath[-1], tuple((Context.LocalPath[-1][Index] - Context.LocalPath[-2][Index] for Index in range(3))), Context.GuideCells, Context.Port.Signal, Context.PortLayer, Context.ForeignCorridorClaims, FabricAttachment=Context.CertifiedCandidate.FabricAttachment)
                 if not Context.GlobalPath:
                     Context.SignalLaneDiagnostics['CertifiedGuideDisconnectedCount'] = int(Context.SignalLaneDiagnostics['CertifiedGuideDisconnectedCount']) + 1
                     continue
@@ -83,11 +121,6 @@ def BuildPhysicalPortLaneFactors(Context):
                 if any((Context.ResourceGraph.BuildPrimitive(First, Second) is None or (Context.PortLayer in Context.ExteriorFabricByLayer and (not Context.ExteriorFabricByLayer[Context.PortLayer].AllowsEdge(First, Second))) for First, Second in zip(Context.GlobalPath, Context.GlobalPath[1:]))):
                     Context.SignalLaneDiagnostics['CertifiedInvalidOutwardPrimitiveCount'] = int(Context.SignalLaneDiagnostics['CertifiedInvalidOutwardPrimitiveCount']) + 1
                     continue
-                Context.PoweredCandidateDomains = FilterExternalSourcePoweredSeamCandidateDomains(Context.Problem, Context.Port.Signal, Context.Domains, Context.SelectedCandidateDomains, Context.LocalPath, FabricAdjacency=Context.PoweredSeamFabricAdjacency, FabricParentCache=Context.PoweredSeamFabricParentCache, RouteClaimsCache=Context.PoweredSeamRouteClaimsCache, TreeRepeaterSubproblemCache=Context.PoweredSeamTreeRepeaterSubproblemCache, TreeRepeaterCacheStatistics=Context.PoweredSeamTreeRepeaterCacheStatistics)
-                if any((not Values for Values in Context.PoweredCandidateDomains)):
-                    Context.SignalLaneDiagnostics['CertifiedUnarySeamInfeasibleCount'] = int(Context.SignalLaneDiagnostics['CertifiedUnarySeamInfeasibleCount']) + 1
-                    continue
-                Context.BoundCandidates = tuple((Values[0] for Values in Context.PoweredCandidateDomains)) if all((len(Values) == 1 for Values in Context.PoweredCandidateDomains)) else ()
                 Context.SeamClaims = Context.ResourceGraph.BuildRouteClaims(frozenset((*Context.LocalPath, *Context.GlobalPath)))
                 if FindSelfClaimConflicts({Context.Port.Signal: Context.SeamClaims}):
                     Context.SignalLaneDiagnostics['CertifiedSelfClaimConflictCount'] = int(Context.SignalLaneDiagnostics['CertifiedSelfClaimConflictCount']) + 1
@@ -142,7 +175,7 @@ def BuildPhysicalPortLaneFactors(Context):
                 Context.LaneFactorExpansionCount += 1
                 if Context.WorkCheck is not None:
                     Context.WorkCheck({'Stage': 'physical-port-lane-assignment', 'Signal': Context.Port.Signal, 'ComponentIndex': Context.ComponentIndex, 'LaneFactorExpansionCount': Context.LaneFactorExpansionCount, 'AccessFactorExpansionCount': Context.AccessFactorExpansionCount, 'SeamFactorExpansionCount': Context.SeamFactorExpansionCount, 'ConnectorSearchCount': Context.GlobalConnectorSearchCount, 'ConnectorExpansionCount': Context.GlobalConnectorExpansionCount, 'ConnectorCacheHitCount': Context.GlobalConnectorCacheHitCount, 'GuideFieldBuildCount': Context.GlobalGuideFieldBuildCount, 'GuideFieldExpansionCount': Context.GlobalGuideFieldExpansionCount, 'GuideFieldHitCount': Context.GlobalGuideFieldHitCount, 'GuideFieldCanonicalPathCount': Context.GlobalGuideFieldCanonicalPathCount, 'GuideFieldFallbackCount': Context.GlobalGuideFieldFallbackCount, 'PoweredSeamRouteClaimsCacheSize': len(Context.PoweredSeamRouteClaimsCache)})
-                for Context.LocalPath in BuildComponentEgressPaths(Context.FabricAttachment, TargetY=Context.ResourceGraph.Technology.RoutingY(Context.MinimumPlacementY, Context.PortLayer)):
+                for Context.LocalPath in BuildComponentEgressPaths(Context.FabricAttachment, TargetY=Context.ResourceGraph.Technology.RoutingY(Context.MinimumPlacementY, Context.PortLayer), EnvelopeMinimum=Context.ComponentEnvelopeMinimum, EnvelopeMaximum=Context.ComponentEnvelopeMaximum):
                     Context.SignalLaneDiagnostics['EgressPathCount'] = int(Context.SignalLaneDiagnostics['EgressPathCount']) + 1
                     Context.LocalDirection = (Context.LocalPath[1][0] - Context.LocalPath[0][0], Context.LocalPath[1][2] - Context.LocalPath[0][2])
                     Context.LocalEndpoint = Context.LocalPath[-1]
@@ -150,11 +183,11 @@ def BuildPhysicalPortLaneFactors(Context):
                     if not Context.ExitsFabricEnvelope:
                         continue
                     Context.SignalLaneDiagnostics['EnvelopeExitPathCount'] = int(Context.SignalLaneDiagnostics['EnvelopeExitPathCount']) + 1
-                    Context.PoweredCandidateDomains = FilterExternalSourcePoweredSeamCandidateDomains(Context.Problem, Context.Port.Signal, Context.Domains, Context.ComponentCandidatesByDomain, tuple(Context.LocalPath), FabricAdjacency=Context.PoweredSeamFabricAdjacency, FabricParentCache=Context.PoweredSeamFabricParentCache, RouteClaimsCache=Context.PoweredSeamRouteClaimsCache, TreeRepeaterSubproblemCache=Context.PoweredSeamTreeRepeaterSubproblemCache, TreeRepeaterCacheStatistics=Context.PoweredSeamTreeRepeaterCacheStatistics)
+                    Context.PoweredCandidateDomains = FilterExternalSourcePoweredSeamCandidateDomains(Context.Problem, Context.Port.Signal, Context.Domains, Context.ComponentCandidatesByDomain, tuple(Context.LocalPath), FabricAdjacency=Context.PoweredSeamFabricAdjacency, FabricParentCache=Context.PoweredSeamFabricParentCache, RouteClaimsCache=Context.PoweredSeamRouteClaimsCache, TreeRepeaterSubproblemCache=Context.PoweredSeamTreeRepeaterSubproblemCache, TreeRepeaterCacheStatistics=Context.PoweredSeamTreeRepeaterCacheStatistics, CandidateEligibilityDiagnostics=Context.UnarySeamEligibilityDiagnostics)
                     if any((not Values for Values in Context.PoweredCandidateDomains)):
                         Context.SignalLaneDiagnostics['UnarySeamInfeasiblePathCount'] = int(Context.SignalLaneDiagnostics['UnarySeamInfeasiblePathCount']) + 1
                         continue
-                    Context.GlobalPath = BuildGlobalPathToGuide(Context, Context.LocalEndpoint, (Context.LocalDirection[0], Context.LocalPath[-1][1] - Context.LocalPath[-2][1], Context.LocalDirection[1]), Context.GuideCells, Context.Port.Signal, Context.PortLayer, Context.ForeignCorridorClaims)
+                    Context.GlobalPath = BuildGlobalPathToGuide(Context, Context.LocalEndpoint, (Context.LocalDirection[0], Context.LocalPath[-1][1] - Context.LocalPath[-2][1], Context.LocalDirection[1]), Context.GuideCells, Context.Port.Signal, Context.PortLayer, Context.ForeignCorridorClaims, FabricAttachment=Context.FabricAttachment)
                     if not Context.GlobalPath:
                         continue
                     if not PhysicalPortPathsOwnExclusiveSeam(Context.LocalPath, Context.GlobalPath):
@@ -225,27 +258,11 @@ def CertifyPhysicalPortFactors(Context):
             Context.Diagnostics['Reason'] = 'all-exterior-apertures-conflict-with-immutable-claims' if not Context.LaneFactorsBySignal.get(Context.Signal) else 'exterior-fixed-claim-apertures-pruned'
 
 def CachePhysicalPortLocalFactors(Context):
+    """Finalize authoritative factors without eager derived-domain publication."""
     Context.LocalFactorPreparationStartedAt = monotonic()
-    Context.LocalFactorDomainsBySignal: dict[str, PreparedPhysicalSignalLocalFactorDomain] = {}
+    Context.LocalFactorDomainsBySignal = {}
     Context.LocalFactorCacheHitSignals: list[str] = []
     Context.LocalFactorRebuiltSignals: list[str] = []
-    Context.CachedLocalFactorsBySignal: dict[str, tuple[PhysicalPortLocalAccessFactor, ...]] = {}
-    Context.LocalFactorCache = Context.Resources.PhysicalSignalLocalFactorDomainCache
-    for Context.Signal, Context.Factors in Context.LocalAccessFactorsBySignal:
-        Context.Domain = PreparePhysicalSignalLocalFactorDomain(Context.Problem, Context.AccessCertificate, Context.Signal, Context.ResourceGraph, LocalAccessFactors=Context.Factors, TechnologyFingerprint=Context.TechnologyFingerprint)
-        Context.Existing = Context.LocalFactorCache.get(Context.Domain.LocalIdentityFingerprint)
-        if Context.Existing is not None:
-            if Context.Existing.Domain != Context.Domain:
-                raise ValueError('physical signal-local factor cache identity mismatch')
-            Context.LocalFactorCacheHitSignals.append(Context.Signal)
-            Context.Domain = Context.Existing.Domain
-        else:
-            Context.LocalFactorRebuiltSignals.append(Context.Signal)
-            if Context.Domain.Complete:
-                Context.LocalFactorCache[Context.Domain.LocalIdentityFingerprint] = PhysicalSignalLocalFactorReuseEntry(LocalIdentityFingerprint=Context.Domain.LocalIdentityFingerprint, Domain=Context.Domain, SourcePlacementFingerprint=Context.Problem.PlacementFingerprint)
-        Context.LocalFactorDomainsBySignal[Context.Signal] = Context.Domain
-        Context.CachedLocalFactorsBySignal[Context.Signal] = Context.Domain.LocalAccessFactors
-    Context.LocalAccessFactorsBySignal = tuple(((Signal, Context.CachedLocalFactorsBySignal[Signal]) for Signal, _Factors in Context.LocalAccessFactorsBySignal))
     Context.LocalFactorPreparationElapsedSeconds = monotonic() - Context.LocalFactorPreparationStartedAt
     Context.ExteriorFactorPreparationElapsedSeconds = Context.LocalFactorPreparationStartedAt - Context.ExteriorFactorPreparationStartedAt
     Context.EmptySignals = tuple(sorted((Signal for Signal, Values in Context.LaneFactorsBySignal.items() if not Values)))
@@ -259,6 +276,6 @@ def CachePhysicalPortLocalFactors(Context):
     Context.LocalApertureSupportsByOption = tuple(((Key, tuple(sorted(Values, key=lambda Value: Value.SupportFingerprint))) for Key, Values in sorted(Context.LocalApertureSupportsByOptionValues.items())))
 
 def FinalizePhysicalPortPreparation(Context):
-    Context.Preparation = PreparedPhysicalComponentPortFactorDomain(DomainFingerprint=Context.FactorDomainFingerprint, PlacementFingerprint=Context.Problem.PlacementFingerprint, ComponentGraphFingerprint=Context.ComponentGraphFingerprint, ResourceGraphFingerprint=Context.ResourceGraphFingerprint, GuideFingerprint=Context.GuideFingerprint, AccessCertificateFingerprint=Context.AccessCertificate.CertificateFingerprint, AccessCertificatePlacementFingerprint=Context.AccessCertificate.PlacementFingerprint, AccessCertificateResourceGraphFingerprint=Context.AccessCertificate.ResourceGraphFingerprint, AccessCertificateComponentGraphFingerprint=Context.AccessCertificate.ComponentGraphFingerprint, Problem=Context.Problem, CoarsePlan=Context.CoarsePlan, AccessCertificate=Context.AccessCertificate, ChannelReservations=tuple(Context.ChannelReservations), LaneFactorsBySignal=tuple(sorted(Context.LaneFactorsBySignal.items())), DiagnosticsBySignal=tuple(((Signal, Context.LaneFactorDiagnosticsBySignal[Signal]) for Signal in sorted(Context.LaneFactorDiagnosticsBySignal))), FabricOrigin=Context.FabricOrigin, MinimumPlacementY=Context.MinimumPlacementY, ComponentEnvelopeMinimum=Context.ComponentEnvelopeMinimum, ComponentEnvelopeMaximum=Context.ComponentEnvelopeMaximum, FabricAdjacency=tuple(((Node, tuple(sorted(Neighbors))) for Node, Neighbors in sorted(Context.FabricAdjacency.items()))), ComponentKeepoutNodes=Context.ComponentKeepoutNodes, ComponentKeepoutGuideCellsByLayer=tuple(sorted(Context.ComponentKeepoutGuideCellsByLayer.items())), LaneFactorExpansionCount=Context.LaneFactorExpansionCount, AccessFactorExpansionCount=Context.AccessFactorExpansionCount, SeamFactorExpansionCount=Context.SeamFactorExpansionCount, GlobalConnectorSearchCount=Context.GlobalConnectorSearchCount, GlobalConnectorCacheHitCount=Context.GlobalConnectorCacheHitCount, GlobalConnectorPortableCacheHitCount=Context.GlobalConnectorPortableCacheHitCount, GlobalConnectorPortableCacheValidationRejectCount=Context.GlobalConnectorPortableCacheValidationRejectCount, GlobalConnectorPortableCacheStoreCount=Context.GlobalConnectorPortableCacheStoreCount, GlobalConnectorExpansionCount=Context.GlobalConnectorExpansionCount, GlobalGuideFieldBuildCount=Context.GlobalGuideFieldBuildCount, GlobalGuideFieldExpansionCount=Context.GlobalGuideFieldExpansionCount, GlobalGuideFieldHitCount=Context.GlobalGuideFieldHitCount, GlobalGuideFieldCanonicalPathCount=Context.GlobalGuideFieldCanonicalPathCount, GlobalGuideFieldFallbackCount=Context.GlobalGuideFieldFallbackCount, NativeConnectorBatchWorkItems=Context.NativeConnectorBatchWorkItems, NativeConnectorBatchActiveWorkerCount=Context.NativeConnectorBatchActiveWorkerCount, Complete=bool(all((Domain.Complete for Domain in Context.FeedthroughEndpointDomainsBySignal.values())) and (Context.Profiles is None or all((Certificate.Complete for Certificate in Context.ExteriorFixedClaimCertificates)))), Feasible=bool(not Context.EmptySignals and all((Domain.Candidates for Domain in Context.FeedthroughEndpointDomainsBySignal.values()))), LocalAccessFactorsBySignal=Context.LocalAccessFactorsBySignal, ApertureFactorsBySignal=Context.ApertureFactorsBySignal, LocalApertureSupportBySignal=Context.LocalApertureSupportBySignal, LocalApertureSupportsByOption=Context.LocalApertureSupportsByOption, SignalLocalFactorDomains=tuple(sorted(Context.LocalFactorDomainsBySignal.items())), LocalFactorCacheHitSignals=tuple(sorted(Context.LocalFactorCacheHitSignals)), LocalFactorRebuiltSignals=tuple(sorted(Context.LocalFactorRebuiltSignals)), LocalFactorPreparationElapsedSeconds=Context.LocalFactorPreparationElapsedSeconds, ExteriorFactorPreparationElapsedSeconds=Context.ExteriorFactorPreparationElapsedSeconds, ExteriorFixedClaimCertificates=Context.ExteriorFixedClaimCertificates, BoundaryPortReservationsBySignal=Context.BoundaryPortReservationsBySignal, FeedthroughEndpointDomains=tuple((Context.FeedthroughEndpointDomainsBySignal[Signal] for Signal in sorted(Context.FeedthroughEndpointDomainsBySignal))), ExteriorFabricSetFingerprint=Context.ExteriorFabricSetFingerprint, ExteriorRegionFingerprint=str(Context.AuthoritativeRegionFingerprint), ExteriorCapacityLedgerFingerprint=Context.ExteriorCapacityLedgerFingerprint, ExteriorFabrics=Context.ExteriorFabrics)
+    Context.Preparation = PreparedPhysicalComponentPortFactorDomain(DomainFingerprint=Context.FactorDomainFingerprint, PlacementFingerprint=Context.Problem.PlacementFingerprint, ComponentGraphFingerprint=Context.ComponentGraphFingerprint, ResourceGraphFingerprint=Context.ResourceGraphFingerprint, GuideFingerprint=Context.GuideFingerprint, AccessCertificateFingerprint=Context.AccessCertificate.CertificateFingerprint, AccessCertificatePlacementFingerprint=Context.AccessCertificate.PlacementFingerprint, AccessCertificateResourceGraphFingerprint=Context.AccessCertificate.ResourceGraphFingerprint, AccessCertificateComponentGraphFingerprint=Context.AccessCertificate.ComponentGraphFingerprint, Problem=Context.Problem, CoarsePlan=Context.CoarsePlan, AccessCertificate=Context.AccessCertificate, ChannelReservations=tuple(Context.ChannelReservations), LaneFactorsBySignal=tuple(sorted(Context.LaneFactorsBySignal.items())), DiagnosticsBySignal=tuple(((Signal, Context.LaneFactorDiagnosticsBySignal[Signal]) for Signal in sorted(Context.LaneFactorDiagnosticsBySignal))), FabricOrigin=Context.FabricOrigin, MinimumPlacementY=Context.MinimumPlacementY, ComponentEnvelopeMinimum=Context.ComponentEnvelopeMinimum, ComponentEnvelopeMaximum=Context.ComponentEnvelopeMaximum, FabricAdjacency=tuple(((Node, tuple(sorted(Neighbors))) for Node, Neighbors in sorted(Context.FabricAdjacency.items()))), ComponentKeepoutNodes=Context.ComponentKeepoutNodes, ComponentKeepoutGuideCellsByLayer=tuple(sorted(Context.ComponentKeepoutGuideCellsByLayer.items())), LaneFactorExpansionCount=Context.LaneFactorExpansionCount, AccessFactorExpansionCount=Context.AccessFactorExpansionCount, SeamFactorExpansionCount=Context.SeamFactorExpansionCount, GlobalConnectorSearchCount=Context.GlobalConnectorSearchCount, GlobalConnectorCacheHitCount=Context.GlobalConnectorCacheHitCount, GlobalConnectorPortableCacheHitCount=Context.GlobalConnectorPortableCacheHitCount, GlobalConnectorPortableCacheValidationRejectCount=Context.GlobalConnectorPortableCacheValidationRejectCount, GlobalConnectorPortableCacheStoreCount=Context.GlobalConnectorPortableCacheStoreCount, GlobalConnectorExpansionCount=Context.GlobalConnectorExpansionCount, GlobalGuideFieldBuildCount=Context.GlobalGuideFieldBuildCount, GlobalGuideFieldExpansionCount=Context.GlobalGuideFieldExpansionCount, GlobalGuideFieldHitCount=Context.GlobalGuideFieldHitCount, GlobalGuideFieldCanonicalPathCount=Context.GlobalGuideFieldCanonicalPathCount, GlobalGuideFieldFallbackCount=Context.GlobalGuideFieldFallbackCount, NativeConnectorBatchWorkItems=Context.NativeConnectorBatchWorkItems, NativeConnectorBatchActiveWorkerCount=Context.NativeConnectorBatchActiveWorkerCount, Complete=bool(all((Domain.Complete for Domain in Context.FeedthroughEndpointDomainsBySignal.values())) and (Context.Profiles is None or all((Certificate.Complete for Certificate in Context.ExteriorFixedClaimCertificates)))), Feasible=bool(not Context.EmptySignals and all((Domain.Candidates for Domain in Context.FeedthroughEndpointDomainsBySignal.values()))), LocalAccessFactorsBySignal=Context.LocalAccessFactorsBySignal, ApertureFactorsBySignal=Context.ApertureFactorsBySignal, LocalApertureSupportBySignal=Context.LocalApertureSupportBySignal, LocalApertureSupportsByOption=Context.LocalApertureSupportsByOption, SignalLocalFactorDomains=tuple(sorted(Context.LocalFactorDomainsBySignal.items())), LocalFactorCacheHitSignals=tuple(sorted(Context.LocalFactorCacheHitSignals)), LocalFactorRebuiltSignals=tuple(sorted(Context.LocalFactorRebuiltSignals)), LocalFactorPreparationElapsedSeconds=Context.LocalFactorPreparationElapsedSeconds, ExteriorFactorPreparationElapsedSeconds=Context.ExteriorFactorPreparationElapsedSeconds, FactorPreparationTimings=tuple(sorted(Context.FactorPreparationTimings.items())), PhysicalLocalSeamEligibilityCacheHitCount=int(Context.PhysicalLocalSeamEligibilityCacheStatistics.get('HitCount', 0)), PhysicalLocalSeamEligibilityCacheMissCount=int(Context.PhysicalLocalSeamEligibilityCacheStatistics.get('MissCount', 0)), PhysicalLocalSeamEligibilityCacheStoreCount=int(Context.PhysicalLocalSeamEligibilityCacheStatistics.get('StoreCount', 0)), ExteriorFixedClaimCertificates=Context.ExteriorFixedClaimCertificates, BoundaryPortReservationsBySignal=Context.BoundaryPortReservationsBySignal, FeedthroughEndpointDomains=tuple((Context.FeedthroughEndpointDomainsBySignal[Signal] for Signal in sorted(Context.FeedthroughEndpointDomainsBySignal))), ExteriorFabricSetFingerprint=Context.ExteriorFabricSetFingerprint, ExteriorRegionFingerprint=str(Context.AuthoritativeRegionFingerprint), ExteriorCapacityLedgerFingerprint=Context.ExteriorCapacityLedgerFingerprint, ExteriorFabrics=Context.ExteriorFabrics)
     Context.Resources.PreparedPhysicalComponentPortFactorDomain = Context.Preparation
     return Context.Preparation

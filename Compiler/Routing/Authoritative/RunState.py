@@ -679,6 +679,7 @@ class AuthoritativeRoutingState:
     PlacementAccessDomains: Any = None
     PlacementAccessFabric: Any = None
     PlacementAccessOuterBounds: Any = None
+    PlacementPinAccessWitness: Any = None
     PlacementAccessTerminalKeys: Any = None
     PlacementAndInterfaceIdentityBound: Any = None
     PlacementAssignmentCutDiagnostics: Any = None
@@ -841,6 +842,8 @@ class AuthoritativeRoutingState:
     RawIngressTargets: Any = None
     RawPortalCache: Any = None
     RawPortalEntries: Any = None
+    RawPortalPlacementGeometryFingerprint: Any = None
+    RawPortalResourceGeometryFingerprint: Any = None
     RawPortalVariantCounts: Any = None
     RawPortals: Any = None
     RawTrackAssignmentExtractionIncompleteReasons: Any = None

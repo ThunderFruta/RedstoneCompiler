@@ -2693,14 +2693,18 @@ class RawPortalGeometryCache:
         self,
         Placed: Any,
         Resources: Any,
+        PlacementFingerprint: str | None = None,
+        ResourceFingerprint: str | None = None,
     ) -> bool:
         """Match stable geometry, retaining identity only for opaque fixtures."""
-        PlacementFingerprint = (
-            BuildRawPortalPlacementGeometryFingerprint(Placed)
-        )
-        ResourceFingerprint = (
-            BuildRawPortalResourceGeometryFingerprint(Resources)
-        )
+        if PlacementFingerprint is None:
+            PlacementFingerprint = (
+                BuildRawPortalPlacementGeometryFingerprint(Placed)
+            )
+        if ResourceFingerprint is None:
+            ResourceFingerprint = (
+                BuildRawPortalResourceGeometryFingerprint(Resources)
+            )
         return (
             (
                 bool(self.PlacementGeometryFingerprint)

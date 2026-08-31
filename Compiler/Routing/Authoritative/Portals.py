@@ -576,6 +576,7 @@ def ApplyPlacementAccessFabricPortalDomains(
     Technology: RedstoneRoutingTechnology,
     MinimumY: int,
     LayerCount: int,
+    TerminalDomains: Iterable[Any] | None = None,
 ) -> dict[
     tuple[str, Position3, int],
     tuple[PinAccessPortal, ...],
@@ -588,16 +589,21 @@ def ApplyPlacementAccessFabricPortalDomains(
     remaining portal candidates and immutable local claims.  The later
     frozen track preparation then records that single combined witness.
     """
+    EffectiveTerminalDomains = tuple(
+        Fabric.TerminalDomains
+        if TerminalDomains is None
+        else TerminalDomains
+    )
     Result = {
         Key: Values
         for Key, Values in Portals.items()
         if not any(
             Key[0] == str(Domain.Signal)
             and Key[1] == tuple(Domain.Terminal)
-            for Domain in Fabric.TerminalDomains
+            for Domain in EffectiveTerminalDomains
         )
     }
-    for Domain in Fabric.TerminalDomains:
+    for Domain in EffectiveTerminalDomains:
         Signal = str(Domain.Signal)
         Terminal = tuple(Domain.Terminal)
         for StubIndex, Stub in enumerate(Domain.EscapeStubs):
@@ -1094,7 +1100,7 @@ def _ReserveRepeaters(
                     Resource=RoutingResourceId(RoutingResourceKind.Wire, Position),
                     Position=Position,
                     Purpose="Repeater",
-                    Facing=Facing,
+                    InputFacing=Facing,
                 ),
             )
             LastRefresh = Selected
@@ -1292,7 +1298,7 @@ def _MaterializeCandidate(
             Resource=RoutingResourceId(RoutingResourceKind.Wire, Position),
             Position=Position,
             Purpose="Repeater",
-            Facing=Facing,
+            InputFacing=Facing,
         )
         for Position, Facing in NativeReservationValues
         if IsFlatStraightRepeaterSite(Position, Facing)
@@ -1320,9 +1326,9 @@ def _MaterializeCandidate(
             Profile.Root,
             Graph,
             {
-                Position: Reservation.Facing
+                Position: Reservation.InputFacing
                 for Position, Reservation in NativeReservations.items()
-                if Reservation.Facing is not None
+                if Reservation.InputFacing is not None
             },
         )
         NativePowerValid = all(
@@ -1349,9 +1355,9 @@ def _MaterializeCandidate(
             Profile.Root,
             Graph,
             {
-                Position: Reservation.Facing
+                Position: Reservation.InputFacing
                 for Position, Reservation in EffectiveRepeaterReservations.items()
-                if Reservation.Facing is not None
+                if Reservation.InputFacing is not None
             },
         )
     else:
@@ -1379,7 +1385,7 @@ def _MaterializeCandidate(
             UsableNativeRepeaters=[
                 {
                     "Position": list(Position),
-                    "Facing": Reservation.Facing,
+                    "InputFacing": Reservation.InputFacing,
                 }
                 for Position, Reservation in sorted(
                     NativeReservations.items()
@@ -1388,7 +1394,7 @@ def _MaterializeCandidate(
             FallbackRepeaters=[
                 {
                     "Position": list(Position),
-                    "Facing": Reservation.Facing,
+                    "InputFacing": Reservation.InputFacing,
                 }
                 for Position, Reservation in sorted(
                     EffectiveRepeaterReservations.items()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
 
 from ..Cells.Library import GetCellMacro
@@ -30,6 +31,304 @@ class PlacedGate:
     MirrorX: bool
     InputDirections: list[tuple[int, int, int]]
     OutputDirection: tuple[int, int, int] | None
+
+
+@dataclass(frozen=True)
+class PlacementPinAccessSelection:
+    """One catalog-named physical pin path after placement transforms."""
+
+    Signal: str
+    GateName: str
+    GateKind: str
+    Role: str
+    PinId: str
+    PatternId: str
+    Terminal: tuple[int, int, int]
+    ApproachDirection: tuple[int, int, int]
+    Path: tuple[tuple[int, int, int], ...]
+    CatalogAccessLength: int
+    CatalogMatched: bool
+
+    def __post_init__(self) -> None:
+        if self.Role not in {"Source", "Target"}:
+            raise ValueError("pin-access selection role is invalid")
+        if not self.Signal or not self.GateName or not self.PatternId:
+            raise ValueError("pin-access selection requires stable identities")
+        if not self.Path or self.Path[0] != self.Terminal:
+            raise ValueError("pin-access path must begin at its terminal")
+        if len(self.Path) > self.CatalogAccessLength:
+            raise ValueError("pin-access path exceeds its catalog pattern")
+        ExpectedPath = tuple(
+            (
+                self.Terminal[0] + self.ApproachDirection[0] * Offset,
+                self.Terminal[1] + self.ApproachDirection[1] * Offset,
+                self.Terminal[2] + self.ApproachDirection[2] * Offset,
+            )
+            for Offset in range(len(self.Path))
+        )
+        if self.Path != ExpectedPath:
+            raise ValueError("pin-access path is not the selected straight ray")
+
+    def StructuralIdentity(self) -> tuple[object, ...]:
+        return (
+            self.Signal,
+            self.GateName,
+            self.GateKind,
+            self.Role,
+            self.PinId,
+            self.PatternId,
+            self.Terminal,
+            self.ApproachDirection,
+            self.Path,
+            self.CatalogAccessLength,
+            self.CatalogMatched,
+        )
+
+    @property
+    def SelectionFingerprint(self) -> str:
+        return sha256(
+            repr((
+                "placement-pin-access-selection-v1",
+                self.StructuralIdentity(),
+            )).encode("utf-8")
+        ).hexdigest()
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "GateName": self.GateName,
+            "GateKind": self.GateKind,
+            "Role": self.Role,
+            "PinId": self.PinId,
+            "PatternId": self.PatternId,
+            "Terminal": list(self.Terminal),
+            "ApproachDirection": list(self.ApproachDirection),
+            "Path": [list(Position) for Position in self.Path],
+            "CatalogAccessLength": self.CatalogAccessLength,
+            "CatalogMatched": self.CatalogMatched,
+            "SelectionFingerprint": self.SelectionFingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class PlacementPinAccessWitness:
+    """Complete straight-only access identity for one placed gate set."""
+
+    AccessLength: int
+    Selections: tuple[PlacementPinAccessSelection, ...]
+    Complete: bool
+    IncompleteReason: str = ""
+    SchemaVersion: str = "placement-pin-access-witness-v1"
+
+    def __post_init__(self) -> None:
+        if self.AccessLength < 1:
+            raise ValueError("pin-access witness requires positive access length")
+        if self.Complete == bool(self.IncompleteReason):
+            raise ValueError(
+                "complete pin-access witness and incomplete reason disagree"
+            )
+        Ordered = tuple(sorted(
+            self.Selections,
+            key=lambda Value: Value.StructuralIdentity(),
+        ))
+        if self.Selections != Ordered:
+            raise ValueError("pin-access witness selections must be sorted")
+        Identities = tuple(
+            (
+                Value.Signal,
+                Value.GateName,
+                Value.Role,
+                Value.PinId,
+            )
+            for Value in self.Selections
+        )
+        if len(Identities) != len(set(Identities)):
+            raise ValueError("pin-access witness repeats a terminal identity")
+        if any(len(Value.Path) != self.AccessLength for Value in self.Selections):
+            raise ValueError("pin-access witness contains a truncated selection")
+
+    @property
+    def CatalogMatched(self) -> bool:
+        return all(Value.CatalogMatched for Value in self.Selections)
+
+    @property
+    def WitnessFingerprint(self) -> str:
+        return sha256(
+            repr((
+                self.SchemaVersion,
+                self.AccessLength,
+                tuple(
+                    Value.StructuralIdentity()
+                    for Value in self.Selections
+                ),
+                self.Complete,
+                self.IncompleteReason,
+            )).encode("utf-8")
+        ).hexdigest()
+
+    def FindSelection(
+        self,
+        Signal: str,
+        GateName: str,
+        Role: str,
+        PinId: str,
+    ) -> PlacementPinAccessSelection:
+        Match = next(
+            (
+                Value
+                for Value in self.Selections
+                if (
+                    Value.Signal,
+                    Value.GateName,
+                    Value.Role,
+                    Value.PinId,
+                ) == (Signal, GateName, Role, PinId)
+            ),
+            None,
+        )
+        if Match is None:
+            raise ValueError(
+                "pin-access witness is missing "
+                f"{Signal}:{GateName}:{Role}:{PinId}"
+            )
+        return Match
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": self.SchemaVersion,
+            "WitnessFingerprint": self.WitnessFingerprint,
+            "AccessLength": self.AccessLength,
+            "SelectionCount": len(self.Selections),
+            "SignalCount": len({
+                Value.Signal for Value in self.Selections
+            }),
+            "CatalogMatched": self.CatalogMatched,
+            "Selections": [
+                Value.ToDictionary() for Value in self.Selections
+            ],
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+        }
+
+
+def BuildPlacementPinAccessWitness(
+    PlacedGates: Any,
+    *,
+    AccessLength: int,
+    RequireCatalogMatch: bool = True,
+) -> PlacementPinAccessWitness:
+    """Transform the cell catalog's straight patterns into placed paths."""
+    if AccessLength < 1:
+        raise ValueError("pin-access witness requires positive access length")
+    Selections = []
+    for Gate in PlacedGates:
+        Macro = GetCellMacro(Gate.Kind)
+        Rotation = int(getattr(Gate, "Rotation", 0))
+        MirrorX = bool(getattr(Gate, "MirrorX", False))
+        PatternsByPinId = {
+            Pattern.PinId: Pattern
+            for Pattern in Macro.PinAccessPatterns
+        }
+
+        def BuildSelection(
+            Signal: str,
+            Role: str,
+            PinId: str,
+            PhysicalTerminal: tuple[int, int, int],
+            PhysicalDirection: tuple[int, int, int],
+        ) -> PlacementPinAccessSelection:
+            Pattern = PatternsByPinId.get(PinId)
+            if Pattern is None:
+                raise ValueError(
+                    f"cell {Gate.Name} has no catalog pattern for {PinId}"
+                )
+            LocalTerminal = TransformLocalPosition(
+                Pattern.ConnectionPosition,
+                Macro.Footprint,
+                Rotation,
+                MirrorX,
+            )
+            CatalogTerminal = (
+                Gate.X + LocalTerminal[0],
+                Gate.Y + LocalTerminal[1],
+                Gate.Z + LocalTerminal[2],
+            )
+            CatalogDirection = TransformDirection(
+                Pattern.ApproachDirection,
+                Rotation,
+                MirrorX,
+            )
+            CatalogMatched = (
+                CatalogTerminal == tuple(PhysicalTerminal)
+                and CatalogDirection == tuple(PhysicalDirection)
+                and AccessLength <= Pattern.AccessLength
+            )
+            if RequireCatalogMatch and not CatalogMatched:
+                raise ValueError(
+                    f"placed pin {Gate.Name}:{PinId} does not match its "
+                    "catalog access pattern"
+                )
+            Terminal = (
+                CatalogTerminal if CatalogMatched else tuple(PhysicalTerminal)
+            )
+            Direction = (
+                CatalogDirection if CatalogMatched else tuple(PhysicalDirection)
+            )
+            return PlacementPinAccessSelection(
+                Signal=str(Signal),
+                GateName=str(Gate.Name),
+                GateKind=str(Gate.Kind),
+                Role=Role,
+                PinId=PinId,
+                PatternId=Pattern.PatternId,
+                Terminal=Terminal,
+                ApproachDirection=Direction,
+                Path=tuple(
+                    (
+                        Terminal[0] + Direction[0] * Offset,
+                        Terminal[1] + Direction[1] * Offset,
+                        Terminal[2] + Direction[2] * Offset,
+                    )
+                    for Offset in range(AccessLength)
+                ),
+                CatalogAccessLength=Pattern.AccessLength,
+                CatalogMatched=CatalogMatched,
+            )
+
+        if Gate.OutputPin is not None and Gate.OutputDirection is not None:
+            Selections.extend(
+                BuildSelection(
+                    Signal,
+                    "Source",
+                    "Output0",
+                    Gate.OutputPin,
+                    Gate.OutputDirection,
+                )
+                for Signal in Gate.Outputs
+            )
+        for InputIndex, Signal in enumerate(Gate.Inputs):
+            Pin, Direction = GetGateInputAccess(Gate, InputIndex)
+            Selections.append(BuildSelection(
+                Signal,
+                "Target",
+                f"Input{InputIndex}",
+                Pin,
+                Direction,
+            ))
+    Ordered = tuple(sorted(
+        Selections,
+        key=lambda Value: Value.StructuralIdentity(),
+    ))
+    CatalogMatched = all(Value.CatalogMatched for Value in Ordered)
+    return PlacementPinAccessWitness(
+        AccessLength=AccessLength,
+        Selections=Ordered,
+        Complete=CatalogMatched or not RequireCatalogMatch,
+        IncompleteReason=(
+            "" if CatalogMatched or not RequireCatalogMatch
+            else "catalog-geometry-mismatch"
+        ),
+    )
 
 
 @dataclass

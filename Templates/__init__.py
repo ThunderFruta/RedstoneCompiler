@@ -3,7 +3,7 @@
 from pathlib import Path
 
 ExternalTemplateDirectory = Path(
-    "/home/bananawewe/Documents/curseforge/minecraft/Instances/wee/schematics"
+    "/home/bananawewe/.local/share/PrismLauncher/instances/wee 26.2/minecraft/schematics"
 )
 RequiredTemplateNames = ("Input.litematic", "Output.litematic", "Nand.litematic")
 TemplateDirectory = (

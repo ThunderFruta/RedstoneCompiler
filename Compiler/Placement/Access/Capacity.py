@@ -8,6 +8,7 @@ from collections import (
 from dataclasses import (
     dataclass,
 )
+from enum import Enum
 from hashlib import (
     sha256,
 )
@@ -24,15 +25,19 @@ from Compiler.Routing.Contracts.Core import (
     Position3,
 )
 from Compiler.Routing.ResourceGraph import (
+    FindClaimConflicts,
     FindSelfClaimConflicts,
     RoutingResourceClaims,
+    RoutingResourceGraph,
 )
+from Compiler.Routing.Reliability import BuildStableFingerprint
 from Compiler.Routing.Technology import (
     DefaultRedstoneRoutingTechnology,
 )
 from .EscapePaths import (
     _BuildDerivedPerimeterCycleRouteNodeSets,
 )
+from Compiler.Placement.Geometry import PlacementPinAccessSelection
 
 
 def _MergePlacementAccessClaims(
@@ -66,6 +71,545 @@ def _PlacementAccessClaimsConflict(
         or (First.RequiredAirCells & Second.WireCells)
         or (Second.RequiredAirCells & First.WireCells)
     )
+
+
+class FixedPlacementPinAccessStatus(str, Enum):
+    """Terminal result of one complete-or-bounded fixed-placement solve."""
+
+    Feasible = "Feasible"
+    Unsatisfiable = "Unsatisfiable"
+    Incomplete = "Incomplete"
+
+
+@dataclass(frozen=True)
+class FixedPlacementPinAccessDomain:
+    """Finite pattern domain for one logical terminal on a fixed placement."""
+
+    DomainId: str
+    Signal: str
+    Terminal: Position3
+    Options: tuple[PlacementPinAccessSelection, ...]
+    Complete: bool = True
+    IncompleteReason: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.DomainId or not self.Signal:
+            raise ValueError("fixed pin-access domain requires identities")
+        if self.Complete == bool(self.IncompleteReason):
+            raise ValueError("fixed pin-access domain completeness disagrees")
+        OptionFingerprints = tuple(
+            Value.SelectionFingerprint for Value in self.Options
+        )
+        if len(OptionFingerprints) != len(set(OptionFingerprints)):
+            raise ValueError("fixed pin-access domain repeats an option")
+        for Option in self.Options:
+            if Option.Signal != self.Signal or Option.Terminal != self.Terminal:
+                raise ValueError(
+                    "fixed pin-access option does not belong to its domain"
+                )
+
+    @property
+    def DomainFingerprint(self) -> str:
+        return BuildStableFingerprint({
+            "Kind": "fixed-placement-pin-access-domain-v1",
+            "DomainId": self.DomainId,
+            "Signal": self.Signal,
+            "Terminal": self.Terminal,
+            "Options": [
+                Value.ToDictionary() for Value in self.Options
+            ],
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+        })
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "DomainId": self.DomainId,
+            "DomainFingerprint": self.DomainFingerprint,
+            "Signal": self.Signal,
+            "Terminal": list(self.Terminal),
+            "OptionCount": len(self.Options),
+            "Options": [Value.ToDictionary() for Value in self.Options],
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+        }
+
+
+@dataclass(frozen=True)
+class FixedPlacementPinAccessConflict:
+    """One exact incompatible option pair inside a replayable core."""
+
+    FirstDomainId: str
+    FirstOptionFingerprint: str
+    SecondDomainId: str
+    SecondOptionFingerprint: str
+    ResourceIds: tuple[str, ...]
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "FirstDomainId": self.FirstDomainId,
+            "FirstOptionFingerprint": self.FirstOptionFingerprint,
+            "SecondDomainId": self.SecondDomainId,
+            "SecondOptionFingerprint": self.SecondOptionFingerprint,
+            "ResourceIds": list(self.ResourceIds),
+        }
+
+
+@dataclass(frozen=True)
+class FixedPlacementPinAccessUnsatisfiableCore:
+    """Complete independent conflict component that can be replayed alone."""
+
+    CoreFingerprint: str
+    ProblemFingerprint: str
+    Domains: tuple[FixedPlacementPinAccessDomain, ...]
+    Conflicts: tuple[FixedPlacementPinAccessConflict, ...]
+
+    @property
+    def Signals(self) -> tuple[str, ...]:
+        return tuple(sorted({Value.Signal for Value in self.Domains}))
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "CoreFingerprint": self.CoreFingerprint,
+            "ProblemFingerprint": self.ProblemFingerprint,
+            "Signals": list(self.Signals),
+            "Domains": [Value.ToDictionary() for Value in self.Domains],
+            "Conflicts": [Value.ToDictionary() for Value in self.Conflicts],
+            "Complete": True,
+        }
+
+
+@dataclass(frozen=True)
+class FixedPlacementPinAccessSolveResult:
+    """Typed exact result for one fixed finite cell-pattern problem."""
+
+    Status: FixedPlacementPinAccessStatus
+    ProblemFingerprint: str
+    AssignmentFingerprint: str
+    SelectedOptionFingerprints: tuple[tuple[str, str], ...]
+    ExpansionCount: int
+    MaximumExpansions: int
+    UnsatisfiableCore: FixedPlacementPinAccessUnsatisfiableCore | None = None
+    IncompleteReason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.ExpansionCount < 0 or self.MaximumExpansions < 1:
+            raise ValueError("fixed pin-access solve work values are invalid")
+        if self.Status is FixedPlacementPinAccessStatus.Feasible:
+            if not self.AssignmentFingerprint or self.UnsatisfiableCore is not None:
+                raise ValueError("feasible pin-access result is malformed")
+        elif self.Status is FixedPlacementPinAccessStatus.Unsatisfiable:
+            if self.UnsatisfiableCore is None or self.IncompleteReason:
+                raise ValueError("unsatisfiable pin-access result is malformed")
+        elif not self.IncompleteReason or self.UnsatisfiableCore is not None:
+            raise ValueError("incomplete pin-access result is malformed")
+
+    @property
+    def Complete(self) -> bool:
+        return self.Status is not FixedPlacementPinAccessStatus.Incomplete
+
+    @property
+    def Success(self) -> bool:
+        return self.Status is FixedPlacementPinAccessStatus.Feasible
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Status": self.Status.value,
+            "ProblemFingerprint": self.ProblemFingerprint,
+            "AssignmentFingerprint": self.AssignmentFingerprint,
+            "SelectedOptionFingerprints": [
+                list(Value) for Value in self.SelectedOptionFingerprints
+            ],
+            "ExpansionCount": self.ExpansionCount,
+            "MaximumExpansions": self.MaximumExpansions,
+            "Success": self.Success,
+            "Complete": self.Complete,
+            "UnsatisfiableCore": (
+                self.UnsatisfiableCore.ToDictionary()
+                if self.UnsatisfiableCore is not None
+                else None
+            ),
+            "IncompleteReason": self.IncompleteReason,
+        }
+
+
+def _BuildFixedPinAccessOptionClaims(
+    Domains: tuple[FixedPlacementPinAccessDomain, ...],
+    ResourceGraph: RoutingResourceGraph,
+) -> dict[tuple[str, str], RoutingResourceClaims]:
+    return {
+        (Domain.DomainId, Option.SelectionFingerprint): (
+            ResourceGraph.BuildRouteClaims(Option.Path)
+        )
+        for Domain in Domains
+        for Option in Domain.Options
+    }
+
+
+def _FixedPinAccessConflictResources(
+    FirstDomain: FixedPlacementPinAccessDomain,
+    FirstOption: PlacementPinAccessSelection,
+    SecondDomain: FixedPlacementPinAccessDomain,
+    SecondOption: PlacementPinAccessSelection,
+    ClaimsByOption: dict[tuple[str, str], RoutingResourceClaims],
+) -> tuple[str, ...]:
+    FirstClaims = ClaimsByOption[
+        (FirstDomain.DomainId, FirstOption.SelectionFingerprint)
+    ]
+    SecondClaims = ClaimsByOption[
+        (SecondDomain.DomainId, SecondOption.SelectionFingerprint)
+    ]
+    if FirstDomain.Signal == SecondDomain.Signal:
+        Conflicts = FindSelfClaimConflicts({
+            FirstDomain.Signal: _MergePlacementAccessClaims(
+                FirstClaims,
+                SecondClaims,
+            )
+        })
+    else:
+        Conflicts = FindClaimConflicts({
+            "First": FirstClaims,
+            "Second": SecondClaims,
+        })
+    return tuple(sorted(map(str, Conflicts)))
+
+
+def _BuildFixedPinAccessConflictDomainComponents(
+    Domains: tuple[FixedPlacementPinAccessDomain, ...],
+    Conflicts: tuple[FixedPlacementPinAccessConflict, ...],
+) -> tuple[tuple[str, ...], ...]:
+    Adjacency = {Value.DomainId: set() for Value in Domains}
+    for Conflict in Conflicts:
+        Adjacency[Conflict.FirstDomainId].add(Conflict.SecondDomainId)
+        Adjacency[Conflict.SecondDomainId].add(Conflict.FirstDomainId)
+    Components = []
+    Remaining = set(Adjacency)
+    while Remaining:
+        Root = min(Remaining)
+        Pending = [Root]
+        Component = set()
+        while Pending:
+            DomainId = Pending.pop()
+            if DomainId in Component:
+                continue
+            Component.add(DomainId)
+            Pending.extend(sorted(Adjacency[DomainId] - Component))
+        Remaining.difference_update(Component)
+        Components.append(tuple(sorted(Component)))
+    return tuple(sorted(Components))
+
+
+def SolveFixedPlacementPinAccessDomains(
+    Domains: Iterable[FixedPlacementPinAccessDomain],
+    *,
+    ResourceGraph: RoutingResourceGraph | None = None,
+    MaximumExpansions: int = 100_000,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> FixedPlacementPinAccessSolveResult:
+    """Solve one immutable option per terminal with exact pair conflicts."""
+    if MaximumExpansions < 1:
+        raise ValueError("fixed pin-access solve requires a positive work cap")
+    OrderedDomains = tuple(sorted(Domains, key=lambda Value: Value.DomainId))
+    if len({Value.DomainId for Value in OrderedDomains}) != len(OrderedDomains):
+        raise ValueError("fixed pin-access problem repeats a domain id")
+    ProblemFingerprint = BuildStableFingerprint({
+        "Kind": "fixed-placement-pin-access-problem-v1",
+        "Domains": [Value.ToDictionary() for Value in OrderedDomains],
+    })
+    IncompleteDomain = next(
+        (Value for Value in OrderedDomains if not Value.Complete),
+        None,
+    )
+    if IncompleteDomain is not None:
+        return FixedPlacementPinAccessSolveResult(
+            Status=FixedPlacementPinAccessStatus.Incomplete,
+            ProblemFingerprint=ProblemFingerprint,
+            AssignmentFingerprint="",
+            SelectedOptionFingerprints=(),
+            ExpansionCount=0,
+            MaximumExpansions=MaximumExpansions,
+            IncompleteReason=(
+                IncompleteDomain.IncompleteReason or "incomplete-domain"
+            ),
+        )
+    ResourceGraph = ResourceGraph or RoutingResourceGraph(
+        ActualBlocks=frozenset(),
+        ElectricalBlocks=frozenset(),
+        SolidBlocks=frozenset(),
+    )
+    ClaimsByOption = _BuildFixedPinAccessOptionClaims(
+        OrderedDomains,
+        ResourceGraph,
+    )
+    ValidOptionsByDomain = {
+        Domain.DomainId: tuple(
+            Option
+            for Option in Domain.Options
+            if not FindSelfClaimConflicts({
+                Domain.Signal: ClaimsByOption[
+                    (Domain.DomainId, Option.SelectionFingerprint)
+                ]
+            })
+        )
+        for Domain in OrderedDomains
+    }
+    IsCompleteSingletonProblem = all(
+        len(ValidOptionsByDomain[Domain.DomainId]) == 1
+        and len(Domain.Options) == 1
+        for Domain in OrderedDomains
+    )
+    if IsCompleteSingletonProblem:
+        ClaimsBySignal: dict[str, RoutingResourceClaims] = {}
+        for Domain in OrderedDomains:
+            Option = ValidOptionsByDomain[Domain.DomainId][0]
+            OptionClaims = ClaimsByOption[
+                (Domain.DomainId, Option.SelectionFingerprint)
+            ]
+            ClaimsBySignal[Domain.Signal] = (
+                _MergePlacementAccessClaims(
+                    ClaimsBySignal[Domain.Signal],
+                    OptionClaims,
+                )
+                if Domain.Signal in ClaimsBySignal
+                else OptionClaims
+            )
+        HasAggregateConflict = bool(
+            FindClaimConflicts(ClaimsBySignal)
+            or FindSelfClaimConflicts(ClaimsBySignal)
+        )
+        if not HasAggregateConflict:
+            if len(OrderedDomains) > MaximumExpansions:
+                return FixedPlacementPinAccessSolveResult(
+                    Status=FixedPlacementPinAccessStatus.Incomplete,
+                    ProblemFingerprint=ProblemFingerprint,
+                    AssignmentFingerprint="",
+                    SelectedOptionFingerprints=(),
+                    ExpansionCount=MaximumExpansions,
+                    MaximumExpansions=MaximumExpansions,
+                    IncompleteReason="assignment-work-cap",
+                )
+            SelectedOptionFingerprints = tuple(
+                (
+                    Domain.DomainId,
+                    ValidOptionsByDomain[
+                        Domain.DomainId
+                    ][0].SelectionFingerprint,
+                )
+                for Domain in OrderedDomains
+            )
+            return FixedPlacementPinAccessSolveResult(
+                Status=FixedPlacementPinAccessStatus.Feasible,
+                ProblemFingerprint=ProblemFingerprint,
+                AssignmentFingerprint=BuildStableFingerprint({
+                    "ProblemFingerprint": ProblemFingerprint,
+                    "SelectedOptionFingerprints": (
+                        SelectedOptionFingerprints
+                    ),
+                }),
+                SelectedOptionFingerprints=SelectedOptionFingerprints,
+                ExpansionCount=len(OrderedDomains),
+                MaximumExpansions=MaximumExpansions,
+            )
+    Conflicts = []
+    for FirstIndex, FirstDomain in enumerate(OrderedDomains):
+        for SecondDomain in OrderedDomains[FirstIndex + 1:]:
+            for FirstOption in ValidOptionsByDomain[FirstDomain.DomainId]:
+                for SecondOption in ValidOptionsByDomain[SecondDomain.DomainId]:
+                    ResourceIds = _FixedPinAccessConflictResources(
+                        FirstDomain,
+                        FirstOption,
+                        SecondDomain,
+                        SecondOption,
+                        ClaimsByOption,
+                    )
+                    if ResourceIds:
+                        Conflicts.append(FixedPlacementPinAccessConflict(
+                            FirstDomainId=FirstDomain.DomainId,
+                            FirstOptionFingerprint=(
+                                FirstOption.SelectionFingerprint
+                            ),
+                            SecondDomainId=SecondDomain.DomainId,
+                            SecondOptionFingerprint=(
+                                SecondOption.SelectionFingerprint
+                            ),
+                            ResourceIds=ResourceIds,
+                        ))
+    OrderedConflicts = tuple(sorted(
+        Conflicts,
+        key=lambda Value: (
+            Value.FirstDomainId,
+            Value.FirstOptionFingerprint,
+            Value.SecondDomainId,
+            Value.SecondOptionFingerprint,
+            Value.ResourceIds,
+        ),
+    ))
+    ConflictKeys = frozenset(
+        (
+            Conflict.FirstDomainId,
+            Conflict.FirstOptionFingerprint,
+            Conflict.SecondDomainId,
+            Conflict.SecondOptionFingerprint,
+        )
+        for Conflict in OrderedConflicts
+    )
+    DomainById = {Value.DomainId: Value for Value in OrderedDomains}
+    ExpansionCount = 0
+    SelectedByDomain: dict[str, PlacementPinAccessSelection] = {}
+
+    def OptionsConflict(
+        FirstDomainId: str,
+        FirstOptionFingerprint: str,
+        SecondDomainId: str,
+        SecondOptionFingerprint: str,
+    ) -> bool:
+        if FirstDomainId > SecondDomainId:
+            FirstDomainId, SecondDomainId = SecondDomainId, FirstDomainId
+            FirstOptionFingerprint, SecondOptionFingerprint = (
+                SecondOptionFingerprint,
+                FirstOptionFingerprint,
+            )
+        return (
+            FirstDomainId,
+            FirstOptionFingerprint,
+            SecondDomainId,
+            SecondOptionFingerprint,
+        ) in ConflictKeys
+
+    def Search(ComponentDomainIds: tuple[str, ...]) -> bool | None:
+        nonlocal ExpansionCount
+        OrderedComponentDomains = tuple(sorted(
+            (DomainById[DomainId] for DomainId in ComponentDomainIds),
+            key=lambda Value: (
+                len(ValidOptionsByDomain[Value.DomainId]),
+                Value.DomainId,
+            ),
+        ))
+
+        def Visit(DomainIndex: int) -> bool | None:
+            nonlocal ExpansionCount
+            if DomainIndex == len(OrderedComponentDomains):
+                return True
+            Domain = OrderedComponentDomains[DomainIndex]
+            for Option in ValidOptionsByDomain[Domain.DomainId]:
+                if ExpansionCount >= MaximumExpansions:
+                    return None
+                ExpansionCount += 1
+                if WorkCheck is not None and ExpansionCount % 256 == 0:
+                    WorkCheck({
+                        "Phase": "fixed-placement-pin-access-search",
+                        "ExpansionCount": ExpansionCount,
+                        "MaximumExpansions": MaximumExpansions,
+                        "DomainId": Domain.DomainId,
+                    })
+                if any(
+                    OptionsConflict(
+                        Domain.DomainId,
+                        Option.SelectionFingerprint,
+                        SelectedDomainId,
+                        SelectedOption.SelectionFingerprint,
+                    )
+                    for SelectedDomainId, SelectedOption
+                    in SelectedByDomain.items()
+                ):
+                    continue
+                SelectedByDomain[Domain.DomainId] = Option
+                Result = Visit(DomainIndex + 1)
+                if Result is not False:
+                    return Result
+                SelectedByDomain.pop(Domain.DomainId, None)
+            return False
+
+        return Visit(0)
+
+    for ComponentDomainIds in _BuildFixedPinAccessConflictDomainComponents(
+        OrderedDomains,
+        OrderedConflicts,
+    ):
+        ComponentResult = Search(ComponentDomainIds)
+        if ComponentResult is None:
+            return FixedPlacementPinAccessSolveResult(
+                Status=FixedPlacementPinAccessStatus.Incomplete,
+                ProblemFingerprint=ProblemFingerprint,
+                AssignmentFingerprint="",
+                SelectedOptionFingerprints=(),
+                ExpansionCount=ExpansionCount,
+                MaximumExpansions=MaximumExpansions,
+                IncompleteReason="assignment-work-cap",
+            )
+        if ComponentResult:
+            continue
+        CoreDomains = tuple(
+            DomainById[DomainId] for DomainId in ComponentDomainIds
+        )
+        CoreConflicts = tuple(
+            Value
+            for Value in OrderedConflicts
+            if (
+                Value.FirstDomainId in ComponentDomainIds
+                and Value.SecondDomainId in ComponentDomainIds
+            )
+        )
+        CoreFingerprint = BuildStableFingerprint({
+            "Kind": "fixed-placement-pin-access-unsat-core-v1",
+            "Domains": [Value.ToDictionary() for Value in CoreDomains],
+            "Conflicts": [Value.ToDictionary() for Value in CoreConflicts],
+        })
+        return FixedPlacementPinAccessSolveResult(
+            Status=FixedPlacementPinAccessStatus.Unsatisfiable,
+            ProblemFingerprint=ProblemFingerprint,
+            AssignmentFingerprint="",
+            SelectedOptionFingerprints=(),
+            ExpansionCount=ExpansionCount,
+            MaximumExpansions=MaximumExpansions,
+            UnsatisfiableCore=FixedPlacementPinAccessUnsatisfiableCore(
+                CoreFingerprint=CoreFingerprint,
+                ProblemFingerprint=ProblemFingerprint,
+                Domains=CoreDomains,
+                Conflicts=CoreConflicts,
+            ),
+        )
+    SelectedOptionFingerprints = tuple(sorted(
+        (
+            DomainId,
+            Option.SelectionFingerprint,
+        )
+        for DomainId, Option in SelectedByDomain.items()
+    ))
+    return FixedPlacementPinAccessSolveResult(
+        Status=FixedPlacementPinAccessStatus.Feasible,
+        ProblemFingerprint=ProblemFingerprint,
+        AssignmentFingerprint=BuildStableFingerprint({
+            "ProblemFingerprint": ProblemFingerprint,
+            "SelectedOptionFingerprints": SelectedOptionFingerprints,
+        }),
+        SelectedOptionFingerprints=SelectedOptionFingerprints,
+        ExpansionCount=ExpansionCount,
+        MaximumExpansions=MaximumExpansions,
+    )
+
+
+def ReplayFixedPlacementPinAccessUnsatisfiableCore(
+    Core: FixedPlacementPinAccessUnsatisfiableCore,
+    *,
+    ResourceGraph: RoutingResourceGraph | None = None,
+) -> FixedPlacementPinAccessSolveResult:
+    """Re-run one published independent core with no omitted domains."""
+    Result = SolveFixedPlacementPinAccessDomains(
+        Core.Domains,
+        ResourceGraph=ResourceGraph,
+        MaximumExpansions=max(1, sum(
+            max(1, len(Value.Options)) for Value in Core.Domains
+        ) * max(1, len(Core.Domains)) * 8),
+    )
+    if Result.Status is not FixedPlacementPinAccessStatus.Unsatisfiable:
+        raise ValueError("published pin-access core did not replay as unsat")
+    if (
+        Result.UnsatisfiableCore is None
+        or Result.UnsatisfiableCore.CoreFingerprint != Core.CoreFingerprint
+    ):
+        raise ValueError("published pin-access core identity changed on replay")
+    return Result
 
 @dataclass(frozen=True)
 class _ImmutableStubClaimMask:

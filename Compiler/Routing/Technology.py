@@ -3,9 +3,83 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 Position3 = tuple[int, int, int]
+RepeaterInputFacing = Literal["north", "south", "east", "west"]
+
+HorizontalFacingDeltas: dict[RepeaterInputFacing, Position3] = {
+    "north": (0, 0, -1),
+    "south": (0, 0, 1),
+    "east": (1, 0, 0),
+    "west": (-1, 0, 0),
+}
+OppositeHorizontalFacings: dict[
+    RepeaterInputFacing,
+    RepeaterInputFacing,
+] = {
+    "north": "south",
+    "south": "north",
+    "east": "west",
+    "west": "east",
+}
+
+
+def ValidateRepeaterInputFacing(Facing: str) -> RepeaterInputFacing:
+    """Validate one Java repeater input-side ``facing`` blockstate."""
+    if Facing not in HorizontalFacingDeltas:
+        raise ValueError(
+            f"Repeater input facing must be horizontal: {Facing!r}"
+        )
+    return Facing  # type: ignore[return-value]
+
+
+def OppositeHorizontalFacing(
+    Facing: RepeaterInputFacing | str,
+) -> RepeaterInputFacing:
+    """Return the opposite cardinal side after strict validation."""
+    return OppositeHorizontalFacings[ValidateRepeaterInputFacing(Facing)]
+
+
+def RepeaterInputDelta(
+    InputFacing: RepeaterInputFacing | str,
+) -> Position3:
+    """Return the offset from a repeater to its Java input/rear side."""
+    return HorizontalFacingDeltas[
+        ValidateRepeaterInputFacing(InputFacing)
+    ]
+
+
+def RepeaterOutputDelta(
+    InputFacing: RepeaterInputFacing | str,
+) -> Position3:
+    """Return the offset from a repeater to its driven output/front side."""
+    return HorizontalFacingDeltas[
+        OppositeHorizontalFacing(InputFacing)
+    ]
+
+
+def RepeaterInputFacingForStep(
+    Current: Position3,
+    Next: Position3,
+) -> RepeaterInputFacing:
+    """Return the Java input-facing state for power flowing to ``Next``."""
+    Delta = (
+        Next[0] - Current[0],
+        Next[1] - Current[1],
+        Next[2] - Current[2],
+    )
+    InputFacingByOutputDelta = {
+        RepeaterOutputDelta(InputFacing): InputFacing
+        for InputFacing in HorizontalFacingDeltas
+    }
+    try:
+        return InputFacingByOutputDelta[Delta]
+    except KeyError as Error:
+        raise ValueError(
+            "A routing repeater must lie on a flat straight run"
+        ) from Error
 
 
 @dataclass(frozen=True)

@@ -53,19 +53,19 @@ independently proves otherwise.
 
 ## Acceptance evidence and tools
 
-- [`Scripts/RunRouterAcceptance.py`](../../Scripts/RunRouterAcceptance.py) --
+- [`Scripts/Routing/RunRouterAcceptance.py`](../../Scripts/Routing/RunRouterAcceptance.py) --
   canonical sequential strict matrix, immutable per-circuit wall ceilings,
   explicit publication reserve, incremental
   `router-acceptance-manifest-v2`, artifact hashes, deterministic
   repeated-run comparison, and explicit optional CLA4 checkpoints.
-- [`Tests/test_router_acceptance_harness.py`](../../Tests/test_router_acceptance_harness.py)
+- [`Tests/Integration/test_router_acceptance_harness.py`](../../Tests/Integration/test_router_acceptance_harness.py)
   -- focused dry-run, sequencing, rejection-shape, determinism,
   publication-reserve, and immutable-ceiling coverage.
-- [`Scripts/CaptureRoutingDesignSnapshot.py`](../../Scripts/CaptureRoutingDesignSnapshot.py)
+- [`Scripts/Routing/CaptureRoutingDesignSnapshot.py`](../../Scripts/Routing/CaptureRoutingDesignSnapshot.py)
   -- explicit timestamped source/artifact capture with separate exact-byte and
   portable-semantic evidence identities and no implicit latest-artifact
   discovery.
-- [`Tests/test_routing_design_snapshot.py`](../../Tests/test_routing_design_snapshot.py)
+- [`Tests/Structural/test_routing_design_snapshot.py`](../../Tests/Structural/test_routing_design_snapshot.py)
   -- focused snapshot identity, typed failure, source/runtime consistency,
   manifest validation, and staged-publication coverage.
 - [`RustRouting/Src/`](../../RustRouting/Src/) -- the native router's exact
@@ -74,7 +74,7 @@ independently proves otherwise.
 Inspecting the matrix is safe and does not launch a physical compile:
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3 --dry-run
 ```
 

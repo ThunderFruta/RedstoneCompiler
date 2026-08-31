@@ -38,7 +38,6 @@ use crate::Planning::AssignmentPlanning::{
 use crate::Planning::LeasePlanning::{
     LeaseCandidate, LeaseDomain, LeaseSolveStatus, SolveLeaseDomainsWithDeadline,
 };
-use crate::Simulation::LogicSimulation::EvaluateLogicPrograms;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -294,7 +293,6 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
         Module
     )?)?;
     Module.add_function(wrap_pyfunction!(GenerateRectilinearTopology, Module)?)?;
-    Module.add_function(wrap_pyfunction!(EvaluateLogicPrograms, Module)?)?;
     Module.add_function(wrap_pyfunction!(SolveLeaseDomainsBounded, Module)?)?;
     Module.add_function(wrap_pyfunction!(
         BuildAccessRegionGraphCatalogBounded,

@@ -906,6 +906,11 @@ class PlacementAccessFabric:
     LegalEscapeWorkLimitKind: str = ""
     LegalEscapeDirectionStateUpperBound: int | None = None
     IncompleteReason: str = ""
+    # Phase-one straight access is a catalog-derived immutable witness. It is
+    # execution-neutral metadata here: the existing fabric fingerprint and
+    # selected physical geometry remain unchanged for parity.
+    PinAccessWitness: Any = field(default=None, compare=False, repr=False)
+    FixedPinAccessSolve: Any = field(default=None, compare=False, repr=False)
     Technology: Any = field(default=None, compare=False, repr=False)
 
     @property
@@ -956,6 +961,16 @@ class PlacementAccessFabric:
             ),
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
+            "PinAccessWitness": (
+                self.PinAccessWitness.ToDictionary()
+                if self.PinAccessWitness is not None
+                else None
+            ),
+            "FixedPinAccessSolve": (
+                self.FixedPinAccessSolve.ToDictionary()
+                if self.FixedPinAccessSolve is not None
+                else None
+            ),
         }
 
 

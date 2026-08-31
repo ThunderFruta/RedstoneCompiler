@@ -288,6 +288,11 @@ def PlaceLocalizedTerminals(Context, Gates: list[Any], PortIndexes: dict[str, in
         CheckWork(Context, 'localized-terminal', GateName=Gate.Name)
         Signal = TerminalSignal(Gate)
         DesiredPins = Targets.get(Signal, []) if TerminalKind(Gate) == 'INPUT' else [Producers[Signal].OutputPin]
+        if not DesiredPins:
+            # An unused input has no internal consumer to localize against.
+            # Leave it out of the localized selection so the final commit can
+            # place it through the ordinary terminal-bank fallback.
+            continue
         TargetXs = sorted((Pin[0] for Pin in DesiredPins))
         TargetZs = sorted((Pin[2] for Pin in DesiredPins))
         TargetMiddle = len(DesiredPins) // 2

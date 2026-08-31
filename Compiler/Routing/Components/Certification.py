@@ -158,7 +158,7 @@ def BuildGlobalRelaxedLocalProofDomainFingerprint(
                     _NormalizedClaimsIdentity(Candidate.Claims, Origin),
                     tuple(
                         (_Normalize(Position, Origin), Facing)
-                        for Position, Facing in Candidate.Repeaters
+                        for Position, Facing in Candidate.RepeaterInputFacings
                     ),
                     tuple(sorted(
                         _Normalize(Value, Origin)
@@ -1200,7 +1200,7 @@ def _BuildPhysicalComponentSymbolicNetStateFingerprint(
                 tuple(sorted(map(str, State.Claims.ResourceIds))),
                 tuple(State.CoveredTerminals),
                 tuple(State.ExportedPorts),
-                tuple(State.Repeaters),
+                tuple(State.RepeaterInputFacings),
             )
             for State in States
         )),

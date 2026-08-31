@@ -9,6 +9,7 @@ role in [Benchmarks](../Testing/Benchmarks.md); do not make its name select a
 routing heuristic.
 
 Generated files belong under `Output/<ExampleName>/` and should include NAND
-JSON, truth table, physical design JSON, diagram, and litematic only after a
-successful compile. Large generated artifacts and ad hoc logs are evidence,
-not source fixtures, unless a test explicitly owns them.
+JSON, physical design JSON, diagram, and litematic after a successful compile.
+Fabric-server validation artifacts will be added at the server boundary. Large
+generated artifacts and ad hoc logs are evidence, not source fixtures, unless
+a test explicitly owns them.

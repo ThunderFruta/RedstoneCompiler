@@ -891,7 +891,7 @@ missing-artifact, runtime, conflict, unresolved-claim, and overflow violations.
 A repeated-run fingerprint mismatch must fail the complete manifest.
 
 **Code and documentation changed:** Added
-`Scripts/RunRouterAcceptance.py` and
+`Scripts/Routing/RunRouterAcceptance.py` and
 `Tests/test_router_acceptance_harness.py`; updated the canonical guide, design,
 routing-doc index, root README, current snapshot, and this journal.
 
@@ -970,7 +970,7 @@ five qualifying durable runs.
 **Command:**
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21
 ```
 
 The manifest records `/usr/bin/python3.12`, `PYTHONHASHSEED=0`, Linux
@@ -1691,7 +1691,7 @@ python3 -m unittest \
   Tests.test_routing_resources
 cargo test --manifest-path RustRouting/Cargo.toml --release
 git diff --check
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21
 ```
 
 **Evidence and artifact paths:** The current source is Git revision
@@ -1783,7 +1783,7 @@ checks conflict classification. `Compiler/Routing/ResourceGraph.py`,
 `Compiler/Placement/Pcb.py`, and `Compiler/Placement/PcbFlow.py` add periodic
 work checks and fair-share placement-generation slices.
 `RustRouting/Src/Assignment.rs` checks the native deadline inside base and
-conflict loops. `Scripts/RunRouterAcceptance.py` defines the 2.0-second
+conflict loops. `Scripts/Routing/RunRouterAcceptance.py` defines the 2.0-second
 capture-only grace.
 
 **Behavior changed:** RCA4 now ends both processes around 22.27 seconds with
@@ -1813,7 +1813,7 @@ python3 -m unittest \
 cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
 cargo test --manifest-path RustRouting/Cargo.toml --release
 git diff --check
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21
 ```
 
 **Evidence and artifact paths:** The current manifest is
@@ -1930,7 +1930,7 @@ python3 -m unittest \
 cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
 cargo test --manifest-path RustRouting/Cargo.toml --release
 git diff --check
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 
@@ -2011,7 +2011,7 @@ python3 -m unittest \
 cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
 cargo test --manifest-path RustRouting/Cargo.toml --release
 git diff --check
-python3 Scripts/RunRouterAcceptance.py --date 2026-07-21 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 

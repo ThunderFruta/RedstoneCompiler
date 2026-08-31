@@ -80,21 +80,46 @@ def RunGuidePlanning(State: AuthoritativeRoutingState, Services: AuthoritativeRo
         raise Services.RoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ComponentAssemblyIdentityMismatch, Stage='PhysicalComponentGlobalPlanning', Detail='the global-channel pass selected a routing layer domain different from the frozen post-closure portal handoff', Diagnostics={'PreparedLayerCount': State.RawPortalCache.LayerCount, 'SelectedLayerCount': State.LayerCount, 'ImplicitForeignTransitDomainCount': 0}))
     State.WorkTelemetry['PhysicalAssemblyLayerContract'] = {'PlanFingerprint': State.PhysicalAssemblyPlan.PlanFingerprint if State.PhysicalAssemblyPlan is not None else '', 'RequiredPhysicalAssemblyLayerCount': RequiredPhysicalAssemblyLayerCount, 'RequiredAccessLayerCount': RequiredAccessLayerCount, 'SelectedLayerCount': State.LayerCount, 'EffectiveMaximumLayerCount': State.EffectiveMaximumLayerCount, 'PolicyMaximumLayerCount': PolicyLayerLimit if PolicyLayerLimit > 0 else State.Technology.MaximumRoutableLayerCount, 'TechnologyMaximumLayerCount': State.Technology.MaximumRoutableLayerCount, 'InterfaceDeckLayer': State.InterfaceDeckLayer, 'InterfaceDeckAuthorization': 'explicit-hierarchical-deck' if State.InterfaceDeckLayer is not None else 'flat-policy', 'Satisfied': State.LayerCount >= RequiredPhysicalAssemblyLayerCount}
     State.DedicatedInterfaceDeckNodes = frozenset(((int(Cell[0]), State.Technology.RoutingY(State.MinimumY, int(Lane.Layer)), int(Cell[2])) for Lane in (State.InterClusterChannel.Lanes if State.InterClusterChannel is not None else ()) if State.InterfaceDeckLayer is not None and int(Lane.Layer) == int(State.InterfaceDeckLayer) for Cell in Lane.Cells))
-    State.ClosedComponentOwnedTerminalPairs = Services.SelectClosedComponentOwnedTerminalPairs(State.Placed, State.Profiles) if State.PreparePhysicalComponentAssemblyOnly and (not State.Resources.PreparingPhysicalComponentGlobalChannels) and (State.UnboundOwnedSignalFrontierProofCallback is not None) else frozenset()
+    State.ClosedComponentOwnedTerminalPairs = Services.SelectClosedComponentOwnedTerminalPairs(State.Placed, State.Profiles) if State.PreparePhysicalComponentAssemblyOnly and (not State.Resources.PreparingPhysicalComponentGlobalChannels) else frozenset()
+    ComponentGuideProfileSignals = frozenset(
+        Signal
+        for Signal, _Terminal in State.ClosedComponentOwnedTerminalPairs
+    )
+    SelectiveComponentGuidePlanning = bool(
+        State.PreparePhysicalComponentAssemblyOnly
+        and not State.Resources.PreparingPhysicalComponentGlobalChannels
+        and ComponentGuideProfileSignals
+    )
+    GuidePlanningProfiles = (
+        {
+            Signal: State.Profiles[Signal]
+            for Signal in sorted(ComponentGuideProfileSignals)
+        }
+        if SelectiveComponentGuidePlanning
+        else State.Profiles
+    )
+    State.WorkTelemetry['PhysicalComponentGuidePreparation'] = {
+        'Selective': SelectiveComponentGuidePlanning,
+        'PreparedSignalCount': len(GuidePlanningProfiles),
+        'WholeDesignSignalCount': len(State.Profiles),
+        'PreparedSignals': sorted(GuidePlanningProfiles),
+    }
     State.RawPortalVariantCounts = dict(State.RoutePortalVariantCounts)
     for OwnedSignal, _Terminal in State.ClosedComponentOwnedTerminalPairs:
         State.RawPortalVariantCounts.setdefault(OwnedSignal, max(1, int(State.DemandDerivedPortalLimit)))
     State.WorkTelemetry['PhysicalComponentPortalPreparation'] = {'Selective': False, 'AuthoritativeScope': 'whole-design', 'PreparedSignals': sorted(State.RawPortalVariantCounts), 'DeferredSignalCount': 0}
+    State.RawPortalPlacementGeometryFingerprint = Services.BuildRawPortalPlacementGeometryFingerprint(State.Placed)
+    State.RawPortalResourceGeometryFingerprint = Services.BuildRawPortalResourceGeometryFingerprint(State.Resources)
     State.ResourceRawPortalReusePlan: Services.RawPortalGeometryReusePlan | None = None
     if State.RawPortalCache is None:
-        State.ResourceRawPortalReusePlan = Services.SelectRawPortalGeometryReusePlan(State.Resources.RawPortalGeometryCaches, State.Placed, State.Resources, State.LayerCount, State.PortalLimit, State.RawPortalVariantCounts, State.Policy.DetailedRouting.GuideExpansion, State.Policy.DetailedRouting.StrictMaximumExpansions, State.PortalAccessGeometryFingerprint, State.CoordinatedCandidateDiversificationSignals, AllowPortableSignalReuse=State.TopologyRequiresJointPortfolio and State.PlacementWasRelocated or State.PreparePhysicalComponentAssemblyOnly or State.Resources.PreparingPhysicalComponentGlobalChannels, PhysicalGlobalKeepoutFingerprint=State.PhysicalGlobalKeepoutFingerprint)
+        State.ResourceRawPortalReusePlan = Services.SelectRawPortalGeometryReusePlan(State.Resources.RawPortalGeometryCaches, State.Placed, State.Resources, State.LayerCount, State.PortalLimit, State.RawPortalVariantCounts, State.Policy.DetailedRouting.GuideExpansion, State.Policy.DetailedRouting.StrictMaximumExpansions, State.PortalAccessGeometryFingerprint, State.CoordinatedCandidateDiversificationSignals, AllowPortableSignalReuse=State.TopologyRequiresJointPortfolio and State.PlacementWasRelocated or State.PreparePhysicalComponentAssemblyOnly or State.Resources.PreparingPhysicalComponentGlobalChannels, PhysicalGlobalKeepoutFingerprint=State.PhysicalGlobalKeepoutFingerprint, PlacementGeometryFingerprint=State.RawPortalPlacementGeometryFingerprint, ResourceGeometryFingerprint=State.RawPortalResourceGeometryFingerprint)
         if State.ResourceRawPortalReusePlan is not None:
             State.RawPortalCache = State.ResourceRawPortalReusePlan.Cache
     State.WorkTelemetry['RawPortalResourceCacheSelected'] = State.ResourceRawPortalReusePlan is not None
     State.WorkTelemetry['RawPortalPortablePlanarTransforms'] = {Signal: {'Transform': Transform, 'Translation': list(Translation)} for Signal, Transform, Translation in (State.ResourceRawPortalReusePlan.SignalPlanarTransforms if State.ResourceRawPortalReusePlan is not None else ())}
     State.WorkTelemetry['RawPortalCacheCallerProvided'] = State.CallerProvidedRawPortalCache
     State.WorkTelemetry['MaturePortfolioSearchCaps'] = {**dict(State.WorkTelemetry['MaturePortfolioSearchCaps']), 'ReusedRawPortalProfile': ReusedRawPortalProfile}
-    State.GuideInputFingerprint = Services.BuildCapacityAwareGuideInputFingerprint(State.Profiles, State.LayerCount, State.MinimumX, State.MinimumZ, State.Policy.GlobalRouting, State.Technology, State.Policy.Placement.LocalFanoutDistance)
+    State.GuideInputFingerprint = Services.BuildCapacityAwareGuideInputFingerprint(GuidePlanningProfiles, State.LayerCount, State.MinimumX, State.MinimumZ, State.Policy.GlobalRouting, State.Technology, State.Policy.Placement.LocalFanoutDistance)
     if State.PhysicalAssemblyPlan is not None:
         State.GuideInputFingerprint = Services.BuildStableFingerprint((State.GuideInputFingerprint, Services.BuildPhysicalAssemblyGuideContractFingerprint(State.PhysicalAssemblyPlan)))
     CachedGuideInputFingerprint = State.RawPortalCache.GuideInputFingerprint if State.RawPortalCache is not None else ''
@@ -137,7 +162,7 @@ def RunGuidePlanning(State: AuthoritativeRoutingState, Services: AuthoritativeRo
         assert State.RawPortalCache is not None
         State.CoarsePlan = State.RawPortalCache.GuidePlan
     else:
-        State.CoarsePlan = Services.BuildCapacityAwareGuidePlan(State.Profiles, State.LayerCount, State.MinimumX, State.MinimumZ, State.Policy.GlobalRouting, State.Technology, State.Policy.Placement.LocalFanoutDistance, ComponentObstacleBounds=ComponentGuideObstacleBounds if State.PreparePhysicalComponentAssemblyOnly and State.PhysicalAssemblyPlan is None else None, ComponentObstacleCellsByLayer=ComponentGuideObstacleCellsByLayer if State.PhysicalAssemblyPlan is not None else None, ComponentObstacleExemptCellsBySignal=ComponentGuideObstacleExemptCellsBySignal if State.PhysicalAssemblyPlan is not None else None, ComponentOwnedSignals=ComponentGuideOwnedSignals if State.PreparePhysicalComponentAssemblyOnly else frozenset(), SeedPlan=State.RawPortalCache.GuidePlan if State.RawPortalCache is not None else None, WorkCheck=lambda Diagnostics: State.CheckRuntimeBudget('Guide', Diagnostics)) if BuildGlobalGuidePlan else None
+        State.CoarsePlan = Services.BuildCapacityAwareGuidePlan(GuidePlanningProfiles, State.LayerCount, State.MinimumX, State.MinimumZ, State.Policy.GlobalRouting, State.Technology, State.Policy.Placement.LocalFanoutDistance, ComponentObstacleBounds=ComponentGuideObstacleBounds if State.PreparePhysicalComponentAssemblyOnly and State.PhysicalAssemblyPlan is None else None, ComponentObstacleCellsByLayer=ComponentGuideObstacleCellsByLayer if State.PhysicalAssemblyPlan is not None else None, ComponentObstacleExemptCellsBySignal=ComponentGuideObstacleExemptCellsBySignal if State.PhysicalAssemblyPlan is not None else None, ComponentOwnedSignals=ComponentGuideOwnedSignals if State.PreparePhysicalComponentAssemblyOnly else frozenset(), SeedPlan=State.RawPortalCache.GuidePlan if State.RawPortalCache is not None else None, WorkCheck=lambda Diagnostics: State.CheckRuntimeBudget('Guide', Diagnostics)) if BuildGlobalGuidePlan else None
     if State.PlanningPhysicalComponentExterior:
         if State.CoarsePlan is None:
             raise Services.RoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ComponentAssemblyIdentityMismatch, Stage='PhysicalComponentGlobalPlanning', Detail='physical assembly requires a complete global guide plan', Diagnostics={'PhysicalAssemblyPlanFingerprint': State.PhysicalAssemblyPlan.PlanFingerprint}))
@@ -175,7 +200,7 @@ def RunGuidePlanning(State: AuthoritativeRoutingState, Services: AuthoritativeRo
     PreparedExteriorGuideColumnsBySignal = Services.BuildPreparedPhysicalExteriorGuideColumnsBySignal(State.Resources.PreparedPhysicalComponentPortFactorDomain) if State.Resources.PreparingPhysicalComponentGlobalChannels else {}
     State.WorkTelemetry['PreparedPhysicalExteriorGuideFabric'] = {'Enabled': bool(PreparedExteriorGuideColumnsBySignal), 'Signals': sorted(PreparedExteriorGuideColumnsBySignal), 'ColumnCounts': {Signal: len(Columns) for Signal, Columns in sorted(PreparedExteriorGuideColumnsBySignal.items())}, 'Fingerprint': Services.BuildStableFingerprint(tuple(((Signal, tuple(sorted(Columns))) for Signal, Columns in sorted(PreparedExteriorGuideColumnsBySignal.items()))))}
     RegionExpansion = State.Policy.DetailedRouting.GuideExpansion + State.Technology.TrackPitch * State.LaneDiversityLevel
-    for Signal, Profile in State.Profiles.items():
+    for Signal, Profile in GuidePlanningProfiles.items():
         TerminalColumns = tuple(((Path[-1][0], Path[-1][2]) for Path in (Profile.SourceAccessPath, *Profile.TargetAccessPaths.values())))
         if Profile.Seed is not None and Profile.Seed.ContinuationNodes:
             TerminalColumns = tuple(dict.fromkeys((*((Position[0], Position[2]) for Position in Profile.Seed.ContinuationNodes), *TerminalColumns)))

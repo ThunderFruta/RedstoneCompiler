@@ -119,10 +119,10 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                                 Next.1 - CurrentState.0 .1,
                                 Next.2 - CurrentState.0 .2,
                             );
-                            let CurrentFacing = RepeaterFacing(CurrentState.0, Next);
-                            let ExistingRepeaterFacing =
+                            let CurrentFacing = RepeaterInputFacing(CurrentState.0, Next);
+                            let ExistingRepeaterInputFacing =
                                 CandidateRepeaters.get(&CurrentState.0).cloned();
-                            if ExistingRepeaterFacing
+                            if ExistingRepeaterInputFacing
                                 .as_ref()
                                 .is_some_and(|Facing| Some(Facing) != CurrentFacing.as_ref())
                             {
@@ -158,7 +158,7 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                                     {
                                         return None;
                                     }
-                                    let Facing = RepeaterFacing(Candidate, After)?;
+                                    let Facing = RepeaterInputFacing(Candidate, After)?;
                                     if CandidateRepeaters
                                         .get(&Candidate)
                                         .is_some_and(|Value| Value != &Facing)
@@ -171,7 +171,7 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                             let MustRefreshCurrent = CurrentState.2
                                 <= crate::Path::PathRouting::REPEATER_TURN_HEADROOM
                                 || NextRefreshDistance >= usize::from(CurrentState.2);
-                            let RefreshCurrent = ExistingRepeaterFacing.is_some()
+                            let RefreshCurrent = ExistingRepeaterInputFacing.is_some()
                                 || (CanPhysicallyRefreshCurrent && MustRefreshCurrent);
                             let RemainingStrength = if RefreshCurrent {
                                 let Some(Facing) = CurrentFacing else {
@@ -336,7 +336,7 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                                     {
                                         return None;
                                     }
-                                    let Facing = RepeaterFacing(Candidate, After)?;
+                                    let Facing = RepeaterInputFacing(Candidate, After)?;
                                     if CandidateRepeaters
                                         .get(&Candidate)
                                         .is_some_and(|Value| Value != &Facing)
@@ -383,7 +383,7 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                             if let (Some(RepeaterPosition), Some(RepeaterAfter)) =
                                 (RepeaterPosition, RepeaterAfter)
                             {
-                                let Some(Facing) = RepeaterFacing(RepeaterPosition, RepeaterAfter)
+                                let Some(Facing) = RepeaterInputFacing(RepeaterPosition, RepeaterAfter)
                                 else {
                                     ExactBranchComplete = false;
                                     break;
@@ -720,7 +720,7 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                         && InputDirection.1 == 0
                         && !$ForbiddenRepeaterPositions.contains(&SiblingRepeater)
                     {
-                        if let Some(Facing) = RepeaterFacing(SiblingRepeater, SiblingOutput) {
+                        if let Some(Facing) = RepeaterInputFacing(SiblingRepeater, SiblingOutput) {
                             CandidateRepeaters.insert(SiblingRepeater, Facing);
                             CandidatePhysicalPowers = PropagateCanonicalRoutePower(
                                 $Root,
@@ -787,7 +787,6 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                     $StateByNode = CandidateStateByNode;
                     $ParentByNode = CandidateParentByNode;
                     $Repeaters = CandidateRepeaters;
-                    PhysicalNodes = CandidatePhysicalNodes;
                     PhysicalPowers = CandidatePhysicalPowers;
                     RequiredPoweredTargets.insert(Target);
                     if std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {

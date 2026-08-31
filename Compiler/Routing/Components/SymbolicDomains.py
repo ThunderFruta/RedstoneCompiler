@@ -98,6 +98,8 @@ from .Validation import (
     BuildPhysicalPortSeamContractFingerprint,
     _Fingerprint,
 )
+
+
 def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProblem, FactorDomain: PreparedPhysicalComponentPortFactorDomain, SignalPair: Iterable[str], *, DeadlineSeconds: float | None, WorkCheck: Callable[[dict[str, object]], None] | None=None, NetStateCache: dict[str, Any] | None=None, CompletedCertificateCache: dict[str, PhysicalComponentSymbolicPortPairCertificate] | None=None, CompleteCompatibilityIndexCache: dict[str, Any] | None=None, RouteClaimsConstructionCache: dict[frozenset[Position3], RoutingResourceClaims] | None=None) -> PhysicalComponentSymbolicPortPairCertificate:
     """Compile exact unary/binary support across two complete seam domains."""
     if not FactorDomain.Complete:
@@ -1966,13 +1968,52 @@ def ProjectCompletePhysicalPortPairCertificateToApertureClauses(
         ))
         for First, Second in Certificate.UnsupportedSeamPairs
     )
+    AllSeamsBySignal = {
+        Signal: frozenset(
+            Seam
+            for (CandidateSignal, _LocalAccess), Seam
+            in SeamByLocalAccess.items()
+            if CandidateSignal == Signal
+        )
+        for Signal in Signals
+    }
+
+    def SeamPairIsUnsupported(
+        FirstSignal: str,
+        FirstSeam: str,
+        SecondSignal: str,
+        SecondSeam: str,
+    ) -> bool:
+        return bool(
+            (FirstSignal, FirstSeam) in UnsupportedUnarySeams
+            or (SecondSignal, SecondSeam) in UnsupportedUnarySeams
+            or frozenset((
+                (FirstSignal, FirstSeam),
+                (SecondSignal, SecondSeam),
+            )) in UnsupportedSeamPairs
+        )
+
     Clauses: set[frozenset[tuple[str, str]]] = set()
+    UnaryRejectedApertureKeys: set[tuple[str, str]] = set()
     for ApertureKey, Seams in SeamsByApertureContract.items():
+        OtherSignal = next(
+            Signal for Signal in Signals if Signal != ApertureKey[0]
+        )
         if Seams and all(
             (ApertureKey[0], Seam) in UnsupportedUnarySeams
+            or all(
+                SeamPairIsUnsupported(
+                    ApertureKey[0],
+                    Seam,
+                    OtherSignal,
+                    OtherSeam,
+                )
+                for OtherSeam in AllSeamsBySignal[OtherSignal]
+            )
             for Seam in Seams
         ):
             Clauses.add(frozenset((ApertureKey,)))
+            UnaryRejectedApertureKeys.add(ApertureKey)
 
     FirstSignal, SecondSignal = Signals
     FirstApertures = tuple(
@@ -1987,13 +2028,18 @@ def ProjectCompletePhysicalPortPairCertificateToApertureClauses(
     )
     for FirstKey, FirstSeams in FirstApertures:
         for SecondKey, SecondSeams in SecondApertures:
+            if (
+                FirstKey in UnaryRejectedApertureKeys
+                or SecondKey in UnaryRejectedApertureKeys
+            ):
+                continue
             if FirstSeams and SecondSeams and all(
-                (FirstSignal, FirstSeam) in UnsupportedUnarySeams
-                or (SecondSignal, SecondSeam) in UnsupportedUnarySeams
-                or frozenset((
-                    (FirstSignal, FirstSeam),
-                    (SecondSignal, SecondSeam),
-                )) in UnsupportedSeamPairs
+                SeamPairIsUnsupported(
+                    FirstSignal,
+                    FirstSeam,
+                    SecondSignal,
+                    SecondSeam,
+                )
                 for FirstSeam in FirstSeams
                 for SecondSeam in SecondSeams
             ):
@@ -2006,6 +2052,22 @@ def ProjectCompletePhysicalPortPairCertificateToApertureClauses(
             ApertureContractByOption
         ),
         "ApertureProjectionClauseCount": len(Clauses),
+        "ApertureProjectionUnaryClauseCount": sum(
+            len(Clause) == 1 for Clause in Clauses
+        ),
+        "ApertureProjectionBinaryClauseCount": sum(
+            len(Clause) == 2 for Clause in Clauses
+        ),
+        "ApertureProjectionEmptySignals": [
+            Signal
+            for Signal in Signals
+            if {
+                Key for Key in SeamsByApertureContract if Key[0] == Signal
+            }
+            and {
+                Key for Key in SeamsByApertureContract if Key[0] == Signal
+            }.issubset(UnaryRejectedApertureKeys)
+        ],
     })
     return frozenset(Clauses), Diagnostics
 

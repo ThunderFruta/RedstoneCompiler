@@ -22,12 +22,17 @@ from Compiler.Placement.Rotation import (
 )
 from Compiler.Placement.Geometry import (
     BuildPlacedGate,
-    GetGateInputAccess,
+    BuildPlacementPinAccessWitness,
     PlacedGate,
 )
 from Compiler.Placement.PreRouteInterface import (
     DerivedPerimeterSlotDomain,
     DerivedPerimeterTerminalSlot,
+)
+from Compiler.Placement.Access.Capacity import (
+    FixedPlacementPinAccessDomain,
+    FixedPlacementPinAccessSolveResult,
+    SolveFixedPlacementPinAccessDomains,
 )
 from Compiler.Routing.Technology import (
     DefaultRedstoneRoutingTechnology,
@@ -487,6 +492,41 @@ class MandatoryAccessConflictProfile:
             "SelfConflicts": ConflictRecords(self.SelfConflicts),
         }
 
+
+def SolveFixedPlacementMandatoryAccess(
+    PlacedGates: Iterable[Any],
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> FixedPlacementPinAccessSolveResult:
+    """Return the typed exact decision for every committed straight pin ray."""
+    Gates = (
+        PlacedGates
+        if isinstance(PlacedGates, (list, tuple))
+        else tuple(PlacedGates)
+    )
+    Witness = BuildPlacementPinAccessWitness(
+        Gates,
+        AccessLength=DefaultRedstoneRoutingTechnology.AccessLength,
+        RequireCatalogMatch=False,
+    )
+    return SolveFixedPlacementPinAccessDomains(
+        (
+            FixedPlacementPinAccessDomain(
+                DomainId=(
+                    f"{Selection.GateName}:"
+                    f"{Selection.Role}:{Selection.PinId}"
+                ),
+                Signal=Selection.Signal,
+                Terminal=Selection.Terminal,
+                Options=(Selection,),
+                Complete=Witness.Complete,
+                IncompleteReason=Witness.IncompleteReason,
+            )
+            for Selection in Witness.Selections
+        ),
+        MaximumExpansions=max(1, len(Witness.Selections) * 2),
+        WorkCheck=WorkCheck,
+    )
+
 def OrderExactStatesForMandatoryAccessCommit(
     States: Iterable[dict[str, object]],
     ProfilesBySearchCandidate: Mapping[
@@ -649,42 +689,27 @@ def BuildMandatoryAccessClaims(
     NodesBySignal: dict[str, set[tuple[int, int, int]]] = {
         Signal: set() for Signal in RequiredSignals
     }
-    for GateIndex, Gate in enumerate(Gates, start=1):
-        if WorkCheck is not None and GateIndex % 32 == 0:
+    AccessWitness = BuildPlacementPinAccessWitness(
+        Gates,
+        AccessLength=DefaultRedstoneRoutingTechnology.AccessLength,
+        # Tiny resource-graph fixtures may use intentionally synthetic pin
+        # geometry. Production cells still report CatalogMatched=True, while
+        # the witness retains the actual physical ray for those fixtures.
+        RequireCatalogMatch=False,
+    )
+    for SelectionIndex, Selection in enumerate(
+        AccessWitness.Selections,
+        start=1,
+    ):
+        if WorkCheck is not None and SelectionIndex % 32 == 0:
             WorkCheck({
                 "Phase": "mandatory-access-claims-gates",
-                "ProcessedGates": GateIndex,
+                "ProcessedGates": SelectionIndex,
                 "GateCount": len(Gates),
                 "SignalCount": len(RequiredSignals),
             })
-        if Gate.OutputPin is not None and Gate.OutputDirection is not None:
-            for Signal in Gate.Outputs:
-                if Signal not in RequiredSignals:
-                    continue
-                NodesBySignal[Signal].update(
-                    (
-                        Gate.OutputPin[0] + Gate.OutputDirection[0] * Offset,
-                        Gate.OutputPin[1] + Gate.OutputDirection[1] * Offset,
-                        Gate.OutputPin[2] + Gate.OutputDirection[2] * Offset,
-                    )
-                    for Offset in range(
-                        DefaultRedstoneRoutingTechnology.AccessLength
-                    )
-                )
-        for InputIndex, Signal in enumerate(Gate.Inputs):
-            if Signal not in RequiredSignals:
-                continue
-            Pin, Direction = GetGateInputAccess(Gate, InputIndex)
-            NodesBySignal[Signal].update(
-                (
-                    Pin[0] + Direction[0] * Offset,
-                    Pin[1] + Direction[1] * Offset,
-                    Pin[2] + Direction[2] * Offset,
-                )
-                for Offset in range(
-                    DefaultRedstoneRoutingTechnology.AccessLength
-                )
-            )
+        if Selection.Signal in RequiredSignals:
+            NodesBySignal[Selection.Signal].update(Selection.Path)
     ClaimBuilder = RoutingResourceGraph(
         ActualBlocks=frozenset(),
         ElectricalBlocks=frozenset(),

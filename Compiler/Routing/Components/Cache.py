@@ -282,7 +282,7 @@ def _MoveNet(
     )
     Repeaters = tuple(
         (_Move(Position, Delta), Facing)
-        for Position, Facing in Value.Repeaters
+        for Position, Facing in Value.RepeaterInputFacings
     )
     ExportedPorts = tuple(
         _Move(Position, Delta) for Position in Value.ExportedPorts
@@ -300,7 +300,7 @@ def _MoveNet(
             Position for Position, _Facing in Repeaters
         ),
         SupportCells=Claims.SupportCells,
-        Repeaters=Repeaters,
+        RepeaterInputFacings=Repeaters,
         Claims=Claims,
         CoveredTerminals=CoveredTerminals,
         ExportedPorts=ExportedPorts,

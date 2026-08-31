@@ -30,7 +30,7 @@ Authoritative global routing
         ↓
 Placement flow
         ↓
-Compiler pipeline, simulation, writer
+Compiler pipeline, Fabric validation, writer
 ```
 
 `Contracts` and `Interfaces` are neutral. `Components` must not import
@@ -89,6 +89,11 @@ Process-global caches remain in one concrete owner and retain their object
 identity and reset behavior. Process-pool workers remain top-level importable
 functions in their owning worker/boundary module.
 
+`Compiler/FabricServer/` owns fixture creation, authenticated live validation,
+imported-schematic testing, and settled-world snapshots. `FabricServerHarness/`
+contains the tracked Fabric mod source; its `Server/` subdirectory is the one
+canonical local runtime and is deliberately not versioned.
+
 ## Native Rust ownership
 
 The native source is intentionally a nested domain tree, not a flat folder:
@@ -115,7 +120,6 @@ RustRouting/Src/
 │                        SourceIntegration.rs, TargetRouting.rs,
 │                        FrozenBranches.rs, Finalization.rs
 ├── Planning/             AssignmentPlanning.rs, LeasePlanning.rs
-├── Simulation/           LogicSimulation.rs
 ├── Python/               Bindings.rs
 └── Lib.rs                module registration and the PyO3 entrypoint only
 ```
@@ -143,8 +147,10 @@ Compiler/Routing/ComponentRouter.py
 Compiler/Routing/ComponentPipeline.py
 Compiler/Routing/Actions/ConflictRepair.py
 Compiler/Cells/Nand.py
+Compiler/Simulation/{Redstone.py,__init__.py}
 RustRouting/Src/{Assignment,AssignmentPlanning,Bindings,Deadline,
                  EscapePlanning,Generation,LeasePlanning,Models,PathRouting}.rs
+RustRouting/Src/Simulation/{LogicSimulation.rs,mod.rs}
 ```
 
 `ConflictRepair.py` was consolidated into `Routing/Actions/Validation.py` while
@@ -184,15 +190,15 @@ current tree:
   acyclic;
 - the six narrow public entrypoints resolve to their concrete owners.
 
-`Tests/test_source_structure.py` enforces these rules. Contract field order,
+`Tests/Structural/test_source_structure.py` enforces these rules. Contract field order,
 defaults, signatures, aliases, and serialization are pinned separately by
-`Tests/test_routing_contract_schema.py`.
+`Tests/Routing/test_routing_contract_schema.py`.
 
 ## Verification commands
 
 ```bash
 python3 -m compileall -q Compiler/Placement Compiler/Routing
-python3 -m pytest -q Tests/test_source_structure.py Tests/test_routing_contract_schema.py
+python3 -m pytest -q Tests/Structural/test_source_structure.py Tests/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 python3 -m pytest -q
 cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
@@ -205,7 +211,7 @@ the path and hash of the module actually imported before parity tests. Run the
 fixed 5/3/3/2 physical matrix in a fresh output root:
 
 ```bash
-python3 Scripts/RunRouterAcceptance.py --date 2026-08-28 \
+python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
   --python .venv/bin/python --include-cla4
 ```

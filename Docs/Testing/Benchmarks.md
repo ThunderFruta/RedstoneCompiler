@@ -1,15 +1,18 @@
 # Routing benchmarks
 
-| Benchmark | Purpose | Runs | Truth rows | Wall ceiling |
+| Benchmark | Purpose | Runs | Fabric validation vectors | Wall ceiling |
 | --- | --- | ---: | ---: | ---: |
 | FullAdder | Small correctness and deterministic overhead gate | 5 | 8 | 10 s |
 | RippleCarryAdder4 | Repeated-stage congestion and regression gate | 3 | 512 | 25 s |
-| RippleCarryAdder8 | 8-bit carry ripple scalability gate | 3 | 131072 | 30 s |
+| RippleCarryAdder8 | 8-bit carry ripple scalability gate | 3 | 4132 | 30 s |
 | CarryLookaheadAdder4 (extended) | Optional exact-interface proof check | 2 | 512 | 120 s |
 
-All successful runs require zero final conflicts, zero unresolved claims,
-authoritative physical simulation, identical repeated fingerprints, and no
-fallback.
+Full acceptance requires zero final conflicts, zero unresolved claims,
+identical repeated fingerprints, no fallback, a durable Fabric fixture, and
+a passed authoritative Fabric-server validation record. The retired
+`*.TruthTable.txt` simulator artifact is not an acceptance gate: the server
+checks the FullAdder/RCA4/CLA4 vectors exhaustively and uses 4,132
+deterministic wide vectors for RCA8.
 
 ## Current checkpoint
 
@@ -23,9 +26,9 @@ same default routing strategy and no-fallback gate as the default sequence.
 ### Execution commands
 
 - Default sequence:
-  - `python Scripts/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3 --date 2026-08-03 --python .venv/bin/python`
+  - `python Scripts/Routing/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3 --date 2026-08-03 --python .venv/bin/python`
 - Extended sequence with CLA4:
-  - `python Scripts/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3Compat --date 2026-08-03 --python .venv/bin/python --include-cla4`
+  - `python Scripts/Routing/RunRouterAcceptance.py --output-root Output/Acceptance/Pass3Compat --date 2026-08-03 --python .venv/bin/python --include-cla4`
 
 ### Results
 
@@ -46,7 +49,7 @@ Extended CLA4 acceptance manifest: `Output/Acceptance/Pass3Compat/2026-08-03/Rou
   - process exit code 1
   - `ClusterInterfaceSolveIncomplete`
   - routing stage reserve timeout (`98.568s` elapsed in routing reserve window)
-  - missing required artifacts: `Schematic`, `TruthTable`, `PhysicalDesign`
+  - missing required artifacts: `Schematic`, `FabricFixture`, `PhysicalDesign`
 
 CarryLookaheadAdder4 remains an explicit extended gate and is not part of the
 default runtime path.

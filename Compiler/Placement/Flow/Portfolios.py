@@ -76,6 +76,9 @@ class PendingJointPlacementState:
     InternalPinBankGeometryRepairSignals: frozenset[str] = frozenset()
     RequiredDistinctPinBankOwnershipFingerprint: str = ""
     TopologyCutFrontier: tuple[RoutingAssignmentCut, ...] = ()
+    PhysicalProofCoreSignals: frozenset[str] = frozenset()
+    PhysicalProofFingerprint: str = ""
+    FixedConnectivityClusters: tuple[tuple[str, ...], ...] = ()
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -136,6 +139,30 @@ class PendingJointPlacementState:
                 if self.TopologyCutFrontier
                 else {}
             ),
+            **(
+                {
+                    "PhysicalProofCoreSignals": sorted(
+                        self.PhysicalProofCoreSignals
+                    ),
+                }
+                if self.PhysicalProofCoreSignals
+                else {}
+            ),
+            **(
+                {"PhysicalProofFingerprint": self.PhysicalProofFingerprint}
+                if self.PhysicalProofFingerprint
+                else {}
+            ),
+            **(
+                {
+                    "FixedConnectivityClusters": [
+                        list(Cluster)
+                        for Cluster in self.FixedConnectivityClusters
+                    ],
+                }
+                if self.FixedConnectivityClusters
+                else {}
+            ),
         }
 
 @dataclass(frozen=True)
@@ -155,6 +182,9 @@ class PendingJointPlacementPortfolioIdentity:
     AssignmentCutWorkFingerprint: str
     AssignmentConstraintFingerprint: str
     CoordinatedSignals: tuple[str, ...]
+    PhysicalProofCoreSignals: tuple[str, ...]
+    PhysicalProofFingerprint: str = ""
+    FixedConnectivityClusterFingerprint: str = ""
     InternalPinBankGeometryRepairSignals: tuple[str, ...] = ()
     RequiredDistinctPinBankOwnershipFingerprint: str = ""
     TopologyCutFrontierFingerprints: tuple[
@@ -753,6 +783,15 @@ def BuildPendingJointPlacementPortfolioIdentity(
         CoordinatedSignals=tuple(sorted(
             State.CoordinatedCandidateDiversificationSignals
         )),
+        PhysicalProofCoreSignals=tuple(sorted(
+            State.PhysicalProofCoreSignals
+        )),
+        PhysicalProofFingerprint=State.PhysicalProofFingerprint,
+        FixedConnectivityClusterFingerprint=(
+            BuildStableFingerprint(State.FixedConnectivityClusters)
+            if State.FixedConnectivityClusters
+            else ""
+        ),
         InternalPinBankGeometryRepairSignals=tuple(sorted(
             State.InternalPinBankGeometryRepairSignals
         )),
@@ -1033,11 +1072,17 @@ def MandatoryAccessPortfolioIdentityMatchesCurrent(
     CurrentCut: RoutingAssignmentCut | None,
     CurrentConstraints: PlacementAssignmentConstraintSet,
 ) -> bool:
-    """Reject evidence from a superseded cut or constraint epoch."""
-    return (
+    """Reject evidence from a superseded placement/cut constraint epoch."""
+    CutMatches = (
+        CurrentCut is None
+        and not Identity.AssignmentCutFingerprint
+    ) or (
         CurrentCut is not None
         and CurrentCut.ConflictFingerprint
         == Identity.AssignmentCutFingerprint
+    )
+    return (
+        CutMatches
         and CurrentConstraints.Fingerprint
         == Identity.AssignmentConstraintFingerprint
     )
@@ -1437,7 +1482,10 @@ def SelectExhaustedRepeaterAccessCutSignals(
         not RelevantSearch
         or any(
             Entry.get("Status") != "NoPath"
-            or Entry.get("NoPathReason") != "SearchLimitReached"
+            or Entry.get("NoPathReason") not in {
+                "SearchLimitReached",
+                "NoRepeaterRepairPath",
+            }
             or bool(Entry.get("BoundaryFrontierNodes"))
             for Entry in RelevantSearch
         )

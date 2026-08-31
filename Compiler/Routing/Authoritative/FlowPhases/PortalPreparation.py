@@ -2,6 +2,19 @@
 from __future__ import annotations
 from ..RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
 
+def ShouldUseNativeTypedStraightClaimBatch(
+    *,
+    NativeAvailable: bool,
+    WorkItemCount: int,
+    WirePositionCount: int,
+) -> bool:
+    """Dispatch only claim batches large enough to amortize native transfer."""
+    return bool(
+        NativeAvailable
+        and WorkItemCount >= 32
+        and WirePositionCount >= 256
+    )
+
 def RunPortalPreparation(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
     """Run the PortalPreparation phase against shared routing state."""
     ReusableRawPortalEntries = State.RawPortalCache.PortalEntries if State.RawPortalCache is not None else ()
@@ -133,7 +146,7 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
     else:
         State.CompletePortalDomainKeys = set(PortableValidatedCompletePortalDomainKeys) if PartialPortalCacheMatches and State.ResourceRawPortalReusePlan is not None and State.ResourceRawPortalReusePlan.PortableAcrossPlacement else {Key for Key in (State.RawPortalCache.CompletePortalDomainKeys if State.RawPortalCache is not None else ()) if Key[0] in ReusedPortalSignals}
         State.PortalRequestDomainFingerprintBySignal = {Signal: Fingerprint for Signal, Fingerprint in (State.RawPortalCache.PortalRequestDomainFingerprints if State.RawPortalCache is not None else ()) if Signal in ReusedPortalSignals and (State.ResourceRawPortalReusePlan is None or not State.ResourceRawPortalReusePlan.PortableAcrossPlacement or Signal in PortablePortalProofReusableSignalSet)}
-        State.Context = State.RawPortalCache.Context if PartialPortalCacheMatches and State.RawPortalCache is not None and (State.ResourceRawPortalReusePlan is not None) and (not State.ResourceRawPortalReusePlan.PortableAcrossPlacement) else Services.RustRoutingContext(State.Bounds, (State.MinimumX, State.MaximumX, State.MinimumZ, State.MaximumZ), sorted(State.Region.Nodes), sorted(State.Region.Edges))
+        State.Context = State.RawPortalCache.Context if PartialPortalCacheMatches and State.RawPortalCache is not None and (State.ResourceRawPortalReusePlan is not None) and (not State.ResourceRawPortalReusePlan.PortableAcrossPlacement) else None
         (GeneratedRawPortals): dict[tuple[str, Services.Position3, int], tuple[Services.PinAccessPortal, ...]] = {}
         (CompleteGeneratedPortalDomainKeys): set[tuple[str, Services.Position3, int]] = set()
         (PolicyCompleteEmptyPortalDomainKeys): set[tuple[str, Services.Position3, int]] = set(PortableValidatedPolicyCompleteEmptyPortalDomainKeys if PartialPortalCacheMatches and State.ResourceRawPortalReusePlan is not None and State.ResourceRawPortalReusePlan.PortableAcrossPlacement else (Key for Key in getattr(State.RawPortalCache, 'PolicyCompleteEmptyPortalDomainKeys', ()) if Key[0] in ReusedPortalSignals))
@@ -146,24 +159,210 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
         SignalStarvationCounts = {Signal: CachedSignalStarvationCounts[Signal] if Signal in ReusedPortalSignals else 0 for Signal in State.Profiles}
         RegionNodeSet = frozenset(State.Region.Nodes)
         (NodesByColumn): dict[Services.Position2, list[Services.Position3]] = Services.defaultdict(list)
-        for Position in State.Region.Nodes:
-            NodesByColumn[Position[0], Position[2]].append(Position)
-        (NodesByLayer): dict[int, tuple[Services.Position3, ...]] = {State.Technology.RoutingY(State.MinimumY, LayerIndex): tuple(sorted((Position for Position in State.Region.Nodes if Position[1] == State.Technology.RoutingY(State.MinimumY, LayerIndex)))) for LayerIndex in range(State.LayerCount)}
+        (NodesByLayer): dict[int, tuple[Services.Position3, ...]] = {}
+        GenericPortalInfrastructureBuilt = False
+
+        def EnsureGenericPortalInfrastructure() -> None:
+            nonlocal GenericPortalInfrastructureBuilt
+            if GenericPortalInfrastructureBuilt:
+                return
+            InfrastructureStarted = Services.monotonic()
+            if State.Context is None:
+                State.Context = Services.RustRoutingContext(State.Bounds, (State.MinimumX, State.MaximumX, State.MinimumZ, State.MaximumZ), sorted(State.Region.Nodes), sorted(State.Region.Edges))
+            for Position in State.Region.Nodes:
+                NodesByColumn[Position[0], Position[2]].append(Position)
+            for LayerIndex in range(State.LayerCount):
+                RoutingY = State.Technology.RoutingY(State.MinimumY, LayerIndex)
+                NodesByLayer[RoutingY] = tuple(sorted(
+                    Position
+                    for Position in State.Region.Nodes
+                    if Position[1] == RoutingY
+                ))
+            GenericPortalInfrastructureBuilt = True
+            State.WorkTelemetry['GenericPortalInfrastructure'] = {
+                'Built': True,
+                'DeferredUntilGenericRequest': True,
+                'RegionNodeCount': len(State.Region.Nodes),
+                'ColumnCount': len(NodesByColumn),
+                'Seconds': Services.monotonic() - InfrastructureStarted,
+            }
+        TypedPlacementAccessPortals = Services.ApplyPlacementAccessFabricPortalDomains({}, State.PlacementAccessFabric, State.Resources.ResourceGraph, State.Technology, State.MinimumY, State.LayerCount, TerminalDomains=tuple(State.PlacementAccessDomains.values())) if State.PlacementAccessFabric is not None and State.PlacementAccessDomains else {}
+        TypedPlacementAccessDomainCount = 0
+        TypedPlacementAccessPortalCount = 0
+        TypedStraightAccessPortals: dict[tuple[str, Services.Position3, int], tuple[Services.PinAccessPortal, ...]] = {}
+        TypedStraightAccessMissingPairs: frozenset[tuple[str, Services.Position3]] = frozenset()
+        if State.PreparePhysicalComponentAssemblyOnly and (not State.Resources.PreparingPhysicalComponentGlobalChannels) and State.PlacementPinAccessWitness.Complete and State.ClosedComponentOwnedTerminalPairs:
+            SelectionsByPair = Services.defaultdict(list)
+            for Selection in State.PlacementPinAccessWitness.Selections:
+                SelectionsByPair[str(Selection.Signal), tuple(Selection.Terminal)].append(Selection)
+            TypedStraightAccessMissingPairs = frozenset(State.ClosedComponentOwnedTerminalPairs - set(SelectionsByPair))
+            if not TypedStraightAccessMissingPairs:
+                MutableTypedStraightAccessPortals = Services.defaultdict(list)
+                TypedStraightAccessRows = []
+                for Signal, Terminal in sorted(State.ClosedComponentOwnedTerminalPairs):
+                    Layer = int(State.CoarsePlan.Layers.get(Signal, 0))
+                    if Layer < 0 or Layer >= State.LayerCount:
+                        raise Services.RoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.PhysicalComponentAssemblyIncomplete, Stage='TypedStraightAccessHandoff', AffectedNets=(Signal,), Detail='the frozen straight-access witness references a coarse layer outside the authoritative routing domain', Diagnostics={'Signal': Signal, 'Layer': Layer, 'LayerCount': State.LayerCount, 'Complete': False}))
+                    for Selection in sorted(SelectionsByPair[Signal, Terminal], key=lambda Value: Value.SelectionFingerprint):
+                        Path = tuple(Selection.Path)
+                        TypedStraightAccessRows.append((
+                            Signal,
+                            Terminal,
+                            Layer,
+                            Selection,
+                            Path,
+                        ))
+                TypedStraightWirePositionCount = sum(
+                    len(Path)
+                    for _Signal, _Terminal, _Layer, _Selection, Path
+                    in TypedStraightAccessRows
+                )
+                NativeTypedStraightClaims = (
+                    ShouldUseNativeTypedStraightClaimBatch(
+                        NativeAvailable=bool(
+                            Services.BuildRouteClaimsBatchWithTelemetry
+                            is not None
+                            and State.Resources.ResourceGraph.Technology
+                            == Services.DefaultRedstoneRoutingTechnology
+                        ),
+                        WorkItemCount=len(TypedStraightAccessRows),
+                        WirePositionCount=TypedStraightWirePositionCount,
+                    )
+                )
+                if NativeTypedStraightClaims:
+                    NativeClaims, ActiveWorkerCount = (
+                        Services.BuildRouteClaimsBatchWithTelemetry(
+                            [
+                                tuple(sorted(Path))
+                                for _Signal, _Terminal, _Layer, _Selection, Path
+                                in TypedStraightAccessRows
+                            ],
+                            tuple(sorted(State.Resources.ResourceGraph.ActualBlocks)),
+                            tuple(sorted(State.Resources.ResourceGraph.SolidBlocks)),
+                        )
+                    )
+                    TypedStraightClaims = tuple(
+                        Services.RoutingResourceClaims(
+                            WireCells=frozenset(Wire),
+                            SupportCells=frozenset(Support),
+                            RequiredAirCells=frozenset(Air),
+                            ElectricalCells=frozenset(Electrical),
+                        )
+                        for Wire, Support, Air, Electrical in NativeClaims
+                    )
+                else:
+                    ActiveWorkerCount = 0
+                    TypedStraightClaims = tuple(
+                        State.Resources.ResourceGraph.BuildRouteClaims(Path)
+                        for _Signal, _Terminal, _Layer, _Selection, Path
+                        in TypedStraightAccessRows
+                    )
+                for (
+                    Signal,
+                    Terminal,
+                    Layer,
+                    Selection,
+                    Path,
+                ), Claims in zip(
+                    TypedStraightAccessRows,
+                    TypedStraightClaims,
+                    strict=True,
+                ):
+                    Portal = Services.PinAccessPortal(PortalId=f'{Signal}:{Terminal}:{Layer}:TypedStraightAccess:{State.PlacementPinAccessWitness.WitnessFingerprint}:{Selection.SelectionFingerprint}', Signal=Signal, Terminal=Terminal, Layer=Layer, Path=Path, Edges=frozenset(((First, Second) if First <= Second else (Second, First) for First, Second in zip(Path, Path[1:]))), Claims=Claims, Length=len(Path), BendCount=0, ViaCount=0, Cost=len(Path))
+                    MutableTypedStraightAccessPortals[Signal, Terminal, Layer].append(Portal)
+                TypedStraightAccessPortals = {Key: tuple(sorted(Values, key=lambda Value: Value.PortalId)) for Key, Values in MutableTypedStraightAccessPortals.items()}
+                State.WorkTelemetry['TypedStraightAccessNativeClaimBatch'] = {
+                    'Applied': NativeTypedStraightClaims,
+                    'WorkItemCount': len(TypedStraightAccessRows),
+                    'WirePositionCount': TypedStraightWirePositionCount,
+                    'DispatchThreshold': {
+                        'MinimumWorkItemCount': 32,
+                        'MinimumWirePositionCount': 256,
+                    },
+                    'ConfiguredWorkerCount': (
+                        int(Services.GetRustRoutingThreadCount())
+                        if NativeTypedStraightClaims
+                        else 0
+                    ),
+                    'ActiveWorkerCount': int(ActiveWorkerCount),
+                }
+        TypedStraightAccessDomainCount = 0
+        TypedStraightAccessPortalCount = 0
         PortalStarvationCount = sum(SignalStarvationCounts.values())
         PortalRequestMetadata = []
-        OrderedPortalSignals = tuple(sorted(State.RawPortalVariantCounts, key=lambda Signal: (Signal not in State.ExactPhysicalPortalSignalsForPreparation, Signal)))
+        SelectiveOwnedPortalPreparation = bool(
+            State.PreparePhysicalComponentAssemblyOnly
+            and not State.Resources.PreparingPhysicalComponentGlobalChannels
+            and State.ClosedComponentOwnedTerminalPairs
+        )
+        OwnedPortalPreparationSignals = frozenset(
+            Signal
+            for Signal, _Terminal in State.ClosedComponentOwnedTerminalPairs
+        )
+        PortalPreparationSignals = (
+            OwnedPortalPreparationSignals
+            if SelectiveOwnedPortalPreparation
+            else frozenset(State.RawPortalVariantCounts)
+        )
+        OrderedPortalSignals = tuple(sorted(
+            PortalPreparationSignals,
+            key=lambda Signal: (
+                Signal not in State.ExactPhysicalPortalSignalsForPreparation,
+                Signal,
+            ),
+        ))
+        State.WorkTelemetry['PortalPreparationSignalScope'] = {
+            'SelectiveOwnedTerminalPreparation': (
+                SelectiveOwnedPortalPreparation
+            ),
+            'PreparedSignalCount': len(OrderedPortalSignals),
+            'WholeDesignSignalCount': len(State.RawPortalVariantCounts),
+            'PreparedSignals': list(OrderedPortalSignals),
+        }
         for SignalIndex, Signal in enumerate(OrderedPortalSignals):
             State.CheckRuntimeBudget('PortalRequestPreparation', {'PreparedSignalCount': SignalIndex, 'PortalSignalCount': len(OrderedPortalSignals), 'PreparedPortalRequestCount': len(PortalRequests)})
             if Signal in ReusedPortalSignals:
                 continue
             Profile = State.Profiles[Signal]
             TerminalPaths = Services.SelectGenericPortalTerminalPaths(Profile, None if State.PreparePhysicalComponentAssemblyOnly else State.PhysicalAssemblyPlan)
+            if SelectiveOwnedPortalPreparation:
+                TerminalPaths = tuple(
+                    (Terminal, AccessPath)
+                    for Terminal, AccessPath in TerminalPaths
+                    if (str(Signal), tuple(Terminal))
+                    in State.ClosedComponentOwnedTerminalPairs
+                )
             for TerminalIndex, (Terminal, AccessPath) in enumerate(TerminalPaths):
                 State.CheckRuntimeBudget('PortalRequestPreparation', {'Signal': Signal, 'PreparedTerminalCount': TerminalIndex, 'TerminalCount': len(TerminalPaths), 'PreparedPortalRequestCount': len(PortalRequests)})
+                AccessFabricDomain = State.PlacementAccessDomains.get((str(Signal), tuple(Terminal)))
+                if (str(Signal), tuple(Terminal)) in State.ClosedComponentOwnedTerminalPairs and TypedStraightAccessPortals:
+                    TypedStraightAccessDomainCount += 1
+                    for Layer in range(State.LayerCount):
+                        Key = (str(Signal), tuple(Terminal), int(Layer))
+                        Values = tuple(TypedStraightAccessPortals.get(Key, ()))
+                        GeneratedRawPortals[Key] = Values
+                        CompleteGeneratedPortalDomainKeys.add(Key)
+                        if not Values:
+                            PolicyCompleteEmptyPortalDomainKeys.add(Key)
+                        TypedStraightAccessPortalCount += len(Values)
+                        PortalRequestDomainRecordsBySignal[Signal].append((Terminal, int(Layer), 'typed-straight-component-access', str(State.PlacementPinAccessWitness.WitnessFingerprint), tuple(Value.PortalId for Value in Values), str(State.GuideInputFingerprint)))
+                    continue
+                EnsureGenericPortalInfrastructure()
                 AccessColumns = {(X, Z) for X, _Y, Z in AccessPath}
                 AllowedColumns = {(AccessX + DeltaX, AccessZ + DeltaZ) for AccessX, AccessZ in AccessColumns for DeltaX in range(-State.Policy.DetailedRouting.GuideExpansion, State.Policy.DetailedRouting.GuideExpansion + 1) for DeltaZ in range(-State.Policy.DetailedRouting.GuideExpansion, State.Policy.DetailedRouting.GuideExpansion + 1) if abs(DeltaX) + abs(DeltaZ) <= State.Policy.DetailedRouting.GuideExpansion}
                 AllowedNodeSet = {Position for Column in AllowedColumns for Position in NodesByColumn.get(Column, ())} | set(AccessPath)
-                AccessFabricDomain = State.PlacementAccessDomains.get((str(Signal), tuple(Terminal)))
+                if AccessFabricDomain is not None and bool(AccessFabricDomain.Complete):
+                    TypedPlacementAccessDomainCount += 1
+                    for Layer in range(State.LayerCount):
+                        Key = (str(Signal), tuple(Terminal), int(Layer))
+                        Values = tuple(TypedPlacementAccessPortals.get(Key, ()))
+                        GeneratedRawPortals[Key] = Values
+                        CompleteGeneratedPortalDomainKeys.add(Key)
+                        if not Values:
+                            PolicyCompleteEmptyPortalDomainKeys.add(Key)
+                        TypedPlacementAccessPortalCount += len(Values)
+                        PortalRequestDomainRecordsBySignal[Signal].append((Terminal, int(Layer), 'typed-placement-access-fabric', str(State.PlacementAccessContractFingerprint), tuple(Value.PortalId for Value in Values), str(State.GuideInputFingerprint)))
+                    continue
                 if AccessFabricDomain is not None:
                     AllowedNodeSet.update((Position for Stub in AccessFabricDomain.EscapeStubs for Position in Stub.Path))
                 AllowedNodes = sorted(AllowedNodeSet)
@@ -245,6 +444,8 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
         State.WorkTelemetry['PortalCacheGeneratedSignals'] = sorted(GeneratedPortalSignals)
         State.WorkTelemetry['PortalReusedRequestCount'] = ReusedPortalRequestCount
         State.WorkTelemetry['PortalGeneratedRequestCount'] = GeneratedPortalRequestCount
+        State.WorkTelemetry['TypedPlacementAccessPortalHandoff'] = {'Applied': bool(TypedPlacementAccessDomainCount), 'CompleteDomainCount': TypedPlacementAccessDomainCount, 'PortalCount': TypedPlacementAccessPortalCount, 'NativePortalRequestsAvoided': TypedPlacementAccessDomainCount * State.LayerCount, 'ContractFingerprint': str(State.PlacementAccessContractFingerprint)}
+        State.WorkTelemetry['TypedStraightAccessComponentHandoff'] = {'Applied': bool(TypedStraightAccessDomainCount), 'CompleteDomainCount': TypedStraightAccessDomainCount, 'PortalCount': TypedStraightAccessPortalCount, 'MissingOwnedTerminalPairs': [[Signal, list(Terminal)] for Signal, Terminal in sorted(TypedStraightAccessMissingPairs)], 'NativePortalSearchReplaced': bool(TypedStraightAccessDomainCount), 'WitnessFingerprint': str(State.PlacementPinAccessWitness.WitnessFingerprint)}
         PortalBatchCount = 0
         PortalCompletedWork = 0
 
@@ -252,6 +453,7 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
             nonlocal PortalBatchCount, PortalCompletedWork
             if not Requests:
                 return ([], (), False)
+            EnsureGenericPortalInfrastructure()
             PortalBatchCount += 1
             State.CheckRuntimeBudget(Stage)
             if hasattr(State.Context, 'GeneratePortalCandidateBatchesBounded'):
@@ -316,7 +518,15 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
                 EarlyAccessProblemSeconds = Services.monotonic() - EarlyAccessProblemStartedAt
                 State.UnboundOwnedSignalFrontierProofCallback(PreparedAccessProblem)
                 UnboundOwnedSignalFrontierProofCompleted = True
-                State.WorkTelemetry['PhysicalOwnedTerminalPortalEligibility'] = {'Complete': True, 'Feasible': True, 'OwnedTerminalPairCount': len(OwnedTerminalPairs), 'OwnedPortalDomainKeyCount': len(PreparedOwnedPortalDomainKeys), 'DeferredPortalRequestCount': len(PortalRequests), 'WholeDesignGuideIdentityPreserved': True, 'WholeDesignRegionIdentityPreserved': True}
+                DeferredPortalRequestCount = len(PortalRequests)
+                DeferredPortalSignals = frozenset(
+                    Signal
+                    for Signal, _Terminal, _Layer in PortalRequestMetadata
+                )
+                State.WorkTelemetry['PhysicalOwnedTerminalPortalEligibility'] = {'Complete': True, 'Feasible': True, 'OwnedTerminalPairCount': len(OwnedTerminalPairs), 'OwnedPortalDomainKeyCount': len(PreparedOwnedPortalDomainKeys), 'DeferredPortalRequestCount': DeferredPortalRequestCount, 'DeferredPortalSignals': sorted(DeferredPortalSignals), 'WholeDesignGuideIdentityPreserved': True, 'WholeDesignRegionIdentityPreserved': True}
+                State.WorkTelemetry['PhysicalComponentPortalPreparation'] = {'Selective': True, 'AuthoritativeScope': 'closed-component-owned-terminals', 'PreparedSignals': sorted({Signal for Signal, _Terminal in OwnedTerminalPairs}), 'DeferredSignalCount': len(DeferredPortalSignals), 'DeferredRequestCount': DeferredPortalRequestCount}
+                PortalRequests = []
+                PortalRequestMetadata = []
         if State.TransactionalLeasePrescreenSignals and (not State.PreparePortalGeometryOnly):
             PrescreenRequestIndices = tuple((RequestIndex for RequestIndex, (Signal, _Terminal, _Layer) in enumerate(PortalRequestMetadata) if Signal in State.TransactionalLeasePrescreenSignals))
             PrescreenRequestIndexSet = frozenset(PrescreenRequestIndices)
@@ -370,8 +580,15 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
             RawPortals = {Key: Values for Key, Values in RawPortals.items() if Key[0] in State.Profiles}
             RawPortalEntries = tuple(sorted(RawPortals.items()))
             State.WorkTelemetry['RoutedComponentGlobalPortalScope'] = {'ProfileSignalCount': len(State.Profiles), 'RemovedComponentSignalCount': len(RemovedComponentPortalSignals), 'RemovedComponentSignals': sorted(RemovedComponentPortalSignals), 'RetainedPortalEntryCount': len(RawPortalEntries)}
-        State.EffectiveRawPortalCache = Services.RawPortalGeometryCache(PlacementGeometryFingerprint=Services.BuildRawPortalPlacementGeometryFingerprint(State.Placed), ResourceGeometryFingerprint=Services.BuildRawPortalResourceGeometryFingerprint(State.Resources), PlacedReference=State.Placed, ResourcesReference=State.Resources, Region=State.Region, LayerCount=State.LayerCount, PortalLimit=State.PortalLimit, PortalVariantCounts=tuple(sorted(State.RawPortalVariantCounts.items())), GuideExpansion=State.Policy.DetailedRouting.GuideExpansion, StrictMaximumExpansions=State.Policy.DetailedRouting.StrictMaximumExpansions, Context=State.Context, AssignmentIndexed=State.Resources.ResourceGraph.BuildIndexedGraph(State.Region), PortalEntries=RawPortalEntries, RequestCount=sum(SignalRequestCounts.values()), TargetCount=int(State.WorkTelemetry['PortalTargetCount']), StarvationCount=PortalStarvationCount, AccessGeometryFingerprint=State.PortalAccessGeometryFingerprint, AssignedColumns=State.EffectiveAssignedColumns, ReservedAccess=State.ReservedAccess, GuidePlanPrepared=True, GuideInputFingerprint=State.GuideInputFingerprint, GuidePlan=State.CoarsePlan, SignalRequestCounts=tuple(sorted(SignalRequestCounts.items())), SignalTargetCounts=tuple(sorted(SignalTargetCounts.items())), SignalStarvationCounts=tuple(sorted(SignalStarvationCounts.items())), RetainedPortfolioSliceLimited=State.PortalSliceLimited or State.RetainedPortfolioPortalProfileFrozen, PhysicalGlobalKeepoutFingerprint=State.PhysicalGlobalKeepoutFingerprint, CompletePortalDomainKeys=tuple(sorted(State.CompletePortalDomainKeys)), PolicyCompleteEmptyPortalDomainKeys=tuple(sorted(PolicyCompleteEmptyPortalDomainKeys)), PortalRequestDomainFingerprints=tuple(sorted(State.PortalRequestDomainFingerprintBySignal.items())), ExteriorRegionFingerprint=State.PhysicalExteriorRegionFingerprint, AuthoritativeResourceGraphFingerprint=Services.BuildPhysicalExteriorResourceGraphFingerprint(State.Resources.ResourceGraph, State.PhysicalExteriorRegionFingerprint, State.Region), ConfiguredPortalRequests=tuple((Request for _Metadata, Request in sorted(ConfiguredPortalRequestByMetadata.items()))), ConfiguredPortalRequestMetadata=tuple((Metadata for Metadata in sorted(ConfiguredPortalRequestByMetadata))))
-    Services.RetainRawPortalGeometryCache(State.Resources, State.EffectiveRawPortalCache)
+        if not GenericPortalInfrastructureBuilt:
+            State.WorkTelemetry['GenericPortalInfrastructure'] = {
+                'Built': False,
+                'DeferredUntilGenericRequest': True,
+                'Reason': 'complete-typed-portal-domain',
+            }
+        State.EffectiveRawPortalCache = Services.RawPortalGeometryCache(PlacementGeometryFingerprint=State.RawPortalPlacementGeometryFingerprint, ResourceGeometryFingerprint=State.RawPortalResourceGeometryFingerprint, PlacedReference=State.Placed, ResourcesReference=State.Resources, Region=State.Region, LayerCount=State.LayerCount, PortalLimit=State.PortalLimit, PortalVariantCounts=tuple(sorted(State.RawPortalVariantCounts.items())), GuideExpansion=State.Policy.DetailedRouting.GuideExpansion, StrictMaximumExpansions=State.Policy.DetailedRouting.StrictMaximumExpansions, Context=State.Context, AssignmentIndexed=State.Resources.ResourceGraph.BuildIndexedGraph(State.Region) if State.Context is not None else None, PortalEntries=RawPortalEntries, RequestCount=sum(SignalRequestCounts.values()), TargetCount=int(State.WorkTelemetry['PortalTargetCount']), StarvationCount=PortalStarvationCount, AccessGeometryFingerprint=State.PortalAccessGeometryFingerprint, AssignedColumns=State.EffectiveAssignedColumns, ReservedAccess=State.ReservedAccess, GuidePlanPrepared=True, GuideInputFingerprint=State.GuideInputFingerprint, GuidePlan=State.CoarsePlan, SignalRequestCounts=tuple(sorted(SignalRequestCounts.items())), SignalTargetCounts=tuple(sorted(SignalTargetCounts.items())), SignalStarvationCounts=tuple(sorted(SignalStarvationCounts.items())), RetainedPortfolioSliceLimited=State.PortalSliceLimited or State.RetainedPortfolioPortalProfileFrozen, PhysicalGlobalKeepoutFingerprint=State.PhysicalGlobalKeepoutFingerprint, CompletePortalDomainKeys=tuple(sorted(State.CompletePortalDomainKeys)), PolicyCompleteEmptyPortalDomainKeys=tuple(sorted(PolicyCompleteEmptyPortalDomainKeys)), PortalRequestDomainFingerprints=tuple(sorted(State.PortalRequestDomainFingerprintBySignal.items())), ExteriorRegionFingerprint=State.PhysicalExteriorRegionFingerprint, AuthoritativeResourceGraphFingerprint=Services.BuildPhysicalExteriorResourceGraphFingerprint(State.Resources.ResourceGraph, State.PhysicalExteriorRegionFingerprint, State.Region), ConfiguredPortalRequests=tuple((Request for _Metadata, Request in sorted(ConfiguredPortalRequestByMetadata.items()))), ConfiguredPortalRequestMetadata=tuple((Metadata for Metadata in sorted(ConfiguredPortalRequestByMetadata))))
+    if State.EffectiveRawPortalCache.Context is not None:
+        Services.RetainRawPortalGeometryCache(State.Resources, State.EffectiveRawPortalCache)
     if not CacheMatches and PortalNativeDeadlineExceeded:
         Services.EnforceRoutingRuntimeLimit(Deadline=State.Deadline, AdaptiveStartedAt=State.RoutingStarted, AdaptiveExpiresAt=State.AdaptiveExpiresAt, Stage='Portal', Diagnostics={**State.CurrentRuntimeBudgetDiagnostics(), 'PortalCompletedWork': PortalCompletedWork, 'PortalRequestCount': len(PortalRequests), 'PortalCompleteKeyCount': len(State.EffectiveRawPortalCache.CompletePortalDomainKeys), 'PartialRawPortalCachePublished': True}, NativeDeadlineExceeded=True)
     if State.PreparePhysicalComponentAssemblyOnly and (not State.Resources.PreparingPhysicalComponentGlobalChannels):
@@ -384,11 +601,28 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
             State.UnboundOwnedSignalFrontierProofCallback(PreparedAccessProblem)
         ComponentGraphFingerprint = str(getattr(getattr(State.Placed, 'ComponentGraph', None), 'StructuralFingerprint', ''))
         AccessCertificateStartedAt = Services.monotonic()
-        PreparedAccessCertificate = Services.BuildComponentCutAccessFeasibilityCertificate(PreparedAccessProblem, State.Resources.ResourceGraph, LayerCount=State.LayerCount, MinimumPlacementY=State.MinimumY, ComponentGraphFingerprint=ComponentGraphFingerprint, RequiredLayerBySignal={Port.Signal: int(State.CoarsePlan.Layers.get(Port.Signal, 0)) for Port in PreparedAccessProblem.Interface.Ports}, WorkCheck=lambda Diagnostics: State.CheckRuntimeBudget('ComponentAccessCertification', Diagnostics))
+        def CheckComponentAccessCertification(Diagnostics: dict[str, object]) -> None:
+            State.WorkTelemetry['ComponentAccessCertificateProgress'] = dict(Diagnostics)
+            State.CheckRuntimeBudget('ComponentAccessCertification', Diagnostics)
+        ActiveAccessCertificateSignals = tuple(getattr(State.Resources, 'PhysicalComponentBoundaryTraversalPrioritySignals', ())) or State.PriorityInterfaceCutSignals
+        RequiredAccessGuideTargetsBySignal = Services.BuildComponentAccessGuideTargetColumns(PreparedAccessProblem, {Port.Signal: frozenset(State.CoarsePlan.Guides.get(Port.Signal, ())) for Port in PreparedAccessProblem.Interface.Ports})
+        State.WorkTelemetry['ComponentAccessGuideTargetHandoff'] = {'SignalCount': len(RequiredAccessGuideTargetsBySignal), 'CoarseGuideTargetCount': sum(len(State.CoarsePlan.Guides.get(Port.Signal, ())) for Port in PreparedAccessProblem.Interface.Ports), 'ExternalContinuationTargetCount': len(PreparedAccessProblem.ExternalContinuationTerminals), 'CombinedTargetCount': sum(map(len, RequiredAccessGuideTargetsBySignal.values())), 'ExternalContinuationTargetsIncluded': True}
+        PreparedAccessCertificate = Services.BuildComponentCutAccessFeasibilityCertificate(PreparedAccessProblem, State.Resources.ResourceGraph, LayerCount=State.LayerCount, MinimumPlacementY=State.MinimumY, ComponentGraphFingerprint=ComponentGraphFingerprint, RequiredLayerBySignal={Port.Signal: int(State.CoarsePlan.Layers.get(Port.Signal, 0)) for Port in PreparedAccessProblem.Interface.Ports}, RequiredGuideCellsBySignal=RequiredAccessGuideTargetsBySignal, PrioritySignals=ActiveAccessCertificateSignals, WorkCheck=CheckComponentAccessCertification)
         AccessCertificateSeconds = Services.monotonic() - AccessCertificateStartedAt
         State.Resources.PreparedPhysicalComponentUnboundProblem = PreparedAccessProblem
         State.Resources.PreparedComponentAccessCertificate = PreparedAccessCertificate
-        State.WorkTelemetry['ComponentAccessCertificate'] = PreparedAccessCertificate.ToDictionary()
+        State.WorkTelemetry['ComponentAccessCertificate'] = {
+            'CertificateFingerprint': PreparedAccessCertificate.CertificateFingerprint,
+            'StructuralFingerprint': PreparedAccessCertificate.StructuralFingerprint,
+            'Complete': PreparedAccessCertificate.Complete,
+            'Feasible': PreparedAccessCertificate.Feasible,
+            'ProofKind': PreparedAccessCertificate.ProofKind,
+            'AffectedSignals': list(PreparedAccessCertificate.AffectedSignals),
+            'PortDomainCount': len(PreparedAccessCertificate.PortDomains),
+            'CandidateCount': sum(len(Domain.Candidates) for Domain in PreparedAccessCertificate.PortDomains),
+            'Diagnostics': dict(PreparedAccessCertificate.Diagnostics),
+            'TelemetryDisposition': 'compact-success-summary',
+        }
         if not PreparedAccessCertificate.Complete:
             raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ComponentAccessCertificationIncomplete, Stage='ComponentAccessCertification', AffectedNets=PreparedAccessCertificate.AffectedSignals, Detail='the local component access domain was not completed', Diagnostics=PreparedAccessCertificate.ToDictionary()))
         if not PreparedAccessCertificate.Feasible:

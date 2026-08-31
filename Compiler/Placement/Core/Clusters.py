@@ -210,7 +210,7 @@ def TranslateClusterLocalRouteClaim(
                 ),
                 Position=Translate(Reservation.Position),
                 Purpose=Reservation.Purpose,
-                Facing=Reservation.Facing,
+                InputFacing=Reservation.InputFacing,
             )
             for Reservation in Claim.RepeaterReservations
         ),
@@ -300,6 +300,7 @@ def BuildBoundedInterClusterRoutingChannel(
     MaximumAffectedClusters: int = 3,
     MaximumBoundaryStrips: int = 2,
     RoutingLayerCount: int = 3,
+    RequiredComponentGateNames: Iterable[str] = (),
     ForcedAffectedClusters: tuple[int, ...] | None = None,
     ForcedRoot: int | None = None,
     ForcedAxisPattern: tuple[str, ...] | None = None,
@@ -332,6 +333,9 @@ def BuildBoundedInterClusterRoutingChannel(
         raise ValueError("channel topology variant must be non-negative")
     if Source.InterClusterRoutingChannel is not None:
         return Source
+    RequiredComponentGateNameSet = frozenset(
+        str(Name) for Name in RequiredComponentGateNames
+    )
 
     GateByName = {
         Gate.Name: Gate for Gate in Source.Placed.PlacedGates
@@ -498,10 +502,22 @@ def BuildBoundedInterClusterRoutingChannel(
                 Visited.update(Expanded)
             if Visited != set(Component):
                 continue
+            ComponentGateNames = frozenset(
+                Gate.Name
+                for Cluster in ComponentSet
+                for Gate in ClusterGates[Cluster]
+            )
+            RequiredGateDomainCovered = bool(
+                RequiredComponentGateNameSet
+                and RequiredComponentGateNameSet.issubset(
+                    ComponentGateNames
+                )
+            )
             if (
                 LogicalComponentGraph is not None
                 and LogicalComponentGraph.Hierarchical
                 and LogicalComponentForClusterSet(ComponentSet) is None
+                and not RequiredGateDomainCovered
             ):
                 continue
             StructuralSignatures = tuple(sorted(
@@ -534,6 +550,20 @@ def BuildBoundedInterClusterRoutingChannel(
             "no connected two-or-three-cluster channel component"
         )
     RankedComponents = tuple(sorted(CandidateComponents))
+    if RequiredComponentGateNameSet:
+        RankedComponents = tuple(
+            Value
+            for Value in RankedComponents
+            if RequiredComponentGateNameSet.issubset(frozenset(
+                Gate.Name
+                for Cluster in Value[1]
+                for Gate in ClusterGates[Cluster]
+            ))
+        )
+        if not RankedComponents:
+            raise ValueError(
+                "no legal connected channel preserves the required gate domain"
+            )
     if ForcedAffectedClusters is None:
         _ComponentScore, AffectedClusters = RankedComponents[0]
     else:
@@ -677,10 +707,13 @@ def BuildBoundedInterClusterRoutingChannel(
                     Candidate = BuildBoundedInterClusterRoutingChannel(
                         Source,
                         TrackPitch=TrackPitch,
-                        MaximumAffectedClusters=MaximumAffectedClusters,
-                        MaximumBoundaryStrips=MaximumBoundaryStrips,
-                        RoutingLayerCount=RoutingLayerCount,
-                        ForcedAffectedClusters=tuple(AffectedClusters),
+                            MaximumAffectedClusters=MaximumAffectedClusters,
+                            MaximumBoundaryStrips=MaximumBoundaryStrips,
+                            RoutingLayerCount=RoutingLayerCount,
+                            RequiredComponentGateNames=(
+                                RequiredComponentGateNameSet
+                            ),
+                            ForcedAffectedClusters=tuple(AffectedClusters),
                         ForcedRoot=RootCandidate,
                         ForcedAxisPattern=tuple(AxisPattern),
                         ChannelClearanceTracks=ChannelClearanceTracks,
@@ -1071,6 +1104,11 @@ def BuildBoundedInterClusterRoutingChannel(
     Diagnostics["__InterClusterRoutingChannel__"] = (
         Channel.ToDictionary()
     )
+    Diagnostics["__InterClusterRoutingChannelSelection__"] = {
+        "RequiredComponentGateNames": sorted(
+            RequiredComponentGateNameSet
+        ),
+    }
     CandidatePlaced = PlacedDesign(
         Module=Source.Placed.Module,
         PlacedGates=CandidateGates,
@@ -1135,6 +1173,7 @@ def BuildBoundedInterClusterRoutingDeck(
     InterfaceDeckLayer: int = 3,
     ComponentVariant: int = 0,
     PreferredSignals: Iterable[str] = (),
+    RequiredComponentGateNames: Iterable[str] = (),
     ForcedAffectedClusters: tuple[int, ...] | None = None,
 ) -> PcbPlacement:
     """Add one component-owned routing deck above the compact three layers."""
@@ -1157,6 +1196,9 @@ def BuildBoundedInterClusterRoutingDeck(
         raise ValueError("component variant cannot be negative")
     PreferredSignalSet = frozenset(
         str(Signal) for Signal in PreferredSignals
+    )
+    RequiredComponentGateNameSet = frozenset(
+        str(Name) for Name in RequiredComponentGateNames
     )
 
     GateByName = {
@@ -1310,10 +1352,22 @@ def BuildBoundedInterClusterRoutingDeck(
                 Visited.update(Expanded)
             if Visited != set(Component):
                 continue
+            ComponentGateNames = frozenset(
+                Gate.Name
+                for Cluster in ComponentSet
+                for Gate in ClusterGates[Cluster]
+            )
+            RequiredGateDomainCovered = bool(
+                RequiredComponentGateNameSet
+                and RequiredComponentGateNameSet.issubset(
+                    ComponentGateNames
+                )
+            )
             if (
                 LogicalComponentGraph is not None
                 and LogicalComponentGraph.Hierarchical
                 and LogicalComponentForClusterSet(ComponentSet) is None
+                and not RequiredGateDomainCovered
             ):
                 continue
             Signatures = tuple(sorted(
@@ -1439,7 +1493,33 @@ def BuildBoundedInterClusterRoutingDeck(
                 ),
                 default=0,
             )
-            if PreferredSignalSet:
+            if RequiredComponentGateNameSet:
+                # A complete capacity proof is rooted at one physical gate
+                # access domain.  Once every reported signal touches the
+                # component, keep that domain minimal; absorbing additional
+                # producers creates a large rectangular access envelope that
+                # can hide otherwise valid exterior guide targets.
+                Score = (
+                    -len(PreferredCoveredSignals),
+                    ComponentSize,
+                    len(CrossingSignals),
+                    CrossingOwnedTerminalDemand,
+                    max(DirectedPerimeterPenalties, default=0),
+                    sum(DirectedPerimeterPenalties),
+                    max(PerimeterDepths, default=0),
+                    sum(PerimeterDepths),
+                    -PreferredFullyOwnedRequestCount,
+                    -PreferredOwnedTerminalCoverage,
+                    PeakInternalDemand,
+                    TotalInternalDemand,
+                    len(IncidentSignals),
+                    PeakInternalSignalCount,
+                    -len(InternallyOwnedSignals),
+                    -InternallyOwnedTerminalDemand,
+                    Signatures,
+                    Component,
+                )
+            elif PreferredSignalSet:
                 # A learned global cut identifies work that must move inside
                 # the routed component.  First maximize exact ownership of
                 # that cut; only then prefer the least-demanding residual
@@ -1520,6 +1600,20 @@ def BuildBoundedInterClusterRoutingDeck(
             "no connected two-or-three-cluster interface deck component"
         )
     RankedComponents = tuple(sorted(CandidateComponents))
+    if RequiredComponentGateNameSet:
+        RankedComponents = tuple(
+            Value
+            for Value in RankedComponents
+            if RequiredComponentGateNameSet.issubset(frozenset(
+                Gate.Name
+                for Cluster in Value[1]
+                for Gate in ClusterGates[Cluster]
+            ))
+        )
+        if not RankedComponents:
+            raise ValueError(
+                "no legal connected component preserves the required gate domain"
+            )
     if len(ClusterIndexes) <= MaximumAffectedClusters:
         WholePlacementComponents = tuple(
             Value
@@ -1627,7 +1721,7 @@ def BuildBoundedInterClusterRoutingDeck(
     def BuildTreeLane(
         DeltaX: int,
         DeltaZ: int,
-        XFirst: bool,
+        XFirstByEdge: tuple[bool, ...],
     ) -> tuple[tuple[tuple[int, int, int], ...], ...] | None:
         def InclusiveRange(Start: int, End: int) -> range:
             return range(
@@ -1637,12 +1731,12 @@ def BuildBoundedInterClusterRoutingDeck(
             )
 
         EdgePaths = []
-        for First, Second in TreeEdges:
+        for EdgeIndex, (First, Second) in enumerate(TreeEdges):
             FirstX, FirstZ = Centers[First]
             SecondX, SecondZ = Centers[Second]
             StartX, StartZ = FirstX + DeltaX, FirstZ + DeltaZ
             EndX, EndZ = SecondX + DeltaX, SecondZ + DeltaZ
-            if XFirst:
+            if XFirstByEdge[EdgeIndex]:
                 Cells = tuple((
                     *((X, RoutingY, StartZ)
                       for X in InclusiveRange(StartX, EndX)),
@@ -1668,6 +1762,33 @@ def BuildBoundedInterClusterRoutingDeck(
             EdgePaths.append(Cells)
         return tuple(EdgePaths)
 
+    def EdgePathsFormTreeFabric(
+        EdgePaths: tuple[tuple[tuple[int, int, int], ...], ...],
+    ) -> bool:
+        Nodes = frozenset(
+            Cell for Path in EdgePaths for Cell in Path
+        )
+        Edges = frozenset(
+            tuple(sorted((First, Second)))
+            for Path in EdgePaths
+            for First, Second in zip(Path, Path[1:])
+        )
+        if not Nodes or len(Edges) != len(Nodes) - 1:
+            return False
+        Adjacency = {Node: set() for Node in Nodes}
+        for First, Second in Edges:
+            Adjacency[First].add(Second)
+            Adjacency[Second].add(First)
+        Visited = {min(Nodes)}
+        Pending = list(Visited)
+        while Pending:
+            Current = Pending.pop()
+            for Neighbor in Adjacency[Current]:
+                if Neighbor not in Visited:
+                    Visited.add(Neighbor)
+                    Pending.append(Neighbor)
+        return len(Visited) == len(Nodes)
+
     LaneCandidates = []
     LaneOffsets = (
         (0, 0),
@@ -1683,13 +1804,19 @@ def BuildBoundedInterClusterRoutingDeck(
         ),
     )
     for DeltaX, DeltaZ in LaneOffsets:
-        for XFirst in (True, False):
+        for XFirstByEdge in product(
+            (True, False),
+            repeat=len(TreeEdges),
+        ):
             EdgePaths = BuildTreeLane(
                 DeltaX,
                 DeltaZ,
-                XFirst,
+                XFirstByEdge,
             )
-            if EdgePaths is None:
+            if (
+                EdgePaths is None
+                or not EdgePathsFormTreeFabric(EdgePaths)
+            ):
                 continue
             Cells = frozenset(
                 Position
@@ -1701,7 +1828,7 @@ def BuildBoundedInterClusterRoutingDeck(
                     abs(DeltaX) + abs(DeltaZ),
                     DeltaX,
                     DeltaZ,
-                    not XFirst,
+                    tuple(not Value for Value in XFirstByEdge),
                 ),
                 EdgePaths,
                 Cells,
@@ -1862,6 +1989,11 @@ def BuildBoundedInterClusterRoutingDeck(
     Diagnostics["__InterClusterRoutingChannel__"] = Deck.ToDictionary()
     Diagnostics["__InterClusterRoutingDeckSelection__"] = {
         "PreferredSignals": sorted(PreferredSignalSet),
+        "RequiredComponentGateNames": sorted(RequiredComponentGateNameSet),
+        "ProofRootedMinimalComponent": bool(
+            RequiredComponentGateNameSet
+        ),
+        "SelectedComponentSize": len(AffectedClusters),
         "SelectedPreferredSignalCount": -_Score[0],
         "SelectedPeakInternalEdgeDemand": max(
             (

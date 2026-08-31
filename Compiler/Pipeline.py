@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -22,14 +22,18 @@ from .Synthesis.Validation import ValidateNandOnlyDesign
 from Compiler.Placement.Flow.Candidates import ApplyRoutingRuntimeBudget
 from Compiler.Placement.Flow.Results import PcbProgress
 from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
-from SchemEncoder import Writer262
-from SchemEncoder.Writer262 import BlockCompositionMetrics
-from .Simulation.Redstone import (
-    ShouldSimulateRenderedMinecraftTruthTable,
-    SimulateRenderedMinecraftTruthTable,
-    SimulateRoutedTruthTable,
-    WriteTruthTable,
+from .FabricServer import (
+    BuildExpectedVectors,
+    BuildFabricFixture,
+    CaptureServerUpdatedLitematic,
+    FabricServerConfiguration,
+    FabricServerSnapshotArtifact,
+    FabricServerSupervisor,
+    FabricServerValidationResult,
+    WriteFabricFixture,
 )
+from SchemEncoder import SchemWriter
+from SchemEncoder.SchemWriter import BlockCompositionMetrics
 from .Routing.ChannelPlanner import RoutingStageMetrics
 from .Routing.Failures import (
     RoutingFailure,
@@ -63,9 +67,7 @@ class CompileResult:
     Depth: int
     OriginalLogicGateCount: int
     OptimizedLogicGateCount: int
-    TruthTablePath: Path
-    TruthTablePassed: bool
-    TruthTableRows: int
+    FabricServerValidation: FabricServerValidationResult
     RoutingMetrics: RoutingStageMetrics | None
     PhysicalDesignPath: Path
     RequestedStrategy: str
@@ -109,6 +111,19 @@ RoutingFailureArtifactAggregateDiagnosticKeys = frozenset({
     "PlacementAttempts",
     "RoutingEscalationState",
 })
+
+
+def RequireFabricServerValidation(
+    Result: FabricServerValidationResult,
+) -> None:
+    """Reject an artifact unless the authoritative server observed a pass."""
+    if Result.Status != "passed":
+        Detail = Result.Diagnostics.get("Error") or Result.Diagnostics.get("Reason")
+        raise ValueError(
+            "FabricServerValidation:"
+            f"{Result.Status}"
+            + (f":{Detail}" if Detail else "")
+        )
 
 
 def BuildRoutingFailureArtifactSnapshot(
@@ -166,15 +181,24 @@ def SuccessArtifactPaths(OutputPath: Path) -> dict[str, Path]:
     """Return every artifact whose presence means a compile was successful."""
     return {
         "Schematic": OutputPath,
-        "TruthTable": OutputPath.with_suffix(".TruthTable.txt"),
         "PhysicalDesign": OutputPath.with_suffix(".PhysicalDesign.json"),
+        "FabricFixture": OutputPath.with_suffix(".FabricFixture.json"),
     }
+
+
+def ObsoleteArtifactPaths(OutputPath: Path) -> tuple[Path, ...]:
+    """Return artifacts produced by the removed in-house simulator."""
+    return (OutputPath.with_suffix(".TruthTable.txt"),)
 
 
 def ClearStaleSuccessArtifacts(OutputPath: Path) -> list[str]:
     """Remove prior success artifacts before a new compile can fail."""
     Removed = []
-    for ArtifactPath in SuccessArtifactPaths(OutputPath).values():
+    ArtifactPaths = (
+        *SuccessArtifactPaths(OutputPath).values(),
+        *ObsoleteArtifactPaths(OutputPath),
+    )
+    for ArtifactPath in ArtifactPaths:
         if ArtifactPath.exists():
             ArtifactPath.unlink()
             Removed.append(NormalizeArtifactPath(ArtifactPath))
@@ -394,7 +418,7 @@ def BuildSuccessRouterReliability(
     """Build the successful-run envelope parallel to routing-failure-v1."""
     return {
         "SchemaVersion": "router-reliability-v1",
-        "RunVerdict": "ROUTED_AND_SIMULATED",
+        "RunVerdict": "ROUTED_AWAITING_FABRIC_SERVER_VALIDATION",
         "PlacementCandidates": Evidence.get(
             "PlacementFeedbackCandidates", []
         ),
@@ -450,15 +474,48 @@ def BuildPartialArtifactPaths(
     return dict(sorted(Result.items()))
 
 
+def BuildFabricServerSnapshotDocument(
+    Artifact: FabricServerSnapshotArtifact,
+    OutputPath: Path,
+) -> dict[str, object]:
+    """Describe the authoritative all-zero world state published as output."""
+    return {
+        "Path": NormalizeArtifactPath(OutputPath),
+        "State": "all-inputs-zero-server-updated",
+        "RequestedPositionCount": Artifact.RequestedPositionCount,
+        "ObservedBlockCount": Artifact.ObservedBlockCount,
+        "WorldReadRequests": Artifact.WorldReadRequests,
+        "InputCountSetToZero": Artifact.InputCountSetToZero,
+        "SnapshotReadPasses": Artifact.SnapshotReadPasses,
+        "InputZeroGameTime": Artifact.InputZeroGameTime,
+        "FirstObservedGameTime": Artifact.FirstObservedGameTime,
+        "LastObservedGameTime": Artifact.LastObservedGameTime,
+    }
+
+
 def PublishSuccessArtifacts(
     *,
     Routed: object,
     Rendered: object,
-    Simulation: object,
     PhysicalDesignDocument: dict[str, object],
+    FabricFixture: dict[str, object] | None = None,
+    FabricServerSnapshotSupervisor: FabricServerSupervisor | None = None,
     OutputPath: Path,
-) -> tuple[Path, Path]:
-    """Stage all success outputs and publish metadata after the schematic."""
+) -> Path:
+    """Stage all success outputs and publish a settled server snapshot.
+
+    A compiler run always supplies both ``FabricFixture`` and
+    ``FabricServerSnapshotSupervisor``.  The static litematic is written only
+    into the private staging directory so the existing compiler-side
+    orientation audit and I/O labels remain authoritative.  Minecraft then
+    supplies the final block-state snapshot after all fixture inputs have been
+    reset to zero.  Direct callers that do not supply a supervisor retain the
+    static writer behavior for narrow unit tests and fixture-only workflows.
+    """
+    if FabricServerSnapshotSupervisor is not None and FabricFixture is None:
+        raise ValueError(
+            "Fabric server snapshot requires a Fabric fixture",
+        )
     ArtifactPaths = SuccessArtifactPaths(OutputPath)
     OutputPath.parent.mkdir(parents=True, exist_ok=True)
     ClearStaleSuccessArtifacts(OutputPath)
@@ -469,18 +526,53 @@ def PublishSuccessArtifacts(
         ) as TemporaryDirectoryValue:
             TemporaryRoot = Path(TemporaryDirectoryValue)
             TemporaryOutputPath = TemporaryRoot / OutputPath.name
-            TemporaryTruthTablePath = (
-                TemporaryRoot / ArtifactPaths["TruthTable"].name
-            )
             TemporaryPhysicalDesignPath = (
                 TemporaryRoot / ArtifactPaths["PhysicalDesign"].name
             )
-            Writer262.WriteLitematic(
-                Routed,
-                OutputPath=TemporaryOutputPath,
-                Build=Rendered,
+            if FabricServerSnapshotSupervisor is None:
+                SchemWriter.WriteLitematic(
+                    Routed,
+                    OutputPath=TemporaryOutputPath,
+                    Build=Rendered,
+                )
+            else:
+                TemporaryStaticOutputPath = TemporaryRoot / (
+                    f"{OutputPath.stem}.Static{OutputPath.suffix}"
+                )
+                SchemWriter.WriteLitematic(
+                    Routed,
+                    OutputPath=TemporaryStaticOutputPath,
+                    Build=Rendered,
+                )
+                SnapshotArtifact = CaptureServerUpdatedLitematic(
+                    Supervisor=FabricServerSnapshotSupervisor,
+                    Fixture=FabricFixture,
+                    SourcePath=TemporaryStaticOutputPath,
+                    OutputPath=TemporaryOutputPath,
+                )
+                RunSummary = PhysicalDesignDocument.get("RunSummary")
+                if isinstance(RunSummary, dict):
+                    RunSummary["FabricServerSnapshot"] = (
+                        BuildFabricServerSnapshotDocument(
+                            SnapshotArtifact,
+                            OutputPath,
+                        )
+                    )
+            if FabricFixture is not None:
+                TemporaryFixturePath = (
+                    TemporaryRoot / ArtifactPaths["FabricFixture"].name
+                )
+                WriteFabricFixture(TemporaryFixturePath, FabricFixture)
+            RepeaterOrientation = getattr(
+                Rendered,
+                "RepeaterOrientation",
+                {},
             )
-            WriteTruthTable(Simulation, TemporaryTruthTablePath)
+            FinalValidation = PhysicalDesignDocument.get("FinalValidation")
+            if isinstance(FinalValidation, dict):
+                FinalValidation["RepeaterOrientationReadbackPassed"] = (
+                    RepeaterOrientation.get("ReadbackPassed") is True
+                )
             TemporaryPhysicalDesignPath.write_text(
                 json.dumps(
                     PhysicalDesignDocument,
@@ -490,12 +582,13 @@ def PublishSuccessArtifacts(
                 encoding="utf-8",
             )
             TemporaryOutputPath.replace(ArtifactPaths["Schematic"])
-            TemporaryTruthTablePath.replace(ArtifactPaths["TruthTable"])
+            if FabricFixture is not None:
+                TemporaryFixturePath.replace(ArtifactPaths["FabricFixture"])
             TemporaryPhysicalDesignPath.replace(ArtifactPaths["PhysicalDesign"])
     except Exception:
         ClearStaleSuccessArtifacts(OutputPath)
         raise
-    return ArtifactPaths["TruthTable"], ArtifactPaths["PhysicalDesign"]
+    return ArtifactPaths["PhysicalDesign"]
 
 
 def WriteRoutingFailureArtifact(
@@ -640,47 +733,12 @@ def CompileSvToLitematic(
     DotPath = WriteNandDiagram(NandIR, DiagramPath)
     Stages.append("nand_diagram")
 
-    ValidatedSimulation = None
-
-    def ValidateRoutedCandidate(RoutedCandidate: object) -> None:
-        nonlocal ValidatedSimulation
-        CandidateSimulation = SimulateRoutedTruthTable(
-            RoutedCandidate,
-            ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
-        )
-        if not CandidateSimulation.Passed:
-            Failed = CandidateSimulation.FailedRows[0]
-            raise RoutingStageError(
-                RoutingFailure(
-                    Reason=RoutingFailureReason.ElectricalConflict,
-                    Stage="PhysicalSimulation",
-                    Detail=(
-                        "routed placement failed physical truth-table validation"
-                    ),
-                    Diagnostics={
-                        "Inputs": [int(Value) for Value in Failed.Inputs],
-                        "ExpectedOutputs": [
-                            int(Value) for Value in Failed.ExpectedOutputs
-                        ],
-                        "SimulatedOutputs": [
-                            int(Value) for Value in Failed.SimulatedOutputs
-                        ],
-                        "SimulationBackend": CandidateSimulation.Backend,
-                        "SimulationRuntimeSeconds": (
-                            CandidateSimulation.RuntimeSeconds
-                        ),
-                    },
-                )
-            )
-        ValidatedSimulation = CandidateSimulation
-
     try:
         Physical = PlaceAndRoutePcb(
             NandIR,
             ProgressCallback=ProgressCallback,
             Strategy=RequestedStrategy,
             Policy=EffectivePolicy,
-            RoutedValidationCallback=ValidateRoutedCandidate,
             RoutingDeadlineSeconds=RoutingDeadlineSeconds,
         )
     except RoutingStageError as Error:
@@ -719,60 +777,65 @@ def CompileSvToLitematic(
     Routed = Physical.Routed
     Stages.append("pcb_routing")
     Stages.append("route_cleanup")
-
-    Simulation = ValidatedSimulation or SimulateRoutedTruthTable(
-        Routed,
-        ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
-    )
-    Stages.append("redstone_simulation")
-    if not Simulation.Passed:
-        Failed = Simulation.FailedRows[0]
-        raise ValueError(
-            "Physical redstone truth table failed: "
-            f"inputs={tuple(int(Value) for Value in Failed.Inputs)}, "
-            "expected="
-            f"{tuple(int(Value) for Value in Failed.ExpectedOutputs)}, "
-            "simulated="
-            f"{tuple(int(Value) for Value in Failed.SimulatedOutputs)}"
-        )
-    TruthTablePath = OutputPath.with_suffix(".TruthTable.txt")
-
     ValidateNandOnlyDesign(Physical.Placed, NandIR)
     Routed.TraceSupportBlocks = (
         tuple(TraceSupportBlocks) if TraceSupportBlocks is not None else ()
     )
-    Rendered = Writer262.BuildLitematicBlockMap(
+    Rendered = SchemWriter.BuildLitematicBlockMap(
         Routed,
         TraceSupportBlocks=Routed.TraceSupportBlocks,
     )
     Composition = Rendered.Composition
-
-    # The routed-net check above covers every row.  For the parity-proven
-    # small-table bound, additionally require the exact rendered Minecraft
-    # block layout, where opaque supports and dust can couple distinct nets.
-    if ShouldSimulateRenderedMinecraftTruthTable(
-        OptimizedIR.Modules[OptimizedIR.Top]
-    ):
-        Simulation = SimulateRenderedMinecraftTruthTable(
-            Routed,
-            ReferenceModule=OptimizedIR.Modules[OptimizedIR.Top],
+    NandModule = NandIR.Modules[NandIR.Top]
+    FabricFixture = BuildFabricFixture(
+        RoutedDesign=Routed,
+        Rendered=Rendered,
+        Module=NandModule,
+    )
+    ServerSupervisor = FabricServerSupervisor(
+        FabricServerConfiguration.FromEnvironment(),
+    )
+    with TemporaryDirectory(
+        dir=OutputPath.parent,
+        prefix=f".{OutputPath.stem}-fabric-validate-",
+    ) as FixtureDirectory:
+        ValidationFixture = WriteFabricFixture(
+            Path(FixtureDirectory) / OutputPath.with_suffix(".FabricFixture.json").name,
+            FabricFixture,
         )
-    else:
-        Simulation = replace(
-            Simulation,
-            Diagnostics={
-                **(Simulation.Diagnostics or {}),
-                "RenderedMinecraftCrossCheck": "skipped-row-ceiling",
-            },
+        FabricServerValidation = ServerSupervisor.Validate(
+            Fixture=ValidationFixture,
+            Vectors=BuildExpectedVectors(
+                NandModule,
+                (Value["Name"] for Value in FabricFixture["Inputs"]),
+                (Value["Name"] for Value in FabricFixture["Outputs"]),
+            ),
         )
-    if not Simulation.Passed:
-        Failed = Simulation.FailedRows[0]
-        raise ValueError(
-            "Rendered Minecraft redstone truth table failed: "
-            f"inputs={tuple(int(Value) for Value in Failed.Inputs)}, "
-            f"expected={tuple(int(Value) for Value in Failed.ExpectedOutputs)}, "
-            f"simulated={tuple(int(Value) for Value in Failed.SimulatedOutputs)}"
+    Stages.append("fabric_server_validation")
+    if FabricServerValidation.Status != "passed":
+        TryWriteRoutingFailureArtifact(
+            OutputPath=OutputPath,
+            RequestedStrategy=RequestedStrategy,
+            Failure=RoutingFailure(
+                Reason=RoutingFailureReason.FinalDrcViolation,
+                Stage="FabricServerValidation",
+                Detail=(
+                    "authoritative Fabric validation did not pass: "
+                    f"{FabricServerValidation.Status}"
+                ),
+                Diagnostics={
+                    "FabricServerValidation": asdict(FabricServerValidation),
+                },
+            ),
+            StartedAt=StartedAt,
+            InputPath=InputPath,
+            DiagramPath=DiagramPath,
+            DotPath=DotPath,
+            Workdir=Workdir,
+            TopModule=TopModule,
+            EffectivePolicy=EffectivePolicy,
         )
+        RequireFabricServerValidation(FabricServerValidation)
 
     GlobalPlan = Routed.GlobalPlan
     Metrics = Routed.RoutingMetrics
@@ -860,6 +923,13 @@ def CompileSvToLitematic(
         "RepeaterOptimization": Rendered.RepeaterOptimization,
     }
     RouterReliabilityDocument = BuildSuccessRouterReliability(SuccessEvidence)
+    # The routing envelope is created before the live world probe, but the
+    # persisted success document is written only after that probe passes.
+    # Record the completed end-to-end verdict rather than leaving consumers
+    # to infer it from a separate final-validation object.
+    RouterReliabilityDocument["RunVerdict"] = (
+        "ROUTED_AND_FABRIC_SERVER_VALIDATED"
+    )
     PhysicalDesignDocument = {
         "Strategy": {
             "Requested": Physical.RequestedStrategy,
@@ -914,20 +984,35 @@ def CompileSvToLitematic(
             ),
             "PerNetLength": PerNetLengths,
             "MaximumNetLengthShare": round(MaximumNetLengthShare, 6),
-            "TruthTablePassed": Simulation.Passed,
-            "TruthTableRows": len(Simulation.Rows),
-            "SimulationBackend": Simulation.Backend,
-            "SimulationRuntimeSeconds": Simulation.RuntimeSeconds,
-            "SimulationDiagnostics": Simulation.Diagnostics,
+            "FabricServerValidation": asdict(FabricServerValidation),
+            "FabricFixture": {
+                "Path": NormalizeArtifactPath(
+                    OutputPath.with_suffix(".FabricFixture.json"),
+                ),
+                "Sha256": ValidationFixture.Sha256,
+                "BlockCount": ValidationFixture.BlockCount,
+                "InputCount": ValidationFixture.InputCount,
+                "OutputCount": ValidationFixture.OutputCount,
+            },
         },
         "BlockComposition": Composition.ToDictionary(),
+        "RepeaterOrientation": Rendered.RepeaterOrientation,
         "NormalizedQuality": NormalizedQuality,
         "FinalValidation": {
-            "ValidationMode": "authoritative-exact",
+            "ValidationMode": "fabric-server-authoritative",
+            "FabricServerValidationRequired": True,
+            "FabricServerValidationStatus": FabricServerValidation.Status,
             "ZeroConflicts": Routed.ZeroResourceConflicts,
             "ConflictCount": 0 if Routed.ZeroResourceConflicts else 1,
             "UnresolvedClaims": UnresolvedClaims,
             "UnresolvedClaimCount": len(UnresolvedClaims),
+            "RepeaterOrientationPassed": (
+                Rendered.RepeaterOrientation.get("Passed") is True
+            ),
+            "RepeaterOrientationMismatchCount": int(
+                Rendered.RepeaterOrientation.get("MismatchCount", 0)
+            ),
+            "RepeaterOrientationReadbackRequired": True,
         },
         "RoutingResourceGraph": RoutingResourceGraphDocument,
         "GlobalRouting": (
@@ -949,15 +1034,16 @@ def CompileSvToLitematic(
             else None
         ),
     }
-    TruthTablePath, PhysicalDesignPath = PublishSuccessArtifacts(
+    PhysicalDesignPath = PublishSuccessArtifacts(
         Routed=Routed,
         Rendered=Rendered,
-        Simulation=Simulation,
         PhysicalDesignDocument=PhysicalDesignDocument,
+        FabricFixture=FabricFixture,
+        FabricServerSnapshotSupervisor=ServerSupervisor,
         OutputPath=OutputPath,
     )
+    Stages.append("fabric_server_snapshot")
     Stages.append("litematic_writer")
-    Stages.append("truth_table")
     Stages.append("physical_design_diagnostics")
 
     NandGateCount = sum(
@@ -976,9 +1062,7 @@ def CompileSvToLitematic(
         Depth=Composition.Depth,
         OriginalLogicGateCount=OriginalLogicGateCount,
         OptimizedLogicGateCount=OptimizedLogicGateCount,
-        TruthTablePath=TruthTablePath,
-        TruthTablePassed=Simulation.Passed,
-        TruthTableRows=len(Simulation.Rows),
+        FabricServerValidation=FabricServerValidation,
         RoutingMetrics=Routed.RoutingMetrics,
         PhysicalDesignPath=PhysicalDesignPath,
         RequestedStrategy=Physical.RequestedStrategy,

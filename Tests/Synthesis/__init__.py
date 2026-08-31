@@ -1,0 +1,1 @@
+"""Synthesis-stage tests."""

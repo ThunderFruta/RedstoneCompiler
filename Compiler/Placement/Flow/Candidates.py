@@ -17,6 +17,7 @@ from time import (
 from typing import (
     Any,
     Callable,
+    Collection,
     Iterable,
     Mapping,
     Sequence,
@@ -250,15 +251,57 @@ def HasDistinctRetainedPhysicalEligibilityState(
         ) in Queue
     )
 
+
+def HasQueuedGeneratedProofGuidedEligibilityState(
+    Queue: Iterable[tuple[str, int, Any, int, int]],
+    GeneratedPlacementFingerprints: Collection[str],
+) -> bool:
+    """Return whether a generated repair is waiting for physical evaluation."""
+
+    return any(
+        Phase == "prepare-eligibility"
+        and Candidate.PlacementFingerprint in GeneratedPlacementFingerprints
+        for (
+            Phase,
+            _InterfaceIndex,
+            Candidate,
+            _InterfaceCutEpoch,
+            _QueuedComponentVariant,
+        ) in Queue
+    )
+
+
+def QueuedPhysicalEligibilityPlacementFingerprints(
+    Queue: Iterable[tuple[str, int, Any, int, int]],
+) -> frozenset[str]:
+    """Return immutable placement identities waiting for eligibility work."""
+
+    return frozenset(
+        Candidate.PlacementFingerprint
+        for (
+            Phase,
+            _InterfaceIndex,
+            Candidate,
+            _InterfaceCutEpoch,
+            _QueuedComponentVariant,
+        ) in Queue
+        if Phase == "prepare-eligibility"
+    )
+
 @dataclass(frozen=True)
 class ClusterInterfaceStageSchedule:
     """Shared deadline and immutable state order for one component solve."""
 
     StartedAt: float
     PlanningExpiresAt: float
+    ProofGuidedPlanningExpiresAt: float
+    AccessRepairPlanningExpiresAt: float
+    AccessRepairExpiresAt: float
     ExpiresAt: float
     LocalCompilationReserveSeconds: float
+    ProofGuidedLocalCompilationReserveSeconds: float
     GlobalRoutingReserveSeconds: float
+    AccessRepairGlobalRoutingReserveSeconds: float
     PublicationReserveSeconds: float
     StateFingerprints: tuple[str, ...]
 
@@ -274,14 +317,27 @@ class ClusterInterfaceStageSchedule:
         return {
             "StartedAt": self.StartedAt,
             "PlanningExpiresAt": self.PlanningExpiresAt,
+            "ProofGuidedPlanningExpiresAt": (
+                self.ProofGuidedPlanningExpiresAt
+            ),
+            "AccessRepairPlanningExpiresAt": (
+                self.AccessRepairPlanningExpiresAt
+            ),
+            "AccessRepairExpiresAt": self.AccessRepairExpiresAt,
             "ExpiresAt": self.ExpiresAt,
             "AvailableSeconds": round(self.AvailableSeconds, 6),
             "PlanningSeconds": round(self.PlanningSeconds, 6),
             "LocalCompilationReserveSeconds": (
                 self.LocalCompilationReserveSeconds
             ),
+            "ProofGuidedLocalCompilationReserveSeconds": (
+                self.ProofGuidedLocalCompilationReserveSeconds
+            ),
             "GlobalRoutingReserveSeconds": (
                 self.GlobalRoutingReserveSeconds
+            ),
+            "AccessRepairGlobalRoutingReserveSeconds": (
+                self.AccessRepairGlobalRoutingReserveSeconds
             ),
             "PublicationReserveSeconds": (
                 self.PublicationReserveSeconds
@@ -839,6 +895,7 @@ def BuildClusterInterfaceStageSchedule(
     LocalCompilationReserveSeconds: float,
     GlobalRoutingReserveSeconds: float,
     PublicationReserveSeconds: float = 2.0,
+    ProofGuidedLocalCompilationReserveSeconds: float = 2.0,
 ) -> ClusterInterfaceStageSchedule:
     """Reserve global routing while funding complete interface states."""
     if LocalCompilationReserveSeconds < 0:
@@ -847,6 +904,10 @@ def BuildClusterInterfaceStageSchedule(
         raise ValueError("global routing reserve cannot be negative")
     if PublicationReserveSeconds < 0:
         raise ValueError("publication reserve cannot be negative")
+    if ProofGuidedLocalCompilationReserveSeconds < 0:
+        raise ValueError(
+            "proof-guided local compilation reserve cannot be negative"
+        )
     AvailableSeconds = max(0.0, Deadline.RemainingSeconds())
     # Keep fixed per-interface reserves for generous deadlines, but avoid
     # consuming the entire tail for late-stage cases (CLA4) where remaining
@@ -890,12 +951,46 @@ def BuildClusterInterfaceStageSchedule(
         StartedAt,
         ExpiresAt - ScaledLocalReserveSeconds,
     )
+    ScaledProofGuidedLocalCompilationReserveSeconds = min(
+        ScaledLocalReserveSeconds,
+        ProofGuidedLocalCompilationReserveSeconds,
+    )
+    ProofGuidedPlanningExpiresAt = max(
+        PlanningExpiresAt,
+        ExpiresAt - ScaledProofGuidedLocalCompilationReserveSeconds,
+    )
+    AccessRepairGlobalRoutingReserveSeconds = min(
+        ScaledGlobalReserveSeconds,
+        10.0,
+    )
+    AccessRepairPlanningExpiresAt = max(
+        ProofGuidedPlanningExpiresAt,
+        Deadline.ExpiresAt
+        - PublicationReserveSeconds
+        - AccessRepairGlobalRoutingReserveSeconds
+        - ScaledProofGuidedLocalCompilationReserveSeconds,
+    )
+    AccessRepairExpiresAt = max(
+        AccessRepairPlanningExpiresAt,
+        Deadline.ExpiresAt
+        - PublicationReserveSeconds
+        - AccessRepairGlobalRoutingReserveSeconds,
+    )
     return ClusterInterfaceStageSchedule(
         StartedAt=StartedAt,
         PlanningExpiresAt=PlanningExpiresAt,
+        ProofGuidedPlanningExpiresAt=ProofGuidedPlanningExpiresAt,
+        AccessRepairPlanningExpiresAt=AccessRepairPlanningExpiresAt,
+        AccessRepairExpiresAt=AccessRepairExpiresAt,
         ExpiresAt=ExpiresAt,
         LocalCompilationReserveSeconds=ScaledLocalReserveSeconds,
+        ProofGuidedLocalCompilationReserveSeconds=(
+            ScaledProofGuidedLocalCompilationReserveSeconds
+        ),
         GlobalRoutingReserveSeconds=ScaledGlobalReserveSeconds,
+        AccessRepairGlobalRoutingReserveSeconds=(
+            AccessRepairGlobalRoutingReserveSeconds
+        ),
         PublicationReserveSeconds=PublicationReserveSeconds,
         StateFingerprints=tuple(StateFingerprints),
     )

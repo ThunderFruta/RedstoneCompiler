@@ -1,7 +1,7 @@
 # Freerouting upstream
 
 This directory holds the independently developed Freerouting PCB autorouter
-used by `Scripts/RunFreeroutingBenchmark.py` as an external routing baseline.
+used by `Scripts/Routing/RunFreeroutingBenchmark.py` as an external routing baseline.
 
 - Project: <https://github.com/freerouting/freerouting>
 - Release: `v2.3.0` (2026-08-07)
