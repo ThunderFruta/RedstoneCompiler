@@ -809,6 +809,7 @@ def CompileSvToLitematic(
                 NandModule,
                 (Value["Name"] for Value in FabricFixture["Inputs"]),
                 (Value["Name"] for Value in FabricFixture["Outputs"]),
+                IncludeTraceValues=True,
             ),
         )
     Stages.append("fabric_server_validation")

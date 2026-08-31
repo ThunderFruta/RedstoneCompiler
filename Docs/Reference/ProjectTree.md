@@ -27,8 +27,8 @@ The compiler now uses a stage-aligned runtime layout:
 - `Compiler/Routing/Contracts/` and `Interfaces/` are neutral lower layers.
   `Components/` owns local component solving, and `Authoritative/` owns the
   global physical route.
-- `Compiler/FabricServer/` owns fixtures, live validation, schematic testing,
-  and settled-server snapshots. `FabricServerHarness/` owns the tracked mod
+- `Compiler/FabricServer/` owns fixtures, live validation, mismatch failure
+  traces, schematic testing, and settled-server snapshots. `FabricServerHarness/` owns the tracked mod
   source; its `Server/` runtime is local and intentionally ignored.
 - `RustRouting/Src/` is split into nested `Core`, `Geometry`, `Path`,
   `Assignment`, `Escape`, `Generation`, `Planning`, and `Python`
