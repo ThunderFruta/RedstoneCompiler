@@ -89,15 +89,6 @@ Adopt as a readable reference for:
 Do not adopt its full fixed lattice or GPU requirement. Redstone resource
 claims and incremental graph exposure are materially different.
 
-## Freerouting: mature PCB repair mechanics
-
-Repository: [freerouting/freerouting](https://github.com/freerouting/freerouting)
-
-Freerouting provides mature maze routing, pass control, localized rip-up, and
-deterministic search behavior. It is useful for comparing repair-loop and
-failure-handling structure. Its Java implementation and GPL license make it a
-secondary reference rather than a direct port target.
-
 ## Redstone projects
 
 - [MinecraftHDL](https://github.com/itsfrank/MinecraftHDL) demonstrates a full

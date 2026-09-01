@@ -54,8 +54,6 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
             OutputPath = Directory / "Design.litematic"
             DiagramPath = Directory / "Design.Nand.json"
             DiagramPath.write_text("{}\n", encoding="utf-8")
-            DotPath = Directory / "Design.Nand.dot"
-            DotPath.write_text("digraph Design {}\n", encoding="utf-8")
             CheckpointPath = Directory / "Candidate.json"
             CheckpointPath.write_text("{}\n", encoding="utf-8")
             ResourceGraph = {
@@ -100,7 +98,6 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                 StartedAt=monotonic(),
                 InputPath=InputPath,
                 DiagramPath=DiagramPath,
-                DotPath=DotPath,
                 Workdir=Directory / "Frontend",
                 TopModule="Design",
             )
@@ -138,7 +135,6 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
             },
         )
         self.assertIn("Diagram", FailureDocument["PartialArtifactPaths"])
-        self.assertIn("Dot", FailureDocument["PartialArtifactPaths"])
         self.assertIn(
             "CandidateCheckpoint",
             FailureDocument["PartialArtifactPaths"],

@@ -1016,7 +1016,6 @@ def Main(Args: list[str] | None = None) -> int:
         f"max_net_share={Result.MaximumNetLengthShare:.3%}"
     )
     print(f"NAND JSON: {Result.DiagramPath}")
-    print(f"NAND DOT:  {Result.DotPath}")
     ServerValidation = Result.FabricServerValidation
     print(f"Fabric server validation: {ServerValidation.Status.upper()}")
     print(f"Litematic: {Result.OutputPath}")

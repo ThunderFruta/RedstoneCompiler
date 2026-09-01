@@ -97,11 +97,7 @@ That artifact records:
 | CLA4 physical design, truth table, litematic | not published |
 
 The current successful acceptance evidence for FullAdder, RCA4, and RCA8 does
-not establish CLA4 acceptance. The external Freerouting CLA4 result uses a
-synthetic PCB placement and PCB design rules; it demonstrates that the logical
-hypergraph can be routed in that different domain, not that the native
-Redstone placement, access, repeater, materialization, or simulation contracts
-are satisfied.
+not establish CLA4 acceptance.
 
 ### Confirmed code behavior
 
@@ -276,7 +272,6 @@ For this compiler that means:
 ## Non-goals
 
 - Full-board detailed routing in SAT, ILP, or CP-SAT.
-- A direct Freerouting code transplant.
 - Unbounded enumeration of all pin patterns, portals, lanes, or route trees.
 - A visual-only compactness score that can accept an invalid block map.
 - Whole-board relocation when a complete local core identifies a smaller cut.
@@ -1601,13 +1596,6 @@ signal strength, and repeaters creates an unnecessarily large exact model.
 Use exact solving for finite local/interface/coarse decisions and negotiated
 search for detailed spatial paths.
 
-### Direct Freerouting transplant
-
-Rejected because PCB copper clearance does not encode Redstone support,
-required air, electrical adjacency, powered dust, repeater orientation/strength,
-cell materialization, or Minecraft simulation. Freerouting remains a useful
-algorithmic comparator.
-
 ### Add whitespace everywhere
 
 Rejected as a final architecture. Capacity-sized rows/channels are allowed as
@@ -1671,5 +1659,4 @@ measured evidence. None may be resolved by a CLA4-name special case.
 - [Failure catalog](FailureCatalog.md)
 - [Current routing failures](CurrentRoutingFailures.md), retained as dated
   historical/current-tree evidence for its own revision
-- [Freerouting benchmark report](../../Testing/FreeroutingBenchmark-2026-08-25.md)
 - [Routing-aware placement and access snapshots](RoutingAwarePlacementAccessSnapshots.md)

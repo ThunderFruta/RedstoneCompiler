@@ -16,5 +16,4 @@ FabricServerHarness/build/
 Output/
 RustRouting/target/
 RedstoneCompiler/*.so
-Tools/graphviz/
 /**/*.o

@@ -916,7 +916,6 @@ def BuildRunArtifacts(RunDirectory: Path, RunName: str) -> dict[str, Path]:
         "PhysicalDesign": OutputPath.with_suffix(".PhysicalDesign.json"),
         "RoutingFailure": OutputPath.with_suffix(".RoutingFailure.json"),
         "Diagram": OutputPath.with_suffix(".Nand.json"),
-        "Dot": OutputPath.with_suffix(".Nand.dot"),
         "Stdout": RunDirectory / "stdout.log",
         "Stderr": RunDirectory / "stderr.log",
         "Workdir": RunDirectory / "Frontend",
@@ -2107,7 +2106,6 @@ def ClearPriorRunArtifacts(Artifacts: dict[str, Path]) -> None:
         "PhysicalDesign",
         "RoutingFailure",
         "Diagram",
-        "Dot",
     ):
         Artifacts[Name].unlink(missing_ok=True)
 

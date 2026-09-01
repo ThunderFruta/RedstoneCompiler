@@ -65,13 +65,10 @@ python3 Scripts/Fabric/ControlFabricServer.py stop
 
 - `Routing/RunRouterAcceptance.py` runs the compiler's physical acceptance
   matrix. Its no-flag guide defaults to `--dry-run` before offering full runs.
-- `Routing/RunFreeroutingBenchmark.py` benchmarks the separate synthetic PCB
-  comparison; it is not Redstone validation.
 - `Routing/CaptureRoutingDesignSnapshot.py` captures explicit routing evidence
   in a new timestamped output directory.
 
 ```bash
 python3 Scripts/Routing/RunRouterAcceptance.py
-python3 Scripts/Routing/RunFreeroutingBenchmark.py --case FullAdder --runs 1
 python3 Scripts/Routing/CaptureRoutingDesignSnapshot.py --help
 ```

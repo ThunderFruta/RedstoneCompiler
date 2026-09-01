@@ -2007,7 +2007,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun1/FullAdderRun1.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun1/FullAdderRun1.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun1/FullAdderRun1.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun1/FullAdderRun1.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun1",
@@ -2119,12 +2118,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun1/FullAdderRun1.Nand.json",
             "Sha256": "8bbd1241f373a47b9657a95340c85787dce17f36c6e47b427aa2e63eafd3450e",
             "SizeBytes": 2366
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun1/FullAdderRun1.Nand.dot",
-            "Sha256": "c2770268e056d8618e670694f058c6de0621dd7f8e8feb01eecb06df092818f4",
-            "SizeBytes": 1613
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -2343,7 +2336,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun2/FullAdderRun2.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun2/FullAdderRun2.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun2/FullAdderRun2.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun2/FullAdderRun2.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun2",
@@ -2455,12 +2447,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun2/FullAdderRun2.Nand.json",
             "Sha256": "8bbd1241f373a47b9657a95340c85787dce17f36c6e47b427aa2e63eafd3450e",
             "SizeBytes": 2366
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun2/FullAdderRun2.Nand.dot",
-            "Sha256": "c2770268e056d8618e670694f058c6de0621dd7f8e8feb01eecb06df092818f4",
-            "SizeBytes": 1613
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -2679,7 +2665,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun3/FullAdderRun3.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun3/FullAdderRun3.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun3/FullAdderRun3.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun3/FullAdderRun3.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun3",
@@ -2791,12 +2776,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun3/FullAdderRun3.Nand.json",
             "Sha256": "8bbd1241f373a47b9657a95340c85787dce17f36c6e47b427aa2e63eafd3450e",
             "SizeBytes": 2366
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun3/FullAdderRun3.Nand.dot",
-            "Sha256": "c2770268e056d8618e670694f058c6de0621dd7f8e8feb01eecb06df092818f4",
-            "SizeBytes": 1613
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -3015,7 +2994,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun4/FullAdderRun4.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun4/FullAdderRun4.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun4/FullAdderRun4.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun4/FullAdderRun4.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun4",
@@ -3127,12 +3105,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun4/FullAdderRun4.Nand.json",
             "Sha256": "8bbd1241f373a47b9657a95340c85787dce17f36c6e47b427aa2e63eafd3450e",
             "SizeBytes": 2366
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun4/FullAdderRun4.Nand.dot",
-            "Sha256": "c2770268e056d8618e670694f058c6de0621dd7f8e8feb01eecb06df092818f4",
-            "SizeBytes": 1613
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -3351,7 +3323,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun5/FullAdderRun5.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun5/FullAdderRun5.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun5/FullAdderRun5.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun5/FullAdderRun5.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun5",
@@ -3463,12 +3434,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun5/FullAdderRun5.Nand.json",
             "Sha256": "8bbd1241f373a47b9657a95340c85787dce17f36c6e47b427aa2e63eafd3450e",
             "SizeBytes": 2366
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/FullAdderRun5/FullAdderRun5.Nand.dot",
-            "Sha256": "c2770268e056d8618e670694f058c6de0621dd7f8e8feb01eecb06df092818f4",
-            "SizeBytes": 1613
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -3687,7 +3652,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run1/RippleCarryAdder4Run1.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run1/RippleCarryAdder4Run1.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run1/RippleCarryAdder4Run1.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run1/RippleCarryAdder4Run1.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run1",
@@ -3832,12 +3796,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run1/RippleCarryAdder4Run1.Nand.json",
             "Sha256": "4bedb5069991cfa34b928db0974a22eabe7579f11fc7e8aaf2d2f3ba91a2ce3d",
             "SizeBytes": 8358
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run1/RippleCarryAdder4Run1.Nand.dot",
-            "Sha256": "0544e52d2e8d4289c6457f4ba2770c59a5cc4c1cf31cb6aa0e28facd74d7f0a5",
-            "SizeBytes": 5956
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -4537,7 +4495,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run2/RippleCarryAdder4Run2.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run2/RippleCarryAdder4Run2.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run2/RippleCarryAdder4Run2.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run2/RippleCarryAdder4Run2.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run2",
@@ -4682,12 +4639,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run2/RippleCarryAdder4Run2.Nand.json",
             "Sha256": "4bedb5069991cfa34b928db0974a22eabe7579f11fc7e8aaf2d2f3ba91a2ce3d",
             "SizeBytes": 8358
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run2/RippleCarryAdder4Run2.Nand.dot",
-            "Sha256": "0544e52d2e8d4289c6457f4ba2770c59a5cc4c1cf31cb6aa0e28facd74d7f0a5",
-            "SizeBytes": 5956
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -5387,7 +5338,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run3/RippleCarryAdder4Run3.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run3/RippleCarryAdder4Run3.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run3/RippleCarryAdder4Run3.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run3/RippleCarryAdder4Run3.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run3",
@@ -5532,12 +5482,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run3/RippleCarryAdder4Run3.Nand.json",
             "Sha256": "4bedb5069991cfa34b928db0974a22eabe7579f11fc7e8aaf2d2f3ba91a2ce3d",
             "SizeBytes": 8358
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder4Run3/RippleCarryAdder4Run3.Nand.dot",
-            "Sha256": "0544e52d2e8d4289c6457f4ba2770c59a5cc4c1cf31cb6aa0e28facd74d7f0a5",
-            "SizeBytes": 5956
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -6237,7 +6181,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run1/RippleCarryAdder8Run1.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run1/RippleCarryAdder8Run1.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run1/RippleCarryAdder8Run1.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run1/RippleCarryAdder8Run1.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run1",
@@ -6426,12 +6369,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run1/RippleCarryAdder8Run1.Nand.json",
             "Sha256": "89a13c918174cdd943d7479f9d492b51edc39113e13cfb7ac9b301363bc919ca",
             "SizeBytes": 16330
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run1/RippleCarryAdder8Run1.Nand.dot",
-            "Sha256": "8b5806228638589e0e338720013477f4372e11f01bf724cc732dcf106470b51a",
-            "SizeBytes": 11744
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -7014,7 +6951,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run2/RippleCarryAdder8Run2.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run2/RippleCarryAdder8Run2.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run2/RippleCarryAdder8Run2.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run2/RippleCarryAdder8Run2.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run2",
@@ -7203,12 +7139,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run2/RippleCarryAdder8Run2.Nand.json",
             "Sha256": "89a13c918174cdd943d7479f9d492b51edc39113e13cfb7ac9b301363bc919ca",
             "SizeBytes": 16330
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run2/RippleCarryAdder8Run2.Nand.dot",
-            "Sha256": "8b5806228638589e0e338720013477f4372e11f01bf724cc732dcf106470b51a",
-            "SizeBytes": 11744
           },
           "PhysicalDesign": {
             "Exists": true,
@@ -7791,7 +7721,6 @@
       "Accepted": true,
       "ArtifactPaths": {
         "Diagram": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run3/RippleCarryAdder8Run3.Nand.json",
-        "Dot": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run3/RippleCarryAdder8Run3.Nand.dot",
         "PhysicalDesign": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run3/RippleCarryAdder8Run3.PhysicalDesign.json",
         "RoutingFailure": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run3/RippleCarryAdder8Run3.RoutingFailure.json",
         "RunDirectory": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run3",
@@ -7980,12 +7909,6 @@
             "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run3/RippleCarryAdder8Run3.Nand.json",
             "Sha256": "89a13c918174cdd943d7479f9d492b51edc39113e13cfb7ac9b301363bc919ca",
             "SizeBytes": 16330
-          },
-          "Dot": {
-            "Exists": true,
-            "Path": "/tmp/RedstoneCompilerMonolithRerun.lBhxKP/2026-08-28/RouterRegression/StandaloneAcceptance/RippleCarryAdder8Run3/RippleCarryAdder8Run3.Nand.dot",
-            "Sha256": "8b5806228638589e0e338720013477f4372e11f01bf724cc732dcf106470b51a",
-            "SizeBytes": 11744
           },
           "PhysicalDesign": {
             "Exists": true,

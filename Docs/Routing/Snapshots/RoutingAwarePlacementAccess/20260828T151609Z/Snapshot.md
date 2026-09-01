@@ -3,12 +3,12 @@
 - Snapshot ID: `20260828T151609Z-2c2132084dda3215`
 - Captured UTC: `2026-08-28T15:16:09Z`
 - Captured local: `2026-08-28T11:16:09-04:00`
-- Exact evidence SHA-256: `06d4b8149212ab611814af1dad6af25181b75f782f4d3a3b6b86f7b87136a539`
+- Exact evidence SHA-256: `aebd93a82e8fce1e10fdf07c04d9c2ace735fd97f4f51fbba77122f1aafef081`
 - Portable semantic evidence SHA-256: `2c2132084dda3215ab17b96b22e639e804ba0f2dd3d1ca3e89496866811f34df`
 - Revision: `1681514368979f2cca1635b90b7f27062a966e33`
 - Branch: `main`
 - Dirty: `true`
-- Status SHA-256: `01e3f799baf400ded7d88e670839a7991e8a8106357c23601d5c314c69f3452d`
+- Status SHA-256: `a9fa30931eb872fb332c1add0b5dcd247016b461d7bf336c3a5b8f8dd74a2052`
 
 ## Source
 
@@ -87,10 +87,9 @@
 
 | Snapshot path | Bytes | SHA-256 |
 | --- | ---: | --- |
-| [AcceptanceManifest.json](Artifacts/AcceptanceManifest.json) | 421091 | `b5668b6e67bb7fd52cfe045181e9305226ca6cfe790092dc889585a6d5f180ec` |
-| [CarryLookaheadAdder4Run1.Nand.dot](Artifacts/CarryLookaheadAdder4Run1.Nand.dot) | 11398 | `dd06752150a1bad7972e3adb461aea2c56655395a41c1f3fbfccda153fdb1207` |
+| [AcceptanceManifest.json](Artifacts/AcceptanceManifest.json) | 415151 | `c5dc005b938dea3cdff8ba794ce315cd30ecc3946185cc1977e75256299ef8e3` |
 | [CarryLookaheadAdder4Run1.Nand.json](Artifacts/CarryLookaheadAdder4Run1.Nand.json) | 15019 | `5593b4536c985b3d99a9aa9ff20a94e6ddcb105741f21df21a694b1f980b424f` |
-| [CarryLookaheadAdder4Run1.RoutingFailure.json](Artifacts/CarryLookaheadAdder4Run1.RoutingFailure.json) | 16762 | `fe859cbfce1e76ee6e81f814ed9523046708ae53cd24c283b9f936e462a6c661` |
-| [Rca8PerformanceRerunAcceptanceManifest.json](Artifacts/Rca8PerformanceRerunAcceptanceManifest.json) | 410857 | `15a1383f08559570d8fa9768b72ad7f0fa465c4fcc65be99f0b3b3b51097a27f` |
+| [CarryLookaheadAdder4Run1.RoutingFailure.json](Artifacts/CarryLookaheadAdder4Run1.RoutingFailure.json) | 16605 | `e2eaa1db52deedc27605327f1b9cbc1afa7deaff78e4decc0eb6566fd3bac149` |
+| [Rca8PerformanceRerunAcceptanceManifest.json](Artifacts/Rca8PerformanceRerunAcceptanceManifest.json) | 405415 | `5f6f0c132fbcd029c608ffc8dca6b7a1397e1b74524086c399f01c25bac39622` |
 
 This snapshot records a typed structural placement failure. It does not establish CLA4 routing acceptance.

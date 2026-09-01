@@ -11,8 +11,8 @@ python3 Main.py \
   --routing-strategy new-router-first
 ```
 
-A successful compile publishes the litematic, NAND JSON, truth table, physical
-design JSON, and Graphviz diagram together. Check that the truth table reports
+A successful compile publishes the litematic, NAND JSON, truth table, and
+physical design JSON together. Check that the truth table reports
 8/8 passing rows and that `FinalValidation` has zero conflicts and unresolved
 claims. `Strategy.FallbackUsed` must be false.
 

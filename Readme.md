@@ -73,14 +73,13 @@ and retained-branch repair as the present regression, not a need for a circuit-s
 exception. CLA4 remains gated behind RCA4. The 2026-07-21 RRF-073 matrix remains the last
 complete durable acceptance record.
 
-Each compile also writes a Graphviz `.dot` file beside the NAND JSON diagram
-and a `.PhysicalDesign.json` file beside the litematic. The latter records the
+Each compile also writes a NAND JSON diagram and a `.PhysicalDesign.json` file
+beside the litematic. The latter records the
 effective policy, technology version, global signal order, assigned layers,
 resource count, and any global overflow. Successful v10 metadata also carries a
 `RouterReliability` envelope with placement/resource fingerprints and native
 work evidence. Typed failures write the parallel reproduction and partial-work
-evidence to `.RoutingFailure.json`. The graph is diagnostic only; physical
-placement uses NAND connectivity and does not reproduce the drawing.
+evidence to `.RoutingFailure.json`.
 
 The physical router uses the template PCB backend and exact capacity-one
 resource ownership. The v10 recovery makes placement electrical legality,

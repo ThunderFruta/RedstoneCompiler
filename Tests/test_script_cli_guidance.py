@@ -19,7 +19,6 @@ from Scripts.Fabric import (
 )
 from Scripts.Routing import (
     CaptureRoutingDesignSnapshot,
-    RunFreeroutingBenchmark,
     RunRouterAcceptance,
 )
 
@@ -358,8 +357,6 @@ class ScriptCliGuidanceTests(unittest.TestCase):
     def testRoutingGuidesDefaultToSafePreviews(self) -> None:
         with patch("builtins.input", side_effect=[""]):
             self.assertEqual(RunRouterAcceptance.GuidedArguments(), ["--dry-run"])
-        with patch("builtins.input", side_effect=[""]), redirect_stdout(StringIO()):
-            self.assertEqual(RunFreeroutingBenchmark.Main([]), 0)
 
     def testSnapshotGuideCollectsExplicitInputPaths(self) -> None:
         with patch("builtins.input", side_effect=["failure.json", "", "manifest.json", "diagram.json", ""]):

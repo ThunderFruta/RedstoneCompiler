@@ -59,7 +59,6 @@ class CompileResult:
 
     OutputPath: Path
     DiagramPath: Path
-    DotPath: Path
     NandGateCount: int
     Stages: list[str]
     EstimatedBlocks: int
@@ -438,13 +437,11 @@ def BuildPartialArtifactPaths(
     *,
     OutputPath: Path,
     DiagramPath: Path | None = None,
-    DotPath: Path | None = None,
     ExplicitPaths: object = None,
 ) -> dict[str, str]:
     """Return known partial artifacts, excluding absent success outputs."""
     Candidates: dict[str, Path | str | None] = {
         "Diagram": DiagramPath,
-        "Dot": DotPath,
         **SuccessArtifactPaths(OutputPath),
     }
     ExplicitNames: set[str] = set()
@@ -599,7 +596,6 @@ def WriteRoutingFailureArtifact(
     StartedAt: float,
     InputPath: Path | None = None,
     DiagramPath: Path | None = None,
-    DotPath: Path | None = None,
     Workdir: Path | None = None,
     TopModule: str | None = None,
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
@@ -652,7 +648,6 @@ def WriteRoutingFailureArtifact(
                 "PartialArtifactPaths": BuildPartialArtifactPaths(
                     OutputPath=OutputPath,
                     DiagramPath=DiagramPath,
-                    DotPath=DotPath,
                     ExplicitPaths=Diagnostics.get("PartialArtifactPaths"),
                 ),
                 "ConflictGraph": ConflictGraph,
@@ -730,7 +725,7 @@ def CompileSvToLitematic(
     ValidateNandOnlyDesign(NandIR)
     Stages.append("nand_transform")
 
-    DotPath = WriteNandDiagram(NandIR, DiagramPath)
+    WriteNandDiagram(NandIR, DiagramPath)
     Stages.append("nand_diagram")
 
     try:
@@ -749,7 +744,6 @@ def CompileSvToLitematic(
             StartedAt=StartedAt,
             InputPath=InputPath,
             DiagramPath=DiagramPath,
-            DotPath=DotPath,
             Workdir=Workdir,
             TopModule=TopModule,
             EffectivePolicy=EffectivePolicy,
@@ -767,7 +761,6 @@ def CompileSvToLitematic(
             StartedAt=StartedAt,
             InputPath=InputPath,
             DiagramPath=DiagramPath,
-            DotPath=DotPath,
             Workdir=Workdir,
             TopModule=TopModule,
             EffectivePolicy=EffectivePolicy,
@@ -831,7 +824,6 @@ def CompileSvToLitematic(
             StartedAt=StartedAt,
             InputPath=InputPath,
             DiagramPath=DiagramPath,
-            DotPath=DotPath,
             Workdir=Workdir,
             TopModule=TopModule,
             EffectivePolicy=EffectivePolicy,
@@ -1055,7 +1047,6 @@ def CompileSvToLitematic(
     return CompileResult(
         OutputPath=OutputPath,
         DiagramPath=DiagramPath,
-        DotPath=DotPath,
         NandGateCount=NandGateCount,
         Stages=Stages,
         EstimatedBlocks=Composition.NonAirBlocks,

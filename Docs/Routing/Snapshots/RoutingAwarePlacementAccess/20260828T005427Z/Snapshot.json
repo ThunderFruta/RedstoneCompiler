@@ -1,7 +1,7 @@
 {
   "AcceptanceManifest": {
     "Accepted": false,
-    "ArtifactSha256": "787d8adff005466fc9da866dc930b1b7973365c96a3049f039ebcaabddfcadae",
+    "ArtifactSha256": "f52bbef7aecba829fdb7c27da243035880008f1487bc12f8b8a5c154f599b91f",
     "BaselineMode": null,
     "BenchmarkInputs": {
       "CarryLookaheadAdder4": {
@@ -123,15 +123,9 @@
   "Artifacts": [
     {
       "OriginalPath": "/tmp/redstone-timegraph-20260825-2128/2026-08-25/RouterRegression/StandaloneAcceptance/AcceptanceManifest.json",
-      "Sha256": "787d8adff005466fc9da866dc930b1b7973365c96a3049f039ebcaabddfcadae",
-      "SizeBytes": 347237,
+      "Sha256": "f52bbef7aecba829fdb7c27da243035880008f1487bc12f8b8a5c154f599b91f",
+      "SizeBytes": 341369,
       "SnapshotPath": "Artifacts/AcceptanceManifest.json"
-    },
-    {
-      "OriginalPath": "/tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.dot",
-      "Sha256": "dd06752150a1bad7972e3adb461aea2c56655395a41c1f3fbfccda153fdb1207",
-      "SizeBytes": 11398,
-      "SnapshotPath": "Artifacts/CarryLookaheadAdder4Run2.Nand.dot"
     },
     {
       "OriginalPath": "/tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.json",
@@ -141,8 +135,8 @@
     },
     {
       "OriginalPath": "/tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.RoutingFailure.json",
-      "Sha256": "c4f57aad994f168e47fb6165f6858bbb3898ec3b31507503cb394b7e95736ebb",
-      "SizeBytes": 16261,
+      "Sha256": "b4c5b9c8d6f07e3df0b9a26a7c8e506392e3e7404ed6c152dbd9edbe188efb94",
+      "SizeBytes": 16144,
       "SnapshotPath": "Artifacts/CarryLookaheadAdder4Run2.RoutingFailure.json"
     }
   ],
@@ -192,11 +186,6 @@
       },
       {
         "IndexStatus": "?",
-        "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T001726Z/Artifacts/CarryLookaheadAdder4Run2.Nand.dot",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
         "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T001726Z/Artifacts/CarryLookaheadAdder4Run2.Nand.json",
         "WorktreeStatus": "?"
       },
@@ -223,11 +212,6 @@
       {
         "IndexStatus": "?",
         "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T004131Z/Artifacts/AcceptanceManifest.json",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T004131Z/Artifacts/CarryLookaheadAdder4Run2.Nand.dot",
         "WorktreeStatus": "?"
       },
       {
@@ -262,92 +246,22 @@
       },
       {
         "IndexStatus": "?",
-        "Path": "Docs/Testing/FreeroutingBenchmark-2026-08-25.md",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
         "Path": "Scripts/CaptureRoutingDesignSnapshot.py",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Scripts/RunFreeroutingBenchmark.py",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tests/test_freerouting_benchmark.py",
         "WorktreeStatus": "?"
       },
       {
         "IndexStatus": "?",
         "Path": "Tests/test_routing_design_snapshot.py",
         "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/ExternalRouters/Freerouting/.gitignore",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/ExternalRouters/Freerouting/LICENSE-GPL-3.0",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/ExternalRouters/Freerouting/README.md",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/ExternalRouters/Freerouting/UPSTREAM.md",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/ExternalRouters/Freerouting/Upstream.json",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/ExternalRouters/Freerouting/Upstream/.gitkeep",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/Visualizations/SyntheticPlacements/.gitignore",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/Visualizations/SyntheticPlacements/README.md",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/Visualizations/SyntheticPlacements/index.html",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/Visualizations/SyntheticPlacements/package-lock.json",
-        "WorktreeStatus": "?"
-      },
-      {
-        "IndexStatus": "?",
-        "Path": "Tools/Visualizations/SyntheticPlacements/package.json",
-        "WorktreeStatus": "?"
       }
     ],
-    "StatusPorcelainBytes": 2539,
-    "StatusPorcelainSha256": "cd0e28509cf65af7e06527e99cad2986aade5765660c569dca105bc185433101",
+    "StatusPorcelainBytes": 1595,
+    "StatusPorcelainSha256": "b368ddc4fa99d280949e1d7dc7bf1ed975ae71b76723fbddebe66154bdb7f859",
     "UnstagedPatchBytes": 6262,
     "UnstagedPatchSha256": "714d8fd1d50cfbd2de61ac33bfb60828d95de196964e769c36ec4bfe74986523",
     "UntrackedTree": {
-      "AggregateSha256": "1cb62881237df8837ac766e7711aa6568fd5e81aa419a9fe3f563f4c002dcd3e",
-      "FileCount": 33,
+      "AggregateSha256": "bb825d1301878902ab9db4a6752044a390438a7d1dc0efd5b5abd9ca8f00a3bf",
+      "FileCount": 17,
       "Files": [
         {
           "Exists": true,
@@ -369,13 +283,6 @@
           "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T001726Z/Artifacts/AcceptanceManifest.json",
           "Sha256": "787d8adff005466fc9da866dc930b1b7973365c96a3049f039ebcaabddfcadae",
           "SizeBytes": 347237
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T001726Z/Artifacts/CarryLookaheadAdder4Run2.Nand.dot",
-          "Sha256": "dd06752150a1bad7972e3adb461aea2c56655395a41c1f3fbfccda153fdb1207",
-          "SizeBytes": 11398
         },
         {
           "Exists": true,
@@ -422,13 +329,6 @@
         {
           "Exists": true,
           "IsRegularFile": true,
-          "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T004131Z/Artifacts/CarryLookaheadAdder4Run2.Nand.dot",
-          "Sha256": "dd06752150a1bad7972e3adb461aea2c56655395a41c1f3fbfccda153fdb1207",
-          "SizeBytes": 11398
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
           "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T004131Z/Artifacts/CarryLookaheadAdder4Run2.Nand.json",
           "Sha256": "5593b4536c985b3d99a9aa9ff20a94e6ddcb105741f21df21a694b1f980b424f",
           "SizeBytes": 15019
@@ -471,13 +371,6 @@
         {
           "Exists": true,
           "IsRegularFile": true,
-          "Path": "Docs/Testing/FreeroutingBenchmark-2026-08-25.md",
-          "Sha256": "ec496ecd337a6a8cd688e7dd42382836e2373152614f11a262d49703647273b9",
-          "SizeBytes": 9681
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
           "Path": "Scripts/CaptureRoutingDesignSnapshot.py",
           "Sha256": "7e2530d5ec44d0e979e5d12f67c08b85d26aa8721fbb34f42c3b3c3c16d066a5",
           "SizeBytes": 63438
@@ -485,106 +378,15 @@
         {
           "Exists": true,
           "IsRegularFile": true,
-          "Path": "Scripts/RunFreeroutingBenchmark.py",
-          "Sha256": "9b1826162a166b36c97b47dc7e939ba0d04b67b113de6674430e511a2d6b6886",
-          "SizeBytes": 55012
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tests/test_freerouting_benchmark.py",
-          "Sha256": "0dd3639bad64bc5044afac3d616ba614a5b90dccf9de51c1b2260b1c770062a4",
-          "SizeBytes": 7869
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
           "Path": "Tests/test_routing_design_snapshot.py",
           "Sha256": "bc34af050de2128c8c1e12939039c254f387f429a9acf37782524f552df53a4d",
           "SizeBytes": 20122
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/ExternalRouters/Freerouting/.gitignore",
-          "Sha256": "3f623cb02eb7c0e6095e919862d859bf64c3eeb9a15bbcee2fa6eaad574ebef1",
-          "SizeBytes": 16
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/ExternalRouters/Freerouting/LICENSE-GPL-3.0",
-          "Sha256": "fe3eea6c599e23a00c08c5f5cb2320c30adc8f8687db5fcec9b79a662c53ff6b",
-          "SizeBytes": 35120
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/ExternalRouters/Freerouting/README.md",
-          "Sha256": "d64cb93eec9c77a330940996077f19e37a8bbd5c994a8c920cd7092c33efc830",
-          "SizeBytes": 2906
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/ExternalRouters/Freerouting/UPSTREAM.md",
-          "Sha256": "e36e6807a81e42c47c985e9933a126107b25a56defc8fceaac38752b900c65b6",
-          "SizeBytes": 1444
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/ExternalRouters/Freerouting/Upstream.json",
-          "Sha256": "ceec3bfd5dd8a09d5a30827032e0730efc7e845fd954a5730b29560ad0657c6e",
-          "SizeBytes": 398
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/ExternalRouters/Freerouting/Upstream/.gitkeep",
-          "Sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
-          "SizeBytes": 1
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/Visualizations/SyntheticPlacements/.gitignore",
-          "Sha256": "4d56952b0fb13bf8f9b6c13a6d4c34a075bac3af447636a1df4335d7576e2f97",
-          "SizeBytes": 14
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/Visualizations/SyntheticPlacements/README.md",
-          "Sha256": "2e9adc82250d616031697c029e4bfcb9b4c7046d8c51ed7ef900a2fccb7f43f4",
-          "SizeBytes": 476
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/Visualizations/SyntheticPlacements/index.html",
-          "Sha256": "44913e7f190b6b0a7cdc542b37d95c287f01d1a5d0930e5e1b4e3e72663b59c6",
-          "SizeBytes": 52873
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/Visualizations/SyntheticPlacements/package-lock.json",
-          "Sha256": "209f2dde2dd42dea9df5a0036523f04017ed35f919b187ed18af405c3307bcce",
-          "SizeBytes": 85748
-        },
-        {
-          "Exists": true,
-          "IsRegularFile": true,
-          "Path": "Tools/Visualizations/SyntheticPlacements/package.json",
-          "Sha256": "fc89f943b5c3b03c354b4251b984ca1ec97deb7fc5e1e1af201c2b5bfabf9c6f",
-          "SizeBytes": 286
         }
       ]
     }
   },
   "Cla4Failure": {
-    "ArtifactSha256": "c4f57aad994f168e47fb6165f6858bbb3898ec3b31507503cb394b7e95736ebb",
+    "ArtifactSha256": "b4c5b9c8d6f07e3df0b9a26a7c8e506392e3e7404ed6c152dbd9edbe188efb94",
     "ArtifactSourceState": {
       "Dirty": false,
       "Revision": "1681514368979f2cca1635b90b7f27062a966e33"
@@ -1071,7 +873,7 @@
       ]
     }
   },
-  "ExactEvidenceSha256": "4e2c1c0b6bc5a3d56e2d8754c4853735495f23b48030c1045a4e9c5692c84b12",
+  "ExactEvidenceSha256": "28167d900ccf6c8fe0b95eb0680a2d23539db9f27303621536f9173f5d560082",
   "Generator": {
     "Exists": true,
     "IsRegularFile": true,

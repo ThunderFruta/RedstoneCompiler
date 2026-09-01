@@ -89,7 +89,7 @@ portable-semantic identity and must not be compared to either one. Per-file
 Suggested capture command for the current baseline:
 
 ```bash
-python3 Scripts/Routing/CaptureRoutingDesignSnapshot.py --output-root Docs/Routing/Snapshots/RoutingAwarePlacementAccess --cla4-failure /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.RoutingFailure.json --acceptance-manifest /tmp/redstone-timegraph-20260825-2128/2026-08-25/RouterRegression/StandaloneAcceptance/AcceptanceManifest.json --artifact /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.json --artifact /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.dot
+python3 Scripts/Routing/CaptureRoutingDesignSnapshot.py --output-root Docs/Routing/Snapshots/RoutingAwarePlacementAccess --cla4-failure /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.RoutingFailure.json --acceptance-manifest /tmp/redstone-timegraph-20260825-2128/2026-08-25/RouterRegression/StandaloneAcceptance/AcceptanceManifest.json --artifact /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.json
 ```
 
 Full raw bundles are versioned only when they are named evidence for a design
@@ -146,33 +146,7 @@ failed and the complete design remains not accepted.
 **Branch:** `main`.
 
 **Artifact source state:** The CLA4 failure artifact records the same full
-revision and `Dirty=false`. Its source state therefore predates the current
-untracked benchmark and visualization additions.
-
-**Capture working-tree identity:** Tracked source was unchanged. The complete
-porcelain listing contained 14 nonignored untracked files belonging to the
-existing Freerouting benchmark and synthetic-placement visualization work:
-
-```text
-?? Docs/Testing/FreeroutingBenchmark-2026-08-25.md
-?? Scripts/Routing/RunFreeroutingBenchmark.py
-?? Tests/test_freerouting_benchmark.py
-?? Tools/ExternalRouters/Freerouting/.gitignore
-?? Tools/ExternalRouters/Freerouting/LICENSE-GPL-3.0
-?? Tools/ExternalRouters/Freerouting/README.md
-?? Tools/ExternalRouters/Freerouting/UPSTREAM.md
-?? Tools/ExternalRouters/Freerouting/Upstream.json
-?? Tools/ExternalRouters/Freerouting/Upstream/.gitkeep
-?? Tools/Visualizations/SyntheticPlacements/.gitignore
-?? Tools/Visualizations/SyntheticPlacements/README.md
-?? Tools/Visualizations/SyntheticPlacements/index.html
-?? Tools/Visualizations/SyntheticPlacements/package-lock.json
-?? Tools/Visualizations/SyntheticPlacements/package.json
-```
-
-SHA-256 of the exact newline-terminated output from
-`git status --porcelain=v1 --untracked-files=all`:
-`63ce42227e30495fd9666156be89be4b9e6fb64364fa50a088c806ce148bef19`.
+revision and `Dirty=false`.
 
 **Commands:**
 
@@ -182,7 +156,6 @@ git branch --show-current
 git status --porcelain=v1 --untracked-files=all
 sha256sum /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.RoutingFailure.json
 sha256sum /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.json
-sha256sum /tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.Nand.dot
 sha256sum /tmp/redstone-timegraph-20260825-2128/2026-08-25/RouterRegression/StandaloneAcceptance/AcceptanceManifest.json
 ```
 
@@ -192,7 +165,6 @@ sha256sum /tmp/redstone-timegraph-20260825-2128/2026-08-25/RouterRegression/Stan
 | --- | --- |
 | `CarryLookaheadAdder4Run2.RoutingFailure.json` | `c4f57aad994f168e47fb6165f6858bbb3898ec3b31507503cb394b7e95736ebb` |
 | `CarryLookaheadAdder4Run2.Nand.json` | `5593b4536c985b3d99a9aa9ff20a94e6ddcb105741f21df21a694b1f980b424f` |
-| `CarryLookaheadAdder4Run2.Nand.dot` | `dd06752150a1bad7972e3adb461aea2c56655395a41c1f3fbfccda153fdb1207` |
 | native `AcceptanceManifest.json` | `787d8adff005466fc9da866dc930b1b7973365c96a3049f039ebcaabddfcadae` |
 
 **Relevant code identities:**

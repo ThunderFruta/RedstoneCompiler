@@ -1,13 +1,13 @@
 # Routing design snapshot
 
-- Snapshot ID: `20260828T001726Z-5cf76bd100006383`
+- Snapshot ID: `20260828T001726Z-e4354645f99ae42d`
 - Captured UTC: `2026-08-28T00:17:26Z`
 - Captured local: `2026-08-27T20:17:26-04:00`
-- Canonical evidence: `5cf76bd100006383702ac28c9b7e3e86f10b5cb579f58ae053f9429ca87a0956`
+- Canonical evidence: `e4354645f99ae42d78f681688d93b21ca46ad7248c6d694eecc06f019e406465`
 - Revision: `1681514368979f2cca1635b90b7f27062a966e33`
 - Branch: `main`
 - Dirty: `true`
-- Status SHA-256: `9899b1c04dc9c15f38d03a4181ce442be0dd787ada3ffd8febd1753101f61af9`
+- Status SHA-256: `1a3a9d51409b691ea50c7c41a4a198a490a6f291294c9ff931ca243fdc48dbef`
 
 ## Source
 
@@ -54,9 +54,8 @@
 
 | Snapshot path | Bytes | SHA-256 |
 | --- | ---: | --- |
-| [AcceptanceManifest.json](Artifacts/AcceptanceManifest.json) | 347237 | `787d8adff005466fc9da866dc930b1b7973365c96a3049f039ebcaabddfcadae` |
-| [CarryLookaheadAdder4Run2.Nand.dot](Artifacts/CarryLookaheadAdder4Run2.Nand.dot) | 11398 | `dd06752150a1bad7972e3adb461aea2c56655395a41c1f3fbfccda153fdb1207` |
+| [AcceptanceManifest.json](Artifacts/AcceptanceManifest.json) | 341369 | `f52bbef7aecba829fdb7c27da243035880008f1487bc12f8b8a5c154f599b91f` |
 | [CarryLookaheadAdder4Run2.Nand.json](Artifacts/CarryLookaheadAdder4Run2.Nand.json) | 15019 | `5593b4536c985b3d99a9aa9ff20a94e6ddcb105741f21df21a694b1f980b424f` |
-| [CarryLookaheadAdder4Run2.RoutingFailure.json](Artifacts/CarryLookaheadAdder4Run2.RoutingFailure.json) | 16261 | `c4f57aad994f168e47fb6165f6858bbb3898ec3b31507503cb394b7e95736ebb` |
+| [CarryLookaheadAdder4Run2.RoutingFailure.json](Artifacts/CarryLookaheadAdder4Run2.RoutingFailure.json) | 16144 | `b4c5b9c8d6f07e3df0b9a26a7c8e506392e3e7404ed6c152dbd9edbe188efb94` |
 
 This snapshot records a typed structural placement failure. It does not establish CLA4 routing acceptance.
