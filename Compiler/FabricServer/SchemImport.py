@@ -198,18 +198,18 @@ def BuildFabricFixtureFromSchem(
     Sponge block data is ordered X, then Z, then Y.  Tile entities and normal
     entities are deliberately rejected: the validation harness has no safe
     generic NBT entity application contract, so silently dropping them would
-    make a Sponge import misleading. Litematic block entities are not loaded;
-    compiler circuits use their rendered block states and do not need sign
-    text while compiling. For a post-export test, compiler-created ``IN`` and
-    ``OUT`` sign annotations recover the physical test ports; generic imports
-    without those annotations remain loadable but are not testable.
+    make a Sponge import misleading. For compiler-created litematics, the
+    narrow sign-text contract is retained while ``IN`` and ``OUT`` annotations
+    also recover the physical test ports. Generic imports without those
+    annotations remain loadable but are not testable.
     """
     PathValue = Path(SchemPath).expanduser().resolve()
     if PathValue.suffix.lower() == ".litematic":
         Template = LoadTemplate(PathValue)
+        Labels = ReadLitematicIoLabels(PathValue)
         Inputs, Outputs = InferLitematicPorts(
             Template,
-            ReadLitematicIoLabels(PathValue),
+            Labels,
         )
         return {
             "SchemaVersion": 1,
@@ -220,6 +220,14 @@ def BuildFabricFixtureFromSchem(
                     "State": NeutralDynamicState(State),
                 }
                 for Position, State in sorted(Template.Blocks.items())
+            ],
+            "Signs": [
+                {
+                    "Position": list(Position),
+                    "FrontText": [f"{Prefix} {Name}", "", "", ""],
+                    "BackText": [f"{Prefix} {Name}", "", "", ""],
+                }
+                for Position, Prefix, Name in sorted(Labels)
             ],
             "Inputs": Inputs,
             "Outputs": Outputs,

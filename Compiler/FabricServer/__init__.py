@@ -16,6 +16,7 @@ from .Testing import (
     BuildImportedSchematicVectors,
     ReadFabricFixture,
     ReadNandModule,
+    ReadSvModule,
 )
 from .Validation import (
     BuildExpectedVectors,
@@ -45,5 +46,6 @@ __all__ = [
     "ResolveFabricServerRoot",
     "ReadFabricFixture",
     "ReadNandModule",
+    "ReadSvModule",
     "WriteFabricFixture",
 ]

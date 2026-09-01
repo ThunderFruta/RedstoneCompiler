@@ -23,6 +23,7 @@ from Scripts.Routing.RunRouterAcceptance import (
     AuthoritativeServerBackends,
     BaselinePolicyVersion,
     BaselineSchemaVersion,
+    BaselineCompatibilityCaseNames,
     BuildBaselineComparison,
     BuildComparisonCompatibility,
     BuildEmittedDesignDigest,
@@ -44,6 +45,7 @@ from Scripts.Routing.RunRouterAcceptance import (
     DeterministicEvidenceFields,
     EvaluateRun,
     EvaluateExactInterfaceProofCheckpoint,
+    ExpandedCaseNames,
     MaximumDeadlineOverrunSeconds,
     MaximumRuntimeRegressionFraction,
     MaximumRuntimeSpreadFraction,
@@ -496,6 +498,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         BaselineMode: str | None = None,
         BaselinePath: Path | None = None,
         ExpectedPolicyVersion: str | None = None,
+        MatrixMode: str = "default",
         IncludeCla4: bool = False,
     ) -> AcceptanceConfiguration:
         if ExpectedPolicyVersion is None:
@@ -518,6 +521,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             BaselineMode=BaselineMode,
             BaselinePath=BaselinePath,
             ExpectedPolicyVersion=ExpectedPolicyVersion,
+            MatrixMode=MatrixMode,
             IncludeCla4=IncludeCla4,
         )
 
@@ -662,12 +666,16 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(
                 [Run["Circuit"] for Run in Manifest["Runs"]],
                 [
-                    *("FullAdder" for _ in range(5)),
-                    *("RippleCarryAdder4" for _ in range(3)),
-                    *("RippleCarryAdder8" for _ in range(3)),
+                    "FullAdder",
+                    "RippleCarryAdder4",
+                    "RippleCarryAdder8",
                 ],
             )
-            self.assertEqual(len(Manifest["Runs"]), 11)
+            self.assertEqual(len(Manifest["Runs"]), 3)
+            self.assertTrue(all(
+                Case["RequiredRuns"] == 1
+                for Case in Manifest["Cases"]
+            ))
             self.assertTrue(all(
                 "default" in Run["Command"]
                 for Run in Manifest["Runs"]
@@ -773,13 +781,58 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(
                 [Run["Circuit"] for Run in Manifest["Runs"]],
                 [
-                    *("FullAdder" for _ in range(5)),
-                    *("RippleCarryAdder4" for _ in range(3)),
-                    *("RippleCarryAdder8" for _ in range(3)),
-                    *("CarryLookaheadAdder4" for _ in range(2)),
+                    "FullAdder",
+                    "RippleCarryAdder4",
+                    "RippleCarryAdder8",
+                    "CarryLookaheadAdder4",
                 ],
             )
-            self.assertEqual(len(Manifest["Runs"]), 13)
+            self.assertEqual(len(Manifest["Runs"]), 4)
+
+    def testExpandedDryRunPlansEveryExampleWithoutFailFast(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Calls = []
+
+            def FailIfCalled(**Options):
+                Calls.append(Options)
+                raise AssertionError("dry-run launched a compiler")
+
+            Manifest = RunAcceptance(
+                self.Configuration(
+                    Root,
+                    DryRun=True,
+                    MatrixMode="expanded",
+                ),
+                CommandRunner=FailIfCalled,
+                SourceStateProvider=lambda _Root: {
+                    "Revision": "revision",
+                    "Dirty": True,
+                },
+                SourceProvenanceProvider=SourceProvenanceFixture,
+                UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
+            )
+
+            self.assertEqual(Calls, [])
+            self.assertEqual(Manifest["MatrixMode"], "expanded")
+            self.assertFalse(Manifest["FailFast"])
+            self.assertEqual(
+                [Run["Circuit"] for Run in Manifest["Runs"]],
+                [
+                    "HalfAdder",
+                    "FullAdder",
+                    "RippleCarryAdder4",
+                    "RippleCarryAdder8",
+                    "DecimalToBinary4",
+                    "TFlipFlopLatch",
+                    "CarryLookaheadAdder4",
+                ],
+            )
+            self.assertEqual(len(Manifest["Runs"]), 7)
+            self.assertEqual(
+                set(Run["Circuit"] for Run in Manifest["Runs"]),
+                set(ExpandedCaseNames),
+            )
 
     def testPassingRunsAreSequentialAndDeterministic(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
@@ -827,13 +880,12 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
 
             self.assertEqual(MaximumActive, 1)
-            self.assertEqual(len(Calls), 11)
+            self.assertEqual(len(Calls), 3)
             ExpectedTimeouts = [
                 Case.RuntimeCeilingSeconds
                 + SubprocessFinalizationGraceSeconds
                 for Case in AcceptanceCases
                 if Case.Name in RegressionCaseNames
-                for _RunIndex in range(Case.RequiredRuns)
             ]
             self.assertEqual(
                 [Timeout for _Name, Timeout, _Command in Calls],
@@ -842,9 +894,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(
                 [Name for Name, _Timeout, _Command in Calls],
                 [
-                    *(f"FullAdderRun{Index}" for Index in range(1, 6)),
-                    *(f"RippleCarryAdder4Run{Index}" for Index in range(1, 4)),
-                    *(f"RippleCarryAdder8Run{Index}" for Index in range(1, 4)),
+                    "FullAdderRun1",
+                    "RippleCarryAdder4Run1",
+                    "RippleCarryAdder8Run1",
                 ],
             )
             self.assertTrue(Manifest["Accepted"])
@@ -875,9 +927,24 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 ],
                 "PASSED",
             )
+            for RunName, _Timeout, _Command in Calls:
+                RunDirectory = Configuration.RecoveryRoot / RunName
+                SummaryLines = (
+                    RunDirectory / "Summary.txt"
+                ).read_text(encoding="utf-8").splitlines()
+                RawText = (
+                    RunDirectory / "RawDump.txt"
+                ).read_text(encoding="utf-8")
+                self.assertEqual(SummaryLines[0], "RESULT: SUCCESS")
+                self.assertTrue(SummaryLines[1].startswith("TIME: wall="))
+                self.assertIn(f"{RunName} stdout", RawText)
+                self.assertIn(f"{RunName} stderr", RawText)
+                self.assertIn("Evaluation", RawText)
 
     def testTimeoutGraceIsExplicitAndCaptureOnly(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             Normal = self.Configuration(Root / "normal")
@@ -998,7 +1065,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertLess(Result.RuntimeSeconds, 1.0)
 
     def testEvaluatorCapturesRouterReliabilityPerformanceTelemetry(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         with tempfile.TemporaryDirectory() as DirectoryValue:
             RunDirectory = Path(DirectoryValue) / "FullAdderRun1"
             Artifacts = BuildRunArtifacts(RunDirectory, "FullAdderRun1")
@@ -1105,7 +1174,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
 
     def testPerfTelemetrySchemaSurvivesMissingFields(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         with tempfile.TemporaryDirectory() as DirectoryValue:
             RunDirectory = Path(DirectoryValue) / "FullAdderRun1"
             Artifacts = BuildRunArtifacts(RunDirectory, "FullAdderRun1")
@@ -1129,7 +1200,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertIn("Deadline", Evaluation["Perf"])
 
     def testEvaluatorCrossChecksEmittedLitematicComposition(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             MatchingArtifacts = BuildRunArtifacts(
@@ -1225,7 +1298,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     ))
 
     def testEvaluatorRejectsEveryDisallowedSuccessShape(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         Scenarios = (
             (
                 "timeout",
@@ -1366,7 +1441,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     ))
 
     def testEvaluatorRecordsAndEnforcesSubsecondDeadlineOverrun(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         with tempfile.TemporaryDirectory() as DirectoryValue:
             RunDirectory = Path(DirectoryValue) / "FullAdderRun1"
             Artifacts = BuildRunArtifacts(RunDirectory, "FullAdderRun1")
@@ -1425,7 +1502,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
 
     def testEvaluatorKeepsReserveInsideUnchangedWallCeiling(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         with tempfile.TemporaryDirectory() as DirectoryValue:
             RunDirectory = Path(DirectoryValue) / "FullAdderRun1"
             Artifacts = BuildRunArtifacts(RunDirectory, "FullAdderRun1")
@@ -1582,11 +1661,16 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     Case,
                     BuildRunArtifacts(RunDirectory, RunName),
                     PlacementFingerprint=Fingerprint,
+                    PolicyVersion=BaselinePolicyVersion,
                 )
                 return AcceptanceCommandResult(0, "", "", 1.0)
 
             Manifest = RunAcceptance(
-                self.Configuration(Root),
+                self.Configuration(
+                    Root,
+                    BaselineMode="capture",
+                    BaselinePath=Root / "baseline.json",
+                ),
                 CommandRunner=Runner,
                 SourceStateProvider=lambda _Root: {
                     "Revision": "revision",
@@ -1598,7 +1682,10 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
             )
 
-            SecondRun = Manifest["Runs"][1]
+            SecondRun = next(
+                Run for Run in Manifest["Runs"]
+                if Run["RunName"] == "FullAdderRun2"
+            )
             self.assertFalse(Manifest["Accepted"])
             self.assertEqual(Manifest["Status"], "FAILED")
             self.assertEqual(
@@ -1666,6 +1753,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         WriteSuccessfulArtifacts(
                             Case,
                             Artifacts,
+                            PolicyVersion=BaselinePolicyVersion,
                             **RunChanges,
                         )
                         if (
@@ -1695,7 +1783,11 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         )
 
                     Manifest = RunAcceptance(
-                        self.Configuration(Root),
+                        self.Configuration(
+                            Root,
+                            BaselineMode="capture",
+                            BaselinePath=Root / "baseline.json",
+                        ),
                         CommandRunner=Runner,
                         SourceStateProvider=lambda _Root: {
                             "Revision": "revision",
@@ -1711,7 +1803,10 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         ),
                     )
 
-                    SecondRun = Manifest["Runs"][1]
+                    SecondRun = next(
+                        Run for Run in Manifest["Runs"]
+                        if Run["RunName"] == "FullAdderRun2"
+                    )
                     self.assertFalse(SecondRun["Accepted"])
                     self.assertIn(
                         ExpectedField,
@@ -2060,7 +2155,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
 
     def testFabricFixtureDigestIsAnExplicitHardGate(self) -> None:
-        Case = AcceptanceCases[0]
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             FirstArtifacts = BuildRunArtifacts(
@@ -3138,6 +3235,12 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
 
     def testCaptureAndComparisonPreserveSeparateRawEvidence(self) -> None:
         BaselinePath = Path("/baseline.json")
+        Standalone = AcceptanceConfiguration(
+            RepositoryRoot=Path("/repo"),
+            OutputRoot=Path("/output/Acceptance"),
+            DateLabel="2026-07-25",
+            PythonExecutable=Path("/python"),
+        )
         Capture = AcceptanceConfiguration(
             RepositoryRoot=Path("/repo"),
             OutputRoot=Path("/output"),
@@ -3158,8 +3261,20 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         )
 
         self.assertNotEqual(Capture.RecoveryRoot, Comparison.RecoveryRoot)
+        self.assertEqual(
+            Standalone.RecoveryRoot,
+            Path("/output/Acceptance/2026-07-25"),
+        )
+        self.assertEqual(
+            Standalone.ManifestPath,
+            Path("/output/Acceptance/2026-07-25/AcceptanceManifest.json"),
+        )
         self.assertEqual(Capture.RecoveryRoot.name, "BaselineCapture")
         self.assertEqual(Comparison.RecoveryRoot.name, "CandidateComparison")
+        self.assertEqual(
+            Capture.RecoveryRoot.parent,
+            Path("/output/2026-07-25"),
+        )
         self.assertEqual(
             Capture.ExpectedPolicyVersion,
             BaselinePolicyVersion,
@@ -3313,7 +3428,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertTrue(FullAdderRuntime["StableConservative"])
         self.assertEqual(
             set(Baseline["Compatibility"]["BenchmarkInputs"]),
-            {Case.Name for Case in AcceptanceCases},
+            set(BaselineCompatibilityCaseNames),
         )
         self.assertEqual(
             set(CandidateCompatibility).difference(
@@ -3991,29 +4106,46 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     RuntimeSeconds=1.0,
                 )
 
-            Configuration = self.Configuration(Root)
-            Manifest = RunAcceptance(
-                Configuration,
-                CommandRunner=Runner,
-                SourceStateProvider=lambda _Root: {
-                    "Revision": "revision",
-                    "Dirty": False,
-                },
-                SourceProvenanceProvider=SourceProvenanceFixture,
-                UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
-            )
+            for MatrixMode, ExpectedRuns in (
+                ("default", 3),
+                ("expanded", 7),
+            ):
+                with self.subTest(MatrixMode=MatrixMode):
+                    Configuration = self.Configuration(
+                        Root / MatrixMode,
+                        MatrixMode=MatrixMode,
+                    )
+                    Manifest = RunAcceptance(
+                        Configuration,
+                        CommandRunner=Runner,
+                        SourceStateProvider=lambda _Root: {
+                            "Revision": "revision",
+                            "Dirty": False,
+                        },
+                        SourceProvenanceProvider=SourceProvenanceFixture,
+                        UtcNowProvider=lambda: (
+                            "2026-07-21T12:00:00+00:00"
+                        ),
+                    )
 
-            self.assertEqual(len(Manifest["Runs"]), 1)
-            self.assertEqual(Manifest["Status"], "FAILED")
-            self.assertFalse(Manifest["Accepted"])
-            self.assertEqual(
-                Manifest["Runs"][0]["Evaluation"]["Process"]["ReturnCode"],
-                1,
-            )
-            self.assertTrue(
-                Manifest["Runs"][0]["Evaluation"]["Artifacts"]
-                ["RoutingFailure"]["Exists"]
-            )
+                    self.assertEqual(len(Manifest["Runs"]), ExpectedRuns)
+                    self.assertEqual(Manifest["Status"], "FAILED")
+                    self.assertFalse(Manifest["Accepted"])
+                    self.assertFalse(Manifest["FailFast"])
+                    self.assertTrue(all(
+                        Run["Status"] == "FAILED"
+                        for Run in Manifest["Runs"]
+                    ))
+                    self.assertEqual(
+                        Manifest["Runs"][0]["Evaluation"]["Process"]
+                        ["ReturnCode"],
+                        1,
+                    )
+                    self.assertTrue(all(
+                        Run["Evaluation"]["Artifacts"]
+                        ["RoutingFailure"]["Exists"]
+                        for Run in Manifest["Runs"]
+                    ))
 
 
 if __name__ == "__main__":

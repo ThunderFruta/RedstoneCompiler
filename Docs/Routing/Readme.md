@@ -7,7 +7,8 @@ their native artifact/correctness gates, while CLA4 fails before routing at
 `Placement / PlacementOverlap`; the CLA4-inclusive design is **NOT ACCEPTED**.
 The negotiated route-tree implementation is active, deterministic policy
 selection is profile-driven instead of circuit-keyed, and the canonical
-harness runs CLA4 only when `--include-cla4` is supplied.
+harness offers a default FA/RCA4/RCA8 matrix and an expanded all-examples
+matrix selected with `--matrix expanded`.
 
 Structural update (2026-08-28): placement, component routing, authoritative
 routing, and native kernels now use the clean-break domain ownership documented
@@ -54,7 +55,8 @@ independently proves otherwise.
 ## Acceptance evidence and tools
 
 - [`Scripts/Routing/RunRouterAcceptance.py`](../../Scripts/Routing/RunRouterAcceptance.py) --
-  canonical sequential strict matrix, immutable per-circuit wall ceilings,
+  canonical sequential default and expanded matrices, all-run failure
+  collection, immutable per-circuit wall ceilings,
   explicit publication reserve, incremental
   `router-acceptance-manifest-v2`, artifact hashes, deterministic
   repeated-run comparison, and explicit optional CLA4 checkpoints.
@@ -81,8 +83,9 @@ python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-07-21 \
 The physical form of that command, without `--dry-run`, must be run only after
 the lightweight gates pass.
 
-To append the `CarryLookaheadAdder4` runs and exact-interface proof evidence,
-add `--include-cla4`.
+To run every bundled example, including `CarryLookaheadAdder4` and its
+exact-interface proof evidence, add `--matrix expanded`. The harness attempts
+all scheduled repetitions even if an earlier run fails.
 
 ## Historical design record
 

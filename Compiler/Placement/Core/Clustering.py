@@ -42,6 +42,7 @@ from Compiler.Routing.Policy import (
 )
 from Compiler.Routing.Actions.Geometry import (
     BuildPlacedCellGeometry,
+    BuildPlacedCellGeometryWithKeepOut,
 )
 from .Clusters import (
     ClusterLayoutVariant,
@@ -960,10 +961,29 @@ def _PhysicalGateElectricalExclusions(
         Rotation,
         MirrorX,
     )
+    Gate = type(
+        "CachedPlacedGateKeepOut",
+        (),
+        {
+            "Name": "CachedCell",
+            "Kind": Kind,
+            "X": X,
+            "Y": Y,
+            "Z": Z,
+            "Rotation": Rotation,
+            "MirrorX": MirrorX,
+        },
+    )()
+    _Actual, _Electrical, _Solid, ExplicitKeepOut = (
+        BuildPlacedCellGeometryWithKeepOut(
+            type("CachedPlacement", (), {"PlacedGates": [Gate]})()
+        )
+    )
     return frozenset(
         DefaultRedstoneRoutingTechnology.BuildElectricalExclusions(
             set(Electrical)
         )
+        | ExplicitKeepOut
     )
 
 

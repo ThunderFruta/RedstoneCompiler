@@ -19,6 +19,7 @@ from Compiler.FabricServer import (
     FabricServerValidationResult,
     ReadFabricFixture,
     ReadNandModule,
+    ReadSvModule,
     ResolveFabricServerRoot,
 )
 from Compiler.FabricServer.SchemImport import InferLitematicPorts
@@ -157,6 +158,56 @@ class FabricServerBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(Ready.call_args.kwargs["Port"], 25566)
         self.assertEqual(Result.Diagnostics, WorldClear)
+
+    def testExistingWorldValidationDoesNotClearOrPasteTheFixture(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            Root = Path(TemporaryDirectoryPath)
+            (Root / "config").mkdir()
+            (Root / "config" / "redstonecompiler-harness.json").write_text(
+                '{"Token":"live-token","Port":25566}',
+                encoding="utf-8",
+            )
+            FixturePath = Root / "fixture.FabricFixture.json"
+            WriteMinimalFabricFixture(FixturePath)
+            Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
+            with patch.object(
+                Supervisor,
+                "_ClearCanonicalSimulationWorld",
+            ) as Clear, patch.object(
+                Supervisor,
+                "_RequestWhenReady",
+                return_value={
+                    "Status": "passed",
+                    "Diagnostics": {
+                        "WorldStateMode": "existing",
+                        "FixturePasted": False,
+                    },
+                },
+            ) as Ready:
+                Result = Supervisor.ValidateExisting(
+                    Fixture=SimpleNamespace(Path=FixturePath, Sha256="fixture-sha"),
+                    Vectors=[{"Inputs": {"a": False}, "Expected": {"y": False}}],
+                )
+
+        self.assertEqual(Result.Status, "passed")
+        self.assertFalse(Result.Diagnostics["WorldCleared"])
+        self.assertFalse(Result.Diagnostics["FixturePasted"])
+        Clear.assert_not_called()
+        self.assertEqual(
+            Ready.call_args.args,
+            (
+                "live-token",
+                {
+                    "Action": "ValidateExisting",
+                    "FixturePath": str(FixturePath.resolve()),
+                    "FixtureSha256": "fixture-sha",
+                    "Vectors": [
+                        {"Inputs": {"a": False}, "Expected": {"y": False}},
+                    ],
+                },
+            ),
+        )
+        self.assertEqual(Ready.call_args.kwargs, {"Port": 25566})
 
     def testFullWorldClearInvokesTheManagerClearActionWithoutRestarting(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
@@ -382,6 +433,25 @@ class FabricServerBoundaryTests(unittest.TestCase):
             [Gate["Name"] for Gate in Fixture["Trace"]["Gates"]],
             ["InputA", "OutputY"],
         )
+
+    def testFixtureCarriesRenderedSignTextIntoTheServerPaste(self) -> None:
+        Routed = SimpleNamespace(PlacedGates=[])
+        Rendered = SimpleNamespace(
+            Blocks={(2, 3, 4): {"Name": "minecraft:oak_sign"}},
+            Signs=[((2, 3, 4), "OUT result")],
+        )
+
+        Fixture = BuildFabricFixture(
+            RoutedDesign=Routed,
+            Rendered=Rendered,
+            Module=ModuleIR(Name="Top"),
+        )
+
+        self.assertEqual(Fixture["Signs"], [{
+            "Position": [2, 3, 4],
+            "FrontText": ["OUT result", "", "", ""],
+            "BackText": ["OUT result", "", "", ""],
+        }])
 
     def testExpectedVectorsUseLogicOnlyAsAnOracle(self) -> None:
         Module = ModuleIR(
@@ -658,6 +728,26 @@ class FabricServerBoundaryTests(unittest.TestCase):
             ],
         )
 
+    def testSystemVerilogSourceCanBeTheExistingWorldOracle(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            SourcePath = Path(TemporaryDirectoryPath) / "Top.sv"
+            SourcePath.write_text(
+                "module Top(input logic a, output logic y); assign y = ~a; endmodule\n",
+                encoding="utf-8",
+            )
+
+            Module = ReadSvModule(SourcePath)
+            Vectors = BuildImportedSchematicVectors({
+                "Blocks": [],
+                "Inputs": [{"Name": "a", "LeverPosition": [0, 0, 0]}],
+                "Outputs": [{"Name": "y", "LampPosition": [1, 0, 0]}],
+            }, Module)
+
+        self.assertEqual(
+            [Vector["Expected"] for Vector in Vectors],
+            [{"y": True}, {"y": False}],
+        )
+
     def testImportedSchematicVectorsRejectAPortlessFixture(self) -> None:
         Module = ModuleIR(Name="Top", Inputs=["a"], Outputs=["y"])
 
@@ -678,7 +768,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
                     "Outputs": [{"Name": "y", "LampPosition": [1, 0, 0]}],
                 }, Module)
         with self.subTest(Case="output"):
-            with self.assertRaisesRegex(ValueError, "not produced by the NAND oracle"):
+            with self.assertRaisesRegex(ValueError, "not produced by the logic oracle"):
                 BuildImportedSchematicVectors({
                     "Blocks": [],
                     "Inputs": [{"Name": "a", "LeverPosition": [0, 0, 0]}],

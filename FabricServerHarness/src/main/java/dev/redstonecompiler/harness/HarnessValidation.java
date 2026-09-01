@@ -9,9 +9,12 @@ import net.minecraft.commands.arguments.blocks.BlockStateParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.permissions.PermissionSet;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.gamerules.GameRules;
@@ -35,9 +38,17 @@ import java.util.concurrent.CompletableFuture;
 
 /** Executes only validated compiler fixtures on the main server thread. */
 final class HarnessValidation {
-    private static final int REQUIRED_UNCHANGED_TICKS = 20;
+    static final int REQUIRED_UNCHANGED_TICKS = 40;
     private static final int MAXIMUM_FORCED_FIXTURE_CHUNKS = 256;
     private static final int MAXIMUM_TRACE_PROBES = 10_000;
+    private static final Set<String> FALLBACK_TRACE_BLOCKS = Set.of(
+            "minecraft:comparator",
+            "minecraft:lever",
+            "minecraft:redstone_lamp",
+            "minecraft:redstone_torch",
+            "minecraft:redstone_wall_torch",
+            "minecraft:redstone_wire",
+            "minecraft:repeater");
     private static final Set<ChunkCoordinate> ForcedFixtureChunks = new LinkedHashSet<>();
 
     private record ChunkCoordinate(int X, int Z) {
@@ -125,9 +136,12 @@ final class HarnessValidation {
                 writeResponse(response, diagnostics, output);
                 return;
             }
-            if (!"Validate".equals(action) && !"LoadFixture".equals(action)) {
+            if (!"Validate".equals(action)
+                    && !"ValidateExisting".equals(action)
+                    && !"LoadFixture".equals(action)) {
                 throw new IllegalArgumentException("unsupported-action");
             }
+            boolean validateExisting = "ValidateExisting".equals(action);
             Path fixturePath = Path.of(request.get("FixturePath").getAsString()).toRealPath();
             String expectedDigest = request.get("FixtureSha256").getAsString();
             String actualDigest = sha256(Files.readAllBytes(fixturePath));
@@ -142,9 +156,16 @@ final class HarnessValidation {
                 ServerLevel level = server.overworld();
                 int forcedChunkCount = forceFixtureChunks(
                         level, fixture.getAsJsonArray("Blocks"), origin, fixture.getAsJsonObject("Arena"));
-                clearFixture(level, fixture.getAsJsonArray("Blocks"), origin, fixture.getAsJsonObject("Arena"));
-                placeFixture(server, level, fixture.getAsJsonArray("Blocks"), origin);
-                forceBlockUpdates(level, fixture.getAsJsonArray("Blocks"), origin);
+                if (!validateExisting) {
+                    clearFixture(level, fixture.getAsJsonArray("Blocks"), origin, fixture.getAsJsonObject("Arena"));
+                    placeFixture(
+                            server,
+                            level,
+                            fixture.getAsJsonArray("Blocks"),
+                            fixture.has("Signs") ? fixture.getAsJsonArray("Signs") : new JsonArray(),
+                            origin);
+                    forceBlockUpdates(level, fixture.getAsJsonArray("Blocks"), origin);
+                }
                 return forcedChunkCount;
             });
             waitForTicks(server, 2);
@@ -152,22 +173,39 @@ final class HarnessValidation {
                 response.addProperty("Status", "loaded");
                 diagnostics.addProperty("FixtureSha256", actualDigest);
                 diagnostics.addProperty("LoadedBlocks", fixture.getAsJsonArray("Blocks").size());
+                diagnostics.addProperty(
+                        "LoadedSigns",
+                        fixture.has("Signs") ? fixture.getAsJsonArray("Signs").size() : 0);
                 diagnostics.addProperty("ForcedFixtureChunks", forcedFixtureChunkCount);
                 diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
                 diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
                 writeResponse(response, diagnostics, output);
                 return;
             }
-            Map<String, JsonObject> inputStates = inputStates(fixture.getAsJsonArray("Inputs"), fixture.getAsJsonArray("Blocks"), origin);
+            Map<String, JsonObject> inputStates = validateExisting
+                    ? OnServer(server, () -> inputStatesFromWorld(
+                            server.overworld(), fixture.getAsJsonArray("Inputs"), origin))
+                    : inputStates(fixture.getAsJsonArray("Inputs"), fixture.getAsJsonArray("Blocks"), origin);
             Map<String, BlockPos> outputPositions = outputPositions(fixture.getAsJsonArray("Outputs"), origin);
-            ValidationSummary summary = validateVectors(
-                    server,
-                    request.getAsJsonArray("Vectors"),
-                    inputStates,
-                    outputPositions,
-                    configuration.settleTimeoutTicks(),
-                    fixture,
-                    origin);
+            ValidationSummary summary;
+            try {
+                summary = validateVectors(
+                        server,
+                        request.getAsJsonArray("Vectors"),
+                        inputStates,
+                        outputPositions,
+                        configuration.settleTimeoutTicks(),
+                        fixture,
+                        origin);
+            } finally {
+                if (validateExisting) {
+                    OnServer(server, () -> {
+                        restoreInputStates(server, server.overworld(), inputStates);
+                        return null;
+                    });
+                    waitForTicks(server, 2);
+                }
+            }
             response.addProperty("Status", "passed");
             diagnostics.addProperty("FixtureSha256", actualDigest);
             diagnostics.addProperty("TestedVectors", summary.TestedVectors());
@@ -178,6 +216,9 @@ final class HarnessValidation {
             diagnostics.addProperty("ForcedFixtureChunks", forcedFixtureChunkCount);
             diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
             diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
+            diagnostics.addProperty("WorldStateMode", validateExisting ? "existing" : "fixture-paste");
+            diagnostics.addProperty("FixturePasted", !validateExisting);
+            diagnostics.addProperty("InputStatesRestored", validateExisting);
         } catch (Mismatch error) {
             response.addProperty("Status", "mismatch");
             diagnostics.addProperty("Error", error.getMessage());
@@ -234,16 +275,42 @@ final class HarnessValidation {
         server.getCommands().performPrefixedCommand(source, "tick rate " + rate);
     }
 
-    private static void placeFixture(MinecraftServer server, ServerLevel level, JsonArray blocks, JsonArray origin) {
+    private static void placeFixture(
+            MinecraftServer server,
+            ServerLevel level,
+            JsonArray blocks,
+            JsonArray signs,
+            JsonArray origin) {
         for (JsonElement element : blocks) {
             JsonObject block = element.getAsJsonObject();
             BlockPos position = absolute(block.getAsJsonArray("Position"), origin);
             level.setBlock(position, parseState(server, blockState(block.getAsJsonObject("State"))), 3);
         }
+        for (JsonElement element : signs) {
+            JsonObject sign = element.getAsJsonObject();
+            BlockPos position = absolute(sign.getAsJsonArray("Position"), origin);
+            if (!(level.getBlockEntity(position) instanceof SignBlockEntity blockEntity)) {
+                throw new IllegalArgumentException("fixture-sign-position-is-not-a-sign:" + position.toShortString());
+            }
+            blockEntity.setText(signText(sign.getAsJsonArray("FrontText")), true);
+            blockEntity.setText(signText(sign.getAsJsonArray("BackText")), false);
+        }
         for (JsonElement element : blocks) {
             BlockPos position = absolute(element.getAsJsonObject().getAsJsonArray("Position"), origin);
             level.updateNeighborsAt(position, level.getBlockState(position).getBlock());
         }
+    }
+
+    private static SignText signText(JsonArray lines) {
+        if (lines.size() != 4) throw new IllegalArgumentException("fixture-sign-text-must-have-four-lines");
+        SignText result = new SignText();
+        for (int index = 0; index < lines.size(); index++) {
+            if (!lines.get(index).isJsonPrimitive() || !lines.get(index).getAsJsonPrimitive().isString()) {
+                throw new IllegalArgumentException("fixture-sign-line-must-be-a-string");
+            }
+            result = result.setMessage(index, Component.literal(lines.get(index).getAsString()));
+        }
+        return result;
     }
 
     private static int forceFixtureChunks(
@@ -428,6 +495,44 @@ final class HarnessValidation {
             result.put(port.get("Name").getAsString(), state);
         }
         return result;
+    }
+
+    private static Map<String, JsonObject> inputStatesFromWorld(
+            ServerLevel level, JsonArray inputs, JsonArray origin) {
+        Map<String, JsonObject> result = new LinkedHashMap<>();
+        for (JsonElement input : inputs) {
+            JsonObject port = input.getAsJsonObject();
+            BlockPos position = absolute(port.getAsJsonArray("LeverPosition"), origin);
+            JsonObject state = serializeState(level.getBlockState(position));
+            if (!"minecraft:lever".equals(state.get("Name").getAsString())
+                    || !state.has("Properties")
+                    || !state.getAsJsonObject("Properties").has("powered")) {
+                throw new IllegalArgumentException(
+                        "existing-fixture-input-is-not-a-lever:" + position.toShortString());
+            }
+            state.addProperty("_Position", position.getX() + " " + position.getY() + " " + position.getZ());
+            result.put(port.get("Name").getAsString(), state);
+        }
+        return result;
+    }
+
+    private static void restoreInputStates(
+            MinecraftServer server, ServerLevel level, Map<String, JsonObject> inputStates) {
+        Set<BlockPos> affected = new LinkedHashSet<>();
+        for (JsonObject original : inputStates.values()) {
+            JsonObject state = original.deepCopy();
+            String[] position = state.remove("_Position").getAsString().split(" ");
+            BlockPos blockPosition = new BlockPos(
+                    Integer.parseInt(position[0]),
+                    Integer.parseInt(position[1]),
+                    Integer.parseInt(position[2]));
+            level.setBlock(blockPosition, parseState(server, blockState(state)), 3);
+            affected.add(blockPosition);
+            for (net.minecraft.core.Direction direction : net.minecraft.core.Direction.values()) {
+                affected.add(blockPosition.relative(direction));
+            }
+        }
+        forceBlockUpdates(level, affected);
     }
 
     private static Map<String, BlockPos> outputPositions(JsonArray outputs, JsonArray origin) {
@@ -632,10 +737,19 @@ final class HarnessValidation {
             JsonObject Fixture,
             JsonArray Origin) {
         List<TraceProbe> Result = new ArrayList<>();
-        if (!Fixture.has("Trace")) return Result;
-        JsonObject Trace = Fixture.getAsJsonObject("Trace");
-        if (!Trace.has("ProbePositions")) return Result;
-        JsonArray Positions = Trace.getAsJsonArray("ProbePositions");
+        JsonArray Positions = new JsonArray();
+        if (Fixture.has("Trace")
+                && Fixture.getAsJsonObject("Trace").has("ProbePositions")) {
+            Positions = Fixture.getAsJsonObject("Trace").getAsJsonArray("ProbePositions");
+        } else {
+            for (JsonElement Element : Fixture.getAsJsonArray("Blocks")) {
+                JsonObject Block = Element.getAsJsonObject();
+                String Name = Block.getAsJsonObject("State").get("Name").getAsString();
+                if (FALLBACK_TRACE_BLOCKS.contains(Name)) {
+                    Positions.add(Block.getAsJsonArray("Position").deepCopy());
+                }
+            }
+        }
         if (Positions.size() > MAXIMUM_TRACE_PROBES) {
             throw new IllegalArgumentException("too-many-trace-probes:" + Positions.size());
         }

@@ -120,7 +120,7 @@ def BuildExpectedVectors(
 
 
 class FabricServerSupervisor:
-    """Validate through the managed Fabric runtime after a live full-world clear."""
+    """Load or validate circuits through the managed Fabric runtime."""
 
     def __init__(self, Configuration: FabricServerConfiguration) -> None:
         self.Configuration = Configuration
@@ -264,6 +264,59 @@ class FabricServerSupervisor:
             },
         )
 
+    def ValidateExisting(
+        self,
+        *,
+        Fixture: FabricFixtureArtifact,
+        Vectors: list[dict[str, object]],
+    ) -> FabricServerValidationResult:
+        """Validate the current live blocks without clearing or pasting a fixture."""
+        StartedAt = monotonic()
+        Root = self.Configuration.Root
+        if Root is None:
+            return self._Failure("server-root-not-configured", StartedAt, {
+                "WorldStateMode": "existing",
+                "WorldCleared": False,
+                "FixturePasted": False,
+            })
+        try:
+            Configuration = json.loads(
+                (Root / "config" / "redstonecompiler-harness.json").read_text(
+                    encoding="utf-8",
+                ),
+            )
+            Response = self._RequestWhenReady(
+                str(Configuration["Token"]),
+                {
+                    "Action": "ValidateExisting",
+                    "FixturePath": str(Fixture.Path.resolve()),
+                    "FixtureSha256": Fixture.Sha256,
+                    "Vectors": Vectors,
+                },
+                Port=int(Configuration["Port"]),
+            )
+        except Exception as Error:
+            return self._Failure(
+                "existing-world-validation-failure",
+                StartedAt,
+                {
+                    "WorldStateMode": "existing",
+                    "WorldCleared": False,
+                    "FixturePasted": False,
+                    "Error": str(Error),
+                },
+            )
+        return self._BuildValidationResult(
+            Response=Response,
+            Fixture=Fixture,
+            StartedAt=StartedAt,
+            PrefixDiagnostics={
+                "WorldStateMode": "existing",
+                "WorldCleared": False,
+                "FixturePasted": False,
+            },
+        )
+
     def ControlRunningServer(
         self,
         *,
@@ -343,6 +396,52 @@ class FabricServerSupervisor:
                 + (f" ({Error})" if Error else ""),
             )
         return Token, Port
+
+    def _BuildValidationResult(
+        self,
+        *,
+        Response: dict[str, object],
+        Fixture: FabricFixtureArtifact,
+        StartedAt: float,
+        PrefixDiagnostics: dict[str, object] | None = None,
+    ) -> FabricServerValidationResult:
+        """Normalize one harness validation response and attach failure evidence."""
+        RuntimeSeconds = monotonic() - StartedAt
+        Status = str(Response.get("Status", "infrastructure-failure"))
+        if Status not in {"passed", "mismatch", "timeout", "infrastructure-failure"}:
+            Status = "infrastructure-failure"
+        ResponseDiagnostics = dict(Response.get("Diagnostics", {}))
+        if Status in {"mismatch", "timeout"}:
+            try:
+                FixtureDocument = json.loads(Fixture.Path.read_text(encoding="utf-8"))
+                FailureTrace = BuildFabricFailureTrace(
+                    FixtureDocument,
+                    ResponseDiagnostics,
+                )
+                if FailureTrace is not None:
+                    ResponseDiagnostics["FailureTrace"] = FailureTrace
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as Error:
+                ResponseDiagnostics["FailureTraceError"] = str(Error)
+        return FabricServerValidationResult(
+            Status=Status,
+            Backend="fabric-26.2",
+            RuntimeSeconds=RuntimeSeconds,
+            Diagnostics={
+                **(PrefixDiagnostics or {}),
+                **ResponseDiagnostics,
+                **(
+                    {"ControlError": Response["Error"]}
+                    if "Error" in Response
+                    else {}
+                ),
+            },
+        )
 
     def _ClearCanonicalSimulationWorld(
         self,

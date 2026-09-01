@@ -44,6 +44,12 @@ RequiredRegressionRoutingThreads = 16
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
+from Compiler.RunReporting import (
+    CaptureTerminalOutput,
+    UtcTimestamp,
+    WriteRunReport,
+)
+
 
 @dataclass(frozen=True)
 class AcceptanceCase:
@@ -108,6 +114,14 @@ class AcceptanceCase:
 
 AcceptanceCases = (
     AcceptanceCase(
+        Name="HalfAdder",
+        ExamplePath=Path("Examples/HalfAdder.sv"),
+        TopModule="HalfAdder",
+        RequiredRuns=3,
+        TruthTableRows=4,
+        RuntimeCeilingSeconds=10.0,
+    ),
+    AcceptanceCase(
         Name="FullAdder",
         ExamplePath=Path("Examples/FullAdder.sv"),
         TopModule="FullAdder",
@@ -133,6 +147,22 @@ AcceptanceCases = (
         ValidationVectorCount=4_132,
     ),
     AcceptanceCase(
+        Name="DecimalToBinary4",
+        ExamplePath=Path("Examples/DecimalToBinary4.sv"),
+        TopModule="DecimalToBinary4",
+        RequiredRuns=3,
+        TruthTableRows=1_024,
+        RuntimeCeilingSeconds=30.0,
+    ),
+    AcceptanceCase(
+        Name="TFlipFlopLatch",
+        ExamplePath=Path("Examples/TFlipFlopLatch.sv"),
+        TopModule="TFlipFlopLatch",
+        RequiredRuns=3,
+        TruthTableRows=8,
+        RuntimeCeilingSeconds=15.0,
+    ),
+    AcceptanceCase(
         Name="CarryLookaheadAdder4",
         ExamplePath=Path("Examples/CarryLookaheadAdder4.sv"),
         TopModule="CarryLookaheadAdder4",
@@ -148,11 +178,16 @@ RegressionCaseNames = frozenset({
     "RippleCarryAdder4",
     "RippleCarryAdder8",
 })
+ExpandedCaseNames = frozenset(Case.Name for Case in AcceptanceCases)
 ExtendedCaseNames = frozenset(
     Case.Name
     for Case in AcceptanceCases
     if Case.NeedsExactInterfaceProof
 )
+# Keep the version-one regression baseline identity limited to the cases that
+# existed when that schema was published. Expanded standalone acceptance adds
+# evidence without silently redefining historical baseline compatibility.
+BaselineCompatibilityCaseNames = RegressionCaseNames | ExtendedCaseNames
 BaselineSchemaVersion = "router-regression-baseline-v1"
 FirstValidBaselineSchemaVersion = "router-first-valid-baseline-v1"
 AcceptanceManifestSchemaVersion = "router-acceptance-manifest-v2"
@@ -164,6 +199,9 @@ DefaultExactInterfaceProofPath = (
 )
 ExactInterfaceProofCheckpointField = "ExactInterfaceProofCheckpoint"
 CanonicalArithmeticDigests = {
+    "HalfAdder": (
+        "b7bcd21d28b93f6e25cd8e95d19dee5d9c827373681c7c45c416c4f9164209ac"
+    ),
     "FullAdder": (
         "2ac95308cc8e1566382817333b1995734fcd61ae6890c189767935cec96bbd12"
     ),
@@ -172,6 +210,12 @@ CanonicalArithmeticDigests = {
     ),
     "RippleCarryAdder8": (
         "6bf3f999868950799e2ce167870e8453e4bb9d0a80b5a2f4fab776a1eaf30b16"
+    ),
+    "DecimalToBinary4": (
+        "6163bd035cc523c1b65f8298a8a28a7aee7bd99207251cddbcfde12450901cd3"
+    ),
+    "TFlipFlopLatch": (
+        "5423cc18938a9ffcdd0f087e3218ce658d0772a5aeaae659f8718ece7b027a4b"
     ),
     "CarryLookaheadAdder4": (
         "2432227f6d42a9b034409f23f0e8471e9b254a528160c3642d8ff53715bf4ff5"
@@ -337,11 +381,20 @@ class AcceptanceConfiguration:
     BaselinePath: Path | None = None
     ExpectedPolicyVersion: str | None = None
     CaptureTimeoutGraceSeconds: float = 0.0
+    MatrixMode: str = "default"
+    # Read-only compatibility for existing baseline tests and callers. The
+    # public CLI now selects `--matrix default|expanded`.
     IncludeCla4: bool = False
 
     def __post_init__(self) -> None:
         if self.BaselineMode not in {None, "capture", "compare"}:
             raise ValueError("baseline mode must be capture, compare, or None")
+        if self.MatrixMode not in {"default", "expanded"}:
+            raise ValueError("matrix mode must be default or expanded")
+        if self.MatrixMode == "expanded" and self.BaselineMode is not None:
+            raise ValueError(
+                "expanded matrix cannot be combined with baseline capture/compare"
+            )
         if (self.BaselineMode is None) != (self.BaselinePath is None):
             raise ValueError("baseline mode and baseline path must be set together")
         if self.IncludeCla4 and self.BaselineMode == "capture":
@@ -401,17 +454,12 @@ class AcceptanceConfiguration:
 
     @property
     def RecoveryRoot(self) -> Path:
+        DateRoot = (self.OutputRoot / self.DateLabel).resolve(strict=False)
         SessionName = {
             "capture": "BaselineCapture",
             "compare": "CandidateComparison",
-            None: "StandaloneAcceptance",
-        }[self.BaselineMode]
-        return (
-            self.OutputRoot
-            / self.DateLabel
-            / "RouterRegression"
-            / SessionName
-        ).resolve(strict=False)
+        }.get(self.BaselineMode)
+        return DateRoot if SessionName is None else DateRoot / SessionName
 
     @property
     def ManifestPath(self) -> Path:
@@ -2128,18 +2176,49 @@ def _BuildPlannedCases(
     Configuration: AcceptanceConfiguration,
 ) -> tuple[AcceptanceCase, ...]:
     """Return the ordered case list that this run should execute."""
-    IncludeExtendedCases = (
+    IncludeLegacyExactInterfaceCase = (
         Configuration.IncludeCla4
         and Configuration.BaselineMode != "capture"
+    )
+    SelectedNames = (
+        ExpandedCaseNames
+        if Configuration.MatrixMode == "expanded"
+        else RegressionCaseNames
     )
     return tuple(
         Case
         for Case in AcceptanceCases
         if (
-            Case.Name in RegressionCaseNames
-            or (IncludeExtendedCases and Case.Name in ExtendedCaseNames)
+            Case.Name in SelectedNames
+            or (
+                IncludeLegacyExactInterfaceCase
+                and Case.Name in ExtendedCaseNames
+            )
         )
     )
+
+
+def ExecutionRunCount(
+    Case: AcceptanceCase,
+    Configuration: AcceptanceConfiguration,
+) -> int:
+    """Run each normal acceptance case once; retain baseline sampling policy."""
+    if Configuration.BaselineMode is None:
+        return 1
+    return Case.RequiredRuns
+
+
+def BuildExecutionRequirements(
+    Case: AcceptanceCase,
+    Configuration: AcceptanceConfiguration,
+) -> dict[str, object]:
+    """Describe the run count used by this invocation without rewriting v1 baselines."""
+    Requirements = Case.ToDictionary()
+    ScheduledRuns = ExecutionRunCount(Case, Configuration)
+    Requirements["RequiredRuns"] = ScheduledRuns
+    if ScheduledRuns != Case.RequiredRuns:
+        Requirements["HistoricalBaselineRequiredRuns"] = Case.RequiredRuns
+    return Requirements
 
 
 def BuildPlannedRuns(
@@ -2156,7 +2235,10 @@ def BuildPlannedRuns(
             Repetitions.append((0, True))
         Repetitions.extend(
             (RunIndex, False)
-            for RunIndex in range(1, Case.RequiredRuns + 1)
+            for RunIndex in range(
+                1,
+                ExecutionRunCount(Case, Configuration) + 1,
+            )
         )
         for RunIndex, IsWarmup in Repetitions:
             Sequence += 1
@@ -2180,7 +2262,10 @@ def BuildPlannedRuns(
                 "Repetition": RunIndex,
                 "Warmup": IsWarmup,
                 "MeasurementIncluded": not IsWarmup,
-                "Requirements": Case.ToDictionary(),
+                "Requirements": BuildExecutionRequirements(
+                    Case,
+                    Configuration,
+                ),
                 "RequestedRoutingDeadlineSeconds": (
                     Case.RoutingDeadlineSeconds
                 ),
@@ -2256,6 +2341,7 @@ def BuildComparisonCompatibility(
     RequiredInputs = {
         Case.Name: BenchmarkInputs.get(Case.Name)
         for Case in AcceptanceCases
+        if Case.Name in BaselineCompatibilityCaseNames
     }
     BenchmarkProfile = {
         "SchemaVersion": "router-regression-profile-v1",
@@ -2266,6 +2352,7 @@ def BuildComparisonCompatibility(
                 if Key != "NeedsExactInterfaceProof"
             }
             for Case in AcceptanceCases
+            if Case.Name in BaselineCompatibilityCaseNames
         },
         "RegressionCircuits": sorted(RegressionCaseNames),
         "Warmup": {
@@ -2277,7 +2364,11 @@ def BuildComparisonCompatibility(
         "RoutingThreads": RequiredRegressionRoutingThreads,
         "PolicySeed": 0,
         "CanonicalArithmeticDigests": dict(
-            sorted(CanonicalArithmeticDigests.items())
+            sorted(
+                (Name, Digest)
+                for Name, Digest in CanonicalArithmeticDigests.items()
+                if Name in BaselineCompatibilityCaseNames
+            )
         ),
     }
     Result = {
@@ -4047,7 +4138,7 @@ def RunAcceptance(
     )
     def BuildRequestedCases() -> list[dict[str, object]]:
         return [
-            Case.ToDictionary()
+            BuildExecutionRequirements(Case, Configuration)
             for Case in PlannedCases
         ]
     Manifest: dict[str, object] = {
@@ -4055,6 +4146,8 @@ def RunAcceptance(
         "Status": "DRY_RUN" if Configuration.DryRun else "RUNNING",
         "Accepted": False,
         "ExecutionMode": "sequential",
+        "MatrixMode": Configuration.MatrixMode,
+        "FailFast": False,
         "BaselineMode": Configuration.BaselineMode,
         "BaselinePath": (
             str(Configuration.BaselinePath.resolve(strict=False))
@@ -4360,7 +4453,7 @@ def RunAcceptance(
         )
         ExactInterfaceProofCheckpoint = None
         if (
-            Configuration.IncludeCla4
+            Case.NeedsExactInterfaceProof
             and Case.Name in ExtendedCaseNames
         ):
             ExactInterfaceProofCheckpoint = (
@@ -4432,6 +4525,60 @@ def RunAcceptance(
             ),
             "Determinism": Determinism,
         }
+        FailureList = Evaluation.get("Failures", [])
+        FirstFailure = (
+            str(FailureList[0])
+            if isinstance(FailureList, list) and FailureList
+            else "acceptance gates failed"
+        )
+        try:
+            Report = WriteRunReport(
+                RunDirectory=RunDirectory,
+                Result=(
+                    "SUCCESS" if Completed["Accepted"] else "FAILURE"
+                ),
+                WallSeconds=Process.RuntimeSeconds,
+                CpuSeconds=None,
+                Summary=(
+                    f"{RunName} passed all acceptance gates."
+                    if Completed["Accepted"]
+                    else f"{RunName} failed: {FirstFailure}"
+                ),
+                RepositoryRoot=Configuration.RepositoryRoot,
+                StartedAtUtc=StartedAtUtc,
+                CompletedAtUtc=str(Completed["CompletedAtUtc"]),
+                Command=Command,
+                WorkingDirectory=Configuration.RepositoryRoot,
+                Stdout=Process.Stdout,
+                Stderr=Process.Stderr,
+                FailureType=(
+                    None
+                    if Completed["Accepted"]
+                    else f"Acceptance: {FirstFailure}"
+                ),
+                Details={
+                    "TimedOut": Process.TimedOut,
+                    "ReturnCode": Process.ReturnCode,
+                    "Evaluation": Evaluation,
+                    "Determinism": Determinism,
+                    "PlannedRun": Planned,
+                },
+            )
+        except OSError as Error:
+            Evaluation.setdefault("Failures", []).append(
+                f"Reporting:write-failed:{Error}"
+            )
+            Evaluation["Accepted"] = False
+            Completed["Accepted"] = False
+            Completed["Status"] = "FAILED"
+            print("RESULT: FAILURE — Reporting: write-failed")
+            print(f"TIME: wall={Process.RuntimeSeconds:.3f}s")
+            print(
+                f"OUTPUT: {RunName} finished, but its report could not be saved."
+            )
+            print(f"RAW REPORT: {RunDirectory / 'RawDump.txt'}")
+        else:
+            print("\n".join(Report.ResultLines))
         return Completed
 
     RegressionPlanned = [
@@ -4457,11 +4604,6 @@ def RunAcceptance(
             *PlannedRuns[len(CompletedRuns):],
         ]
         WriteManifest(Configuration.ManifestPath, Manifest)
-        if (
-            Configuration.BaselineMode is None
-            and not Completed["Accepted"]
-        ):
-            break
 
     if Configuration.BaselineMode == "capture":
         CheckSourceProvenance("after-regression-capture")
@@ -4940,17 +5082,18 @@ def ParseDateLabel(Value: str) -> str:
 def BuildParser() -> argparse.ArgumentParser:
     Parser = argparse.ArgumentParser(
         description=(
-            "Run the fixed physical router regression matrix sequentially and "
+            "Run the selected physical router acceptance matrix sequentially and "
             "write machine-readable accuracy, footprint, and speed evidence."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  %(prog)s --dry-run\n"
-            "  %(prog)s --date 2026-08-29 --output-root Output/Regression\n"
+            "  %(prog)s --matrix default --dry-run\n"
+            "  %(prog)s --matrix expanded --date 2026-08-29\n"
             "  %(prog)s --capture-baseline Output/Baselines/router.json\n\n"
-            "Default runs the standard FA/RCA acceptance matrix. Add "
-            "--include-cla4 only when the extended case is intended."
+            "The default matrix runs FullAdder/RCA4/RCA8 once each. The "
+            "expanded matrix runs all seven bundled examples once each and "
+            "never stops after a failure."
         ),
     )
     Parser.add_argument(
@@ -4964,7 +5107,7 @@ def BuildParser() -> argparse.ArgumentParser:
         "--output-root",
         dest="OutputRoot",
         type=Path,
-        default=Path("Output/Regression"),
+        default=Path("Output/Acceptance"),
     )
     Parser.add_argument(
         "--python",
@@ -4998,8 +5141,7 @@ def BuildParser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "compare FA/RCA4/RCA8 against PATH, then run CLA4 only "
-            "when --include-cla4 is supplied and all regression gates pass"
+            "compare the default FA/RCA4/RCA8 matrix against PATH"
         ),
     )
     Parser.add_argument(
@@ -5022,13 +5164,20 @@ def BuildParser() -> argparse.ArgumentParser:
         ),
     )
     Parser.add_argument(
+        "--matrix",
+        dest="MatrixMode",
+        choices=("default", "expanded"),
+        default="default",
+        help=(
+            "acceptance matrix: default=FA/RCA4/RCA8 once each; expanded=all "
+            "seven bundled examples once each (default: default)"
+        ),
+    )
+    Parser.add_argument(
         "--include-cla4",
         dest="IncludeCla4",
         action="store_true",
-        help=(
-            "include the extended CLA4 runs and exact-interface proof "
-            "checkpoint; default/no-fallback gates remain enabled"
-        ),
+        help=argparse.SUPPRESS,
     )
     Parser.add_argument(
         "--dry-run",
@@ -5040,17 +5189,18 @@ def BuildParser() -> argparse.ArgumentParser:
 
 
 def GuidedArguments() -> list[str]:
-    """Choose a safe acceptance mode when invoked without flags."""
+    """Choose the default or expanded acceptance run without preview modes."""
     print("RedstoneCompiler physical router acceptance")
-    print("1) Preview the standard matrix (recommended)\n2) Run standard matrix\n3) Run standard matrix plus CLA4")
-    Choice = input("Choose a mode [1]: ").strip() or "1"
+    print(
+        "1) Run expanded matrix\n"
+        "2) Run default matrix (recommended)"
+    )
+    Choice = input("Choose a mode [2]: ").strip() or "2"
     if Choice == "1":
-        return ["--dry-run"]
+        return ["--matrix", "expanded"]
     if Choice == "2":
         return []
-    if Choice == "3":
-        return ["--include-cla4"]
-    raise ValueError("choose 1, 2, or 3")
+    raise ValueError("choose 1 or 2")
 
 
 def Main(Arguments: list[str] | None = None) -> int:
@@ -5094,6 +5244,10 @@ def Main(Arguments: list[str] | None = None) -> int:
     if Parsed.IncludeCla4 and BaselineMode == "capture":
         raise SystemExit(
             "--include-cla4 cannot be combined with --capture-baseline"
+        )
+    if Parsed.MatrixMode == "expanded" and BaselineMode is not None:
+        raise SystemExit(
+            "--matrix expanded cannot be combined with baseline capture/compare"
         )
     RoutingThreads = Parsed.RoutingThreads
     if BaselineMode is not None:
@@ -5173,9 +5327,83 @@ def Main(Arguments: list[str] | None = None) -> int:
         CaptureTimeoutGraceSeconds=(
             Parsed.CaptureTimeoutGraceSeconds
         ),
+        MatrixMode=Parsed.MatrixMode,
         IncludeCla4=Parsed.IncludeCla4,
     )
-    Manifest = RunAcceptance(Configuration)
+    SessionStartedAtUtc = UtcTimestamp()
+    SessionStartedAt = monotonic()
+    Capture = CaptureTerminalOutput()
+    with Capture:
+        Manifest = RunAcceptance(Configuration)
+    SessionWallSeconds = monotonic() - SessionStartedAt
+    Accepted = bool(Manifest.get("Accepted"))
+    IsDryRun = Manifest.get("Status") == "DRY_RUN"
+    Runs = Manifest.get("Runs", [])
+    CompletedRuns = [
+        Run
+        for Run in Runs
+        if isinstance(Run, dict)
+        and Run.get("Status") in {"PASSED", "FAILED", "SKIPPED"}
+    ] if isinstance(Runs, list) else []
+    PassedCount = sum(
+        Run.get("Status") == "PASSED" for Run in CompletedRuns
+    )
+    FailedCount = sum(
+        Run.get("Status") == "FAILED" for Run in CompletedRuns
+    )
+    SkippedCount = sum(
+        Run.get("Status") == "SKIPPED" for Run in CompletedRuns
+    )
+    SessionSummary = (
+        f"Router acceptance planned {len(Runs) if isinstance(Runs, list) else 0} run(s)."
+        if IsDryRun
+        else f"Router acceptance passed {PassedCount} run(s)."
+        if Accepted
+        else (
+            "Router acceptance did not pass: "
+            f"{PassedCount} passed, {FailedCount} failed, "
+            f"{SkippedCount} skipped."
+        )
+    )
+    try:
+        SessionReport = WriteRunReport(
+            RunDirectory=Configuration.RecoveryRoot,
+            Result=("SKIPPED" if IsDryRun else "SUCCESS" if Accepted else "FAILURE"),
+            WallSeconds=SessionWallSeconds,
+            CpuSeconds=None,
+            Summary=SessionSummary,
+            RepositoryRoot=RepoRoot,
+            StartedAtUtc=SessionStartedAtUtc,
+            CompletedAtUtc=UtcTimestamp(),
+            Command=[sys.executable, str(Path(__file__).resolve()), *RawArguments],
+            WorkingDirectory=RepoRoot,
+            Stdout=Capture.StdoutText,
+            Stderr=Capture.StderrText,
+            FailureType=(
+                None
+                if Accepted or IsDryRun
+                else "Acceptance: session-failed"
+            ),
+            Details={
+                "ManifestPath": str(Configuration.ManifestPath),
+                "ManifestStatus": Manifest.get("Status"),
+                "Accepted": Accepted,
+                "PassedRuns": PassedCount,
+                "FailedRuns": FailedCount,
+                "SkippedRuns": SkippedCount,
+                "Runs": CompletedRuns,
+            },
+        )
+    except OSError as Error:
+        print("RESULT: FAILURE — Reporting: write-failed")
+        print(f"TIME: wall={SessionWallSeconds:.3f}s")
+        print(
+            "OUTPUT: Acceptance finished, but its session report could not "
+            f"be saved: {Error}"
+        )
+        print(f"RAW REPORT: {Configuration.RecoveryRoot / 'RawDump.txt'}")
+        return 1
+    print("\n".join(SessionReport.ResultLines))
     print(f"Acceptance manifest: {Configuration.ManifestPath}")
     print(f"Acceptance status: {Manifest['Status']}")
     if Configuration.DryRun:

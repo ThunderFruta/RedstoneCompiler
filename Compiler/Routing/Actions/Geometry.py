@@ -25,6 +25,10 @@ ElectricalBlockNames = {
     "minecraft:repeater",
 }
 NonSolidBlockNames = ElectricalBlockNames | {"minecraft:air"}
+TorchBlockNames = {
+    "minecraft:redstone_torch",
+    "minecraft:redstone_wall_torch",
+}
 
 
 @lru_cache(maxsize=1)
@@ -36,15 +40,21 @@ def LoadRoutingTemplates() -> dict[str, Any]:
     }
 
 
-def BuildPlacedCellGeometry(
+def BuildPlacedCellGeometryWithKeepOut(
     Placed: Any,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
-) -> tuple[set[Position3], set[Position3], set[Position3]]:
-    """Return occupied, electrical, and solid template positions."""
+) -> tuple[
+    set[Position3],
+    set[Position3],
+    set[Position3],
+    set[Position3],
+]:
+    """Return template occupancy plus block-aware electrical keep-outs."""
     Templates = LoadRoutingTemplates()
     OccupiedOwners: dict[Position3, str] = {}
     ElectricalBlocks: set[Position3] = set()
     SolidBlocks: set[Position3] = set()
+    ElectricalKeepOutBlocks: set[Position3] = set()
 
     Gates = list(Placed.PlacedGates)
     for GateIndex, Gate in enumerate(Gates):
@@ -86,9 +96,31 @@ def BuildPlacedCellGeometry(
             OccupiedOwners[Position] = Gate.Name
             if State["Name"] in ElectricalBlockNames:
                 ElectricalBlocks.add(Position)
+            if State["Name"] in TorchBlockNames:
+                ElectricalKeepOutBlocks.add(
+                    DefaultRedstoneRoutingTechnology
+                    .TorchPoweredDustKeepOut(Position)
+                )
             if State["Name"] not in NonSolidBlockNames:
                 SolidBlocks.add(Position)
-    return set(OccupiedOwners), ElectricalBlocks, SolidBlocks
+    return (
+        set(OccupiedOwners),
+        ElectricalBlocks,
+        SolidBlocks,
+        ElectricalKeepOutBlocks,
+    )
+
+
+def BuildPlacedCellGeometry(
+    Placed: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[set[Position3], set[Position3], set[Position3]]:
+    """Return occupied, electrical, and solid template positions."""
+    Actual, Electrical, Solid, _KeepOut = BuildPlacedCellGeometryWithKeepOut(
+        Placed,
+        WorkCheck=WorkCheck,
+    )
+    return Actual, Electrical, Solid
 
 
 def ValidatePlacedCellElectricalIsolation(
@@ -106,13 +138,28 @@ def ValidatePlacedCellElectricalIsolation(
                 "TotalGates": len(Gates),
                 "GateName": Gate.Name,
             })
-        Actual, Electrical, _Solid = BuildPlacedCellGeometry(
+        (
+            Actual,
+            Electrical,
+            _Solid,
+            ElectricalKeepOut,
+        ) = BuildPlacedCellGeometryWithKeepOut(
             type("SingleCellPlacement", (), {"PlacedGates": [Gate]})(),
             WorkCheck=WorkCheck,
         )
-        Geometry.append((Gate.Name, Actual, Electrical))
+        Geometry.append((
+            Gate.Name,
+            Actual,
+            Electrical,
+            ElectricalKeepOut,
+        ))
     Technology = DefaultRedstoneRoutingTechnology
-    for Index, (FirstName, FirstActual, FirstElectrical) in enumerate(Geometry):
+    for Index, (
+        FirstName,
+        FirstActual,
+        FirstElectrical,
+        FirstExplicitKeepOut,
+    ) in enumerate(Geometry):
         if WorkCheck is not None:
             WorkCheck({
                 "Phase": "electrical-isolation-pairs",
@@ -120,11 +167,15 @@ def ValidatePlacedCellElectricalIsolation(
                 "TotalGates": len(Geometry),
                 "GateName": FirstName,
             })
-        FirstKeepOut = Technology.BuildElectricalExclusions(set(FirstElectrical))
+        FirstKeepOut = (
+            Technology.BuildElectricalExclusions(set(FirstElectrical))
+            | set(FirstExplicitKeepOut)
+        )
         for PairIndex, (
             SecondName,
             SecondActual,
             SecondElectrical,
+            SecondExplicitKeepOut,
         ) in enumerate(Geometry[Index + 1 :]):
             if WorkCheck is not None and PairIndex % 32 == 0:
                 WorkCheck({
@@ -134,7 +185,10 @@ def ValidatePlacedCellElectricalIsolation(
                     "CompletedPairsForGate": PairIndex,
                 })
             Conflicts = (FirstKeepOut & set(SecondActual)) | (
-                Technology.BuildElectricalExclusions(set(SecondElectrical))
+                (
+                    Technology.BuildElectricalExclusions(set(SecondElectrical))
+                    | set(SecondExplicitKeepOut)
+                )
                 & set(FirstActual)
             )
             if Conflicts:
@@ -152,7 +206,12 @@ def BuildRoutingResources(
     if WorkCheck is not None:
         WorkCheck({"Phase": "routing-resources-start"})
     ValidatePlacedCellElectricalIsolation(Placed, WorkCheck=WorkCheck)
-    ActualBlocks, ElectricalBlocks, SolidBlocks = BuildPlacedCellGeometry(
+    (
+        ActualBlocks,
+        ElectricalBlocks,
+        SolidBlocks,
+        TemplateElectricalKeepOutBlocks,
+    ) = BuildPlacedCellGeometryWithKeepOut(
         Placed,
         WorkCheck=WorkCheck,
     )
@@ -198,6 +257,9 @@ def BuildRoutingResources(
             ActualBlocks=StaticGeometry.ActualBlocks,
             ElectricalBlocks=StaticGeometry.ElectricalBlocks,
             SolidBlocks=StaticGeometry.SolidBlocks,
+            StaticKeepOutBlocks=frozenset(
+                TemplateElectricalKeepOutBlocks
+            ),
         ),
     )
 

@@ -31,7 +31,7 @@ python3 Scripts/Fabric/ControlFabricServer.py stop
 
 The manager updates the installed harness at
 `FabricServerHarness/Server/mods/redstonecompiler-harness.jar` from the Gradle
-build when necessary, writes a private loopback token and 1,000-TPS
+build when necessary, writes a private loopback token and 5,000-TPS
 configuration, and waits until the server is ready. On its first start it
 creates a localhost-only creative `minecraft:the_void` flat world with no
 terrain or generated structures, then persists no-spawning, no-drops, frozen
@@ -62,7 +62,7 @@ running; use `:help` and `:quit` in the interactive console, or
 
 Each loaded fixture force-loads its intersecting chunks (up to 256), so its
 redstone keeps ticking even when no player is near it. Truth-table validation
-then gives redstone a 50-tick propagation guard before it accepts stable output
-samples, and requires two unchanged samples within the 200-tick settle ceiling.
-This avoids declaring a long routed signal settled before it has reached its
-output lamp.
+samples the complete dynamic trace every observed game tick and requires 40
+consecutive unchanged ticks within the 200-tick settle ceiling. A trace change
+or skipped tick resets that proof window. This avoids declaring a long routed
+signal settled before it has reached its output lamp.

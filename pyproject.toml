@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 redstone-compiler = "Main:Main"
+redstone-benchmark = "Main:RunBenchmark"
 
 [tool.maturin]
 manifest-path = "RustRouting/Cargo.toml"

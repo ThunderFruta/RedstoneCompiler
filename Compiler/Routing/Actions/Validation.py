@@ -307,11 +307,13 @@ def ValidateTemplateIsolation(
     Producers: dict[str, Any],
     Targets: dict[str, list[Position3]],
     AccessBySignal: dict[str, set[Position3]] | None = None,
+    TemplateKeepOutBlocks: set[Position3] | frozenset[Position3] | None = None,
     WorkCheck: RoutingWorkCheck | None = None,
 ) -> None:
     """Reject routed dust that enters or side-powers a cell template."""
     TemplateElectrical = set(ElectricalBlocks) | set(SolidBlocks)
-    TemplateKeepOut = set(TemplateElectrical)
+    ExplicitKeepOut = set(TemplateKeepOutBlocks or ())
+    TemplateKeepOut = set(TemplateElectrical) | ExplicitKeepOut
     if WorkCheck is not None:
         WorkCheck({
             "Phase": "start",
@@ -360,7 +362,7 @@ def ValidateTemplateIsolation(
                     "CompletedSignals": SignalIndex - 1,
                     "ProcessedPositions": ProcessedRoutePositions,
                 })
-            if Position in AllowedPins:
+            if Position in AllowedPins and Position not in ExplicitKeepOut:
                 continue
             if Position in ActualBlocks:
                 Overlaps.add(Position)

@@ -84,18 +84,18 @@ non-air blocks cleared; otherwise validation fails closed. The harness then clea
 incoming fixture arena immediately before placement as a second, idempotent
 pre-paste guard.
 
-The server sets a 1,000 TPS target, force-loads every chunk intersecting the
+The server sets a 5,000 TPS target, force-loads every chunk intersecting the
 fixture arena (up to 256 chunks), places the exact fixture states, drives
 levers, and forces updates at each lever and its six direct neighbors. It then
 samples every dynamic block listed by the fixture trace. A vector is settled
 only after all traced dust, repeaters, torches, lamps, comparators, and levers
-remain unchanged for 20 consecutive observed game ticks (up to 200 ticks
+remain unchanged for 40 consecutive observed game ticks (up to 200 ticks
 total). Only then does the harness compare output lamps. It returns `passed`,
 `mismatch`, `timeout`, or
 `infrastructure-failure`; absence of the configured server is an infrastructure
 failure, never a functional pass.
 
-Skipped game ticks do not count toward the 20-tick proof: the unchanged counter
+Skipped game ticks do not count toward the 40-tick proof: the unchanged counter
 resets whenever the harness cannot observe the next consecutive game tick.
 Mismatch traces are serialized from the same atomic snapshot used for output
 comparison, so a continuing server clock cannot move the trace past the failed

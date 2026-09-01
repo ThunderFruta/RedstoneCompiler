@@ -317,6 +317,7 @@ def CompactRoutedTrees(
         Producers,
         Targets,
         AccessBySignal,
+        set(Resources.ResourceGraph.StaticKeepOutBlocks),
         WorkCheck=CheckWork("template-isolation-validation"),
     )
     TrackAssignmentValue = Routed.TrackAssignment

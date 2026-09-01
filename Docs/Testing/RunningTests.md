@@ -18,6 +18,11 @@ alone, because many routing checks are module-level pytest functions:
 python3 -m pytest -q
 ```
 
+Guided-menu pytest runs stream their normal output and then print a concise
+result headed by `RESULT`, `TIME`, optional `CPU`, and `OUTPUT`. Complete stdout, stderr,
+runtime provenance, Git identity, and artifact evidence are retained under
+`Output/Pytest/<UTC run id>/{Summary.txt,RawDump.txt}`.
+
 ## Focused routing checks
 
 ```bash
@@ -47,21 +52,31 @@ python3 Scripts/Routing/RunRouterAcceptance.py \
   --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
   --python .venv/bin/python \
-  --include-cla4 \
+  --matrix expanded \
   --dry-run
 ```
 
 Remove `--dry-run` only after fast tests pass and no other scale routing job is
-running. The refactor comparison uses the fixed 5/3/3/2 matrix and a fresh,
-empty output root. The harness stops judging acceptance when a required gate
-fails; CLA4's current `PlacementOverlap` is structural and must not be reported
-as timeout exhaustion.
+running. The default matrix runs FA, RCA4, and RCA8 once each. Expanded mode
+runs HalfAdder, FullAdder, RCA4, RCA8, DecimalToBinary4, TFlipFlopLatch, and
+CLA4 once each. Use a fresh, empty
+output root. The harness does not fail fast: it attempts every scheduled run,
+preserves each failure independently, and rejects the overall session if any
+required gate fails. CLA4's current `PlacementOverlap` is structural and must
+not be reported as timeout exhaustion.
 
 Every wall-time median and every internal stage whose baseline median is at
 least 100 ms must be at most `1.05 ×` its baseline. If one exceeds 5%, rerun the
 complete case once and judge the combined median. Preserve existing wall
 ceilings and require exact truth tables, zero conflicts/unresolved claims, no
 fallback, and stable repeated fingerprints.
+
+The acceptance harness defaults to `Output/Acceptance/<date>/`. Each executed
+circuit run retains `Summary.txt`, `RawDump.txt`, `stdout.log`, and
+`stderr.log`; the dated directory also contains an overall summary/raw report
+next to `AcceptanceManifest.json`. Baseline capture and comparison use named
+subdirectories under the same date. An explicit `--output-root` still selects
+a fresh alternative evidence root.
 
 ## Evidence
 

@@ -1,11 +1,14 @@
 # Routing benchmarks
 
-| Benchmark | Purpose | Runs | Fabric validation vectors | Wall ceiling |
-| --- | --- | ---: | ---: | ---: |
-| FullAdder | Small correctness and deterministic overhead gate | 5 | 8 | 10 s |
-| RippleCarryAdder4 | Repeated-stage congestion and regression gate | 3 | 512 | 25 s |
-| RippleCarryAdder8 | 8-bit carry ripple scalability gate | 3 | 4132 | 30 s |
-| CarryLookaheadAdder4 (extended) | Optional exact-interface proof check | 2 | 512 | 120 s |
+| Benchmark | Matrix | Purpose | Runs | Fabric validation vectors | Wall ceiling |
+| --- | --- | --- | ---: | ---: | ---: |
+| HalfAdder | Expanded | Small two-input arithmetic check | 1 | 4 | 10 s |
+| FullAdder | Default and expanded | Small correctness and deterministic overhead gate | 1 | 8 | 10 s |
+| RippleCarryAdder4 | Default and expanded | Repeated-stage congestion and regression gate | 1 | 512 | 25 s |
+| RippleCarryAdder8 | Default and expanded | 8-bit carry ripple scalability gate | 1 | 4132 | 30 s |
+| DecimalToBinary4 | Expanded | One-hot decimal encoder check | 1 | 1024 | 30 s |
+| TFlipFlopLatch | Expanded | Explicit-state toggle/latch logic check | 1 | 8 | 15 s |
+| CarryLookaheadAdder4 | Expanded | Exact-interface proof check | 1 | 512 | 120 s |
 
 Full acceptance requires zero final conflicts, zero unresolved claims,
 identical repeated fingerprints, no fallback, a durable Fabric fixture, and
@@ -14,12 +17,30 @@ a passed authoritative Fabric-server validation record. The retired
 checks the FullAdder/RCA4/CLA4 vectors exhaustively and uses 4,132
 deterministic wide vectors for RCA8.
 
+## Saved run reports
+
+Compiler runs write immutable evidence beneath
+`Output/<Circuit>/Runs/<UTC run id>/`. `Summary.txt` always starts with result,
+time and CPU utilization, optional CPU breakdown, a one-line output, and the
+raw-report path. `RawDump.txt` retains full
+stdout/stderr, Git and runtime provenance, stage telemetry, typed failure
+evidence, validation gates, and an artifact size/hash inventory. Only a fully
+successful run atomically refreshes the stable artifacts directly under
+`Output/<Circuit>/`.
+
 ## Current checkpoint
 
-The default acceptance sequence is FA/RCA4/RCA8 with reproducible determinism
-and strict no-fallback evidence. Add `--include-cla4` to append the two CLA4
-runs and the fixture-backed exact-interface proof checkpoint. CLA4 uses the
-same default routing strategy and no-fallback gate as the default sequence.
+The default acceptance matrix is exactly FA/RCA4/RCA8. Select
+`--matrix expanded` to run all seven bundled examples: HalfAdder, FullAdder,
+RCA4, RCA8, DecimalToBinary4, TFlipFlopLatch, and CLA4. CLA4 retains its
+fixture-backed exact-interface proof checkpoint. Both matrices execute every
+scheduled repetition even after an earlier failure; the overall session fails
+if any required run or correctness gate fails. Expanded mode is standalone and
+cannot capture or compare the historical regression baseline.
+
+Normal default and expanded acceptance execute each selected circuit exactly
+once. Specialized baseline capture/comparison retains its historical repeated
+sampling contract so existing version-one baseline evidence remains readable.
 
 ## Latest acceptance sweep (2026-08-03)
 

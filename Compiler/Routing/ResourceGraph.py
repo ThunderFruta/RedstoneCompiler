@@ -290,7 +290,8 @@ class RoutingResourceGraph:
     ElectricalBlocks: frozenset[Position3]
     SolidBlocks: frozenset[Position3]
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology
-    GraphVersion: str = "routing-resource-graph-v1"
+    GraphVersion: str = "routing-resource-graph-v2"
+    StaticKeepOutBlocks: frozenset[Position3] = frozenset()
     _RegionCache: dict[
         tuple[
             tuple[int, int, int, int, int, int],
@@ -320,6 +321,7 @@ class RoutingResourceGraph:
             self.Technology.BuildElectricalExclusions(
                 set(self.ElectricalBlocks) | set(self.SolidBlocks)
             )
+            | set(self.StaticKeepOutBlocks)
         )
 
     @property
@@ -335,6 +337,8 @@ class RoutingResourceGraph:
         Position: Position3,
         AllowedAccess: frozenset[Position3] = frozenset(),
     ) -> bool:
+        if Position in self.StaticKeepOutBlocks:
+            return False
         if Position in AllowedAccess:
             return Position not in self.ActualBlocks
         Support = (Position[0], Position[1] - 1, Position[2])

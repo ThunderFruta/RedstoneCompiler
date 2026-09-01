@@ -6,7 +6,12 @@ Cache/
 .cache/
 .pytest_cache/
 **/__pycache__/
-FabricServerHarness/Server/
+# Track the small canonical runtime manager, but keep the actual Fabric server
+# installation, private configuration, generated fixtures, logs, and worlds out.
+FabricServerHarness/Server/*
+!FabricServerHarness/Server/PyScripts/
+FabricServerHarness/Server/PyScripts/*
+!FabricServerHarness/Server/PyScripts/*.py
 **/*.pyc
 .venv/
 Build/

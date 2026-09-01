@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
+from SVDecoder import Sv
 
 from .Fixture import FabricFixtureArtifact
 from .Validation import BuildExpectedVectors
@@ -91,6 +92,20 @@ def ReadNandModule(PathValue: Path) -> ModuleIR:
     )
 
 
+def ReadSvModule(
+    PathValue: Path,
+    *,
+    TopModule: str | None = None,
+) -> ModuleIR:
+    """Parse a SystemVerilog source file into the live-test logic oracle."""
+    ResolvedPath = Path(PathValue).expanduser().resolve()
+    Netlist = Sv.ParseSvToNetlist(
+        InputPath=ResolvedPath,
+        TopModule=TopModule,
+    )
+    return Netlist.Modules[Netlist.Top]
+
+
 def FixturePortNames(Fixture: dict[str, object], Field: str) -> list[str]:
     """Return the validated, deterministic signal names for a fixture port kind."""
     Values = Fixture.get(Field)
@@ -115,12 +130,12 @@ def BuildImportedSchematicVectors(
     OutputNames = FixturePortNames(Fixture, "Outputs")
     if set(InputNames) != set(Module.Inputs):
         raise ValueError(
-            "fixture inputs do not match the NAND oracle: "
+            "fixture inputs do not match the logic oracle: "
             f"fixture={sorted(InputNames)}, oracle={sorted(Module.Inputs)}",
         )
     try:
         return BuildExpectedVectors(Module, InputNames, OutputNames)
     except KeyError as Error:
         raise ValueError(
-            f"fixture output {Error.args[0]!r} is not produced by the NAND oracle",
+            f"fixture output {Error.args[0]!r} is not produced by the logic oracle",
         ) from Error

@@ -30,6 +30,16 @@ def _Position(Value: tuple[int, int, int]) -> list[int]:
     return [int(Axis) for Axis in Value]
 
 
+def _Sign(Position: tuple[int, int, int], Text: str) -> dict[str, object]:
+    """Serialize one compiler sign without exposing generic block-entity NBT."""
+    Lines = [str(Text), "", "", ""]
+    return {
+        "Position": _Position(Position),
+        "FrontText": Lines,
+        "BackText": list(Lines),
+    }
+
+
 def _TemplateBlockPosition(Gate: Any, TemplateName: str, BlockName: str) -> tuple[int, int, int]:
     """Locate an I/O template block after the exact writer transform."""
     Template = SchemWriter.LoadTemplate(SchemWriter.LitematicTemplates[TemplateName])
@@ -209,10 +219,15 @@ def BuildFabricFixture(
         }
         for Position, State in sorted(Rendered.Blocks.items())
     ]
+    Signs = [
+        _Sign(Position, Text)
+        for Position, Text in sorted(getattr(Rendered, "Signs", ()))
+    ]
     return {
         "SchemaVersion": FixtureSchemaVersion,
         "TopModule": str(Module.Name),
         "Blocks": Blocks,
+        "Signs": Signs,
         "Inputs": Inputs,
         "Outputs": Outputs,
         "Trace": _BuildTraceMap(

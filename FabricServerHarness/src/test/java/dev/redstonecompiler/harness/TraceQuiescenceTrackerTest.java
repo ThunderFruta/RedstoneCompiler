@@ -9,20 +9,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class TraceQuiescenceTrackerTest {
     @Test
-    void SettlesOnlyOnTheTwentiethConsecutiveUnchangedTick() {
+    void SettlesOnlyOnTheFortiethConsecutiveUnchangedTick() {
         TraceQuiescenceTracker Tracker = new TraceQuiescenceTracker(
-                20, 200, 100, "initial");
+                HarnessValidation.REQUIRED_UNCHANGED_TICKS,
+                200,
+                100,
+                "initial");
 
-        for (long GameTime = 101; GameTime < 120; GameTime++) {
+        for (long GameTime = 101; GameTime < 140; GameTime++) {
             assertFalse(Tracker.Observe(GameTime, "initial").Settled());
         }
 
         TraceQuiescenceTracker.TraceQuiescenceStatus Status =
-                Tracker.Observe(120, "initial");
+                Tracker.Observe(140, "initial");
         assertTrue(Status.Settled());
         assertFalse(Status.TimedOut());
-        assertEquals(20, Status.ObservedUnchangedTicks());
-        assertEquals(20, Status.ElapsedTicks());
+        assertEquals(40, Status.ObservedUnchangedTicks());
+        assertEquals(40, Status.ElapsedTicks());
     }
 
     @Test

@@ -1,15 +1,21 @@
 from pathlib import Path
 from dataclasses import replace
 from types import SimpleNamespace
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
 from typing import Any
 
 from SVDecoder import Sv
-from Compiler.Main import BuildParser, Main, PrintRoutingFailureSummary
+from Compiler.Main import (
+    BuildParser,
+    Main,
+    PrintFabricFailureSummary,
+    PrintRoutingFailureSummary,
+)
 from Compiler.Pipeline import CompileSvToLitematic
 from Compiler.Placement.Flow.Demand import BuildPlacementGenerationPlan
 from Compiler.Placement.Flow.Preparation import PlacementNeedsDemandDiversity
@@ -435,12 +441,14 @@ class LocalFirstRouterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Directory = Path(DirectoryValue)
             ErrorOutput = StringIO()
+            StandardOutput = StringIO()
             with (
                 patch(
                     "Compiler.Main.CompileSvToLitematic",
                     side_effect=Failure,
                 ) as Compile,
                 redirect_stderr(ErrorOutput),
+                redirect_stdout(StandardOutput),
             ):
                 ReturnCode = Main([
                     "--input",
@@ -454,7 +462,16 @@ class LocalFirstRouterTests(unittest.TestCase):
                 ])
 
         self.assertEqual(ReturnCode, 1)
-        self.assertIn("PortalGeneration:NoBoundaryEscape", ErrorOutput.getvalue())
+        self.assertIn(
+            "PortalGeneration: NoBoundaryEscape",
+            StandardOutput.getvalue(),
+        )
+        self.assertIn("RESULT: FAILURE", StandardOutput.getvalue())
+        self.assertIn("Operation failed:", ErrorOutput.getvalue())
+        self.assertIn(
+            "controlled routing failure",
+            ErrorOutput.getvalue(),
+        )
         self.assertEqual(
             Compile.call_args.kwargs["RoutingDeadlineSeconds"],
             3.5,
@@ -498,6 +515,108 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertIn("component placement attempts (1)", Text)
         self.assertIn("NandNet26", Text)
         self.assertIn("CLA4.RoutingFailure.json", Text)
+
+    def testCliFabricFailureSummaryPrintsExactMismatchBlock(self) -> None:
+        Output = StringIO()
+        Failure = RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.FinalDrcViolation,
+            Stage="FabricServerValidation",
+            Diagnostics={
+                "FabricServerValidation": {
+                    "Diagnostics": {
+                        "FailureTrace": {
+                            "FailureKind": "mismatch",
+                            "FailedOutput": "Sum2$Output",
+                            "Expected": True,
+                            "Actual": False,
+                            "FirstFailingBlock": {
+                                "FixturePosition": [12, 1, 9],
+                                "WorldPosition": [112, 65, 209],
+                                "State": {
+                                    "Name": "minecraft:redstone_wire",
+                                    "Properties": {
+                                        "west": "side",
+                                        "power": "0",
+                                        "east": "side",
+                                    },
+                                },
+                            },
+                            "SubcircuitTrace": [],
+                        },
+                    },
+                },
+            },
+        ))
+
+        with redirect_stderr(Output):
+            PrintFabricFailureSummary(Failure, None)
+
+        Text = Output.getvalue()
+        self.assertIn("output: Sum2$Output expected=true actual=false", Text)
+        self.assertIn(
+            "block: minecraft:redstone_wire[east=side,power=0,west=side]",
+            Text,
+        )
+        self.assertIn(
+            "coords: fixture=(12, 1, 9) world=(112, 65, 209)",
+            Text,
+        )
+        self.assertIn("evidence: first mismatching block", Text)
+
+    def testCliFabricTimeoutUsesFailedOutputProbeFromArtifact(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            OutputPath = Path(DirectoryValue) / "Rca4.litematic"
+            ArtifactPath = OutputPath.with_suffix(".RoutingFailure.json")
+            ArtifactPath.write_text(json.dumps({
+                "Failure": {
+                    "Stage": "FabricServerValidation",
+                    "Diagnostics": {
+                        "FabricServerValidation": {
+                            "Diagnostics": {
+                                "FailureTrace": {
+                                    "FailureKind": "timeout",
+                                    "FailedOutput": "Sum3$Output",
+                                    "Expected": False,
+                                    "Actual": False,
+                                    "FirstFailingBlock": None,
+                                    "SubcircuitTrace": [{
+                                        "Output": {
+                                            "Signal": "Sum3$Output",
+                                            "Blocks": [{
+                                                "FixturePosition": [60, 1, 29],
+                                                "WorldPosition": [60, 65, 29],
+                                                "State": {
+                                                    "Name": "minecraft:redstone_lamp",
+                                                    "Properties": {"lit": "false"},
+                                                },
+                                            }],
+                                        },
+                                    }],
+                                },
+                            },
+                        },
+                    },
+                },
+            }), encoding="utf-8")
+            Output = StringIO()
+
+            with redirect_stderr(Output):
+                PrintFabricFailureSummary(
+                    ValueError(
+                        "FabricServerValidation:timeout:"
+                        "redstone-network-did-not-settle"
+                    ),
+                    OutputPath,
+                )
+
+        Text = Output.getvalue()
+        self.assertIn("kind: timeout", Text)
+        self.assertIn("block: minecraft:redstone_lamp[lit=false]", Text)
+        self.assertIn(
+            "coords: fixture=(60, 1, 29) world=(60, 65, 29)",
+            Text,
+        )
+        self.assertIn("failed-output probe", Text)
 
     def testDefaultPolicyEnablesAuthoritativeRoutingFeatures(self) -> None:
         self.assertTrue(
