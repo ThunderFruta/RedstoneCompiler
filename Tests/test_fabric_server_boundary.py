@@ -25,7 +25,7 @@ from Compiler.FabricServer import (
 )
 from Compiler.FabricServer.SchemImport import InferLitematicPorts
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
-from Compiler.Pipeline import RequireFabricServerValidation
+from Compiler.Pipeline import RequirePhysicalValidation
 from SchemEncoder.SchemWriter import CellTemplate, BuildLitematicBlockMap, NeutralDynamicState
 
 
@@ -129,16 +129,19 @@ class FabricServerBoundaryTests(unittest.TestCase):
                     Completed=0,
                     Total=2,
                     Stage="authoritative Fabric truth-table validation",
+                    Backend="fabric-26.2-canary",
                 ),
                 FabricValidationProgress(
                     Completed=1,
                     Total=2,
                     Stage="authoritative Fabric truth-table validation",
+                    Backend="fabric-26.2-canary",
                 ),
                 FabricValidationProgress(
                     Completed=2,
                     Total=2,
                     Stage="authoritative Fabric truth-table validation",
+                    Backend="fabric-26.2-canary",
                 ),
             ],
         )
@@ -450,15 +453,21 @@ class FabricServerBoundaryTests(unittest.TestCase):
         Ready.assert_not_called()
 
     def testOnlyAnObservedFabricPassCanCompleteThePipeline(self) -> None:
-        RequireFabricServerValidation(FabricServerValidationResult(Status="passed"))
+        RequirePhysicalValidation(
+            FabricServerValidationResult(Status="passed"),
+            "FabricFinalCheck",
+        )
         with self.assertRaisesRegex(
             ValueError,
-            "FabricServerValidation:mismatch:output-mismatch:y",
+            "FabricFinalCheck:mismatch:output-mismatch:y",
         ):
-            RequireFabricServerValidation(FabricServerValidationResult(
-                Status="mismatch",
-                Diagnostics={"Error": "output-mismatch:y"},
-            ))
+            RequirePhysicalValidation(
+                FabricServerValidationResult(
+                    Status="mismatch",
+                    Diagnostics={"Error": "output-mismatch:y"},
+                ),
+                "FabricFinalCheck",
+            )
 
     def testVectorPolicyIsExhaustiveThenDeterministic(self) -> None:
         self.assertEqual(len(BuildValidationVectors(("a", "b"))), 4)
@@ -690,10 +699,6 @@ class FabricServerBoundaryTests(unittest.TestCase):
                 "ExpectedSignals": {"n1": True, "y": True},
                 "TestedVectorsBeforeFailure": 3,
                 "GlobalVectorIndex": 3,
-                "ValidationLaneIndex": 1,
-                "ValidationStackIndex": 0,
-                "ValidationVerticalIndex": 1,
-                "ValidationLaneOrigin": [80, 64, 0],
                 "ElapsedTicks": 200,
                 "ObservedUnchangedTicks": 0,
             },
@@ -713,10 +718,10 @@ class FabricServerBoundaryTests(unittest.TestCase):
         self.assertEqual(Trace["FailedOutput"], "y")
         self.assertEqual(Trace["TestedVectorsBeforeFailure"], 3)
         self.assertEqual(Trace["GlobalVectorIndex"], 3)
-        self.assertEqual(Trace["ValidationLaneIndex"], 1)
-        self.assertEqual(Trace["ValidationStackIndex"], 0)
-        self.assertEqual(Trace["ValidationVerticalIndex"], 1)
-        self.assertEqual(Trace["ValidationLaneOrigin"], [80, 64, 0])
+        self.assertNotIn("ValidationLaneIndex", Trace)
+        self.assertNotIn("ValidationStackIndex", Trace)
+        self.assertNotIn("ValidationVerticalIndex", Trace)
+        self.assertNotIn("ValidationLaneOrigin", Trace)
         self.assertEqual(Trace["FirstFailingSubcircuit"]["Gate"], "OutputY")
         self.assertEqual(Trace["FirstFailingBlock"]["FixturePosition"], [4, 0, 1])
         self.assertEqual(Trace["FirstFailingBlock"]["WorldPosition"], [4, 64, 1])

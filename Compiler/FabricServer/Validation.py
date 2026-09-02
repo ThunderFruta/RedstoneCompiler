@@ -31,7 +31,11 @@ WideInputSampleCount = 4096
 
 def DefaultFabricServerRoot() -> Path:
     """Return the repository-owned canonical local Fabric runtime directory."""
-    return Path(__file__).resolve().parents[2] / "FabricServerHarness" / "Server"
+    return (
+        Path(__file__).resolve().parents[2]
+        / "ValidationServerHarness"
+        / "Server"
+    )
 
 
 def ResolveFabricServerRoot() -> Path:
@@ -144,10 +148,10 @@ class FabricServerSupervisor:
         Manager = Root / "PyScripts" / "Main.py"
         BuiltHarness = (
             Path(__file__).resolve().parents[2]
-            / "FabricServerHarness"
+            / "ValidationServerHarness"
             / "build"
             / "libs"
-            / "redstonecompiler-harness-1.0.0.jar"
+            / "validation-server-harness-1.0.0.jar"
         )
         UsesCanonicalManager = Manager.is_file()
         HarnessAvailable = Harness.is_file() or (
@@ -590,6 +594,7 @@ class FabricServerSupervisor:
                                     Completed=Completed,
                                     Total=Total,
                                     Stage=Stage,
+                                    Backend="fabric-26.2-canary",
                                 ))
                             RemainingSeconds = ResponseDeadline - monotonic()
                             if RemainingSeconds <= 0.0:

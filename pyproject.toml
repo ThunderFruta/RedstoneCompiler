@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "redstone-compiler"
 version = "0.1.0"
-description = "SystemVerilog-to-Redstone compiler with NAND synthesis, PCB routing, and Fabric-server validation"
+description = "SystemVerilog-to-Redstone compiler with NAND synthesis, PCB routing, MCHPRS validation, and a Fabric final gate"
 readme = "Readme.md"
 requires-python = ">=3.11"
 dependencies = []

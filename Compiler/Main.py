@@ -18,7 +18,7 @@ from threading import Event, Lock, Thread, active_count
 
 if __package__:
     from .Pipeline import CompileSvToLitematic
-    from .FabricServer import FabricValidationProgress
+    from .PhysicalValidation import PhysicalValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
     from .Routing.Policy import RoutingStrategy
     from .RunReporting import (
@@ -32,7 +32,7 @@ if __package__:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from Compiler.Pipeline import CompileSvToLitematic
-    from Compiler.FabricServer import FabricValidationProgress
+    from Compiler.PhysicalValidation import PhysicalValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
     from Compiler.Routing.Policy import RoutingStrategy
     from Compiler.RunReporting import (
@@ -767,7 +767,7 @@ class TerminalValidationProgressReporter:
         self.Interactive = sys.stderr.isatty()
         self.RefreshIntervalSeconds = 0.1
         self.StartTime: float | None = None
-        self.LatestProgress: FabricValidationProgress | None = None
+        self.LatestProgress: PhysicalValidationProgress | None = None
         self.LastRenderKey: tuple[object, ...] | None = None
         self.LastRenderAt = 0.0
         self.HasRendered = False
@@ -775,7 +775,7 @@ class TerminalValidationProgressReporter:
         self.RefreshStop = Event()
         self.RefreshThread: Thread | None = None
 
-    def __call__(self, Progress: FabricValidationProgress) -> None:
+    def __call__(self, Progress: PhysicalValidationProgress) -> None:
         with self.RenderLock:
             if self.StartTime is None:
                 self.StartTime = time.monotonic()
@@ -795,7 +795,7 @@ class TerminalValidationProgressReporter:
                 if self.LatestProgress is not None:
                     self._Render(self.LatestProgress)
 
-    def _Render(self, Progress: FabricValidationProgress) -> None:
+    def _Render(self, Progress: PhysicalValidationProgress) -> None:
         StartedAt = self.StartTime or time.monotonic()
         Elapsed = max(0.0, time.monotonic() - StartedAt)
         BarWidth = 30
@@ -812,8 +812,13 @@ class TerminalValidationProgressReporter:
             if Progress.Status is not None
             else ""
         )
+        Prefix = (
+            "FABRIC CHECK"
+            if str(Progress.Backend or "").startswith("fabric")
+            else "VALIDATION"
+        )
         Line = (
-            f"VALIDATION [{Bar}] {PercentText} "
+            f"{Prefix} [{Bar}] {PercentText} "
             f"{CompletedText}/{TotalText} vectors | {Progress.Stage}"
             f"{StatusText} | {Elapsed:.1f}s"
         )
@@ -1005,7 +1010,7 @@ def _FabricFailureTraceFromDiagnostics(
     """Extract a Fabric failure trace from routing-failure diagnostics."""
     if not isinstance(Diagnostics, dict):
         return None
-    FabricValidation = Diagnostics.get("FabricServerValidation")
+    FabricValidation = Diagnostics.get("FabricFinalCheck")
     if not isinstance(FabricValidation, dict):
         return None
     FabricDiagnostics = FabricValidation.get("Diagnostics")
@@ -1038,7 +1043,7 @@ def _LoadFabricFailureTrace(
     ArtifactFailure = Artifact.get("Failure")
     if not isinstance(ArtifactFailure, dict):
         return None, ArtifactPath
-    if ArtifactFailure.get("Stage") != "FabricServerValidation":
+    if ArtifactFailure.get("Stage") != "FabricFinalCheck":
         return None, ArtifactPath
     return (
         _FabricFailureTraceFromDiagnostics(ArtifactFailure.get("Diagnostics")),
@@ -1073,11 +1078,11 @@ def PrintFabricFailureSummary(
     OutputPath: Path | None,
 ) -> None:
     """Print the exact retained Fabric block state and coordinates."""
-    IsFabricFailure = str(Error).startswith("FabricServerValidation:")
+    IsFabricFailure = str(Error).startswith("FabricFinalCheck:")
     Failure = getattr(Error, "Failure", None)
     IsFabricFailure = IsFabricFailure or (
         Failure is not None
-        and str(getattr(Failure, "Stage", "")) == "FabricServerValidation"
+        and str(getattr(Failure, "Stage", "")) == "FabricFinalCheck"
     )
     if not IsFabricFailure:
         return
@@ -1106,19 +1111,11 @@ def PrintFabricFailureSummary(
         f"  output: {FailedOutput} expected={Expected} actual={Actual}",
         file=sys.stderr,
     )
-    LaneIndex = FailureTrace.get("ValidationLaneIndex")
-    StackIndex = FailureTrace.get("ValidationStackIndex")
-    VerticalIndex = FailureTrace.get("ValidationVerticalIndex")
-    LaneOrigin = FailureTrace.get("ValidationLaneOrigin")
     GlobalVectorIndex = FailureTrace.get("GlobalVectorIndex")
-    if LaneIndex is not None or GlobalVectorIndex is not None:
+    if GlobalVectorIndex is not None:
         print(
             "  validation: "
-            f"vector={_FormatFabricDiagnosticValue(GlobalVectorIndex)} "
-            f"lane={_FormatFabricDiagnosticValue(LaneIndex)} "
-            f"stack={_FormatFabricDiagnosticValue(StackIndex)} "
-            f"vertical={_FormatFabricDiagnosticValue(VerticalIndex)} "
-            f"origin={_FormatFabricCoordinates(LaneOrigin)}",
+            f"vector={_FormatFabricDiagnosticValue(GlobalVectorIndex)}",
             file=sys.stderr,
         )
 
@@ -1255,7 +1252,8 @@ def _CompileResultDetails(Result, CpuTelemetry: dict[str, object]) -> dict[str, 
         },
         "PipelineRuntimeSeconds": Result.RuntimeSeconds,
         "MaximumNetLengthShare": Result.MaximumNetLengthShare,
-        "FabricServerValidation": vars(Result.FabricServerValidation),
+        "MchprsValidation": vars(Result.MchprsValidation),
+        "FabricFinalCheck": vars(Result.FabricFinalCheck),
         "Artifacts": {
             "Litematic": str(Result.OutputPath),
             "NandJson": str(Result.DiagramPath),
@@ -1275,7 +1273,8 @@ def _CompileOutputSummary(Result, StableOutputPath: Path) -> str:
     )
     return (
         f"{StableOutputPath.stem} | "
-        f"fabric={Result.FabricServerValidation.Status.upper()} | "
+        f"mchprs={Result.MchprsValidation.Status.upper()} "
+        f"fabric={Result.FabricFinalCheck.Status.upper()} | "
         f"nand={Result.NandGateCount} blocks={Result.EstimatedBlocks} "
         f"size={Result.Width}x{Result.Depth}{ConflictText} | "
         f"litematic={StableOutputPath.resolve(strict=False)}"

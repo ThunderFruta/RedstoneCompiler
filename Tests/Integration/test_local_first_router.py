@@ -523,9 +523,9 @@ class LocalFirstRouterTests(unittest.TestCase):
         Output = StringIO()
         Failure = RoutingStageError(RoutingFailure(
             Reason=RoutingFailureReason.FinalDrcViolation,
-            Stage="FabricServerValidation",
+            Stage="FabricFinalCheck",
             Diagnostics={
-                "FabricServerValidation": {
+                "FabricFinalCheck": {
                     "Diagnostics": {
                         "FailureTrace": {
                             "FailureKind": "mismatch",
@@ -533,10 +533,6 @@ class LocalFirstRouterTests(unittest.TestCase):
                             "Expected": True,
                             "Actual": False,
                             "GlobalVectorIndex": 272,
-                            "ValidationLaneIndex": 2,
-                            "ValidationStackIndex": 0,
-                            "ValidationVerticalIndex": 2,
-                            "ValidationLaneOrigin": [80, 64, 48],
                             "FirstFailingBlock": {
                                 "FixturePosition": [12, 1, 9],
                                 "WorldPosition": [112, 65, 209],
@@ -561,11 +557,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
         Text = Output.getvalue()
         self.assertIn("output: Sum2$Output expected=true actual=false", Text)
-        self.assertIn(
-            "validation: vector=272 lane=2 stack=0 vertical=2 "
-            "origin=(80, 64, 48)",
-            Text,
-        )
+        self.assertIn("validation: vector=272", Text)
         self.assertIn(
             "block: minecraft:redstone_wire[east=side,power=0,west=side]",
             Text,
@@ -582,9 +574,9 @@ class LocalFirstRouterTests(unittest.TestCase):
             ArtifactPath = OutputPath.with_suffix(".RoutingFailure.json")
             ArtifactPath.write_text(json.dumps({
                 "Failure": {
-                    "Stage": "FabricServerValidation",
+                    "Stage": "FabricFinalCheck",
                     "Diagnostics": {
-                        "FabricServerValidation": {
+                        "FabricFinalCheck": {
                             "Diagnostics": {
                                 "FailureTrace": {
                                     "FailureKind": "timeout",
@@ -616,7 +608,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             with redirect_stderr(Output):
                 PrintFabricFailureSummary(
                     ValueError(
-                        "FabricServerValidation:timeout:"
+                        "FabricFinalCheck:timeout:"
                         "redstone-network-did-not-settle"
                     ),
                     OutputPath,
@@ -1848,7 +1840,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             Diagnostics = Result.PhysicalDesignPath.read_text(encoding="utf-8")
             EmittedBlockCount = len(LoadTemplate(Result.OutputPath).Blocks)
         self.assertEqual(
-            Result.FabricServerValidation.Status,
+            Result.FabricFinalCheck.Status,
             "passed",
         )
         self.assertEqual(Result.UsedStrategy, "default")
@@ -1868,7 +1860,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(TimingEvents[-1], ("Validation", "finish"))
         self.assertEqual(
             ValidationProgressEvents[0].Stage,
-            "waiting for authoritative Fabric server",
+            "MCHPRS exhaustive physical validation",
         )
         self.assertEqual(ValidationProgressEvents[0].Completed, 0)
         self.assertEqual(ValidationProgressEvents[0].Total, 8)

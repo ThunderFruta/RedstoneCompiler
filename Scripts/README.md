@@ -4,11 +4,23 @@ Every command is runnable from the repository root. Run it with no flags for
 an interactive, safe-by-default guide, or use `--help` for explicit automation
 flags.
 
+## MCHPRS
+
+- `Mchprs/TestPhysicalFixture.py` validates a shared `.PhysicalFixture.json`
+  against its `.Nand.json` oracle using the embedded pinned MCHPRS/Redpiler
+  backend. Designs through 20 inputs run every truth-table vector.
+
+```bash
+python3 Scripts/Mchprs/TestPhysicalFixture.py \
+  Output/FullAdder/FullAdder.PhysicalFixture.json \
+  Output/FullAdder/FullAdder.Nand.json
+```
+
 ## Fabric
 
 - `Fabric/ControlFabricServer.py` is the one lifecycle entry point for the
-  canonical runtime at `FabricServerHarness/Server/`. It delegates to the
-  modular runtime manager under `FabricServerHarness/Server/PyScripts/`; use
+  canonical runtime at `ValidationServerHarness/Server/`. It delegates to the
+  modular runtime manager under `ValidationServerHarness/Server/PyScripts/`; use
   it with `start`, `stop`, `clear`, or no action for a guided menu. `clear`
   preserves the existing `world/` directory and its level identity while
   flushing and palette-scanning every persisted simulation chunk, then clearing

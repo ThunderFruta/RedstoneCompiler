@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start, stop, inspect, or live-clear the canonical local Fabric server."""
+"""Start, stop, inspect, or live-clear the canonical validation server."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ RuntimeMain = RuntimeScripts / "Main.py"
 
 def GuidedArguments() -> list[str]:
     """Ask for one explicit Fabric server lifecycle action."""
-    print("RedstoneCompiler Fabric server")
+    print("RedstoneCompiler validation server")
     print(
         "1) Start or repair server\n"
         "2) Stop server\n"

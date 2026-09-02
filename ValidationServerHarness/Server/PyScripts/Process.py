@@ -29,11 +29,7 @@ from Protocol import SendRequest, WaitForReady
 
 RequestedTickRate = 1000.0
 SettleTimeoutTicks = 200
-ValidationLanesPerStack = 4
-MaximumValidationStackCount = int(
-    os.environ.get("RC_FABRIC_VALIDATION_MAX_STACKS", "16")
-)
-ServiceUnitName = "redstonecompiler-fabric-server.service"
+ServiceUnitName = "redstonecompiler-validation-server.service"
 MaximumWorldSetBlocksPerRequest = 10_000
 
 # This only applies when this canonical runtime has no properties yet.  Once a
@@ -58,7 +54,7 @@ NewServerProperties = {
     "level-name": "world",
     "level-type": "minecraft\\:flat",
     "max-players": "1",
-    "motd": "RedstoneCompiler Fabric simulation",
+    "motd": "RedstoneCompiler validation simulation",
     "online-mode": "true",
     "pause-when-empty-seconds": "0",
     "pvp": "false",
@@ -170,7 +166,7 @@ def EnsureHarnessInstalled() -> None:
         shutil.copy2(BuiltHarnessJarPath, HarnessJarPath)
     if not HarnessJarPath.is_file():
         raise RuntimeError(
-            "harness JAR is missing; build FabricServerHarness before starting"
+            "harness JAR is missing; build ValidationServerHarness before starting"
         )
 
 
@@ -220,8 +216,6 @@ def WriteHarnessConfiguration(Port: int) -> None:
     """Create one fresh private loopback capability for this server run."""
     if not 1 <= Port <= 65535:
         raise ValueError("control port must be between 1 and 65535")
-    if not 1 <= MaximumValidationStackCount <= 16:
-        raise ValueError("maximum validation stack count must be between 1 and 16")
     HarnessConfigurationPath.parent.mkdir(parents=True, exist_ok=True)
     TemporaryPath = HarnessConfigurationPath.with_suffix(".tmp")
     TemporaryPath.write_text(json.dumps({
@@ -229,8 +223,6 @@ def WriteHarnessConfiguration(Port: int) -> None:
         "Port": Port,
         "RequestedTickRate": RequestedTickRate,
         "SettleTimeoutTicks": SettleTimeoutTicks,
-        "ValidationLanesPerStack": ValidationLanesPerStack,
-        "MaximumValidationStackCount": MaximumValidationStackCount,
         "Token": secrets.token_hex(32),
     }, sort_keys=True), encoding="utf-8")
     TemporaryPath.replace(HarnessConfigurationPath)

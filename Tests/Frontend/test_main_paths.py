@@ -160,7 +160,7 @@ class MainPathTests(unittest.TestCase):
                     ".PhysicalDesign.json"
                 )
                 PhysicalDesignPath.write_text("{}")
-                OutputPath.with_suffix(".FabricFixture.json").write_text("{}")
+                OutputPath.with_suffix(".PhysicalFixture.json").write_text("{}")
                 Composition = SimpleNamespace(
                     Footprint=10,
                     XYFootprint=20,
@@ -183,7 +183,13 @@ class MainPathTests(unittest.TestCase):
                     Depth=6,
                     OriginalLogicGateCount=2,
                     OptimizedLogicGateCount=1,
-                    FabricServerValidation=SimpleNamespace(
+                    MchprsValidation=SimpleNamespace(
+                        Status="passed",
+                        Backend="mchprs",
+                        RuntimeSeconds=0.01,
+                        Diagnostics={},
+                    ),
+                    FabricFinalCheck=SimpleNamespace(
                         Status="passed",
                         Backend="fabric",
                         RuntimeSeconds=0.01,

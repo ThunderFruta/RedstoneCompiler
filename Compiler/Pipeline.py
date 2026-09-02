@@ -23,15 +23,18 @@ from Compiler.Placement.Flow.Candidates import ApplyRoutingRuntimeBudget
 from Compiler.Placement.Flow.Results import PcbProgress
 from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
 from .FabricServer import (
-    BuildExpectedVectors,
-    BuildFabricFixture,
     CaptureServerUpdatedLitematic,
     FabricServerConfiguration,
     FabricServerSnapshotArtifact,
     FabricServerSupervisor,
-    FabricServerValidationResult,
-    FabricValidationProgress,
-    WriteFabricFixture,
+)
+from ValidationServerHarness.Mchprs import MchprsValidator
+from .PhysicalValidation import (
+    BuildFabricCanaryVectors,
+    BuildPhysicalFixture,
+    PhysicalValidationProgress,
+    PhysicalValidationResult,
+    WritePhysicalFixture,
 )
 from SchemEncoder import SchemWriter
 from SchemEncoder.SchemWriter import BlockCompositionMetrics
@@ -67,7 +70,8 @@ class CompileResult:
     Depth: int
     OriginalLogicGateCount: int
     OptimizedLogicGateCount: int
-    FabricServerValidation: FabricServerValidationResult
+    MchprsValidation: PhysicalValidationResult
+    FabricFinalCheck: PhysicalValidationResult
     RoutingMetrics: RoutingStageMetrics | None
     PhysicalDesignPath: Path
     RequestedStrategy: str
@@ -113,14 +117,15 @@ RoutingFailureArtifactAggregateDiagnosticKeys = frozenset({
 })
 
 
-def RequireFabricServerValidation(
-    Result: FabricServerValidationResult,
+def RequirePhysicalValidation(
+    Result: PhysicalValidationResult,
+    Stage: str,
 ) -> None:
-    """Reject an artifact unless the authoritative server observed a pass."""
+    """Reject an artifact unless one required physical backend passed."""
     if Result.Status != "passed":
         Detail = Result.Diagnostics.get("Error") or Result.Diagnostics.get("Reason")
         raise ValueError(
-            "FabricServerValidation:"
+            f"{Stage}:"
             f"{Result.Status}"
             + (f":{Detail}" if Detail else "")
         )
@@ -182,13 +187,16 @@ def SuccessArtifactPaths(OutputPath: Path) -> dict[str, Path]:
     return {
         "Schematic": OutputPath,
         "PhysicalDesign": OutputPath.with_suffix(".PhysicalDesign.json"),
-        "FabricFixture": OutputPath.with_suffix(".FabricFixture.json"),
+        "PhysicalFixture": OutputPath.with_suffix(".PhysicalFixture.json"),
     }
 
 
 def ObsoleteArtifactPaths(OutputPath: Path) -> tuple[Path, ...]:
     """Return artifacts produced by the removed in-house simulator."""
-    return (OutputPath.with_suffix(".TruthTable.txt"),)
+    return (
+        OutputPath.with_suffix(".TruthTable.txt"),
+        OutputPath.with_suffix(".FabricFixture.json"),
+    )
 
 
 def ClearStaleSuccessArtifacts(OutputPath: Path) -> list[str]:
@@ -496,13 +504,13 @@ def PublishSuccessArtifacts(
     Routed: object,
     Rendered: object,
     PhysicalDesignDocument: dict[str, object],
-    FabricFixture: dict[str, object] | None = None,
+    PhysicalFixture: dict[str, object] | None = None,
     FabricServerSnapshotSupervisor: FabricServerSupervisor | None = None,
     OutputPath: Path,
 ) -> Path:
     """Stage all success outputs and publish a settled server snapshot.
 
-    A compiler run always supplies both ``FabricFixture`` and
+    A compiler run always supplies both ``PhysicalFixture`` and
     ``FabricServerSnapshotSupervisor``.  The static litematic is written only
     into the private staging directory so the existing compiler-side
     orientation audit and I/O labels remain authoritative.  Minecraft then
@@ -510,9 +518,9 @@ def PublishSuccessArtifacts(
     reset to zero.  Direct callers that do not supply a supervisor retain the
     static writer behavior for narrow unit tests and fixture-only workflows.
     """
-    if FabricServerSnapshotSupervisor is not None and FabricFixture is None:
+    if FabricServerSnapshotSupervisor is not None and PhysicalFixture is None:
         raise ValueError(
-            "Fabric server snapshot requires a Fabric fixture",
+            "Fabric server snapshot requires a physical fixture",
         )
     ArtifactPaths = SuccessArtifactPaths(OutputPath)
     OutputPath.parent.mkdir(parents=True, exist_ok=True)
@@ -544,7 +552,7 @@ def PublishSuccessArtifacts(
                 )
                 SnapshotArtifact = CaptureServerUpdatedLitematic(
                     Supervisor=FabricServerSnapshotSupervisor,
-                    Fixture=FabricFixture,
+                    Fixture=PhysicalFixture,
                     SourcePath=TemporaryStaticOutputPath,
                     OutputPath=TemporaryOutputPath,
                 )
@@ -556,11 +564,11 @@ def PublishSuccessArtifacts(
                             OutputPath,
                         )
                     )
-            if FabricFixture is not None:
+            if PhysicalFixture is not None:
                 TemporaryFixturePath = (
-                    TemporaryRoot / ArtifactPaths["FabricFixture"].name
+                    TemporaryRoot / ArtifactPaths["PhysicalFixture"].name
                 )
-                WriteFabricFixture(TemporaryFixturePath, FabricFixture)
+                WritePhysicalFixture(TemporaryFixturePath, PhysicalFixture)
             RepeaterOrientation = getattr(
                 Rendered,
                 "RepeaterOrientation",
@@ -580,8 +588,8 @@ def PublishSuccessArtifacts(
                 encoding="utf-8",
             )
             TemporaryOutputPath.replace(ArtifactPaths["Schematic"])
-            if FabricFixture is not None:
-                TemporaryFixturePath.replace(ArtifactPaths["FabricFixture"])
+            if PhysicalFixture is not None:
+                TemporaryFixturePath.replace(ArtifactPaths["PhysicalFixture"])
             TemporaryPhysicalDesignPath.replace(ArtifactPaths["PhysicalDesign"])
     except Exception:
         ClearStaleSuccessArtifacts(OutputPath)
@@ -693,7 +701,7 @@ def CompileSvToLitematic(
     TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
     TimingCallback: Callable[[str, str], None] | None = None,
     ValidationProgressCallback: (
-        Callable[[FabricValidationProgress], None] | None
+        Callable[[PhysicalValidationProgress], None] | None
     ) = None,
 ) -> CompileResult:
     """Run the complete SV to NAND diagram and litematic flow."""
@@ -799,108 +807,141 @@ def CompileSvToLitematic(
     NandModule = NandIR.Modules[NandIR.Top]
     if TimingCallback is not None:
         TimingCallback("Validation", "begin")
-    ValidationVectorCount = 0
-    LastCompletedValidationVectors = 0
+    PhysicalFixture = BuildPhysicalFixture(
+        RoutedDesign=Routed,
+        Rendered=Rendered,
+        Module=NandModule,
+    )
+    InputNames = [str(Value["Name"]) for Value in PhysicalFixture["Inputs"]]
+    OutputNames = [str(Value["Name"]) for Value in PhysicalFixture["Outputs"]]
+    MchprsCompletedVectors = 0
+    FabricCompletedVectors = 0
 
-    def ReportValidationProgress(Progress: FabricValidationProgress) -> None:
-        nonlocal LastCompletedValidationVectors
-        LastCompletedValidationVectors = max(
-            LastCompletedValidationVectors,
-            Progress.Completed,
-        )
+    def ReportValidationProgress(Progress: PhysicalValidationProgress) -> None:
+        nonlocal MchprsCompletedVectors, FabricCompletedVectors
+        if Progress.Backend and Progress.Backend.startswith("mchprs"):
+            MchprsCompletedVectors = max(MchprsCompletedVectors, Progress.Completed)
+        elif Progress.Backend and Progress.Backend.startswith("fabric"):
+            FabricCompletedVectors = max(FabricCompletedVectors, Progress.Completed)
         if ValidationProgressCallback is not None:
             ValidationProgressCallback(Progress)
 
     try:
-        FabricFixture = BuildFabricFixture(
-            RoutedDesign=Routed,
-            Rendered=Rendered,
-            Module=NandModule,
-        )
-        ValidationVectors = BuildExpectedVectors(
-            NandModule,
-            (Value["Name"] for Value in FabricFixture["Inputs"]),
-            (Value["Name"] for Value in FabricFixture["Outputs"]),
-            IncludeTraceValues=True,
-        )
-        ValidationVectorCount = len(ValidationVectors)
-        ServerSupervisor = FabricServerSupervisor(
-            FabricServerConfiguration.FromEnvironment(),
-        )
         with TemporaryDirectory(
             dir=OutputPath.parent,
-            prefix=f".{OutputPath.stem}-fabric-validate-",
+            prefix=f".{OutputPath.stem}-physical-validate-",
         ) as FixtureDirectory:
-            ValidationFixture = WriteFabricFixture(
-                Path(FixtureDirectory) / OutputPath.with_suffix(".FabricFixture.json").name,
-                FabricFixture,
+            ValidationFixture = WritePhysicalFixture(
+                Path(FixtureDirectory)
+                / OutputPath.with_suffix(".PhysicalFixture.json").name,
+                PhysicalFixture,
             )
-            if ValidationProgressCallback is not None:
-                ReportValidationProgress(FabricValidationProgress(
-                    Completed=0,
-                    Total=ValidationVectorCount,
-                    Stage="waiting for authoritative Fabric server",
-                ))
-            FabricServerValidation = ServerSupervisor.Validate(
+            MchprsValidation = MchprsValidator().Validate(
                 Fixture=ValidationFixture,
-                Vectors=ValidationVectors,
+                LogicPath=DiagramPath,
                 ProgressCallback=(
                     ReportValidationProgress
                     if ValidationProgressCallback is not None
                     else None
                 ),
             )
-        TestedVectors = FabricServerValidation.Diagnostics.get("TestedVectors")
-        FailureDetails = FabricServerValidation.Diagnostics.get(
-            "Mismatch" if FabricServerValidation.Status == "mismatch" else "Timeout",
-            {},
-        )
-        if not isinstance(FailureDetails, dict):
-            FailureDetails = {}
-        if type(TestedVectors) is not int:
-            TestedVectors = FailureDetails.get("TestedVectorsBeforeFailure")
-        CompletedVectors = (
-            max(0, min(ValidationVectorCount, TestedVectors))
-            if type(TestedVectors) is int
-            else (
-                ValidationVectorCount
-                if FabricServerValidation.Status == "passed"
-                else LastCompletedValidationVectors
+            MchprsTotal = int(MchprsValidation.Diagnostics.get("TotalVectors", 0))
+            MchprsTested = int(MchprsValidation.Diagnostics.get(
+                "TestedVectors",
+                MchprsTotal if MchprsValidation.Status == "passed" else MchprsCompletedVectors,
+            ))
+            if ValidationProgressCallback is not None:
+                ReportValidationProgress(PhysicalValidationProgress(
+                    Completed=MchprsTested,
+                    Total=MchprsTotal,
+                    Stage="MCHPRS exhaustive validation complete",
+                    Status=MchprsValidation.Status,
+                    Backend=MchprsValidation.Backend,
+                ))
+            if MchprsValidation.Status != "passed":
+                TryWriteRoutingFailureArtifact(
+                    OutputPath=OutputPath,
+                    RequestedStrategy=RequestedStrategy,
+                    Failure=RoutingFailure(
+                        Reason=RoutingFailureReason.FinalDrcViolation,
+                        Stage="MchprsValidation",
+                        Detail=(
+                            "MCHPRS exhaustive physical validation did not pass: "
+                            f"{MchprsValidation.Status}"
+                        ),
+                        Diagnostics={"MchprsValidation": asdict(MchprsValidation)},
+                    ),
+                    StartedAt=StartedAt,
+                    InputPath=InputPath,
+                    DiagramPath=DiagramPath,
+                    Workdir=Workdir,
+                    TopModule=TopModule,
+                    EffectivePolicy=EffectivePolicy,
+                )
+                RequirePhysicalValidation(MchprsValidation, "MchprsValidation")
+
+            Stages.append("mchprs_validation")
+            FabricCanaryVectors = BuildFabricCanaryVectors(
+                NandModule,
+                InputNames,
+                OutputNames,
             )
-        )
-        if ValidationProgressCallback is not None:
-            ReportValidationProgress(FabricValidationProgress(
-                Completed=CompletedVectors,
-                Total=ValidationVectorCount,
-                Stage="authoritative Fabric validation complete",
-                Status=FabricServerValidation.Status,
-            ))
-    except BaseException:
-        if ValidationProgressCallback is not None:
-            ReportValidationProgress(FabricValidationProgress(
-                Completed=LastCompletedValidationVectors,
-                Total=ValidationVectorCount,
-                Stage="authoritative Fabric validation failed",
-                Status="failed",
-            ))
-        raise
+            FabricTotal = len(FabricCanaryVectors)
+            ServerSupervisor = FabricServerSupervisor(
+                FabricServerConfiguration.FromEnvironment(),
+            )
+            if ValidationProgressCallback is not None:
+                ReportValidationProgress(PhysicalValidationProgress(
+                    Completed=0,
+                    Total=FabricTotal,
+                    Stage="waiting for required Fabric final check",
+                    Backend="fabric-26.2-canary",
+                ))
+            FabricFinalCheck = ServerSupervisor.Validate(
+                Fixture=ValidationFixture,
+                Vectors=FabricCanaryVectors,
+                ProgressCallback=(
+                    ReportValidationProgress
+                    if ValidationProgressCallback is not None
+                    else None
+                ),
+            )
+            FabricFinalCheck = PhysicalValidationResult(
+                Status=FabricFinalCheck.Status,
+                Backend="fabric-26.2-canary",
+                RuntimeSeconds=FabricFinalCheck.RuntimeSeconds,
+                Diagnostics=FabricFinalCheck.Diagnostics,
+            )
+            FabricTested = FabricFinalCheck.Diagnostics.get("TestedVectors")
+            if type(FabricTested) is not int:
+                FabricTested = FabricTotal if FabricFinalCheck.Status == "passed" else FabricCompletedVectors
+            if ValidationProgressCallback is not None:
+                ReportValidationProgress(PhysicalValidationProgress(
+                    Completed=int(FabricTested),
+                    Total=FabricTotal,
+                    Stage="required Fabric final check complete",
+                    Status=FabricFinalCheck.Status,
+                    Backend=FabricFinalCheck.Backend,
+                ))
     finally:
         if TimingCallback is not None:
             TimingCallback("Validation", "finish")
-    Stages.append("fabric_server_validation")
-    if FabricServerValidation.Status != "passed":
+
+    Stages.append("fabric_final_check")
+    if FabricFinalCheck.Status != "passed":
         TryWriteRoutingFailureArtifact(
             OutputPath=OutputPath,
             RequestedStrategy=RequestedStrategy,
             Failure=RoutingFailure(
                 Reason=RoutingFailureReason.FinalDrcViolation,
-                Stage="FabricServerValidation",
+                Stage="FabricFinalCheck",
                 Detail=(
-                    "authoritative Fabric validation did not pass: "
-                    f"{FabricServerValidation.Status}"
+                    "required Fabric final check did not pass: "
+                    f"{FabricFinalCheck.Status}"
                 ),
                 Diagnostics={
-                    "FabricServerValidation": asdict(FabricServerValidation),
+                    "MchprsValidation": asdict(MchprsValidation),
+                    "FabricFinalCheck": asdict(FabricFinalCheck),
                 },
             ),
             StartedAt=StartedAt,
@@ -910,7 +951,7 @@ def CompileSvToLitematic(
             TopModule=TopModule,
             EffectivePolicy=EffectivePolicy,
         )
-        RequireFabricServerValidation(FabricServerValidation)
+        RequirePhysicalValidation(FabricFinalCheck, "FabricFinalCheck")
 
     GlobalPlan = Routed.GlobalPlan
     Metrics = Routed.RoutingMetrics
@@ -1059,10 +1100,11 @@ def CompileSvToLitematic(
             ),
             "PerNetLength": PerNetLengths,
             "MaximumNetLengthShare": round(MaximumNetLengthShare, 6),
-            "FabricServerValidation": asdict(FabricServerValidation),
-            "FabricFixture": {
+            "MchprsValidation": asdict(MchprsValidation),
+            "FabricFinalCheck": asdict(FabricFinalCheck),
+            "PhysicalFixture": {
                 "Path": NormalizeArtifactPath(
-                    OutputPath.with_suffix(".FabricFixture.json"),
+                    OutputPath.with_suffix(".PhysicalFixture.json"),
                 ),
                 "Sha256": ValidationFixture.Sha256,
                 "BlockCount": ValidationFixture.BlockCount,
@@ -1074,9 +1116,11 @@ def CompileSvToLitematic(
         "RepeaterOrientation": Rendered.RepeaterOrientation,
         "NormalizedQuality": NormalizedQuality,
         "FinalValidation": {
-            "ValidationMode": "fabric-server-authoritative",
-            "FabricServerValidationRequired": True,
-            "FabricServerValidationStatus": FabricServerValidation.Status,
+            "ValidationMode": "mchprs-exhaustive-plus-fabric-canary",
+            "MchprsValidationRequired": True,
+            "MchprsValidationStatus": MchprsValidation.Status,
+            "FabricFinalCheckRequired": True,
+            "FabricFinalCheckStatus": FabricFinalCheck.Status,
             "ZeroConflicts": Routed.ZeroResourceConflicts,
             "ConflictCount": 0 if Routed.ZeroResourceConflicts else 1,
             "UnresolvedClaims": UnresolvedClaims,
@@ -1113,7 +1157,7 @@ def CompileSvToLitematic(
         Routed=Routed,
         Rendered=Rendered,
         PhysicalDesignDocument=PhysicalDesignDocument,
-        FabricFixture=FabricFixture,
+        PhysicalFixture=PhysicalFixture,
         FabricServerSnapshotSupervisor=ServerSupervisor,
         OutputPath=OutputPath,
     )
@@ -1136,7 +1180,8 @@ def CompileSvToLitematic(
         Depth=Composition.Depth,
         OriginalLogicGateCount=OriginalLogicGateCount,
         OptimizedLogicGateCount=OptimizedLogicGateCount,
-        FabricServerValidation=FabricServerValidation,
+        MchprsValidation=MchprsValidation,
+        FabricFinalCheck=FabricFinalCheck,
         RoutingMetrics=Routed.RoutingMetrics,
         PhysicalDesignPath=PhysicalDesignPath,
         RequestedStrategy=Physical.RequestedStrategy,

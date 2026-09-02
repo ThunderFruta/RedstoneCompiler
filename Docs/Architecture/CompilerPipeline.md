@@ -10,9 +10,11 @@
    materializes repeaters, and validates claims.
 5. `SchemEncoder/` writes a neutral-state staging litematic and audits its
    rendered orientation contract.
-6. `Compiler/FabricServer/` validates that staging layout, resets every input
-   low, waits for Minecraft to settle, and publishes the observed all-zero
-   server state as the final `.litematic`.
+6. `ValidationServerHarness/Mchprs/` validates the physical fixture exhaustively
+   through 20 inputs with the pinned MCHPRS/Redpiler engine.
+7. `Compiler/FabricServer/` runs the required single-fixture canary set on
+   Minecraft 26.2, resets every input low, waits for settlement, and publishes
+   the observed all-zero server state as the final `.litematic`.
 
 `Compiler/Pipeline.py` owns end-to-end orchestration.
 `Compiler/Placement/Flow/` owns the placement/routing feedback loop, with the

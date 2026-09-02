@@ -337,7 +337,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
     def testOnlyFabricServerIsAnAuthoritativeSimulationBackend(self) -> None:
         self.assertEqual(
             AuthoritativeServerBackends,
-            frozenset({"fabric-26.2"}),
+            frozenset({"fabric-26.2", "fabric-26.2-canary"}),
         )
 
     def test_compatibility_exact_interface_checkpoint_accepts_frozen_proof(self):
@@ -1377,7 +1377,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 {"ValidationMode": "projected"},
                 AcceptanceCommandResult(0, "", "", 1.0),
                 None,
-                "final validation mode is not Fabric-server authoritative",
+                "final validation mode is not a supported physical authority",
             ),
             (
                 "missing-candidate-fingerprint",

@@ -6,6 +6,7 @@ mod Escape;
 mod Generation;
 mod Geometry;
 mod Path;
+mod PhysicalValidation;
 mod Planning;
 mod Python;
 

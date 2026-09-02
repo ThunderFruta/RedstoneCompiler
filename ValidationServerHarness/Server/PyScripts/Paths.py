@@ -11,7 +11,7 @@ RepositoryRoot = HarnessRoot.parent
 LauncherPath = RuntimeRoot / "fabric-server-launch.jar"
 HarnessJarPath = RuntimeRoot / "mods" / "redstonecompiler-harness.jar"
 BuiltHarnessJarPath = (
-    HarnessRoot / "build" / "libs" / "redstonecompiler-harness-1.0.0.jar"
+    HarnessRoot / "build" / "libs" / "validation-server-harness-1.0.0.jar"
 )
 HarnessConfigurationPath = (
     RuntimeRoot / "config" / "redstonecompiler-harness.json"

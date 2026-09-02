@@ -459,6 +459,7 @@ def PromoteRunArtifacts(
         ".ServerUpdated.litematic",
         ".Nand.json",
         ".PhysicalDesign.json",
+        ".PhysicalFixture.json",
         ".FabricFixture.json",
     )
     StableOutputPath.parent.mkdir(parents=True, exist_ok=True)

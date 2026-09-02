@@ -144,8 +144,8 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
 
         self.assertEqual(Configuration["RequestedTickRate"], 1000.0)
         self.assertEqual(Configuration["SettleTimeoutTicks"], 200)
-        self.assertEqual(Configuration["ValidationLanesPerStack"], 4)
-        self.assertEqual(Configuration["MaximumValidationStackCount"], 16)
+        self.assertNotIn("ValidationLanesPerStack", Configuration)
+        self.assertNotIn("MaximumValidationStackCount", Configuration)
 
     def testCurrentStatusRecoversAUserServiceOwner(self) -> None:
         WriteManagerState = Mock()
@@ -204,22 +204,6 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
 
         RecoveredState = WriteManagerState.call_args.args[0]
         self.assertEqual(RecoveredState["LaunchMethod"], "recovered")
-
-    def testHarnessConfigurationRejectsUnsafeValidationStackCounts(self) -> None:
-        with TemporaryDirectory() as TemporaryDirectoryPath, patch.object(
-            self.Process,
-            "HarnessConfigurationPath",
-            Path(TemporaryDirectoryPath) / "redstonecompiler-harness.json",
-        ), patch.object(
-            self.Process,
-            "MaximumValidationStackCount",
-            17,
-        ):
-            with self.assertRaisesRegex(
-                ValueError,
-                "maximum validation stack count must be between 1 and 16",
-            ):
-                self.Process.WriteHarnessConfiguration(25566)
 
     def testAnvilScannerFindsOnlyNonAirBlocksUsingPaddedStorage(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:

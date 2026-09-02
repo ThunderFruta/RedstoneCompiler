@@ -136,6 +136,7 @@ AcceptanceCases = (
         RequiredRuns=3,
         TruthTableRows=512,
         RuntimeCeilingSeconds=25.0,
+        ValidationVectorCount=20,
     ),
     AcceptanceCase(
         Name="RippleCarryAdder8",
@@ -144,7 +145,7 @@ AcceptanceCases = (
         RequiredRuns=3,
         TruthTableRows=131_072,
         RuntimeCeilingSeconds=30.0,
-        ValidationVectorCount=4_132,
+        ValidationVectorCount=36,
     ),
     AcceptanceCase(
         Name="DecimalToBinary4",
@@ -153,6 +154,7 @@ AcceptanceCases = (
         RequiredRuns=3,
         TruthTableRows=1_024,
         RuntimeCeilingSeconds=30.0,
+        ValidationVectorCount=22,
     ),
     AcceptanceCase(
         Name="TFlipFlopLatch",
@@ -263,6 +265,7 @@ DeterministicEvidenceFields = (
 )
 AuthoritativeServerBackends = frozenset({
     "fabric-26.2",
+    "fabric-26.2-canary",
 })
 PerfBlockSchemaVersion = "router-performance-v1"
 # Baseline capture remains pinned to the frozen pre-change policy. Ordinary
@@ -960,7 +963,7 @@ def BuildRunArtifacts(RunDirectory: Path, RunName: str) -> dict[str, Path]:
         # baseline fixtures can be inspected. It is no longer an acceptance
         # artifact.
         "TruthTable": OutputPath.with_suffix(".TruthTable.txt"),
-        "FabricFixture": OutputPath.with_suffix(".FabricFixture.json"),
+        "FabricFixture": OutputPath.with_suffix(".PhysicalFixture.json"),
         "PhysicalDesign": OutputPath.with_suffix(".PhysicalDesign.json"),
         "RoutingFailure": OutputPath.with_suffix(".RoutingFailure.json"),
         "Diagram": OutputPath.with_suffix(".Nand.json"),
@@ -1864,7 +1867,9 @@ def EvaluateRun(
                 f"{float(PhysicalRuntime):.6f}s > "
                 f"{Case.RuntimeCeilingSeconds:.6f}s"
             )
-        FabricValidation = RunSummary.get("FabricServerValidation")
+        FabricValidation = RunSummary.get("FabricFinalCheck")
+        if not isinstance(FabricValidation, dict):
+            FabricValidation = RunSummary.get("FabricServerValidation")
         if not isinstance(FabricValidation, dict):
             Failures.append("missing Fabric server validation evidence")
             FabricValidation = {}
@@ -1895,7 +1900,9 @@ def EvaluateRun(
                 f"{Diagnostics.get('TestedVectors')!r} != "
                 f"{Case.ExpectedFabricValidationVectorCount}"
             )
-        FabricFixture = RunSummary.get("FabricFixture")
+        FabricFixture = RunSummary.get("PhysicalFixture")
+        if not isinstance(FabricFixture, dict):
+            FabricFixture = RunSummary.get("FabricFixture")
         if not isinstance(FabricFixture, dict):
             Failures.append("missing Fabric fixture evidence")
             FabricFixture = {}
@@ -1921,9 +1928,15 @@ def EvaluateRun(
         if not isinstance(FinalValidation, dict):
             Failures.append("missing FinalValidation evidence")
             FinalValidation = {}
-        if FinalValidation.get("ValidationMode") != "fabric-server-authoritative":
-            Failures.append("final validation mode is not Fabric-server authoritative")
-        if FinalValidation.get("FabricServerValidationStatus") != "passed":
+        if FinalValidation.get("ValidationMode") not in {
+            "fabric-server-authoritative",
+            "mchprs-exhaustive-plus-fabric-canary",
+        }:
+            Failures.append("final validation mode is not a supported physical authority")
+        FabricFinalStatus = FinalValidation.get("FabricFinalCheckStatus")
+        if FabricFinalStatus is None:
+            FabricFinalStatus = FinalValidation.get("FabricServerValidationStatus")
+        if FabricFinalStatus != "passed":
             Failures.append("final Fabric server validation status is not passed")
         if FinalValidation.get("ZeroConflicts") is not True:
             Failures.append("FinalValidation.ZeroConflicts is not true")

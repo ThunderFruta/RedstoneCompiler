@@ -17,7 +17,7 @@ from Process import (
 def BuildParser() -> argparse.ArgumentParser:
     """Build the explicit lifecycle command parser."""
     Parser = argparse.ArgumentParser(
-        description="Start and manage the canonical RedstoneCompiler Fabric server.",
+        description="Start and manage the canonical RedstoneCompiler validation server.",
     )
     Parser.add_argument(
         "Action",
