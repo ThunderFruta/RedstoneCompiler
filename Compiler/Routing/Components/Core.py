@@ -43,14 +43,14 @@ from ..ResourceGraph import (
 from ..Technology import DefaultRedstoneRoutingTechnology
 
 try:
-    from ...RustRouting import (
+    from RedstoneCompiler.RustRouting import (
         BuildFabricSubtreesBatchWithTelemetry as _BuildFabricSubtreesBatchWithTelemetry,
     )
-    from ...RustRouting import BuildRouteClaimsBatch as _BuildRouteClaimsBatch
-    from ...RustRouting import (
+    from RedstoneCompiler.RustRouting import BuildRouteClaimsBatch as _BuildRouteClaimsBatch
+    from RedstoneCompiler.RustRouting import (
         BuildRouteClaimsBatchWithTelemetry as _BuildRouteClaimsBatchWithTelemetry,
     )
-    from ...RustRouting import GetRoutingThreadCount as _GetRoutingThreadCount
+    from RedstoneCompiler.RustRouting import GetRoutingThreadCount as _GetRoutingThreadCount
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import (

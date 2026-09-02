@@ -1,15 +1,21 @@
 from pathlib import Path
 from dataclasses import replace
 from types import SimpleNamespace
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
 from typing import Any
 
 from SVDecoder import Sv
-from Compiler.Main import BuildParser, Main, PrintRoutingFailureSummary
+from Compiler.Main import (
+    BuildParser,
+    Main,
+    PrintFabricFailureSummary,
+    PrintRoutingFailureSummary,
+)
 from Compiler.Pipeline import CompileSvToLitematic
 from Compiler.Placement.Flow.Demand import BuildPlacementGenerationPlan
 from Compiler.Placement.Flow.Preparation import PlacementNeedsDemandDiversity
@@ -36,7 +42,10 @@ from Compiler.Placement.Geometry import (
 )
 from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
-from Compiler.FabricServer import FabricServerValidationResult
+from Compiler.FabricServer import (
+    FabricServerValidationResult,
+    FabricValidationProgress,
+)
 from Compiler.Routing.LocalFirst import (
     AssignCapacityAwareGuideOptionDomains,
     BuildCapacityAwareGuidePlan,
@@ -435,12 +444,14 @@ class LocalFirstRouterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Directory = Path(DirectoryValue)
             ErrorOutput = StringIO()
+            StandardOutput = StringIO()
             with (
                 patch(
                     "Compiler.Main.CompileSvToLitematic",
                     side_effect=Failure,
                 ) as Compile,
                 redirect_stderr(ErrorOutput),
+                redirect_stdout(StandardOutput),
             ):
                 ReturnCode = Main([
                     "--input",
@@ -454,7 +465,16 @@ class LocalFirstRouterTests(unittest.TestCase):
                 ])
 
         self.assertEqual(ReturnCode, 1)
-        self.assertIn("PortalGeneration:NoBoundaryEscape", ErrorOutput.getvalue())
+        self.assertIn(
+            "PortalGeneration: NoBoundaryEscape",
+            StandardOutput.getvalue(),
+        )
+        self.assertIn("RESULT: FAILURE", StandardOutput.getvalue())
+        self.assertIn("Operation failed:", ErrorOutput.getvalue())
+        self.assertIn(
+            "controlled routing failure",
+            ErrorOutput.getvalue(),
+        )
         self.assertEqual(
             Compile.call_args.kwargs["RoutingDeadlineSeconds"],
             3.5,
@@ -498,6 +518,110 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertIn("component placement attempts (1)", Text)
         self.assertIn("NandNet26", Text)
         self.assertIn("CLA4.RoutingFailure.json", Text)
+
+    def testCliFabricFailureSummaryPrintsExactMismatchBlock(self) -> None:
+        Output = StringIO()
+        Failure = RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.FinalDrcViolation,
+            Stage="FabricFinalCheck",
+            Diagnostics={
+                "FabricFinalCheck": {
+                    "Diagnostics": {
+                        "FailureTrace": {
+                            "FailureKind": "mismatch",
+                            "FailedOutput": "Sum2$Output",
+                            "Expected": True,
+                            "Actual": False,
+                            "GlobalVectorIndex": 272,
+                            "FirstFailingBlock": {
+                                "FixturePosition": [12, 1, 9],
+                                "WorldPosition": [112, 65, 209],
+                                "State": {
+                                    "Name": "minecraft:redstone_wire",
+                                    "Properties": {
+                                        "west": "side",
+                                        "power": "0",
+                                        "east": "side",
+                                    },
+                                },
+                            },
+                            "SubcircuitTrace": [],
+                        },
+                    },
+                },
+            },
+        ))
+
+        with redirect_stderr(Output):
+            PrintFabricFailureSummary(Failure, None)
+
+        Text = Output.getvalue()
+        self.assertIn("output: Sum2$Output expected=true actual=false", Text)
+        self.assertIn("validation: vector=272", Text)
+        self.assertIn(
+            "block: minecraft:redstone_wire[east=side,power=0,west=side]",
+            Text,
+        )
+        self.assertIn(
+            "coords: fixture=(12, 1, 9) world=(112, 65, 209)",
+            Text,
+        )
+        self.assertIn("evidence: first mismatching block", Text)
+
+    def testCliFabricTimeoutUsesFailedOutputProbeFromArtifact(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            OutputPath = Path(DirectoryValue) / "Rca4.litematic"
+            ArtifactPath = OutputPath.with_suffix(".RoutingFailure.json")
+            ArtifactPath.write_text(json.dumps({
+                "Failure": {
+                    "Stage": "FabricFinalCheck",
+                    "Diagnostics": {
+                        "FabricFinalCheck": {
+                            "Diagnostics": {
+                                "FailureTrace": {
+                                    "FailureKind": "timeout",
+                                    "FailedOutput": "Sum3$Output",
+                                    "Expected": False,
+                                    "Actual": False,
+                                    "FirstFailingBlock": None,
+                                    "SubcircuitTrace": [{
+                                        "Output": {
+                                            "Signal": "Sum3$Output",
+                                            "Blocks": [{
+                                                "FixturePosition": [60, 1, 29],
+                                                "WorldPosition": [60, 65, 29],
+                                                "State": {
+                                                    "Name": "minecraft:redstone_lamp",
+                                                    "Properties": {"lit": "false"},
+                                                },
+                                            }],
+                                        },
+                                    }],
+                                },
+                            },
+                        },
+                    },
+                },
+            }), encoding="utf-8")
+            Output = StringIO()
+
+            with redirect_stderr(Output):
+                PrintFabricFailureSummary(
+                    ValueError(
+                        "FabricFinalCheck:timeout:"
+                        "redstone-network-did-not-settle"
+                    ),
+                    OutputPath,
+                )
+
+        Text = Output.getvalue()
+        self.assertIn("kind: timeout", Text)
+        self.assertIn("block: minecraft:redstone_lamp[lit=false]", Text)
+        self.assertIn(
+            "coords: fixture=(60, 1, 29) world=(60, 65, 29)",
+            Text,
+        )
+        self.assertIn("failed-output probe", Text)
 
     def testDefaultPolicyEnablesAuthoritativeRoutingFeatures(self) -> None:
         self.assertTrue(
@@ -1657,6 +1781,8 @@ class LocalFirstRouterTests(unittest.TestCase):
     def testNewRouterFullAdderWritesCompleteDiagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
             Root = Path(Directory)
+            TimingEvents = []
+            ValidationProgressEvents = []
             def CaptureServerSnapshot(*, SourcePath, OutputPath, **_Options):
                 OutputPath.write_bytes(SourcePath.read_bytes())
                 return SimpleNamespace(
@@ -1677,11 +1803,26 @@ class LocalFirstRouterTests(unittest.TestCase):
                     side_effect=CaptureServerSnapshot,
                 ),
             ):
-                Supervisor.return_value.Validate.return_value = FabricServerValidationResult(
-                    Status="passed",
-                    Backend="fabric-26.2",
-                    RuntimeSeconds=0.0,
-                )
+                def ValidateInFabric(**Options):
+                    ProgressCallback = Options["ProgressCallback"]
+                    VectorCount = len(Options["Vectors"])
+                    ProgressCallback(FabricValidationProgress(
+                        Completed=0,
+                        Total=VectorCount,
+                        Stage="authoritative Fabric truth-table validation",
+                    ))
+                    ProgressCallback(FabricValidationProgress(
+                        Completed=VectorCount // 2,
+                        Total=VectorCount,
+                        Stage="authoritative Fabric truth-table validation",
+                    ))
+                    return FabricServerValidationResult(
+                        Status="passed",
+                        Backend="fabric-26.2",
+                        RuntimeSeconds=0.0,
+                    )
+
+                Supervisor.return_value.Validate.side_effect = ValidateInFabric
                 Result = CompileSvToLitematic(
                     InputPath=Path("Examples/FullAdder.sv"),
                     TopModule="FullAdder",
@@ -1689,14 +1830,54 @@ class LocalFirstRouterTests(unittest.TestCase):
                     DiagramPath=Root / "FullAdder.Nand.json",
                     Workdir=Root / "Frontend",
                     RoutingStrategyValue=RoutingStrategy.Default,
+                    TimingCallback=lambda Name, Event: TimingEvents.append(
+                        (Name, Event)
+                    ),
+                    ValidationProgressCallback=(
+                        ValidationProgressEvents.append
+                    ),
                 )
             Diagnostics = Result.PhysicalDesignPath.read_text(encoding="utf-8")
             EmittedBlockCount = len(LoadTemplate(Result.OutputPath).Blocks)
         self.assertEqual(
-            Result.FabricServerValidation.Status,
+            Result.FabricFinalCheck.Status,
             "passed",
         )
         self.assertEqual(Result.UsedStrategy, "default")
+        self.assertEqual(TimingEvents[0], ("Routing", "begin"))
+        self.assertIn(
+            ("RoutingStage", "physical component interface planning"),
+            TimingEvents,
+        )
+        self.assertIn(
+            ("RoutingStage", "placement candidate routing"),
+            TimingEvents,
+        )
+        self.assertLess(
+            TimingEvents.index(("Routing", "finish")),
+            TimingEvents.index(("Validation", "begin")),
+        )
+        self.assertEqual(TimingEvents[-1], ("Validation", "finish"))
+        self.assertEqual(
+            ValidationProgressEvents[0].Stage,
+            "MCHPRS exhaustive physical validation",
+        )
+        self.assertEqual(ValidationProgressEvents[0].Completed, 0)
+        self.assertEqual(ValidationProgressEvents[0].Total, 8)
+        self.assertEqual(
+            ValidationProgressEvents[-1].Status,
+            "passed",
+        )
+        self.assertEqual(
+            ValidationProgressEvents[-1].Completed,
+            ValidationProgressEvents[-1].Total,
+        )
+        self.assertTrue(any(
+            Progress.Completed == 4
+            and Progress.Total == 8
+            and Progress.Stage == "authoritative Fabric truth-table validation"
+            for Progress in ValidationProgressEvents
+        ))
         self.assertIn('"UnresolvedClaimCount": 0', Diagnostics)
         self.assertIn('"PlanningContracts"', Diagnostics)
         self.assertIn('"BlockComposition"', Diagnostics)

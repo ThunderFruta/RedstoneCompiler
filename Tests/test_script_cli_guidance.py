@@ -139,7 +139,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
         self.assertIn("'ObservedBlockCount': 8", Output.getvalue())
 
     def testFabricTesterGuidesToTheImportedSchematic(self) -> None:
-        with patch("builtins.input", side_effect=["build.litematic", "", ""]):
+        with patch("builtins.input", side_effect=["", "build.litematic", "", ""]):
             Arguments = TestSchemInFabricServer.GuidedArguments()
 
         self.assertEqual(
@@ -148,7 +148,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
         )
 
     def testFabricTesterGuidesToOneTruthTableRow(self) -> None:
-        with patch("builtins.input", side_effect=["build.litematic", "", "1", "3"]):
+        with patch("builtins.input", side_effect=["1", "build.litematic", "", "1", "3"]):
             Arguments = TestSchemInFabricServer.GuidedArguments()
 
         self.assertEqual(
@@ -160,7 +160,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
         )
 
     def testFabricTesterGuidesToAllRowsOneAtATime(self) -> None:
-        with patch("builtins.input", side_effect=["build.litematic", "", "3"]):
+        with patch("builtins.input", side_effect=["1", "build.litematic", "", "3"]):
             Arguments = TestSchemInFabricServer.GuidedArguments()
 
         self.assertEqual(
@@ -168,6 +168,22 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             [
                 "build.litematic", "--server-root", CanonicalServerRoot,
                 "--all-one-at-a-time",
+            ],
+        )
+
+    def testFabricTesterGuidesToExistingWorldStateWithAnSvOracle(self) -> None:
+        with patch(
+            "builtins.input",
+            side_effect=["2", "Examples/FullAdder.sv", "", ""],
+        ):
+            Arguments = TestSchemInFabricServer.GuidedArguments()
+
+        self.assertEqual(
+            Arguments,
+            [
+                "--existing-state", "Examples/FullAdder.sv",
+                "--server-root", CanonicalServerRoot,
+                "--all",
             ],
         )
 
@@ -193,6 +209,12 @@ class ScriptCliGuidanceTests(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             Parser.parse_args(["build.litematic", "--all", "--vector-index", "3"])
+        self.assertEqual(
+            Parser.parse_args([
+                "--existing-state", "Examples/FullAdder.sv",
+            ]).existing_state,
+            Path("Examples/FullAdder.sv"),
+        )
 
     def testFabricTesterSelectsOneTruthTableRowAndRejectsInvalidRows(self) -> None:
         Vectors = [
@@ -354,9 +376,126 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             [{"Inputs": {"a": True}, "Expected": {"y": True}}],
         )
 
-    def testRoutingGuidesDefaultToSafePreviews(self) -> None:
+    def testFabricTesterExistingStateUsesSvAndNeverCallsReloadValidation(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            Root = Path(TemporaryDirectoryPath)
+            Source = Root / "Top.sv"
+            Source.write_text(
+                "module Top(input logic a, output logic y); assign y = a; endmodule\n",
+                encoding="utf-8",
+            )
+            FixtureDirectory = Root / "server" / "fixtures"
+            FixtureDirectory.mkdir(parents=True)
+            (FixtureDirectory / "Top.FabricFixture.json").write_text(
+                '{"Arena":{"Origin":[0,64,0]},"Blocks":[],"Inputs":'
+                '[{"Name":"a","LeverPosition":[0,0,0]}],"Outputs":'
+                '[{"Name":"y","LampPosition":[1,0,0]}]}',
+                encoding="utf-8",
+            )
+            Result = SimpleNamespace(
+                Status="passed",
+                Backend="fabric-26.2",
+                RuntimeSeconds=0.1,
+                Diagnostics={
+                    "WorldStateMode": "existing",
+                    "WorldCleared": False,
+                    "FixturePasted": False,
+                },
+            )
+            Output = StringIO()
+            with patch(
+                "Scripts.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
+            ) as Supervisor, redirect_stdout(Output):
+                Supervisor.return_value.ValidateExisting.return_value = Result
+                ExitCode = TestSchemInFabricServer.Main([
+                    "--existing-state",
+                    str(Source),
+                    "--server-root",
+                    str(Root / "server"),
+                ])
+
+        self.assertEqual(ExitCode, 0)
+        Supervisor.return_value.Validate.assert_not_called()
+        ExistingCall = Supervisor.return_value.ValidateExisting.call_args.kwargs
+        self.assertEqual(
+            [Vector["Expected"] for Vector in ExistingCall["Vectors"]],
+            [{"y": False}, {"y": True}],
+        )
+        self.assertIn("'WorldState': 'existing'", Output.getvalue())
+        self.assertIn(f"'Sv': '{Source.resolve()}'", Output.getvalue())
+        self.assertIn("'Nand': None", Output.getvalue())
+
+    def testFabricTesterRegistersMissingExistingStatePortMapWithoutPasting(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            Root = Path(TemporaryDirectoryPath)
+            Source = Root / "Top.sv"
+            Litematic = Root / "Top.litematic"
+            ServerRoot = Root / "server"
+            FixturePath = ServerRoot / "fixtures" / "Top.FabricFixture.json"
+            Source.write_text(
+                "module Top(input logic a, output logic y); assign y = a; endmodule\n",
+                encoding="utf-8",
+            )
+            Litematic.write_bytes(b"fixture-builder-is-mocked")
+            Document = {
+                "SchemaVersion": 2,
+                "TopModule": "Top",
+                "Arena": {"Origin": [12, 70, -8], "ResetBeforeLoad": False},
+                "Blocks": [],
+                "Inputs": [{"Name": "a", "LeverPosition": [12, 70, -8]}],
+                "Outputs": [{"Name": "y", "LampPosition": [13, 70, -8]}],
+            }
+            Result = SimpleNamespace(
+                Status="passed",
+                Backend="fabric-26.2",
+                RuntimeSeconds=0.1,
+                Diagnostics={"FixturePasted": False, "WorldCleared": False},
+            )
+            Output = StringIO()
+            with patch(
+                "Scripts.Fabric.TestSchemInFabricServer.BuildFabricFixtureFromSchem",
+                return_value=Document,
+            ) as BuildFixture, patch(
+                "Scripts.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
+            ) as Supervisor, redirect_stdout(Output):
+                Supervisor.return_value.ValidateExisting.return_value = Result
+                ExitCode = TestSchemInFabricServer.Main([
+                    "--existing-state",
+                    str(Source),
+                    "--litematic",
+                    str(Litematic),
+                    "--origin",
+                    "12",
+                    "70",
+                    "-8",
+                    "--server-root",
+                    str(ServerRoot),
+                    "--vector-index",
+                    "0",
+                ])
+                FixtureWasWritten = FixturePath.is_file()
+
+        self.assertEqual(ExitCode, 0)
+        BuildFixture.assert_called_once_with(
+            Litematic.resolve(),
+            Origin=(12, 70, -8),
+            ResetBeforeLoad=False,
+        )
+        self.assertTrue(FixtureWasWritten)
+        Supervisor.return_value.Validate.assert_not_called()
+        Supervisor.return_value.ValidateExisting.assert_called_once()
+        self.assertIn(f"'FixtureRegisteredFrom': '{Litematic.resolve()}'", Output.getvalue())
+
+    def testRoutingGuideDefaultsToDefaultRunWithoutPreviews(self) -> None:
         with patch("builtins.input", side_effect=[""]):
-            self.assertEqual(RunRouterAcceptance.GuidedArguments(), ["--dry-run"])
+            self.assertEqual(RunRouterAcceptance.GuidedArguments(), [])
+        with patch("builtins.input", side_effect=["1"]):
+            self.assertEqual(
+                RunRouterAcceptance.GuidedArguments(),
+                ["--matrix", "expanded"],
+            )
+        with patch("builtins.input", side_effect=["2"]):
+            self.assertEqual(RunRouterAcceptance.GuidedArguments(), [])
 
     def testSnapshotGuideCollectsExplicitInputPaths(self) -> None:
         with patch("builtins.input", side_effect=["failure.json", "", "manifest.json", "diagram.json", ""]):

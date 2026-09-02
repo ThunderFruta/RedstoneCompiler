@@ -173,8 +173,12 @@ success.
   bindings; `Lib.rs` is the PyO3 registration entrypoint.
 - `Scripts/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
   evidence-manifest harness.
-- `Compiler/FabricServer/` and `FabricServerHarness/` -- live Fabric validation
-  and tracked harness source; `FabricServerHarness/Server/` is the ignored local runtime.
+- `ValidationServerHarness/Mchprs/` -- fast exhaustive physical redstone
+  validation through the pinned MCHPRS/Redpiler engine.
+- `Compiler/FabricServer/` and `ValidationServerHarness/` -- the required
+  single-fixture Minecraft 26.2 canary check, validation backends, and tracked
+  harness source;
+  `ValidationServerHarness/Server/` is the ignored local runtime.
 - `Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
 - `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.
 

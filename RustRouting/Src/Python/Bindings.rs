@@ -27,6 +27,7 @@ use crate::Geometry::RouteClaims::{
     BuildRouteClaimsBatchWithTelemetry, GenerateRectilinearTopology,
 };
 use crate::Path::PathRouting::FindPath;
+use crate::PhysicalValidation::Mchprs::ValidateMchprsFixture;
 use crate::Planning::AssignmentPlanning::{
     AssignmentCandidateValue, BaseAssignmentValue, CompactClaimPrimitiveValue,
     CompactFactorMemberValue, DeadlineExceededAssignmentResult,
@@ -326,6 +327,7 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
         SolveCompactTemplateFactorCatalogBounded,
         Module
     )?)?;
+    Module.add_function(wrap_pyfunction!(ValidateMchprsFixture, Module)?)?;
     Ok(())
 }
 

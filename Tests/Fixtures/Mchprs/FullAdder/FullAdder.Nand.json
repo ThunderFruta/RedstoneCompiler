@@ -1,0 +1,157 @@
+{
+  "Module": "FullAdder",
+  "Inputs": [
+    "A",
+    "B",
+    "CarryIn"
+  ],
+  "Outputs": [
+    "Sum",
+    "CarryOut"
+  ],
+  "Gates": [
+    {
+      "Name": "InputA",
+      "Kind": "INPUT",
+      "Inputs": [],
+      "Outputs": [
+        "A"
+      ]
+    },
+    {
+      "Name": "InputB",
+      "Kind": "INPUT",
+      "Inputs": [],
+      "Outputs": [
+        "B"
+      ]
+    },
+    {
+      "Name": "InputCarryIn",
+      "Kind": "INPUT",
+      "Inputs": [],
+      "Outputs": [
+        "CarryIn"
+      ]
+    },
+    {
+      "Name": "NandGate0",
+      "Kind": "NAND",
+      "Inputs": [
+        "A",
+        "B"
+      ],
+      "Outputs": [
+        "NandNet0"
+      ]
+    },
+    {
+      "Name": "NandGate1",
+      "Kind": "NAND",
+      "Inputs": [
+        "A",
+        "NandNet0"
+      ],
+      "Outputs": [
+        "NandNet1"
+      ]
+    },
+    {
+      "Name": "NandGate2",
+      "Kind": "NAND",
+      "Inputs": [
+        "B",
+        "NandNet0"
+      ],
+      "Outputs": [
+        "NandNet2"
+      ]
+    },
+    {
+      "Name": "NandGate3",
+      "Kind": "NAND",
+      "Inputs": [
+        "NandNet1",
+        "NandNet2"
+      ],
+      "Outputs": [
+        "Propagate"
+      ]
+    },
+    {
+      "Name": "NandGate4",
+      "Kind": "NAND",
+      "Inputs": [
+        "Propagate",
+        "CarryIn"
+      ],
+      "Outputs": [
+        "NandNet3"
+      ]
+    },
+    {
+      "Name": "NandGate5",
+      "Kind": "NAND",
+      "Inputs": [
+        "Propagate",
+        "NandNet3"
+      ],
+      "Outputs": [
+        "NandNet4"
+      ]
+    },
+    {
+      "Name": "NandGate6",
+      "Kind": "NAND",
+      "Inputs": [
+        "CarryIn",
+        "NandNet3"
+      ],
+      "Outputs": [
+        "NandNet5"
+      ]
+    },
+    {
+      "Name": "NandGate7",
+      "Kind": "NAND",
+      "Inputs": [
+        "NandNet4",
+        "NandNet5"
+      ],
+      "Outputs": [
+        "Sum"
+      ]
+    },
+    {
+      "Name": "NandGate8",
+      "Kind": "NAND",
+      "Inputs": [
+        "NandNet0",
+        "NandNet3"
+      ],
+      "Outputs": [
+        "CarryOut"
+      ]
+    },
+    {
+      "Name": "OutputSum",
+      "Kind": "OUTPUT",
+      "Inputs": [
+        "Sum"
+      ],
+      "Outputs": [
+        "Sum$Output"
+      ]
+    },
+    {
+      "Name": "OutputCarryOut",
+      "Kind": "OUTPUT",
+      "Inputs": [
+        "CarryOut"
+      ],
+      "Outputs": [
+        "CarryOut$Output"
+      ]
+    }
+  ]
+}

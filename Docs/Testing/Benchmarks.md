@@ -1,27 +1,58 @@
 # Routing benchmarks
 
-| Benchmark | Purpose | Runs | Fabric validation vectors | Wall ceiling |
-| --- | --- | ---: | ---: | ---: |
-| FullAdder | Small correctness and deterministic overhead gate | 5 | 8 | 10 s |
-| RippleCarryAdder4 | Repeated-stage congestion and regression gate | 3 | 512 | 25 s |
-| RippleCarryAdder8 | 8-bit carry ripple scalability gate | 3 | 4132 | 30 s |
-| CarryLookaheadAdder4 (extended) | Optional exact-interface proof check | 2 | 512 | 120 s |
+| Benchmark | Matrix | Purpose | Runs | MCHPRS vectors | Fabric canaries | Wall ceiling |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| HalfAdder | Expanded | Small two-input arithmetic check | 1 | 4 | 4 | 10 s |
+| FullAdder | Default and expanded | Small correctness and deterministic overhead gate | 1 | 8 | 8 | 15 s |
+| RippleCarryAdder4 | Default and expanded | Repeated-stage congestion and regression gate | 1 | 512 | 20 | 25 s |
+| RippleCarryAdder8 | Default and expanded | 8-bit carry ripple scalability gate | 1 | 131072 | 36 | 30 s |
+| DecimalToBinary4 | Expanded | One-hot decimal encoder check | 1 | 1024 | 22 | 30 s |
+| TFlipFlopLatch | Expanded | Explicit-state toggle/latch logic check | 1 | 8 | 8 | 15 s |
+| CarryLookaheadAdder4 | Expanded | Exact-interface proof check | 1 | 512 | 20 | 120 s |
 
 Full acceptance requires zero final conflicts, zero unresolved claims,
 identical repeated fingerprints, no fallback, a durable Fabric fixture, and
-a passed authoritative Fabric-server validation record. The retired
-`*.TruthTable.txt` simulator artifact is not an acceptance gate: the server
-checks the FullAdder/RCA4/CLA4 vectors exhaustively and uses 4,132
-deterministic wide vectors for RCA8.
+a passed MCHPRS record plus the required Fabric-server canaries. The retired
+`*.TruthTable.txt` simulator artifact is not an acceptance gate. MCHPRS is
+exhaustive through 20 inputs; wider designs use deterministic edge cases plus
+4,096 samples. Fabric remains the final Minecraft correctness gate.
 
-## Current checkpoint
+## Saved run reports
 
-The default acceptance sequence is FA/RCA4/RCA8 with reproducible determinism
-and strict no-fallback evidence. Add `--include-cla4` to append the two CLA4
-runs and the fixture-backed exact-interface proof checkpoint. CLA4 uses the
-same default routing strategy and no-fallback gate as the default sequence.
+Compiler runs write immutable evidence beneath
+`Output/<Circuit>/Runs/<UTC run id>/`. `Summary.txt` always starts with result,
+total time and CPU utilization. Compiler summaries then report the bounded
+routing interval, each named routing sub-stage, and authoritative validation
+time before the optional CPU breakdown, one-line output, and raw-report path.
+The terminal closes the routing progress bar before opening a separate Fabric
+validation bar. Because the harness returns one terminal response, that bar is
+indeterminate while the known vector set is running and becomes determinate
+from the authoritative tested-vector count when the response arrives.
+`RawDump.txt` retains full
+stdout/stderr, Git and runtime provenance, stage telemetry, typed failure
+evidence, validation gates, and an artifact size/hash inventory. Only a fully
+successful run atomically refreshes the stable artifacts directly under
+`Output/<Circuit>/`.
 
-## Latest acceptance sweep (2026-08-03)
+## Acceptance matrix
+
+The default acceptance matrix is exactly FA/RCA4/RCA8. Select
+`--matrix expanded` to run all seven bundled examples: HalfAdder, FullAdder,
+RCA4, RCA8, DecimalToBinary4, TFlipFlopLatch, and CLA4. CLA4 retains its
+fixture-backed exact-interface proof checkpoint. Both matrices execute every
+scheduled repetition even after an earlier failure; the overall session fails
+if any required run or correctness gate fails. Expanded mode is standalone and
+cannot capture or compare the historical regression baseline.
+
+Normal default and expanded acceptance execute each selected circuit exactly
+once. Specialized baseline capture/comparison retains its historical repeated
+sampling contract so existing version-one baseline evidence remains readable.
+
+## Historical acceptance sweep — 2026-08-03
+
+The following retained evidence is historical and must not be presented as the
+current checkout result. Establish current status with a fresh output root and
+manifest.
 
 ### Execution commands
 

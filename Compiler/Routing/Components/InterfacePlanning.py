@@ -18,7 +18,7 @@ import os
 from typing import Any
 
 try:
-    from ...RustRouting import SolveLeaseDomainsBounded as _SolveLeaseDomainsBounded
+    from RedstoneCompiler.RustRouting import SolveLeaseDomainsBounded as _SolveLeaseDomainsBounded
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import SolveLeaseDomainsBounded as _SolveLeaseDomainsBounded

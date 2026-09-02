@@ -284,6 +284,7 @@ def BuildFabricFailureTrace(
         "Expected": ExpectedOutput,
         "Actual": ActualOutput,
         "TestedVectorsBeforeFailure": Mismatch.get("TestedVectorsBeforeFailure"),
+        "GlobalVectorIndex": Mismatch.get("GlobalVectorIndex"),
         "SubcircuitTrace": Entries,
         "FirstFailingSubcircuit": (
             {

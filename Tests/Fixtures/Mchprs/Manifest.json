@@ -1,0 +1,29 @@
+{
+  "SchemaVersion": "mchprs-test-fixtures-v1",
+  "Circuits": {
+    "FullAdder": {
+      "SourceRevision": "361fd884ca4cec87283f79b1ce620aff622759e9",
+      "ExpectedVectors": 8,
+      "PhysicalFixture": {
+        "Path": "FullAdder/FullAdder.PhysicalFixture.json",
+        "Sha256": "a64bf6c51ae8fb4dddee315d18917bc8a51ad02b0b16758bf495d4662c8e0ffe"
+      },
+      "NandLogic": {
+        "Path": "FullAdder/FullAdder.Nand.json",
+        "Sha256": "8bbd1241f373a47b9657a95340c85787dce17f36c6e47b427aa2e63eafd3450e"
+      }
+    },
+    "RippleCarryAdder8": {
+      "SourceRevision": "6312761ce0a5f3fdcd9ef05f2c34cd8b225bc2f5",
+      "ExpectedVectors": 131072,
+      "PhysicalFixture": {
+        "Path": "RippleCarryAdder8/RippleCarryAdder8.PhysicalFixture.json",
+        "Sha256": "96423394a14ebdc8441fdeb97e43d0fa56848ae4f21366ae849e82e4d74c3f35"
+      },
+      "NandLogic": {
+        "Path": "RippleCarryAdder8/RippleCarryAdder8.Nand.json",
+        "Sha256": "89a13c918174cdd943d7479f9d492b51edc39113e13cfb7ac9b301363bc919ca"
+      }
+    }
+  }
+}

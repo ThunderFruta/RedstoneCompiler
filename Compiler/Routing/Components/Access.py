@@ -25,10 +25,10 @@ from ..ResourceGraph import (
 from ..Technology import DefaultRedstoneRoutingTechnology
 
 try:
-    from ...RustRouting import (
+    from RedstoneCompiler.RustRouting import (
         BuildRouteClaimsBatchWithTelemetry as _BuildRouteClaimsBatchWithTelemetry,
     )
-    from ...RustRouting import GetRoutingThreadCount as _GetRoutingThreadCount
+    from RedstoneCompiler.RustRouting import GetRoutingThreadCount as _GetRoutingThreadCount
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import (

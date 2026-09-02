@@ -1,10 +1,11 @@
-"""Guided and argument-driven RedstoneCompiler entrypoint."""
+"""Argument-driven RedstoneCompiler compiler entrypoint."""
 
 from __future__ import annotations
 
 import argparse
-import atexit
+from contextlib import redirect_stderr
 import json
+from io import StringIO
 from math import isfinite
 from pathlib import Path
 import shutil
@@ -12,17 +13,36 @@ import subprocess
 import sys
 import os
 import time
+import traceback
 from threading import Event, Lock, Thread, active_count
 
 if __package__:
     from .Pipeline import CompileSvToLitematic
+    from .PhysicalValidation import PhysicalValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
     from .Routing.Policy import RoutingStrategy
+    from .RunReporting import (
+        BuildRunId,
+        CaptureTerminalOutput,
+        FormatResultLines,
+        PromoteRunArtifacts,
+        UtcTimestamp,
+        WriteRunReport,
+    )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from Compiler.Pipeline import CompileSvToLitematic
+    from Compiler.PhysicalValidation import PhysicalValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
     from Compiler.Routing.Policy import RoutingStrategy
+    from Compiler.RunReporting import (
+        BuildRunId,
+        CaptureTerminalOutput,
+        FormatResultLines,
+        PromoteRunArtifacts,
+        UtcTimestamp,
+        WriteRunReport,
+    )
 
 
 MinecraftSchematicsDirectory = Path(
@@ -65,6 +85,8 @@ class CpuRunTelemetry:
         self.CompileStartTimes: os.times_result | None = None
         self.CompileFinishedAt: float | None = None
         self.CompileFinishTimes: os.times_result | None = None
+        self.IntervalStarts: dict[str, tuple[float, os.times_result]] = {}
+        self.IntervalFinishes: dict[str, tuple[float, os.times_result]] = {}
         self.RoutingStages: list[tuple[str, float, os.times_result]] = []
         self.PeakOsThreads = self.ReadOsThreadCount()
         self.PeakPythonThreads = active_count()
@@ -79,6 +101,7 @@ class CpuRunTelemetry:
         self.SampleThread.start()
         self.HasPrinted = False
         self.PrintLock = Lock()
+        self.Stopped = False
 
     @staticmethod
     def ReadOsThreadCount() -> int:
@@ -120,17 +143,42 @@ class CpuRunTelemetry:
             self.CompileFinishedAt = time.monotonic()
             self.CompileFinishTimes = os.times()
 
-    def RecordRoutingProgress(self, Progress: PcbProgress) -> None:
-        """Record only stage transitions; rendering remains independent."""
-        Stage = str(Progress.Stage)
+    def RecordPipelineTimingEvent(self, Name: str, Event: str) -> None:
+        """Capture exact pipeline interval boundaries for final reporting."""
+        if Name == "RoutingStage":
+            self.RecordRoutingStage(Event)
+            return
+        CapturedAt = time.monotonic()
+        CapturedTimes = os.times()
+        if Event == "begin":
+            self.IntervalStarts[Name] = (CapturedAt, CapturedTimes)
+            self.IntervalFinishes.pop(Name, None)
+            if Name == "Routing":
+                self.RoutingStages = [
+                    ("routing setup", CapturedAt, CapturedTimes),
+                ]
+            return
+        if Event == "finish" and Name in self.IntervalStarts:
+            self.IntervalFinishes[Name] = (CapturedAt, CapturedTimes)
+
+    def RecordRoutingStage(self, StageValue: str) -> None:
+        """Record one stable routing stage transition."""
+        Stage = str(StageValue)
         # Progress text may append per-net/iteration diagnostics after a
         # separator.  Keep the stable stage name so the final CPU report is
         # useful rather than hundreds of near-duplicate lines.
-        if " | " in Stage:
-            Stage = Stage.split(" | ", 1)[-1]
+        StageParts = Stage.split(" | ")
+        if StageParts and StageParts[0].startswith("spacing "):
+            StageParts = StageParts[1:]
+        if StageParts:
+            Stage = StageParts[0]
         if self.RoutingStages and self.RoutingStages[-1][0] == Stage:
             return
         self.RoutingStages.append((Stage, time.monotonic(), os.times()))
+
+    def RecordRoutingProgress(self, Progress: PcbProgress) -> None:
+        """Record routing progress without coupling timing to rendering."""
+        self.RecordRoutingStage(str(Progress.Stage))
 
     @staticmethod
     def FormatInterval(
@@ -162,14 +210,13 @@ class CpuRunTelemetry:
             f"average_cores={AverageCores:.2f}"
         )
 
-    def PrintSummary(self) -> None:
-        """Print exactly once, including after an unexpected traceback."""
+    def BuildSummary(self) -> dict[str, object]:
+        """Stop sampling and return complete interval and stage measurements."""
         with self.PrintLock:
-            if self.HasPrinted:
-                return
-            self.HasPrinted = True
-        self.StopEvent.set()
-        self.SampleThread.join(timeout=0.25)
+            if not self.Stopped:
+                self.Stopped = True
+                self.StopEvent.set()
+                self.SampleThread.join(timeout=0.25)
         FinishedAt = time.monotonic()
         FinishedTimes = os.times()
         self.LastOsThreads = self.ReadOsThreadCount()
@@ -179,24 +226,35 @@ class CpuRunTelemetry:
             self.PeakPythonThreads,
             self.LastPythonThreads,
         )
-        print("CPU telemetry:")
-        print(self.FormatInterval(
-            "total",
-            self.StartedAt,
-            self.StartTimes,
-            FinishedAt,
-            FinishedTimes,
-        ))
+        Intervals: dict[str, object] = {
+            "Total": self.MeasureInterval(
+                self.StartedAt,
+                self.StartTimes,
+                FinishedAt,
+                FinishedTimes,
+            ),
+        }
         if self.CompileStartedAt is not None:
-            print(self.FormatInterval(
-                "compile",
+            Intervals["Compile"] = self.MeasureInterval(
                 self.CompileStartedAt,
                 self.CompileStartTimes or self.StartTimes,
                 self.CompileFinishedAt or FinishedAt,
                 self.CompileFinishTimes or FinishedTimes,
-            ))
+            )
+        for Name, (IntervalStartedAt, IntervalStartedTimes) in (
+            self.IntervalStarts.items()
+        ):
+            IntervalFinishedAt, IntervalFinishedTimes = (
+                self.IntervalFinishes.get(Name, (FinishedAt, FinishedTimes))
+            )
+            Intervals[Name] = self.MeasureInterval(
+                IntervalStartedAt,
+                IntervalStartedTimes,
+                IntervalFinishedAt,
+                IntervalFinishedTimes,
+            )
+        StageMeasurements = []
         if self.RoutingStages:
-            print("  routing stages:")
             StageTotals: dict[str, list[float]] = {}
             for Index, (Stage, StartedAt, StartedTimes) in enumerate(
                 self.RoutingStages
@@ -206,8 +264,13 @@ class CpuRunTelemetry:
                         self.RoutingStages[Index + 1]
                     )
                 else:
-                    EndedAt = self.CompileFinishedAt or FinishedAt
-                    EndedTimes = self.CompileFinishTimes or FinishedTimes
+                    EndedAt, EndedTimes = self.IntervalFinishes.get(
+                        "Routing",
+                        (
+                            self.CompileFinishedAt or FinishedAt,
+                            self.CompileFinishTimes or FinishedTimes,
+                        ),
+                    )
                 Totals = StageTotals.setdefault(
                     Stage,
                     [0.0, 0.0, 0.0, 0.0, 0.0],
@@ -239,22 +302,70 @@ class CpuRunTelemetry:
             ):
                 CpuSeconds = UserSeconds + SystemSeconds + ChildCpuSeconds
                 AverageCores = CpuSeconds / WallSeconds if WallSeconds else 0.0
-                print(
-                    f"    {Stage} (events={int(Count)}): "
-                    f"wall={WallSeconds:.3f}s cpu={CpuSeconds:.3f}s "
-                    f"(user={UserSeconds:.3f}s system={SystemSeconds:.3f}s "
-                    f"child_cpu={ChildCpuSeconds:.3f}s) "
-                    f"average_cores={AverageCores:.2f}"
-                )
-        print(
-            "  threads: "
-            f"os_current={self.LastOsThreads} "
-            f"os_peak={self.PeakOsThreads} "
-            f"python_current={self.LastPythonThreads} "
-            f"python_peak={self.PeakPythonThreads} "
-            f"native_routing_limit={os.environ.get('RC_ROUTING_THREADS', 'auto')} "
-            f"logical_cpus={os.cpu_count() or 1}"
+                StageMeasurements.append({
+                    "Stage": Stage,
+                    "Events": int(Count),
+                    "WallSeconds": WallSeconds,
+                    "CpuSeconds": CpuSeconds,
+                    "UserSeconds": UserSeconds,
+                    "SystemSeconds": SystemSeconds,
+                    "ChildCpuSeconds": ChildCpuSeconds,
+                    "AverageCores": AverageCores,
+                })
+        return {
+            "Intervals": Intervals,
+            "RoutingStages": StageMeasurements,
+            "Threads": {
+                "OsCurrent": self.LastOsThreads,
+                "OsPeak": self.PeakOsThreads,
+                "PythonCurrent": self.LastPythonThreads,
+                "PythonPeak": self.PeakPythonThreads,
+                "NativeRoutingLimit": os.environ.get(
+                    "RC_ROUTING_THREADS", "auto"
+                ),
+                "LogicalCpus": os.cpu_count() or 1,
+            },
+        }
+
+    @staticmethod
+    def MeasureInterval(
+        StartedAt: float,
+        StartedTimes: os.times_result,
+        FinishedAt: float,
+        FinishedTimes: os.times_result,
+    ) -> dict[str, float]:
+        """Return numeric wall and CPU evidence for one interval."""
+        WallSeconds = max(0.0, FinishedAt - StartedAt)
+        UserSeconds = max(0.0, FinishedTimes.user - StartedTimes.user)
+        SystemSeconds = max(0.0, FinishedTimes.system - StartedTimes.system)
+        ChildCpuSeconds = max(
+            0.0,
+            FinishedTimes.children_user
+            + FinishedTimes.children_system
+            - StartedTimes.children_user
+            - StartedTimes.children_system,
         )
+        CpuSeconds = UserSeconds + SystemSeconds + ChildCpuSeconds
+        return {
+            "WallSeconds": WallSeconds,
+            "CpuSeconds": CpuSeconds,
+            "UserSeconds": UserSeconds,
+            "SystemSeconds": SystemSeconds,
+            "ChildCpuSeconds": ChildCpuSeconds,
+            "AverageCores": CpuSeconds / WallSeconds if WallSeconds else 0.0,
+        }
+
+    def PrintSummary(self) -> None:
+        """Compatibility printer; normal CLI finalization writes a report."""
+        Summary = self.BuildSummary()
+        print("CPU telemetry:")
+        for Name, Interval in Summary["Intervals"].items():
+            assert isinstance(Interval, dict)
+            print(
+                f"  {str(Name).lower()}: "
+                f"wall={Interval['WallSeconds']:.3f}s "
+                f"cpu={Interval['CpuSeconds']:.3f}s"
+            )
 
 
 def ParsePositiveSeconds(Value: str) -> float:
@@ -338,11 +449,6 @@ def BuildParser() -> argparse.ArgumentParser:
         ),
     )
     Parser.add_argument(
-        "--guided",
-        action="store_true",
-        help="Open the guided compile menu",
-    )
-    Parser.add_argument(
         "--push",
         action="store_true",
         help="Push the compiled litematic to the Minecraft client",
@@ -361,7 +467,7 @@ def BuildParser() -> argparse.ArgumentParser:
         "--defaults-file",
         type=Path,
         default=DefaultsPath,
-        help="Persistent guided-menu defaults file",
+        help="Persistent compiler defaults file",
     )
     return Parser
 
@@ -385,119 +491,6 @@ def LoadDefaults(PathValue: Path) -> dict[str, object]:
     if not str(Defaults["PushFilePath"]).strip():
         Defaults["PushFilePath"] = BuiltInDefaults["PushFilePath"]
     return Defaults
-
-
-def SaveDefaults(
-    PathValue: Path,
-    Defaults: dict[str, object],
-) -> None:
-    """Persist guided defaults in a stable, human-readable format."""
-    PathValue.parent.mkdir(parents=True, exist_ok=True)
-    PathValue.write_text(
-        json.dumps(Defaults, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def PromptText(Label: str, Default: str = "") -> str:
-    DefaultText = f" [{Default}]" if Default else ""
-    Value = input(f"{Label}{DefaultText}: ").strip()
-    return Value if Value else Default
-
-
-def PromptBoolean(Label: str, Default: bool) -> bool:
-    DefaultText = "Y/n" if Default else "y/N"
-    while True:
-        Value = input(f"{Label} [{DefaultText}]: ").strip().lower()
-        if not Value:
-            return Default
-        if Value in {"y", "yes"}:
-            return True
-        if Value in {"n", "no"}:
-            return False
-        print("Enter y or n.")
-
-
-def ShowDefaults(
-    Defaults: dict[str, object],
-    PathValue: Path,
-) -> None:
-    print(f"Defaults file: {PathValue}")
-    for Name, Value in Defaults.items():
-        DisplayValue = Value
-        if Name == "TopModule" and not Value:
-            DisplayValue = "auto-detect"
-        if Name == "OutputName" and not Value:
-            DisplayValue = "input filename"
-        print(f"  {Name}: {DisplayValue}")
-
-
-def ConfigureDefaults(
-    Defaults: dict[str, object],
-    PathValue: Path,
-) -> dict[str, object]:
-    """Edit persistent defaults using guided prompts."""
-    Updated = dict(Defaults)
-    print("Configure Defaults")
-    print("Press Enter to retain the displayed value.")
-    Updated["InputPath"] = PromptText(
-        "Default SystemVerilog file (blank means prompt)",
-        str(Defaults["InputPath"]),
-    )
-    Updated["OutputDirectory"] = PromptText(
-        "Output directory",
-        str(Defaults["OutputDirectory"]),
-    )
-    Updated["OutputName"] = PromptText(
-        "Output name (blank means input filename)",
-        str(Defaults["OutputName"]),
-    )
-    TraceBlocksValue = Defaults.get("TraceSupportBlocks", ())
-    TraceBlocksDisplay = (
-        ",".join(TraceBlocksValue)
-        if isinstance(TraceBlocksValue, (list, tuple))
-        else str(TraceBlocksValue)
-    )
-    Updated["TraceSupportBlocks"] = ParseTraceSupportBlocks(
-        PromptText(
-            "Trace support blocks (comma-separated block IDs)",
-            TraceBlocksDisplay,
-        )
-    )
-    Updated["TopModule"] = PromptText(
-        "Top module (blank means auto-detect)",
-        str(Defaults["TopModule"]),
-    )
-    Updated["WorkDirectory"] = PromptText(
-        "Compiler work directory",
-        str(Defaults["WorkDirectory"]),
-    )
-    Updated["PushToMinecraft"] = PromptBoolean(
-        "Push after compiling",
-        bool(Defaults["PushToMinecraft"]),
-    )
-    Updated["MinecraftDirectory"] = PromptText(
-        "Minecraft schematics directory",
-        str(Defaults["MinecraftDirectory"]),
-    )
-    Updated["PushFilePath"] = PromptText(
-        "Default litematic to push",
-        str(Defaults["PushFilePath"]),
-    )
-    SaveDefaults(PathValue, Updated)
-    print(f"Saved defaults: {PathValue}")
-    return Updated
-
-
-def PromptPath(Label: str, Default: Path | None = None) -> Path:
-    DefaultText = f" [{Default}]" if Default is not None else ""
-    while True:
-        Value = input(f"{Label}{DefaultText}: ").strip()
-        if Value:
-            return ParsePromptPath(Value)
-        if Default is not None:
-            return Default
-        print("A path is required.")
 
 
 def ParsePromptPath(Value: str) -> Path:
@@ -531,109 +524,120 @@ def PushToMinecraft(
     return DestinationPath
 
 
-def RunPytest() -> int:
-    """Run the repository test suite with the active Python interpreter."""
-    RepositoryRoot = Path(__file__).resolve().parent.parent
-    Result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "Tests"],
-        cwd=RepositoryRoot,
-        check=False,
-    )
-    return Result.returncode
-
-
-def PromptCompile(
-    Defaults: dict[str, object],
-) -> tuple[Path, Path, Path, str | None, Path, bool, tuple[str, ...]]:
-    DefaultInput = str(Defaults["InputPath"])
-    InputPath = PromptPath(
-        "SystemVerilog file",
-        Path(DefaultInput) if DefaultInput else None,
-    )
-    TopValue = PromptText(
-        "Top module",
-        str(Defaults["TopModule"]),
-    )
-    OutputDirectory = PromptPath(
-        "Output directory",
-        Path(str(Defaults["OutputDirectory"])),
-    )
-    DefaultOutputName = str(Defaults["OutputName"]) or InputPath.stem
-    BaseName = PromptText("Output name", DefaultOutputName)
-    PushResult = PromptBoolean(
-        "Push to Minecraft after compiling",
-        bool(Defaults["PushToMinecraft"]),
-    )
-    TraceSupportBlocks = ParseTraceSupportBlocks(Defaults.get("TraceSupportBlocks"))
-    ArtifactDirectory = OutputDirectory / BaseName
-    OutputPath = ArtifactDirectory / f"{BaseName}.litematic"
-    DiagramPath = ArtifactDirectory / f"{BaseName}.Nand.json"
-    Workdir = Path(str(Defaults["WorkDirectory"]))
+def _PytestSummary(Output: str, ReturnCode: int) -> str:
+    """Extract pytest's compact terminal summary without losing raw output."""
+    for Line in reversed(Output.splitlines()):
+        Normalized = Line.strip().strip("=").strip()
+        if not Normalized:
+            continue
+        if any(
+            Token in Normalized
+            for Token in (" passed", " failed", " error", " skipped")
+        ):
+            return Normalized
     return (
-        InputPath,
-        OutputPath,
-        DiagramPath,
-        TopValue or None,
-        Workdir,
-        PushResult,
-        TraceSupportBlocks,
+        "Pytest completed successfully."
+        if ReturnCode == 0
+        else f"Pytest exited with code {ReturnCode}."
     )
 
 
-def GuidedMenu(
-    Defaults: dict[str, object],
-    DefaultsFile: Path,
-) -> tuple[
-    tuple[
-        Path,
-        Path,
-        Path,
-        str | None,
-        Path,
-        bool,
-        tuple[str, ...],
-    ]
-    | None,
-    dict[str, object],
-]:
-    while True:
-        print("RedstoneCompiler")
-        print("1. Compile SystemVerilog")
-        print("2. Configure defaults")
-        print("3. Show defaults")
-        print("4. Push an existing litematic to Minecraft")
-        print("5. Run pytest")
-        print("6. Exit")
-        Choice = input("Select an option [1]: ").strip() or "1"
-        if Choice == "1":
-            return PromptCompile(Defaults), Defaults
-        if Choice == "2":
-            Defaults = ConfigureDefaults(Defaults, DefaultsFile)
-            continue
-        if Choice == "3":
-            ShowDefaults(Defaults, DefaultsFile)
-            continue
-        if Choice == "4":
-            LitematicPath = PromptPath(
-                "Litematic file",
-                Path(str(Defaults["PushFilePath"])),
-            )
-            DestinationPath = PushToMinecraft(
-                LitematicPath,
-                Path(str(Defaults["MinecraftDirectory"])),
-            )
-            print(f"Pushed to Minecraft: {DestinationPath}")
-            continue
-        if Choice == "5":
-            ExitCode = RunPytest()
-            if ExitCode == 0:
-                print("Pytest passed.")
-            else:
-                print(f"Pytest failed with exit code {ExitCode}.")
-            continue
-        if Choice == "6":
-            return None, Defaults
-        print(f"Unknown menu option: {Choice}")
+def RunPytest() -> int:
+    """Run pytest live and persist one complete report under Output/Pytest."""
+    RepositoryRoot = Path(__file__).resolve().parent.parent
+    Command = [sys.executable, "-m", "pytest", "-q", "Tests"]
+    Environment = os.environ.copy()
+    Environment["RC_RUN_SCALE_TESTS"] = "0"
+    RunDirectory = RepositoryRoot / "Output" / "Pytest" / BuildRunId()
+    StartedAtUtc = UtcTimestamp()
+    StartedAt = time.monotonic()
+    StartedTimes = os.times()
+    Process = subprocess.Popen(
+        Command,
+        cwd=RepositoryRoot,
+        env=Environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    StdoutParts: list[str] = []
+    StderrParts: list[str] = []
+
+    def Pump(Stream, Destination, Parts: list[str]) -> None:
+        if Stream is None:
+            return
+        for Line in iter(Stream.readline, ""):
+            Parts.append(Line)
+            Destination.write(Line)
+            Destination.flush()
+        Stream.close()
+
+    StdoutThread = Thread(
+        target=Pump,
+        args=(Process.stdout, sys.stdout, StdoutParts),
+        daemon=True,
+    )
+    StderrThread = Thread(
+        target=Pump,
+        args=(Process.stderr, sys.stderr, StderrParts),
+        daemon=True,
+    )
+    StdoutThread.start()
+    StderrThread.start()
+    ReturnCode = Process.wait()
+    StdoutThread.join()
+    StderrThread.join()
+    FinishedTimes = os.times()
+    WallSeconds = time.monotonic() - StartedAt
+    CpuInterval = CpuRunTelemetry.MeasureInterval(
+        StartedAt,
+        StartedTimes,
+        StartedAt + WallSeconds,
+        FinishedTimes,
+    )
+    Stdout = "".join(StdoutParts)
+    Stderr = "".join(StderrParts)
+    Summary = _PytestSummary(f"{Stdout}\n{Stderr}", ReturnCode)
+    try:
+        Report = WriteRunReport(
+            RunDirectory=RunDirectory,
+            Result="SUCCESS" if ReturnCode == 0 else "FAILURE",
+            WallSeconds=WallSeconds,
+            CpuSeconds=CpuInterval["CpuSeconds"],
+            CpuDetails=CpuInterval,
+            Summary=Summary,
+            RepositoryRoot=RepositoryRoot,
+            StartedAtUtc=StartedAtUtc,
+            CompletedAtUtc=UtcTimestamp(),
+            Command=Command,
+            WorkingDirectory=RepositoryRoot,
+            Stdout=Stdout,
+            Stderr=Stderr,
+            FailureType=(
+                None if ReturnCode == 0 else f"Pytest: exit-{ReturnCode}"
+            ),
+            Details={
+                "ExitCode": ReturnCode,
+                "CpuTelemetry": CpuInterval,
+            },
+        )
+    except OSError as Error:
+        print("RESULT: FAILURE — Reporting: write-failed", file=sys.stderr)
+        CpuSeconds = float(CpuInterval["CpuSeconds"])
+        Utilization = CpuSeconds / WallSeconds * 100.0 if WallSeconds else 0.0
+        print(
+            f"TIME: total wall={WallSeconds:.3f}s cpu={CpuSeconds:.3f}s "
+            f"utilization={Utilization:.1f}% "
+            f"average_cores={CpuSeconds / WallSeconds if WallSeconds else 0.0:.2f}",
+            file=sys.stderr,
+        )
+        print(
+            f"OUTPUT: Pytest finished, but its report could not be saved: {Error}",
+            file=sys.stderr,
+        )
+        return 1
+    print("\n".join(Report.ResultLines))
+    return ReturnCode
 
 
 class TerminalProgressReporter:
@@ -759,6 +763,110 @@ class TerminalProgressReporter:
                 self.HasRendered = False
 
 
+class TerminalValidationProgressReporter:
+    """Render validation independently after the routing bar has closed."""
+
+    def __init__(self) -> None:
+        self.Interactive = sys.stderr.isatty()
+        self.RefreshIntervalSeconds = 0.1
+        self.StartTime: float | None = None
+        self.LatestProgress: PhysicalValidationProgress | None = None
+        self.LastRenderKey: tuple[object, ...] | None = None
+        self.LastRenderAt = 0.0
+        self.HasRendered = False
+        self.RenderLock = Lock()
+        self.RefreshStop = Event()
+        self.RefreshThread: Thread | None = None
+
+    def __call__(self, Progress: PhysicalValidationProgress) -> None:
+        with self.RenderLock:
+            if self.StartTime is None:
+                self.StartTime = time.monotonic()
+                if self.Interactive:
+                    self.RefreshThread = Thread(
+                        target=self._RefreshLoop,
+                        name="redstone-validation-progress",
+                        daemon=True,
+                    )
+                    self.RefreshThread.start()
+            self.LatestProgress = Progress
+            self._Render(Progress)
+
+    def _RefreshLoop(self) -> None:
+        while not self.RefreshStop.wait(self.RefreshIntervalSeconds):
+            with self.RenderLock:
+                if self.LatestProgress is not None:
+                    self._Render(self.LatestProgress)
+
+    def _Render(self, Progress: PhysicalValidationProgress) -> None:
+        StartedAt = self.StartTime or time.monotonic()
+        Elapsed = max(0.0, time.monotonic() - StartedAt)
+        BarWidth = 30
+        SafeTotal = max(1, Progress.Total)
+        SafeCompleted = max(0, min(Progress.Total, Progress.Completed))
+        Percent = min(100, int(SafeCompleted * 100 / SafeTotal))
+        Filled = int(Percent * BarWidth / 100)
+        Bar = "#" * Filled + "-" * (BarWidth - Filled)
+        PercentText = f"{Percent:3d}%"
+        CompletedText = str(SafeCompleted)
+        TotalText = str(Progress.Total) if Progress.Total > 0 else "?"
+        StatusText = (
+            f" | {Progress.Status.upper()}"
+            if Progress.Status is not None
+            else ""
+        )
+        Prefix = (
+            "FABRIC CHECK"
+            if str(Progress.Backend or "").startswith("fabric")
+            else "VALIDATION"
+        )
+        Line = (
+            f"{Prefix} [{Bar}] {PercentText} "
+            f"{CompletedText}/{TotalText} vectors | {Progress.Stage}"
+            f"{StatusText} | {Elapsed:.1f}s"
+        )
+        RenderKey = (
+            Progress.Completed,
+            Progress.Total,
+            Progress.Stage,
+            Progress.Status,
+        )
+        if self.Interactive:
+            CurrentTime = time.monotonic()
+            if (
+                RenderKey == self.LastRenderKey
+                and CurrentTime - self.LastRenderAt < self.RefreshIntervalSeconds
+            ):
+                return
+            TerminalWidth = max(
+                20,
+                min(shutil.get_terminal_size(fallback=(120, 24)).columns - 1, 160),
+            )
+            if len(Line) > TerminalWidth:
+                Line = f"{Line[:TerminalWidth - 3]}..."
+            print(
+                f"\r\x1b[2K{Line}",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.HasRendered = True
+            self.LastRenderAt = CurrentTime
+        elif RenderKey != self.LastRenderKey:
+            print(Line, file=sys.stderr, flush=True)
+        self.LastRenderKey = RenderKey
+
+    def Finish(self) -> None:
+        self.RefreshStop.set()
+        if self.RefreshThread is not None:
+            self.RefreshThread.join(timeout=self.RefreshIntervalSeconds * 2)
+            self.RefreshThread = None
+        with self.RenderLock:
+            if self.Interactive and self.HasRendered:
+                print(file=sys.stderr, flush=True)
+                self.HasRendered = False
+
+
 def BuildProgressReporter(
     CpuTelemetry: CpuRunTelemetry | None = None,
 ) -> TerminalProgressReporter:
@@ -864,6 +972,318 @@ def PrintRoutingFailureSummary(Error: Exception, OutputPath: Path | None) -> Non
         )
 
 
+def _FormatFabricDiagnosticValue(Value: object) -> str:
+    """Format one Fabric diagnostic value compactly and deterministically."""
+    if isinstance(Value, bool):
+        return str(Value).lower()
+    if Value is None:
+        return "unknown"
+    return str(Value)
+
+
+def _FormatFabricBlockState(State: object) -> str:
+    """Format a serialized Minecraft block state using command syntax."""
+    if not isinstance(State, dict):
+        return "unknown"
+    Name = str(State.get("Name", "unknown"))
+    Properties = State.get("Properties")
+    if not isinstance(Properties, dict) or not Properties:
+        return Name
+    PropertyText = ",".join(
+        f"{Key}={_FormatFabricDiagnosticValue(Value)}"
+        for Key, Value in sorted(Properties.items())
+    )
+    return f"{Name}[{PropertyText}]"
+
+
+def _FormatFabricCoordinates(Value: object) -> str:
+    """Format one fixture or world XYZ tuple without accepting partial data."""
+    if (
+        not isinstance(Value, (list, tuple))
+        or len(Value) != 3
+        or not all(type(Axis) is int for Axis in Value)
+    ):
+        return "unknown"
+    return f"({Value[0]}, {Value[1]}, {Value[2]})"
+
+
+def _FabricFailureTraceFromDiagnostics(
+    Diagnostics: object,
+) -> dict[str, object] | None:
+    """Extract a Fabric failure trace from routing-failure diagnostics."""
+    if not isinstance(Diagnostics, dict):
+        return None
+    FabricValidation = Diagnostics.get("FabricFinalCheck")
+    if not isinstance(FabricValidation, dict):
+        return None
+    FabricDiagnostics = FabricValidation.get("Diagnostics")
+    if not isinstance(FabricDiagnostics, dict):
+        return None
+    FailureTrace = FabricDiagnostics.get("FailureTrace")
+    return FailureTrace if isinstance(FailureTrace, dict) else None
+
+
+def _LoadFabricFailureTrace(
+    Error: Exception,
+    OutputPath: Path | None,
+) -> tuple[dict[str, object] | None, Path | None]:
+    """Load retained Fabric trace evidence from the exception or run artifact."""
+    Failure = getattr(Error, "Failure", None)
+    FailureTrace = _FabricFailureTraceFromDiagnostics(
+        getattr(Failure, "Diagnostics", None),
+    )
+    if FailureTrace is not None:
+        return FailureTrace, None
+    if OutputPath is None:
+        return None, None
+    ArtifactPath = OutputPath.with_suffix(".RoutingFailure.json")
+    try:
+        Artifact = json.loads(ArtifactPath.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None, ArtifactPath
+    if not isinstance(Artifact, dict):
+        return None, ArtifactPath
+    ArtifactFailure = Artifact.get("Failure")
+    if not isinstance(ArtifactFailure, dict):
+        return None, ArtifactPath
+    if ArtifactFailure.get("Stage") != "FabricFinalCheck":
+        return None, ArtifactPath
+    return (
+        _FabricFailureTraceFromDiagnostics(ArtifactFailure.get("Diagnostics")),
+        ArtifactPath,
+    )
+
+
+def _FailedOutputProbe(
+    FailureTrace: dict[str, object],
+) -> dict[str, object] | None:
+    """Return the observed probe for the output named by a Fabric failure."""
+    FailedOutput = FailureTrace.get("FailedOutput")
+    Entries = FailureTrace.get("SubcircuitTrace")
+    if not isinstance(Entries, list):
+        return None
+    for Entry in Entries:
+        if not isinstance(Entry, dict):
+            continue
+        Output = Entry.get("Output")
+        if not isinstance(Output, dict) or Output.get("Signal") != FailedOutput:
+            continue
+        Blocks = Output.get("Blocks")
+        if isinstance(Blocks, list):
+            for Block in Blocks:
+                if isinstance(Block, dict):
+                    return Block
+    return None
+
+
+def PrintFabricFailureSummary(
+    Error: Exception,
+    OutputPath: Path | None,
+) -> None:
+    """Print the exact retained Fabric block state and coordinates."""
+    IsFabricFailure = str(Error).startswith("FabricFinalCheck:")
+    Failure = getattr(Error, "Failure", None)
+    IsFabricFailure = IsFabricFailure or (
+        Failure is not None
+        and str(getattr(Failure, "Stage", "")) == "FabricFinalCheck"
+    )
+    if not IsFabricFailure:
+        return
+    FailureTrace, ArtifactPath = _LoadFabricFailureTrace(Error, OutputPath)
+    print("Fabric failure details:", file=sys.stderr)
+    if FailureTrace is None:
+        print(
+            "  exact block and coordinates: unavailable "
+            "(failure trace was not retained)",
+            file=sys.stderr,
+        )
+        if ArtifactPath is not None:
+            print(f"  diagnostic artifact: {ArtifactPath}", file=sys.stderr)
+        return
+
+    FailureKind = _FormatFabricDiagnosticValue(
+        FailureTrace.get("FailureKind"),
+    )
+    FailedOutput = _FormatFabricDiagnosticValue(
+        FailureTrace.get("FailedOutput"),
+    )
+    Expected = _FormatFabricDiagnosticValue(FailureTrace.get("Expected"))
+    Actual = _FormatFabricDiagnosticValue(FailureTrace.get("Actual"))
+    print(f"  kind: {FailureKind}", file=sys.stderr)
+    print(
+        f"  output: {FailedOutput} expected={Expected} actual={Actual}",
+        file=sys.stderr,
+    )
+    GlobalVectorIndex = FailureTrace.get("GlobalVectorIndex")
+    if GlobalVectorIndex is not None:
+        print(
+            "  validation: "
+            f"vector={_FormatFabricDiagnosticValue(GlobalVectorIndex)}",
+            file=sys.stderr,
+        )
+
+    Block = FailureTrace.get("FirstFailingBlock")
+    EvidenceKind = "first mismatching block"
+    if not isinstance(Block, dict):
+        Block = _FailedOutputProbe(FailureTrace)
+        EvidenceKind = (
+            "failed-output probe; no mismatching block was identified "
+            "before timeout"
+        )
+    if not isinstance(Block, dict):
+        print(
+            "  exact block and coordinates: unavailable "
+            "(trace contained no observed output probe)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"  block: {_FormatFabricBlockState(Block.get('State'))}",
+            file=sys.stderr,
+        )
+        print(
+            "  coords: "
+            f"fixture={_FormatFabricCoordinates(Block.get('FixturePosition'))} "
+            f"world={_FormatFabricCoordinates(Block.get('WorldPosition'))}",
+            file=sys.stderr,
+        )
+        print(f"  evidence: {EvidenceKind}", file=sys.stderr)
+    if ArtifactPath is not None:
+        print(f"  diagnostic artifact: {ArtifactPath}", file=sys.stderr)
+
+
+def _FailureType(Error: BaseException) -> str:
+    """Return the shortest stable typed failure available."""
+    Failure = getattr(Error, "Failure", None)
+    if Failure is not None:
+        Stage = str(getattr(Failure, "Stage", Error.__class__.__name__))
+        ReasonValue = getattr(Failure, "Reason", "failure")
+        Reason = str(getattr(ReasonValue, "value", ReasonValue))
+        return f"{Stage}: {Reason}"
+    MessageParts = str(Error).split(":", 2)
+    if (
+        len(MessageParts) >= 2
+        and all(MessageParts[:2])
+        and " " not in MessageParts[0]
+        and "/" not in MessageParts[1]
+        and len(MessageParts[0]) <= 64
+        and len(MessageParts[1]) <= 64
+    ):
+        return f"{MessageParts[0]}: {MessageParts[1]}"
+    return Error.__class__.__name__
+
+
+def _FailureSummary(Error: BaseException) -> str:
+    Message = " ".join(str(Error).split())
+    if Message:
+        return Message
+    return f"The operation raised {Error.__class__.__name__}."
+
+
+def PrintOperationFailure(
+    Error: BaseException,
+    FailureDiagnostics: str = "",
+) -> None:
+    """Restore the complete pre-reporting CLI failure message and evidence."""
+    print(f"Operation failed: {Error}", file=sys.stderr)
+    if FailureDiagnostics:
+        print(FailureDiagnostics, file=sys.stderr, end=(
+            "" if FailureDiagnostics.endswith("\n") else "\n"
+        ))
+
+
+def _AtomicCopy(SourcePath: Path, DestinationPath: Path) -> None:
+    DestinationPath.parent.mkdir(parents=True, exist_ok=True)
+    TemporaryPath = DestinationPath.with_name(
+        f".{DestinationPath.name}.promote-P{os.getpid()}"
+    )
+    shutil.copy2(SourcePath, TemporaryPath)
+    TemporaryPath.replace(DestinationPath)
+
+
+def _CompileResultDetails(Result, CpuTelemetry: dict[str, object]) -> dict[str, object]:
+    """Serialize the detailed success evidence formerly printed to terminal."""
+    Composition = Result.BlockComposition
+    RoutingMetrics = Result.RoutingMetrics
+    return {
+        "LogicOptimization": {
+            "OriginalIrGates": Result.OriginalLogicGateCount,
+            "OptimizedIrGates": Result.OptimizedLogicGateCount,
+            "NandGates": Result.NandGateCount,
+        },
+        "RoutingMetrics": (
+            {
+                "Stage": RoutingMetrics.Stage,
+                "NetCount": RoutingMetrics.NetCount,
+                "TotalLength": RoutingMetrics.TotalLength,
+                "BendCount": RoutingMetrics.BendCount,
+                "ViaCount": RoutingMetrics.ViaCount,
+                "ReroutedNets": RoutingMetrics.ReroutedNets,
+                "ConflictCount": RoutingMetrics.ConflictCount,
+                "CorridorOverflowPeak": RoutingMetrics.CorridorOverflowPeak,
+            }
+            if RoutingMetrics is not None
+            else None
+        ),
+        "Layout": {
+            "EstimatedBlocks": Result.EstimatedBlocks,
+            "Width": Result.Width,
+            "Depth": Result.Depth,
+            "Footprint": Composition.Footprint,
+            "XyFootprint": Composition.XYFootprint,
+            "FullFootprint": Composition.FullFootprint,
+        },
+        "BlockComposition": {
+            "ComponentOwnedFunctionalBlocks": (
+                Composition.ComponentOwnedFunctionalBlocks
+            ),
+            "ComponentFunctionalShare": Composition.ComponentFunctionalShare,
+            "RoutingOwnedFunctionalBlocks": (
+                Composition.RoutingOwnedFunctionalBlocks
+            ),
+            "RoutingFunctionalShare": Composition.RoutingFunctionalShare,
+            "RawDustBlocks": Composition.RawDustBlocks,
+            "RawDustFunctionalShare": Composition.RawDustFunctionalShare,
+            "SupportBlocks": Composition.SupportBlocks,
+            "AnnotationBlocks": Composition.AnnotationBlocks,
+        },
+        "RoutingStrategy": {
+            "Requested": Result.RequestedStrategy,
+            "Used": Result.UsedStrategy,
+            "FallbackUsed": Result.FallbackUsed,
+            "FallbackReason": Result.FallbackReason,
+        },
+        "PipelineRuntimeSeconds": Result.RuntimeSeconds,
+        "MaximumNetLengthShare": Result.MaximumNetLengthShare,
+        "MchprsValidation": vars(Result.MchprsValidation),
+        "FabricFinalCheck": vars(Result.FabricFinalCheck),
+        "Artifacts": {
+            "Litematic": str(Result.OutputPath),
+            "NandJson": str(Result.DiagramPath),
+            "PhysicalDesign": str(Result.PhysicalDesignPath),
+        },
+        "CpuTelemetry": CpuTelemetry,
+    }
+
+
+def _CompileOutputSummary(Result, StableOutputPath: Path) -> str:
+    """Build a compact but useful successful compiler output line."""
+    Metrics = Result.RoutingMetrics
+    ConflictText = (
+        f" conflicts={Metrics.ConflictCount}"
+        if Metrics is not None
+        else ""
+    )
+    return (
+        f"{StableOutputPath.stem} | "
+        f"mchprs={Result.MchprsValidation.Status.upper()} "
+        f"fabric={Result.FabricFinalCheck.Status.upper()} | "
+        f"nand={Result.NandGateCount} blocks={Result.EstimatedBlocks} "
+        f"size={Result.Width}x{Result.Depth}{ConflictText} | "
+        f"litematic={StableOutputPath.resolve(strict=False)}"
+    )
+
+
 def Main(Args: list[str] | None = None) -> int:
     RawArgs = list(sys.argv[1:] if Args is None else Args)
     Parser = BuildParser()
@@ -885,148 +1305,256 @@ def Main(Args: list[str] | None = None) -> int:
             print(f"Pushed to Minecraft: {DestinationPath}")
             return 0
 
-        if Parsed.guided or not RawArgs:
-            Guided, Defaults = GuidedMenu(
-                Defaults,
-                Parsed.defaults_file,
-            )
-            if Guided is None:
-                return 0
-            (
-                InputPath,
-                OutputPath,
-                DiagramPath,
-                TopModule,
-                Workdir,
-                PushResult,
-                TraceSupportBlocks,
-            ) = Guided
-            MinecraftDirectory = Path(str(Defaults["MinecraftDirectory"]))
+        if Parsed.input is None:
+            Parser.error("--input is required")
+        InputPath = Parsed.input
+        if Parsed.outputname:
+            OutputDirectory = Parsed.output or Path("Output") / Parsed.outputname
+            OutputPath = OutputDirectory / f"{Parsed.outputname}.litematic"
         else:
-            if Parsed.input is None:
-                Parser.error("--input is required outside guided mode")
-            InputPath = Parsed.input
-            if Parsed.outputname:
-                OutputDirectory = Parsed.output or Path("Output") / Parsed.outputname
-                OutputPath = OutputDirectory / f"{Parsed.outputname}.litematic"
-            else:
-                OutputPath = Parsed.output or (
-                    Path("Output")
-                    / InputPath.stem
-                    / f"{InputPath.stem}.litematic"
-                )
-            DiagramPath = Parsed.diagram or OutputPath.with_suffix(".Nand.json")
-            TopModule = Parsed.top
-            Workdir = Parsed.workdir
-            PushResult = Parsed.push
-            TraceSupportBlocks = ParseTraceSupportBlocks(
-                Parsed.trace_support_blocks
-                if Parsed.trace_support_blocks is not None
-                else Defaults.get("TraceSupportBlocks"),
+            OutputPath = Parsed.output or (
+                Path("Output")
+                / InputPath.stem
+                / f"{InputPath.stem}.litematic"
             )
+        DiagramPath = Parsed.diagram or OutputPath.with_suffix(".Nand.json")
+        TopModule = Parsed.top
+        Workdir = Parsed.workdir
+        PushResult = Parsed.push
+        TraceSupportBlocks = ParseTraceSupportBlocks(
+            Parsed.trace_support_blocks
+            if Parsed.trace_support_blocks is not None
+            else Defaults.get("TraceSupportBlocks"),
+        )
         if OutputPath.suffix.lower() != ".litematic":
             OutputPath = OutputPath.with_suffix(".litematic")
-
-        # Start telemetry after guided input.  Otherwise the total interval
-        # includes arbitrary time spent answering CLI prompts and can look
-        # like a harness timeout despite the compiler having finished within
-        # its actual routing budget.
-        CpuTelemetry = CpuRunTelemetry()
-        atexit.register(CpuTelemetry.PrintSummary)
-        SearchDescription = "Generating clustered PCB-style multilayer routing..."
-        print(SearchDescription, file=sys.stderr)
-        ProgressReporter = BuildProgressReporter(CpuTelemetry)
-        try:
-            if Parsed.routing_threads is not None:
-                if Parsed.routing_threads <= 0:
-                    Parser.error("--routing-threads must be positive")
-                os.environ["RC_ROUTING_THREADS"] = str(Parsed.routing_threads)
-            CpuTelemetry.BeginCompilation()
-            Result = CompileSvToLitematic(
-                InputPath=InputPath,
-                OutputPath=OutputPath,
-                DiagramPath=DiagramPath,
-                TopModule=TopModule,
-                Workdir=Workdir,
-                ProgressCallback=ProgressReporter,
-                RoutingStrategyValue=Parsed.routing_strategy,
-                RoutingDeadlineSeconds=Parsed.routing_deadline_seconds,
-                TraceSupportBlocks=TraceSupportBlocks,
-            )
-        finally:
-            CpuTelemetry.FinishCompilation()
-            ProgressReporter.Finish()
-
-        DestinationPath = None
-        if PushResult:
-            DestinationPath = PushToMinecraft(
-                Result.OutputPath,
-                MinecraftDirectory,
-            )
+        if Parsed.routing_threads is not None:
+            if Parsed.routing_threads <= 0:
+                Parser.error("--routing-threads must be positive")
+            os.environ["RC_ROUTING_THREADS"] = str(Parsed.routing_threads)
     except (FileNotFoundError, ValueError, NotImplementedError) as Error:
         print(f"Operation failed: {Error}", file=sys.stderr)
-        PrintRoutingFailureSummary(Error, OutputPath)
         return 1
 
-    print(
-        f"Logic optimization: {Result.OriginalLogicGateCount} -> "
-        f"{Result.OptimizedLogicGateCount} IR gates"
-    )
-    print(f"Compiled {Result.NandGateCount} NAND gates")
-    if Result.RoutingMetrics is not None:
-        Metrics = Result.RoutingMetrics
-        print(
-            "Routing quality: "
-            f"stage={Metrics.Stage}, nets={Metrics.NetCount}, "
-            f"length={Metrics.TotalLength}, bends={Metrics.BendCount}, "
-            f"vias={Metrics.ViaCount}, rerouted={Metrics.ReroutedNets}, "
-            f"conflicts={Metrics.ConflictCount}, "
-            f"overflow_peak={Metrics.CorridorOverflowPeak}"
+    RepositoryRoot = Path(__file__).resolve().parent.parent
+    StableOutputPath = OutputPath
+    StableDiagramPath = DiagramPath
+    RunDirectory = StableOutputPath.parent / "Runs" / BuildRunId()
+    RunOutputPath = RunDirectory / StableOutputPath.name
+    RunDiagramPath = RunDirectory / StableOutputPath.with_suffix(
+        ".Nand.json"
+    ).name
+    OutputPath = RunOutputPath
+    StartedAtUtc = UtcTimestamp()
+    RunStartedAt = time.monotonic()
+    CpuTelemetry = CpuRunTelemetry()
+    ProgressReporter = BuildProgressReporter(CpuTelemetry)
+    ValidationProgressReporter = TerminalValidationProgressReporter()
+    Capture = CaptureTerminalOutput()
+    Error: BaseException | None = None
+    ExceptionText = ""
+    Result = None
+
+    def RecordPipelineTimingEvent(Name: str, Event: str) -> None:
+        CpuTelemetry.RecordPipelineTimingEvent(Name, Event)
+        if Name == "Routing" and Event == "finish":
+            ProgressReporter.Finish()
+        if Name == "Validation" and Event == "finish":
+            ValidationProgressReporter.Finish()
+
+    try:
+        with Capture:
+            print(
+                "Generating clustered PCB-style multilayer routing...",
+                file=sys.stderr,
+            )
+            try:
+                CpuTelemetry.BeginCompilation()
+                Result = CompileSvToLitematic(
+                    InputPath=InputPath,
+                    OutputPath=RunOutputPath,
+                    DiagramPath=RunDiagramPath,
+                    TopModule=TopModule,
+                    Workdir=Workdir,
+                    ProgressCallback=ProgressReporter,
+                    RoutingStrategyValue=Parsed.routing_strategy,
+                    RoutingDeadlineSeconds=Parsed.routing_deadline_seconds,
+                    TraceSupportBlocks=TraceSupportBlocks,
+                    TimingCallback=RecordPipelineTimingEvent,
+                    ValidationProgressCallback=ValidationProgressReporter,
+                )
+            finally:
+                CpuTelemetry.FinishCompilation()
+                ProgressReporter.Finish()
+                ValidationProgressReporter.Finish()
+    except KeyboardInterrupt as Caught:
+        Error = Caught
+        ExceptionText = traceback.format_exc()
+    except Exception as Caught:
+        Error = Caught
+        ExceptionText = traceback.format_exc()
+
+    PromotedPaths: list[Path] = []
+    DestinationPath: Path | None = None
+    if Error is None and Result is not None:
+        try:
+            PromotedPaths = PromoteRunArtifacts(
+                RunDirectory=RunDirectory,
+                RunBaseName=StableOutputPath.stem,
+                StableOutputPath=StableOutputPath,
+            )
+            if Result.DiagramPath.is_file():
+                _AtomicCopy(Result.DiagramPath, StableDiagramPath)
+                if StableDiagramPath not in PromotedPaths:
+                    PromotedPaths.append(StableDiagramPath)
+            # Prove report persistence before an optional external push.  The
+            # final report below replaces this provisional evidence after the
+            # push result and complete timing are known.
+            WriteRunReport(
+                RunDirectory=RunDirectory,
+                Result="SUCCESS",
+                WallSeconds=time.monotonic() - RunStartedAt,
+                CpuSeconds=None,
+                Summary=(
+                    f"{StableOutputPath.stem} compiled and passed Fabric "
+                    "validation; finalization is pending."
+                ),
+                RepositoryRoot=RepositoryRoot,
+                StartedAtUtc=StartedAtUtc,
+                CompletedAtUtc=UtcTimestamp(),
+                Command=[sys.executable, str(RepositoryRoot / "Main.py"), *RawArgs],
+                WorkingDirectory=RepositoryRoot,
+                Stdout=Capture.StdoutText,
+                Stderr=Capture.StderrText,
+                Details={"ReportPersistenceProbe": True},
+                ArtifactRoots=PromotedPaths,
+            )
+            if PushResult:
+                DestinationPath = PushToMinecraft(
+                    StableOutputPath,
+                    MinecraftDirectory,
+                )
+        except Exception as Caught:
+            Error = Caught
+            ExceptionText = traceback.format_exc()
+
+    Telemetry = CpuTelemetry.BuildSummary()
+    TotalInterval = Telemetry["Intervals"]["Total"]
+    assert isinstance(TotalInterval, dict)
+    WallSeconds = time.monotonic() - RunStartedAt
+    CpuSeconds = float(TotalInterval["CpuSeconds"])
+
+    FailureDiagnostics = ""
+    if Error is not None and isinstance(Error, Exception):
+        DiagnosticBuffer = StringIO()
+        with redirect_stderr(DiagnosticBuffer):
+            PrintRoutingFailureSummary(Error, RunOutputPath)
+            PrintFabricFailureSummary(Error, RunOutputPath)
+        FailureDiagnostics = DiagnosticBuffer.getvalue()
+
+    if Error is None and Result is not None:
+        ReportResult = "SUCCESS"
+        FailureType = None
+        Summary = (
+            _CompileOutputSummary(Result, StableOutputPath)
         )
-    ResultLabel = "PCB layout generated"
-    Composition = Result.BlockComposition
-    print(
-        f"{ResultLabel}: {Result.EstimatedBlocks} blocks, "
-        f"{Result.Width}x{Result.Depth}, "
-        f"xz_footprint {Composition.Footprint}, "
-        f"xy_footprint {Composition.XYFootprint}, "
-        f"full_footprint {Composition.FullFootprint}"
-    )
-    print(
-        "Block composition: "
-        f"components={Composition.ComponentOwnedFunctionalBlocks} "
-        f"({Composition.ComponentFunctionalShare:.1%}), "
-        f"routing={Composition.RoutingOwnedFunctionalBlocks} "
-        f"({Composition.RoutingFunctionalShare:.1%}), "
-        f"dust={Composition.RawDustBlocks} "
-        f"({Composition.RawDustFunctionalShare:.1%} functional), "
-        f"support={Composition.SupportBlocks}, "
-        f"annotations={Composition.AnnotationBlocks}"
-    )
-    print("Output mode: Authoritative resource-graph PCB router")
-    print(
-        "Routing strategy: "
-        f"requested={Result.RequestedStrategy}, used={Result.UsedStrategy}, "
-        f"fallback={'yes' if Result.FallbackUsed else 'no'}"
-    )
-    if Result.FallbackReason:
-        print(f"Fallback reason: {Result.FallbackReason}")
-    print(
-        f"Run summary: runtime={Result.RuntimeSeconds:.3f}s, "
-        f"max_net_share={Result.MaximumNetLengthShare:.3%}"
-    )
-    print(f"NAND JSON: {Result.DiagramPath}")
-    ServerValidation = Result.FabricServerValidation
-    print(f"Fabric server validation: {ServerValidation.Status.upper()}")
-    print(f"Litematic: {Result.OutputPath}")
-    if DestinationPath is not None:
-        print(f"Minecraft: {DestinationPath}")
-    return 0
+        Details = _CompileResultDetails(Result, Telemetry)
+        Details["ResolvedInputs"] = {
+            "SystemVerilog": str(InputPath),
+            "TopModule": TopModule,
+            "WorkDirectory": str(Workdir),
+        }
+        Details["StableArtifacts"] = [str(PathValue) for PathValue in PromotedPaths]
+        Details["MinecraftDestination"] = (
+            str(DestinationPath) if DestinationPath is not None else None
+        )
+        ExitCode = 0
+    else:
+        assert Error is not None
+        ReportResult = "CANCELLED" if isinstance(Error, KeyboardInterrupt) else "FAILURE"
+        FailureType = (
+            "KeyboardInterrupt" if isinstance(Error, KeyboardInterrupt)
+            else _FailureType(Error)
+        )
+        Summary = (
+            "Compilation was cancelled by the user."
+            if isinstance(Error, KeyboardInterrupt)
+            else _FailureSummary(Error)
+        )
+        Details = {
+            "ResolvedInputs": {
+                "SystemVerilog": str(InputPath),
+                "TopModule": TopModule,
+                "WorkDirectory": str(Workdir),
+            },
+            "StableOutputPath": str(StableOutputPath),
+            "RunOutputPath": str(RunOutputPath),
+            "PromotedBeforeFailure": [str(PathValue) for PathValue in PromotedPaths],
+            "CpuTelemetry": Telemetry,
+            "RoutingFailureSummary": FailureDiagnostics,
+        }
+        ExitCode = 130 if isinstance(Error, KeyboardInterrupt) else 1
+
+    try:
+        Report = WriteRunReport(
+            RunDirectory=RunDirectory,
+            Result=ReportResult,
+            WallSeconds=WallSeconds,
+            CpuSeconds=CpuSeconds,
+            Summary=Summary,
+            RepositoryRoot=RepositoryRoot,
+            StartedAtUtc=StartedAtUtc,
+            CompletedAtUtc=UtcTimestamp(),
+            Command=[sys.executable, str(RepositoryRoot / "Main.py"), *RawArgs],
+            WorkingDirectory=RepositoryRoot,
+            Stdout=Capture.StdoutText,
+            Stderr=Capture.StderrText + FailureDiagnostics,
+            FailureType=FailureType,
+            CpuDetails={
+                **TotalInterval,
+                **(
+                    Telemetry["Threads"]
+                    if isinstance(Telemetry.get("Threads"), dict)
+                    else {}
+                ),
+            },
+            TimingDetails=Telemetry,
+            ExceptionText=ExceptionText,
+            Details=Details,
+            ArtifactRoots=PromotedPaths,
+        )
+    except OSError as ReportError:
+        FallbackLines = FormatResultLines(
+            Result="FAILURE",
+            FailureType="Reporting: write-failed",
+            WallSeconds=WallSeconds,
+            CpuSeconds=CpuSeconds,
+            Summary=(
+                "The operation finished, but its required report could not "
+                f"be saved: {ReportError}"
+            ),
+            RawReportPath=(
+                RunDirectory.resolve(strict=False) / "RawDump.txt"
+            ),
+            CpuDetails={
+                **TotalInterval,
+                **(
+                    Telemetry["Threads"]
+                    if isinstance(Telemetry.get("Threads"), dict)
+                    else {}
+                ),
+            },
+            TimingDetails=Telemetry,
+        )
+        print("\n".join(FallbackLines), file=sys.stderr)
+        if Error is not None:
+            PrintOperationFailure(Error, FailureDiagnostics)
+        return 1
+    print("\n".join(Report.ResultLines))
+    if Error is not None:
+        PrintOperationFailure(Error, FailureDiagnostics)
+    return ExitCode
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(Main())
-    except KeyboardInterrupt:
-        print("\nCancelled.")
-        raise SystemExit(130) from None
+    raise SystemExit(Main())

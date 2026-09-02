@@ -7,7 +7,7 @@ from typing import Any
 from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Placement.Geometry import PlacedDesign
 from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
-from Compiler.Routing.Actions.Geometry import BuildPlacedCellGeometry
+from Compiler.Routing.Actions.Geometry import BuildPlacedCellGeometryWithKeepOut
 from Compiler.Routing.Actions.Validation import ValidateTemplateIsolation
 from Compiler.Routing.ResourceGraph import LocalRouteClaim, NormalizeRoutingEdge, RoutingResourceGraph, ValidateLocalRouteClaims
 from .Cache import _ClusterLocalRouteTemplateCache
@@ -64,8 +64,20 @@ def RouteCommittedClusterTemplates(Context):
             Context.LocalRouteDiagnostics['__JointClusterPlacement__'] = Context.JointPlacementDiagnostics
         if Context.PackedAccessRepairByCluster:
             Context.LocalRouteDiagnostics['__PackedAccessRepair__'] = {str(ClusterIndex): Diagnostics for ClusterIndex, Diagnostics in sorted(Context.PackedAccessRepairByCluster.items())}
-        Context.ActualBlocks, Context.ElectricalBlocks, Context.SolidBlocks = BuildPlacedCellGeometry(Context.Placed)
-        Context.LocalResourceGraph = RoutingResourceGraph(ActualBlocks=frozenset(Context.ActualBlocks), ElectricalBlocks=frozenset(Context.ElectricalBlocks), SolidBlocks=frozenset(Context.SolidBlocks))
+        (
+            Context.ActualBlocks,
+            Context.ElectricalBlocks,
+            Context.SolidBlocks,
+            Context.TemplateElectricalKeepOutBlocks,
+        ) = BuildPlacedCellGeometryWithKeepOut(Context.Placed)
+        Context.LocalResourceGraph = RoutingResourceGraph(
+            ActualBlocks=frozenset(Context.ActualBlocks),
+            ElectricalBlocks=frozenset(Context.ElectricalBlocks),
+            SolidBlocks=frozenset(Context.SolidBlocks),
+            StaticKeepOutBlocks=frozenset(
+                Context.TemplateElectricalKeepOutBlocks
+            ),
+        )
         Context.ClusterByGate = {Name: ClusterIndex for ClusterIndex, Names in enumerate(Context.Clusters) for Name in Names}
         Context.GateByInputPin = {Pin: Gate.Name for Gate in Context.PlacedGates for Pin in Gate.InputPins}
         Context.MaximumLength = Context.PackingPolicy.DirectConnectMaximumLength
@@ -189,8 +201,16 @@ def RouteCommittedClusterTemplates(Context):
                 ValidateContinuationPortal(Context, Context.CandidateClaim, Context.AllTargets)
                 ValidateBoundaryEscapes(Context, Context.CandidateClaim)
                 ValidateLocalRouteClaims(Context.LocalResourceGraph, Context.TrialClaims)
-                if any((len(Path) - 1 > Context.MaximumLength for Path in Context.Paths)):
-                    ValidateTemplateIsolation({Context.Signal: set(Context.CandidateClaim.Nodes)}, Context.ActualBlocks, Context.ElectricalBlocks, Context.SolidBlocks, Context.Producers, Context.TargetsBySignal, Context.AccessBySignal)
+                ValidateTemplateIsolation(
+                    {Context.Signal: set(Context.CandidateClaim.Nodes)},
+                    Context.ActualBlocks,
+                    Context.ElectricalBlocks,
+                    Context.SolidBlocks,
+                    Context.Producers,
+                    Context.TargetsBySignal,
+                    Context.AccessBySignal,
+                    Context.TemplateElectricalKeepOutBlocks,
+                )
             except ValueError as Error:
                 Context.LocalRouteDiagnostics[Context.Signal] = {'AttemptedTargets': len(set(Context.LocalTargets)), 'AttemptedNodes': len(Context.Nodes), 'Rejected': str(Error)}
                 if not Context.DirectPaths or len(Context.DirectPaths) == len(Context.Paths):

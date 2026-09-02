@@ -4,6 +4,7 @@ from .Models import (
     FabricServerControlResult,
     FabricServerLoadResult,
     FabricServerValidationResult,
+    FabricValidationProgress,
 )
 from .Fixture import BuildFabricFixture, FabricFixtureArtifact, WriteFabricFixture
 from .FailureTrace import BuildFabricFailureTrace
@@ -16,6 +17,7 @@ from .Testing import (
     BuildImportedSchematicVectors,
     ReadFabricFixture,
     ReadNandModule,
+    ReadSvModule,
 )
 from .Validation import (
     BuildExpectedVectors,
@@ -42,8 +44,10 @@ __all__ = [
     "FabricServerSupervisor",
     "FabricServerSnapshotArtifact",
     "FabricServerValidationResult",
+    "FabricValidationProgress",
     "ResolveFabricServerRoot",
     "ReadFabricFixture",
     "ReadNandModule",
+    "ReadSvModule",
     "WriteFabricFixture",
 ]

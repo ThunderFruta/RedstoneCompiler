@@ -14,7 +14,7 @@ from Compiler.Placement.Core.Clusters import PcbPlacement
 from ..Placement.Geometry import BuildPlacementPinAccessWitness
 from ..Placement.Rotation import RotatedCellSize
 try:
-    from ..RustRouting import GetRoutingThreadCount
+    from RedstoneCompiler.RustRouting import GetRoutingThreadCount
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import GetRoutingThreadCount
@@ -317,6 +317,7 @@ def CompactRoutedTrees(
         Producers,
         Targets,
         AccessBySignal,
+        set(Resources.ResourceGraph.StaticKeepOutBlocks),
         WorkCheck=CheckWork("template-isolation-validation"),
     )
     TrackAssignmentValue = Routed.TrackAssignment

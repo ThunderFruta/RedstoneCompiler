@@ -138,6 +138,18 @@ class SpongeSchemImportTests(unittest.TestCase):
         self.assertEqual(States[(1, 1, 0)]["Properties"]["power"], "0")
         self.assertEqual(States[(2, 1, 0)]["Properties"]["lit"], "false")
         self.assertEqual(States[(3, 1, 0)]["Properties"]["lit"], "false")
+        self.assertEqual(Fixture["Signs"], [
+            {
+                "Position": [0, 1, 1],
+                "FrontText": ["IN a", "", "", ""],
+                "BackText": ["IN a", "", "", ""],
+            },
+            {
+                "Position": [3, 1, 1],
+                "FrontText": ["OUT y", "", "", ""],
+                "BackText": ["OUT y", "", "", ""],
+            },
+        ])
 
     def testLitematicPortReaderRejectsMultipleRegionsRatherThanTestingOnlyOne(self) -> None:
         with tempfile.TemporaryDirectory() as TemporaryDirectory:

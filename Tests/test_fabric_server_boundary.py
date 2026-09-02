@@ -17,13 +17,15 @@ from Compiler.FabricServer import (
     FabricServerConfiguration,
     FabricServerSupervisor,
     FabricServerValidationResult,
+    FabricValidationProgress,
     ReadFabricFixture,
     ReadNandModule,
+    ReadSvModule,
     ResolveFabricServerRoot,
 )
 from Compiler.FabricServer.SchemImport import InferLitematicPorts
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
-from Compiler.Pipeline import RequireFabricServerValidation
+from Compiler.Pipeline import RequirePhysicalValidation
 from SchemEncoder.SchemWriter import CellTemplate, BuildLitematicBlockMap, NeutralDynamicState
 
 
@@ -87,6 +89,62 @@ class FabricServerBoundaryTests(unittest.TestCase):
 
         CreateConnection.assert_called_once()
         Connection.settimeout.assert_called_once_with(12.5)
+
+    def testValidationProgressComesFromStreamedTruthTableRows(self) -> None:
+        Supervisor = FabricServerSupervisor(FabricServerConfiguration(
+            Root=None,
+            StartupTimeoutSeconds=1.0,
+            ValidationTimeoutSeconds=12.5,
+        ))
+        Connection = MagicMock()
+        Connection.__enter__.return_value = Connection
+        Stream = MagicMock()
+        Stream.readline.side_effect = [
+            b'{"Status":"progress","Completed":0,"Total":2,'
+            b'"Stage":"authoritative Fabric truth-table validation"}\n',
+            b'{"Status":"progress","Completed":1,"Total":2,'
+            b'"Stage":"authoritative Fabric truth-table validation"}\n',
+            b'{"Status":"progress","Completed":2,"Total":2,'
+            b'"Stage":"authoritative Fabric truth-table validation"}\n',
+            b'{"Status":"passed","Diagnostics":{"TestedVectors":2}}\n',
+        ]
+        Connection.makefile.return_value = Stream
+        Progress = []
+        with patch(
+            "Compiler.FabricServer.Validation.socket.create_connection",
+            return_value=Connection,
+        ):
+            Response = Supervisor._RequestWhenReady(
+                "token",
+                {"Action": "Validate"},
+                Port=25566,
+                ProgressCallback=Progress.append,
+            )
+
+        self.assertEqual(Response["Status"], "passed")
+        self.assertEqual(
+            Progress,
+            [
+                FabricValidationProgress(
+                    Completed=0,
+                    Total=2,
+                    Stage="authoritative Fabric truth-table validation",
+                    Backend="fabric-26.2-canary",
+                ),
+                FabricValidationProgress(
+                    Completed=1,
+                    Total=2,
+                    Stage="authoritative Fabric truth-table validation",
+                    Backend="fabric-26.2-canary",
+                ),
+                FabricValidationProgress(
+                    Completed=2,
+                    Total=2,
+                    Stage="authoritative Fabric truth-table validation",
+                    Backend="fabric-26.2-canary",
+                ),
+            ],
+        )
 
     def testMissingServerIsAnInfrastructureFailure(self) -> None:
         Result = FabricServerSupervisor(
@@ -157,6 +215,59 @@ class FabricServerBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(Ready.call_args.kwargs["Port"], 25566)
         self.assertEqual(Result.Diagnostics, WorldClear)
+
+    def testExistingWorldValidationDoesNotClearOrPasteTheFixture(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            Root = Path(TemporaryDirectoryPath)
+            (Root / "config").mkdir()
+            (Root / "config" / "redstonecompiler-harness.json").write_text(
+                '{"Token":"live-token","Port":25566}',
+                encoding="utf-8",
+            )
+            FixturePath = Root / "fixture.FabricFixture.json"
+            WriteMinimalFabricFixture(FixturePath)
+            Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
+            with patch.object(
+                Supervisor,
+                "_ClearCanonicalSimulationWorld",
+            ) as Clear, patch.object(
+                Supervisor,
+                "_RequestWhenReady",
+                return_value={
+                    "Status": "passed",
+                    "Diagnostics": {
+                        "WorldStateMode": "existing",
+                        "FixturePasted": False,
+                    },
+                },
+            ) as Ready:
+                Result = Supervisor.ValidateExisting(
+                    Fixture=SimpleNamespace(Path=FixturePath, Sha256="fixture-sha"),
+                    Vectors=[{"Inputs": {"a": False}, "Expected": {"y": False}}],
+                )
+
+        self.assertEqual(Result.Status, "passed")
+        self.assertFalse(Result.Diagnostics["WorldCleared"])
+        self.assertFalse(Result.Diagnostics["FixturePasted"])
+        Clear.assert_not_called()
+        self.assertEqual(
+            Ready.call_args.args,
+            (
+                "live-token",
+                {
+                    "Action": "ValidateExisting",
+                    "FixturePath": str(FixturePath.resolve()),
+                    "FixtureSha256": "fixture-sha",
+                    "Vectors": [
+                        {"Inputs": {"a": False}, "Expected": {"y": False}},
+                    ],
+                },
+            ),
+        )
+        self.assertEqual(
+            Ready.call_args.kwargs,
+            {"Port": 25566, "ProgressCallback": None},
+        )
 
     def testFullWorldClearInvokesTheManagerClearActionWithoutRestarting(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
@@ -342,15 +453,21 @@ class FabricServerBoundaryTests(unittest.TestCase):
         Ready.assert_not_called()
 
     def testOnlyAnObservedFabricPassCanCompleteThePipeline(self) -> None:
-        RequireFabricServerValidation(FabricServerValidationResult(Status="passed"))
+        RequirePhysicalValidation(
+            FabricServerValidationResult(Status="passed"),
+            "FabricFinalCheck",
+        )
         with self.assertRaisesRegex(
             ValueError,
-            "FabricServerValidation:mismatch:output-mismatch:y",
+            "FabricFinalCheck:mismatch:output-mismatch:y",
         ):
-            RequireFabricServerValidation(FabricServerValidationResult(
-                Status="mismatch",
-                Diagnostics={"Error": "output-mismatch:y"},
-            ))
+            RequirePhysicalValidation(
+                FabricServerValidationResult(
+                    Status="mismatch",
+                    Diagnostics={"Error": "output-mismatch:y"},
+                ),
+                "FabricFinalCheck",
+            )
 
     def testVectorPolicyIsExhaustiveThenDeterministic(self) -> None:
         self.assertEqual(len(BuildValidationVectors(("a", "b"))), 4)
@@ -382,6 +499,25 @@ class FabricServerBoundaryTests(unittest.TestCase):
             [Gate["Name"] for Gate in Fixture["Trace"]["Gates"]],
             ["InputA", "OutputY"],
         )
+
+    def testFixtureCarriesRenderedSignTextIntoTheServerPaste(self) -> None:
+        Routed = SimpleNamespace(PlacedGates=[])
+        Rendered = SimpleNamespace(
+            Blocks={(2, 3, 4): {"Name": "minecraft:oak_sign"}},
+            Signs=[((2, 3, 4), "OUT result")],
+        )
+
+        Fixture = BuildFabricFixture(
+            RoutedDesign=Routed,
+            Rendered=Rendered,
+            Module=ModuleIR(Name="Top"),
+        )
+
+        self.assertEqual(Fixture["Signs"], [{
+            "Position": [2, 3, 4],
+            "FrontText": ["OUT result", "", "", ""],
+            "BackText": ["OUT result", "", "", ""],
+        }])
 
     def testExpectedVectorsUseLogicOnlyAsAnOracle(self) -> None:
         Module = ModuleIR(
@@ -562,6 +698,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
                 "Inputs": {"a": True},
                 "ExpectedSignals": {"n1": True, "y": True},
                 "TestedVectorsBeforeFailure": 3,
+                "GlobalVectorIndex": 3,
                 "ElapsedTicks": 200,
                 "ObservedUnchangedTicks": 0,
             },
@@ -580,6 +717,11 @@ class FabricServerBoundaryTests(unittest.TestCase):
         self.assertEqual(Trace["FailureKind"], "timeout")
         self.assertEqual(Trace["FailedOutput"], "y")
         self.assertEqual(Trace["TestedVectorsBeforeFailure"], 3)
+        self.assertEqual(Trace["GlobalVectorIndex"], 3)
+        self.assertNotIn("ValidationLaneIndex", Trace)
+        self.assertNotIn("ValidationStackIndex", Trace)
+        self.assertNotIn("ValidationVerticalIndex", Trace)
+        self.assertNotIn("ValidationLaneOrigin", Trace)
         self.assertEqual(Trace["FirstFailingSubcircuit"]["Gate"], "OutputY")
         self.assertEqual(Trace["FirstFailingBlock"]["FixturePosition"], [4, 0, 1])
         self.assertEqual(Trace["FirstFailingBlock"]["WorldPosition"], [4, 64, 1])
@@ -658,6 +800,26 @@ class FabricServerBoundaryTests(unittest.TestCase):
             ],
         )
 
+    def testSystemVerilogSourceCanBeTheExistingWorldOracle(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            SourcePath = Path(TemporaryDirectoryPath) / "Top.sv"
+            SourcePath.write_text(
+                "module Top(input logic a, output logic y); assign y = ~a; endmodule\n",
+                encoding="utf-8",
+            )
+
+            Module = ReadSvModule(SourcePath)
+            Vectors = BuildImportedSchematicVectors({
+                "Blocks": [],
+                "Inputs": [{"Name": "a", "LeverPosition": [0, 0, 0]}],
+                "Outputs": [{"Name": "y", "LampPosition": [1, 0, 0]}],
+            }, Module)
+
+        self.assertEqual(
+            [Vector["Expected"] for Vector in Vectors],
+            [{"y": True}, {"y": False}],
+        )
+
     def testImportedSchematicVectorsRejectAPortlessFixture(self) -> None:
         Module = ModuleIR(Name="Top", Inputs=["a"], Outputs=["y"])
 
@@ -678,7 +840,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
                     "Outputs": [{"Name": "y", "LampPosition": [1, 0, 0]}],
                 }, Module)
         with self.subTest(Case="output"):
-            with self.assertRaisesRegex(ValueError, "not produced by the NAND oracle"):
+            with self.assertRaisesRegex(ValueError, "not produced by the logic oracle"):
                 BuildImportedSchematicVectors({
                     "Blocks": [],
                     "Inputs": [{"Name": "a", "LeverPosition": [0, 0, 0]}],

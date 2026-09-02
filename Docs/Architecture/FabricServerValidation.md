@@ -1,17 +1,27 @@
-# Fabric server validation
+# MCHPRS validation and Fabric final check
 
-The compiler emits `<design>.FabricFixture.json` from the exact neutral block
-map used by its private staging litematic. The fixture names the
+The compiler emits `<design>.PhysicalFixture.json` from the exact neutral block
+map used by its private staging litematic. The shared fixture names the
 already-rendered input levers and output lamps; signs are presentation only and
-are never used as a protocol. After truth-table validation passes, the pipeline
-forces every input low, waits for the live world to settle, and publishes the
-observed block states as `<design>.litematic`. This means the final artifact
+are never used as a protocol. `ValidationServerHarness/Mchprs/` first validates
+the physical block map with MCHPRS/Redpiler. It exhaustively enumerates designs through 20
+inputs (including all 131,072 RCA8 vectors) and uses deterministic sampling for
+wider designs. A failed MCHPRS result stops before Fabric.
+
+After MCHPRS passes, `Compiler/FabricServer/` sends a deterministic canary set
+(zero, all-one, one-hot, and one-cold inputs) through one fixture on the live
+Minecraft 26.2 server. This Fabric check remains required: mismatch, timeout,
+infrastructure failure, or missing server fails compilation. After it passes,
+the pipeline forces every input low, waits for the live world to settle, and
+publishes the observed block states as `<design>.litematic`. The final artifact
 stores Minecraft's dust power, torch/lamp lighting, and repeater state for the
 all-zero vector rather than static neutral properties. The private staging file
-is never published; snapshot failure clears all success artifacts.
+is never published; snapshot failure clears all success artifacts. Legacy
+`.FabricFixture.json` files remain readable, but new runs publish only the
+shared `.PhysicalFixture.json` artifact.
 
 The one canonical local runtime is
-`FabricServerHarness/Server/`. It contains the Fabric 26.2 launcher, world,
+`ValidationServerHarness/Server/`. It contains the Fabric 26.2 launcher, world,
 backups, logs, installed harness JAR, and private control configuration, and is
 intentionally ignored by Git. Compiler validation and the Fabric importer
 default to this root. `RC_FABRIC_SERVER_ROOT` remains an explicit override for
@@ -32,7 +42,7 @@ python3 Scripts/Fabric/ControlFabricServer.py clear
 ```
 
 The tracked control command delegates to the modular, runtime-local
-implementation in `FabricServerHarness/Server/PyScripts/` (`Paths`,
+implementation in `ValidationServerHarness/Server/PyScripts/` (`Paths`,
 `Protocol`, `Anvil`, `Process`, and `Main`). On start it verifies the launcher and
 accepted EULA, refreshes the installed harness JAR from the project build when
 needed, creates a fresh loopback token, and waits for authenticated control
@@ -44,8 +54,8 @@ the typed 26.2 gamerule API.
 
 ## Updating the local harness runtime
 
-`FabricServerHarness/Server/` is not a Git deployment target. When tracked
-Fabric harness Java changes, build `FabricServerHarness` with the available
+`ValidationServerHarness/Server/` is not a Git deployment target. When tracked
+Fabric harness Java changes, build `ValidationServerHarness` with the available
 Gradle installation, then run `Scripts/Fabric/ControlFabricServer.py start`.
 The manager copies a newer built JAR into the local runtime and only restarts a
 healthy running server when that JAR needs refreshing. The runtime-local
@@ -54,7 +64,7 @@ synced by Git; a future fresh-host provisioning flow needs a tracked bootstrap
 or template outside `Server/`.
 
 `clear` is a destructive live block operation. It preserves the existing
-`FabricServerHarness/Server/world/` directory, `level.dat`, world identity,
+`ValidationServerHarness/Server/world/` directory, `level.dat`, world identity,
 generator settings, gamerules, and region files. While the managed server
 remains running, the manager reads each persisted Anvil region header, derives
 every saved Overworld chunk, and decodes its block-state palette. It first
@@ -85,17 +95,29 @@ incoming fixture arena immediately before placement as a second, idempotent
 pre-paste guard.
 
 The server sets a 1,000 TPS target, force-loads every chunk intersecting the
-fixture arena (up to 256 chunks), places the exact fixture states, drives
-levers, and forces updates at each lever and its six direct neighbors. It then
-samples every dynamic block listed by the fixture trace. A vector is settled
+single fixture arena (up to 1,024 chunks), applies canary vectors sequentially,
+and forces updates at each lever and its six direct neighbors. There are no
+Fabric validation copies, lanes, stacks, or capacity workers.
+
+Each vector is sampled atomically on the Minecraft server thread and is settled
 only after all traced dust, repeaters, torches, lamps, comparators, and levers
-remain unchanged for 20 consecutive observed game ticks (up to 200 ticks
-total). Only then does the harness compare output lamps. It returns `passed`,
+remain unchanged for 40 consecutive observed game ticks (up to 200 ticks
+total). Per-tick comparisons use compact immutable block-state lists; the
+harness serializes full coordinate/state JSON only for a settled or failed
+snapshot. Only then does the harness compare output lamps. It returns `passed`,
 `mismatch`, `timeout`, or
 `infrastructure-failure`; absence of the configured server is an infrastructure
 failure, never a functional pass.
 
-Skipped game ticks do not count toward the 20-tick proof: the unchanged counter
+The harness streams authoritative `Completed`/`Total` JSON progress at the
+start of the canary set and after every fully tested vector. The terminal bar
+therefore starts at `0/N` and reflects actual settled and compared Fabric
+canaries. Results are committed in canary order, and mismatch/timeout
+diagnostics carry the global vector index. Fixture and vector preparation do
+not render a placeholder validation bar. Existing-world validation uses the
+same observer and restores the original input states.
+
+Skipped game ticks do not count toward the 40-tick proof: the unchanged counter
 resets whenever the harness cannot observe the next consecutive game tick.
 Mismatch traces are serialized from the same atomic snapshot used for output
 comparison, so a continuing server clock cannot move the trace past the failed

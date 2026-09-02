@@ -5,15 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from Compiler.PhysicalValidation.Models import (
+    PhysicalValidationProgress,
+    PhysicalValidationResult,
+)
 
-@dataclass(frozen=True)
-class FabricServerValidationResult:
-    """Outcome returned by the Fabric-server validation stage."""
-
-    Status: str
-    Backend: str | None = None
-    RuntimeSeconds: float = 0.0
-    Diagnostics: dict[str, Any] = field(default_factory=dict)
+FabricValidationProgress = PhysicalValidationProgress
+FabricServerValidationResult = PhysicalValidationResult
 
 
 @dataclass(frozen=True)

@@ -245,7 +245,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
 
             Removed = ClearStaleSuccessArtifacts(OutputPath)
 
-            self.assertEqual(len(Removed), 4)
+            self.assertEqual(len(Removed), 5)
             self.assertTrue(DiagramPath.exists())
             self.assertFalse(any(
                 ArtifactPath.exists()
@@ -388,7 +388,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                     side_effect=Capture,
                 ),
                 patch(
-                    "Compiler.Pipeline.WriteFabricFixture",
+                    "Compiler.Pipeline.WritePhysicalFixture",
                     side_effect=WriteFixture,
                 ),
             ):
@@ -396,7 +396,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                     Routed=object(),
                     Rendered=SimpleNamespace(),
                     PhysicalDesignDocument=PhysicalDesignDocument,
-                    FabricFixture={"Fixture": "design"},
+                    PhysicalFixture={"Fixture": "design"},
                     FabricServerSnapshotSupervisor=SnapshotSupervisor,
                     OutputPath=OutputPath,
                 )
@@ -449,7 +449,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                     Routed=object(),
                     Rendered=SimpleNamespace(),
                     PhysicalDesignDocument={"RunSummary": {}},
-                    FabricFixture={"Fixture": "design"},
+                    PhysicalFixture={"Fixture": "design"},
                     FabricServerSnapshotSupervisor=object(),
                     OutputPath=OutputPath,
                 )

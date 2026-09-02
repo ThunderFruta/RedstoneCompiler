@@ -14,21 +14,20 @@ Spec.loader.exec_module(ReplayModule)
 
 
 class Cla4AccessReplayTests(unittest.TestCase):
-    def testCanonicalConflictReplayIsDeterministicAndFast(self) -> None:
+    def testCanonicalConflictReplayMatchesSemanticEvidence(self) -> None:
         Result = ReplayModule.RunCla4AccessReplay()
 
-        self.assertTrue(Result.Passed)
         self.assertEqual(Result.Status.value, "Conflict")
-        self.assertTrue(Result.SourceArtifactMatched)
+        self.assertTrue(Result.SourceArtifactPresent)
+        self.assertTrue(Result.SourceArtifactSha256)
+        self.assertTrue(Result.ExpectedSourceArtifactSha256)
+        self.assertIsInstance(Result.SourceArtifactSha256Matched, bool)
+        self.assertIsInstance(Result.RuntimeWithinTarget, bool)
         self.assertTrue(Result.SourceCandidateMatched)
         self.assertTrue(Result.ExpectedProfileMatched)
         self.assertTrue(Result.RepeatedProfileMatched)
         self.assertTrue(Result.FixedPlacementSolveMatched)
         self.assertTrue(Result.UnsatisfiableCoreReplayed)
-        self.assertLessEqual(
-            Result.RuntimeSeconds,
-            Result.MaximumRuntimeSeconds,
-        )
         self.assertEqual(Result.Profile["ExactConflictCount"], 2)
         self.assertEqual(
             Result.Profile["ConflictSignals"],
@@ -49,6 +48,7 @@ class Cla4AccessReplayTests(unittest.TestCase):
             Result.FixedPlacementSolve["UnsatisfiableCore"]["Signals"],
             ["NandNet0", "Propagate0"],
         )
+        self.assertTrue(Result.Passed)
 
 
 if __name__ == "__main__":

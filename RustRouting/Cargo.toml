@@ -15,3 +15,9 @@ python-extension = ["pyo3/extension-module"]
 [dependencies]
 pyo3 = { version = "0.22" }
 rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mchprs_blocks = { git = "https://github.com/MCHPR/MCHPRS.git", rev = "fe2172101e0f025afc0760f4920e0631c4854880" }
+mchprs_redpiler = { git = "https://github.com/MCHPR/MCHPRS.git", rev = "fe2172101e0f025afc0760f4920e0631c4854880" }
+mchprs_redstone = { git = "https://github.com/MCHPR/MCHPRS.git", rev = "fe2172101e0f025afc0760f4920e0631c4854880" }
+mchprs_world = { git = "https://github.com/MCHPR/MCHPRS.git", rev = "fe2172101e0f025afc0760f4920e0631c4854880", features = ["testing"] }

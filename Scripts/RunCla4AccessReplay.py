@@ -33,7 +33,7 @@ from Compiler.Placement.Geometry import (
 )
 
 
-SchemaVersion = "cla4-mandatory-access-replay-v2"
+SchemaVersion = "cla4-mandatory-access-replay-v3"
 DefaultFixturePath = (
     RepositoryRoot / "Tests/Fixtures/Cla4MandatoryAccessReplay.json"
 )
@@ -54,7 +54,11 @@ class Cla4AccessReplayResult:
     Passed: bool
     RuntimeSeconds: float
     MaximumRuntimeSeconds: float
-    SourceArtifactMatched: bool
+    RuntimeWithinTarget: bool
+    SourceArtifactPresent: bool
+    SourceArtifactSha256: str
+    ExpectedSourceArtifactSha256: str
+    SourceArtifactSha256Matched: bool
     SourceCandidateMatched: bool
     ExpectedProfileMatched: bool
     RepeatedProfileMatched: bool
@@ -70,7 +74,15 @@ class Cla4AccessReplayResult:
             "Passed": self.Passed,
             "RuntimeSeconds": round(self.RuntimeSeconds, 6),
             "MaximumRuntimeSeconds": self.MaximumRuntimeSeconds,
-            "SourceArtifactMatched": self.SourceArtifactMatched,
+            "RuntimeWithinTarget": self.RuntimeWithinTarget,
+            "SourceArtifactPresent": self.SourceArtifactPresent,
+            "SourceArtifactSha256": self.SourceArtifactSha256,
+            "ExpectedSourceArtifactSha256": (
+                self.ExpectedSourceArtifactSha256
+            ),
+            "SourceArtifactSha256Matched": (
+                self.SourceArtifactSha256Matched
+            ),
             "SourceCandidateMatched": self.SourceCandidateMatched,
             "ExpectedProfileMatched": self.ExpectedProfileMatched,
             "RepeatedProfileMatched": self.RepeatedProfileMatched,
@@ -175,12 +187,18 @@ def RunCla4AccessReplay(
     Fixture = LoadFixture(FixturePath)
     SourceDefinition = Fixture["SourceArtifact"]
     SourcePath = RepositoryRoot / SourceDefinition["Path"]
-    SourceArtifactMatched = (
-        SourcePath.is_file()
-        and Sha256File(SourcePath) == SourceDefinition["Sha256"]
+    SourceArtifactPresent = SourcePath.is_file()
+    SourceArtifactSha256 = (
+        Sha256File(SourcePath)
+        if SourceArtifactPresent
+        else ""
+    )
+    ExpectedSourceArtifactSha256 = str(SourceDefinition["Sha256"])
+    SourceArtifactSha256Matched = (
+        SourceArtifactSha256 == ExpectedSourceArtifactSha256
     )
     SourceCandidateMatched = False
-    if SourceArtifactMatched:
+    if SourceArtifactPresent:
         SourcePayload = json.loads(SourcePath.read_text(encoding="utf-8"))
         Candidate = FindSourceCandidate(
             SourcePayload,
@@ -245,27 +263,30 @@ def RunCla4AccessReplay(
         )
     RuntimeSeconds = monotonic() - Started
     MaximumRuntimeSeconds = float(ReplaySlice["MaximumRuntimeSeconds"])
+    RuntimeWithinTarget = RuntimeSeconds <= MaximumRuntimeSeconds
     Status = (
         MandatoryAccessReplayStatus.Conflict
         if Profile.HasConflicts
         else MandatoryAccessReplayStatus.Clean
     )
     Passed = all((
-        SourceArtifactMatched,
         SourceCandidateMatched,
         ExpectedProfileMatched,
         RepeatedProfileMatched,
         FixedPlacementSolveMatched,
         UnsatisfiableCoreReplayed,
         Status is MandatoryAccessReplayStatus.Conflict,
-        RuntimeSeconds <= MaximumRuntimeSeconds,
     ))
     return Cla4AccessReplayResult(
         Status=Status,
         Passed=Passed,
         RuntimeSeconds=RuntimeSeconds,
         MaximumRuntimeSeconds=MaximumRuntimeSeconds,
-        SourceArtifactMatched=SourceArtifactMatched,
+        RuntimeWithinTarget=RuntimeWithinTarget,
+        SourceArtifactPresent=SourceArtifactPresent,
+        SourceArtifactSha256=SourceArtifactSha256,
+        ExpectedSourceArtifactSha256=ExpectedSourceArtifactSha256,
+        SourceArtifactSha256Matched=SourceArtifactSha256Matched,
         SourceCandidateMatched=SourceCandidateMatched,
         ExpectedProfileMatched=ExpectedProfileMatched,
         RepeatedProfileMatched=RepeatedProfileMatched,

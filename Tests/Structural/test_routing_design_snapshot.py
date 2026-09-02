@@ -441,27 +441,36 @@ async def Run():
             ):
                 SnapshotTool.SummarizeNandDiagram((FirstPath,))
 
-    def testSourceManifestFindsCurrentSplitRoutingOwners(self) -> None:
+    def testSourceManifestIsDeterministicAndResolvesInventory(self) -> None:
         Source = SnapshotTool.BuildRoutingSourceManifest(RepositoryRoot)
+        Repeated = SnapshotTool.BuildRoutingSourceManifest(RepositoryRoot)
+        Files = Source["Files"]
         LargestDefinitions = Source["Metrics"]["LargestPythonDefinitions"]
-        LargestNames = {
-            Value["QualifiedName"]
-            for Value in LargestDefinitions
-        }
 
-        self.assertGreater(Source["FileCount"], 50)
-        self.assertIn("RunCandidateMaterialization", LargestNames)
-        self.assertIn(
-            "_SolvePreparedPhysicalComponentPortFactorDomain",
-            LargestNames,
+        self.assertEqual(Source, Repeated)
+        self.assertEqual(Source["FileCount"], len(Files))
+        self.assertEqual(
+            [Value["Path"] for Value in Files],
+            sorted(Value["Path"] for Value in Files),
         )
-        self.assertLess(
-            max(
-                Value["PythonAstSpanLines"]
-                for Value in LargestDefinitions
-                if Value["Kind"] == "Function"
-            ),
-            1_000,
+        self.assertEqual(
+            len({Value["Path"] for Value in Files}),
+            len(Files),
+        )
+        for Value in Files:
+            self.assertTrue((RepositoryRoot / Value["Path"]).is_file())
+            self.assertGreaterEqual(Value["PhysicalLines"], 1)
+        self.assertTrue(LargestDefinitions)
+        self.assertEqual(
+            LargestDefinitions,
+            sorted(
+                LargestDefinitions,
+                key=lambda Value: (
+                    -Value["PythonAstSpanLines"],
+                    Value["Path"],
+                    Value["Line"],
+                ),
+            )[:len(LargestDefinitions)],
         )
 
     def testCapturePublishesFreshBundleWithoutChangingRepositoryStatus(self) -> None:

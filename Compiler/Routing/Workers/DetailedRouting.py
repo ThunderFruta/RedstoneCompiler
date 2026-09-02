@@ -6,7 +6,7 @@ import os
 from typing import Any, Callable
 
 try:
-    from ...RustRouting import RoutingContext as RustRoutingContext
+    from RedstoneCompiler.RustRouting import RoutingContext as RustRoutingContext
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import RoutingContext as RustRoutingContext

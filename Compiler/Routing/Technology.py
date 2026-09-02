@@ -149,6 +149,15 @@ class RedstoneRoutingTechnology:
             Result.update(self.NeighborPositions(Position))
         return Result
 
+    def TorchPoweredDustKeepOut(self, Position: Position3) -> Position3:
+        """Return dust above the solid block directly powered by a torch.
+
+        Both standing and wall redstone torches power a solid block placed
+        immediately above them. Dust on top of that block is therefore part
+        of the torch's electrical domain even though it is two Y cells away.
+        """
+        return (Position[0], Position[1] + 2, Position[2])
+
     def RoutingY(self, BaseY: int, Layer: int) -> int:
         """Map a logical routing layer to its concrete dust elevation."""
         if Layer < 0:

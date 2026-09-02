@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Test an imported compiler schematic against its NAND truth table in Fabric."""
+"""Test a pasted or manually edited compiler circuit in the Fabric server."""
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 from typing import Callable
@@ -14,13 +15,16 @@ if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
 from Compiler.FabricServer import (
+    BuildFabricFixtureFromSchem,
     BuildImportedSchematicVectors,
     FabricServerConfiguration,
     FabricServerSupervisor,
     FabricServerValidationResult,
     ReadFabricFixture,
     ReadNandModule,
+    ReadSvModule,
     ResolveFabricServerRoot,
+    WriteFabricFixture,
 )
 
 
@@ -30,16 +34,48 @@ def BuildParser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "The schematic must first be loaded with "
-            "ImportSchemToFabricServer.py. The tester derives the matching "
-            ".FabricFixture.json from the server and .Nand.json oracle from "
-            "the schematic directory."
+            "Normal mode clears and reloads the fixture before testing. Use "
+            "--existing-state <design.sv> to preserve manually edited world "
+            "blocks and test them against the SystemVerilog source."
         ),
     )
     Parser.add_argument(
         "Schem",
+        nargs="?",
         type=Path,
         help="previously imported compiler .litematic or .schem artifact",
+    )
+    Parser.add_argument(
+        "--existing-state",
+        type=Path,
+        metavar="SV",
+        help=(
+            "do not clear or paste blocks; test the current world using this "
+            "SystemVerilog file as the logic oracle; input lever states are "
+            "restored after the test"
+        ),
+    )
+    Parser.add_argument(
+        "--top",
+        help="top module when --existing-state points to a multi-module SV file",
+    )
+    Parser.add_argument(
+        "--litematic",
+        type=Path,
+        help=(
+            "litematic used only to derive a missing existing-world port map; "
+            "it is never pasted"
+        ),
+    )
+    Parser.add_argument(
+        "--origin",
+        nargs=3,
+        type=int,
+        metavar=("X", "Y", "Z"),
+        help=(
+            "world origin of the manually pasted circuit when deriving its "
+            "port map (default: 0 64 0)"
+        ),
     )
     Parser.add_argument(
         "--server-root",
@@ -53,7 +89,10 @@ def BuildParser() -> argparse.ArgumentParser:
     Parser.add_argument(
         "--fixture",
         type=Path,
-        help="imported fixture path (default: <server-root>/fixtures/<schem>.FabricFixture.json)",
+        help=(
+            "port-map fixture path (default: <server-root>/fixtures/"
+            "<schem-or-sv-stem>.FabricFixture.json)"
+        ),
     )
     Parser.add_argument(
         "--nand",
@@ -91,14 +130,28 @@ def BuildParser() -> argparse.ArgumentParser:
 
 
 def GuidedArguments() -> list[str]:
-    """Collect one post-import truth-table test request."""
+    """Collect one pasted-fixture or existing-world truth-table test request."""
     print("RedstoneCompiler schematic truth-table test")
-    Schem = input("Path to the imported .schem or .litematic file: ").strip().strip("'\"")
-    if not Schem:
-        raise ValueError("a .schem or .litematic path is required")
+    print(
+        "1) Reload the imported fixture, then test it\n"
+        "2) Test the existing world state without clearing or pasting"
+    )
+    StateMode = input("Choose world-state mode [1]: ").strip() or "1"
+    if StateMode in {"1", "reload", "fixture"}:
+        Schem = input("Path to the imported .schem or .litematic file: ").strip().strip("'\"")
+        if not Schem:
+            raise ValueError("a .schem or .litematic path is required")
+        Arguments = [Schem]
+    elif StateMode in {"2", "existing", "existing-state"}:
+        Source = input("SystemVerilog file describing the existing circuit: ").strip().strip("'\"")
+        if not Source:
+            raise ValueError("a SystemVerilog source path is required")
+        Arguments = ["--existing-state", Source]
+    else:
+        raise ValueError("choose 1 to reload the fixture or 2 to test existing state")
     DefaultRoot = str(ResolveFabricServerRoot())
     Root = input(f"Server root [{DefaultRoot}]: ").strip() or DefaultRoot
-    Arguments = [Schem, "--server-root", Root]
+    Arguments.extend(("--server-root", Root))
     print(
         "1) Test one selected truth-table row\n"
         "2) Test all truth-table rows\n"
@@ -129,6 +182,77 @@ def DefaultFixturePath(Schem: Path, ServerRoot: Path) -> Path:
 def DefaultNandPath(Schem: Path) -> Path:
     """Return the compiler NAND oracle emitted beside the schematic."""
     return Schem.with_suffix(".Nand.json")
+
+
+def ExistingLitematicCandidates(SvPath: Path) -> list[Path]:
+    """Return conventional litematic locations for one SV source stem."""
+    Stem = SvPath.stem
+    Candidates = [
+        SvPath.with_suffix(".litematic"),
+        RepositoryRoot / "Output" / Stem / f"{Stem}.litematic",
+    ]
+    DefaultsPath = Path.home() / ".config" / "RedstoneCompiler" / "Defaults.json"
+    try:
+        Defaults = json.loads(DefaultsPath.read_text(encoding="utf-8"))
+        MinecraftDirectory = Defaults.get("MinecraftDirectory")
+        if isinstance(MinecraftDirectory, str) and MinecraftDirectory.strip():
+            Candidates.append(
+                Path(MinecraftDirectory).expanduser() / f"{Stem}.litematic",
+            )
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    PrismInstances = (
+        Path.home() / ".local/share/PrismLauncher/instances"
+    )
+    Candidates.extend(sorted(
+        PrismInstances.glob(f"*/minecraft/schematics/{Stem}.litematic"),
+    ))
+    return list(dict.fromkeys(Path(Value).resolve() for Value in Candidates))
+
+
+def ResolveExistingLitematic(
+    SvPath: Path,
+    ExplicitPath: Path | None,
+) -> Path:
+    """Resolve the read-only litematic used to register live port positions."""
+    if ExplicitPath is not None:
+        Resolved = ExplicitPath.expanduser().resolve()
+        if not Resolved.is_file():
+            raise FileNotFoundError(
+                f"existing-state litematic does not exist: {Resolved}",
+            )
+        return Resolved
+    Candidates = ExistingLitematicCandidates(SvPath)
+    Match = next((PathValue for PathValue in Candidates if PathValue.is_file()), None)
+    if Match is not None:
+        return Match
+    Locations = ", ".join(str(PathValue) for PathValue in Candidates)
+    raise FileNotFoundError(
+        "existing-state port map is missing and no matching litematic was found; "
+        f"checked: {Locations}; specify one with --litematic",
+    )
+
+
+def ReadOrRegisterExistingFixture(
+    *,
+    FixturePath: Path,
+    SvPath: Path,
+    LitematicPath: Path | None,
+    Origin: tuple[int, int, int] | None,
+) -> tuple[object, dict[str, object], Path | None]:
+    """Read a port map or derive it from a litematic without loading blocks."""
+    Regenerate = LitematicPath is not None or Origin is not None
+    if FixturePath.is_file() and not Regenerate:
+        Artifact, Document = ReadFabricFixture(FixturePath)
+        return Artifact, Document, None
+    SourceLitematic = ResolveExistingLitematic(SvPath, LitematicPath)
+    Document = BuildFabricFixtureFromSchem(
+        SourceLitematic,
+        Origin=Origin or (0, 64, 0),
+        ResetBeforeLoad=False,
+    )
+    Artifact = WriteFabricFixture(FixturePath, Document)
+    return Artifact, Document, SourceLitematic
 
 
 def SelectTruthTableVectors(
@@ -197,12 +321,14 @@ def TestAllVectorsOneAtATime(
     Vectors: list[dict[str, object]],
     ReportRow: Callable[[dict[str, object]], None] | None = None,
     PauseAfterRow: Callable[[int, int], None] | None = None,
+    ExistingState: bool = False,
 ) -> tuple[FabricServerValidationResult, list[dict[str, object]]]:
     """Run every vector independently, pausing between observable rows."""
     Results: list[FabricServerValidationResult] = []
     Rows: list[dict[str, object]] = []
+    Validate = Supervisor.ValidateExisting if ExistingState else Supervisor.Validate
     for VectorIndex, Vector in enumerate(Vectors):
-        Result = Supervisor.Validate(Fixture=Fixture, Vectors=[Vector])
+        Result = Validate(Fixture=Fixture, Vectors=[Vector])
         Results.append(Result)
         Row = {
             "VectorIndex": VectorIndex,
@@ -234,13 +360,46 @@ def Main(Arguments: list[str] | None = None) -> int:
         except ValueError as Error:
             Parser.error(str(Error))
     Parsed = Parser.parse_args(RawArguments)
-    Schem = Parsed.Schem.expanduser().resolve()
+    if Parsed.existing_state is None and Parsed.Schem is None:
+        Parser.error("Schem is required unless --existing-state specifies an SV file")
+    if Parsed.existing_state is not None and Parsed.nand is not None:
+        Parser.error("--nand cannot be combined with --existing-state; the SV file is the oracle")
+    if Parsed.existing_state is None and Parsed.top is not None:
+        Parser.error("--top is only valid with --existing-state")
+    if Parsed.existing_state is None and Parsed.litematic is not None:
+        Parser.error("--litematic is only valid with --existing-state")
+    if Parsed.existing_state is None and Parsed.origin is not None:
+        Parser.error("--origin is only valid with --existing-state")
+    ExistingState = Parsed.existing_state is not None
+    Schem = Parsed.Schem.expanduser().resolve() if Parsed.Schem is not None else None
+    SvPath = Parsed.existing_state.expanduser().resolve() if ExistingState else None
     ServerRoot = Parsed.server_root.expanduser().resolve()
-    FixturePath = (Parsed.fixture or DefaultFixturePath(Schem, ServerRoot)).expanduser().resolve()
-    NandPath = (Parsed.nand or DefaultNandPath(Schem)).expanduser().resolve()
+    FixtureSource = Schem or SvPath
+    assert FixtureSource is not None
+    FixturePath = (
+        Parsed.fixture or DefaultFixturePath(FixtureSource, ServerRoot)
+    ).expanduser().resolve()
+    NandPath = (
+        (Parsed.nand or DefaultNandPath(Schem)).expanduser().resolve()
+        if not ExistingState and Schem is not None
+        else None
+    )
     try:
-        Fixture, Document = ReadFabricFixture(FixturePath)
-        Module = ReadNandModule(NandPath)
+        if ExistingState and SvPath is not None:
+            Fixture, Document, RegisteredFrom = ReadOrRegisterExistingFixture(
+                FixturePath=FixturePath,
+                SvPath=SvPath,
+                LitematicPath=Parsed.litematic,
+                Origin=tuple(Parsed.origin) if Parsed.origin is not None else None,
+            )
+        else:
+            Fixture, Document = ReadFabricFixture(FixturePath)
+            RegisteredFrom = None
+        Module = (
+            ReadSvModule(SvPath, TopModule=Parsed.top)
+            if ExistingState and SvPath is not None
+            else ReadNandModule(NandPath)
+        )
         AllVectors = BuildImportedSchematicVectors(Document, Module)
         Supervisor = FabricServerSupervisor(
             FabricServerConfiguration(Root=ServerRoot),
@@ -254,6 +413,7 @@ def Main(Arguments: list[str] | None = None) -> int:
                 Vectors,
                 lambda Row: print({"Event": "truth-table-row", **Row}),
                 PauseForNextTruthTableRow,
+                ExistingState=ExistingState,
             )
             Mode = "all-one-at-a-time"
         else:
@@ -261,7 +421,8 @@ def Main(Arguments: list[str] | None = None) -> int:
                 AllVectors,
                 Parsed.vector_index,
             )
-            Result = Supervisor.Validate(Fixture=Fixture, Vectors=Vectors)
+            Validate = Supervisor.ValidateExisting if ExistingState else Supervisor.Validate
+            Result = Validate(Fixture=Fixture, Vectors=Vectors)
             RowResults = []
             Mode = "one" if SelectedVectorIndex is not None else "all"
     except (OSError, ValueError) as Error:
@@ -274,7 +435,12 @@ def Main(Arguments: list[str] | None = None) -> int:
         "Status": Result.Status,
         "Backend": Result.Backend,
         "Fixture": str(Fixture.Path),
-        "Nand": str(NandPath),
+        "FixtureRegisteredFrom": (
+            str(RegisteredFrom) if RegisteredFrom is not None else None
+        ),
+        "WorldState": "existing" if ExistingState else "fixture-reloaded",
+        "Sv": str(SvPath) if SvPath is not None else None,
+        "Nand": str(NandPath) if NandPath is not None else None,
         "Mode": Mode,
         "Vectors": len(Vectors),
         "TotalVectors": len(AllVectors),

@@ -181,8 +181,7 @@ macro_rules! PrepareLayeredCatalogSolverPhase {
         } else {
             Vec::new()
         };
-        let $WarmCandidateIdByVariable =
-            $WarmSelections.iter().cloned().collect::<HashMap<_, _>>();
+        let $WarmCandidateIdByVariable = $WarmSelections.iter().cloned().collect::<HashMap<_, _>>();
         for (Variable, Values) in $Groups.iter_mut() {
             let Some(PreferredCandidateId) = $WarmCandidateIdByVariable.get(Variable) else {
                 continue;

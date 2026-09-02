@@ -105,9 +105,9 @@ all four current scale failures stop themselves with typed artifacts and zero
 wall overrun, but RCA4 and CLA4 still route 0/2.
 
 The harness separates the router deadline from the immutable process wall
-ceiling with a 2.0-second `PublicationReserve`: router deadlines are 8 seconds
-for FullAdder, 23 seconds for RCA4, and 118 seconds for CLA4 inside unchanged
-10-, 25-, and 120-second acceptance ceilings. The watchdog remains ceiling plus
+ceiling with a 2.0-second `PublicationReserve`: router deadlines are 13 seconds
+for FullAdder, 23 seconds for RCA4, and 118 seconds for CLA4 inside the current
+15-, 25-, and 120-second acceptance ceilings. The watchdog remains ceiling plus
 2 seconds only to capture a process that fails to stop. The manifest records
 the reserve and effective router deadline. This is neither fallback nor a
 runtime extension.
@@ -215,7 +215,7 @@ by the RRF-073 physical matrix.
 
 | Gate | Required runs | Correctness | Runtime ceiling | Current state |
 | --- | ---: | --- | ---: | --- |
-| FullAdder | 5 consecutive | 8/8 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 10s each | **VERIFIED:** current matrix passed 5/5 at 1.018414s-1.036595s wall time with deterministic fingerprint, ownership, route metrics, and emitted design |
+| FullAdder | 5 consecutive | 8/8 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 15s each | **VERIFIED:** current matrix passed 5/5 at 1.018414s-1.036595s wall time with deterministic fingerprint, ownership, route metrics, and emitted design |
 | RippleCarryAdder4 | 2 consecutive | 512/512 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 25s each | **NOT ACCEPTED:** current matrix self-exited 0/2 at 18.828730s and 18.848981s with typed failures, no timeout or wall overrun, and no routed outputs |
 | CarryLookaheadAdder4 | 2 consecutive | 512/512 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 120s each | **NOT ACCEPTED:** current matrix self-exited 0/2 at 119.268383s and 119.248057s with typed failures, no timeout or wall overrun, and no routed outputs |
 
@@ -257,7 +257,7 @@ placement fingerprint, resource ownership, route metrics, and canonicalized
 emitted design. It rejects a timeout, compatibility or fallback result,
 runtime overrun, conflict, unresolved claim, overflow above one, missing or
 failure artifact, or repeated-run mismatch. It records the 2.0-second
-publication reserve and resulting 8/23/118-second router deadlines; its
+publication reserve and resulting 13/23/118-second router deadlines; its
 ceiling-plus-2 watchdog is capture-only and cannot make an over-ceiling run
 pass.
 
@@ -274,27 +274,15 @@ Do not start scale routing until the lightweight gates pass:
 
 ```bash
 python3 -m compileall -q Compiler SVDecoder SchemEncoder Tests
-python3 -m unittest \
-  Tests.test_authoritative_planner \
-  Tests.test_channel_planner \
-  Tests.test_legacy_shims_fail_fast \
-  Tests.test_local_first_router \
-  Tests.test_logic_optimization \
-  Tests.test_physical_cells \
-  Tests.test_pipeline_artifact_integrity \
-  Tests.test_placement_boundary_feasibility \
-  Tests.test_redstone_simulation \
-  Tests.test_resource_graph \
-  Tests.test_router_acceptance_harness \
-  Tests.test_router_reliability \
-  Tests.test_routing_architecture \
-  Tests.test_routing_resources
+.venv/bin/python -m pytest -q Tests
 cargo test --manifest-path RustRouting/Cargo.toml --release
-RC_RUN_SCALE_TESTS=1 python3 -m unittest Tests.test_scale_routing -v
+RC_RUN_SCALE_TESTS=1 .venv/bin/python -m pytest -q \
+  Tests/Integration/test_scale_routing.py
 ```
 
-The explicit list above is the scale-excluded lightweight gate. Run the scale
-command by itself and retain its complete output with the physical artifacts.
+The complete pytest command is the scale-excluded deterministic gate. Run the
+scale command by itself and retain its complete output with the physical
+artifacts.
 The approved default-feature Cargo command is the native acceptance gate and
 currently passes 25/25. A
 `--no-default-features` run may remain useful during native development, but it

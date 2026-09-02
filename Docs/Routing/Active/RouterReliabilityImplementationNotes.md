@@ -4,6 +4,11 @@
 failed attempt, measurement, or decision. Add a dated correction that cites the
 earlier entry when evidence changes.
 
+Commands and test paths inside dated entries are retained historical evidence
+and may name pre-reorganization modules. Use
+[`Docs/Testing/RunningTests.md`](../../Testing/RunningTests.md) for current test
+paths and tier commands.
+
 This file records implementation activity. The
 [design document](RouterReliabilityDesignDoc.md) remains normative, and the
 [guide](RouterReliabilityGuide.md) owns the current operator verdict.

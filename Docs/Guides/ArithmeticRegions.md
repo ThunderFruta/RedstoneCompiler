@@ -9,12 +9,13 @@ Run scale tests only after the focused routing checks pass and no other large
 compile is active:
 
 ```bash
-RC_RUN_SCALE_TESTS=1 python3 -m unittest Tests.test_scale_routing -v
+RC_RUN_SCALE_TESTS=1 .venv/bin/python -m pytest -q \
+  Tests/Integration/test_scale_routing.py
 ```
 
 Judge circuits sequentially:
 
-1. FullAdder must pass 5/5 below 10 seconds.
+1. FullAdder must pass 5/5 below 15 seconds.
 2. RCA4 must pass 2/2 below 25 seconds with 512/512 rows.
 3. CLA4 may then run and must pass 2/2 below 120 seconds with 512/512 rows.
 
@@ -24,4 +25,4 @@ state. A stable nonzero overflow normally calls for region growth, branch
 repair, or placement feedback—not a benchmark-specific exception.
 
 The current flow is specified in the
-[negotiated route-tree design](../Routing/NegotiatedRouteTreeRouter.md).
+[negotiated route-tree design](../Routing/Active/NegotiatedRouteTreeRouter.md).

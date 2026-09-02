@@ -1,4 +1,5 @@
 import os
+from random import Random
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -134,6 +135,71 @@ def test_native_lease_fixture_cross_checks_unsat_and_budget(monkeypatch):
         ComponentPlanningStatus.SearchIncomplete
     )
     assert NativeBudget.Diagnostics["NativeLeaseBudgetExhausted"] is True
+
+
+def test_random_small_lease_domains_match_python_oracle(monkeypatch):
+    """Cross-check native feasibility and witnesses over bounded domains."""
+    for Seed in range(24):
+        Generator = Random(Seed)
+        Domains = {}
+        for SignalIndex in range(3):
+            Signal = f"Signal{SignalIndex}"
+            Domains[Signal] = tuple(
+                _Boundary(
+                    Signal,
+                    Generator.choice((0, 6, 12, 18)),
+                    Fingerprint=f"{Signal}-{OptionIndex}",
+                )
+                for OptionIndex in range(Generator.randint(1, 3))
+            )
+        Guide = BuildComponentCapacityGuide(
+            _Preparation(Domains, Capacity=1),
+            TrackPitch=3,
+        )
+        ContractKeys = [
+            (Signal, Option.ApertureContractFingerprint)
+            for Signal, Options in sorted(Domains.items())
+            for Option in Options
+        ]
+        RejectedClauses = []
+        if Generator.choice((False, True)):
+            RejectedClauses.append(frozenset((Generator.choice(ContractKeys),)))
+        if Generator.choice((False, True)):
+            First = Generator.choice(ContractKeys)
+            OtherSignals = [
+                Value for Value in ContractKeys if Value[0] != First[0]
+            ]
+            RejectedClauses.append(frozenset((
+                First,
+                Generator.choice(OtherSignals),
+            )))
+
+        monkeypatch.delenv("RC_COMPONENT_LEASE_SOLVER", raising=False)
+        Native = SolveComponentInterfaceCsp(
+            Guide,
+            RejectedClauses=RejectedClauses,
+        )
+        monkeypatch.setenv("RC_COMPONENT_LEASE_SOLVER", "python")
+        Python = SolveComponentInterfaceCsp(
+            Guide,
+            RejectedClauses=RejectedClauses,
+        )
+
+        assert Native.Status == Python.Status, Seed
+        assert (Native.Contract is None) == (Python.Contract is None), Seed
+        if Native.Contract is not None and Python.Contract is not None:
+            for Contract in (Native.Contract, Python.Contract):
+                SelectedKeys = frozenset(
+                    (
+                        Port.Signal,
+                        Port.ApertureContractFingerprint,
+                    )
+                    for Port in Contract.SelectedBoundaryPorts
+                )
+                assert not Contract.Overflow, Seed
+                assert not any(
+                    Clause <= SelectedKeys for Clause in RejectedClauses
+                ), Seed
 
 
 def test_native_lease_deadline_and_unavailable_fail_closed(monkeypatch):

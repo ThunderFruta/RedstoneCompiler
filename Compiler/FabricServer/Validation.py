@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 from time import monotonic, sleep
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .Fixture import FabricFixtureArtifact
 from .FailureTrace import BuildFabricFailureTrace
@@ -20,6 +20,7 @@ from .Models import (
     FabricServerControlResult,
     FabricServerLoadResult,
     FabricServerValidationResult,
+    FabricValidationProgress,
 )
 from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
 
@@ -30,7 +31,11 @@ WideInputSampleCount = 4096
 
 def DefaultFabricServerRoot() -> Path:
     """Return the repository-owned canonical local Fabric runtime directory."""
-    return Path(__file__).resolve().parents[2] / "FabricServerHarness" / "Server"
+    return (
+        Path(__file__).resolve().parents[2]
+        / "ValidationServerHarness"
+        / "Server"
+    )
 
 
 def ResolveFabricServerRoot() -> Path:
@@ -120,7 +125,7 @@ def BuildExpectedVectors(
 
 
 class FabricServerSupervisor:
-    """Validate through the managed Fabric runtime after a live full-world clear."""
+    """Load or validate circuits through the managed Fabric runtime."""
 
     def __init__(self, Configuration: FabricServerConfiguration) -> None:
         self.Configuration = Configuration
@@ -130,6 +135,9 @@ class FabricServerSupervisor:
         *,
         Fixture: FabricFixtureArtifact,
         Vectors: list[dict[str, object]],
+        ProgressCallback: (
+            Callable[[FabricValidationProgress], None] | None
+        ) = None,
     ) -> FabricServerValidationResult:
         StartedAt = monotonic()
         Root = self.Configuration.Root
@@ -140,10 +148,10 @@ class FabricServerSupervisor:
         Manager = Root / "PyScripts" / "Main.py"
         BuiltHarness = (
             Path(__file__).resolve().parents[2]
-            / "FabricServerHarness"
+            / "ValidationServerHarness"
             / "build"
             / "libs"
-            / "redstonecompiler-harness-1.0.0.jar"
+            / "validation-server-harness-1.0.0.jar"
         )
         UsesCanonicalManager = Manager.is_file()
         HarnessAvailable = Harness.is_file() or (
@@ -178,7 +186,7 @@ class FabricServerSupervisor:
                 "FixturePath": str(Fixture.Path.resolve()),
                 "FixtureSha256": Fixture.Sha256,
                 "Vectors": Vectors,
-            }, Port=Port)
+            }, Port=Port, ProgressCallback=ProgressCallback)
         except Exception as Error:
             return self._Failure(
                 "server-protocol-failure",
@@ -264,6 +272,63 @@ class FabricServerSupervisor:
             },
         )
 
+    def ValidateExisting(
+        self,
+        *,
+        Fixture: FabricFixtureArtifact,
+        Vectors: list[dict[str, object]],
+        ProgressCallback: (
+            Callable[[FabricValidationProgress], None] | None
+        ) = None,
+    ) -> FabricServerValidationResult:
+        """Validate the current live blocks without clearing or pasting a fixture."""
+        StartedAt = monotonic()
+        Root = self.Configuration.Root
+        if Root is None:
+            return self._Failure("server-root-not-configured", StartedAt, {
+                "WorldStateMode": "existing",
+                "WorldCleared": False,
+                "FixturePasted": False,
+            })
+        try:
+            Configuration = json.loads(
+                (Root / "config" / "redstonecompiler-harness.json").read_text(
+                    encoding="utf-8",
+                ),
+            )
+            Response = self._RequestWhenReady(
+                str(Configuration["Token"]),
+                {
+                    "Action": "ValidateExisting",
+                    "FixturePath": str(Fixture.Path.resolve()),
+                    "FixtureSha256": Fixture.Sha256,
+                    "Vectors": Vectors,
+                },
+                Port=int(Configuration["Port"]),
+                ProgressCallback=ProgressCallback,
+            )
+        except Exception as Error:
+            return self._Failure(
+                "existing-world-validation-failure",
+                StartedAt,
+                {
+                    "WorldStateMode": "existing",
+                    "WorldCleared": False,
+                    "FixturePasted": False,
+                    "Error": str(Error),
+                },
+            )
+        return self._BuildValidationResult(
+            Response=Response,
+            Fixture=Fixture,
+            StartedAt=StartedAt,
+            PrefixDiagnostics={
+                "WorldStateMode": "existing",
+                "WorldCleared": False,
+                "FixturePasted": False,
+            },
+        )
+
     def ControlRunningServer(
         self,
         *,
@@ -343,6 +408,52 @@ class FabricServerSupervisor:
                 + (f" ({Error})" if Error else ""),
             )
         return Token, Port
+
+    def _BuildValidationResult(
+        self,
+        *,
+        Response: dict[str, object],
+        Fixture: FabricFixtureArtifact,
+        StartedAt: float,
+        PrefixDiagnostics: dict[str, object] | None = None,
+    ) -> FabricServerValidationResult:
+        """Normalize one harness validation response and attach failure evidence."""
+        RuntimeSeconds = monotonic() - StartedAt
+        Status = str(Response.get("Status", "infrastructure-failure"))
+        if Status not in {"passed", "mismatch", "timeout", "infrastructure-failure"}:
+            Status = "infrastructure-failure"
+        ResponseDiagnostics = dict(Response.get("Diagnostics", {}))
+        if Status in {"mismatch", "timeout"}:
+            try:
+                FixtureDocument = json.loads(Fixture.Path.read_text(encoding="utf-8"))
+                FailureTrace = BuildFabricFailureTrace(
+                    FixtureDocument,
+                    ResponseDiagnostics,
+                )
+                if FailureTrace is not None:
+                    ResponseDiagnostics["FailureTrace"] = FailureTrace
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as Error:
+                ResponseDiagnostics["FailureTraceError"] = str(Error)
+        return FabricServerValidationResult(
+            Status=Status,
+            Backend="fabric-26.2",
+            RuntimeSeconds=RuntimeSeconds,
+            Diagnostics={
+                **(PrefixDiagnostics or {}),
+                **ResponseDiagnostics,
+                **(
+                    {"ControlError": Response["Error"]}
+                    if "Error" in Response
+                    else {}
+                ),
+            },
+        )
 
     def _ClearCanonicalSimulationWorld(
         self,
@@ -434,27 +545,68 @@ class FabricServerSupervisor:
         Request: dict[str, object],
         *,
         Port: int,
+        ProgressCallback: (
+            Callable[[FabricValidationProgress], None] | None
+        ) = None,
     ) -> dict[str, object]:
         Deadline = monotonic() + self.Configuration.StartupTimeoutSeconds
         LastError: OSError | None = None
         while monotonic() < Deadline:
             try:
                 with socket.create_connection(("127.0.0.1", Port), timeout=2) as Connection:
-                    Connection.settimeout(
-                        self.Configuration.ValidationTimeoutSeconds,
-                    )
                     Stream = Connection.makefile("rwb")
                     Payload = {"Token": Token, **Request}
                     Stream.write(json.dumps(Payload, sort_keys=True).encode("utf-8") + b"\n")
                     Stream.flush()
-                    Response = Stream.readline()
-                    if not Response:
-                        raise RuntimeError("harness closed the control connection")
-                    Parsed = json.loads(Response.decode("utf-8"))
-                    if Parsed.get("Error") == "minecraft-server-not-ready":
-                        sleep(0.2)
-                        continue
-                    return Parsed
+                    ResponseDeadline = (
+                        monotonic()
+                        + self.Configuration.ValidationTimeoutSeconds
+                    )
+                    Connection.settimeout(
+                        self.Configuration.ValidationTimeoutSeconds,
+                    )
+                    while True:
+                        Response = Stream.readline()
+                        if not Response:
+                            raise RuntimeError(
+                                "harness closed the control connection",
+                            )
+                        Parsed = json.loads(Response.decode("utf-8"))
+                        if Parsed.get("Status") == "progress":
+                            Completed = Parsed.get("Completed")
+                            Total = Parsed.get("Total")
+                            Stage = Parsed.get("Stage")
+                            if (
+                                type(Completed) is not int
+                                or type(Total) is not int
+                                or Completed < 0
+                                or Total < 0
+                                or Completed > Total
+                                or not isinstance(Stage, str)
+                                or not Stage
+                            ):
+                                raise RuntimeError(
+                                    "harness returned invalid validation progress: "
+                                    + json.dumps(Parsed, sort_keys=True),
+                                )
+                            if ProgressCallback is not None:
+                                ProgressCallback(FabricValidationProgress(
+                                    Completed=Completed,
+                                    Total=Total,
+                                    Stage=Stage,
+                                    Backend="fabric-26.2-canary",
+                                ))
+                            RemainingSeconds = ResponseDeadline - monotonic()
+                            if RemainingSeconds <= 0.0:
+                                raise socket.timeout(
+                                    "validation response deadline",
+                                )
+                            Connection.settimeout(RemainingSeconds)
+                            continue
+                        if Parsed.get("Error") == "minecraft-server-not-ready":
+                            sleep(0.2)
+                            break
+                        return Parsed
             except socket.timeout as Error:
                 raise RuntimeError(
                     "Fabric validation request exceeded its response timeout: "

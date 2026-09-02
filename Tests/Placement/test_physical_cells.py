@@ -16,7 +16,9 @@ from Compiler.Routing.Actions import (
     AreConnected,
     BuildElectricalExclusions,
     BuildPhysicalGraphs,
+    BuildRoutingResources,
     NeighborPositions,
+    ValidateTemplateIsolation,
 )
 from Compiler.Routing.Actions.Repeaters import PruneRedundantRepeaterReservations
 from Compiler.Routing.Actions.Geometry import ValidatePlacedCellElectricalIsolation
@@ -488,6 +490,43 @@ class PhysicalCellTests(unittest.TestCase):
                 for Position in Exclusions
             )
         )
+
+    def testTorchPoweredSupportColumnRejectsDustAboveIt(self) -> None:
+        Nand = BuildPlacedGate(
+            Gate("NandGate", GateKind.NAND, ["Y"], ["A", "B"]),
+            0,
+            1,
+            0,
+            0,
+        )
+        Resources = BuildRoutingResources(
+            SimpleNamespace(PlacedGates=[Nand]),
+        )
+        KeepOut = set(Resources.ResourceGraph.StaticKeepOutBlocks)
+        self.assertTrue(KeepOut)
+        for Position in KeepOut:
+            self.assertFalse(
+                Resources.ResourceGraph.IsLegalNode(
+                    Position,
+                    AllowedAccess=frozenset({Position}),
+                )
+            )
+
+        Position = min(KeepOut)
+        with self.assertRaisesRegex(
+            ValueError,
+            "template electrical clearance",
+        ):
+            ValidateTemplateIsolation(
+                {"ForeignSignal": {Position}},
+                set(Resources.StaticGeometry.ActualBlocks),
+                set(Resources.StaticGeometry.TemplateElectricalBlocks),
+                set(Resources.StaticGeometry.SolidBlocks),
+                {"ForeignSignal": SimpleNamespace(OutputPin=Position)},
+                {"ForeignSignal": []},
+                {"ForeignSignal": {Position}},
+                KeepOut,
+            )
 
     def testWallTorchDoesNotBlockDustStairConnection(self) -> None:
         Lower = (0, 0, 0)
