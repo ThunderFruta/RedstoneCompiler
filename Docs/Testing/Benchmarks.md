@@ -24,10 +24,10 @@ Compiler runs write immutable evidence beneath
 total time and CPU utilization. Compiler summaries then report the bounded
 routing interval, each named routing sub-stage, and authoritative validation
 time before the optional CPU breakdown, one-line output, and raw-report path.
-The terminal closes the routing progress bar before opening a separate Fabric
-validation bar. Because the harness returns one terminal response, that bar is
-indeterminate while the known vector set is running and becomes determinate
-from the authoritative tested-vector count when the response arrives.
+The terminal closes the routing progress bar before opening separate MCHPRS
+validation and Fabric-canary bars. Each bar starts at authoritative `0/N` and
+advances only after a vector has settled and been compared; it never presents
+placeholder or inferred progress.
 `RawDump.txt` retains full
 stdout/stderr, Git and runtime provenance, stage telemetry, typed failure
 evidence, validation gates, and an artifact size/hash inventory. Only a fully

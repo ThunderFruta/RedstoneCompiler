@@ -28,7 +28,9 @@ module-level pytest functions:
 
 The guided `Run pytest` action runs this deterministic tier, explicitly
 disables `RC_RUN_SCALE_TESTS`, streams output, and retains `Summary.txt` and
-`RawDump.txt` beneath `Output/Pytest/<UTC run id>/`.
+`RawDump.txt` beneath `Output/Pytest/<UTC run id>/`. Its concise terminal
+result is headed by `RESULT`, `TIME`, optional `CPU`, and `OUTPUT`; the saved
+report also records runtime provenance, Git identity, and artifact evidence.
 
 ## Focused routing checks
 
@@ -60,7 +62,8 @@ RC_RUN_SCALE_TESTS=1 .venv/bin/python -m pytest -q \
 
 The scale tier attempts RCA4, RCA8, and CLA4 independently. It is not part of
 the guided deterministic run and must not be marked successful when CLA4
-returns a typed routing failure.
+returns a typed routing failure. CLA4's current `PlacementOverlap` is a
+structural failure and must not be reported as timeout exhaustion.
 
 ## Rust router and MCHPRS backend
 
@@ -97,9 +100,9 @@ python3 Scripts/Routing/RunRouterAcceptance.py \
 Remove `--dry-run` only after fast tests pass and no other scale routing job is
 running. The default matrix runs FA, RCA4, and RCA8 once each. Expanded mode
 runs HalfAdder, FullAdder, RCA4, RCA8, DecimalToBinary4, TFlipFlopLatch, and
-CLA4 once each. Use a fresh, empty output root. The harness attempts every
-scheduled run, preserves each failure independently, and rejects the overall
-session if any required gate fails.
+CLA4 once each. Use a fresh, empty output root. The harness does not fail
+fast: it attempts every scheduled run, preserves each failure independently,
+and rejects the overall session if any required gate fails.
 
 Every wall-time median and every internal stage whose baseline median is at
 least 100 ms must be at most `1.05 ×` its baseline. If one exceeds 5%, rerun the
