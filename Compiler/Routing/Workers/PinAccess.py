@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
-    from ...RustRouting import RoutingContext as RustRoutingContext
+    from RedstoneCompiler.RustRouting import RoutingContext as RustRoutingContext
 except ImportError:
     try:
         from RedstoneCompiler.RustRouting import RoutingContext as RustRoutingContext

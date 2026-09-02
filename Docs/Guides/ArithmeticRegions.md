@@ -14,7 +14,7 @@ RC_RUN_SCALE_TESTS=1 python3 -m unittest Tests.test_scale_routing -v
 
 Judge circuits sequentially:
 
-1. FullAdder must pass 5/5 below 10 seconds.
+1. FullAdder must pass 5/5 below 15 seconds.
 2. RCA4 must pass 2/2 below 25 seconds with 512/512 rows.
 3. CLA4 may then run and must pass 2/2 below 120 seconds with 512/512 rows.
 

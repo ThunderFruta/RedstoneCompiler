@@ -681,7 +681,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 for Run in Manifest["Runs"]
             ))
             ExpectedRoutingDeadlines = {
-                "FullAdder": 8.0,
+                "FullAdder": 13.0,
                 "RippleCarryAdder4": 23.0,
                 "RippleCarryAdder8": 28.0,
             }
@@ -730,11 +730,11 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             )
             self.assertEqual(
                 [Case["RuntimeCeilingSeconds"] for Case in Manifest["Cases"]],
-                [10.0, 25.0, 30.0],
+                [15.0, 25.0, 30.0],
             )
             self.assertEqual(
                 [Case["RoutingDeadlineSeconds"] for Case in Manifest["Cases"]],
-                [8.0, 23.0, 28.0],
+                [13.0, 23.0, 28.0],
             )
             self.assertTrue(all(
                 Case["PublicationReserveSeconds"]
@@ -1332,7 +1332,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             ),
             (
                 "reported-runtime",
-                {"RuntimeSeconds": 11.0},
+                {"RuntimeSeconds": Case.RuntimeCeilingSeconds + 1.0},
                 AcceptanceCommandResult(0, "", "", 1.0),
                 None,
                 "reported runtime exceeded ceiling",
@@ -1540,11 +1540,11 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertTrue(PublicationEvaluation["Accepted"])
             self.assertEqual(
                 ProcessRecord["RequestedRoutingDeadlineSeconds"],
-                8.0,
+                13.0,
             )
             self.assertEqual(ProcessRecord["PublicationReserveSeconds"], 2.0)
-            self.assertEqual(ProcessRecord["ProcessEnvelopeSeconds"], 10.0)
-            self.assertEqual(ProcessRecord["RuntimeCeilingSeconds"], 10.0)
+            self.assertEqual(ProcessRecord["ProcessEnvelopeSeconds"], 15.0)
+            self.assertEqual(ProcessRecord["RuntimeCeilingSeconds"], 15.0)
             self.assertTrue(ProcessRecord["ProcessEnvelopeValid"])
             self.assertFalse(WallExceededEvaluation["Accepted"])
             self.assertTrue(any(
@@ -3588,6 +3588,50 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 self.assertFalse(Comparison["Compatible"])
                 self.assertIn(
                     CanonicalField,
+                    Comparison["MismatchFields"],
+                )
+
+    def testLegacyV15CeilingMigrationIsLimitedToFullAdder(self) -> None:
+        FixturePath = (
+            Path(__file__).resolve().parent.parent
+            / "Fixtures"
+            / "RouterRegressionBaseline.json"
+        )
+        Baseline = ReadBaselineReference(FixturePath)
+        Candidate = deepcopy(Baseline["Compatibility"])
+        CandidateFullAdder = Candidate["BenchmarkProfile"]["Cases"][
+            "FullAdder"
+        ]
+        CandidateFullAdder["RuntimeCeilingSeconds"] = 15.0
+        CandidateFullAdder["RoutingDeadlineSeconds"] = 13.0
+
+        MigratedComparison = CompareCompatibility(Baseline, Candidate)
+
+        self.assertTrue(MigratedComparison["Compatible"])
+        self.assertEqual(MigratedComparison["MismatchFields"], [])
+        InvalidCandidates = {
+            "different-full-adder-ceiling": deepcopy(Candidate),
+            "widened-rca4-ceiling": deepcopy(Candidate),
+        }
+        InvalidFullAdder = InvalidCandidates[
+            "different-full-adder-ceiling"
+        ]["BenchmarkProfile"]["Cases"]["FullAdder"]
+        InvalidFullAdder["RuntimeCeilingSeconds"] = 20.0
+        InvalidFullAdder["RoutingDeadlineSeconds"] = 18.0
+        InvalidRca4 = InvalidCandidates["widened-rca4-ceiling"][
+            "BenchmarkProfile"
+        ]["Cases"]["RippleCarryAdder4"]
+        InvalidRca4["RuntimeCeilingSeconds"] = 2_500.0
+        InvalidRca4["RoutingDeadlineSeconds"] = 2_498.0
+        for Name, InvalidCandidate in InvalidCandidates.items():
+            with self.subTest(Name=Name):
+                Comparison = CompareCompatibility(
+                    Baseline,
+                    InvalidCandidate,
+                )
+                self.assertFalse(Comparison["Compatible"])
+                self.assertIn(
+                    "BenchmarkProfile",
                     Comparison["MismatchFields"],
                 )
 

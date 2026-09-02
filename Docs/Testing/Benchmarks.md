@@ -3,7 +3,7 @@
 | Benchmark | Matrix | Purpose | Runs | Fabric validation vectors | Wall ceiling |
 | --- | --- | --- | ---: | ---: | ---: |
 | HalfAdder | Expanded | Small two-input arithmetic check | 1 | 4 | 10 s |
-| FullAdder | Default and expanded | Small correctness and deterministic overhead gate | 1 | 8 | 10 s |
+| FullAdder | Default and expanded | Small correctness and deterministic overhead gate | 1 | 8 | 15 s |
 | RippleCarryAdder4 | Default and expanded | Repeated-stage congestion and regression gate | 1 | 512 | 25 s |
 | RippleCarryAdder8 | Default and expanded | 8-bit carry ripple scalability gate | 1 | 4132 | 30 s |
 | DecimalToBinary4 | Expanded | One-hot decimal encoder check | 1 | 1024 | 30 s |

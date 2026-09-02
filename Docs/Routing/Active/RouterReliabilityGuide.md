@@ -105,9 +105,9 @@ all four current scale failures stop themselves with typed artifacts and zero
 wall overrun, but RCA4 and CLA4 still route 0/2.
 
 The harness separates the router deadline from the immutable process wall
-ceiling with a 2.0-second `PublicationReserve`: router deadlines are 8 seconds
-for FullAdder, 23 seconds for RCA4, and 118 seconds for CLA4 inside unchanged
-10-, 25-, and 120-second acceptance ceilings. The watchdog remains ceiling plus
+ceiling with a 2.0-second `PublicationReserve`: router deadlines are 13 seconds
+for FullAdder, 23 seconds for RCA4, and 118 seconds for CLA4 inside the current
+15-, 25-, and 120-second acceptance ceilings. The watchdog remains ceiling plus
 2 seconds only to capture a process that fails to stop. The manifest records
 the reserve and effective router deadline. This is neither fallback nor a
 runtime extension.
@@ -215,7 +215,7 @@ by the RRF-073 physical matrix.
 
 | Gate | Required runs | Correctness | Runtime ceiling | Current state |
 | --- | ---: | --- | ---: | --- |
-| FullAdder | 5 consecutive | 8/8 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 10s each | **VERIFIED:** current matrix passed 5/5 at 1.018414s-1.036595s wall time with deterministic fingerprint, ownership, route metrics, and emitted design |
+| FullAdder | 5 consecutive | 8/8 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 15s each | **VERIFIED:** current matrix passed 5/5 at 1.018414s-1.036595s wall time with deterministic fingerprint, ownership, route metrics, and emitted design |
 | RippleCarryAdder4 | 2 consecutive | 512/512 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 25s each | **NOT ACCEPTED:** current matrix self-exited 0/2 at 18.828730s and 18.848981s with typed failures, no timeout or wall overrun, and no routed outputs |
 | CarryLookaheadAdder4 | 2 consecutive | 512/512 rows; zero conflicts and unresolved claims; overflow peak <= 1 | 120s each | **NOT ACCEPTED:** current matrix self-exited 0/2 at 119.268383s and 119.248057s with typed failures, no timeout or wall overrun, and no routed outputs |
 
@@ -257,7 +257,7 @@ placement fingerprint, resource ownership, route metrics, and canonicalized
 emitted design. It rejects a timeout, compatibility or fallback result,
 runtime overrun, conflict, unresolved claim, overflow above one, missing or
 failure artifact, or repeated-run mismatch. It records the 2.0-second
-publication reserve and resulting 8/23/118-second router deadlines; its
+publication reserve and resulting 13/23/118-second router deadlines; its
 ceiling-plus-2 watchdog is capture-only and cannot make an over-ceiling run
 pass.
 

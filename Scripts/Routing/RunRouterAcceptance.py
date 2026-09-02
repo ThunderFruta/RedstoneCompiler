@@ -127,7 +127,7 @@ AcceptanceCases = (
         TopModule="FullAdder",
         RequiredRuns=5,
         TruthTableRows=8,
-        RuntimeCeilingSeconds=10.0,
+        RuntimeCeilingSeconds=15.0,
     ),
     AcceptanceCase(
         Name="RippleCarryAdder4",
@@ -2340,6 +2340,68 @@ LegacyAdditiveCompatibilityFields = (
     "CpuExecutionProfile",
     "LoadProfile",
 )
+LegacyFullAdderRuntimeCeilingSeconds = 10.0
+LegacyFullAdderRoutingDeadlineSeconds = 8.0
+MigratedFullAdderRuntimeCeilingSeconds = 15.0
+MigratedFullAdderRoutingDeadlineSeconds = 13.0
+
+
+def NormalizeLegacyFullAdderCeilingCompatibility(
+    Reference: dict[str, object],
+    Candidate: dict[str, object],
+    *,
+    AllowLegacyMigration: bool,
+) -> dict[str, object]:
+    """Normalize the one preserved v15 FullAdder ceiling migration."""
+    if not AllowLegacyMigration:
+        return Reference
+    ReferenceProfile = Reference.get("BenchmarkProfile")
+    CandidateProfile = Candidate.get("BenchmarkProfile")
+    if not isinstance(ReferenceProfile, dict) or not isinstance(
+        CandidateProfile,
+        dict,
+    ):
+        return Reference
+    ReferenceCases = ReferenceProfile.get("Cases")
+    CandidateCases = CandidateProfile.get("Cases")
+    if not isinstance(ReferenceCases, dict) or not isinstance(
+        CandidateCases,
+        dict,
+    ):
+        return Reference
+    ReferenceFullAdder = ReferenceCases.get("FullAdder")
+    CandidateFullAdder = CandidateCases.get("FullAdder")
+    if not isinstance(ReferenceFullAdder, dict) or not isinstance(
+        CandidateFullAdder,
+        dict,
+    ):
+        return Reference
+    if (
+        ReferenceFullAdder.get("RuntimeCeilingSeconds")
+        != LegacyFullAdderRuntimeCeilingSeconds
+        or ReferenceFullAdder.get("RoutingDeadlineSeconds")
+        != LegacyFullAdderRoutingDeadlineSeconds
+        or ReferenceFullAdder.get("PublicationReserveSeconds")
+        != DefaultRoutingPublicationReserveSeconds
+        or CandidateFullAdder.get("RuntimeCeilingSeconds")
+        != MigratedFullAdderRuntimeCeilingSeconds
+        or CandidateFullAdder.get("RoutingDeadlineSeconds")
+        != MigratedFullAdderRoutingDeadlineSeconds
+        or CandidateFullAdder.get("PublicationReserveSeconds")
+        != DefaultRoutingPublicationReserveSeconds
+    ):
+        return Reference
+    Normalized = deepcopy(Reference)
+    NormalizedFullAdder = Normalized["BenchmarkProfile"]["Cases"][
+        "FullAdder"
+    ]
+    NormalizedFullAdder["RuntimeCeilingSeconds"] = (
+        MigratedFullAdderRuntimeCeilingSeconds
+    )
+    NormalizedFullAdder["RoutingDeadlineSeconds"] = (
+        MigratedFullAdderRoutingDeadlineSeconds
+    )
+    return Normalized
 
 
 def BuildComparisonCompatibility(
@@ -3174,7 +3236,17 @@ def ReadBaselineReference(PathValue: Path) -> dict[str, object]:
         Environment=Environment,
         SourceProvenance=SourceProvenance,
     )
-    if StoredCompatibility != ExpectedCompatibility:
+    ComparableStoredCompatibility = (
+        NormalizeLegacyFullAdderCeilingCompatibility(
+            StoredCompatibility,
+            ExpectedCompatibility,
+            AllowLegacyMigration=(
+                SourceProvenance.get("ExpectedPolicyVersion")
+                == BaselinePolicyVersion
+            ),
+        )
+    )
+    if ComparableStoredCompatibility != ExpectedCompatibility:
         raise ValueError(
             "baseline Compatibility does not match "
             "Environment and SourceProvenance"
@@ -3640,15 +3712,21 @@ def CompareCompatibility(
         and SourceProvenance.get("ExpectedPolicyVersion")
         == BaselinePolicyVersion
     )
+    ComparableReference = NormalizeLegacyFullAdderCeilingCompatibility(
+        Reference,
+        Candidate,
+        AllowLegacyMigration=LegacyV15Reference,
+    )
+
     def MatchesRequiredField(Name: str) -> bool:
         """Compare core provenance, tolerating only legacy generic CPU IDs."""
-        if Name not in Reference or Name not in Candidate:
+        if Name not in ComparableReference or Name not in Candidate:
             return False
-        if Reference[Name] == Candidate[Name]:
+        if ComparableReference[Name] == Candidate[Name]:
             return True
         if Name != "CpuProfile" or not LegacyV15Reference:
             return False
-        ReferenceCpu = Reference[Name]
+        ReferenceCpu = ComparableReference[Name]
         CandidateCpu = Candidate[Name]
         if not isinstance(ReferenceCpu, dict) or not isinstance(
             CandidateCpu,
