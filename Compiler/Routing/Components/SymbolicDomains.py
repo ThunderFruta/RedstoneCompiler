@@ -13,6 +13,7 @@ import os
 from time import monotonic
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
+from Compiler.Telemetry import AwaitTelemetryTask, EmitTelemetryEvent, RunTelemetryTask
 from ..Failures import (
     RoutingFailure,
     RoutingFailureReason,
@@ -1160,6 +1161,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         else None
     )
     if Cached is not None:
+        EmitTelemetryEvent("cache", Cache="unary-clause", Hit=True)
         Clauses, Diagnostics = Cached
         return Clauses, {**Diagnostics, "UnaryCertificateCacheHit": True}
 
@@ -1188,6 +1190,10 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
             else monotonic() + max(0.0, DeadlineSeconds)
         )
         StartedParallelAt = monotonic()
+        TaskIds = {Signal: f"unary:{StartedParallelAt}:{Signal}" for Signal in Signals}
+        for Task in TaskIds.values():
+            EmitTelemetryEvent("task", Task=Task, State="queued")
+        EmitTelemetryEvent("pool", Pool="unary-proof", Workers=WorkerCount, Mode="spawn")
         try:
             Context = multiprocessing.get_context("spawn")
             with ProcessPoolExecutor(
@@ -1196,6 +1202,8 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
             ) as Executor:
                 FuturesBySignal = {
                     Signal: Executor.submit(
+                        RunTelemetryTask,
+                        TaskIds[Signal],
                         CompilePhysicalComponentSymbolicUnaryApertureSignalWorker,
                         Problem,
                         FactorDomain,
@@ -1220,8 +1228,8 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
                             "UnarySignalProcessWorkerCount": WorkerCount,
                             "UnarySignalProcessStatus": "deadline-expired",
                         }
-                    ResultsBySignal[Signal] = FuturesBySignal[Signal].result(
-                        timeout=Remaining,
+                    ResultsBySignal[Signal] = AwaitTelemetryTask(
+                        TaskIds[Signal], FuturesBySignal[Signal], Remaining,
                     )
         except TimeoutError:
             return frozenset(), {
@@ -1307,6 +1315,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
                 CompletedClauseCache[CacheKey] = (Result, Diagnostics)
             return Result, Diagnostics
 
+    EmitTelemetryEvent("pool", Pool="unary-proof", Workers=1, Mode="parent-cache" if NetStateCache else "serial")
     LocalFactorsBySignal = dict(FactorDomain.LocalAccessFactorsBySignal)
     SupportedAccessesBySignal = {
         str(Signal): frozenset(

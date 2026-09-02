@@ -22,6 +22,7 @@ ReportFileNames = frozenset({"Summary.txt", "RawDump.txt"})
 SafeEnvironmentNames = (
     "PYTHONHASHSEED",
     "RC_ROUTING_THREADS",
+    "RC_ROUTING_TELEMETRY",
     "OMP_NUM_THREADS",
     "RAYON_NUM_THREADS",
 )
@@ -175,8 +176,9 @@ def FormatResultLines(
     FailureType: str | None = None,
     CpuDetails: Mapping[str, object] | None = None,
     TimingDetails: Mapping[str, object] | None = None,
+    IncludeRoutingDetails: bool = False,
 ) -> list[str]:
-    """Format the concise terminal and Summary.txt result contract."""
+    """Format concise terminal output or the detailed saved-report variant."""
     ResultLine = f"RESULT: {Result}"
     if FailureType:
         ResultLine += f" — {FailureType}"
@@ -229,7 +231,7 @@ def FormatResultLines(
                 )
             Lines.append(IntervalLine)
         RoutingStages = TimingDetails.get("RoutingStages", ())
-        if isinstance(RoutingStages, (list, tuple)):
+        if IncludeRoutingDetails and isinstance(RoutingStages, (list, tuple)):
             for Stage in RoutingStages:
                 if not isinstance(Stage, Mapping):
                     continue
@@ -245,6 +247,8 @@ def FormatResultLines(
                 )
                 if isinstance(StageCpu, (int, float)):
                     StageLine += f" cpu={max(0.0, float(StageCpu)):.3f}s"
+                    if StageWall >= 0.1:
+                        StageLine += f" average_cores={float(StageCpu) / float(StageWall):.2f}"
                 if isinstance(EventCount, int) and EventCount > 1:
                     StageLine += f" events={EventCount}"
                 Lines.append(StageLine)
@@ -294,6 +298,13 @@ def FormatResultLines(
         CpuParts.append(f"routing_limit={RoutingLimit}")
     if CpuParts:
         Lines.append("CPU: " + " ".join(CpuParts))
+    Detailed = TimingDetails.get("Detailed") if TimingDetails else None
+    if IncludeRoutingDetails and isinstance(Detailed, Mapping):
+        Lines.append(
+            "TELEMETRY: " + str(Detailed.get("Status", "unavailable"))
+            + f" samples={Detailed.get('SampleCount', 0)}"
+            + f" raw={RawReportPath.parent / 'RoutingTelemetry.samples.jsonl'}"
+        )
     Lines.extend([
         f"OUTPUT: {_NormalizeSummary(Summary)}",
         f"RAW REPORT: {RawReportPath.resolve(strict=False)}",
@@ -343,7 +354,7 @@ def WriteRunReport(
     Directory.mkdir(parents=True, exist_ok=True)
     SummaryPath = Directory / "Summary.txt"
     RawReportPath = Directory / "RawDump.txt"
-    ResultLines = FormatResultLines(
+    ResultArguments = dict(
         Result=Result,
         WallSeconds=WallSeconds,
         CpuSeconds=CpuSeconds,
@@ -353,9 +364,11 @@ def WriteRunReport(
         CpuDetails=CpuDetails,
         TimingDetails=TimingDetails,
     )
+    ResultLines = FormatResultLines(**ResultArguments)
+    SavedLines = FormatResultLines(**ResultArguments, IncludeRoutingDetails=True)
     InventoryRoots = [Directory, *ArtifactRoots]
     Sections: list[tuple[str, str]] = [
-        ("RUN", "\n".join(ResultLines)),
+        ("RUN", "\n".join(SavedLines)),
         ("TIMESTAMPS", _JsonText({
             "StartedAtUtc": StartedAtUtc,
             "CompletedAtUtc": CompletedAtUtc,
@@ -377,7 +390,7 @@ def WriteRunReport(
         for Name, Text in Sections
     ) + "\n"
     _AtomicWriteText(RawReportPath, RawText)
-    _AtomicWriteText(SummaryPath, "\n".join(ResultLines) + "\n")
+    _AtomicWriteText(SummaryPath, "\n".join(SavedLines) + "\n")
     return RunReportResult(
         SummaryPath=SummaryPath,
         RawReportPath=RawReportPath,

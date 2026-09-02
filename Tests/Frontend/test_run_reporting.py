@@ -17,6 +17,7 @@ from Compiler.RunReporting import (
 class RunReportingTests(unittest.TestCase):
     def testResultLinesAlwaysStartWithResultThenTime(self) -> None:
         Lines = FormatResultLines(
+            IncludeRoutingDetails=True,
             Result="FAILURE",
             WallSeconds=7.385,
             CpuSeconds=8.95,
@@ -60,7 +61,7 @@ class RunReportingTests(unittest.TestCase):
         )
         self.assertEqual(
             Lines[3],
-            "  authoritative resource graph: wall=0.750s cpu=1.000s",
+            "  authoritative resource graph: wall=0.750s cpu=1.000s average_cores=1.33",
         )
         self.assertEqual(
             len([Line for Line in Lines if Line.startswith("TIME: routing")]),
@@ -79,6 +80,34 @@ class RunReportingTests(unittest.TestCase):
         self.assertNotIn("python_peak", "\n".join(Lines))
         self.assertTrue(Lines[6].startswith("OUTPUT: "))
         self.assertTrue(Lines[7].startswith("RAW REPORT: "))
+
+    def testDetailedTelemetryIsSavedWithoutBeingPrinted(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Timing = {
+                "Intervals": {"Routing": {"WallSeconds": 1.0, "CpuSeconds": 1.5}},
+                "RoutingStages": [{"Stage": "expensive interface preparation", "WallSeconds": 1.0, "CpuSeconds": 1.5}],
+                "Detailed": {"Status": "complete", "SampleCount": 4},
+            }
+            with patch("Compiler.RunReporting.BuildGitIdentity", return_value={}):
+                Report = WriteRunReport(
+                    RunDirectory=Root, Result="SUCCESS", WallSeconds=1.0,
+                    CpuSeconds=1.5, Summary="done", RepositoryRoot=Root,
+                    StartedAtUtc="start", CompletedAtUtc="finish",
+                    Command=["compiler"], WorkingDirectory=Root,
+                    TimingDetails=Timing, Details={"CpuTelemetry": Timing},
+                )
+            Terminal = "\n".join(Report.ResultLines)
+            self.assertIn("TIME: routing wall=1.000s", Terminal)
+            self.assertIn("CPU: average_cores=1.50", Terminal)
+            self.assertIn("TIME: validation not-run", Terminal)
+            self.assertNotIn("expensive interface preparation", Terminal)
+            self.assertNotIn("TELEMETRY:", Terminal)
+            self.assertNotIn("SampleCount", Terminal)
+            Saved = Report.SummaryPath.read_text()
+            self.assertIn("expensive interface preparation", Saved)
+            self.assertIn("TELEMETRY: complete samples=4", Saved)
+            self.assertIn('"SampleCount": 4', Report.RawReportPath.read_text())
 
     def testWriteRunReportKeepsCompleteEvidenceAndSafeEnvironment(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:

@@ -9,8 +9,6 @@ import json
 import os
 from pathlib import Path
 import socket
-import subprocess
-import sys
 from time import monotonic, sleep
 from typing import Any, Callable, Iterable
 
@@ -145,7 +143,6 @@ class FabricServerSupervisor:
             return self._Failure("server-root-not-configured", StartedAt)
         Launcher = Root / "fabric-server-launch.jar"
         Harness = Root / "mods" / "redstonecompiler-harness.jar"
-        Manager = Root / "PyScripts" / "Main.py"
         BuiltHarness = (
             Path(__file__).resolve().parents[2]
             / "ValidationServerHarness"
@@ -153,32 +150,18 @@ class FabricServerSupervisor:
             / "libs"
             / "validation-server-harness-1.0.0.jar"
         )
-        UsesCanonicalManager = Manager.is_file()
-        HarnessAvailable = Harness.is_file() or (
-            UsesCanonicalManager and BuiltHarness.is_file()
-        )
+        HarnessAvailable = Harness.is_file() or BuiltHarness.is_file()
         if not Launcher.is_file() or not HarnessAvailable:
             return self._Failure("fabric-server-or-harness-not-installed", StartedAt, {
                 "ServerRoot": str(Root),
                 "LauncherExists": Launcher.is_file(),
                 "HarnessExists": HarnessAvailable,
             })
-        if not UsesCanonicalManager:
-            return self._Failure(
-                "full-simulation-world-clear-requires-runtime-manager",
-                StartedAt,
-                {
-                    "ServerRoot": str(Root),
-                    "Manager": str(Manager),
-                },
-            )
         try:
-            PrePasteClear = self._ClearCanonicalSimulationWorld(Root, Manager)
             RunningControl = self._GetRunningControl(Root)
             if RunningControl is None:
                 raise RuntimeError(
-                    "canonical Fabric manager completed without an authenticated "
-                    "control endpoint after the full simulation-world clear",
+                    "Fabric validation requires an authenticated running control endpoint",
                 )
             Token, Port = RunningControl
             Response = self._RequestWhenReady(Token, {
@@ -220,7 +203,8 @@ class FabricServerSupervisor:
             Backend="fabric-26.2",
             RuntimeSeconds=RuntimeSeconds,
             Diagnostics={
-                **PrePasteClear,
+                "WorldStateMode": "fixture-paste",
+                "WorldCleared": False,
                 **ResponseDiagnostics,
                 **(
                     {"ControlError": Response["Error"]}
@@ -454,90 +438,6 @@ class FabricServerSupervisor:
                 ),
             },
         )
-
-    def _ClearCanonicalSimulationWorld(
-        self,
-        Root: Path,
-        Manager: Path,
-    ) -> dict[str, object]:
-        """Live-clear all persisted simulation blocks before one validation paste."""
-        Result = self._RunCanonicalManager(Root, Manager, "clear")
-        if Result.get("Status") != "running" or Result.get("Cleared") is not True:
-            raise RuntimeError(
-                "canonical Fabric manager did not acknowledge the full "
-                f"simulation-world clear: {json.dumps(Result, sort_keys=True)}",
-            )
-        ClearMode = Result.get("ClearMode")
-        if ClearMode != "live-persisted-overworld-blocks":
-            raise RuntimeError(
-                "canonical Fabric manager did not acknowledge a live full-world "
-                f"block clear: {ClearMode!r}",
-            )
-        ClearedChunkCount = Result.get("ClearedChunkCount")
-        ClearedNonAirBlocks = Result.get("ClearedNonAirBlocks")
-        ScannedChunkCount = Result.get("ScannedChunkCount")
-        ScannedRegionFileCount = Result.get("ScannedRegionFileCount")
-        if (
-            type(ClearedChunkCount) is not int
-            or ClearedChunkCount < 0
-            or type(ClearedNonAirBlocks) is not int
-            or ClearedNonAirBlocks < 0
-            or type(ScannedChunkCount) is not int
-            or ScannedChunkCount < 0
-            or type(ScannedRegionFileCount) is not int
-            or ScannedRegionFileCount < 0
-        ):
-            raise RuntimeError(
-                "canonical Fabric manager returned invalid full-world clear "
-                f"diagnostics: {json.dumps(Result, sort_keys=True)}",
-            )
-        return {
-            "PrePasteWorldClearMode": str(ClearMode),
-            "PrePasteWorldClearChunkCount": ClearedChunkCount,
-            "PrePasteWorldClearNonAirBlockCount": ClearedNonAirBlocks,
-            "PrePasteWorldScannedChunkCount": ScannedChunkCount,
-            "PrePasteWorldScannedRegionFileCount": ScannedRegionFileCount,
-        }
-
-    def _RunCanonicalManager(
-        self,
-        Root: Path,
-        Manager: Path,
-        Action: str,
-    ) -> dict[str, object]:
-        """Run one manager action and return its authoritative JSON result."""
-        try:
-            Result = subprocess.run(
-                [sys.executable, str(Manager), Action],
-                cwd=Root,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=self.Configuration.StartupTimeoutSeconds + 15.0,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as Error:
-            raise RuntimeError(
-                f"could not invoke the canonical Fabric manager: {Error}",
-            ) from Error
-        if Result.returncode != 0:
-            Detail = Result.stdout.strip() or "manager returned no diagnostic"
-            raise RuntimeError(
-                f"canonical Fabric manager failed to {Action}: {Detail}",
-            )
-        try:
-            Parsed = json.loads(Result.stdout)
-        except json.JSONDecodeError as Error:
-            raise RuntimeError(
-                "canonical Fabric manager returned non-JSON output for "
-                f"{Action}: {Result.stdout.strip() or 'empty output'}",
-            ) from Error
-        if not isinstance(Parsed, dict):
-            raise RuntimeError(
-                f"canonical Fabric manager returned a non-object result for {Action}",
-            )
-        return Parsed
 
     def _RequestWhenReady(
         self,

@@ -45,6 +45,9 @@ else:
     )
 
 
+from Compiler.Telemetry import RoutingTelemetry
+
+
 MinecraftSchematicsDirectory = Path(
     "/home/bananawewe/.local/share/PrismLauncher/instances/wee 26.2/minecraft/schematics"
 )
@@ -78,7 +81,9 @@ BuiltInDefaults = {
 class CpuRunTelemetry:
     """Process CPU and thread telemetry for one CLI invocation."""
 
-    def __init__(self) -> None:
+    def __init__(self, DetailedDirectory: Path | None = None) -> None:
+        self.Detailed = RoutingTelemetry(DetailedDirectory or Path('.'), DetailedDirectory is not None)
+        self.DetailedSummary: dict[str, object] | None = None
         self.StartedAt = time.monotonic()
         self.StartTimes = os.times()
         self.CompileStartedAt: float | None = None
@@ -135,6 +140,7 @@ class CpuRunTelemetry:
             )
 
     def BeginCompilation(self) -> None:
+        self.Detailed.Start()
         self.CompileStartedAt = time.monotonic()
         self.CompileStartTimes = os.times()
 
@@ -142,6 +148,7 @@ class CpuRunTelemetry:
         if self.CompileStartedAt is not None:
             self.CompileFinishedAt = time.monotonic()
             self.CompileFinishTimes = os.times()
+        self.DetailedSummary = self.Detailed.Finish()
 
     def RecordPipelineTimingEvent(self, Name: str, Event: str) -> None:
         """Capture exact pipeline interval boundaries for final reporting."""
@@ -151,6 +158,7 @@ class CpuRunTelemetry:
         CapturedAt = time.monotonic()
         CapturedTimes = os.times()
         if Event == "begin":
+            self.Detailed.Stage(Name.lower(), Name)
             self.IntervalStarts[Name] = (CapturedAt, CapturedTimes)
             self.IntervalFinishes.pop(Name, None)
             if Name == "Routing":
@@ -160,6 +168,7 @@ class CpuRunTelemetry:
             return
         if Event == "finish" and Name in self.IntervalStarts:
             self.IntervalFinishes[Name] = (CapturedAt, CapturedTimes)
+            self.Detailed.Stage("rendering" if Name == "Routing" else "publication", "Compile")
 
     def RecordRoutingStage(self, StageValue: str) -> None:
         """Record one stable routing stage transition."""
@@ -175,6 +184,7 @@ class CpuRunTelemetry:
         if self.RoutingStages and self.RoutingStages[-1][0] == Stage:
             return
         self.RoutingStages.append((Stage, time.monotonic(), os.times()))
+        self.Detailed.Stage(Stage)
 
     def RecordRoutingProgress(self, Progress: PcbProgress) -> None:
         """Record routing progress without coupling timing to rendering."""
@@ -315,6 +325,7 @@ class CpuRunTelemetry:
         return {
             "Intervals": Intervals,
             "RoutingStages": StageMeasurements,
+            "Detailed": self.DetailedSummary,
             "Threads": {
                 "OsCurrent": self.LastOsThreads,
                 "OsPeak": self.PeakOsThreads,
@@ -430,6 +441,13 @@ def BuildParser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override Rust routing worker count (RC_ROUTING_THREADS)",
+    )
+    Parser.add_argument(
+        "--routing-telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("RC_ROUTING_TELEMETRY", "1").strip().lower()
+        in {"1", "true", "yes", "on"},
+        help="Save detailed CPU samples, task events, and stacks to run files (enabled by default)",
     )
     Parser.add_argument(
         "--routing-deadline-seconds",
@@ -1347,7 +1365,7 @@ def Main(Args: list[str] | None = None) -> int:
     OutputPath = RunOutputPath
     StartedAtUtc = UtcTimestamp()
     RunStartedAt = time.monotonic()
-    CpuTelemetry = CpuRunTelemetry()
+    CpuTelemetry = CpuRunTelemetry(RunDirectory if Parsed.routing_telemetry else None)
     ProgressReporter = BuildProgressReporter(CpuTelemetry)
     ValidationProgressReporter = TerminalValidationProgressReporter()
     Capture = CaptureTerminalOutput()

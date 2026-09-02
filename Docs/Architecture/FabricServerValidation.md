@@ -86,13 +86,12 @@ attaches to Java stdin, exposes a remote console, or starts a competing JVM.
 the harness acknowledgement and is intended for diagnostics and world setup,
 not compiler validation.
 
-Before every compiler or tester validation paste, the Python boundary invokes
-the canonical manager's live `clear` action. Therefore no persisted non-air
-block from an earlier fixture, failed validation, or manual import can survive
-into the new test. The manager must report the regions/chunks inspected and
-non-air blocks cleared; otherwise validation fails closed. The harness then clears the
-incoming fixture arena immediately before placement as a second, idempotent
-pre-paste guard.
+Before every compiler or tester validation paste, the harness clears the
+incoming fixture arena and pastes the new fixture in the same server-thread
+operation. It does not pause ticks, change automatic saving, flush the world,
+or scan persisted chunks. Fixture arenas are the canonical validation location;
+their bounds must contain every block that can influence the fixture. The
+harness then forces neighbor updates before it starts validation.
 
 The server sets a 1,000 TPS target, force-loads every chunk intersecting the
 single fixture arena (up to 1,024 chunks), applies canary vectors sequentially,

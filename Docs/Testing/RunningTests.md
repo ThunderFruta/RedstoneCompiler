@@ -32,6 +32,57 @@ disables `RC_RUN_SCALE_TESTS`, streams output, and retains `Summary.txt` and
 result is headed by `RESULT`, `TIME`, optional `CPU`, and `OUTPUT`; the saved
 report also records runtime provenance, Git identity, and artifact evidence.
 
+## Routing CPU telemetry
+
+Detailed routing telemetry is enabled by default for CLI compiles, including
+guided compiles and acceptance runs. Terminal output keeps the result, total,
+routing and validation timings, and overall CPU summary. Per-stage timing,
+sample records, task events, and stacks are retained in run files without
+being dumped to the terminal.
+
+Use `--no-routing-telemetry` or `RC_ROUTING_TELEMETRY=0` to disable detailed
+collection; explicit CLI flags override the environment. Telemetry does not
+change thread limits, search policy, validation gates, or deadlines.
+
+```bash
+.venv/bin/python Main.py --input Examples/HalfAdder.sv \
+  --output Output/Telemetry/HalfAdder.litematic
+.venv/bin/python Scripts/Routing/RunRouterAcceptance.py \
+  --matrix expanded --routing-threads 8 --output-root Output/TelemetryAcceptance
+```
+
+Each compiler run directory retains:
+
+- `RoutingTelemetry.events.jsonl`: stage and placement subphase transitions,
+  symbolic proof task lifecycle, coordinator waits, and pool/cache decisions.
+- `RoutingTelemetry.samples.jsonl`: 250 ms observations of compiler and child
+  CPU time, main-thread CPU, native-thread CPU, positive-CPU thread counts,
+  process counts, thread states, and instrumented queue state.
+- `RoutingTelemetry.stacks.txt`: main-thread Python snapshots requested every
+  second under the GIL, avoiding asynchronous traversal of Python frames.
+- `RoutingTelemetry.json` and `RoutingTelemetry.txt`: aggregate evidence and
+  explicit coverage limits. `RawDump.txt` includes the structured telemetry.
+  `Summary.txt` keeps the full per-stage timing breakdown for inspection.
+
+The CPU observer runs in a separate interpreter so a GIL-held native call
+cannot stop CPU sampling. It excludes itself and external Fabric service CPU.
+Its own CPU cost is recorded in telemetry metadata. Busy thread counts mean
+positive CPU ticks during an interval, not simultaneous execution. Intervals
+crossing phase boundaries are marked mixed; use the existing exact stage
+wall/CPU deltas alongside these sampled measurements. Sub-100 ms stage core
+ratios are omitted because CPU tick resolution makes them misleading.
+
+Task queue metrics cover the symbolic unary proof pool, not every router
+queue. Queue-to-start time includes both waiting and process startup/transfer;
+it is not a separate serialization measurement. Python stack dumps do not
+contain native backtraces and can be delayed by a GIL-held native call; use
+their monotonic timestamps to identify gaps. A killed run retains a partial sample stream, which
+can be summarized afterward without treating it as routing success:
+
+```bash
+.venv/bin/python Compiler/TelemetryObserver.py --directory <compiler-run-directory>
+```
+
 ## Focused routing checks
 
 ```bash

@@ -21,6 +21,16 @@ from Compiler.Main import (
 
 
 class MainPathTests(unittest.TestCase):
+    def testDetailedTelemetryDefaultsOnWithExplicitOptOut(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            Parser = CompilerMainModule.BuildParser()
+            self.assertTrue(Parser.parse_args([]).routing_telemetry)
+            self.assertFalse(Parser.parse_args(["--no-routing-telemetry"]).routing_telemetry)
+        with patch.dict(os.environ, {"RC_ROUTING_TELEMETRY": "0"}):
+            Parser = CompilerMainModule.BuildParser()
+            self.assertFalse(Parser.parse_args([]).routing_telemetry)
+            self.assertTrue(Parser.parse_args(["--routing-telemetry"]).routing_telemetry)
+
     def testRootEntrypointExclusivelyOwnsGuidedCli(self) -> None:
         self.assertFalse(hasattr(CompilerMainModule, "GuidedMenu"))
         self.assertNotIn(
@@ -235,10 +245,14 @@ class MainPathTests(unittest.TestCase):
             self.assertEqual(ResultLines[0], "RESULT: SUCCESS")
             self.assertTrue(ResultLines[1].startswith("TIME: total wall="))
             self.assertTrue(ResultLines[2].startswith("TIME: routing wall="))
-            self.assertTrue(any(
+            self.assertFalse(any(
                 Line.startswith("  physical component interface planning:")
                 for Line in ResultLines
             ))
+            self.assertIn(
+                "physical component interface planning:",
+                (RunDirectory / "Summary.txt").read_text(),
+            )
             self.assertEqual(
                 len([
                     Line for Line in ResultLines

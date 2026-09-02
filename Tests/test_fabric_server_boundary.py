@@ -1,6 +1,5 @@
 import os
 import socket
-import sys
 import unittest
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
@@ -157,15 +156,13 @@ class FabricServerBoundaryTests(unittest.TestCase):
         self.assertEqual(Result.Status, "infrastructure-failure")
         self.assertEqual(Result.Diagnostics["Reason"], "server-root-not-configured")
 
-    def testValidationClearsTheEntireManagedWorldBeforePasting(self) -> None:
+    def testValidationOnlyClearsAndPastesTheFixtureArena(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
             Root = Path(TemporaryDirectoryPath)
             (Root / "mods").mkdir()
             (Root / "config").mkdir()
-            (Root / "PyScripts").mkdir()
             (Root / "fabric-server-launch.jar").write_bytes(b"launcher")
             (Root / "mods" / "redstonecompiler-harness.jar").write_bytes(b"harness")
-            (Root / "PyScripts" / "Main.py").write_text("", encoding="utf-8")
             (Root / "config" / "redstonecompiler-harness.json").write_text(
                 '{"Token":"manager-token","Port":25566}',
                 encoding="utf-8",
@@ -173,25 +170,20 @@ class FabricServerBoundaryTests(unittest.TestCase):
             FixturePath = Root / "fixture.FabricFixture.json"
             WriteMinimalFabricFixture(FixturePath)
             Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
-            WorldClear = {
-                "PrePasteWorldClearMode": "live-persisted-overworld-blocks",
-                "PrePasteWorldClearChunkCount": 5,
-                "PrePasteWorldClearNonAirBlockCount": 4096,
-                "PrePasteWorldScannedChunkCount": 8,
-                "PrePasteWorldScannedRegionFileCount": 2,
-            }
             with patch.object(
-                Supervisor,
-                "_ClearCanonicalSimulationWorld",
-                return_value=WorldClear,
-            ) as Clear, patch.object(
                 Supervisor,
                 "_GetRunningControl",
                 return_value=("fresh-manager-token", 25566),
             ) as Control, patch.object(
                 Supervisor,
                 "_RequestWhenReady",
-                return_value={"Status": "passed", "Diagnostics": {}},
+                return_value={
+                    "Status": "passed",
+                    "Diagnostics": {
+                        "FixtureArenaCleared": True,
+                        "FixturePasted": True,
+                    },
+                },
             ) as Ready:
                 Result = Supervisor.Validate(
                     Fixture=SimpleNamespace(Path=FixturePath, Sha256="fixture-sha"),
@@ -199,7 +191,6 @@ class FabricServerBoundaryTests(unittest.TestCase):
                 )
 
         self.assertEqual(Result.Status, "passed")
-        Clear.assert_called_once_with(Root, Root / "PyScripts" / "Main.py")
         Control.assert_called_once_with(Root)
         self.assertEqual(
             Ready.call_args.args,
@@ -214,7 +205,10 @@ class FabricServerBoundaryTests(unittest.TestCase):
             ),
         )
         self.assertEqual(Ready.call_args.kwargs["Port"], 25566)
-        self.assertEqual(Result.Diagnostics, WorldClear)
+        self.assertEqual(Result.Diagnostics["WorldStateMode"], "fixture-paste")
+        self.assertFalse(Result.Diagnostics["WorldCleared"])
+        self.assertTrue(Result.Diagnostics["FixtureArenaCleared"])
+        self.assertTrue(Result.Diagnostics["FixturePasted"])
 
     def testExistingWorldValidationDoesNotClearOrPasteTheFixture(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
@@ -228,9 +222,6 @@ class FabricServerBoundaryTests(unittest.TestCase):
             WriteMinimalFabricFixture(FixturePath)
             Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
             with patch.object(
-                Supervisor,
-                "_ClearCanonicalSimulationWorld",
-            ) as Clear, patch.object(
                 Supervisor,
                 "_RequestWhenReady",
                 return_value={
@@ -249,7 +240,6 @@ class FabricServerBoundaryTests(unittest.TestCase):
         self.assertEqual(Result.Status, "passed")
         self.assertFalse(Result.Diagnostics["WorldCleared"])
         self.assertFalse(Result.Diagnostics["FixturePasted"])
-        Clear.assert_not_called()
         self.assertEqual(
             Ready.call_args.args,
             (
@@ -269,87 +259,13 @@ class FabricServerBoundaryTests(unittest.TestCase):
             {"Port": 25566, "ProgressCallback": None},
         )
 
-    def testFullWorldClearInvokesTheManagerClearActionWithoutRestarting(self) -> None:
-        with TemporaryDirectory() as TemporaryDirectoryPath:
-            Root = Path(TemporaryDirectoryPath)
-            Manager = Root / "PyScripts" / "Main.py"
-            Manager.parent.mkdir(parents=True)
-            Manager.write_text("", encoding="utf-8")
-            Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
-            with patch(
-                "Compiler.FabricServer.Validation.subprocess.run",
-            ) as Run:
-                Run.return_value.returncode = 0
-                Run.return_value.stdout = (
-                    '{"Status":"running","Cleared":true,'
-                    '"ClearMode":"live-persisted-overworld-blocks",'
-                    '"ClearedChunkCount":4,'
-                    '"ClearedNonAirBlocks":8192,'
-                    '"ScannedChunkCount":7,'
-                    '"ScannedRegionFileCount":2}'
-                )
-                Result = Supervisor._ClearCanonicalSimulationWorld(Root, Manager)
-
-        self.assertEqual(
-            Run.call_args.args[0],
-            [
-                sys.executable,
-                str(Manager),
-                "clear",
-            ],
-        )
-        self.assertEqual(
-            Result,
-            {
-                "PrePasteWorldClearMode": "live-persisted-overworld-blocks",
-                "PrePasteWorldClearChunkCount": 4,
-                "PrePasteWorldClearNonAirBlockCount": 8192,
-                "PrePasteWorldScannedChunkCount": 7,
-                "PrePasteWorldScannedRegionFileCount": 2,
-            },
-        )
-
-    def testValidationFailsClosedWhenFullWorldClearIsRejected(self) -> None:
-        with TemporaryDirectory() as TemporaryDirectoryPath:
-            Root = Path(TemporaryDirectoryPath)
-            (Root / "mods").mkdir()
-            (Root / "config").mkdir()
-            (Root / "PyScripts").mkdir()
-            (Root / "fabric-server-launch.jar").write_bytes(b"launcher")
-            (Root / "mods" / "redstonecompiler-harness.jar").write_bytes(b"harness")
-            (Root / "PyScripts" / "Main.py").write_text("", encoding="utf-8")
-            (Root / "config" / "redstonecompiler-harness.json").write_text(
-                '{"Token":"manager-token","Port":25566}',
-                encoding="utf-8",
-            )
-            FixturePath = Root / "fixture.FabricFixture.json"
-            WriteMinimalFabricFixture(FixturePath)
-            Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
-            with patch.object(
-                Supervisor,
-                "_ClearCanonicalSimulationWorld",
-                side_effect=RuntimeError("clear-rejected"),
-            ) as Clear, patch.object(Supervisor, "_RequestWhenReady") as Ready:
-                Result = Supervisor.Validate(
-                    Fixture=SimpleNamespace(Path=FixturePath, Sha256="fixture-sha"),
-                    Vectors=[],
-                )
-
-        self.assertEqual(Result.Status, "infrastructure-failure")
-        self.assertEqual(Result.Diagnostics["Reason"], "server-protocol-failure")
-        self.assertIn("clear-rejected", Result.Diagnostics["Error"])
-        Clear.assert_called_once()
-        Ready.assert_not_called()
-
     def testSupervisorAttachesTheSourceLinkedTraceToAMismatch(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
             Root = Path(TemporaryDirectoryPath)
             (Root / "mods").mkdir()
             (Root / "config").mkdir()
-            (Root / "PyScripts").mkdir()
             (Root / "fabric-server-launch.jar").write_bytes(b"launcher")
             (Root / "mods" / "redstonecompiler-harness.jar").write_bytes(b"harness")
-            (Root / "PyScripts" / "Main.py").write_text("", encoding="utf-8")
             FixturePath = Root / "fixture.FabricFixture.json"
             FixturePath.write_text(
                 '{"Trace":{"Circuit":"Top","Gates":[],"Signals":[]}}',
@@ -357,10 +273,6 @@ class FabricServerBoundaryTests(unittest.TestCase):
             )
             Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
             with patch.object(
-                Supervisor,
-                "_ClearCanonicalSimulationWorld",
-                return_value={},
-            ), patch.object(
                 Supervisor,
                 "_GetRunningControl",
                 return_value=("token", 25566),
@@ -387,7 +299,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
         )
         BuildTrace.assert_called_once()
 
-    def testValidationRequiresTheRuntimeManagerForAFullWorldClear(self) -> None:
+    def testValidationDoesNotRequireTheRuntimeManagerForFixturePaste(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
             Root = Path(TemporaryDirectoryPath)
             (Root / "mods").mkdir()
@@ -396,61 +308,21 @@ class FabricServerBoundaryTests(unittest.TestCase):
             FixturePath = Root / "fixture.FabricFixture.json"
             WriteMinimalFabricFixture(FixturePath)
 
-            Result = FabricServerSupervisor(
-                FabricServerConfiguration(Root=Root),
-            ).Validate(
-                Fixture=SimpleNamespace(Path=FixturePath, Sha256="fixture-sha"),
-                Vectors=[],
-            )
-
-        self.assertEqual(Result.Status, "infrastructure-failure")
-        self.assertEqual(
-            Result.Diagnostics["Reason"],
-            "full-simulation-world-clear-requires-runtime-manager",
-        )
-
-    def testValidationFailsClosedWhenTheClearDoesNotRestoreControl(self) -> None:
-        with TemporaryDirectory() as TemporaryDirectoryPath:
-            Root = Path(TemporaryDirectoryPath)
-            (Root / "mods").mkdir()
-            (Root / "config").mkdir()
-            (Root / "PyScripts").mkdir()
-            (Root / "fabric-server-launch.jar").write_bytes(b"launcher")
-            (Root / "mods" / "redstonecompiler-harness.jar").write_bytes(b"harness")
-            (Root / "PyScripts" / "Main.py").write_text("", encoding="utf-8")
-            (Root / "config" / "redstonecompiler-harness.json").write_text(
-                '{"Token":"stale-token","Port":25566}',
-                encoding="utf-8",
-            )
-            FixturePath = Root / "fixture.FabricFixture.json"
-            WriteMinimalFabricFixture(FixturePath)
             Supervisor = FabricServerSupervisor(FabricServerConfiguration(Root=Root))
             with patch.object(
                 Supervisor,
-                "_ClearCanonicalSimulationWorld",
-                return_value={
-                    "PrePasteWorldClearMode": "live-persisted-overworld-blocks",
-                    "PrePasteWorldClearChunkCount": 0,
-                    "PrePasteWorldClearNonAirBlockCount": 0,
-                    "PrePasteWorldScannedChunkCount": 0,
-                    "PrePasteWorldScannedRegionFileCount": 0,
-                },
-            ) as Clear, patch.object(
-                Supervisor,
                 "_GetRunningControl",
-                return_value=None,
-            ) as Control, patch.object(Supervisor, "_RequestWhenReady") as Ready:
+                return_value=("token", 25566),
+            ), patch.object(
+                Supervisor,
+                "_RequestWhenReady",
+                return_value={"Status": "passed", "Diagnostics": {}},
+            ):
                 Result = Supervisor.Validate(
                     Fixture=SimpleNamespace(Path=FixturePath, Sha256="fixture-sha"),
                     Vectors=[],
                 )
-
-        self.assertEqual(Result.Status, "infrastructure-failure")
-        self.assertEqual(Result.Diagnostics["Reason"], "server-protocol-failure")
-        self.assertIn("after the full simulation-world clear", Result.Diagnostics["Error"])
-        Clear.assert_called_once()
-        Control.assert_called_once_with(Root)
-        Ready.assert_not_called()
+        self.assertEqual(Result.Status, "passed")
 
     def testOnlyAnObservedFabricPassCanCompleteThePipeline(self) -> None:
         RequirePhysicalValidation(

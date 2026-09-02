@@ -181,6 +181,10 @@ final class HarnessValidation {
                 }
                 return forcedChunkCount;
             });
+            diagnostics.addProperty("WorldStateMode", validateExisting ? "existing" : "fixture-paste");
+            diagnostics.addProperty("FixtureArenaCleared", !validateExisting);
+            diagnostics.addProperty("FixturePasted", !validateExisting);
+            diagnostics.addProperty("InputStatesRestored", validateExisting);
             waitForTicks(server, 2);
             if ("LoadFixture".equals(action)) {
                 response.addProperty("Status", "loaded");
@@ -241,9 +245,6 @@ final class HarnessValidation {
                     initialForcedFixtureChunkCount);
             diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
             diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
-            diagnostics.addProperty("WorldStateMode", validateExisting ? "existing" : "fixture-paste");
-            diagnostics.addProperty("FixturePasted", !validateExisting);
-            diagnostics.addProperty("InputStatesRestored", validateExisting);
         } catch (Mismatch error) {
             response.addProperty("Status", "mismatch");
             diagnostics.addProperty("Error", error.getMessage());
