@@ -42,7 +42,10 @@ from Compiler.Placement.Geometry import (
 )
 from Compiler.Placement.Rotation import RotatedCellSize
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
-from Compiler.FabricServer import FabricServerValidationResult
+from Compiler.FabricServer import (
+    FabricServerValidationResult,
+    FabricValidationProgress,
+)
 from Compiler.Routing.LocalFirst import (
     AssignCapacityAwareGuideOptionDomains,
     BuildCapacityAwareGuidePlan,
@@ -529,6 +532,11 @@ class LocalFirstRouterTests(unittest.TestCase):
                             "FailedOutput": "Sum2$Output",
                             "Expected": True,
                             "Actual": False,
+                            "GlobalVectorIndex": 272,
+                            "ValidationLaneIndex": 2,
+                            "ValidationStackIndex": 0,
+                            "ValidationVerticalIndex": 2,
+                            "ValidationLaneOrigin": [80, 64, 48],
                             "FirstFailingBlock": {
                                 "FixturePosition": [12, 1, 9],
                                 "WorldPosition": [112, 65, 209],
@@ -553,6 +561,11 @@ class LocalFirstRouterTests(unittest.TestCase):
 
         Text = Output.getvalue()
         self.assertIn("output: Sum2$Output expected=true actual=false", Text)
+        self.assertIn(
+            "validation: vector=272 lane=2 stack=0 vertical=2 "
+            "origin=(80, 64, 48)",
+            Text,
+        )
         self.assertIn(
             "block: minecraft:redstone_wire[east=side,power=0,west=side]",
             Text,
@@ -1776,6 +1789,8 @@ class LocalFirstRouterTests(unittest.TestCase):
     def testNewRouterFullAdderWritesCompleteDiagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
             Root = Path(Directory)
+            TimingEvents = []
+            ValidationProgressEvents = []
             def CaptureServerSnapshot(*, SourcePath, OutputPath, **_Options):
                 OutputPath.write_bytes(SourcePath.read_bytes())
                 return SimpleNamespace(
@@ -1796,11 +1811,26 @@ class LocalFirstRouterTests(unittest.TestCase):
                     side_effect=CaptureServerSnapshot,
                 ),
             ):
-                Supervisor.return_value.Validate.return_value = FabricServerValidationResult(
-                    Status="passed",
-                    Backend="fabric-26.2",
-                    RuntimeSeconds=0.0,
-                )
+                def ValidateInFabric(**Options):
+                    ProgressCallback = Options["ProgressCallback"]
+                    VectorCount = len(Options["Vectors"])
+                    ProgressCallback(FabricValidationProgress(
+                        Completed=0,
+                        Total=VectorCount,
+                        Stage="authoritative Fabric truth-table validation",
+                    ))
+                    ProgressCallback(FabricValidationProgress(
+                        Completed=VectorCount // 2,
+                        Total=VectorCount,
+                        Stage="authoritative Fabric truth-table validation",
+                    ))
+                    return FabricServerValidationResult(
+                        Status="passed",
+                        Backend="fabric-26.2",
+                        RuntimeSeconds=0.0,
+                    )
+
+                Supervisor.return_value.Validate.side_effect = ValidateInFabric
                 Result = CompileSvToLitematic(
                     InputPath=Path("Examples/FullAdder.sv"),
                     TopModule="FullAdder",
@@ -1808,6 +1838,12 @@ class LocalFirstRouterTests(unittest.TestCase):
                     DiagramPath=Root / "FullAdder.Nand.json",
                     Workdir=Root / "Frontend",
                     RoutingStrategyValue=RoutingStrategy.Default,
+                    TimingCallback=lambda Name, Event: TimingEvents.append(
+                        (Name, Event)
+                    ),
+                    ValidationProgressCallback=(
+                        ValidationProgressEvents.append
+                    ),
                 )
             Diagnostics = Result.PhysicalDesignPath.read_text(encoding="utf-8")
             EmittedBlockCount = len(LoadTemplate(Result.OutputPath).Blocks)
@@ -1816,6 +1852,40 @@ class LocalFirstRouterTests(unittest.TestCase):
             "passed",
         )
         self.assertEqual(Result.UsedStrategy, "default")
+        self.assertEqual(TimingEvents[0], ("Routing", "begin"))
+        self.assertIn(
+            ("RoutingStage", "physical component interface planning"),
+            TimingEvents,
+        )
+        self.assertIn(
+            ("RoutingStage", "placement candidate routing"),
+            TimingEvents,
+        )
+        self.assertLess(
+            TimingEvents.index(("Routing", "finish")),
+            TimingEvents.index(("Validation", "begin")),
+        )
+        self.assertEqual(TimingEvents[-1], ("Validation", "finish"))
+        self.assertEqual(
+            ValidationProgressEvents[0].Stage,
+            "waiting for authoritative Fabric server",
+        )
+        self.assertEqual(ValidationProgressEvents[0].Completed, 0)
+        self.assertEqual(ValidationProgressEvents[0].Total, 8)
+        self.assertEqual(
+            ValidationProgressEvents[-1].Status,
+            "passed",
+        )
+        self.assertEqual(
+            ValidationProgressEvents[-1].Completed,
+            ValidationProgressEvents[-1].Total,
+        )
+        self.assertTrue(any(
+            Progress.Completed == 4
+            and Progress.Total == 8
+            and Progress.Stage == "authoritative Fabric truth-table validation"
+            for Progress in ValidationProgressEvents
+        ))
         self.assertIn('"UnresolvedClaimCount": 0', Diagnostics)
         self.assertIn('"PlanningContracts"', Diagnostics)
         self.assertIn('"BlockComposition"', Diagnostics)

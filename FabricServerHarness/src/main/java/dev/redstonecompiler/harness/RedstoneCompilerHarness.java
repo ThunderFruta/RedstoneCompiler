@@ -16,13 +16,42 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Server-only, loopback-only control plane for compiler validation. */
 public final class RedstoneCompilerHarness implements DedicatedServerModInitializer {
     private static volatile MinecraftServer server;
+    private static final AtomicReference<ServerTickObserver> TickObserver =
+            new AtomicReference<>();
+
+    @FunctionalInterface
+    public interface ServerTickObserver {
+        void OnServerTick(MinecraftServer server);
+
+        default void OnServerTickComplete(long TickProcessingNanos) {
+        }
+    }
 
     public static void setServer(MinecraftServer value) {
         server = value;
+    }
+
+    public static void InstallServerTickObserver(ServerTickObserver observer) {
+        if (!TickObserver.compareAndSet(null, observer)) {
+            throw new IllegalStateException("server-tick-observer-already-installed");
+        }
+    }
+
+    public static void RemoveServerTickObserver(ServerTickObserver observer) {
+        TickObserver.compareAndSet(observer, null);
+    }
+
+    public static void OnServerTick(MinecraftServer server, long TickStartedNanos) {
+        ServerTickObserver observer = TickObserver.get();
+        if (observer != null) {
+            observer.OnServerTick(server);
+            observer.OnServerTickComplete(System.nanoTime() - TickStartedNanos);
+        }
     }
 
     @Override

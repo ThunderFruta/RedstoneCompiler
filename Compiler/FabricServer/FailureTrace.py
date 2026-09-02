@@ -284,6 +284,11 @@ def BuildFabricFailureTrace(
         "Expected": ExpectedOutput,
         "Actual": ActualOutput,
         "TestedVectorsBeforeFailure": Mismatch.get("TestedVectorsBeforeFailure"),
+        "GlobalVectorIndex": Mismatch.get("GlobalVectorIndex"),
+        "ValidationLaneIndex": Mismatch.get("ValidationLaneIndex"),
+        "ValidationStackIndex": Mismatch.get("ValidationStackIndex"),
+        "ValidationVerticalIndex": Mismatch.get("ValidationVerticalIndex"),
+        "ValidationLaneOrigin": Mismatch.get("ValidationLaneOrigin"),
         "SubcircuitTrace": Entries,
         "FirstFailingSubcircuit": (
             {

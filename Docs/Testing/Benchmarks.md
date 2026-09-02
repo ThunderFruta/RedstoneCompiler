@@ -21,8 +21,14 @@ deterministic wide vectors for RCA8.
 
 Compiler runs write immutable evidence beneath
 `Output/<Circuit>/Runs/<UTC run id>/`. `Summary.txt` always starts with result,
-time and CPU utilization, optional CPU breakdown, a one-line output, and the
-raw-report path. `RawDump.txt` retains full
+total time and CPU utilization. Compiler summaries then report the bounded
+routing interval, each named routing sub-stage, and authoritative validation
+time before the optional CPU breakdown, one-line output, and raw-report path.
+The terminal closes the routing progress bar before opening a separate Fabric
+validation bar. Because the harness returns one terminal response, that bar is
+indeterminate while the known vector set is running and becomes determinate
+from the authoritative tested-vector count when the response arrives.
+`RawDump.txt` retains full
 stdout/stderr, Git and runtime provenance, stage telemetry, typed failure
 evidence, validation gates, and an artifact size/hash inventory. Only a fully
 successful run atomically refreshes the stable artifacts directly under

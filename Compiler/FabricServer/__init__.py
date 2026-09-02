@@ -4,6 +4,7 @@ from .Models import (
     FabricServerControlResult,
     FabricServerLoadResult,
     FabricServerValidationResult,
+    FabricValidationProgress,
 )
 from .Fixture import BuildFabricFixture, FabricFixtureArtifact, WriteFabricFixture
 from .FailureTrace import BuildFabricFailureTrace
@@ -43,6 +44,7 @@ __all__ = [
     "FabricServerSupervisor",
     "FabricServerSnapshotArtifact",
     "FabricServerValidationResult",
+    "FabricValidationProgress",
     "ResolveFabricServerRoot",
     "ReadFabricFixture",
     "ReadNandModule",

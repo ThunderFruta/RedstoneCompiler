@@ -32,6 +32,18 @@ class RunReportingTests(unittest.TestCase):
                 "LogicalCpus": 32,
                 "NativeRoutingLimit": "auto",
             },
+            TimingDetails={
+                "Intervals": {
+                    "Routing": {"WallSeconds": 2.5, "CpuSeconds": 4.0},
+                    "Validation": {"WallSeconds": 3.0, "CpuSeconds": 0.3},
+                },
+                "RoutingStages": [{
+                    "Stage": "authoritative resource graph",
+                    "WallSeconds": 0.75,
+                    "CpuSeconds": 1.0,
+                    "Events": 1,
+                }],
+            },
         )
 
         self.assertEqual(
@@ -40,17 +52,33 @@ class RunReportingTests(unittest.TestCase):
         )
         self.assertEqual(
             Lines[1],
-            "TIME: wall=7.385s cpu=8.950s utilization=121.2%",
+            "TIME: total wall=7.385s cpu=8.950s utilization=121.2%",
         )
         self.assertEqual(
             Lines[2],
+            "TIME: routing wall=2.500s cpu=4.000s utilization=160.0%",
+        )
+        self.assertEqual(
+            Lines[3],
+            "  authoritative resource graph: wall=0.750s cpu=1.000s",
+        )
+        self.assertEqual(
+            len([Line for Line in Lines if Line.startswith("TIME: routing")]),
+            1,
+        )
+        self.assertEqual(
+            Lines[4],
+            "TIME: validation wall=3.000s cpu=0.300s utilization=10.0%",
+        )
+        self.assertEqual(
+            Lines[5],
             "CPU: user=8.000s system=0.500s child=0.450s "
             "average_cores=1.21 logical_cpus=32 routing_limit=auto",
         )
         self.assertNotIn("os_peak", "\n".join(Lines))
         self.assertNotIn("python_peak", "\n".join(Lines))
-        self.assertTrue(Lines[3].startswith("OUTPUT: "))
-        self.assertTrue(Lines[4].startswith("RAW REPORT: "))
+        self.assertTrue(Lines[6].startswith("OUTPUT: "))
+        self.assertTrue(Lines[7].startswith("RAW REPORT: "))
 
     def testWriteRunReportKeepsCompleteEvidenceAndSafeEnvironment(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:

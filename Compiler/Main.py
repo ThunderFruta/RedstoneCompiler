@@ -18,11 +18,13 @@ from threading import Event, Lock, Thread, active_count
 
 if __package__:
     from .Pipeline import CompileSvToLitematic
+    from .FabricServer import FabricValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
     from .Routing.Policy import RoutingStrategy
     from .RunReporting import (
         BuildRunId,
         CaptureTerminalOutput,
+        FormatResultLines,
         PromoteRunArtifacts,
         UtcTimestamp,
         WriteRunReport,
@@ -30,11 +32,13 @@ if __package__:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from Compiler.Pipeline import CompileSvToLitematic
+    from Compiler.FabricServer import FabricValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
     from Compiler.Routing.Policy import RoutingStrategy
     from Compiler.RunReporting import (
         BuildRunId,
         CaptureTerminalOutput,
+        FormatResultLines,
         PromoteRunArtifacts,
         UtcTimestamp,
         WriteRunReport,
@@ -81,6 +85,8 @@ class CpuRunTelemetry:
         self.CompileStartTimes: os.times_result | None = None
         self.CompileFinishedAt: float | None = None
         self.CompileFinishTimes: os.times_result | None = None
+        self.IntervalStarts: dict[str, tuple[float, os.times_result]] = {}
+        self.IntervalFinishes: dict[str, tuple[float, os.times_result]] = {}
         self.RoutingStages: list[tuple[str, float, os.times_result]] = []
         self.PeakOsThreads = self.ReadOsThreadCount()
         self.PeakPythonThreads = active_count()
@@ -137,17 +143,42 @@ class CpuRunTelemetry:
             self.CompileFinishedAt = time.monotonic()
             self.CompileFinishTimes = os.times()
 
-    def RecordRoutingProgress(self, Progress: PcbProgress) -> None:
-        """Record only stage transitions; rendering remains independent."""
-        Stage = str(Progress.Stage)
+    def RecordPipelineTimingEvent(self, Name: str, Event: str) -> None:
+        """Capture exact pipeline interval boundaries for final reporting."""
+        if Name == "RoutingStage":
+            self.RecordRoutingStage(Event)
+            return
+        CapturedAt = time.monotonic()
+        CapturedTimes = os.times()
+        if Event == "begin":
+            self.IntervalStarts[Name] = (CapturedAt, CapturedTimes)
+            self.IntervalFinishes.pop(Name, None)
+            if Name == "Routing":
+                self.RoutingStages = [
+                    ("routing setup", CapturedAt, CapturedTimes),
+                ]
+            return
+        if Event == "finish" and Name in self.IntervalStarts:
+            self.IntervalFinishes[Name] = (CapturedAt, CapturedTimes)
+
+    def RecordRoutingStage(self, StageValue: str) -> None:
+        """Record one stable routing stage transition."""
+        Stage = str(StageValue)
         # Progress text may append per-net/iteration diagnostics after a
         # separator.  Keep the stable stage name so the final CPU report is
         # useful rather than hundreds of near-duplicate lines.
-        if " | " in Stage:
-            Stage = Stage.split(" | ", 1)[-1]
+        StageParts = Stage.split(" | ")
+        if StageParts and StageParts[0].startswith("spacing "):
+            StageParts = StageParts[1:]
+        if StageParts:
+            Stage = StageParts[0]
         if self.RoutingStages and self.RoutingStages[-1][0] == Stage:
             return
         self.RoutingStages.append((Stage, time.monotonic(), os.times()))
+
+    def RecordRoutingProgress(self, Progress: PcbProgress) -> None:
+        """Record routing progress without coupling timing to rendering."""
+        self.RecordRoutingStage(str(Progress.Stage))
 
     @staticmethod
     def FormatInterval(
@@ -210,6 +241,18 @@ class CpuRunTelemetry:
                 self.CompileFinishedAt or FinishedAt,
                 self.CompileFinishTimes or FinishedTimes,
             )
+        for Name, (IntervalStartedAt, IntervalStartedTimes) in (
+            self.IntervalStarts.items()
+        ):
+            IntervalFinishedAt, IntervalFinishedTimes = (
+                self.IntervalFinishes.get(Name, (FinishedAt, FinishedTimes))
+            )
+            Intervals[Name] = self.MeasureInterval(
+                IntervalStartedAt,
+                IntervalStartedTimes,
+                IntervalFinishedAt,
+                IntervalFinishedTimes,
+            )
         StageMeasurements = []
         if self.RoutingStages:
             StageTotals: dict[str, list[float]] = {}
@@ -221,8 +264,13 @@ class CpuRunTelemetry:
                         self.RoutingStages[Index + 1]
                     )
                 else:
-                    EndedAt = self.CompileFinishedAt or FinishedAt
-                    EndedTimes = self.CompileFinishTimes or FinishedTimes
+                    EndedAt, EndedTimes = self.IntervalFinishes.get(
+                        "Routing",
+                        (
+                            self.CompileFinishedAt or FinishedAt,
+                            self.CompileFinishTimes or FinishedTimes,
+                        ),
+                    )
                 Totals = StageTotals.setdefault(
                     Stage,
                     [0.0, 0.0, 0.0, 0.0, 0.0],
@@ -575,7 +623,7 @@ def RunPytest() -> int:
         CpuSeconds = float(CpuInterval["CpuSeconds"])
         Utilization = CpuSeconds / WallSeconds * 100.0 if WallSeconds else 0.0
         print(
-            f"TIME: wall={WallSeconds:.3f}s cpu={CpuSeconds:.3f}s "
+            f"TIME: total wall={WallSeconds:.3f}s cpu={CpuSeconds:.3f}s "
             f"utilization={Utilization:.1f}% "
             f"average_cores={CpuSeconds / WallSeconds if WallSeconds else 0.0:.2f}",
             file=sys.stderr,
@@ -702,6 +750,105 @@ class TerminalProgressReporter:
 
     def Finish(self) -> None:
         """Move output following an interactive progress line to a new line."""
+        self.RefreshStop.set()
+        if self.RefreshThread is not None:
+            self.RefreshThread.join(timeout=self.RefreshIntervalSeconds * 2)
+            self.RefreshThread = None
+        with self.RenderLock:
+            if self.Interactive and self.HasRendered:
+                print(file=sys.stderr, flush=True)
+                self.HasRendered = False
+
+
+class TerminalValidationProgressReporter:
+    """Render validation independently after the routing bar has closed."""
+
+    def __init__(self) -> None:
+        self.Interactive = sys.stderr.isatty()
+        self.RefreshIntervalSeconds = 0.1
+        self.StartTime: float | None = None
+        self.LatestProgress: FabricValidationProgress | None = None
+        self.LastRenderKey: tuple[object, ...] | None = None
+        self.LastRenderAt = 0.0
+        self.HasRendered = False
+        self.RenderLock = Lock()
+        self.RefreshStop = Event()
+        self.RefreshThread: Thread | None = None
+
+    def __call__(self, Progress: FabricValidationProgress) -> None:
+        with self.RenderLock:
+            if self.StartTime is None:
+                self.StartTime = time.monotonic()
+                if self.Interactive:
+                    self.RefreshThread = Thread(
+                        target=self._RefreshLoop,
+                        name="redstone-validation-progress",
+                        daemon=True,
+                    )
+                    self.RefreshThread.start()
+            self.LatestProgress = Progress
+            self._Render(Progress)
+
+    def _RefreshLoop(self) -> None:
+        while not self.RefreshStop.wait(self.RefreshIntervalSeconds):
+            with self.RenderLock:
+                if self.LatestProgress is not None:
+                    self._Render(self.LatestProgress)
+
+    def _Render(self, Progress: FabricValidationProgress) -> None:
+        StartedAt = self.StartTime or time.monotonic()
+        Elapsed = max(0.0, time.monotonic() - StartedAt)
+        BarWidth = 30
+        SafeTotal = max(1, Progress.Total)
+        SafeCompleted = max(0, min(Progress.Total, Progress.Completed))
+        Percent = min(100, int(SafeCompleted * 100 / SafeTotal))
+        Filled = int(Percent * BarWidth / 100)
+        Bar = "#" * Filled + "-" * (BarWidth - Filled)
+        PercentText = f"{Percent:3d}%"
+        CompletedText = str(SafeCompleted)
+        TotalText = str(Progress.Total) if Progress.Total > 0 else "?"
+        StatusText = (
+            f" | {Progress.Status.upper()}"
+            if Progress.Status is not None
+            else ""
+        )
+        Line = (
+            f"VALIDATION [{Bar}] {PercentText} "
+            f"{CompletedText}/{TotalText} vectors | {Progress.Stage}"
+            f"{StatusText} | {Elapsed:.1f}s"
+        )
+        RenderKey = (
+            Progress.Completed,
+            Progress.Total,
+            Progress.Stage,
+            Progress.Status,
+        )
+        if self.Interactive:
+            CurrentTime = time.monotonic()
+            if (
+                RenderKey == self.LastRenderKey
+                and CurrentTime - self.LastRenderAt < self.RefreshIntervalSeconds
+            ):
+                return
+            TerminalWidth = max(
+                20,
+                min(shutil.get_terminal_size(fallback=(120, 24)).columns - 1, 160),
+            )
+            if len(Line) > TerminalWidth:
+                Line = f"{Line[:TerminalWidth - 3]}..."
+            print(
+                f"\r\x1b[2K{Line}",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.HasRendered = True
+            self.LastRenderAt = CurrentTime
+        elif RenderKey != self.LastRenderKey:
+            print(Line, file=sys.stderr, flush=True)
+        self.LastRenderKey = RenderKey
+
+    def Finish(self) -> None:
         self.RefreshStop.set()
         if self.RefreshThread is not None:
             self.RefreshThread.join(timeout=self.RefreshIntervalSeconds * 2)
@@ -959,6 +1106,21 @@ def PrintFabricFailureSummary(
         f"  output: {FailedOutput} expected={Expected} actual={Actual}",
         file=sys.stderr,
     )
+    LaneIndex = FailureTrace.get("ValidationLaneIndex")
+    StackIndex = FailureTrace.get("ValidationStackIndex")
+    VerticalIndex = FailureTrace.get("ValidationVerticalIndex")
+    LaneOrigin = FailureTrace.get("ValidationLaneOrigin")
+    GlobalVectorIndex = FailureTrace.get("GlobalVectorIndex")
+    if LaneIndex is not None or GlobalVectorIndex is not None:
+        print(
+            "  validation: "
+            f"vector={_FormatFabricDiagnosticValue(GlobalVectorIndex)} "
+            f"lane={_FormatFabricDiagnosticValue(LaneIndex)} "
+            f"stack={_FormatFabricDiagnosticValue(StackIndex)} "
+            f"vertical={_FormatFabricDiagnosticValue(VerticalIndex)} "
+            f"origin={_FormatFabricCoordinates(LaneOrigin)}",
+            file=sys.stderr,
+        )
 
     Block = FailureTrace.get("FirstFailingBlock")
     EvidenceKind = "first mismatching block"
@@ -1185,10 +1347,18 @@ def Main(Args: list[str] | None = None) -> int:
     RunStartedAt = time.monotonic()
     CpuTelemetry = CpuRunTelemetry()
     ProgressReporter = BuildProgressReporter(CpuTelemetry)
+    ValidationProgressReporter = TerminalValidationProgressReporter()
     Capture = CaptureTerminalOutput()
     Error: BaseException | None = None
     ExceptionText = ""
     Result = None
+
+    def RecordPipelineTimingEvent(Name: str, Event: str) -> None:
+        CpuTelemetry.RecordPipelineTimingEvent(Name, Event)
+        if Name == "Routing" and Event == "finish":
+            ProgressReporter.Finish()
+        if Name == "Validation" and Event == "finish":
+            ValidationProgressReporter.Finish()
 
     try:
         with Capture:
@@ -1208,10 +1378,13 @@ def Main(Args: list[str] | None = None) -> int:
                     RoutingStrategyValue=Parsed.routing_strategy,
                     RoutingDeadlineSeconds=Parsed.routing_deadline_seconds,
                     TraceSupportBlocks=TraceSupportBlocks,
+                    TimingCallback=RecordPipelineTimingEvent,
+                    ValidationProgressCallback=ValidationProgressReporter,
                 )
             finally:
                 CpuTelemetry.FinishCompilation()
                 ProgressReporter.Finish()
+                ValidationProgressReporter.Finish()
     except KeyboardInterrupt as Caught:
         Error = Caught
         ExceptionText = traceback.format_exc()
@@ -1343,28 +1516,35 @@ def Main(Args: list[str] | None = None) -> int:
                     else {}
                 ),
             },
+            TimingDetails=Telemetry,
             ExceptionText=ExceptionText,
             Details=Details,
             ArtifactRoots=PromotedPaths,
         )
     except OSError as ReportError:
-        print("RESULT: FAILURE — Reporting: write-failed", file=sys.stderr)
-        Utilization = CpuSeconds / WallSeconds * 100.0 if WallSeconds else 0.0
-        print(
-            f"TIME: wall={WallSeconds:.3f}s cpu={CpuSeconds:.3f}s "
-            f"utilization={Utilization:.1f}% "
-            f"average_cores={CpuSeconds / WallSeconds if WallSeconds else 0.0:.2f}",
-            file=sys.stderr,
+        FallbackLines = FormatResultLines(
+            Result="FAILURE",
+            FailureType="Reporting: write-failed",
+            WallSeconds=WallSeconds,
+            CpuSeconds=CpuSeconds,
+            Summary=(
+                "The operation finished, but its required report could not "
+                f"be saved: {ReportError}"
+            ),
+            RawReportPath=(
+                RunDirectory.resolve(strict=False) / "RawDump.txt"
+            ),
+            CpuDetails={
+                **TotalInterval,
+                **(
+                    Telemetry["Threads"]
+                    if isinstance(Telemetry.get("Threads"), dict)
+                    else {}
+                ),
+            },
+            TimingDetails=Telemetry,
         )
-        print(
-            "OUTPUT: The operation finished, but its required report could "
-            f"not be saved: {ReportError}",
-            file=sys.stderr,
-        )
-        print(
-            f"RAW REPORT: {RunDirectory.resolve(strict=False) / 'RawDump.txt'}",
-            file=sys.stderr,
-        )
+        print("\n".join(FallbackLines), file=sys.stderr)
         if Error is not None:
             PrintOperationFailure(Error, FailureDiagnostics)
         return 1

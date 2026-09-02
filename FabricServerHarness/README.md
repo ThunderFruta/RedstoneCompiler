@@ -31,8 +31,15 @@ python3 Scripts/Fabric/ControlFabricServer.py stop
 
 The manager updates the installed harness at
 `FabricServerHarness/Server/mods/redstonecompiler-harness.jar` from the Gradle
-build when necessary, writes a private loopback token and 5,000-TPS
-configuration, and waits until the server is ready. On its first start it
+build when necessary, writes a private loopback token and 1,000-TPS
+configuration, and waits until the server is ready. Validation uses adaptive
+groups of vertical lanes: it starts with the largest useful count allowed by
+the 16-stack cap, measures 40 full server ticks with the real aggregate trace
+sampler active, and removes one fixture at a time until average tick processing
+fits the 1 ms budget required for 1,000 TPS. The final stack may contain fewer
+than four lanes. Set `RC_FABRIC_VALIDATION_MAX_STACKS=1..16` before startup to
+override the physical cap.
+On its first start it
 creates a localhost-only creative `minecraft:the_void` flat world with no
 terrain or generated structures, then persists no-spawning, no-drops, frozen
 time, and frozen weather rules through the 26.2 typed server API. Where the
@@ -60,9 +67,35 @@ the Java process or exposing a network console. The server must already be
 running; use `:help` and `:quit` in the interactive console, or
 `--command "say hello"` to execute one command for automation.
 
-Each loaded fixture force-loads its intersecting chunks (up to 256), so its
+The private compiler server disables vanilla player and vehicle speed-based
+position corrections, preventing `moved too quickly`/`moved wrongly`
+rubberbanding while retaining invalid numeric packet rejection and collision
+checks. `allow-flight=true` remains enabled separately for creative flight.
+
+Each loaded fixture force-loads its intersecting chunks (up to 1,024), so its
 redstone keeps ticking even when no player is near it. Truth-table validation
-samples the complete dynamic trace every observed game tick and requires 40
+places normal compiler fixtures into groups of vertical stacks. Each stack has
+up to four lanes sharing one X/Z footprint and separated by 16 air blocks in
+Y. Up to 16 stacks are arranged in a deterministic 4x4 horizontal array, also
+with 16 air blocks between fixture bounds.
+One vector is assigned to each active lane in a lockstep batch. The harness
+samples every active lane atomically on the server thread at each observed game
+tick and requires 40
 consecutive unchanged ticks within the 200-tick settle ceiling. A trace change
 or skipped tick resets that proof window. This avoids declaring a long routed
 signal settled before it has reached its output lamp.
+Per-tick settlement compares compact immutable block-state lists. Full JSON
+block states and coordinates are serialized only for the settled or failed
+snapshot, retaining exact diagnostics without paying that cost on every tick.
+Results and progress are committed in original truth-table order after each
+lane settles and compares. `ValidateExisting` remains single-lane because it
+must operate on the one manually edited circuit already present in the world.
+The reported estimate is
+`ceil(vectors / lanes) * settle-timeout-ticks / requested-TPS`; it is a tick
+budget, not a wall-time target. TPS selection instead uses measured full-tick
+processing time, including aggregate trace sampling, and accepts the greatest
+lane count whose average processing capacity reaches the requested 1,000 TPS.
+If even one lane cannot sustain that rate, validation fails explicitly.
+Diagnostics retain every rejected lane-count sample plus the selected stack and
+lane counts, batch count, tick budget, average/max tick processing time, and
+sustained TPS.

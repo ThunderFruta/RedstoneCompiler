@@ -17,6 +17,7 @@ from Compiler.FabricServer import (
     FabricServerConfiguration,
     FabricServerSupervisor,
     FabricServerValidationResult,
+    FabricValidationProgress,
     ReadFabricFixture,
     ReadNandModule,
     ReadSvModule,
@@ -88,6 +89,59 @@ class FabricServerBoundaryTests(unittest.TestCase):
 
         CreateConnection.assert_called_once()
         Connection.settimeout.assert_called_once_with(12.5)
+
+    def testValidationProgressComesFromStreamedTruthTableRows(self) -> None:
+        Supervisor = FabricServerSupervisor(FabricServerConfiguration(
+            Root=None,
+            StartupTimeoutSeconds=1.0,
+            ValidationTimeoutSeconds=12.5,
+        ))
+        Connection = MagicMock()
+        Connection.__enter__.return_value = Connection
+        Stream = MagicMock()
+        Stream.readline.side_effect = [
+            b'{"Status":"progress","Completed":0,"Total":2,'
+            b'"Stage":"authoritative Fabric truth-table validation"}\n',
+            b'{"Status":"progress","Completed":1,"Total":2,'
+            b'"Stage":"authoritative Fabric truth-table validation"}\n',
+            b'{"Status":"progress","Completed":2,"Total":2,'
+            b'"Stage":"authoritative Fabric truth-table validation"}\n',
+            b'{"Status":"passed","Diagnostics":{"TestedVectors":2}}\n',
+        ]
+        Connection.makefile.return_value = Stream
+        Progress = []
+        with patch(
+            "Compiler.FabricServer.Validation.socket.create_connection",
+            return_value=Connection,
+        ):
+            Response = Supervisor._RequestWhenReady(
+                "token",
+                {"Action": "Validate"},
+                Port=25566,
+                ProgressCallback=Progress.append,
+            )
+
+        self.assertEqual(Response["Status"], "passed")
+        self.assertEqual(
+            Progress,
+            [
+                FabricValidationProgress(
+                    Completed=0,
+                    Total=2,
+                    Stage="authoritative Fabric truth-table validation",
+                ),
+                FabricValidationProgress(
+                    Completed=1,
+                    Total=2,
+                    Stage="authoritative Fabric truth-table validation",
+                ),
+                FabricValidationProgress(
+                    Completed=2,
+                    Total=2,
+                    Stage="authoritative Fabric truth-table validation",
+                ),
+            ],
+        )
 
     def testMissingServerIsAnInfrastructureFailure(self) -> None:
         Result = FabricServerSupervisor(
@@ -207,7 +261,10 @@ class FabricServerBoundaryTests(unittest.TestCase):
                 },
             ),
         )
-        self.assertEqual(Ready.call_args.kwargs, {"Port": 25566})
+        self.assertEqual(
+            Ready.call_args.kwargs,
+            {"Port": 25566, "ProgressCallback": None},
+        )
 
     def testFullWorldClearInvokesTheManagerClearActionWithoutRestarting(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
@@ -632,6 +689,11 @@ class FabricServerBoundaryTests(unittest.TestCase):
                 "Inputs": {"a": True},
                 "ExpectedSignals": {"n1": True, "y": True},
                 "TestedVectorsBeforeFailure": 3,
+                "GlobalVectorIndex": 3,
+                "ValidationLaneIndex": 1,
+                "ValidationStackIndex": 0,
+                "ValidationVerticalIndex": 1,
+                "ValidationLaneOrigin": [80, 64, 0],
                 "ElapsedTicks": 200,
                 "ObservedUnchangedTicks": 0,
             },
@@ -650,6 +712,11 @@ class FabricServerBoundaryTests(unittest.TestCase):
         self.assertEqual(Trace["FailureKind"], "timeout")
         self.assertEqual(Trace["FailedOutput"], "y")
         self.assertEqual(Trace["TestedVectorsBeforeFailure"], 3)
+        self.assertEqual(Trace["GlobalVectorIndex"], 3)
+        self.assertEqual(Trace["ValidationLaneIndex"], 1)
+        self.assertEqual(Trace["ValidationStackIndex"], 0)
+        self.assertEqual(Trace["ValidationVerticalIndex"], 1)
+        self.assertEqual(Trace["ValidationLaneOrigin"], [80, 64, 0])
         self.assertEqual(Trace["FirstFailingSubcircuit"]["Gate"], "OutputY")
         self.assertEqual(Trace["FirstFailingBlock"]["FixturePosition"], [4, 0, 1])
         self.assertEqual(Trace["FirstFailingBlock"]["WorldPosition"], [4, 64, 1])

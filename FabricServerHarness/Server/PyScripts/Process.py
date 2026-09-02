@@ -27,8 +27,12 @@ from Paths import (
 from Protocol import SendRequest, WaitForReady
 
 
-RequestedTickRate = 5000.0
+RequestedTickRate = 1000.0
 SettleTimeoutTicks = 200
+ValidationLanesPerStack = 4
+MaximumValidationStackCount = int(
+    os.environ.get("RC_FABRIC_VALIDATION_MAX_STACKS", "16")
+)
 ServiceUnitName = "redstonecompiler-fabric-server.service"
 MaximumWorldSetBlocksPerRequest = 10_000
 
@@ -126,10 +130,20 @@ def CurrentStatus() -> dict[str, object]:
     StatePid = int(State.get("Pid", 0)) if State else 0
     Pid = StatePid if ProcessIsOwned(StatePid) else FindOwnedServerPid()
     Running = Pid > 0
-    if Running and (State is None or StatePid != Pid):
+    StateLaunchMethod = str(State.get("LaunchMethod", "")) if State else ""
+    if Running and (
+        State is None
+        or StatePid != Pid
+        or StateLaunchMethod == "recovered"
+    ):
+        LaunchMethod = (
+            "user-service"
+            if ServiceMainPid() == Pid
+            else "recovered"
+        )
         State = {
             "Launcher": str(LauncherPath),
-            "LaunchMethod": "recovered",
+            "LaunchMethod": LaunchMethod,
             "Pid": Pid,
             "Port": 25566,
             "RecoveredAtUnixSeconds": time(),
@@ -206,6 +220,8 @@ def WriteHarnessConfiguration(Port: int) -> None:
     """Create one fresh private loopback capability for this server run."""
     if not 1 <= Port <= 65535:
         raise ValueError("control port must be between 1 and 65535")
+    if not 1 <= MaximumValidationStackCount <= 16:
+        raise ValueError("maximum validation stack count must be between 1 and 16")
     HarnessConfigurationPath.parent.mkdir(parents=True, exist_ok=True)
     TemporaryPath = HarnessConfigurationPath.with_suffix(".tmp")
     TemporaryPath.write_text(json.dumps({
@@ -213,6 +229,8 @@ def WriteHarnessConfiguration(Port: int) -> None:
         "Port": Port,
         "RequestedTickRate": RequestedTickRate,
         "SettleTimeoutTicks": SettleTimeoutTicks,
+        "ValidationLanesPerStack": ValidationLanesPerStack,
+        "MaximumValidationStackCount": MaximumValidationStackCount,
         "Token": secrets.token_hex(32),
     }, sort_keys=True), encoding="utf-8")
     TemporaryPath.replace(HarnessConfigurationPath)
@@ -511,16 +529,6 @@ def ClearPersistedWorldBlocks() -> dict[str, int]:
             "the active Fabric harness can only clear the simulation overworld; "
             f"saved chunks also exist in {NonOverworldDimensions}",
         )
-    SaveResponse = SendRequest({
-        "Action": "WorldRunCommand",
-        "Command": "save-all flush",
-    }, TimeoutSeconds=60.0)
-    if SaveResponse.get("Status") != "command-complete":
-        raise RuntimeError(
-            "Fabric harness could not flush live simulation blocks before clear: "
-            + json.dumps(SaveResponse, sort_keys=True),
-        )
-
     RegionPaths = RegionsByDimension.get("minecraft:overworld", [])
     ClearedNonAirBlocks = 0
     ClearedChunkCount = 0
@@ -555,20 +563,89 @@ def ClearPersistedWorldBlocks() -> dict[str, int]:
         ClearRequestCount += 1
         PendingBlocks.clear()
 
-    for RegionPath in RegionPaths:
-        for Chunk in ReadRegionNonAirBlocks(RegionPath):
-            ScannedChunkCount += 1
-            if Chunk.Positions:
-                ClearedChunkCount += 1
-            for Position in Chunk.Positions:
-                PendingBlocks.append({
-                    "Position": list(Position),
-                    "State": "minecraft:air",
-                })
-                ClearedNonAirBlocks += 1
-                if len(PendingBlocks) == MaximumWorldSetBlocksPerRequest:
-                    FlushPendingBlocks()
-    FlushPendingBlocks()
+    PauseResponse = SendRequest({"Action": "PauseTicks"}, TimeoutSeconds=60.0)
+    if PauseResponse.get("Status") != "paused":
+        raise RuntimeError(
+            "Fabric harness could not pause ticks for a stable world clear: "
+            + json.dumps(PauseResponse, sort_keys=True),
+        )
+
+    MainError: Exception | None = None
+    CleanupErrors: list[str] = []
+    SavingDisabled = False
+    try:
+        SaveOffResponse = SendRequest({
+            "Action": "WorldRunCommand",
+            "Command": "save-off",
+        }, TimeoutSeconds=60.0)
+        if SaveOffResponse.get("Status") != "command-complete":
+            raise RuntimeError(
+                "Fabric harness could not disable saving for a stable world clear: "
+                + json.dumps(SaveOffResponse, sort_keys=True),
+            )
+        SavingDisabled = True
+
+        SaveResponse = SendRequest({
+            "Action": "WorldRunCommand",
+            "Command": "save-all flush",
+        }, TimeoutSeconds=60.0)
+        if SaveResponse.get("Status") != "command-complete":
+            raise RuntimeError(
+                "Fabric harness could not flush live simulation blocks before clear: "
+                + json.dumps(SaveResponse, sort_keys=True),
+            )
+
+        for RegionPath in RegionPaths:
+            for Chunk in ReadRegionNonAirBlocks(RegionPath):
+                ScannedChunkCount += 1
+                if Chunk.Positions:
+                    ClearedChunkCount += 1
+                for Position in Chunk.Positions:
+                    PendingBlocks.append({
+                        "Position": list(Position),
+                        "State": "minecraft:air",
+                    })
+                    ClearedNonAirBlocks += 1
+                    if len(PendingBlocks) == MaximumWorldSetBlocksPerRequest:
+                        FlushPendingBlocks()
+        FlushPendingBlocks()
+    except Exception as Error:
+        MainError = Error
+    finally:
+        if SavingDisabled:
+            try:
+                SaveOnResponse = SendRequest({
+                    "Action": "WorldRunCommand",
+                    "Command": "save-on",
+                }, TimeoutSeconds=60.0)
+                if SaveOnResponse.get("Status") != "command-complete":
+                    raise RuntimeError(json.dumps(SaveOnResponse, sort_keys=True))
+                PersistResponse = SendRequest({
+                    "Action": "WorldRunCommand",
+                    "Command": "save-all flush",
+                }, TimeoutSeconds=60.0)
+                if PersistResponse.get("Status") != "command-complete":
+                    raise RuntimeError(json.dumps(PersistResponse, sort_keys=True))
+            except Exception as Error:
+                CleanupErrors.append(f"restore-saving: {Error}")
+        try:
+            ResumeResponse = SendRequest(
+                {"Action": "ResumeTicks"},
+                TimeoutSeconds=60.0,
+            )
+            if ResumeResponse.get("Status") != "resumed":
+                raise RuntimeError(json.dumps(ResumeResponse, sort_keys=True))
+        except Exception as Error:
+            CleanupErrors.append(f"resume-ticks: {Error}")
+
+    if MainError is not None:
+        for CleanupError in CleanupErrors:
+            MainError.add_note(CleanupError)
+        raise MainError
+    if CleanupErrors:
+        raise RuntimeError(
+            "world clear cleanup failed: " + "; ".join(CleanupErrors),
+        )
     return {
         "ClearedChunkCount": ClearedChunkCount,
         "ClearedDimensionCount": 1 if RegionPaths else 0,
@@ -576,6 +653,9 @@ def ClearPersistedWorldBlocks() -> dict[str, int]:
         "ClearRequestCount": ClearRequestCount,
         "ScannedChunkCount": ScannedChunkCount,
         "ScannedRegionFileCount": len(RegionPaths),
+        "TicksPausedDuringClear": True,
+        "WorldSavingSuppressedDuringScan": True,
+        "ClearedStateFlushed": True,
     }
 
 

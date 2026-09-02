@@ -936,7 +936,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     RunDirectory / "RawDump.txt"
                 ).read_text(encoding="utf-8")
                 self.assertEqual(SummaryLines[0], "RESULT: SUCCESS")
-                self.assertTrue(SummaryLines[1].startswith("TIME: wall="))
+                self.assertTrue(SummaryLines[1].startswith("TIME: total wall="))
                 self.assertIn(f"{RunName} stdout", RawText)
                 self.assertIn(f"{RunName} stderr", RawText)
                 self.assertIn("Evaluation", RawText)

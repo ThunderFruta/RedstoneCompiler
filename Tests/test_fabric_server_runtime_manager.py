@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -121,6 +122,105 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
             RuntimeAnvilPath,
         )
 
+    def testHarnessConfigurationDefaultsToOneThousandTps(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath:
+            ConfigurationPath = (
+                Path(TemporaryDirectoryPath) / "redstonecompiler-harness.json"
+            )
+            with patch.object(
+                self.Process,
+                "HarnessConfigurationPath",
+                ConfigurationPath,
+            ), patch.object(
+                self.Process.secrets,
+                "token_hex",
+                return_value="private-token",
+            ):
+                self.Process.WriteHarnessConfiguration(25566)
+
+            Configuration = json.loads(
+                ConfigurationPath.read_text(encoding="utf-8"),
+            )
+
+        self.assertEqual(Configuration["RequestedTickRate"], 1000.0)
+        self.assertEqual(Configuration["SettleTimeoutTicks"], 200)
+        self.assertEqual(Configuration["ValidationLanesPerStack"], 4)
+        self.assertEqual(Configuration["MaximumValidationStackCount"], 16)
+
+    def testCurrentStatusRecoversAUserServiceOwner(self) -> None:
+        WriteManagerState = Mock()
+        with patch.object(
+            self.Process,
+            "ReadManagerState",
+            return_value=None,
+        ), patch.object(
+            self.Process,
+            "ProcessIsOwned",
+            return_value=False,
+        ), patch.object(
+            self.Process,
+            "FindOwnedServerPid",
+            return_value=3456,
+        ), patch.object(
+            self.Process,
+            "ServiceMainPid",
+            return_value=3456,
+        ), patch.object(
+            self.Process,
+            "WriteManagerState",
+            WriteManagerState,
+        ):
+            Status = self.Process.CurrentStatus()
+
+        self.assertEqual(Status["Status"], "running")
+        self.assertEqual(Status["Pid"], 3456)
+        RecoveredState = WriteManagerState.call_args.args[0]
+        self.assertEqual(RecoveredState["LaunchMethod"], "user-service")
+
+    def testCurrentStatusKeepsAnUnmanagedRecoveredProcessDistinct(self) -> None:
+        WriteManagerState = Mock()
+        with patch.object(
+            self.Process,
+            "ReadManagerState",
+            return_value=None,
+        ), patch.object(
+            self.Process,
+            "ProcessIsOwned",
+            return_value=False,
+        ), patch.object(
+            self.Process,
+            "FindOwnedServerPid",
+            return_value=3456,
+        ), patch.object(
+            self.Process,
+            "ServiceMainPid",
+            return_value=7890,
+        ), patch.object(
+            self.Process,
+            "WriteManagerState",
+            WriteManagerState,
+        ):
+            self.Process.CurrentStatus()
+
+        RecoveredState = WriteManagerState.call_args.args[0]
+        self.assertEqual(RecoveredState["LaunchMethod"], "recovered")
+
+    def testHarnessConfigurationRejectsUnsafeValidationStackCounts(self) -> None:
+        with TemporaryDirectory() as TemporaryDirectoryPath, patch.object(
+            self.Process,
+            "HarnessConfigurationPath",
+            Path(TemporaryDirectoryPath) / "redstonecompiler-harness.json",
+        ), patch.object(
+            self.Process,
+            "MaximumValidationStackCount",
+            17,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "maximum validation stack count must be between 1 and 16",
+            ):
+                self.Process.WriteHarnessConfiguration(25566)
+
     def testAnvilScannerFindsOnlyNonAirBlocksUsingPaddedStorage(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
             RegionPath = Path(TemporaryDirectoryPath) / "r.-1.2.mca"
@@ -193,11 +293,16 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
             Ready = Mock(return_value=(True, None))
             Start = Mock()
             Send = Mock(side_effect=[
+                {"Status": "paused"},
+                {"Status": "command-complete"},
                 {"Status": "command-complete"},
                 {
                     "Status": "updated",
                     "Diagnostics": {"UpdatedBlockCount": 2},
                 },
+                {"Status": "command-complete"},
+                {"Status": "command-complete"},
+                {"Status": "resumed"},
             ])
             ReadNonAirBlocks = Mock(return_value=iter([
                 SimpleNamespace(
@@ -243,6 +348,13 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
             ReadNonAirBlocks.assert_called_once_with(RegionPath)
             self.assertEqual(Send.call_args_list, [
                 call({
+                    "Action": "PauseTicks",
+                }, TimeoutSeconds=60.0),
+                call({
+                    "Action": "WorldRunCommand",
+                    "Command": "save-off",
+                }, TimeoutSeconds=60.0),
+                call({
                     "Action": "WorldRunCommand",
                     "Command": "save-all flush",
                 }, TimeoutSeconds=60.0),
@@ -253,6 +365,17 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
                         {"Position": [1, 64, -512], "State": "minecraft:air"},
                     ],
                 }, TimeoutSeconds=60.0),
+                call({
+                    "Action": "WorldRunCommand",
+                    "Command": "save-on",
+                }, TimeoutSeconds=60.0),
+                call({
+                    "Action": "WorldRunCommand",
+                    "Command": "save-all flush",
+                }, TimeoutSeconds=60.0),
+                call({
+                    "Action": "ResumeTicks",
+                }, TimeoutSeconds=60.0),
             ])
             self.assertEqual(Result["Status"], "running")
             self.assertTrue(Result["Cleared"])
@@ -262,7 +385,58 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
             self.assertEqual(Result["ClearRequestCount"], 1)
             self.assertEqual(Result["ScannedChunkCount"], 2)
             self.assertEqual(Result["ScannedRegionFileCount"], 1)
+            self.assertTrue(Result["TicksPausedDuringClear"])
+            self.assertTrue(Result["WorldSavingSuppressedDuringScan"])
+            self.assertTrue(Result["ClearedStateFlushed"])
             self.assertFalse(Result["Restarted"])
+
+    def testClearPersistedWorldBlocksRestoresServerStateAfterScannerFailure(self) -> None:
+        RegionPath = Path("/synthetic/world/region/r.-4.22.mca")
+        Send = Mock(side_effect=[
+            {"Status": "paused"},
+            {"Status": "command-complete"},
+            {"Status": "command-complete"},
+            {"Status": "command-complete"},
+            {"Status": "command-complete"},
+            {"Status": "resumed"},
+        ])
+
+        with patch.object(
+            self.Process,
+            "PersistedWorldRegionsByDimension",
+            return_value={"minecraft:overworld": [RegionPath]},
+        ), patch.object(
+            self.Process,
+            "ReadRegionNonAirBlocks",
+            side_effect=RuntimeError("header/NBT race"),
+        ), patch.object(
+            self.Process,
+            "SendRequest",
+            Send,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "header/NBT race"):
+                self.Process.ClearPersistedWorldBlocks()
+
+        self.assertEqual(Send.call_args_list, [
+            call({"Action": "PauseTicks"}, TimeoutSeconds=60.0),
+            call({
+                "Action": "WorldRunCommand",
+                "Command": "save-off",
+            }, TimeoutSeconds=60.0),
+            call({
+                "Action": "WorldRunCommand",
+                "Command": "save-all flush",
+            }, TimeoutSeconds=60.0),
+            call({
+                "Action": "WorldRunCommand",
+                "Command": "save-on",
+            }, TimeoutSeconds=60.0),
+            call({
+                "Action": "WorldRunCommand",
+                "Command": "save-all flush",
+            }, TimeoutSeconds=60.0),
+            call({"Action": "ResumeTicks"}, TimeoutSeconds=60.0),
+        ])
 
     def testClearServerWorldRefusesToCreateAMissingWorld(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:

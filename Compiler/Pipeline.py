@@ -30,6 +30,7 @@ from .FabricServer import (
     FabricServerSnapshotArtifact,
     FabricServerSupervisor,
     FabricServerValidationResult,
+    FabricValidationProgress,
     WriteFabricFixture,
 )
 from SchemEncoder import SchemWriter
@@ -690,6 +691,10 @@ def CompileSvToLitematic(
     RoutingStrategyValue: RoutingStrategy | str = RoutingStrategy.Default,
     RoutingDeadlineSeconds: float | None = None,
     TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
+    TimingCallback: Callable[[str, str], None] | None = None,
+    ValidationProgressCallback: (
+        Callable[[FabricValidationProgress], None] | None
+    ) = None,
 ) -> CompileResult:
     """Run the complete SV to NAND diagram and litematic flow."""
 
@@ -728,14 +733,26 @@ def CompileSvToLitematic(
     WriteNandDiagram(NandIR, DiagramPath)
     Stages.append("nand_diagram")
 
+    if TimingCallback is not None:
+        TimingCallback("Routing", "begin")
+
+    def ReportRoutingStage(Stage: str) -> None:
+        if TimingCallback is not None:
+            TimingCallback("RoutingStage", Stage)
+
     try:
-        Physical = PlaceAndRoutePcb(
-            NandIR,
-            ProgressCallback=ProgressCallback,
-            Strategy=RequestedStrategy,
-            Policy=EffectivePolicy,
-            RoutingDeadlineSeconds=RoutingDeadlineSeconds,
-        )
+        try:
+            Physical = PlaceAndRoutePcb(
+                NandIR,
+                ProgressCallback=ProgressCallback,
+                Strategy=RequestedStrategy,
+                Policy=EffectivePolicy,
+                RoutingDeadlineSeconds=RoutingDeadlineSeconds,
+                StageCallback=ReportRoutingStage,
+            )
+        finally:
+            if TimingCallback is not None:
+                TimingCallback("Routing", "finish")
     except RoutingStageError as Error:
         TryWriteRoutingFailureArtifact(
             OutputPath=OutputPath,
@@ -780,31 +797,96 @@ def CompileSvToLitematic(
     )
     Composition = Rendered.Composition
     NandModule = NandIR.Modules[NandIR.Top]
-    FabricFixture = BuildFabricFixture(
-        RoutedDesign=Routed,
-        Rendered=Rendered,
-        Module=NandModule,
-    )
-    ServerSupervisor = FabricServerSupervisor(
-        FabricServerConfiguration.FromEnvironment(),
-    )
-    with TemporaryDirectory(
-        dir=OutputPath.parent,
-        prefix=f".{OutputPath.stem}-fabric-validate-",
-    ) as FixtureDirectory:
-        ValidationFixture = WriteFabricFixture(
-            Path(FixtureDirectory) / OutputPath.with_suffix(".FabricFixture.json").name,
-            FabricFixture,
+    if TimingCallback is not None:
+        TimingCallback("Validation", "begin")
+    ValidationVectorCount = 0
+    LastCompletedValidationVectors = 0
+
+    def ReportValidationProgress(Progress: FabricValidationProgress) -> None:
+        nonlocal LastCompletedValidationVectors
+        LastCompletedValidationVectors = max(
+            LastCompletedValidationVectors,
+            Progress.Completed,
         )
-        FabricServerValidation = ServerSupervisor.Validate(
-            Fixture=ValidationFixture,
-            Vectors=BuildExpectedVectors(
-                NandModule,
-                (Value["Name"] for Value in FabricFixture["Inputs"]),
-                (Value["Name"] for Value in FabricFixture["Outputs"]),
-                IncludeTraceValues=True,
-            ),
+        if ValidationProgressCallback is not None:
+            ValidationProgressCallback(Progress)
+
+    try:
+        FabricFixture = BuildFabricFixture(
+            RoutedDesign=Routed,
+            Rendered=Rendered,
+            Module=NandModule,
         )
+        ValidationVectors = BuildExpectedVectors(
+            NandModule,
+            (Value["Name"] for Value in FabricFixture["Inputs"]),
+            (Value["Name"] for Value in FabricFixture["Outputs"]),
+            IncludeTraceValues=True,
+        )
+        ValidationVectorCount = len(ValidationVectors)
+        ServerSupervisor = FabricServerSupervisor(
+            FabricServerConfiguration.FromEnvironment(),
+        )
+        with TemporaryDirectory(
+            dir=OutputPath.parent,
+            prefix=f".{OutputPath.stem}-fabric-validate-",
+        ) as FixtureDirectory:
+            ValidationFixture = WriteFabricFixture(
+                Path(FixtureDirectory) / OutputPath.with_suffix(".FabricFixture.json").name,
+                FabricFixture,
+            )
+            if ValidationProgressCallback is not None:
+                ReportValidationProgress(FabricValidationProgress(
+                    Completed=0,
+                    Total=ValidationVectorCount,
+                    Stage="waiting for authoritative Fabric server",
+                ))
+            FabricServerValidation = ServerSupervisor.Validate(
+                Fixture=ValidationFixture,
+                Vectors=ValidationVectors,
+                ProgressCallback=(
+                    ReportValidationProgress
+                    if ValidationProgressCallback is not None
+                    else None
+                ),
+            )
+        TestedVectors = FabricServerValidation.Diagnostics.get("TestedVectors")
+        FailureDetails = FabricServerValidation.Diagnostics.get(
+            "Mismatch" if FabricServerValidation.Status == "mismatch" else "Timeout",
+            {},
+        )
+        if not isinstance(FailureDetails, dict):
+            FailureDetails = {}
+        if type(TestedVectors) is not int:
+            TestedVectors = FailureDetails.get("TestedVectorsBeforeFailure")
+        CompletedVectors = (
+            max(0, min(ValidationVectorCount, TestedVectors))
+            if type(TestedVectors) is int
+            else (
+                ValidationVectorCount
+                if FabricServerValidation.Status == "passed"
+                else LastCompletedValidationVectors
+            )
+        )
+        if ValidationProgressCallback is not None:
+            ReportValidationProgress(FabricValidationProgress(
+                Completed=CompletedVectors,
+                Total=ValidationVectorCount,
+                Stage="authoritative Fabric validation complete",
+                Status=FabricServerValidation.Status,
+            ))
+    except BaseException:
+        if ValidationProgressCallback is not None:
+            ReportValidationProgress(FabricValidationProgress(
+                Completed=LastCompletedValidationVectors,
+                Total=ValidationVectorCount,
+                Stage="authoritative Fabric validation failed",
+                Status="failed",
+            ))
+        raise
+    finally:
+        if TimingCallback is not None:
+            TimingCallback("Validation", "finish")
     Stages.append("fabric_server_validation")
     if FabricServerValidation.Status != "passed":
         TryWriteRoutingFailureArtifact(

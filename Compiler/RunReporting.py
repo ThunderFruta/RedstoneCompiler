@@ -174,12 +174,13 @@ def FormatResultLines(
     RawReportPath: Path,
     FailureType: str | None = None,
     CpuDetails: Mapping[str, object] | None = None,
+    TimingDetails: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Format the concise terminal and Summary.txt result contract."""
     ResultLine = f"RESULT: {Result}"
     if FailureType:
         ResultLine += f" — {FailureType}"
-    TimeLine = f"TIME: wall={max(0.0, WallSeconds):.3f}s"
+    TimeLine = f"TIME: total wall={max(0.0, WallSeconds):.3f}s"
     CalculatedAverageCores: float | None = None
     if CpuSeconds is not None:
         SafeCpuSeconds = max(0.0, CpuSeconds)
@@ -199,6 +200,77 @@ def FormatResultLines(
         ResultLine,
         TimeLine,
     ]
+    if TimingDetails is not None:
+        Intervals = TimingDetails.get("Intervals", {})
+        SafeIntervals = Intervals if isinstance(Intervals, Mapping) else {}
+        for IntervalName in ("Routing",):
+            Interval = SafeIntervals.get(IntervalName)
+            if not isinstance(Interval, Mapping):
+                Lines.append(f"TIME: {IntervalName.lower()} not-run")
+                continue
+            IntervalWall = Interval.get("WallSeconds")
+            IntervalCpu = Interval.get("CpuSeconds")
+            if not isinstance(IntervalWall, (int, float)):
+                continue
+            IntervalLine = (
+                f"TIME: {IntervalName.lower()} "
+                f"wall={max(0.0, float(IntervalWall)):.3f}s"
+            )
+            if isinstance(IntervalCpu, (int, float)):
+                SafeIntervalCpu = max(0.0, float(IntervalCpu))
+                IntervalUtilization = (
+                    SafeIntervalCpu / float(IntervalWall) * 100.0
+                    if IntervalWall > 0.0
+                    else 0.0
+                )
+                IntervalLine += (
+                    f" cpu={SafeIntervalCpu:.3f}s"
+                    f" utilization={IntervalUtilization:.1f}%"
+                )
+            Lines.append(IntervalLine)
+        RoutingStages = TimingDetails.get("RoutingStages", ())
+        if isinstance(RoutingStages, (list, tuple)):
+            for Stage in RoutingStages:
+                if not isinstance(Stage, Mapping):
+                    continue
+                StageName = str(Stage.get("Stage", "unknown"))
+                StageWall = Stage.get("WallSeconds")
+                StageCpu = Stage.get("CpuSeconds")
+                EventCount = Stage.get("Events")
+                if not isinstance(StageWall, (int, float)):
+                    continue
+                StageLine = (
+                    f"  {StageName}: "
+                    f"wall={max(0.0, float(StageWall)):.3f}s"
+                )
+                if isinstance(StageCpu, (int, float)):
+                    StageLine += f" cpu={max(0.0, float(StageCpu)):.3f}s"
+                if isinstance(EventCount, int) and EventCount > 1:
+                    StageLine += f" events={EventCount}"
+                Lines.append(StageLine)
+        Validation = SafeIntervals.get("Validation")
+        if not isinstance(Validation, Mapping):
+            Lines.append("TIME: validation not-run")
+        else:
+            ValidationWall = Validation.get("WallSeconds")
+            ValidationCpu = Validation.get("CpuSeconds")
+            if isinstance(ValidationWall, (int, float)):
+                ValidationLine = (
+                    "TIME: validation "
+                    f"wall={max(0.0, float(ValidationWall)):.3f}s"
+                )
+                if isinstance(ValidationCpu, (int, float)):
+                    SafeValidationCpu = max(0.0, float(ValidationCpu))
+                    ValidationUtilization = (
+                        SafeValidationCpu / float(ValidationWall) * 100.0
+                        if ValidationWall > 0.0
+                        else 0.0
+                    )
+                    ValidationLine += (
+                        f" cpu={SafeValidationCpu:.3f}s"
+                        f" utilization={ValidationUtilization:.1f}%"
+                    )
+                Lines.append(ValidationLine)
     Details = dict(CpuDetails or {})
     CpuParts = []
     for Key, Label in (
@@ -261,6 +333,7 @@ def WriteRunReport(
     Stderr: str = "",
     FailureType: str | None = None,
     CpuDetails: Mapping[str, object] | None = None,
+    TimingDetails: Mapping[str, object] | None = None,
     ExceptionText: str = "",
     Details: Mapping[str, object] | None = None,
     ArtifactRoots: Iterable[Path] = (),
@@ -278,6 +351,7 @@ def WriteRunReport(
         RawReportPath=RawReportPath,
         FailureType=FailureType,
         CpuDetails=CpuDetails,
+        TimingDetails=TimingDetails,
     )
     InventoryRoots = [Directory, *ArtifactRoots]
     Sections: list[tuple[str, str]] = [

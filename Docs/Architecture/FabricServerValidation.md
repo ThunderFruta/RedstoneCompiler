@@ -84,16 +84,50 @@ non-air blocks cleared; otherwise validation fails closed. The harness then clea
 incoming fixture arena immediately before placement as a second, idempotent
 pre-paste guard.
 
-The server sets a 5,000 TPS target, force-loads every chunk intersecting the
-fixture arena (up to 256 chunks), places the exact fixture states, drives
-levers, and forces updates at each lever and its six direct neighbors. It then
-samples every dynamic block listed by the fixture trace. A vector is settled
+The server sets a 1,000 TPS target, force-loads every chunk intersecting the
+fixture arenas (up to 1,024 combined chunks), drives one truth-table vector per
+active lane, and forces updates at each lever and its six direct neighbors.
+Each stack holds up to four vertical lanes with a shared X/Z footprint and 16
+air blocks between fixture bounds. The capacity selector begins with the
+largest useful count allowed by 1–16 stacks, so the final stack may be partial,
+and lays stacks out in a deterministic 4x4 horizontal array for a maximum of 64
+lanes. Configure the physical cap with
+`RC_FABRIC_VALIDATION_MAX_STACKS=1..16` before server startup.
+
+The estimate is
+`ceil(vector-count / lane-count) * settle-timeout-ticks / requested-TPS`.
+This is deliberately based on the full 200-tick ceiling and is reported only as
+a worst-case tick budget. Lane capacity is selected separately from measured
+performance. For each candidate count, the harness applies representative
+truth-table vectors and measures 40 full server ticks while the same aggregate
+trace sampler used by validation is active. It tries the largest useful count
+first, clears one rejected fixture at a time, and accepts the first candidate
+whose average processing time fits the 1 ms per-tick budget required for 1,000
+TPS. If one lane cannot meet the requested rate, validation fails instead of
+claiming a sustainable lane count. Results report every capacity sample,
+selected stacks/lanes, batch count, tick budget, average and maximum tick
+processing time, and sustained TPS.
+
+Each lockstep batch is sampled atomically on the Minecraft server thread, so
+every lane observation has the same game time. A vector is settled
 only after all traced dust, repeaters, torches, lamps, comparators, and levers
 remain unchanged for 40 consecutive observed game ticks (up to 200 ticks
-total). Only then does the harness compare output lamps. It returns `passed`,
+total). Per-tick comparisons use compact immutable block-state lists; the
+harness serializes full coordinate/state JSON only for a settled or failed
+snapshot. Only then does the harness compare output lamps. It returns `passed`,
 `mismatch`, `timeout`, or
 `infrastructure-failure`; absence of the configured server is an infrastructure
 failure, never a functional pass.
+
+The harness streams authoritative `Completed`/`Total` JSON progress at the
+start of the truth table and after every fully tested vector. The terminal bar
+therefore starts at `0/N` once the truth-table size is known and then reflects
+settled and compared Fabric vectors across all active lanes. Results are
+committed in original truth-table order, and mismatch/timeout diagnostics carry
+the stack index, vertical slot, lane index, lane origin, and global vector
+index. Fixture and vector
+preparation do not render a placeholder validation bar. Existing-world
+validation stays single-lane and restores the original input states.
 
 Skipped game ticks do not count toward the 40-tick proof: the unchanged counter
 resets whenever the harness cannot observe the next consecutive game tick.

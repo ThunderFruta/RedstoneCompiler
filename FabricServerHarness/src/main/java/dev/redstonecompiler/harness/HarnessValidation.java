@@ -35,12 +35,17 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 
 /** Executes only validated compiler fixtures on the main server thread. */
 final class HarnessValidation {
     static final int REQUIRED_UNCHANGED_TICKS = 40;
-    private static final int MAXIMUM_FORCED_FIXTURE_CHUNKS = 256;
+    static final int VALIDATION_TPS_CALIBRATION_TICKS = 40;
+    private static final int MAXIMUM_FORCED_FIXTURE_CHUNKS = 1_024;
     private static final int MAXIMUM_TRACE_PROBES = 10_000;
+    private static final int MAXIMUM_ACTIVE_TRACE_PROBES = 160_000;
+    private static final int VALIDATION_LANE_CLEARANCE_BLOCKS = 16;
+    private static final int VALIDATION_STACK_GRID_COLUMNS = 4;
     private static final Set<String> FALLBACK_TRACE_BLOCKS = Set.of(
             "minecraft:comparator",
             "minecraft:lever",
@@ -150,21 +155,49 @@ final class HarnessValidation {
             }
             JsonObject fixture = JsonParser.parseString(Files.readString(fixturePath)).getAsJsonObject();
             JsonArray origin = fixture.getAsJsonObject("Arena").getAsJsonArray("Origin");
-            int forcedFixtureChunkCount = OnServer(server, () -> {
+            boolean selectValidationLaneCount = "Validate".equals(action);
+            int maximumValidationLaneCount = selectValidationLaneCount
+                    ? BuildMaximumValidationLaneCount(
+                            request.getAsJsonArray("Vectors").size(),
+                            configuration.validationLanesPerStack(),
+                            configuration.maximumValidationStackCount(),
+                            BuildTraceProbes(fixture, origin).size())
+                    : 1;
+            List<JsonArray> laneOrigins = "Validate".equals(action)
+                    ? BuildValidationLaneOriginsForLaneCount(
+                            fixture,
+                            maximumValidationLaneCount,
+                            configuration.validationLanesPerStack())
+                    : List.of(origin.deepCopy());
+            int initialForcedFixtureChunkCount = OnServer(server, () -> {
                 CommandSourceStack source = server.createCommandSourceStack().withPermission(PermissionSet.ALL_PERMISSIONS);
                 setTickRate(server, source, configuration.requestedTickRate());
                 ServerLevel level = server.overworld();
                 int forcedChunkCount = forceFixtureChunks(
-                        level, fixture.getAsJsonArray("Blocks"), origin, fixture.getAsJsonObject("Arena"));
+                        level,
+                        fixture.getAsJsonArray("Blocks"),
+                        laneOrigins,
+                        fixture.getAsJsonObject("Arena"));
                 if (!validateExisting) {
-                    clearFixture(level, fixture.getAsJsonArray("Blocks"), origin, fixture.getAsJsonObject("Arena"));
-                    placeFixture(
-                            server,
-                            level,
-                            fixture.getAsJsonArray("Blocks"),
-                            fixture.has("Signs") ? fixture.getAsJsonArray("Signs") : new JsonArray(),
-                            origin);
-                    forceBlockUpdates(level, fixture.getAsJsonArray("Blocks"), origin);
+                    for (JsonArray laneOrigin : laneOrigins) {
+                        clearFixture(
+                                level,
+                                fixture.getAsJsonArray("Blocks"),
+                                laneOrigin,
+                                fixture.getAsJsonObject("Arena"));
+                        placeFixture(
+                                server,
+                                level,
+                                fixture.getAsJsonArray("Blocks"),
+                                fixture.has("Signs")
+                                        ? fixture.getAsJsonArray("Signs")
+                                        : new JsonArray(),
+                                laneOrigin);
+                        forceBlockUpdates(
+                                level,
+                                fixture.getAsJsonArray("Blocks"),
+                                laneOrigin);
+                    }
                 }
                 return forcedChunkCount;
             });
@@ -176,31 +209,102 @@ final class HarnessValidation {
                 diagnostics.addProperty(
                         "LoadedSigns",
                         fixture.has("Signs") ? fixture.getAsJsonArray("Signs").size() : 0);
-                diagnostics.addProperty("ForcedFixtureChunks", forcedFixtureChunkCount);
+                diagnostics.addProperty("ForcedFixtureChunks", initialForcedFixtureChunkCount);
                 diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
                 diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
                 writeResponse(response, diagnostics, output);
                 return;
             }
-            Map<String, JsonObject> inputStates = validateExisting
-                    ? OnServer(server, () -> inputStatesFromWorld(
-                            server.overworld(), fixture.getAsJsonArray("Inputs"), origin))
-                    : inputStates(fixture.getAsJsonArray("Inputs"), fixture.getAsJsonArray("Blocks"), origin);
-            Map<String, BlockPos> outputPositions = outputPositions(fixture.getAsJsonArray("Outputs"), origin);
+            List<ValidationLane> availableValidationLanes = new ArrayList<>();
+            for (int laneIndex = 0; laneIndex < laneOrigins.size(); laneIndex++) {
+                JsonArray laneOrigin = laneOrigins.get(laneIndex);
+                Map<String, JsonObject> laneInputStates = validateExisting
+                        ? OnServer(server, () -> inputStatesFromWorld(
+                                server.overworld(),
+                                fixture.getAsJsonArray("Inputs"),
+                                laneOrigin))
+                        : inputStates(
+                                fixture.getAsJsonArray("Inputs"),
+                                fixture.getAsJsonArray("Blocks"),
+                                laneOrigin);
+                availableValidationLanes.add(new ValidationLane(
+                        laneIndex,
+                        laneOrigin.deepCopy(),
+                        laneInputStates,
+                        outputPositions(
+                                fixture.getAsJsonArray("Outputs"),
+                                laneOrigin),
+                        BuildTraceProbes(fixture, laneOrigin)));
+            }
+            ValidationTpsSelection tpsSelection = selectValidationLaneCount
+                    ? SelectMaximumSustainingValidationLanes(
+                            server,
+                            fixture,
+                            request.getAsJsonArray("Vectors"),
+                            availableValidationLanes,
+                            configuration.requestedTickRate())
+                    : new ValidationTpsSelection(
+                            1,
+                            initialForcedFixtureChunkCount,
+                            List.of());
+            JsonArray tpsCalibrationSamples = new JsonArray();
+            for (ValidationTpsSample sample : tpsSelection.Samples()) {
+                JsonObject sampleJson = new JsonObject();
+                sampleJson.addProperty("ValidationLaneCount", sample.LaneCount());
+                sampleJson.addProperty("ObservedTicks", sample.ObservedTicks());
+                sampleJson.addProperty(
+                        "AverageTickProcessingNanos",
+                        sample.AverageTickProcessingNanos());
+                sampleJson.addProperty(
+                        "MaximumTickProcessingNanos",
+                        sample.MaximumTickProcessingNanos());
+                sampleJson.addProperty(
+                        "SustainedTickRate",
+                        sample.SustainedTickRate());
+                sampleJson.addProperty(
+                        "MeetsRequestedTickRate",
+                        sample.MeetsRequestedTickRate());
+                tpsCalibrationSamples.add(sampleJson);
+            }
+            diagnostics.add("ValidationTpsCalibration", tpsCalibrationSamples);
+            diagnostics.addProperty(
+                    "ValidationLaneSelectionPolicy",
+                    selectValidationLaneCount
+                            ? "maximum-measured-at-requested-tps"
+                            : "single-existing-fixture");
+            if (tpsSelection.LaneCount() < 1) {
+                throw new IllegalStateException(
+                        "no-validation-lane-count-sustains-requested-tps:"
+                                + configuration.requestedTickRate());
+            }
+            List<ValidationLane> validationLanes = List.copyOf(
+                    availableValidationLanes.subList(
+                            0,
+                            tpsSelection.LaneCount()));
+            ValidationLanePlan lanePlan = selectValidationLaneCount
+                    ? BuildValidationLanePlan(
+                            request.getAsJsonArray("Vectors").size(),
+                            validationLanes.size(),
+                            configuration.validationLanesPerStack(),
+                            configuration.maximumValidationStackCount(),
+                            configuration.settleTimeoutTicks(),
+                            configuration.requestedTickRate())
+                    : ValidationLanePlan.SingleLane();
             ValidationSummary summary;
             try {
                 summary = validateVectors(
                         server,
                         request.getAsJsonArray("Vectors"),
-                        inputStates,
-                        outputPositions,
+                        validationLanes,
                         configuration.settleTimeoutTicks(),
-                        fixture,
-                        origin);
+                        output);
             } finally {
                 if (validateExisting) {
                     OnServer(server, () -> {
-                        restoreInputStates(server, server.overworld(), inputStates);
+                        restoreInputStates(
+                                server,
+                                server.overworld(),
+                                validationLanes.getFirst().InputStates());
                         return null;
                     });
                     waitForTicks(server, 2);
@@ -213,7 +317,29 @@ final class HarnessValidation {
             diagnostics.addProperty("TraceProbeCount", summary.TraceProbeCount());
             diagnostics.addProperty("MaximumSettleTicks", summary.MaximumSettleTicks());
             diagnostics.addProperty("UnobservedTickGapCount", summary.UnobservedTickGapCount());
-            diagnostics.addProperty("ForcedFixtureChunks", forcedFixtureChunkCount);
+            diagnostics.addProperty("ValidationLaneCount", validationLanes.size());
+            diagnostics.addProperty("ValidationLanesPerStack", lanePlan.LanesPerStack());
+            diagnostics.addProperty("ValidationStackCount", lanePlan.StackCount());
+            diagnostics.addProperty(
+                    "MaximumValidationStackCount",
+                    lanePlan.MaximumStackCount());
+            diagnostics.addProperty(
+                    "WorstCaseValidationTickBudgetSeconds",
+                    lanePlan.TickBudgetSeconds());
+            diagnostics.addProperty(
+                    "EstimatedValidationBatchCount",
+                    lanePlan.BatchCount());
+            JsonArray validationLaneOrigins = new JsonArray();
+            for (ValidationLane validationLane : validationLanes) {
+                validationLaneOrigins.add(validationLane.Origin().deepCopy());
+            }
+            diagnostics.add("ValidationLaneOrigins", validationLaneOrigins);
+            diagnostics.addProperty(
+                    "ActiveTraceProbeCount",
+                    summary.TraceProbeCount() * validationLanes.size());
+            diagnostics.addProperty(
+                    "ForcedFixtureChunks",
+                    tpsSelection.ForcedFixtureChunkCount());
             diagnostics.addProperty("RequestedTickRate", configuration.requestedTickRate());
             diagnostics.addProperty("ObservedGameTime", OnServer(server, () -> server.overworld().getGameTime()));
             diagnostics.addProperty("WorldStateMode", validateExisting ? "existing" : "fixture-paste");
@@ -223,11 +349,19 @@ final class HarnessValidation {
             response.addProperty("Status", "mismatch");
             diagnostics.addProperty("Error", error.getMessage());
             diagnostics.add("Mismatch", error.Details());
+            diagnostics.add(
+                    "TestedVectors",
+                    error.Details().get("TestedVectorsBeforeFailure"));
             diagnostics.add("TraceBlocks", error.TraceBlocks());
         } catch (Timeout error) {
             response.addProperty("Status", "timeout");
             diagnostics.addProperty("Error", error.getMessage());
-            if (error.Details() != null) diagnostics.add("Timeout", error.Details());
+            if (error.Details() != null) {
+                diagnostics.add("Timeout", error.Details());
+                diagnostics.add(
+                        "TestedVectors",
+                        error.Details().get("TestedVectorsBeforeFailure"));
+            }
             if (error.TraceBlocks() != null) diagnostics.add("TraceBlocks", error.TraceBlocks());
         } catch (Exception error) {
             response.addProperty("Status", "infrastructure-failure");
@@ -268,6 +402,31 @@ final class HarnessValidation {
     private static void writeResponse(JsonObject response, JsonObject diagnostics, BufferedWriter output) throws IOException {
         response.add("Diagnostics", diagnostics);
         output.write(response + "\n");
+        output.flush();
+    }
+
+    static JsonObject BuildValidationProgress(
+            int completed,
+            int total,
+            int laneCount) {
+        JsonObject Progress = new JsonObject();
+        Progress.addProperty("Status", "progress");
+        Progress.addProperty("Completed", completed);
+        Progress.addProperty("Total", total);
+        Progress.addProperty("ValidationLaneCount", laneCount);
+        Progress.addProperty(
+                "Stage",
+                "authoritative Fabric truth-table validation | lanes="
+                        + laneCount);
+        return Progress;
+    }
+
+    private static void WriteValidationProgress(
+            int completed,
+            int total,
+            int laneCount,
+            BufferedWriter output) throws IOException {
+        output.write(BuildValidationProgress(completed, total, laneCount) + "\n");
         output.flush();
     }
 
@@ -314,8 +473,14 @@ final class HarnessValidation {
     }
 
     private static int forceFixtureChunks(
-            ServerLevel level, JsonArray blocks, JsonArray origin, JsonObject arena) {
-        Set<ChunkCoordinate> requested = fixtureChunks(blocks, origin, arena);
+            ServerLevel level,
+            JsonArray blocks,
+            List<JsonArray> origins,
+            JsonObject arena) {
+        Set<ChunkCoordinate> requested = new LinkedHashSet<>();
+        for (JsonArray origin : origins) {
+            requested.addAll(fixtureChunks(blocks, origin, arena));
+        }
         if (requested.size() > MAXIMUM_FORCED_FIXTURE_CHUNKS) {
             throw new IllegalArgumentException("fixture-spans-too-many-chunks:" + requested.size());
         }
@@ -333,6 +498,168 @@ final class HarnessValidation {
         ForcedFixtureChunks.clear();
         ForcedFixtureChunks.addAll(requested);
         return requested.size();
+    }
+
+    static int BuildMaximumValidationLaneCount(
+            int vectorCount,
+            int lanesPerStack,
+            int maximumStackCount,
+            int traceProbeCount) {
+        if (vectorCount < 0) {
+            throw new IllegalArgumentException("validation-vector-count-is-negative");
+        }
+        if (lanesPerStack != 4) {
+            throw new IllegalArgumentException("validation-lanes-per-stack-must-be-four");
+        }
+        if (maximumStackCount < 1 || maximumStackCount > 16) {
+            throw new IllegalArgumentException("validation-stack-count-out-of-range");
+        }
+        if (traceProbeCount <= 0 || traceProbeCount > MAXIMUM_TRACE_PROBES) {
+            throw new IllegalArgumentException("validation-trace-probe-count-is-invalid");
+        }
+        int usefulLaneCount = Math.max(1, vectorCount);
+        int configuredLaneCount = maximumStackCount * lanesPerStack;
+        int traceLimitedLaneCount = MAXIMUM_ACTIVE_TRACE_PROBES / traceProbeCount;
+        return Math.min(
+                usefulLaneCount,
+                Math.min(configuredLaneCount, traceLimitedLaneCount));
+    }
+
+    static ValidationLanePlan BuildValidationLanePlan(
+            int vectorCount,
+            int laneCount,
+            int lanesPerStack,
+            int maximumStackCount,
+            int settleTimeoutTicks,
+            double requestedTickRate) {
+        if (laneCount < 1 || laneCount > maximumStackCount * lanesPerStack) {
+            throw new IllegalArgumentException("validation-lane-count-out-of-range");
+        }
+        if (!Double.isFinite(requestedTickRate) || requestedTickRate <= 0.0D) {
+            throw new IllegalArgumentException("validation-tick-rate-is-invalid");
+        }
+        if (settleTimeoutTicks <= 0) {
+            throw new IllegalArgumentException("validation-settle-timeout-is-invalid");
+        }
+        int stackCount = (int) Math.ceil(laneCount / (double) lanesPerStack);
+        int batchCount = vectorCount == 0
+                ? 0
+                : (int) Math.ceil(vectorCount / (double) laneCount);
+        double tickBudgetSeconds = batchCount
+                * settleTimeoutTicks
+                / requestedTickRate;
+        return new ValidationLanePlan(
+                laneCount,
+                lanesPerStack,
+                stackCount,
+                maximumStackCount,
+                batchCount,
+                tickBudgetSeconds);
+    }
+
+    static ValidationTpsSample BuildValidationTpsSample(
+            int laneCount,
+            int observedTicks,
+            long totalTickProcessingNanos,
+            long maximumTickProcessingNanos,
+            double requestedTickRate) {
+        if (laneCount < 1 || observedTicks < 1 || totalTickProcessingNanos < 1L
+                || maximumTickProcessingNanos < 1L
+                || !Double.isFinite(requestedTickRate)
+                || requestedTickRate <= 0.0D) {
+            throw new IllegalArgumentException("validation-tps-sample-is-invalid");
+        }
+        double averageTickProcessingNanos =
+                totalTickProcessingNanos / (double) observedTicks;
+        double processingCapacityTps = 1_000_000_000.0D
+                / averageTickProcessingNanos;
+        double sustainedTickRate = Math.min(
+                requestedTickRate,
+                processingCapacityTps);
+        return new ValidationTpsSample(
+                laneCount,
+                observedTicks,
+                averageTickProcessingNanos,
+                maximumTickProcessingNanos,
+                sustainedTickRate,
+                processingCapacityTps >= requestedTickRate);
+    }
+
+    static List<JsonArray> BuildValidationLaneOriginsForLaneCount(
+            JsonObject fixture,
+            int laneCount,
+            int lanesPerStack) {
+        if (laneCount < 1 || laneCount > 64) {
+            throw new IllegalArgumentException("validation-lane-count-out-of-range");
+        }
+        int stackCount = (int) Math.ceil(laneCount / (double) lanesPerStack);
+        List<JsonArray> origins = BuildValidationLaneOrigins(
+                fixture,
+                stackCount,
+                lanesPerStack);
+        return new ArrayList<>(origins.subList(0, laneCount));
+    }
+
+    static List<JsonArray> BuildValidationLaneOrigins(
+            JsonObject fixture,
+            int stackCount,
+            int lanesPerStack) {
+        if (stackCount < 1 || stackCount > 16) {
+            throw new IllegalArgumentException("validation-stack-count-out-of-range");
+        }
+        if (lanesPerStack != 4) {
+            throw new IllegalArgumentException("validation-lanes-per-stack-must-be-four");
+        }
+        JsonArray baseOrigin = fixture.getAsJsonObject("Arena").getAsJsonArray("Origin");
+        int minimumX = Integer.MAX_VALUE;
+        int minimumY = Integer.MAX_VALUE;
+        int minimumZ = Integer.MAX_VALUE;
+        int maximumX = Integer.MIN_VALUE;
+        int maximumY = Integer.MIN_VALUE;
+        int maximumZ = Integer.MIN_VALUE;
+        JsonObject arena = fixture.getAsJsonObject("Arena");
+        if (arena.has("Bounds")) {
+            JsonObject bounds = arena.getAsJsonObject("Bounds");
+            JsonArray minimum = bounds.getAsJsonArray("Minimum");
+            JsonArray maximum = bounds.getAsJsonArray("Maximum");
+            minimumX = minimum.get(0).getAsInt();
+            minimumY = minimum.get(1).getAsInt();
+            minimumZ = minimum.get(2).getAsInt();
+            maximumX = maximum.get(0).getAsInt();
+            maximumY = maximum.get(1).getAsInt();
+            maximumZ = maximum.get(2).getAsInt();
+        }
+        for (JsonElement element : fixture.getAsJsonArray("Blocks")) {
+            JsonArray position = element.getAsJsonObject().getAsJsonArray("Position");
+            minimumX = Math.min(minimumX, position.get(0).getAsInt());
+            minimumY = Math.min(minimumY, position.get(1).getAsInt());
+            minimumZ = Math.min(minimumZ, position.get(2).getAsInt());
+            maximumX = Math.max(maximumX, position.get(0).getAsInt());
+            maximumY = Math.max(maximumY, position.get(1).getAsInt());
+            maximumZ = Math.max(maximumZ, position.get(2).getAsInt());
+        }
+        int width = minimumX == Integer.MAX_VALUE ? 1 : maximumX - minimumX + 1;
+        int height = minimumY == Integer.MAX_VALUE ? 1 : maximumY - minimumY + 1;
+        int depth = minimumZ == Integer.MAX_VALUE ? 1 : maximumZ - minimumZ + 1;
+        int pitchX = width + VALIDATION_LANE_CLEARANCE_BLOCKS;
+        int pitchY = height + VALIDATION_LANE_CLEARANCE_BLOCKS;
+        int pitchZ = depth + VALIDATION_LANE_CLEARANCE_BLOCKS;
+        List<JsonArray> origins = new ArrayList<>();
+        for (int stackIndex = 0; stackIndex < stackCount; stackIndex++) {
+            int stackColumn = stackIndex % VALIDATION_STACK_GRID_COLUMNS;
+            int stackRow = stackIndex / VALIDATION_STACK_GRID_COLUMNS;
+            for (int verticalIndex = 0; verticalIndex < lanesPerStack; verticalIndex++) {
+                JsonArray laneOrigin = new JsonArray();
+                laneOrigin.add(
+                        baseOrigin.get(0).getAsInt() + stackColumn * pitchX);
+                laneOrigin.add(
+                        baseOrigin.get(1).getAsInt() + verticalIndex * pitchY);
+                laneOrigin.add(
+                        baseOrigin.get(2).getAsInt() + stackRow * pitchZ);
+                origins.add(laneOrigin);
+            }
+        }
+        return origins;
     }
 
     private static Set<ChunkCoordinate> fixtureChunks(
@@ -544,101 +871,260 @@ final class HarnessValidation {
         return result;
     }
 
+    private static ValidationTpsSelection SelectMaximumSustainingValidationLanes(
+            MinecraftServer server,
+            JsonObject fixture,
+            JsonArray vectors,
+            List<ValidationLane> lanes,
+            double requestedTickRate) {
+        List<ValidationTpsSample> samples = new ArrayList<>();
+        int forcedFixtureChunkCount = OnServer(server, () -> forceFixtureChunks(
+                server.overworld(),
+                fixture.getAsJsonArray("Blocks"),
+                lanes.stream().map(ValidationLane::Origin).toList(),
+                fixture.getAsJsonObject("Arena")));
+        for (int candidateLaneCount = lanes.size();
+                candidateLaneCount >= 1;
+                candidateLaneCount--) {
+            List<ValidationLane> candidateLanes = List.copyOf(
+                    lanes.subList(0, candidateLaneCount));
+            if (!vectors.isEmpty()) {
+                OnServer(server, () -> {
+                    ServerLevel level = server.overworld();
+                    for (int laneIndex = 0;
+                            laneIndex < candidateLanes.size();
+                            laneIndex++) {
+                        int vectorIndex = (int) Math.floor(
+                                laneIndex
+                                        * vectors.size()
+                                        / (double) candidateLanes.size());
+                        ApplyValidationVector(
+                                server,
+                                level,
+                                candidateLanes.get(laneIndex).InputStates(),
+                                vectors.get(vectorIndex).getAsJsonObject());
+                    }
+                    return null;
+                });
+            }
+            waitForTicks(server, 1);
+            TickRateCalibrationObserver observer = OnServer(server, () -> {
+                TickRateCalibrationObserver installed =
+                        new TickRateCalibrationObserver(
+                                server,
+                                candidateLanes,
+                                VALIDATION_TPS_CALIBRATION_TICKS);
+                RedstoneCompilerHarness.InstallServerTickObserver(installed);
+                return installed;
+            });
+            try {
+                observer.AwaitCompletion();
+            } finally {
+                RedstoneCompilerHarness.RemoveServerTickObserver(observer);
+            }
+            ValidationTpsSample sample = observer.BuildSample(
+                    candidateLaneCount,
+                    requestedTickRate);
+            samples.add(sample);
+            if (sample.MeetsRequestedTickRate()) {
+                return new ValidationTpsSelection(
+                        candidateLaneCount,
+                        forcedFixtureChunkCount,
+                        List.copyOf(samples));
+            }
+
+            ValidationLane rejectedLane = lanes.get(candidateLaneCount - 1);
+            List<JsonArray> remainingOrigins = lanes.subList(
+                            0,
+                            candidateLaneCount - 1)
+                    .stream()
+                    .map(ValidationLane::Origin)
+                    .toList();
+            forcedFixtureChunkCount = OnServer(server, () -> {
+                clearFixture(
+                        server.overworld(),
+                        fixture.getAsJsonArray("Blocks"),
+                        rejectedLane.Origin(),
+                        fixture.getAsJsonObject("Arena"));
+                return forceFixtureChunks(
+                        server.overworld(),
+                        fixture.getAsJsonArray("Blocks"),
+                        remainingOrigins,
+                        fixture.getAsJsonObject("Arena"));
+            });
+            waitForTicks(server, 2);
+        }
+        return new ValidationTpsSelection(
+                0,
+                forcedFixtureChunkCount,
+                List.copyOf(samples));
+    }
+
     private static ValidationSummary validateVectors(
             MinecraftServer server,
             JsonArray vectors,
-            Map<String, JsonObject> inputs,
-            Map<String, BlockPos> outputs,
+            List<ValidationLane> lanes,
             int timeoutTicks,
-            JsonObject fixture,
-            JsonArray origin) {
-        List<TraceProbe> TraceProbes = BuildTraceProbes(fixture, origin);
-        if (TraceProbes.isEmpty()) {
+            BufferedWriter progressOutput) throws IOException {
+        if (lanes.isEmpty() || lanes.getFirst().TraceProbes().isEmpty()) {
             throw new IllegalArgumentException("fixture-has-no-trace-probes");
+        }
+        int traceProbeCount = lanes.getFirst().TraceProbes().size();
+        if ((long) traceProbeCount * lanes.size() > MAXIMUM_ACTIVE_TRACE_PROBES) {
+            throw new IllegalArgumentException(
+                    "too-many-active-trace-probes:"
+                            + ((long) traceProbeCount * lanes.size()));
         }
         int tested = 0;
         int MaximumSettleTicks = 0;
         int TotalUnobservedTickGaps = 0;
-        for (JsonElement vector : vectors) {
-            JsonObject item = vector.getAsJsonObject();
+        WriteValidationProgress(
+                tested,
+                vectors.size(),
+                lanes.size(),
+                progressOutput);
+        for (int batchStart = 0; batchStart < vectors.size(); batchStart += lanes.size()) {
+            int batchSize = Math.min(lanes.size(), vectors.size() - batchStart);
+            List<ValidationLane> activeLanes = lanes.subList(0, batchSize);
+            List<JsonObject> activeVectors = new ArrayList<>();
+            for (int laneOffset = 0; laneOffset < batchSize; laneOffset++) {
+                activeVectors.add(
+                        vectors.get(batchStart + laneOffset).getAsJsonObject());
+            }
             OnServer(server, () -> {
                 ServerLevel level = server.overworld();
-                Set<BlockPos> affected = new LinkedHashSet<>();
-                for (Map.Entry<String, JsonObject> input : inputs.entrySet()) {
-                    JsonObject state = input.getValue().deepCopy();
-                    state.getAsJsonObject("Properties").addProperty("powered", item.getAsJsonObject("Inputs").get(input.getKey()).getAsBoolean());
-                    String[] position = state.remove("_Position").getAsString().split(" ");
-                    BlockPos blockPosition = new BlockPos(Integer.parseInt(position[0]), Integer.parseInt(position[1]), Integer.parseInt(position[2]));
-                    level.setBlock(blockPosition, parseState(server, blockState(state)), 3);
-                    affected.add(blockPosition);
-                    for (net.minecraft.core.Direction direction : net.minecraft.core.Direction.values()) {
-                        affected.add(blockPosition.relative(direction));
-                    }
+                for (int laneOffset = 0; laneOffset < batchSize; laneOffset++) {
+                    ApplyValidationVector(
+                            server,
+                            level,
+                            activeLanes.get(laneOffset).InputStates(),
+                            activeVectors.get(laneOffset));
                 }
-                forceBlockUpdates(level, affected);
                 return null;
             });
             waitForTicks(server, 1);
-            Snapshot Previous = SnapshotCircuit(server, outputs, TraceProbes);
-            TraceQuiescenceTracker Quiescence = new TraceQuiescenceTracker(
-                    REQUIRED_UNCHANGED_TICKS,
-                    timeoutTicks,
-                    Previous.GameTime(),
-                    Previous.TraceBlocks());
-            Snapshot Settled = null;
-            while (!Quiescence.Status().TimedOut()) {
-                Snapshot Current = SnapshotCircuit(server, outputs, TraceProbes);
-                if (Current.GameTime() == Previous.GameTime()) {
-                    Thread.onSpinWait();
-                    continue;
-                }
-                TraceQuiescenceTracker.TraceQuiescenceStatus QuiescenceStatus =
-                        Quiescence.Observe(Current.GameTime(), Current.TraceBlocks());
-                Previous = Current;
-                if (QuiescenceStatus.Settled()) {
-                    Settled = Current;
-                    break;
-                }
-            }
-            TraceQuiescenceTracker.TraceQuiescenceStatus QuiescenceStatus =
-                    Quiescence.Status();
-            SettlementEvidence Evidence = new SettlementEvidence(
-                    QuiescenceStatus.ElapsedTicks(),
-                    QuiescenceStatus.LastObservedChangeTick(),
-                    QuiescenceStatus.ObservedUnchangedTicks(),
-                    TraceProbes.size(),
-                    QuiescenceStatus.UnobservedTickGapCount());
-            if (Settled == null) {
-                throw BuildTimeout(item, Previous.OutputValues(), tested, Evidence)
-                        .WithTraceBlocks(Previous.TraceBlocks());
-            }
+            TickBatchObserver observer = OnServer(server, () -> {
+                TickBatchObserver installed = new TickBatchObserver(
+                        server,
+                        activeLanes,
+                        timeoutTicks);
+                RedstoneCompilerHarness.InstallServerTickObserver(installed);
+                return installed;
+            });
             try {
-                compare(item, Settled.OutputValues(), tested, Evidence);
-            } catch (Mismatch error) {
-                throw error.WithTraceBlocks(Settled.TraceBlocks());
+                observer.AwaitCompletion();
+            } finally {
+                RedstoneCompilerHarness.RemoveServerTickObserver(observer);
             }
-            MaximumSettleTicks = Math.max(MaximumSettleTicks, Evidence.ElapsedTicks());
-            TotalUnobservedTickGaps += QuiescenceStatus.UnobservedTickGapCount();
-            tested++;
+            List<Snapshot> previous = observer.PreviousSnapshots();
+            List<TraceQuiescenceTracker> quiescence = observer.Quiescence();
+            List<Snapshot> settled = observer.SettledSnapshots();
+            for (int laneOffset = 0; laneOffset < batchSize; laneOffset++) {
+                TraceQuiescenceTracker.TraceQuiescenceStatus status =
+                        quiescence.get(laneOffset).Status();
+                SettlementEvidence evidence = new SettlementEvidence(
+                        status.ElapsedTicks(),
+                        status.LastObservedChangeTick(),
+                        status.ObservedUnchangedTicks(),
+                        traceProbeCount,
+                        status.UnobservedTickGapCount());
+                ValidationLane lane = activeLanes.get(laneOffset);
+                JsonObject vector = activeVectors.get(laneOffset);
+                Snapshot laneSettled = settled.get(laneOffset);
+                if (laneSettled == null) {
+                    Snapshot lastObserved = previous.get(laneOffset);
+                    throw BuildTimeout(
+                            vector,
+                            lastObserved.OutputValues(),
+                            tested,
+                            evidence,
+                            lane)
+                            .WithTraceBlocks(lastObserved.TraceBlocks());
+                }
+                try {
+                    compare(
+                            vector,
+                            laneSettled.OutputValues(),
+                            tested,
+                            evidence,
+                            lane);
+                } catch (Mismatch error) {
+                    throw error.WithTraceBlocks(laneSettled.TraceBlocks());
+                }
+                MaximumSettleTicks = Math.max(
+                        MaximumSettleTicks,
+                        evidence.ElapsedTicks());
+                TotalUnobservedTickGaps += status.UnobservedTickGapCount();
+                tested++;
+                WriteValidationProgress(
+                        tested,
+                        vectors.size(),
+                        lanes.size(),
+                        progressOutput);
+            }
         }
         return new ValidationSummary(
                 tested,
-                TraceProbes.size(),
+                traceProbeCount,
                 MaximumSettleTicks,
                 TotalUnobservedTickGaps);
     }
 
-    private static Snapshot SnapshotCircuit(
+    private static void ApplyValidationVector(
             MinecraftServer server,
-            Map<String, BlockPos> outputs,
-            List<TraceProbe> TraceProbes) {
-        return OnServer(server, () -> {
-            ServerLevel Level = server.overworld();
-            return new Snapshot(
-                    Level.getGameTime(),
-                    sample(Level, outputs),
-                    ReadTraceBlocks(Level, TraceProbes));
-        });
+            ServerLevel level,
+            Map<String, JsonObject> inputs,
+            JsonObject vector) {
+        Set<BlockPos> affected = new LinkedHashSet<>();
+        for (Map.Entry<String, JsonObject> input : inputs.entrySet()) {
+            JsonObject state = input.getValue().deepCopy();
+            state.getAsJsonObject("Properties").addProperty(
+                    "powered",
+                    vector.getAsJsonObject("Inputs")
+                            .get(input.getKey()).getAsBoolean());
+            String[] position = state.remove("_Position").getAsString().split(" ");
+            BlockPos blockPosition = new BlockPos(
+                    Integer.parseInt(position[0]),
+                    Integer.parseInt(position[1]),
+                    Integer.parseInt(position[2]));
+            level.setBlock(
+                    blockPosition,
+                    parseState(server, blockState(state)),
+                    3);
+            affected.add(blockPosition);
+            for (net.minecraft.core.Direction direction
+                    : net.minecraft.core.Direction.values()) {
+                affected.add(blockPosition.relative(direction));
+            }
+        }
+        forceBlockUpdates(level, affected);
+    }
+
+    private static List<Snapshot> CaptureSnapshots(
+            ServerLevel level,
+            List<ValidationLane> lanes) {
+        long gameTime = level.getGameTime();
+        List<Snapshot> snapshots = new ArrayList<>();
+        for (ValidationLane lane : lanes) {
+            snapshots.add(new Snapshot(
+                    gameTime,
+                    sample(level, lane.OutputPositions()),
+                    ReadTraceStates(level, lane.TraceProbes()),
+                    null));
+        }
+        return snapshots;
+    }
+
+    private static Snapshot CaptureDetailedSnapshot(
+            ServerLevel level,
+            ValidationLane lane,
+            long gameTime,
+            List<BlockState> traceStates) {
+        return new Snapshot(
+                gameTime,
+                sample(level, lane.OutputPositions()),
+                traceStates,
+                ReadTraceBlocks(level, lane.TraceProbes()));
     }
 
     private static void waitForTicks(MinecraftServer server, int ticks) {
@@ -668,7 +1154,8 @@ final class HarnessValidation {
             JsonObject vector,
             Map<String, Boolean> actual,
             int testedVectorsBeforeFailure,
-            SettlementEvidence Evidence) {
+            SettlementEvidence Evidence,
+            ValidationLane Lane) {
         JsonObject inputs = vector.getAsJsonObject("Inputs");
         JsonObject expected = vector.getAsJsonObject("Expected");
         for (Map.Entry<String, Boolean> output : actual.entrySet()) {
@@ -681,6 +1168,10 @@ final class HarnessValidation {
                 details.add("Inputs", inputs.deepCopy());
                 details.addProperty("TestedVectorsBeforeFailure", testedVectorsBeforeFailure);
                 AddSettlementEvidence(details, Evidence);
+                AddValidationLaneEvidence(
+                        details,
+                        Lane,
+                        testedVectorsBeforeFailure);
                 if (vector.has("ExpectedSignals")) {
                     details.add("ExpectedSignals", vector.getAsJsonObject("ExpectedSignals").deepCopy());
                 }
@@ -688,6 +1179,7 @@ final class HarnessValidation {
                         "output-mismatch:" + output.getKey()
                                 + ":expected=" + expectedValue
                                 + ":actual=" + output.getValue()
+                                + ":lane=" + Lane.Index()
                                 + ":inputs=" + inputs,
                         details,
                         new JsonArray());
@@ -699,7 +1191,8 @@ final class HarnessValidation {
             JsonObject vector,
             Map<String, Boolean> actual,
             int testedVectorsBeforeFailure,
-            SettlementEvidence Evidence) {
+            SettlementEvidence Evidence,
+            ValidationLane Lane) {
         JsonObject expected = vector.getAsJsonObject("Expected");
         String selectedOutput = null;
         for (Map.Entry<String, Boolean> output : actual.entrySet()) {
@@ -711,6 +1204,10 @@ final class HarnessValidation {
         details.add("Inputs", vector.getAsJsonObject("Inputs").deepCopy());
         details.addProperty("TestedVectorsBeforeFailure", testedVectorsBeforeFailure);
         AddSettlementEvidence(details, Evidence);
+        AddValidationLaneEvidence(
+                details,
+                Lane,
+                testedVectorsBeforeFailure);
         if (selectedOutput != null) {
             details.addProperty("Output", selectedOutput);
             details.addProperty("Expected", expected.get(selectedOutput).getAsBoolean());
@@ -720,6 +1217,17 @@ final class HarnessValidation {
             details.add("ExpectedSignals", vector.getAsJsonObject("ExpectedSignals").deepCopy());
         }
         return new Timeout("redstone-network-did-not-settle", details, new JsonArray());
+    }
+
+    private static void AddValidationLaneEvidence(
+            JsonObject Details,
+            ValidationLane Lane,
+            int GlobalVectorIndex) {
+        Details.addProperty("ValidationLaneIndex", Lane.Index());
+        Details.addProperty("ValidationStackIndex", Lane.Index() / 4);
+        Details.addProperty("ValidationVerticalIndex", Lane.Index() % 4);
+        Details.add("ValidationLaneOrigin", Lane.Origin().deepCopy());
+        Details.addProperty("GlobalVectorIndex", GlobalVectorIndex);
     }
 
     private static void AddSettlementEvidence(
@@ -782,6 +1290,16 @@ final class HarnessValidation {
         return result;
     }
 
+    private static List<BlockState> ReadTraceStates(
+            ServerLevel level,
+            List<TraceProbe> TraceProbes) {
+        List<BlockState> states = new ArrayList<>(TraceProbes.size());
+        for (TraceProbe probe : TraceProbes) {
+            states.add(level.getBlockState(probe.WorldPosition()));
+        }
+        return states;
+    }
+
     private static JsonObject findState(JsonArray blocks, JsonArray position) {
         for (JsonElement element : blocks) {
             JsonObject block = element.getAsJsonObject();
@@ -824,6 +1342,203 @@ final class HarnessValidation {
         return value.toString();
     }
 
+    private static final class TickBatchObserver
+            implements RedstoneCompilerHarness.ServerTickObserver {
+        private final List<ValidationLane> Lanes;
+        private final List<Snapshot> PreviousSnapshots;
+        private final List<TraceQuiescenceTracker> Quiescence;
+        private final List<Snapshot> SettledSnapshots;
+        private final CountDownLatch Finished = new CountDownLatch(1);
+        private volatile RuntimeException Failure;
+
+        TickBatchObserver(
+                MinecraftServer server,
+                List<ValidationLane> lanes,
+                int timeoutTicks) {
+            Lanes = List.copyOf(lanes);
+            PreviousSnapshots = CaptureSnapshots(server.overworld(), Lanes);
+            Quiescence = new ArrayList<>();
+            SettledSnapshots = new ArrayList<>();
+            for (Snapshot snapshot : PreviousSnapshots) {
+                Quiescence.add(new TraceQuiescenceTracker(
+                        REQUIRED_UNCHANGED_TICKS,
+                        timeoutTicks,
+                        snapshot.GameTime(),
+                        snapshot.TraceStates()));
+                SettledSnapshots.add(null);
+            }
+        }
+
+        @Override
+        public void OnServerTick(MinecraftServer server) {
+            if (Finished.getCount() == 0) {
+                return;
+            }
+            try {
+                List<Snapshot> current = CaptureSnapshots(
+                        server.overworld(),
+                        Lanes);
+                boolean complete = true;
+                for (int laneOffset = 0; laneOffset < Lanes.size(); laneOffset++) {
+                    if (SettledSnapshots.get(laneOffset) != null
+                            || Quiescence.get(laneOffset).Status().TimedOut()) {
+                        continue;
+                    }
+                    Snapshot laneCurrent = current.get(laneOffset);
+                    Snapshot lanePrevious = PreviousSnapshots.get(laneOffset);
+                    if (laneCurrent.GameTime() == lanePrevious.GameTime()) {
+                        complete = false;
+                        continue;
+                    }
+                    TraceQuiescenceTracker.TraceQuiescenceStatus status =
+                            Quiescence.get(laneOffset).Observe(
+                                    laneCurrent.GameTime(),
+                                    laneCurrent.TraceStates());
+                    if (status.Settled()) {
+                        Snapshot detailed = CaptureDetailedSnapshot(
+                                server.overworld(),
+                                Lanes.get(laneOffset),
+                                laneCurrent.GameTime(),
+                                laneCurrent.TraceStates());
+                        PreviousSnapshots.set(laneOffset, detailed);
+                        SettledSnapshots.set(laneOffset, detailed);
+                    } else if (status.TimedOut()) {
+                        PreviousSnapshots.set(
+                                laneOffset,
+                                CaptureDetailedSnapshot(
+                                        server.overworld(),
+                                        Lanes.get(laneOffset),
+                                        laneCurrent.GameTime(),
+                                        laneCurrent.TraceStates()));
+                    } else {
+                        PreviousSnapshots.set(laneOffset, laneCurrent);
+                        complete = false;
+                    }
+                }
+                if (complete) {
+                    Finished.countDown();
+                }
+            } catch (RuntimeException error) {
+                Failure = error;
+                Finished.countDown();
+            }
+        }
+
+        void AwaitCompletion() {
+            try {
+                Finished.await();
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new Timeout("validation-interrupted");
+            }
+            if (Failure != null) {
+                throw Failure;
+            }
+        }
+
+        List<Snapshot> PreviousSnapshots() {
+            return PreviousSnapshots;
+        }
+
+        List<TraceQuiescenceTracker> Quiescence() {
+            return Quiescence;
+        }
+
+        List<Snapshot> SettledSnapshots() {
+            return SettledSnapshots;
+        }
+    }
+
+    private static final class TickRateCalibrationObserver
+            implements RedstoneCompilerHarness.ServerTickObserver {
+        private final List<ValidationLane> Lanes;
+        private final int RequiredTicks;
+        private final CountDownLatch Finished = new CountDownLatch(1);
+        private List<Snapshot> PreviousSnapshots;
+        private int ObservedTicks;
+        private long TotalTickProcessingNanos;
+        private long MaximumTickProcessingNanos;
+        private int TraceChangeCount;
+        private boolean CompleteAfterDuration;
+        private volatile RuntimeException Failure;
+
+        TickRateCalibrationObserver(
+                MinecraftServer server,
+                List<ValidationLane> lanes,
+                int requiredTicks) {
+            if (lanes.isEmpty() || requiredTicks < 1) {
+                throw new IllegalArgumentException(
+                        "validation-tps-calibration-is-invalid");
+            }
+            Lanes = List.copyOf(lanes);
+            RequiredTicks = requiredTicks;
+            PreviousSnapshots = CaptureSnapshots(server.overworld(), Lanes);
+        }
+
+        @Override
+        public void OnServerTick(MinecraftServer server) {
+            if (Finished.getCount() == 0) {
+                return;
+            }
+            try {
+                List<Snapshot> current = CaptureSnapshots(
+                        server.overworld(),
+                        Lanes);
+                for (int laneIndex = 0;
+                        laneIndex < current.size();
+                        laneIndex++) {
+                    if (!current.get(laneIndex).TraceStates().equals(
+                            PreviousSnapshots.get(laneIndex).TraceStates())) {
+                        TraceChangeCount++;
+                    }
+                }
+                PreviousSnapshots = current;
+                ObservedTicks++;
+                CompleteAfterDuration = ObservedTicks >= RequiredTicks;
+            } catch (RuntimeException error) {
+                Failure = error;
+                CompleteAfterDuration = true;
+            }
+        }
+
+        @Override
+        public void OnServerTickComplete(long TickProcessingNanos) {
+            if (Finished.getCount() == 0) {
+                return;
+            }
+            TotalTickProcessingNanos += TickProcessingNanos;
+            MaximumTickProcessingNanos = Math.max(
+                    MaximumTickProcessingNanos,
+                    TickProcessingNanos);
+            if (CompleteAfterDuration) {
+                Finished.countDown();
+            }
+        }
+
+        void AwaitCompletion() {
+            try {
+                Finished.await();
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new Timeout("validation-tps-calibration-interrupted");
+            }
+            if (Failure != null) {
+                throw Failure;
+            }
+        }
+
+        ValidationTpsSample BuildSample(
+                int laneCount,
+                double requestedTickRate) {
+            return BuildValidationTpsSample(
+                    laneCount,
+                    ObservedTicks,
+                    TotalTickProcessingNanos,
+                    MaximumTickProcessingNanos,
+                    requestedTickRate);
+        }
+    }
+
     private static final class Mismatch extends RuntimeException {
         private final JsonObject Details;
         private final JsonArray TraceBlocks;
@@ -863,9 +1578,44 @@ final class HarnessValidation {
         }
     }
     private record TraceProbe(JsonArray RelativePosition, BlockPos WorldPosition) { }
+    record ValidationLanePlan(
+            int LaneCount,
+            int LanesPerStack,
+            int StackCount,
+            int MaximumStackCount,
+            int BatchCount,
+            double TickBudgetSeconds) {
+        static ValidationLanePlan SingleLane() {
+            return new ValidationLanePlan(
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    0.0D);
+        }
+    }
+    record ValidationTpsSample(
+            int LaneCount,
+            int ObservedTicks,
+            double AverageTickProcessingNanos,
+            long MaximumTickProcessingNanos,
+            double SustainedTickRate,
+            boolean MeetsRequestedTickRate) { }
+    private record ValidationTpsSelection(
+            int LaneCount,
+            int ForcedFixtureChunkCount,
+            List<ValidationTpsSample> Samples) { }
+    private record ValidationLane(
+            int Index,
+            JsonArray Origin,
+            Map<String, JsonObject> InputStates,
+            Map<String, BlockPos> OutputPositions,
+            List<TraceProbe> TraceProbes) { }
     private record Snapshot(
             long GameTime,
             Map<String, Boolean> OutputValues,
+            List<BlockState> TraceStates,
             JsonArray TraceBlocks) { }
     private record SettlementEvidence(
             int ElapsedTicks,

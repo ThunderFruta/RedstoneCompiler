@@ -3,7 +3,8 @@
   "package": "dev.redstonecompiler.harness.mixin",
   "compatibilityLevel": "JAVA_25",
   "server": [
-    "MinecraftServerMixin"
+    "MinecraftServerMixin",
+    "ServerGamePacketListenerImplMixin"
   ],
   "injectors": {
     "defaultRequire": 1

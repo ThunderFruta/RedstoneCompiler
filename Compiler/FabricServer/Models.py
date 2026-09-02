@@ -7,6 +7,16 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class FabricValidationProgress:
+    """Observable progress for one authoritative Fabric validation run."""
+
+    Completed: int
+    Total: int
+    Stage: str
+    Status: str | None = None
+
+
+@dataclass(frozen=True)
 class FabricServerValidationResult:
     """Outcome returned by the Fabric-server validation stage."""
 

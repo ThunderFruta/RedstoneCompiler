@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 from time import monotonic, sleep
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .Fixture import FabricFixtureArtifact
 from .FailureTrace import BuildFabricFailureTrace
@@ -20,6 +20,7 @@ from .Models import (
     FabricServerControlResult,
     FabricServerLoadResult,
     FabricServerValidationResult,
+    FabricValidationProgress,
 )
 from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
 
@@ -130,6 +131,9 @@ class FabricServerSupervisor:
         *,
         Fixture: FabricFixtureArtifact,
         Vectors: list[dict[str, object]],
+        ProgressCallback: (
+            Callable[[FabricValidationProgress], None] | None
+        ) = None,
     ) -> FabricServerValidationResult:
         StartedAt = monotonic()
         Root = self.Configuration.Root
@@ -178,7 +182,7 @@ class FabricServerSupervisor:
                 "FixturePath": str(Fixture.Path.resolve()),
                 "FixtureSha256": Fixture.Sha256,
                 "Vectors": Vectors,
-            }, Port=Port)
+            }, Port=Port, ProgressCallback=ProgressCallback)
         except Exception as Error:
             return self._Failure(
                 "server-protocol-failure",
@@ -269,6 +273,9 @@ class FabricServerSupervisor:
         *,
         Fixture: FabricFixtureArtifact,
         Vectors: list[dict[str, object]],
+        ProgressCallback: (
+            Callable[[FabricValidationProgress], None] | None
+        ) = None,
     ) -> FabricServerValidationResult:
         """Validate the current live blocks without clearing or pasting a fixture."""
         StartedAt = monotonic()
@@ -294,6 +301,7 @@ class FabricServerSupervisor:
                     "Vectors": Vectors,
                 },
                 Port=int(Configuration["Port"]),
+                ProgressCallback=ProgressCallback,
             )
         except Exception as Error:
             return self._Failure(
@@ -533,27 +541,67 @@ class FabricServerSupervisor:
         Request: dict[str, object],
         *,
         Port: int,
+        ProgressCallback: (
+            Callable[[FabricValidationProgress], None] | None
+        ) = None,
     ) -> dict[str, object]:
         Deadline = monotonic() + self.Configuration.StartupTimeoutSeconds
         LastError: OSError | None = None
         while monotonic() < Deadline:
             try:
                 with socket.create_connection(("127.0.0.1", Port), timeout=2) as Connection:
-                    Connection.settimeout(
-                        self.Configuration.ValidationTimeoutSeconds,
-                    )
                     Stream = Connection.makefile("rwb")
                     Payload = {"Token": Token, **Request}
                     Stream.write(json.dumps(Payload, sort_keys=True).encode("utf-8") + b"\n")
                     Stream.flush()
-                    Response = Stream.readline()
-                    if not Response:
-                        raise RuntimeError("harness closed the control connection")
-                    Parsed = json.loads(Response.decode("utf-8"))
-                    if Parsed.get("Error") == "minecraft-server-not-ready":
-                        sleep(0.2)
-                        continue
-                    return Parsed
+                    ResponseDeadline = (
+                        monotonic()
+                        + self.Configuration.ValidationTimeoutSeconds
+                    )
+                    Connection.settimeout(
+                        self.Configuration.ValidationTimeoutSeconds,
+                    )
+                    while True:
+                        Response = Stream.readline()
+                        if not Response:
+                            raise RuntimeError(
+                                "harness closed the control connection",
+                            )
+                        Parsed = json.loads(Response.decode("utf-8"))
+                        if Parsed.get("Status") == "progress":
+                            Completed = Parsed.get("Completed")
+                            Total = Parsed.get("Total")
+                            Stage = Parsed.get("Stage")
+                            if (
+                                type(Completed) is not int
+                                or type(Total) is not int
+                                or Completed < 0
+                                or Total < 0
+                                or Completed > Total
+                                or not isinstance(Stage, str)
+                                or not Stage
+                            ):
+                                raise RuntimeError(
+                                    "harness returned invalid validation progress: "
+                                    + json.dumps(Parsed, sort_keys=True),
+                                )
+                            if ProgressCallback is not None:
+                                ProgressCallback(FabricValidationProgress(
+                                    Completed=Completed,
+                                    Total=Total,
+                                    Stage=Stage,
+                                ))
+                            RemainingSeconds = ResponseDeadline - monotonic()
+                            if RemainingSeconds <= 0.0:
+                                raise socket.timeout(
+                                    "validation response deadline",
+                                )
+                            Connection.settimeout(RemainingSeconds)
+                            continue
+                        if Parsed.get("Error") == "minecraft-server-not-ready":
+                            sleep(0.2)
+                            break
+                        return Parsed
             except socket.timeout as Error:
                 raise RuntimeError(
                     "Fabric validation request exceeded its response timeout: "
