@@ -10,9 +10,9 @@
    materializes repeaters, and validates claims.
 5. `PhysicalDesign/Rendering/` writes a neutral-state staging litematic and audits its
    rendered orientation contract.
-6. `ValidationServerHarness/Mchprs/` validates the physical fixture exhaustively
+6. `Validation/Mchprs/` validates the physical fixture exhaustively
    through 20 inputs with the pinned MCHPRS/Redpiler engine.
-7. `Compiler/FabricServer/` runs the required single-fixture canary set on
+7. `Validation/Fabric/` runs the required single-fixture canary set on
    Minecraft 26.2, resets every input low, waits for settlement, and publishes
    the observed all-zero server state as the final `.litematic`.
 

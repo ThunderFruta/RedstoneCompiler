@@ -7,7 +7,7 @@ import socket
 from time import monotonic, sleep
 from typing import Any
 
-from Paths import HarnessConfigurationPath
+from .Paths import HarnessConfigurationPath
 
 
 def ReadHarnessConfiguration() -> dict[str, object]:

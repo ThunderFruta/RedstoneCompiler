@@ -11,17 +11,17 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 import unittest
 
-from Compiler.FabricServer import DefaultFabricServerRoot
 from PhysicalDesign.Rendering.SchemWriter import EncodePayload, EncodeString, NbtValue
 
 
-RuntimeScripts = DefaultFabricServerRoot() / "PyScripts"
+RuntimeScripts = Path(__file__).resolve().parents[3] / "Validation/Fabric/Runtime"
 RuntimeProcessPath = RuntimeScripts / "Process.py"
 RuntimeAnvilPath = RuntimeScripts / "Anvil.py"
 
 
 def LoadRuntimeModule(Name: str, PathValue: Path) -> ModuleType:
     """Load one local runtime module without invoking server lifecycle actions."""
+    Name = f"Validation.Fabric.Runtime.{Name}"
     ModuleSpecification = importlib.util.spec_from_file_location(
         Name,
         PathValue,
@@ -108,9 +108,29 @@ def WriteSyntheticRegionChunk(
 
 @unittest.skipUnless(
     RuntimeProcessPath.is_file() and RuntimeAnvilPath.is_file(),
-    "the ignored canonical Fabric runtime manager is not installed",
+    "the tracked Fabric runtime manager source is unavailable",
 )
 class FabricServerRuntimeManagerTests(unittest.TestCase):
+    def testRuntimePathsKeepResolvedDataSeparateFromManagerSource(self) -> None:
+        with TemporaryDirectory() as Directory:
+            RuntimeRoot = Path(Directory) / "retained-runtime" / "Server"
+            with patch(
+                "Validation.Fabric.Validation.ResolveFabricServerRoot",
+                return_value=RuntimeRoot,
+            ):
+                Paths = LoadRuntimeModule(
+                    "RelocatedRuntimePathsTests",
+                    RuntimeScripts / "Paths.py",
+                )
+        self.assertEqual(Paths.RuntimeRoot, RuntimeRoot)
+        self.assertEqual(Paths.WorldPath, RuntimeRoot / "world")
+        self.assertEqual(Paths.HarnessConfigurationPath, RuntimeRoot / "config/redstonecompiler-harness.json")
+        self.assertEqual(Paths.SourceRepositoryRoot, Path(__file__).resolve().parents[3])
+        self.assertEqual(
+            Paths.BuiltHarnessJarPath,
+            RuntimeRoot.parent / "build/libs/validation-server-harness-1.0.0.jar",
+        )
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.Process = LoadRuntimeModule(

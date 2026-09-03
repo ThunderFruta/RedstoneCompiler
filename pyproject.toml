@@ -15,7 +15,7 @@ redstone-compiler = "Main:Main"
 redstone-benchmark = "Main:RunBenchmark"
 
 [tool.maturin]
-manifest-path = "RustRouting/Cargo.toml"
+manifest-path = "Native/Routing/Cargo.toml"
 features = ["python-extension"]
 python-source = "."
 module-name = "RedstoneCompiler.RustRouting"

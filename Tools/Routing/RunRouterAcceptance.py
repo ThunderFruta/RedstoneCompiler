@@ -1269,7 +1269,8 @@ def BuildSourceContentManifest(
         (Path("App"), "*.py"),
         (Path("Compiler"), "*.py"),
         (Path("PhysicalDesign"), "*.py"),
-        (Path("RustRouting/Src"), "*.rs"),
+        (Path("Validation"), "*.py"),
+        (Path("Native/Routing/Src"), "*.rs"),
     ):
         Root = RepositoryPath / RelativeRoot
         if Root.is_dir():
@@ -1284,8 +1285,8 @@ def BuildSourceContentManifest(
         Path("Tools/Routing/RunRouterAcceptance.py"),
         Path("RedstoneCompiler/__init__.py"),
         Path("Assets/Templates/__init__.py"),
-        Path("RustRouting/Cargo.toml"),
-        Path("RustRouting/Cargo.lock"),
+        Path("Native/Routing/Cargo.toml"),
+        Path("Native/Routing/Cargo.lock"),
     ):
         Value = RepositoryPath / RelativePath
         if Value.is_file():

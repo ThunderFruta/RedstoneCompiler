@@ -88,8 +88,8 @@ Process-global caches remain in one concrete owner and retain their object
 identity and reset behavior. Process-pool workers remain top-level importable
 functions in their owning worker/boundary module.
 
-`Compiler/FabricServer/` owns fixture creation, authenticated live validation,
-source-linked mismatch traces, imported-schematic testing, and settled-world snapshots. `ValidationServerHarness/`
+`Validation/Fabric/` owns fixture creation, authenticated live validation,
+source-linked mismatch traces, imported-schematic testing, and settled-world snapshots. `Validation/Fabric/Harness/`
 contains the tracked Fabric mod source; its `Server/` subdirectory is the one
 canonical local runtime and is deliberately not versioned.
 
@@ -98,7 +98,7 @@ canonical local runtime and is deliberately not versioned.
 The native source is intentionally a nested domain tree, not a flat folder:
 
 ```text
-RustRouting/Src/
+Native/Routing/Src/
 ├── Core/                 Runtime.rs, Deadline.rs, Models.rs
 ├── Geometry/             RouteClaims.rs, ExteriorConnectors.rs
 ├── Path/                 PathRouting.rs
@@ -147,9 +147,9 @@ PhysicalDesign/Routing/ComponentPipeline.py
 PhysicalDesign/Redstone/Actions/ConflictRepair.py
 PhysicalDesign/Cells/Nand.py
 Compiler/Simulation/{Redstone.py,__init__.py}
-RustRouting/Src/{Assignment,AssignmentPlanning,Bindings,Deadline,
+Native/Routing/Src/{Assignment,AssignmentPlanning,Bindings,Deadline,
                  EscapePlanning,Generation,LeasePlanning,Models,PathRouting}.rs
-RustRouting/Src/Simulation/{LogicSimulation.rs,mod.rs}
+Native/Routing/Src/Simulation/{LogicSimulation.rs,mod.rs}
 ```
 
 `ConflictRepair.py` was consolidated into `Routing/Actions/Validation.py` while
@@ -174,7 +174,7 @@ clean break. Use this ownership map to locate the current owner:
 | `Routing/ComponentPipeline.py` | `Routing/Components/{Pipeline,Cache,Certification}.py` |
 | `Routing/Actions/ConflictRepair.py` | `Routing/Actions/Validation.py` |
 | `Cells/Nand.py` | `Cells/Library.py` |
-| former flat `RustRouting/Src/*.rs` kernels | the matching nested Rust domain under `RustRouting/Src/` |
+| former flat `Native/Routing/Src/*.rs` kernels | the matching nested Rust domain under `Native/Routing/Src/` |
 
 ## Structural acceptance contract
 
@@ -200,9 +200,9 @@ python3 -m compileall -q PhysicalDesign/Placement PhysicalDesign/Routing
 python3 -m pytest -q Tests/Structural/test_source_structure.py Tests/PhysicalDesign/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 python3 -m pytest -q
-cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
-cargo test --manifest-path RustRouting/Cargo.toml --release
-cargo build --manifest-path RustRouting/Cargo.toml --release --features python-extension
+cargo fmt --manifest-path Native/Routing/Cargo.toml -- --check
+cargo test --manifest-path Native/Routing/Cargo.toml --release
+cargo build --manifest-path Native/Routing/Cargo.toml --release --features python-extension
 ```
 
 After a Rust change, copy the release library into the Python package and verify

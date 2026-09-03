@@ -12,14 +12,7 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from Compiler.FabricServer import (
-    BuildFabricFixtureFromSchem,
-    CaptureServerUpdatedLitematic,
-    FabricServerConfiguration,
-    FabricServerSupervisor,
-    ResolveFabricServerRoot,
-    WriteFabricFixture,
-)
+from Validation.Fabric import BuildFabricFixtureFromSchem, CaptureServerUpdatedLitematic, FabricServerConfiguration, FabricServerSupervisor, ResolveFabricServerRoot, WriteFabricFixture
 
 
 def BuildParser() -> argparse.ArgumentParser:

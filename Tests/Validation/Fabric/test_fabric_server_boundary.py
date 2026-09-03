@@ -6,23 +6,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
-from Compiler.FabricServer import (
-    BuildExpectedVectors,
-    BuildFabricFailureTrace,
-    BuildFabricFixture,
-    BuildImportedSchematicVectors,
-    BuildValidationVectors,
-    DefaultFabricServerRoot,
-    FabricServerConfiguration,
-    FabricServerSupervisor,
-    FabricServerValidationResult,
-    FabricValidationProgress,
-    ReadFabricFixture,
-    ReadNandModule,
-    ReadSvModule,
-    ResolveFabricServerRoot,
-)
-from Compiler.FabricServer.SchemImport import InferLitematicPorts
+from Validation.Fabric import BuildExpectedVectors, BuildFabricFailureTrace, BuildFabricFixture, BuildImportedSchematicVectors, BuildValidationVectors, DefaultFabricServerRoot, FabricServerConfiguration, FabricServerSupervisor, FabricServerValidationResult, FabricValidationProgress, ReadFabricFixture, ReadNandModule, ReadSvModule, ResolveFabricServerRoot
+from Validation.Fabric.SchemImport import InferLitematicPorts
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
 from Compiler.Pipeline import RequirePhysicalValidation
 from PhysicalDesign.Rendering.SchemWriter import CellTemplate, BuildLitematicBlockMap, NeutralDynamicState
@@ -42,7 +27,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
             os.environ,
             {"RC_FABRIC_SERVER_ROOT": ""},
         ), patch(
-            "Compiler.FabricServer.Validation.HasFabricServerRuntime",
+            "Validation.Fabric.Validation.HasFabricServerRuntime",
             return_value=True,
         ):
             Configuration = FabricServerConfiguration.FromEnvironment()
@@ -55,10 +40,10 @@ class FabricServerBoundaryTests(unittest.TestCase):
             os.environ,
             {"RC_FABRIC_SERVER_ROOT": ""},
         ), patch(
-            "Compiler.FabricServer.Validation.HasFabricServerRuntime",
+            "Validation.Fabric.Validation.HasFabricServerRuntime",
             return_value=False,
         ), patch(
-            "Compiler.FabricServer.Validation.FindSharedWorktreeFabricServerRoot",
+            "Validation.Fabric.Validation.FindSharedWorktreeFabricServerRoot",
             return_value=SharedRoot,
         ):
             Configuration = FabricServerConfiguration.FromEnvironment()
@@ -95,7 +80,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
         Stream.readline.side_effect = socket.timeout("response deadline")
         Connection.makefile.return_value = Stream
         with patch(
-            "Compiler.FabricServer.Validation.socket.create_connection",
+            "Validation.Fabric.Validation.socket.create_connection",
             return_value=Connection,
         ) as CreateConnection, self.assertRaisesRegex(
             RuntimeError,
@@ -131,7 +116,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
         Connection.makefile.return_value = Stream
         Progress = []
         with patch(
-            "Compiler.FabricServer.Validation.socket.create_connection",
+            "Validation.Fabric.Validation.socket.create_connection",
             return_value=Connection,
         ):
             Response = Supervisor._RequestWhenReady(
@@ -305,7 +290,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
                     "Diagnostics": {"Mismatch": {"Output": "y", "Expected": True}},
                 },
             ), patch(
-                "Compiler.FabricServer.Validation.BuildFabricFailureTrace",
+                "Validation.Fabric.Validation.BuildFabricFailureTrace",
                 return_value={"FirstFailingBlock": {"WorldPosition": [4, 64, 1]}},
             ) as BuildTrace:
                 Result = Supervisor.Validate(

@@ -8,7 +8,7 @@ ComponentRouter,ComponentPipeline}.py`, and the former flat Rust source files.
 No forwarding modules remain. Repository imports, test patch targets, and
 workers now name their concrete owners under `Placement/{Access,Core,Flow}` and
 `Routing/{Contracts,Interfaces,Components,Authoritative}`; Rust uses nested
-domain directories under `RustRouting/Src/`.
+domain directories under `Native/Routing/Src/`.
 
 `Routing/Actions/ConflictRepair.py` was consolidated into `Actions/Validation.py`
 without changing the `Actions` exports. The unused `Cells/Nand.py` duplicate was

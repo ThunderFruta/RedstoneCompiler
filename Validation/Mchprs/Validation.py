@@ -8,14 +8,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from Compiler.PhysicalValidation import (
-    BuildValidationAssignments,
-    ExhaustiveInputLimit,
-    PackAssignment,
-    PhysicalFixtureArtifact,
-    PhysicalValidationProgress,
-    PhysicalValidationResult,
-)
+from Validation.Core import BuildValidationAssignments, ExhaustiveInputLimit, PackAssignment, PhysicalFixtureArtifact, PhysicalValidationProgress, PhysicalValidationResult
 
 
 @dataclass(frozen=True)

@@ -38,7 +38,7 @@ OwnershipRoots = (
     "PhysicalDesign/Routing/Regions",
     "PhysicalDesign/Contracts",
     "PhysicalDesign/Interfaces",
-    "RustRouting/Src",
+    "Native/Routing/Src",
 )
 OrchestratorPaths = (
     "PhysicalDesign/Placement/Core/Commit/Commit.py",
@@ -49,7 +49,7 @@ OrchestratorPaths = (
     "PhysicalDesign/Routing/Global/Ports/PortPreparation.py",
     "PhysicalDesign/Routing/Global/Ports/Solving/__init__.py",
     "PhysicalDesign/Routing/Regions/Pipeline.py",
-    "RustRouting/Src/Lib.rs",
+    "Native/Routing/Src/Lib.rs",
 )
 
 

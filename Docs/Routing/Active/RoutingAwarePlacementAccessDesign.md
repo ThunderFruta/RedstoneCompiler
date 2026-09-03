@@ -941,9 +941,9 @@ must not wait for the full shared-boundary implementation.
 | New `PhysicalDesign/Placement/Core/HandoffValidation.py` | not present | recompute placed transforms, pin mappings, blocks, and placement-side fingerprint using existing placement geometry |
 | New `PhysicalDesign/Interfaces/HandoffValidation.py` | not present | validate claims, repeater reservations, access coverage, leases, and routing-side fingerprint without importing `PhysicalDesign/Placement` |
 | [`PhysicalDesign/Redstone/Actions/Validation.py`](../../../PhysicalDesign/Redstone/Actions/Validation.py) | physical connectivity graphs and route validation | retain route connectivity ownership and add only route-level strengthened checks |
-| [`Compiler/FabricServer/`](../../../Compiler/FabricServer/) | authoritative server-validation contract | own server lifecycle, ticking, readback, and result diagnostics without an in-process redstone model |
+| [`Validation/Fabric/`](../../../Validation/Fabric/) | authoritative server-validation contract | own server lifecycle, ticking, readback, and result diagnostics without an in-process redstone model |
 | [`Compiler/Pipeline.py`](../../../Compiler/Pipeline.py) | stage orchestration, final validation, failure evidence, staged multi-file replacement with exception cleanup | compose placement-side and routing-side handoff validation, serialize v17 contract/proof telemetry, and add manifest/directory finalization before immutable-incumbent replacement |
-| New `RustRouting/Src/PlacementAccess/` domain | not present | optional production finite solver split into state/domain/search/API modules, with propagation and a typed bounded result |
+| New `Native/Routing/Src/PlacementAccess/` domain | not present | optional production finite solver split into state/domain/search/API modules, with propagation and a typed bounded result |
 
 New modules are justified because they create stage boundaries currently
 embedded in multi-thousand-line functions. They remain inside the existing
@@ -1044,7 +1044,7 @@ def SolveJointPlacementAccess(
 
 - **Owner:** proposed `PhysicalDesign/Placement/Core/PlacementAccess.py` with an
   optional native implementation in a nested
-  `RustRouting/Src/PlacementAccess/` domain.
+  `Native/Routing/Src/PlacementAccess/` domain.
 - **Calls:** deterministic propagation/search and existing narrow interface
   factor projection where applicable.
 - **Returns:** exactly one typed result.

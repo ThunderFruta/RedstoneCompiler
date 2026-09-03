@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..Validation import ResolveFabricServerRoot
 
-RuntimeRoot = Path(__file__).resolve().parent.parent
+
+SourceRepositoryRoot = Path(__file__).resolve().parents[3]
+RuntimeRoot = ResolveFabricServerRoot()
 HarnessRoot = RuntimeRoot.parent
 RepositoryRoot = HarnessRoot.parent
 LauncherPath = RuntimeRoot / "fabric-server-launch.jar"

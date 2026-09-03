@@ -14,18 +14,7 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from Compiler.FabricServer import (
-    BuildFabricFixtureFromSchem,
-    BuildImportedSchematicVectors,
-    FabricServerConfiguration,
-    FabricServerSupervisor,
-    FabricServerValidationResult,
-    ReadFabricFixture,
-    ReadNandModule,
-    ReadSvModule,
-    ResolveFabricServerRoot,
-    WriteFabricFixture,
-)
+from Validation.Fabric import BuildFabricFixtureFromSchem, BuildImportedSchematicVectors, FabricServerConfiguration, FabricServerSupervisor, FabricServerValidationResult, ReadFabricFixture, ReadNandModule, ReadSvModule, ResolveFabricServerRoot, WriteFabricFixture
 
 
 def BuildParser() -> argparse.ArgumentParser:

@@ -5,10 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from Compiler.PhysicalValidation.Models import (
-    PhysicalValidationProgress,
-    PhysicalValidationResult,
-)
+from Validation.Core.Models import PhysicalValidationProgress, PhysicalValidationResult
 
 FabricValidationProgress = PhysicalValidationProgress
 FabricServerValidationResult = PhysicalValidationResult

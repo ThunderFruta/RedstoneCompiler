@@ -12,11 +12,11 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from Compiler.FabricServer import ResolveFabricServerRoot
+from Validation.Fabric import ResolveFabricServerRoot
 
 
 ServerRoot = ResolveFabricServerRoot()
-RuntimeScripts = ServerRoot / "PyScripts"
+RuntimeScripts = RepositoryRoot / "Validation/Fabric/Runtime"
 RuntimeMain = RuntimeScripts / "Main.py"
 
 
@@ -62,7 +62,7 @@ def Main(Arguments: list[str] | None = None) -> int:
         return 1
     os.environ["RC_FABRIC_SERVER_ROOT"] = str(ServerRoot)
     sys.path.insert(0, str(RuntimeScripts))
-    from Main import Main as RuntimeEntryPoint
+    from Validation.Fabric.Runtime.Main import Main as RuntimeEntryPoint
 
     RawArguments = list(sys.argv[1:] if Arguments is None else Arguments)
     if not RawArguments:

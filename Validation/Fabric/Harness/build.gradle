@@ -4,6 +4,7 @@ plugins {
 
 version = project.mod_version
 group = project.maven_group
+layout.buildDirectory.set(file("../../../ValidationServerHarness/build"))
 
 repositories {
     mavenCentral()

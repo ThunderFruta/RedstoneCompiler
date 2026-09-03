@@ -14,8 +14,8 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from ValidationServerHarness.Mchprs import MchprsValidator
-from Compiler.PhysicalValidation import PhysicalFixtureArtifact
+from Validation.Mchprs import MchprsValidator
+from Validation.Core import PhysicalFixtureArtifact
 
 
 def BuildParser() -> argparse.ArgumentParser:

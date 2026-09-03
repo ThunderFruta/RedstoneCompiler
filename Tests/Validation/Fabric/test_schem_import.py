@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from Compiler.FabricServer import BuildFabricFixtureFromSchem
-from Compiler.FabricServer.SchemImport import ReadLitematicIoLabels
+from Validation.Fabric import BuildFabricFixtureFromSchem
+from Validation.Fabric.SchemImport import ReadLitematicIoLabels
 from PhysicalDesign.Rendering import SchemWriter
 from PhysicalDesign.Rendering.SchemWriter import CellTemplate, EncodePayload, EncodeString, NbtValue
 
@@ -111,10 +111,10 @@ class SpongeSchemImportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as TemporaryDirectory:
             PathValue = Path(TemporaryDirectory) / "Top.litematic"
             with patch(
-                "Compiler.FabricServer.SchemImport.LoadTemplate",
+                "Validation.Fabric.SchemImport.LoadTemplate",
                 return_value=Template,
             ), patch(
-                "Compiler.FabricServer.SchemImport.ReadLitematicIoLabels",
+                "Validation.Fabric.SchemImport.ReadLitematicIoLabels",
                 return_value=[
                     ((0, 1, 1), "IN", "a"),
                     ((3, 1, 1), "OUT", "y"),

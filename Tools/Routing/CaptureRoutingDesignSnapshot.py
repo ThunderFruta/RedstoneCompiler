@@ -297,11 +297,12 @@ def IsRoutingImplementationSource(RelativePath: str) -> bool:
         "Compiler/",
         "PhysicalDesign/",
         "RedstoneCompiler/",
+        "Validation/",
     )):
         return True
     return (
         RelativePath.endswith(".rs")
-        and RelativePath.startswith("RustRouting/Src/")
+        and RelativePath.startswith("Native/Routing/Src/")
     )
 
 
@@ -564,8 +565,8 @@ def BuildCurrentRuntimeProvenance(Root: Path) -> dict[str, object]:
     BuildRecords = [
         BuildRequiredRepositoryFileRecord(Root, RelativePath)
         for RelativePath in (
-            "RustRouting/Cargo.toml",
-            "RustRouting/Cargo.lock",
+            "Native/Routing/Cargo.toml",
+            "Native/Routing/Cargo.lock",
             "Tools/Routing/RunRouterAcceptance.py",
             "pyproject.toml",
             "Assets/Templates/__init__.py",

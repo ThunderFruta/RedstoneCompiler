@@ -8,16 +8,11 @@ from pathlib import Path
 import unittest
 
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
-from ValidationServerHarness.Mchprs import MchprsValidator
-from Compiler.PhysicalValidation import (
-    BuildFabricCanaryVectors,
-    BuildValidationAssignments,
-    ExhaustiveInputLimit,
-    PhysicalFixtureArtifact,
-)
+from Validation.Mchprs import MchprsValidator
+from Validation.Core import BuildFabricCanaryVectors, BuildValidationAssignments, ExhaustiveInputLimit, PhysicalFixtureArtifact
 
 
-RepositoryRoot = Path(__file__).resolve().parents[1]
+RepositoryRoot = Path(__file__).resolve().parents[3]
 FixtureRoot = RepositoryRoot / "Tests/Fixtures/Mchprs"
 
 

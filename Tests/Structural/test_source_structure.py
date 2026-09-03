@@ -13,8 +13,9 @@ CompilerRoot = RepositoryRoot / "Compiler"
 CompilerSiblingRoots = (
     RepositoryRoot / "App",
     RepositoryRoot / "PhysicalDesign",
+    RepositoryRoot / "Validation",
 )
-RustSourceRoot = RepositoryRoot / "RustRouting/Src"
+RustSourceRoot = RepositoryRoot / "Native/Routing/Src"
 
 BannedModulePaths = (
     "Compiler/Cells/Nand.py",
@@ -30,6 +31,17 @@ BannedModulePaths = (
     "Compiler/Routing/Models.py",
     "Compiler/Simulation/Redstone.py",
     "Compiler/Simulation/__init__.py",
+    "Native/Routing/Src/Assignment.rs",
+    "Native/Routing/Src/AssignmentPlanning.rs",
+    "Native/Routing/Src/Bindings.rs",
+    "Native/Routing/Src/Deadline.rs",
+    "Native/Routing/Src/EscapePlanning.rs",
+    "Native/Routing/Src/Generation.rs",
+    "Native/Routing/Src/LeasePlanning.rs",
+    "Native/Routing/Src/Models.rs",
+    "Native/Routing/Src/PathRouting.rs",
+    "Native/Routing/Src/Simulation/LogicSimulation.rs",
+    "Native/Routing/Src/Simulation/mod.rs",
     "PhysicalDesign/Cells/Nand.py",
     "PhysicalDesign/Placement/AccessFabric.py",
     "PhysicalDesign/Placement/Pcb.py",
@@ -303,6 +315,7 @@ class SourceStructureTests(unittest.TestCase):
             RepositoryRoot / "PhysicalDesign",
             RepositoryRoot / "RedstoneCompiler",
             RepositoryRoot / "Tools",
+            RepositoryRoot / "Validation",
             RepositoryRoot / "Tests",
         ):
             for SourcePath in sorted(SourceRoot.rglob("*.py")):

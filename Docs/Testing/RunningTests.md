@@ -97,7 +97,7 @@ can be summarized afterward without treating it as routing success:
 ## MCHPRS physical validation
 
 ```bash
-.venv/bin/python -m pytest -q Tests/test_mchprs_validation.py
+.venv/bin/python -m pytest -q Tests/Validation/Mchprs/test_mchprs_validation.py
 ```
 
 MCHPRS fixture tests use tracked inputs under `Tests/Fixtures/Mchprs/`; they
@@ -119,9 +119,9 @@ structural failure and must not be reported as timeout exhaustion.
 ## Rust router and MCHPRS backend
 
 ```bash
-cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
-cargo test --manifest-path RustRouting/Cargo.toml --release
-cargo build --manifest-path RustRouting/Cargo.toml --release --features python-extension
+cargo fmt --manifest-path Native/Routing/Cargo.toml -- --check
+cargo test --manifest-path Native/Routing/Cargo.toml --release
+cargo build --manifest-path Native/Routing/Cargo.toml --release --features python-extension
 ```
 
 After any Rust source change, copy the release extension into the Python
@@ -132,7 +132,7 @@ does not prove the rebuilt native code was exercised.
 ## Validation harness
 
 ```bash
-gradle -p ValidationServerHarness test
+gradle -p Validation/Fabric/Harness test
 ```
 
 Harness unit tests do not substitute for a live Fabric acceptance run.

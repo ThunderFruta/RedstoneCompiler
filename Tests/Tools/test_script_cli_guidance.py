@@ -11,10 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 
-from Compiler.FabricServer import (
-    FabricServerValidationResult,
-    ResolveFabricServerRoot,
-)
+from Validation.Fabric import FabricServerValidationResult, ResolveFabricServerRoot
 from Tools.Fabric import ControlFabricServer, ImportSchemToFabricServer, TestSchemInFabricServer
 from Tools.Routing import CaptureRoutingDesignSnapshot, RunRouterAcceptance
 
@@ -25,16 +22,29 @@ CanonicalServerRoot = str(ResolveFabricServerRoot())
 class ScriptCliGuidanceTests(unittest.TestCase):
     def testFabricControlUsesTheCanonicalRuntimeManager(self) -> None:
         ExpectedRoot = ResolveFabricServerRoot()
+        SourceRoot = Path(__file__).resolve().parents[2] / "Validation/Fabric/Runtime"
 
         self.assertEqual(ControlFabricServer.ServerRoot, ExpectedRoot)
         self.assertEqual(
             ControlFabricServer.RuntimeScripts,
-            ExpectedRoot / "PyScripts",
+            SourceRoot,
         )
         self.assertEqual(
             ControlFabricServer.RuntimeMain,
-            ExpectedRoot / "PyScripts" / "Main.py",
+            SourceRoot / "Main.py",
         )
+
+    def testFabricControlDispatchesToTheManagerPackage(self) -> None:
+        with (
+            patch.dict(os.environ, {}),
+            patch("Validation.Fabric.Runtime.Main.Main", return_value=7) as Manager,
+        ):
+            self.assertEqual(ControlFabricServer.Main(["status"]), 7)
+            self.assertEqual(
+                os.environ["RC_FABRIC_SERVER_ROOT"],
+                str(ControlFabricServer.ServerRoot),
+            )
+        Manager.assert_called_once_with(["status"])
 
     def testFabricControlGuidesLifecycleActions(self) -> None:
         with patch("builtins.input", side_effect=["1"]):

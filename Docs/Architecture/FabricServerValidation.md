@@ -3,12 +3,12 @@
 The compiler emits `<design>.PhysicalFixture.json` from the exact neutral block
 map used by its private staging litematic. The shared fixture names the
 already-rendered input levers and output lamps; signs are presentation only and
-are never used as a protocol. `ValidationServerHarness/Mchprs/` first validates
+are never used as a protocol. `Validation/Mchprs/` first validates
 the physical block map with MCHPRS/Redpiler. It exhaustively enumerates designs through 20
 inputs (including all 131,072 RCA8 vectors) and uses deterministic sampling for
 wider designs. A failed MCHPRS result stops before Fabric.
 
-After MCHPRS passes, `Compiler/FabricServer/` sends a deterministic canary set
+After MCHPRS passes, `Validation/Fabric/` sends a deterministic canary set
 (zero, all-one, one-hot, and one-cold inputs) through one fixture on the live
 Minecraft 26.2 server. This Fabric check remains required: mismatch, timeout,
 infrastructure failure, or missing server fails compilation. After it passes,
@@ -42,7 +42,7 @@ python3 Tools/Fabric/ControlFabricServer.py clear
 ```
 
 The tracked control command delegates to the modular, runtime-local
-implementation in `ValidationServerHarness/Server/PyScripts/` (`Paths`,
+implementation in `Validation/Fabric/Runtime/` (`Paths`,
 `Protocol`, `Anvil`, `Process`, and `Main`). On start it verifies the launcher and
 accepted EULA, refreshes the installed harness JAR from the project build when
 needed, creates a fresh loopback token, and waits for authenticated control

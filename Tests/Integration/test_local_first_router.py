@@ -22,10 +22,7 @@ from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign, PlacedGate
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
-from Compiler.FabricServer import (
-    FabricServerValidationResult,
-    FabricValidationProgress,
-)
+from Validation.Fabric import FabricServerValidationResult, FabricValidationProgress
 from PhysicalDesign.Routing.Planning.LocalFirst import AssignCapacityAwareGuideOptionDomains, BuildCapacityAwareGuidePlan, BuildCapacityAwareGuideOptionDomains, BuildPlacementSolution, BuildRipupPlan, DeriveRoutingBudget, RoutingDemandEstimate
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 from PhysicalDesign.Redstone.Actions.Geometry import ValidatePlacedCellElectricalIsolation

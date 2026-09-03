@@ -8,11 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 
-from Compiler.FabricServer.ServerSnapshot import (
-    CaptureServerUpdatedLitematic,
-    IterFixtureWorldPositionBatches,
-)
-from Compiler.FabricServer.SchemImport import ReadLitematicIoLabels
+from Validation.Fabric.ServerSnapshot import CaptureServerUpdatedLitematic, IterFixtureWorldPositionBatches
+from Validation.Fabric.SchemImport import ReadLitematicIoLabels
 from PhysicalDesign.Rendering.SchemWriter import LoadTemplate
 
 
@@ -64,7 +61,7 @@ class FabricServerSnapshotTests(unittest.TestCase):
         with TemporaryDirectory() as TemporaryDirectoryPath:
             OutputPath = Path(TemporaryDirectoryPath) / "Top.ServerUpdated.litematic"
             with patch(
-                "Compiler.FabricServer.ServerSnapshot.ReadLitematicIoLabels",
+                "Validation.Fabric.ServerSnapshot.ReadLitematicIoLabels",
                 return_value=[((0, 0, 0), "IN", "a")],
             ):
                 Artifact = CaptureServerUpdatedLitematic(
@@ -147,7 +144,7 @@ class FabricServerSnapshotTests(unittest.TestCase):
         with TemporaryDirectory() as TemporaryDirectoryPath:
             OutputPath = Path(TemporaryDirectoryPath) / "Top.ServerUpdated.litematic"
             with patch(
-                "Compiler.FabricServer.ServerSnapshot.ReadLitematicIoLabels",
+                "Validation.Fabric.ServerSnapshot.ReadLitematicIoLabels",
                 return_value=[((0, 0, 0), "IN", "a")],
             ):
                 CaptureServerUpdatedLitematic(

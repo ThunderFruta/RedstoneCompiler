@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from Compiler.Ir.Models import ModuleIR
-from Compiler.PhysicalValidation.Testing import ReadNandModule
+from Validation.Core.Testing import ReadNandModule
 from Compiler.Frontend import Sv
 
 from .Fixture import FabricFixtureArtifact

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import App.CompilerCli as CompilerMainModule
 import App.Main as RootMain
-from Compiler.FabricServer import FabricValidationProgress
+from Validation.Fabric import FabricValidationProgress
 from App.CompilerCli import CpuRunTelemetry, Main, ParsePromptPath, RunPytest, TerminalValidationProgressReporter
 
 

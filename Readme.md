@@ -145,14 +145,14 @@ state, and affected resources without converting the failure to success.
 - `PhysicalDesign/Redstone/Technology.py` -- authoritative redstone design rules.
 - `PhysicalDesign/Policy.py` -- serializable physical-design policy.
 - `PhysicalDesign/Routing/Assignment/TrackAssignment.py` -- exact global track ownership types.
-- `RustRouting/Src/` -- native router domains for runtime, geometry, path
+- `Native/Routing/Src/` -- native router domains for runtime, geometry, path
   search, assignment, escape planning, generation, and Python
   bindings; `Lib.rs` is the PyO3 registration entrypoint.
 - `Tools/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
   evidence-manifest harness.
-- `ValidationServerHarness/Mchprs/` -- fast exhaustive physical redstone
+- `Validation/Mchprs/` -- fast exhaustive physical redstone
   validation through the pinned MCHPRS/Redpiler engine.
-- `Compiler/FabricServer/` and `ValidationServerHarness/` -- the required
+- `Validation/Fabric/` and `Validation/Fabric/Harness/` -- the required
   single-fixture Minecraft 26.2 canary check, validation backends, and tracked
   harness source;
   `ValidationServerHarness/Server/` is the ignored local runtime.

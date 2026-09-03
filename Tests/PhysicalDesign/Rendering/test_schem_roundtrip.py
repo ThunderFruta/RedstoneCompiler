@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from Compiler.FabricServer.SchemImport import ReadLitematicIoLabels
+from Validation.Fabric.SchemImport import ReadLitematicIoLabels
 from PhysicalDesign.Rendering.SchemWriter import LoadTemplate, WriteObservedLitematic
 
 

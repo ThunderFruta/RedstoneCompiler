@@ -25,7 +25,7 @@ Current implementation note (2026-08-28):
 - Placement orchestration uses `PlacementFlowState`/`PlacementFlowServices` and
   authoritative routing uses
   `AuthoritativeRoutingState`/`AuthoritativeRoutingServices`.
-- Native kernels live in nested Rust domain folders; `RustRouting/Src/Lib.rs`
+- Native kernels live in nested Rust domain folders; `Native/Routing/Src/Lib.rs`
   contains only module registration and the PyO3 entrypoint.
 
 ## Current code map
@@ -37,7 +37,7 @@ Current implementation note (2026-08-28):
 | component problem, portfolios, solvers, certificates, cache | `PhysicalDesign/Routing/Regions/` |
 | candidates, leases, negotiated trees, ports, assignment, materialization | `PhysicalDesign/Routing/Global/` |
 | placement access, core search/repair/commit, flow | `PhysicalDesign/Placement/{Access,Core,Flow}/` |
-| native runtime, geometry, path, assignment, escape, generation, planning, simulation, binding | `RustRouting/Src/*/`; escape candidates/catalogs and generation detailed-tree phases use nested subdomains |
+| native runtime, geometry, path, assignment, escape, generation, planning, simulation, binding | `Native/Routing/Src/*/`; escape candidates/catalogs and generation detailed-tree phases use nested subdomains |
 
 The six supported Python entrypoints and clean-break retirement list are in
 [`ProjectTreeDesignDoc.md`](ProjectTreeDesignDoc.md). Historical code

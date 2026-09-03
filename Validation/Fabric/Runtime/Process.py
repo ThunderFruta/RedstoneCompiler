@@ -11,8 +11,8 @@ import signal
 import subprocess
 from time import monotonic, sleep, time
 
-from Anvil import ReadRegionNonAirBlocks
-from Paths import (
+from .Anvil import ReadRegionNonAirBlocks
+from .Paths import (
     BuiltHarnessJarPath,
     EulaPath,
     HarnessConfigurationPath,
@@ -24,7 +24,7 @@ from Paths import (
     ServerPropertiesPath,
     WorldPath,
 )
-from Protocol import SendRequest, WaitForReady
+from .Protocol import SendRequest, WaitForReady
 
 
 RequestedTickRate = 1000.0

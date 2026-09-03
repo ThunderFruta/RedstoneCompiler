@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from PhysicalDesign.Rendering import SchemWriter
-from Compiler.PhysicalValidation.Models import PhysicalFixtureArtifact
+from Validation.Core.Models import PhysicalFixtureArtifact
 
 
 FixtureSchemaVersion = 2
