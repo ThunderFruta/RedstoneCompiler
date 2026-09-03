@@ -3,10 +3,10 @@
 ## Structural and contract gates
 
 ```bash
-python3 -m compileall -q Compiler/Placement Compiler/Routing
+python3 -m compileall -q PhysicalDesign/Placement PhysicalDesign/Routing
 python3 -m pytest -q \
   Tests/Structural/test_source_structure.py \
-  Tests/Routing/test_routing_contract_schema.py
+  Tests/PhysicalDesign/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 ```
 
@@ -14,7 +14,7 @@ These gates enforce objective dependency, import, API-owner, and schema
 contracts. Source size and implementation shape are advisory review signals:
 
 ```bash
-python3 Scripts/Routing/ReviewSourceStructure.py
+python3 Tools/Routing/ReviewSourceStructure.py
 ```
 
 The review command reports ownership and the largest files/definitions but
@@ -47,7 +47,7 @@ change thread limits, search policy, validation gates, or deadlines.
 ```bash
 .venv/bin/python Main.py --input Examples/HalfAdder.sv \
   --output Output/Telemetry/HalfAdder.litematic
-.venv/bin/python Scripts/Routing/RunRouterAcceptance.py \
+.venv/bin/python Tools/Routing/RunRouterAcceptance.py \
   --matrix expanded --routing-threads 8 --output-root Output/TelemetryAcceptance
 ```
 
@@ -80,24 +80,24 @@ their monotonic timestamps to identify gaps. A killed run retains a partial samp
 can be summarized afterward without treating it as routing success:
 
 ```bash
-.venv/bin/python Compiler/TelemetryObserver.py --directory <compiler-run-directory>
+.venv/bin/python App/TelemetryObserver.py --directory <compiler-run-directory>
 ```
 
 ## Focused routing checks
 
 ```bash
 .venv/bin/python -m pytest -q \
-  Tests/Routing/test_authoritative_*.py \
-  Tests/Routing/test_component_pipeline_*.py \
-  Tests/Routing/test_physical_assembly_*.py \
+  Tests/PhysicalDesign/Routing/test_authoritative_*.py \
+  Tests/PhysicalDesign/Routing/test_component_pipeline_*.py \
+  Tests/PhysicalDesign/Routing/test_physical_assembly_*.py \
   Tests/Integration/test_router_reliability.py \
-  Tests/Placement/test_placement_boundary_feasibility.py
+  Tests/PhysicalDesign/Placement/test_placement_boundary_feasibility.py
 ```
 
 ## MCHPRS physical validation
 
 ```bash
-.venv/bin/python -m pytest -q Tests/test_mchprs_validation.py
+.venv/bin/python -m pytest -q Tests/Validation/Mchprs/test_mchprs_validation.py
 ```
 
 MCHPRS fixture tests use tracked inputs under `Tests/Fixtures/Mchprs/`; they
@@ -119,9 +119,9 @@ structural failure and must not be reported as timeout exhaustion.
 ## Rust router and MCHPRS backend
 
 ```bash
-cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
-cargo test --manifest-path RustRouting/Cargo.toml --release
-cargo build --manifest-path RustRouting/Cargo.toml --release --features python-extension
+cargo fmt --manifest-path Native/Routing/Cargo.toml -- --check
+cargo test --manifest-path Native/Routing/Cargo.toml --release
+cargo build --manifest-path Native/Routing/Cargo.toml --release --features python-extension
 ```
 
 After any Rust source change, copy the release extension into the Python
@@ -132,7 +132,7 @@ does not prove the rebuilt native code was exercised.
 ## Validation harness
 
 ```bash
-gradle -p ValidationServerHarness test
+gradle -p Validation/Fabric/Harness test
 ```
 
 Harness unit tests do not substitute for a live Fabric acceptance run.
@@ -140,7 +140,7 @@ Harness unit tests do not substitute for a live Fabric acceptance run.
 ## Acceptance plan without execution
 
 ```bash
-python3 Scripts/Routing/RunRouterAcceptance.py \
+python3 Tools/Routing/RunRouterAcceptance.py \
   --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
   --python .venv/bin/python \

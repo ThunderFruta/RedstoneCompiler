@@ -1,16 +1,11 @@
 from types import SimpleNamespace
 import unittest
 
-from Compiler.Placement.Geometry import ValidatePlacedGateContract
-from Compiler.Routing.Failures import RoutingFailureReason
-from Compiler.Routing.Policy import (
-    DefaultPhysicalDesignPolicy,
-    RoutingAttemptPolicy,
-)
-from Compiler.Routing.Technology import (
-    DefaultRedstoneRoutingTechnology,
-)
-from Compiler.Routing.Pcb import BuildPcbRoutingConfigurations
+from PhysicalDesign.Geometry.Placement import ValidatePlacedGateContract
+from PhysicalDesign.Contracts.Failures import RoutingFailureReason
+from PhysicalDesign.Policy import DefaultPhysicalDesignPolicy, RoutingAttemptPolicy
+from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
+from PhysicalDesign.Routing.Pcb import BuildPcbRoutingConfigurations
 
 
 def BuildGate(

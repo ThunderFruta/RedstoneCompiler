@@ -11,136 +11,23 @@ from Compiler.Pipeline import (
     TryWriteRoutingFailureArtifact,
     WriteRoutingFailureArtifact,
 )
-from Compiler.Placement.Geometry import PlacedDesign
-from Compiler.Placement.Core.Clusters import PcbPlacement
-from Compiler.Placement.Core.Constraints import (
-    PlacementConstraintObservation,
-    PlacementAssignmentConstraintSet,
-)
-from Compiler.Placement.Core.MandatoryAccess import MeasureMandatoryAccessConflictProfile
-from Compiler.Routing.Pcb import (
-    ClusterBoundaryLeaseEndgameReserveSeconds,
-    ClusterBoundaryLeaseStateCount,
-    ClusterBoundaryLeaseStateSliceSeconds,
-)
-from Compiler.Placement.Flow.Demand import (
-    BuildPlacementFailureHistorySnapshot,
-    PlacementGenerationPlan,
-    MeasurePlacementTopologyDemand,
-    TopologyDemandProfile,
-)
-from Compiler.Placement.Flow.Feedback import (
-    BuildCandidateStarvationPlacementEvidence,
-    BuildCurrentAssignmentCutRelocationSignals,
-    BuildTopologyCutEpochPinBankRelocationSignals,
-    BuildTopologyCutEpochGeometryRelocationSignals,
-    BuildTopologyCutEpochGeometryConstraints,
-    SelectTopologyCutFrontier,
-    SelectRepeatedLeaseRealizabilityGeometrySignals,
-    BuildPlacementFingerprint,
-    BuildStructuredPlacementRelocationSignals,
-    CandidateStarvationPlacementEvidence,
-    ExtractPlacementRelocationSignals,
-    ExtractCompletedEscalationRelocationSignals,
-    ExpandAnalogousMandatoryRepairSignals,
-    FailureRequestsPlacementAdvance,
-    FailureRequiresPackedAccessRepair,
-    SelectReleasableLocalClaimSignals,
-    SelectRefinedAssignmentCutDiversificationSignals,
-    SelectRepeatedAssignmentSubcutDiversificationSignals,
-    SelectAssignmentCutGeometrySignals,
-    SelectRepeatedCandidateStarvationDiversificationSignals,
-    SelectCutDrivenClusterRefinementSignals,
-    ShouldDiversifyRepeatedAssignmentCut,
-    ShouldDeferTopologyCutForMaterializedSibling,
-    ShouldPreserveCurrentStructuredAssignmentCut,
-    ShouldUseCurrentAssignmentCutGeometry,
-)
-from Compiler.Placement.Flow.Portfolios import (
-    AccessDistinctAssignmentCutDiversificationEvidence,
-    ApplyCoordinatedCandidateDiversificationProfile,
-    ApplyActivePlacementAssignmentConstraints,
-    ApplyRemainingExactLegalJointStateCount,
-    AssignmentCutHasBoundedExactCore,
-    AssignmentCutRepeatsAcrossDistinctPlacementOwnership,
-    BoundedAssignmentCutRepeatsAcrossDistinctOwnership,
-    BoundedAssignmentSignalCutRepeatsAcrossDistinctOwnership,
-    CompleteAssignmentCutSupersedesLeasePairRetry,
-    SelectTransactionalEndpointRepairSignals,
-    ShouldBoundClusterPinBankRepairProbe,
-    BuildCoordinatedCandidateDiversificationProfile,
-    BuildTopologyCutEpochIdentity,
-    BuildTargetedPinBankPackingPolicy,
-    BuildSamePlacementRoutingControlRetryState,
-    ExtractAccessDistinctLeaseOwnershipFingerprints,
-    HasDenseBoundaryLeaseRepairEligibility,
-    IsExactPairedLeaseCut,
-    PlacementGenerationRequest,
-    PlacementGenerationRoutingReserveSeconds,
-    HasTopologyCutEpochRoutingReserve,
-    TopologyCutEpochRoutingReserveSeconds,
-    TopologyCutEpochAdmissionReserveSeconds,
-    PlacementMatchesTopologyCutEpoch,
-    PinBankRepairOwnershipIsDistinct,
-    RoutingControlAttemptIdentity,
-    SelectRepeatedPairedLeaseSubcutSignals,
-    SelectRepeatedHigherOrderPinBankRepairSignals,
-    SelectExhaustiveExactPairPinBankRepairSignals,
-    SelectTopologyCoordinatedCandidateDiversificationSignals,
-    SelectImmediateTopologyPinBankRepairSignals,
-    SelectExhaustedRepeaterAccessCutSignals,
-    SerializedPlacementAssignmentConstraintsAreActive,
-    ShouldPrioritizeCurrentExactCutBeforeBroad,
-    ShouldPrioritizePlacementConflictRelocation,
-    ShouldPrioritizeTopologyCutEpochRelocation,
-    ShouldOpenTopologyCutEpoch,
-    ShouldWidenTopologyCutTerminalShell,
-    ShouldRetrySamePlacementRoutingControl,
-    ShouldContinuePostPinBankRepairEpoch,
-    ShouldDeferSamePlacementRoutingControlRetry,
-    TopologyCutEpochIdentity,
-)
-from Compiler.Placement.Flow.Preparation import (
-    IsAuthoritativeMandatoryAccessConflict,
-    RequiresDenseBoundaryLeaseRouting,
-    ShouldEnableClusterBoundaryLeaseInterface,
-    PlacementCandidateIsExactAccessLegal,
-    PlacementPortfolioGenerationNotAfter,
-    PlacementFeedbackRoutingSlotCount,
-    PromoteAuthoritativeMandatoryAccessConflict,
-    RetainedPlacementRoutingSlotCount,
-    TopologyPortfolioRoutingFraction,
-    ShouldGiveRankedJointPortfolioLeadSlice,
-)
-from Compiler.Placement.Flow.Runner import _PlaceAndRoutePcbWithPolicy
-from Compiler.Routing.Failures import (
-    RoutingAssignmentCut,
-    RoutingAssignmentCutClassification,
-    RoutingFailure,
-    RoutingFailureReason,
-    RoutingStageError,
-)
-from Compiler.Routing.Policy import (
-    BuildRoutingAttemptPolicies,
-    LocalFirstPhysicalDesignPolicy,
-    RoutingStrategy,
-)
-from Compiler.Routing.Contracts.Results import RoutedDesign
-from Compiler.Routing.Pcb import CompactRoutedTrees, RoutePcbAttempt
-from Compiler.Routing.LocalFirst import PlacementRoutingFeedback
-from Compiler.Routing.Reliability import (
-    BuildRoutingDeadlineDiagnostics,
-    BuildStableFingerprint,
-    ChooseRoutingEscalationAction,
-    EnforceRoutingRuntimeLimit,
-    HasAdaptiveEscalationBudget,
-    RemainingRoutingRuntimeMilliseconds,
-    RetainUnaffectedCandidateCache,
-    SelectBoundedDiverseCandidatePool,
-    RoutingDeadline,
-    RoutingEscalationState,
-)
-from Compiler.Routing.Technology import DefaultRedstoneRoutingTechnology
+from PhysicalDesign.Geometry.Placement import PlacedDesign
+from PhysicalDesign.Placement.Core.Clusters import PcbPlacement
+from PhysicalDesign.Placement.Core.Constraints import PlacementConstraintObservation, PlacementAssignmentConstraintSet
+from PhysicalDesign.Placement.Core.MandatoryAccess import MeasureMandatoryAccessConflictProfile
+from PhysicalDesign.Routing.Pcb import ClusterBoundaryLeaseEndgameReserveSeconds, ClusterBoundaryLeaseStateCount, ClusterBoundaryLeaseStateSliceSeconds
+from PhysicalDesign.Flow.Demand import BuildPlacementFailureHistorySnapshot, PlacementGenerationPlan, MeasurePlacementTopologyDemand, TopologyDemandProfile
+from PhysicalDesign.Flow.Feedback import BuildCandidateStarvationPlacementEvidence, BuildCurrentAssignmentCutRelocationSignals, BuildTopologyCutEpochPinBankRelocationSignals, BuildTopologyCutEpochGeometryRelocationSignals, BuildTopologyCutEpochGeometryConstraints, SelectTopologyCutFrontier, SelectRepeatedLeaseRealizabilityGeometrySignals, BuildPlacementFingerprint, BuildStructuredPlacementRelocationSignals, CandidateStarvationPlacementEvidence, ExtractPlacementRelocationSignals, ExtractCompletedEscalationRelocationSignals, ExpandAnalogousMandatoryRepairSignals, FailureRequestsPlacementAdvance, FailureRequiresPackedAccessRepair, SelectReleasableLocalClaimSignals, SelectRefinedAssignmentCutDiversificationSignals, SelectRepeatedAssignmentSubcutDiversificationSignals, SelectAssignmentCutGeometrySignals, SelectRepeatedCandidateStarvationDiversificationSignals, SelectCutDrivenClusterRefinementSignals, ShouldDiversifyRepeatedAssignmentCut, ShouldDeferTopologyCutForMaterializedSibling, ShouldPreserveCurrentStructuredAssignmentCut, ShouldUseCurrentAssignmentCutGeometry
+from PhysicalDesign.Flow.Portfolios import AccessDistinctAssignmentCutDiversificationEvidence, ApplyCoordinatedCandidateDiversificationProfile, ApplyActivePlacementAssignmentConstraints, ApplyRemainingExactLegalJointStateCount, AssignmentCutHasBoundedExactCore, AssignmentCutRepeatsAcrossDistinctPlacementOwnership, BoundedAssignmentCutRepeatsAcrossDistinctOwnership, BoundedAssignmentSignalCutRepeatsAcrossDistinctOwnership, CompleteAssignmentCutSupersedesLeasePairRetry, SelectTransactionalEndpointRepairSignals, ShouldBoundClusterPinBankRepairProbe, BuildCoordinatedCandidateDiversificationProfile, BuildTopologyCutEpochIdentity, BuildTargetedPinBankPackingPolicy, BuildSamePlacementRoutingControlRetryState, ExtractAccessDistinctLeaseOwnershipFingerprints, HasDenseBoundaryLeaseRepairEligibility, IsExactPairedLeaseCut, PlacementGenerationRequest, PlacementGenerationRoutingReserveSeconds, HasTopologyCutEpochRoutingReserve, TopologyCutEpochRoutingReserveSeconds, TopologyCutEpochAdmissionReserveSeconds, PlacementMatchesTopologyCutEpoch, PinBankRepairOwnershipIsDistinct, RoutingControlAttemptIdentity, SelectRepeatedPairedLeaseSubcutSignals, SelectRepeatedHigherOrderPinBankRepairSignals, SelectExhaustiveExactPairPinBankRepairSignals, SelectTopologyCoordinatedCandidateDiversificationSignals, SelectImmediateTopologyPinBankRepairSignals, SelectExhaustedRepeaterAccessCutSignals, SerializedPlacementAssignmentConstraintsAreActive, ShouldPrioritizeCurrentExactCutBeforeBroad, ShouldPrioritizePlacementConflictRelocation, ShouldPrioritizeTopologyCutEpochRelocation, ShouldOpenTopologyCutEpoch, ShouldWidenTopologyCutTerminalShell, ShouldRetrySamePlacementRoutingControl, ShouldContinuePostPinBankRepairEpoch, ShouldDeferSamePlacementRoutingControlRetry, TopologyCutEpochIdentity
+from PhysicalDesign.Flow.Preparation import IsAuthoritativeMandatoryAccessConflict, RequiresDenseBoundaryLeaseRouting, ShouldEnableClusterBoundaryLeaseInterface, PlacementCandidateIsExactAccessLegal, PlacementPortfolioGenerationNotAfter, PlacementFeedbackRoutingSlotCount, PromoteAuthoritativeMandatoryAccessConflict, RetainedPlacementRoutingSlotCount, TopologyPortfolioRoutingFraction, ShouldGiveRankedJointPortfolioLeadSlice
+from PhysicalDesign.Flow.Runner import _PlaceAndRoutePcbWithPolicy
+from PhysicalDesign.Contracts.Failures import RoutingAssignmentCut, RoutingAssignmentCutClassification, RoutingFailure, RoutingFailureReason, RoutingStageError
+from PhysicalDesign.Policy import BuildRoutingAttemptPolicies, LocalFirstPhysicalDesignPolicy, RoutingStrategy
+from PhysicalDesign.Contracts.Results import RoutedDesign
+from PhysicalDesign.Routing.Pcb import CompactRoutedTrees, RoutePcbAttempt
+from PhysicalDesign.Routing.Planning.LocalFirst import PlacementRoutingFeedback
+from PhysicalDesign.Execution.Reliability import BuildRoutingDeadlineDiagnostics, BuildStableFingerprint, ChooseRoutingEscalationAction, EnforceRoutingRuntimeLimit, HasAdaptiveEscalationBudget, RemainingRoutingRuntimeMilliseconds, RetainUnaffectedCandidateCache, SelectBoundedDiverseCandidatePool, RoutingDeadline, RoutingEscalationState
+from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 
 class RouterReliabilityTests(unittest.TestCase):
     @staticmethod
@@ -1322,24 +1209,24 @@ class RouterReliabilityTests(unittest.TestCase):
         )
 
         with (
-            patch("Compiler.Placement.Flow.Runner.ValidateNandOnlyDesign"),
-            patch("Compiler.Placement.Flow.Runner.PlacePcbGraph", side_effect=PlaceGraph),
+            patch("PhysicalDesign.Flow.Runner.ValidateNandOnlyDesign"),
+            patch("PhysicalDesign.Flow.Runner.PlacePcbGraph", side_effect=PlaceGraph),
             patch(
-                "Compiler.Placement.Flow.Runner.ValidatePlacedCellElectricalIsolation",
+                "PhysicalDesign.Flow.Runner.ValidatePlacedCellElectricalIsolation",
                 side_effect=IsolationBehavior,
             ),
-            patch("Compiler.Placement.Flow.Runner.BuildRoutingResources"),
+            patch("PhysicalDesign.Flow.Runner.BuildRoutingResources"),
             patch(
-                "Compiler.Placement.Flow.Runner.MeasurePlacementRoutingFeedback",
+                "PhysicalDesign.Flow.Runner.MeasurePlacementRoutingFeedback",
                 side_effect=Feedback,
             ),
-            patch("Compiler.Placement.Flow.Runner.RoutePcbDesign", side_effect=Route),
+            patch("PhysicalDesign.Flow.Runner.RoutePcbDesign", side_effect=Route),
             patch(
-                "Compiler.Placement.Flow.Runner.BuildLocalFirstSnapshot",
+                "PhysicalDesign.Flow.Runner.BuildLocalFirstSnapshot",
                 return_value=Snapshot,
             ),
             patch(
-                "Compiler.Placement.Flow.Runner.MeasurePcbDesign",
+                "PhysicalDesign.Flow.Runner.MeasurePcbDesign",
                 return_value=(1, 1, 1, 1),
             ),
         ):
@@ -3713,9 +3600,9 @@ class RouterReliabilityTests(unittest.TestCase):
         )
 
         with (
-            patch("Compiler.Placement.Flow.Runner.ValidateNandOnlyDesign"),
+            patch("PhysicalDesign.Flow.Runner.ValidateNandOnlyDesign"),
             patch(
-                "Compiler.Placement.Flow.Runner.PlacePcbGraph",
+                "PhysicalDesign.Flow.Runner.PlacePcbGraph",
                 side_effect=RoutingStageError(BoundaryFailure),
             ),
         ):
@@ -4092,7 +3979,7 @@ class RouterReliabilityTests(unittest.TestCase):
         Deadline = RoutingDeadline(StartedAt=0.0, ExpiresAt=100.0)
 
         with patch(
-            "Compiler.Routing.Reliability.monotonic",
+            "PhysicalDesign.Execution.Reliability.monotonic",
             return_value=10.0,
         ):
             self.assertEqual(
@@ -4101,7 +3988,7 @@ class RouterReliabilityTests(unittest.TestCase):
             )
 
         with patch(
-            "Compiler.Routing.Reliability.monotonic",
+            "PhysicalDesign.Execution.Reliability.monotonic",
             return_value=12.1,
         ):
             with self.assertRaises(RoutingStageError) as Context:
@@ -4129,7 +4016,7 @@ class RouterReliabilityTests(unittest.TestCase):
         Deadline = RoutingDeadline(StartedAt=0.0, ExpiresAt=100.0)
 
         with patch(
-            "Compiler.Routing.Reliability.monotonic",
+            "PhysicalDesign.Execution.Reliability.monotonic",
             return_value=11.9995,
         ):
             with self.assertRaises(RoutingStageError) as Context:
@@ -4326,8 +4213,8 @@ class RouterReliabilityTests(unittest.TestCase):
             Events.append(("progress", Completed, Total))
 
         with (
-            patch("Compiler.Routing.Pcb.RoutePcbNets", side_effect=Route),
-            patch("Compiler.Routing.Pcb.CompactRoutedTrees", side_effect=Compact),
+            patch("PhysicalDesign.Routing.Pcb.RoutePcbNets", side_effect=Route),
+            patch("PhysicalDesign.Routing.Pcb.CompactRoutedTrees", side_effect=Compact),
         ):
             Result = RoutePcbAttempt(
                 Placement,

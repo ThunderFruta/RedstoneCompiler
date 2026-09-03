@@ -6,19 +6,18 @@ Cache/
 .cache/
 .pytest_cache/
 **/__pycache__/
-# Track the small canonical runtime manager, but keep the actual Fabric server
-# installation, private configuration, generated fixtures, logs, and worlds out.
-ValidationServerHarness/Server/*
-!ValidationServerHarness/Server/PyScripts/
-ValidationServerHarness/Server/PyScripts/*
-!ValidationServerHarness/Server/PyScripts/*.py
+# Runtime installations stay here; manager source lives in Validation/Fabric.
+ValidationServerHarness/Server/
 **/*.pyc
 .venv/
 Build/
 ValidationServerHarness/.gradle/
 ValidationServerHarness/build/
+# Ignore a default cache if a caller explicitly overrides project cache settings.
+Validation/Fabric/Harness/.gradle/
 .runtime/
 Output/
 RustRouting/target/
 RedstoneCompiler/*.so
 /**/*.o
+Validation/Fabric/Harness/build/

@@ -13,7 +13,7 @@ Canonical implementation focus remains:
 
 Current implementation note (2026-08-28):
 
-- `Main.py` / `Compiler/Main.py` drives the authoritative default router.
+- `Main.py` / `App/CompilerCli.py` drives the authoritative default router.
 - The active default strategy is `default`.
 - RCA4 currently compiles to a routed, truth-verified artifact in live runs.
 - Compatibility checks are now profile-driven by normalized circuit metrics and are
@@ -25,19 +25,19 @@ Current implementation note (2026-08-28):
 - Placement orchestration uses `PlacementFlowState`/`PlacementFlowServices` and
   authoritative routing uses
   `AuthoritativeRoutingState`/`AuthoritativeRoutingServices`.
-- Native kernels live in nested Rust domain folders; `RustRouting/Src/Lib.rs`
+- Native kernels live in nested Rust domain folders; `Native/Routing/Src/Lib.rs`
   contains only module registration and the PyO3 entrypoint.
 
 ## Current code map
 
 | Responsibility | Owner |
 |---|---|
-| immutable routing schemas | `Compiler/Routing/Contracts/` |
-| portal/claim/boundary relations | `Compiler/Routing/Interfaces/` |
-| component problem, portfolios, solvers, certificates, cache | `Compiler/Routing/Components/` |
-| candidates, leases, negotiated trees, ports, assignment, materialization | `Compiler/Routing/Authoritative/` |
-| placement access, core search/repair/commit, flow | `Compiler/Placement/{Access,Core,Flow}/` |
-| native runtime, geometry, path, assignment, escape, generation, planning, simulation, binding | `RustRouting/Src/*/`; escape candidates/catalogs and generation detailed-tree phases use nested subdomains |
+| immutable routing schemas | `PhysicalDesign/Contracts/` |
+| portal/claim/boundary relations | `PhysicalDesign/Interfaces/` |
+| component problem, portfolios, solvers, certificates, cache | `PhysicalDesign/Routing/Regions/` |
+| candidates, leases, negotiated trees, ports, assignment, materialization | `PhysicalDesign/Routing/Global/` |
+| placement access, core search/repair/commit, flow | `PhysicalDesign/Placement/{Access,Core,Flow}/` |
+| native runtime, geometry, path, assignment, escape, generation, planning, simulation, binding | `Native/Routing/Src/*/`; escape candidates/catalogs and generation detailed-tree phases use nested subdomains |
 
 The six supported Python entrypoints and clean-break retirement list are in
 [`ProjectTreeDesignDoc.md`](ProjectTreeDesignDoc.md). Historical code

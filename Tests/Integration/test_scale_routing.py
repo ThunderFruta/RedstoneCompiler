@@ -8,11 +8,11 @@ import tempfile
 
 import pytest
 
-from SVDecoder.Sv import ParseSvToNetlist
-from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
+from Compiler.Frontend.Sv import ParseSvToNetlist
+from PhysicalDesign.Flow.Runner import PlaceAndRoutePcb
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
-from Compiler.Routing.Policy import RoutingStrategy
+from PhysicalDesign.Policy import RoutingStrategy
 
 
 RUN_SCALE_TESTS = os.environ.get("RC_RUN_SCALE_TESTS", "").strip().lower() in {

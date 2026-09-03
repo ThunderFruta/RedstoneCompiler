@@ -2,7 +2,7 @@
 
 ## Authority
 
-`Compiler/Routing/ResourceGraph.py` owns the physical routing-resource model.
+`PhysicalDesign/Resources/ResourceGraph.py` owns the physical routing-resource model.
 Nodes represent legal wire positions. Edges represent legal Redstone movement
 primitives. Route claims include wire, support, required air, and electrical
 exclusion cells.

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`Main.py` and `Compiler/Main.py` provide the CLI; `Compiler/Pipeline.py` coordinates SystemVerilog parsing, NAND synthesis, placement, routing, schematic writing, and physical validation. Keep stage-specific work in its owner: `SVDecoder/`, `Compiler/{Ir,Synthesis,Cells,Placement,Routing}/`, or `SchemEncoder/`. The PyO3 routing backend lives in `RustRouting/Src/`. `ValidationServerHarness/` contains the tracked Java/Fabric harness, while its ignored `Server/` directory is local runtime state. Put tests under the matching domain in `Tests/`; shared fixtures belong in `Tests/Fixtures/`. Examples, templates, documentation, and automation are in `Examples/`, `Templates/`, `Docs/`, and `Scripts/`.
+`Main.py` forwards to `App/Main.py`; `App/CompilerCli.py` owns argument-driven compilation. `App/` also contains reporting and telemetry. `Compiler/` contains `Frontend`, `Ir`, `Synthesis`, and the existing `Pipeline.py` coordinator. Keep placement, routing, geometry, contracts, redstone rules, resources, and schematic rendering in their owners under `PhysicalDesign/`. The PyO3 backend lives in `Native/Routing/Src/` and remains importable as `RedstoneCompiler.RustRouting`. `Validation/` owns core validation, MCHPRS, Fabric integration, tracked manager source in `Fabric/Runtime/`, and Java/Gradle source in `Fabric/Harness/`. The ignored `ValidationServerHarness/Server/` remains runtime data. Group tests by their source domain under `Tests/`; shared fixtures stay in `Tests/Fixtures/`. Templates are under `Assets/Templates/`, tools under `Tools/`, examples under `Examples/`, and references under `Docs/`.
 
 ## Build, Test, and Development Commands
 
@@ -13,9 +13,9 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 redstone-compiler
 python3 -m pytest -q
-cargo fmt --manifest-path RustRouting/Cargo.toml -- --check
-cargo test --manifest-path RustRouting/Cargo.toml --release
-gradle -p ValidationServerHarness test
+cargo fmt --manifest-path Native/Routing/Cargo.toml -- --check
+cargo test --manifest-path Native/Routing/Cargo.toml --release
+gradle -p Validation/Fabric/Harness test
 ```
 
 The editable install builds the Python/PyO3 package; the CLI runs a guided or argument-driven compile. Pytest covers Python contracts and integration. Rust changes require formatting plus release tests and a rebuilt extension before Python parity checks. The Fabric harness requires Java 25 and Gradle 9.5.1.

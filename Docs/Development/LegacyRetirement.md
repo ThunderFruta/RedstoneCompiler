@@ -1,5 +1,10 @@
 # Legacy Routing and Shim Retirement
 
+The [repository layout migration](../Reference/RepositoryLayoutMigration.md)
+records the current source paths. The dated retirement plans below retain their
+original scope, including old package and cache names; they are not instructions
+to move the retained runtime/cache locations again.
+
 ## 2026-08-28 structural clean break
 
 The Python/Rust monolith split retired `Placement/{AccessFabric,Pcb,PcbFlow}.py`,
@@ -8,7 +13,7 @@ ComponentRouter,ComponentPipeline}.py`, and the former flat Rust source files.
 No forwarding modules remain. Repository imports, test patch targets, and
 workers now name their concrete owners under `Placement/{Access,Core,Flow}` and
 `Routing/{Contracts,Interfaces,Components,Authoritative}`; Rust uses nested
-domain directories under `RustRouting/Src/`.
+domain directories under `Native/Routing/Src/`.
 
 `Routing/Actions/ConflictRepair.py` was consolidated into `Actions/Validation.py`
 without changing the `Actions` exports. The unused `Cells/Nand.py` duplicate was
@@ -45,14 +50,14 @@ Remove these together because they implement one old idea: independently route
 many candidate guides, negotiate conflicts, repair pairs, and recursively
 assign a flat whole-design solution.
 
-- `Compiler/Routing/ChannelPlanner.py::BuildChannelPlan` and helpers used only
+- `PhysicalDesign/Routing/Planning/ChannelPlanner.py::BuildChannelPlan` and helpers used only
   by it;
 - legacy guide negotiation, pair repair, and Python exact assignment in that
   path;
-- `Compiler/Routing/TrackAssignment.py::AssignGlobalTracks` and its old
+- `PhysicalDesign/Routing/Assignment/TrackAssignment.py::AssignGlobalTracks` and its old
   assignment/repeater helpers;
-- `Compiler/Routing/Actions/ConflictRepair.py`;
-- `Compiler/Routing/Workers/PinAccess.py` after Rust portal parity coverage
+- `PhysicalDesign/Redstone/Actions/ConflictRepair.py`;
+- `PhysicalDesign/Routing/Workers/PinAccess.py` after Rust portal parity coverage
   replaces its tests;
 - Rust `FindPathOnResourceGraph` and `FindPathsOnResourceGraph` after the old
   pin-access worker is gone;
@@ -106,7 +111,7 @@ removed. It must not remain as a second inactive placement philosophy.
 The following exist only during the project-tree migration:
 
 ```text
-RedstoneCompiler.* imports  → Compiler.*, SVDecoder.*, SchemEncoder.*
+RedstoneCompiler.* imports  → Compiler.*, Compiler.Frontend.*, PhysicalDesign.Rendering.*
 Build/                      → Output/
 .RedstoneWork/             → Cache/Frontend/
 .pytest_cache/             → Cache/Tests/

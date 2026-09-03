@@ -1,8 +1,8 @@
 # Code style
 
-Keep the pipeline stage-aligned: frontend parsing in `SVDecoder`, synthesis and
-IR in `Compiler`, placement in `Compiler/Placement`, routing in
-`Compiler/Routing`, and output encoding in `SchemEncoder`.
+Keep the pipeline stage-aligned: frontend parsing in `Compiler/Frontend`, synthesis and
+IR in `Compiler`, placement in `PhysicalDesign/Placement`, routing in
+`PhysicalDesign/Routing`, and output encoding in `PhysicalDesign/Rendering`.
 
 Source identifiers use PascalCase, including functions, methods, classes, and
 public members. Prefer explicit stage names over generic helpers. Preserve
@@ -15,19 +15,18 @@ Never select behavior from circuit names, generated gate names, or fixed net
 counts. Add focused tests beside the owning stage and avoid unrelated
 refactors.
 
-## Source ownership and size gates
+## Source ownership and size review
 
 Routing dependencies are one-way: contracts/resources → physical interfaces →
 components → authoritative routing → placement flow → compiler pipeline. A
 lower layer must not import a higher layer, and the Python compiler import graph
 must remain acyclic. The source-structure test records the two existing neutral
-`Placement.Geometry`/`Placement.Rotation` primitive imports explicitly; they do
+`PhysicalDesign.Geometry.Placement`/`PhysicalDesign.Geometry.Rotation` imports explicitly; they do
 not authorize a dependency on placement search or flow.
 
-Implementation modules are limited to 3,000 physical lines, orchestrators to
-fewer than 500, and Python/Rust functions to fewer than 1,000. New split
-implementation files must be at least 150 lines unless
-`Tests/Structural/test_source_structure.py` records a concrete API, binding, worker,
+Implementation size targets are advisory: 3,000 physical lines per module,
+500 per orchestrator, and 1,000 per Python/Rust function. A split implementation
+file normally targets at least 150 lines unless it has a concrete API, binding, worker,
 state/schema, cache-identity, or phase-contract reason. Prefer merging short
 same-purpose helpers over inventing another module.
 

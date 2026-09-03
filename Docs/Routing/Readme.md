@@ -29,9 +29,9 @@ and the acceptance manifest produced for that run.
 - [Running tests](../Testing/RunningTests.md) and
   [benchmarks and acceptance gates](../Testing/Benchmarks.md) define current
   commands and gates.
-- [`Scripts/Routing/RunRouterAcceptance.py`](../../Scripts/Routing/RunRouterAcceptance.py)
+- [`Tools/Routing/RunRouterAcceptance.py`](../../Tools/Routing/RunRouterAcceptance.py)
   writes the acceptance manifest for a selected matrix.
-- [`Scripts/Routing/CaptureRoutingDesignSnapshot.py`](../../Scripts/Routing/CaptureRoutingDesignSnapshot.py)
+- [`Tools/Routing/CaptureRoutingDesignSnapshot.py`](../../Tools/Routing/CaptureRoutingDesignSnapshot.py)
   captures explicit inputs under
   `Output/DesignSnapshots/RoutingAwarePlacementAccess/`.
 

@@ -1,0 +1,122 @@
+"""Call-time dependency surface for authoritative routing phases."""
+from __future__ import annotations
+from ....Geometry.Rotation import RotatedCellSize
+from ....Redstone.Actions import BuildPhysicalGraphs
+from ....Redstone.Actions import MaterializeReservedRepeaters
+from ....Redstone.Actions import ValidatePhysicalRoutes
+from ...Planning.ChannelPlanner import BuildNetRoutingProfiles
+from ...Planning.ChannelPlanner import BuildPlacementPinAccessWitness
+from ...Planning.ChannelPlanner import CandidateLanes
+from ...Planning.ChannelPlanner import ChannelPlan
+from ...Planning.ChannelPlanner import MeasureRoutingStage
+from ...Planning.ChannelPlanner import NegotiatedRoutePlan
+from ...Planning.ChannelPlanner import RoutingIterationMetrics
+from ...Regions.Interfaces.Access import BuildComponentAccessGuideTargetColumns
+from ...Regions.Interfaces.Access import BuildComponentCutAccessFeasibilityCertificate
+from ...Regions.Planning.PhysicalPlanning import ApplyPhysicalComponentAssemblyGlobalProfiles
+from ...Regions.Planning.PhysicalPlanning import BuildPhysicalComponentPortSolverCacheKey
+from ...Regions.Planning.PhysicalPlanning import BuildPhysicalRequestAperturePortNoGood
+from ...Regions.Planning.PhysicalPlanning import SelectPhysicalAssemblyGlobalBoundaryPorts
+from ...Regions.Planning.PhysicalPlanning import SelectPhysicalComponentExactGlobalChannelSignals
+from ...Regions.Interfaces.Fabric import ApplyRoutedComponentGlobalProfiles
+from ...Regions.Interfaces.Problem import BuildComponentRoutingProblem
+from ...Regions.Solving.Solver import PreserveRoutedComponentForeignEscapes
+from ...Regions.Interfaces.Fabric import SelectClosedComponentOwnedTerminalPairs
+from ...Regions.Interfaces.Fabric import SelectComponentIncidentSignals
+from ....Contracts.Component import ComponentRoutingProblemPrepared
+from ....Contracts.Core import Position2
+from ....Contracts.Core import Position3
+from ....Contracts.PhysicalInterface import FrozenPhysicalComponentPostClosurePortalHandoff
+from ....Contracts.PhysicalInterface import PhysicalComponentAssemblyPrepared
+from ....Contracts.PhysicalInterface import PhysicalSignalApertureCandidateDomainIdentity
+from ....Contracts.PhysicalInterface import PreparedPhysicalComponentPortFactorDomain
+from ....Contracts.Placement import ClusterInterfaceAssignmentPrepared
+from ....Contracts.Placement import ClusterInterfaceRealizabilityNogood
+from ....Contracts.Placement import TrackAssignmentPreparation
+from ....Contracts.Placement import TrackAssignmentPrepared
+from ....Contracts.Results import RoutedDesign
+from ....Contracts.Results import RoutingResources
+from ....Contracts.Failures import RoutingFailure
+from ....Contracts.Failures import RoutingFailureReason
+from ....Contracts.Failures import RoutingStageError
+from ....Interfaces.BoundaryRelations import BuildMandatoryPortalPairDomainFingerprint
+from ....Interfaces.BoundaryRelations import BuildPhysicalBoundaryMandatoryPortalFactorDomains
+from ....Interfaces.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
+from ....Interfaces.BoundaryRelations import BuildRawPortalPlacementGeometryFingerprint
+from ....Interfaces.BoundaryRelations import BuildRawPortalResourceGeometryFingerprint
+from ....Interfaces.BoundaryRelations import GetMandatoryPortalPairFeasibilityCertificate
+from ....Interfaces.BoundaryRelations import PublishPhysicalBoundaryMandatoryPortalFactorDomains
+from ....Interfaces.BoundaryRelations import RawPortalGeometryCache
+from ....Interfaces.BoundaryRelations import SelectCertifiedMandatoryPortalPairCuts
+from ....Interfaces.PhysicalClaims import ComponentClaimsConflict
+from ....Interfaces.PhysicalClaims import MandatoryClaimsConflict
+from ....Interfaces.PhysicalClaims import PortalTupleConflictsWithFrozenComponentClaims
+from ...Planning.LocalFirst import BuildCapacityAwareGuidePlan
+from ...Planning.LocalFirst import DeriveRoutingBudget
+from ...Planning.LocalFirst import EstimateRoutingDemand
+from ....Policy import DefaultPhysicalDesignPolicy
+from ....Policy import PhysicalDesignPolicy
+from ....Execution.Reliability import BuildStableFingerprint
+from ....Execution.Reliability import EnforceRoutingRuntimeLimit
+from ....Execution.Reliability import RemainingRoutingRuntimeMilliseconds
+from ....Execution.Reliability import RoutingDeadline
+from ....Execution.Reliability import SelectBoundedDiverseCandidatePool
+from ....Resources.ResourceGraph import FindClaimConflicts
+from ....Resources.ResourceGraph import FindSelfClaimConflicts
+from ....Resources.ResourceGraph import LocalRouteClaim
+from ....Resources.ResourceGraph import NetRouteCandidate
+from ....Resources.ResourceGraph import PinAccessPortal
+from ....Resources.ResourceGraph import PortalReservation
+from ....Resources.ResourceGraph import RoutingAssignment
+from ....Resources.ResourceGraph import RoutingResourceClaims
+from ....Resources.ResourceGraph import RoutingResourceId
+from ....Resources.ResourceGraph import RoutingResourceKind
+from ....Resources.ResourceGraph import ValidateLocalRouteClaims
+from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
+from ....Redstone.Technology import RedstoneRoutingTechnology
+from ...Assignment.TrackAssignment import AssignedTrack
+from ...Assignment.TrackAssignment import TrackAssignment
+from collections import Counter
+from collections import defaultdict
+from dataclasses import replace
+from math import ceil
+from math import prod
+from math import sqrt
+from time import monotonic
+from types import SimpleNamespace
+from typing import Any
+from typing import Callable
+from typing import Iterable
+from typing import Mapping
+import os
+try:
+    from RedstoneCompiler.RustRouting import BuildRouteClaimsBatchWithTelemetry
+    from RedstoneCompiler.RustRouting import GetRoutingThreadCount as GetRustRoutingThreadCount, RoutingContext as RustRoutingContext, SearchExteriorConnectorsBatchWithTelemetry as _SearchExteriorConnectorsBatchWithTelemetry
+except ImportError:
+    try:
+        from RedstoneCompiler.RustRouting import BuildRouteClaimsBatchWithTelemetry
+        from RedstoneCompiler.RustRouting import GetRoutingThreadCount as GetRustRoutingThreadCount, RoutingContext as RustRoutingContext, SearchExteriorConnectorsBatchWithTelemetry as _SearchExteriorConnectorsBatchWithTelemetry
+    except Exception:
+        RustRoutingContext = None
+        _SearchExteriorConnectorsBatchWithTelemetry = None
+        BuildRouteClaimsBatchWithTelemetry = None
+
+        def GetRustRoutingThreadCount() -> int:
+            return 1
+from ..Assignment.AssignmentState import BeginPhysicalAssignmentArcPass, CandidatePortalShapeRank, CandidatePortalTupleIndex, CandidateRequestShapeDescriptor, ConflictClassificationSupportsPhysicalPortPairNoGoods, GetPhysicalGlobalAssignmentArcIndex, IsPhysicalCandidateRequestDomainComplete, LazyCandidateRouteRequest, PhysicalGlobalAssignmentDomainIsComplete, PlanPhysicalGlobalAssignmentAvoidingExactNoGoods, ShouldCompletePhysicalCandidateRequestWindow, ShouldDeferUnreservedCandidateRequestShape, ShouldGrowAssignmentBudget, _ClaimsConflict
+from ..Leases.BoundaryLeasePlanning import BuildPreRouteLocalClaimChoices, PreRouteLocalClaimChoice, ReserveBoundaryPortals, ReserveNegotiatedBoundaryEscapes, SelectAccessAwareLocalClaimReleases
+from ..Leases.BoundaryLeases import ReserveClusterBoundaryLeases
+from ..Candidates.CandidateCache import BuildClusterInterfaceReservationAssignmentFingerprint, BuildConfiguredPortalRequestDomainFingerprint, BuildExactPhysicalPortalCertificateIdentityConditions, BuildFrozenPostClosurePortalHandoffTelemetry, BuildPhysicalGlobalRouteTreeResultCacheKey, BuildPinnedOrdinaryPortalReuseColumns, ClassifyEmptyPhysicalCandidateDomains, ExtendIndexedRoutingResourceGraph, FilterPhysicalCandidatesToCurrentPortalDomain, FindUnindexedClaimPositions, MaterializeValidatedPortablePortalPositiveWitness, MaximumPhysicalGlobalRouteTreeResultCacheEntries, MergePartialRawPortalBatchWork, MergePostClosurePortalCompletionKeys, MergeSignalScopedRawPortalEntries, PartitionExpectedGenericPortalDomainKeys, PartitionPhysicalOwnedTerminalPortalRequests, PreparedPortalDomainCache, RawPortalGeometryReusePlan, ReadPortalBatchCandidatesAndCompletionMask, ReadRouteTreeBatchCompletionMask, RetainPhysicalGlobalRouteTreeResults, RetainPreparedPortalDomainCache, RetainRawPortalGeometryCache, SelectAuthoritativeBaseClaims, SelectCompletedPortalBatchEntries, SelectMatchingPartialPortalReplaySignals, SelectPortablePortalPositiveReusableSignals, SelectPortablePortalProofReusableSignals, SelectPreparedPortalDomainCache, SelectRawPortalGeometryReusePlan, ShouldRunShapeOptimization, TouchPhysicalGlobalRouteTreeResult, TransformPlanarRoutingPosition, TransformPortableCompletePortalDomainKeys, _CollectSignalTargets
+from ..Candidates.CandidateDomains import BuildCandidateStarvationClassFingerprint, BuildClusterLeaseSignalPatternFingerprint, BuildCompleteMandatoryClaimCutCoverage, BuildMandatoryPortalTupleSelfConflictFailure, BuildOptionalPortalSeedWorkCheck, BuildTelemetryRoutingStageError, BuildUnavoidableMandatoryClaimCutFailure, CountExactLegalRetainedJointStates, CountJointAssignmentConstraintKinds, FindAllUnavoidableMandatoryClaimCuts, FrozenComponentBlockedWireNodes, GenerateStagedInitialRouteTrees, HasCumulativeJointAssignmentConstraintMaturity, ImmutableRoutingClaimsBlockedWireNodes, MayAdvanceStagedCandidateOnExhaustion, PortalTupleEmptyProofDomainIsComplete, PortalTupleFeasibilityDomainIsComplete, RawPortalProfileMatchesRequestedControls, SelectClusterLeaseOwnershipSignals, SelectCoordinatedPortalVariantCount, SelectEffectiveCoordinatedCandidateDiversityLevel, SelectJointHigherOrderConstraintSignals, SelectJointPairwiseConstraintSignals, SelectMaturePortfolioExactInitialRequestFloor, SelectMaturePortfolioPortalLimit, SelectOptionalPortalSeedSliceSeconds, SelectTransactionalLeasePrescreenSignals, ShouldCapMatureCumulativeJointPortfolio, ShouldContinueCutScopedFixedLegalityWindow, ShouldLimitRetainedPortfolioPortalDomain, ShouldPrepareMandatoryPortalTuples, ShouldPrepareOptionalPortalSeed, ShouldRejectRoutedComponentForeignEscape, ShouldRetainBoundedPortfolioPortalProfile, ShouldRetryRelocatedCandidateStarvation, ShouldStageTopologyPressureJointPortfolio, ShouldUseMatureStagedInitialCandidateScheduler, ShouldUseNegotiatedRouting, StagedInitialRouteTreeResult
+from ..Candidates.CandidateGuides import BuildCapacityAwareGuideInputFingerprint, BuildCertifiedEmptyPhysicalSignalRouteDomainFailure, BuildCertifiedPhysicalComponentApertureDomain, BuildCompletePhysicalRequestAlternativeApertureNoGoods, BuildFactorizedPhysicalGuideIdentity, BuildMinimalPhysicalRequestApertureNoGood, BuildPhysicalAssemblyGuideContractFingerprint, BuildPhysicalRouteDescriptorRemainingCounts, BuildPhysicalSignalApertureCandidateDomainIdentity, BuildPortalAccessGeometryFingerprint, BuildPreparedPhysicalExteriorGuideColumnsBySignal, CaptureCompletePhysicalPortCorridorDomains, ClassifySiblingApertureSeamOwnershipConflicts, CompletePhysicalCandidatePairDomainsHaveNoSupport, FilterPhysicalCandidatesAgainstSiblingApertures, PhysicalSignalLocalCandidateRequestFactorProofComplete, PhysicalSignalRouteDomainContinuation, PhysicalSignalRouteDomainIsCertifiedEmpty, PortablePhysicalSignalRouteDomainPreparation, PreparePortablePhysicalSignalRouteDomain, RetainCompletePhysicalSignalRouteDomainContinuations, RetainCompletePortablePhysicalSignalRouteDomains, RetainPhysicalSignalRouteDomainDescriptorProgress, SelectPendingPhysicalRouteDescriptorRows, SelectPortableReplayTelemetryReason, SelectPreparedPortablePhysicalSignalRouteDomainContinuation, SelectReplayablePhysicalSignalRouteDomainContinuation, SelectReusablePhysicalPortCorridorCandidates, _BuildApertureClaimsFingerprint
+from ..Materialization import SelectComponentPreparationProfiles
+from ..Negotiation.NegotiatedTrees import PlanNegotiatedRouteTrees
+from ..Guides.PhysicalGuides import BuildPhysicalExteriorResourceGraphFingerprint, CanReuseFrozenPhysicalPortGuidePlan, ShouldBuildCapacityAwareGlobalGuidePlan
+from ..Ports.PortPreparation import PreparePhysicalComponentPortFactorDomain
+from ..Ports.Solving import SolvePreparedPhysicalComponentPortFactorDomain
+import PhysicalDesign.Routing.Global.Ports.Portals as PortalOperations
+import PhysicalDesign.Routing.Global.Assignment.TrackPortfolio as TrackPortfolioOperations
+from ..Ports.Portals import ApplyPhysicalComponentAssemblyPortalDomains, ApplyPlacementAccessAssignmentPortalDomains, ApplyPlacementAccessFabricPortalDomains, BuildRepeaterReadyPortalDomains, FilterSourceConnectedTargetBranches, PortalPathRespectsOutwardAccess, RequiredPhysicalAssemblyRoutingLayerCount, RequiredRoutingLayerCountForAccess, ResolvePlacementAccessFabricRegionContract, SelectGenericPortalTerminalPaths, SelectGraphAccessStarts, SelectHierarchicalRoutingMaximumLayerCount, SelectInitialRoutingLayerCount, ValidatePhysicalAssemblyRoutingLayerLimit, ValidatePhysicalComponentExactAttachmentPortals, _PortalFromRust, _ReserveRepeaters
+from .RunModels import ClusterLeaseCandidateRealizabilityNogood, MandatoryPortalTupleSelfConflictEvidence, OptionalPortalSeedSliceExpired, RawTrackAssignmentDomainPrepared
+from ..Assignment.TrackPortfolio import BuildDetachedLocalClaimObstacleNodes, BuildForeignElectricalExclusionsBySignal, BuildInvariantRouteRequestGuidePayload, BuildInvariantRouteRequestNodePayload, BuildPhysicalCandidateRequestShapeDependencyIdentity, BuildRawTrackAssignmentDomain, BuildRawTrackAssignmentPortalDomainFingerprint, BuildRoutingConflictGraph, BuildTrackAssignmentCandidateDomainFingerprint, InvariantRouteRequestNodePayload, PartitionLocalClaimSeedComponents, PhysicalRouteRequestFactorHasNecessaryConnectivity, SelectAuthoritativeRouteRequestGuide, SelectPlacementRelocationSignals, SelectPriorityPlacementRelocationSignals, _BuildGuide, _BuildTargetPortalBranches
+__all__ = tuple((Name for Name in globals() if not Name.startswith('__')))

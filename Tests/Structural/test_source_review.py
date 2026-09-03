@@ -9,7 +9,7 @@ import sys
 
 
 RepositoryRoot = Path(__file__).resolve().parents[2]
-ScriptPath = RepositoryRoot / "Scripts/Routing/ReviewSourceStructure.py"
+ScriptPath = RepositoryRoot / "Tools/Routing/ReviewSourceStructure.py"
 Spec = importlib.util.spec_from_file_location("ReviewSourceStructure", ScriptPath)
 assert Spec is not None and Spec.loader is not None
 ReviewModule = importlib.util.module_from_spec(Spec)

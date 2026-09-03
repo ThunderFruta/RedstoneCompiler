@@ -92,16 +92,16 @@ matching output artifacts for the checkout under test. The slower RCA4 and
 CLA4 physical tests remain opt-in:
 
 ```bash
-RC_RUN_SCALE_TESTS=1 python3 -m unittest Tests.test_scale_routing -v
+RC_RUN_SCALE_TESTS=1 .venv/bin/python -m pytest -q Tests/Integration/test_scale_routing.py
 ```
 
 The canonical physical acceptance owner runs its configured matrix sequentially
 and writes a durable evidence manifest:
 
 ```bash
-python3 Scripts/Routing/RunRouterAcceptance.py \
+python3 Tools/Routing/RunRouterAcceptance.py \
   --output-root Output/Acceptance --python /usr/bin/python3 --dry-run
-python3 Scripts/Routing/RunRouterAcceptance.py \
+python3 Tools/Routing/RunRouterAcceptance.py \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 
@@ -120,44 +120,22 @@ state, and affected resources without converting the failure to success.
 
 ## Package layout
 
-- `Main.py` -- project-root CLI entrypoint (preferred).
-- `Compiler/Main.py` -- command-line implementation and guided/argument workflow.
-- `Compiler/Pipeline.py` -- end-to-end orchestration.
-- `SVDecoder/` -- SystemVerilog parser/adaptor.
-- `Compiler/Ir/` -- compiler IR definitions.
-- `Compiler/Synthesis/` -- NAND normalization transforms.
-- `Compiler/Cells/` -- authoritative standard-cell macro definitions.
-- `Compiler/Placement/Access/`, `Core/`, and `Flow/` -- placement access
-  geometry, search/commit, and the physical-flow orchestrator.
-- `Compiler/Placement/Geometry.py` and `Rotation.py` -- shared placed-cell
-  geometry primitives.
-- `Compiler/Routing/Authoritative/` -- production portal, route-tree,
-  base-ownership, exact-assignment, and escalation orchestration.
-- `Compiler/Routing/Reliability.py` -- shared deadline, fingerprint, placement,
-  failure, and evidence contracts.
-- `Compiler/Routing/Pcb.py` -- PCB routing search and retries.
-- `Compiler/Routing/Contracts/` -- shared immutable routing-stage data
-  contracts.
-- `Compiler/Routing/Actions/` -- focused geometry, validation, cleanup, and
-  authoritative repeater operations.
-- `Compiler/Routing/Workers/` -- pin-access and detailed-routing stage
-  orchestration.
-- `Compiler/Routing/Technology.py` -- authoritative redstone design rules.
-- `Compiler/Routing/Policy.py` -- serializable physical-design policy.
-- `Compiler/Routing/TrackAssignment.py` -- exact global track ownership types.
-- `RustRouting/Src/` -- native router domains for runtime, geometry, path
-  search, assignment, escape planning, generation, and Python
-  bindings; `Lib.rs` is the PyO3 registration entrypoint.
-- `Scripts/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
-  evidence-manifest harness.
-- `ValidationServerHarness/Mchprs/` -- fast exhaustive physical redstone
-  validation through the pinned MCHPRS/Redpiler engine.
-- `Compiler/FabricServer/` and `ValidationServerHarness/` -- the required
-  single-fixture Minecraft 26.2 canary check, validation backends, and tracked
-  harness source;
-  `ValidationServerHarness/Server/` is the ignored local runtime.
-- `Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
-- `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.
+- `App/` owns the guided/argument CLIs, reporting, and telemetry.
+- `Compiler/` owns the frontend, IR, synthesis, and existing pipeline coordinator.
+- `PhysicalDesign/` groups placement, routing, contracts, geometry, resources,
+  redstone rules, and schematic rendering.
+- `Validation/` groups physical validation, MCHPRS, Fabric integration, the
+  tracked runtime manager, and Java/Gradle harness sources.
+- `Native/Routing/` contains the existing Rust crate. Its Python import remains
+  `RedstoneCompiler.RustRouting`.
+- `Assets/Templates/` contains the template catalog and litematic assets.
+- `Tools/{Fabric,Mchprs,Routing}/` groups executable tools by domain.
+- `Tests/` mirrors source ownership; shared fixtures remain in `Tests/Fixtures/`.
 
-The complete current ownership map, retired-path list, and structural gates are
-in [Docs/Reference/ProjectTreeDesignDoc.md](Docs/Reference/ProjectTreeDesignDoc.md).
+Root `Main.py` remains the compatibility launcher. The installed CLI names and
+`python -m RedstoneCompiler` retain their existing behavior. Server data stays in
+the resolved `ValidationServerHarness/Server/` runtime; build/cache/output data
+retains its existing locations.
+
+See the [project tree](Docs/Reference/ProjectTree.md) and
+[complete migration crosswalk](Docs/Reference/RepositoryLayoutMigration.md).
