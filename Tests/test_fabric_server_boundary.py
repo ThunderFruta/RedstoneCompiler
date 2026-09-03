@@ -37,11 +37,33 @@ def WriteMinimalFabricFixture(PathValue: Path) -> None:
 
 
 class FabricServerBoundaryTests(unittest.TestCase):
-    def testEnvironmentUsesTheRepositoryCanonicalServerRootByDefault(self) -> None:
-        with patch.dict(os.environ, {"RC_FABRIC_SERVER_ROOT": ""}):
+    def testEnvironmentUsesTheLocalRuntimeWhenItIsInstalled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"RC_FABRIC_SERVER_ROOT": ""},
+        ), patch(
+            "Compiler.FabricServer.Validation.HasFabricServerRuntime",
+            return_value=True,
+        ):
             Configuration = FabricServerConfiguration.FromEnvironment()
 
         self.assertEqual(Configuration.Root, DefaultFabricServerRoot())
+
+    def testEnvironmentUsesACompleteSiblingRuntimeForALinkedWorktree(self) -> None:
+        SharedRoot = Path("/shared/ValidationServerHarness/Server")
+        with patch.dict(
+            os.environ,
+            {"RC_FABRIC_SERVER_ROOT": ""},
+        ), patch(
+            "Compiler.FabricServer.Validation.HasFabricServerRuntime",
+            return_value=False,
+        ), patch(
+            "Compiler.FabricServer.Validation.FindSharedWorktreeFabricServerRoot",
+            return_value=SharedRoot,
+        ):
+            Configuration = FabricServerConfiguration.FromEnvironment()
+
+        self.assertEqual(Configuration.Root, SharedRoot)
 
     def testEnvironmentHonorsAnExplicitServerRootOverride(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath, patch.dict(
@@ -51,7 +73,6 @@ class FabricServerBoundaryTests(unittest.TestCase):
             Configuration = FabricServerConfiguration.FromEnvironment()
 
         self.assertEqual(Configuration.Root, Path(TemporaryDirectoryPath).resolve())
-        self.assertEqual(ResolveFabricServerRoot(), DefaultFabricServerRoot())
 
     def testEnvironmentConfiguresTheLongRunningValidationResponseTimeout(self) -> None:
         with patch.dict(

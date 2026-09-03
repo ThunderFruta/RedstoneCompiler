@@ -12,10 +12,10 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from Compiler.FabricServer import DefaultFabricServerRoot
+from Compiler.FabricServer import ResolveFabricServerRoot
 
 
-ServerRoot = DefaultFabricServerRoot()
+ServerRoot = ResolveFabricServerRoot()
 RuntimeScripts = ServerRoot / "PyScripts"
 RuntimeMain = RuntimeScripts / "Main.py"
 

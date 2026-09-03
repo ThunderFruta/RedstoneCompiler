@@ -12,6 +12,7 @@ in this tree instead of being duplicated in the repository root.
   - [Readme](Architecture/Readme.md)
   - [Compiler pipeline](Architecture/CompilerPipeline.md)
   - [Data contracts](Architecture/DataContracts.md)
+  - [Physical design architecture review and proposed boundaries](Architecture/PhysicalDesignArchitectureReview.md)
   - [Architecture decisions](Architecture/Decisions.md)
 - [Development]
   - [Readme](Development/Readme.md)

@@ -11,7 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 
-from Compiler.FabricServer import DefaultFabricServerRoot, FabricServerValidationResult
+from Compiler.FabricServer import (
+    FabricServerValidationResult,
+    ResolveFabricServerRoot,
+)
 from Scripts.Fabric import (
     ControlFabricServer,
     ImportSchemToFabricServer,
@@ -23,12 +26,12 @@ from Scripts.Routing import (
 )
 
 
-CanonicalServerRoot = str(DefaultFabricServerRoot())
+CanonicalServerRoot = str(ResolveFabricServerRoot())
 
 
 class ScriptCliGuidanceTests(unittest.TestCase):
     def testFabricControlUsesTheCanonicalRuntimeManager(self) -> None:
-        ExpectedRoot = DefaultFabricServerRoot()
+        ExpectedRoot = ResolveFabricServerRoot()
 
         self.assertEqual(ControlFabricServer.ServerRoot, ExpectedRoot)
         self.assertEqual(
@@ -68,7 +71,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
     def testFabricImportDefaultsToTheCanonicalServerRoot(self) -> None:
         Arguments = ImportSchemToFabricServer.BuildParser().parse_args(["build.schem"])
 
-        self.assertEqual(Arguments.server_root, DefaultFabricServerRoot())
+        self.assertEqual(Arguments.server_root, ResolveFabricServerRoot())
 
     def testFabricImporterHonorsTheSharedRootOverride(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath, patch.dict(
@@ -190,7 +193,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
     def testFabricTesterDefaultsToTheCanonicalServerRoot(self) -> None:
         Arguments = TestSchemInFabricServer.BuildParser().parse_args(["build.litematic"])
 
-        self.assertEqual(Arguments.server_root, DefaultFabricServerRoot())
+        self.assertEqual(Arguments.server_root, ResolveFabricServerRoot())
 
     def testFabricTesterOffersExplicitOneAndAllModes(self) -> None:
         Parser = TestSchemInFabricServer.BuildParser()

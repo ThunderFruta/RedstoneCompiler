@@ -3036,7 +3036,16 @@ def test_parallel_unary_workers_merge_symbolic_state_cache_into_parent():
         def __exit__(self, *_Arguments):
             return False
 
-        def submit(self, _Worker, _Problem, _FactorDomain, Signal, _Deadline):
+        def submit(
+            self,
+            _TelemetryWorker,
+            _TaskId,
+            _Worker,
+            _Problem,
+            _FactorDomain,
+            Signal,
+            _Deadline,
+        ):
             Clause = frozenset(((Signal, f"aperture-{Signal}"),))
             return Future((
                 Signal,

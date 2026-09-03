@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 from time import monotonic, sleep
 from typing import Any, Callable, Iterable
 
@@ -36,14 +37,58 @@ def DefaultFabricServerRoot() -> Path:
     )
 
 
-def ResolveFabricServerRoot() -> Path:
-    """Return the canonical runtime root or the explicit environment override."""
-    ConfiguredRoot = os.environ.get("RC_FABRIC_SERVER_ROOT")
+def HasFabricServerRuntime(Root: Path) -> bool:
+    """Return whether one runtime root has the launch and harness artifacts."""
     return (
-        Path(ConfiguredRoot).expanduser().resolve()
-        if ConfiguredRoot
-        else DefaultFabricServerRoot()
+        (Root / "fabric-server-launch.jar").is_file()
+        and (Root / "mods" / "redstonecompiler-harness.jar").is_file()
     )
+
+
+def FindSharedWorktreeFabricServerRoot(
+    RepositoryRoot: Path,
+    LocalRoot: Path,
+) -> Path | None:
+    """Find a sibling worktree runtime when this linked checkout has none."""
+    if not (RepositoryRoot / ".git").is_file():
+        return None
+    try:
+        Result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=RepositoryRoot,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for Line in Result.stdout.splitlines():
+        if not Line.startswith("worktree "):
+            continue
+        Candidate = (
+            Path(Line.removeprefix("worktree ")).resolve()
+            / "ValidationServerHarness"
+            / "Server"
+        )
+        if Candidate != LocalRoot and HasFabricServerRuntime(Candidate):
+            return Candidate
+    return None
+
+
+def ResolveFabricServerRoot() -> Path:
+    """Return an explicit, local, or shared-worktree Fabric runtime root."""
+    ConfiguredRoot = os.environ.get("RC_FABRIC_SERVER_ROOT")
+    if ConfiguredRoot:
+        return Path(ConfiguredRoot).expanduser().resolve()
+    LocalRoot = DefaultFabricServerRoot()
+    if HasFabricServerRuntime(LocalRoot):
+        return LocalRoot
+    RepositoryRoot = Path(__file__).resolve().parents[2]
+    return FindSharedWorktreeFabricServerRoot(
+        RepositoryRoot,
+        LocalRoot,
+    ) or LocalRoot
 
 
 @dataclass(frozen=True)
