@@ -85,6 +85,8 @@ Extended CLA4 acceptance manifest: `Output/Acceptance/Pass3Compat/2026-08-03/Rou
 CarryLookaheadAdder4 remains an explicit extended gate and is not part of the
 default runtime path.
 
-Attempt-by-attempt behavior, evidence boundaries, and current hypotheses are
-maintained in
-[Current routing failures](../Routing/Active/CurrentRoutingFailures.md).
+Current diagnosis must use fresh `.RoutingFailure.json` artifacts and an
+acceptance manifest produced for the checkout under test. The
+[physical-design architecture review](../Architecture/PhysicalDesignArchitectureReview.md)
+and [running-tests guide](RunningTests.md) describe the current boundaries and
+commands.

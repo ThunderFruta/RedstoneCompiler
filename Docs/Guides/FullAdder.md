@@ -18,6 +18,6 @@ claims. `Strategy.FallbackUsed` must be false.
 
 Failure is transactional: a typed `.RoutingFailure.json` may be published, but
 no failed physical design or litematic is accepted. See the
-[failure catalog](../Routing/FailureCatalog.md) before changing budgets.
+[failure catalog](../Routing/Active/FailureCatalog.md) before changing budgets.
 
 FullAdder passing is necessary but does not imply RCA4 or CLA4 acceptance.

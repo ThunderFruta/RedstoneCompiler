@@ -1,9 +1,8 @@
 # Monolith split and ownership design
 
 > **Canonical reference.** This is the authoritative ownership and
-> clean-break record for the current source tree. Dated files under
-> `Docs/Routing/Historical/` and `Docs/Routing/Snapshots/` remain historical
-> evidence, not instructions for current imports or module ownership.
+> clean-break record for the current source tree. Current source and active
+> documentation control imports and module ownership.
 
 ## Status and scope
 
@@ -157,10 +156,10 @@ RustRouting/Src/Simulation/{LogicSimulation.rs,mod.rs}
 the established `Actions` exports were preserved. The unused duplicate NAND
 dataclass was removed; `Compiler/Cells/Library.py` remains authoritative.
 
-The retired names may still appear in immutable snapshots and dated
-implementation notes as pre-refactor provenance. They are not import
-instructions. Use this ownership map when following that history into the
-current tree:
+The retired names below are an active denylist, not import instructions. They
+may be mentioned only in this ownership policy and in
+[`LegacyRetirement.md`](../Development/LegacyRetirement.md) when enforcing the
+clean break. Use this ownership map to locate the current owner:
 
 | Pre-refactor path | Current owner |
 |---|---|
@@ -223,35 +222,11 @@ wall median and every stage with a baseline median of at least 100 ms must stay
 within `1.05 ×` baseline; a failed first comparison is rerun as a complete case
 and judged by the combined median.
 
-## Timestamped evidence — 2026-08-28
+## Evidence boundary
 
-The pre-refactor capture is revision
-`1681514368979f2cca1635b90b7f27062a966e33`, with 1,301 collected pytest cases,
-56 passing Rust release tests, and native-extension SHA-256
-`519bf9ebab4700539a93ee0718fc63069698b1dcbcc51cef399fc25d02447113`.
-Its acceptance medians were 5.231127 s (FullAdder), 6.978186 s (RCA4), and
-10.671757 s (RCA8). CLA4 failed in 16.646 s at
-`Placement / PlacementOverlap` with detail
-`no exact-legal placement candidate was generated`; it was not timed out.
-
-The final post-refactor bundle is
-[`20260828T151609Z`](../Routing/Snapshots/RoutingAwarePlacementAccess/20260828T151609Z/Snapshot.md),
-snapshot ID `20260828T151609Z-2c2132084dda3215`. Its exact-evidence SHA-256 is
-`06d4b8149212ab611814af1dad6af25181b75f782f4d3a3b6b86f7b87136a539`
-and its portable-semantic SHA-256 is
-`2c2132084dda3215ab17b96b22e639e804ba0f2dd3d1ca3e89496866811f34df`.
-It includes the primary fixed-matrix manifest and the required complete-case
-RCA8 performance rerun manifest.
-
-The rebuilt native module was loaded from
-`RedstoneCompiler/RustRouting.cpython-312-x86_64-linux-gnu.so`, SHA-256
-`9750ecb2752be302ecf789e1bbc739f19886a0a9529d3895144d2e39435c956e`.
-FullAdder/RCA4/RCA8 retain exact semantic fingerprints and pass 5/3/3 runs;
-CLA4 retains the non-timeout `Placement / PlacementOverlap` failure. Wall
-median changes are `+0.756%`, `+1.496%`, and `+0.194%` (combined RCA8 rerun).
-Every qualifying internal median is below the 5% ceiling; the largest is the
-combined RCA8 total at `+3.256%`.
-
-Existing directories under `Docs/Routing/Snapshots/` are immutable historical
-evidence and must never be rewritten. Exploratory captures continue to belong
-under `Output/DesignSnapshots/RoutingAwarePlacementAccess/`.
+This document records source ownership and structural gates, not a current
+acceptance result. Fresh acceptance manifests, typed `.RoutingFailure.json`
+artifacts, and exploratory design captures belong under `Output/`; routing-aware
+placement captures use `Output/DesignSnapshots/RoutingAwarePlacementAccess/`.
+Use the current [testing documentation](../Testing/RunningTests.md) to produce
+and assess evidence for the checkout under test.

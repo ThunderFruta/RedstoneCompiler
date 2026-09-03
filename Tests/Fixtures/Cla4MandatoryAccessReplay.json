@@ -1,7 +1,7 @@
 {
   "SchemaVersion": "cla4-mandatory-access-replay-v3",
   "SourceArtifact": {
-    "Path": "Docs/Routing/Snapshots/RoutingAwarePlacementAccess/20260828T151609Z/Artifacts/CarryLookaheadAdder4Run1.RoutingFailure.json",
+    "Path": "Tests/Fixtures/Cla4MandatoryAccessSource.RoutingFailure.json",
     "Sha256": "e2eaa1db52deedc27605327f1b9cbc1afa7deaff78e4decc0eb6566fd3bac149",
     "Revision": "1681514368979f2cca1635b90b7f27062a966e33"
   },

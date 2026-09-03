@@ -43,17 +43,13 @@ The compiler now uses a stage-aligned runtime layout:
 - `Docs/Architecture/` explains stage boundaries and cross-stage contracts.
 - `Docs/Routing/Active/RoutingAwarePlacementAccessDesign.md` owns the proposed
   fixed-access replacement and its typed placement/access handoff contracts.
-- `Docs/Routing/Active/RoutingAwarePlacementAccessSnapshots.md` is append-only
-  and owns timestamped evidence for that proposal.
 - `Docs/Routing/Active/NegotiatedRouteTreeRouter.md` owns the current router design.
 - `Docs/Routing/Active/RouterResearchAndInspiration.md` records external algorithmic
   sources and the parts adopted here.
-- `Docs/Routing/Active/RouterReliabilityGuide.md` owns the operational verdict and
-  acceptance evidence.
-- `Docs/Routing/Active/RouterReliabilityImplementationNotes.md` is append-only and
-  records dated implementation checkpoints.
+- `Docs/Routing/Active/FailureCatalog.md` owns the typed routing failure taxonomy.
+- `Docs/Architecture/PhysicalDesignArchitectureReview.md` owns the boundary
+  findings and proposed module seams.
 - `Docs/Testing/` owns test commands, layers, and physical acceptance gates.
 
 [`ProjectTreeDesignDoc.md`](ProjectTreeDesignDoc.md) defines the completed
-clean-break ownership contract,
-structural gates, and timestamped refactor evidence.
+clean-break ownership contract and structural gates.

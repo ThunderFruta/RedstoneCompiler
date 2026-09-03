@@ -11,17 +11,10 @@ and their milestone/non-accepted status. The policy must not become the default
 or be described as accepted production behavior until the gates in this
 document pass.
 
-**Baseline captured:** `2026-08-28T00:03:58Z`
-(`2026-08-27T20:03:58-04:00`). See the append-only
-[snapshot record](RoutingAwarePlacementAccessSnapshots.md).
-
-**Normative relationship:** The enduring correctness, typed-failure, shared-
-deadline, determinism, and validation invariants in the
-[router reliability design](RouterReliabilityDesignDoc.md) remain mandatory.
-Its v10 policy/version checkpoints, older matrix shape, manifest version, and
-native file-count checkpoint are historical for this source. The live
-`Scripts/Routing/RunRouterAcceptance.py`, the matrix below, and timestamped source
-snapshots control concrete v17 evidence. The existing
+**Evidence relationship:** Correctness, typed failure, deterministic execution,
+and final validation remain mandatory. The live
+`Scripts/Routing/RunRouterAcceptance.py`, the matrix below, and fresh output
+artifacts control concrete v17 evidence. The existing
 [negotiated route-tree router](NegotiatedRouteTreeRouter.md) remains the target
 global and detailed router. This proposal replaces the placement-to-access
 handoff and simplifies how that router receives physical work; it does not
@@ -30,9 +23,7 @@ weaken final validation.
 **Current source ownership:** The behavior and evidence below predate the
 2026-08-28 clean-break monolith split, but the v17 proposal itself is
 unchanged. Current paths in this document follow the domain packages in
-[`ProjectTreeDesignDoc.md`](../../Reference/ProjectTreeDesignDoc.md). Dated snapshot
-tables retain their original path/hash provenance and are not current import
-instructions.
+[`ProjectTreeDesignDoc.md`](../../Reference/ProjectTreeDesignDoc.md).
 
 ## Decision
 
@@ -69,35 +60,13 @@ NAND IR
 
 ## Status and evidence boundary
 
-### Confirmed current evidence
+### Current evidence
 
-The source snapshot is revision
-`1681514368979f2cca1635b90b7f27062a966e33`. The second isolated current-tree
-CLA4 diagnostic is
-`/tmp/redstone-timegraph-20260825-2128/Diagnostics/CarryLookaheadAdder4Run2/CarryLookaheadAdder4Run2.RoutingFailure.json`,
-SHA-256
-`c4f57aad994f168e47fb6165f6858bbb3898ec3b31507503cb394b7e95736ebb`.
-
-That artifact records:
-
-| Field | Observed value |
-| --- | --- |
-| Circuit | `CarryLookaheadAdder4`, 72 NAND gates, 9 inputs, 5 outputs |
-| Process result | nonzero typed routing failure |
-| Runtime | `16.376594 s` |
-| Failure stage | `Placement` |
-| Failure reason | `PlacementOverlap` |
-| Detail | `no exact-legal placement candidate was generated` |
-| Deadline | not expired; `101700 ms` remained |
-| Primary candidate | `row-beam`, `13.810852 s`, 8,814 access claims |
-| Primary conflict | two electrical resources owned by `NandNet0` and `Propagate0` |
-| Alternate candidate | `row-beam-direct-only`, `2.488325 s`, 8,808 access claims |
-| Alternate conflict | two electrical resources owned by `NandNet0` and `NandNet2` |
-| Native detailed routing | not reached |
-| CLA4 physical design, truth table, litematic | not published |
-
-The current successful acceptance evidence for FullAdder, RCA4, and RCA8 does
-not establish CLA4 acceptance.
+This proposal does not carry a current acceptance verdict or a durable dated
+failure report. Establish the state of a checkout from fresh artifacts under
+`Output/`: the relevant `.RoutingFailure.json`, the matching acceptance
+manifest, and the produced physical-design and validation artifacts. A passing
+smaller circuit never establishes CLA4 acceptance.
 
 ### Confirmed code behavior
 
@@ -1437,12 +1406,7 @@ requirements.
 Focused tests, a feasible access witness, reaching detailed routing, or one
 successful CLA4 run are milestones, not full acceptance.
 
-## Snapshot and evidence protocol
-
-The companion
-[snapshot record](RoutingAwarePlacementAccessSnapshots.md) is append-only. A
-snapshot entry is never edited to make later evidence look current; append a
-correction referencing the earlier timestamp.
+## Evidence protocol
 
 The reproducible capture tool is
 `Scripts/Routing/CaptureRoutingDesignSnapshot.py`. Each timestamped bundle records:
@@ -1460,10 +1424,11 @@ The reproducible capture tool is
 - a human-readable Markdown projection plus `SHA256SUMS`.
 
 The tool never searches `/tmp` for a latest artifact. Every evidence path is an
-explicit argument. It rejects an existing/nonempty output directory. The
-versioned snapshot record contains durable concise facts and hashes; full raw
-bundles may also be retained under the timestamped snapshot directory when
-explicitly requested.
+explicit argument. It rejects an existing/nonempty output directory and writes
+new captures under `Output/DesignSnapshots/RoutingAwarePlacementAccess/`.
+Commit neither capture bundles nor dated documentation logs; use the fresh
+artifact with the current [testing guidance](../../Testing/RunningTests.md) and
+[architecture review](../../Architecture/PhysicalDesignArchitectureReview.md).
 
 Capture at these real milestones only:
 
@@ -1483,8 +1448,8 @@ Do not pre-create successful future entries.
 
 ### Phase 0: contracts and baseline
 
-**Changes:** land this design, append-only snapshot record, capture tool, and
-focused capture tests. Add no routing behavior.
+**Changes:** land this design, the capture tool, and focused capture tests.
+Add no routing behavior.
 
 **Exit gate:** reproducible `RAPA-S0`, clean documentation links, focused tests,
 and unchanged pre-existing worktree content.
@@ -1625,8 +1590,8 @@ These are deliberately unresolved until Phase 1/2 evidence exists:
    input-row ceiling; and
 8. the compactness metrics and ceilings to adopt after first acceptance.
 
-Every decision receives a dated snapshot or implementation-note entry with
-measured evidence. None may be resolved by a CLA4-name special case.
+Every decision requires fresh measured evidence in its output artifacts. None
+may be resolved by a CLA4-name special case.
 
 ## Implementation checklist
 
@@ -1650,13 +1615,11 @@ measured evidence. None may be resolved by a CLA4-name special case.
 
 ## References
 
-- [Router reliability design](RouterReliabilityDesignDoc.md)
 - [Negotiated route-tree router](NegotiatedRouteTreeRouter.md)
 - [Incremental physical factor reuse](IncrementalPhysicalFactorReuse.md)
 - [Resource graph](ResourceGraph.md)
 - [Hierarchical routing regions](HierarchicalRegions.md)
 - [Track assignment and boundary capacity](TrackAssignment.md)
 - [Failure catalog](FailureCatalog.md)
-- [Current routing failures](CurrentRoutingFailures.md), retained as dated
-  historical/current-tree evidence for its own revision
-- [Routing-aware placement and access snapshots](RoutingAwarePlacementAccessSnapshots.md)
+- [Physical design architecture review](../../Architecture/PhysicalDesignArchitectureReview.md)
+- [Running tests](../../Testing/RunningTests.md)

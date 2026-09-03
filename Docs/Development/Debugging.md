@@ -21,5 +21,5 @@ that a larger timeout fixes topology.
 
 Run focused unit tests before repeating a scale compile. Preserve the first
 failed circuit's artifact and stop the acceptance sequence there. The
-[failure catalog](../Routing/FailureCatalog.md) maps each typed failure to its
+[failure catalog](../Routing/Active/FailureCatalog.md) maps each typed failure to its
 required evidence and next owning stage.

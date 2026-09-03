@@ -22,5 +22,6 @@ Every failure should include stage, affected nets, resources, locations,
 bounded repair actions, deadline state, and the relevant conflict or boundary
 cut.
 
-See [Current routing failures](CurrentRoutingFailures.md) for the active RCA4
-failure sequence and the distinction between observed facts and hypotheses.
+Diagnose a current run from its fresh `.RoutingFailure.json` and acceptance
+manifest. The [testing guide](../../Testing/RunningTests.md) defines the
+commands and evidence gates for those artifacts.
