@@ -1,7 +1,7 @@
 # Adding standard cells
 
 Standard-cell geometry is authoritative physical behavior. Add or change cells
-under `Compiler/Cells` and keep their placement, routing access, writer, and
+under `PhysicalDesign/Cells` and keep their placement, routing access, writer, and
 Fabric-server contracts aligned.
 
 A cell definition must provide deterministic dimensions, block geometry,

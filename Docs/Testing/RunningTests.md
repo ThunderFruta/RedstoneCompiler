@@ -3,10 +3,10 @@
 ## Structural and contract gates
 
 ```bash
-python3 -m compileall -q Compiler/Placement Compiler/Routing
+python3 -m compileall -q PhysicalDesign/Placement PhysicalDesign/Routing
 python3 -m pytest -q \
   Tests/Structural/test_source_structure.py \
-  Tests/Routing/test_routing_contract_schema.py
+  Tests/PhysicalDesign/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 ```
 
@@ -87,11 +87,11 @@ can be summarized afterward without treating it as routing success:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  Tests/Routing/test_authoritative_*.py \
-  Tests/Routing/test_component_pipeline_*.py \
-  Tests/Routing/test_physical_assembly_*.py \
+  Tests/PhysicalDesign/Routing/test_authoritative_*.py \
+  Tests/PhysicalDesign/Routing/test_component_pipeline_*.py \
+  Tests/PhysicalDesign/Routing/test_physical_assembly_*.py \
   Tests/Integration/test_router_reliability.py \
-  Tests/Placement/test_placement_boundary_feasibility.py
+  Tests/PhysicalDesign/Placement/test_placement_boundary_feasibility.py
 ```
 
 ## MCHPRS physical validation

@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 
 from Tools.Fabric.BuildRepeaterOrientationSmoke import BuildSmokeLitematic
-from SchemEncoder.SchemWriter import LoadTemplate
+from PhysicalDesign.Rendering.SchemWriter import LoadTemplate
 
 
 class RepeaterOrientationSmokeTests(unittest.TestCase):

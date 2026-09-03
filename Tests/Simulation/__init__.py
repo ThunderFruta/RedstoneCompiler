@@ -1,1 +1,0 @@
-"""Simulation-stage tests."""

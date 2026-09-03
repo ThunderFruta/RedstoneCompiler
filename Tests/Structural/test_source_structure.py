@@ -10,12 +10,14 @@ import unittest
 
 RepositoryRoot = Path(__file__).resolve().parents[2]
 CompilerRoot = RepositoryRoot / "Compiler"
+CompilerSiblingRoots = (
+    RepositoryRoot / "App",
+    RepositoryRoot / "PhysicalDesign",
+)
 RustSourceRoot = RepositoryRoot / "RustRouting/Src"
 
 BannedModulePaths = (
     "Compiler/Cells/Nand.py",
-    "Compiler/Simulation/Redstone.py",
-    "Compiler/Simulation/__init__.py",
     "Compiler/Placement/AccessFabric.py",
     "Compiler/Placement/Pcb.py",
     "Compiler/Placement/PcbFlow.py",
@@ -26,6 +28,19 @@ BannedModulePaths = (
     "Compiler/Routing/ComponentPlanning.py",
     "Compiler/Routing/ComponentRouter.py",
     "Compiler/Routing/Models.py",
+    "Compiler/Simulation/Redstone.py",
+    "Compiler/Simulation/__init__.py",
+    "PhysicalDesign/Cells/Nand.py",
+    "PhysicalDesign/Placement/AccessFabric.py",
+    "PhysicalDesign/Placement/Pcb.py",
+    "PhysicalDesign/Placement/PcbFlow.py",
+    "PhysicalDesign/Redstone/Actions/ConflictRepair.py",
+    "PhysicalDesign/Routing/AuthoritativePlanner.py",
+    "PhysicalDesign/Routing/ComponentAccess.py",
+    "PhysicalDesign/Routing/ComponentPipeline.py",
+    "PhysicalDesign/Routing/ComponentPlanning.py",
+    "PhysicalDesign/Routing/ComponentRouter.py",
+    "PhysicalDesign/Routing/Models.py",
     "RustRouting/Src/Assignment.rs",
     "RustRouting/Src/AssignmentPlanning.rs",
     "RustRouting/Src/Bindings.rs",
@@ -40,8 +55,6 @@ BannedModulePaths = (
 )
 BannedModuleNames = frozenset({
     "Compiler.Cells.Nand",
-    "Compiler.Simulation",
-    "Compiler.Simulation.Redstone",
     "Compiler.Placement.AccessFabric",
     "Compiler.Placement.Pcb",
     "Compiler.Placement.PcbFlow",
@@ -52,38 +65,60 @@ BannedModuleNames = frozenset({
     "Compiler.Routing.ComponentPlanning",
     "Compiler.Routing.ComponentRouter",
     "Compiler.Routing.Models",
+    "Compiler.Simulation",
+    "Compiler.Simulation.Redstone",
+    "PhysicalDesign.Cells.Nand",
+    "PhysicalDesign.Placement.AccessFabric",
+    "PhysicalDesign.Placement.Pcb",
+    "PhysicalDesign.Placement.PcbFlow",
+    "PhysicalDesign.Redstone.Actions.ConflictRepair",
+    "PhysicalDesign.Routing.AuthoritativePlanner",
+    "PhysicalDesign.Routing.ComponentAccess",
+    "PhysicalDesign.Routing.ComponentPipeline",
+    "PhysicalDesign.Routing.ComponentPlanning",
+    "PhysicalDesign.Routing.ComponentRouter",
+    "PhysicalDesign.Routing.Models",
 })
 
 LowerLayerPrefixes = {
-    "Compiler.Routing.Contracts": (
-        "Compiler.Routing.Interfaces",
-        "Compiler.Routing.Components",
-        "Compiler.Routing.Authoritative",
-        "Compiler.Placement",
+    "PhysicalDesign.Contracts": (
+        "PhysicalDesign.Interfaces",
+        "PhysicalDesign.Routing.Regions",
+        "PhysicalDesign.Routing.Global",
+        "PhysicalDesign.Placement",
+        "PhysicalDesign.Flow",
+        "PhysicalDesign.Geometry",
     ),
-    "Compiler.Routing.Interfaces": (
-        "Compiler.Routing.Components",
-        "Compiler.Routing.Authoritative",
-        "Compiler.Placement",
+    "PhysicalDesign.Interfaces": (
+        "PhysicalDesign.Routing.Regions",
+        "PhysicalDesign.Routing.Global",
+        "PhysicalDesign.Placement",
+        "PhysicalDesign.Flow",
+        "PhysicalDesign.Geometry",
     ),
-    "Compiler.Routing.Components": (
-        "Compiler.Routing.Authoritative",
-        "Compiler.Placement",
+    "PhysicalDesign.Routing.Regions": (
+        "PhysicalDesign.Routing.Global",
+        "PhysicalDesign.Placement",
+        "PhysicalDesign.Flow",
+        "PhysicalDesign.Geometry",
     ),
-    "Compiler.Routing.Authoritative": ("Compiler.Placement",),
+    "PhysicalDesign.Routing.Global": (
+        "PhysicalDesign.Placement",
+        "PhysicalDesign.Flow",
+        "PhysicalDesign.Geometry",
+    ),
 }
 
-# Geometry and rotation are intentionally neutral physical primitives retained
-# in their established namespace; importing them does not couple authoritative
-# routing to placement search or placement-flow orchestration.
+# Preserve the two existing geometry exceptions across the namespace move.
+# Flow and geometry retain the restrictions of their former placement owner.
 DocumentedDependencyExceptions = frozenset({
     (
-        "Compiler.Routing.Authoritative.CandidateCache",
-        "Compiler.Placement.Geometry",
+        "PhysicalDesign.Routing.Global.Candidates.CandidateCache",
+        "PhysicalDesign.Geometry.Placement",
     ),
     (
-        "Compiler.Routing.Authoritative.Dependencies",
-        "Compiler.Placement.Rotation",
+        "PhysicalDesign.Routing.Global.Flow.Dependencies",
+        "PhysicalDesign.Geometry.Rotation",
     ),
 })
 
@@ -152,6 +187,9 @@ def BuildCompilerImportGraph(
 ) -> dict[str, frozenset[str]]:
     """Build a deterministic static import graph for compiler modules."""
     ModuleIndex = BuildPythonModuleIndex(SourceRoot)
+    if SourceRoot == CompilerRoot:
+        for SiblingRoot in CompilerSiblingRoots:
+            ModuleIndex.update(BuildPythonModuleIndex(SiblingRoot))
     KnownModules = frozenset({*ModuleIndex, *AdditionalKnownModules})
     Result: dict[str, frozenset[str]] = {}
     for ModuleName, (SourcePath, IsPackage) in sorted(ModuleIndex.items()):
@@ -259,7 +297,11 @@ class SourceStructureTests(unittest.TestCase):
     def testRepositoryPythonDoesNotReferenceRetiredImportNames(self) -> None:
         References: list[tuple[str, str]] = []
         for SourceRoot in (
+            RepositoryRoot / "App",
+            RepositoryRoot / "Assets",
             RepositoryRoot / "Compiler",
+            RepositoryRoot / "PhysicalDesign",
+            RepositoryRoot / "RedstoneCompiler",
             RepositoryRoot / "Tools",
             RepositoryRoot / "Tests",
         ):
@@ -299,22 +341,19 @@ class SourceStructureTests(unittest.TestCase):
         self.assertEqual(tuple(sorted(Violations)), ())
 
     def testNarrowPublicEntrypointsHaveConcreteOwners(self) -> None:
-        from Compiler.Placement.Access import BuildPlacementAccessFabric
-        from Compiler.Placement.Core import PlacePcbGraph
-        from Compiler.Placement.Flow import PlaceAndRoutePcb
-        from Compiler.Routing.Authoritative import RouteAuthoritativeResources
-        from Compiler.Routing.Components import (
-            CompileClosedComponent,
-            SolveComponentRoutingProblem,
-        )
+        from PhysicalDesign.Placement.Access import BuildPlacementAccessFabric
+        from PhysicalDesign.Placement.Core import PlacePcbGraph
+        from PhysicalDesign.Flow import PlaceAndRoutePcb
+        from PhysicalDesign.Routing.Global import RouteAuthoritativeResources
+        from PhysicalDesign.Routing.Regions import CompileClosedComponent, SolveComponentRoutingProblem
 
         Owners = {
-            BuildPlacementAccessFabric: "Compiler.Placement.Access.Fabric",
-            PlacePcbGraph: "Compiler.Placement.Core.Commit",
-            PlaceAndRoutePcb: "Compiler.Placement.Flow.Runner",
-            RouteAuthoritativeResources: "Compiler.Routing.Authoritative.Flow",
-            CompileClosedComponent: "Compiler.Routing.Components.Pipeline",
-            SolveComponentRoutingProblem: "Compiler.Routing.Components.Solver",
+            BuildPlacementAccessFabric: "PhysicalDesign.Placement.Access.Fabric",
+            PlacePcbGraph: "PhysicalDesign.Placement.Core.Commit.Commit",
+            PlaceAndRoutePcb: "PhysicalDesign.Flow.Runner",
+            RouteAuthoritativeResources: "PhysicalDesign.Routing.Global.Flow.Flow",
+            CompileClosedComponent: "PhysicalDesign.Routing.Regions.Pipeline",
+            SolveComponentRoutingProblem: "PhysicalDesign.Routing.Regions.Solving.Solver",
         }
         self.assertEqual(
             tuple(sorted(
@@ -328,14 +367,8 @@ class SourceStructureTests(unittest.TestCase):
             self.assertIsInstance(inspect.signature(Function), inspect.Signature)
 
     def testAuthoritativePhaseRunnerAcceptsExplicitServices(self) -> None:
-        from Compiler.Routing.Authoritative.Flow import (
-            RunAuthoritativeRoutingPhases,
-        )
-        from Compiler.Routing.Authoritative.RunState import (
-            AuthoritativeRoutingServices,
-            AuthoritativeRoutingState,
-            PhaseOutcome,
-        )
+        from PhysicalDesign.Routing.Global.Flow.Flow import RunAuthoritativeRoutingPhases
+        from PhysicalDesign.Routing.Global.Flow.RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
 
         Sentinel = object()
         Services = AuthoritativeRoutingServices({"Sentinel": Sentinel})
@@ -355,8 +388,8 @@ class SourceStructureTests(unittest.TestCase):
         )
 
     def testActionsPackagePreservesConsolidatedConflictExports(self) -> None:
-        from Compiler.Routing import Actions
-        from Compiler.Routing.Actions import Validation
+        from PhysicalDesign.Redstone import Actions
+        from PhysicalDesign.Redstone.Actions import Validation
 
         self.assertIs(
             Actions.AnalyzeFlatRouteConflicts,

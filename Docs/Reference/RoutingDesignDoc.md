@@ -32,11 +32,11 @@ Current implementation note (2026-08-28):
 
 | Responsibility | Owner |
 |---|---|
-| immutable routing schemas | `Compiler/Routing/Contracts/` |
-| portal/claim/boundary relations | `Compiler/Routing/Interfaces/` |
-| component problem, portfolios, solvers, certificates, cache | `Compiler/Routing/Components/` |
-| candidates, leases, negotiated trees, ports, assignment, materialization | `Compiler/Routing/Authoritative/` |
-| placement access, core search/repair/commit, flow | `Compiler/Placement/{Access,Core,Flow}/` |
+| immutable routing schemas | `PhysicalDesign/Contracts/` |
+| portal/claim/boundary relations | `PhysicalDesign/Interfaces/` |
+| component problem, portfolios, solvers, certificates, cache | `PhysicalDesign/Routing/Regions/` |
+| candidates, leases, negotiated trees, ports, assignment, materialization | `PhysicalDesign/Routing/Global/` |
+| placement access, core search/repair/commit, flow | `PhysicalDesign/Placement/{Access,Core,Flow}/` |
 | native runtime, geometry, path, assignment, escape, generation, planning, simulation, binding | `RustRouting/Src/*/`; escape candidates/catalogs and generation detailed-tree phases use nested subdomains |
 
 The six supported Python entrypoints and clean-break retirement list are in

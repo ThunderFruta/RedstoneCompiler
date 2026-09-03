@@ -1268,7 +1268,7 @@ def BuildSourceContentManifest(
     for RelativeRoot, Pattern in (
         (Path("App"), "*.py"),
         (Path("Compiler"), "*.py"),
-        (Path("SchemEncoder"), "*.py"),
+        (Path("PhysicalDesign"), "*.py"),
         (Path("RustRouting/Src"), "*.rs"),
     ):
         Root = RepositoryPath / RelativeRoot
@@ -1540,10 +1540,7 @@ except Exception as Error:
 
 def BuildPolicyProvenanceRecord() -> dict[str, object]:
     """Fingerprint the complete immutable policy selected by ``default``."""
-    from Compiler.Routing.Policy import (
-        PolicyForRoutingStrategy,
-        RoutingStrategy,
-    )
+    from PhysicalDesign.Policy import PolicyForRoutingStrategy, RoutingStrategy
 
     Policy = PolicyForRoutingStrategy(RoutingStrategy.Default)
     Snapshot = Policy.ToDictionary()
@@ -1610,7 +1607,7 @@ def CanonicalizeNbt(Value: object) -> object:
 
 def BuildEmittedDesignDigest(SchematicPath: Path) -> str:
     """Hash the emitted regions while excluding timestamps and output names."""
-    from SchemEncoder.SchemWriter import ReadNbt
+    from PhysicalDesign.Rendering.SchemWriter import ReadNbt
 
     Root = ReadNbt(SchematicPath)
     Regions = Root.get("Regions")
@@ -1628,7 +1625,7 @@ def BuildLitematicCompositionEvidence(
     SchematicPath: Path,
 ) -> dict[str, int]:
     """Measure the emitted region independently of physical JSON summaries."""
-    from SchemEncoder.SchemWriter import LoadTemplate, ReadNbt
+    from PhysicalDesign.Rendering.SchemWriter import LoadTemplate, ReadNbt
 
     Root = ReadNbt(SchematicPath)
     RegionsTag = Root.get("Regions")

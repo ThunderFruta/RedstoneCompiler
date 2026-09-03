@@ -126,25 +126,25 @@ state, and affected resources without converting the failure to success.
 - `Compiler/Frontend/` -- SystemVerilog parser/adaptor.
 - `Compiler/Ir/` -- compiler IR definitions.
 - `Compiler/Synthesis/` -- NAND normalization transforms.
-- `Compiler/Cells/` -- authoritative standard-cell macro definitions.
-- `Compiler/Placement/Access/`, `Core/`, and `Flow/` -- placement access
+- `PhysicalDesign/Cells/` -- authoritative standard-cell macro definitions.
+- `PhysicalDesign/Placement/Access/`, `Core/`, and `Flow/` -- placement access
   geometry, search/commit, and the physical-flow orchestrator.
-- `Compiler/Placement/Geometry.py` and `Rotation.py` -- shared placed-cell
+- `PhysicalDesign/Geometry/Placement.py` and `Rotation.py` -- shared placed-cell
   geometry primitives.
-- `Compiler/Routing/Authoritative/` -- production portal, route-tree,
+- `PhysicalDesign/Routing/Global/` -- production portal, route-tree,
   base-ownership, exact-assignment, and escalation orchestration.
-- `Compiler/Routing/Reliability.py` -- shared deadline, fingerprint, placement,
+- `PhysicalDesign/Execution/Reliability.py` -- shared deadline, fingerprint, placement,
   failure, and evidence contracts.
-- `Compiler/Routing/Pcb.py` -- PCB routing search and retries.
-- `Compiler/Routing/Contracts/` -- shared immutable routing-stage data
+- `PhysicalDesign/Routing/Pcb.py` -- PCB routing search and retries.
+- `PhysicalDesign/Contracts/` -- shared immutable routing-stage data
   contracts.
-- `Compiler/Routing/Actions/` -- focused geometry, validation, cleanup, and
+- `PhysicalDesign/Redstone/Actions/` -- focused geometry, validation, cleanup, and
   authoritative repeater operations.
-- `Compiler/Routing/Workers/` -- pin-access and detailed-routing stage
+- `PhysicalDesign/Routing/Workers/` -- pin-access and detailed-routing stage
   orchestration.
-- `Compiler/Routing/Technology.py` -- authoritative redstone design rules.
-- `Compiler/Routing/Policy.py` -- serializable physical-design policy.
-- `Compiler/Routing/TrackAssignment.py` -- exact global track ownership types.
+- `PhysicalDesign/Redstone/Technology.py` -- authoritative redstone design rules.
+- `PhysicalDesign/Policy.py` -- serializable physical-design policy.
+- `PhysicalDesign/Routing/Assignment/TrackAssignment.py` -- exact global track ownership types.
 - `RustRouting/Src/` -- native router domains for runtime, geometry, path
   search, assignment, escape planning, generation, and Python
   bindings; `Lib.rs` is the PyO3 registration entrypoint.
@@ -157,7 +157,7 @@ state, and affected resources without converting the failure to success.
   harness source;
   `ValidationServerHarness/Server/` is the ignored local runtime.
 - `Assets/Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
-- `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.
+- `PhysicalDesign/Rendering/SchemWriter.py` -- self-contained Litematica NBT writer.
 
 The complete current ownership map, retired-path list, and structural gates are
 in [Docs/Reference/ProjectTreeDesignDoc.md](Docs/Reference/ProjectTreeDesignDoc.md).

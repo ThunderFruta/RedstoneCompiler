@@ -45,14 +45,14 @@ Remove these together because they implement one old idea: independently route
 many candidate guides, negotiate conflicts, repair pairs, and recursively
 assign a flat whole-design solution.
 
-- `Compiler/Routing/ChannelPlanner.py::BuildChannelPlan` and helpers used only
+- `PhysicalDesign/Routing/Planning/ChannelPlanner.py::BuildChannelPlan` and helpers used only
   by it;
 - legacy guide negotiation, pair repair, and Python exact assignment in that
   path;
-- `Compiler/Routing/TrackAssignment.py::AssignGlobalTracks` and its old
+- `PhysicalDesign/Routing/Assignment/TrackAssignment.py::AssignGlobalTracks` and its old
   assignment/repeater helpers;
-- `Compiler/Routing/Actions/ConflictRepair.py`;
-- `Compiler/Routing/Workers/PinAccess.py` after Rust portal parity coverage
+- `PhysicalDesign/Redstone/Actions/ConflictRepair.py`;
+- `PhysicalDesign/Routing/Workers/PinAccess.py` after Rust portal parity coverage
   replaces its tests;
 - Rust `FindPathOnResourceGraph` and `FindPathsOnResourceGraph` after the old
   pin-access worker is gone;
@@ -106,7 +106,7 @@ removed. It must not remain as a second inactive placement philosophy.
 The following exist only during the project-tree migration:
 
 ```text
-RedstoneCompiler.* imports  → Compiler.*, Compiler.Frontend.*, SchemEncoder.*
+RedstoneCompiler.* imports  → Compiler.*, Compiler.Frontend.*, PhysicalDesign.Rendering.*
 Build/                      → Output/
 .RedstoneWork/             → Cache/Frontend/
 .pytest_cache/             → Cache/Tests/

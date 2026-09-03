@@ -25,7 +25,7 @@ from Compiler.FabricServer import (
 from Compiler.FabricServer.SchemImport import InferLitematicPorts
 from Compiler.Ir.Models import Gate, GateKind, ModuleIR
 from Compiler.Pipeline import RequirePhysicalValidation
-from SchemEncoder.SchemWriter import CellTemplate, BuildLitematicBlockMap, NeutralDynamicState
+from PhysicalDesign.Rendering.SchemWriter import CellTemplate, BuildLitematicBlockMap, NeutralDynamicState
 
 
 def WriteMinimalFabricFixture(PathValue: Path) -> None:

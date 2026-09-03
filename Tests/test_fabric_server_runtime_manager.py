@@ -12,7 +12,7 @@ from unittest.mock import Mock, call, patch
 import unittest
 
 from Compiler.FabricServer import DefaultFabricServerRoot
-from SchemEncoder.SchemWriter import EncodePayload, EncodeString, NbtValue
+from PhysicalDesign.Rendering.SchemWriter import EncodePayload, EncodeString, NbtValue
 
 
 RuntimeScripts = DefaultFabricServerRoot() / "PyScripts"

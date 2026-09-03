@@ -293,9 +293,9 @@ def IsRoutingImplementationSource(RelativePath: str) -> bool:
     if RelativePath == "Main.py":
         return True
     if RelativePath.endswith(".py") and RelativePath.startswith((
+        "App/",
         "Compiler/",
-        "Compiler/Frontend/",
-        "SchemEncoder/",
+        "PhysicalDesign/",
         "RedstoneCompiler/",
     )):
         return True
@@ -600,7 +600,7 @@ def BuildCurrentRuntimeProvenance(Root: Path) -> dict[str, object]:
         "Loaded": True,
         "Module": "RedstoneCompiler.RustRouting",
     })
-    PolicyModule = importlib.import_module("Compiler.Routing.Policy")
+    PolicyModule = importlib.import_module("PhysicalDesign.Policy")
     RoutingStrategy = getattr(PolicyModule, "RoutingStrategy")
     PolicyForRoutingStrategy = getattr(
         PolicyModule,

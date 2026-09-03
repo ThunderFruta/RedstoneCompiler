@@ -19,9 +19,9 @@ from .Synthesis.Diagram import WriteNandDiagram
 from .Synthesis.LogicOptimization import OptimizeLogic
 from .Synthesis.NandTransform import ToNandOnly
 from .Synthesis.Validation import ValidateNandOnlyDesign
-from Compiler.Placement.Flow.Candidates import ApplyRoutingRuntimeBudget
-from Compiler.Placement.Flow.Results import PcbProgress
-from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
+from PhysicalDesign.Flow.Candidates import ApplyRoutingRuntimeBudget
+from PhysicalDesign.Flow.Results import PcbProgress
+from PhysicalDesign.Flow.Runner import PlaceAndRoutePcb
 from .FabricServer import (
     CaptureServerUpdatedLitematic,
     FabricServerConfiguration,
@@ -36,25 +36,13 @@ from .PhysicalValidation import (
     PhysicalValidationResult,
     WritePhysicalFixture,
 )
-from SchemEncoder import SchemWriter
-from SchemEncoder.SchemWriter import BlockCompositionMetrics
-from .Routing.ChannelPlanner import RoutingStageMetrics
-from .Routing.Failures import (
-    RoutingFailure,
-    RoutingFailureReason,
-    RoutingStageError,
-)
-from .Routing.Policy import (
-    ExecutionStrategyForRequest,
-    PhysicalDesignPolicy,
-    PolicyForRoutingStrategy,
-    RoutingStrategy,
-)
-from .Routing.Reliability import BuildStableFingerprint
-from .Routing.Technology import (
-    DefaultRedstoneRoutingTechnology,
-    RedstoneRoutingTechnology,
-)
+from PhysicalDesign.Rendering import SchemWriter
+from PhysicalDesign.Rendering.SchemWriter import BlockCompositionMetrics
+from PhysicalDesign.Routing.Planning.ChannelPlanner import RoutingStageMetrics
+from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
+from PhysicalDesign.Policy import ExecutionStrategyForRequest, PhysicalDesignPolicy, PolicyForRoutingStrategy, RoutingStrategy
+from PhysicalDesign.Execution.Reliability import BuildStableFingerprint
+from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology, RedstoneRoutingTechnology
 
 
 @dataclass

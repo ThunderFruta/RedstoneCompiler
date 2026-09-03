@@ -58,7 +58,7 @@ document and still matched the review inventory.
 | Declared `PlacementFlowState` fields | 8; 7 annotated `Any` |
 | Declared `PlacementCommitState` fields | 30; all annotated `Any` |
 
-The AST inventory covered `Compiler/`, `Compiler/Frontend/`, `SchemEncoder/`,
+The AST inventory covered `Compiler/`, `Compiler/Frontend/`, `PhysicalDesign/Rendering/`,
 `Assets/Templates/`, `Tools/`, `ValidationServerHarness/Mchprs/`, and `Main.py`.
 It included explicit imports inside functions and conditional branches.
 It did not reconstruct implicit package initialization, dynamic imports,
@@ -71,7 +71,7 @@ The recorded gate command was:
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider \
   Tests/Structural/test_source_structure.py \
-  Tests/Routing/test_routing_contract_schema.py
+  Tests/PhysicalDesign/Routing/test_routing_contract_schema.py
 ~~~
 
 Routing acceptance, native behavioral tests, MCHPRS validation, and Fabric
@@ -169,7 +169,7 @@ Most crossings identified here are allowed by the current rules.
 
 ### F2. The public router combines different use cases
 
-[RouteAuthoritativeResources](../../Compiler/Routing/Authoritative/Flow.py#L20)
+[RouteAuthoritativeResources](../../PhysicalDesign/Routing/Global/Flow/Flow.py#L20)
 has 50 parameters. Nine end in `Only`, covering portal geometry, track
 assignment, raw domains, foreign-access validation, interface assignment,
 component problems, assembly, and port-factor preparation.
@@ -184,12 +184,12 @@ Each operation needs a specific input type, output family, and budget.
 
 ### F3. Phase state is broad and weakly specified
 
-[AuthoritativeRoutingState](../../Compiler/Routing/Authoritative/RunState.py#L44)
+[AuthoritativeRoutingState](../../PhysicalDesign/Routing/Global/Flow/RunState.py#L44)
 declares 1,078 fields, all `Any`. Slots constrain attribute names but do not
 establish field types, valid stage transitions, or which phase may mutate a
 field.
 
-[PlacementFlowState](../../Compiler/Placement/Flow/State.py#L28) declares eight
+[PlacementFlowState](../../PhysicalDesign/Flow/State.py#L28) declares eight
 initial fields and allows dynamic attributes. Its helper uses `setattr`.
 The source inventory found 566 distinct `Context.*` assignment names across
 Placement/Flow and 411 across the Placement/Core/Commit modules. Those are
@@ -201,7 +201,7 @@ should become a deliberate input/output contract or coordinator-owned state.
 
 ### F4. Service injection preserves a broad namespace
 
-[AuthoritativeRoutingServices](../../Compiler/Routing/Authoritative/RunState.py#L12)
+[AuthoritativeRoutingServices](../../PhysicalDesign/Routing/Global/Flow/RunState.py#L12)
 wraps `Mapping[str, Any]`, exposing it through `__getattr__`.
 The public flow constructs that table from `globals()`.
 
@@ -212,14 +212,14 @@ clock, or event sink it needs, with concrete signatures.
 
 ### F5. Contracts mix output data with solver sessions
 
-[Contracts/Results.py](../../Compiler/Routing/Contracts/Results.py#L29) imports
+[Contracts/Results.py](../../PhysicalDesign/Contracts/Results.py#L29) imports
 types from ChannelPlanner, ResourceGraph, and TrackAssignment.
 `RoutedDesign` includes geometry alongside selected planning and diagnostic
 objects. `RoutingResources` contains static geometry together with mutable
 caches, native contexts, ownership fingerprints, and prepared solver state.
 
 For example,
-[boundary-relation code](../../Compiler/Routing/Interfaces/BoundaryRelations.py#L1897)
+[boundary-relation code](../../PhysicalDesign/Interfaces/BoundaryRelations.py#L1897)
 can attach cache fields to the resource object. This lets consumers expand a
 shared object's responsibilities.
 
@@ -232,14 +232,14 @@ The proposed split is:
 
 ### F6. Physical responsibilities cross placement, routing, and rendering
 
-[Placement/Core/CommitRouting.py](../../Compiler/Placement/Core/CommitRouting.py#L46)
+[Placement/Core/CommitRouting.py](../../PhysicalDesign/Placement/Core/Commit/CommitRouting.py#L46)
 finds local paths, validates local power, builds claims, and freezes local
 wires. This means placement results already contain a mixture of positions
 and routing decisions.
 
-[Routing/Actions/Geometry.py](../../Compiler/Routing/Actions/Geometry.py#L9)
-imports `LoadTemplate` from SchemEncoder. The
-[writer](../../SchemEncoder/SchemWriter.py#L15) imports cell definitions,
+[Routing/Actions/Geometry.py](../../PhysicalDesign/Redstone/Actions/Geometry.py#L9)
+imports `LoadTemplate` from PhysicalDesign.Rendering. The
+[writer](../../PhysicalDesign/Rendering/SchemWriter.py#L15) imports cell definitions,
 placement transforms, and routing technology helpers.
 
 Coordinated placement and routing are necessary. The boundary improvement is
@@ -249,7 +249,7 @@ geometry and redstone semantics into shared foundations.
 The physical model also remains distributed. Resource generation, final
 physical graphs, power propagation, and wire-state rendering implement related
 decisions in different places.
-[BuildRoutingResources](../../Compiler/Routing/Actions/Geometry.py#L201)
+[BuildRoutingResources](../../PhysicalDesign/Redstone/Actions/Geometry.py#L201)
 does not receive the selected technology when constructing its resource graph.
 That is a concrete propagation gap for a future versioned model contract.
 
@@ -257,12 +257,12 @@ That is a concrete propagation gap for a future versioned model contract.
 
 The compact-placement score compares access/electrical conflict penalties,
 area, maximum dimension, and then estimated wire length. The
-[score ordering](../../Compiler/Placement/Core/Compactness.py#L357) means that,
+[score ordering](../../PhysicalDesign/Placement/Core/Compactness.py#L357) means that,
 with equal conflict penalties, a smaller area wins before connection length
 is considered. Some other placement paths also contain distance and capacity
 costs; the current implementation is not uniformly footprint-only.
 
-[CompactRoutedTrees](../../Compiler/Routing/Pcb.py#L99) builds a graph from
+[CompactRoutedTrees](../../PhysicalDesign/Routing/Pcb.py#L99) builds a graph from
 existing wire positions and retains paths to required terminals and access
 points. It removes loops and unused branches but cannot create a new path
 through an empty gap. A winding path can remain necessary within that
@@ -421,7 +421,7 @@ search are different results. A domain may be fully searched without covering
 every possible circuit layout.
 
 The current
-[portfolio solver](../../Compiler/Routing/TemplateAssignment.py#L616)
+[portfolio solver](../../PhysicalDesign/Routing/Assignment/TemplateAssignment.py#L616)
 returns immediately for an incomplete materialized domain. The proposed
 feasibility policy should retain legal incumbents and consider alternatives
 while separately reporting search completeness and optimality.
@@ -503,12 +503,12 @@ cell palette, with progressively more detailed queries:
 | Diagnostics | Legal, illegal, or unknown decisions with claims, assumptions, affected positions and reasons. |
 
 Current implementations to reconcile include
-[Technology.py](../../Compiler/Routing/Technology.py),
-[ResourceGraph.py](../../Compiler/Routing/ResourceGraph.py),
-[Actions/Geometry.py](../../Compiler/Routing/Actions/Geometry.py),
-[Actions/Validation.py](../../Compiler/Routing/Actions/Validation.py),
-[PropagateRoutePower](../../Compiler/Routing/Actions/Repeaters.py#L156), and
-[BuildWireState](../../SchemEncoder/SchemWriter.py#L517).
+[Technology.py](../../PhysicalDesign/Redstone/Technology.py),
+[ResourceGraph.py](../../PhysicalDesign/Resources/ResourceGraph.py),
+[Actions/Geometry.py](../../PhysicalDesign/Redstone/Actions/Geometry.py),
+[Actions/Validation.py](../../PhysicalDesign/Redstone/Actions/Validation.py),
+[PropagateRoutePower](../../PhysicalDesign/Redstone/Actions/Repeaters.py#L156), and
+[BuildWireState](../../PhysicalDesign/Rendering/SchemWriter.py#L517).
 
 The model must be cheap enough for search. Cached orientation masks and local
 queries should avoid complete block-map expansion. Exact candidate checks
@@ -556,7 +556,7 @@ backpressure.
 
 One absolute routing deadline covers planning, search, and routing cleanup.
 Tasks need cancellation checkpoints and bounded teardown. The current
-[per-batch proof pool](../../Compiler/Routing/Components/SymbolicDomains.py#L1178)
+[per-batch proof pool](../../PhysicalDesign/Routing/Regions/Symbolic/SymbolicDomains.py#L1178)
 and its context-manager lifetime are specific migration targets: a wait on
 shutdown must not extend the intended deadline indefinitely.
 

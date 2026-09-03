@@ -41,14 +41,14 @@ required to be acyclic.
 ## Python ownership
 
 ```text
-Compiler/Placement/
+PhysicalDesign/Placement/
 ├── Access/       geometry, escape paths, attachment, capacity oracle
 ├── Core/         constraints, channels, clusters, search, mandatory access,
 │                 repair, compactness, final commit
 └── Flow/         run state/services, demand, feedback, portfolios, attempts,
                   component assembly, routing, publication, runner
 
-Compiler/Routing/
+PhysicalDesign/Routing/
 ├── Contracts/    core, placement, component, physical-interface, result schemas
 ├── Interfaces/   portal constraints, exact claims, boundary relations
 ├── Components/   fabric/problem construction, portfolios, legacy and dynamic
@@ -65,12 +65,12 @@ The narrow supported entrypoints are:
 
 | Entrypoint | Concrete owner |
 |---|---|
-| `Compiler.Placement.Flow.PlaceAndRoutePcb` | `Placement/Flow/Runner.py` |
-| `Compiler.Placement.Core.PlacePcbGraph` | `Placement/Core/Commit.py` |
-| `Compiler.Placement.Access.BuildPlacementAccessFabric` | `Placement/Access/Fabric.py` |
-| `Compiler.Routing.Authoritative.RouteAuthoritativeResources` | `Routing/Authoritative/Flow.py` |
-| `Compiler.Routing.Components.SolveComponentRoutingProblem` | `Routing/Components/Solver.py` |
-| `Compiler.Routing.Components.CompileClosedComponent` | `Routing/Components/Pipeline.py` |
+| `PhysicalDesign.Flow.PlaceAndRoutePcb` | `Placement/Flow/Runner.py` |
+| `PhysicalDesign.Placement.Core.PlacePcbGraph` | `Placement/Core/Commit.py` |
+| `PhysicalDesign.Placement.Access.BuildPlacementAccessFabric` | `Placement/Access/Fabric.py` |
+| `PhysicalDesign.Routing.Global.RouteAuthoritativeResources` | `Routing/Authoritative/Flow.py` |
+| `PhysicalDesign.Routing.Regions.SolveComponentRoutingProblem` | `Routing/Components/Solver.py` |
+| `PhysicalDesign.Routing.Regions.CompileClosedComponent` | `Routing/Components/Pipeline.py` |
 
 Internal helpers are imported from their concrete owner. Package APIs do not
 re-export the old broad implementation surfaces.
@@ -135,17 +135,17 @@ remain unchanged.
 The following implementation paths must stay absent:
 
 ```text
-Compiler/Placement/AccessFabric.py
-Compiler/Placement/Pcb.py
-Compiler/Placement/PcbFlow.py
-Compiler/Routing/Models.py
-Compiler/Routing/AuthoritativePlanner.py
-Compiler/Routing/ComponentAccess.py
-Compiler/Routing/ComponentPlanning.py
-Compiler/Routing/ComponentRouter.py
-Compiler/Routing/ComponentPipeline.py
-Compiler/Routing/Actions/ConflictRepair.py
-Compiler/Cells/Nand.py
+PhysicalDesign/Placement/AccessFabric.py
+PhysicalDesign/Placement/Pcb.py
+PhysicalDesign/Placement/PcbFlow.py
+PhysicalDesign/Routing/Models.py
+PhysicalDesign/Routing/AuthoritativePlanner.py
+PhysicalDesign/Routing/ComponentAccess.py
+PhysicalDesign/Routing/ComponentPlanning.py
+PhysicalDesign/Routing/ComponentRouter.py
+PhysicalDesign/Routing/ComponentPipeline.py
+PhysicalDesign/Redstone/Actions/ConflictRepair.py
+PhysicalDesign/Cells/Nand.py
 Compiler/Simulation/{Redstone.py,__init__.py}
 RustRouting/Src/{Assignment,AssignmentPlanning,Bindings,Deadline,
                  EscapePlanning,Generation,LeasePlanning,Models,PathRouting}.rs
@@ -154,7 +154,7 @@ RustRouting/Src/Simulation/{LogicSimulation.rs,mod.rs}
 
 `ConflictRepair.py` was consolidated into `Routing/Actions/Validation.py` while
 the established `Actions` exports were preserved. The unused duplicate NAND
-dataclass was removed; `Compiler/Cells/Library.py` remains authoritative.
+dataclass was removed; `PhysicalDesign/Cells/Library.py` remains authoritative.
 
 The retired names below are an active denylist, not import instructions. They
 may be mentioned only in this ownership policy and in
@@ -191,13 +191,13 @@ clean break. Use this ownership map to locate the current owner:
 
 `Tests/Structural/test_source_structure.py` enforces these rules. Contract field order,
 defaults, signatures, aliases, and serialization are pinned separately by
-`Tests/Routing/test_routing_contract_schema.py`.
+`Tests/PhysicalDesign/Routing/test_routing_contract_schema.py`.
 
 ## Verification commands
 
 ```bash
-python3 -m compileall -q Compiler/Placement Compiler/Routing
-python3 -m pytest -q Tests/Structural/test_source_structure.py Tests/Routing/test_routing_contract_schema.py
+python3 -m compileall -q PhysicalDesign/Placement PhysicalDesign/Routing
+python3 -m pytest -q Tests/Structural/test_source_structure.py Tests/PhysicalDesign/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 python3 -m pytest -q
 cargo fmt --manifest-path RustRouting/Cargo.toml -- --check

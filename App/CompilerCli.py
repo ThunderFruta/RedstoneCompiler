@@ -19,8 +19,8 @@ from threading import Event, Lock, Thread, active_count
 if __package__:
     from Compiler.Pipeline import CompileSvToLitematic
     from Compiler.PhysicalValidation import PhysicalValidationProgress
-    from Compiler.Placement.Flow.Results import PcbProgress
-    from Compiler.Routing.Policy import RoutingStrategy
+    from PhysicalDesign.Flow.Results import PcbProgress
+    from PhysicalDesign.Policy import RoutingStrategy
     from .RunReporting import (
         BuildRunId,
         CaptureTerminalOutput,
@@ -33,8 +33,8 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from Compiler.Pipeline import CompileSvToLitematic
     from Compiler.PhysicalValidation import PhysicalValidationProgress
-    from Compiler.Placement.Flow.Results import PcbProgress
-    from Compiler.Routing.Policy import RoutingStrategy
+    from PhysicalDesign.Flow.Results import PcbProgress
+    from PhysicalDesign.Policy import RoutingStrategy
     from App.RunReporting import BuildRunId, CaptureTerminalOutput, FormatResultLines, PromoteRunArtifacts, UtcTimestamp, WriteRunReport
 
 

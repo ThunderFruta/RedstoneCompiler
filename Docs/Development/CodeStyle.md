@@ -1,8 +1,8 @@
 # Code style
 
 Keep the pipeline stage-aligned: frontend parsing in `SVDecoder`, synthesis and
-IR in `Compiler`, placement in `Compiler/Placement`, routing in
-`Compiler/Routing`, and output encoding in `SchemEncoder`.
+IR in `Compiler`, placement in `PhysicalDesign/Placement`, routing in
+`PhysicalDesign/Routing`, and output encoding in `SchemEncoder`.
 
 Source identifiers use PascalCase, including functions, methods, classes, and
 public members. Prefer explicit stage names over generic helpers. Preserve

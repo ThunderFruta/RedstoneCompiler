@@ -70,34 +70,34 @@ smaller circuit never establishes CLA4 acceptance.
 
 ### Confirmed code behavior
 
-The [cell library](../../../Compiler/Cells/Library.py) declares
+The [cell library](../../../PhysicalDesign/Cells/Library.py) declares
 `PinAccessPattern`, but `CellMacro.PinAccessPatterns` currently constructs one
 straight three-block pattern for each input or output pin. Production
 placement does not consume that property as its authoritative option domain.
 
 The current tree already contains a substantial pre-route access subsystem in
-`Compiler/Placement/Access/`. `BuildPlacementAccessFabric` and the attachment
+`PhysicalDesign/Placement/Access/`. `BuildPlacementAccessFabric` and the attachment
 helpers in `Access/Fabric.py`, together with the standalone oracle in
 `Access/Capacity.py`, construct immutable escape stubs, terminal domains,
 fabric, and assignment representations named
 `PlacementAccessEscapeStub`, `PlacementAccessTerminalDomain`,
 `PlacementAccessFabric`, and `PlacementAccessAssignment` in
-`Compiler/Routing/Contracts/Placement.py`. The standalone
+`PhysicalDesign/Contracts/Placement.py`. The standalone
 `SolvePlacementAccessFabricCapacity`/`AttachPlacementAccessAssignment` path is
 not the current production selector; it is exercised by focused fixtures.
-Production `Compiler/Placement/Flow/` deliberately leaves stubs unselected and
+Production `PhysicalDesign/Flow/` deliberately leaves stubs unselected and
 `SolveRawTrackAssignmentPortfolioWithContext` selects the combined
 track/access witness later. The proposal must extend that production selection
 seam rather than accidentally reviving the unused standalone capacity solver.
 
 Instead, fixed access is reconstructed independently in several places:
 
-- `Compiler/Placement/Core/Clustering.py::PcbGatesConflict` derives straight access rays
+- `PhysicalDesign/Placement/Core/Clustering.py::PcbGatesConflict` derives straight access rays
   during placement legality;
-- `Compiler/Placement/Core/MandatoryAccess.py::BuildMandatoryAccessClaims` reconstructs those
+- `PhysicalDesign/Placement/Core/MandatoryAccess.py::BuildMandatoryAccessClaims` reconstructs those
   rays and expands them into wire, support, required-air, and electrical
   claims;
-- `Compiler/Routing/Pcb.py::CompactRoutedTrees` reconstructs terminal access
+- `PhysicalDesign/Routing/Pcb.py::CompactRoutedTrees` reconstructs terminal access
   again while compacting routed trees; and
 - later component-interface code constructs a richer physical port-option
   domain after a placement has already survived the fixed-access screen.
@@ -109,15 +109,15 @@ The missing behavior is to expose verified cell-local alternatives while
 placement variables remain live and to preserve one selected identity through
 every later representation.
 
-`Compiler/Placement/Core/Search.py::OptimizeJointClusterPlacement` searches
+`PhysicalDesign/Placement/Core/Search.py::OptimizeJointClusterPlacement` searches
 cluster slots and eight rigid transforms, then
-`Compiler/Placement/Core/Commit.py::PlacePcbGraph` materializes and exact-
+`PhysicalDesign/Placement/Core/Commit/Commit.py::PlacePcbGraph` materializes and exact-
 screens retained states.
-`Compiler/Placement/Flow/PlacementAttempts.py::_TryPlacement` rejects a
+`PhysicalDesign/Flow/PlacementAttempts.py::_TryPlacement` rejects a
 complete candidate on mandatory-access conflicts. If no candidate survives,
-`Compiler/Placement/Flow/Runner.py::_PlaceAndRoutePcbWithPolicy` creates the
+`PhysicalDesign/Flow/Runner.py::_PlaceAndRoutePcbWithPolicy` creates the
 observed placement failure before
-`Compiler/Routing/Authoritative/Flow.py::RouteAuthoritativeResources` is
+`PhysicalDesign/Routing/Global/Flow/Flow.py::RouteAuthoritativeResources` is
 called.
 
 ### Hypotheses to test
@@ -309,14 +309,14 @@ For this compiler that means:
 ### Stage 1: authoritative access-template catalog
 
 `CellMacro.PinAccessPatterns` owns cell-local pattern seeds and logical pin
-roles. `Compiler/Routing/Technology.py` remains the single owner of shared
+roles. `PhysicalDesign/Redstone/Technology.py` remains the single owner of shared
 physical rules such as access length, track pitch, routing layers, and repeater
-limits. Existing `Compiler/Placement/Access/Fabric.py` owns fabric and
-terminal-domain construction, `Compiler/Placement/Access/Geometry.py` owns its
-derived perimeter shells, and `Compiler/Placement/Geometry.py` owns pure placed
+limits. Existing `PhysicalDesign/Placement/Access/Fabric.py` owns fabric and
+terminal-domain construction, `PhysicalDesign/Placement/Access/Geometry.py` owns its
+derived perimeter shells, and `PhysicalDesign/Geometry/Placement.py` owns pure placed
 cell transforms. The production raw track-assignment portfolio
 owns final combined selection until the proposed master explicitly replaces
-that responsibility. `Compiler/Routing/ResourceGraph.py` remains the exact
+that responsibility. `PhysicalDesign/Resources/ResourceGraph.py` remains the exact
 claim authority. No second access-length constant or parallel claim model is
 introduced.
 
@@ -397,15 +397,15 @@ No downstream stage reconstructs or substitutes those decisions. A mismatch
 is a typed identity error.
 
 The code dependency remains one-way. Placement constructs the contract using a
-neutral immutable schema in `Compiler/Routing/Contracts/Placement.py`,
+neutral immutable schema in `PhysicalDesign/Contracts/Placement.py`,
 consistent with the existing Placement-to-Routing contract imports.
 Placement-owned validation
 recomputes transforms, pin mappings, and blocks through
-`Compiler/Placement/Geometry.py`. Routing independently validates the contract's
+`PhysicalDesign/Geometry/Placement.py`. Routing independently validates the contract's
 claims, reservations, access coverage, leases, and fingerprints without
-importing `Compiler/Placement`. `Compiler/Pipeline.py`, which already sits above
+importing `PhysicalDesign/Placement`. `Compiler/Pipeline.py`, which already sits above
 both stages, composes those two validators. In particular,
-`Compiler/Routing/Authoritative/` must not import `Compiler/Placement/Access/`
+`PhysicalDesign/Routing/Global/` must not import `PhysicalDesign/Placement/Access/`
 or duplicate `BuildPlacedGate` to recover placement state.
 
 ### Stage 5: existing negotiated routing
@@ -417,7 +417,7 @@ route claim/connectivity checks. Within that flow, `PlanNegotiatedRouteTrees`
 remains the detailed per-net negotiated tree/repair substage. It uses sparse
 resource regions, present/history congestion costs, branch-preserving repair,
 and repeater-aware state. Placement feedback remains owned by the surrounding
-`Compiler/Placement/Flow/` controller, not by that subroutine.
+`PhysicalDesign/Flow/` controller, not by that subroutine.
 
 `RouteAuthoritativeResources` receives selected access roots and reserved
 claims as immutable occupancy. The new strategy forbids it from regenerating a
@@ -454,7 +454,7 @@ The v17 validation chain shall perform:
 The solver's witness is evidence supplied to validation, not a replacement for
 validation.
 
-Current `Compiler/Routing/Actions/Validation.py::ValidatePhysicalRoutes` proves
+Current `PhysicalDesign/Redstone/Actions/Validation.py::ValidatePhysicalRoutes` proves
 that each signal reaches all of its own required targets. It does not explicitly
 reject a route that also reaches another signal's logical target. That
 foreign-target reachability check is a new v17 route-level validator applied
@@ -851,10 +851,10 @@ the accepted incumbent.
 ## Canonical sealed component macros
 
 The existing
-`Compiler/Routing/Contracts/Component.py::RoutedComponentTemplate` and
-`Compiler/Routing/Components/Pipeline.py::CompileClosedComponent` already have
+`PhysicalDesign/Contracts/Component.py::RoutedComponentTemplate` and
+`PhysicalDesign/Routing/Regions/Pipeline.py::CompileClosedComponent` already have
 a normalized reusable cache seam.
-`Compiler/Routing/Components/Cache.py::BuildCompletedComponentTemplateCacheFingerprint`
+`PhysicalDesign/Routing/Regions/Cache.py::BuildCompletedComponentTemplateCacheFingerprint`
 normalizes origin, signal roles, ports, claims, and technology;
 `_InstantiateCachedTemplate` translates coordinates and signal bindings and
 then revalidates physical claims. The proposal extends that existing cache with
@@ -925,22 +925,22 @@ must not wait for the full shared-boundary implementation.
 
 | Current owner | Current responsibility | Proposed change |
 | --- | --- | --- |
-| [`Compiler/Cells/Library.py`](../../../Compiler/Cells/Library.py) | `CellMacro`, one straight cell-local `PinAccessPattern` seed per pin | own logical pin roles and finite cell-local pattern seeds without duplicating technology rules |
-| [`Compiler/Routing/Technology.py`](../../../Compiler/Routing/Technology.py) | shared access length, track, layer, and repeater rules | remain the only physical technology authority consumed by access generation |
-| [`Compiler/Placement/Geometry.py`](../../../Compiler/Placement/Geometry.py) | transforms cell pins/directions into placed gates | provide pure cell transforms used by `Placement/Access/`; do not compile claims here |
-| [`Compiler/Placement/Access/`](../../../Compiler/Placement/Access/) | fabric/escape construction and attachment in `Fabric.py`; standalone capacity selection in `Capacity.py` is not the production selector | extend authoritative option/domain construction while integrating final selection with the production raw track-assignment portfolio, then preserve one frozen binding |
-| [`Compiler/Placement/Core/`](../../../Compiler/Placement/Core/) | clustering, joint search, fixed-ray legality, mandatory claims, exact screen, local route templates, and final commit | generate placement domains, consume canonical access claims, and retire duplicate fixed-ray reconstruction on the new strategy |
-| New `Compiler/Placement/Core/PlacementAccess.py` | not present | master construction, solve dispatch, and core translation; typed neutral records belong in `Routing/Contracts/Placement.py` |
-| New `Compiler/Placement/Core/ClusterTemplates.py` | not present | access-legal local template synthesis and Pareto retention |
-| [`Compiler/Placement/Flow/`](../../../Compiler/Placement/Flow/) | typed placement/routing lifecycle, attempts, retries, repair epochs, and narrow runner | add explicit v17 phases without reintroducing a monolithic controller; retire superseded control-plane branches only after acceptance |
-| [`Compiler/Routing/Contracts/`](../../../Compiler/Routing/Contracts/) | placement-access fabric/assignment, physical port factors/CSP state, and concrete routed component templates | add the neutral immutable handoff schema; Placement constructs it and Routing consumes it without a Routing-to-Placement import |
-| [`Compiler/Routing/Components/`](../../../Compiler/Routing/Components/) | exact component interface CSP, closed-component compilation, normalized template fingerprint, cache, instantiation, and revalidation | expose a narrow identity-stable access/lease subproblem or proof-core projection and extend the existing cache identity with selected-access and proof records; do not add a parallel macro cache |
-| [`Compiler/Routing/Authoritative/`](../../../Compiler/Routing/Authoritative/) | physical port factors, negotiated routing, materialization, and final route checks | accept the frozen contract, forbid access regeneration, and keep negotiated routing/final DRC |
-| [`Compiler/Routing/ResourceGraph.py`](../../../Compiler/Routing/ResourceGraph.py) | canonical routing graph and claim construction | remain the single exact claim authority for access and routes |
-| [`Compiler/Routing/Pcb.py`](../../../Compiler/Routing/Pcb.py) | route compaction and physical route orchestration | consume frozen access instead of reconstructing straight terminal rays |
-| New `Compiler/Placement/Core/HandoffValidation.py` | not present | recompute placed transforms, pin mappings, blocks, and placement-side fingerprint using existing placement geometry |
-| New `Compiler/Routing/Interfaces/HandoffValidation.py` | not present | validate claims, repeater reservations, access coverage, leases, and routing-side fingerprint without importing `Compiler/Placement` |
-| [`Compiler/Routing/Actions/Validation.py`](../../../Compiler/Routing/Actions/Validation.py) | physical connectivity graphs and route validation | retain route connectivity ownership and add only route-level strengthened checks |
+| [`PhysicalDesign/Cells/Library.py`](../../../PhysicalDesign/Cells/Library.py) | `CellMacro`, one straight cell-local `PinAccessPattern` seed per pin | own logical pin roles and finite cell-local pattern seeds without duplicating technology rules |
+| [`PhysicalDesign/Redstone/Technology.py`](../../../PhysicalDesign/Redstone/Technology.py) | shared access length, track, layer, and repeater rules | remain the only physical technology authority consumed by access generation |
+| [`PhysicalDesign/Geometry/Placement.py`](../../../PhysicalDesign/Geometry/Placement.py) | transforms cell pins/directions into placed gates | provide pure cell transforms used by `Placement/Access/`; do not compile claims here |
+| [`PhysicalDesign/Placement/Access/`](../../../PhysicalDesign/Placement/Access/) | fabric/escape construction and attachment in `Fabric.py`; standalone capacity selection in `Capacity.py` is not the production selector | extend authoritative option/domain construction while integrating final selection with the production raw track-assignment portfolio, then preserve one frozen binding |
+| [`PhysicalDesign/Placement/Core/`](../../../PhysicalDesign/Placement/Core/) | clustering, joint search, fixed-ray legality, mandatory claims, exact screen, local route templates, and final commit | generate placement domains, consume canonical access claims, and retire duplicate fixed-ray reconstruction on the new strategy |
+| New `PhysicalDesign/Placement/Core/PlacementAccess.py` | not present | master construction, solve dispatch, and core translation; typed neutral records belong in `Routing/Contracts/Placement.py` |
+| New `PhysicalDesign/Placement/Core/ClusterTemplates.py` | not present | access-legal local template synthesis and Pareto retention |
+| [`PhysicalDesign/Flow/`](../../../PhysicalDesign/Flow/) | typed placement/routing lifecycle, attempts, retries, repair epochs, and narrow runner | add explicit v17 phases without reintroducing a monolithic controller; retire superseded control-plane branches only after acceptance |
+| [`PhysicalDesign/Contracts/`](../../../PhysicalDesign/Contracts/) | placement-access fabric/assignment, physical port factors/CSP state, and concrete routed component templates | add the neutral immutable handoff schema; Placement constructs it and Routing consumes it without a Routing-to-Placement import |
+| [`PhysicalDesign/Routing/Regions/`](../../../PhysicalDesign/Routing/Regions/) | exact component interface CSP, closed-component compilation, normalized template fingerprint, cache, instantiation, and revalidation | expose a narrow identity-stable access/lease subproblem or proof-core projection and extend the existing cache identity with selected-access and proof records; do not add a parallel macro cache |
+| [`PhysicalDesign/Routing/Global/`](../../../PhysicalDesign/Routing/Global/) | physical port factors, negotiated routing, materialization, and final route checks | accept the frozen contract, forbid access regeneration, and keep negotiated routing/final DRC |
+| [`PhysicalDesign/Resources/ResourceGraph.py`](../../../PhysicalDesign/Resources/ResourceGraph.py) | canonical routing graph and claim construction | remain the single exact claim authority for access and routes |
+| [`PhysicalDesign/Routing/Pcb.py`](../../../PhysicalDesign/Routing/Pcb.py) | route compaction and physical route orchestration | consume frozen access instead of reconstructing straight terminal rays |
+| New `PhysicalDesign/Placement/Core/HandoffValidation.py` | not present | recompute placed transforms, pin mappings, blocks, and placement-side fingerprint using existing placement geometry |
+| New `PhysicalDesign/Interfaces/HandoffValidation.py` | not present | validate claims, repeater reservations, access coverage, leases, and routing-side fingerprint without importing `PhysicalDesign/Placement` |
+| [`PhysicalDesign/Redstone/Actions/Validation.py`](../../../PhysicalDesign/Redstone/Actions/Validation.py) | physical connectivity graphs and route validation | retain route connectivity ownership and add only route-level strengthened checks |
 | [`Compiler/FabricServer/`](../../../Compiler/FabricServer/) | authoritative server-validation contract | own server lifecycle, ticking, readback, and result diagnostics without an in-process redstone model |
 | [`Compiler/Pipeline.py`](../../../Compiler/Pipeline.py) | stage orchestration, final validation, failure evidence, staged multi-file replacement with exception cleanup | compose placement-side and routing-side handoff validation, serialize v17 contract/proof telemetry, and add manifest/directory finalization before immutable-incumbent replacement |
 | New `RustRouting/Src/PlacementAccess/` domain | not present | optional production finite solver split into state/domain/search/API modules, with propagation and a typed bounded result |
@@ -967,7 +967,7 @@ def EnumeratePlacedPinAccessOptions(
     """Return a typed complete or incomplete domain for one placed cell."""
 ```
 
-- **Owner:** extended `Compiler/Placement/Access/Fabric.py`, consuming
+- **Owner:** extended `PhysicalDesign/Placement/Access/Fabric.py`, consuming
   cell-local seeds and the routing technology.
 - **Reads:** immutable placed-cell transform, logical pin binding, catalog,
   technology.
@@ -994,9 +994,9 @@ def BuildPinAccessOptionOwnership(
 ```
 
 - **Owner:** a narrow physical-ownership adapter called from
-  `Compiler/Placement/Access/Fabric.py`.
+  `PhysicalDesign/Placement/Access/Fabric.py`.
   It delegates four-kind claim construction to the authoritative compiler in
-  `Compiler/Routing/ResourceGraph.py` and repeater position/facing construction
+  `PhysicalDesign/Resources/ResourceGraph.py` and repeater position/facing construction
   to the established routing reservation model; placement must not maintain
   parallel implementations.
 - **Reads:** complete option blocks/path and resource-model identity.
@@ -1021,7 +1021,7 @@ def BuildAccessLegalClusterTemplates(
     """Return a typed local frontier with explicit completeness certificates."""
 ```
 
-- **Owner:** proposed `Compiler/Placement/Core/ClusterTemplates.py`.
+- **Owner:** proposed `PhysicalDesign/Placement/Core/ClusterTemplates.py`.
 - **Calls:** typed option-domain enumeration, physical-ownership compiler,
   local exact solver, and physical validators.
 - **Returns:** templates, per-domain completeness certificates, attrition
@@ -1042,7 +1042,7 @@ def SolveJointPlacementAccess(
     """Select exact placement/access ownership without detailed route paths."""
 ```
 
-- **Owner:** proposed `Compiler/Placement/Core/PlacementAccess.py` with an
+- **Owner:** proposed `PhysicalDesign/Placement/Core/PlacementAccess.py` with an
   optional native implementation in a nested
   `RustRouting/Src/PlacementAccess/` domain.
 - **Calls:** deterministic propagation/search and existing narrow interface
@@ -1068,11 +1068,11 @@ def ValidateFrozenPhysicalPlacementContract(
 ```
 
 - **Owner:** orchestration in `Compiler/Pipeline.py`. Proposed
-  `Compiler/Placement/Core/HandoffValidation.py` recomputes transforms, pin mappings,
+  `PhysicalDesign/Placement/Core/HandoffValidation.py` recomputes transforms, pin mappings,
   and blocks through placement geometry. Proposed
-  `Compiler/Routing/Interfaces/HandoffValidation.py` independently checks claims,
+  `PhysicalDesign/Interfaces/HandoffValidation.py` independently checks claims,
   repeater reservations, access coverage, leases, and fingerprints without a
-  Routing-to-Placement import. `Compiler/Routing/Actions/Validation.py` retains
+  Routing-to-Placement import. `PhysicalDesign/Redstone/Actions/Validation.py` retains
   route-connectivity responsibility.
 - **Reads:** contract, NAND IR, technology/resource model.
 - **Returns:** `None` or typed hard error.
@@ -1085,7 +1085,7 @@ def ValidateFrozenPhysicalPlacementContract(
 ### `RouteAuthoritativeResources`
 
 Current owner and behavior remain in
-`Compiler/Routing/Authoritative/Flow.py`. The proposed signature gains an
+`PhysicalDesign/Routing/Global/Flow/Flow.py`. The proposed signature gains an
 explicit `PlacementContract` argument. On v17 it shall:
 
 - validate the contract once at entry;
@@ -1099,7 +1099,7 @@ explicit `PlacementContract` argument. On v17 it shall:
 
 ### `CompactRoutedTrees`
 
-The current function in `Compiler/Routing/Pcb.py` must receive the frozen
+The current function in `PhysicalDesign/Routing/Pcb.py` must receive the frozen
 contract or explicit immutable access paths. It may remove redundant routed
 branches but may not recreate pin rays, delete selected access claims or
 repeater reservations, or change access identity.

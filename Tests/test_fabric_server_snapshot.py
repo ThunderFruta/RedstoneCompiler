@@ -13,7 +13,7 @@ from Compiler.FabricServer.ServerSnapshot import (
     IterFixtureWorldPositionBatches,
 )
 from Compiler.FabricServer.SchemImport import ReadLitematicIoLabels
-from SchemEncoder.SchemWriter import LoadTemplate
+from PhysicalDesign.Rendering.SchemWriter import LoadTemplate
 
 
 class FabricServerSnapshotTests(unittest.TestCase):

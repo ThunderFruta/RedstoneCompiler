@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 from Compiler.FabricServer import BuildFabricFixtureFromSchem
 from Compiler.FabricServer.SchemImport import ReadLitematicIoLabels
-from SchemEncoder import SchemWriter
-from SchemEncoder.SchemWriter import CellTemplate, EncodePayload, EncodeString, NbtValue
+from PhysicalDesign.Rendering import SchemWriter
+from PhysicalDesign.Rendering.SchemWriter import CellTemplate, EncodePayload, EncodeString, NbtValue
 
 
 def _WriteSpongeSchem(PathValue: Path, *, BlockData: bytes, BlockEntities: list[dict[str, NbtValue]] | None = None) -> None:

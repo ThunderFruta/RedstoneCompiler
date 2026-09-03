@@ -13,15 +13,8 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from Compiler.Routing.Technology import (
-    OppositeHorizontalFacing,
-    RepeaterInputDelta,
-    RepeaterOutputDelta,
-)
-from SchemEncoder.SchemWriter import (
-    BuildRepeaterOrientationAudit,
-    WriteLitematic,
-)
+from PhysicalDesign.Redstone.Technology import OppositeHorizontalFacing, RepeaterInputDelta, RepeaterOutputDelta
+from PhysicalDesign.Rendering.SchemWriter import BuildRepeaterOrientationAudit, WriteLitematic
 
 
 Position = tuple[int, int, int]

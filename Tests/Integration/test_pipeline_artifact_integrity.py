@@ -16,12 +16,8 @@ from Compiler.Pipeline import (
     SuccessArtifactPaths,
     WriteRoutingFailureArtifact,
 )
-from Compiler.Routing.Failures import (
-    RoutingFailure,
-    RoutingFailureReason,
-    RoutingStageError,
-)
-from Compiler.Routing.Policy import RoutingStrategy
+from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
+from PhysicalDesign.Policy import RoutingStrategy
 
 
 class PipelineArtifactIntegrityTests(unittest.TestCase):

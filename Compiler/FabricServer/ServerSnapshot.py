@@ -7,7 +7,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from typing import Any, Iterator
 
-from SchemEncoder.SchemWriter import WriteObservedLitematic
+from PhysicalDesign.Rendering.SchemWriter import WriteObservedLitematic
 
 from .SchemImport import ReadLitematicIoLabels
 from .Validation import FabricServerSupervisor

@@ -4,7 +4,7 @@ The compiler now uses a stage-aligned runtime layout:
 
 - Parsing and elaboration are under `Compiler/Frontend/`.
 - Core compiler behavior is under `Compiler/` by phase.
-- Litematic encoding is in `SchemEncoder/SchemWriter.py`.
+- Litematic encoding is in `PhysicalDesign/Rendering/SchemWriter.py`.
 - Templates are in `Assets/Templates/`.
 - User-visible artifacts are under `Output/`.
 - Disposable runtime state is under `Cache/`.
@@ -14,17 +14,17 @@ The compiler now uses a stage-aligned runtime layout:
 
 - Frontend parsing belongs to `Compiler/Frontend/`.
 - Core compiler behavior belongs to `Compiler/` by phase.
-- Litematic encoding belongs in `SchemEncoder/SchemWriter.py`.
+- Litematic encoding belongs in `PhysicalDesign/Rendering/SchemWriter.py`.
 - Templates are in `Assets/Templates/`.
 - Tests remain in `Tests/` and generated artifacts in `Output/`.
 - Disposables are isolated under `Cache/`.
 
 ## Placement and routing ownership (2026-08-28)
 
-- `Compiler/Placement/Access/` owns access geometry and the standalone capacity
+- `PhysicalDesign/Placement/Access/` owns access geometry and the standalone capacity
   oracle; `Core/` owns placement search/repair/commit; `Flow/` owns run-local
   orchestration and publication.
-- `Compiler/Routing/Contracts/` and `Interfaces/` are neutral lower layers.
+- `PhysicalDesign/Contracts/` and `Interfaces/` are neutral lower layers.
   `Components/` owns local component solving, and `Authoritative/` owns the
   global physical route.
 - `Compiler/FabricServer/` owns fixtures, live validation, mismatch failure
