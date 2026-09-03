@@ -17,10 +17,10 @@ import traceback
 from threading import Event, Lock, Thread, active_count
 
 if __package__:
-    from .Pipeline import CompileSvToLitematic
-    from .PhysicalValidation import PhysicalValidationProgress
+    from Compiler.Pipeline import CompileSvToLitematic
+    from Compiler.PhysicalValidation import PhysicalValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
-    from .Routing.Policy import RoutingStrategy
+    from Compiler.Routing.Policy import RoutingStrategy
     from .RunReporting import (
         BuildRunId,
         CaptureTerminalOutput,
@@ -35,17 +35,10 @@ else:
     from Compiler.PhysicalValidation import PhysicalValidationProgress
     from Compiler.Placement.Flow.Results import PcbProgress
     from Compiler.Routing.Policy import RoutingStrategy
-    from Compiler.RunReporting import (
-        BuildRunId,
-        CaptureTerminalOutput,
-        FormatResultLines,
-        PromoteRunArtifacts,
-        UtcTimestamp,
-        WriteRunReport,
-    )
+    from App.RunReporting import BuildRunId, CaptureTerminalOutput, FormatResultLines, PromoteRunArtifacts, UtcTimestamp, WriteRunReport
 
 
-from Compiler.Telemetry import RoutingTelemetry
+from App.Telemetry import RoutingTelemetry
 
 
 MinecraftSchematicsDirectory = Path(

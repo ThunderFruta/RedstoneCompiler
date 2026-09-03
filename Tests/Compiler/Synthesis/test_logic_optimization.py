@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from SVDecoder.Sv import ParseSvToNetlist
+from Compiler.Frontend.Sv import ParseSvToNetlist
 from Compiler.Synthesis.LogicOptimization import (
     CountNands,
     EvaluateModuleOutputs,

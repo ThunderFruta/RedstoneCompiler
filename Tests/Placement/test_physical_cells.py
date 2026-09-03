@@ -36,7 +36,7 @@ from SchemEncoder.SchemWriter import (
     WriteLitematic,
     _PlaceIoSigns,
 )
-from Templates import LitematicTemplates
+from Assets.Templates import LitematicTemplates
 
 
 class PhysicalCellTests(unittest.TestCase):

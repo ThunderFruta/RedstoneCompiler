@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 
-from Scripts.Fabric import ConsoleFabricServer
+from Tools.Fabric import ConsoleFabricServer
 
 
 class FabricServerConsoleTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class FabricServerConsoleTests(unittest.TestCase):
             Root = Path(TemporaryDirectoryPath)
             Output = StringIO()
             with patch(
-                "Scripts.Fabric.ConsoleFabricServer.FabricServerSupervisor",
+                "Tools.Fabric.ConsoleFabricServer.FabricServerSupervisor",
             ) as SupervisorConstructor, redirect_stdout(Output):
                 SupervisorConstructor.return_value.ControlRunningServer.return_value = (
                     SimpleNamespace(

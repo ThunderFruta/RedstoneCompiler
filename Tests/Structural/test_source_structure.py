@@ -260,7 +260,7 @@ class SourceStructureTests(unittest.TestCase):
         References: list[tuple[str, str]] = []
         for SourceRoot in (
             RepositoryRoot / "Compiler",
-            RepositoryRoot / "Scripts",
+            RepositoryRoot / "Tools",
             RepositoryRoot / "Tests",
         ):
             for SourcePath in sorted(SourceRoot.rglob("*.py")):

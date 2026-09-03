@@ -6,12 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from Compiler.RunReporting import (
-    CaptureTerminalOutput,
-    FormatResultLines,
-    PromoteRunArtifacts,
-    WriteRunReport,
-)
+from App.RunReporting import CaptureTerminalOutput, FormatResultLines, PromoteRunArtifacts, WriteRunReport
 
 
 class RunReportingTests(unittest.TestCase):
@@ -89,7 +84,7 @@ class RunReportingTests(unittest.TestCase):
                 "RoutingStages": [{"Stage": "expensive interface preparation", "WallSeconds": 1.0, "CpuSeconds": 1.5}],
                 "Detailed": {"Status": "complete", "SampleCount": 4},
             }
-            with patch("Compiler.RunReporting.BuildGitIdentity", return_value={}):
+            with patch("App.RunReporting.BuildGitIdentity", return_value={}):
                 Report = WriteRunReport(
                     RunDirectory=Root, Result="SUCCESS", WallSeconds=1.0,
                     CpuSeconds=1.5, Summary="done", RepositoryRoot=Root,
@@ -123,7 +118,7 @@ class RunReportingTests(unittest.TestCase):
                     },
                 ),
                 patch(
-                    "Compiler.RunReporting.BuildGitIdentity",
+                    "App.RunReporting.BuildGitIdentity",
                     return_value={"Branch": "main", "Head": "abc"},
                 ),
             ):

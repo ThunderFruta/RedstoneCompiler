@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from SVDecoder import Sv
+from Compiler.Frontend import Sv
 
 from Compiler.Placement.Core.Commit import PlacePcbGraph
 from Compiler.Placement.PreRouteInterface import (

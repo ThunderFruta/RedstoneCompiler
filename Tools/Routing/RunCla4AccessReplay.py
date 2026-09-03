@@ -14,7 +14,7 @@ from time import monotonic
 from typing import Any
 
 
-RepositoryRoot = Path(__file__).resolve().parents[1]
+RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 

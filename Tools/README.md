@@ -11,7 +11,7 @@ flags.
   backend. Designs through 20 inputs run every truth-table vector.
 
 ```bash
-python3 Scripts/Mchprs/TestPhysicalFixture.py \
+python3 Tools/Mchprs/TestPhysicalFixture.py \
   Output/FullAdder/FullAdder.PhysicalFixture.json \
   Output/FullAdder/FullAdder.Nand.json
 ```
@@ -54,23 +54,23 @@ python3 Scripts/Mchprs/TestPhysicalFixture.py \
   requiring Enter before each next row.
 
 ```bash
-python3 Scripts/Fabric/ControlFabricServer.py start
+python3 Tools/Fabric/ControlFabricServer.py start
 # Open an interactive authenticated Minecraft command console.
-python3 Scripts/Fabric/ConsoleFabricServer.py
+python3 Tools/Fabric/ConsoleFabricServer.py
 # Or issue exactly one server command.
-python3 Scripts/Fabric/ConsoleFabricServer.py --command "say RedstoneCompiler ready"
-python3 Scripts/Fabric/ImportSchemToFabricServer.py build.litematic \
+python3 Tools/Fabric/ConsoleFabricServer.py --command "say RedstoneCompiler ready"
+python3 Tools/Fabric/ImportSchemToFabricServer.py build.litematic \
   --origin 0 64 0 --replace
 # Run every row (also the default when neither option is supplied).
-python3 Scripts/Fabric/TestSchemInFabricServer.py build.litematic --all
+python3 Tools/Fabric/TestSchemInFabricServer.py build.litematic --all
 # Run only row 3 of the same derived truth table.
-python3 Scripts/Fabric/TestSchemInFabricServer.py build.litematic --one 3
+python3 Tools/Fabric/TestSchemInFabricServer.py build.litematic --one 3
 # Run the complete table, with one independent Fabric validation per row.
 # Press Enter after each completed row to advance.
-python3 Scripts/Fabric/TestSchemInFabricServer.py build.litematic --all-one-at-a-time
+python3 Tools/Fabric/TestSchemInFabricServer.py build.litematic --all-one-at-a-time
 # Erase all imported circuit blocks while preserving the same saved world.
-python3 Scripts/Fabric/ControlFabricServer.py clear
-python3 Scripts/Fabric/ControlFabricServer.py stop
+python3 Tools/Fabric/ControlFabricServer.py clear
+python3 Tools/Fabric/ControlFabricServer.py stop
 ```
 
 ## Routing
@@ -81,6 +81,6 @@ python3 Scripts/Fabric/ControlFabricServer.py stop
   in a new timestamped output directory.
 
 ```bash
-python3 Scripts/Routing/RunRouterAcceptance.py
-python3 Scripts/Routing/CaptureRoutingDesignSnapshot.py --help
+python3 Tools/Routing/RunRouterAcceptance.py
+python3 Tools/Routing/CaptureRoutingDesignSnapshot.py --help
 ```

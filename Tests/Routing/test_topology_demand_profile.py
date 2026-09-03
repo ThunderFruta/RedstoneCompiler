@@ -119,7 +119,7 @@ from Compiler.Routing.Contracts.Placement import (
 )
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
-from SVDecoder.Sv import ParseSvToNetlist
+from Compiler.Frontend.Sv import ParseSvToNetlist
 
 
 def BuildNandModule(

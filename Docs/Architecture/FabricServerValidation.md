@@ -32,13 +32,13 @@ Manage the canonical runtime from the repository root with:
 
 ```bash
 # Guided lifecycle menu; Enter selects a safe status check.
-python3 Scripts/Fabric/ControlFabricServer.py
-python3 Scripts/Fabric/ControlFabricServer.py start
+python3 Tools/Fabric/ControlFabricServer.py
+python3 Tools/Fabric/ControlFabricServer.py start
 # Open the authenticated manual command console against the running server.
-python3 Scripts/Fabric/ConsoleFabricServer.py
-python3 Scripts/Fabric/ControlFabricServer.py stop
+python3 Tools/Fabric/ConsoleFabricServer.py
+python3 Tools/Fabric/ControlFabricServer.py stop
 # Clear every persisted non-air simulation block without restarting the server.
-python3 Scripts/Fabric/ControlFabricServer.py clear
+python3 Tools/Fabric/ControlFabricServer.py clear
 ```
 
 The tracked control command delegates to the modular, runtime-local
@@ -56,7 +56,7 @@ the typed 26.2 gamerule API.
 
 `ValidationServerHarness/Server/` is not a Git deployment target. When tracked
 Fabric harness Java changes, build `ValidationServerHarness` with the available
-Gradle installation, then run `Scripts/Fabric/ControlFabricServer.py start`.
+Gradle installation, then run `Tools/Fabric/ControlFabricServer.py start`.
 The manager copies a newer built JAR into the local runtime and only restarts a
 healthy running server when that JAR needs refreshing. The runtime-local
 `PyScripts` modules survive a branch merge on this canonical host, but are not
@@ -182,7 +182,7 @@ With the dedicated server already running, load a Sponge v2/v3 `.schem` or the
 compiler's `.litematic` artifact into the local world with:
 
 ```bash
-python3 Scripts/Fabric/ImportSchemToFabricServer.py /path/to/build.schem \
+python3 Tools/Fabric/ImportSchemToFabricServer.py /path/to/build.schem \
   --origin 0 64 0 --replace
 ```
 
@@ -201,7 +201,7 @@ requires the run token in its local configuration.
 For compiler-produced litematics, run the paired tester after import:
 
 ```bash
-python3 Scripts/Fabric/TestSchemInFabricServer.py /path/to/build.litematic
+python3 Tools/Fabric/TestSchemInFabricServer.py /path/to/build.litematic
 ```
 
 It reads the imported fixture and the adjacent `<build>.Nand.json` oracle,

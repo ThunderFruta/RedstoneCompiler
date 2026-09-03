@@ -9,13 +9,8 @@ import unittest
 from unittest.mock import patch
 from typing import Any
 
-from SVDecoder import Sv
-from Compiler.Main import (
-    BuildParser,
-    Main,
-    PrintFabricFailureSummary,
-    PrintRoutingFailureSummary,
-)
+from Compiler.Frontend import Sv
+from App.CompilerCli import BuildParser, Main, PrintFabricFailureSummary, PrintRoutingFailureSummary
 from Compiler.Pipeline import CompileSvToLitematic
 from Compiler.Placement.Flow.Demand import BuildPlacementGenerationPlan
 from Compiler.Placement.Flow.Preparation import PlacementNeedsDemandDiversity
@@ -447,7 +442,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             StandardOutput = StringIO()
             with (
                 patch(
-                    "Compiler.Main.CompileSvToLitematic",
+                    "App.CompilerCli.CompileSvToLitematic",
                     side_effect=Failure,
                 ) as Compile,
                 redirect_stderr(ErrorOutput),

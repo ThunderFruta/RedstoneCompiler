@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable
-from Compiler.Telemetry import TelemetryWork
+from App.Telemetry import TelemetryWork
 from Compiler.Routing.Policy import ClusteringPolicy, NandPackingPolicy, PlacementPolicy
 from Compiler.Routing.Failures import RoutingAssignmentCut
 from .Clusters import PcbPlacement

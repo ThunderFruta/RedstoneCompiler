@@ -15,7 +15,7 @@ from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
 from Compiler.Synthesis.Validation import ValidateNandOnlyDesign
-from SVDecoder.Sv import ParseSvToNetlist
+from Compiler.Frontend.Sv import ParseSvToNetlist
 
 
 @dataclass(frozen=True)

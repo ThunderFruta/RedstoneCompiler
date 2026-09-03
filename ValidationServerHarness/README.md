@@ -19,14 +19,14 @@ JARs, worlds, backups, and logs.
 From the repository root, manage it with:
 
 ```sh
-python3 Scripts/Fabric/ControlFabricServer.py start
+python3 Tools/Fabric/ControlFabricServer.py start
 # Sends commands through the authenticated harness; :quit leaves the console.
-python3 Scripts/Fabric/ConsoleFabricServer.py
+python3 Tools/Fabric/ConsoleFabricServer.py
 # No arguments show the guided lifecycle menu.
-python3 Scripts/Fabric/ControlFabricServer.py
+python3 Tools/Fabric/ControlFabricServer.py
 # Clears every persisted non-air simulation block without restarting the server.
-python3 Scripts/Fabric/ControlFabricServer.py clear
-python3 Scripts/Fabric/ControlFabricServer.py stop
+python3 Tools/Fabric/ControlFabricServer.py clear
+python3 Tools/Fabric/ControlFabricServer.py stop
 ```
 
 The manager updates the installed harness at

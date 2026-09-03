@@ -99,9 +99,9 @@ The canonical physical acceptance owner runs its configured matrix sequentially
 and writes a durable evidence manifest:
 
 ```bash
-python3 Scripts/Routing/RunRouterAcceptance.py \
+python3 Tools/Routing/RunRouterAcceptance.py \
   --output-root Output/Acceptance --python /usr/bin/python3 --dry-run
-python3 Scripts/Routing/RunRouterAcceptance.py \
+python3 Tools/Routing/RunRouterAcceptance.py \
   --output-root Output/Acceptance --python /usr/bin/python3
 ```
 
@@ -121,9 +121,9 @@ state, and affected resources without converting the failure to success.
 ## Package layout
 
 - `Main.py` -- project-root CLI entrypoint (preferred).
-- `Compiler/Main.py` -- command-line implementation and guided/argument workflow.
+- `App/CompilerCli.py` -- command-line implementation and guided/argument workflow.
 - `Compiler/Pipeline.py` -- end-to-end orchestration.
-- `SVDecoder/` -- SystemVerilog parser/adaptor.
+- `Compiler/Frontend/` -- SystemVerilog parser/adaptor.
 - `Compiler/Ir/` -- compiler IR definitions.
 - `Compiler/Synthesis/` -- NAND normalization transforms.
 - `Compiler/Cells/` -- authoritative standard-cell macro definitions.
@@ -148,7 +148,7 @@ state, and affected resources without converting the failure to success.
 - `RustRouting/Src/` -- native router domains for runtime, geometry, path
   search, assignment, escape planning, generation, and Python
   bindings; `Lib.rs` is the PyO3 registration entrypoint.
-- `Scripts/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
+- `Tools/Routing/RunRouterAcceptance.py` -- sequential physical acceptance and
   evidence-manifest harness.
 - `ValidationServerHarness/Mchprs/` -- fast exhaustive physical redstone
   validation through the pinned MCHPRS/Redpiler engine.
@@ -156,7 +156,7 @@ state, and affected resources without converting the failure to success.
   single-fixture Minecraft 26.2 canary check, validation backends, and tracked
   harness source;
   `ValidationServerHarness/Server/` is the ignored local runtime.
-- `Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
+- `Assets/Templates/` -- simple lego blueprints (`Input`, `Output`, `Nand`) for cell placement.
 - `SchemEncoder/SchemWriter.py` -- self-contained Litematica NBT writer.
 
 The complete current ownership map, retired-path list, and structural gates are

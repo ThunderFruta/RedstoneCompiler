@@ -44,11 +44,7 @@ RequiredRegressionRoutingThreads = 16
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from Compiler.RunReporting import (
-    CaptureTerminalOutput,
-    UtcTimestamp,
-    WriteRunReport,
-)
+from App.RunReporting import CaptureTerminalOutput, UtcTimestamp, WriteRunReport
 
 
 @dataclass(frozen=True)
@@ -882,7 +878,7 @@ def ReadConfiguredPythonProfile(
 import json
 import platform
 import sys
-from Scripts.Routing.RunRouterAcceptance import (
+from Tools.Routing.RunRouterAcceptance import (
     BuildCpuExecutionProfile,
     BuildLoadProfile,
     ReadCpuProfile,
@@ -1270,8 +1266,8 @@ def BuildSourceContentManifest(
     """Hash compiler sources that can affect physical benchmark results."""
     CandidatePaths: set[Path] = set()
     for RelativeRoot, Pattern in (
+        (Path("App"), "*.py"),
         (Path("Compiler"), "*.py"),
-        (Path("SVDecoder"), "*.py"),
         (Path("SchemEncoder"), "*.py"),
         (Path("RustRouting/Src"), "*.rs"),
     ):
@@ -1285,9 +1281,9 @@ def BuildSourceContentManifest(
     for RelativePath in (
         Path("Main.py"),
         Path("pyproject.toml"),
-        Path("Scripts/Routing/RunRouterAcceptance.py"),
+        Path("Tools/Routing/RunRouterAcceptance.py"),
         Path("RedstoneCompiler/__init__.py"),
-        Path("Templates/__init__.py"),
+        Path("Assets/Templates/__init__.py"),
         Path("RustRouting/Cargo.toml"),
         Path("RustRouting/Cargo.lock"),
     ):
@@ -1370,7 +1366,7 @@ print(json.dumps({
         ):
             ResolvedPaths = {}
     if not ResolvedPaths:
-        TemplateModulePath = RepositoryPath / "Templates" / "__init__.py"
+        TemplateModulePath = RepositoryPath / "Assets/Templates" / "__init__.py"
         try:
             Namespace = runpy.run_path(str(TemplateModulePath))
             Loaded = Namespace.get("LitematicTemplates")

@@ -8,16 +8,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import Compiler.Main as CompilerMainModule
-import Main as RootMain
+import App.CompilerCli as CompilerMainModule
+import App.Main as RootMain
 from Compiler.FabricServer import FabricValidationProgress
-from Compiler.Main import (
-    CpuRunTelemetry,
-    Main,
-    ParsePromptPath,
-    RunPytest,
-    TerminalValidationProgressReporter,
-)
+from App.CompilerCli import CpuRunTelemetry, Main, ParsePromptPath, RunPytest, TerminalValidationProgressReporter
 
 
 class MainPathTests(unittest.TestCase):
@@ -67,7 +61,7 @@ class MainPathTests(unittest.TestCase):
 
     def testRootBenchmarkUsesCanonicalDefaultAcceptanceMatrix(self) -> None:
         with patch(
-            "Scripts.Routing.RunRouterAcceptance.Main",
+            "Tools.Routing.RunRouterAcceptance.Main",
             return_value=9,
         ) as AcceptanceMain:
             self.assertEqual(RootMain.RunBenchmark([]), 9)
@@ -76,8 +70,8 @@ class MainPathTests(unittest.TestCase):
     def testRootFlagCliDelegatesWithoutOpeningGuidedMenu(self) -> None:
         Arguments = ["--input", "Examples/FullAdder.sv"]
         with (
-            patch("Main.GuidedMenu") as Guided,
-            patch("Main.CompilerCli.Main", return_value=7) as FlagMain,
+            patch("App.Main.GuidedMenu") as Guided,
+            patch("App.Main.CompilerCli.Main", return_value=7) as FlagMain,
         ):
             self.assertEqual(RootMain.Main(Arguments), 7)
         Guided.assert_not_called()
@@ -94,8 +88,8 @@ class MainPathTests(unittest.TestCase):
 
         self.assertEqual(ParsePromptPath(str(Expected)), Expected)
 
-    @patch("Compiler.Main.WriteRunReport")
-    @patch("Compiler.Main.subprocess.Popen")
+    @patch("App.CompilerCli.WriteRunReport")
+    @patch("App.CompilerCli.subprocess.Popen")
     def testRunPytestUsesActiveInterpreterAndRepositoryRoot(
         self,
         Popen,
@@ -224,8 +218,8 @@ class MainPathTests(unittest.TestCase):
             StandardOutput = StringIO()
             StandardError = StringIO()
             with (
-                patch("Compiler.Main.CompileSvToLitematic", side_effect=Compile),
-                patch("Compiler.Main.BuildRunId", return_value="run-id"),
+                patch("App.CompilerCli.CompileSvToLitematic", side_effect=Compile),
+                patch("App.CompilerCli.BuildRunId", return_value="run-id"),
                 redirect_stdout(StandardOutput),
                 redirect_stderr(StandardError),
             ):
@@ -333,14 +327,14 @@ class MainPathTests(unittest.TestCase):
             StandardError = StringIO()
             with (
                 patch(
-                    "Compiler.Main.CompileSvToLitematic",
+                    "App.CompilerCli.CompileSvToLitematic",
                     side_effect=ValueError("controlled compile failure"),
                 ),
                 patch(
-                    "Compiler.Main.WriteRunReport",
+                    "App.CompilerCli.WriteRunReport",
                     side_effect=PermissionError("denied"),
                 ),
-                patch("Compiler.Main.BuildRunId", return_value="run-id"),
+                patch("App.CompilerCli.BuildRunId", return_value="run-id"),
                 redirect_stderr(StandardError),
             ):
                 ReturnCode = Main([

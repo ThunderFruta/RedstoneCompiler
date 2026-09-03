@@ -14,52 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from Scripts.Routing.RunRouterAcceptance import (
-    AcceptanceCase,
-    AcceptanceCases,
-    AcceptanceCommandResult,
-    AcceptanceConfiguration,
-    AcceptedPolicyVersion,
-    AuthoritativeServerBackends,
-    BaselinePolicyVersion,
-    BaselineSchemaVersion,
-    BaselineCompatibilityCaseNames,
-    BuildBaselineComparison,
-    BuildComparisonCompatibility,
-    BuildEmittedDesignDigest,
-    BuildParser,
-    BuildLitematicCompositionEvidence,
-    BuildRunArtifacts,
-    BuildResolvedTemplateInputManifest,
-    BuildSourceProvenance,
-    BuildSubprocessTimeoutSeconds,
-    BuildTruthTableSemanticEvidence,
-    CalculateRuntimeStatistics,
-    ExtendedCaseNames,
-    CandidatePolicyVersion,
-    CanonicalArithmeticDigests,
-    CompareCompatibility,
-    CurrentPolicyVersion,
-    DefaultRoutingPublicationReserveSeconds,
-    DefaultPythonExecutable,
-    DeterministicEvidenceFields,
-    EvaluateRun,
-    EvaluateExactInterfaceProofCheckpoint,
-    ExpandedCaseNames,
-    MaximumDeadlineOverrunSeconds,
-    MaximumRuntimeRegressionFraction,
-    MaximumRuntimeSpreadFraction,
-    NormalizeLegacyFullAdderCeilingCompatibility,
-    RegressionCaseNames,
-    ReadBaselineReference,
-    ReadCgroupCpuQuotaProfile,
-    ReadCpuProfile,
-    RequiredRegressionRoutingThreads,
-    RunAcceptance,
-    RunCompilerCommand,
-    SubprocessDeadlineGraceSeconds,
-    SubprocessFinalizationGraceSeconds,
-)
+from Tools.Routing.RunRouterAcceptance import AcceptanceCase, AcceptanceCases, AcceptanceCommandResult, AcceptanceConfiguration, AcceptedPolicyVersion, AuthoritativeServerBackends, BaselinePolicyVersion, BaselineSchemaVersion, BaselineCompatibilityCaseNames, BuildBaselineComparison, BuildComparisonCompatibility, BuildEmittedDesignDigest, BuildParser, BuildLitematicCompositionEvidence, BuildRunArtifacts, BuildResolvedTemplateInputManifest, BuildSourceProvenance, BuildSubprocessTimeoutSeconds, BuildTruthTableSemanticEvidence, CalculateRuntimeStatistics, ExtendedCaseNames, CandidatePolicyVersion, CanonicalArithmeticDigests, CompareCompatibility, CurrentPolicyVersion, DefaultRoutingPublicationReserveSeconds, DefaultPythonExecutable, DeterministicEvidenceFields, EvaluateRun, EvaluateExactInterfaceProofCheckpoint, ExpandedCaseNames, MaximumDeadlineOverrunSeconds, MaximumRuntimeRegressionFraction, MaximumRuntimeSpreadFraction, NormalizeLegacyFullAdderCeilingCompatibility, RegressionCaseNames, ReadBaselineReference, ReadCgroupCpuQuotaProfile, ReadCpuProfile, RequiredRegressionRoutingThreads, RunAcceptance, RunCompilerCommand, SubprocessDeadlineGraceSeconds, SubprocessFinalizationGraceSeconds
 from SchemEncoder.SchemWriter import WriteLitematic
 
 FrozenRouterRegressionBaselineSha256 = (
@@ -1931,7 +1886,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 Record["Path"]
                 for Record in Provenance["SourceContent"]["Files"]
             }
-            self.assertIn("Templates/__init__.py", SourcePaths)
+            self.assertIn("Assets/Templates/__init__.py", SourcePaths)
             self.assertEqual(
                 set(Provenance["PhysicalTemplates"]["Templates"]),
                 {"Input", "Nand", "Output"},
@@ -1954,7 +1909,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch(
-                "Scripts.Routing.RunRouterAcceptance.platform.processor",
+                "Tools.Routing.RunRouterAcceptance.platform.processor",
                 return_value="x86_64",
             ):
                 Profile = ReadCpuProfile(CpuInfoPath)
@@ -2117,7 +2072,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as DirectoryValue:
             Root = Path(DirectoryValue)
             Repository = Root / "repo"
-            TemplatesDirectory = Repository / "Templates"
+            TemplatesDirectory = Repository / "Assets/Templates"
             TemplatesDirectory.mkdir(parents=True)
             ExternalDirectory = Root / "external-pack"
             ExternalDirectory.mkdir()

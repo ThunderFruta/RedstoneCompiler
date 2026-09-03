@@ -22,7 +22,7 @@ from Compiler.Routing.Technology import (
     OppositeHorizontalFacing,
     ValidateRepeaterInputFacing,
 )
-from Templates import LitematicTemplates
+from Assets.Templates import LitematicTemplates
 
 
 LITEMATIC_VERSION = 7

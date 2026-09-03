@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from Compiler.Telemetry import AwaitTelemetryTask, EmitTelemetryEvent, RunTelemetryTask, TelemetryWork
-from Compiler.TelemetryObserver import MeasureSample, ReadProcessTree, ReadStat, SummarizeTelemetry
+from App.Telemetry import AwaitTelemetryTask, EmitTelemetryEvent, RunTelemetryTask, TelemetryWork
+from App.TelemetryObserver import MeasureSample, ReadProcessTree, ReadStat, SummarizeTelemetry
 
 
 def Stat(Ticks=0, ChildTicks=0, Name="python", Start=1):

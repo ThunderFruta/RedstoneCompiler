@@ -5,7 +5,7 @@ import unittest
 
 
 RepositoryRoot = Path(__file__).resolve().parents[2]
-ScriptPath = RepositoryRoot / "Scripts/RunCla4AccessReplay.py"
+ScriptPath = RepositoryRoot / "Tools/Routing/RunCla4AccessReplay.py"
 Spec = importlib.util.spec_from_file_location("RunCla4AccessReplay", ScriptPath)
 assert Spec is not None and Spec.loader is not None
 ReplayModule = importlib.util.module_from_spec(Spec)

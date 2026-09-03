@@ -294,7 +294,7 @@ def IsRoutingImplementationSource(RelativePath: str) -> bool:
         return True
     if RelativePath.endswith(".py") and RelativePath.startswith((
         "Compiler/",
-        "SVDecoder/",
+        "Compiler/Frontend/",
         "SchemEncoder/",
         "RedstoneCompiler/",
     )):
@@ -548,7 +548,7 @@ def BuildCurrentRuntimeProvenance(Root: Path) -> dict[str, object]:
     ]
     TemplateInventory = RunGit(
         Root,
-        ("ls-files", "-z", "--", "Templates"),
+        ("ls-files", "-z", "--", "Assets/Templates"),
     )
     TemplatePaths = sorted(
         Value.decode("utf-8", errors="surrogateescape")
@@ -566,9 +566,9 @@ def BuildCurrentRuntimeProvenance(Root: Path) -> dict[str, object]:
         for RelativePath in (
             "RustRouting/Cargo.toml",
             "RustRouting/Cargo.lock",
-            "Scripts/Routing/RunRouterAcceptance.py",
+            "Tools/Routing/RunRouterAcceptance.py",
             "pyproject.toml",
-            "Templates/__init__.py",
+            "Assets/Templates/__init__.py",
         )
     ]
 

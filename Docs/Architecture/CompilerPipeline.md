@@ -2,7 +2,7 @@
 
 ## Stage ownership
 
-1. `SVDecoder/` parses and elaborates the supported SystemVerilog subset.
+1. `Compiler/Frontend/` parses and elaborates the supported SystemVerilog subset.
 2. `Compiler/Synthesis/` simplifies logic and maps it to NAND-only form.
 3. `Compiler/Placement/` places standard-cell templates and captures legal
    local routes.

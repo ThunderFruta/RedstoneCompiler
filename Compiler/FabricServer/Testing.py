@@ -9,7 +9,7 @@ from typing import Any
 
 from Compiler.Ir.Models import ModuleIR
 from Compiler.PhysicalValidation.Testing import ReadNandModule
-from SVDecoder import Sv
+from Compiler.Frontend import Sv
 
 from .Fixture import FabricFixtureArtifact
 from .Validation import BuildExpectedVectors

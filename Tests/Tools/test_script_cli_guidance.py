@@ -15,15 +15,8 @@ from Compiler.FabricServer import (
     FabricServerValidationResult,
     ResolveFabricServerRoot,
 )
-from Scripts.Fabric import (
-    ControlFabricServer,
-    ImportSchemToFabricServer,
-    TestSchemInFabricServer,
-)
-from Scripts.Routing import (
-    CaptureRoutingDesignSnapshot,
-    RunRouterAcceptance,
-)
+from Tools.Fabric import ControlFabricServer, ImportSchemToFabricServer, TestSchemInFabricServer
+from Tools.Routing import CaptureRoutingDesignSnapshot, RunRouterAcceptance
 
 
 CanonicalServerRoot = str(ResolveFabricServerRoot())
@@ -116,16 +109,16 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             )
             Output = StringIO()
             with patch(
-                "Scripts.Fabric.ImportSchemToFabricServer.BuildFabricFixtureFromSchem",
+                "Tools.Fabric.ImportSchemToFabricServer.BuildFabricFixtureFromSchem",
                 return_value=Fixture,
             ), patch(
-                "Scripts.Fabric.ImportSchemToFabricServer.WriteFabricFixture",
+                "Tools.Fabric.ImportSchemToFabricServer.WriteFabricFixture",
                 return_value=FixtureArtifact,
             ), patch(
-                "Scripts.Fabric.ImportSchemToFabricServer.FabricServerSupervisor",
+                "Tools.Fabric.ImportSchemToFabricServer.FabricServerSupervisor",
                 return_value=Supervisor,
             ), patch(
-                "Scripts.Fabric.ImportSchemToFabricServer.CaptureServerUpdatedLitematic",
+                "Tools.Fabric.ImportSchemToFabricServer.CaptureServerUpdatedLitematic",
                 return_value=SnapshotArtifact,
             ) as Capture, redirect_stdout(Output):
                 ExitCode = ImportSchemToFabricServer.main([
@@ -317,7 +310,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             )
             Output = StringIO()
             with patch(
-                "Scripts.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
+                "Tools.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
             ) as Supervisor, redirect_stdout(Output):
                 Supervisor.return_value.Validate.return_value = Result
                 ExitCode = TestSchemInFabricServer.Main([
@@ -358,7 +351,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             )
             Output = StringIO()
             with patch(
-                "Scripts.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
+                "Tools.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
             ) as Supervisor, redirect_stdout(Output):
                 Supervisor.return_value.Validate.return_value = Result
                 ExitCode = TestSchemInFabricServer.Main([
@@ -407,7 +400,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             )
             Output = StringIO()
             with patch(
-                "Scripts.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
+                "Tools.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
             ) as Supervisor, redirect_stdout(Output):
                 Supervisor.return_value.ValidateExisting.return_value = Result
                 ExitCode = TestSchemInFabricServer.Main([
@@ -456,10 +449,10 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             )
             Output = StringIO()
             with patch(
-                "Scripts.Fabric.TestSchemInFabricServer.BuildFabricFixtureFromSchem",
+                "Tools.Fabric.TestSchemInFabricServer.BuildFabricFixtureFromSchem",
                 return_value=Document,
             ) as BuildFixture, patch(
-                "Scripts.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
+                "Tools.Fabric.TestSchemInFabricServer.FabricServerSupervisor",
             ) as Supervisor, redirect_stdout(Output):
                 Supervisor.return_value.ValidateExisting.return_value = Result
                 ExitCode = TestSchemInFabricServer.Main([

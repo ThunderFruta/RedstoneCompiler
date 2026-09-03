@@ -58,8 +58,8 @@ document and still matched the review inventory.
 | Declared `PlacementFlowState` fields | 8; 7 annotated `Any` |
 | Declared `PlacementCommitState` fields | 30; all annotated `Any` |
 
-The AST inventory covered `Compiler/`, `SVDecoder/`, `SchemEncoder/`,
-`Templates/`, `Scripts/`, `ValidationServerHarness/Mchprs/`, and `Main.py`.
+The AST inventory covered `Compiler/`, `Compiler/Frontend/`, `SchemEncoder/`,
+`Assets/Templates/`, `Tools/`, `ValidationServerHarness/Mchprs/`, and `Main.py`.
 It included explicit imports inside functions and conditional branches.
 It did not reconstruct implicit package initialization, dynamic imports,
 runtime service lookups, or object aliasing. Native implementation internals,

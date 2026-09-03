@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from SVDecoder import Sv
+from Compiler.Frontend import Sv
 from Compiler.Placement.Geometry import BuildPlacedGate, PlacedDesign
 from Compiler.Placement.Core.Clustering import TransformPackedClusterLayout
 from Compiler.Placement.Core.Commit import PlacePcbGraph

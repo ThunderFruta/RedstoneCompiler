@@ -2,20 +2,20 @@
 
 The compiler now uses a stage-aligned runtime layout:
 
-- Parsing and elaboration are under `SVDecoder/`.
+- Parsing and elaboration are under `Compiler/Frontend/`.
 - Core compiler behavior is under `Compiler/` by phase.
 - Litematic encoding is in `SchemEncoder/SchemWriter.py`.
-- Templates are in `Templates/`.
+- Templates are in `Assets/Templates/`.
 - User-visible artifacts are under `Output/`.
 - Disposable runtime state is under `Cache/`.
 - Project references are under `Docs/`.
 
 ## Ownership at a glance
 
-- Frontend parsing belongs to `SVDecoder/`.
+- Frontend parsing belongs to `Compiler/Frontend/`.
 - Core compiler behavior belongs to `Compiler/` by phase.
 - Litematic encoding belongs in `SchemEncoder/SchemWriter.py`.
-- Templates are in `Templates/`.
+- Templates are in `Assets/Templates/`.
 - Tests remain in `Tests/` and generated artifacts in `Output/`.
 - Disposables are isolated under `Cache/`.
 

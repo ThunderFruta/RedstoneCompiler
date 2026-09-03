@@ -210,7 +210,7 @@ the path and hash of the module actually imported before parity tests. Run the
 fixed 5/3/3/2 physical matrix in a fresh output root:
 
 ```bash
-python3 Scripts/Routing/RunRouterAcceptance.py --date 2026-08-28 \
+python3 Tools/Routing/RunRouterAcceptance.py --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
   --python .venv/bin/python --include-cla4
 ```

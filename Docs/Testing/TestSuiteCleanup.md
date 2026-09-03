@@ -37,7 +37,7 @@ Correctness-sensitive ordering remains covered through typed outcomes,
 deadline/incomplete classification, exact no-good scope, scheduling and repair
 state, cache identity, final conflict checks, and handoff validation. Local
 helper placement and source spelling are reviewed with
-`Scripts/Routing/ReviewSourceStructure.py` and do not gate pytest.
+`Tools/Routing/ReviewSourceStructure.py` and do not gate pytest.
 
 The FullAdder and RCA8 MCHPRS cases read hash-bound tracked fixtures under
 `Tests/Fixtures/Mchprs/`, so a clean checkout exercises all 131,072 RCA8

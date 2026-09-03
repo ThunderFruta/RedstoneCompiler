@@ -6,7 +6,7 @@ from Compiler.Ir.ComponentGraph import BuildComponentGraph
 from Compiler.Ir.Models import Gate, ModuleIR
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
-from SVDecoder.Sv import ParseSvToNetlist
+from Compiler.Frontend.Sv import ParseSvToNetlist
 
 
 def _Example(ModuleName: str) -> ModuleIR:

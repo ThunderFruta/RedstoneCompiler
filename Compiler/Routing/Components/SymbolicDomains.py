@@ -13,7 +13,7 @@ import os
 from time import monotonic
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
-from Compiler.Telemetry import AwaitTelemetryTask, EmitTelemetryEvent, RunTelemetryTask
+from App.Telemetry import AwaitTelemetryTask, EmitTelemetryEvent, RunTelemetryTask
 from ..Failures import (
     RoutingFailure,
     RoutingFailureReason,

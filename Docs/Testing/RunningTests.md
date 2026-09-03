@@ -14,7 +14,7 @@ These gates enforce objective dependency, import, API-owner, and schema
 contracts. Source size and implementation shape are advisory review signals:
 
 ```bash
-python3 Scripts/Routing/ReviewSourceStructure.py
+python3 Tools/Routing/ReviewSourceStructure.py
 ```
 
 The review command reports ownership and the largest files/definitions but
@@ -47,7 +47,7 @@ change thread limits, search policy, validation gates, or deadlines.
 ```bash
 .venv/bin/python Main.py --input Examples/HalfAdder.sv \
   --output Output/Telemetry/HalfAdder.litematic
-.venv/bin/python Scripts/Routing/RunRouterAcceptance.py \
+.venv/bin/python Tools/Routing/RunRouterAcceptance.py \
   --matrix expanded --routing-threads 8 --output-root Output/TelemetryAcceptance
 ```
 
@@ -80,7 +80,7 @@ their monotonic timestamps to identify gaps. A killed run retains a partial samp
 can be summarized afterward without treating it as routing success:
 
 ```bash
-.venv/bin/python Compiler/TelemetryObserver.py --directory <compiler-run-directory>
+.venv/bin/python App/TelemetryObserver.py --directory <compiler-run-directory>
 ```
 
 ## Focused routing checks
@@ -140,7 +140,7 @@ Harness unit tests do not substitute for a live Fabric acceptance run.
 ## Acceptance plan without execution
 
 ```bash
-python3 Scripts/Routing/RunRouterAcceptance.py \
+python3 Tools/Routing/RunRouterAcceptance.py \
   --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
   --python .venv/bin/python \

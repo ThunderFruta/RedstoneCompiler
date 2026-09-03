@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from SVDecoder.Sv import ParseSvToNetlist
+from Compiler.Frontend.Sv import ParseSvToNetlist
 
 
 @pytest.mark.parametrize(

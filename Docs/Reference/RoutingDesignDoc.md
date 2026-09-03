@@ -13,7 +13,7 @@ Canonical implementation focus remains:
 
 Current implementation note (2026-08-28):
 
-- `Main.py` / `Compiler/Main.py` drives the authoritative default router.
+- `Main.py` / `App/CompilerCli.py` drives the authoritative default router.
 - The active default strategy is `default`.
 - RCA4 currently compiles to a routed, truth-verified artifact in live runs.
 - Compatibility checks are now profile-driven by normalized circuit metrics and are

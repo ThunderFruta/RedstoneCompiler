@@ -8,7 +8,7 @@ import tempfile
 
 import pytest
 
-from SVDecoder.Sv import ParseSvToNetlist
+from Compiler.Frontend.Sv import ParseSvToNetlist
 from Compiler.Placement.Flow.Runner import PlaceAndRoutePcb
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly

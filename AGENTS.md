@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`Main.py` and `Compiler/Main.py` provide the CLI; `Compiler/Pipeline.py` coordinates SystemVerilog parsing, NAND synthesis, placement, routing, schematic writing, and physical validation. Keep stage-specific work in its owner: `SVDecoder/`, `Compiler/{Ir,Synthesis,Cells,Placement,Routing}/`, or `SchemEncoder/`. The PyO3 routing backend lives in `RustRouting/Src/`. `ValidationServerHarness/` contains the tracked Java/Fabric harness, while its ignored `Server/` directory is local runtime state. Put tests under the matching domain in `Tests/`; shared fixtures belong in `Tests/Fixtures/`. Examples, templates, documentation, and automation are in `Examples/`, `Templates/`, `Docs/`, and `Scripts/`.
+`Main.py` and `App/CompilerCli.py` provide the CLI; `Compiler/Pipeline.py` coordinates SystemVerilog parsing, NAND synthesis, placement, routing, schematic writing, and physical validation. Keep stage-specific work in its owner: `Compiler/Frontend/`, `Compiler/{Ir,Synthesis,Cells,Placement,Routing}/`, or `SchemEncoder/`. The PyO3 routing backend lives in `RustRouting/Src/`. `ValidationServerHarness/` contains the tracked Java/Fabric harness, while its ignored `Server/` directory is local runtime state. Put tests under the matching domain in `Tests/`; shared fixtures belong in `Tests/Fixtures/`. Examples, templates, documentation, and automation are in `Examples/`, `Assets/Templates/`, `Docs/`, and `Tools/`.
 
 ## Build, Test, and Development Commands
 

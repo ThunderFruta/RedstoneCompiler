@@ -106,7 +106,7 @@ removed. It must not remain as a second inactive placement philosophy.
 The following exist only during the project-tree migration:
 
 ```text
-RedstoneCompiler.* imports  → Compiler.*, SVDecoder.*, SchemEncoder.*
+RedstoneCompiler.* imports  → Compiler.*, Compiler.Frontend.*, SchemEncoder.*
 Build/                      → Output/
 .RedstoneWork/             → Cache/Frontend/
 .pytest_cache/             → Cache/Tests/

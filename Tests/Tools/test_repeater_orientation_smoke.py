@@ -2,7 +2,7 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from Scripts.BuildRepeaterOrientationSmoke import BuildSmokeLitematic
+from Tools.Fabric.BuildRepeaterOrientationSmoke import BuildSmokeLitematic
 from SchemEncoder.SchemWriter import LoadTemplate
 
 

@@ -33,7 +33,7 @@ from Compiler.Placement.PreRouteInterface import (
 from Compiler.Routing.Policy import LocalFirstPhysicalDesignPolicy
 from Compiler.Synthesis.LogicOptimization import OptimizeLogic
 from Compiler.Synthesis.NandTransform import ToNandOnly
-from SVDecoder import Sv
+from Compiler.Frontend import Sv
 from Compiler.Routing.Contracts.Placement import (
     PlacementAccessEscapeStub,
     PlacementAccessFabric,

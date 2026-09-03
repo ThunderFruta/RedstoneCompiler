@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Any, Callable
 
-from SVDecoder import Sv
+from Compiler.Frontend import Sv
 from .Synthesis.Diagram import WriteNandDiagram
 from .Synthesis.LogicOptimization import OptimizeLogic
 from .Synthesis.NandTransform import ToNandOnly

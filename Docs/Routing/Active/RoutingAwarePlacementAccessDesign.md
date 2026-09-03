@@ -13,7 +13,7 @@ document pass.
 
 **Evidence relationship:** Correctness, typed failure, deterministic execution,
 and final validation remain mandatory. The live
-`Scripts/Routing/RunRouterAcceptance.py`, the matrix below, and fresh output
+`Tools/Routing/RunRouterAcceptance.py`, the matrix below, and fresh output
 artifacts control concrete v17 evidence. The existing
 [negotiated route-tree router](NegotiatedRouteTreeRouter.md) remains the target
 global and detailed router. This proposal replaces the placement-to-access
@@ -1409,7 +1409,7 @@ successful CLA4 run are milestones, not full acceptance.
 ## Evidence protocol
 
 The reproducible capture tool is
-`Scripts/Routing/CaptureRoutingDesignSnapshot.py`. Each timestamped bundle records:
+`Tools/Routing/CaptureRoutingDesignSnapshot.py`. Each timestamped bundle records:
 
 - UTC and America/New_York timestamps;
 - branch, full revision, detailed porcelain status, and status digest;
