@@ -1,42 +1,73 @@
 # Project Tree
 
-The compiler now uses a stage-aligned runtime layout:
+The repository groups complete modules by responsibility. The layout migration
+changes source locations and their references; it preserves compiler behavior,
+public launch commands, native exports, and existing runtime data locations.
 
-- Parsing and elaboration are under `Compiler/Frontend/`.
-- Core compiler behavior is under `Compiler/` by phase.
-- Litematic encoding is in `PhysicalDesign/Rendering/SchemWriter.py`.
-- Templates are in `Assets/Templates/`.
-- User-visible artifacts are under `Output/`.
-- Disposable runtime state is under `Cache/`.
-- Project references are under `Docs/`.
+## Source layout
 
-## Ownership at a glance
+```text
+App/                         guided CLI, argument CLI, reports, telemetry
+Assets/Templates/            template catalog and three litematic templates
+Compiler/
+  Frontend/                  SystemVerilog parser
+  Ir/                        logical intermediate representation
+  Synthesis/                 logic and NAND transformations
+  Pipeline.py                existing end-to-end coordinator
+PhysicalDesign/
+  Cells/                     standard-cell definitions
+  Contracts/                 shared physical data contracts and failures
+  Execution/                 existing reliability helpers
+  Flow/                      existing placement/routing orchestration
+  Geometry/                  placement geometry and rotation primitives
+  Interfaces/                claims, boundary relations, portal constraints
+  Placement/                 access, search, repair, and commit modules
+  Redstone/                  technology rules and existing action modules
+  Rendering/                 existing schematic writer
+  Resources/                 routing resource graph
+  Routing/
+    Assignment/              track and template assignment
+    Global/                  existing authoritative global router
+    Planning/                channel planning and local-first routing
+    Regions/                 existing component routing modules
+    Workers/                 eligibility, pin-access, detailed routing
+  Policy.py                  existing physical design policy
+Validation/
+  Core/                      physical fixture, vector, and validation types
+  Fabric/                    Fabric client, fixtures, testing, traces
+    Harness/                 tracked Java/Gradle mod sources
+    Runtime/                 tracked Python runtime-manager sources
+  Mchprs/                    existing MCHPRS validation coordinator
+Native/Routing/              existing Rust crate, lockfile, and nested Src tree
+RedstoneCompiler/            Python facade, native import, native stub
+Tools/{Fabric,Mchprs,Routing}/ developer and runtime tools
+Tests/                       tests grouped by the owning domain
+Docs/                        current references and design documents
+Examples/                    existing SystemVerilog inputs
+Main.py                      compatibility launcher
+```
 
-- Frontend parsing belongs to `Compiler/Frontend/`.
-- Core compiler behavior belongs to `Compiler/` by phase.
-- Litematic encoding belongs in `PhysicalDesign/Rendering/SchemWriter.py`.
-- Templates are in `Assets/Templates/`.
-- Tests remain in `Tests/` and generated artifacts in `Output/`.
-- Disposables are isolated under `Cache/`.
+`App/Main.py` owns the guided launcher and `App/CompilerCli.py` the argument CLI.
+`Compiler/Pipeline.py` remains the coordinator. Folder ownership does not imply
+that the broader boundary refactors proposed in the architecture review are done.
 
-## Placement and routing ownership (2026-08-28)
+The installed commands remain `redstone-compiler` and `redstone-benchmark`.
+`python Main.py` and `python -m RedstoneCompiler` retain their existing entrypoint
+behavior, and the native module remains `RedstoneCompiler.RustRouting`.
 
-- `PhysicalDesign/Placement/Access/` owns access geometry and the standalone capacity
-  oracle; `Core/` owns placement search/repair/commit; `Flow/` owns run-local
-  orchestration and publication.
-- `PhysicalDesign/Contracts/` and `Interfaces/` are neutral lower layers.
-  `Components/` owns local component solving, and `Authoritative/` owns the
-  global physical route.
-- `Validation/Fabric/` owns fixtures, live validation, mismatch failure
-  traces, schematic testing, and settled-server snapshots. `Validation/Fabric/Harness/` owns the tracked mod
-  source; its `Server/` runtime is local and intentionally ignored.
-- `Native/Routing/Src/` is split into nested `Core`, `Geometry`, `Path`,
-  `Assignment`, `Escape`, `Generation`, `Planning`, and `Python`
-  domains. Escape candidates/catalogs and generated detailed-tree phases are
-  further split into their own subdirectories. `Lib.rs` is registration-only.
-- The clean-break retired paths and executable structural limits are listed in
-  [the project-tree design](ProjectTreeDesignDoc.md) and enforced by
-  `Tests/Structural/test_source_structure.py`.
+## Runtime and generated files
+
+- `ValidationServerHarness/Server/` retains the server installation and worlds.
+  The existing override/local/sibling-worktree lookup chooses its runtime root.
+- `ValidationServerHarness/build/` and `ValidationServerHarness/.gradle/` retain
+  Gradle output and project caches.
+- `RustRouting/target/` retains Cargo build output through `.cargo/config.toml`.
+- `Output/`, `Cache/`, `.venv/`, and external Minecraft/template locations keep
+  their existing roles.
+
+These retained runtime/cache containers are ignored and contain no tracked
+compiler or harness source. See the [migration record](RepositoryLayoutMigration.md)
+for the complete file crosswalk and verification boundary.
 
 ## Documentation ownership
 

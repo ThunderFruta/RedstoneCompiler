@@ -1,5 +1,10 @@
 # Legacy Routing and Shim Retirement
 
+The [repository layout migration](../Reference/RepositoryLayoutMigration.md)
+records the current source paths. The dated retirement plans below retain their
+original scope, including old package and cache names; they are not instructions
+to move the retained runtime/cache locations again.
+
 ## 2026-08-28 structural clean break
 
 The Python/Rust monolith split retired `Placement/{AccessFabric,Pcb,PcbFlow}.py`,

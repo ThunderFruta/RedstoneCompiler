@@ -1,4 +1,4 @@
-# Scripts
+# Tools
 
 Every command is runnable from the repository root. Run it with no flags for
 an interactive, safe-by-default guide, or use `--help` for explicit automation

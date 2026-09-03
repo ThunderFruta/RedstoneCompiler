@@ -1,97 +1,97 @@
-# Monolith split and ownership design
+# Source layout and ownership contract
 
-> **Canonical reference.** This is the authoritative ownership and
-> clean-break record for the current source tree. Current source and active
-> documentation control imports and module ownership.
+> **Canonical reference.** This document defines the current source locations,
+> supported package entrypoints, and the structural checks preserved by the
+> repository layout migration. The [migration record](RepositoryLayoutMigration.md)
+> contains the complete old-to-new file map.
 
 ## Status and scope
 
-This is the canonical ownership record for the behavior-preserving Python/Rust
-routing refactor completed in the working tree on 2026-08-28. The change is a
-clean break: repository callers use the concrete new owners and the former
-monolith paths are deleted, with no forwarding modules.
+The September 2026 layout migration moves existing modules intact. Imports,
+resource paths, package initialization, launch wiring, source inventories, and
+build configuration follow those moves. Compiler algorithms, policy defaults,
+schemas, native names, deadline behavior, validation criteria, and runtime data
+locations retain their existing behavior.
 
-The split does not implement routing-aware-placement v17, change the CLI,
-change artifact schemas, change Python-visible native names, or move policy and
-orchestration into Rust. Python still owns orchestration, diagnostics, policy,
-deadlines, and publication. Rust still owns bounded compute kernels.
+This builds on the earlier Python/Rust module split. The broader interface,
+state, compactness, and redstone-model changes in the
+[architecture review](../Architecture/PhysicalDesignArchitectureReview.md) remain
+proposals. This layout does not establish new dependency restrictions.
 
-## Dependency direction
+## Dependency restrictions
 
-```text
-Routing contracts and resource primitives
-        ↓
-Routing physical interfaces
-        ↓
-Component routing
-        ↓
-Authoritative global routing
-        ↓
-Placement flow
-        ↓
-Compiler pipeline, Fabric validation, writer
-```
+The existing lower-layer restrictions now refer to `PhysicalDesign.Contracts`,
+`PhysicalDesign.Interfaces`, `PhysicalDesign.Routing.Regions`, and
+`PhysicalDesign.Routing.Global`. Their prohibited placement dependencies also
+cover the relocated `PhysicalDesign.Flow` and `PhysicalDesign.Geometry` modules.
+The existing candidate-cache/placement-geometry and dependency-service/rotation
+exceptions retain their exact corresponding owners.
 
-`Contracts` and `Interfaces` are neutral. `Components` must not import
-`Authoritative` or placement. `Authoritative` must not import placement search
-or flow; the existing pure `Placement.Geometry` and `Placement.Rotation`
-physical primitives are documented exceptions. The static import graph is
-required to be acyclic.
+The structural import inventory includes `App`, `Compiler`, `PhysicalDesign`,
+and `Validation`, so moving a module cannot remove it from those checks.
 
 ## Python ownership
 
 ```text
-PhysicalDesign/Placement/
-├── Access/       geometry, escape paths, attachment, capacity oracle
-├── Core/         constraints, channels, clusters, search, mandatory access,
-│                 repair, compactness, final commit
-└── Flow/         run state/services, demand, feedback, portfolios, attempts,
-                  component assembly, routing, publication, runner
-
-PhysicalDesign/Routing/
-├── Contracts/    core, placement, component, physical-interface, result schemas
-├── Interfaces/   portal constraints, exact claims, boundary relations
-├── Components/   fabric/problem construction, portfolios, legacy and dynamic
-│                 solvers, no-goods, certification, cache, assembly pipeline
-└── Authoritative/
-    ├── FlowPhases/          ordered global-routing phases
-    ├── NegotiatedRouting/   initialization, preparation, search, state
-    ├── PortSolving/         validation, search, finalization
-    └── *.py                 candidates, leases, guides, ports, assignment,
-                             materialization, run state/services, public flow
+App/                         guided CLI, argument CLI, reports, telemetry
+Assets/Templates/            template catalog and three litematic templates
+Compiler/
+  Frontend/                  SystemVerilog parser
+  Ir/                        logical intermediate representation
+  Synthesis/                 logic and NAND transformations
+  Pipeline.py                existing end-to-end coordinator
+PhysicalDesign/
+  Cells/                     standard-cell definitions
+  Contracts/                 shared physical data contracts and failures
+  Execution/                 existing reliability helpers
+  Flow/                      existing placement/routing orchestration
+  Geometry/                  placement geometry and rotation primitives
+  Interfaces/                claims, boundary relations, portal constraints
+  Placement/                 access, search, repair, and commit modules
+  Redstone/                  technology rules and existing action modules
+  Rendering/                 existing schematic writer
+  Resources/                 routing resource graph
+  Routing/
+    Assignment/              track and template assignment
+    Global/                  existing authoritative global router
+    Planning/                channel planning and local-first routing
+    Regions/                 existing component routing modules
+    Workers/                 eligibility, pin-access, detailed routing
+  Policy.py                  existing physical design policy
+Validation/
+  Core/                      physical fixture, vector, and validation types
+  Fabric/                    Fabric client, fixtures, testing, traces
+    Harness/                 tracked Java/Gradle mod sources
+    Runtime/                 tracked Python runtime-manager sources
+  Mchprs/                    existing MCHPRS validation coordinator
+Native/Routing/              existing Rust crate, lockfile, and nested Src tree
+RedstoneCompiler/            Python facade, native import, native stub
+Tools/{Fabric,Mchprs,Routing}/ developer and runtime tools
+Tests/                       tests grouped by the owning domain
+Docs/                        current references and design documents
+Examples/                    existing SystemVerilog inputs
+Main.py                      compatibility launcher
 ```
 
-The narrow supported entrypoints are:
+The supported physical entrypoints retain their functions and signatures:
 
 | Entrypoint | Concrete owner |
 |---|---|
-| `PhysicalDesign.Flow.PlaceAndRoutePcb` | `Placement/Flow/Runner.py` |
-| `PhysicalDesign.Placement.Core.PlacePcbGraph` | `Placement/Core/Commit.py` |
-| `PhysicalDesign.Placement.Access.BuildPlacementAccessFabric` | `Placement/Access/Fabric.py` |
-| `PhysicalDesign.Routing.Global.RouteAuthoritativeResources` | `Routing/Authoritative/Flow.py` |
-| `PhysicalDesign.Routing.Regions.SolveComponentRoutingProblem` | `Routing/Components/Solver.py` |
-| `PhysicalDesign.Routing.Regions.CompileClosedComponent` | `Routing/Components/Pipeline.py` |
+| `PhysicalDesign.Flow.PlaceAndRoutePcb` | `PhysicalDesign/Flow/Runner.py` |
+| `PhysicalDesign.Placement.Core.PlacePcbGraph` | `PhysicalDesign/Placement/Core/Commit/Commit.py` |
+| `PhysicalDesign.Placement.Access.BuildPlacementAccessFabric` | `PhysicalDesign/Placement/Access/Fabric.py` |
+| `PhysicalDesign.Routing.Global.RouteAuthoritativeResources` | `PhysicalDesign/Routing/Global/Flow/Flow.py` |
+| `PhysicalDesign.Routing.Regions.SolveComponentRoutingProblem` | `PhysicalDesign/Routing/Regions/Solving/Solver.py` |
+| `PhysicalDesign.Routing.Regions.CompileClosedComponent` | `PhysicalDesign/Routing/Regions/Pipeline.py` |
 
-Internal helpers are imported from their concrete owner. Package APIs do not
-re-export the old broad implementation surfaces.
+Existing run-state objects, services, process-global caches, and worker functions
+remain intact in their moved modules. Package initializers retain the established
+exports; newly added grouping packages expose no broad forwarding API.
 
-### Explicit run state and services
-
-`PlacementFlowState` and `PlacementFlowServices` make placement candidates,
-repair history, deadlines, callbacks, and validators run-local and injectable.
-`AuthoritativeRoutingState` and `AuthoritativeRoutingServices` do the same for
-the clock/deadline, Rust context, caches, retained plans, telemetry,
-materialization, and validation. Services are constructed at call time so tests
-can replace a dependency without restoring module-global monkeypatch coupling.
-
-Process-global caches remain in one concrete owner and retain their object
-identity and reset behavior. Process-pool workers remain top-level importable
-functions in their owning worker/boundary module.
-
-`Validation/Fabric/` owns fixture creation, authenticated live validation,
-source-linked mismatch traces, imported-schematic testing, and settled-world snapshots. `Validation/Fabric/Harness/`
-contains the tracked Fabric mod source; its `Server/` subdirectory is the one
-canonical local runtime and is deliberately not versioned.
+`Validation/Fabric/Harness/` contains the mod source. The Python manager runs
+from `Validation/Fabric/Runtime/`, while installed server data stays at the
+resolved `ValidationServerHarness/Server/` runtime. The source checkout and the
+runtime checkout are deliberately resolved separately.
 
 ## Native Rust ownership
 
@@ -152,7 +152,7 @@ Native/Routing/Src/{Assignment,AssignmentPlanning,Bindings,Deadline,
 Native/Routing/Src/Simulation/{LogicSimulation.rs,mod.rs}
 ```
 
-`ConflictRepair.py` was consolidated into `Routing/Actions/Validation.py` while
+`ConflictRepair.py` was consolidated into `PhysicalDesign/Redstone/Actions/Validation.py` while
 the established `Actions` exports were preserved. The unused duplicate NAND
 dataclass was removed; `PhysicalDesign/Cells/Library.py` remains authoritative.
 
@@ -165,33 +165,28 @@ clean break. Use this ownership map to locate the current owner:
 |---|---|
 | `Placement/AccessFabric.py` | `Placement/Access/{Fabric,Capacity,EscapePaths,Geometry}.py` |
 | `Placement/Pcb.py` | `Placement/Core/` |
-| `Placement/PcbFlow.py` | `Placement/Flow/` |
-| `Routing/Models.py` | `Routing/Contracts/{Core,Placement,Component,PhysicalInterface,Results}.py` |
-| `Routing/AuthoritativePlanner.py` | `Routing/Authoritative/` |
-| `Routing/ComponentAccess.py` | `Routing/Components/Access.py` |
-| `Routing/ComponentPlanning.py` | `Routing/Components/{InterfacePlanning,NetPlanning,PhysicalPlanning}.py` |
-| `Routing/ComponentRouter.py` | `Routing/Components/{Solver,LegacySolver,DynamicSolver,Domains,NoGoods}.py` |
-| `Routing/ComponentPipeline.py` | `Routing/Components/{Pipeline,Cache,Certification}.py` |
-| `Routing/Actions/ConflictRepair.py` | `Routing/Actions/Validation.py` |
-| `Cells/Nand.py` | `Cells/Library.py` |
+| `Placement/PcbFlow.py` | `PhysicalDesign/Flow/` |
+| `Routing/Models.py` | `PhysicalDesign/Contracts/{Core,Placement,Component,PhysicalInterface,Results}.py` |
+| `Routing/AuthoritativePlanner.py` | `PhysicalDesign/Routing/Global/` |
+| `Routing/ComponentAccess.py` | `PhysicalDesign/Routing/Regions/Interfaces/Access.py` |
+| `Routing/ComponentPlanning.py` | `PhysicalDesign/Routing/Regions/Planning/{InterfacePlanning,NetPlanning,PhysicalPlanning}.py` |
+| `Routing/ComponentRouter.py` | `PhysicalDesign/Routing/Regions/{Solving,Proofs}/` and `Domains.py` |
+| `Routing/ComponentPipeline.py` | `PhysicalDesign/Routing/Regions/{Pipeline,Cache}.py` and `Proofs/Certification.py` |
+| `Routing/Actions/ConflictRepair.py` | `PhysicalDesign/Redstone/Actions/Validation.py` |
+| `Cells/Nand.py` | `PhysicalDesign/Cells/Library.py` |
 | former flat `Native/Routing/Src/*.rs` kernels | the matching nested Rust domain under `Native/Routing/Src/` |
 
 ## Structural acceptance contract
 
-- implementation modules are at most 3,000 physical lines;
-- named orchestrators are below 500 physical lines;
-- Python and Rust functions are below 1,000 physical lines;
-- a new split implementation file is at least 150 lines unless it is an
-  explicitly documented package API, binding, worker, state/schema, cache
-  identity owner, or phase-contract boundary;
-- retired paths and dotted import/patch targets are forbidden;
-- routing dependency layers stay one-way and the Compiler import graph stays
-  acyclic;
-- the six narrow public entrypoints resolve to their concrete owners.
+The executable gates preserve retired-path/import exclusions, the established
+dependency restrictions, concrete public owners, and physical contract schemas.
+Both historical retired paths and their corresponding new locations stay banned.
+`Tests/Structural/test_source_structure.py` owns the structural checks;
+`Tests/PhysicalDesign/Routing/test_routing_contract_schema.py` owns field order,
+defaults, signatures, aliases, and serialization.
 
-`Tests/Structural/test_source_structure.py` enforces these rules. Contract field order,
-defaults, signatures, aliases, and serialization are pinned separately by
-`Tests/PhysicalDesign/Routing/test_routing_contract_schema.py`.
+Source size and definition spans remain advisory review signals, reported by
+`Tools/Routing/ReviewSourceStructure.py`. They are not new migration gates.
 
 ## Verification commands
 
@@ -206,13 +201,12 @@ cargo build --manifest-path Native/Routing/Cargo.toml --release --features pytho
 ```
 
 After a Rust change, copy the release library into the Python package and verify
-the path and hash of the module actually imported before parity tests. Run the
-fixed 5/3/3/2 physical matrix in a fresh output root:
+the path and hash of the module actually imported before parity tests. Run all seven expanded acceptance examples in a fresh output root:
 
 ```bash
 python3 Tools/Routing/RunRouterAcceptance.py --date 2026-08-28 \
   --output-root /tmp/RedstoneCompilerMonolithPostRefactor \
-  --python .venv/bin/python --include-cla4
+  --python .venv/bin/python --matrix expanded
 ```
 
 The final gate compares semantic routing payloads, exact truth tables,

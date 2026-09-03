@@ -22,6 +22,11 @@ validation requirements remain in
 [RunningTests.md](../Testing/RunningTests.md) and
 [FabricServerValidation.md](FabricServerValidation.md).
 
+The repository layout has since been migrated. Source paths in this document
+follow the current tree; the dated measurements above remain review evidence.
+The [layout migration record](../Reference/RepositoryLayoutMigration.md) separates
+the completed moves from the proposed architecture changes.
+
 Contents:
 
 - [Evidence and limits](#1-evidence-and-limits)

@@ -7,6 +7,7 @@ in this tree instead of being duplicated in the repository root.
 
 - [Project Tree](Reference/ProjectTree.md)
 - [Ownership and structural gates](Reference/ProjectTreeDesignDoc.md)
+- [Repository layout migration and file crosswalk](Reference/RepositoryLayoutMigration.md)
 - [Routing design](Reference/RoutingDesignDoc.md)
 - [Architecture]
   - [Readme](Architecture/Readme.md)

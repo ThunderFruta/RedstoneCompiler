@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`Main.py` and `App/CompilerCli.py` provide the CLI; `Compiler/Pipeline.py` coordinates SystemVerilog parsing, NAND synthesis, placement, routing, schematic writing, and physical validation. Keep stage-specific work in its owner: `Compiler/Frontend/`, `Compiler/{Ir,Synthesis,Cells,Placement,Routing}/`, or `PhysicalDesign/Rendering/`. The PyO3 routing backend lives in `Native/Routing/Src/`. `Validation/Fabric/Harness/` contains the tracked Java/Fabric harness, while its ignored `Server/` directory is local runtime state. Put tests under the matching domain in `Tests/`; shared fixtures belong in `Tests/Fixtures/`. Examples, templates, documentation, and automation are in `Examples/`, `Assets/Templates/`, `Docs/`, and `Tools/`.
+`Main.py` forwards to `App/Main.py`; `App/CompilerCli.py` owns argument-driven compilation. `App/` also contains reporting and telemetry. `Compiler/` contains `Frontend`, `Ir`, `Synthesis`, and the existing `Pipeline.py` coordinator. Keep placement, routing, geometry, contracts, redstone rules, resources, and schematic rendering in their owners under `PhysicalDesign/`. The PyO3 backend lives in `Native/Routing/Src/` and remains importable as `RedstoneCompiler.RustRouting`. `Validation/` owns core validation, MCHPRS, Fabric integration, tracked manager source in `Fabric/Runtime/`, and Java/Gradle source in `Fabric/Harness/`. The ignored `ValidationServerHarness/Server/` remains runtime data. Group tests by their source domain under `Tests/`; shared fixtures stay in `Tests/Fixtures/`. Templates are under `Assets/Templates/`, tools under `Tools/`, examples under `Examples/`, and references under `Docs/`.
 
 ## Build, Test, and Development Commands
 

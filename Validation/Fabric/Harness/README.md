@@ -4,13 +4,18 @@ This is the sole runtime mod required by the compiler's local validation
 server. It is server-only and deliberately has no Fabric API, Litematica,
 WorldEdit, Carpet, or client dependency.
 
-Build it with Gradle 9.5.1 and Java 25:
+Build it from the repository root with Gradle 9.5.1 and Java 25:
 
 ```sh
-gradle build
+gradle -p Validation/Fabric/Harness build
 ```
 
-The repository-owned local server runtime is always
+Build output stays in `ValidationServerHarness/build/`, and
+`org.gradle.projectcachedir` retains the project cache at
+`ValidationServerHarness/.gradle/`. Manager source is under
+`Validation/Fabric/Runtime/`.
+
+The repository-owned local server runtime is
 `ValidationServerHarness/Server/`. Place the Fabric 26.2 launcher at
 `ValidationServerHarness/Server/fabric-server-launch.jar` and accept the Minecraft
 EULA there. This runtime is intentionally ignored because it holds downloaded
