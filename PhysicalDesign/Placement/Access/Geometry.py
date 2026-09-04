@@ -18,7 +18,7 @@ from typing import (
     Any,
     Callable,
 )
-from PhysicalDesign.Redstone.Actions.Geometry import BuildRoutingResources
+from PhysicalDesign.Redstone.Rules.Geometry import BuildRoutingResources
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 from PhysicalDesign.Contracts.Core import Position3
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology, RedstoneRoutingTechnology

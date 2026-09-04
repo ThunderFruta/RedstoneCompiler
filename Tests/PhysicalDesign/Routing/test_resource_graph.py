@@ -2,8 +2,8 @@ import unittest
 
 from PhysicalDesign.Geometry.Placement import PlacedGate
 from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, FindClaimConflictsByResourceIndex, LocalRouteClaim, NormalizeRoutingEdge, RoutingResourceGraph, RoutingResourceKind, ValidateLocalRouteClaims
-from PhysicalDesign.Placement.Core.Channels import LocalClusterRouteCandidate, SelectJointLocalClusterCandidates
-from PhysicalDesign.Placement.Core.MandatoryAccess import FindMandatoryAccessConflictSignals, MeasureMandatoryAccessConflictProfile
+from PhysicalDesign.Placement.Engine.Channels import LocalClusterRouteCandidate, SelectJointLocalClusterCandidates
+from PhysicalDesign.Placement.Engine.MandatoryAccess import FindMandatoryAccessConflictSignals, MeasureMandatoryAccessConflictProfile
 
 
 class RoutingResourceGraphTests(unittest.TestCase):

@@ -85,16 +85,16 @@ fabric, and assignment representations named
 `PhysicalDesign/Contracts/Placement.py`. The standalone
 `SolvePlacementAccessFabricCapacity`/`AttachPlacementAccessAssignment` path is
 not the current production selector; it is exercised by focused fixtures.
-Production `PhysicalDesign/Flow/` deliberately leaves stubs unselected and
+Production `PhysicalDesign/Orchestration/` deliberately leaves stubs unselected and
 `SolveRawTrackAssignmentPortfolioWithContext` selects the combined
 track/access witness later. The proposal must extend that production selection
 seam rather than accidentally reviving the unused standalone capacity solver.
 
 Instead, fixed access is reconstructed independently in several places:
 
-- `PhysicalDesign/Placement/Core/Clustering.py::PcbGatesConflict` derives straight access rays
+- `PhysicalDesign/Placement/Engine/Clustering.py::PcbGatesConflict` derives straight access rays
   during placement legality;
-- `PhysicalDesign/Placement/Core/MandatoryAccess.py::BuildMandatoryAccessClaims` reconstructs those
+- `PhysicalDesign/Placement/Engine/MandatoryAccess.py::BuildMandatoryAccessClaims` reconstructs those
   rays and expands them into wire, support, required-air, and electrical
   claims;
 - `PhysicalDesign/Routing/Pcb.py::CompactRoutedTrees` reconstructs terminal access
@@ -109,15 +109,15 @@ The missing behavior is to expose verified cell-local alternatives while
 placement variables remain live and to preserve one selected identity through
 every later representation.
 
-`PhysicalDesign/Placement/Core/Search.py::OptimizeJointClusterPlacement` searches
+`PhysicalDesign/Placement/Engine/Search.py::OptimizeJointClusterPlacement` searches
 cluster slots and eight rigid transforms, then
-`PhysicalDesign/Placement/Core/Commit/Commit.py::PlacePcbGraph` materializes and exact-
+`PhysicalDesign/Placement/Engine/Commit/Commit.py::PlacePcbGraph` materializes and exact-
 screens retained states.
-`PhysicalDesign/Flow/PlacementAttempts.py::_TryPlacement` rejects a
+`PhysicalDesign/Orchestration/PlacementAttempts.py::_TryPlacement` rejects a
 complete candidate on mandatory-access conflicts. If no candidate survives,
-`PhysicalDesign/Flow/Runner.py::_PlaceAndRoutePcbWithPolicy` creates the
+`PhysicalDesign/Orchestration/Runner.py::_PlaceAndRoutePcbWithPolicy` creates the
 observed placement failure before
-`PhysicalDesign/Routing/Global/Flow/Flow.py::RouteAuthoritativeResources` is
+`PhysicalDesign/Routing/Global/Orchestration/Flow.py::RouteAuthoritativeResources` is
 called.
 
 ### Hypotheses to test
@@ -403,7 +403,7 @@ Placement-owned validation
 recomputes transforms, pin mappings, and blocks through
 `PhysicalDesign/Geometry/Placement.py`. Routing independently validates the contract's
 claims, reservations, access coverage, leases, and fingerprints without
-importing `PhysicalDesign/Placement`. `Compiler/Pipeline.py`, which already sits above
+importing `PhysicalDesign/Placement`. `Compilation/Pipeline.py`, which already sits above
 both stages, composes those two validators. In particular,
 `PhysicalDesign/Routing/Global/` must not import `PhysicalDesign/Placement/Access/`
 or duplicate `BuildPlacedGate` to recover placement state.
@@ -417,7 +417,7 @@ route claim/connectivity checks. Within that flow, `PlanNegotiatedRouteTrees`
 remains the detailed per-net negotiated tree/repair substage. It uses sparse
 resource regions, present/history congestion costs, branch-preserving repair,
 and repeater-aware state. Placement feedback remains owned by the surrounding
-`PhysicalDesign/Flow/` controller, not by that subroutine.
+`PhysicalDesign/Orchestration/` controller, not by that subroutine.
 
 `RouteAuthoritativeResources` receives selected access roots and reserved
 claims as immutable occupancy. The new strategy forbids it from regenerating a
@@ -454,7 +454,7 @@ The v17 validation chain shall perform:
 The solver's witness is evidence supplied to validation, not a replacement for
 validation.
 
-Current `PhysicalDesign/Redstone/Actions/Validation.py::ValidatePhysicalRoutes` proves
+Current `PhysicalDesign/Redstone/Rules/Validation.py::ValidatePhysicalRoutes` proves
 that each signal reaches all of its own required targets. It does not explicitly
 reject a route that also reaches another signal's logical target. That
 foreign-target reachability check is a new v17 route-level validator applied
@@ -929,21 +929,21 @@ must not wait for the full shared-boundary implementation.
 | [`PhysicalDesign/Redstone/Technology.py`](../../../PhysicalDesign/Redstone/Technology.py) | shared access length, track, layer, and repeater rules | remain the only physical technology authority consumed by access generation |
 | [`PhysicalDesign/Geometry/Placement.py`](../../../PhysicalDesign/Geometry/Placement.py) | transforms cell pins/directions into placed gates | provide pure cell transforms used by `Placement/Access/`; do not compile claims here |
 | [`PhysicalDesign/Placement/Access/`](../../../PhysicalDesign/Placement/Access/) | fabric/escape construction and attachment in `Fabric.py`; standalone capacity selection in `Capacity.py` is not the production selector | extend authoritative option/domain construction while integrating final selection with the production raw track-assignment portfolio, then preserve one frozen binding |
-| [`PhysicalDesign/Placement/Core/`](../../../PhysicalDesign/Placement/Core/) | clustering, joint search, fixed-ray legality, mandatory claims, exact screen, local route templates, and final commit | generate placement domains, consume canonical access claims, and retire duplicate fixed-ray reconstruction on the new strategy |
-| New `PhysicalDesign/Placement/Core/PlacementAccess.py` | not present | master construction, solve dispatch, and core translation; typed neutral records belong in `Routing/Contracts/Placement.py` |
-| New `PhysicalDesign/Placement/Core/ClusterTemplates.py` | not present | access-legal local template synthesis and Pareto retention |
-| [`PhysicalDesign/Flow/`](../../../PhysicalDesign/Flow/) | typed placement/routing lifecycle, attempts, retries, repair epochs, and narrow runner | add explicit v17 phases without reintroducing a monolithic controller; retire superseded control-plane branches only after acceptance |
+| [`PhysicalDesign/Placement/Engine/`](../../../PhysicalDesign/Placement/Engine/) | clustering, joint search, fixed-ray legality, mandatory claims, exact screen, local route templates, and final commit | generate placement domains, consume canonical access claims, and retire duplicate fixed-ray reconstruction on the new strategy |
+| New `PhysicalDesign/Placement/Engine/PlacementAccess.py` | not present | master construction, solve dispatch, and core translation; typed neutral records belong in `Routing/Contracts/Placement.py` |
+| New `PhysicalDesign/Placement/Engine/ClusterTemplates.py` | not present | access-legal local template synthesis and Pareto retention |
+| [`PhysicalDesign/Orchestration/`](../../../PhysicalDesign/Orchestration/) | typed placement/routing lifecycle, attempts, retries, repair epochs, and narrow runner | add explicit v17 phases without reintroducing a monolithic controller; retire superseded control-plane branches only after acceptance |
 | [`PhysicalDesign/Contracts/`](../../../PhysicalDesign/Contracts/) | placement-access fabric/assignment, physical port factors/CSP state, and concrete routed component templates | add the neutral immutable handoff schema; Placement constructs it and Routing consumes it without a Routing-to-Placement import |
 | [`PhysicalDesign/Routing/Regions/`](../../../PhysicalDesign/Routing/Regions/) | exact component interface CSP, closed-component compilation, normalized template fingerprint, cache, instantiation, and revalidation | expose a narrow identity-stable access/lease subproblem or proof-core projection and extend the existing cache identity with selected-access and proof records; do not add a parallel macro cache |
 | [`PhysicalDesign/Routing/Global/`](../../../PhysicalDesign/Routing/Global/) | physical port factors, negotiated routing, materialization, and final route checks | accept the frozen contract, forbid access regeneration, and keep negotiated routing/final DRC |
 | [`PhysicalDesign/Resources/ResourceGraph.py`](../../../PhysicalDesign/Resources/ResourceGraph.py) | canonical routing graph and claim construction | remain the single exact claim authority for access and routes |
 | [`PhysicalDesign/Routing/Pcb.py`](../../../PhysicalDesign/Routing/Pcb.py) | route compaction and physical route orchestration | consume frozen access instead of reconstructing straight terminal rays |
-| New `PhysicalDesign/Placement/Core/HandoffValidation.py` | not present | recompute placed transforms, pin mappings, blocks, and placement-side fingerprint using existing placement geometry |
-| New `PhysicalDesign/Interfaces/HandoffValidation.py` | not present | validate claims, repeater reservations, access coverage, leases, and routing-side fingerprint without importing `PhysicalDesign/Placement` |
-| [`PhysicalDesign/Redstone/Actions/Validation.py`](../../../PhysicalDesign/Redstone/Actions/Validation.py) | physical connectivity graphs and route validation | retain route connectivity ownership and add only route-level strengthened checks |
+| New `PhysicalDesign/Placement/Engine/HandoffValidation.py` | not present | recompute placed transforms, pin mappings, blocks, and placement-side fingerprint using existing placement geometry |
+| New `PhysicalDesign/Constraints/HandoffValidation.py` | not present | validate claims, repeater reservations, access coverage, leases, and routing-side fingerprint without importing `PhysicalDesign/Placement` |
+| [`PhysicalDesign/Redstone/Rules/Validation.py`](../../../PhysicalDesign/Redstone/Rules/Validation.py) | physical connectivity graphs and route validation | retain route connectivity ownership and add only route-level strengthened checks |
 | [`Validation/Fabric/`](../../../Validation/Fabric/) | authoritative server-validation contract | own server lifecycle, ticking, readback, and result diagnostics without an in-process redstone model |
-| [`Compiler/Pipeline.py`](../../../Compiler/Pipeline.py) | stage orchestration, final validation, failure evidence, staged multi-file replacement with exception cleanup | compose placement-side and routing-side handoff validation, serialize v17 contract/proof telemetry, and add manifest/directory finalization before immutable-incumbent replacement |
-| New `Native/Routing/Src/PlacementAccess/` domain | not present | optional production finite solver split into state/domain/search/API modules, with propagation and a typed bounded result |
+| [`Compilation/Pipeline.py`](../../../Compilation/Pipeline.py) | stage orchestration, final validation, failure evidence, staged multi-file replacement with exception cleanup | compose placement-side and routing-side handoff validation, serialize v17 contract/proof telemetry, and add manifest/directory finalization before immutable-incumbent replacement |
+| New `Kernels/Routing/Src/PlacementAccess/` domain | not present | optional production finite solver split into state/domain/search/API modules, with propagation and a typed bounded result |
 
 New modules are justified because they create stage boundaries currently
 embedded in multi-thousand-line functions. They remain inside the existing
@@ -1021,7 +1021,7 @@ def BuildAccessLegalClusterTemplates(
     """Return a typed local frontier with explicit completeness certificates."""
 ```
 
-- **Owner:** proposed `PhysicalDesign/Placement/Core/ClusterTemplates.py`.
+- **Owner:** proposed `PhysicalDesign/Placement/Engine/ClusterTemplates.py`.
 - **Calls:** typed option-domain enumeration, physical-ownership compiler,
   local exact solver, and physical validators.
 - **Returns:** templates, per-domain completeness certificates, attrition
@@ -1042,9 +1042,9 @@ def SolveJointPlacementAccess(
     """Select exact placement/access ownership without detailed route paths."""
 ```
 
-- **Owner:** proposed `PhysicalDesign/Placement/Core/PlacementAccess.py` with an
+- **Owner:** proposed `PhysicalDesign/Placement/Engine/PlacementAccess.py` with an
   optional native implementation in a nested
-  `Native/Routing/Src/PlacementAccess/` domain.
+  `Kernels/Routing/Src/PlacementAccess/` domain.
 - **Calls:** deterministic propagation/search and existing narrow interface
   factor projection where applicable.
 - **Returns:** exactly one typed result.
@@ -1067,12 +1067,12 @@ def ValidateFrozenPhysicalPlacementContract(
     """Compose placement-geometry and routing-resource handoff validation."""
 ```
 
-- **Owner:** orchestration in `Compiler/Pipeline.py`. Proposed
-  `PhysicalDesign/Placement/Core/HandoffValidation.py` recomputes transforms, pin mappings,
+- **Owner:** orchestration in `Compilation/Pipeline.py`. Proposed
+  `PhysicalDesign/Placement/Engine/HandoffValidation.py` recomputes transforms, pin mappings,
   and blocks through placement geometry. Proposed
-  `PhysicalDesign/Interfaces/HandoffValidation.py` independently checks claims,
+  `PhysicalDesign/Constraints/HandoffValidation.py` independently checks claims,
   repeater reservations, access coverage, leases, and fingerprints without a
-  Routing-to-Placement import. `PhysicalDesign/Redstone/Actions/Validation.py` retains
+  Routing-to-Placement import. `PhysicalDesign/Redstone/Rules/Validation.py` retains
   route-connectivity responsibility.
 - **Reads:** contract, NAND IR, technology/resource model.
 - **Returns:** `None` or typed hard error.
@@ -1085,7 +1085,7 @@ def ValidateFrozenPhysicalPlacementContract(
 ### `RouteAuthoritativeResources`
 
 Current owner and behavior remain in
-`PhysicalDesign/Routing/Global/Flow/Flow.py`. The proposed signature gains an
+`PhysicalDesign/Routing/Global/Orchestration/Flow.py`. The proposed signature gains an
 explicit `PlacementContract` argument. On v17 it shall:
 
 - validate the contract once at entry;

@@ -5,7 +5,7 @@ example.
 
 ```bash
 python3 Main.py \
-  --input Examples/FullAdder.sv \
+  --input Assets/Examples/FullAdder.sv \
   --output Output/FullAdder/FullAdder.litematic \
   --diagram Output/FullAdder/FullAdder.Nand.json \
   --routing-strategy new-router-first

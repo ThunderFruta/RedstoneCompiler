@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ....Contracts.Core import Position3
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 from ....Resources.ResourceGraph import FindSelfClaimConflicts
 from ....Resources.ResourceGraph import PinAccessPortal
 from ....Resources.ResourceGraph import PortalReservation

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from Compiler.Frontend.Sv import ParseSvToNetlist
+from Formats.SystemVerilog.Sv import ParseSvToNetlist
 
 
 @pytest.mark.parametrize(

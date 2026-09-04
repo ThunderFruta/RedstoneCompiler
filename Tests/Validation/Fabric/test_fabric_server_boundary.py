@@ -8,8 +8,8 @@ from pathlib import Path
 
 from Validation.Fabric import BuildExpectedVectors, BuildFabricFailureTrace, BuildFabricFixture, BuildImportedSchematicVectors, BuildValidationVectors, DefaultFabricServerRoot, FabricServerConfiguration, FabricServerSupervisor, FabricServerValidationResult, FabricValidationProgress, ReadFabricFixture, ReadNandModule, ReadSvModule, ResolveFabricServerRoot
 from Validation.Fabric.SchemImport import InferLitematicPorts
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR
-from Compiler.Pipeline import RequirePhysicalValidation
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR
+from Compilation.Pipeline import RequirePhysicalValidation
 from PhysicalDesign.Rendering.SchemWriter import CellTemplate, BuildLitematicBlockMap, NeutralDynamicState
 
 
@@ -35,7 +35,7 @@ class FabricServerBoundaryTests(unittest.TestCase):
         self.assertEqual(Configuration.Root, DefaultFabricServerRoot())
 
     def testEnvironmentUsesACompleteSiblingRuntimeForALinkedWorktree(self) -> None:
-        SharedRoot = Path("/shared/ValidationServerHarness/Server")
+        SharedRoot = Path("/shared/Runtime/FabricServer")
         with patch.dict(
             os.environ,
             {"RC_FABRIC_SERVER_ROOT": ""},

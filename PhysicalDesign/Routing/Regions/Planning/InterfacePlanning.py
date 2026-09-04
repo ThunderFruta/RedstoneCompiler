@@ -27,7 +27,7 @@ except ImportError:
 
 from ....Contracts.Component import PhysicalComponentBoundaryPortReservation
 from ....Contracts.PhysicalInterface import PreparedPhysicalComponentPortFactorDomain
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
 
 CoarseResource = tuple[int, ...]

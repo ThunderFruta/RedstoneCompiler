@@ -1,6 +1,6 @@
 # Code style
 
-Keep the pipeline stage-aligned: frontend parsing in `Compiler/Frontend`, synthesis and
+Keep the pipeline stage-aligned: frontend parsing in `Formats/SystemVerilog`, synthesis and
 IR in `Compiler`, placement in `PhysicalDesign/Placement`, routing in
 `PhysicalDesign/Routing`, and output encoding in `PhysicalDesign/Rendering`.
 

@@ -2,8 +2,8 @@
 
 ## Stage ownership
 
-1. `Compiler/Frontend/` parses and elaborates the supported SystemVerilog subset.
-2. `Compiler/Synthesis/` simplifies logic and maps it to NAND-only form.
+1. `Formats/SystemVerilog/` parses and elaborates the supported SystemVerilog subset.
+2. `Compilation/Synthesis/` simplifies logic and maps it to NAND-only form.
 3. `PhysicalDesign/Placement/` places standard-cell templates and captures legal
    local routes.
 4. `PhysicalDesign/Routing/` plans coarse capacity, negotiates detailed route trees,
@@ -16,9 +16,9 @@
    Minecraft 26.2, resets every input low, waits for settlement, and publishes
    the observed all-zero server state as the final `.litematic`.
 
-`Compiler/Pipeline.py` owns end-to-end orchestration.
-`PhysicalDesign/Flow/` owns the placement/routing feedback loop, with the
-narrow public entrypoint in `PhysicalDesign/Flow/Runner.py`.
+`Compilation/Pipeline.py` owns end-to-end orchestration.
+`PhysicalDesign/Orchestration/` owns the placement/routing feedback loop, with the
+narrow public entrypoint in `PhysicalDesign/Orchestration/Runner.py`.
 
 ## Publication boundary
 

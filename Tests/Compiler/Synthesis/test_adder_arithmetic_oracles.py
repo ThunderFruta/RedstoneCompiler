@@ -10,12 +10,12 @@ import re
 from tempfile import TemporaryDirectory
 import unittest
 
-from Compiler.Ir.Models import GateKind, ModuleIR
-from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
-from Compiler.Synthesis.Validation import ValidateNandOnlyDesign
-from Compiler.Frontend.Sv import ParseSvToNetlist
+from Compilation.Ir.Models import GateKind, ModuleIR
+from Compilation.Synthesis.LogicEvaluation import EvaluateLogicModule
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
+from Compilation.Synthesis.Validation import ValidateNandOnlyDesign
+from Formats.SystemVerilog.Sv import ParseSvToNetlist
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class AdderOracleCase:
 
     @property
     def SourcePath(self) -> Path:
-        return Path("Examples") / f"{self.ModuleName}.sv"
+        return Path("Assets/Examples") / f"{self.ModuleName}.sv"
 
 
 FullAdderCase = AdderOracleCase(

@@ -21,9 +21,9 @@ proposals. This layout does not establish new dependency restrictions.
 ## Dependency restrictions
 
 The existing lower-layer restrictions now refer to `PhysicalDesign.Contracts`,
-`PhysicalDesign.Interfaces`, `PhysicalDesign.Routing.Regions`, and
+`PhysicalDesign.Constraints`, `PhysicalDesign.Routing.Regions`, and
 `PhysicalDesign.Routing.Global`. Their prohibited placement dependencies also
-cover the relocated `PhysicalDesign.Flow` and `PhysicalDesign.Geometry` modules.
+cover the relocated `PhysicalDesign.Orchestration` and `PhysicalDesign.Geometry` modules.
 The existing candidate-cache/placement-geometry and dependency-service/rotation
 exceptions retain their exact corresponding owners.
 
@@ -35,7 +35,7 @@ and `Validation`, so moving a module cannot remove it from those checks.
 ```text
 App/                         guided CLI, argument CLI, reports, telemetry
 Assets/Templates/            template catalog and three litematic templates
-Compiler/
+Compilation/
   Frontend/                  SystemVerilog parser
   Ir/                        logical intermediate representation
   Synthesis/                 logic and NAND transformations
@@ -64,12 +64,12 @@ Validation/
     Harness/                 tracked Java/Gradle mod sources
     Runtime/                 tracked Python runtime-manager sources
   Mchprs/                    existing MCHPRS validation coordinator
-Native/Routing/              existing Rust crate, lockfile, and nested Src tree
+Kernels/Routing/              existing Rust crate, lockfile, and nested Src tree
 RedstoneCompiler/            Python facade, native import, native stub
 Tools/{Fabric,Mchprs,Routing}/ developer and runtime tools
 Tests/                       tests grouped by the owning domain
 Docs/                        current references and design documents
-Examples/                    existing SystemVerilog inputs
+Assets/Examples/                    existing SystemVerilog inputs
 Main.py                      compatibility launcher
 ```
 
@@ -77,10 +77,10 @@ The supported physical entrypoints retain their functions and signatures:
 
 | Entrypoint | Concrete owner |
 |---|---|
-| `PhysicalDesign.Flow.PlaceAndRoutePcb` | `PhysicalDesign/Flow/Runner.py` |
-| `PhysicalDesign.Placement.Core.PlacePcbGraph` | `PhysicalDesign/Placement/Core/Commit/Commit.py` |
+| `PhysicalDesign.Orchestration.PlaceAndRoutePcb` | `PhysicalDesign/Orchestration/Runner.py` |
+| `PhysicalDesign.Placement.Engine.PlacePcbGraph` | `PhysicalDesign/Placement/Engine/Commit/Commit.py` |
 | `PhysicalDesign.Placement.Access.BuildPlacementAccessFabric` | `PhysicalDesign/Placement/Access/Fabric.py` |
-| `PhysicalDesign.Routing.Global.RouteAuthoritativeResources` | `PhysicalDesign/Routing/Global/Flow/Flow.py` |
+| `PhysicalDesign.Routing.Global.RouteAuthoritativeResources` | `PhysicalDesign/Routing/Global/Orchestration/Flow.py` |
 | `PhysicalDesign.Routing.Regions.SolveComponentRoutingProblem` | `PhysicalDesign/Routing/Regions/Solving/Solver.py` |
 | `PhysicalDesign.Routing.Regions.CompileClosedComponent` | `PhysicalDesign/Routing/Regions/Pipeline.py` |
 
@@ -88,9 +88,9 @@ Existing run-state objects, services, process-global caches, and worker function
 remain intact in their moved modules. Package initializers retain the established
 exports; newly added grouping packages expose no broad forwarding API.
 
-`Validation/Fabric/Harness/` contains the mod source. The Python manager runs
-from `Validation/Fabric/Runtime/`, while installed server data stays at the
-resolved `ValidationServerHarness/Server/` runtime. The source checkout and the
+`Validation/Fabric/ServerHarness/` contains the mod source. The Python manager runs
+from `Validation/Fabric/ServerManager/`, while installed server data stays at the
+resolved `Runtime/FabricServer/` runtime. The source checkout and the
 runtime checkout are deliberately resolved separately.
 
 ## Native Rust ownership
@@ -98,7 +98,7 @@ runtime checkout are deliberately resolved separately.
 The native source is intentionally a nested domain tree, not a flat folder:
 
 ```text
-Native/Routing/Src/
+Kernels/Routing/Src/
 ├── Core/                 Runtime.rs, Deadline.rs, Models.rs
 ├── Geometry/             RouteClaims.rs, ExteriorConnectors.rs
 ├── Path/                 PathRouting.rs
@@ -144,15 +144,15 @@ PhysicalDesign/Routing/ComponentAccess.py
 PhysicalDesign/Routing/ComponentPlanning.py
 PhysicalDesign/Routing/ComponentRouter.py
 PhysicalDesign/Routing/ComponentPipeline.py
-PhysicalDesign/Redstone/Actions/ConflictRepair.py
+PhysicalDesign/Redstone/Rules/ConflictRepair.py
 PhysicalDesign/Cells/Nand.py
-Compiler/Simulation/{Redstone.py,__init__.py}
-Native/Routing/Src/{Assignment,AssignmentPlanning,Bindings,Deadline,
+Compilation/Simulation/{Redstone.py,__init__.py}
+Kernels/Routing/Src/{Assignment,AssignmentPlanning,Bindings,Deadline,
                  EscapePlanning,Generation,LeasePlanning,Models,PathRouting}.rs
-Native/Routing/Src/Simulation/{LogicSimulation.rs,mod.rs}
+Kernels/Routing/Src/Simulation/{LogicSimulation.rs,mod.rs}
 ```
 
-`ConflictRepair.py` was consolidated into `PhysicalDesign/Redstone/Actions/Validation.py` while
+`ConflictRepair.py` was consolidated into `PhysicalDesign/Redstone/Rules/Validation.py` while
 the established `Actions` exports were preserved. The unused duplicate NAND
 dataclass was removed; `PhysicalDesign/Cells/Library.py` remains authoritative.
 
@@ -165,16 +165,16 @@ clean break. Use this ownership map to locate the current owner:
 |---|---|
 | `Placement/AccessFabric.py` | `Placement/Access/{Fabric,Capacity,EscapePaths,Geometry}.py` |
 | `Placement/Pcb.py` | `Placement/Core/` |
-| `Placement/PcbFlow.py` | `PhysicalDesign/Flow/` |
+| `Placement/PcbFlow.py` | `PhysicalDesign/Orchestration/` |
 | `Routing/Models.py` | `PhysicalDesign/Contracts/{Core,Placement,Component,PhysicalInterface,Results}.py` |
 | `Routing/AuthoritativePlanner.py` | `PhysicalDesign/Routing/Global/` |
-| `Routing/ComponentAccess.py` | `PhysicalDesign/Routing/Regions/Interfaces/Access.py` |
+| `Routing/ComponentAccess.py` | `PhysicalDesign/Routing/Regions/Boundaries/Access.py` |
 | `Routing/ComponentPlanning.py` | `PhysicalDesign/Routing/Regions/Planning/{InterfacePlanning,NetPlanning,PhysicalPlanning}.py` |
 | `Routing/ComponentRouter.py` | `PhysicalDesign/Routing/Regions/{Solving,Proofs}/` and `Domains.py` |
 | `Routing/ComponentPipeline.py` | `PhysicalDesign/Routing/Regions/{Pipeline,Cache}.py` and `Proofs/Certification.py` |
-| `Routing/Actions/ConflictRepair.py` | `PhysicalDesign/Redstone/Actions/Validation.py` |
+| `Routing/Actions/ConflictRepair.py` | `PhysicalDesign/Redstone/Rules/Validation.py` |
 | `Cells/Nand.py` | `PhysicalDesign/Cells/Library.py` |
-| former flat `Native/Routing/Src/*.rs` kernels | the matching nested Rust domain under `Native/Routing/Src/` |
+| former flat `Kernels/Routing/Src/*.rs` kernels | the matching nested Rust domain under `Kernels/Routing/Src/` |
 
 ## Structural acceptance contract
 
@@ -195,9 +195,9 @@ python3 -m compileall -q PhysicalDesign/Placement PhysicalDesign/Routing
 python3 -m pytest -q Tests/Structural/test_source_structure.py Tests/PhysicalDesign/Routing/test_routing_contract_schema.py
 python3 -m pytest --collect-only -q
 python3 -m pytest -q
-cargo fmt --manifest-path Native/Routing/Cargo.toml -- --check
-cargo test --manifest-path Native/Routing/Cargo.toml --release
-cargo build --manifest-path Native/Routing/Cargo.toml --release --features python-extension
+cargo fmt --manifest-path Kernels/Routing/Cargo.toml -- --check
+cargo test --manifest-path Kernels/Routing/Cargo.toml --release
+cargo build --manifest-path Kernels/Routing/Cargo.toml --release --features python-extension
 ```
 
 After a Rust change, copy the release library into the Python package and verify

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Any, Callable, Iterable
 
-from ..Execution.Reliability import BuildStableFingerprint
+from ..Runtime.Reliability import BuildStableFingerprint
 
 
 @dataclass(frozen=True)

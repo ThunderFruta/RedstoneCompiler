@@ -2,8 +2,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from Compiler.Frontend.Sv import ParseSvToNetlist
-from Compiler.Synthesis.LogicOptimization import (
+from Formats.SystemVerilog.Sv import ParseSvToNetlist
+from Compilation.Synthesis.LogicOptimization import (
     CountNands,
     EvaluateModuleOutputs,
     OptimizeLogic,
@@ -40,7 +40,7 @@ endmodule
         self.assertLess(CountNands(Optimized), CountNands(Netlist))
 
     def testExampleOptimizationNeverIncreasesNands(self) -> None:
-        for SourcePath in Path("Examples").glob("*.sv"):
+        for SourcePath in Path("Assets/Examples").glob("*.sv"):
             with self.subTest(SourcePath=SourcePath):
                 Netlist = ParseSvToNetlist(InputPath=SourcePath)
                 Optimized = OptimizeLogic(Netlist)

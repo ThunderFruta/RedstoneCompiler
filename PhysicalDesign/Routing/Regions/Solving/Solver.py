@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ....Contracts.Component import ClosedComponentInterface, ComponentFeedthroughContract, ComponentForeignTransitDomain, ComponentInterfacePort, ComponentRoutingFabric, ComponentRoutingProblem, ComponentRoutingSolveResult, ComponentTerminalAccessCandidate, ComponentTerminalAccessDomain, RoutedComponentNet, RoutedComponentTemplate
 from ....Contracts.Core import Position3
-from ....Interfaces.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
+from ....Constraints.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
 from ....Resources.ResourceGraph import FindSelfClaimConflicts, LocalRouteClaim, PinAccessPortal, RoutingEdge, RoutingReservation, RoutingResourceId, RoutingResourceKind, RoutingResourceClaims
 from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
 
@@ -48,7 +48,7 @@ except ImportError:
 
 from ..Core import CompleteComponentNetPortfolioStaticContext, _NormalizedEdge
 from .DynamicSolver import SolveComponentRoutingProblemDynamic
-from ..Interfaces.Fabric import BuildComponentRoutingFabric
+from ..Boundaries.Fabric import BuildComponentRoutingFabric
 from .LegacySolver import _SolveComponentRoutingProblemLegacy
 def SolveComponentRoutingProblem(
     Problem: ComponentRoutingProblem,

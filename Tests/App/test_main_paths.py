@@ -68,7 +68,7 @@ class MainPathTests(unittest.TestCase):
         AcceptanceMain.assert_called_once_with(["--matrix", "default"])
 
     def testRootFlagCliDelegatesWithoutOpeningGuidedMenu(self) -> None:
-        Arguments = ["--input", "Examples/FullAdder.sv"]
+        Arguments = ["--input", "Assets/Examples/FullAdder.sv"]
         with (
             patch("App.Main.GuidedMenu") as Guided,
             patch("App.Main.CompilerCli.Main", return_value=7) as FlagMain,
@@ -78,13 +78,13 @@ class MainPathTests(unittest.TestCase):
         FlagMain.assert_called_once_with(Arguments)
 
     def testParsePromptPathAcceptsQuotedAbsolutePath(self) -> None:
-        Expected = Path("/mnt/Projects/RedstoneCompiler/Examples/RippleCarryAdder4.sv")
+        Expected = Path("/mnt/Projects/RedstoneCompiler/Assets/Examples/RippleCarryAdder4.sv")
 
         self.assertEqual(ParsePromptPath(f"'{Expected}'"), Expected)
         self.assertEqual(ParsePromptPath(f'"{Expected}"'), Expected)
 
     def testParsePromptPathPreservesUnquotedPath(self) -> None:
-        Expected = Path("Examples/FullAdder.sv")
+        Expected = Path("Assets/Examples/FullAdder.sv")
 
         self.assertEqual(ParsePromptPath(str(Expected)), Expected)
 
@@ -224,7 +224,7 @@ class MainPathTests(unittest.TestCase):
                 redirect_stderr(StandardError),
             ):
                 ReturnCode = Main([
-                    "--input", "Examples/FullAdder.sv",
+                    "--input", "Assets/Examples/FullAdder.sv",
                     "--output", str(StableOutput),
                     "--defaults-file", str(Root / "Defaults.json"),
                 ])
@@ -338,7 +338,7 @@ class MainPathTests(unittest.TestCase):
                 redirect_stderr(StandardError),
             ):
                 ReturnCode = Main([
-                    "--input", "Examples/FullAdder.sv",
+                    "--input", "Assets/Examples/FullAdder.sv",
                     "--output", str(Root / "Failed.litematic"),
                     "--defaults-file", str(Root / "Defaults.json"),
                 ])

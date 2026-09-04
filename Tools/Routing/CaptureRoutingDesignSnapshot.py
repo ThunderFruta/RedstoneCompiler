@@ -45,7 +45,7 @@ LocalTimeZone = ZoneInfo("America/New_York")
 ExpectedAcceptanceCases = (
     {
         "Name": "FullAdder",
-        "ExamplePath": "Examples/FullAdder.sv",
+        "ExamplePath": "Assets/Examples/FullAdder.sv",
         "TopModule": "FullAdder",
         "RequiredRuns": 5,
         "TruthTableRows": 8,
@@ -55,7 +55,7 @@ ExpectedAcceptanceCases = (
     },
     {
         "Name": "RippleCarryAdder4",
-        "ExamplePath": "Examples/RippleCarryAdder4.sv",
+        "ExamplePath": "Assets/Examples/RippleCarryAdder4.sv",
         "TopModule": "RippleCarryAdder4",
         "RequiredRuns": 3,
         "TruthTableRows": 512,
@@ -65,7 +65,7 @@ ExpectedAcceptanceCases = (
     },
     {
         "Name": "RippleCarryAdder8",
-        "ExamplePath": "Examples/RippleCarryAdder8.sv",
+        "ExamplePath": "Assets/Examples/RippleCarryAdder8.sv",
         "TopModule": "RippleCarryAdder8",
         "RequiredRuns": 3,
         "TruthTableRows": 131_072,
@@ -75,7 +75,7 @@ ExpectedAcceptanceCases = (
     },
     {
         "Name": "CarryLookaheadAdder4",
-        "ExamplePath": "Examples/CarryLookaheadAdder4.sv",
+        "ExamplePath": "Assets/Examples/CarryLookaheadAdder4.sv",
         "TopModule": "CarryLookaheadAdder4",
         "RequiredRuns": 2,
         "TruthTableRows": 512,
@@ -294,7 +294,7 @@ def IsRoutingImplementationSource(RelativePath: str) -> bool:
         return True
     if RelativePath.endswith(".py") and RelativePath.startswith((
         "App/",
-        "Compiler/",
+        "Compilation/",
         "PhysicalDesign/",
         "RedstoneCompiler/",
         "Validation/",
@@ -302,7 +302,7 @@ def IsRoutingImplementationSource(RelativePath: str) -> bool:
         return True
     return (
         RelativePath.endswith(".rs")
-        and RelativePath.startswith("Native/Routing/Src/")
+        and RelativePath.startswith("Kernels/Routing/Src/")
     )
 
 
@@ -565,8 +565,8 @@ def BuildCurrentRuntimeProvenance(Root: Path) -> dict[str, object]:
     BuildRecords = [
         BuildRequiredRepositoryFileRecord(Root, RelativePath)
         for RelativePath in (
-            "Native/Routing/Cargo.toml",
-            "Native/Routing/Cargo.lock",
+            "Kernels/Routing/Cargo.toml",
+            "Kernels/Routing/Cargo.lock",
             "Tools/Routing/RunRouterAcceptance.py",
             "pyproject.toml",
             "Assets/Templates/__init__.py",

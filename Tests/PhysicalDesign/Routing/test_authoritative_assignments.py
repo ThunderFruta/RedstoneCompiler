@@ -2060,7 +2060,7 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
         self,
     ) -> None:
         """One frozen envelope exports the same values without solving them."""
-        from PhysicalDesign.Flow.Preparation import BuildDerivedRoutingEnvelopeDomain, BuildFrozenEnvelopeRoutingPolicy, BuildPlacementAccessDemand
+        from PhysicalDesign.Orchestration.Preparation import BuildDerivedRoutingEnvelopeDomain, BuildFrozenEnvelopeRoutingPolicy, BuildPlacementAccessDemand
 
         Module = ModuleIR(
             Name="RawTrackAssignmentDomain",
@@ -2144,7 +2144,7 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
         self,
     ) -> None:
         """The selected raw witness reaches routing without a second solve."""
-        from PhysicalDesign.Flow.Preparation import BuildDerivedRoutingEnvelopeDomain, BuildFrozenEnvelopeRoutingPolicy, BuildPlacementAccessDemand
+        from PhysicalDesign.Orchestration.Preparation import BuildDerivedRoutingEnvelopeDomain, BuildFrozenEnvelopeRoutingPolicy, BuildPlacementAccessDemand
         from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentProblem, RawTrackAssignmentTemplate, SolveRawTrackAssignmentProblemWithContext
 
         Module = ModuleIR(

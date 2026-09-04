@@ -6,24 +6,24 @@ import pytest
 
 import PhysicalDesign.Placement.Access.Capacity as AccessFabricModule
 
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
 from PhysicalDesign.Placement.Access.Capacity import SolvePlacementAccessFabricCapacity
 from PhysicalDesign.Placement.Access.EscapePaths import _BuildDerivedPerimeterCycleRouteNodeSets, _BuildShortestFabricEscapePaths
 from PhysicalDesign.Placement.Access.Fabric import AttachPlacementAccessFabric, BuildPlacementAccessFabric
-from PhysicalDesign.Placement.Core.Clusters import PcbPlacement
-from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
-from PhysicalDesign.Placement.Core.Compactness import BuildPinAlignedPackedClusterPortfolio
+from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
+from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
+from PhysicalDesign.Placement.Engine.Compactness import BuildPinAlignedPackedClusterPortfolio
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
-from PhysicalDesign.Flow.Demand import BuildDerivedPinAlignedEnvelopeLowerBoundObjective, BuildPlacementGenerationPlan, SelectDerivedPrimaryPlacementRequests
+from PhysicalDesign.Orchestration.Demand import BuildDerivedPinAlignedEnvelopeLowerBoundObjective, BuildPlacementGenerationPlan, SelectDerivedPrimaryPlacementRequests
 from PhysicalDesign.Placement.PreRouteInterface import DeriveRoutingEnvelopes, PlacementAccessDemand
 from PhysicalDesign.Policy import LocalFirstPhysicalDesignPolicy
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
-from Compiler.Frontend import Sv
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
+from Formats.SystemVerilog import Sv
 from PhysicalDesign.Contracts.Placement import PlacementAccessEscapeStub, PlacementAccessFabric, PlacementAccessTerminalDomain
 from PhysicalDesign.Resources.ResourceGraph import RoutingResourceClaims, RoutingResourceId, RoutingResourceKind
-from PhysicalDesign.Redstone.Actions.Geometry import BuildRoutingResources
+from PhysicalDesign.Redstone.Rules.Geometry import BuildRoutingResources
 from PhysicalDesign.Routing.Global.Ports.Portals import ResolvePlacementAccessFabricRegionContract
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 
@@ -816,7 +816,7 @@ def test_single_component_domain_does_not_silently_fall_back_without_geometry():
 def test_full_adder_access_fabric_is_complete_and_deterministic():
     with tempfile.TemporaryDirectory() as Directory:
         Netlist = ToNandOnly(OptimizeLogic(Sv.ParseSvToNetlist(
-            InputPath=Path("Examples/FullAdder.sv"),
+            InputPath=Path("Assets/Examples/FullAdder.sv"),
             TopModule="FullAdder",
             Workdir=Path(Directory),
         )))
@@ -868,7 +868,7 @@ def test_full_adder_access_fabric_is_complete_and_deterministic():
 def test_full_adder_perimeter_ring_has_four_faces_and_frozen_identity():
     with tempfile.TemporaryDirectory() as Directory:
         Netlist = ToNandOnly(OptimizeLogic(Sv.ParseSvToNetlist(
-            InputPath=Path("Examples/FullAdder.sv"),
+            InputPath=Path("Assets/Examples/FullAdder.sv"),
             TopModule="FullAdder",
             Workdir=Path(Directory),
         )))

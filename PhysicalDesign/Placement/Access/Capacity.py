@@ -20,7 +20,7 @@ from typing import (
 from PhysicalDesign.Contracts.Placement import PlacementAccessAssignment, PlacementAccessFabric
 from PhysicalDesign.Contracts.Core import Position3
 from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, FindSelfClaimConflicts, RoutingResourceClaims, RoutingResourceGraph
-from PhysicalDesign.Execution.Reliability import BuildStableFingerprint
+from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 from .EscapePaths import (
     _BuildDerivedPerimeterCycleRouteNodeSets,

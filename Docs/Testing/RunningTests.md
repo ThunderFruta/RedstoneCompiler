@@ -45,7 +45,7 @@ collection; explicit CLI flags override the environment. Telemetry does not
 change thread limits, search policy, validation gates, or deadlines.
 
 ```bash
-.venv/bin/python Main.py --input Examples/HalfAdder.sv \
+.venv/bin/python Main.py --input Assets/Examples/HalfAdder.sv \
   --output Output/Telemetry/HalfAdder.litematic
 .venv/bin/python Tools/Routing/RunRouterAcceptance.py \
   --matrix expanded --routing-threads 8 --output-root Output/TelemetryAcceptance
@@ -119,9 +119,9 @@ structural failure and must not be reported as timeout exhaustion.
 ## Rust router and MCHPRS backend
 
 ```bash
-cargo fmt --manifest-path Native/Routing/Cargo.toml -- --check
-cargo test --manifest-path Native/Routing/Cargo.toml --release
-cargo build --manifest-path Native/Routing/Cargo.toml --release --features python-extension
+cargo fmt --manifest-path Kernels/Routing/Cargo.toml -- --check
+cargo test --manifest-path Kernels/Routing/Cargo.toml --release
+cargo build --manifest-path Kernels/Routing/Cargo.toml --release --features python-extension
 ```
 
 After any Rust source change, copy the release extension into the Python
@@ -132,7 +132,7 @@ does not prove the rebuilt native code was exercised.
 ## Validation harness
 
 ```bash
-gradle -p Validation/Fabric/Harness test
+gradle -p Validation/Fabric/ServerHarness test
 ```
 
 Harness unit tests do not substitute for a live Fabric acceptance run.

@@ -1,8 +1,8 @@
 """Audit contracts for finite placement-access and detailed-routing bounds."""
 
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
-from PhysicalDesign.Placement.Core.Clusters import PcbPlacement
+from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Routing.Global.Ports.Portals import ResolvePlacementAccessFabricRegionContract
 from PhysicalDesign.Contracts.Placement import DetailedRoutingBounds, PlacementAccessEscapeStub, PlacementAccessFabric, PlacementAccessTerminalDomain
 from PhysicalDesign.Routing.Pcb import _BuildPlacementAccessRoutingBoundsAudit

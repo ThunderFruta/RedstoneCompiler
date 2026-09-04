@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`Main.py` forwards to `App/Main.py`; `App/CompilerCli.py` owns argument-driven compilation. `App/` also contains reporting and telemetry. `Compiler/` contains `Frontend`, `Ir`, `Synthesis`, and the existing `Pipeline.py` coordinator. Keep placement, routing, geometry, contracts, redstone rules, resources, and schematic rendering in their owners under `PhysicalDesign/`. The PyO3 backend lives in `Native/Routing/Src/` and remains importable as `RedstoneCompiler.RustRouting`. `Validation/` owns core validation, MCHPRS, Fabric integration, tracked manager source in `Fabric/Runtime/`, and Java/Gradle source in `Fabric/Harness/`. The ignored `ValidationServerHarness/Server/` remains runtime data. Group tests by their source domain under `Tests/`; shared fixtures stay in `Tests/Fixtures/`. Templates are under `Assets/Templates/`, tools under `Tools/`, examples under `Examples/`, and references under `Docs/`.
+`Main.py` forwards to `App/Main.py`; `App/CompilerCli.py` owns argument-driven compilation. `App/` also contains reporting and telemetry. `Compilation/` contains IR, synthesis, and the `Pipeline.py` coordinator; SystemVerilog decoding belongs in `Formats/SystemVerilog/`. Keep placement, routing, geometry, contracts, redstone rules, resources, and schematic rendering in their owners under `PhysicalDesign/`. The PyO3 backend lives in `Kernels/Routing/Src/` and remains importable as `RedstoneCompiler.RustRouting`. `Validation/` owns core validation, MCHPRS, Fabric integration, tracked manager source in `Fabric/ServerManager/`, and Java/Gradle source in `Fabric/ServerHarness/`. The ignored `Runtime/FabricServer/` remains runtime data. Group tests by their source domain under `Tests/`; shared fixtures stay in `Tests/Fixtures/`. Templates are under `Assets/Templates/`, tools under `Tools/`, examples under `Assets/Examples/`, and references under `Docs/`.
 
 ## Build, Test, and Development Commands
 
@@ -13,9 +13,9 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 redstone-compiler
 python3 -m pytest -q
-cargo fmt --manifest-path Native/Routing/Cargo.toml -- --check
-cargo test --manifest-path Native/Routing/Cargo.toml --release
-gradle -p Validation/Fabric/Harness test
+cargo fmt --manifest-path Kernels/Routing/Cargo.toml -- --check
+cargo test --manifest-path Kernels/Routing/Cargo.toml --release
+gradle -p Validation/Fabric/ServerHarness test
 ```
 
 The editable install builds the Python/PyO3 package; the CLI runs a guided or argument-driven compile. Pytest covers Python contracts and integration. Rust changes require formatting plus release tests and a rebuilt extension before Python parity checks. The Fabric harness requires Java 25 and Gradle 9.5.1.
@@ -30,4 +30,4 @@ Add focused tests beside the owning domain. Before broad runs, use the structura
 
 ## Commit & Pull Request Guidelines
 
-Follow recent history with short, imperative subjects such as `Add MCHPRS validation harness and Fabric canary gate`. Keep commits scoped to one coherent change. Pull requests should explain behavior and architecture impact, list exact verification commands and results, link relevant issues, and identify generated evidence. Do not commit `Output/`, `Cache/`, `.venv/`, `RustRouting/target/`, native `.so` files, or `ValidationServerHarness/Server/` secrets, worlds, logs, and downloaded JARs.
+Follow recent history with short, imperative subjects such as `Add MCHPRS validation harness and Fabric canary gate`. Keep commits scoped to one coherent change. Pull requests should explain behavior and architecture impact, list exact verification commands and results, link relevant issues, and identify generated evidence. Do not commit `Output/`, `Cache/`, `.venv/`, `RustRouting/target/`, native `.so` files, or `Runtime/FabricServer/` secrets, worlds, logs, and downloaded JARs.

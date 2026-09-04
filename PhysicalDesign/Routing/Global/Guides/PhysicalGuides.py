@@ -46,11 +46,11 @@ from ....Contracts.Failures import RoutingFailureReason
 
 from ....Contracts.Failures import RoutingStageError
 
-from ....Interfaces.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
+from ....Constraints.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
 
-from ....Interfaces.PhysicalClaims import PortalTupleConflictsWithFrozenComponentClaims
+from ....Constraints.PhysicalClaims import PortalTupleConflictsWithFrozenComponentClaims
 
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
 from ....Resources.ResourceGraph import FindClaimConflicts
 

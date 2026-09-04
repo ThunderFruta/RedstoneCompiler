@@ -1403,7 +1403,7 @@ def test_fixed_boundary_local_rejections_advance_seams_without_cycling(
         ),
     )
     monkeypatch.setattr(
-        "PhysicalDesign.Routing.Regions.Interfaces.Reservations."
+        "PhysicalDesign.Routing.Regions.Boundaries.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )

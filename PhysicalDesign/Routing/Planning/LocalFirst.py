@@ -14,7 +14,7 @@ from .ChannelPlanner import (
     CandidateLanes,
 )
 from ...Policy import GlobalRoutingPolicy, PhysicalDesignPolicy
-from ...Execution.Reliability import BuildStableFingerprint
+from ...Runtime.Reliability import BuildStableFingerprint
 from ...Redstone.Technology import RedstoneRoutingTechnology
 
 Position2 = tuple[int, int]

@@ -21,7 +21,7 @@ from .Models import (
     FabricServerValidationResult,
     FabricValidationProgress,
 )
-from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
+from Compilation.Synthesis.LogicEvaluation import EvaluateLogicModule
 
 
 ExhaustiveInputLimit = 16

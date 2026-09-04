@@ -14,14 +14,14 @@ import unittest
 from PhysicalDesign.Rendering.SchemWriter import EncodePayload, EncodeString, NbtValue
 
 
-RuntimeScripts = Path(__file__).resolve().parents[3] / "Validation/Fabric/Runtime"
+RuntimeScripts = Path(__file__).resolve().parents[3] / "Validation/Fabric/ServerManager"
 RuntimeProcessPath = RuntimeScripts / "Process.py"
 RuntimeAnvilPath = RuntimeScripts / "Anvil.py"
 
 
 def LoadRuntimeModule(Name: str, PathValue: Path) -> ModuleType:
     """Load one local runtime module without invoking server lifecycle actions."""
-    Name = f"Validation.Fabric.Runtime.{Name}"
+    Name = f"Validation.Fabric.ServerManager.{Name}"
     ModuleSpecification = importlib.util.spec_from_file_location(
         Name,
         PathValue,

@@ -7,7 +7,7 @@ from typing import Callable
 from .....Contracts.Component import PhysicalComponentBoundaryPortReservation
 from .....Contracts.PhysicalInterface import PreparedPhysicalComponentAssembly, PreparedPhysicalComponentPortFactorDomain
 from .....Contracts.Results import RoutingResources
-from .....Execution.Reliability import RoutingDeadline
+from .....Runtime.Reliability import RoutingDeadline
 from .Search import _SolvePreparedPhysicalComponentPortFactorDomain
 
 

@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ....Contracts.Component import ClosedComponentInterface, ComponentFeedthroughContract, ComponentForeignTransitDomain, ComponentInterfacePort, ComponentRoutingFabric, ComponentRoutingProblem, ComponentRoutingSolveResult, ComponentTerminalAccessCandidate, ComponentTerminalAccessDomain, RoutedComponentNet, RoutedComponentTemplate
 from ....Contracts.Core import Position3
-from ....Interfaces.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
+from ....Constraints.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
 from ....Resources.ResourceGraph import FindSelfClaimConflicts, LocalRouteClaim, PinAccessPortal, RoutingEdge, RoutingReservation, RoutingResourceId, RoutingResourceKind, RoutingResourceClaims
 from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
 
@@ -48,7 +48,7 @@ except ImportError:
 
 from ..Core import CompleteComponentNetPortfolioStaticContext, _ClaimsFingerprint, _ComponentNetPortfolioStructuralFingerprint, _ComponentOrigin, _RelativeGeometry, _StableFingerprint, _TranslateAndValidateNetPortfolio
 from ..Domains import FindCompleteComponentNetUnsatSubset, PruneDominatedComponentNetVariants
-from ..Interfaces.Fabric import BuildComponentEgressPaths, _BuildAdjacency, _UniqueFabricSubtree
+from ..Boundaries.Fabric import BuildComponentEgressPaths, _BuildAdjacency, _UniqueFabricSubtree
 from ..Planning.NetPlanning import _BuildCanonicalAccessCombinationKey, _BuildNetVariant
 def _SolveComponentRoutingProblemLegacy(Problem: ComponentRoutingProblem, *, DeadlineSeconds: float | None=None, WorkCheck: Callable[[dict[str, object]], None] | None=None, ForbiddenAssignmentFingerprints: frozenset[str]=frozenset(), ForbiddenExportPortsBySignal: dict[str, tuple[Position3, ...]] | None=None, ForbiddenForeignCandidateFingerprintsBySignal: dict[str, frozenset[str]] | None=None, ForbiddenForeignAssignmentPairs: tuple[frozenset[tuple[str, Position3, str]], ...]=(), VariantPortfolioCache: dict[tuple[str, str], tuple[tuple[RoutedComponentNet, ...], int, dict[str, int], frozenset[str], Position3]] | None=None, NetVariantConstructionCache: dict[tuple[str, frozenset[Position3], frozenset[RoutingEdge], tuple[Position3, ...]], RoutedComponentNet | None] | None=None, RouteClaimsConstructionCache: dict[frozenset[Position3], RoutingResourceClaims] | None=None, NetVariantDiscoveryStateCache: dict[tuple[str, str], dict[str, object]] | None=None, DiscoveryVariantLimit: int | None=8, DiscoveryVariantLimitsBySignal: dict[str, int | None] | None=None, RequiredForeignTransitSignals: frozenset[str]=frozenset(), StopAfterCompleteNetVariantPortfolioSignal: str | None=None, StaticPortfolioContextsBySignal: dict[str, CompleteComponentNetPortfolioStaticContext] | None=None) -> ComponentRoutingSolveResult:
     """Legacy oracle that enumerates complete per-net tree portfolios."""

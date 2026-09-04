@@ -1,6 +1,6 @@
 # Adding examples
 
-Place supported scalar combinational SystemVerilog examples under `Examples/`.
+Place supported scalar combinational SystemVerilog examples under `Assets/Examples/`.
 Use one module per file unless the test explicitly exercises `--top`.
 
 Add a lightweight logical test first. If the example is intended as a physical

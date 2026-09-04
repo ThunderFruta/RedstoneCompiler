@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from ...Regions.Interfaces.Access import ValidateComponentAccessCertificateIdentity
-from ...Regions.Interfaces.Fabric import BuildComponentFabricAdjacency
-from ...Regions.Interfaces.Feedthroughs import BuildDeclaredComponentFeedthroughDomains
+from ...Regions.Boundaries.Access import ValidateComponentAccessCertificateIdentity
+from ...Regions.Boundaries.Fabric import BuildComponentFabricAdjacency
+from ...Regions.Boundaries.Feedthroughs import BuildDeclaredComponentFeedthroughDomains
 from ....Contracts.Component import PhysicalComponentChannelReservation
 from ....Contracts.Component import PreparedPhysicalComponentFeedthroughEndpointDomain
 from ....Contracts.Failures import RoutingFailure
 from ....Contracts.Failures import RoutingFailureReason
 from ....Contracts.Failures import RoutingStageError
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
 from collections import Counter
 from dataclasses import replace

@@ -9,7 +9,7 @@ public launch commands, native exports, and existing runtime data locations.
 ```text
 App/                         guided CLI, argument CLI, reports, telemetry
 Assets/Templates/            template catalog and three litematic templates
-Compiler/
+Compilation/
   Frontend/                  SystemVerilog parser
   Ir/                        logical intermediate representation
   Synthesis/                 logic and NAND transformations
@@ -38,17 +38,17 @@ Validation/
     Harness/                 tracked Java/Gradle mod sources
     Runtime/                 tracked Python runtime-manager sources
   Mchprs/                    existing MCHPRS validation coordinator
-Native/Routing/              existing Rust crate, lockfile, and nested Src tree
+Kernels/Routing/              existing Rust crate, lockfile, and nested Src tree
 RedstoneCompiler/            Python facade, native import, native stub
 Tools/{Fabric,Mchprs,Routing}/ developer and runtime tools
 Tests/                       tests grouped by the owning domain
 Docs/                        current references and design documents
-Examples/                    existing SystemVerilog inputs
+Assets/Examples/                    existing SystemVerilog inputs
 Main.py                      compatibility launcher
 ```
 
 `App/Main.py` owns the guided launcher and `App/CompilerCli.py` the argument CLI.
-`Compiler/Pipeline.py` remains the coordinator. Folder ownership does not imply
+`Compilation/Pipeline.py` remains the coordinator. Folder ownership does not imply
 that the broader boundary refactors proposed in the architecture review are done.
 
 The installed commands remain `redstone-compiler` and `redstone-benchmark`.
@@ -57,9 +57,9 @@ behavior, and the native module remains `RedstoneCompiler.RustRouting`.
 
 ## Runtime and generated files
 
-- `ValidationServerHarness/Server/` retains the server installation and worlds.
+- `Runtime/FabricServer/` retains the server installation and worlds.
   The existing override/local/sibling-worktree lookup chooses its runtime root.
-- `ValidationServerHarness/build/` and `ValidationServerHarness/.gradle/` retain
+- `Cache/Gradle/ServerHarness/Build/` and `Cache/Gradle/ServerHarness/Project/` retain
   Gradle output and project caches.
 - `RustRouting/target/` retains Cargo build output through `.cargo/config.toml`.
 - `Output/`, `Cache/`, `.venv/`, and external Minecraft/template locations keep

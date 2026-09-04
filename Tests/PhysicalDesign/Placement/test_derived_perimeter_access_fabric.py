@@ -9,14 +9,14 @@ import PhysicalDesign.Placement.Access.Fabric as AccessFabricModule
 import PhysicalDesign.Placement.Access.Geometry as AccessGeometryModule
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR
 from PhysicalDesign.Placement.Access.Fabric import BuildPlacementAccessFabric
 from PhysicalDesign.Placement.Access.Geometry import _DerivePerimeterRootAccessFace, BuildDerivedPerimeterFabricShell, MeasureDerivedPerimeterInterfaceDemand, MeasureDerivedPerimeterInterfaceLaunchDemandByFace
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
-from PhysicalDesign.Placement.Core.Clusters import PcbPlacement
+from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Placement.PreRouteInterface import DerivedPerimeterFaceReservation, DerivedPerimeterSlotAssignment, DerivedPerimeterTerminalSlot
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
-from PhysicalDesign.Redstone.Actions.Geometry import BuildRoutingResources
+from PhysicalDesign.Redstone.Rules.Geometry import BuildRoutingResources
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 from PhysicalDesign.Resources.ResourceGraph import FindSelfClaimConflicts
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology

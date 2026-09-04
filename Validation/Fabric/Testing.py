@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from Compiler.Ir.Models import ModuleIR
-from Validation.Core.Testing import ReadNandModule
-from Compiler.Frontend import Sv
+from Compilation.Ir.Models import ModuleIR
+from Validation.Physical.Testing import ReadNandModule
+from Formats.SystemVerilog import Sv
 
 from .Fixture import FabricFixtureArtifact
 from .Validation import BuildExpectedVectors

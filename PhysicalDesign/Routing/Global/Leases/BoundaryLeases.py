@@ -8,7 +8,7 @@ from ....Resources.ResourceGraph import PinAccessPortal
 from ....Resources.ResourceGraph import PortalReservation
 from typing import Any
 from typing import Callable
-from ..Flow.RunModels import ClusterLeaseCandidateRealizabilityNogood
+from ..Orchestration.RunModels import ClusterLeaseCandidateRealizabilityNogood
 from .BoundaryLeaseState import (
     BoundaryLeaseReturn,
     BoundaryLeaseState,

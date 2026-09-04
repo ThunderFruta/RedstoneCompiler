@@ -1569,7 +1569,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
     def testAcceptanceCaseRejectsInvalidDeadlineEnvelopes(self) -> None:
         BaseOptions = {
             "Name": "Fixture",
-            "ExamplePath": Path("Examples/Fixture.sv"),
+            "ExamplePath": Path("Assets/Examples/Fixture.sv"),
             "TopModule": "Fixture",
             "RequiredRuns": 1,
             "TruthTableRows": 1,

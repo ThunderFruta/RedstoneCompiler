@@ -13,7 +13,7 @@ ComponentRouter,ComponentPipeline}.py`, and the former flat Rust source files.
 No forwarding modules remain. Repository imports, test patch targets, and
 workers now name their concrete owners under `Placement/{Access,Core,Flow}` and
 `Routing/{Contracts,Interfaces,Components,Authoritative}`; Rust uses nested
-domain directories under `Native/Routing/Src/`.
+domain directories under `Kernels/Routing/Src/`.
 
 `Routing/Actions/ConflictRepair.py` was consolidated into `Actions/Validation.py`
 without changing the `Actions` exports. The unused `Cells/Nand.py` duplicate was
@@ -56,8 +56,8 @@ assign a flat whole-design solution.
   path;
 - `PhysicalDesign/Routing/Assignment/TrackAssignment.py::AssignGlobalTracks` and its old
   assignment/repeater helpers;
-- `PhysicalDesign/Redstone/Actions/ConflictRepair.py`;
-- `PhysicalDesign/Routing/Workers/PinAccess.py` after Rust portal parity coverage
+- `PhysicalDesign/Redstone/Rules/ConflictRepair.py`;
+- `PhysicalDesign/Routing/Execution/PinAccess.py` after Rust portal parity coverage
   replaces its tests;
 - Rust `FindPathOnResourceGraph` and `FindPathsOnResourceGraph` after the old
   pin-access worker is gone;
@@ -111,7 +111,7 @@ removed. It must not remain as a second inactive placement philosophy.
 The following exist only during the project-tree migration:
 
 ```text
-RedstoneCompiler.* imports  → Compiler.*, Compiler.Frontend.*, PhysicalDesign.Rendering.*
+RedstoneCompiler.* imports  → Compilation.*, Formats.SystemVerilog.*, PhysicalDesign.Rendering.*
 Build/                      → Output/
 .RedstoneWork/             → Cache/Frontend/
 .pytest_cache/             → Cache/Tests/

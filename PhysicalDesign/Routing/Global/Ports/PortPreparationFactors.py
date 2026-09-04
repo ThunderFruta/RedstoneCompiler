@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from ...Regions.Interfaces.Fabric import BuildComponentEgressPaths
-from ...Regions.Interfaces.Fabric import FilterExternalSourcePoweredSeamCandidateDomains
+from ...Regions.Boundaries.Fabric import BuildComponentEgressPaths
+from ...Regions.Boundaries.Fabric import FilterExternalSourcePoweredSeamCandidateDomains
 from ....Contracts.PhysicalInterface import PhysicalPortLaneFactor
 from ....Contracts.PhysicalInterface import PhysicalPortLocalAccessFactor
 from ....Contracts.PhysicalInterface import PhysicalPortSeamFactor
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 from ....Resources.ResourceGraph import FindSelfClaimConflicts
 from ....Resources.ResourceGraph import RoutingResourceClaims
 from collections import Counter

@@ -9,31 +9,31 @@ import unittest
 from unittest.mock import patch
 from typing import Any
 
-from Compiler.Frontend import Sv
+from Formats.SystemVerilog import Sv
 from App.CompilerCli import BuildParser, Main, PrintFabricFailureSummary, PrintRoutingFailureSummary
-from Compiler.Pipeline import CompileSvToLitematic
-from PhysicalDesign.Flow.Demand import BuildPlacementGenerationPlan
-from PhysicalDesign.Flow.Preparation import PlacementNeedsDemandDiversity
-from PhysicalDesign.Flow.Runner import PlaceAndRoutePcb, _PlaceAndRoutePcbWithPolicy
-from PhysicalDesign.Flow.Setup import MaterializeInitialConflictRelocation, MaterializeInitialPendingJointPlacementState
-from PhysicalDesign.Placement.Core.Clustering import BuildTopologicalLevels, FindIsomorphicNandClusterMapping, OptimizeClusterSlots, PcbGatesConflict
-from PhysicalDesign.Placement.Core.Clusters import PcbPlacement
-from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
+from Compilation.Pipeline import CompileSvToLitematic
+from PhysicalDesign.Orchestration.Demand import BuildPlacementGenerationPlan
+from PhysicalDesign.Orchestration.Preparation import PlacementNeedsDemandDiversity
+from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb, _PlaceAndRoutePcbWithPolicy
+from PhysicalDesign.Orchestration.Setup import MaterializeInitialConflictRelocation, MaterializeInitialPendingJointPlacementState
+from PhysicalDesign.Placement.Engine.Clustering import BuildTopologicalLevels, FindIsomorphicNandClusterMapping, OptimizeClusterSlots, PcbGatesConflict
+from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
+from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign, PlacedGate
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
 from Validation.Fabric import FabricServerValidationResult, FabricValidationProgress
 from PhysicalDesign.Routing.Planning.LocalFirst import AssignCapacityAwareGuideOptionDomains, BuildCapacityAwareGuidePlan, BuildCapacityAwareGuideOptionDomains, BuildPlacementSolution, BuildRipupPlan, DeriveRoutingBudget, RoutingDemandEstimate
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
-from PhysicalDesign.Redstone.Actions.Geometry import ValidatePlacedCellElectricalIsolation
+from PhysicalDesign.Redstone.Rules.Geometry import ValidatePlacedCellElectricalIsolation
 from PhysicalDesign.Policy import AdaptiveRoutingPolicy, GlobalRoutingPolicy, LocalFirstPhysicalDesignPolicy, NandPackingPolicy, RoutingAcceptanceProfiles, RoutingStrategy
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Contracts.Results import RoutedDesign
-from PhysicalDesign.Execution.Reliability import RoutingDeadline
-from Compiler.Synthesis.Validation import ValidateNandOnlyDesign
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
+from PhysicalDesign.Runtime.Reliability import RoutingDeadline
+from Compilation.Synthesis.Validation import ValidateNandOnlyDesign
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
 from PhysicalDesign.Rendering.SchemWriter import LoadTemplate
 
 
@@ -48,11 +48,11 @@ class LocalFirstRouterTests(unittest.TestCase):
 
         with (
             patch(
-                "PhysicalDesign.Flow.Setup._TakeNextDeferredRequest",
+                "PhysicalDesign.Orchestration.Setup._TakeNextDeferredRequest",
                 return_value=Request,
             ) as TakeRequest,
             patch(
-                "PhysicalDesign.Flow.Setup._TryPlacement",
+                "PhysicalDesign.Orchestration.Setup._TryPlacement",
                 return_value=False,
             ) as TryPlacement,
         ):
@@ -76,10 +76,10 @@ class LocalFirstRouterTests(unittest.TestCase):
 
         with (
             patch(
-                "PhysicalDesign.Flow.Setup._TakeNextDeferredRequest",
+                "PhysicalDesign.Orchestration.Setup._TakeNextDeferredRequest",
             ) as TakeRequest,
             patch(
-                "PhysicalDesign.Flow.Setup._TryPlacement",
+                "PhysicalDesign.Orchestration.Setup._TryPlacement",
                 return_value=False,
             ) as TryPlacement,
         ):
@@ -114,7 +114,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         )
 
         with patch(
-            "PhysicalDesign.Flow.Setup._TryPlacement",
+            "PhysicalDesign.Orchestration.Setup._TryPlacement",
             return_value=True,
         ) as TryPlacement:
             self.assertTrue(
@@ -243,28 +243,28 @@ class LocalFirstRouterTests(unittest.TestCase):
         EffectiveRouteSideEffect = RouteSideEffect or Routed
         with (
             patch(
-                "PhysicalDesign.Flow.Setup.RoutingDeadline.Start",
+                "PhysicalDesign.Orchestration.Setup.RoutingDeadline.Start",
                 wraps=RoutingDeadline.Start,
             ) as StartDeadline,
             patch(
-                "PhysicalDesign.Flow.Runner.PlacePcbGraph",
+                "PhysicalDesign.Orchestration.Runner.PlacePcbGraph",
                 side_effect=PlaceSideEffect,
             ) as PlaceGraph,
             patch(
-                "PhysicalDesign.Flow.PlacementAttempts.BuildPlacementFingerprint",
+                "PhysicalDesign.Orchestration.PlacementAttempts.BuildPlacementFingerprint",
                 side_effect=Fingerprints,
             ),
             patch(
-                "PhysicalDesign.Flow.PlacementAttempts.BuildPlacementRetentionFingerprint",
+                "PhysicalDesign.Orchestration.PlacementAttempts.BuildPlacementRetentionFingerprint",
                 side_effect=Fingerprints,
             ),
             patch(
-                "PhysicalDesign.Flow.Runner.MeasurePlacementRoutingFeedback",
+                "PhysicalDesign.Orchestration.Runner.MeasurePlacementRoutingFeedback",
                 side_effect=FeedbackSideEffect,
                 return_value=self._BuildPlacementFeedbackFixture(),
             ),
             patch(
-                "PhysicalDesign.Flow.Runner.RoutePcbDesign",
+                "PhysicalDesign.Orchestration.Runner.RoutePcbDesign",
                 side_effect=(
                     EffectiveRouteSideEffect
                     if isinstance(EffectiveRouteSideEffect, list)
@@ -277,22 +277,22 @@ class LocalFirstRouterTests(unittest.TestCase):
                 ),
             ) as RouteDesign,
             patch(
-                "PhysicalDesign.Flow.Runner.ValidateNandOnlyDesign",
+                "PhysicalDesign.Orchestration.Runner.ValidateNandOnlyDesign",
             ),
             patch(
-                "PhysicalDesign.Flow.Runner.ValidatePlacedCellElectricalIsolation",
+                "PhysicalDesign.Orchestration.Runner.ValidatePlacedCellElectricalIsolation",
             ),
-            patch("PhysicalDesign.Flow.Runner.BuildRoutingResources"),
+            patch("PhysicalDesign.Orchestration.Runner.BuildRoutingResources"),
             patch(
-                "PhysicalDesign.Flow.Runner.MeasurePcbDesign",
+                "PhysicalDesign.Orchestration.Runner.MeasurePcbDesign",
                 return_value=(1, 1, 1, 1),
             ),
             patch(
-                "PhysicalDesign.Flow.Runner.BuildLocalFirstSnapshot",
+                "PhysicalDesign.Orchestration.Runner.BuildLocalFirstSnapshot",
                 return_value=SimpleNamespace(ToDictionary=lambda: {}),
             ),
             patch(
-                "PhysicalDesign.Flow.Runner.PreparePlacementRouting",
+                "PhysicalDesign.Orchestration.Runner.PreparePlacementRouting",
                 side_effect=self._PrepareMockedPlacementRouting,
             ),
         ):
@@ -342,14 +342,14 @@ class LocalFirstRouterTests(unittest.TestCase):
     def testCliAliasesAndDefaultRoutingStrategyParse(self) -> None:
         Parsed = BuildParser().parse_args(
             [
-                "--example", "Examples/FullAdder.sv",
+                "--example", "Assets/Examples/FullAdder.sv",
                 "--topmodule", "FullAdder",
                 "--output", "Output/Test",
                 "--outputname", "Test",
                 "--routing-strategy", "default",
             ]
         )
-        self.assertEqual(Parsed.input, Path("Examples/FullAdder.sv"))
+        self.assertEqual(Parsed.input, Path("Assets/Examples/FullAdder.sv"))
         self.assertEqual(Parsed.top, "FullAdder")
         self.assertEqual(Parsed.outputname, "Test")
         self.assertEqual(Parsed.routing_strategy, "default")
@@ -413,7 +413,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             ):
                 ReturnCode = Main([
                     "--input",
-                    "Examples/FullAdder.sv",
+                    "Assets/Examples/FullAdder.sv",
                     "--output",
                     str(Directory / "Failed.litematic"),
                     "--routing-strategy",
@@ -1157,7 +1157,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             FullFootprint=Footprint * 5,
         )
         with patch(
-            "PhysicalDesign.Rendering.SchemWriter.BuildLitematicBlockMap",
+            "PhysicalDesign.Rendering.Renderer.BuildLitematicBlockMap",
             side_effect=[
                 SimpleNamespace(Composition=Composition(0.70, 140, 200)),
                 SimpleNamespace(Composition=Composition(0.55, 150, 210)),
@@ -1381,7 +1381,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             Netlist = ToNandOnly(
                 OptimizeLogic(
                     Sv.ParseSvToNetlist(
-                        InputPath=Path("Examples/FullAdder.sv"),
+                        InputPath=Path("Assets/Examples/FullAdder.sv"),
                         TopModule="FullAdder",
                         Workdir=Path(Directory),
                     )
@@ -1439,7 +1439,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             Netlist = ToNandOnly(
                 OptimizeLogic(
                     Sv.ParseSvToNetlist(
-                        InputPath=Path("Examples/FullAdder.sv"),
+                        InputPath=Path("Assets/Examples/FullAdder.sv"),
                         TopModule="FullAdder",
                         Workdir=Path(Directory),
                     )
@@ -1470,7 +1470,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             Netlist = ToNandOnly(
                 OptimizeLogic(
                     Sv.ParseSvToNetlist(
-                        InputPath=Path("Examples/RippleCarryAdder4.sv"),
+                        InputPath=Path("Assets/Examples/RippleCarryAdder4.sv"),
                         TopModule="RippleCarryAdder4",
                         Workdir=Path(Directory),
                     )
@@ -1575,7 +1575,7 @@ class LocalFirstRouterTests(unittest.TestCase):
             Netlist = ToNandOnly(
                 OptimizeLogic(
                     Sv.ParseSvToNetlist(
-                        InputPath=Path("Examples/RippleCarryAdder4.sv"),
+                        InputPath=Path("Assets/Examples/RippleCarryAdder4.sv"),
                         TopModule="RippleCarryAdder4",
                         Workdir=Path(Directory),
                     )
@@ -1673,7 +1673,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
     def testRemovedHybridStrategyIsRejectedBeforeRouting(self) -> None:
         with patch(
-            "PhysicalDesign.Flow.Runner._PlaceAndRoutePcbWithPolicy",
+            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
         ) as Execute:
             with self.assertRaises(ValueError):
                 PlaceAndRoutePcb(
@@ -1684,7 +1684,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
     def testRemovedCompatibilityStrategyIsRejectedBeforeRouting(self) -> None:
         with patch(
-            "PhysicalDesign.Flow.Runner._PlaceAndRoutePcbWithPolicy",
+            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
         ) as Execute:
             with self.assertRaises(ValueError):
                 PlaceAndRoutePcb(
@@ -1698,7 +1698,7 @@ class LocalFirstRouterTests(unittest.TestCase):
     ) -> None:
         Expected = object()
         with patch(
-            "PhysicalDesign.Flow.Runner._PlaceAndRoutePcbWithPolicy",
+            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
             return_value=Expected,
         ) as Execute:
             Result = PlaceAndRoutePcb(
@@ -1726,7 +1726,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
     def testNewRouterFirstSurfacesLocalRoutingFailure(self) -> None:
         with patch(
-            "PhysicalDesign.Flow.Runner._PlaceAndRoutePcbWithPolicy",
+            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
             side_effect=ValueError("forced local failure"),
         ) as Execute:
             with self.assertRaisesRegex(ValueError, "forced local failure"):
@@ -1755,9 +1755,9 @@ class LocalFirstRouterTests(unittest.TestCase):
                 )
 
             with (
-                patch("Compiler.Pipeline.FabricServerSupervisor") as Supervisor,
+                patch("Compilation.Pipeline.FabricServerSupervisor") as Supervisor,
                 patch(
-                    "Compiler.Pipeline.CaptureServerUpdatedLitematic",
+                    "Compilation.Pipeline.CaptureServerUpdatedLitematic",
                     side_effect=CaptureServerSnapshot,
                 ),
             ):
@@ -1782,7 +1782,7 @@ class LocalFirstRouterTests(unittest.TestCase):
 
                 Supervisor.return_value.Validate.side_effect = ValidateInFabric
                 Result = CompileSvToLitematic(
-                    InputPath=Path("Examples/FullAdder.sv"),
+                    InputPath=Path("Assets/Examples/FullAdder.sv"),
                     TopModule="FullAdder",
                     OutputPath=Root / "FullAdder.litematic",
                     DiagramPath=Root / "FullAdder.Nand.json",

@@ -4,9 +4,9 @@ from itertools import product
 from pathlib import Path
 from random import Random
 
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
-from Compiler.Synthesis.LogicEvaluation import EvaluateLogicModule
-from Compiler.Synthesis.NandTransform import ToNandOnly
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
+from Compilation.Synthesis.LogicEvaluation import EvaluateLogicModule
+from Compilation.Synthesis.NandTransform import ToNandOnly
 
 
 def BuildRandomAcyclicModule(Seed: int) -> ModuleIR:

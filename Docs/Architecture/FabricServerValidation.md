@@ -21,7 +21,7 @@ is never published; snapshot failure clears all success artifacts. Legacy
 shared `.PhysicalFixture.json` artifact.
 
 The one canonical local runtime is
-`ValidationServerHarness/Server/`. It contains the Fabric 26.2 launcher, world,
+`Runtime/FabricServer/`. It contains the Fabric 26.2 launcher, world,
 backups, logs, installed harness JAR, and private control configuration, and is
 intentionally ignored by Git. Compiler validation and the Fabric importer
 default to this root. `RC_FABRIC_SERVER_ROOT` remains an explicit override for
@@ -42,7 +42,7 @@ python3 Tools/Fabric/ControlFabricServer.py clear
 ```
 
 The tracked control command delegates to the modular, runtime-local
-implementation in `Validation/Fabric/Runtime/` (`Paths`,
+implementation in `Validation/Fabric/ServerManager/` (`Paths`,
 `Protocol`, `Anvil`, `Process`, and `Main`). On start it verifies the launcher and
 accepted EULA, refreshes the installed harness JAR from the project build when
 needed, creates a fresh loopback token, and waits for authenticated control
@@ -54,7 +54,7 @@ the typed 26.2 gamerule API.
 
 ## Updating the local harness runtime
 
-`ValidationServerHarness/Server/` is not a Git deployment target. When tracked
+`Runtime/FabricServer/` is not a Git deployment target. When tracked
 Fabric harness Java changes, build `ValidationServerHarness` with the available
 Gradle installation, then run `Tools/Fabric/ControlFabricServer.py start`.
 The manager copies a newer built JAR into the local runtime and only restarts a
@@ -64,7 +64,7 @@ synced by Git; a future fresh-host provisioning flow needs a tracked bootstrap
 or template outside `Server/`.
 
 `clear` is a destructive live block operation. It preserves the existing
-`ValidationServerHarness/Server/world/` directory, `level.dat`, world identity,
+`Runtime/FabricServer/world/` directory, `level.dat`, world identity,
 generator settings, gamerules, and region files. While the managed server
 remains running, the manager reads each persisted Anvil region header, derives
 every saved Overworld chunk, and decodes its block-state palette. It first

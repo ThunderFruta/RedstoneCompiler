@@ -45,7 +45,7 @@ redstone-compiler
 
 ```bash
 redstone-compiler \
-  --input Examples/ExampleAnd.sv \
+  --input Assets/Examples/ExampleAnd.sv \
   --output Output/ExampleAnd/ExampleAnd.litematic \
   --diagram Output/ExampleAnd/ExampleAnd.Nand.json
 ```
@@ -121,12 +121,12 @@ state, and affected resources without converting the failure to success.
 ## Package layout
 
 - `App/` owns the guided/argument CLIs, reporting, and telemetry.
-- `Compiler/` owns the frontend, IR, synthesis, and existing pipeline coordinator.
+- `Compilation/` owns the frontend, IR, synthesis, and existing pipeline coordinator.
 - `PhysicalDesign/` groups placement, routing, contracts, geometry, resources,
   redstone rules, and schematic rendering.
 - `Validation/` groups physical validation, MCHPRS, Fabric integration, the
   tracked runtime manager, and Java/Gradle harness sources.
-- `Native/Routing/` contains the existing Rust crate. Its Python import remains
+- `Kernels/Routing/` contains the existing Rust crate. Its Python import remains
   `RedstoneCompiler.RustRouting`.
 - `Assets/Templates/` contains the template catalog and litematic assets.
 - `Tools/{Fabric,Mchprs,Routing}/` groups executable tools by domain.
@@ -134,7 +134,7 @@ state, and affected resources without converting the failure to success.
 
 Root `Main.py` remains the compatibility launcher. The installed CLI names and
 `python -m RedstoneCompiler` retain their existing behavior. Server data stays in
-the resolved `ValidationServerHarness/Server/` runtime; build/cache/output data
+the resolved `Runtime/FabricServer/` runtime; build/cache/output data
 retains its existing locations.
 
 See the [project tree](Docs/Reference/ProjectTree.md) and

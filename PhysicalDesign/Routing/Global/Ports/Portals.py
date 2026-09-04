@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from ....Redstone.Actions import PropagateRoutePower
+from ....Redstone.Rules import PropagateRoutePower
 
-from ....Redstone.Actions import PruneRedundantRepeaterReservations
+from ....Redstone.Rules import PruneRedundantRepeaterReservations
 
 from ....Contracts.Component import PhysicalComponentAssemblyPlan
 
@@ -20,9 +20,9 @@ from ....Contracts.Failures import RoutingFailureReason
 
 from ....Contracts.Failures import RoutingStageError
 
-from ....Interfaces.BoundaryRelations import BuildPhysicalComponentGlobalPortalId
+from ....Constraints.BoundaryRelations import BuildPhysicalComponentGlobalPortalId
 
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
 from ....Resources.ResourceGraph import BuildRoutingEnvelope
 

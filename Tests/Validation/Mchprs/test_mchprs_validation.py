@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 import unittest
 
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR
 from Validation.Mchprs import MchprsValidator
-from Validation.Core import BuildFabricCanaryVectors, BuildValidationAssignments, ExhaustiveInputLimit, PhysicalFixtureArtifact
+from Validation.Physical import BuildFabricCanaryVectors, BuildValidationAssignments, ExhaustiveInputLimit, PhysicalFixtureArtifact
 
 
 RepositoryRoot = Path(__file__).resolve().parents[3]

@@ -12,9 +12,9 @@ from ....Contracts.Failures import RoutingFailureReason
 
 from ....Contracts.Failures import RoutingStageError
 
-from ....Interfaces.PhysicalClaims import ClaimConflictPositions
+from ....Constraints.PhysicalClaims import ClaimConflictPositions
 
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
 from ....Resources.ResourceGraph import FindSelfClaimConflicts
 

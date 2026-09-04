@@ -120,7 +120,7 @@ def test_routing_contract_dependencies_are_one_way() -> None:
     """Neutral contracts cannot import routing or placement orchestrators."""
 
     ForbiddenPrefixes = (
-        "PhysicalDesign.Flow",
+        "PhysicalDesign.Orchestration",
         "PhysicalDesign.Routing.Global",
         "PhysicalDesign.Routing.Regions",
     )

@@ -3,13 +3,13 @@ from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 
-from PhysicalDesign.Redstone.Actions import BuildPhysicalGraphs, BuildRoutingResources, ForkRoutingResourcesWithSharedStaticGeometry, FindFlatRouteConflicts, MaterializeReservedRepeaters, ValidatePhysicalRoutes, ValidateTemplateIsolation
+from PhysicalDesign.Redstone.Rules import BuildPhysicalGraphs, BuildRoutingResources, ForkRoutingResourcesWithSharedStaticGeometry, FindFlatRouteConflicts, MaterializeReservedRepeaters, ValidatePhysicalRoutes, ValidateTemplateIsolation
 from PhysicalDesign.Resources.ResourceGraph import BuildRoutingEnvelope, FindClaimConflicts, RoutingResourceClaims, RoutingResourceGraph
 from PhysicalDesign.Routing.Pcb import BuildPcbRoutingConfigurations
-from Compiler.Frontend.Sv import ParseSvToNetlist
-from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
+from Formats.SystemVerilog.Sv import ParseSvToNetlist
+from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
 
 
 class RoutingResourceTests(unittest.TestCase):
@@ -359,7 +359,7 @@ class RoutingResourceTests(unittest.TestCase):
     def testTerminalBanksPreserveDeclaredPortOrder(self) -> None:
         with TemporaryDirectory() as Workdir:
             Netlist = ParseSvToNetlist(
-                InputPath=Path("Examples/RippleCarryAdder4.sv"),
+                InputPath=Path("Assets/Examples/RippleCarryAdder4.sv"),
                 Workdir=Path(Workdir),
             )
             Placement = PlacePcbGraph(

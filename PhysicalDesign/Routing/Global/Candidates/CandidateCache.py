@@ -26,11 +26,11 @@ from ....Contracts.Failures import RoutingFailureReason
 
 from ....Contracts.Failures import RoutingStageError
 
-from ....Interfaces.BoundaryRelations import BuildRawPortalPlacementGeometryFingerprint, BuildRawPortalResourceGeometryFingerprint, RawPortalGeometryCache
+from ....Constraints.BoundaryRelations import BuildRawPortalPlacementGeometryFingerprint, BuildRawPortalResourceGeometryFingerprint, RawPortalGeometryCache
 
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
-from ....Execution.Reliability import RoutingDeadline
+from ....Runtime.Reliability import RoutingDeadline
 
 from ....Resources.ResourceGraph import FindSelfClaimConflicts
 
@@ -60,7 +60,7 @@ from typing import Mapping
 
 from ..Guides.PhysicalGuides import BuildPhysicalExteriorResourceGraphFingerprint
 
-from ..Flow.RunModels import RepeatedWorkTransition
+from ..Orchestration.RunModels import RepeatedWorkTransition
 
 def BuildClusterInterfaceAccessDomainFingerprint(
     Domains: dict[

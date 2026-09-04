@@ -28,7 +28,7 @@ from .PortPreparationFactors import (
     FinalizePhysicalPortPreparation,
 )
 from ..Guides.PhysicalGuides import DecomposePhysicalPortLaneFactors
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
 
 def SelectDisjointCapacitySeams(LocalFactorsBySignal, Constraint):

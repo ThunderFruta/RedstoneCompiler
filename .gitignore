@@ -1,23 +1,21 @@
-.tools/
 .vscode/
 .codex/
 # Migration-generated cache
 Cache/
 .cache/
-.pytest_cache/
 **/__pycache__/
 # Runtime installations stay here; manager source lives in Validation/Fabric.
-ValidationServerHarness/Server/
+Runtime/FabricServer/
 **/*.pyc
 .venv/
 Build/
-ValidationServerHarness/.gradle/
-ValidationServerHarness/build/
+Cache/Gradle/ServerHarness/Project/
+Cache/Gradle/ServerHarness/Build/
 # Ignore a default cache if a caller explicitly overrides project cache settings.
-Validation/Fabric/Harness/.gradle/
+Validation/Fabric/ServerHarness/.gradle/
 .runtime/
 Output/
-RustRouting/target/
+Kernels/Routing/target/
 RedstoneCompiler/*.so
 /**/*.o
-Validation/Fabric/Harness/build/
+Validation/Fabric/ServerHarness/build/

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from PhysicalDesign.Flow.Demand import ComputeInterfaceStateCountBound, TopologyDemandProfile
+from PhysicalDesign.Orchestration.Demand import ComputeInterfaceStateCountBound, TopologyDemandProfile
 
 
 class RoutingPolicyGenericProfileTests(unittest.TestCase):

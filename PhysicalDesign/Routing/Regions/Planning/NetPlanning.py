@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ....Contracts.Component import ClosedComponentInterface, ComponentFeedthroughContract, ComponentForeignTransitDomain, ComponentInterfacePort, ComponentRoutingFabric, ComponentRoutingProblem, ComponentRoutingSolveResult, ComponentTerminalAccessCandidate, ComponentTerminalAccessDomain, RoutedComponentNet, RoutedComponentTemplate
 from ....Contracts.Core import Position3
-from ....Interfaces.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
+from ....Constraints.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
 from ....Resources.ResourceGraph import FindSelfClaimConflicts, LocalRouteClaim, PinAccessPortal, RoutingEdge, RoutingReservation, RoutingResourceId, RoutingResourceKind, RoutingResourceClaims
 from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
 
@@ -47,7 +47,7 @@ except ImportError:
         _GetRoutingThreadCount = None
 
 from ..Core import _ClaimsFingerprint, _NormalizedEdge, _StableFingerprint
-from ..Interfaces.Fabric import _BuildAdjacency, _PlanTreeRepeaters, _UniqueFabricSubtree
+from ..Boundaries.Fabric import _BuildAdjacency, _PlanTreeRepeaters, _UniqueFabricSubtree
 def _BuildNetVariant(
     Problem: ComponentRoutingProblem,
     Signal: str,

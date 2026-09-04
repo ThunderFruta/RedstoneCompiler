@@ -19,8 +19,8 @@ python3 Tools/Mchprs/TestPhysicalFixture.py \
 ## Fabric
 
 - `Fabric/ControlFabricServer.py` is the one lifecycle entry point for the
-  canonical runtime at `ValidationServerHarness/Server/`. It delegates to the
-  modular runtime manager under `Validation/Fabric/Runtime/`; use
+  canonical runtime at `Runtime/FabricServer/`. It delegates to the
+  modular runtime manager under `Validation/Fabric/ServerManager/`; use
   it with `start`, `stop`, `clear`, or no action for a guided menu. `clear`
   preserves the existing `world/` directory and its level identity while
   flushing and palette-scanning every persisted simulation chunk, then clearing

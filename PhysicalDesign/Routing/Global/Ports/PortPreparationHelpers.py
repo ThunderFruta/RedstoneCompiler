@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from ....Contracts.Core import Position3
 from ....Contracts.PhysicalInterface import PhysicalGlobalAperturePathTemplate
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 from ....Resources.ResourceGraph import FindClaimConflicts
 from ....Resources.ResourceGraph import FindSelfClaimConflicts
 from ....Resources.ResourceGraph import RoutingResourceClaims
 from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
-from ...Regions.Interfaces.Fabric import FilterExternalSourcePoweredSeamCandidateDomains
+from ...Regions.Boundaries.Fabric import FilterExternalSourcePoweredSeamCandidateDomains
 from dataclasses import dataclass
 from typing import Any
 from typing import Iterable

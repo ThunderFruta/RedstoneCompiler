@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from Compiler.Ir.Models import Gate, GateKind
-from PhysicalDesign.Placement.Core.Compactness import BuildPinAlignedPackedCluster, BuildPinAlignedPackedClusterPortfolio, CountPinAlignedPackedClusterPortfolio
+from Compilation.Ir.Models import Gate, GateKind
+from PhysicalDesign.Placement.Engine.Compactness import BuildPinAlignedPackedCluster, BuildPinAlignedPackedClusterPortfolio, CountPinAlignedPackedClusterPortfolio
 
 
 class PinAlignedPackedClusterPortfolioTests(unittest.TestCase):

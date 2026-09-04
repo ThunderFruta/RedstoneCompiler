@@ -7,7 +7,7 @@ native router.
 python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/python -m compileall -q App Compiler PhysicalDesign Validation Assets Tools RedstoneCompiler Tests
-cargo test --manifest-path Native/Routing/Cargo.toml --release
+cargo test --manifest-path Kernels/Routing/Cargo.toml --release
 ```
 
 Run commands from the repository root. Generated user artifacts belong under

@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ....Contracts.Component import ClosedComponentInterface, ComponentFeedthroughContract, ComponentForeignTransitDomain, ComponentInterfacePort, ComponentRoutingFabric, ComponentRoutingProblem, ComponentRoutingSolveResult, ComponentTerminalAccessCandidate, ComponentTerminalAccessDomain, RoutedComponentNet, RoutedComponentTemplate
 from ....Contracts.Core import Position3
-from ....Interfaces.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
+from ....Constraints.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
 from ....Resources.ResourceGraph import FindSelfClaimConflicts, LocalRouteClaim, PinAccessPortal, RoutingEdge, RoutingReservation, RoutingResourceId, RoutingResourceKind, RoutingResourceClaims
 from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
 
@@ -47,7 +47,7 @@ except ImportError:
         _GetRoutingThreadCount = None
 
 from ..Core import _ClaimsFingerprint, _NormalizedEdge, _RelativeGeometry, _StableFingerprint
-from ..Interfaces.Fabric import BuildClaimsAwareComponentFabricSubtree, BuildComponentEgressPaths, _BuildAdjacency, _PlanTreeRepeaters, _UniqueFabricSubtree
+from ..Boundaries.Fabric import BuildClaimsAwareComponentFabricSubtree, BuildComponentEgressPaths, _BuildAdjacency, _PlanTreeRepeaters, _UniqueFabricSubtree
 from ..Symbolic.SymbolicState import BuildComponentSymbolicNetStateCacheKey, ComponentTreeDpNetState, PreparedComponentSymbolicNetStateContext, PreparedComponentSymbolicTerminalFrontier, SelectComponentSymbolicPhysicalPort, _BuildPreparedComponentSymbolicNetStateContextFingerprint
 def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, DeadlineSeconds: float | None=None, WorkCheck: Callable[[dict[str, object]], None] | None=None, ForbiddenAssignmentFingerprints: frozenset[str]=frozenset(), ForbiddenExportPortsBySignal: dict[str, tuple[Position3, ...]] | None=None, ForbiddenForeignCandidateFingerprintsBySignal: dict[str, frozenset[str]] | None=None, ForbiddenForeignAssignmentPairs: tuple[frozenset[tuple[str, Position3, str]], ...]=(), RequiredForeignTransitSignals: frozenset[str]=frozenset(), RouteClaimsConstructionCache: dict[frozenset[Position3], RoutingResourceClaims] | None=None, SymbolicNetStateCache: dict[str, Any] | None=None, RequestedSymbolicStateSignals: frozenset[str] | None=None, PreparedSymbolicNetStateContext: PreparedComponentSymbolicNetStateContext | None=None, PreparedPhysicalPortVariants: tuple[Any, ...]=(), StopAfterOwnedSignalFrontierProof: bool=False, StopAfterSymbolicCapacityProof: bool=False) -> ComponentRoutingSolveResult:
     """Solve a complete tree fabric through canonical frontier states.

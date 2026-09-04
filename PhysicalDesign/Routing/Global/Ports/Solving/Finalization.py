@@ -44,13 +44,13 @@ from .....Contracts.Failures import RoutingFailureReason
 
 from .....Contracts.Failures import RoutingStageError
 
-from .....Interfaces.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
+from .....Constraints.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
 
-from .....Interfaces.PhysicalClaims import ComponentClaimsConflict
+from .....Constraints.PhysicalClaims import ComponentClaimsConflict
 
-from .....Execution.Reliability import BuildStableFingerprint
+from .....Runtime.Reliability import BuildStableFingerprint
 
-from .....Execution.Reliability import RoutingDeadline
+from .....Runtime.Reliability import RoutingDeadline
 
 from .....Resources.ResourceGraph import BuildRoutingEnvelope
 

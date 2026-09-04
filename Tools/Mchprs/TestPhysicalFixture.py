@@ -15,7 +15,7 @@ if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
 from Validation.Mchprs import MchprsValidator
-from Validation.Core import PhysicalFixtureArtifact
+from Validation.Physical import PhysicalFixtureArtifact
 
 
 def BuildParser() -> argparse.ArgumentParser:

@@ -22,7 +22,7 @@ CanonicalServerRoot = str(ResolveFabricServerRoot())
 class ScriptCliGuidanceTests(unittest.TestCase):
     def testFabricControlUsesTheCanonicalRuntimeManager(self) -> None:
         ExpectedRoot = ResolveFabricServerRoot()
-        SourceRoot = Path(__file__).resolve().parents[2] / "Validation/Fabric/Runtime"
+        SourceRoot = Path(__file__).resolve().parents[2] / "Validation/Fabric/ServerManager"
 
         self.assertEqual(ControlFabricServer.ServerRoot, ExpectedRoot)
         self.assertEqual(
@@ -37,7 +37,7 @@ class ScriptCliGuidanceTests(unittest.TestCase):
     def testFabricControlDispatchesToTheManagerPackage(self) -> None:
         with (
             patch.dict(os.environ, {}),
-            patch("Validation.Fabric.Runtime.Main.Main", return_value=7) as Manager,
+            patch("Validation.Fabric.ServerManager.Main.Main", return_value=7) as Manager,
         ):
             self.assertEqual(ControlFabricServer.Main(["status"]), 7)
             self.assertEqual(
@@ -180,14 +180,14 @@ class ScriptCliGuidanceTests(unittest.TestCase):
     def testFabricTesterGuidesToExistingWorldStateWithAnSvOracle(self) -> None:
         with patch(
             "builtins.input",
-            side_effect=["2", "Examples/FullAdder.sv", "", ""],
+            side_effect=["2", "Assets/Examples/FullAdder.sv", "", ""],
         ):
             Arguments = TestSchemInFabricServer.GuidedArguments()
 
         self.assertEqual(
             Arguments,
             [
-                "--existing-state", "Examples/FullAdder.sv",
+                "--existing-state", "Assets/Examples/FullAdder.sv",
                 "--server-root", CanonicalServerRoot,
                 "--all",
             ],
@@ -217,9 +217,9 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             Parser.parse_args(["build.litematic", "--all", "--vector-index", "3"])
         self.assertEqual(
             Parser.parse_args([
-                "--existing-state", "Examples/FullAdder.sv",
+                "--existing-state", "Assets/Examples/FullAdder.sv",
             ]).existing_state,
-            Path("Examples/FullAdder.sv"),
+            Path("Assets/Examples/FullAdder.sv"),
         )
 
     def testFabricTesterSelectsOneTruthTableRowAndRejectsInvalidRows(self) -> None:

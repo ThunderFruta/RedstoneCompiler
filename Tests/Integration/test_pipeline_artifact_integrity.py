@@ -6,7 +6,7 @@ from time import monotonic
 import unittest
 from unittest.mock import patch
 
-from Compiler.Pipeline import (
+from Compilation.Pipeline import (
     BuildRoutingFailureArtifactSnapshot,
     BuildSuccessRouterReliability,
     ClearStaleSuccessArtifacts,
@@ -196,7 +196,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                 Detail="controlled routing failure",
             )
             with patch(
-                "Compiler.Pipeline.PlaceAndRoutePcb",
+                "Compilation.Pipeline.PlaceAndRoutePcb",
                 side_effect=RoutingStageError(Failure),
             ):
                 with self.assertRaisesRegex(
@@ -204,7 +204,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                     "PortalGeneration:NoBoundaryEscape",
                 ):
                     CompileSvToLitematic(
-                        InputPath=Path("Examples/FullAdder.sv"),
+                        InputPath=Path("Assets/Examples/FullAdder.sv"),
                         OutputPath=OutputPath,
                         DiagramPath=Directory / "Failed.Nand.json",
                         TopModule="FullAdder",
@@ -258,7 +258,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                 ArtifactPath.write_text("prior-success", encoding="utf-8")
 
             with patch(
-                "Compiler.Pipeline.Sv.ParseSvToNetlist",
+                "Compilation.Pipeline.Sv.ParseSvToNetlist",
                 side_effect=ValueError("new compile failed"),
             ):
                 with self.assertRaisesRegex(ValueError, "new compile failed"):
@@ -287,7 +287,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                 raise OSError("schematic write failed")
 
             with patch(
-                "Compiler.Pipeline.SchemWriter.WriteLitematic",
+                "Compilation.Pipeline.SchemWriter.WriteLitematic",
                 side_effect=FailWriter,
             ):
                 with self.assertRaisesRegex(OSError, "schematic write failed"):
@@ -319,7 +319,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
                 OutputPath.write_text("schematic", encoding="utf-8")
 
             with patch(
-                "Compiler.Pipeline.SchemWriter.WriteLitematic",
+                "Compilation.Pipeline.SchemWriter.WriteLitematic",
                 side_effect=WriteSchematic,
             ):
                 PhysicalDesignPath = PublishSuccessArtifacts(
@@ -376,15 +376,15 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
             PhysicalDesignDocument = {"RunSummary": {}}
             with (
                 patch(
-                    "Compiler.Pipeline.SchemWriter.WriteLitematic",
+                    "Compilation.Pipeline.SchemWriter.WriteLitematic",
                     side_effect=WriteStatic,
                 ),
                 patch(
-                    "Compiler.Pipeline.CaptureServerUpdatedLitematic",
+                    "Compilation.Pipeline.CaptureServerUpdatedLitematic",
                     side_effect=Capture,
                 ),
                 patch(
-                    "Compiler.Pipeline.WritePhysicalFixture",
+                    "Compilation.Pipeline.WritePhysicalFixture",
                     side_effect=WriteFixture,
                 ),
             ):
@@ -432,11 +432,11 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Compiler.Pipeline.SchemWriter.WriteLitematic",
+                    "Compilation.Pipeline.SchemWriter.WriteLitematic",
                     side_effect=WriteStatic,
                 ),
                 patch(
-                    "Compiler.Pipeline.CaptureServerUpdatedLitematic",
+                    "Compilation.Pipeline.CaptureServerUpdatedLitematic",
                     side_effect=RuntimeError("server snapshot failed"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "server snapshot failed"),

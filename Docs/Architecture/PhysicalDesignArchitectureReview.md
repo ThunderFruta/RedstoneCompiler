@@ -63,7 +63,7 @@ document and still matched the review inventory.
 | Declared `PlacementFlowState` fields | 8; 7 annotated `Any` |
 | Declared `PlacementCommitState` fields | 30; all annotated `Any` |
 
-The AST inventory covered `Compiler/`, `Compiler/Frontend/`, `PhysicalDesign/Rendering/`,
+The AST inventory covered `Compilation/`, `Formats/SystemVerilog/`, `PhysicalDesign/Rendering/`,
 `Assets/Templates/`, `Tools/`, `Validation/Mchprs/`, and `Main.py`.
 It included explicit imports inside functions and conditional branches.
 It did not reconstruct implicit package initialization, dynamic imports,
@@ -174,7 +174,7 @@ Most crossings identified here are allowed by the current rules.
 
 ### F2. The public router combines different use cases
 
-[RouteAuthoritativeResources](../../PhysicalDesign/Routing/Global/Flow/Flow.py#L20)
+[RouteAuthoritativeResources](../../PhysicalDesign/Routing/Global/Orchestration/Flow.py#L20)
 has 50 parameters. Nine end in `Only`, covering portal geometry, track
 assignment, raw domains, foreign-access validation, interface assignment,
 component problems, assembly, and port-factor preparation.
@@ -189,12 +189,12 @@ Each operation needs a specific input type, output family, and budget.
 
 ### F3. Phase state is broad and weakly specified
 
-[AuthoritativeRoutingState](../../PhysicalDesign/Routing/Global/Flow/RunState.py#L44)
+[AuthoritativeRoutingState](../../PhysicalDesign/Routing/Global/Orchestration/RunState.py#L44)
 declares 1,078 fields, all `Any`. Slots constrain attribute names but do not
 establish field types, valid stage transitions, or which phase may mutate a
 field.
 
-[PlacementFlowState](../../PhysicalDesign/Flow/State.py#L28) declares eight
+[PlacementFlowState](../../PhysicalDesign/Orchestration/State.py#L28) declares eight
 initial fields and allows dynamic attributes. Its helper uses `setattr`.
 The source inventory found 566 distinct `Context.*` assignment names across
 Placement/Flow and 411 across the Placement/Core/Commit modules. Those are
@@ -206,7 +206,7 @@ should become a deliberate input/output contract or coordinator-owned state.
 
 ### F4. Service injection preserves a broad namespace
 
-[AuthoritativeRoutingServices](../../PhysicalDesign/Routing/Global/Flow/RunState.py#L12)
+[AuthoritativeRoutingServices](../../PhysicalDesign/Routing/Global/Orchestration/RunState.py#L12)
 wraps `Mapping[str, Any]`, exposing it through `__getattr__`.
 The public flow constructs that table from `globals()`.
 
@@ -224,7 +224,7 @@ objects. `RoutingResources` contains static geometry together with mutable
 caches, native contexts, ownership fingerprints, and prepared solver state.
 
 For example,
-[boundary-relation code](../../PhysicalDesign/Interfaces/BoundaryRelations.py#L1897)
+[boundary-relation code](../../PhysicalDesign/Constraints/BoundaryRelations.py#L1897)
 can attach cache fields to the resource object. This lets consumers expand a
 shared object's responsibilities.
 
@@ -237,12 +237,12 @@ The proposed split is:
 
 ### F6. Physical responsibilities cross placement, routing, and rendering
 
-[Placement/Core/CommitRouting.py](../../PhysicalDesign/Placement/Core/Commit/CommitRouting.py#L46)
+[Placement/Core/CommitRouting.py](../../PhysicalDesign/Placement/Engine/Commit/CommitRouting.py#L46)
 finds local paths, validates local power, builds claims, and freezes local
 wires. This means placement results already contain a mixture of positions
 and routing decisions.
 
-[Routing/Actions/Geometry.py](../../PhysicalDesign/Redstone/Actions/Geometry.py#L9)
+[Routing/Actions/Geometry.py](../../PhysicalDesign/Redstone/Rules/Geometry.py#L9)
 imports `LoadTemplate` from PhysicalDesign.Rendering. The
 [writer](../../PhysicalDesign/Rendering/SchemWriter.py#L15) imports cell definitions,
 placement transforms, and routing technology helpers.
@@ -254,7 +254,7 @@ geometry and redstone semantics into shared foundations.
 The physical model also remains distributed. Resource generation, final
 physical graphs, power propagation, and wire-state rendering implement related
 decisions in different places.
-[BuildRoutingResources](../../PhysicalDesign/Redstone/Actions/Geometry.py#L201)
+[BuildRoutingResources](../../PhysicalDesign/Redstone/Rules/Geometry.py#L201)
 does not receive the selected technology when constructing its resource graph.
 That is a concrete propagation gap for a future versioned model contract.
 
@@ -262,7 +262,7 @@ That is a concrete propagation gap for a future versioned model contract.
 
 The compact-placement score compares access/electrical conflict penalties,
 area, maximum dimension, and then estimated wire length. The
-[score ordering](../../PhysicalDesign/Placement/Core/Compactness.py#L357) means that,
+[score ordering](../../PhysicalDesign/Placement/Engine/Compactness.py#L357) means that,
 with equal conflict penalties, a smaller area wins before connection length
 is considered. Some other placement paths also contain distance and capacity
 costs; the current implementation is not uniformly footprint-only.
@@ -510,9 +510,9 @@ cell palette, with progressively more detailed queries:
 Current implementations to reconcile include
 [Technology.py](../../PhysicalDesign/Redstone/Technology.py),
 [ResourceGraph.py](../../PhysicalDesign/Resources/ResourceGraph.py),
-[Actions/Geometry.py](../../PhysicalDesign/Redstone/Actions/Geometry.py),
-[Actions/Validation.py](../../PhysicalDesign/Redstone/Actions/Validation.py),
-[PropagateRoutePower](../../PhysicalDesign/Redstone/Actions/Repeaters.py#L156), and
+[Actions/Geometry.py](../../PhysicalDesign/Redstone/Rules/Geometry.py),
+[Actions/Validation.py](../../PhysicalDesign/Redstone/Rules/Validation.py),
+[PropagateRoutePower](../../PhysicalDesign/Redstone/Rules/Repeaters.py#L156), and
 [BuildWireState](../../PhysicalDesign/Rendering/SchemWriter.py#L517).
 
 The model must be cheap enough for search. Cached orientation masks and local

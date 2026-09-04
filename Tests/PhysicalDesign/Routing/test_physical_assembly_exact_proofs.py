@@ -198,7 +198,7 @@ def test_selected_plan_local_proof_core_has_complete_prepared_factor_domain(
         ),
     )
     monkeypatch.setattr(
-        "PhysicalDesign.Routing.Regions.Interfaces.Reservations."
+        "PhysicalDesign.Routing.Regions.Boundaries.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -291,7 +291,7 @@ def test_prepared_physical_port_factor_resume_does_not_rebuild_lanes(
         for Event in Events
     )
     monkeypatch.setattr(
-        "PhysicalDesign.Routing.Regions.Interfaces.Reservations."
+        "PhysicalDesign.Routing.Regions.Boundaries.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -329,7 +329,7 @@ def test_prepared_physical_port_replan_reuses_factorized_domain(
         ),
     )
     monkeypatch.setattr(
-        "PhysicalDesign.Routing.Regions.Interfaces.Reservations."
+        "PhysicalDesign.Routing.Regions.Boundaries.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )
@@ -420,7 +420,7 @@ def test_proof_neutral_port_assignment_deferral_selects_a_distinct_plan(
         ),
     )
     monkeypatch.setattr(
-        "PhysicalDesign.Routing.Regions.Interfaces.Reservations."
+        "PhysicalDesign.Routing.Regions.Boundaries.Reservations."
         "FinalizePhysicalComponentChannelReservations",
         lambda Channels, *_Arguments, **_Keywords: Channels,
     )

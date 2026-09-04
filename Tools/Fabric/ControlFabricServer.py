@@ -16,7 +16,7 @@ from Validation.Fabric import ResolveFabricServerRoot
 
 
 ServerRoot = ResolveFabricServerRoot()
-RuntimeScripts = RepositoryRoot / "Validation/Fabric/Runtime"
+RuntimeScripts = RepositoryRoot / "Validation/Fabric/ServerManager"
 RuntimeMain = RuntimeScripts / "Main.py"
 
 
@@ -62,7 +62,7 @@ def Main(Arguments: list[str] | None = None) -> int:
         return 1
     os.environ["RC_FABRIC_SERVER_ROOT"] = str(ServerRoot)
     sys.path.insert(0, str(RuntimeScripts))
-    from Validation.Fabric.Runtime.Main import Main as RuntimeEntryPoint
+    from Validation.Fabric.ServerManager.Main import Main as RuntimeEntryPoint
 
     RawArguments = list(sys.argv[1:] if Arguments is None else Arguments)
     if not RawArguments:

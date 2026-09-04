@@ -4,19 +4,19 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from Compiler.Frontend import Sv
+from Formats.SystemVerilog import Sv
 
-from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
+from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
 from PhysicalDesign.Placement.PreRouteInterface import SolveDerivedPerimeterSlotDomain
 from PhysicalDesign.Policy import LocalFirstPhysicalDesignPolicy
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
 
 
 def BuildFullAdderNetlist():
     with TemporaryDirectory() as Directory:
         return ToNandOnly(OptimizeLogic(Sv.ParseSvToNetlist(
-            InputPath=Path("Examples/FullAdder.sv"),
+            InputPath=Path("Assets/Examples/FullAdder.sv"),
             TopModule="FullAdder",
             Workdir=Path(Directory),
         )))

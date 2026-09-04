@@ -8,10 +8,10 @@ import tempfile
 
 import pytest
 
-from Compiler.Frontend.Sv import ParseSvToNetlist
-from PhysicalDesign.Flow.Runner import PlaceAndRoutePcb
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
+from Formats.SystemVerilog.Sv import ParseSvToNetlist
+from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
 from PhysicalDesign.Policy import RoutingStrategy
 
 
@@ -38,7 +38,7 @@ RUN_SCALE_TESTS = os.environ.get("RC_RUN_SCALE_TESTS", "").strip().lower() in {
 def test_example_routes_with_final_physical_legality(ExampleName: str) -> None:
     with tempfile.TemporaryDirectory() as Workdir:
         Netlist = ParseSvToNetlist(
-            InputPath=Path("Examples") / ExampleName,
+            InputPath=Path("Assets/Examples") / ExampleName,
             TopModule=None,
             Workdir=Path(Workdir),
         )

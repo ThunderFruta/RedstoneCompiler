@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from Validation.Core.Fixture import BuildPhysicalFixture, CanonicalFixtureBytes, WritePhysicalFixture
-from Validation.Core.Models import PhysicalFixtureArtifact
+from Validation.Physical.Fixture import BuildPhysicalFixture, CanonicalFixtureBytes, WritePhysicalFixture
+from Validation.Physical.Models import PhysicalFixtureArtifact
 
 
 FabricFixtureArtifact = PhysicalFixtureArtifact

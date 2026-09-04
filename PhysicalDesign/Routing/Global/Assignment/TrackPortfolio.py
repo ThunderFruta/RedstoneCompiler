@@ -16,11 +16,11 @@ from ....Contracts.Core import Position3
 
 from ....Contracts.Placement import TrackAssignmentPreparation
 
-from ....Interfaces.BoundaryRelations import BuildRawPortalResourceGeometryFingerprint
+from ....Constraints.BoundaryRelations import BuildRawPortalResourceGeometryFingerprint
 
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
-from ....Execution.Reliability import RetainUnaffectedCandidateCache
+from ....Runtime.Reliability import RetainUnaffectedCandidateCache
 
 from ....Resources.ResourceGraph import FindSelfClaimConflicts
 
@@ -67,7 +67,7 @@ from ..Candidates.CandidateCache import ExtendIndexedRoutingResourceGraph
 
 from ..Ports.Portals import _BuildCandidateGraph, _FindComponentNodes
 
-from ..Flow.RunModels import RawTrackAssignmentBaseClaim, RawTrackAssignmentDomain, RawTrackAssignmentValue
+from ..Orchestration.RunModels import RawTrackAssignmentBaseClaim, RawTrackAssignmentDomain, RawTrackAssignmentValue
 
 def BuildRoutingConflictGraph(
     CandidatesBySignal: dict[str, list[NetRouteCandidate]],

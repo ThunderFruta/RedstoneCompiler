@@ -24,7 +24,7 @@ from ....Contracts.PhysicalInterface import PreparedPhysicalComponentPortFactorD
 
 from ....Contracts.Results import RoutingResources
 
-from ....Interfaces.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
+from ....Constraints.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
 
 from ....Resources.ResourceGraph import NetRouteCandidate
 

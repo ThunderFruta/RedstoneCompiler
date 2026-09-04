@@ -3,27 +3,27 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-import PhysicalDesign.Placement.Core.Channels as ChannelsModule
-import PhysicalDesign.Placement.Core.Clusters as ClustersModule
-import PhysicalDesign.Placement.Core.MandatoryAccess as MandatoryAccessModule
-import PhysicalDesign.Placement.Core.Repair as RepairModule
-import PhysicalDesign.Placement.Core.Cache as PlacementCache
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
-from Compiler.Ir.ComponentGraph import ComponentGraph, TopologyComponent
+import PhysicalDesign.Placement.Engine.Channels as ChannelsModule
+import PhysicalDesign.Placement.Engine.Clusters as ClustersModule
+import PhysicalDesign.Placement.Engine.MandatoryAccess as MandatoryAccessModule
+import PhysicalDesign.Placement.Engine.Repair as RepairModule
+import PhysicalDesign.Placement.Engine.Cache as PlacementCache
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
+from Compilation.Ir.ComponentGraph import ComponentGraph, TopologyComponent
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
-from PhysicalDesign.Placement.Core.Channels import AssignBoundaryDemandSides, BoundaryEscapeCandidate, BoundaryDemandRecord, BuildBoundaryCapacityRecords, BuildClusterBoundaryBundles, BuildClusterBoundaryLeaseRequests, BuildClusterInterfaceTopology, BuildLegalBoundaryEscapeSlots, ClusterBoundaryCorridorKey, CutDrivenClusterRefinementProfile, EvaluateCutBoundaryEscapeFeasibility, EvaluateHardBoundaryFeasibility, HardBoundaryFeasibility, InterClusterBoundaryDemand, ScoreClusterBoundaryContracts, ScoreClusterInterfacePlacement, ScoreClusterInterfaceFacingMismatches, ScoreHigherOrderPhysicalBankDemand, ValidateHardBoundaryFeasibility
-from PhysicalDesign.Placement.Core.Clustering import BuildConnectivityClusters, BuildTopologicalLevels, OptimizeClusterSlots
-from PhysicalDesign.Placement.Core.Clusters import BuildBoundedInterClusterRoutingChannel, BuildBoundedInterClusterRoutingDeck, ClusterLayoutVariant, PackedNandCluster, PcbPlacement
-from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
-from PhysicalDesign.Placement.Core.Compactness import BuildPinAlignedPackedCluster
-from PhysicalDesign.Placement.Core.Constraints import BuildAssignmentCutHigherOrderSignalSet, BuildEffectiveStructuredRelocationFocus, SelectPlacementConstraintWorkingSet, PlacementAssignmentConstraintSet
-from PhysicalDesign.Placement.Core.Costs import BuildInterClusterBoundaryDemand, BuildInterClusterGapPlan
-from PhysicalDesign.Placement.Core.MandatoryAccess import MandatoryAccessConflictProfile, OrderExactStatesForMandatoryAccessCommit, RepairPackedClusterAccess
-from PhysicalDesign.Placement.Core.Repair import BuildTransactionalClusterEndpointRepair, RankTransactionalRepairClusterSelections, SelectTransactionalRepairClusterSelections
-from PhysicalDesign.Placement.Core.Search import BuildJointPortfolioBaseRelocationControls, BuildRelocationClusterSet, JointPlacementSearchRetentionLimit, OptimizeJointClusterPlacement, PrioritizeRelocationClusters, RelocateClusterSlots, SelectFocusedConstraintComponentClusters, SelectFocusedCutEpochClusters, SelectFocusedTopologyFrontierClusters, SelectInternalPinBankGeometrySignals, ShouldReleasePartialLocalTreeBeforeSearch
-from PhysicalDesign.Flow.Demand import BuildPlacementGenerationPlan
-from PhysicalDesign.Flow.Feedback import BuildPlacementFingerprint
-from PhysicalDesign.Flow.Portfolios import ShouldRejectCutBoundaryEscapePlacement
+from PhysicalDesign.Placement.Engine.Channels import AssignBoundaryDemandSides, BoundaryEscapeCandidate, BoundaryDemandRecord, BuildBoundaryCapacityRecords, BuildClusterBoundaryBundles, BuildClusterBoundaryLeaseRequests, BuildClusterInterfaceTopology, BuildLegalBoundaryEscapeSlots, ClusterBoundaryCorridorKey, CutDrivenClusterRefinementProfile, EvaluateCutBoundaryEscapeFeasibility, EvaluateHardBoundaryFeasibility, HardBoundaryFeasibility, InterClusterBoundaryDemand, ScoreClusterBoundaryContracts, ScoreClusterInterfacePlacement, ScoreClusterInterfaceFacingMismatches, ScoreHigherOrderPhysicalBankDemand, ValidateHardBoundaryFeasibility
+from PhysicalDesign.Placement.Engine.Clustering import BuildConnectivityClusters, BuildTopologicalLevels, OptimizeClusterSlots
+from PhysicalDesign.Placement.Engine.Clusters import BuildBoundedInterClusterRoutingChannel, BuildBoundedInterClusterRoutingDeck, ClusterLayoutVariant, PackedNandCluster, PcbPlacement
+from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
+from PhysicalDesign.Placement.Engine.Compactness import BuildPinAlignedPackedCluster
+from PhysicalDesign.Placement.Engine.Constraints import BuildAssignmentCutHigherOrderSignalSet, BuildEffectiveStructuredRelocationFocus, SelectPlacementConstraintWorkingSet, PlacementAssignmentConstraintSet
+from PhysicalDesign.Placement.Engine.Costs import BuildInterClusterBoundaryDemand, BuildInterClusterGapPlan
+from PhysicalDesign.Placement.Engine.MandatoryAccess import MandatoryAccessConflictProfile, OrderExactStatesForMandatoryAccessCommit, RepairPackedClusterAccess
+from PhysicalDesign.Placement.Engine.Repair import BuildTransactionalClusterEndpointRepair, RankTransactionalRepairClusterSelections, SelectTransactionalRepairClusterSelections
+from PhysicalDesign.Placement.Engine.Search import BuildJointPortfolioBaseRelocationControls, BuildRelocationClusterSet, JointPlacementSearchRetentionLimit, OptimizeJointClusterPlacement, PrioritizeRelocationClusters, RelocateClusterSlots, SelectFocusedConstraintComponentClusters, SelectFocusedCutEpochClusters, SelectFocusedTopologyFrontierClusters, SelectInternalPinBankGeometrySignals, ShouldReleasePartialLocalTreeBeforeSearch
+from PhysicalDesign.Orchestration.Demand import BuildPlacementGenerationPlan
+from PhysicalDesign.Orchestration.Feedback import BuildPlacementFingerprint
+from PhysicalDesign.Orchestration.Portfolios import ShouldRejectCutBoundaryEscapePlacement
 from PhysicalDesign.Policy import LocalFirstPhysicalDesignPolicy
 from PhysicalDesign.Contracts.Failures import RoutingAssignmentCut, RoutingAssignmentCutClassification, RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Resources.ResourceGraph import RoutingResourceClaims, RoutingResourceGraph
@@ -3212,7 +3212,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             )
 
         with patch(
-            "PhysicalDesign.Placement.Core.Commit.CommitRouting.BuildLegalBoundaryEscapeSlots",
+            "PhysicalDesign.Placement.Engine.Construction.CommitRouting.BuildLegalBoundaryEscapeSlots",
             side_effect=CaptureFixedPinAccess,
         ):
             Full = PlacePcbGraph(
@@ -3644,7 +3644,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
         }
 
         with patch(
-            "PhysicalDesign.Placement.Core.Commit.CommitRouting.EvaluateHardBoundaryFeasibility",
+            "PhysicalDesign.Placement.Engine.Construction.CommitRouting.EvaluateHardBoundaryFeasibility",
             return_value=Rejected,
         ):
             with self.assertRaisesRegex(ValueError, "NoBoundaryEscape"):
@@ -3725,7 +3725,7 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
                     "MaximumEntrancesPerSignal": 2,
                 }
                 with patch(
-                    "PhysicalDesign.Placement.Core.Commit.CommitRouting.BuildBoundaryCapacityRecords",
+                    "PhysicalDesign.Placement.Engine.Construction.CommitRouting.BuildBoundaryCapacityRecords",
                     side_effect=ValueError("forced transactional rejection"),
                 ):
                     with self.assertRaisesRegex(

@@ -18,7 +18,7 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
-from PhysicalDesign.Placement.Core.MandatoryAccess import MeasureMandatoryAccessConflictProfile
+from PhysicalDesign.Placement.Engine.MandatoryAccess import MeasureMandatoryAccessConflictProfile
 from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessDomain, FixedPlacementPinAccessStatus, ReplayFixedPlacementPinAccessUnsatisfiableCore, SolveFixedPlacementPinAccessDomains
 from PhysicalDesign.Geometry.Placement import BuildPlacementPinAccessWitness, PlacedGate
 

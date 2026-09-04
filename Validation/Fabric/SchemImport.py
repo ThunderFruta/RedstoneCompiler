@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PhysicalDesign.Rendering.SchemWriter import CellTemplate, LoadTemplate, NbtValue, NeutralDynamicState, ReadNbt
+from Formats.Litematic.Codec import CellTemplate, LoadTemplate, NbtValue, NeutralDynamicState, ReadNbt
 
 
 _AirBlocks = {"minecraft:air", "minecraft:cave_air", "minecraft:void_air"}

@@ -17,11 +17,11 @@ from ....Contracts.Failures import RoutingFailure, RoutingFailureReason, Routing
 from ....Contracts.Component import ComponentRoutingProblem, ComponentRoutingSolveResult, PhysicalComponentAssemblyPlan, PhysicalComponentChannelReservation, PhysicalComponentPortReservation, PhysicalComponentSelectedLocalPortSupport, RoutedComponentNet, RoutedComponentTemplate
 from ....Contracts.Core import Position3
 from ....Contracts.PhysicalInterface import PhysicalComponentLocalFactorProjection, PhysicalComponentLocalFactorProjectionComparison, PhysicalComponentLocalFactorUnsatCertificate, PhysicalLocalPortPairProofRecord, PhysicalLocalPortPairSupportCertificate, PhysicalComponentSymbolicHigherOrderCertificate, PhysicalComponentSymbolicPortPairCertificate, PhysicalPortCorridorDomain, PhysicalPortCorridorFactor, PreparedPhysicalComponentAssembly, PreparedPhysicalComponentPortFactorDomain
-from ....Interfaces import BoundaryRelations
-from ....Interfaces.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint, ProjectPhysicalComponentSignalGlobalProfile
-from ....Interfaces.PhysicalClaims import ComponentClaimsConflict
+from ....Constraints import BoundaryRelations
+from ....Constraints.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint, ProjectPhysicalComponentSignalGlobalProfile
+from ....Constraints.PhysicalClaims import ComponentClaimsConflict
 from ....Resources.ResourceGraph import RoutingResourceClaims
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 from .InterfacePlanning import (
     BuildComponentCapacityGuide,
     ComponentCapacityGuide,
@@ -46,7 +46,7 @@ from .Portfolios import (
 )
 from ..Solving.Solver import MaterializeRoutedComponentTemplate, SolveComponentRoutingProblem, ValidateRoutedComponentHandoff
 
-from ..Interfaces.Reservations import FinalizePhysicalComponentChannelReservations
+from ..Boundaries.Reservations import FinalizePhysicalComponentChannelReservations
 from ..Proofs.Validation import BuildPhysicalPortApertureContractFingerprint, BuildPhysicalPortLocalContractFingerprint, ValidatePhysicalBoundaryPortHandoff, ValidatePhysicalExteriorFabricHandoff, _Fingerprint
 def SelectPhysicalAssemblyGlobalBoundaryPorts(
     Plan: PhysicalComponentAssemblyPlan,

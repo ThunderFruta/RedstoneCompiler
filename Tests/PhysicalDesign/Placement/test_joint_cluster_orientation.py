@@ -6,14 +6,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from Compiler.Frontend import Sv
+from Formats.SystemVerilog import Sv
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
-from PhysicalDesign.Placement.Core.Clustering import TransformPackedClusterLayout
-from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
-from PhysicalDesign.Redstone.Actions.Geometry import ValidatePlacedCellElectricalIsolation
+from PhysicalDesign.Placement.Engine.Clustering import TransformPackedClusterLayout
+from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
+from PhysicalDesign.Redstone.Rules.Geometry import ValidatePlacedCellElectricalIsolation
 from PhysicalDesign.Policy import LocalFirstPhysicalDesignPolicy
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
 
 
 class JointClusterOrientationTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class JointClusterOrientationTests(unittest.TestCase):
             Netlist = ToNandOnly(
                 OptimizeLogic(
                     Sv.ParseSvToNetlist(
-                        InputPath=Path("Examples/FullAdder.sv"),
+                        InputPath=Path("Assets/Examples/FullAdder.sv"),
                         TopModule="FullAdder",
                         Workdir=Path(Directory),
                     )
@@ -80,7 +80,7 @@ class JointClusterOrientationTests(unittest.TestCase):
             Netlist = ToNandOnly(
                 OptimizeLogic(
                     Sv.ParseSvToNetlist(
-                        InputPath=Path("Examples/RippleCarryAdder4.sv"),
+                        InputPath=Path("Assets/Examples/RippleCarryAdder4.sv"),
                         TopModule="RippleCarryAdder4",
                         Workdir=Path(Directory),
                     )
@@ -115,7 +115,7 @@ class JointClusterOrientationTests(unittest.TestCase):
             Netlist = ToNandOnly(
                 OptimizeLogic(
                     Sv.ParseSvToNetlist(
-                        InputPath=Path("Examples/RippleCarryAdder4.sv"),
+                        InputPath=Path("Assets/Examples/RippleCarryAdder4.sv"),
                         TopModule="RippleCarryAdder4",
                         Workdir=Path(Directory),
                     )

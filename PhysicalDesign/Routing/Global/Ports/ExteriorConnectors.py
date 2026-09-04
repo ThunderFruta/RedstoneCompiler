@@ -20,9 +20,9 @@ from ....Contracts.PhysicalInterface import PhysicalPortLocalAccessFactor
 
 from ....Contracts.PhysicalInterface import PhysicalPortLocalApertureSupport
 
-from ....Interfaces.PhysicalClaims import ComponentClaimsConflict
+from ....Constraints.PhysicalClaims import ComponentClaimsConflict
 
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
 from ....Resources.ResourceGraph import RoutingResourceClaims
 

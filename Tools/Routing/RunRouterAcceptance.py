@@ -111,7 +111,7 @@ class AcceptanceCase:
 AcceptanceCases = (
     AcceptanceCase(
         Name="HalfAdder",
-        ExamplePath=Path("Examples/HalfAdder.sv"),
+        ExamplePath=Path("Assets/Examples/HalfAdder.sv"),
         TopModule="HalfAdder",
         RequiredRuns=3,
         TruthTableRows=4,
@@ -119,7 +119,7 @@ AcceptanceCases = (
     ),
     AcceptanceCase(
         Name="FullAdder",
-        ExamplePath=Path("Examples/FullAdder.sv"),
+        ExamplePath=Path("Assets/Examples/FullAdder.sv"),
         TopModule="FullAdder",
         RequiredRuns=5,
         TruthTableRows=8,
@@ -127,7 +127,7 @@ AcceptanceCases = (
     ),
     AcceptanceCase(
         Name="RippleCarryAdder4",
-        ExamplePath=Path("Examples/RippleCarryAdder4.sv"),
+        ExamplePath=Path("Assets/Examples/RippleCarryAdder4.sv"),
         TopModule="RippleCarryAdder4",
         RequiredRuns=3,
         TruthTableRows=512,
@@ -136,7 +136,7 @@ AcceptanceCases = (
     ),
     AcceptanceCase(
         Name="RippleCarryAdder8",
-        ExamplePath=Path("Examples/RippleCarryAdder8.sv"),
+        ExamplePath=Path("Assets/Examples/RippleCarryAdder8.sv"),
         TopModule="RippleCarryAdder8",
         RequiredRuns=3,
         TruthTableRows=131_072,
@@ -145,7 +145,7 @@ AcceptanceCases = (
     ),
     AcceptanceCase(
         Name="DecimalToBinary4",
-        ExamplePath=Path("Examples/DecimalToBinary4.sv"),
+        ExamplePath=Path("Assets/Examples/DecimalToBinary4.sv"),
         TopModule="DecimalToBinary4",
         RequiredRuns=3,
         TruthTableRows=1_024,
@@ -154,7 +154,7 @@ AcceptanceCases = (
     ),
     AcceptanceCase(
         Name="TFlipFlopLatch",
-        ExamplePath=Path("Examples/TFlipFlopLatch.sv"),
+        ExamplePath=Path("Assets/Examples/TFlipFlopLatch.sv"),
         TopModule="TFlipFlopLatch",
         RequiredRuns=3,
         TruthTableRows=8,
@@ -162,7 +162,7 @@ AcceptanceCases = (
     ),
     AcceptanceCase(
         Name="CarryLookaheadAdder4",
-        ExamplePath=Path("Examples/CarryLookaheadAdder4.sv"),
+        ExamplePath=Path("Assets/Examples/CarryLookaheadAdder4.sv"),
         TopModule="CarryLookaheadAdder4",
         RequiredRuns=2,
         TruthTableRows=512,
@@ -1270,7 +1270,7 @@ def BuildSourceContentManifest(
         (Path("Compiler"), "*.py"),
         (Path("PhysicalDesign"), "*.py"),
         (Path("Validation"), "*.py"),
-        (Path("Native/Routing/Src"), "*.rs"),
+        (Path("Kernels/Routing/Src"), "*.rs"),
     ):
         Root = RepositoryPath / RelativeRoot
         if Root.is_dir():
@@ -1285,8 +1285,8 @@ def BuildSourceContentManifest(
         Path("Tools/Routing/RunRouterAcceptance.py"),
         Path("RedstoneCompiler/__init__.py"),
         Path("Assets/Templates/__init__.py"),
-        Path("Native/Routing/Cargo.toml"),
-        Path("Native/Routing/Cargo.lock"),
+        Path("Kernels/Routing/Cargo.toml"),
+        Path("Kernels/Routing/Cargo.lock"),
     ):
         Value = RepositoryPath / RelativePath
         if Value.is_file():
@@ -1608,7 +1608,7 @@ def CanonicalizeNbt(Value: object) -> object:
 
 def BuildEmittedDesignDigest(SchematicPath: Path) -> str:
     """Hash the emitted regions while excluding timestamps and output names."""
-    from PhysicalDesign.Rendering.SchemWriter import ReadNbt
+    from Formats.Litematic.Codec import ReadNbt
 
     Root = ReadNbt(SchematicPath)
     Regions = Root.get("Regions")
@@ -1626,7 +1626,7 @@ def BuildLitematicCompositionEvidence(
     SchematicPath: Path,
 ) -> dict[str, int]:
     """Measure the emitted region independently of physical JSON summaries."""
-    from PhysicalDesign.Rendering.SchemWriter import LoadTemplate, ReadNbt
+    from Formats.Litematic.Codec import LoadTemplate, ReadNbt
 
     Root = ReadNbt(SchematicPath)
     RegionsTag = Root.get("Regions")
@@ -2412,17 +2412,24 @@ def BuildComparisonCompatibility(
         for Case in AcceptanceCases
         if Case.Name in BaselineCompatibilityCaseNames
     }
+    BenchmarkProfileCases = {}
+    for Case in AcceptanceCases:
+        if Case.Name not in BaselineCompatibilityCaseNames:
+            continue
+        CaseProfile = {
+            Key: Value
+            for Key, Value in Case.ToDictionary().items()
+            if Key != "NeedsExactInterfaceProof"
+        }
+        ExamplePath = CaseProfile.get("ExamplePath")
+        if isinstance(ExamplePath, str):
+            CaseProfile["ExamplePath"] = ExamplePath.replace(
+                "Assets/Examples/", "Examples/"
+            )
+        BenchmarkProfileCases[Case.Name] = CaseProfile
     BenchmarkProfile = {
         "SchemaVersion": "router-regression-profile-v1",
-        "Cases": {
-            Case.Name: {
-                Key: Value
-                for Key, Value in Case.ToDictionary().items()
-                if Key != "NeedsExactInterfaceProof"
-            }
-            for Case in AcceptanceCases
-            if Case.Name in BaselineCompatibilityCaseNames
-        },
+        "Cases": BenchmarkProfileCases,
         "RegressionCircuits": sorted(RegressionCaseNames),
         "Warmup": {
             "Circuit": "FullAdder",

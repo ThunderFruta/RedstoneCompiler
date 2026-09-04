@@ -6,7 +6,7 @@ Minecraft client's schematics directory, pass `--push` and optionally
 
 ```bash
 python3 Main.py \
-  --input Examples/FullAdder.sv \
+  --input Assets/Examples/FullAdder.sv \
   --output Output/FullAdder/FullAdder.litematic \
   --push \
   --minecraft-directory /path/to/.minecraft/schematics

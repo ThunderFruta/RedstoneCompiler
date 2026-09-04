@@ -90,7 +90,7 @@ def BuildSyntheticFailurePayload(
             "TopModule": "CarryLookaheadAdder4",
             "RequestedStrategy": "default",
             "Input": {
-                "Path": f"{CheckoutRoot}/Examples/CarryLookaheadAdder4.sv",
+                "Path": f"{CheckoutRoot}/Assets/Examples/CarryLookaheadAdder4.sv",
                 "Sha256": "input-hash",
                 "SizeBytes": 123,
             },
@@ -98,7 +98,7 @@ def BuildSyntheticFailurePayload(
                 f"{CheckoutRoot}/.venv/bin/python",
                 f"{CheckoutRoot}/Main.py",
                 "--input",
-                f"{CheckoutRoot}/Examples/CarryLookaheadAdder4.sv",
+                f"{CheckoutRoot}/Assets/Examples/CarryLookaheadAdder4.sv",
                 "--output",
                 OutputRoot,
                 "--outputname",
@@ -205,7 +205,7 @@ class RoutingDesignSnapshotTests(unittest.TestCase):
     def testPorcelainParserPreservesRenameOriginAndUntrackedState(self) -> None:
         Status = (
             b"R  New.py\0Old.py\0"
-            b" M Compiler/Pipeline.py\0"
+            b" M Compilation/Pipeline.py\0"
             b"?? Notes.md\0"
         )
 

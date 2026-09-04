@@ -17,9 +17,9 @@ import traceback
 from threading import Event, Lock, Thread, active_count
 
 if __package__:
-    from Compiler.Pipeline import CompileSvToLitematic
-    from Validation.Core import PhysicalValidationProgress
-    from PhysicalDesign.Flow.Results import PcbProgress
+    from Compilation.Pipeline import CompileSvToLitematic
+    from Validation.Physical import PhysicalValidationProgress
+    from PhysicalDesign.Orchestration.Results import PcbProgress
     from PhysicalDesign.Policy import RoutingStrategy
     from .RunReporting import (
         BuildRunId,
@@ -31,9 +31,9 @@ if __package__:
     )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from Compiler.Pipeline import CompileSvToLitematic
-    from Validation.Core import PhysicalValidationProgress
-    from PhysicalDesign.Flow.Results import PcbProgress
+    from Compilation.Pipeline import CompileSvToLitematic
+    from Validation.Physical import PhysicalValidationProgress
+    from PhysicalDesign.Orchestration.Results import PcbProgress
     from PhysicalDesign.Policy import RoutingStrategy
     from App.RunReporting import BuildRunId, CaptureTerminalOutput, FormatResultLines, PromoteRunArtifacts, UtcTimestamp, WriteRunReport
 
@@ -51,7 +51,7 @@ DefaultsPath = (
     / "Defaults.json"
 )
 BuiltInDefaults = {
-    "InputPath": "Examples/FullAdder.sv",
+    "InputPath": "Assets/Examples/FullAdder.sv",
     "OutputDirectory": "Output",
     "OutputName": "",
     "TopModule": "",

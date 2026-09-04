@@ -2,16 +2,16 @@
 
 from pathlib import Path
 
-from Compiler.Ir.ComponentGraph import BuildComponentGraph
-from Compiler.Ir.Models import Gate, ModuleIR
-from Compiler.Synthesis.LogicOptimization import OptimizeLogic
-from Compiler.Synthesis.NandTransform import ToNandOnly
-from Compiler.Frontend.Sv import ParseSvToNetlist
+from Compilation.Ir.ComponentGraph import BuildComponentGraph
+from Compilation.Ir.Models import Gate, ModuleIR
+from Compilation.Synthesis.LogicOptimization import OptimizeLogic
+from Compilation.Synthesis.NandTransform import ToNandOnly
+from Formats.SystemVerilog.Sv import ParseSvToNetlist
 
 
 def _Example(ModuleName: str) -> ModuleIR:
     Parsed = ParseSvToNetlist(
-        InputPath=Path("Examples") / f"{ModuleName}.sv",
+        InputPath=Path("Assets/Examples") / f"{ModuleName}.sv",
         TopModule=ModuleName,
     )
     NandOnly = ToNandOnly(OptimizeLogic(Parsed))

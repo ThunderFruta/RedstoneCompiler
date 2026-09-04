@@ -10,15 +10,15 @@ from ....Contracts.Failures import RoutingFailureReason
 
 from ....Contracts.Failures import RoutingStageError
 
-from ....Interfaces.BoundaryRelations import RawPortalGeometryCache
+from ....Constraints.BoundaryRelations import RawPortalGeometryCache
 
-from ....Interfaces.PhysicalClaims import ClaimConflictPositions
+from ....Constraints.PhysicalClaims import ClaimConflictPositions
 
-from ....Interfaces.PhysicalClaims import MandatoryClaimsConflict
+from ....Constraints.PhysicalClaims import MandatoryClaimsConflict
 
 from ....Policy import PhysicalDesignPolicy
 
-from ....Execution.Reliability import BuildStableFingerprint
+from ....Runtime.Reliability import BuildStableFingerprint
 
 from ....Resources.ResourceGraph import LocalRouteClaim
 
@@ -42,7 +42,7 @@ from typing import Callable
 
 from typing import Iterable
 
-from ..Flow.RunModels import ClusterLeaseCandidateRealizabilityNogood, MandatoryPortalTupleSelfConflictEvidence, OptionalPortalSeedSliceExpired
+from ..Orchestration.RunModels import ClusterLeaseCandidateRealizabilityNogood, MandatoryPortalTupleSelfConflictEvidence, OptionalPortalSeedSliceExpired
 
 def BuildClusterLeaseSignalPatternFingerprint(
     Reservations: tuple[PortalReservation, ...] | list[PortalReservation],

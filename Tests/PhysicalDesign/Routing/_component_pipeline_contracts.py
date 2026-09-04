@@ -6,49 +6,49 @@ from types import SimpleNamespace
 
 import pytest
 
-from PhysicalDesign.Placement.Core.Repair import SelectTransactionalRepairClusterSelections
+from PhysicalDesign.Placement.Engine.Repair import SelectTransactionalRepairClusterSelections
 
-from PhysicalDesign.Flow.Candidates import BuildPhysicalGlobalPlanResumeCursorFromDiagnostics, ClassifyPhysicalGlobalPlanRetentionAdmission
+from PhysicalDesign.Orchestration.Candidates import BuildPhysicalGlobalPlanResumeCursorFromDiagnostics, ClassifyPhysicalGlobalPlanRetentionAdmission
 
-from PhysicalDesign.Flow.Preparation import SummarizePreRouteAccessFabric
+from PhysicalDesign.Orchestration.Preparation import SummarizePreRouteAccessFabric
 
-from PhysicalDesign.Flow.Results import BuildComponentRoutabilityCore, BuildCapacityRepairEndpointClosureClusters, BuildCapacityRepairGeometryFingerprint, BuildPhysicalLocalFactorDiversificationCore, BuildPhysicalOwnedFrontierTopologyRepairCore, BuildPhysicalInterfaceRepairCore, ComposePhysicalInterfaceRepairCores, BuildSymbolicCapacityRepairEvidence, PreparedEligibilityHasDisjointCapacitySeams, BuildPhysicalComponentPlacementFeedback, IsClusterInterfaceStateIncomplete, IsCompletePhysicalAssemblyUnsatisfiable
+from PhysicalDesign.Orchestration.Results import BuildComponentRoutabilityCore, BuildCapacityRepairEndpointClosureClusters, BuildCapacityRepairGeometryFingerprint, BuildPhysicalLocalFactorDiversificationCore, BuildPhysicalOwnedFrontierTopologyRepairCore, BuildPhysicalInterfaceRepairCore, ComposePhysicalInterfaceRepairCores, BuildSymbolicCapacityRepairEvidence, PreparedEligibilityHasDisjointCapacitySeams, BuildPhysicalComponentPlacementFeedback, IsClusterInterfaceStateIncomplete, IsCompletePhysicalAssemblyUnsatisfiable
 
-from PhysicalDesign.Flow.Runner import _PlaceAndRoutePcbWithPolicy
+from PhysicalDesign.Orchestration.Runner import _PlaceAndRoutePcbWithPolicy
 
-import PhysicalDesign.Flow.CandidateRouting as PlacementCandidateRouting
+import PhysicalDesign.Orchestration.CandidateRouting as PlacementCandidateRouting
 
-import PhysicalDesign.Flow.Feedback as PlacementFeedback
+import PhysicalDesign.Orchestration.Feedback as PlacementFeedback
 
-import PhysicalDesign.Flow.PhysicalAssembly as PlacementPhysicalAssembly
+import PhysicalDesign.Orchestration.PhysicalAssembly as PlacementPhysicalAssembly
 
-import PhysicalDesign.Flow.PhysicalFlow as PlacementPhysicalFlow
+import PhysicalDesign.Orchestration.PhysicalFlow as PlacementPhysicalFlow
 
-import PhysicalDesign.Flow.PlacementAttempts as PlacementAttempts
+import PhysicalDesign.Orchestration.PlacementAttempts as PlacementAttempts
 
-import PhysicalDesign.Flow.Portfolios as PlacementPortfolios
+import PhysicalDesign.Orchestration.Portfolios as PlacementPortfolios
 
-import PhysicalDesign.Flow.Results as PlacementPublication
+import PhysicalDesign.Orchestration.Results as PlacementPublication
 
-import PhysicalDesign.Flow.RoutingAttempts as PlacementRoutingAttempts
+import PhysicalDesign.Orchestration.RoutingAttempts as PlacementRoutingAttempts
 
-import PhysicalDesign.Flow.Setup as PlacementSetup
+import PhysicalDesign.Orchestration.Setup as PlacementSetup
 
 import PhysicalDesign.Routing.Global.Candidates.CandidateDomains as AuthoritativeCandidateDomains
 
 import PhysicalDesign.Routing.Global.Candidates.CandidateGuides as AuthoritativeCandidateGuides
 
-import PhysicalDesign.Routing.Global.Flow.Flow as AuthoritativeFlow
+import PhysicalDesign.Routing.Global.Orchestration.Flow as AuthoritativeFlow
 
-import PhysicalDesign.Routing.Global.Flow.Phases.AssignmentPreparation as AuthoritativeAssignmentPreparation
+import PhysicalDesign.Routing.Global.Orchestration.Stages.AssignmentPreparation as AuthoritativeAssignmentPreparation
 
-import PhysicalDesign.Routing.Global.Flow.Phases.GuidePlanning as AuthoritativeGuidePlanning
+import PhysicalDesign.Routing.Global.Orchestration.Stages.GuidePlanning as AuthoritativeGuidePlanning
 
-import PhysicalDesign.Routing.Global.Flow.Phases.PortalPreparation as AuthoritativePortalPreparation
+import PhysicalDesign.Routing.Global.Orchestration.Stages.PortalPreparation as AuthoritativePortalPreparation
 
 import PhysicalDesign.Routing.Global.Ports.PortPreparation as AuthoritativePortPreparation
 
-import PhysicalDesign.Routing.Global.Flow.RunModels as AuthoritativeRunModels
+import PhysicalDesign.Routing.Global.Orchestration.RunModels as AuthoritativeRunModels
 
 import PhysicalDesign.Routing.Global.Ports.ExteriorConnectors as AuthoritativeExteriorConnectors
 
@@ -60,13 +60,13 @@ import PhysicalDesign.Routing.Global.Ports.Solving as PhysicalPortSolving
 
 import PhysicalDesign.Routing.Global.Ports.Solving.Search as PhysicalPortSearch
 
-import PhysicalDesign.Routing.Regions.Interfaces.Fabric as ComponentFabric
+import PhysicalDesign.Routing.Regions.Boundaries.Fabric as ComponentFabric
 
-import PhysicalDesign.Routing.Regions.Interfaces.Problem as ComponentProblem
+import PhysicalDesign.Routing.Regions.Boundaries.Problem as ComponentProblem
 
 import PhysicalDesign.Routing.Pcb as Pcb
 
-from PhysicalDesign.Interfaces import BoundaryRelations
+from PhysicalDesign.Constraints import BoundaryRelations
 
 from PhysicalDesign.Routing.Regions.Planning.PhysicalPlanning import BuildPhysicalComponentAssemblyChoiceFingerprint, BuildPhysicalComponentAssemblyPlanDomainFingerprint, BuildPhysicalAssemblyGlobalReuseFingerprint, BuildPhysicalGlobalPlanCutFamilyFingerprint, BuildPhysicalGlobalPlanDependencyFingerprint, BuildPhysicalRequestAperturePortNoGood, ClassifyPhysicalComponentGlobalPlanningFailure, PreservePhysicalComponentAssemblyPlanDomainContinuation, PhysicalAssemblyGlobalRouteCanBeRebound, PruneRetainedPhysicalGlobalPlansByRejectedApertureClauses, SelectPhysicalComponentExactGlobalChannelSignals
 
@@ -80,7 +80,7 @@ from PhysicalDesign.Routing.Regions.Symbolic.SymbolicDomains import ProjectCompl
 
 from PhysicalDesign.Routing.Regions.Proofs.Certification import SelectContractIndependentOwnedSignalFrontierUnsatCore
 
-from PhysicalDesign.Interfaces.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
+from PhysicalDesign.Constraints.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint
 
 import PhysicalDesign.Routing.Pcb as RoutingPcb
 
@@ -98,7 +98,7 @@ from PhysicalDesign.Contracts.Placement import TrackAssignmentPreparation, Track
 
 from PhysicalDesign.Policy import DefaultPhysicalDesignPolicy
 
-from PhysicalDesign.Execution.Reliability import RoutingDeadline
+from PhysicalDesign.Runtime.Reliability import RoutingDeadline
 
 def _PhysicalPairApertureProjectionFixture(*, CompleteSupports=True):
     Apertures = (

@@ -5,14 +5,14 @@ import tempfile
 from types import SimpleNamespace
 
 from PhysicalDesign.Cells.Library import CellMacros
-from Compiler.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
-from PhysicalDesign.Placement.Core.Commit.Commit import PlacePcbGraph
+from Compilation.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
+from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, BuildPlacementPinAccessWitness
-from PhysicalDesign.Placement.Core.Clustering import PcbGatesConflict
-from PhysicalDesign.Redstone.Actions import AreConnected, BuildElectricalExclusions, BuildPhysicalGraphs, BuildRoutingResources, NeighborPositions, ValidateTemplateIsolation
-from PhysicalDesign.Redstone.Actions.Repeaters import PruneRedundantRepeaterReservations
-from PhysicalDesign.Redstone.Actions.Geometry import ValidatePlacedCellElectricalIsolation
-from PhysicalDesign.Routing.Workers.DetailedRouting import RustRoutingContext
+from PhysicalDesign.Placement.Engine.Clustering import PcbGatesConflict
+from PhysicalDesign.Redstone.Rules import AreConnected, BuildElectricalExclusions, BuildPhysicalGraphs, BuildRoutingResources, NeighborPositions, ValidateTemplateIsolation
+from PhysicalDesign.Redstone.Rules.Repeaters import PruneRedundantRepeaterReservations
+from PhysicalDesign.Redstone.Rules.Geometry import ValidatePlacedCellElectricalIsolation
+from PhysicalDesign.Routing.Execution.DetailedRouting import RustRoutingContext
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 from PhysicalDesign.Policy import LocalFirstPhysicalDesignPolicy
 from PhysicalDesign.Redstone.Technology import OppositeHorizontalFacing

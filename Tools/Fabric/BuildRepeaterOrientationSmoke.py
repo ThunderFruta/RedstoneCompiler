@@ -14,7 +14,8 @@ if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
 from PhysicalDesign.Redstone.Technology import OppositeHorizontalFacing, RepeaterInputDelta, RepeaterOutputDelta
-from PhysicalDesign.Rendering.SchemWriter import BuildRepeaterOrientationAudit, WriteLitematic
+from Formats.Litematic.Codec import WriteLitematic
+from PhysicalDesign.Rendering.Renderer import BuildRepeaterOrientationAudit
 
 
 Position = tuple[int, int, int]
