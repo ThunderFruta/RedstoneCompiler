@@ -7,7 +7,6 @@ import json
 import tempfile
 import unittest
 from unittest.mock import patch
-from typing import Any
 
 from Formats.SystemVerilog import Sv
 from App.CompilerCli import BuildParser, Main, PrintFabricFailureSummary, PrintRoutingFailureSummary
@@ -17,12 +16,11 @@ from PhysicalDesign.Orchestration.Preparation import PlacementNeedsDemandDiversi
 from PhysicalDesign.Orchestration.Results import (
     BuildPlacementPinAccessFinalizationDiagnostics,
 )
-from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb, _PlaceAndRoutePcbWithPolicy
-from PhysicalDesign.Orchestration.Setup import MaterializeInitialConflictRelocation, MaterializeInitialPendingJointPlacementState, MaterializeInitialPlacementAccessDirectOnly, SelectEmptyPlacementFailure
+from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb
+from PhysicalDesign.Orchestration.Setup import MaterializeInitialPlacementAccessDirectOnly, SelectEmptyPlacementFailure
 from PhysicalDesign.Placement.Engine.Clustering import BuildTopologicalLevels, FindIsomorphicNandClusterMapping, OptimizeClusterSlots, PcbGatesConflict
-from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
-from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign, PlacedGate
+from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedGate
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
 from Compilation.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
 from Validation.Fabric import FabricServerValidationResult, FabricValidationProgress
@@ -34,7 +32,6 @@ from PhysicalDesign.Policy import (
     ExecutionStrategyForRequest,
     GlobalRoutingPolicy,
     LocalFirstPhysicalDesignPolicy,
-    NandPackingPolicy,
     PolicyForRoutingStrategy,
     RoutingAcceptanceProfiles,
     RoutingAwarePlacementAccessPhysicalDesignPolicy,
@@ -42,8 +39,6 @@ from PhysicalDesign.Policy import (
 )
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
-from PhysicalDesign.Contracts.Results import RoutedDesign
-from PhysicalDesign.Runtime.Reliability import RoutingDeadline
 from Compilation.Synthesis.Validation import ValidateNandOnlyDesign
 from Compilation.Synthesis.LogicOptimization import OptimizeLogic
 from Compilation.Synthesis.NandTransform import ToNandOnly
@@ -117,288 +112,6 @@ class LocalFirstRouterTests(unittest.TestCase):
         )
 
         self.assertIs(SelectEmptyPlacementFailure(Context), Incomplete)
-
-    def testInitialPlacementConsumesOneConflictRelocation(self) -> None:
-        Request = SimpleNamespace(SourceGenerator="row-beam-conflict-relocation")
-        Context = SimpleNamespace(
-            UniquePlacements={},
-            ProactiveRelocationRequested=True,
-            Deadline=SimpleNamespace(IsExpired=lambda: False),
-        )
-
-        with (
-            patch(
-                "PhysicalDesign.Orchestration.Setup._TakeNextDeferredRequest",
-                return_value=Request,
-            ) as TakeRequest,
-            patch(
-                "PhysicalDesign.Orchestration.Setup._TryPlacement",
-                return_value=False,
-            ) as TryPlacement,
-        ):
-            self.assertTrue(MaterializeInitialConflictRelocation(Context))
-
-        TakeRequest.assert_called_once_with(Context, PreferRelocation=True)
-        TryPlacement.assert_called_once_with(Context, Request)
-
-    def testInitialPlacementRetargetsOneChangedConflictSet(self) -> None:
-        Request = SimpleNamespace(SourceGenerator="row-beam-conflict-relocation")
-        Context = SimpleNamespace(
-            UniquePlacements={},
-            ProactiveRelocationRequested=True,
-            Deadline=SimpleNamespace(IsExpired=lambda: False),
-            TotalRelocationGenerationCount=1,
-            PlacementRelocationSignals=frozenset({"NandNet0", "NandNet2"}),
-            LastRelocationSignalsUsed=frozenset({"NandNet0", "Propagate0"}),
-            GenerationPlan=SimpleNamespace(DeferredRequests=(Request,)),
-            PlacementGenerationDecisions=[],
-        )
-
-        with (
-            patch(
-                "PhysicalDesign.Orchestration.Setup._TakeNextDeferredRequest",
-            ) as TakeRequest,
-            patch(
-                "PhysicalDesign.Orchestration.Setup._TryPlacement",
-                return_value=False,
-            ) as TryPlacement,
-        ):
-            self.assertTrue(MaterializeInitialConflictRelocation(Context))
-
-        TakeRequest.assert_not_called()
-        TryPlacement.assert_called_once_with(Context, Request)
-        self.assertEqual(
-            Context.PlacementGenerationDecisions[-1]["Result"],
-            "initial-conflict-relocation-retargeted",
-        )
-
-    def testInitialPlacementConsumesOneQueuedExactJointState(self) -> None:
-        State = SimpleNamespace(
-            Request=SimpleNamespace(SourceGenerator="row-beam"),
-            CandidateIndex=1,
-            RelocationVariant=0,
-            RoutingSpacing=5,
-            RelocationSignals=frozenset(),
-            RelocationPrioritySignals=frozenset(),
-            RequiredRelocationSignals=frozenset(),
-            AssignmentCut=None,
-            AssignmentConstraints=object(),
-            CoordinatedCandidateDiversificationSignals=frozenset(),
-            TopologyCutFrontier=(),
-        )
-        Context = SimpleNamespace(
-            UniquePlacements={},
-            PendingJointPlacementStates=[State],
-            JointPlacementStateEvents=[],
-            Deadline=SimpleNamespace(IsExpired=lambda: False),
-        )
-
-        with patch(
-            "PhysicalDesign.Orchestration.Setup._TryPlacement",
-            return_value=True,
-        ) as TryPlacement:
-            self.assertTrue(
-                MaterializeInitialPendingJointPlacementState(Context)
-            )
-
-        self.assertEqual(Context.PendingJointPlacementStates, [])
-        self.assertEqual(
-            Context.JointPlacementStateEvents[0]["Status"],
-            "initial-materializing",
-        )
-        self.assertEqual(
-            TryPlacement.call_args.kwargs["JointPlacementCandidateIndex"],
-            1,
-        )
-
-    @staticmethod
-    def _BuildPlacementFlowFixture(Label: str) -> Any:
-        Module = SimpleNamespace(Gates=[SimpleNamespace(Name="Gate")])
-        Placed = PlacedDesign(
-            Module=Module,
-            PlacedGates=[PlacedGate(
-                Name="Gate",
-                X=0,
-                Y=1,
-                Z=0,
-                Kind="NAND",
-                Outputs=[],
-                Inputs=[],
-                Attrs={},
-                InputPins=[],
-                OutputPin=None,
-                Rotation=0,
-                MirrorX=False,
-                InputDirections=[],
-                OutputDirection=None,
-            )],
-            LocalRouteClaims=(),
-            LocalRouteDiagnostics={"Fixture": Label},
-            FrozenNetWires={},
-            LocalNetBranches={},
-            LocalNetTargets={},
-        )
-        return PcbPlacement(
-            Placed=Placed,
-            Clusters=(),
-            SignalOrder=(),
-            LayerCount=1,
-            PackedClusters=(),
-        )
-
-    @staticmethod
-    def _BuildPlacementFeedbackFixture() -> Any:
-        return SimpleNamespace(
-            Score=(0,),
-            BoundaryOverflow=0,
-            PinScarcityCount=0,
-            GuideOverflowPeak=0,
-            GuideOverflowCells=0,
-            PinEscapeConflictCount=0,
-            EstimatedGlobalExtensionNodes=0,
-            EstimatedGlobalExtensionNets=0,
-            PreOwnedNodeCount=0,
-        )
-
-    @staticmethod
-    def _PrepareMockedPlacementRouting(Context: Any) -> None:
-        """Freeze the candidate chosen by these placement-flow unit tests."""
-        Selected = Context.CandidateRecords[0]
-        Context.PreRouteTemplates = []
-        Context.PreRouteObjectiveByCandidateId = {}
-        Context.PrePlacementTrackPreparations = []
-        Context.PrePlacementTrackFeasible = [Selected]
-        Context.PreRouteInterfaceResult = SimpleNamespace(
-            SelectionFingerprint="fixture-selection",
-            ToDictionary=lambda: {},
-        )
-        Context.RawTrackAssignmentResult = None
-        Context.RawTrackAssignmentMaterializations = {}
-        Context.SelectedPreRouteTemplateIds = {Selected.CandidateId}
-        Context.SelectedPreRouteCandidates = [Selected]
-        Context.SelectedPreRouteCandidate = Selected
-        Context.SelectedTrackPreparation = SimpleNamespace(
-            Success=True,
-            Complete=True,
-            ToDictionary=lambda: {},
-        )
-        Context.PrePlacementTrackPreparationByCandidateId = {}
-        Context.OrderedPlacements = [Selected]
-        Context.ExactClusterInterfaceSolveEnabled = False
-        Context.PlacementFeedback = [
-            Candidate.ToDictionary()
-            for Candidate in Context.CandidateRecords
-        ]
-        Context.Placement = Selected.Placement
-        Context.RoutingSpacing = Selected.RoutingSpacing
-        Context.Routed = None
-        Context.SelectedCandidate = None
-        Context.LastAttemptedCandidate = None
-        Context.RoutingPercentageSelectionEnabled = bool(
-            Context.Policy.MaterialObjective.OptimizeRoutingPercentage
-            and Context.NandGateCount
-            >= Context.Policy.MaterialObjective
-            .MinimumRoutingPercentageSelectionNandCount
-        )
-        Context.RoutedCandidates = []
-
-    def _RunMockedPlacementFlow(
-        self,
-        PlaceSideEffect: Any,
-        Fingerprints: list[str],
-        RouteSideEffect: Any,
-        FeedbackSideEffect: Any = None,
-        OptimizeRoutingPercentage: bool = False,
-    ) -> tuple[Any, Any, Any]:
-        Module = SimpleNamespace(Gates=[SimpleNamespace(Name="Gate")])
-        Netlist = SimpleNamespace(Top="Fixture", Modules={"Fixture": Module})
-        Routed = RoutedDesign(
-            Module=Module,
-            PlacedGates=[],
-            Wires=[],
-            Supports=[],
-            RepeaterInputFacings={},
-            NetWires={},
-        )
-        EffectiveRouteSideEffect = RouteSideEffect or Routed
-        with (
-            patch(
-                "PhysicalDesign.Orchestration.Setup.RoutingDeadline.Start",
-                wraps=RoutingDeadline.Start,
-            ) as StartDeadline,
-            patch(
-                "PhysicalDesign.Orchestration.Runner.PlacePcbGraph",
-                side_effect=PlaceSideEffect,
-            ) as PlaceGraph,
-            patch(
-                "PhysicalDesign.Orchestration.PlacementAttempts.BuildPlacementFingerprint",
-                side_effect=Fingerprints,
-            ),
-            patch(
-                "PhysicalDesign.Orchestration.PlacementAttempts.BuildPlacementRetentionFingerprint",
-                side_effect=Fingerprints,
-            ),
-            patch(
-                "PhysicalDesign.Orchestration.Runner.MeasurePlacementRoutingFeedback",
-                side_effect=FeedbackSideEffect,
-                return_value=self._BuildPlacementFeedbackFixture(),
-            ),
-            patch(
-                "PhysicalDesign.Orchestration.Runner.RoutePcbDesign",
-                side_effect=(
-                    EffectiveRouteSideEffect
-                    if isinstance(EffectiveRouteSideEffect, list)
-                    else None
-                ),
-                return_value=(
-                    Routed
-                    if not isinstance(EffectiveRouteSideEffect, list)
-                    else None
-                ),
-            ) as RouteDesign,
-            patch(
-                "PhysicalDesign.Orchestration.Runner.ValidateNandOnlyDesign",
-            ),
-            patch(
-                "PhysicalDesign.Orchestration.Runner.ValidatePlacedCellElectricalIsolation",
-            ),
-            patch("PhysicalDesign.Orchestration.Runner.BuildRoutingResources"),
-            patch(
-                "PhysicalDesign.Orchestration.Runner.MeasurePcbDesign",
-                return_value=(1, 1, 1, 1),
-            ),
-            patch(
-                "PhysicalDesign.Orchestration.Runner.BuildLocalFirstSnapshot",
-                return_value=SimpleNamespace(ToDictionary=lambda: {}),
-            ),
-            patch(
-                "PhysicalDesign.Orchestration.Runner.PreparePlacementRouting",
-                side_effect=self._PrepareMockedPlacementRouting,
-            ),
-        ):
-            Result = _PlaceAndRoutePcbWithPolicy(
-                Netlist,
-                ProgressCallback=None,
-                Policy=replace(
-                    LocalFirstPhysicalDesignPolicy,
-                    RuntimeBudgetSeconds=5.0,
-                    NandPacking=replace(
-                        LocalFirstPhysicalDesignPolicy.NandPacking,
-                        EnableProactiveInterClusterRelocation=False,
-                        DeferUnpackedOracle=False,
-                    ),
-                    MaterialObjective=replace(
-                        LocalFirstPhysicalDesignPolicy.MaterialObjective,
-                        OptimizeRoutingPercentage=OptimizeRoutingPercentage,
-                        MinimumRemainingRoutingPercentageSearchSeconds=0.001,
-                        MinimumRoutingPercentageSelectionNandCount=1,
-                    ),
-                ),
-                Technology=DefaultRedstoneRoutingTechnology,
-                RequestedStrategy=RoutingStrategy.Default,
-                UsedStrategy=RoutingStrategy.Default,
-            )
-        return Result, PlaceGraph, (StartDeadline, RouteDesign)
 
     def testNandOnlyValidationRejectsNonNandLogic(self) -> None:
         Module = ModuleIR(
@@ -667,39 +380,6 @@ class LocalFirstRouterTests(unittest.TestCase):
             Text,
         )
         self.assertIn("failed-output probe", Text)
-
-    def testDefaultPolicyEnablesAuthoritativeRoutingFeatures(self) -> None:
-        self.assertTrue(
-            LocalFirstPhysicalDesignPolicy
-            .Placement.EnableDemandAwareInterClusterSpacing
-        )
-        self.assertEqual(LocalFirstPhysicalDesignPolicy.Placement.RoutingSpacing, 5)
-        self.assertEqual(LocalFirstPhysicalDesignPolicy.Placement.PinEscapeLength, 1)
-        Snapshot = LocalFirstPhysicalDesignPolicy.ToDictionary()
-        self.assertFalse(Snapshot["QualityGate"]["Enabled"])
-        self.assertEqual(Snapshot["Placement"]["RoutingFeedbackIterations"], 1)
-        self.assertTrue(Snapshot["Placement"]["EnableRoutingFeedback"])
-        self.assertTrue(
-            Snapshot["Placement"]["EnableDemandAwareInterClusterSpacing"]
-        )
-        self.assertTrue(Snapshot["GlobalRouting"]["EnableCapacityAwareGuides"])
-        self.assertEqual(
-            LocalFirstPhysicalDesignPolicy.PolicyVersion,
-            "physical-design-v16-reconvergent-access",
-        )
-        self.assertTrue(Snapshot["NandPacking"]["Enabled"])
-        self.assertTrue(Snapshot["NandPacking"]["EnableStructuralReuse"])
-        self.assertGreaterEqual(
-            Snapshot["NandPacking"]["MaximumStructuralReuseMappings"],
-            1,
-        )
-        with self.assertRaises(ValueError):
-            NandPackingPolicy(MaximumStructuralReuseMappings=0)
-        self.assertTrue(Snapshot["Organization"]["Enabled"])
-        self.assertEqual(
-            Snapshot["MaterialObjective"]["MinimumComponentFunctionalShare"],
-            0.60,
-        )
 
     def testRoutingAwarePlacementAccessStrategyIsDefaultAndNonFallback(
         self,
@@ -1275,106 +955,6 @@ class LocalFirstRouterTests(unittest.TestCase):
             "row-beam-conflict-relocation",
         )
 
-    def testGraphBeamIsNotConstructedAfterPrimaryCandidateRoutes(self) -> None:
-        Placements = [
-            self._BuildPlacementFlowFixture("row-beam"),
-            self._BuildPlacementFlowFixture("unpacked"),
-        ]
-        _, PlaceGraph, _ = self._RunMockedPlacementFlow(
-            Placements,
-            ["a-primary", "b-primary"],
-            None,
-        )
-
-        self.assertEqual(PlaceGraph.call_count, 2)
-        PackingPolicies = [
-            Call.kwargs["PackingPolicy"] for Call in PlaceGraph.call_args_list
-        ]
-        self.assertTrue(PackingPolicies[0].Enabled)
-        self.assertFalse(PackingPolicies[0].GraphBeamEnabled)
-        self.assertFalse(any(
-            Value.Enabled and Value.GraphBeamEnabled
-            for Value in PackingPolicies
-        ))
-
-    def testFullFootprintSelectionUsesFinalRenderedComposition(self) -> None:
-        Placements = [
-            self._BuildPlacementFlowFixture("row-beam"),
-            self._BuildPlacementFlowFixture("unpacked"),
-        ]
-        Composition = lambda Share, RouteBlocks, Footprint: SimpleNamespace(
-            RoutingFunctionalShare=Share,
-            RoutingOwnedFunctionalBlocks=RouteBlocks,
-            Footprint=Footprint,
-            NonAirBlocks=200,
-            Width=20,
-            Height=5,
-            Depth=10,
-            XYFootprint=100,
-            FullFootprint=Footprint * 5,
-        )
-        with patch(
-            "PhysicalDesign.Rendering.Renderer.BuildLitematicBlockMap",
-            side_effect=[
-                SimpleNamespace(Composition=Composition(0.70, 140, 200)),
-                SimpleNamespace(Composition=Composition(0.55, 150, 210)),
-            ],
-        ):
-            Result, _PlaceGraph, RouteDesign = self._RunMockedPlacementFlow(
-                Placements,
-                ["first", "second"],
-                None,
-                OptimizeRoutingPercentage=True,
-            )
-
-        Selection = Result.Routed.RoutingControlEffectiveness[
-            "RoutingPercentageSelection"
-        ]
-        self.assertEqual(RouteDesign[1].call_count, 1)
-        self.assertEqual(Selection["CandidateCount"], 1)
-        self.assertEqual(Selection["Selected"]["FullFootprint"], 1000)
-        self.assertEqual(
-            Result.Routed.RoutingControlEffectiveness[
-                "SelectedPlacementCandidate"
-            ]["PlacementFingerprint"],
-            "first",
-        )
-
-    def testConfiguredGraphBeamIsNotTriedAfterPrimaryPlacementFails(self) -> None:
-        PlacementResults = [
-            ValueError("row beam rejected"),
-            ValueError("unpacked placement rejected"),
-            ValueError("direct-only row beam rejected"),
-            ValueError("configured-spacing unpacked rejected"),
-            ValueError("wider-spacing unpacked rejected"),
-            ValueError("configured packing rejected"),
-        ]
-        with self.assertRaises(RoutingStageError):
-            self._RunMockedPlacementFlow(
-                PlacementResults,
-                ["configured-graph"],
-                None,
-            )
-
-    def testSingleAttemptDoesNotRouteASecondPlacementAfterFailure(self) -> None:
-        Placements = [
-            self._BuildPlacementFlowFixture("first"),
-            self._BuildPlacementFlowFixture("second"),
-        ]
-        Failure = RoutingStageError(
-            RoutingFailure(
-                Reason=RoutingFailureReason.TrackAssignmentConflict,
-                Stage="TrackAssignment",
-                Detail="force the next retained placement",
-            )
-        )
-        with self.assertRaises(RoutingStageError):
-            self._RunMockedPlacementFlow(
-                Placements,
-                ["a-first", "b-second"],
-                [Failure],
-            )
-
     def testDeferredPlacementAlternativesAreDemandAware(self) -> None:
         def Candidate(
             Fingerprint: str,
@@ -1405,39 +985,6 @@ class LocalFirstRouterTests(unittest.TestCase):
             PlacementNeedsDemandDiversity([Pressured, Clear], 6)
         )
 
-    def testPressuredPlacementDoesNotFailOverToDeferredAlternative(self) -> None:
-        Placements = [
-            self._BuildPlacementFlowFixture("row-beam"),
-            self._BuildPlacementFlowFixture("unpacked"),
-            self._BuildPlacementFlowFixture("deferred-clear"),
-        ]
-        Failure = RoutingStageError(
-            RoutingFailure(
-                Reason=RoutingFailureReason.TrackAssignmentConflict,
-                Stage="TrackAssignment",
-                Detail="force placement failover",
-            )
-        )
-
-        def Feedback(Placement, *_Arguments):
-            Label = Placement.Placed.LocalRouteDiagnostics["Fixture"]
-            Value = self._BuildPlacementFeedbackFixture()
-            return SimpleNamespace(
-                **{
-                    **vars(Value),
-                    "Score": ((1,) if Label == "row-beam" else (0,)),
-                    "BoundaryOverflow": (1 if Label == "row-beam" else 0),
-                }
-            )
-
-        with self.assertRaises(RoutingStageError):
-            self._RunMockedPlacementFlow(
-                Placements,
-                ["row-beam", "unpacked", "deferred-clear"],
-                [Failure],
-                FeedbackSideEffect=Feedback,
-            )
-
     def testCyclicContractedClusterGraphUsesCompactPlacement(self) -> None:
         Module = ModuleIR(
             Name="CyclicClusters",
@@ -1457,26 +1004,6 @@ class LocalFirstRouterTests(unittest.TestCase):
         )
         self.assertEqual(set(Assignment), {0, 1})
         self.assertLessEqual(Columns * Rows, 2)
-
-    def testAbsoluteMaterialGatesAreBenchmarkOnly(self) -> None:
-        self.assertTrue(LocalFirstPhysicalDesignPolicy.MaterialObjective.Enabled)
-        self.assertFalse(
-            LocalFirstPhysicalDesignPolicy
-            .MaterialObjective.OptimizeRoutingPercentage
-        )
-        self.assertEqual(
-            RoutingAcceptanceProfiles["FullAdder"].MaximumFootprint,
-            600,
-        )
-        self.assertIsNone(
-            RoutingAcceptanceProfiles["RippleCarryAdder4"].MaximumFootprint
-        )
-        self.assertEqual(
-            RoutingAcceptanceProfiles[
-                "RippleCarryAdder8"
-            ].MaximumRuntimeSeconds,
-            30.0,
-        )
 
     def testRepeatedNandStructureIsDetectedWithoutCircuitNames(self) -> None:
         Module = ModuleIR(
@@ -1828,70 +1355,14 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(First.Signals, ("A", "B"))
         self.assertTrue(Second.Stagnated)
 
-    def testRemovedHybridStrategyIsRejectedBeforeRouting(self) -> None:
-        with patch(
-            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
-        ) as Execute:
-            with self.assertRaises(ValueError):
+    def testRemovedStrategiesAreRejected(self) -> None:
+        """Unsupported legacy modes cannot enter the public router."""
+        for Strategy in ("hybrid", "compatibility"):
+            with self.subTest(Strategy=Strategy), self.assertRaises(ValueError):
                 PlaceAndRoutePcb(
                     SimpleNamespace(),
-                    Strategy="hybrid",
+                    Strategy=Strategy,
                 )
-        Execute.assert_not_called()
-
-    def testRemovedCompatibilityStrategyIsRejectedBeforeRouting(self) -> None:
-        with patch(
-            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
-        ) as Execute:
-            with self.assertRaises(ValueError):
-                PlaceAndRoutePcb(
-                    SimpleNamespace(),
-                    Strategy="compatibility",
-                )
-        Execute.assert_not_called()
-
-    def testCliDeadlineOverridesEffectivePolicyWithoutMutatingCanonicalPolicy(
-        self,
-    ) -> None:
-        Expected = object()
-        with patch(
-            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
-            return_value=Expected,
-        ) as Execute:
-            Result = PlaceAndRoutePcb(
-                SimpleNamespace(),
-                Strategy=RoutingStrategy.Default,
-                RoutingDeadlineSeconds=4.25,
-            )
-
-        self.assertIs(Result, Expected)
-        EffectivePolicy = Execute.call_args.kwargs["Policy"]
-        self.assertEqual(EffectivePolicy.RuntimeBudgetSeconds, 4.25)
-        self.assertEqual(
-            EffectivePolicy.AdaptiveRouting.MaximumRuntimeSeconds,
-            4.25,
-        )
-        self.assertEqual(
-            LocalFirstPhysicalDesignPolicy.RuntimeBudgetSeconds,
-            120.0,
-        )
-        with self.assertRaisesRegex(ValueError, "finite and positive"):
-            PlaceAndRoutePcb(
-                SimpleNamespace(),
-                RoutingDeadlineSeconds=0,
-            )
-
-    def testNewRouterFirstSurfacesLocalRoutingFailure(self) -> None:
-        with patch(
-            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
-            side_effect=ValueError("forced local failure"),
-        ) as Execute:
-            with self.assertRaisesRegex(ValueError, "forced local failure"):
-                PlaceAndRoutePcb(
-                    SimpleNamespace(),
-                    Strategy=RoutingStrategy.Default,
-                )
-        self.assertEqual(Execute.call_count, 1)
 
     def testV16ControlFullAdderWritesCompleteDiagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:

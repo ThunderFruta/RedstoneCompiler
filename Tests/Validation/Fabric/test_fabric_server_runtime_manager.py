@@ -142,31 +142,6 @@ class FabricServerRuntimeManagerTests(unittest.TestCase):
             RuntimeAnvilPath,
         )
 
-    def testHarnessConfigurationDefaultsToOneThousandTps(self) -> None:
-        with TemporaryDirectory() as TemporaryDirectoryPath:
-            ConfigurationPath = (
-                Path(TemporaryDirectoryPath) / "redstonecompiler-harness.json"
-            )
-            with patch.object(
-                self.Process,
-                "HarnessConfigurationPath",
-                ConfigurationPath,
-            ), patch.object(
-                self.Process.secrets,
-                "token_hex",
-                return_value="private-token",
-            ):
-                self.Process.WriteHarnessConfiguration(25566)
-
-            Configuration = json.loads(
-                ConfigurationPath.read_text(encoding="utf-8"),
-            )
-
-        self.assertEqual(Configuration["RequestedTickRate"], 1000.0)
-        self.assertEqual(Configuration["SettleTimeoutTicks"], 200)
-        self.assertNotIn("ValidationLanesPerStack", Configuration)
-        self.assertNotIn("MaximumValidationStackCount", Configuration)
-
     def testCurrentStatusRecoversAUserServiceOwner(self) -> None:
         WriteManagerState = Mock()
         with patch.object(

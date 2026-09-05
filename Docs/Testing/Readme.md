@@ -6,3 +6,4 @@ Contains test strategy and execution guidance.
 - [Running tests](RunningTests.md)
 - [Benchmarks and acceptance gates](Benchmarks.md)
 - [Test-suite cleanup evidence](TestSuiteCleanup.md)
+- [Outcome-first active-test audit](OutcomeFirstTestAudit.md)
