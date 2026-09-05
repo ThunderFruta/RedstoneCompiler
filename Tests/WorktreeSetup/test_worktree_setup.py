@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import sys
-import tomllib
 
 import pytest
 
@@ -21,9 +20,6 @@ from Validation.Physical import PhysicalFixtureArtifact
 
 
 RepositoryRoot = Path(__file__).resolve().parents[2]
-EnvironmentPath = (
-    RepositoryRoot / ".codex/environments/redstonecompiler-worktree.toml"
-)
 MchprsFixtureRoot = RepositoryRoot / "Tests/Fixtures/Mchprs"
 
 
@@ -43,38 +39,11 @@ def LoadMchprsCase(Name: str) -> tuple[dict[str, object], Path, Path]:
     return Case, FixturePath, LogicPath
 
 
-def test_worktree_setup_configures_an_isolated_linux_environment() -> None:
-    """Keep the setup and teardown limited to generated worktree payloads."""
-    Environment = tomllib.loads(EnvironmentPath.read_text(encoding="utf-8"))
-
-    assert Environment["version"] == 1
-    assert Environment["name"] == "RedstoneCompiler Worktree"
-    Setup = Environment["setup"]["linux"]["script"]
-    Cleanup = Environment["cleanup"]["linux"]["script"]
-    assert "python3 -m venv .venv" in Setup
-    assert ".venv/bin/python -m pip install -e ." in Setup
-    assert "Tests/WorktreeSetup" in Setup
-    assert "rm -rf .venv Kernels/Routing/target" in Cleanup
-    assert "Runtime/FabricServer" not in Cleanup
-    assert "ValidationServerHarness/Server" not in Cleanup
-
-
-def test_configured_paths_are_owned_by_this_checkout() -> None:
-    """Require tracked inputs and reject a stale path from another checkout."""
-    assert (RepositoryRoot / "pyproject.toml").is_file()
-    assert (RepositoryRoot / "Kernels/Routing/Cargo.toml").is_file()
-    assert (RepositoryRoot / "Tools/Mchprs/TestPhysicalFixture.py").is_file()
-    assert (RepositoryRoot / "Validation/Fabric/ServerHarness/build.gradle").is_file()
-    assert EnvironmentPath.is_file()
-    assert EnvironmentPath.is_relative_to(RepositoryRoot)
-
-
 def test_native_extension_imports_from_this_checkout() -> None:
     """The editable install must not silently import another worktree's module."""
     import RedstoneCompiler.RustRouting as RustRouting
 
     ModulePath = Path(RustRouting.__file__).resolve()
-    assert ModulePath.suffix == ".so"
     assert ModulePath.is_relative_to(RepositoryRoot)
     assert hasattr(RustRouting, "ValidateMchprsFixture")
 

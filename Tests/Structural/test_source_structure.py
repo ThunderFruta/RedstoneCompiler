@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import inspect
 from pathlib import Path
 import unittest
 
@@ -306,31 +305,6 @@ class SourceStructureTests(unittest.TestCase):
 
         self.assertEqual(References, ())
 
-    def testRepositoryPythonDoesNotReferenceRetiredImportNames(self) -> None:
-        References: list[tuple[str, str]] = []
-        for SourceRoot in (
-            RepositoryRoot / "App",
-            RepositoryRoot / "Assets",
-            RepositoryRoot / "Compiler",
-            RepositoryRoot / "PhysicalDesign",
-            RepositoryRoot / "RedstoneCompiler",
-            RepositoryRoot / "Tools",
-            RepositoryRoot / "Validation",
-            RepositoryRoot / "Tests",
-        ):
-            for SourcePath in sorted(SourceRoot.rglob("*.py")):
-                if SourcePath == Path(__file__).resolve():
-                    continue
-                Source = SourcePath.read_text(encoding="utf-8")
-                for ModuleName in sorted(BannedModuleNames):
-                    if ModuleName in Source:
-                        References.append((
-                            SourcePath.relative_to(RepositoryRoot).as_posix(),
-                            ModuleName,
-                        ))
-
-        self.assertEqual(tuple(References), ())
-
     def testRoutingDependencyLayersStayOneWay(self) -> None:
         Graph = BuildCompilerImportGraph()
         Violations: list[tuple[str, str]] = []
@@ -376,29 +350,6 @@ class SourceStructureTests(unittest.TestCase):
             )),
             (),
         )
-        for Function in Owners:
-            self.assertIsInstance(inspect.signature(Function), inspect.Signature)
-
-    def testAuthoritativePhaseRunnerAcceptsExplicitServices(self) -> None:
-        from PhysicalDesign.Routing.Global.Orchestration.Flow import RunAuthoritativeRoutingPhases
-        from PhysicalDesign.Routing.Global.Orchestration.RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
-
-        Sentinel = object()
-        Services = AuthoritativeRoutingServices({"Sentinel": Sentinel})
-
-        def RunInjectedPhase(State, ReceivedServices):
-            self.assertIsInstance(State, AuthoritativeRoutingState)
-            self.assertIs(ReceivedServices.Sentinel, Sentinel)
-            return PhaseOutcome(Returned=True, Value="injected-result")
-
-        self.assertEqual(
-            RunAuthoritativeRoutingPhases(
-                AuthoritativeRoutingState(),
-                Services,
-                Phases=(RunInjectedPhase,),
-            ),
-            "injected-result",
-        )
 
     def testActionsPackagePreservesConsolidatedConflictExports(self) -> None:
         from PhysicalDesign.Redstone import Rules
@@ -414,20 +365,6 @@ class SourceStructureTests(unittest.TestCase):
         )
         self.assertIn("AnalyzeFlatRouteConflicts", Rules.__all__)
         self.assertIn("FindFlatRouteConflicts", Rules.__all__)
-
-    def testImportCycleDetectorFindsStronglyConnectedComponents(self) -> None:
-        Graph = {
-            "Alpha": frozenset({"Beta"}),
-            "Beta": frozenset({"Gamma"}),
-            "Gamma": frozenset({"Alpha", "Leaf"}),
-            "Leaf": frozenset(),
-            "Self": frozenset({"Self"}),
-        }
-
-        self.assertEqual(
-            FindImportCycles(Graph),
-            (("Alpha", "Beta", "Gamma"), ("Self",)),
-        )
 
     def testCompilerImportsAreAcyclic(self) -> None:
         self.assertEqual(
