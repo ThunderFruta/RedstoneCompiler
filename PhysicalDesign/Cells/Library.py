@@ -7,14 +7,38 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class PinAccessPattern:
-    """One named legal straight escape primitive for a logical cell pin."""
+    """One finite cell-local seed for a logical pin-access pattern."""
 
     PatternId: str
     PinId: str
     ConnectionPosition: tuple[int, int, int]
     ApproachDirection: tuple[int, int, int]
+    PatternFamily: str = "straight"
+    TangentialSign: int = 0
     AccessLength: int = 3
-    AllowedRoutingLayers: tuple[int, ...] = ()
+    AllowedRoutingLayers: tuple[int, ...] = (0,)
+
+    def __post_init__(self) -> None:
+        if self.PatternFamily not in {"straight", "planar-jog"}:
+            raise ValueError("pin-access pattern family is unsupported")
+        ExpectedSigns = (
+            {0} if self.PatternFamily == "straight" else {-1, 1}
+        )
+        if self.TangentialSign not in ExpectedSigns:
+            raise ValueError("pin-access pattern tangential sign is invalid")
+        if self.AccessLength < 1:
+            raise ValueError("pin-access pattern length must be positive")
+        if (
+            self.ApproachDirection[1] != 0
+            or sum(abs(Value) for Value in self.ApproachDirection) != 1
+        ):
+            raise ValueError(
+                "pin-access pattern approach must be horizontal cardinal"
+            )
+        if self.AllowedRoutingLayers != (0,):
+            raise ValueError(
+                "the initial pin-access catalog supports only layer zero"
+            )
 
 
 @dataclass(frozen=True)
@@ -31,10 +55,37 @@ class CellMacro:
     OutputDirection: tuple[int, int, int] | None
     EstimatedBlocks: int
     AllowMirror: bool = False
+    StaticSignalRoles: tuple[
+        tuple[tuple[int, int, int], str], ...
+    ] = ()
+
+    def __post_init__(self) -> None:
+        if self.StaticSignalRoles != tuple(sorted(set(self.StaticSignalRoles))):
+            raise ValueError(
+                "cell static signal roles must be sorted and unique"
+            )
+        for _Position, Role in self.StaticSignalRoles:
+            if Role == "Output0":
+                if self.OutputPin is None:
+                    raise ValueError(
+                        "cell static output role requires an output pin"
+                    )
+                continue
+            if not Role.startswith("Input") or not Role[5:].isdigit():
+                raise ValueError("cell static signal role is invalid")
+            if int(Role[5:]) >= len(self.InputPins):
+                raise ValueError(
+                    "cell static input role is outside the pin domain"
+                )
 
     @property
     def PinAccessPatterns(self) -> tuple[PinAccessPattern, ...]:
-        """Expose named pin escapes instead of recreating offsets downstream."""
+        """Expose the legacy straight-only seed for each physical pin.
+
+        The v16 placement witness consumes this property and intentionally
+        remains singleton.  The routing-aware strategy consumes
+        ``RoutingAwarePinAccessPatterns`` instead.
+        """
         Inputs = tuple(
             PinAccessPattern(
                 PatternId=f"Input{Index}Straight",
@@ -59,6 +110,34 @@ class CellMacro:
         return Inputs + Output
 
     @property
+    def RoutingAwarePinAccessPatterns(self) -> tuple[PinAccessPattern, ...]:
+        """Return straight and symmetric planar-jog seeds for every pin."""
+        Results = []
+        for Straight in self.PinAccessPatterns:
+            Results.extend((
+                Straight,
+                PinAccessPattern(
+                    PatternId=f"{Straight.PinId}PlanarJogNegative",
+                    PinId=Straight.PinId,
+                    ConnectionPosition=Straight.ConnectionPosition,
+                    ApproachDirection=Straight.ApproachDirection,
+                    PatternFamily="planar-jog",
+                    TangentialSign=-1,
+                    AccessLength=Straight.AccessLength,
+                ),
+                PinAccessPattern(
+                    PatternId=f"{Straight.PinId}PlanarJogPositive",
+                    PinId=Straight.PinId,
+                    ConnectionPosition=Straight.ConnectionPosition,
+                    ApproachDirection=Straight.ApproachDirection,
+                    PatternFamily="planar-jog",
+                    TangentialSign=1,
+                    AccessLength=Straight.AccessLength,
+                ),
+            ))
+        return tuple(Results)
+
+    @property
     def Footprint(self) -> tuple[int, int]:
         return self.Width, self.Depth
 
@@ -74,6 +153,11 @@ CellMacros = {
         InputDirections=(),
         OutputDirection=(0, 0, 1),
         EstimatedBlocks=7,
+        StaticSignalRoles=(
+            ((0, 0, 0), "Output0"),
+            ((0, 0, 1), "Output0"),
+            ((0, 0, 2), "Output0"),
+        ),
     ),
     "NAND": CellMacro(
         Name="NAND2",
@@ -86,6 +170,16 @@ CellMacros = {
         OutputDirection=(0, 0, 1),
         EstimatedBlocks=11,
         AllowMirror=True,
+        StaticSignalRoles=(
+            ((0, 0, 0), "Input0"),
+            ((0, 0, 1), "Input0"),
+            ((0, 0, 2), "Output0"),
+            ((1, 0, 2), "Output0"),
+            ((1, 0, 3), "Output0"),
+            ((2, 0, 0), "Input1"),
+            ((2, 0, 1), "Input1"),
+            ((2, 0, 2), "Output0"),
+        ),
     ),
     "OUTPUT": CellMacro(
         Name="OUTPUT",
@@ -97,6 +191,10 @@ CellMacros = {
         InputDirections=((0, 0, -1),),
         OutputDirection=None,
         EstimatedBlocks=5,
+        StaticSignalRoles=(
+            ((0, 0, 0), "Input0"),
+            ((0, 0, 1), "Input0"),
+        ),
     ),
 }
 

@@ -11,7 +11,10 @@ from Assets.Templates import LitematicTemplates
 from ...Contracts.Core import Position3, RoutingStaticGeometry
 from ...Contracts.Results import RoutingResources
 from ...Resources.ResourceGraph import RoutingResourceGraph
-from ..Technology import DefaultRedstoneRoutingTechnology
+from ..Technology import (
+    DefaultRedstoneRoutingTechnology,
+    RedstoneRoutingTechnology,
+)
 
 ElectricalBlockNames = {
     "minecraft:comparator",
@@ -40,6 +43,7 @@ def LoadRoutingTemplates() -> dict[str, Any]:
 def BuildPlacedCellGeometryWithKeepOut(
     Placed: Any,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> tuple[
     set[Position3],
     set[Position3],
@@ -95,8 +99,7 @@ def BuildPlacedCellGeometryWithKeepOut(
                 ElectricalBlocks.add(Position)
             if State["Name"] in TorchBlockNames:
                 ElectricalKeepOutBlocks.add(
-                    DefaultRedstoneRoutingTechnology
-                    .TorchPoweredDustKeepOut(Position)
+                    Technology.TorchPoweredDustKeepOut(Position)
                 )
             if State["Name"] not in NonSolidBlockNames:
                 SolidBlocks.add(Position)
@@ -111,11 +114,13 @@ def BuildPlacedCellGeometryWithKeepOut(
 def BuildPlacedCellGeometry(
     Placed: Any,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> tuple[set[Position3], set[Position3], set[Position3]]:
     """Return occupied, electrical, and solid template positions."""
     Actual, Electrical, Solid, _KeepOut = BuildPlacedCellGeometryWithKeepOut(
         Placed,
         WorkCheck=WorkCheck,
+        Technology=Technology,
     )
     return Actual, Electrical, Solid
 
@@ -123,6 +128,7 @@ def BuildPlacedCellGeometry(
 def ValidatePlacedCellElectricalIsolation(
     Placed: Any,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> None:
     """Reject template adjacency that can create stateful redstone feedback."""
     Geometry = []
@@ -143,6 +149,7 @@ def ValidatePlacedCellElectricalIsolation(
         ) = BuildPlacedCellGeometryWithKeepOut(
             type("SingleCellPlacement", (), {"PlacedGates": [Gate]})(),
             WorkCheck=WorkCheck,
+            Technology=Technology,
         )
         Geometry.append((
             Gate.Name,
@@ -150,7 +157,6 @@ def ValidatePlacedCellElectricalIsolation(
             Electrical,
             ElectricalKeepOut,
         ))
-    Technology = DefaultRedstoneRoutingTechnology
     for Index, (
         FirstName,
         FirstActual,
@@ -198,11 +204,16 @@ def ValidatePlacedCellElectricalIsolation(
 def BuildRoutingResources(
     Placed: Any,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> RoutingResources:
     """Build placement geometry once for reuse across routing retries."""
     if WorkCheck is not None:
         WorkCheck({"Phase": "routing-resources-start"})
-    ValidatePlacedCellElectricalIsolation(Placed, WorkCheck=WorkCheck)
+    ValidatePlacedCellElectricalIsolation(
+        Placed,
+        WorkCheck=WorkCheck,
+        Technology=Technology,
+    )
     (
         ActualBlocks,
         ElectricalBlocks,
@@ -211,6 +222,7 @@ def BuildRoutingResources(
     ) = BuildPlacedCellGeometryWithKeepOut(
         Placed,
         WorkCheck=WorkCheck,
+        Technology=Technology,
     )
     TemplateElectricalBlocks = frozenset(ElectricalBlocks)
     # Complete local nets are immutable obstacles to every remaining signal.
@@ -257,6 +269,7 @@ def BuildRoutingResources(
             StaticKeepOutBlocks=frozenset(
                 TemplateElectricalKeepOutBlocks
             ),
+            Technology=Technology,
         ),
     )
 

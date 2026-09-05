@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PhysicalDesign.Contracts.PlacementAccess import (
+        PlacementAccessSolveResult,
+        SelectedPlacementPinAccessWitness,
+    )
 
 from ..Cells.Library import GetCellMacro
 from .Rotation import (
@@ -347,6 +353,8 @@ class PlacedDesign:
     InterClusterRoutingChannel: Any | None = None
     PlacementAccessFabric: Any | None = None
     PlacementAccessAssignment: Any | None = None
+    SelectedPinAccessWitness: SelectedPlacementPinAccessWitness | None = None
+    PlacementAccessSolve: PlacementAccessSolveResult | None = None
     # A derived packed-core placement freezes terminal face ownership before
     # access-fabric construction.  It remains optional so ordinary placement
     # backends preserve their historical terminal behavior.

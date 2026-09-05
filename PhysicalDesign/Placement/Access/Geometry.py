@@ -317,15 +317,30 @@ def MeasureDerivedPerimeterAccessEnvelope(
     ):
         return None
     Placed = Placement.Placed
-    Resources = Resources or BuildRoutingResources(Placed)
+    Resources = Resources or BuildRoutingResources(
+        Placed,
+        Technology=Technology,
+    )
     EffectiveAccessLength = (
         Technology.AccessLength
         if AccessLength is None
         else int(AccessLength)
     )
+    SelectedPinAccessWitness = (
+        getattr(Placement, "SelectedPinAccessWitness", None)
+        or getattr(Placed, "SelectedPinAccessWitness", None)
+    )
     Profiles = BuildNetRoutingProfiles(
         Placed,
-        AccessLength=EffectiveAccessLength,
+        AccessLength=(
+            Technology.AccessLength
+            if SelectedPinAccessWitness is not None
+            else EffectiveAccessLength
+        ),
+        AccessWitness=SelectedPinAccessWitness,
+        RequireExplicitAccessWitness=(
+            SelectedPinAccessWitness is not None
+        ),
     )
     TerminalPathByIdentity = {
         (str(Signal), tuple(Terminal)): tuple(Path)
@@ -1069,10 +1084,23 @@ def BuildDerivedPerimeterFabricShell(
     Resources = Resources or BuildRoutingResources(
         Placement.Placed,
         WorkCheck=WorkCheck,
+        Technology=Technology,
+    )
+    SelectedPinAccessWitness = (
+        getattr(Placement, "SelectedPinAccessWitness", None)
+        or getattr(Placement.Placed, "SelectedPinAccessWitness", None)
     )
     ProfilesBySignal = BuildNetRoutingProfiles(
         Placement.Placed,
-        AccessLength=EffectiveAccessLength,
+        AccessLength=(
+            Technology.AccessLength
+            if SelectedPinAccessWitness is not None
+            else EffectiveAccessLength
+        ),
+        AccessWitness=SelectedPinAccessWitness,
+        RequireExplicitAccessWitness=(
+            SelectedPinAccessWitness is not None
+        ),
     )
     if BoundarySignals is not None:
         ProfilesBySignal = {
