@@ -42,3 +42,16 @@ helper placement and source spelling are reviewed with
 The FullAdder and RCA8 MCHPRS cases read hash-bound tracked fixtures under
 `Tests/Fixtures/Mchprs/`, so a clean checkout exercises all 131,072 RCA8
 vectors without relying on ignored `Output/` state.
+
+## September 2026 outcome-first follow-up
+
+A second audit removed 43 implementation-coupled or redundant cases from the
+1,450-case collection, leaving 1,407 collected cases. This is not a target
+count. The main removals were the 81-class introspection hash, private
+placement/orchestration call choreography, source-text bans, exact menu/default
+argument snapshots, duplicated worktree/package smoke checks, and tests of
+snapshot-analysis helpers rather than published evidence.
+
+See [OutcomeFirstTestAudit.md](OutcomeFirstTestAudit.md) for the disposition,
+retained contract ownership, and replacement rationale. The earlier counts in
+this document remain historical migration accounting only.
