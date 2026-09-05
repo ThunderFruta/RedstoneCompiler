@@ -17,6 +17,8 @@ ValidationServerHarness/Server/PyScripts/*
 Build/
 ValidationServerHarness/.gradle/
 ValidationServerHarness/build/
+Validation/Fabric/Harness/build/
+Validation/Fabric/ServerHarness/build/
 .runtime/
 Output/
 RustRouting/target/
