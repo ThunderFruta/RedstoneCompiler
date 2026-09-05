@@ -1,6 +1,8 @@
 .tools/
 .vscode/
-.codex/
+.codex/*
+!.codex/environments/
+!.codex/environments/redstonecompiler-worktree.toml
 # Migration-generated cache
 Cache/
 .cache/
