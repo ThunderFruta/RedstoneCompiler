@@ -412,6 +412,11 @@ class AuthoritativeRoutingState:
     ForeignExclusionStarted: Any = None
     ForeignLeaseNodes: Any = None
     ForeignPortalOverlapBySignal: Any = None
+    ForeignSelectedAccessCandidateConflictBySignal: Any = None
+    ForeignSelectedAccessConflictSignalsBySignal: Any = None
+    ForeignSelectedAccessRequiredClaimConflictBySignal: Any = None
+    ForeignSelectedPinAccessBlockedWireNodesBySignal: Any = None
+    ForeignSelectedPinAccessClaimsBySignal: Any = None
     FrozenAxes: Any = None
     FrozenComponentBlockedWireNodesBySignal: Any = None
     FrozenComponentClaims: Any = None

@@ -2,6 +2,98 @@
 from __future__ import annotations
 from ..RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
 
+def BuildProtectedRoutingNodesBySignal(
+    Profiles,
+    LocalClaimsBySignal,
+    SelectedPinAccessWitness=None,
+):
+    """Collect every fixed node that must constrain candidate generation.
+
+    A signal omitted from detailed routing can still own placement-selected
+    access material through a frozen/local tree.  Keep that material in this
+    projection so another signal does not generate candidates through it and
+    then fail immediately at the exact base-claim assignment boundary.
+    """
+    SelectedAccessNodesBySignal = {
+        str(Signal): frozenset(Claims.WireCells)
+        for Signal, Claims in getattr(
+            SelectedPinAccessWitness,
+            "ClaimsBySignal",
+            (),
+        )
+    }
+    Signals = tuple(sorted({
+        *map(str, Profiles),
+        *map(str, LocalClaimsBySignal),
+        *SelectedAccessNodesBySignal,
+    }))
+    Result = {}
+    for Signal in Signals:
+        Profile = Profiles.get(Signal)
+        Result[Signal] = frozenset({
+            *(
+                Profile.SourceAccessPath
+                if Profile is not None
+                else ()
+            ),
+            *(
+                tuple(
+                    Position
+                    for Path in Profile.TargetAccessPaths.values()
+                    for Position in Path
+                )
+                if Profile is not None
+                else ()
+            ),
+            *(
+                Position
+                for Claim in LocalClaimsBySignal.get(Signal, ())
+                for Position in Claim.Nodes
+            ),
+            *SelectedAccessNodesBySignal.get(Signal, ()),
+        })
+    return Result
+
+
+def BuildForeignSelectedPinAccessClaimsBySignal(
+    Signals,
+    SelectedPinAccessWitness=None,
+):
+    """Bind each routed signal to every foreign selected-access claim."""
+    SelectedClaimsBySignal = {
+        str(Signal): Claims
+        for Signal, Claims in getattr(
+            SelectedPinAccessWitness,
+            "ClaimsBySignal",
+            (),
+        )
+    }
+    return {
+        str(Signal): tuple(
+            (Owner, Claims)
+            for Owner, Claims in sorted(SelectedClaimsBySignal.items())
+            if Owner != str(Signal)
+        )
+        for Signal in sorted(map(str, Signals))
+    }
+
+
+def FindForeignSelectedPinAccessConflictSignals(
+    Signal,
+    Claims,
+    ForeignClaimsBySignal,
+    ConflictPredicate,
+):
+    """Return exact immutable access owners conflicting with one claim set."""
+    return tuple(
+        Owner
+        for Owner, ForeignClaims in ForeignClaimsBySignal.get(
+            str(Signal),
+            (),
+        )
+        if ConflictPredicate(Claims, ForeignClaims)
+    )
+
 def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
     """Run the CandidatePreparation phase against shared routing state."""
     State.CandidateRequestCount = 0
@@ -138,6 +230,54 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     State.CandidateLimitsBySignal: dict[str, int] = {}
     State.CandidateDiagnostics: dict[str, dict[str, object]] = {}
     State.RawTrackAssignmentExtractionIncompleteReasons: dict[str, str] = {}
+    State.ForeignSelectedPinAccessClaimsBySignal = (
+        BuildForeignSelectedPinAccessClaimsBySignal(
+            State.Profiles,
+            State.PlacementPinAccessWitness,
+        )
+        if State.Policy.PlacementAccess.Enabled
+        else {
+            str(Signal): ()
+            for Signal in sorted(State.Profiles)
+        }
+    )
+    State.ForeignSelectedAccessRequiredClaimConflictBySignal = (
+        Services.Counter()
+    )
+    State.ForeignSelectedAccessCandidateConflictBySignal = (
+        Services.Counter()
+    )
+    State.ForeignSelectedAccessConflictSignalsBySignal = {
+        str(Signal): []
+        for Signal in sorted(State.Profiles)
+    }
+    SelectedAccessAuthorityDiagnostics = {
+        'Enabled': bool(State.Policy.PlacementAccess.Enabled),
+        'WitnessFingerprint': str(getattr(
+            State.PlacementPinAccessWitness,
+            'WitnessFingerprint',
+            '',
+        )),
+        'ForeignClaimOwnerCountBySignal': {
+            Signal: len(Claims)
+            for Signal, Claims in sorted(
+                State.ForeignSelectedPinAccessClaimsBySignal.items()
+            )
+        },
+        'ExactBlockedWireNodeCountBySignal': {},
+        'RequiredClaimRejectionCountBySignal': (
+            State.ForeignSelectedAccessRequiredClaimConflictBySignal
+        ),
+        'CandidateRejectionCountBySignal': (
+            State.ForeignSelectedAccessCandidateConflictBySignal
+        ),
+        'ConflictSignalsBySignal': (
+            State.ForeignSelectedAccessConflictSignalsBySignal
+        ),
+    }
+    State.WorkTelemetry['SelectedPinAccessCandidateAuthority'] = (
+        SelectedAccessAuthorityDiagnostics
+    )
     if State.PlacementAccessFabric is not None and State.PlacementAccessAssignment is not None and getattr(State.PlacementAccessAssignment, 'Success', False):
         FabricGuide = frozenset(((int(Position[0]), int(Position[2])) for Position in State.PlacementAccessFabric.Nodes))
         for Signal, RouteNodes in getattr(State.PlacementAccessAssignment, 'SignalRoutes', ()):
@@ -154,15 +294,95 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
             Candidate = Services.PortalOperations._MaterializeCandidate(Signal, Profile, SourcePortalValues[0], tuple((Values[0] for Values in TargetPortalValues)), FabricGuide, Layer, 'X', 0, 0, list(RouteNodes), State.Region, State.Resources, State.Technology, State.Policy.DetailedRouting.LengthPenalty, State.Policy.DetailedRouting.CandidateBendWeight, State.Policy.DetailedRouting.CandidateViaWeight, State.Policy.DetailedRouting.LayerPenalty, 0, State.Policy.DetailedRouting.RepeaterPenalty, RejectionCounts=RejectionCounts)
             if Candidate is None:
                 raise Services.RoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='PlacementAccessWitnessRealization', AffectedNets=(Signal,), Detail='the frozen placement-access tree failed exact materialization', Diagnostics={'Complete': False, 'Rejections': dict(RejectionCounts), 'FabricFingerprint': State.PlacementAccessFabric.FabricFingerprint, 'AssignmentFingerprint': State.PlacementAccessAssignment.AssignmentFingerprint}))
+            ForeignAccessConflicts = (
+                FindForeignSelectedPinAccessConflictSignals(
+                    Signal,
+                    Candidate.Claims,
+                    State.ForeignSelectedPinAccessClaimsBySignal,
+                    Services.ComponentClaimsConflict,
+                )
+            )
+            if ForeignAccessConflicts:
+                State.ForeignSelectedAccessCandidateConflictBySignal[
+                    Signal
+                ] += 1
+                State.ForeignSelectedAccessConflictSignalsBySignal[Signal] = (
+                    list(ForeignAccessConflicts)
+                )
+                raise Services.RoutingStageError(Services.RoutingFailure(
+                    Reason=(
+                        Services.RoutingFailureReason
+                        .ClusterInterfaceSolveIncomplete
+                    ),
+                    Stage='PlacementAccessWitnessRealization',
+                    AffectedNets=(Signal, *ForeignAccessConflicts),
+                    Detail=(
+                        'the frozen placement-access tree conflicts with a '
+                        'foreign selected pin-access claim'
+                    ),
+                    Diagnostics={
+                        'Complete': False,
+                        'ConflictSignals': list(ForeignAccessConflicts),
+                        'SelectedPinAccessWitnessFingerprint': str(getattr(
+                            State.PlacementPinAccessWitness,
+                            'WitnessFingerprint',
+                            '',
+                        )),
+                        'FabricFingerprint': (
+                            State.PlacementAccessFabric.FabricFingerprint
+                        ),
+                        'AssignmentFingerprint': (
+                            State.PlacementAccessAssignment
+                            .AssignmentFingerprint
+                        ),
+                    },
+                ))
             State.CandidatesBySignal[Signal] = [Candidate]
             State.CandidateLimitsBySignal[Signal] = 1
             State.CandidateDiagnostics[Signal] = {'FrozenPlacementAccessWitness': True, 'Requests': 0, 'RoutedTrees': 1, 'Materialized': 1, 'DeferredRequests': 0, 'Rejections': {}}
     InterfacePreparationSignals = State.LeaseOwnershipSignals if State.PrepareClusterInterfaceAssignmentOnly else frozenset(State.Profiles)
     State.CandidateSignalOrder = sorted(InterfacePreparationSignals, key=lambda Value: (-len(State.Profiles[Value].Targets), -max((abs(State.Profiles[Value].Root[0] - Target[0]) + abs(State.Profiles[Value].Root[2] - Target[2]) for Target in State.Profiles[Value].Targets)), Value))
     State.CandidatePortalPhaseBySignal = {Signal: Index for Index, Signal in enumerate(State.CandidateSignalOrder)}
-    ProtectedNodesBySignal = {Signal: frozenset({*State.Profiles[Signal].SourceAccessPath, *(Position for Path in State.Profiles[Signal].TargetAccessPaths.values() for Position in Path), *(Position for Claim in State.LocalClaimsBySignal.get(Signal, ()) for Position in Claim.Nodes)}) for Signal in State.Profiles}
+    ProtectedNodesBySignal = BuildProtectedRoutingNodesBySignal(
+        State.Profiles,
+        State.LocalClaimsBySignal,
+        State.PlacementPinAccessWitness
+        if State.Policy.PlacementAccess.Enabled
+        else None,
+    )
     ForeignExclusionStarted = Services.monotonic()
     State.ForeignBlockedNodesBySignal = Services.BuildForeignElectricalExclusionsBySignal(ProtectedNodesBySignal, State.Technology, DeferredPairwiseSignals=State.Resources.PhysicalComponentExactGlobalChannelSignals if State.Resources.PreparingPhysicalComponentGlobalChannels else frozenset())
+    State.ForeignSelectedPinAccessBlockedWireNodesBySignal = {
+        Signal: Services.ImmutableRoutingClaimsBlockedWireNodes(
+            Claims
+            for _Owner, Claims in (
+                State.ForeignSelectedPinAccessClaimsBySignal.get(
+                    Signal,
+                    (),
+                )
+            )
+        )
+        for Signal in ProtectedNodesBySignal
+    }
+    if State.Policy.PlacementAccess.Enabled:
+        State.ForeignBlockedNodesBySignal = {
+            Signal: frozenset((
+                *State.ForeignBlockedNodesBySignal.get(Signal, ()),
+                *State.ForeignSelectedPinAccessBlockedWireNodesBySignal.get(
+                    Signal,
+                    (),
+                ),
+            ))
+            for Signal in ProtectedNodesBySignal
+        }
+    SelectedAccessAuthorityDiagnostics[
+        'ExactBlockedWireNodeCountBySignal'
+    ] = {
+        Signal: len(Nodes)
+        for Signal, Nodes in sorted(
+            State.ForeignSelectedPinAccessBlockedWireNodesBySignal.items()
+        )
+    }
     State.StageTimings['ForeignElectricalExclusionProjection'] = Services.monotonic() - ForeignExclusionStarted
     State.FrozenComponentBlockedWireNodesBySignal = {Signal: Services.FrozenComponentBlockedWireNodes(Signal, State.FrozenComponentClaims) for Signal in State.Profiles} if State.HasRoutedComponentTemplate else {}
     if State.PlanningPhysicalComponentExterior:
@@ -515,9 +735,38 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
             State.CandidateAxisLaneBySignal[Signal] = dict(Values)
     for Signal, Values in (State.RetainedCandidateCache or {}).items():
         if Signal in State.Profiles and Signal not in State.RegenerateSignals:
-            State.CandidatesBySignal[Signal] = list(Values)
-            State.CandidateAxisLaneBySignal[Signal] = dict((State.RetainedCandidateMetadata or {}).get(Signal, {}))
-    State.InvariantRequestPayloadCacheDiagnostics: dict[str, int] = {'ConsideredRequestShapeCount': 0, 'MaterializedRequestCount': 0, 'AccessPayloadCacheHits': 0, 'AccessPayloadCacheMisses': 0, 'SelfConflictCacheHits': 0, 'GuidePayloadCacheHits': 0, 'GuidePayloadCacheMisses': 0, 'ConnectivityFactorChecks': 0, 'ConnectivityFactorCacheHits': 0, 'ConnectivityFactorPruned': 0}
+            RetainedValues = []
+            RetainedMetadata = dict(
+                (State.RetainedCandidateMetadata or {}).get(Signal, {})
+            )
+            for Candidate in Values:
+                ConflictSignals = FindForeignSelectedPinAccessConflictSignals(
+                    Signal,
+                    Candidate.Claims,
+                    State.ForeignSelectedPinAccessClaimsBySignal,
+                    Services.ComponentClaimsConflict,
+                )
+                if ConflictSignals:
+                    State.ForeignSelectedAccessCandidateConflictBySignal[
+                        Signal
+                    ] += 1
+                    State.ForeignSelectedAccessConflictSignalsBySignal[
+                        Signal
+                    ] = sorted({
+                        *State.ForeignSelectedAccessConflictSignalsBySignal[
+                            Signal
+                        ],
+                        *ConflictSignals,
+                    })
+                    continue
+                RetainedValues.append(Candidate)
+            State.CandidatesBySignal[Signal] = RetainedValues
+            State.CandidateAxisLaneBySignal[Signal] = {
+                Candidate.CandidateId: RetainedMetadata[Candidate.CandidateId]
+                for Candidate in RetainedValues
+                if Candidate.CandidateId in RetainedMetadata
+            }
+    State.InvariantRequestPayloadCacheDiagnostics: dict[str, int] = {'ConsideredRequestShapeCount': 0, 'MaterializedRequestCount': 0, 'AccessPayloadCacheHits': 0, 'AccessPayloadCacheMisses': 0, 'SelfConflictCacheHits': 0, 'ForeignSelectedAccessConflictCacheHits': 0, 'ForeignSelectedAccessRequiredClaimRejections': 0, 'GuidePayloadCacheHits': 0, 'GuidePayloadCacheMisses': 0, 'ConnectivityFactorChecks': 0, 'ConnectivityFactorCacheHits': 0, 'ConnectivityFactorPruned': 0}
     State.WorkTelemetry['InvariantRequestPayloadCache'] = State.InvariantRequestPayloadCacheDiagnostics
     State.PhysicalRouteFactorAdjacency: dict[Services.Position3, set[Services.Position3]] = Services.defaultdict(set)
     if State.Resources.PreparingPhysicalComponentGlobalChannels:

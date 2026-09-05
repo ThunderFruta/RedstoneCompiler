@@ -99,6 +99,7 @@ def RoutePcbNets(
                 if Deadline is not None
                 else None
             ),
+            Technology=Technology,
         )
     if bool(os.environ.get("RCS_DEBUG_AUTHORITATIVE")) and Deadline is not None:
         print(

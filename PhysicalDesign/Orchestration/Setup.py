@@ -49,6 +49,12 @@ def InitializePlacementFlow(Context):
     Context.PlacementGenerationFailures: list[dict[str, object]] = []
     Context.PlacementGenerationDecisions: list[dict[str, object]] = [{'Result': 'topology-demand-profile', 'Trigger': 'reconvergent-access-pressure' if Context.TopologyPressure.ReconvergentAccessPressure else 'scale-geometry-pressure' if Context.TopologyPressure.ScaleGeometryPressure else 'none', 'EnableInitialJointOrientation': Context.TopologyDemand.EnableInitialJointOrientation, 'Profile': Context.TopologyDemand.ToDictionary(), 'Pressure': Context.TopologyPressure.ToDictionary()}]
     Context.LastStructuredPlacementFailure: RoutingFailure | None = None
+    Context.LastPlacementAccessIncompleteFailure: RoutingFailure | None = None
+    Context.LastPlacementAccessUnsatisfiableFailure: RoutingFailure | None = None
+    Context.PlacementAccessDomainsByProblemFingerprint: dict[str, tuple[Any, ...]] = {}
+    Context.PlacementAccessSolveResultsByProblemFingerprint: dict[str, Any] = {}
+    Context.RejectedPlacementAccessProblemFingerprints: set[str] = set()
+    Context.PendingPlacementAccessDirectOnly = False
     Context.UniquePlacements: dict[str, tuple[str, int, PcbPlacement]] = {}
     Context.FeedbackByFingerprint: dict[str, Any] = {}
     Context.RoutingResourcesByFingerprint: dict[str, Any] = {}
@@ -233,6 +239,51 @@ def MaterializeInitialConflictRelocation(Context) -> bool:
     return True
 
 
+def MaterializeInitialPlacementAccessDirectOnly(Context) -> bool:
+    """Try the existing no-local-route variant after an exact access core."""
+    if (
+        Context.UniquePlacements
+        or not Context.PendingPlacementAccessDirectOnly
+        or Context.Deadline.IsExpired()
+    ):
+        return False
+    HasDirectOnlyRequest = any(
+        Index not in Context.ConsumedDeferredRequestIndexes
+        and Request.SourceGenerator == 'row-beam-direct-only'
+        for Index, Request in enumerate(Context.GenerationPlan.DeferredRequests)
+    )
+    Context.PendingPlacementAccessDirectOnly = False
+    if not HasDirectOnlyRequest:
+        return False
+    Request = _TakeNextDeferredRequest(Context, PreferDirectOnly=True)
+    if Request is None or Request.SourceGenerator != 'row-beam-direct-only':
+        raise RuntimeError(
+            'direct-only placement access repair selected another generator'
+        )
+    Context.PlacementGenerationDecisions.append({
+        'Result': 'placement-access-direct-only-materializing',
+        'Reason': (
+            'a complete access core implicated legacy pre-owned local routes'
+        ),
+    })
+    _TryPlacement(Context, Request)
+    return True
+
+
+def SelectEmptyPlacementFailure(Context) -> RoutingFailure:
+    """Preserve bounded access uncertainty ahead of generic placement errors."""
+    return (
+        getattr(Context, 'LastPlacementAccessIncompleteFailure', None)
+        or getattr(Context, 'LastPlacementAccessUnsatisfiableFailure', None)
+        or getattr(Context, 'LastStructuredPlacementFailure', None)
+        or RoutingFailure(
+            Reason=RoutingFailureReason.PlacementOverlap,
+            Stage='Placement',
+            Detail='no exact-legal placement candidate was generated',
+        )
+    )
+
+
 def GeneratePlacementCandidates(Context):
     if Context.ProgressCallback is not None:
         Context.ProgressCallback(PcbProgress(Completed=0, Total=1, Workers=0, Valid=0, BestBlocks=None, BestWidth=None, BestDepth=None, BestFootprint=None, Failed=0, Stage=f'spacing {Context.RoutingSpacing} | placing clustered NAND graph'))
@@ -249,13 +300,15 @@ def GeneratePlacementCandidates(Context):
             break
         _TryPlacement(Context, Context.Request, CountPlacementGenerationAttempt=False, QueueRetainedJointPortfolioStates=False)
     while not Context.UniquePlacements:
+        if MaterializeInitialPlacementAccessDirectOnly(Context):
+            continue
         if MaterializeInitialPendingJointPlacementState(Context):
             continue
         if MaterializeInitialConflictRelocation(Context):
             continue
         break
     if not Context.UniquePlacements:
-        Context.BaseFailure = Context.LastStructuredPlacementFailure or RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='Placement', Detail='no exact-legal placement candidate was generated')
+        Context.BaseFailure = SelectEmptyPlacementFailure(Context)
         Context.FailureDiagnostics = dict(Context.BaseFailure.Diagnostics or {})
         Context.FailureDiagnostics.update({'PlacementGenerationFailures': Context.PlacementGenerationFailures, 'PlacementGenerationDecisions': Context.PlacementGenerationDecisions, 'PlacementAttempts': Context.PlacementAttemptFailures, 'Deadline': Context.Deadline.ToDictionary()})
         raise RoutingStageError(RoutingFailure(Reason=Context.BaseFailure.Reason, Stage=Context.BaseFailure.Stage, AffectedNets=Context.BaseFailure.AffectedNets, Resources=Context.BaseFailure.Resources, Locations=Context.BaseFailure.Locations, RepairActions=Context.BaseFailure.RepairActions, Detail=Context.BaseFailure.Detail, Diagnostics=Context.FailureDiagnostics))
@@ -278,11 +331,11 @@ def GeneratePlacementCandidates(Context):
             continue
         Context.CandidateResources = Context.RoutingResourcesByFingerprint.get(Context.Candidate.PlacementFingerprint)
         if Context.CandidateResources is None:
-            Context.CandidateResources = Context.Services.BuildRoutingResources(Context.Candidate.Placement.Placed)
+            Context.CandidateResources = Context.Services.BuildRoutingResources(Context.Candidate.Placement.Placed, Technology=Context.Technology)
         Context.IsCertifiedIncumbent = Context.Candidate.SourceGenerator == 'row-beam'
         Context.IsDerivedPerimeterCandidate = not Context.IsCertifiedIncumbent and IsDerivedSingleComponentPlacementSource(Context.Candidate.SourceGenerator)
         Context.StaticAccessPlacement = PrepareDerivedPlacementForFrozenAccessContract(Context.Candidate.Placement) if Context.IsDerivedPerimeterCandidate else Context.Candidate.Placement
-        Context.StaticAccessResources = Context.Services.BuildRoutingResources(Context.StaticAccessPlacement.Placed)
+        Context.StaticAccessResources = Context.Services.BuildRoutingResources(Context.StaticAccessPlacement.Placed, Technology=Context.Technology)
         Context.AccessByEnvelopeIdentity: dict[tuple[int, int, str], Any] = {}
         for Context.Envelope in Context.Envelopes:
             Context.EnvelopeCandidateId = f'{Context.Candidate.CandidateId}:layers-{Context.Envelope.RoutingLayerCount}'
@@ -312,7 +365,38 @@ def GeneratePlacementCandidates(Context):
             Context.AccessDomainKey = (Context.Envelope.RoutingLayerCount, 0 if Context.IsCertifiedIncumbent else Context.Envelope.AccessRingTrackCount, 'fixed-access-band-v1' if Context.IsCertifiedIncumbent else 'derived-perimeter-access-v1')
             Context.Fabric = Context.AccessByEnvelopeIdentity.get(Context.AccessDomainKey)
             if Context.Fabric is None:
-                Context.Fabric = BuildPlacementAccessFabric(Context.AccessFabricPlacement, Resources=Context.EnvelopeResources, Technology=Context.Technology, AccessLength=Context.Envelope.AccessLength, TopologyKind=Context.TopologyKind, AccessRingTrackCount=Context.RingTrackCount, CompleteRouteSignals=frozenset(), DeriveLegalEscapeWorkLimit=Context.IsDerivedPerimeterCandidate, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('PrePlacementAccessFabric', Diagnostics))
+                Context.Fabric = BuildPlacementAccessFabric(
+                    Context.AccessFabricPlacement,
+                    Resources=Context.EnvelopeResources,
+                    Technology=Context.Technology,
+                    AccessLength=(
+                        Context.Technology.AccessLength
+                        if Context.Policy.PlacementAccess.Enabled
+                        else Context.Envelope.AccessLength
+                    ),
+                    TopologyKind=Context.TopologyKind,
+                    AccessRingTrackCount=Context.RingTrackCount,
+                    CompleteRouteSignals=frozenset(),
+                    DeriveLegalEscapeWorkLimit=(
+                        Context.IsDerivedPerimeterCandidate
+                    ),
+                    WorkCheck=lambda Diagnostics: (
+                        Context.Deadline.RaiseIfExpired(
+                            'PrePlacementAccessFabric',
+                            Diagnostics,
+                        )
+                    ),
+                    PinAccessWitness=(
+                        Context.AccessFabricPlacement
+                        .SelectedPinAccessWitness
+                    ),
+                    FixedPinAccessSolve=(
+                        Context.AccessFabricPlacement.PlacementAccessSolve
+                    ),
+                    RequireSelectedPinAccessWitness=(
+                        Context.Policy.PlacementAccess.Enabled
+                    ),
+                )
                 Context.AccessByEnvelopeIdentity[Context.AccessDomainKey] = Context.Fabric
             Context.PlacementAccessEvidenceByCandidateId[Context.EnvelopeCandidateId] = (Context.Fabric, None)
             Context.AttachedPlacement = AttachPlacementAccessFabric(Context.AccessFabricPlacement if Context.IsDerivedPerimeterCandidate else Context.FabricPlacement, Context.Fabric)
@@ -381,7 +465,7 @@ def PreparePlacementRouting(Context):
     Context.SelectedPreRouteCandidate = Context.SelectedPreRouteCandidates[0]
     Context.SelectedCandidateResources = Context.RoutingResourcesByCandidateId.get(Context.SelectedPreRouteCandidate.CandidateId) or Context.RoutingResourcesByFingerprint.get(Context.SelectedPreRouteCandidate.PlacementFingerprint)
     if Context.SelectedCandidateResources is None:
-        Context.SelectedCandidateResources = Context.Services.BuildRoutingResources(Context.SelectedPreRouteCandidate.Placement.Placed)
+        Context.SelectedCandidateResources = Context.Services.BuildRoutingResources(Context.SelectedPreRouteCandidate.Placement.Placed, Technology=Context.Technology)
         Context.RoutingResourcesByCandidateId[Context.SelectedPreRouteCandidate.CandidateId] = Context.SelectedCandidateResources
         Context.RoutingResourcesByFingerprint[Context.SelectedPreRouteCandidate.PlacementFingerprint] = Context.SelectedCandidateResources
     Context.SelectedPreparationPolicy = BuildFrozenEnvelopeRoutingPolicy(Context.Policy, Context.SelectedPreRouteCandidate.RoutingEnvelope) if Context.SelectedPreRouteCandidate.RoutingEnvelope is not None and len(Context.SelectedPreRouteCandidate.Placement.Clusters) == 1 else Context.Policy

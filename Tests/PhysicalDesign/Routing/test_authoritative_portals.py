@@ -3107,3 +3107,32 @@ class AuthoritativePortalsTests(AuthoritativePlannerTestBase):
             for Portal in Values
             if Portal.Signal == "Signal"
         ))
+
+        SelectedFabric = replace(
+            Fabric,
+            PinAccessDomainFingerprint="selected-domain",
+            TerminalDomains=(replace(
+                Fabric.TerminalDomains[0],
+                EscapeStubs=(Fabric.TerminalDomains[0].EscapeStubs[0],),
+            ),),
+        )
+        SelectedPortals = ApplyPlacementAccessFabricPortalDomains(
+            {},
+            SelectedFabric,
+            Graph,
+            DefaultRedstoneRoutingTechnology,
+            0,
+            2,
+        )
+        self.assertEqual(
+            tuple(SelectedPortals),
+            (("Signal", Terminal, 0), ("Signal", Terminal, 1)),
+        )
+        self.assertEqual(
+            {
+                Portal.Path
+                for Values in SelectedPortals.values()
+                for Portal in Values
+            },
+            {Fabric.TerminalDomains[0].EscapeStubs[0].Path},
+        )

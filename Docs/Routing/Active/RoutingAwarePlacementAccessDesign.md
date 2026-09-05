@@ -7,9 +7,10 @@ then speed.
 
 **Working policy name:** `physical-design-v17-routing-aware-placement-access`.
 Experimental artifacts produced by the new path must report that exact policy
-and their milestone/non-accepted status. The policy must not become the default
-or be described as accepted production behavior until the gates in this
-document pass.
+and their milestone/non-accepted status. V17 is the rewrite branch's development
+and acceptance-run default; selecting it by default does not establish accepted
+production behavior. Promotion to stable `main` still requires the gates in
+this document and the [rewrite workflow](../../Pillars/RewriteWorkflow.md).
 
 **Evidence relationship:** Correctness, typed failure, deterministic execution,
 and final validation remain mandatory. The live
@@ -24,6 +25,35 @@ weaken final validation.
 2026-08-28 clean-break monolith split, but the v17 proposal itself is
 unchanged. Current paths in this document follow the domain packages in
 [`ProjectTreeDesignDoc.md`](../../Reference/ProjectTreeDesignDoc.md).
+
+## Branch scope: core router rewrite, not CLA4 repair
+
+This scope guidance is recovered from the architectural portion of legacy
+commit `14646a9`, separately from its benchmark-archive implementation. Its
+placement/access and coordinator scope belongs to `Joint-Physical-Design`,
+not to R1's lazy-expansion requirement.
+
+CLA4 is an acceptance pressure and diagnostic fixture, not a circuit-specific
+implementation target. Its failures identify missing general placement,
+access, ownership, or routing capabilities. A passing named circuit is not a
+reason to restore the old cross-stage assumptions.
+
+In-scope work establishes authoritative access domains and immutable witnesses;
+explicit placement/interface/channel/claim contracts; stage-owned state and
+services; deterministic orchestration; typed proof outcomes; bounded handoffs;
+and physically verified topology-driven behavior.
+
+Do not introduce circuit-name conditions, fixture-shaped exceptions, legacy
+fallback, or deadline/worker/beam/retry inflation merely to advance a benchmark.
+Local symptom repairs do not substitute for changing the defective contract.
+Physical validation remains authoritative, and incomplete work never becomes
+an unsatisfiability proof.
+
+Develop and test general capabilities at explicit checkpoints under the
+[rewrite workflow](../../Pillars/RewriteWorkflow.md). Dependent phases may be
+developed before full acceptance, but compactness or speed cannot compensate
+for invalid physical behavior. The RAPA milestones remain evidence gates,
+not a queue of circuit-specific repairs.
 
 ## Decision
 
@@ -1446,6 +1476,13 @@ Do not pre-create successful future entries.
 
 ## Implementation phases
 
+The exit gates below establish milestone acceptance, not a requirement to finish
+every earlier phase before developing a needed prerequisite in another phase.
+Use the [rewrite workflow](../../Pillars/RewriteWorkflow.md) and
+[dependency register](../../Pillars/CapabilityDependencies.md) to declare and
+test those dependencies. Scope changes need explicit agreement; this does not
+enable deferred behavior or waive any RAPA acceptance evidence.
+
 ### Phase 0: contracts and baseline
 
 **Changes:** land this design, the capture tool, and focused capture tests.
@@ -1595,14 +1632,23 @@ may be resolved by a CLA4-name special case.
 
 ## Implementation checklist
 
-- [ ] Add typed access catalog and proof version.
-- [ ] Make straight access use the canonical typed option/ownership compiler.
+Checklist evidence is scoped by the [R2 Stage 1 conformance ledger](../../Pillars/R/R2/Notes.md#stage-1-conformance-ledger).
+Checked source/test behaviors below do not mean Stage 1 or R2 is accepted:
+the clean `2024d7d` live Stage-1 matrix fails before finalization.
+
+- [x] Add typed access catalog and proof version.
+- [x] Make straight access use the canonical typed option/ownership compiler.
 - [ ] Remove direct fixed-ray derivation from new-strategy consumers.
 - [ ] Add frozen placement/access contract plus composed placement/routing
       validators.
+- [x] Round-trip Stage-1 solve, witness, domains, and scoped cores with strict
+      identity/corruption checks; unit-test the narrow five-stage handoff.
+- [x] Implement `PlanningContracts.PlacementAccess` publication with the full
+      selected witness; verify the serializer/adapter in tests. Live successful
+      artifact publication remains unverified.
 - [ ] Serialize contract identity and detailed timers in failures/successes.
 - [ ] Add alternate access templates with isolated physical proofs.
-- [ ] Add fixed-placement exact access solver and small oracle parity.
+- [x] Add fixed-placement exact access solver and small oracle parity.
 - [ ] Translate complete cores into local placement actions.
 - [ ] Pass one frozen witness unchanged to negotiated routing.
 - [ ] Produce first native CLA4 physical artifact and snapshot it.

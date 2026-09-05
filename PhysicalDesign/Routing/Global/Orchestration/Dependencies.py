@@ -34,6 +34,7 @@ from ....Contracts.Placement import ClusterInterfaceAssignmentPrepared
 from ....Contracts.Placement import ClusterInterfaceRealizabilityNogood
 from ....Contracts.Placement import TrackAssignmentPreparation
 from ....Contracts.Placement import TrackAssignmentPrepared
+from ....Contracts.PlacementAccessHandoff import PlacementPinAccessStageObservation
 from ....Contracts.Results import RoutedDesign
 from ....Contracts.Results import RoutingResources
 from ....Contracts.Failures import RoutingFailure

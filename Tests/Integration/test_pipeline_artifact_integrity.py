@@ -182,7 +182,7 @@ class PipelineArtifactIntegrityTests(unittest.TestCase):
         })
         self.assertEqual(
             Document["Policy"]["PolicyVersion"],
-            "physical-design-v16-reconvergent-access",
+            "physical-design-v17-routing-aware-placement-access",
         )
 
     def testTypedRoutingFailureEscapesAndLeavesOnlyFailureArtifact(self) -> None:

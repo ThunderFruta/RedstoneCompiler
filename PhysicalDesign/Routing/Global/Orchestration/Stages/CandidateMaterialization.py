@@ -1,9 +1,56 @@
 """CandidateMaterialization phase of authoritative routing."""
 from __future__ import annotations
 from ..RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
+from .CandidatePreparation import FindForeignSelectedPinAccessConflictSignals
 
 def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
     """Run the CandidateMaterialization phase against shared routing state."""
+    def SelectedAccessConflictSignals(Signal: str, Claims) -> tuple[str, ...]:
+        return FindForeignSelectedPinAccessConflictSignals(
+            Signal,
+            Claims,
+            State.ForeignSelectedPinAccessClaimsBySignal,
+            Services.ComponentClaimsConflict,
+        )
+
+    def RecordSelectedAccessCandidateConflict(
+        Signal: str,
+        Claims,
+        RejectionCounts=None,
+    ) -> tuple[str, ...]:
+        ConflictSignals = SelectedAccessConflictSignals(Signal, Claims)
+        if not ConflictSignals:
+            return ()
+        State.ForeignSelectedAccessCandidateConflictBySignal[Signal] += 1
+        State.ForeignSelectedAccessConflictSignalsBySignal[Signal] = sorted({
+            *State.ForeignSelectedAccessConflictSignalsBySignal.get(
+                Signal,
+                (),
+            ),
+            *ConflictSignals,
+        })
+        if RejectionCounts is not None:
+            RejectionCounts['ForeignSelectedAccessConflict'] += 1
+        return ConflictSignals
+
+    def SelectedAccessDiagnostics(Signal: str) -> dict[str, object]:
+        return {
+            'ForeignSelectedAccessRequiredClaimConflicts': int(
+                State.ForeignSelectedAccessRequiredClaimConflictBySignal[
+                    Signal
+                ]
+            ),
+            'ForeignSelectedAccessCandidateConflicts': int(
+                State.ForeignSelectedAccessCandidateConflictBySignal[Signal]
+            ),
+            'ForeignSelectedAccessConflictSignals': list(
+                State.ForeignSelectedAccessConflictSignalsBySignal.get(
+                    Signal,
+                    (),
+                )
+            ),
+        }
+
     for Signal in State.PhysicalCandidateConstructionOrder:
         if Signal in State.RegenerateSignals and State.CandidatesBySignal.get(Signal):
             State.CandidatesBySignal.pop(Signal, None)
@@ -33,6 +80,7 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         SortedBlockedNodeBase = tuple(sorted(State.ForeignBlockedNodesBySignal[Signal] | DetachedSeedObstacleNodes | State.AvoidRoutingPositions | State.EffectiveAvoidRoutingPositionsBySignal.get(Signal, frozenset()) | State.FrozenComponentBlockedWireNodesBySignal.get(Signal, frozenset()) | (State.DedicatedInterfaceDeckNodes if Signal not in State.InterClusterChannelSignals else frozenset())))
         (AccessPayloadByPortalTuple): dict[tuple[str, ...], Services.InvariantRouteRequestNodePayload] = {}
         (SelfConflictingPortalTuples): set[tuple[str, ...]] = set()
+        (ForeignAccessConflictingPortalTuples): set[tuple[str, ...]] = set()
         (GuidePayloadByGeometry): dict[tuple[frozenset[Services.Position2], int], tuple[tuple[Services.Position2, ...], tuple[Services.Position2, ...]]] = {}
         SignalInitialRequestLimit = max(State.InitialRequestLimit, 128 if len(Profile.Targets) >= 4 or 200 <= State.Demand.TerminalCount <= 256 else 16) if len(Profile.Targets) >= 4 or 200 <= State.Demand.TerminalCount <= 256 or bool(State.LocalClaims) else State.InitialRequestLimit
         if not State.UseNegotiatedRouting and 33 <= len(State.Profiles) <= 72 and (SignalCandidateDiversityLevel >= 2):
@@ -107,6 +155,18 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                         if PortalNodes & State.ForeignBlockedNodesBySignal[Signal]:
                             State.ForeignPortalOverlapBySignal[Signal] += 1
                         PortalForeignAccessOverlap = bool(PortalNodes & State.ForeignBlockedNodesBySignal[Signal])
+                        if (
+                            PortalForeignAccessOverlap
+                            and State.Policy.PlacementAccess.Enabled
+                        ):
+                            # A v17 pin-access choice is already committed
+                            # placement ownership, not another portal-domain
+                            # variable.  A portal tuple crossing a foreign
+                            # selected leg can never survive the exact base-
+                            # claim assignment, so do not generate a route
+                            # request whose mandatory nodes reopen that
+                            # frozen choice.
+                            continue
                         Terminals = tuple(((Portal.Path[-1][0], Portal.Path[-1][2]) for Portal in (SourcePortal, *TargetPortals)))
                         if DetachedSeedAnchors:
                             Terminals = tuple(dict.fromkeys((*Terminals, *((Position[0], Position[2]) for Position in DetachedSeedAnchors))))
@@ -118,7 +178,7 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                         RequestPriority = (1 if ApplyCoordinatedPortalWindow and PortalForeignAccessOverlap else 0, min((BootstrapIndex * 2 + BootstrapRank for BootstrapIndex, BootstrapRank in enumerate(SparseBootstrapRanks)), default=PortalShapeRank) if State.UseSparseCandidateBootstrap else PortalShapeRank, LayerPriority, LaneIndex, AxisPriority, Axis, Lane)
                         ShapeDescriptor = Services.CandidateRequestShapeDescriptor(SourcePortal=SourcePortal, TargetPortals=tuple(TargetPortals), Guide=Guide, Layer=Layer, Axis=Axis, Lane=Lane, Variant=Variant, PortalShapeRank=PortalShapeRank, RoutingY=RoutingY, GuideExpansion=GuideExpansion, InitiallyDeferred=InitiallyDeferredRequestShape, Priority=RequestPriority)
 
-                        def BuildCandidateRequest(*, Shape=ShapeDescriptor, SignalValue=Signal, ProfileValue=Profile, PortalNodesValue=PortalNodes, SeedStartsValue=tuple(SeedStarts), SeedNodeSetValue=SeedNodeSet, TargetAccessPathsValue=TargetAccessPaths, DetachedSeedAnchorsValue=DetachedSeedAnchors, FixedRequiredNodesValue=FixedRequiredNodes, SortedBlockedNodeBaseValue=SortedBlockedNodeBase, CandidateExpansionLimitValue=CandidateExpansionLimit, GuidePayloadCache=GuidePayloadByGeometry, AccessPayloadCache=AccessPayloadByPortalTuple, SelfConflictCache=SelfConflictingPortalTuples) -> tuple[Any, ...] | None:
+                        def BuildCandidateRequest(*, Shape=ShapeDescriptor, SignalValue=Signal, ProfileValue=Profile, PortalNodesValue=PortalNodes, SeedStartsValue=tuple(SeedStarts), SeedNodeSetValue=SeedNodeSet, TargetAccessPathsValue=TargetAccessPaths, DetachedSeedAnchorsValue=DetachedSeedAnchors, FixedRequiredNodesValue=FixedRequiredNodes, SortedBlockedNodeBaseValue=SortedBlockedNodeBase, CandidateExpansionLimitValue=CandidateExpansionLimit, GuidePayloadCache=GuidePayloadByGeometry, AccessPayloadCache=AccessPayloadByPortalTuple, SelfConflictCache=SelfConflictingPortalTuples, ForeignAccessConflictCache=ForeignAccessConflictingPortalTuples) -> tuple[Any, ...] | None:
                             GuidePayloadKey = (Shape.Guide, Shape.GuideExpansion)
                             GuidePayload = GuidePayloadCache.get(GuidePayloadKey)
                             if GuidePayload is None:
@@ -132,6 +192,11 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                             if PortalTupleKey in SelfConflictCache:
                                 State.InvariantRequestPayloadCacheDiagnostics['SelfConflictCacheHits'] += 1
                                 return None
+                            if PortalTupleKey in ForeignAccessConflictCache:
+                                State.InvariantRequestPayloadCacheDiagnostics[
+                                    'ForeignSelectedAccessConflictCacheHits'
+                                ] += 1
+                                return None
                             NodePayload = AccessPayloadCache.get(PortalTupleKey)
                             if NodePayload is None:
                                 State.InvariantRequestPayloadCacheDiagnostics['AccessPayloadCacheMisses'] += 1
@@ -141,6 +206,32 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                                     RequiredClaims = State.Resources.ResourceGraph.BuildRouteClaims(NodePayload.RequiredNodeSet)
                                 if Services.FindSelfClaimConflicts({SignalValue: RequiredClaims}):
                                     SelfConflictCache.add(PortalTupleKey)
+                                    return None
+                                ForeignAccessConflicts = (
+                                    SelectedAccessConflictSignals(
+                                        SignalValue,
+                                        RequiredClaims,
+                                    )
+                                )
+                                if ForeignAccessConflicts:
+                                    ForeignAccessConflictCache.add(
+                                        PortalTupleKey
+                                    )
+                                    State.ForeignSelectedAccessRequiredClaimConflictBySignal[
+                                        SignalValue
+                                    ] += 1
+                                    State.ForeignSelectedAccessConflictSignalsBySignal[
+                                        SignalValue
+                                    ] = sorted({
+                                        *State.ForeignSelectedAccessConflictSignalsBySignal.get(
+                                            SignalValue,
+                                            (),
+                                        ),
+                                        *ForeignAccessConflicts,
+                                    })
+                                    State.InvariantRequestPayloadCacheDiagnostics[
+                                        'ForeignSelectedAccessRequiredClaimRejections'
+                                    ] += 1
                                     return None
                                 if any((Claim.Signal != SignalValue and Services.ComponentClaimsConflict(RequiredClaims, Claim.Claims) for Claim in State.FrozenComponentClaims)):
                                     State.FrozenComponentPortalConflictBySignal[SignalValue] += 1
@@ -247,7 +338,26 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
             State.PreSiblingCandidatesBySignal[Signal].extend(Continuation.Candidates)
             State.PreSiblingCandidateIdsBySignal[Signal].update((Candidate.CandidateId for Candidate in Continuation.Candidates))
             State.PreSiblingCandidateMetadataBySignal[Signal].update(dict(Continuation.CandidateMetadata))
-            Filtered = Services.FilterPhysicalCandidatesAgainstSiblingApertures(Continuation.Candidates, State.AssemblySpecificSiblingAperturesBySignal.get(Signal, ()), ConflictClassifier=lambda Claims, SignalValue=Signal: State.AssemblySpecificSiblingApertureConflictSignals(SignalValue, Claims))
+            Filtered = tuple(
+                Candidate
+                for Candidate in Services.FilterPhysicalCandidatesAgainstSiblingApertures(
+                    Continuation.Candidates,
+                    State.AssemblySpecificSiblingAperturesBySignal.get(
+                        Signal,
+                        (),
+                    ),
+                    ConflictClassifier=lambda Claims, SignalValue=Signal: (
+                        State.AssemblySpecificSiblingApertureConflictSignals(
+                            SignalValue,
+                            Claims,
+                        )
+                    ),
+                )
+                if not RecordSelectedAccessCandidateConflict(
+                    Signal,
+                    Candidate.Claims,
+                )
+            )
             State.CandidatesBySignal[Signal] = list(Filtered)
             State.CandidateAxisLaneBySignal.setdefault(Signal, {}).update({Candidate.CandidateId: Metadata for Candidate in Filtered if (Metadata := State.PreSiblingCandidateMetadataBySignal[Signal].get(Candidate.CandidateId)) is not None})
             if Continuation.Complete:
@@ -279,7 +389,26 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                 continue
             if Candidates:
                 State.IncompletePreSiblingDomainSignals.add(Signal)
-            State.CandidatesBySignal[Signal].extend(Services.FilterPhysicalCandidatesAgainstSiblingApertures(Candidates, State.AssemblySpecificSiblingAperturesBySignal.get(Signal, ()), ConflictClassifier=lambda Claims, SignalValue=Signal: State.AssemblySpecificSiblingApertureConflictSignals(SignalValue, Claims)))
+            State.CandidatesBySignal[Signal].extend(
+                Candidate
+                for Candidate in Services.FilterPhysicalCandidatesAgainstSiblingApertures(
+                    Candidates,
+                    State.AssemblySpecificSiblingAperturesBySignal.get(
+                        Signal,
+                        (),
+                    ),
+                    ConflictClassifier=lambda Claims, SignalValue=Signal: (
+                        State.AssemblySpecificSiblingApertureConflictSignals(
+                            SignalValue,
+                            Claims,
+                        )
+                    ),
+                )
+                if not RecordSelectedAccessCandidateConflict(
+                    Signal,
+                    Candidate.Claims,
+                )
+            )
             State.RouteRequestsBySignal[Signal] = []
             State.RouteMetadataBySignal[Signal] = []
         State.WorkTelemetry['PhysicalPortCorridorDomainReuse'] = {'CachedDomainCount': len(State.Resources.PhysicalPortCorridorDomainCache), 'ReusedSignalCount': len(ReusablePhysicalCandidatesBySignal), 'ReusedSignals': sorted(ReusablePhysicalCandidatesBySignal), 'ReusedCandidateCount': sum((len(Candidates) for Candidates in ReusablePhysicalCandidatesBySignal.values())), 'CompleteDomainsOnly': True}
@@ -310,6 +439,56 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         MissingNegotiatedSignals = tuple(sorted(set(State.Profiles) - set(State.NegotiatedPlan.SelectedCandidates)))
         if MissingNegotiatedSignals:
             raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.TrackAssignmentConflict, Stage='NegotiatedDetailedRouting', AffectedNets=MissingNegotiatedSignals, Detail='negotiated detailed routing produced no legal route tree; legacy candidate materialization is not a fallback', RepairActions=('RelocateAffectedClusters',), Diagnostics={'MissingSignals': list(MissingNegotiatedSignals), 'OverflowProgression': list(State.NegotiatedPlan.OverflowProgression), **State.NegotiatedPlan.Diagnostics}))
+        NegotiatedSelectedAccessConflicts = {
+            Signal: RecordSelectedAccessCandidateConflict(
+                Signal,
+                Candidate.Claims,
+            )
+            for Signal, Candidate
+            in sorted(State.NegotiatedPlan.SelectedCandidates.items())
+            if SelectedAccessConflictSignals(Signal, Candidate.Claims)
+        }
+        if NegotiatedSelectedAccessConflicts:
+            ConflictSignals = tuple(sorted({
+                *NegotiatedSelectedAccessConflicts,
+                *(
+                    ForeignSignal
+                    for Values in NegotiatedSelectedAccessConflicts.values()
+                    for ForeignSignal in Values
+                ),
+            }))
+            raise State.StructuredRoutingStageError(Services.RoutingFailure(
+                Reason=Services.RoutingFailureReason.TrackAssignmentConflict,
+                Stage='NegotiatedDetailedRouting',
+                AffectedNets=ConflictSignals,
+                Detail=(
+                    'negotiated detailed routing selected a candidate that '
+                    'conflicts with immutable foreign pin access'
+                ),
+                RepairActions=('RelocateAffectedClusters',),
+                Diagnostics={
+                    'ConflictSignalsByCandidate': {
+                        Signal: list(Values)
+                        for Signal, Values in sorted(
+                            NegotiatedSelectedAccessConflicts.items()
+                        )
+                    },
+                    'SelectedPinAccessWitnessFingerprint': str(getattr(
+                        State.PlacementPinAccessWitness,
+                        'WitnessFingerprint',
+                        '',
+                    )),
+                    'CandidateDiagnostics': {
+                        Signal: SelectedAccessDiagnostics(Signal)
+                        for Signal in sorted(
+                            NegotiatedSelectedAccessConflicts
+                        )
+                    },
+                    'OverflowProgression': list(
+                        State.NegotiatedPlan.OverflowProgression
+                    ),
+                },
+            ))
         State.CandidatesBySignal = Services.defaultdict(list, {Signal: [Candidate] for Signal, Candidate in State.NegotiatedPlan.SelectedCandidates.items()})
         State.WorkTelemetry['NegotiatedRouting'] = {'Algorithm': 'negotiated-route-trees-v1', 'Iterations': len(State.NegotiatedPlan.Iterations), 'OverflowProgression': list(State.NegotiatedPlan.OverflowProgression), 'ReroutedSignals': list(State.NegotiatedPlan.ReroutedSignals), 'CachedNodeCount': State.NegotiatedPlan.CachedNodeCount, 'CachedEdgeCount': State.NegotiatedPlan.CachedEdgeCount, **State.NegotiatedPlan.Diagnostics}
     State.WorkTelemetry['CandidateRequestConstructionSeconds'] = round(Services.monotonic() - State.CandidateStarted, 6)
@@ -405,7 +584,7 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         for Signal in ExhaustedSignals:
             Profile = State.Profiles[Signal]
             ExecutedInitialRequestCount = ExecutedInitialRequestCountsBySignal.get(Signal, 0)
-            SignalDiagnostics = {'Requests': ExecutedInitialRequestCount, 'RoutedTrees': 0, 'Materialized': 0, 'DeferredRequests': State.DeferredRouteRequestCountsBySignal[Signal] + len(State.RouteRequestsBySignal[Signal]) - ExecutedInitialRequestCount, 'SeedNodes': sum((len(Claim.Nodes) for Claim in (Profile.Seed.LocalClaims if Profile.Seed is not None else ()))), 'SourcePortals': sum((len(State.Portals.get((Signal, Profile.Root, Layer), ())) for Layer in range(State.LayerCount))), 'TargetPortals': sum((len(State.Portals.get((Signal, Target, Layer), ())) for Target in Profile.Targets for Layer in range(State.LayerCount))), 'ForeignBlockedNodes': len(State.ForeignBlockedNodesBySignal[Signal]), 'ForeignPortalOverlapRequests': State.ForeignPortalOverlapBySignal[Signal], 'FrozenComponentPortalConflictRequests': State.FrozenComponentPortalConflictBySignal[Signal], 'PriorCandidates': 0, 'Rejections': {}}
+            SignalDiagnostics = {'Requests': ExecutedInitialRequestCount, 'RoutedTrees': 0, 'Materialized': 0, 'DeferredRequests': State.DeferredRouteRequestCountsBySignal[Signal] + len(State.RouteRequestsBySignal[Signal]) - ExecutedInitialRequestCount, 'SeedNodes': sum((len(Claim.Nodes) for Claim in (Profile.Seed.LocalClaims if Profile.Seed is not None else ()))), 'SourcePortals': sum((len(State.Portals.get((Signal, Profile.Root, Layer), ())) for Layer in range(State.LayerCount))), 'TargetPortals': sum((len(State.Portals.get((Signal, Target, Layer), ())) for Target in Profile.Targets for Layer in range(State.LayerCount))), 'ForeignBlockedNodes': len(State.ForeignBlockedNodesBySignal[Signal]), 'ForeignPortalOverlapRequests': State.ForeignPortalOverlapBySignal[Signal], 'FrozenComponentPortalConflictRequests': State.FrozenComponentPortalConflictBySignal[Signal], 'PriorCandidates': 0, 'Rejections': {}, **SelectedAccessDiagnostics(Signal)}
             State.CandidateDiagnostics[Signal] = SignalDiagnostics
             ExhaustedSignalDiagnostics[Signal] = SignalDiagnostics
         PrimarySignal = ExhaustedSignals[0]
@@ -433,6 +612,12 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                 (RejectionCounts): Services.Counter[str] = Services.Counter()
                 Candidate = Services.PortalOperations._MaterializeCandidate(Signal, Profile, SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant, RoutedTree, State.Region, State.Resources, State.Technology, State.Policy.DetailedRouting.LengthPenalty, State.Policy.DetailedRouting.CandidateBendWeight, State.Policy.DetailedRouting.CandidateViaWeight, State.Policy.DetailedRouting.LayerPenalty, 0 if State.CoarsePlan is None else (len(Guide.symmetric_difference(State.CoarsePlan.Guides[Signal])) + (0 if Layer == State.CoarsePlan.Layers[Signal] else State.Policy.GlobalRouting.OverflowPenalty)) * State.Policy.GlobalRouting.ExistingGuideHintWeight, State.Policy.DetailedRouting.RepeaterPenalty, RejectionCounts=RejectionCounts)
                 if Candidate is None:
+                    continue
+                if RecordSelectedAccessCandidateConflict(
+                    Signal,
+                    Candidate.Claims,
+                    RejectionCounts,
+                ):
                     continue
                 if any((Claim.Signal != Signal and Services.ComponentClaimsConflict(Candidate.Claims, Claim.Claims) for Claim in State.FrozenComponentClaims)):
                     RejectionCounts['FrozenComponentConflict'] += 1
@@ -480,13 +665,19 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         ResultStart, ResultEnd = InitialResultSlices[Signal]
         RoutedTrees = BatchedInitialTrees[ResultStart:min(ResultEnd, ResultStart + ExecutedInitialRequestCount)]
         (RejectionCounts): Services.Counter[str] = Services.Counter()
-        State.CandidateDiagnostics[Signal] = {'Requests': len(InitialRouteRequests), 'RoutedTrees': sum((Value is not None for Value in RoutedTrees)), 'Materialized': 0, 'DeferredRequests': State.DeferredRouteRequestCountsBySignal[Signal] + len(RouteRequests) - len(InitialRouteRequests), 'SeedNodes': sum((len(Claim.Nodes) for Claim in (Profile.Seed.LocalClaims if Profile.Seed is not None else ()))), 'SourcePortals': sum((len(State.Portals.get((Signal, Profile.Root, Layer), ())) for Layer in range(State.LayerCount))), 'TargetPortals': sum((len(State.Portals.get((Signal, Target, Layer), ())) for Target in Profile.Targets for Layer in range(State.LayerCount))), 'ForeignBlockedNodes': len(State.ForeignBlockedNodesBySignal[Signal]), 'ForeignPortalOverlapRequests': State.ForeignPortalOverlapBySignal[Signal], 'FrozenComponentPortalConflictRequests': State.FrozenComponentPortalConflictBySignal[Signal]}
+        State.CandidateDiagnostics[Signal] = {'Requests': len(InitialRouteRequests), 'RoutedTrees': sum((Value is not None for Value in RoutedTrees)), 'Materialized': 0, 'DeferredRequests': State.DeferredRouteRequestCountsBySignal[Signal] + len(RouteRequests) - len(InitialRouteRequests), 'SeedNodes': sum((len(Claim.Nodes) for Claim in (Profile.Seed.LocalClaims if Profile.Seed is not None else ()))), 'SourcePortals': sum((len(State.Portals.get((Signal, Profile.Root, Layer), ())) for Layer in range(State.LayerCount))), 'TargetPortals': sum((len(State.Portals.get((Signal, Target, Layer), ())) for Target in Profile.Targets for Layer in range(State.LayerCount))), 'ForeignBlockedNodes': len(State.ForeignBlockedNodesBySignal[Signal]), 'ForeignPortalOverlapRequests': State.ForeignPortalOverlapBySignal[Signal], 'FrozenComponentPortalConflictRequests': State.FrozenComponentPortalConflictBySignal[Signal], **SelectedAccessDiagnostics(Signal)}
 
         def MaterializeBatch(Trees: list[Any], MetadataValues: list[tuple[Any, ...]], *, SignalValue: str=Signal, ProfileValue: Any=Profile, RejectionCountsValue: Counter[str]=RejectionCounts) -> None:
             for RoutedTree, Metadata in zip(Trees, MetadataValues):
                 SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant = Metadata
                 Candidate = Services.PortalOperations._MaterializeCandidate(SignalValue, ProfileValue, SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant, RoutedTree, State.Region, State.Resources, State.Technology, State.Policy.DetailedRouting.LengthPenalty, State.Policy.DetailedRouting.CandidateBendWeight, State.Policy.DetailedRouting.CandidateViaWeight, State.Policy.DetailedRouting.LayerPenalty, 0 if State.CoarsePlan is None else (len(Guide.symmetric_difference(State.CoarsePlan.Guides[Signal])) + (0 if Layer == State.CoarsePlan.Layers[Signal] else State.Policy.GlobalRouting.OverflowPenalty)) * State.Policy.GlobalRouting.ExistingGuideHintWeight, State.Policy.DetailedRouting.RepeaterPenalty, RejectionCounts=RejectionCountsValue)
                 if Candidate is not None:
+                    if RecordSelectedAccessCandidateConflict(
+                        SignalValue,
+                        Candidate.Claims,
+                        RejectionCountsValue,
+                    ):
+                        continue
                     if any((Claim.Signal != SignalValue and Services.ComponentClaimsConflict(Candidate.Claims, Claim.Claims) for Claim in State.FrozenComponentClaims)):
                         RejectionCountsValue['FrozenComponentConflict'] += 1
                         continue
@@ -538,7 +729,34 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
             State.IncompletePreSiblingDomainSignals.add(Signal)
         PriorCandidateIds = frozenset((Candidate.CandidateId for Candidate in PriorValues))
         ExistingCandidateIds = {Candidate.CandidateId for Candidate in State.CandidatesBySignal[Signal]}
-        State.CandidatesBySignal[Signal].extend((Candidate for Candidate in Services.FilterPhysicalCandidatesAgainstSiblingApertures(PriorValues, State.AssemblySpecificSiblingAperturesBySignal.get(Signal, ()), ConflictClassifier=lambda Claims, SignalValue=Signal: State.AssemblySpecificSiblingApertureConflictSignals(SignalValue, Claims)) if Candidate.CandidateId not in ExistingCandidateIds and (not any((Claim.Signal != Signal and Services.ComponentClaimsConflict(Candidate.Claims, Claim.Claims) for Claim in State.FrozenComponentClaims)))))
+        for Candidate in Services.FilterPhysicalCandidatesAgainstSiblingApertures(
+            PriorValues,
+            State.AssemblySpecificSiblingAperturesBySignal.get(Signal, ()),
+            ConflictClassifier=lambda Claims, SignalValue=Signal: (
+                State.AssemblySpecificSiblingApertureConflictSignals(
+                    SignalValue,
+                    Claims,
+                )
+            ),
+        ):
+            if Candidate.CandidateId in ExistingCandidateIds:
+                continue
+            if any((
+                Claim.Signal != Signal
+                and Services.ComponentClaimsConflict(
+                    Candidate.Claims,
+                    Claim.Claims,
+                )
+                for Claim in State.FrozenComponentClaims
+            )):
+                continue
+            if RecordSelectedAccessCandidateConflict(
+                Signal,
+                Candidate.Claims,
+                RejectionCounts,
+            ):
+                continue
+            State.CandidatesBySignal[Signal].append(Candidate)
         State.CandidateDiagnostics[Signal]['PriorCandidates'] = len(PriorValues)
         State.CandidateDiagnostics[Signal]['Rejections'] = dict(RejectionCounts)
         InitialRoutedTreeCountValue = int(State.CandidateDiagnostics[Signal]['RoutedTrees'])

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .Core import Position3
+from .PlacementAccessHandoff import PlacementPinAccessStageObservation
 from ..Resources.ResourceGraph import RoutingResourceClaims, RoutingResourceId
 
 @dataclass(frozen=True)
@@ -583,6 +584,12 @@ class TrackAssignmentPreparation:
     # templates; it must not treat a locally solved candidate as a resource-
     # free witness merely because its access-fabric assignment was deferred.
     SelectedCapacityResourceIds: tuple[str, ...] = ()
+    # Governing pin-access identities belong in the typed handoff.  They are
+    # intentionally separate from Diagnostics so a regenerated access domain
+    # cannot be accepted merely because telemetry happens to look similar.
+    PinAccessDomainFingerprint: str = ""
+    PinAccessWitnessFingerprint: str = ""
+    PinAccessHandoffObservation: PlacementPinAccessStageObservation | None = None
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -603,6 +610,13 @@ class TrackAssignmentPreparation:
             "SelectedCapacityResourceIds": list(
                 self.SelectedCapacityResourceIds
             ),
+            "PinAccessDomainFingerprint": (
+                self.PinAccessDomainFingerprint
+            ),
+            "PinAccessWitnessFingerprint": (
+                self.PinAccessWitnessFingerprint
+            ),
+            **({"PinAccessHandoffObservation": self.PinAccessHandoffObservation.ToDictionary()} if self.PinAccessHandoffObservation is not None else {}),
         }
 
 
@@ -906,6 +920,8 @@ class PlacementAccessFabric:
     LegalEscapeWorkLimitKind: str = ""
     LegalEscapeDirectionStateUpperBound: int | None = None
     IncompleteReason: str = ""
+    PinAccessDomainFingerprint: str = ""
+    PinAccessWitnessFingerprint: str = ""
     # Phase-one straight access is a catalog-derived immutable witness. It is
     # execution-neutral metadata here: the existing fabric fingerprint and
     # selected physical geometry remain unchanged for parity.
@@ -961,6 +977,12 @@ class PlacementAccessFabric:
             ),
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
+            "PinAccessDomainFingerprint": (
+                self.PinAccessDomainFingerprint
+            ),
+            "PinAccessWitnessFingerprint": (
+                self.PinAccessWitnessFingerprint
+            ),
             "PinAccessWitness": (
                 self.PinAccessWitness.ToDictionary()
                 if self.PinAccessWitness is not None

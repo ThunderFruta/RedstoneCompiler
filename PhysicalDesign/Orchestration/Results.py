@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import (
+    asdict,
     dataclass,
     replace,
 )
@@ -14,6 +15,10 @@ from typing import (
 from PhysicalDesign.Cells.Library import GetCellMacro
 from PhysicalDesign.Contracts.Placement import ComponentRoutabilityCore
 from PhysicalDesign.Contracts.Results import RoutedDesign
+from PhysicalDesign.Contracts.PlacementAccess import PlacementAccessSolveResult
+from PhysicalDesign.Contracts.PlacementAccessHandoff import PlacementPinAccessStageObservation, ValidatePlacementPinAccessHandoff
+from PhysicalDesign.Placement.Access.Catalog import BuildPlacedPinAccessModelFingerprint
+from PhysicalDesign.Redstone.Rules.Geometry import BuildRoutingResources
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint
 from PhysicalDesign.Resources.ResourceGraph import LocalRouteClaim
@@ -1238,6 +1243,108 @@ def MeasurePcbDesign(
     )
     return Footprint, EstimatedBlocks, Width, Depth
 
+
+def BuildPlacementPinAccessFinalizationDiagnostics(
+    Context: Any,
+) -> dict[str, object]:
+    """Collect Stage-1 observations and delegate to the pure handoff validator."""
+    try:
+        Placement = Context.Placement
+        Witness = Placement.SelectedPinAccessWitness
+        Solve = Placement.PlacementAccessSolve
+        Fabric = Placement.PlacementAccessFabric
+        Preparation = Context.SelectedTrackPreparation
+        if Witness is None or Fabric is None or not isinstance(Solve, PlacementAccessSolveResult):
+            raise ValueError("missing selected witness, fabric, or typed solve")
+        if Fabric.PinAccessWitness is None or Fabric.FixedPinAccessSolve is None:
+            raise ValueError("fabric omitted its consumed witness or solve")
+        Detailed = Context.Routed.RoutingControlEffectiveness.get("PlacementPinAccessWitness", {})
+        Compaction = Context.Routed.RoutingFootprintDiagnostics.get("PlacementPinAccessWitness", {})
+        Raw = Preparation.PinAccessHandoffObservation
+        if Raw is None or Raw.WitnessFingerprint != Preparation.PinAccessWitnessFingerprint or Raw.DomainFingerprint != Preparation.PinAccessDomainFingerprint:
+            raise ValueError("raw assignment omitted or substituted its observation")
+
+        def ReadObservation(Stage: str, Values: dict[str, object]) -> PlacementPinAccessStageObservation:
+            return PlacementPinAccessStageObservation(
+                Stage=Stage,
+                PolicyVersion=Values["PolicyVersion"],
+                CatalogVersion=Values["CatalogVersion"],
+                TechnologyFingerprint=Values["TechnologyFingerprint"],
+                ResourceModelFingerprint=Values["ResourceModelFingerprint"],
+                DomainFingerprint=Values["DomainFingerprint"],
+                WitnessFingerprint=Values["ObservedWitnessFingerprint"] if Stage == "Compaction" else Values["WitnessFingerprint"],
+                AccessRegenerationCount=Values["AccessRegenerationCount"],
+                UnselectedPortalLeakCount=Values["UnselectedPortalLeakCount"],
+                CompactionPreserved=Values["CompactionPreserved"] if Stage == "Compaction" else None,
+            )
+
+        FabricObservation = replace(
+            PlacementPinAccessStageObservation.FromWitness(
+                "AccessFabric", Fabric.PinAccessWitness, Fabric.FixedPinAccessSolve.PolicyVersion,
+            ),
+            DomainFingerprint=Fabric.PinAccessDomainFingerprint,
+            WitnessFingerprint=Fabric.PinAccessWitnessFingerprint,
+        )
+        Observations = (
+            PlacementPinAccessStageObservation.FromWitness("Placement", Witness, Solve.PolicyVersion),
+            FabricObservation, Raw,
+            ReadObservation("DetailedRouting", Detailed),
+            ReadObservation("Compaction", Compaction),
+        )
+        Resources = BuildRoutingResources(
+            Placement.Placed, Technology=Context.Technology,
+            WorkCheck=lambda Details: Context.Deadline.RaiseIfExpired("PlacementPinAccessFinalization", Details),
+        )
+        CurrentModel = BuildPlacedPinAccessModelFingerprint(
+            Placement.Placed.PlacedGates, ResourceGraph=Resources.ResourceGraph,
+            PreOwnedNodesBySignal=Placement.Placed.FrozenNetWires or {},
+        )
+        Evidence = ValidatePlacementPinAccessHandoff(
+            Witness, Observations, SolveResult=Solve,
+            PolicyVersion=Context.Policy.PolicyVersion,
+            CatalogVersion=Context.Policy.PlacementAccess.CatalogVersion,
+            TechnologyFingerprint=BuildStableFingerprint({
+                "Kind": "pin-access-technology-v1", "Technology": asdict(Context.Technology),
+            }),
+            ResourceModelFingerprint=CurrentModel,
+        )
+    except RoutingStageError:
+        # In particular, preserve a deadline failure raised while rebuilding
+        # the current model; it is neither corruption nor an infeasibility proof.
+        raise
+    except (ValueError, KeyError, AttributeError, TypeError) as Error:
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceInvariantViolation,
+            Stage="PlacementPinAccessFinalization",
+            Detail="the selected pin-access contract changed after placement",
+            Diagnostics={"Error": str(Error)},
+        )) from Error
+    return {
+        "CatalogVersion": Witness.CatalogVersion,
+        "AccessLength": Witness.AccessLength,
+        "SelectedTerminalCount": len(Witness.Selections),
+        "ExpectedWitnessFingerprint": Witness.WitnessFingerprint,
+        "ObservedWitnessFingerprints": {Value.Stage: Value.WitnessFingerprint for Value in Observations},
+        "ExpectedDomainFingerprint": Witness.DomainFingerprint,
+        "ObservedDomainFingerprints": {Value.Stage: Value.DomainFingerprint for Value in Observations},
+        "AccessRegenerationCount": 0,
+        "UnselectedPortalLeakCount": 0,
+        "CompactionPreserved": True,
+        "HandoffEvidence": Evidence.ToDictionary(),
+    }
+
+
+def BuildPlacementAccessPlanningContract(Placement, Finalization):
+    """Project a successfully checked access handoff into the physical artifact."""
+    if Finalization is None:
+        return {}
+    return {"PlacementAccess": {
+        "SolveResult": Placement.PlacementAccessSolve.ToDictionary(),
+        "SelectedWitness": Placement.SelectedPinAccessWitness.ToDictionary(),
+        "HandoffEvidence": Finalization["HandoffEvidence"],
+    }}
+
+
 def PublishPlacementFlowResult(Context):
     if Context.RoutedCandidates:
         Context._Score, Context.SelectedCandidate, Context.Placement, Context.Routed, Context.SelectedCompositionDiagnostics = min(Context.RoutedCandidates, key=lambda Value: Value[0])
@@ -1253,6 +1360,15 @@ def PublishPlacementFlowResult(Context):
         Context.FailureDiagnostics.update({'PlacementCandidates': Context.PlacementFeedback, 'PlacementGenerationFailures': Context.PlacementGenerationFailures, 'PlacementGenerationDecisions': Context.PlacementGenerationDecisions, 'PlacementAttempts': Context.PlacementAttemptFailures, 'JointPlacementStateEvents': Context.JointPlacementStateEvents, 'AssignmentCutHistory': [AssignmentCut.ToDictionary() for AssignmentCut in Context.PlacementAssignmentCutHistory], 'CurrentAssignmentCut': Context.CurrentPlacementAssignmentCut.ToDictionary() if Context.CurrentPlacementAssignmentCut is not None else None, 'ActivePlacementConstraints': Context.PlacementAssignmentConstraints.ToDictionary(), 'CoordinatedCandidateDiversificationSignals': sorted(Context.PlacementCoordinatedCandidateDiversificationSignals), 'Deadline': Context.Deadline.ToDictionary()})
         raise RoutingStageError(RoutingFailure(Reason=Context.BaseFailure.Reason, Stage=Context.BaseFailure.Stage, AffectedNets=Context.BaseFailure.AffectedNets, Resources=Context.BaseFailure.Resources, Locations=Context.BaseFailure.Locations, RepairActions=Context.BaseFailure.RepairActions, Detail=Context.BaseFailure.Detail, Diagnostics=Context.FailureDiagnostics)) from Context.LastRoutingError
     Context.Services.ValidateNandOnlyDesign(Context.Placement.Placed, Context.Netlist)
+    Context.PlacementPinAccessFinalization = (
+        BuildPlacementPinAccessFinalizationDiagnostics(Context)
+        if Context.Policy.PlacementAccess.Enabled
+        else None
+    )
+    if Context.PlacementPinAccessFinalization is not None:
+        Context.Routed.RoutingControlEffectiveness[
+            "PlacementPinAccessContract"
+        ] = Context.PlacementPinAccessFinalization
     Context.Routed.RoutingControlEffectiveness['PlacementFeedbackCandidates'] = Context.PlacementFeedback
     Context.Routed.RoutingControlEffectiveness['SelectedPlacementCandidate'] = Context.SelectedCandidate.ToDictionary() if Context.SelectedCandidate is not None else None
     Context.Routed.RoutingControlEffectiveness['TopologyDemandProfile'] = Context.TopologyDemand.ToDictionary()
@@ -1277,6 +1393,11 @@ def PublishPlacementFlowResult(Context):
     Context.Footprint, Context.EstimatedBlocks, Context.Width, Context.Depth = Context.Services.MeasurePcbDesign(Context.Placement.Placed, Context.Routed)
     Context.Snapshot = Context.Services.BuildLocalFirstSnapshot(Context.Placement, Context.Routed, LocalFanoutDistance=Context.Policy.Placement.LocalFanoutDistance, LocalRouteBudget=10)
     Context.PlanningContracts = Context.Snapshot.ToDictionary()
+    if Context.PlacementPinAccessFinalization is not None:
+        Context.PlanningContracts[
+            "PlacementPinAccessContract"
+        ] = Context.PlacementPinAccessFinalization
+        Context.PlanningContracts.update(BuildPlacementAccessPlanningContract(Context.Placement, Context.PlacementPinAccessFinalization))
     Context.PlanningContracts['PackedNandClusters'] = [{'ClusterId': Cluster.ClusterId, 'MemberNands': list(Cluster.MemberNands), 'BoundarySignals': list(Cluster.BoundarySignals), 'InternalSignals': list(Cluster.InternalSignals), 'RelativePlacements': {Name: list(Value) for Name, Value in sorted(Cluster.RelativePlacements.items())}, 'DirectConnections': list(Cluster.DirectConnections), 'LocalClaimSignals': list(Cluster.LocalClaimSignals), 'BoundaryTerminals': [list(Position) for Position in Cluster.BoundaryTerminals], 'ExactLocalRoutingBlocks': Cluster.ExactLocalRoutingBlocks, 'GlobalEntrances': Cluster.GlobalEntrances, 'RejectionReasons': list(Cluster.RejectionReasons), 'StructuralSignature': Cluster.StructuralSignature, 'ReusedFromClusterId': Cluster.ReusedFromClusterId, 'StructuralMapping': dict(sorted((Cluster.StructuralMapping or {}).items())), 'StackId': Cluster.StackId, 'StackLevel': Cluster.StackLevel, 'BaseY': Cluster.BaseY, 'BoundaryDemand': dict(sorted((Cluster.BoundaryDemand or {}).items())), 'EstimatedCorridorLanes': Cluster.EstimatedCorridorLanes, 'LocalClaimCoverage': Cluster.LocalClaimCoverage, 'BoundaryDemandRecords': [{'Signal': Record.Signal, 'UnresolvedTargets': Record.UnresolvedTargets, 'RequiredPortalSlots': Record.RequiredPortalSlots, 'RequiredCorridorLanes': Record.RequiredCorridorLanes, 'PreferredBoundarySide': Record.PreferredBoundarySide} for Record in Cluster.BoundaryDemandRecords], 'BoundaryCapacityRecords': [{'BoundarySide': Record.BoundarySide, 'LegalPortalSlots': Record.LegalPortalSlots, 'LegalCorridorLanes': Record.LegalCorridorLanes, 'Overflow': Record.Overflow} for Record in Cluster.BoundaryCapacityRecords], 'BoundaryOverflow': Cluster.BoundaryOverflow, 'PinScarcityCount': Cluster.PinScarcityCount, 'OrientationRotation': Cluster.OrientationRotation, 'OrientationMirrorX': Cluster.OrientationMirrorX} for Cluster in Context.Placement.PackedClusters]
     Context.PlanningContracts['StructuralReuse'] = {'Enabled': Context.Policy.NandPacking.EnableStructuralReuse, 'ReuseScope': 'relative-layout-with-joint-world-transform', 'JointClusterOrientationEnabled': Context.Policy.NandPacking.EnableJointClusterOrientation, 'LocalRoutesRecomputedAndValidated': True, 'UniqueTemplates': len({Cluster.StructuralSignature for Cluster in Context.Placement.PackedClusters if Cluster.StructuralSignature}), 'ReusedClusters': sum((Cluster.ReusedFromClusterId is not None for Cluster in Context.Placement.PackedClusters))}
     Context.PlanningContracts['LocalRouteClaims'] = [{'Signal': Claim.Signal, 'ClusterId': Claim.ClusterId, 'Root': list(Claim.Root), 'ConnectedTargets': [list(Value) for Value in Claim.ConnectedTargets], 'BoundaryNodes': [list(Value) for Value in Claim.BoundaryNodes], 'NodeCount': len(Claim.Nodes), 'EdgeCount': len(Claim.Edges), 'PreOwnedResourceCount': len(Claim.Claims.ResourceIds), 'ExactRouteSignalBlocks': Claim.ExactRouteSignalBlocks, 'ExactRouteRefreshBlocks': Claim.ExactRouteRefreshBlocks, 'ExactRouteSupportBlocks': Claim.ExactRouteSupportBlocks} for Claim in Context.Placement.Placed.LocalRouteClaims]

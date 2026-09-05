@@ -640,7 +640,7 @@ def PolicyForRoutingStrategy(
     """Resolve the immutable policy attached to one routing implementation."""
     Strategy = RoutingStrategy.Parse(Strategy)
     if Strategy is RoutingStrategy.Default:
-        return LocalFirstPhysicalDesignPolicy
+        return RoutingAwarePlacementAccessPhysicalDesignPolicy
     if Strategy is RoutingStrategy.RoutingAwarePlacementAccess:
         return RoutingAwarePlacementAccessPhysicalDesignPolicy
     raise ValueError(f"Unknown routing strategy: {Strategy}")

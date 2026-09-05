@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 from PhysicalDesign.Redstone.Rules import BuildPhysicalGraphs, BuildRoutingResources, ForkRoutingResourcesWithSharedStaticGeometry, FindFlatRouteConflicts, MaterializeReservedRepeaters, ValidatePhysicalRoutes, ValidateTemplateIsolation
@@ -10,9 +11,26 @@ from Formats.SystemVerilog.Sv import ParseSvToNetlist
 from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
 from Compilation.Synthesis.LogicOptimization import OptimizeLogic
 from Compilation.Synthesis.NandTransform import ToNandOnly
+from PhysicalDesign.Redstone.Technology import (
+    DefaultRedstoneRoutingTechnology,
+)
 
 
 class RoutingResourceTests(unittest.TestCase):
+    def testRoutingResourcesRetainTheSuppliedTechnology(self) -> None:
+        Technology = replace(
+            DefaultRedstoneRoutingTechnology,
+            TechnologyVersion="redstone-routing-test-v1",
+            TrackPitch=5,
+        )
+
+        Resources = BuildRoutingResources(
+            SimpleNamespace(PlacedGates=[]),
+            Technology=Technology,
+        )
+
+        self.assertIs(Resources.ResourceGraph.Technology, Technology)
+
     def testStaticGeometryForkKeepsEnvelopeProofStateIndependent(self) -> None:
         Base = BuildRoutingResources(SimpleNamespace(PlacedGates=[]))
         Base.RustContexts[(1, 2, 3, 4, 5)] = object()

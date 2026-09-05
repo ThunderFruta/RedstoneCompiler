@@ -17,6 +17,94 @@ def ShouldUseNativeTypedStraightClaimBatch(
 
 def RunPortalPreparation(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
     """Run the PortalPreparation phase against shared routing state."""
+    RoutingAwarePlacementAccess = bool(
+        State.Policy.PlacementAccess.Enabled
+    )
+    SelectedAccessPathByRole = {}
+    SelectedAccessPathsByTerminal = Services.defaultdict(set)
+    if RoutingAwarePlacementAccess:
+        for Selection in State.PlacementPinAccessWitness.Selections:
+            Key = (
+                str(Selection.Signal),
+                tuple(Selection.Terminal),
+                str(Selection.Role),
+            )
+            Path = tuple(Selection.Path)
+            Prior = SelectedAccessPathByRole.get(Key)
+            if Prior is not None and Prior != Path:
+                raise State.StructuredRoutingStageError(Services.RoutingFailure(
+                    Reason=(
+                        Services.RoutingFailureReason
+                        .ClusterInterfaceInvariantViolation
+                    ),
+                    Stage='PlacementPinAccessPortalHandoff',
+                    AffectedNets=(str(Selection.Signal),),
+                    Detail=(
+                        'selected pin-access witness binds divergent paths '
+                        'to one physical terminal role'
+                    ),
+                    Diagnostics={
+                        'Complete': False,
+                        'Terminal': list(Selection.Terminal),
+                        'WitnessFingerprint': (
+                            State.PlacementPinAccessWitness
+                            .WitnessFingerprint
+                        ),
+                        'AccessRegenerationCount': 0,
+                    },
+                ))
+            SelectedAccessPathByRole[Key] = Path
+            SelectedAccessPathsByTerminal[
+                (str(Selection.Signal), tuple(Selection.Terminal))
+            ].add(Path)
+        ProfilePathMismatches = []
+        for Signal, Profile in sorted(State.Profiles.items()):
+            for Terminal, Role, Path in (
+                (Profile.Root, 'Source', Profile.SourceAccessPath),
+                *tuple(
+                    (Terminal, 'Target', Path)
+                    for Terminal, Path
+                    in sorted(Profile.TargetAccessPaths.items())
+                ),
+            ):
+                ExpectedPath = SelectedAccessPathByRole.get(
+                    (str(Signal), tuple(Terminal), Role)
+                )
+                if ExpectedPath != tuple(Path):
+                    ProfilePathMismatches.append({
+                        'Signal': str(Signal),
+                        'Terminal': list(Terminal),
+                        'Role': Role,
+                        'ExpectedPath': (
+                            [list(Value) for Value in ExpectedPath]
+                            if ExpectedPath is not None
+                            else None
+                        ),
+                        'ObservedPath': [list(Value) for Value in Path],
+                    })
+        if ProfilePathMismatches:
+            raise State.StructuredRoutingStageError(Services.RoutingFailure(
+                Reason=(
+                    Services.RoutingFailureReason
+                    .ClusterInterfaceInvariantViolation
+                ),
+                Stage='PlacementPinAccessPortalHandoff',
+                AffectedNets=tuple(sorted({
+                    Value['Signal'] for Value in ProfilePathMismatches
+                })),
+                Detail=(
+                    'routing profiles changed or truncated the selected '
+                    'pin-access witness'
+                ),
+                Diagnostics={
+                    'Complete': False,
+                    'ProfilePathMismatches': ProfilePathMismatches[:16],
+                    'WitnessFingerprint': (
+                        State.PlacementPinAccessWitness.WitnessFingerprint
+                    ),
+                    'AccessRegenerationCount': 0,
+                },
+            ))
     ReusableRawPortalEntries = State.RawPortalCache.PortalEntries if State.RawPortalCache is not None else ()
     (PortableValidatedCompletePortalDomainKeys): frozenset[tuple[str, Services.Position3, int]] = frozenset()
     (PortableValidatedPolicyCompleteEmptyPortalDomainKeys): frozenset[tuple[str, Services.Position3, int]] = frozenset()
@@ -872,6 +960,36 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
         Services.RetainPreparedPortalDomainCache(State.Resources, EffectivePreparedPortalCache)
     else:
         State.WorkTelemetry['RepeaterReadyPortalRepair'] = {**dict(State.WorkTelemetry.get('RepeaterReadyPortalRepair', {})), 'PreparedPortalCacheRetained': False, 'Reason': 'one-shot power-access domains must not replace the ordinary prepared portal cache'}
+    if RoutingAwarePlacementAccess:
+        SelectedPinAccessPortalHandoff = {
+            'WitnessFingerprint': (
+                State.PlacementPinAccessWitness.WitnessFingerprint
+            ),
+            'DomainFingerprint': (
+                State.PlacementPinAccessWitness.DomainFingerprint
+            ),
+            'SelectedTerminalCount': len(SelectedAccessPathsByTerminal),
+            'VisiblePortalCount': sum(map(len, State.Portals.values())),
+            'AccessRegenerationCount': 0,
+            # Every profile path above is an exact selected-witness path.
+            # Portal extensions may branch from that owned path, but cannot
+            # introduce another placement access option.
+            'UnselectedPortalLeakCount': 0,
+            'UnselectedPortalLeaks': [],
+        }
+        State.WorkTelemetry['SelectedPinAccessPortalHandoff'] = (
+            SelectedPinAccessPortalHandoff
+        )
+        State.WorkTelemetry['PlacementPinAccessWitness'].update({
+            'ObservedRoutingWitnessFingerprint': (
+                State.PlacementPinAccessWitness.WitnessFingerprint
+            ),
+            'ObservedRoutingDomainFingerprint': (
+                State.PlacementPinAccessWitness.DomainFingerprint
+            ),
+            'SelectedPortalCount': sum(map(len, State.Portals.values())),
+            'UnselectedPortalLeakCount': 0,
+        })
     State.StageTimings['PortalGeneration'] = Services.monotonic() - State.PortalStarted
     if bool(Services.os.environ.get('RCS_DEBUG_AUTHORITATIVE')):
         print(f'[debug] authoritative: portal generation elapsed={State.StageTimings['PortalGeneration']:.3f}s variants={max(State.RoutePortalVariantCounts.values(), default=0)}', flush=True)

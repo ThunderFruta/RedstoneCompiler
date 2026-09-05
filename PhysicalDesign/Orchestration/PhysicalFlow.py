@@ -346,7 +346,7 @@ def RunPhysicalComponentFlow(Context):
                         Context.DuplicateChannelizedPlacementAdvanced = EnqueueProofGuidedPhysicalPlacement(Context, Context.GenerationFailure, Context.GenerationSourceCandidate, Context.GenerationComponentVariant)
                     Context.InterfaceAttemptDiagnostics.append({'CandidateId': Context.InterfaceCandidate.CandidateId, 'SourceCandidateId': Context.RetainedBaseInterfaceCandidate.CandidateId, 'SourcePlacementFingerprint': Context.RetainedPlacementFingerprint, 'PlacementFingerprint': Context.ChannelizedPlacementFingerprint, 'ComponentStateFingerprint': Context.ComponentStateFingerprint, 'ComponentVariant': Context.ComponentVariantForState, 'ComponentSelectionFingerprint': Context.ComponentSelectionFingerprint, 'EquivalentProofComponentStateFingerprint': getattr(Context.ChannelizedEquivalentProof, 'ComponentStateFingerprint', ''), 'PlacementAdvanced': Context.DuplicateChannelizedPlacementAdvanced, 'Result': 'duplicate-channelized-state-proof-reused'})
                     continue
-                Context.InterfaceResources, Context.RetainedPlacementResourceCacheHit = ReuseRetainedPlacementRoutingResources(Context.RoutingResourcesByRetainedPlacementFingerprint, Context.RetainedPlacementFingerprint, lambda: Context.Services.BuildRoutingResources(Context.MaterializedInterfacePlacement.Placed, WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfaceResourceMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics})))
+                Context.InterfaceResources, Context.RetainedPlacementResourceCacheHit = ReuseRetainedPlacementRoutingResources(Context.RoutingResourcesByRetainedPlacementFingerprint, Context.RetainedPlacementFingerprint, lambda: Context.Services.BuildRoutingResources(Context.MaterializedInterfacePlacement.Placed, WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfaceResourceMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}), Technology=Context.Technology))
                 Context.RoutingResourcesByFingerprint[Context.InterfaceCandidate.PlacementFingerprint] = Context.InterfaceResources
                 Context.InterfaceResources.PhysicalGlobalApertureTemplateCache = Context.PhysicalGlobalApertureTemplateCache
                 Context.InterfaceResources.PhysicalLocalSeamEligibilityCache = Context.PhysicalLocalSeamEligibilityCache
@@ -562,7 +562,7 @@ def RunPhysicalComponentFlow(Context):
                     Context.GlobalRemainingSeconds = max(0.001, Context.Deadline.RemainingSeconds())
                     Context.GlobalHandoffPolicy = replace(Context.Policy, RuntimeBudgetSeconds=Context.GlobalRemainingSeconds, AdaptiveRouting=replace(Context.Policy.AdaptiveRouting, MaximumRuntimeSeconds=min(Context.Policy.AdaptiveRouting.MaximumRuntimeSeconds, Context.GlobalRemainingSeconds)))
                     try:
-                        Context.PreRoutedDesign = Context.Services.RoutePcbDesign(Context.MaterializedInterfacePlacement, Policy=Context.GlobalHandoffPolicy, Deadline=Context.Deadline, Resources=Context.InterfaceResources, RequireCompleteClusterInterfaceDomain=True)
+                        Context.PreRoutedDesign = Context.Services.RoutePcbDesign(Context.MaterializedInterfacePlacement, Policy=Context.GlobalHandoffPolicy, Deadline=Context.Deadline, Resources=Context.InterfaceResources, RequireCompleteClusterInterfaceDomain=True, Technology=Context.Technology)
                         break
                     except RoutingStageError as GlobalError:
                         Context.LastGlobalHandoffError = GlobalError
@@ -612,6 +612,7 @@ def RunPhysicalComponentFlow(Context):
                                             RequireCompleteClusterInterfaceDomain=(
                                                 True
                                             ),
+                                            Technology=Context.Technology,
                                         )
                                     )
                                     break

@@ -11,6 +11,7 @@ class PlacementCommitState:
     """State shared only by the bounded phases of one placement."""
 
     Netlist: Any
+    Technology: Any
     RoutingSpacing: Any
     PlacementPolicy: Any
     PackingPolicy: Any

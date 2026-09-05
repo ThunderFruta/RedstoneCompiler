@@ -55,7 +55,7 @@ def RoutePlacementCandidates(Context):
         Context.Placement = Context.CandidatePlacement
         Context.CandidateResources = Context.RoutingResourcesByCandidateId.get(Context.CandidateRecord.CandidateId) or Context.RoutingResourcesByFingerprint.get(Context.CandidateRecord.PlacementFingerprint)
         if Context.CandidateResources is None:
-            Context.CandidateResources = Context.Services.BuildRoutingResources(Context.CandidatePlacement.Placed, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('PlacementCandidateResourceMaterialization', {'CandidateId': Context.CandidateRecord.CandidateId, **Diagnostics}))
+            Context.CandidateResources = Context.Services.BuildRoutingResources(Context.CandidatePlacement.Placed, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('PlacementCandidateResourceMaterialization', {'CandidateId': Context.CandidateRecord.CandidateId, **Diagnostics}), Technology=Context.Technology)
             Context.RoutingResourcesByFingerprint[Context.CandidateRecord.PlacementFingerprint] = Context.CandidateResources
         if Context.ExactClusterInterfaceSolveEnabled:
             Context.FrozenComponentTemplate = Context.RoutedComponentTemplatesByPlacementFingerprint.get(Context.CandidateRecord.PlacementFingerprint)
@@ -120,13 +120,13 @@ def RoutePlacementCandidates(Context):
                 Context.Placement = Context.CandidatePlacement
             if ApplyRemainingExactLegalJointStateCount(Context.CandidatePlacement, max(1, Context.RemainingRetainedCandidates)):
                 Context.JointPlacementStateEvents.append({'Status': 'materialized-remaining-joint-state-count-rebound', 'CandidateId': Context.CandidateRecord.CandidateId, 'RemainingExactLegalRetainedStateCount': max(1, Context.RemainingRetainedCandidates)})
-            Context.Services.ValidatePlacedCellElectricalIsolation(Context.CandidatePlacement.Placed, WorkCheck=partial(CheckCandidateValidation, Context))
+            Context.Services.ValidatePlacedCellElectricalIsolation(Context.CandidatePlacement.Placed, WorkCheck=partial(CheckCandidateValidation, Context), Technology=Context.Technology)
             if bool(os.environ.get('RCS_DEBUG_AUTHORITATIVE')):
                 print(f'[debug] authoritative: remaining_runtime_for_attempt={Context.AttemptPolicy.RuntimeBudgetSeconds:.3f}s elapsed_from_start={Context.Services.monotonic() - Context.Started:.3f}s', flush=True)
             Context.Routed = Context.PreRoutedClusterInterfaceDesignsByPlacementFingerprint.get(Context.CandidateRecord.PlacementFingerprint)
             if Context.Routed is None:
                 Context.FrozenTrackAssignmentPreparation = Context.PrePlacementTrackPreparationByCandidateId.get(Context.CandidateRecord.CandidateId)
-                Context.Routed = Context.Services.RoutePcbDesign(Context.CandidatePlacement, ProgressCallback=partial(ReportRoutingProgress, Context), Policy=Context.AttemptPolicy, Deadline=Context.AttemptDeadline, Resources=Context.CandidateResources, FrozenTrackAssignmentPreparation=Context.FrozenTrackAssignmentPreparation)
+                Context.Routed = Context.Services.RoutePcbDesign(Context.CandidatePlacement, ProgressCallback=partial(ReportRoutingProgress, Context), Policy=Context.AttemptPolicy, Deadline=Context.AttemptDeadline, Resources=Context.CandidateResources, FrozenTrackAssignmentPreparation=Context.FrozenTrackAssignmentPreparation, Technology=Context.Technology)
             CapturePortableRawPortalGeometryCaches(Context, Context.CandidateResources)
             Context.Deadline.RaiseIfExpired('Routing', {'PlacementCandidate': Context.CandidateRecord.CandidateId})
             Context.Deadline.RaiseIfExpired('RoutedValidation', {'Phase': 'before', 'PlacementCandidate': Context.CandidateRecord.CandidateId})

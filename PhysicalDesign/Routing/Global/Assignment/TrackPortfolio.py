@@ -15,6 +15,7 @@ from ....Contracts.Core import Position2
 from ....Contracts.Core import Position3
 
 from ....Contracts.Placement import TrackAssignmentPreparation
+from ....Contracts.PlacementAccessHandoff import PlacementPinAccessStageObservation
 
 from ....Constraints.BoundaryRelations import BuildRawPortalResourceGeometryFingerprint
 
@@ -535,6 +536,9 @@ def BuildRawTrackAssignmentDomain(
         Iterable[PreRouteLocalClaimChoice],
     ],
     BaseLocalClaims: Iterable[LocalRouteClaim],
+    AdditionalBaseClaims: Iterable[
+        tuple[str, str, RoutingResourceClaims]
+    ] = (),
     BoundaryLeaseReservations: Iterable[PortalReservation],
     AssignmentIndexed: IndexedRoutingResourceGraph,
     CandidateDomainFingerprint: str,
@@ -544,6 +548,9 @@ def BuildRawTrackAssignmentDomain(
     PortalDomainFingerprint: str,
     Complete: bool,
     IncompleteReason: str = "",
+    PinAccessDomainFingerprint: str = "",
+    PinAccessWitnessFingerprint: str = "",
+    PinAccessHandoffObservation: PlacementPinAccessStageObservation | None = None,
     MaximumAssignmentExpansions: int = 1,
     MinimizeMaximumRoutingLayer: bool = False,
     Diagnostics: Iterable[tuple[str, object]] = (),
@@ -593,6 +600,13 @@ def BuildRawTrackAssignmentDomain(
             str(Value.PortalId),
         ),
     ))
+    OrderedAdditionalBaseClaims = tuple(sorted(
+        (
+            (str(Signal), str(ClaimId), Claims)
+            for Signal, ClaimId, Claims in AdditionalBaseClaims
+        ),
+        key=lambda Value: (Value[0], Value[1]),
+    ))
     Indexed = ExtendIndexedRoutingResourceGraph(
         AssignmentIndexed,
         (
@@ -608,6 +622,7 @@ def BuildRawTrackAssignmentDomain(
             ),
             *(Claim.Claims for Claim in OrderedBaseLocalClaims),
             *(Reservation.Claims for Reservation in OrderedBoundaryLeases),
+            *(Claims for _Signal, _ClaimId, Claims in OrderedAdditionalBaseClaims),
         ),
     )
     Values = tuple(
@@ -668,6 +683,15 @@ def BuildRawTrackAssignmentDomain(
                 )
                 for Index, Reservation in enumerate(OrderedBoundaryLeases)
             ),
+            *(
+                RawTrackAssignmentBaseClaim(
+                    Signal=Signal,
+                    ClaimId=ClaimId,
+                    Claims=Claims,
+                )
+                for Signal, ClaimId, Claims
+                in OrderedAdditionalBaseClaims
+            ),
         )
     )
     return RawTrackAssignmentDomain(
@@ -685,6 +709,9 @@ def BuildRawTrackAssignmentDomain(
         PortalDomainFingerprint=PortalDomainFingerprint,
         Complete=bool(Complete),
         IncompleteReason=IncompleteReason,
+        PinAccessDomainFingerprint=PinAccessDomainFingerprint,
+        PinAccessWitnessFingerprint=PinAccessWitnessFingerprint,
+        PinAccessHandoffObservation=PinAccessHandoffObservation,
         MaximumAssignmentExpansions=max(1, int(MaximumAssignmentExpansions)),
         MinimizeMaximumRoutingLayer=bool(MinimizeMaximumRoutingLayer),
         Diagnostics=tuple(Diagnostics),
@@ -770,6 +797,9 @@ def BuildTrackAssignmentPreparationFromRawDomain(
         SelectedCapacityResourceIds=Domain.SelectedCapacityResourceIds(
             Selected
         ),
+        PinAccessDomainFingerprint=Domain.PinAccessDomainFingerprint,
+        PinAccessWitnessFingerprint=Domain.PinAccessWitnessFingerprint,
+        PinAccessHandoffObservation=Domain.PinAccessHandoffObservation,
     )
 
 def SelectCandidateRegenerationSignals(

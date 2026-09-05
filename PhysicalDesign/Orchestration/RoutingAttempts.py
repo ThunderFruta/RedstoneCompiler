@@ -98,7 +98,7 @@ def SolvePrePlacementCapacityProblem(Context, Candidates: Iterable[PcbPlacementC
         if AccessAssignment is None:
             CandidateResources = Context.RoutingResourcesByCandidateId.get(Candidate.CandidateId) or Context.RoutingResourcesByFingerprint.get(Candidate.PlacementFingerprint)
             if CandidateResources is None:
-                CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placement.Placed)
+                CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placement.Placed, Technology=Context.Technology)
                 Context.RoutingResourcesByFingerprint[Candidate.PlacementFingerprint] = CandidateResources
             try:
                 Preparation = PrepareTrackAssignment(
@@ -221,7 +221,35 @@ def MaterializeRawTemplate(Context, Descriptor: RawTrackAssignmentPortfolioTempl
         raise RuntimeError('raw pre-route portfolio is missing its fixed fabric descriptor')
     CandidateResources = ForkRoutingResourcesWithSharedStaticGeometry(FabricDescriptor.StaticResources)
     try:
-        Fabric = BuildPlacementAccessFabric(Candidate.Placement, Resources=CandidateResources, Technology=Context.Technology, AccessLength=Candidate.RoutingEnvelope.AccessLength if Candidate.RoutingEnvelope is not None else None, TopologyKind=FabricDescriptor.TopologyKind, AccessRingTrackCount=FabricDescriptor.AccessRingTrackCount, Shell=FabricDescriptor.Shell, CompleteRouteSignals=frozenset(), DeriveLegalEscapeWorkLimit=FabricDescriptor.DeriveLegalEscapeWorkLimit, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('PrePlacementAccessFabric', Diagnostics))
+        RoutingAwarePlacementAccess = bool(
+            Context.Policy.PlacementAccess.Enabled
+        )
+        Fabric = BuildPlacementAccessFabric(
+            Candidate.Placement,
+            Resources=CandidateResources,
+            Technology=Context.Technology,
+            AccessLength=(
+                Context.Technology.AccessLength
+                if RoutingAwarePlacementAccess
+                else Candidate.RoutingEnvelope.AccessLength
+                if Candidate.RoutingEnvelope is not None
+                else None
+            ),
+            TopologyKind=FabricDescriptor.TopologyKind,
+            AccessRingTrackCount=FabricDescriptor.AccessRingTrackCount,
+            Shell=FabricDescriptor.Shell,
+            CompleteRouteSignals=frozenset(),
+            DeriveLegalEscapeWorkLimit=(
+                FabricDescriptor.DeriveLegalEscapeWorkLimit
+            ),
+            WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired(
+                'PrePlacementAccessFabric',
+                Diagnostics,
+            ),
+            PinAccessWitness=Candidate.Placement.SelectedPinAccessWitness,
+            FixedPinAccessSolve=Candidate.Placement.PlacementAccessSolve,
+            RequireSelectedPinAccessWitness=RoutingAwarePlacementAccess,
+        )
     except RoutingStageError as Error:
         Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, Domain=None, Complete=False, IncompleteReason=Error.Failure.Reason.value if hasattr(Error.Failure.Reason, 'value') else str(Error.Failure.Reason), Diagnostics=(('Candidate', Candidate.ToDictionary()), ('PlacementAccessFabricFailure', Error.Failure.ToDictionary()), ('FabricDescriptor', FabricDescriptor.ToDictionary())))
         Context.RawTrackAssignmentMaterializations[Descriptor.TemplateId] = Result
@@ -312,7 +340,7 @@ def _RouteWithFailedLocalClaimsReleased(Context, CandidatePlacement: PcbPlacemen
     if RemainingAdaptiveSeconds <= 0:
         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.TrackAssignmentConflict, Stage='LocalClaimRelease', Detail='original placement adaptive slice expired before same-candidate local-claim recovery', RepairActions=('AdvancePlacementCandidate',), Diagnostics={'Action': 'advance-placement-adaptive-slice-expired', 'AdaptiveStartedAt': AdaptiveStartedAt, 'AdaptiveExpiresAt': AdaptiveExpiresAt, 'Deadline': Context.Deadline.ToDictionary()}))
     RecoveryPolicy = replace(AttemptPolicy, RuntimeBudgetSeconds=min(AttemptPolicy.RuntimeBudgetSeconds, Context.Deadline.RemainingSeconds(), RemainingAdaptiveSeconds), AdaptiveRouting=replace(AttemptPolicy.AdaptiveRouting, MaximumRuntimeSeconds=min(AttemptPolicy.AdaptiveRouting.MaximumRuntimeSeconds, RemainingAdaptiveSeconds)))
-    ReleasedRouted = Context.Services.RoutePcbDesign(ReleasedPlacement, ProgressCallback=partial(ReportRoutingProgress, Context), Policy=RecoveryPolicy, Deadline=AttemptDeadline)
+    ReleasedRouted = Context.Services.RoutePcbDesign(ReleasedPlacement, ProgressCallback=partial(ReportRoutingProgress, Context), Policy=RecoveryPolicy, Deadline=AttemptDeadline, Technology=Context.Technology)
     if Context.Services.monotonic() >= AdaptiveExpiresAt:
         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.TrackAssignmentConflict, Stage='LocalClaimRelease', Detail='same-candidate local-claim recovery exceeded the original placement adaptive slice', RepairActions=('AdvancePlacementCandidate',), Diagnostics={'Action': 'advance-placement-adaptive-slice-expired', 'AdaptiveStartedAt': AdaptiveStartedAt, 'AdaptiveExpiresAt': AdaptiveExpiresAt, 'RecoveryStartedAt': RecoveryStartedAt, 'Deadline': Context.Deadline.ToDictionary()}))
     Context.Deadline.RaiseIfExpired('Routing', {'Recovery': 'released-affected-local-claims', 'AffectedSignals': sorted(Signals)})
@@ -369,7 +397,7 @@ def MaterializeSelectedJointPlacementLocalRouting(Context, Candidate: PcbPlaceme
         State.Request.UseCurrentAssignmentCutRelocationSignals
         or PhysicalProofCoreFocusedPlacement
     )
-    Materialized = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=State.RoutingSpacing, PlacementPolicy=Context.Policy.Placement, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=PackingPolicy, RelocationSignals=State.RelocationSignals, RelocationPrioritySignals=State.RelocationPrioritySignals, RequiredRelocationSignals=State.RequiredRelocationSignals, RelocationVariant=State.RelocationVariant, JointPlacementCandidateIndex=State.CandidateIndex, AssignmentCut=State.AssignmentCut, AssignmentConstraints=State.AssignmentConstraints, CoordinatedCandidateDiversificationSignals=State.CoordinatedCandidateDiversificationSignals, EnableClusterLocalRouteReuse=State.EnableClusterLocalRouteReuse or bool(ScoringDiagnostics.get('__ClusterPinBankRepair__', {})) or bool(State.AssignmentCut is not None and len(State.AssignmentCut.PairwiseConflictEdges) >= 2 and (Candidate.TopologyDemand is not None) and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)) or bool(Candidate.TopologyDemand is not None and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)), EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio, IsPostPinBankRepairEpoch=State.IsPostPinBankRepairEpoch), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=CutDrivenClusterRefinementSignals, FixedConnectivityClusters=State.FixedConnectivityClusters, EnableInternalPinBankGeometryRepair=State.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=State.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=FocusedCutEpochPlacement, TopologyCutFrontier=State.TopologyCutFrontier, PlacementScoringOnly=False, WorkCheck=WorkCheck)
+    Materialized = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=State.RoutingSpacing, PlacementPolicy=Context.Policy.Placement, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=PackingPolicy, RelocationSignals=State.RelocationSignals, RelocationPrioritySignals=State.RelocationPrioritySignals, RequiredRelocationSignals=State.RequiredRelocationSignals, RelocationVariant=State.RelocationVariant, JointPlacementCandidateIndex=State.CandidateIndex, AssignmentCut=State.AssignmentCut, AssignmentConstraints=State.AssignmentConstraints, CoordinatedCandidateDiversificationSignals=State.CoordinatedCandidateDiversificationSignals, EnableClusterLocalRouteReuse=State.EnableClusterLocalRouteReuse or bool(ScoringDiagnostics.get('__ClusterPinBankRepair__', {})) or bool(State.AssignmentCut is not None and len(State.AssignmentCut.PairwiseConflictEdges) >= 2 and (Candidate.TopologyDemand is not None) and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)) or bool(Candidate.TopologyDemand is not None and RequiresDenseBoundaryRoutingReserve(Candidate.TopologyDemand, Context.Policy)), EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio, IsPostPinBankRepairEpoch=State.IsPostPinBankRepairEpoch), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=CutDrivenClusterRefinementSignals, FixedConnectivityClusters=State.FixedConnectivityClusters, EnableInternalPinBankGeometryRepair=State.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=State.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=FocusedCutEpochPlacement, TopologyCutFrontier=State.TopologyCutFrontier, PlacementScoringOnly=False, Technology=Context.Technology, WorkCheck=WorkCheck)
     ExpectedTopologyDemand = Candidate.TopologyDemand
     if ExpectedTopologyDemand is None:
         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='PlacementLocalRoutingMaterialization', Detail='selected local-route materialization lacked its retained topology proof', Diagnostics={'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint}))
@@ -381,8 +409,8 @@ def MaterializeSelectedJointPlacementLocalRouting(Context, Candidate: PcbPlaceme
         MaterializedTopologyDemand = ExpectedTopologyDemand
         RankingMatches = True
     else:
-        Context.Services.ValidatePlacedCellElectricalIsolation(Materialized.Placed, WorkCheck=WorkCheck)
-        MandatoryProfile = MeasureMandatoryAccessConflictProfile(Materialized.Placed.PlacedGates, Materialized.SignalOrder, WorkCheck=WorkCheck)
+        Context.Services.ValidatePlacedCellElectricalIsolation(Materialized.Placed, WorkCheck=WorkCheck, Technology=Context.Technology)
+        MandatoryProfile = MeasureMandatoryAccessConflictProfile(Materialized.Placed.PlacedGates, Materialized.SignalOrder, WorkCheck=WorkCheck, Technology=Context.Technology)
         for Resource, Owners in (*MandatoryProfile.CrossConflicts, *MandatoryProfile.SelfConflicts):
             MandatoryConflicts.setdefault(Resource, set()).update(map(str, Owners))
         MaterializedTopologyDemand = MeasurePlacementTopologyDemand(Context.TopologyDemand, Materialized, MandatoryConflicts=MandatoryConflicts, MandatoryProfile=MandatoryProfile)
@@ -823,7 +851,7 @@ def _PublishTransactionalClusterEndpointRepair(Context, SourceCandidate: PcbPlac
         Context.PlacementGenerationDecisions.append({'Result': 'transactional-cluster-endpoint-repair-rejected', 'CandidateId': SourceCandidate.CandidateId, 'Signals': sorted(RepairSignals), 'Diagnostics': {**Result.Diagnostics, 'Reason': 'duplicate-or-rejected-identity', 'PlacementFingerprint': Fingerprint, 'PlacementRetentionFingerprint': RetentionFingerprint}, 'ElapsedSeconds': round(Context.Services.monotonic() - StartedAt, 6)})
         return False
     try:
-        CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placed, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('TransactionalClusterEndpointResourceMaterialization', {'CandidateId': SourceCandidate.CandidateId, **Diagnostics}))
+        CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placed, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('TransactionalClusterEndpointResourceMaterialization', {'CandidateId': SourceCandidate.CandidateId, **Diagnostics}), Technology=Context.Technology)
     except (RoutingStageError, ValueError) as Error:
         Context.PlacementGenerationDecisions.append({'Result': 'transactional-cluster-endpoint-repair-rejected', 'CandidateId': SourceCandidate.CandidateId, 'Signals': sorted(RepairSignals), 'Diagnostics': {**Result.Diagnostics, 'Reason': 'resource-materialization-rejected', 'Validation': str(Error)}, 'ElapsedSeconds': round(Context.Services.monotonic() - StartedAt, 6)})
         return False

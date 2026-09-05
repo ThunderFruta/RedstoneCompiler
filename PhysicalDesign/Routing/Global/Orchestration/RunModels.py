@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ....Contracts.Core import Position3
+from ....Contracts.PlacementAccessHandoff import PlacementPinAccessStageObservation
 
 from ....Runtime.Reliability import BuildStableFingerprint
 
@@ -148,6 +149,9 @@ class RawTrackAssignmentDomain:
     PortalDomainFingerprint: str
     Complete: bool
     IncompleteReason: str = ""
+    PinAccessDomainFingerprint: str = ""
+    PinAccessWitnessFingerprint: str = ""
+    PinAccessHandoffObservation: PlacementPinAccessStageObservation | None = None
     MaximumAssignmentExpansions: int = 1
     MinimizeMaximumRoutingLayer: bool = False
     Diagnostics: tuple[tuple[str, object], ...] = ()
@@ -215,6 +219,12 @@ class RawTrackAssignmentDomain:
             "PlacementFingerprint": self.PlacementFingerprint,
             "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
             "PortalDomainFingerprint": self.PortalDomainFingerprint,
+            "PinAccessDomainFingerprint": (
+                self.PinAccessDomainFingerprint
+            ),
+            "PinAccessWitnessFingerprint": (
+                self.PinAccessWitnessFingerprint
+            ),
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
             "MaximumAssignmentExpansions": self.MaximumAssignmentExpansions,
@@ -262,6 +272,12 @@ class RawTrackAssignmentDomain:
             "PlacementFingerprint": self.PlacementFingerprint,
             "ResourceGraphFingerprint": self.ResourceGraphFingerprint,
             "PortalDomainFingerprint": self.PortalDomainFingerprint,
+            "PinAccessDomainFingerprint": (
+                self.PinAccessDomainFingerprint
+            ),
+            "PinAccessWitnessFingerprint": (
+                self.PinAccessWitnessFingerprint
+            ),
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
             "MaximumAssignmentExpansions": self.MaximumAssignmentExpansions,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from copy import (
     deepcopy,
 )
@@ -19,9 +20,13 @@ from typing import (
 )
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, BuildPlacementPinAccessWitness, PlacedGate
+from PhysicalDesign.Redstone.Rules.Validation import FindFlatRouteConflicts
+from PhysicalDesign.Contracts.PlacementAccess import (
+    SelectedPlacementPinAccessWitness,
+)
 from PhysicalDesign.Placement.PreRouteInterface import DerivedPerimeterSlotDomain, DerivedPerimeterTerminalSlot
 from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessDomain, FixedPlacementPinAccessSolveResult, SolveFixedPlacementPinAccessDomains
-from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
+from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology, RedstoneRoutingTechnology
 from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint
 from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, FindClaimConflictsByResourceIndex, FindSelfClaimConflicts, RoutingResourceClaims, RoutingResourceGraph, RoutingResourceId
 from .Clustering import (
@@ -472,6 +477,8 @@ class MandatoryAccessConflictProfile:
 def SolveFixedPlacementMandatoryAccess(
     PlacedGates: Iterable[Any],
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    *,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> FixedPlacementPinAccessSolveResult:
     """Return the typed exact decision for every committed straight pin ray."""
     Gates = (
@@ -481,7 +488,7 @@ def SolveFixedPlacementMandatoryAccess(
     )
     Witness = BuildPlacementPinAccessWitness(
         Gates,
-        AccessLength=DefaultRedstoneRoutingTechnology.AccessLength,
+        AccessLength=Technology.AccessLength,
         RequireCatalogMatch=False,
     )
     return SolveFixedPlacementPinAccessDomains(
@@ -502,6 +509,7 @@ def SolveFixedPlacementMandatoryAccess(
         MaximumExpansions=max(1, len(Witness.Selections) * 2),
         WorkCheck=WorkCheck,
     )
+
 
 def OrderExactStatesForMandatoryAccessCommit(
     States: Iterable[dict[str, object]],
@@ -648,6 +656,9 @@ def BuildMandatoryAccessClaims(
     PlacedGates: Iterable[Any],
     Signals: Iterable[str],
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    *,
+    SelectedPinAccessWitness: SelectedPlacementPinAccessWitness | None = None,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> dict[str, RoutingResourceClaims]:
     """Build the fixed pin-access claims that every detailed route must own."""
     Gates = (
@@ -662,12 +673,31 @@ def BuildMandatoryAccessClaims(
             "GateCount": len(Gates),
             "SignalCount": len(RequiredSignals),
         })
+    if SelectedPinAccessWitness is not None:
+        Claims = {
+            Signal: Claim
+            for Signal, Claim in SelectedPinAccessWitness.ClaimsBySignal
+            if Signal in RequiredSignals
+        }
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "mandatory-access-claims-complete",
+                "GateCount": len(Gates),
+                "SignalCount": len(Claims),
+                "ClaimCount": sum(
+                    len(Claim.ResourceIds) for Claim in Claims.values()
+                ),
+                "SelectedPinAccessWitnessFingerprint": (
+                    SelectedPinAccessWitness.WitnessFingerprint
+                ),
+            })
+        return Claims
     NodesBySignal: dict[str, set[tuple[int, int, int]]] = {
         Signal: set() for Signal in RequiredSignals
     }
     AccessWitness = BuildPlacementPinAccessWitness(
         Gates,
-        AccessLength=DefaultRedstoneRoutingTechnology.AccessLength,
+        AccessLength=Technology.AccessLength,
         # Tiny resource-graph fixtures may use intentionally synthetic pin
         # geometry. Production cells still report CatalogMatched=True, while
         # the witness retains the actual physical ray for those fixtures.
@@ -690,6 +720,7 @@ def BuildMandatoryAccessClaims(
         ActualBlocks=frozenset(),
         ElectricalBlocks=frozenset(),
         SolidBlocks=frozenset(),
+        Technology=Technology,
     )
     Claims: dict[str, RoutingResourceClaims] = {}
     NonEmptySignals = tuple(
@@ -750,12 +781,17 @@ def MeasureMandatoryAccessConflictProfile(
     PlacedGates: Iterable[Any],
     Signals: Iterable[str],
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    *,
+    SelectedPinAccessWitness: SelectedPlacementPinAccessWitness | None = None,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> MandatoryAccessConflictProfile:
     """Measure fixed access ownership with rename-independent fingerprints."""
     Claims = BuildMandatoryAccessClaims(
         PlacedGates,
         Signals,
         WorkCheck=WorkCheck,
+        SelectedPinAccessWitness=SelectedPinAccessWitness,
+        Technology=Technology,
     )
     OwnershipRecords = tuple(
         (
@@ -1441,3 +1477,27 @@ def RepairPackedClusterAccess(
             for Position in sorted(PriorityTerminalPositions)
         ],
     }
+def FindSelectedPinAccessFrozenRouteConflicts(
+    Placed: Any,
+    SelectedPinAccessWitness: Any,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[set[tuple[int, int, int]], Counter[str]]:
+    """Check selected access together with immutable completed local nets.
+
+    The access-domain solve proves the selected legs against each other. A
+    completed local tree is a separate placement-owned fact, so its union
+    with those legs must also be legal before the placement can enter global
+    routing.
+    """
+    FrozenNetWires = getattr(Placed, "FrozenNetWires", None) or {}
+    if not FrozenNetWires:
+        return set(), Counter()
+    Combined = {
+        str(Signal): set(Positions)
+        for Signal, Positions in FrozenNetWires.items()
+    }
+    for Selection in SelectedPinAccessWitness.Selections:
+        Combined.setdefault(str(Selection.Signal), set()).update(
+            Selection.Path
+        )
+    return FindFlatRouteConflicts(Combined, WorkCheck=WorkCheck)

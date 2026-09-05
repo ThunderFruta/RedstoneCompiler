@@ -14,8 +14,11 @@ from App.CompilerCli import BuildParser, Main, PrintFabricFailureSummary, PrintR
 from Compilation.Pipeline import CompileSvToLitematic
 from PhysicalDesign.Orchestration.Demand import BuildPlacementGenerationPlan
 from PhysicalDesign.Orchestration.Preparation import PlacementNeedsDemandDiversity
+from PhysicalDesign.Orchestration.Results import (
+    BuildPlacementPinAccessFinalizationDiagnostics,
+)
 from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb, _PlaceAndRoutePcbWithPolicy
-from PhysicalDesign.Orchestration.Setup import MaterializeInitialConflictRelocation, MaterializeInitialPendingJointPlacementState
+from PhysicalDesign.Orchestration.Setup import MaterializeInitialConflictRelocation, MaterializeInitialPendingJointPlacementState, MaterializeInitialPlacementAccessDirectOnly, SelectEmptyPlacementFailure
 from PhysicalDesign.Placement.Engine.Clustering import BuildTopologicalLevels, FindIsomorphicNandClusterMapping, OptimizeClusterSlots, PcbGatesConflict
 from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
@@ -48,6 +51,73 @@ from PhysicalDesign.Rendering.SchemWriter import LoadTemplate
 
 
 class LocalFirstRouterTests(unittest.TestCase):
+    def testPlacementPinAccessFinalizationRejectsFingerprintOnlyClaims(self) -> None:
+        # Matching strings are insufficient without the solve, domain evidence,
+        # current model, and observations checked in the real-record tests.
+        Context = SimpleNamespace(Placement=SimpleNamespace(
+            SelectedPinAccessWitness=SimpleNamespace(
+                WitnessFingerprint="witness", DomainFingerprint="domain",
+            ),
+            PlacementAccessSolve=None,
+            PlacementAccessFabric=None,
+        ), SelectedTrackPreparation=None)
+        with self.assertRaises(RoutingStageError) as Error:
+            BuildPlacementPinAccessFinalizationDiagnostics(Context)
+        self.assertIs(
+            Error.exception.Failure.Reason,
+            RoutingFailureReason.ClusterInterfaceInvariantViolation,
+        )
+
+    def testInitialAccessCorePrioritizesExistingDirectOnlyVariant(self) -> None:
+        Request = SimpleNamespace(SourceGenerator="row-beam-direct-only")
+        Context = SimpleNamespace(
+            UniquePlacements={},
+            PendingPlacementAccessDirectOnly=True,
+            Deadline=SimpleNamespace(IsExpired=lambda: False),
+            ConsumedDeferredRequestIndexes=set(),
+            GenerationPlan=SimpleNamespace(DeferredRequests=(Request,)),
+            PlacementGenerationDecisions=[],
+        )
+
+        with (
+            patch(
+                "PhysicalDesign.Orchestration.Setup._TakeNextDeferredRequest",
+                return_value=Request,
+            ) as TakeRequest,
+            patch(
+                "PhysicalDesign.Orchestration.Setup._TryPlacement",
+                return_value=True,
+            ) as TryPlacement,
+        ):
+            self.assertTrue(
+                MaterializeInitialPlacementAccessDirectOnly(Context)
+            )
+
+        TakeRequest.assert_called_once_with(Context, PreferDirectOnly=True)
+        TryPlacement.assert_called_once_with(Context, Request)
+        self.assertFalse(Context.PendingPlacementAccessDirectOnly)
+
+    def testIncompletePlacementAccessIsNeverReclassifiedAsOverlap(self) -> None:
+        Incomplete = RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="PlacementAccessSolve",
+        )
+        Unsatisfiable = RoutingFailure(
+            Reason=RoutingFailureReason.NoPinAccessPattern,
+            Stage="PlacementAccessSolve",
+        )
+        Generic = RoutingFailure(
+            Reason=RoutingFailureReason.PlacementOverlap,
+            Stage="PlacementGeneration",
+        )
+        Context = SimpleNamespace(
+            LastPlacementAccessIncompleteFailure=Incomplete,
+            LastPlacementAccessUnsatisfiableFailure=Unsatisfiable,
+            LastStructuredPlacementFailure=Generic,
+        )
+
+        self.assertIs(SelectEmptyPlacementFailure(Context), Incomplete)
+
     def testInitialPlacementConsumesOneConflictRelocation(self) -> None:
         Request = SimpleNamespace(SourceGenerator="row-beam-conflict-relocation")
         Context = SimpleNamespace(
@@ -631,40 +701,43 @@ class LocalFirstRouterTests(unittest.TestCase):
             0.60,
         )
 
-    def testRoutingAwarePlacementAccessStrategyIsExplicitAndNonFallback(
+    def testRoutingAwarePlacementAccessStrategyIsDefaultAndNonFallback(
         self,
     ) -> None:
         DefaultPolicy = PolicyForRoutingStrategy(RoutingStrategy.Default)
-        ExperimentalPolicy = PolicyForRoutingStrategy(
+        ExplicitPolicy = PolicyForRoutingStrategy(
             "routing-aware-placement-access"
         )
 
-        self.assertIs(DefaultPolicy, LocalFirstPhysicalDesignPolicy)
-        self.assertFalse(DefaultPolicy.PlacementAccess.Enabled)
+        self.assertIs(
+            DefaultPolicy,
+            RoutingAwarePlacementAccessPhysicalDesignPolicy,
+        )
+        self.assertTrue(DefaultPolicy.PlacementAccess.Enabled)
         self.assertEqual(
             DefaultPolicy.PolicyVersion,
-            "physical-design-v16-reconvergent-access",
+            "physical-design-v17-routing-aware-placement-access",
         )
         self.assertIs(
-            ExperimentalPolicy,
+            ExplicitPolicy,
             RoutingAwarePlacementAccessPhysicalDesignPolicy,
         )
         self.assertEqual(
-            ExperimentalPolicy.PolicyVersion,
+            ExplicitPolicy.PolicyVersion,
             "physical-design-v17-routing-aware-placement-access",
         )
-        self.assertTrue(ExperimentalPolicy.PlacementAccess.Enabled)
+        self.assertTrue(ExplicitPolicy.PlacementAccess.Enabled)
         self.assertEqual(
-            ExperimentalPolicy.PlacementAccess.CatalogVersion,
+            ExplicitPolicy.PlacementAccess.CatalogVersion,
             "physical-pin-access-catalog-v1",
         )
         self.assertEqual(
-            ExperimentalPolicy.PlacementAccess.EnabledPatternFamilies,
+            ExplicitPolicy.PlacementAccess.EnabledPatternFamilies,
             ("straight",),
         )
-        self.assertEqual(ExperimentalPolicy.Placement, DefaultPolicy.Placement)
+        self.assertEqual(ExplicitPolicy.Placement, DefaultPolicy.Placement)
         self.assertEqual(
-            ExperimentalPolicy.NandPacking,
+            ExplicitPolicy.NandPacking,
             DefaultPolicy.NandPacking,
         )
         self.assertIs(
@@ -1820,7 +1893,7 @@ class LocalFirstRouterTests(unittest.TestCase):
                 )
         self.assertEqual(Execute.call_count, 1)
 
-    def testNewRouterFullAdderWritesCompleteDiagnostics(self) -> None:
+    def testV16ControlFullAdderWritesCompleteDiagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
             Root = Path(Directory)
             TimingEvents = []
@@ -1839,6 +1912,10 @@ class LocalFirstRouterTests(unittest.TestCase):
                 )
 
             with (
+                patch(
+                    "Compilation.Pipeline.PolicyForRoutingStrategy",
+                    return_value=LocalFirstPhysicalDesignPolicy,
+                ),
                 patch("Compilation.Pipeline.FabricServerSupervisor") as Supervisor,
                 patch(
                     "Compilation.Pipeline.CaptureServerUpdatedLitematic",

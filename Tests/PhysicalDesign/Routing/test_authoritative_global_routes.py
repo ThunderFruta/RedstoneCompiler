@@ -1,9 +1,110 @@
 """Global Routes contracts for authoritative routing."""
 
 from ._authoritative_planner_contracts import *
+from PhysicalDesign.Constraints.PhysicalClaims import ComponentClaimsConflict
+from PhysicalDesign.Routing.Global.Orchestration.Stages.CandidatePreparation import (
+    BuildForeignSelectedPinAccessClaimsBySignal,
+    BuildProtectedRoutingNodesBySignal,
+    FindForeignSelectedPinAccessConflictSignals,
+)
 
 
 class AuthoritativeGlobalRoutesTests(AuthoritativePlannerTestBase):
+    def testSelectedPinAccessClaimsBecomeExactForeignCandidateObstacles(
+        self,
+    ) -> None:
+        AlphaClaims = RoutingResourceClaims(
+            WireCells=frozenset(((1, 2, 3),)),
+            SupportCells=frozenset(((1, 1, 3),)),
+            RequiredAirCells=frozenset(((2, 2, 3),)),
+            ElectricalCells=frozenset(((0, 2, 3),)),
+        )
+        BetaClaims = RoutingResourceClaims(
+            WireCells=frozenset(((8, 2, 3),)),
+        )
+        Witness = SimpleNamespace(ClaimsBySignal=(
+            ("Alpha", AlphaClaims),
+            ("Beta", BetaClaims),
+        ))
+
+        Foreign = BuildForeignSelectedPinAccessClaimsBySignal(
+            ("Alpha", "Beta", "Gamma"),
+            Witness,
+        )
+
+        self.assertEqual(
+            tuple(Owner for Owner, _Claims in Foreign["Alpha"]),
+            ("Beta",),
+        )
+        self.assertEqual(
+            tuple(Owner for Owner, _Claims in Foreign["Gamma"]),
+            ("Alpha", "Beta"),
+        )
+        self.assertTrue({
+            (0, 2, 3),
+            (1, 1, 3),
+            (1, 2, 3),
+            (1, 3, 3),
+            (2, 2, 3),
+            (2, 3, 3),
+        }.issubset(ImmutableRoutingClaimsBlockedWireNodes(
+            Claims for _Owner, Claims in Foreign["Gamma"]
+        )))
+        CandidateClaims = RoutingResourceClaims(
+            WireCells=frozenset(((1, 1, 3),)),
+        )
+        self.assertEqual(
+            FindForeignSelectedPinAccessConflictSignals(
+                "Gamma",
+                CandidateClaims,
+                Foreign,
+                ComponentClaimsConflict,
+            ),
+            ("Alpha",),
+        )
+        self.assertEqual(
+            FindForeignSelectedPinAccessConflictSignals(
+                "Alpha",
+                AlphaClaims,
+                Foreign,
+                ComponentClaimsConflict,
+            ),
+            (),
+        )
+
+    def testSelectedOnlyAccessOwnerRemainsInProtectedNodeProjection(
+        self,
+    ) -> None:
+        Profiles = {
+            "Routed": SimpleNamespace(
+                SourceAccessPath=((0, 1, 0),),
+                TargetAccessPaths={(3, 1, 0): ((2, 1, 0),)},
+            ),
+        }
+        Witness = SimpleNamespace(ClaimsBySignal=(
+            (
+                "SelectedOnly",
+                RoutingResourceClaims(
+                    WireCells=frozenset(((9, 1, 9),)),
+                ),
+            ),
+        ))
+
+        Protected = BuildProtectedRoutingNodesBySignal(
+            Profiles,
+            {},
+            Witness,
+        )
+
+        self.assertEqual(
+            Protected["Routed"],
+            frozenset(((0, 1, 0), (2, 1, 0))),
+        )
+        self.assertEqual(
+            Protected["SelectedOnly"],
+            frozenset(((9, 1, 9),)),
+        )
+
     def testRoutedComponentForeignEscapeFeedbackIsStructurallyScoped(
         self,
     ) -> None:

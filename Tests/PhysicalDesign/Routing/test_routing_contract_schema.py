@@ -11,7 +11,7 @@ from PhysicalDesign.Contracts import Component, Core, PhysicalInterface, Placeme
 
 
 ExpectedRoutingContractSchemaHash = (
-    "aebaa503e69a9dfe7c430448b08609896cf320ad82436c14cbc6643a117920da"
+    "542b7f2210ab6eec76a8db31ef8dca457a98893ee5d96cfa73347256260baed8"
 )
 ContractFamilies = {
     "Component": Component,
@@ -103,8 +103,8 @@ def _CaptureRoutingContractSchema() -> dict[str, object]:
     }
 
 
-def test_routing_contract_schema_matches_pre_split_baseline() -> None:
-    """Schema matches the input-facing clean-break contract checkpoint."""
+def test_routing_contract_schema_matches_s1_access_handoff() -> None:
+    """Schema matches the explicit S1 pin-access identity handoff."""
 
     Payload = json.dumps(
         _CaptureRoutingContractSchema(),
