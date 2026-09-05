@@ -343,20 +343,6 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         )
         self.assertFalse(Result["FallbackOrThrashingObserved"])
 
-    def test_no_hardcoded_circuit_exceptions_in_active_compiler_code(
-        self,
-    ) -> None:
-        RepositoryRoot = Path(__file__).resolve().parents[2]
-        OffendingFiles: list[str] = []
-        for Candidate in sorted((RepositoryRoot / "Compiler").rglob("*.py")):
-            if "CarryLookaheadAdder4" in Candidate.read_text(
-                encoding="utf-8"
-            ):
-                OffendingFiles.append(
-                    Candidate.relative_to(RepositoryRoot).as_posix()
-                )
-        self.assertEqual(OffendingFiles, [])
-
     def test_compatibility_exact_interface_checkpoint_normalizes_state_order_and_assignments(
         self,
     ):

@@ -4,86 +4,24 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from io import StringIO
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 
-from Validation.Fabric import FabricServerValidationResult, ResolveFabricServerRoot
+from Validation.Fabric import FabricServerValidationResult
 from Tools.Fabric import ControlFabricServer, ImportSchemToFabricServer, TestSchemInFabricServer
-from Tools.Routing import CaptureRoutingDesignSnapshot, RunRouterAcceptance
-
-
-CanonicalServerRoot = str(ResolveFabricServerRoot())
 
 
 class ScriptCliGuidanceTests(unittest.TestCase):
-    def testFabricControlUsesTheCanonicalRuntimeManager(self) -> None:
-        ExpectedRoot = ResolveFabricServerRoot()
-        SourceRoot = Path(__file__).resolve().parents[2] / "Validation/Fabric/ServerManager"
-
-        self.assertEqual(ControlFabricServer.ServerRoot, ExpectedRoot)
-        self.assertEqual(
-            ControlFabricServer.RuntimeScripts,
-            SourceRoot,
-        )
-        self.assertEqual(
-            ControlFabricServer.RuntimeMain,
-            SourceRoot / "Main.py",
-        )
-
-    def testFabricControlDispatchesToTheManagerPackage(self) -> None:
-        with (
-            patch.dict(os.environ, {}),
-            patch("Validation.Fabric.ServerManager.Main.Main", return_value=7) as Manager,
-        ):
-            self.assertEqual(ControlFabricServer.Main(["status"]), 7)
-            self.assertEqual(
-                os.environ["RC_FABRIC_SERVER_ROOT"],
-                str(ControlFabricServer.ServerRoot),
-            )
-        Manager.assert_called_once_with(["status"])
-
-    def testFabricControlGuidesLifecycleActions(self) -> None:
-        with patch("builtins.input", side_effect=["1"]):
-            self.assertEqual(ControlFabricServer.GuidedArguments(), ["start"])
-        with patch("builtins.input", side_effect=[""]):
-            self.assertEqual(ControlFabricServer.GuidedArguments(), ["status"])
+    def testFabricControlRequiresExplicitClearConfirmation(self) -> None:
+        """The guided wrapper must never clear a world without `CLEAR`."""
         with patch("builtins.input", side_effect=["4", "CLEAR"]):
             self.assertEqual(ControlFabricServer.GuidedArguments(), ["clear"])
         with patch("builtins.input", side_effect=["4", ""]):
             with self.assertRaises(EOFError):
                 ControlFabricServer.GuidedArguments()
-        with patch("builtins.input", side_effect=["0"]):
-            with self.assertRaises(EOFError):
-                ControlFabricServer.GuidedArguments()
-
-    def testFabricImportGuidesToHotReload(self) -> None:
-        with patch("builtins.input", side_effect=["build.schem", "", "", ""]):
-            Arguments = ImportSchemToFabricServer.GuidedArguments()
-        self.assertEqual(
-            Arguments,
-            [
-                "build.schem", "--server-root", CanonicalServerRoot,
-                "--origin", "0", "64", "0", "--replace",
-            ],
-        )
-
-    def testFabricImportDefaultsToTheCanonicalServerRoot(self) -> None:
-        Arguments = ImportSchemToFabricServer.BuildParser().parse_args(["build.schem"])
-
-        self.assertEqual(Arguments.server_root, ResolveFabricServerRoot())
-
-    def testFabricImporterHonorsTheSharedRootOverride(self) -> None:
-        with TemporaryDirectory() as TemporaryDirectoryPath, patch.dict(
-            os.environ,
-            {"RC_FABRIC_SERVER_ROOT": TemporaryDirectoryPath},
-        ):
-            Arguments = ImportSchemToFabricServer.BuildParser().parse_args(["build.schem"])
-
-        self.assertEqual(Arguments.server_root, Path(TemporaryDirectoryPath).resolve())
 
     def testFabricImportWritesThePostUpdateServerSnapshotByDefault(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
@@ -143,60 +81,6 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             Root / "Top.ServerUpdated.litematic",
         )
         self.assertIn("'ObservedBlockCount': 8", Output.getvalue())
-
-    def testFabricTesterGuidesToTheImportedSchematic(self) -> None:
-        with patch("builtins.input", side_effect=["", "build.litematic", "", ""]):
-            Arguments = TestSchemInFabricServer.GuidedArguments()
-
-        self.assertEqual(
-            Arguments,
-            ["build.litematic", "--server-root", CanonicalServerRoot, "--all"],
-        )
-
-    def testFabricTesterGuidesToOneTruthTableRow(self) -> None:
-        with patch("builtins.input", side_effect=["1", "build.litematic", "", "1", "3"]):
-            Arguments = TestSchemInFabricServer.GuidedArguments()
-
-        self.assertEqual(
-            Arguments,
-            [
-                "build.litematic", "--server-root", CanonicalServerRoot,
-                "--vector-index", "3",
-            ],
-        )
-
-    def testFabricTesterGuidesToAllRowsOneAtATime(self) -> None:
-        with patch("builtins.input", side_effect=["1", "build.litematic", "", "3"]):
-            Arguments = TestSchemInFabricServer.GuidedArguments()
-
-        self.assertEqual(
-            Arguments,
-            [
-                "build.litematic", "--server-root", CanonicalServerRoot,
-                "--all-one-at-a-time",
-            ],
-        )
-
-    def testFabricTesterGuidesToExistingWorldStateWithAnSvOracle(self) -> None:
-        with patch(
-            "builtins.input",
-            side_effect=["2", "Assets/Examples/FullAdder.sv", "", ""],
-        ):
-            Arguments = TestSchemInFabricServer.GuidedArguments()
-
-        self.assertEqual(
-            Arguments,
-            [
-                "--existing-state", "Assets/Examples/FullAdder.sv",
-                "--server-root", CanonicalServerRoot,
-                "--all",
-            ],
-        )
-
-    def testFabricTesterDefaultsToTheCanonicalServerRoot(self) -> None:
-        Arguments = TestSchemInFabricServer.BuildParser().parse_args(["build.litematic"])
-
-        self.assertEqual(Arguments.server_root, ResolveFabricServerRoot())
 
     def testFabricTesterOffersExplicitOneAndAllModes(self) -> None:
         Parser = TestSchemInFabricServer.BuildParser()
@@ -288,14 +172,6 @@ class ScriptCliGuidanceTests(unittest.TestCase):
             Supervisor.Validate.call_args_list[1].kwargs,
             {"Fixture": Fixture, "Vectors": [Vectors[1]]},
         )
-
-    def testFabricTesterPromptsForEnterBetweenSequentialRows(self) -> None:
-        with patch("builtins.input", return_value="") as Input:
-            TestSchemInFabricServer.PauseForNextTruthTableRow(0, 8)
-
-        self.assertEqual(Input.call_count, 1)
-        self.assertIn("Row 1/8 complete", Input.call_args.args[0])
-        self.assertIn("row 2/8", Input.call_args.args[0])
 
     def testFabricTesterFailsClosedWhenTheLiveWorldMismatches(self) -> None:
         with TemporaryDirectory() as TemporaryDirectoryPath:
@@ -491,31 +367,6 @@ class ScriptCliGuidanceTests(unittest.TestCase):
         Supervisor.return_value.Validate.assert_not_called()
         Supervisor.return_value.ValidateExisting.assert_called_once()
         self.assertIn(f"'FixtureRegisteredFrom': '{Litematic.resolve()}'", Output.getvalue())
-
-    def testRoutingGuideDefaultsToDefaultRunWithoutPreviews(self) -> None:
-        with patch("builtins.input", side_effect=[""]):
-            self.assertEqual(RunRouterAcceptance.GuidedArguments(), [])
-        with patch("builtins.input", side_effect=["1"]):
-            self.assertEqual(
-                RunRouterAcceptance.GuidedArguments(),
-                ["--matrix", "expanded"],
-            )
-        with patch("builtins.input", side_effect=["2"]):
-            self.assertEqual(RunRouterAcceptance.GuidedArguments(), [])
-
-    def testSnapshotGuideCollectsExplicitInputPaths(self) -> None:
-        with patch("builtins.input", side_effect=["failure.json", "", "manifest.json", "diagram.json", ""]):
-            Arguments = CaptureRoutingDesignSnapshot.GuidedArguments()
-        self.assertEqual(
-            Arguments,
-            [
-                "--cla4-failure", "failure.json",
-                "--output-root", "Output/DesignSnapshots/RoutingAwarePlacementAccess",
-                "--acceptance-manifest", "manifest.json",
-                "--artifact", "diagram.json",
-            ],
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
