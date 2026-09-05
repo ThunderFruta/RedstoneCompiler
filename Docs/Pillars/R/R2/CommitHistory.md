@@ -5,13 +5,13 @@ listed only when its scope and verification are known.
 
 | Commit | Date | Relationship to R2 |
 |---|---|---|
-| `f946ffc` — Enforce selected access across joint routing | 2026-09-05 | Joint-owned placement, orchestration, assignment, and routing consumer slice. Physical realization, domain solving, and legality are provided by Physical-Rules. |
-| `ec6c7d1` — Harden joint access handoff | 2026-09-05 | Joint-owned result, orchestration, assignment, commitment, and integration-test hardening over Physical-Rules proof contracts. Retained evidence was captured at patch-equivalent pre-split `2024d7d`; Stage 1 remains unaccepted. |
+| `ea77a28` — Implement joint physical-design Stage 1 | 2026-09-05 | Squashed Joint checkpoint covering placement/orchestration, assignment, routing consumers, result transport, candidate commitment, integration tests, R2 evidence, and the v17-default decision. It consumes Physical-Rules checkpoint `2f69160`; retained live evidence remains tied to pre-split `2024d7d`, and Stage 1 remains unaccepted. |
 
 ## Reclassified prerequisites from the legacy R1 branch
 
 - `b8160bb`'s opt-in policy and caller/provenance behavior is already present
-  through `7a88051`, followed by the intentional Joint v17-default change `16be70c`.
+  through policy checkpoint `ce96cde`, followed by the v17-default behavior in
+  `ea77a28`.
   Do not replay the old commit and restore v16 as the development default.
   Its archive-aware integration belongs to `Telemetry-And-Acceptance` and is
   on `Telemetry-And-Acceptance`.

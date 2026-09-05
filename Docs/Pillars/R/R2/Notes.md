@@ -11,10 +11,10 @@ controls when the two disagree.
   ref is preserved; moving work to this bucket does not imply integration.
 - The branch starts from capability-neutral Router Refactor history and merges
   the Physical-Rules access-contract and domain-query checkpoints explicitly.
-- `f946ffc` is the first Joint-owned implementation commit intentionally
-  attributed to R2; physical realization remains independently owned.
-- `7a88051` supplies the opt-in policy and Physical-Rules supplies the catalog
-  prerequisite. These are supporting history rather than an R2-completion claim.
+- `ea77a28` is the simplified Joint implementation/evidence checkpoint.
+- `ce96cde` supplies the narrow policy contract and Physical-Rules checkpoint
+  `2f69160` supplies the access-rule prerequisite. These are supporting history
+  rather than an R2-completion claim.
 
 ## Decisions
 
