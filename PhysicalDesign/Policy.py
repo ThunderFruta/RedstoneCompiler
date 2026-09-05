@@ -10,6 +10,7 @@ class RoutingStrategy(str, Enum):
     """User-visible physical-routing strategy."""
 
     Default = "default"
+    RoutingAwarePlacementAccess = "routing-aware-placement-access"
 
     @classmethod
     def Parse(cls, Value: str | "RoutingStrategy") -> "RoutingStrategy":
@@ -55,6 +56,37 @@ class PlacementPolicy:
     def __post_init__(self) -> None:
         if self.DemandAwareBoundaryTrackPitch < 0:
             raise ValueError("DemandAwareBoundaryTrackPitch cannot be negative")
+
+
+@dataclass(frozen=True)
+class PlacementAccessPolicy:
+    """Finite-domain controls for routing-aware placement and pin access."""
+
+    Enabled: bool = False
+    CatalogVersion: str = "physical-pin-access-catalog-v1"
+    EnabledPatternFamilies: tuple[str, ...] = ()
+    MaximumDomainGenerationWork: int = 100_000
+    MaximumAssignmentExpansions: int = 100_000
+
+    def __post_init__(self) -> None:
+        if not self.CatalogVersion:
+            raise ValueError("CatalogVersion must not be empty")
+        if self.MaximumDomainGenerationWork < 1:
+            raise ValueError("MaximumDomainGenerationWork must be positive")
+        if self.MaximumAssignmentExpansions < 1:
+            raise ValueError("MaximumAssignmentExpansions must be positive")
+        if any(not Family for Family in self.EnabledPatternFamilies):
+            raise ValueError("EnabledPatternFamilies must not contain empty names")
+        if len(set(self.EnabledPatternFamilies)) != len(
+            self.EnabledPatternFamilies
+        ):
+            raise ValueError(
+                "EnabledPatternFamilies must be duplicate-free"
+            )
+        if self.Enabled and not self.EnabledPatternFamilies:
+            raise ValueError(
+                "enabled placement access requires at least one pattern family"
+            )
 
 
 @dataclass(frozen=True)
@@ -414,6 +446,9 @@ class PhysicalDesignPolicy:
     PolicyVersion: str = "physical-design-v1"
     Clustering: ClusteringPolicy = field(default_factory=ClusteringPolicy)
     Placement: PlacementPolicy = field(default_factory=PlacementPolicy)
+    PlacementAccess: PlacementAccessPolicy = field(
+        default_factory=PlacementAccessPolicy
+    )
     NandPacking: NandPackingPolicy = field(default_factory=NandPackingPolicy)
     MaterialObjective: MaterialObjectivePolicy = field(
         default_factory=MaterialObjectivePolicy
@@ -565,6 +600,19 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
 )
 
 
+RoutingAwarePlacementAccessPhysicalDesignPolicy = replace(
+    LocalFirstPhysicalDesignPolicy,
+    PolicyVersion="physical-design-v17-routing-aware-placement-access",
+    PlacementAccess=PlacementAccessPolicy(
+        Enabled=True,
+        CatalogVersion="physical-pin-access-catalog-v1",
+        EnabledPatternFamilies=("straight",),
+        MaximumDomainGenerationWork=100_000,
+        MaximumAssignmentExpansions=100_000,
+    ),
+)
+
+
 RoutingAcceptanceProfiles = {
     "FullAdder": RoutingAcceptanceProfile(
         Name="FullAdder",
@@ -586,14 +634,23 @@ RoutingAcceptanceProfiles = {
 }
 
 
-def PolicyForRoutingStrategy(Strategy: RoutingStrategy) -> PhysicalDesignPolicy:
+def PolicyForRoutingStrategy(
+    Strategy: RoutingStrategy | str,
+) -> PhysicalDesignPolicy:
     """Resolve the immutable policy attached to one routing implementation."""
-    return LocalFirstPhysicalDesignPolicy
+    Strategy = RoutingStrategy.Parse(Strategy)
+    if Strategy is RoutingStrategy.Default:
+        return LocalFirstPhysicalDesignPolicy
+    if Strategy is RoutingStrategy.RoutingAwarePlacementAccess:
+        return RoutingAwarePlacementAccessPhysicalDesignPolicy
+    raise ValueError(f"Unknown routing strategy: {Strategy}")
 
 
-def ExecutionStrategyForRequest(Strategy: RoutingStrategy) -> RoutingStrategy:
+def ExecutionStrategyForRequest(
+    Strategy: RoutingStrategy | str,
+) -> RoutingStrategy:
     """Resolve an explicit request without enabling automatic fallback."""
-    return RoutingStrategy.Default
+    return RoutingStrategy.Parse(Strategy)
 
 
 def BuildRoutingAttemptPolicies() -> tuple[RoutingAttemptPolicy, ...]:

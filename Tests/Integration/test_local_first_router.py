@@ -26,7 +26,17 @@ from Validation.Fabric import FabricServerValidationResult, FabricValidationProg
 from PhysicalDesign.Routing.Planning.LocalFirst import AssignCapacityAwareGuideOptionDomains, BuildCapacityAwareGuidePlan, BuildCapacityAwareGuideOptionDomains, BuildPlacementSolution, BuildRipupPlan, DeriveRoutingBudget, RoutingDemandEstimate
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 from PhysicalDesign.Redstone.Rules.Geometry import ValidatePlacedCellElectricalIsolation
-from PhysicalDesign.Policy import AdaptiveRoutingPolicy, GlobalRoutingPolicy, LocalFirstPhysicalDesignPolicy, NandPackingPolicy, RoutingAcceptanceProfiles, RoutingStrategy
+from PhysicalDesign.Policy import (
+    AdaptiveRoutingPolicy,
+    ExecutionStrategyForRequest,
+    GlobalRoutingPolicy,
+    LocalFirstPhysicalDesignPolicy,
+    NandPackingPolicy,
+    PolicyForRoutingStrategy,
+    RoutingAcceptanceProfiles,
+    RoutingAwarePlacementAccessPhysicalDesignPolicy,
+    RoutingStrategy,
+)
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Contracts.Results import RoutedDesign
@@ -339,7 +349,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"missing=\['N0'\]"):
             ValidateNandOnlyDesign(SimpleNamespace(PlacedGates=[]), Reference)
 
-    def testCliAliasesAndDefaultRoutingStrategyParse(self) -> None:
+    def testCliAliasesAndRoutingStrategyParse(self) -> None:
         Parsed = BuildParser().parse_args(
             [
                 "--example", "Assets/Examples/FullAdder.sv",
@@ -379,6 +389,13 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(
             BuildParser().parse_args([]).routing_strategy,
             "default",
+        )
+        self.assertEqual(
+            BuildParser().parse_args([
+                "--routing-strategy",
+                "routing-aware-placement-access",
+            ]).routing_strategy,
+            "routing-aware-placement-access",
         )
         for InvalidDeadline in ("0", "-1", "nan", "inf"):
             with (
@@ -612,6 +629,73 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(
             Snapshot["MaterialObjective"]["MinimumComponentFunctionalShare"],
             0.60,
+        )
+
+    def testRoutingAwarePlacementAccessStrategyIsExplicitAndNonFallback(
+        self,
+    ) -> None:
+        DefaultPolicy = PolicyForRoutingStrategy(RoutingStrategy.Default)
+        ExperimentalPolicy = PolicyForRoutingStrategy(
+            "routing-aware-placement-access"
+        )
+
+        self.assertIs(DefaultPolicy, LocalFirstPhysicalDesignPolicy)
+        self.assertFalse(DefaultPolicy.PlacementAccess.Enabled)
+        self.assertEqual(
+            DefaultPolicy.PolicyVersion,
+            "physical-design-v16-reconvergent-access",
+        )
+        self.assertIs(
+            ExperimentalPolicy,
+            RoutingAwarePlacementAccessPhysicalDesignPolicy,
+        )
+        self.assertEqual(
+            ExperimentalPolicy.PolicyVersion,
+            "physical-design-v17-routing-aware-placement-access",
+        )
+        self.assertTrue(ExperimentalPolicy.PlacementAccess.Enabled)
+        self.assertEqual(
+            ExperimentalPolicy.PlacementAccess.CatalogVersion,
+            "physical-pin-access-catalog-v1",
+        )
+        self.assertEqual(
+            ExperimentalPolicy.PlacementAccess.EnabledPatternFamilies,
+            ("straight",),
+        )
+        self.assertEqual(ExperimentalPolicy.Placement, DefaultPolicy.Placement)
+        self.assertEqual(
+            ExperimentalPolicy.NandPacking,
+            DefaultPolicy.NandPacking,
+        )
+        self.assertIs(
+            ExecutionStrategyForRequest(
+                "routing-aware-placement-access"
+            ),
+            RoutingStrategy.RoutingAwarePlacementAccess,
+        )
+
+        Expected = object()
+        with patch(
+            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
+            return_value=Expected,
+        ) as Execute:
+            Result = PlaceAndRoutePcb(
+                SimpleNamespace(),
+                Strategy="routing-aware-placement-access",
+            )
+
+        self.assertIs(Result, Expected)
+        self.assertIs(
+            Execute.call_args.kwargs["Policy"],
+            RoutingAwarePlacementAccessPhysicalDesignPolicy,
+        )
+        self.assertIs(
+            Execute.call_args.kwargs["RequestedStrategy"],
+            RoutingStrategy.RoutingAwarePlacementAccess,
+        )
+        self.assertIs(
+            Execute.call_args.kwargs["UsedStrategy"],
+            RoutingStrategy.RoutingAwarePlacementAccess,
         )
 
     def testCapacityAwareGuidesAreDeterministicAndBounded(self) -> None:
