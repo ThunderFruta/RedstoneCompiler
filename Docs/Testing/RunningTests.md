@@ -147,7 +147,7 @@ does not prove the rebuilt native code was exercised.
 ## Validation harness
 
 ```bash
-gradle -p Validation/Fabric/ServerHarness test
+./Validation/Fabric/ServerHarness/gradlew -p Validation/Fabric/ServerHarness test build
 ```
 
 Harness unit tests do not substitute for a live Fabric acceptance run.

@@ -15,10 +15,10 @@ redstone-compiler
 python3 -m pytest -q
 cargo fmt --manifest-path Kernels/Routing/Cargo.toml -- --check
 cargo test --manifest-path Kernels/Routing/Cargo.toml --release
-gradle -p Validation/Fabric/ServerHarness test
+./Validation/Fabric/ServerHarness/gradlew -p Validation/Fabric/ServerHarness test build
 ```
 
-The editable install builds the Python/PyO3 package; the CLI runs a guided or argument-driven compile. Pytest covers Python contracts and integration. Rust changes require formatting plus release tests and a rebuilt extension before Python parity checks. The Fabric harness requires Java 25 and Gradle 9.5.1.
+The editable install builds the Python/PyO3 package; the CLI runs a guided or argument-driven compile. Pytest covers Python contracts and integration. Rust changes require formatting plus release tests and a rebuilt extension before Python parity checks. The Fabric harness requires Java 25; its checked-in wrapper downloads and verifies Gradle 9.5.1.
 
 ## Coding Style & Naming Conventions
 
