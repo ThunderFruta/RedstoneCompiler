@@ -15,6 +15,8 @@ import unittest
 from unittest.mock import patch
 
 from Tools.Routing.RunRouterAcceptance import AcceptanceCase, AcceptanceCases, AcceptanceCommandResult, AcceptanceConfiguration, AcceptedPolicyVersion, AuthoritativeServerBackends, BaselinePolicyVersion, BaselineSchemaVersion, BaselineCompatibilityCaseNames, BuildBaselineComparison, BuildComparisonCompatibility, BuildEmittedDesignDigest, BuildParser, BuildLitematicCompositionEvidence, BuildRunArtifacts, BuildResolvedTemplateInputManifest, BuildSourceProvenance, BuildSubprocessTimeoutSeconds, BuildTruthTableSemanticEvidence, CalculateRuntimeStatistics, ExtendedCaseNames, CandidatePolicyVersion, CanonicalArithmeticDigests, CompareCompatibility, CurrentPolicyVersion, DefaultRoutingPublicationReserveSeconds, DefaultPythonExecutable, DeterministicEvidenceFields, EvaluateRun, EvaluateExactInterfaceProofCheckpoint, ExpandedCaseNames, MaximumDeadlineOverrunSeconds, MaximumRuntimeRegressionFraction, MaximumRuntimeSpreadFraction, NormalizeLegacyFullAdderCeilingCompatibility, RegressionCaseNames, ReadBaselineReference, ReadCgroupCpuQuotaProfile, ReadCpuProfile, RequiredRegressionRoutingThreads, RunAcceptance, RunCompilerCommand, SubprocessDeadlineGraceSeconds, SubprocessFinalizationGraceSeconds
+from Tools.Routing.RunRouterAcceptance import BuildPolicyProvenanceRecord
+from PhysicalDesign.Policy import PolicyForRoutingStrategy, RoutingStrategy
 from PhysicalDesign.Rendering.SchemWriter import WriteLitematic
 
 FrozenRouterRegressionBaselineSha256 = (
@@ -29,6 +31,7 @@ def BuildPhysicalDesign(
     CandidateFingerprint: str = "candidate-stable",
     ResourceGraphFingerprint: str = "resource-graph-stable",
     EffectiveWorkFingerprint: str | None = None,
+    RequestedStrategy: str = "default",
     UsedStrategy: str = "default",
     FallbackUsed: bool = False,
     RuntimeSeconds: float = 1.0,
@@ -55,7 +58,7 @@ def BuildPhysicalDesign(
         UnresolvedClaims = []
     return {
         "Strategy": {
-            "Requested": "default",
+            "Requested": RequestedStrategy,
             "Used": UsedStrategy,
             "FallbackUsed": FallbackUsed,
         },
@@ -285,6 +288,9 @@ def SourceProvenanceFixture(
             "SizeBytes": 10,
             "Sha256": NativeDigest,
         },
+        "RequestedRoutingStrategy": (
+            Configuration.RequestedRoutingStrategy
+        ),
         "ExpectedPolicyVersion": Configuration.ExpectedPolicyVersion,
     }
 
@@ -454,6 +460,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         BaselineMode: str | None = None,
         BaselinePath: Path | None = None,
         ExpectedPolicyVersion: str | None = None,
+        RequestedRoutingStrategy: str = RoutingStrategy.Default.value,
         MatrixMode: str = "default",
         IncludeCla4: bool = False,
     ) -> AcceptanceConfiguration:
@@ -461,7 +468,11 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             ExpectedPolicyVersion = (
                 BaselinePolicyVersion
                 if BaselineMode == "capture"
-                else AcceptedPolicyVersion
+                else CurrentPolicyVersion
+                if BaselineMode == "compare"
+                else PolicyForRoutingStrategy(
+                    RequestedRoutingStrategy
+                ).PolicyVersion
             )
         return AcceptanceConfiguration(
             RepositoryRoot=Path(__file__).resolve().parents[2],
@@ -474,6 +485,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 if BaselineMode is not None
                 else 3
             ),
+            RequestedRoutingStrategy=RequestedRoutingStrategy,
             BaselineMode=BaselineMode,
             BaselinePath=BaselinePath,
             ExpectedPolicyVersion=ExpectedPolicyVersion,
@@ -525,12 +537,22 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 if RunName.startswith(Value.Name)
             )
             Runtime = RuntimeByRun.get(RunName, 1.0)
+            StrategyIndex = Command.index("--routing-strategy")
+            RequestedStrategy = Command[StrategyIndex + 1]
+            PhysicalChanges = dict(
+                PhysicalChangesByRun.get(RunName, {})
+            )
+            PhysicalChanges.setdefault(
+                "RequestedStrategy",
+                RequestedStrategy,
+            )
+            PhysicalChanges.setdefault("UsedStrategy", RequestedStrategy)
             WriteSuccessfulArtifacts(
                 Case,
                 Artifacts,
                 PolicyVersion=PolicyVersion,
                 RuntimeSeconds=Runtime,
-                **PhysicalChangesByRun.get(RunName, {}),
+                **PhysicalChanges,
             )
             return AcceptanceCommandResult(0, "", "", Runtime)
 
@@ -706,6 +728,61 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 MaximumDeadlineOverrunSeconds,
             )
             self.assertTrue(Configuration.ManifestPath.is_file())
+
+    def testRoutingAwareDryRunRecordsExactStrategyAndPolicy(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Strategy = RoutingStrategy.RoutingAwarePlacementAccess.value
+            Configuration = self.Configuration(
+                Root,
+                DryRun=True,
+                RequestedRoutingStrategy=Strategy,
+            )
+            Manifest = RunAcceptance(
+                Configuration,
+                CommandRunner=lambda **_Options: self.fail(
+                    "dry-run launched a compiler"
+                ),
+                SourceStateProvider=lambda _Root: {
+                    "Revision": "revision",
+                    "Dirty": True,
+                },
+                SourceProvenanceProvider=SourceProvenanceFixture,
+                UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
+            )
+
+        ExpectedPolicy = PolicyForRoutingStrategy(Strategy)
+        self.assertEqual(Manifest["Status"], "DRY_RUN")
+        self.assertEqual(Manifest["RoutingStrategy"], Strategy)
+        self.assertEqual(
+            Configuration.ExpectedPolicyVersion,
+            ExpectedPolicy.PolicyVersion,
+        )
+        self.assertEqual(
+            Manifest["SourceProvenance"]["RequestedRoutingStrategy"],
+            Strategy,
+        )
+        for Run in Manifest["Runs"]:
+            Command = Run["Command"]
+            StrategyIndex = Command.index("--routing-strategy")
+            self.assertEqual(Command[StrategyIndex + 1], Strategy)
+
+        Provenance = BuildPolicyProvenanceRecord(Strategy)
+        self.assertEqual(Provenance["RoutingStrategy"], Strategy)
+        self.assertEqual(
+            Provenance["PolicyVersion"],
+            "physical-design-v17-routing-aware-placement-access",
+        )
+        self.assertEqual(
+            Provenance["Snapshot"]["PlacementAccess"],
+            {
+                "Enabled": True,
+                "CatalogVersion": "physical-pin-access-catalog-v1",
+                "EnabledPatternFamilies": ("straight",),
+                "MaximumDomainGenerationWork": 100_000,
+                "MaximumAssignmentExpansions": 100_000,
+            },
+        )
 
     def testDryRunWithIncludeCla4IncludesExtendedCase(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
@@ -1277,7 +1354,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 {"UsedStrategy": "compatibility"},
                 AcceptanceCommandResult(0, "", "", 1.0),
                 None,
-                "used strategy is not default",
+                "used strategy mismatch",
             ),
             (
                 "missing-artifact",
@@ -1395,6 +1472,38 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         ExpectedFailure in Failure
                         for Failure in Evaluation["Failures"]
                     ))
+
+    def testEvaluatorAcceptsMatchingRoutingAwareStrategyAndPolicy(
+        self,
+    ) -> None:
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
+        Strategy = RoutingStrategy.RoutingAwarePlacementAccess.value
+        PolicyVersion = PolicyForRoutingStrategy(Strategy).PolicyVersion
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Artifacts = BuildRunArtifacts(
+                Path(DirectoryValue) / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            WriteSuccessfulArtifacts(
+                Case,
+                Artifacts,
+                RequestedStrategy=Strategy,
+                UsedStrategy=Strategy,
+                PolicyVersion=PolicyVersion,
+            )
+            Evaluation, _Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                ExpectedPolicyVersion=PolicyVersion,
+                ExpectedRoutingStrategy=Strategy,
+                DesignDigestBuilder=DigestFixture,
+            )
+
+        self.assertTrue(Evaluation["Accepted"], Evaluation["Failures"])
 
     def testEvaluatorRecordsAndEnforcesSubsecondDeadlineOverrun(self) -> None:
         Case = next(
@@ -1887,6 +1996,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 for Record in Provenance["SourceContent"]["Files"]
             }
             self.assertIn("Assets/Templates/__init__.py", SourcePaths)
+            self.assertIn("App/BenchmarkArchive.py", SourcePaths)
+            self.assertIn("Compilation/Pipeline.py", SourcePaths)
+            self.assertIn("Formats/SystemVerilog/Sv.py", SourcePaths)
             self.assertEqual(
                 set(Provenance["PhysicalTemplates"]["Templates"]),
                 {"Input", "Nand", "Output"},
@@ -3176,6 +3288,26 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 BaselinePath=Path("/baseline.json"),
                 IncludeCla4=True,
             )
+        for BaselineMode in ("capture", "compare"):
+            with (
+                self.subTest(BaselineMode=BaselineMode),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "baseline capture/compare requires routing strategy default",
+                ),
+            ):
+                AcceptanceConfiguration(
+                    RepositoryRoot=Path("/repo"),
+                    OutputRoot=Path("/output"),
+                    DateLabel="2026-07-25",
+                    PythonExecutable=Path("/python"),
+                    RoutingThreads=RequiredRegressionRoutingThreads,
+                    RequestedRoutingStrategy=(
+                        RoutingStrategy.RoutingAwarePlacementAccess.value
+                    ),
+                    BaselineMode=BaselineMode,
+                    BaselinePath=Path("/baseline.json"),
+                )
 
     def testDefaultPythonExecutablePreservesVenvLauncherPath(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
@@ -3224,6 +3356,14 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertEqual(
             Standalone.ManifestPath,
             Path("/output/Acceptance/2026-07-25/AcceptanceManifest.json"),
+        )
+        ArchivedStandalone = replace(
+            Standalone,
+            ArchiveSessionRoot=Path("/output/Acceptance/2026-07-25/Archives/id"),
+        )
+        self.assertEqual(
+            ArchivedStandalone.RecoveryRoot,
+            Path("/output/Acceptance/2026-07-25/Archives/id"),
         )
         self.assertEqual(Capture.RecoveryRoot.name, "BaselineCapture")
         self.assertEqual(Comparison.RecoveryRoot.name, "CandidateComparison")

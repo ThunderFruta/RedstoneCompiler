@@ -177,10 +177,19 @@ ceilings and require exact MCHPRS truth tables, the required Fabric canaries,
 zero conflicts/unresolved claims, no fallback, and stable repeated
 fingerprints.
 
-The acceptance harness defaults to `Output/Acceptance/<date>/`. Each executed
-circuit retains `Summary.txt`, `RawDump.txt`, `stdout.log`, and `stderr.log`;
-the dated directory also contains an overall report and
-`AcceptanceManifest.json`.
+Real ordinary acceptance runs use a fresh commit-stamped archive beneath
+`Output/Acceptance/<date>/Archives/<UTC timestamp>-<commit>[-dirty-<status hash>]/`.
+Each circuit retains `Summary.txt`, `RawDump.txt`, `stdout.log`, `stderr.log`,
+and its compiler-run artifacts. The archive root retains the session reports,
+`AcceptanceManifest.json`, `ArchiveManifest.json`, and `SHA256SUMS`.
+Passed, failed, partial, and interrupted outcomes remain distinct.
+
+`--dry-run` writes a plan without creating an archive. Use `--no-archive` only
+for deliberately disposable execution. Historical capture/compare modes retain
+their fixed recovery paths and receive a separate archive mirror; their policy
+and interpreter checks are unchanged. See [benchmark archives](Benchmarks.md#immutable-benchmark-archives)
+for identity, collision, symlink, and checksum rules. Archive sealing does not
+turn a routing failure into acceptance.
 
 ## Evidence
 

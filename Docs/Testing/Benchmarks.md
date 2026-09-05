@@ -48,6 +48,61 @@ Normal default and expanded acceptance execute each selected circuit exactly
 once. Specialized baseline capture/comparison retains its historical repeated
 sampling contract so existing version-one baseline evidence remains readable.
 
+## Immutable benchmark archives
+
+
+Every executed `redstone-benchmark` or `RunRouterAcceptance.py` default or
+expanded matrix automatically writes into a new immutable-by-contract archive:
+
+```text
+<output-root>/<date>/Archives/
+  <YYYYMMDDTHHMMSS.ffffffZ>-<12-character-commit>/
+```
+
+The archive ID gains `-dirty-<12-character-status-sha256>` when the checkout
+has staged, unstaged, or ordinary untracked changes. The digest is computed
+from Git porcelain-v2 NUL-delimited status bytes. Ignored build caches,
+`Runtime/FabricServer/`, and prior `Output/` evidence therefore do not make a
+checkout dirty. The full commit, full status digest, branch or detached state,
+source-content digest, and start/end identities remain in
+`ArchiveManifest.json`.
+
+Ordinary runs execute directly in the unique archive, so a same-day run cannot
+inherit stale evidence. The top-level `Summary.txt` is the surface view headed
+by `RESULT`, `TIME`, optional `CPU`, and `OUTPUT`. `RawDump.txt`,
+`AcceptanceManifest.json`, circuit reports and logs, compiler-run telemetry,
+typed failures, fixtures, and schematics preserve the complete session.
+`ArchiveManifest.json` uses schema `router-benchmark-archive-v1`; its compact
+run surface distinguishes passed, failed, skipped, timed-out, validation, and
+missing-artifact states. `SHA256SUMS` covers every regular archive file except
+itself. Archive sealing rejects symlinks and never overwrites or merges an
+existing archive directory.
+
+A benchmark failure remains a failure even when its evidence seals correctly.
+An otherwise successful benchmark becomes nonzero when archive publication
+fails and prints `Archiving: write-failed`. Interrupted or unexpected harness
+failures retain their unique directory with an `INTERRUPTED` or `PARTIAL`
+manifest whenever best-effort finalization succeeds. The command always prints
+the absolute archive path for an attempted archived run.
+
+Use `--no-archive` only for deliberately disposable execution. `--dry-run`
+never creates an archive. Archives are uncompressed and have no automatic
+retention or pruning policy.
+
+The automatic archive is separate from the promotable v15 regression baseline.
+`--capture-baseline` and `--compare-baseline` keep their fixed recovery paths,
+sampling, compatibility policy, reference promotion, and overwrite protection;
+after completion, that session is mirrored wholesale into a separate
+commit-stamped archive.
+
+This functionality was extracted from the archive portion of legacy R1 commit
+`14646a9`, including its later archive-aware strategy integration in `b8160bb`.
+It belongs to the Telemetry-And-Acceptance bucket (R8/N5), not R1 lazy expansion.
+Joint-Physical-Design owns the v17-default policy. The archive mechanism is
+policy-neutral and records the strategy supplied by its checkout. Historical
+baseline modes retain their original policy/interpreter checks; use the matching
+source checkpoint rather than presenting a current-policy run as an older baseline.
+
 ## Historical acceptance sweep — 2026-08-03
 
 The following retained evidence is historical and must not be presented as the

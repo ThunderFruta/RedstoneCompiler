@@ -21,6 +21,7 @@ from statistics import median
 import subprocess
 import sys
 from time import monotonic
+import traceback
 from typing import Any, Callable
 
 
@@ -44,7 +45,18 @@ RequiredRegressionRoutingThreads = 16
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
+from App.BenchmarkArchive import (
+    BenchmarkArchiveContext,
+    BuildBenchmarkArchiveDirectory,
+    BuildBenchmarkArchiveIdentity,
+    EnsureArchiveTargetAvailable,
+    PublishBenchmarkArchive,
+)
 from App.RunReporting import CaptureTerminalOutput, UtcTimestamp, WriteRunReport
+from PhysicalDesign.Policy import (
+    PolicyForRoutingStrategy,
+    RoutingStrategy,
+)
 
 
 @dataclass(frozen=True)
@@ -267,7 +279,9 @@ PerfBlockSchemaVersion = "router-performance-v1"
 # Baseline capture remains pinned to the frozen pre-change policy. Ordinary
 # acceptance and comparison target the current implementation policy.
 BaselinePolicyVersion = "physical-design-v15-compact-boundaries"
-CurrentPolicyVersion = "physical-design-v16-reconvergent-access"
+CurrentPolicyVersion = PolicyForRoutingStrategy(
+    RoutingStrategy.Default
+).PolicyVersion
 # Backwards-compatible constants for callers of the earlier harness surface.
 AcceptedPolicyVersion = CurrentPolicyVersion
 CandidatePolicyVersion = CurrentPolicyVersion
@@ -376,18 +390,40 @@ class AcceptanceConfiguration:
     DryRun: bool = False
     RoutingThreads: int | None = None
     ExpectedSeed: int = 0
+    RequestedRoutingStrategy: str = RoutingStrategy.Default.value
     BaselineMode: str | None = None
     BaselinePath: Path | None = None
     ExpectedPolicyVersion: str | None = None
     CaptureTimeoutGraceSeconds: float = 0.0
     MatrixMode: str = "default"
+    ArchiveSessionRoot: Path | None = None
     # Read-only compatibility for existing baseline tests and callers. The
     # public CLI now selects `--matrix default|expanded`.
     IncludeCla4: bool = False
 
     def __post_init__(self) -> None:
+        try:
+            RequestedRoutingStrategy = RoutingStrategy.Parse(
+                self.RequestedRoutingStrategy
+            )
+        except ValueError as Error:
+            raise ValueError(
+                f"unknown routing strategy: {self.RequestedRoutingStrategy}"
+            ) from Error
+        object.__setattr__(
+            self,
+            "RequestedRoutingStrategy",
+            RequestedRoutingStrategy.value,
+        )
         if self.BaselineMode not in {None, "capture", "compare"}:
             raise ValueError("baseline mode must be capture, compare, or None")
+        if (
+            self.BaselineMode is not None
+            and RequestedRoutingStrategy is not RoutingStrategy.Default
+        ):
+            raise ValueError(
+                "baseline capture/compare requires routing strategy default"
+            )
         if self.MatrixMode not in {"default", "expanded"}:
             raise ValueError("matrix mode must be default or expanded")
         if self.MatrixMode == "expanded" and self.BaselineMode is not None:
@@ -424,6 +460,10 @@ class AcceptanceConfiguration:
                 BaselinePolicyVersion
                 if self.BaselineMode == "capture"
                 else CurrentPolicyVersion
+                if self.BaselineMode == "compare"
+                else PolicyForRoutingStrategy(
+                    RequestedRoutingStrategy
+                ).PolicyVersion
             )
             object.__setattr__(
                 self,
@@ -441,11 +481,18 @@ class AcceptanceConfiguration:
         RequiredPolicyVersion = {
             "capture": BaselinePolicyVersion,
             "compare": CurrentPolicyVersion,
-            None: ExpectedPolicyVersion,
+            None: PolicyForRoutingStrategy(
+                RequestedRoutingStrategy
+            ).PolicyVersion,
         }[self.BaselineMode]
         if ExpectedPolicyVersion != RequiredPolicyVersion:
+            PolicyOwner = (
+                f"{self.BaselineMode} mode"
+                if self.BaselineMode is not None
+                else f"{RequestedRoutingStrategy.value} strategy"
+            )
             raise ValueError(
-                f"{self.BaselineMode} mode requires policy version "
+                f"{PolicyOwner} requires policy version "
                 f"{RequiredPolicyVersion}"
             )
         if not ExpectedPolicyVersion:
@@ -453,6 +500,8 @@ class AcceptanceConfiguration:
 
     @property
     def RecoveryRoot(self) -> Path:
+        if self.ArchiveSessionRoot is not None:
+            return self.ArchiveSessionRoot.resolve(strict=False)
         DateRoot = (self.OutputRoot / self.DateLabel).resolve(strict=False)
         SessionName = {
             "capture": "BaselineCapture",
@@ -1225,7 +1274,7 @@ def BuildCompilerCommand(
         "--workdir",
         str(Artifacts["Workdir"]),
         "--routing-strategy",
-        "default",
+        Configuration.RequestedRoutingStrategy,
         "--routing-deadline-seconds",
         str(Case.RoutingDeadlineSeconds),
     ]
@@ -1267,7 +1316,8 @@ def BuildSourceContentManifest(
     CandidatePaths: set[Path] = set()
     for RelativeRoot, Pattern in (
         (Path("App"), "*.py"),
-        (Path("Compiler"), "*.py"),
+        (Path("Compilation"), "*.py"),
+        (Path("Formats"), "*.py"),
         (Path("PhysicalDesign"), "*.py"),
         (Path("Validation"), "*.py"),
         (Path("Kernels/Routing/Src"), "*.rs"),
@@ -1539,11 +1589,12 @@ except Exception as Error:
     return Record
 
 
-def BuildPolicyProvenanceRecord() -> dict[str, object]:
-    """Fingerprint the complete immutable policy selected by ``default``."""
-    from PhysicalDesign.Policy import PolicyForRoutingStrategy, RoutingStrategy
-
-    Policy = PolicyForRoutingStrategy(RoutingStrategy.Default)
+def BuildPolicyProvenanceRecord(
+    RequestedRoutingStrategy: RoutingStrategy | str = RoutingStrategy.Default,
+) -> dict[str, object]:
+    """Fingerprint the policy selected by one explicit routing strategy."""
+    Strategy = RoutingStrategy.Parse(RequestedRoutingStrategy)
+    Policy = PolicyForRoutingStrategy(Strategy)
     Snapshot = Policy.ToDictionary()
     Encoded = json.dumps(
         Snapshot,
@@ -1551,6 +1602,7 @@ def BuildPolicyProvenanceRecord() -> dict[str, object]:
         separators=(",", ":"),
     ).encode("utf-8")
     return {
+        "RoutingStrategy": Strategy.value,
         "PolicyVersion": Policy.PolicyVersion,
         "Seed": Policy.Seed,
         "Sha256": sha256(Encoded).hexdigest(),
@@ -1580,7 +1632,10 @@ def BuildSourceProvenance(
             Configuration.RepositoryRoot,
             Configuration.PythonExecutable,
         ),
-        "Policy": BuildPolicyProvenanceRecord(),
+        "Policy": BuildPolicyProvenanceRecord(
+            Configuration.RequestedRoutingStrategy
+        ),
+        "RequestedRoutingStrategy": Configuration.RequestedRoutingStrategy,
         "ExpectedPolicyVersion": Configuration.ExpectedPolicyVersion,
     }
 
@@ -1731,6 +1786,7 @@ def EvaluateRun(
     Artifacts: dict[str, Path],
     ExpectedSeed: int,
     ExpectedPolicyVersion: str = CurrentPolicyVersion,
+    ExpectedRoutingStrategy: str = RoutingStrategy.Default.value,
     DesignDigestBuilder: Callable[[Path], str] = BuildEmittedDesignDigest,
     LitematicCompositionEvidenceBuilder: Callable[
         [Path], dict[str, int]
@@ -1740,6 +1796,9 @@ def EvaluateRun(
     ] = BuildTruthTableSemanticEvidence,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
     """Judge one completed process solely from its result and durable artifacts."""
+    ExpectedRoutingStrategy = RoutingStrategy.Parse(
+        ExpectedRoutingStrategy
+    ).value
     Failures: list[str] = []
     ProcessEnvelopeSeconds = (
         Case.RoutingDeadlineSeconds + Case.PublicationReserveSeconds
@@ -1812,10 +1871,16 @@ def EvaluateRun(
             Strategy = {}
         RequestedStrategy = Strategy.get("Requested")
         UsedStrategy = Strategy.get("Used")
-        if RequestedStrategy != "default":
-            Failures.append("requested strategy is not default")
-        if UsedStrategy != "default":
-            Failures.append("used strategy is not default")
+        if RequestedStrategy != ExpectedRoutingStrategy:
+            Failures.append(
+                "requested strategy mismatch: "
+                f"{RequestedStrategy!r} != {ExpectedRoutingStrategy!r}"
+            )
+        if UsedStrategy != ExpectedRoutingStrategy:
+            Failures.append(
+                "used strategy mismatch: "
+                f"{UsedStrategy!r} != {ExpectedRoutingStrategy!r}"
+            )
         if Strategy.get("FallbackUsed") is not False:
             Failures.append(
                 "fallback was used or not explicitly disabled"
@@ -2436,7 +2501,10 @@ def BuildComparisonCompatibility(
             "Count": 1,
             "MeasurementIncluded": False,
         },
-        "RoutingStrategy": "default",
+        "RoutingStrategy": SourceProvenance.get(
+            "RequestedRoutingStrategy",
+            RoutingStrategy.Default.value,
+        ),
         "RoutingThreads": RequiredRegressionRoutingThreads,
         "PolicySeed": 0,
         "CanonicalArithmeticDigests": dict(
@@ -4238,6 +4306,7 @@ def RunAcceptance(
         "Status": "DRY_RUN" if Configuration.DryRun else "RUNNING",
         "Accepted": False,
         "ExecutionMode": "sequential",
+        "RoutingStrategy": Configuration.RequestedRoutingStrategy,
         "MatrixMode": Configuration.MatrixMode,
         "FailFast": False,
         "BaselineMode": Configuration.BaselineMode,
@@ -4537,6 +4606,9 @@ def RunAcceptance(
             Artifacts=Artifacts,
             ExpectedSeed=Configuration.ExpectedSeed,
             ExpectedPolicyVersion=Configuration.ExpectedPolicyVersion,
+            ExpectedRoutingStrategy=(
+                Configuration.RequestedRoutingStrategy
+            ),
             DesignDigestBuilder=DesignDigestBuilder,
             LitematicCompositionEvidenceBuilder=(
                 LitematicCompositionEvidenceBuilder
@@ -5214,6 +5286,16 @@ def BuildParser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
+    Parser.add_argument(
+        "--routing-strategy",
+        dest="RequestedRoutingStrategy",
+        choices=tuple(Value.value for Value in RoutingStrategy),
+        default=RoutingStrategy.Default.value,
+        help=(
+            "explicit router implementation; default remains v16 and "
+            "routing-aware-placement-access selects experimental v17"
+        ),
+    )
     BaselineModes = Parser.add_mutually_exclusive_group()
     BaselineModes.add_argument(
         "--capture-baseline",
@@ -5277,6 +5359,16 @@ def BuildParser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the complete sequential plan without launching the compiler",
     )
+    Parser.add_argument(
+        "--no-archive",
+        dest="ArchiveEnabled",
+        action="store_false",
+        default=True,
+        help=(
+            "run without creating the automatic timestamped, commit-stamped "
+            "benchmark archive"
+        ),
+    )
     return Parser
 
 
@@ -5293,6 +5385,48 @@ def GuidedArguments() -> list[str]:
     if Choice == "2":
         return []
     raise ValueError("choose 1 or 2")
+
+
+def _LoadIncompleteAcceptanceManifest(
+    Configuration: AcceptanceConfiguration,
+    *,
+    Status: str,
+    Failure: str,
+) -> dict[str, object]:
+    """Retain on-disk progress when an acceptance session exits unexpectedly."""
+    Manifest: dict[str, object] = {}
+    try:
+        Loaded = json.loads(
+            Configuration.ManifestPath.read_text(encoding="utf-8")
+        )
+        if isinstance(Loaded, dict):
+            Manifest = Loaded
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    Manifest.update({
+        "SchemaVersion": Manifest.get(
+            "SchemaVersion",
+            AcceptanceManifestSchemaVersion,
+        ),
+        "Status": Status,
+        "Accepted": False,
+        "CompletedAtUtc": UtcTimestamp(),
+        "RecoveryRoot": str(Configuration.RecoveryRoot),
+        "ManifestPath": str(Configuration.ManifestPath),
+        "ArchiveRecoveryFailure": Failure,
+    })
+    Manifest.setdefault(
+        "RoutingStrategy",
+        Configuration.RequestedRoutingStrategy,
+    )
+    Manifest.setdefault("MatrixMode", Configuration.MatrixMode)
+    Manifest.setdefault("BaselineMode", Configuration.BaselineMode)
+    Manifest.setdefault("Runs", [])
+    try:
+        WriteManifest(Configuration.ManifestPath, Manifest)
+    except OSError:
+        pass
+    return Manifest
 
 
 def Main(Arguments: list[str] | None = None) -> int:
@@ -5316,6 +5450,16 @@ def Main(Arguments: list[str] | None = None) -> int:
         if Parsed.CompareBaseline is not None
         else None
     )
+    RequestedRoutingStrategy = RoutingStrategy.Parse(
+        Parsed.RequestedRoutingStrategy
+    )
+    if (
+        BaselineMode is not None
+        and RequestedRoutingStrategy is not RoutingStrategy.Default
+    ):
+        raise SystemExit(
+            "baseline capture/compare requires --routing-strategy default"
+        )
     if (
         not isfinite(Parsed.CaptureTimeoutGraceSeconds)
         or Parsed.CaptureTimeoutGraceSeconds < 0.0
@@ -5394,18 +5538,50 @@ def Main(Arguments: list[str] | None = None) -> int:
             BaselinePolicyVersion
             if BaselineMode == "capture"
             else CurrentPolicyVersion
+            if BaselineMode == "compare"
+            else PolicyForRoutingStrategy(
+                RequestedRoutingStrategy
+            ).PolicyVersion
         )
     )
     RequiredModePolicyVersion = {
         "capture": BaselinePolicyVersion,
         "compare": CurrentPolicyVersion,
-        None: ExpectedPolicyVersion,
+        None: PolicyForRoutingStrategy(
+            RequestedRoutingStrategy
+        ).PolicyVersion,
     }[BaselineMode]
     if ExpectedPolicyVersion != RequiredModePolicyVersion:
+        PolicyOwner = (
+            f"{BaselineMode} mode"
+            if BaselineMode is not None
+            else f"{RequestedRoutingStrategy.value} strategy"
+        )
         raise SystemExit(
-            f"{BaselineMode} mode requires --expected-policy-version "
+            f"{PolicyOwner} requires --expected-policy-version "
             f"{RequiredModePolicyVersion}"
         )
+    ArchiveIdentity = None
+    ArchiveDirectory = None
+    if Parsed.ArchiveEnabled and not Parsed.DryRun:
+        try:
+            ArchiveIdentity = BuildBenchmarkArchiveIdentity(RepoRoot)
+            ArchiveDirectory = BuildBenchmarkArchiveDirectory(
+                OutputRoot,
+                Parsed.DateLabel,
+                ArchiveIdentity,
+            )
+            EnsureArchiveTargetAvailable(ArchiveDirectory)
+        except (OSError, RuntimeError, FileExistsError) as Error:
+            print("RESULT: FAILURE — Archiving: identity-failed")
+            print("TIME: wall=0.000s")
+            print(
+                "OUTPUT: Benchmark was not launched because a unique Git-"
+                f"stamped archive could not be reserved: {Error}"
+            )
+            if ArchiveDirectory is not None:
+                print(f"ARCHIVE: {ArchiveDirectory}")
+            return 1
     Configuration = AcceptanceConfiguration(
         RepositoryRoot=RepoRoot,
         OutputRoot=OutputRoot,
@@ -5413,6 +5589,7 @@ def Main(Arguments: list[str] | None = None) -> int:
         PythonExecutable=PythonExecutable,
         DryRun=Parsed.DryRun,
         RoutingThreads=RoutingThreads,
+        RequestedRoutingStrategy=RequestedRoutingStrategy.value,
         BaselineMode=BaselineMode,
         BaselinePath=BaselinePath,
         ExpectedPolicyVersion=ExpectedPolicyVersion,
@@ -5421,13 +5598,65 @@ def Main(Arguments: list[str] | None = None) -> int:
         ),
         MatrixMode=Parsed.MatrixMode,
         IncludeCla4=Parsed.IncludeCla4,
+        ArchiveSessionRoot=(
+            ArchiveDirectory
+            if ArchiveDirectory is not None and BaselineMode is None
+            else None
+        ),
     )
     SessionStartedAtUtc = UtcTimestamp()
+    ArchiveContext = (
+        BenchmarkArchiveContext(
+            Identity=ArchiveIdentity,
+            ArchiveDirectory=ArchiveDirectory,
+            SourceDirectory=Configuration.RecoveryRoot,
+            Command=(
+                sys.executable,
+                str(Path(__file__).resolve()),
+                *RawArguments,
+            ),
+            WorkingDirectory=RepoRoot,
+            MatrixMode=Configuration.MatrixMode,
+            RoutingThreads=Configuration.RoutingThreads,
+            BaselineMode=Configuration.BaselineMode,
+            StartedAtUtc=SessionStartedAtUtc,
+        )
+        if ArchiveIdentity is not None and ArchiveDirectory is not None
+        else None
+    )
     SessionStartedAt = monotonic()
     Capture = CaptureTerminalOutput()
+    ExecutionFailure: BaseException | None = None
+    Interrupted = False
     with Capture:
-        Manifest = RunAcceptance(Configuration)
+        try:
+            Manifest = RunAcceptance(Configuration)
+        except KeyboardInterrupt as Error:
+            ExecutionFailure = Error
+            Interrupted = True
+            print(
+                "Router acceptance interrupted; preserving partial evidence.",
+                file=sys.stderr,
+            )
+        except Exception as Error:
+            ExecutionFailure = Error
+            print(
+                "Router acceptance failed unexpectedly; preserving partial "
+                "evidence.",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
     SessionWallSeconds = monotonic() - SessionStartedAt
+    if ExecutionFailure is not None:
+        Manifest = _LoadIncompleteAcceptanceManifest(
+            Configuration,
+            Status="INTERRUPTED" if Interrupted else "PARTIAL",
+            Failure=(
+                "KeyboardInterrupt"
+                if Interrupted
+                else f"{type(ExecutionFailure).__name__}: {ExecutionFailure}"
+            ),
+        )
     Accepted = bool(Manifest.get("Accepted"))
     IsDryRun = Manifest.get("Status") == "DRY_RUN"
     Runs = Manifest.get("Runs", [])
@@ -5457,6 +5686,8 @@ def Main(Arguments: list[str] | None = None) -> int:
             f"{SkippedCount} skipped."
         )
     )
+    SessionReport = None
+    ReportingError: OSError | None = None
     try:
         SessionReport = WriteRunReport(
             RunDirectory=Configuration.RecoveryRoot,
@@ -5472,7 +5703,11 @@ def Main(Arguments: list[str] | None = None) -> int:
             Stdout=Capture.StdoutText,
             Stderr=Capture.StderrText,
             FailureType=(
-                None
+                "Acceptance: interrupted"
+                if Interrupted
+                else "Acceptance: unexpected-failure"
+                if ExecutionFailure is not None
+                else None
                 if Accepted or IsDryRun
                 else "Acceptance: session-failed"
             ),
@@ -5484,23 +5719,90 @@ def Main(Arguments: list[str] | None = None) -> int:
                 "FailedRuns": FailedCount,
                 "SkippedRuns": SkippedCount,
                 "Runs": CompletedRuns,
+                "UnexpectedFailure": (
+                    None
+                    if ExecutionFailure is None
+                    else f"{type(ExecutionFailure).__name__}: {ExecutionFailure}"
+                ),
             },
         )
     except OSError as Error:
+        ReportingError = Error
+
+    BenchmarkExitCode = (
+        130
+        if Interrupted
+        else 1
+        if ExecutionFailure is not None or ReportingError is not None
+        else 0
+        if IsDryRun or Accepted
+        else 1
+    )
+    ExitClassification = (
+        "interrupted"
+        if Interrupted
+        else "unexpected-harness-failure"
+        if ExecutionFailure is not None
+        else "reporting-failure"
+        if ReportingError is not None
+        else "dry-run"
+        if IsDryRun
+        else "passed"
+        if Accepted
+        else "benchmark-failed"
+    )
+    PublishedArchive = None
+    if ArchiveContext is not None:
+        PublicationStatus = (
+            "INTERRUPTED"
+            if Interrupted
+            else "PARTIAL"
+            if ExecutionFailure is not None or ReportingError is not None
+            else "SEALED"
+        )
+        PublicationFailure = (
+            f"Reporting: write-failed: {ReportingError}"
+            if ReportingError is not None
+            else f"{type(ExecutionFailure).__name__}: {ExecutionFailure}"
+            if ExecutionFailure is not None
+            else None
+        )
+        try:
+            PublishedArchive = PublishBenchmarkArchive(
+                ArchiveContext,
+                Manifest,
+                CompletedAtUtc=UtcTimestamp(),
+                WallSeconds=SessionWallSeconds,
+                ExitCode=BenchmarkExitCode,
+                ExitClassification=ExitClassification,
+                PublicationStatus=PublicationStatus,
+                PublicationFailure=PublicationFailure,
+            )
+        except Exception as Error:
+            print("RESULT: FAILURE — Archiving: write-failed")
+            print(f"TIME: wall={SessionWallSeconds:.3f}s")
+            print(
+                "OUTPUT: Benchmark evidence could not be sealed in its "
+                f"archive: {Error}"
+            )
+            print(f"ARCHIVE: {ArchiveContext.ArchiveDirectory}")
+            return 1
+
+    if ReportingError is not None:
         print("RESULT: FAILURE — Reporting: write-failed")
         print(f"TIME: wall={SessionWallSeconds:.3f}s")
         print(
             "OUTPUT: Acceptance finished, but its session report could not "
-            f"be saved: {Error}"
+            f"be saved: {ReportingError}"
         )
         print(f"RAW REPORT: {Configuration.RecoveryRoot / 'RawDump.txt'}")
-        return 1
-    print("\n".join(SessionReport.ResultLines))
+    elif SessionReport is not None:
+        print("\n".join(SessionReport.ResultLines))
     print(f"Acceptance manifest: {Configuration.ManifestPath}")
-    print(f"Acceptance status: {Manifest['Status']}")
-    if Configuration.DryRun:
-        return 0
-    return 0 if Manifest["Accepted"] else 1
+    print(f"Acceptance status: {Manifest.get('Status', 'UNKNOWN')}")
+    if PublishedArchive is not None:
+        print(f"ARCHIVE: {PublishedArchive}")
+    return BenchmarkExitCode
 
 
 if __name__ == "__main__":

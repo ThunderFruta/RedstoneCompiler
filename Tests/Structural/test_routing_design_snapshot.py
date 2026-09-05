@@ -167,6 +167,40 @@ def BuildValidNandPayload() -> dict[str, object]:
 class RoutingDesignSnapshotTests(unittest.TestCase):
     """Protect evidence identity, typed failure meaning, and fresh publication."""
 
+    def test_process_timeout_preserves_absence_of_compiler_proof(self):
+        with TemporaryDirectory() as Directory:
+            Root = Path(Directory)
+            ManifestPath = Root / "AcceptanceManifest.json"
+            Paths = {Key: str(Root / Name) for Key, Name in {
+                "RoutingFailure": "CLA4.RoutingFailure.json", "Schematic": "CLA4.litematic",
+                "PhysicalDesign": "CLA4.PhysicalDesign.json", "TruthTable": "CLA4.TruthTable.txt",
+            }.items()}
+            Payload = {
+                "SchemaVersion": SnapshotTool.AcceptanceManifestSchemaVersion,
+                "SourceState": {"Revision": "baseline"},
+                "SourceProvenance": {"ExpectedPolicyVersion": "baseline-policy", "BenchmarkInputs": {"CarryLookaheadAdder4": {"Sha256": "input"}}},
+                "Runs": [{"Circuit": "CarryLookaheadAdder4", "RunName": "CLA4", "Accepted": False, "ArtifactPaths": Paths, "Evaluation": {"Process": {"TimedOut": True, "ReturnCode": 124, "WallRuntimeSeconds": 125.0}}}],
+            }
+            ManifestPath.write_text(json.dumps(Payload))
+            Result = SnapshotTool.SummarizeCla4ProcessTimeout(ManifestPath)
+            self.assertEqual(Result["EvidenceKind"], "ACCEPTANCE_PROCESS_TIMEOUT")
+            self.assertEqual(Result["Reason"], "ProcessTimeout")
+            self.assertTrue(Result["TimedOut"])
+            self.assertIsNone(Result["DetailedRoutingStarted"])
+            Path(Paths["RoutingFailure"]).write_text("{}")
+            with self.assertRaisesRegex(ValueError, "mixed compiler evidence"):
+                SnapshotTool.SummarizeCla4ProcessTimeout(ManifestPath)
+
+    def test_non_timeout_manifest_cannot_supply_a_compiler_failure(self):
+        with TemporaryDirectory() as Directory:
+            PathValue = Path(Directory) / "AcceptanceManifest.json"
+            PathValue.write_text(json.dumps({
+                "SchemaVersion": SnapshotTool.AcceptanceManifestSchemaVersion,
+                "Runs": [{"Circuit": "CarryLookaheadAdder4", "Accepted": False, "Evaluation": {"Process": {"TimedOut": False, "ReturnCode": 1}}}],
+            }))
+            with self.assertRaisesRegex(ValueError, "not a recorded process timeout"):
+                SnapshotTool.SummarizeCla4ProcessTimeout(PathValue)
+
     def testCla4PlacementOverlapWithRemainingBudgetIsNotTimeout(self) -> None:
         with TemporaryDirectory() as Directory:
             FailurePath = WriteSyntheticFailure(Path(Directory))
