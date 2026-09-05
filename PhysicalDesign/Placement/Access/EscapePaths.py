@@ -18,6 +18,7 @@ from typing import (
     Iterable,
 )
 from PhysicalDesign.Contracts.Core import Position3
+from PhysicalDesign.Constraints.PhysicalClaims import MandatoryClaimsConflict
 from PhysicalDesign.Resources.ResourceGraph import FindSelfClaimConflicts
 from PhysicalDesign.Redstone.Technology import RedstoneRoutingTechnology
 from .Geometry import (
@@ -328,6 +329,7 @@ def _BuildShortestLegalFabricEscapePaths(
     FixedPrefix: tuple[Position3, ...],
     ResourceGraph: Any,
     Adjacency: dict[Position3, tuple[Position3, ...]] | None = None,
+    ForeignFixedClaims: tuple[Any, ...] = (),
 ) -> tuple[tuple[Position3, ...], ...]:
     """Return one deterministic, geometrically distinct path per ingress."""
     if Adjacency is None:
@@ -346,7 +348,13 @@ def _BuildShortestLegalFabricEscapePaths(
     ):
         return ()
     InitialClaims = ResourceGraph.BuildRouteClaims(FixedPrefix)
-    if FindSelfClaimConflicts({"PlacementAccess": InitialClaims}):
+    if (
+        FindSelfClaimConflicts({"PlacementAccess": InitialClaims})
+        or any(
+            MandatoryClaimsConflict(InitialClaims, Claims)
+            for Claims in ForeignFixedClaims
+        )
+    ):
         return ()
     Results = []
     for Ingress in OrderedIngresses:
@@ -409,6 +417,12 @@ def _BuildShortestLegalFabricEscapePaths(
                     ReachedPath = Path
                     break
             for Next in OrderedNeighbors.get(Current, ()):
+                StepClaims = ResourceGraph.BuildRouteClaims((Current, Next))
+                if any(
+                    MandatoryClaimsConflict(StepClaims, Claims)
+                    for Claims in ForeignFixedClaims
+                ):
+                    continue
                 Direction = tuple(
                     Next[Index] - Current[Index]
                     for Index in range(3)
@@ -602,6 +616,7 @@ def _BuildSharedLegalFabricEscapePaths(
     Edges: Iterable[tuple[Position3, Position3]],
     FixedPrefix: tuple[Position3, ...],
     ResourceGraph: Any,
+    ForeignFixedClaims: tuple[Any, ...] = (),
 ) -> tuple[tuple[Position3, ...], ...]:
     """Build the compact shared escape tree used by one-plane fabrics."""
     Adjacency: dict[Position3, list[Position3]] = {}
@@ -636,7 +651,13 @@ def _BuildSharedLegalFabricEscapePaths(
                 Next,
             ))
             CandidateClaims = ResourceGraph.BuildRouteClaims(CandidatePath)
-            if FindSelfClaimConflicts({"PlacementAccess": CandidateClaims}):
+            if (
+                FindSelfClaimConflicts({"PlacementAccess": CandidateClaims})
+                or any(
+                    MandatoryClaimsConflict(CandidateClaims, Claims)
+                    for Claims in ForeignFixedClaims
+                )
+            ):
                 continue
             Parent[Next] = Current
             CompletePathByNode[Next] = CandidatePath

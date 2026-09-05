@@ -21,8 +21,14 @@ from typing import (
     Iterable,
 )
 from PhysicalDesign.Redstone.Rules.Geometry import BuildRoutingResources
+from PhysicalDesign.Constraints.PhysicalClaims import MandatoryClaimsConflict
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 from PhysicalDesign.Contracts.Placement import PlacementAccessAssignment, PlacementAccessEscapeStub, PlacementAccessFabric, PlacementAccessTerminalDomain
+from PhysicalDesign.Contracts.PlacementAccess import (
+    PlacementAccessSolveResult,
+    PlacementAccessSolveStatus,
+    SelectedPlacementPinAccessWitness,
+)
 from PhysicalDesign.Contracts.Core import Position3
 from PhysicalDesign.Resources.ResourceGraph import FindSelfClaimConflicts
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology, RedstoneRoutingTechnology
@@ -113,6 +119,7 @@ def _BuildPlacementAccessEscapeStubs(
     Terminal: Position3,
     Resources: Any,
     TopologyKind: str,
+    ForeignFixedClaims: tuple[Any, ...] = (),
 ) -> list[PlacementAccessEscapeStub]:
     """Materialize the deterministic conflict-free stubs of one terminal."""
     Results = []
@@ -122,7 +129,13 @@ def _BuildPlacementAccessEscapeStubs(
         if not StubPath or StubPath in SeenStubPaths:
             continue
         Claims = Resources.ResourceGraph.BuildRouteClaims(StubPath)
-        if FindSelfClaimConflicts({Signal: Claims}):
+        if (
+            FindSelfClaimConflicts({Signal: Claims})
+            or any(
+                MandatoryClaimsConflict(Claims, FixedClaims)
+                for FixedClaims in ForeignFixedClaims
+            )
+        ):
             continue
         SeenStubPaths.add(StubPath)
         Results.append(PlacementAccessEscapeStub(
@@ -188,6 +201,240 @@ def _ValidatePlacementAccessFabricOptions(
     return IsPerimeterTopology
 
 
+def _BuildSelectedStraightPlacementAccessFabric(
+    Placement: Any,
+    *,
+    TerminalPaths: tuple[
+        tuple[str, Position3, tuple[Position3, ...]],
+        ...,
+    ],
+    Resources: Any,
+    Technology: RedstoneRoutingTechnology,
+    PinAccessWitness: SelectedPlacementPinAccessWitness,
+    FixedPinAccessSolve: PlacementAccessSolveResult | Any,
+    TopologyKind: str,
+    AccessRingTrackCount: int,
+    Shell: DerivedPerimeterFabricShell | None,
+    DerivedSlotAssignment: Any | None,
+    PinAccessDomainFingerprint: str,
+    PinAccessWitnessFingerprint: str,
+    WorkCheck: Callable[[dict[str, object]], None] | None,
+) -> PlacementAccessFabric:
+    """Materialize one authoritative S1 stub per selected straight leg.
+
+    The selected access option already fixes the complete physical first leg
+    and its first-track entry.  The stub retains that first leg verbatim and
+    projects the first-track coordinate onto its routing layer for portal
+    grouping; detailed routing remains responsible for geometry after the
+    immutable first leg.  Re-enumerating the legacy whole-band escape domain
+    would turn the frozen choice back into a speculative access search.
+    """
+    SelectionsByTerminal: dict[
+        tuple[str, Position3, tuple[Position3, ...]],
+        Any,
+    ] = {}
+    for Selection in PinAccessWitness.Selections:
+        if str(Selection.PatternFamily) != "straight":
+            raise ValueError(
+                "the S1 selected-access fabric requires straight options"
+            )
+        Key = (
+            str(Selection.Signal),
+            tuple(Selection.Terminal),
+            tuple(Selection.FirstLegNodes),
+        )
+        Existing = SelectionsByTerminal.get(Key)
+        if (
+            Existing is not None
+            and Existing.SelectionFingerprint
+            != Selection.SelectionFingerprint
+        ):
+            raise ValueError(
+                "selected pin access repeats a physical path identity"
+            )
+        SelectionsByTerminal[Key] = Selection
+
+    Gates = tuple(Placement.Placed.PlacedGates)
+    BaseY = min(Gate.Y for Gate in Gates)
+    RoutingLayerCount = max(1, int(Placement.LayerCount))
+    ProvisionalDomains = []
+    IngressNodes = set()
+    for TerminalIndex, (Signal, Terminal, AccessPath) in enumerate(
+        TerminalPaths
+    ):
+        if WorkCheck is not None:
+            WorkCheck({
+                "Phase": "selected-straight-access-terminal-domain",
+                "CompletedTerminalCount": TerminalIndex,
+                "TerminalCount": len(TerminalPaths),
+                "Signal": Signal,
+            })
+        Selection = SelectionsByTerminal.get((
+            str(Signal),
+            tuple(Terminal),
+            tuple(AccessPath),
+        ))
+        if Selection is None:
+            raise ValueError(
+                "routing profile is missing its selected pin-access option"
+            )
+        FirstLegNodes = tuple(Selection.FirstLegNodes)
+        if tuple(AccessPath) != FirstLegNodes:
+            raise ValueError(
+                "routing profile substituted its selected pin-access first leg"
+            )
+        FirstTrackNode = tuple(Selection.FirstTrackNode)
+        Face = tuple(Selection.Face)
+        if Face[1] != 0 or abs(Face[0]) + abs(Face[2]) != 1:
+            raise ValueError("selected straight access has an invalid face")
+        MatchingLayers = tuple(
+            Layer
+            for Layer in range(RoutingLayerCount)
+            if Technology.RoutingY(BaseY, Layer) == FirstTrackNode[1] + 1
+        )
+        if not MatchingLayers:
+            raise ValueError(
+                "selected pin access has no corresponding routing layer"
+            )
+        RoutingY = Technology.RoutingY(BaseY, MatchingLayers[0])
+        Ingress = (
+            FirstTrackNode[0],
+            RoutingY,
+            FirstTrackNode[2],
+        )
+        # The fixed-placement solve already validated the exact claims of
+        # every selected first leg and their aggregate.  Rebuilding or
+        # extending those claims here would create a second access decision.
+        Stub = PlacementAccessEscapeStub(
+            Terminal=tuple(Terminal),
+            Ingress=Ingress,
+            Path=FirstLegNodes,
+            PhysicalClaims=Selection.Claims,
+            CapacityResourceIds=tuple(sorted(
+                Selection.Claims.ResourceIds,
+                key=str,
+            )),
+            Complete=True,
+        )
+        IngressNodes.add(Ingress)
+        ProvisionalDomains.append(PlacementAccessTerminalDomain(
+            Signal=str(Signal),
+            Terminal=tuple(Terminal),
+            EscapeStubs=(Stub,),
+            Complete=True,
+        ))
+    TerminalDomains = tuple(ProvisionalDomains)
+    IngressNodesValue = tuple(sorted(
+        Stub.Ingress
+        for Domain in TerminalDomains
+        for Stub in Domain.EscapeStubs
+    ))
+    FabricNodes = tuple(sorted(set(IngressNodesValue)))
+    FabricEdges: tuple[tuple[Position3, Position3], ...] = ()
+    PhysicalClaims = Resources.ResourceGraph.BuildRouteClaims(FabricNodes)
+    Complete = all(Domain.Complete for Domain in TerminalDomains)
+    IncompleteReason = next((
+        Domain.IncompleteReason
+        for Domain in TerminalDomains
+        if not Domain.Complete
+    ), "")
+    OuterBounds = (
+        tuple(Shell.OuterBounds)
+        if Shell is not None
+        else None
+    )
+    ActiveFaces = tuple(Shell.ActiveFaces) if Shell is not None else ()
+    PerimeterSlotAssignmentFingerprint = str(getattr(
+        DerivedSlotAssignment,
+        "AssignmentFingerprint",
+        "",
+    ))
+    FabricLayers = tuple(sorted({
+        Layer
+        for Layer in range(RoutingLayerCount)
+        if any(
+            Technology.RoutingY(BaseY, Layer) == Ingress[1]
+            for Ingress in IngressNodesValue
+        )
+    }))
+    CanonicalIdentity = (
+        TopologyKind,
+        AccessRingTrackCount,
+        OuterBounds,
+        ActiveFaces,
+        PerimeterSlotAssignmentFingerprint,
+        getattr(Technology, "TechnologyVersion", ""),
+        repr(Technology),
+        FabricLayers,
+        FabricNodes,
+        FabricEdges,
+        tuple(
+            (
+                Domain.Signal,
+                Domain.Terminal,
+                tuple(
+                    (Stub.Ingress, Stub.Path, Stub.CapacityResourceIds)
+                    for Stub in Domain.EscapeStubs
+                ),
+                Domain.Complete,
+            )
+            for Domain in TerminalDomains
+        ),
+        Complete,
+        (
+            "selected-straight-first-track-v1",
+            PinAccessDomainFingerprint,
+            PinAccessWitnessFingerprint,
+        ),
+    )
+    AccessRingFingerprint = (
+        sha256(repr((
+            "selected-straight-first-track-v1",
+            TopologyKind,
+            AccessRingTrackCount,
+            OuterBounds,
+            ActiveFaces,
+            FabricLayers,
+            FabricNodes,
+        )).encode("utf-8")).hexdigest()[:16]
+        if AccessRingTrackCount
+        else ""
+    )
+    return PlacementAccessFabric(
+        FabricFingerprint=sha256(
+            repr(CanonicalIdentity).encode("utf-8")
+        ).hexdigest()[:16],
+        Nodes=FabricNodes,
+        Edges=FabricEdges,
+        IngressNodes=IngressNodesValue,
+        PhysicalClaims=PhysicalClaims,
+        CapacityResourceIds=tuple(sorted(
+            PhysicalClaims.ResourceIds,
+            key=str,
+        )),
+        TerminalDomains=TerminalDomains,
+        TopologyKind=TopologyKind,
+        Complete=Complete,
+        AccessRingTrackCount=AccessRingTrackCount,
+        AccessRingFingerprint=AccessRingFingerprint,
+        OuterBounds=OuterBounds,
+        ActiveFaces=ActiveFaces,
+        PerimeterSlotAssignmentFingerprint=(
+            PerimeterSlotAssignmentFingerprint
+        ),
+        LegalEscapeExpansionCount=0,
+        LegalEscapeExpansionLimit=None,
+        LegalEscapeWorkLimitKind="selected-straight-first-track-v1",
+        LegalEscapeDirectionStateUpperBound=None,
+        IncompleteReason=("" if Complete else IncompleteReason),
+        PinAccessWitness=PinAccessWitness,
+        FixedPinAccessSolve=FixedPinAccessSolve,
+        Technology=Technology,
+        PinAccessDomainFingerprint=PinAccessDomainFingerprint,
+        PinAccessWitnessFingerprint=PinAccessWitnessFingerprint,
+    )
+
+
 def BuildPlacementAccessFabric(
     Placement: Any,
     *,
@@ -206,6 +453,9 @@ def BuildPlacementAccessFabric(
     MaximumLegalEscapeExpansions: int | None = None,
     DeriveLegalEscapeWorkLimit: bool = False,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    PinAccessWitness: SelectedPlacementPinAccessWitness | Any | None = None,
+    FixedPinAccessSolve: PlacementAccessSolveResult | Any | None = None,
+    RequireSelectedPinAccessWitness: bool = False,
 ) -> PlacementAccessFabric:
     """Construct one fixed access fabric from placement and technology."""
     IsPerimeterTopology = _ValidatePlacementAccessFabricOptions(
@@ -218,10 +468,48 @@ def BuildPlacementAccessFabric(
         DeriveLegalEscapeWorkLimit=DeriveLegalEscapeWorkLimit,
     )
     Placed = Placement.Placed
-    Resources = Resources or BuildRoutingResources(Placed, WorkCheck=WorkCheck)
+    Resources = Resources or BuildRoutingResources(
+        Placed,
+        WorkCheck=WorkCheck,
+        Technology=Technology,
+    )
+    AttachedPinAccessWitness = (
+        getattr(Placement, "SelectedPinAccessWitness", None)
+        or getattr(Placed, "SelectedPinAccessWitness", None)
+    )
+    if PinAccessWitness is None:
+        PinAccessWitness = AttachedPinAccessWitness
+    elif (
+        AttachedPinAccessWitness is not None
+        and PinAccessWitness.WitnessFingerprint
+        != AttachedPinAccessWitness.WitnessFingerprint
+    ):
+        raise ValueError(
+            "placement access fabric received a substituted pin-access "
+            "witness"
+        )
+    AttachedPinAccessSolve = (
+        getattr(Placement, "PlacementAccessSolve", None)
+        or getattr(Placed, "PlacementAccessSolve", None)
+    )
+    if FixedPinAccessSolve is None:
+        FixedPinAccessSolve = AttachedPinAccessSolve
+    elif (
+        AttachedPinAccessSolve is not None
+        and str(getattr(FixedPinAccessSolve, "ProblemFingerprint", ""))
+        != str(getattr(AttachedPinAccessSolve, "ProblemFingerprint", ""))
+    ):
+        raise ValueError(
+            "placement access fabric received a substituted pin-access solve"
+        )
+    if RequireSelectedPinAccessWitness and PinAccessWitness is None:
+        raise ValueError(
+            "routing-aware placement access requires the placement-selected "
+            "pin-access witness"
+        )
     EffectiveAccessLength = (
         int(Technology.AccessLength)
-        if AccessLength is None
+        if AccessLength is None or RequireSelectedPinAccessWitness
         else int(AccessLength)
     )
     if EffectiveAccessLength < 1:
@@ -232,15 +520,58 @@ def BuildPlacementAccessFabric(
         else None
     )
     Gates = tuple(Placed.PlacedGates)
-    PinAccessWitness = BuildPlacementPinAccessWitness(
-        Gates,
-        AccessLength=EffectiveAccessLength,
-        RequireCatalogMatch=True,
-    )
-    FixedPinAccessSolve = BuildFixedPlacementPinAccessSolve(
+    if PinAccessWitness is None:
+        PinAccessWitness = BuildPlacementPinAccessWitness(
+            Gates,
+            AccessLength=EffectiveAccessLength,
+            RequireCatalogMatch=True,
+        )
+    if (
+        not bool(getattr(PinAccessWitness, "Complete", False))
+        or not bool(getattr(PinAccessWitness, "CatalogMatched", False))
+    ):
+        raise ValueError(
+            "placement access fabric requires a complete catalog witness"
+        )
+    if int(getattr(PinAccessWitness, "AccessLength", 0)) != (
+        EffectiveAccessLength
+    ):
+        raise ValueError(
+            "placement access fabric cannot truncate or extend its selected "
+            "pin-access witness"
+        )
+    if FixedPinAccessSolve is None:
+        if RequireSelectedPinAccessWitness:
+            raise ValueError(
+                "routing-aware placement access requires the exact placement "
+                "pin-access solve"
+            )
+        FixedPinAccessSolve = BuildFixedPlacementPinAccessSolve(
+            PinAccessWitness,
+            Resources.ResourceGraph,
+            WorkCheck,
+        )
+    SolveWitness = getattr(FixedPinAccessSolve, "SelectedWitness", None)
+    if (
+        RequireSelectedPinAccessWitness
+        and (
+            getattr(FixedPinAccessSolve, "Status", None) is not PlacementAccessSolveStatus.Feasible
+            or SolveWitness is None
+            or SolveWitness.WitnessFingerprint
+            != PinAccessWitness.WitnessFingerprint
+        )
+    ):
+        raise ValueError(
+            "placement access fabric requires the successful solve that "
+            "selected its exact pin-access witness"
+        )
+    PinAccessDomainFingerprint = str(getattr(
         PinAccessWitness,
-        Resources.ResourceGraph,
-        WorkCheck,
+        "DomainFingerprint",
+        "",
+    ))
+    PinAccessWitnessFingerprint = str(
+        PinAccessWitness.WitnessFingerprint
     )
     if not Gates:
         if Shell is not None:
@@ -267,6 +598,8 @@ def BuildPlacementAccessFabric(
             PinAccessWitness=PinAccessWitness,
             FixedPinAccessSolve=FixedPinAccessSolve,
             Technology=Technology,
+            PinAccessDomainFingerprint=PinAccessDomainFingerprint,
+            PinAccessWitnessFingerprint=PinAccessWitnessFingerprint,
         )
     if (
         DerivedSlotAssignment is not None
@@ -329,6 +662,8 @@ def BuildPlacementAccessFabric(
             PinAccessWitness=PinAccessWitness,
             FixedPinAccessSolve=FixedPinAccessSolve,
             Technology=Technology,
+            PinAccessDomainFingerprint=PinAccessDomainFingerprint,
+            PinAccessWitnessFingerprint=PinAccessWitnessFingerprint,
         )
     if DerivedSlotAssignment is not None:
         if Shell is None:
@@ -362,6 +697,9 @@ def BuildPlacementAccessFabric(
             Placed,
             AccessLength=EffectiveAccessLength,
             AccessWitness=PinAccessWitness,
+            RequireExplicitAccessWitness=(
+                RequireSelectedPinAccessWitness
+            ),
         )
         if BoundarySignals is not None:
             Profiles = {
@@ -419,6 +757,28 @@ def BuildPlacementAccessFabric(
         TerminalPaths = tuple(
             (Signal, Terminal, TerminalPathByIdentity[(Signal, Terminal)])
             for Signal, Terminal in sorted(TerminalPathByIdentity)
+        )
+    if (
+        RequireSelectedPinAccessWitness
+        and all(
+            str(Selection.PatternFamily) == "straight"
+            for Selection in PinAccessWitness.Selections
+        )
+    ):
+        return _BuildSelectedStraightPlacementAccessFabric(
+            Placement,
+            TerminalPaths=TerminalPaths,
+            Resources=Resources,
+            Technology=Technology,
+            PinAccessWitness=PinAccessWitness,
+            FixedPinAccessSolve=FixedPinAccessSolve,
+            TopologyKind=TopologyKind,
+            AccessRingTrackCount=AccessRingTrackCount,
+            Shell=Shell,
+            DerivedSlotAssignment=DerivedSlotAssignment,
+            PinAccessDomainFingerprint=PinAccessDomainFingerprint,
+            PinAccessWitnessFingerprint=PinAccessWitnessFingerprint,
+            WorkCheck=WorkCheck,
         )
     Margin = TrackPitch * (
         AccessRingTrackCount
@@ -735,10 +1095,22 @@ def BuildPlacementAccessFabric(
             LegalEscapeWorkBudget = _AccessFabricWorkBudget(
                 MaximumExpansions=LegalEscapeDirectionStateUpperBound,
             )
+    SelectedAccessClaimsBySignal = (
+        dict(PinAccessWitness.ClaimsBySignal)
+        if RequireSelectedPinAccessWitness
+        else {}
+    )
     TerminalDomains = []
     for TerminalIndex, (Signal, Terminal, AccessPath) in enumerate(
         TerminalPaths
     ):
+        ForeignFixedClaims = tuple(
+            Claims
+            for Owner, Claims in sorted(
+                SelectedAccessClaimsBySignal.items()
+            )
+            if Owner != Signal
+        )
         if WorkCheck is not None:
             WorkCheck({
                 "Phase": "placement-access-terminal-domain",
@@ -762,6 +1134,7 @@ def BuildPlacementAccessFabric(
         if (
             len(AccessPath) >= 2
             and not IsPerimeterTopology
+            and not RequireSelectedPinAccessWitness
         ):
             Delta = tuple(
                 AccessPath[-1][Index] - AccessPath[-2][Index]
@@ -1028,6 +1401,7 @@ def BuildPlacementAccessFabric(
                     Region.Edges,
                     tuple(EscapePrefix),
                     Resources.ResourceGraph,
+                    ForeignFixedClaims=ForeignFixedClaims,
                 )
             )
         else:
@@ -1038,6 +1412,7 @@ def BuildPlacementAccessFabric(
             Terminal=Terminal,
             Resources=Resources,
             TopologyKind=TopologyKind,
+            ForeignFixedClaims=ForeignFixedClaims,
         )
         if (
             not Stubs
@@ -1060,12 +1435,14 @@ def BuildPlacementAccessFabric(
                         tuple(EscapePrefix),
                         Resources.ResourceGraph,
                         Adjacency=RegionAdjacency,
+                        ForeignFixedClaims=ForeignFixedClaims,
                     )
                 ),
                 Signal=Signal,
                 Terminal=Terminal,
                 Resources=Resources,
                 TopologyKind=TopologyKind,
+                ForeignFixedClaims=ForeignFixedClaims,
             )
         Stubs = tuple(Stubs)
         TerminalDomains.append(PlacementAccessTerminalDomain(
@@ -1125,6 +1502,15 @@ def BuildPlacementAccessFabric(
         ),
         Complete,
     )
+    if PinAccessDomainFingerprint:
+        CanonicalIdentity = (
+            *CanonicalIdentity,
+            (
+                "selected-pin-access-v1",
+                PinAccessDomainFingerprint,
+                PinAccessWitnessFingerprint,
+            ),
+        )
     AccessRingFingerprint = (
         sha256(repr((
             TopologyKind,
@@ -1180,6 +1566,8 @@ def BuildPlacementAccessFabric(
         PinAccessWitness=PinAccessWitness,
         FixedPinAccessSolve=FixedPinAccessSolve,
         Technology=Technology,
+        PinAccessDomainFingerprint=PinAccessDomainFingerprint,
+        PinAccessWitnessFingerprint=PinAccessWitnessFingerprint,
     )
 
 def AttachPlacementAccessFabric(
