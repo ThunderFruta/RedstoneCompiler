@@ -26,6 +26,10 @@ and the acceptance manifest produced for that run.
 
 ## Validation and evidence
 
+- [Rewrite readiness and branch workflow](../Pillars/RewriteWorkflow.md) separates
+  commit/integration gates from production promotion; the
+  [dependency register](../Pillars/CapabilityDependencies.md) tracks tested
+  capability checkpoints across parallel branches.
 - [Running tests](../Testing/RunningTests.md) and
   [benchmarks and acceptance gates](../Testing/Benchmarks.md) define current
   commands and gates.

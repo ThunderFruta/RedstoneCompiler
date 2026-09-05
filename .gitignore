@@ -1,5 +1,7 @@
 .vscode/
-.codex/
+.codex/*
+!.codex/environments/
+!.codex/environments/redstonecompiler-worktree.toml
 # Migration-generated cache
 Cache/
 .cache/
@@ -13,9 +15,18 @@ Cache/Gradle/ServerHarness/Project/
 Cache/Gradle/ServerHarness/Build/
 # Ignore a default cache if a caller explicitly overrides project cache settings.
 Validation/Fabric/ServerHarness/.gradle/
+# Keep manager source visible while excluding the installed Fabric runtime.
+ValidationServerHarness/Server/*
+!ValidationServerHarness/Server/PyScripts/
+ValidationServerHarness/Server/PyScripts/*
+!ValidationServerHarness/Server/PyScripts/*.py
+ValidationServerHarness/.gradle/
+ValidationServerHarness/build/
 .runtime/
 Output/
 Kernels/Routing/target/
+RustRouting/target/
 RedstoneCompiler/*.so
 /**/*.o
 Validation/Fabric/ServerHarness/build/
+Validation/Fabric/Harness/build/

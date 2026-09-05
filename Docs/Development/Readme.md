@@ -7,4 +7,5 @@ Contains setup, contribution conventions, and workflow guidance.
 - [Adding cells](AddingCells.md)
 - [Adding examples](AddingExamples.md)
 - [Routing debugging](Debugging.md)
+- [Arithmetic routing regions](ArithmeticRoutingRegions.md)
 - [Legacy routing and shim retirement](LegacyRetirement.md)

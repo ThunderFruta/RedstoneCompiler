@@ -11,6 +11,17 @@ The two groups have different roles:
 - `N/` contains the correctness, execution, reuse, and acceptance requirements
   that every applicable pillar must obey.
 
+## Development workflow
+
+Use the [rewrite-readiness and dependent-branch workflow](RewriteWorkflow.md)
+to distinguish commit-ready changes, proven capabilities, and production
+promotion. `main` remains stable; `Router-Refactor(R10-N5)` is the existing
+shared rewrite integration branch. Parallel work consumes explicit tested
+checkpoints recorded in the [capability dependency register](CapabilityDependencies.md).
+Use the [worktree buckets](WorktreeBuckets.md) to place tightly coupled R/N work
+together and separate consumers that can develop against stable interfaces.
+These development gates do not redefine or waive the acceptance claims below.
+
 ## Requested pillars
 
 | ID | Requirement | Primary owner | Records |

@@ -19,10 +19,12 @@ in this tree instead of being duplicated in the repository root.
 - [Development]
   - [Readme](Development/Readme.md)
   - [Legacy routing and shim retirement](Development/LegacyRetirement.md)
+- [Getting started]
+  - [Readme](GettingStarted/Readme.md)
+  - [Compile FullAdder](GettingStarted/CompileFullAdder.md)
+  - [Export to Minecraft](GettingStarted/ExportToMinecraft.md)
 - [Formats]
   - [Readme](Formats/Readme.md)
-- [Guides]
-  - [Readme](Guides/Readme.md)
 - [Routing]
   - [Readme](Routing/Readme.md)
   - [Routing-aware placement and access design](Routing/Active/RoutingAwarePlacementAccessDesign.md)

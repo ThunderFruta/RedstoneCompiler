@@ -7,14 +7,13 @@ example.
 python3 Main.py \
   --input Assets/Examples/FullAdder.sv \
   --output Output/FullAdder/FullAdder.litematic \
-  --diagram Output/FullAdder/FullAdder.Nand.json \
-  --routing-strategy new-router-first
+  --diagram Output/FullAdder/FullAdder.Nand.json
 ```
 
 A successful compile publishes the litematic, NAND JSON, truth table, and
-physical design JSON together. Check that the truth table reports
-8/8 passing rows and that `FinalValidation` has zero conflicts and unresolved
-claims. `Strategy.FallbackUsed` must be false.
+physical design JSON together. Check that the truth table reports 8/8 passing
+rows and that `FinalValidation` has zero conflicts and unresolved claims.
+`Strategy.FallbackUsed` must be false.
 
 Failure is transactional: a typed `.RoutingFailure.json` may be published, but
 no failed physical design or litematic is accepted. See the

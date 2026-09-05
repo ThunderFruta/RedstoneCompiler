@@ -13,4 +13,4 @@ validation.
 Publication is transactional: routing or simulation failure must not leave a
 new litematic that appears successful. Use the compiler's `--push` or
 `--push-file` workflow described in the
-[Minecraft export guide](../Guides/MinecraftExport.md).
+[Minecraft export guide](../GettingStarted/ExportToMinecraft.md).

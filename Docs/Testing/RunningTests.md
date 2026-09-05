@@ -1,5 +1,20 @@
 # Running tests
 
+## Rewrite readiness versus production acceptance
+
+Follow the [rewrite workflow](../Pillars/RewriteWorkflow.md) for commit and
+integration readiness. Scoped soundness, architecture/ownership constraints,
+and small real producer/consumer tests gate developing capabilities; full-router
+acceptance gates production promotion rather than every intermediate commit.
+Record exact dependency checkpoints in the
+[capability register](../Pillars/CapabilityDependencies.md).
+
+A unit suite cannot establish a production path it mocks or bypasses. Likewise,
+a known missing experimental capability does not require restoring old router
+assumptions to get the matrix green. Classify failures, preserve all outcomes,
+and keep milestone acceptance unmet until its actual evidence exists. The
+physical, MCHPRS/Fabric, provenance, and operational gates below are not weakened.
+
 ## Structural and contract gates
 
 ```bash

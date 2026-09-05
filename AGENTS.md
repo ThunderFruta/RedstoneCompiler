@@ -30,4 +30,10 @@ Add focused tests beside the owning domain. Before broad runs, use the structura
 
 ## Commit & Pull Request Guidelines
 
+For parallel rewrite work, read `Docs/Pillars/WorktreeBuckets.md` and
+`Docs/Pillars/RewriteWorkflow.md`. Use the bucket assigned to the capability;
+coordinate shared-contract edits and consume explicit dependency checkpoints
+from `Docs/Pillars/CapabilityDependencies.md`. The base checkout serves `main`
+and `Router-Refactor(R10-N5)` for integration/release, not feature ownership.
+
 Follow recent history with short, imperative subjects such as `Add MCHPRS validation harness and Fabric canary gate`. Keep commits scoped to one coherent change. Pull requests should explain behavior and architecture impact, list exact verification commands and results, link relevant issues, and identify generated evidence. Do not commit `Output/`, `Cache/`, `.venv/`, `RustRouting/target/`, native `.so` files, or `Runtime/FabricServer/` secrets, worlds, logs, and downloaded JARs.
