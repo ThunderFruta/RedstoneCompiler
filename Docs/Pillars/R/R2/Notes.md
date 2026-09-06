@@ -55,6 +55,14 @@ controls when the two disagree.
 
 ## Working notes
 
+- `a4c622b4b66944938f4cfd9bcfae0b699db75992` (`Preserve selected routing
+  envelopes during capacity preparation`) is a Joint-owned consumer-boundary
+  checkpoint. Capacity preparation now preserves the selected routing envelope
+  rather than replacing or weakening the selected route data; the accompanying
+  placement-envelope replay test covers that integration behavior. This is a
+  scoped routing/coordination change, not a new Physical-Rules legality rule or
+  a claim of end-to-end physical-design acceptance. Telemetry provenance and
+  separate dependency/acceptance work remain outstanding.
 - The current implementation compiles complete straight-only option domains at
   each fixed placement, selects exactly one option per logical terminal, and
   freezes the resulting witness.

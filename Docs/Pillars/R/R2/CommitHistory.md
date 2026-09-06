@@ -5,6 +5,7 @@ listed only when its scope and verification are known.
 
 | Commit | Date | Relationship to R2 |
 |---|---|---|
+| `a4c622b` — Preserve selected routing envelopes during capacity preparation | 2026-09-06 | Joint consumer checkpoint: capacity preparation retains selected routing envelopes, with placement-envelope replay coverage. It does not establish a complete five-stage handoff, Telemetry provenance, or R2 acceptance. |
 | `ea77a28` — Implement joint physical-design Stage 1 | 2026-09-05 | Squashed Joint checkpoint covering placement/orchestration, assignment, routing consumers, result transport, candidate commitment, integration tests, R2 evidence, and the v17-default decision. It consumes Physical-Rules checkpoint `2f69160`; retained live evidence remains tied to pre-split `2024d7d`, and Stage 1 remains unaccepted. |
 
 ## Reclassified prerequisites from the legacy R1 branch

@@ -100,11 +100,22 @@ def SolvePrePlacementCapacityProblem(Context, Candidates: Iterable[PcbPlacementC
             if CandidateResources is None:
                 CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placement.Placed, Technology=Context.Technology)
                 Context.RoutingResourcesByFingerprint[Candidate.PlacementFingerprint] = CandidateResources
+            CandidatePolicy = (
+                BuildFrozenEnvelopeRoutingPolicy(
+                    Context.Policy,
+                    Candidate.RoutingEnvelope,
+                )
+                if (
+                    Candidate.RoutingEnvelope is not None
+                    and len(Candidate.Placement.Clusters) == 1
+                )
+                else Context.Policy
+            )
             try:
                 Preparation = PrepareTrackAssignment(
                     Candidate.Placement,
                     Resources=CandidateResources,
-                    Policy=Context.Policy,
+                    Policy=CandidatePolicy,
                     Deadline=Context.Deadline,
                     DeferClusterBoundaryLeaseUntilCapacityPrecheck=(
                         RequiresExactClusterInterfaceSolve(
