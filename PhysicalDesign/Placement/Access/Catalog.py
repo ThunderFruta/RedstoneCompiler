@@ -57,9 +57,10 @@ def _Translate(Value: Position3, Origin: Position3) -> Position3:
     return _Add(Value, Origin)
 
 
-def _TechnologyFingerprint(
+def BuildPinAccessTechnologyFingerprint(
     Technology: RedstoneRoutingTechnology,
 ) -> str:
+    """Identify the exact routing technology used by pin-access proofs."""
     return BuildStableFingerprint({
         "Kind": "pin-access-technology-v1",
         "Technology": asdict(Technology),
@@ -76,7 +77,7 @@ def _ResourceModelFingerprint(
     return BuildStableFingerprint({
         "Kind": "pin-access-resource-model-v1",
         "GraphVersion": ResourceGraph.GraphVersion,
-        "TechnologyFingerprint": _TechnologyFingerprint(
+        "TechnologyFingerprint": BuildPinAccessTechnologyFingerprint(
             ResourceGraph.Technology
         ),
         "ActualBlocks": sorted(ResourceGraph.ActualBlocks),
@@ -181,7 +182,7 @@ def BuildPhysicalPinAccessCatalog(
     if not CatalogVersion:
         raise ValueError("pin-access catalog requires a version")
     Families = _NormalizeFamilies(EnabledPatternFamilies)
-    TechnologyFingerprint = _TechnologyFingerprint(Technology)
+    TechnologyFingerprint = BuildPinAccessTechnologyFingerprint(Technology)
     Templates = []
     for CellKind, Macro in sorted(CellMacros.items()):
         Patterns = (
@@ -245,6 +246,60 @@ def _PlacedTerminalBindings(
             Value[3],
         ),
     ))
+
+
+def ValidateSelectedPlacementPinAccessBindings(
+    PlacedGates: Iterable[Any],
+    Selections: Iterable[Any],
+) -> None:
+    """Require selected access to bind every current placed terminal once."""
+    CurrentBindings = tuple(sorted(
+        (
+            Signal,
+            str(Gate.Name),
+            str(Gate.Kind).upper(),
+            Role,
+            PinId,
+            Terminal,
+            Face,
+        )
+        for Gate, Signal, Role, PinId, Terminal, Face
+        in _PlacedTerminalBindings(PlacedGates)
+    ))
+    SelectedBindings = []
+    SelectedTerminalIdentities = []
+    for Selection in Selections:
+        Face = getattr(Selection, "Face", None)
+        if Face is None:
+            Face = getattr(Selection, "ApproachDirection", None)
+        if Face is None:
+            raise ValueError(
+                "selected pin-access binding has no terminal face"
+            )
+        TerminalIdentity = (
+            str(Selection.Signal),
+            str(Selection.GateName),
+            str(Selection.Role),
+            str(Selection.PinId),
+        )
+        SelectedTerminalIdentities.append(TerminalIdentity)
+        SelectedBindings.append((
+            TerminalIdentity[0],
+            TerminalIdentity[1],
+            str(Selection.GateKind).upper(),
+            TerminalIdentity[2],
+            TerminalIdentity[3],
+            tuple(Selection.Terminal),
+            tuple(Face),
+        ))
+    if len(SelectedTerminalIdentities) != len(
+        set(SelectedTerminalIdentities)
+    ):
+        raise ValueError("selected pin-access bindings repeat a terminal")
+    if tuple(sorted(SelectedBindings)) != CurrentBindings:
+        raise ValueError(
+            "selected pin-access bindings do not match current placement"
+        )
 
 
 def _StaticRoleSignals(Gate: Any, Role: str) -> tuple[str, ...]:
@@ -554,8 +609,10 @@ def EnumeratePlacedPinAccessOptionDomains(
     if MaximumGenerationWork < 1:
         raise ValueError("pin-access generation work cap must be positive")
     Families = _NormalizeFamilies(EnabledPatternFamilies)
-    ExpectedTechnologyFingerprint = _TechnologyFingerprint(Technology)
-    if _TechnologyFingerprint(ResourceGraph.Technology) != (
+    ExpectedTechnologyFingerprint = BuildPinAccessTechnologyFingerprint(
+        Technology
+    )
+    if BuildPinAccessTechnologyFingerprint(ResourceGraph.Technology) != (
         ExpectedTechnologyFingerprint
     ):
         raise ValueError("pin-access resource graph uses another technology")
@@ -792,9 +849,11 @@ def FreezeSelectedPlacementPinAccessWitness(
 
 
 __all__ = [
+    "BuildPinAccessTechnologyFingerprint",
     "BuildPhysicalPinAccessCatalog",
     "EnumeratePlacedPinAccessOptionDomains",
     "FreezeSelectedPlacementPinAccessWitness",
     "PhysicalPinAccessCatalogVersion",
     "SupportedPinAccessPatternFamilies",
+    "ValidateSelectedPlacementPinAccessBindings",
 ]

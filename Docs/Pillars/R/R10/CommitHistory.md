@@ -5,6 +5,7 @@ is listed only when its scope and verification are known.
 
 | Commit | Date | Relationship to R10 |
 |---|---|---|
+| `dc95e349` — Enforce current selected access and add conformance coverage | 2026-09-06 | Enforces current selected-access bindings and current resource/technology identity at the profile/fabric boundary, with stale-state and conformance coverage. Supplied to Joint as a Physical checkpoint only; it is not Joint integration or full R10 acceptance. |
 | `2f69160` — Implement physical access rule contracts | 2026-09-05 | Squashed R10/N2 access checkpoint covering technology-bound templates, physical realization, legality, exact claims, proof transport, domain construction, and conflict queries. This remains a bounded access slice, not complete R10 acceptance. |
 
 The placement/access consumer contract types also support

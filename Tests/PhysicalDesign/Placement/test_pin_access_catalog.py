@@ -17,6 +17,7 @@ from PhysicalDesign.Contracts.PlacementAccess import (
 from PhysicalDesign.Geometry.Placement import (
     BuildPlacedGate,
     BuildPlacementPinAccessWitness,
+    PlacedDesign,
 )
 from PhysicalDesign.Geometry.Rotation import TransformLocalPosition
 from PhysicalDesign.Placement.Access.Capacity import (
@@ -26,9 +27,12 @@ from PhysicalDesign.Placement.Access.Capacity import (
 )
 from PhysicalDesign.Placement.Access.Catalog import (
     BuildPhysicalPinAccessCatalog,
+    BuildPlacedPinAccessModelFingerprint,
     EnumeratePlacedPinAccessOptionDomains,
     FreezeSelectedPlacementPinAccessWitness,
 )
+from PhysicalDesign.Placement.Access.Fabric import BuildPlacementAccessFabric
+from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Redstone.Rules.Geometry import (
     BuildRoutingResources,
     LoadRoutingTemplates,
@@ -86,6 +90,212 @@ def _SelectedFirstOptions(Domains):
         Domain.DomainId: Domain.Options[0].SelectionFingerprint
         for Domain in Domains
     }
+
+
+def _SelectedStraightAccessFixture():
+    Gates = (
+        BuildPlacedGate(
+            Gate("Source", GateKind.INPUT, ["A"], []),
+            0,
+            1,
+            0,
+            0,
+            False,
+        ),
+        BuildPlacedGate(
+            Gate("Target", GateKind.OUTPUT, [], ["A"]),
+            10,
+            1,
+            10,
+            0,
+            False,
+        ),
+    )
+    Placed = PlacedDesign(
+        Module=None,
+        PlacedGates=list(Gates),
+        FrozenNetWires={},
+    )
+    Placement = PcbPlacement(
+        Placed=Placed,
+        Clusters=(),
+        SignalOrder=("A",),
+        LayerCount=1,
+    )
+    Resources = BuildRoutingResources(Placed, Technology=Technology)
+    Domains = EnumeratePlacedPinAccessOptionDomains(
+        Gates,
+        ResourceGraph=Resources.ResourceGraph,
+        Technology=Technology,
+        EnabledPatternFamilies=("straight",),
+        PreOwnedNodesBySignal={},
+    )
+    Solve = SolvePlacedPinAccessOptionDomains(
+        Domains,
+        ResourceGraph=Resources.ResourceGraph,
+        MaximumExpansions=100,
+    )
+    assert Solve.Status is PlacementAccessSolveStatus.Feasible
+    assert Solve.SelectedWitness is not None
+    return Placement, Resources, Domains, Solve
+
+
+def testExplicitPlacementAccessFabricAcceptsCurrentSelectedWitness() -> None:
+    Placement, Resources, _Domains, Solve = (
+        _SelectedStraightAccessFixture()
+    )
+    Witness = Solve.SelectedWitness
+
+    Fabric = BuildPlacementAccessFabric(
+        Placement,
+        Resources=Resources,
+        Technology=Technology,
+        PinAccessWitness=Witness,
+        FixedPinAccessSolve=Solve,
+        RequireSelectedPinAccessWitness=True,
+    )
+
+    assert Fabric.Complete is True
+    assert Fabric.PinAccessWitnessFingerprint == Witness.WitnessFingerprint
+
+
+def testExplicitPlacementAccessFabricRejectsCurrentForeignOwnership() -> None:
+    Placement, _Resources, _Domains, Solve = (
+        _SelectedStraightAccessFixture()
+    )
+    Witness = Solve.SelectedWitness
+    ForeignPosition = (1, 1, 4)
+    FrozenNetWires = {"Foreign": (ForeignPosition,)}
+    CurrentPlaced = replace(
+        Placement.Placed,
+        FrozenNetWires=FrozenNetWires,
+    )
+    CurrentPlacement = replace(Placement, Placed=CurrentPlaced)
+    CurrentResources = BuildRoutingResources(
+        CurrentPlaced,
+        Technology=Technology,
+    )
+    CurrentDomains = EnumeratePlacedPinAccessOptionDomains(
+        CurrentPlaced.PlacedGates,
+        ResourceGraph=CurrentResources.ResourceGraph,
+        Technology=Technology,
+        EnabledPatternFamilies=("straight",),
+        PreOwnedNodesBySignal=FrozenNetWires,
+    )
+    CurrentSource = next(
+        Domain for Domain in CurrentDomains if Domain.Role == "Source"
+    )
+    SelectedSource = next(
+        Selection
+        for Selection in Witness.Selections
+        if Selection.Role == "Source"
+    )
+
+    assert SelectedSource.FirstLegNodes == (
+        (0, 1, 3),
+        (0, 1, 4),
+        (0, 1, 5),
+    )
+    assert ForeignPosition == (1, 1, 4)
+    assert CurrentSource.Complete is True
+    assert CurrentSource.Options == ()
+    assert CurrentSource.RejectedOptionCount == 1
+    assert Witness.ResourceModelFingerprint != (
+        BuildPlacedPinAccessModelFingerprint(
+            CurrentPlaced.PlacedGates,
+            ResourceGraph=CurrentResources.ResourceGraph,
+            PreOwnedNodesBySignal=FrozenNetWires,
+        )
+    )
+    with pytest.raises(ValueError):
+        BuildPlacementAccessFabric(
+            CurrentPlacement,
+            Resources=CurrentResources,
+            Technology=Technology,
+            PinAccessWitness=Witness,
+            FixedPinAccessSolve=Solve,
+            RequireSelectedPinAccessWitness=True,
+        )
+
+
+def testExplicitPlacementAccessFabricRejectsCurrentTechnology() -> None:
+    Placement, _Resources, _Domains, Solve = (
+        _SelectedStraightAccessFixture()
+    )
+    Witness = Solve.SelectedWitness
+    ChangedTechnology = replace(
+        Technology,
+        TechnologyVersion="redstone-routing-current-v2",
+    )
+    CurrentResources = BuildRoutingResources(
+        Placement.Placed,
+        Technology=ChangedTechnology,
+    )
+
+    assert ChangedTechnology.TechnologyVersion != Technology.TechnologyVersion
+    with pytest.raises(ValueError):
+        BuildPlacementAccessFabric(
+            Placement,
+            Resources=CurrentResources,
+            Technology=ChangedTechnology,
+            PinAccessWitness=Witness,
+            FixedPinAccessSolve=Solve,
+            RequireSelectedPinAccessWitness=True,
+        )
+
+
+def _OracleTransformNandPosition(
+    Position,
+    *,
+    SourceOrigin,
+    DestinationOrigin,
+    Rotation,
+    MirrorX,
+):
+    """Apply the documented mirror-then-clockwise-rotation contract."""
+    X = Position[0] - SourceOrigin[0]
+    Y = Position[1] - SourceOrigin[1]
+    Z = Position[2] - SourceOrigin[2]
+    if MirrorX:
+        X = 2 - X
+    if Rotation == 90:
+        X, Z = 3 - Z, X
+    elif Rotation == 180:
+        X, Z = 2 - X, 3 - Z
+    elif Rotation == 270:
+        X, Z = Z, 2 - X
+    return (
+        DestinationOrigin[0] + X,
+        DestinationOrigin[1] + Y,
+        DestinationOrigin[2] + Z,
+    )
+
+
+def _OracleTransformDirection(Direction, *, Rotation, MirrorX):
+    X, Y, Z = Direction
+    if MirrorX:
+        X = -X
+    if Rotation == 90:
+        return -Z, Y, X
+    if Rotation == 180:
+        return -X, Y, -Z
+    if Rotation == 270:
+        return Z, Y, -X
+    return X, Y, Z
+
+
+def testDirectionOracleMirrorsEastAndWestWithoutRotation() -> None:
+    """Validate oracle math, not production east/west access capability."""
+    assert _OracleTransformDirection(
+        (1, 0, 0),
+        Rotation=0,
+        MirrorX=True,
+    ) == (-1, 0, 0)
+    assert _OracleTransformDirection(
+        (-1, 0, 0),
+        Rotation=0,
+        MirrorX=True,
+    ) == (1, 0, 0)
 
 
 def testCatalogCompilesTheThreeApprovedLocalShapes() -> None:
@@ -221,6 +431,101 @@ def testPlacedCatalogTransformsClaimsAndCanonicalChirality(
 
 @pytest.mark.parametrize("Rotation", (0, 90, 180, 270))
 @pytest.mark.parametrize("MirrorX", (False, True))
+def testPlacedCatalogTransformsNonemptyClaimsAndPreservesEmptyRequiredAir(
+    Rotation: int,
+    MirrorX: bool,
+) -> None:
+    SourceOrigin = (10, 1, 10)
+    DestinationOrigin = (30, 5, -20)
+    SourceGate = _Nand(Origin=SourceOrigin)
+    DestinationGate = _Nand(
+        Origin=DestinationOrigin,
+        Rotation=Rotation,
+        MirrorX=MirrorX,
+    )
+    SourceDomains = EnumeratePlacedPinAccessOptionDomains(
+        (SourceGate,),
+        ResourceGraph=_Resources((SourceGate,)),
+        Technology=Technology,
+    )
+    DestinationDomains = EnumeratePlacedPinAccessOptionDomains(
+        (DestinationGate,),
+        ResourceGraph=_Resources((DestinationGate,)),
+        Technology=Technology,
+    )
+    SourceOptions = {
+        (Domain.Role, Domain.PinId, Option.TemplateId): Option
+        for Domain in SourceDomains
+        for Option in Domain.Options
+    }
+    DestinationOptions = {
+        (Domain.Role, Domain.PinId, Option.TemplateId): Option
+        for Domain in DestinationDomains
+        for Option in Domain.Options
+    }
+    FacingVectors = {
+        "north": (0, 0, -1),
+        "south": (0, 0, 1),
+        "east": (1, 0, 0),
+        "west": (-1, 0, 0),
+    }
+
+    assert SourceOptions
+    assert SourceOptions.keys() == DestinationOptions.keys()
+    for Identity, Source in SourceOptions.items():
+        Destination = DestinationOptions[Identity]
+
+        def Transform(Position):
+            return _OracleTransformNandPosition(
+                Position,
+                SourceOrigin=SourceOrigin,
+                DestinationOrigin=DestinationOrigin,
+                Rotation=Rotation,
+                MirrorX=MirrorX,
+            )
+
+        assert Destination.Terminal == Transform(Source.Terminal)
+        assert Destination.FirstLegNodes == tuple(
+            Transform(Value) for Value in Source.FirstLegNodes
+        )
+        assert Destination.FirstTrackNode == Transform(Source.FirstTrackNode)
+        assert Destination.BlockRoles == tuple(
+            (Transform(Position), Role)
+            for Position, Role in Source.BlockRoles
+        )
+        for ClaimName in (
+            "WireCells",
+            "SupportCells",
+            "ElectricalCells",
+        ):
+            assert getattr(Source.Claims, ClaimName)
+            assert getattr(Destination.Claims, ClaimName) == frozenset(
+                Transform(Value)
+                for Value in getattr(Source.Claims, ClaimName)
+            )
+        assert not Source.Claims.RequiredAirCells
+        assert not Destination.Claims.RequiredAirCells
+        assert Destination.Face == _OracleTransformDirection(
+            Source.Face,
+            Rotation=Rotation,
+            MirrorX=MirrorX,
+        )
+        SourceRepeater = Source.RepeaterReservations[0]
+        DestinationRepeater = Destination.RepeaterReservations[0]
+        assert DestinationRepeater.Position == Transform(
+            SourceRepeater.Position
+        )
+        assert FacingVectors[DestinationRepeater.InputFacing] == (
+            _OracleTransformDirection(
+                FacingVectors[SourceRepeater.InputFacing],
+                Rotation=Rotation,
+                MirrorX=MirrorX,
+            )
+        )
+
+
+@pytest.mark.parametrize("Rotation", (0, 90, 180, 270))
+@pytest.mark.parametrize("MirrorX", (False, True))
 def testEveryNandPinPatternPowersAndRoundTripsItsRepeater(
     Rotation: int,
     MirrorX: bool,
@@ -351,6 +656,81 @@ def testAnonymousGeometryIdentityIsTranslationInvariant() -> None:
         for Domain in SecondDomains
         for Value in Domain.Options
     }
+
+
+def testAccessIdentityChangesWithTechnologyAndCatalogVersions() -> None:
+    GateValue = _Nand()
+    ChangedTechnology = replace(
+        Technology,
+        TechnologyVersion="redstone-routing-conformance-v2",
+    )
+
+    def OptionsByIdentity(TechnologyValue, CatalogVersion):
+        ResourceGraph = BuildRoutingResources(
+            _Placement((GateValue,)),
+            Technology=TechnologyValue,
+        ).ResourceGraph
+        Domains = EnumeratePlacedPinAccessOptionDomains(
+            (GateValue,),
+            ResourceGraph=ResourceGraph,
+            Technology=TechnologyValue,
+            CatalogVersion=CatalogVersion,
+        )
+        return {
+            (Domain.Role, Domain.PinId, Option.TemplateId): Option
+            for Domain in Domains
+            for Option in Domain.Options
+        }
+
+    Original = OptionsByIdentity(Technology, "physical-access-catalog-a")
+    NewTechnology = OptionsByIdentity(
+        ChangedTechnology,
+        "physical-access-catalog-a",
+    )
+    NewCatalog = OptionsByIdentity(Technology, "physical-access-catalog-b")
+
+    assert Original.keys() == NewTechnology.keys() == NewCatalog.keys()
+    for Identity, OriginalOption in Original.items():
+        TechnologyOption = NewTechnology[Identity]
+        CatalogOption = NewCatalog[Identity]
+        assert TechnologyOption.FirstLegNodes == OriginalOption.FirstLegNodes
+        assert CatalogOption.FirstLegNodes == OriginalOption.FirstLegNodes
+        assert (
+            TechnologyOption.TechnologyFingerprint
+            != OriginalOption.TechnologyFingerprint
+        )
+        assert (
+            TechnologyOption.TemplateProofFingerprint
+            != OriginalOption.TemplateProofFingerprint
+        )
+        assert (
+            TechnologyOption.AnonymousGeometryFingerprint
+            != OriginalOption.AnonymousGeometryFingerprint
+        )
+        assert TechnologyOption.ResourceModelFingerprint != (
+            OriginalOption.ResourceModelFingerprint
+        )
+        assert TechnologyOption.PlacedBindingFingerprint != (
+            OriginalOption.PlacedBindingFingerprint
+        )
+        assert CatalogOption.TechnologyFingerprint == (
+            OriginalOption.TechnologyFingerprint
+        )
+        assert CatalogOption.ResourceModelFingerprint == (
+            OriginalOption.ResourceModelFingerprint
+        )
+        assert CatalogOption.TemplateProofFingerprint == (
+            OriginalOption.TemplateProofFingerprint
+        )
+        assert CatalogOption.TemplateFingerprint != (
+            OriginalOption.TemplateFingerprint
+        )
+        assert CatalogOption.AnonymousGeometryFingerprint != (
+            OriginalOption.AnonymousGeometryFingerprint
+        )
+        assert CatalogOption.PlacedBindingFingerprint != (
+            OriginalOption.PlacedBindingFingerprint
+        )
 
 
 def testDomainGenerationCapIsIncompleteRatherThanEmptyUnsat() -> None:
@@ -799,6 +1179,39 @@ def testFreezeBuildsDeeplyImmutableSelectedWitnessAndContract() -> None:
         Witness.Complete = False
     with pytest.raises(ValueError, match="identities disagree"):
         replace(Contract, TechnologyFingerprint="stale")
+
+
+def testSelectedWitnessRejectsMissingAndTruncatedExplicitAccess() -> None:
+    GateValue = _Nand()
+    Domains = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=_Resources((GateValue,)),
+        Technology=Technology,
+        EnabledPatternFamilies=("straight",),
+    )
+    Selected = _SelectedFirstOptions(Domains)
+    MissingDomain = dict(Selected)
+    MissingDomain.pop(next(iter(sorted(MissingDomain))))
+
+    with pytest.raises(ValueError):
+        FreezeSelectedPlacementPinAccessWitness(Domains, MissingDomain)
+
+    Witness = FreezeSelectedPlacementPinAccessWitness(Domains, Selected)
+    TruncatedDocument = json.loads(json.dumps(Witness.ToDictionary()))
+    TruncatedSelection = TruncatedDocument["Selections"][0]
+    TruncatedSelection["FirstLegNodes"] = (
+        TruncatedSelection["FirstLegNodes"][:-1]
+    )
+
+    with pytest.raises(ValueError):
+        type(Witness).FromDictionary(TruncatedDocument)
+
+    MissingProofDocument = json.loads(
+        json.dumps(Witness.Selections[0].ToDictionary())
+    )
+    MissingProofDocument["Template"] = None
+    with pytest.raises(ValueError):
+        type(Witness.Selections[0]).FromDictionary(MissingProofDocument)
 
 
 def testCla4OpposingStraightRaysBecomeFeasibleWithAPlanarJog() -> None:

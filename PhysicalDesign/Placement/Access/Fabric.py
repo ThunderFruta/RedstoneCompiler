@@ -34,6 +34,10 @@ from PhysicalDesign.Resources.ResourceGraph import FindSelfClaimConflicts
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology, RedstoneRoutingTechnology
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
 from PhysicalDesign.Geometry.Placement import BuildPlacementPinAccessWitness
+from .Catalog import (
+    BuildPinAccessTechnologyFingerprint,
+    BuildPlacedPinAccessModelFingerprint,
+)
 from .Capacity import (
     FixedPlacementPinAccessDomain,
     SolveFixedPlacementPinAccessDomains,
@@ -540,6 +544,38 @@ def BuildPlacementAccessFabric(
             "placement access fabric cannot truncate or extend its selected "
             "pin-access witness"
         )
+    if RequireSelectedPinAccessWitness:
+        ResourceGraphTechnology = getattr(
+            Resources.ResourceGraph,
+            "Technology",
+            None,
+        )
+        if ResourceGraphTechnology != Technology:
+            raise ValueError(
+                "placement access fabric resource graph uses another "
+                "technology"
+            )
+        if PinAccessWitness.TechnologyFingerprint != (
+            BuildPinAccessTechnologyFingerprint(Technology)
+        ):
+            raise ValueError(
+                "placement access fabric pin-access technology is stale"
+            )
+        CurrentResourceModelFingerprint = (
+            BuildPlacedPinAccessModelFingerprint(
+                Gates,
+                ResourceGraph=Resources.ResourceGraph,
+                PreOwnedNodesBySignal=(
+                    getattr(Placed, "FrozenNetWires", None) or {}
+                ),
+            )
+        )
+        if PinAccessWitness.ResourceModelFingerprint != (
+            CurrentResourceModelFingerprint
+        ):
+            raise ValueError(
+                "placement access fabric pin-access resource model is stale"
+            )
     if FixedPinAccessSolve is None:
         if RequireSelectedPinAccessWitness:
             raise ValueError(

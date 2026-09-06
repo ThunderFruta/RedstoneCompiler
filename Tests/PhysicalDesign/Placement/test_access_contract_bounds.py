@@ -1,5 +1,7 @@
 """Audit contracts for finite placement-access and detailed-routing bounds."""
 
+from dataclasses import replace
+
 from Compilation.Ir.Models import Gate, GateKind, ModuleIR
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
 from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
@@ -91,6 +93,27 @@ def test_access_contract_bounds_enclose_every_materialized_fixed_band_member():
     )
     assert Fabric.ToDictionary()["AccessContractBounds"] == (
         Bounds.ToDictionary()
+    )
+
+
+def test_access_fabric_serializes_distinct_pin_access_identities():
+    DefaultFabric = _BuildFixedBandFabric()
+    ExplicitFabric = replace(
+        DefaultFabric,
+        PinAccessDomainFingerprint="domain-fixture-v1",
+        PinAccessWitnessFingerprint="witness-fixture-v1",
+    )
+
+    DefaultDocument = DefaultFabric.ToDictionary()
+    ExplicitDocument = ExplicitFabric.ToDictionary()
+
+    assert DefaultDocument["PinAccessDomainFingerprint"] == ""
+    assert DefaultDocument["PinAccessWitnessFingerprint"] == ""
+    assert ExplicitDocument["PinAccessDomainFingerprint"] == (
+        "domain-fixture-v1"
+    )
+    assert ExplicitDocument["PinAccessWitnessFingerprint"] == (
+        "witness-fixture-v1"
     )
 
 
