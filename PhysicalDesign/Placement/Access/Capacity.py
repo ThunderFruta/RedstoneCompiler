@@ -16,8 +16,16 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    TypeAlias,
 )
 from PhysicalDesign.Contracts.Placement import PlacementAccessAssignment, PlacementAccessFabric
+from PhysicalDesign.Contracts.PlacementAccess import (
+    PlacedPinAccessOption,
+    PlacedPinAccessOptionDomain,
+    PlacementAccessConflictCore,
+    PlacementAccessSolveResult,
+    PlacementAccessSolveStatus,
+)
 from PhysicalDesign.Contracts.Core import Position3
 from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, FindSelfClaimConflicts, RoutingResourceClaims, RoutingResourceGraph
 from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint
@@ -25,7 +33,13 @@ from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 from .EscapePaths import (
     _BuildDerivedPerimeterCycleRouteNodeSets,
 )
+from .Catalog import FreezeSelectedPlacementPinAccessWitness
 from PhysicalDesign.Geometry.Placement import PlacementPinAccessSelection
+
+
+FixedPlacementPinAccessOption: TypeAlias = (
+    PlacementPinAccessSelection | PlacedPinAccessOption
+)
 
 
 def _MergePlacementAccessClaims(
@@ -76,9 +90,13 @@ class FixedPlacementPinAccessDomain:
     DomainId: str
     Signal: str
     Terminal: Position3
-    Options: tuple[PlacementPinAccessSelection, ...]
+    Options: tuple[FixedPlacementPinAccessOption, ...]
     Complete: bool = True
     IncompleteReason: str = ""
+    SourceDomainFingerprint: str = ""
+    CatalogVersion: str = ""
+    TechnologyFingerprint: str = ""
+    ResourceModelFingerprint: str = ""
 
     def __post_init__(self) -> None:
         if not self.DomainId or not self.Signal:
@@ -90,37 +108,166 @@ class FixedPlacementPinAccessDomain:
         )
         if len(OptionFingerprints) != len(set(OptionFingerprints)):
             raise ValueError("fixed pin-access domain repeats an option")
+        PlacedOptions = tuple(
+            Value
+            for Value in self.Options
+            if isinstance(Value, PlacedPinAccessOption)
+        )
+        if PlacedOptions and len(PlacedOptions) != len(self.Options):
+            raise ValueError(
+                "fixed pin-access domain cannot mix legacy and exact options"
+            )
         for Option in self.Options:
             if Option.Signal != self.Signal or Option.Terminal != self.Terminal:
                 raise ValueError(
                     "fixed pin-access option does not belong to its domain"
                 )
+        if PlacedOptions:
+            ExpectedDependencies = (
+                PlacedOptions[0].CatalogVersion,
+                PlacedOptions[0].TechnologyFingerprint,
+                PlacedOptions[0].ResourceModelFingerprint,
+            )
+            if any(
+                (
+                    Value.CatalogVersion,
+                    Value.TechnologyFingerprint,
+                    Value.ResourceModelFingerprint,
+                )
+                != ExpectedDependencies
+                for Value in PlacedOptions
+            ):
+                raise ValueError(
+                    "fixed pin-access exact options use mixed dependencies"
+                )
+            DeclaredDependencies = (
+                self.CatalogVersion,
+                self.TechnologyFingerprint,
+                self.ResourceModelFingerprint,
+            )
+            if any(DeclaredDependencies) and (
+                DeclaredDependencies != ExpectedDependencies
+            ):
+                raise ValueError(
+                    "fixed pin-access domain dependency identity mismatch"
+                )
+        else:
+            DeclaredExactIdentity = (
+                self.SourceDomainFingerprint,
+                self.CatalogVersion,
+                self.TechnologyFingerprint,
+                self.ResourceModelFingerprint,
+            )
+            if any(DeclaredExactIdentity) and not all(DeclaredExactIdentity):
+                raise ValueError(
+                    "an empty exact pin-access domain requires all identities"
+                )
+
+    @property
+    def UsesExactOptions(self) -> bool:
+        return bool(
+            self.SourceDomainFingerprint
+            or self.CatalogVersion
+            or self.TechnologyFingerprint
+            or self.ResourceModelFingerprint
+            or (
+                self.Options
+                and isinstance(self.Options[0], PlacedPinAccessOption)
+            )
+        )
+
+    @property
+    def CanonicalOptions(self) -> tuple[FixedPlacementPinAccessOption, ...]:
+        return (
+            tuple(sorted(self.Options, key=_FixedPinAccessOptionRank))
+            if self.UsesExactOptions
+            else self.Options
+        )
+
+    @property
+    def EffectiveCatalogVersion(self) -> str:
+        return (
+            self.CatalogVersion
+            or (
+                self.Options[0].CatalogVersion
+                if self.UsesExactOptions
+                else ""
+            )
+        )
+
+    @property
+    def EffectiveTechnologyFingerprint(self) -> str:
+        return (
+            self.TechnologyFingerprint
+            or (
+                self.Options[0].TechnologyFingerprint
+                if self.UsesExactOptions
+                else ""
+            )
+        )
+
+    @property
+    def EffectiveResourceModelFingerprint(self) -> str:
+        return (
+            self.ResourceModelFingerprint
+            or (
+                self.Options[0].ResourceModelFingerprint
+                if self.UsesExactOptions
+                else ""
+            )
+        )
 
     @property
     def DomainFingerprint(self) -> str:
-        return BuildStableFingerprint({
+        Identity = {
             "Kind": "fixed-placement-pin-access-domain-v1",
             "DomainId": self.DomainId,
             "Signal": self.Signal,
             "Terminal": self.Terminal,
             "Options": [
-                Value.ToDictionary() for Value in self.Options
+                Value.ToIdentityDictionary() if isinstance(Value, PlacedPinAccessOption) else Value.ToDictionary() for Value in self.CanonicalOptions
             ],
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
-        })
+        }
+        if self.UsesExactOptions:
+            Identity.update({
+                "SourceDomainFingerprint": self.SourceDomainFingerprint,
+                "CatalogVersion": self.EffectiveCatalogVersion,
+                "TechnologyFingerprint": (
+                    self.EffectiveTechnologyFingerprint
+                ),
+                "ResourceModelFingerprint": (
+                    self.EffectiveResourceModelFingerprint
+                ),
+            })
+        return BuildStableFingerprint(Identity)
 
     def ToDictionary(self) -> dict[str, object]:
-        return {
+        Result = {
             "DomainId": self.DomainId,
             "DomainFingerprint": self.DomainFingerprint,
             "Signal": self.Signal,
             "Terminal": list(self.Terminal),
             "OptionCount": len(self.Options),
-            "Options": [Value.ToDictionary() for Value in self.Options],
+            "Options": [
+                Value.ToIdentityDictionary() if isinstance(Value, PlacedPinAccessOption) else Value.ToDictionary() for Value in self.CanonicalOptions
+            ],
             "Complete": self.Complete,
             "IncompleteReason": self.IncompleteReason,
         }
+        if self.UsesExactOptions:
+            Result.update({
+                "SourceDomainFingerprint": self.SourceDomainFingerprint,
+                "CatalogVersion": self.EffectiveCatalogVersion,
+                "TechnologyFingerprint": (
+                    self.EffectiveTechnologyFingerprint
+                ),
+                "ResourceModelFingerprint": (
+                    self.EffectiveResourceModelFingerprint
+                ),
+            })
+        return Result
 
 
 @dataclass(frozen=True)
@@ -227,18 +374,74 @@ def _BuildFixedPinAccessOptionClaims(
 ) -> dict[tuple[str, str], RoutingResourceClaims]:
     return {
         (Domain.DomainId, Option.SelectionFingerprint): (
-            ResourceGraph.BuildRouteClaims(Option.Path)
+            Option.Claims
+            if isinstance(Option, PlacedPinAccessOption)
+            else ResourceGraph.BuildRouteClaims(Option.Path)
         )
         for Domain in Domains
         for Option in Domain.Options
     }
 
 
+def _FixedPinAccessOptionRank(
+    Option: FixedPlacementPinAccessOption,
+) -> tuple[object, ...]:
+    if isinstance(Option, PlacedPinAccessOption):
+        return Option.RankKey()
+    return (0, 0, len(Option.Path), Option.SelectionFingerprint)
+
+
+def _FixedPinAccessPhysicalRoleConflictResources(
+    FirstOption: FixedPlacementPinAccessOption,
+    SecondOption: FixedPlacementPinAccessOption,
+) -> tuple[str, ...]:
+    """Return exact block-state conflicts omitted by resource claims."""
+    if not isinstance(FirstOption, PlacedPinAccessOption) or not isinstance(
+        SecondOption,
+        PlacedPinAccessOption,
+    ):
+        return ()
+    Conflicts = set()
+    FirstRoles = dict(FirstOption.BlockRoles)
+    SecondRoles = dict(SecondOption.BlockRoles)
+    for Position in sorted(set(FirstRoles) & set(SecondRoles)):
+        FirstRole = FirstRoles[Position]
+        SecondRole = SecondRoles[Position]
+        if FirstRole == SecondRole:
+            continue
+        Roles = tuple(sorted((FirstRole, SecondRole)))
+        Conflicts.add(
+            "BlockRole:"
+            f"{Position[0]},{Position[1]},{Position[2]}:"
+            f"{Roles[0]}!={Roles[1]}"
+        )
+    FirstRepeaters = {
+        Value.Position: str(Value.InputFacing)
+        for Value in FirstOption.RepeaterReservations
+    }
+    SecondRepeaters = {
+        Value.Position: str(Value.InputFacing)
+        for Value in SecondOption.RepeaterReservations
+    }
+    for Position in sorted(set(FirstRepeaters) & set(SecondRepeaters)):
+        FirstFacing = FirstRepeaters[Position]
+        SecondFacing = SecondRepeaters[Position]
+        if FirstFacing == SecondFacing:
+            continue
+        Facings = tuple(sorted((FirstFacing, SecondFacing)))
+        Conflicts.add(
+            "RepeaterFacing:"
+            f"{Position[0]},{Position[1]},{Position[2]}:"
+            f"{Facings[0]}!={Facings[1]}"
+        )
+    return tuple(sorted(Conflicts))
+
+
 def _FixedPinAccessConflictResources(
     FirstDomain: FixedPlacementPinAccessDomain,
-    FirstOption: PlacementPinAccessSelection,
+    FirstOption: FixedPlacementPinAccessOption,
     SecondDomain: FixedPlacementPinAccessDomain,
-    SecondOption: PlacementPinAccessSelection,
+    SecondOption: FixedPlacementPinAccessOption,
     ClaimsByOption: dict[tuple[str, str], RoutingResourceClaims],
 ) -> tuple[str, ...]:
     FirstClaims = ClaimsByOption[
@@ -259,7 +462,13 @@ def _FixedPinAccessConflictResources(
             "First": FirstClaims,
             "Second": SecondClaims,
         })
-    return tuple(sorted(map(str, Conflicts)))
+    return tuple(sorted({
+        *map(str, Conflicts),
+        *_FixedPinAccessPhysicalRoleConflictResources(
+            FirstOption,
+            SecondOption,
+        ),
+    }))
 
 
 def _BuildFixedPinAccessConflictDomainComponents(
@@ -287,8 +496,54 @@ def _BuildFixedPinAccessConflictDomainComponents(
     return tuple(sorted(Components))
 
 
+def _BuildFixedPinAccessProblemFingerprint(
+    OrderedDomains: tuple[FixedPlacementPinAccessDomain, ...],
+) -> str:
+    UsesExactOptions = any(Value.UsesExactOptions for Value in OrderedDomains)
+    if UsesExactOptions and any(
+        Value.Options and not Value.UsesExactOptions
+        for Value in OrderedDomains
+    ):
+        raise ValueError(
+            "fixed pin-access problem cannot mix legacy and exact domains"
+        )
+    ProblemIdentity = {
+        "Kind": (
+            "fixed-placement-pin-access-problem-v2"
+            if UsesExactOptions
+            else "fixed-placement-pin-access-problem-v1"
+        ),
+        "Domains": [Value.ToDictionary() for Value in OrderedDomains],
+    }
+    if UsesExactOptions:
+        ProblemIdentity.update({
+            "CatalogVersions": sorted({
+                Value.EffectiveCatalogVersion
+                for Value in OrderedDomains
+                if Value.UsesExactOptions
+            }),
+            "TechnologyFingerprints": sorted({
+                Value.EffectiveTechnologyFingerprint
+                for Value in OrderedDomains
+                if Value.UsesExactOptions
+            }),
+            "ResourceModelFingerprints": sorted({
+                Value.EffectiveResourceModelFingerprint
+                for Value in OrderedDomains
+                if Value.UsesExactOptions
+            }),
+            "SourceDomainFingerprints": sorted({
+                Value.SourceDomainFingerprint or Value.DomainFingerprint
+                for Value in OrderedDomains
+            }),
+        })
+    return BuildStableFingerprint(ProblemIdentity)
+
+
 def SolveFixedPlacementPinAccessDomains(
-    Domains: Iterable[FixedPlacementPinAccessDomain],
+    Domains: Iterable[
+        FixedPlacementPinAccessDomain | PlacedPinAccessOptionDomain
+    ],
     *,
     ResourceGraph: RoutingResourceGraph | None = None,
     MaximumExpansions: int = 100_000,
@@ -297,13 +552,32 @@ def SolveFixedPlacementPinAccessDomains(
     """Solve one immutable option per terminal with exact pair conflicts."""
     if MaximumExpansions < 1:
         raise ValueError("fixed pin-access solve requires a positive work cap")
-    OrderedDomains = tuple(sorted(Domains, key=lambda Value: Value.DomainId))
+    ReceivedDomains = tuple(Domains)
+    HasPlacedDomains = any(
+        isinstance(Value, PlacedPinAccessOptionDomain)
+        for Value in ReceivedDomains
+    )
+    if HasPlacedDomains:
+        if not all(
+            isinstance(Value, PlacedPinAccessOptionDomain)
+            for Value in ReceivedDomains
+        ):
+            raise ValueError(
+                "fixed pin-access solve cannot mix domain contract families"
+            )
+        _SourceDomains, OrderedDomains = _ConvertPlacedPinAccessDomains(
+            ReceivedDomains
+        )
+    else:
+        OrderedDomains = tuple(sorted(
+            ReceivedDomains,
+            key=lambda Value: Value.DomainId,
+        ))
     if len({Value.DomainId for Value in OrderedDomains}) != len(OrderedDomains):
         raise ValueError("fixed pin-access problem repeats a domain id")
-    ProblemFingerprint = BuildStableFingerprint({
-        "Kind": "fixed-placement-pin-access-problem-v1",
-        "Domains": [Value.ToDictionary() for Value in OrderedDomains],
-    })
+    ProblemFingerprint = _BuildFixedPinAccessProblemFingerprint(
+        OrderedDomains
+    )
     IncompleteDomain = next(
         (Value for Value in OrderedDomains if not Value.Complete),
         None,
@@ -329,8 +603,9 @@ def SolveFixedPlacementPinAccessDomains(
         OrderedDomains,
         ResourceGraph,
     )
-    ValidOptionsByDomain = {
-        Domain.DomainId: tuple(
+    ValidOptionsByDomain = {}
+    for Domain in OrderedDomains:
+        ValidOptions = tuple(
             Option
             for Option in Domain.Options
             if not FindSelfClaimConflicts({
@@ -339,8 +614,11 @@ def SolveFixedPlacementPinAccessDomains(
                 ]
             })
         )
-        for Domain in OrderedDomains
-    }
+        ValidOptionsByDomain[Domain.DomainId] = (
+            tuple(sorted(ValidOptions, key=_FixedPinAccessOptionRank))
+            if Domain.UsesExactOptions
+            else ValidOptions
+        )
     IsCompleteSingletonProblem = all(
         len(ValidOptionsByDomain[Domain.DomainId]) == 1
         and len(Domain.Options) == 1
@@ -361,9 +639,21 @@ def SolveFixedPlacementPinAccessDomains(
                 if Domain.Signal in ClaimsBySignal
                 else OptionClaims
             )
+        SelectedSingletons = tuple(
+            ValidOptionsByDomain[Domain.DomainId][0]
+            for Domain in OrderedDomains
+        )
         HasAggregateConflict = bool(
             FindClaimConflicts(ClaimsBySignal)
             or FindSelfClaimConflicts(ClaimsBySignal)
+            or any(
+                _FixedPinAccessPhysicalRoleConflictResources(
+                    First,
+                    Second,
+                )
+                for FirstIndex, First in enumerate(SelectedSingletons)
+                for Second in SelectedSingletons[FirstIndex + 1:]
+            )
         )
         if not HasAggregateConflict:
             if len(OrderedDomains) > MaximumExpansions:
@@ -443,7 +733,7 @@ def SolveFixedPlacementPinAccessDomains(
     )
     DomainById = {Value.DomainId: Value for Value in OrderedDomains}
     ExpansionCount = 0
-    SelectedByDomain: dict[str, PlacementPinAccessSelection] = {}
+    SelectedByDomain: dict[str, FixedPlacementPinAccessOption] = {}
 
     def OptionsConflict(
         FirstDomainId: str,
@@ -575,6 +865,183 @@ def SolveFixedPlacementPinAccessDomains(
         ExpansionCount=ExpansionCount,
         MaximumExpansions=MaximumExpansions,
     )
+
+
+def _ConvertPlacedPinAccessDomains(
+    Domains: Iterable[PlacedPinAccessOptionDomain],
+) -> tuple[
+    tuple[PlacedPinAccessOptionDomain, ...],
+    tuple[FixedPlacementPinAccessDomain, ...],
+]:
+    OrderedDomains = tuple(sorted(Domains, key=lambda Value: Value.DomainId))
+    if not OrderedDomains:
+        raise ValueError("placed pin-access solve requires terminal domains")
+    if len({Value.DomainId for Value in OrderedDomains}) != len(OrderedDomains):
+        raise ValueError("placed pin-access solve repeats a domain id")
+    Dependencies = {
+        (
+            Value.CatalogVersion,
+            Value.TechnologyFingerprint,
+            Value.ResourceModelFingerprint,
+        )
+        for Value in OrderedDomains
+    }
+    if len(Dependencies) != 1:
+        raise ValueError("placed pin-access domains use mixed dependencies")
+    return OrderedDomains, tuple(
+        FixedPlacementPinAccessDomain(
+            DomainId=Value.DomainId,
+            Signal=Value.Signal,
+            Terminal=Value.Terminal,
+            Options=Value.Options,
+            Complete=Value.Complete,
+            IncompleteReason=Value.IncompleteReason,
+            SourceDomainFingerprint=Value.DomainFingerprint,
+            CatalogVersion=Value.CatalogVersion,
+            TechnologyFingerprint=Value.TechnologyFingerprint,
+            ResourceModelFingerprint=Value.ResourceModelFingerprint,
+        )
+        for Value in OrderedDomains
+    )
+
+
+def AdaptFixedPlacementPinAccessSolveResult(
+    Domains: Iterable[PlacedPinAccessOptionDomain],
+    Result: FixedPlacementPinAccessSolveResult,
+) -> PlacementAccessSolveResult:
+    """Publish the legacy exact solve through the v17 typed boundary."""
+    OrderedDomains, FixedDomains = _ConvertPlacedPinAccessDomains(Domains)
+    ExpectedProblemFingerprint = _BuildFixedPinAccessProblemFingerprint(
+        FixedDomains
+    )
+    if Result.ProblemFingerprint != ExpectedProblemFingerprint:
+        raise ValueError("fixed pin-access result problem identity mismatch")
+    DomainById = {Value.DomainId: Value for Value in OrderedDomains}
+    if Result.Status is FixedPlacementPinAccessStatus.Feasible:
+        Witness = FreezeSelectedPlacementPinAccessWitness(
+            OrderedDomains,
+            Result.SelectedOptionFingerprints,
+        )
+        return PlacementAccessSolveResult(
+            Status=PlacementAccessSolveStatus.Feasible,
+            ProblemFingerprint=Result.ProblemFingerprint,
+            ExpansionCount=Result.ExpansionCount,
+            MaximumExpansions=Result.MaximumExpansions,
+            SearchComplete=True,
+            OptimalityProven=False,
+            SelectedWitness=Witness,
+            Domains=OrderedDomains,
+        )
+    if Result.Status is FixedPlacementPinAccessStatus.Incomplete:
+        return PlacementAccessSolveResult(
+            Status=PlacementAccessSolveStatus.Incomplete,
+            ProblemFingerprint=Result.ProblemFingerprint,
+            ExpansionCount=Result.ExpansionCount,
+            MaximumExpansions=Result.MaximumExpansions,
+            SearchComplete=False,
+            OptimalityProven=False,
+            IncompleteReason=Result.IncompleteReason,
+            Domains=OrderedDomains,
+        )
+    if Result.UnsatisfiableCore is None:
+        raise ValueError("unsatisfiable fixed access result has no core")
+    CoreDomainIds = tuple(
+        Value.DomainId for Value in Result.UnsatisfiableCore.Domains
+    )
+    if any(Value not in DomainById for Value in CoreDomainIds):
+        raise ValueError("fixed access core references an unknown domain")
+    CoreDomainFingerprints = tuple(sorted(
+        DomainById[Value].DomainFingerprint for Value in CoreDomainIds
+    ))
+    SelectionLiterals = tuple(sorted(
+        (
+            Domain.DomainId,
+            Option.SelectionFingerprint,
+        )
+        for Domain in Result.UnsatisfiableCore.Domains
+        for Option in Domain.Options
+    ))
+    BlockingResources = tuple(sorted({
+        Resource
+        for Conflict in Result.UnsatisfiableCore.Conflicts
+        for Resource in Conflict.ResourceIds
+    }))
+    CoreFingerprint = BuildStableFingerprint({
+        "Kind": "placement-access-conflict-core-v1",
+        "ProblemFingerprint": Result.ProblemFingerprint,
+        "DomainFingerprints": CoreDomainFingerprints,
+        "SelectionLiterals": SelectionLiterals,
+        "BlockingResources": BlockingResources,
+        "Complete": True,
+        "Minimal": False,
+    })
+    return PlacementAccessSolveResult(
+        Status=PlacementAccessSolveStatus.Unsatisfiable,
+        ProblemFingerprint=Result.ProblemFingerprint,
+        ExpansionCount=Result.ExpansionCount,
+        MaximumExpansions=Result.MaximumExpansions,
+        SearchComplete=True,
+        OptimalityProven=False,
+        ConflictCore=PlacementAccessConflictCore(
+            CoreFingerprint=CoreFingerprint,
+            ProblemFingerprint=Result.ProblemFingerprint,
+            DomainFingerprints=CoreDomainFingerprints,
+            SelectionLiterals=SelectionLiterals,
+            BlockingResources=BlockingResources,
+            Complete=True,
+            Minimal=False,
+            ProblemDomains=OrderedDomains,
+        ),
+        Domains=OrderedDomains,
+    )
+
+
+def SolvePlacedPinAccessOptionDomains(
+    Domains: Iterable[PlacedPinAccessOptionDomain],
+    *,
+    ResourceGraph: RoutingResourceGraph | None = None,
+    MaximumExpansions: int = 100_000,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+) -> PlacementAccessSolveResult:
+    """Solve exact catalog domains while preserving the legacy solver API."""
+    OrderedDomains, FixedDomains = _ConvertPlacedPinAccessDomains(Domains)
+    Result = SolveFixedPlacementPinAccessDomains(
+        FixedDomains,
+        ResourceGraph=ResourceGraph,
+        MaximumExpansions=MaximumExpansions,
+        WorkCheck=WorkCheck,
+    )
+    return AdaptFixedPlacementPinAccessSolveResult(
+        OrderedDomains,
+        Result,
+    )
+
+
+def ReplayPlacedPinAccessConflictCore(
+    Domains: Iterable[PlacedPinAccessOptionDomain],
+    Core: PlacementAccessConflictCore,
+    *,
+    ResourceGraph: RoutingResourceGraph | None = None,
+    MaximumExpansions: int = 100_000,
+) -> PlacementAccessSolveResult:
+    """Replay one retained exact-domain problem and verify its complete core."""
+    if not Core.Complete:
+        raise ValueError("only a complete pin-access core can be replayed")
+    OrderedDomains = tuple(sorted(Domains, key=lambda Value: Value.DomainId))
+    Result = SolvePlacedPinAccessOptionDomains(
+        OrderedDomains,
+        ResourceGraph=ResourceGraph,
+        MaximumExpansions=MaximumExpansions,
+    )
+    if (
+        Result.Status is not PlacementAccessSolveStatus.Unsatisfiable
+        or Result.ProblemFingerprint != Core.ProblemFingerprint
+        or Result.ConflictCore != Core
+    ):
+        raise ValueError(
+            "retained placement pin-access core did not replay identically"
+        )
+    return Result
 
 
 def ReplayFixedPlacementPinAccessUnsatisfiableCore(

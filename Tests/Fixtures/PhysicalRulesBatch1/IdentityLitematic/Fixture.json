@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "physical-rules-fixture-v1",
+  "source": {
+    "kind": "litematic",
+    "path": "Fixture.litematic",
+    "sha256": "44e0c3c94f5e19c78f629d717c70cf83b9570ebb61103092c9fb8387211ccefe"
+  },
+  "inputs": [
+    {
+      "name": "A",
+      "position": [
+        0,
+        1,
+        0
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "Y",
+      "position": [
+        2,
+        1,
+        0
+      ]
+    }
+  ],
+  "routeInputs": {
+    "A": [
+      1,
+      1,
+      0
+    ]
+  }
+}

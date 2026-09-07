@@ -1,0 +1,100 @@
+{
+  "schemaVersion": "physical-rules-expectations-v1",
+  "kind": "combinational",
+  "cases": [
+    {
+      "id": "off-to-on",
+      "initialInputs": {
+        "A": false
+      },
+      "appliedInputs": {
+        "A": true
+      },
+      "expectedOutputs": {
+        "Y": false
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3,
+      "checkerStatus": "Legal",
+      "physical": {
+        "DustConnections": [],
+        "SupportPositions": [
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            2,
+            1,
+            0
+          ]
+        ],
+        "HeadroomPositions": [
+          [
+            1,
+            2,
+            0
+          ]
+        ],
+        "BlockedHeadroom": [
+          [
+            1,
+            2,
+            0
+          ]
+        ],
+        "MissingSupport": [],
+        "ConflictPositions": [],
+        "RepeaterDirections": []
+      }
+    },
+    {
+      "id": "on-to-off",
+      "initialInputs": {
+        "A": true
+      },
+      "appliedInputs": {
+        "A": false
+      },
+      "expectedOutputs": {
+        "Y": false
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3,
+      "checkerStatus": "Legal",
+      "physical": {
+        "DustConnections": [],
+        "SupportPositions": [
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            2,
+            1,
+            0
+          ]
+        ],
+        "HeadroomPositions": [
+          [
+            1,
+            2,
+            0
+          ]
+        ],
+        "BlockedHeadroom": [
+          [
+            1,
+            2,
+            0
+          ]
+        ],
+        "MissingSupport": [],
+        "ConflictPositions": [],
+        "RepeaterDirections": []
+      }
+    }
+  ]
+}

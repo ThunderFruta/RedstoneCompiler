@@ -28,6 +28,7 @@ use crate::Geometry::RouteClaims::{
 };
 use crate::Path::PathRouting::FindPath;
 use crate::PhysicalValidation::Mchprs::ValidateMchprsFixture;
+use crate::PhysicalValidation::Observation::ObserveMchprsFixture;
 use crate::Planning::AssignmentPlanning::{
     AssignmentCandidateValue, BaseAssignmentValue, CompactClaimPrimitiveValue,
     CompactFactorMemberValue, DeadlineExceededAssignmentResult,
@@ -328,6 +329,7 @@ pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
         Module
     )?)?;
     Module.add_function(wrap_pyfunction!(ValidateMchprsFixture, Module)?)?;
+    Module.add_function(wrap_pyfunction!(ObserveMchprsFixture, Module)?)?;
     Ok(())
 }
 

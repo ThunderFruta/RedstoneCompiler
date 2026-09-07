@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "physical-rules-expectations-v1",
+  "kind": "combinational",
+  "cases": [
+    {
+      "id": "vector-0",
+      "initialInputs": {
+        "A": true,
+        "B": false
+      },
+      "appliedInputs": {
+        "A": false,
+        "B": true
+      },
+      "expectedOutputs": {
+        "YA": false,
+        "YB": false
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3
+    },
+    {
+      "id": "vector-1",
+      "initialInputs": {
+        "A": false,
+        "B": true
+      },
+      "appliedInputs": {
+        "A": true,
+        "B": false
+      },
+      "expectedOutputs": {
+        "YA": true,
+        "YB": false
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3
+    },
+    {
+      "id": "vector-2",
+      "initialInputs": {
+        "A": true,
+        "B": true
+      },
+      "appliedInputs": {
+        "A": true,
+        "B": true
+      },
+      "expectedOutputs": {
+        "YA": true,
+        "YB": false
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3
+    }
+  ]
+}

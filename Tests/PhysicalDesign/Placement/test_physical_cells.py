@@ -512,22 +512,33 @@ class PhysicalCellTests(unittest.TestCase):
     def testWallTorchDoesNotBlockDustStairConnection(self) -> None:
         Lower = (0, 0, 0)
         Upper = (1, 1, 0)
+        LowerSupport = (0, -1, 0)
         UpperSupport = (1, 0, 0)
         WallTorch = (0, 1, 0)
+        WallTorchBacking = (-1, 1, 0)
         NetWires = {"Signal": {Lower, Upper}}
+        # This is the exact source-qualified W1 state.  Its observed arms are
+        # geometric evidence only; routing claims remain owned by the public
+        # decision's separate RouteClaimStatus.
+        Blocks = {
+            LowerSupport: {"Name": "minecraft:smooth_stone"},
+            UpperSupport: {"Name": "minecraft:smooth_stone"},
+            WallTorch: {
+                "Name": "minecraft:redstone_wall_torch",
+                "Properties": {"facing": "east", "lit": "true"},
+            },
+            WallTorchBacking: {"Name": "minecraft:smooth_stone"},
+        }
         Graph = BuildPhysicalGraphs(
             NetWires,
-            ActualBlocks={UpperSupport, WallTorch},
-            Supports={(0, -1, 0), UpperSupport},
-            SolidBlocks={UpperSupport},
+            ActualBlocks=set(Blocks),
+            Supports={LowerSupport, UpperSupport, WallTorchBacking},
+            SolidBlocks={LowerSupport, UpperSupport, WallTorchBacking},
+            BlockStates=Blocks,
         )
         self.assertIn(Upper, Graph["Signal"][Lower])
         self.assertIn(Lower, Graph["Signal"][Upper])
 
-        Blocks = {
-            UpperSupport: {"Name": "minecraft:smooth_stone"},
-            WallTorch: {"Name": "minecraft:redstone_wall_torch"},
-        }
         LowerState = BuildWireState(Lower, NetWires["Signal"], Blocks, 15)
         UpperState = BuildWireState(Upper, NetWires["Signal"], Blocks, 15)
         self.assertEqual(LowerState["Properties"]["east"], "up")

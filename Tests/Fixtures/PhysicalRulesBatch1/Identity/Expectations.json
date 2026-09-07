@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "physical-rules-expectations-v1",
+  "kind": "combinational",
+  "cases": [
+    {
+      "id": "vector-0",
+      "initialInputs": {
+        "A": false
+      },
+      "appliedInputs": {
+        "A": true
+      },
+      "expectedOutputs": {
+        "Y": true
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3
+    },
+    {
+      "id": "vector-1",
+      "initialInputs": {
+        "A": true
+      },
+      "appliedInputs": {
+        "A": false
+      },
+      "expectedOutputs": {
+        "Y": false
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3
+    }
+  ]
+}

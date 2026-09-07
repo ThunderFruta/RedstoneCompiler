@@ -1,8 +1,16 @@
+from dataclasses import replace
 from itertools import product
 
-from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessDomain, FixedPlacementPinAccessStatus, ReplayFixedPlacementPinAccessUnsatisfiableCore, SolveFixedPlacementPinAccessDomains
+import pytest
+
+from PhysicalDesign.Contracts.PlacementAccess import (
+    PlacedPinAccessOption,
+    PlacedPinAccessOptionDomain,
+    PlacementAccessSolveStatus,
+)
+from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessDomain, FixedPlacementPinAccessStatus, ReplayFixedPlacementPinAccessUnsatisfiableCore, ReplayPlacedPinAccessConflictCore, SolveFixedPlacementPinAccessDomains, SolvePlacedPinAccessOptionDomains
 from PhysicalDesign.Geometry.Placement import PlacementPinAccessSelection
-from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, RoutingResourceGraph
+from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, RoutingReservation, RoutingResourceClaims, RoutingResourceGraph, RoutingResourceId, RoutingResourceKind
 
 
 def BuildSelection(
@@ -84,6 +92,102 @@ def BruteForceFeasible(
         if not FindClaimConflicts(Claims):
             return True
     return False
+
+
+def BuildExactOption(
+    DomainId: str,
+    Nodes: tuple[tuple[int, int, int], ...],
+    FirstTrackNode: tuple[int, int, int],
+    *,
+    PatternFamily: str = "straight",
+    RepeaterIndex: int = 1,
+    RepeaterFacing: str = "west",
+    Claims: RoutingResourceClaims | None = None,
+    CatalogVersion: str = "catalog-v1",
+    TechnologyFingerprint: str = "technology-v1",
+    ResourceModelFingerprint: str = "resources-v1",
+) -> PlacedPinAccessOption:
+    Signal = f"Signal{DomainId}"
+    RepeaterPosition = Nodes[RepeaterIndex]
+    ExactClaims = Claims or RoutingResourceClaims(
+        WireCells=frozenset(Nodes),
+    )
+    return PlacedPinAccessOption(
+        Signal=Signal,
+        GateName=f"Gate{DomainId}",
+        GateKind="NAND",
+        Role="Source",
+        PinId="Output0",
+        CatalogVersion=CatalogVersion,
+        TemplateId=f"NAND:{DomainId}:{PatternFamily}",
+        PatternFamily=PatternFamily,
+        TemplateFingerprint=f"template:{DomainId}:{PatternFamily}",
+        TemplateProofFingerprint=f"proof:{DomainId}:{PatternFamily}",
+        TechnologyFingerprint=TechnologyFingerprint,
+        ResourceModelFingerprint=ResourceModelFingerprint,
+        Terminal=Nodes[0],
+        Face=(
+            Nodes[1][0] - Nodes[0][0],
+            0,
+            Nodes[1][2] - Nodes[0][2],
+        ),
+        Layer=0,
+        FirstLegNodes=Nodes,
+        FirstTrackNode=FirstTrackNode,
+        BlockRoles=tuple(
+            (
+                Position,
+                "repeater" if Index == RepeaterIndex else "dust",
+            )
+            for Index, Position in enumerate(Nodes)
+        ),
+        Claims=ExactClaims,
+        RepeaterReservations=(RoutingReservation(
+            Signal=Signal,
+            Resource=RoutingResourceId(
+                RoutingResourceKind.Wire,
+                RepeaterPosition,
+            ),
+            Position=RepeaterPosition,
+            Purpose="PinAccessRepeater",
+            InputFacing=RepeaterFacing,
+        ),),
+    )
+
+
+def BuildExactDomain(
+    DomainId: str,
+    Options: tuple[PlacedPinAccessOption, ...],
+    *,
+    Complete: bool = True,
+    IncompleteReason: str = "",
+    CatalogVersion: str = "catalog-v1",
+    TechnologyFingerprint: str = "technology-v1",
+    ResourceModelFingerprint: str = "resources-v1",
+) -> PlacedPinAccessOptionDomain:
+    OrderedOptions = tuple(sorted(
+        Options,
+        key=lambda Value: Value.RankKey(),
+    ))
+    Terminal = OrderedOptions[0].Terminal if OrderedOptions else (0, 1, 0)
+    return PlacedPinAccessOptionDomain(
+        DomainId=DomainId,
+        Signal=f"Signal{DomainId}",
+        GateName=f"Gate{DomainId}",
+        Role="Source",
+        PinId="Output0",
+        Terminal=Terminal,
+        Options=OrderedOptions,
+        Complete=Complete,
+        IncompleteReason=IncompleteReason,
+        CatalogVersion=CatalogVersion,
+        TechnologyFingerprint=TechnologyFingerprint,
+        ResourceModelFingerprint=ResourceModelFingerprint,
+        GeneratedOptionCount=len(OrderedOptions),
+        RejectedOptionCount=0,
+        DeduplicatedOptionCount=0,
+        MaximumGenerationWork=100,
+    )
 
 
 def testFixedPlacementPinAccessSolverReturnsStableFeasibleAssignment() -> None:
@@ -225,3 +329,187 @@ def testFixedPlacementPinAccessSolverMatchesExhaustiveOracle() -> None:
     assert CaseCount == 27
     assert FeasibleCount > 0
     assert UnsatisfiableCount > 0
+
+
+def testExactPinAccessSolverConsumesPrecompiledClaims() -> None:
+    AlphaNodes = ((0, 1, 0), (1, 1, 0), (2, 1, 0))
+    BetaNodes = ((10, 1, 0), (11, 1, 0), (12, 1, 0))
+    Alpha = BuildExactOption(
+        "Alpha",
+        AlphaNodes,
+        (3, 1, 0),
+        Claims=RoutingResourceClaims(
+            WireCells=frozenset(AlphaNodes),
+            RequiredAirCells=frozenset({BetaNodes[0]}),
+        ),
+    )
+    Beta = BuildExactOption("Beta", BetaNodes, (13, 1, 0))
+
+    Result = SolvePlacedPinAccessOptionDomains((
+        BuildExactDomain("Alpha", (Alpha,)),
+        BuildExactDomain("Beta", (Beta,)),
+    ))
+
+    assert Result.Status is PlacementAccessSolveStatus.Unsatisfiable
+    assert Result.SearchComplete
+    assert not Result.OptimalityProven
+    assert Result.ConflictCore is not None
+    assert "Air:10,1,0" in Result.ConflictCore.BlockingResources
+
+    Replayed = ReplayPlacedPinAccessConflictCore(
+        (
+            BuildExactDomain("Alpha", (Alpha,)),
+            BuildExactDomain("Beta", (Beta,)),
+        ),
+        Result.ConflictCore,
+    )
+    assert Replayed == Result
+
+
+@pytest.mark.parametrize(
+    "AlphaRepeaterIndex, BetaFacing, ExpectedPrefix",
+    (
+        (0, "north", "BlockRole:1,1,0:"),
+        (1, "north", "RepeaterFacing:1,1,0:"),
+    ),
+)
+def testExactPinAccessCompatibilityIncludesBlockStateConflicts(
+    AlphaRepeaterIndex: int,
+    BetaFacing: str,
+    ExpectedPrefix: str,
+) -> None:
+    Alpha = BuildExactOption(
+        "Alpha",
+        ((0, 1, 0), (1, 1, 0), (2, 1, 0)),
+        (3, 1, 0),
+        RepeaterIndex=AlphaRepeaterIndex,
+        RepeaterFacing="west",
+    )
+    Beta = BuildExactOption(
+        "Beta",
+        ((1, 1, -1), (1, 1, 0), (1, 1, 1)),
+        (1, 1, 2),
+        RepeaterIndex=1,
+        RepeaterFacing=BetaFacing,
+    )
+
+    Result = SolvePlacedPinAccessOptionDomains((
+        BuildExactDomain("Alpha", (Alpha,)),
+        BuildExactDomain("Beta", (Beta,)),
+    ))
+
+    assert Result.Status is PlacementAccessSolveStatus.Unsatisfiable
+    assert Result.ConflictCore is not None
+    assert any(
+        Value.startswith(ExpectedPrefix)
+        for Value in Result.ConflictCore.BlockingResources
+    )
+
+
+def testExactPinAccessAdapterPrefersStraightAndFreezesWitness() -> None:
+    Straight = BuildExactOption(
+        "Alpha",
+        ((0, 1, 0), (1, 1, 0), (2, 1, 0)),
+        (3, 1, 0),
+    )
+    Dogleg = BuildExactOption(
+        "Alpha",
+        ((0, 1, 0), (1, 1, 0), (1, 1, 1)),
+        (1, 1, 2),
+        PatternFamily="planar-jog",
+        RepeaterIndex=0,
+    )
+    Domain = BuildExactDomain("Alpha", (Dogleg, Straight))
+
+    Result = SolvePlacedPinAccessOptionDomains((Domain,))
+
+    assert Result.Status is PlacementAccessSolveStatus.Feasible
+    assert Result.SearchComplete
+    assert not Result.OptimalityProven
+    assert not Result.IncompleteReason
+    assert Result.SelectedWitness is not None
+    assert Result.SelectedWitness.Selections == (Straight,)
+    assert Result.SelectedWitness.DomainFingerprints == (
+        Domain.DomainFingerprint,
+    )
+    assert Result.SelectedWitness.ClaimsBySignal == (
+        (Straight.Signal, Straight.Claims),
+    )
+    assert Result.SelectedWitness.RepeaterReservations == (
+        Straight.RepeaterReservations[0],
+    )
+
+
+@pytest.mark.parametrize(
+    "ChangedField, ChangedValue",
+    (
+        ("CatalogVersion", "catalog-v2"),
+        ("TechnologyFingerprint", "technology-v2"),
+        ("ResourceModelFingerprint", "resources-v2"),
+    ),
+)
+def testExactPinAccessProblemIdentityIncludesEveryDependency(
+    ChangedField: str,
+    ChangedValue: str,
+) -> None:
+    BaseOption = BuildExactOption(
+        "Alpha",
+        ((0, 1, 0), (1, 1, 0), (2, 1, 0)),
+        (3, 1, 0),
+    )
+    BaseDomain = BuildExactDomain("Alpha", (BaseOption,))
+    ChangedOption = replace(BaseOption, **{ChangedField: ChangedValue})
+    ChangedDomain = BuildExactDomain(
+        "Alpha",
+        (ChangedOption,),
+        **{ChangedField: ChangedValue},
+    )
+
+    Base = SolvePlacedPinAccessOptionDomains((BaseDomain,))
+    Changed = SolvePlacedPinAccessOptionDomains((ChangedDomain,))
+
+    assert Base.ProblemFingerprint != Changed.ProblemFingerprint
+
+
+def testExactPinAccessAdapterPreservesIncompleteWithoutAFalseCore() -> None:
+    Domain = BuildExactDomain(
+        "Alpha",
+        (),
+        Complete=False,
+        IncompleteReason="catalog-domain-generation-work-cap",
+    )
+
+    Result = SolvePlacedPinAccessOptionDomains((Domain,))
+
+    assert Result.Status is PlacementAccessSolveStatus.Incomplete
+    assert not Result.SearchComplete
+    assert not Result.OptimalityProven
+    assert Result.IncompleteReason == "catalog-domain-generation-work-cap"
+    assert Result.SelectedWitness is None
+    assert Result.ConflictCore is None
+
+
+def testExactPinAccessAdapterMapsAssignmentCapToIncomplete() -> None:
+    Alpha = BuildExactOption(
+        "Alpha",
+        ((0, 1, 0), (1, 1, 0), (2, 1, 0)),
+        (3, 1, 0),
+    )
+    Beta = BuildExactOption(
+        "Beta",
+        ((10, 1, 0), (11, 1, 0), (12, 1, 0)),
+        (13, 1, 0),
+    )
+
+    Result = SolvePlacedPinAccessOptionDomains(
+        (
+            BuildExactDomain("Alpha", (Alpha,)),
+            BuildExactDomain("Beta", (Beta,)),
+        ),
+        MaximumExpansions=1,
+    )
+
+    assert Result.Status is PlacementAccessSolveStatus.Incomplete
+    assert Result.IncompleteReason == "assignment-work-cap"
+    assert Result.ExpansionCount == 1
+    assert Result.ConflictCore is None

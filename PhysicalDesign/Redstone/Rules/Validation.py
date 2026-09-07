@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections import Counter, deque
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from ...Contracts.Core import Position3
 from .Geometry import NeighborPositions
+from .Stairs import GeometryStatus, QueryDustStair
 
 
 RoutingWorkCheck = Callable[[dict[str, object]], None]
@@ -65,10 +66,22 @@ def AnalyzeFlatRouteConflicts(
             SignalSupports.add((X, Y - 1, Z))
             Exclusion.update(NeighborPositions(Position))
             for Neighbor in NeighborPositions(Position):
-                if Neighbor not in Positions or Neighbor[1] == Position[1]:
+                if (
+                    Neighbor not in Positions
+                    or Neighbor[1] == Position[1]
+                    or Neighbor <= Position
+                ):
                     continue
-                Lower = Position if Position[1] < Neighbor[1] else Neighbor
-                RequiredAir.add((Lower[0], Lower[1] + 1, Lower[2]))
+                Decision = QueryDustStair(
+                    Position,
+                    Neighbor,
+                    DustPositions=Positions,
+                    SupportMode="Claimable",
+                )
+                if Decision.ClaimPositions is not None:
+                    RequiredAir.update(
+                        Decision.ClaimPositions.RequiredAirPositions
+                    )
         Exclusions[Signal] = Exclusion
         Supports[Signal] = SignalSupports
         Headroom[Signal] = RequiredAir
@@ -153,6 +166,7 @@ def BuildPhysicalGraphs(
     Supports: set[Position3],
     SolidBlocks: set[Position3] | frozenset[Position3] | None = None,
     WorkCheck: RoutingWorkCheck | None = None,
+    BlockStates: Mapping[Position3, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[Position3, list[Position3]]]:
     """Build net graphs using only connections Minecraft can physically make."""
     if WorkCheck is not None:
@@ -188,20 +202,17 @@ def BuildPhysicalGraphs(
         if DeltaY != 1 or DeltaX + DeltaZ != 1:
             return False
 
-        Lower, Upper = (
-            (First, Second) if First[1] < Second[1] else (Second, First)
+        Decision = QueryDustStair(
+            First,
+            Second,
+            ActualBlocks=ActualBlocks,
+            SolidBlocks=SolidBlocks,
+            SupportPositions=Supports,
+            DustPositions=AllWires,
+            BlockStates=BlockStates,
+            SupportMode="Existing",
         )
-        Support = (Upper[0], Upper[1] - 1, Upper[2])
-        Headroom = (Lower[0], Lower[1] + 1, Lower[2])
-        SupportIsSolid = (
-            Support in Supports or Support in SolidBlocks
-        ) and Support not in AllWires
-        HeadroomIsClear = (
-            Headroom not in Supports
-            and Headroom not in SolidBlocks
-            and Headroom not in AllWires
-        )
-        return SupportIsSolid and HeadroomIsClear
+        return Decision.GeometryStatus is GeometryStatus.Connected
 
     Graphs: dict[str, dict[Position3, list[Position3]]] = {}
     ProcessedCells = 0
