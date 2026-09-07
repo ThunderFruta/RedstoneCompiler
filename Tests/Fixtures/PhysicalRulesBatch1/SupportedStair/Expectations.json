@@ -1,0 +1,136 @@
+{
+  "schemaVersion": "physical-rules-expectations-v1",
+  "kind": "combinational",
+  "cases": [
+    {
+      "id": "off-to-on",
+      "initialInputs": {
+        "A": false
+      },
+      "appliedInputs": {
+        "A": true
+      },
+      "expectedOutputs": {
+        "Y": true
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3,
+      "checkerStatus": "Legal",
+      "physical": {
+        "DustConnections": [
+          [
+            [
+              1,
+              1,
+              0
+            ],
+            [
+              2,
+              2,
+              0
+            ]
+          ],
+          [
+            [
+              2,
+              2,
+              0
+            ],
+            [
+              1,
+              1,
+              0
+            ]
+          ]
+        ],
+        "SupportPositions": [
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            2,
+            1,
+            0
+          ]
+        ],
+        "HeadroomPositions": [
+          [
+            1,
+            2,
+            0
+          ]
+        ],
+        "MissingSupport": [],
+        "BlockedHeadroom": [],
+        "ConflictPositions": []
+      }
+    },
+    {
+      "id": "on-to-off",
+      "initialInputs": {
+        "A": true
+      },
+      "appliedInputs": {
+        "A": false
+      },
+      "expectedOutputs": {
+        "Y": false
+      },
+      "settlementTicks": 4,
+      "stabilityWindowTicks": 3,
+      "checkerStatus": "Legal",
+      "physical": {
+        "DustConnections": [
+          [
+            [
+              1,
+              1,
+              0
+            ],
+            [
+              2,
+              2,
+              0
+            ]
+          ],
+          [
+            [
+              2,
+              2,
+              0
+            ],
+            [
+              1,
+              1,
+              0
+            ]
+          ]
+        ],
+        "SupportPositions": [
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            2,
+            1,
+            0
+          ]
+        ],
+        "HeadroomPositions": [
+          [
+            1,
+            2,
+            0
+          ]
+        ],
+        "MissingSupport": [],
+        "BlockedHeadroom": [],
+        "ConflictPositions": []
+      }
+    }
+  ]
+}

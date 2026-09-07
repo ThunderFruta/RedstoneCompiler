@@ -1,18 +1,56 @@
 import unittest
 
 from PhysicalDesign.Geometry.Placement import PlacedGate
-from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, FindClaimConflictsByResourceIndex, LocalRouteClaim, NormalizeRoutingEdge, RoutingResourceGraph, RoutingResourceKind, ValidateLocalRouteClaims
+from PhysicalDesign.Redstone.Rules import BuildPhysicalGraphs
+from PhysicalDesign.Rendering.SchemWriter import BuildWireState
+from PhysicalDesign.Resources.ResourceGraph import FindClaimConflicts, FindClaimConflictsByResourceIndex, FreezeRoutingResourceState, LocalRouteClaim, NormalizeRoutingEdge, RoutingResourceGraph, RoutingResourceGraphVersion, RoutingResourceKind, ValidateLocalRouteClaims
 from PhysicalDesign.Placement.Engine.Channels import LocalClusterRouteCandidate, SelectJointLocalClusterCandidates
 from PhysicalDesign.Placement.Engine.MandatoryAccess import FindMandatoryAccessConflictSignals, MeasureMandatoryAccessConflictProfile
 
 
 class RoutingResourceGraphTests(unittest.TestCase):
-    def BuildGraph(self, *, Actual=(), Electrical=(), Solid=()):
+    def BuildGraph(self, *, Actual=(), Electrical=(), Solid=(), BlockStates=None):
         return RoutingResourceGraph(
             ActualBlocks=frozenset(Actual),
             ElectricalBlocks=frozenset(Electrical),
             SolidBlocks=frozenset(Solid),
+            BlockStates=BlockStates or {},
         )
+
+    def test_graph_version_defaults_to_v3_is_immutable_and_allows_explicit_custom(self):
+        Graph = self.BuildGraph()
+        self.assertEqual(Graph.GraphVersion, RoutingResourceGraphVersion)
+        with self.assertRaises(AttributeError):
+            Graph.GraphVersion = "routing-resource-graph-v4"
+        Custom = RoutingResourceGraph(
+            ActualBlocks=frozenset(),
+            ElectricalBlocks=frozenset(),
+            SolidBlocks=frozenset(),
+            GraphVersion="abstract-cache-test-v1",
+        )
+        self.assertEqual(Custom.GraphVersion, "abstract-cache-test-v1")
+        with self.assertRaises(TypeError):
+            RoutingResourceGraph(
+                ActualBlocks=frozenset(), ElectricalBlocks=frozenset(),
+                SolidBlocks=frozenset(), GraphVersion="",
+            )
+
+    def test_public_state_freezer_is_finite_canonical_and_rejects_lossy_inputs(self):
+        Frozen = FreezeRoutingResourceState({
+            "z": [True, 2, 3.5], "a": {"nested": None},
+        })
+        self.assertEqual(tuple(Frozen), ("a", "z"))
+        self.assertEqual(Frozen["z"], (True, 2, 3.5))
+        with self.assertRaises(TypeError):
+            Frozen["z"] = ()
+        Cyclic = {}
+        Cyclic["self"] = Cyclic
+        for Invalid in (
+            float("nan"), float("inf"), float("-inf"),
+            {0: "not-a-string-key"}, iter(("one-shot",)), Cyclic,
+        ):
+            with self.assertRaises(TypeError):
+                FreezeRoutingResourceState(Invalid)
 
     def BuildMandatoryOutput(
         self,
@@ -158,6 +196,233 @@ class RoutingResourceGraphTests(unittest.TestCase):
 
         self.assertIsNone(NonSolid.BuildPrimitive((0, 1, 0), (1, 2, 0)))
         self.assertIsNotNone(Solid.BuildPrimitive((0, 1, 0), (1, 2, 0)))
+
+    def testSupportedStairRuleAgreesAcrossPhysicalConsumers(self) -> None:
+        Lower = (0, 1, 0)
+        Upper = (1, 2, 0)
+        LowerSupport = (0, 0, 0)
+        UpperSupport = (1, 1, 0)
+        Headroom = (0, 2, 0)
+        Nodes = frozenset({Lower, Upper})
+        Edge = NormalizeRoutingEdge(Lower, Upper)
+        ClearGraph = self.BuildGraph(
+            Actual={UpperSupport},
+            Solid={UpperSupport},
+        )
+
+        Primitive = ClearGraph.BuildPrimitive(Lower, Upper)
+        self.assertIsNotNone(Primitive)
+        self.assertEqual(Primitive.Claims.WireCells, Nodes)
+        self.assertEqual(
+            Primitive.Claims.SupportCells,
+            frozenset({LowerSupport, UpperSupport}),
+        )
+        self.assertEqual(
+            Primitive.Claims.RequiredAirCells,
+            frozenset({Headroom}),
+        )
+
+        Claims = ClearGraph.BuildRouteClaims(Nodes)
+        self.assertEqual(Claims.WireCells, Nodes)
+        self.assertEqual(
+            Claims.SupportCells,
+            frozenset({LowerSupport, UpperSupport}),
+        )
+        self.assertEqual(Claims.RequiredAirCells, frozenset({Headroom}))
+        LocalClaim = LocalRouteClaim(
+            Signal="Signal",
+            ClusterId=0,
+            Root=Lower,
+            ConnectedTargets=(Upper,),
+            BoundaryNodes=(),
+            Nodes=Nodes,
+            Edges=frozenset({Edge}),
+            Claims=Claims,
+        )
+        self.assertEqual(
+            ValidateLocalRouteClaims(ClearGraph, (LocalClaim,))["Signal"],
+            Claims,
+        )
+
+        ClearPhysical = BuildPhysicalGraphs(
+            {"Signal": set(Nodes)},
+            ActualBlocks={UpperSupport},
+            Supports={LowerSupport, UpperSupport},
+            SolidBlocks={UpperSupport},
+        )
+        self.assertIn(Upper, ClearPhysical["Signal"][Lower])
+        self.assertIn(Lower, ClearPhysical["Signal"][Upper])
+        ClearBlocks = {
+            LowerSupport: {"Name": "minecraft:smooth_stone"},
+            UpperSupport: {"Name": "minecraft:smooth_stone"},
+        }
+        self.assertEqual(
+            BuildWireState(Lower, set(Nodes), ClearBlocks, 0)["Properties"]["east"],
+            "up",
+        )
+        self.assertEqual(
+            BuildWireState(Upper, set(Nodes), ClearBlocks, 0)["Properties"]["west"],
+            "side",
+        )
+
+        BlockedGraph = self.BuildGraph(
+            Actual={UpperSupport, Headroom},
+            Solid={UpperSupport, Headroom},
+        )
+        self.assertIsNone(BlockedGraph.BuildPrimitive(Lower, Upper))
+        with self.assertRaises(ValueError):
+            ValidateLocalRouteClaims(BlockedGraph, (LocalClaim,))
+        BlockedPhysical = BuildPhysicalGraphs(
+            {"Signal": set(Nodes)},
+            ActualBlocks={UpperSupport, Headroom},
+            Supports={LowerSupport, UpperSupport},
+            SolidBlocks={UpperSupport, Headroom},
+        )
+        self.assertNotIn(Upper, BlockedPhysical["Signal"][Lower])
+        self.assertNotIn(Lower, BlockedPhysical["Signal"][Upper])
+        BlockedBlocks = {
+            **ClearBlocks,
+            Headroom: {"Name": "minecraft:smooth_stone"},
+        }
+        self.assertEqual(
+            BuildWireState(Lower, set(Nodes), BlockedBlocks, 0)["Properties"]["east"],
+            "none",
+        )
+
+    def testWallTorchStairSeparatesGeometricConsumersFromRouteClaims(self) -> None:
+        Lower = (0, 0, 0)
+        Upper = (1, 1, 0)
+        LowerSupport = (0, -1, 0)
+        UpperSupport = (1, 0, 0)
+        Headroom = (0, 1, 0)
+        Backing = (-1, 1, 0)
+        Nodes = frozenset({Lower, Upper})
+        Edge = NormalizeRoutingEdge(Lower, Upper)
+        BlockStates = {
+            LowerSupport: {"Name": "minecraft:smooth_stone"},
+            UpperSupport: {"Name": "minecraft:smooth_stone"},
+            Headroom: {
+                "Name": "minecraft:redstone_wall_torch",
+                "Properties": {"facing": "east", "lit": "true"},
+            },
+            Backing: {"Name": "minecraft:smooth_stone"},
+        }
+        Graph = self.BuildGraph(
+            Actual={LowerSupport, UpperSupport, Headroom, Backing},
+            Electrical={Headroom},
+            Solid={LowerSupport, UpperSupport, Backing},
+            BlockStates=BlockStates,
+        )
+
+        Decision = Graph.QueryDustStairDecision(Lower, Upper)
+        self.assertEqual(Decision.GeometryStatus.value, "Connected")
+        self.assertEqual(Decision.RouteClaimStatus.value, "Unknown")
+        self.assertEqual(
+            Decision.ReasonCode,
+            "electrical-headroom-ownership-unavailable",
+        )
+        self.assertIsNone(Decision.ClaimPositions)
+        self.assertIsNone(Graph.BuildPrimitive(Lower, Upper))
+        with self.assertRaisesRegex(ValueError, "stair-status-is-not-legal"):
+            Graph.BuildRouteClaims(Nodes)
+
+        Region = Graph.BuildRegion(
+            (-1, 1, 0, 1, 0, 0),
+            AllowedAccess=Nodes,
+        )
+        self.assertFalse(Region.ContainsEdge(Lower, Upper))
+        self.assertNotIn(Edge, Region.Edges)
+
+        Physical = BuildPhysicalGraphs(
+            {"Signal": set(Nodes)},
+            ActualBlocks={LowerSupport, UpperSupport, Headroom, Backing},
+            Supports={LowerSupport, UpperSupport, Backing},
+            SolidBlocks={LowerSupport, UpperSupport, Backing},
+            BlockStates=BlockStates,
+        )
+        self.assertIn(Upper, Physical["Signal"][Lower])
+        self.assertIn(Lower, Physical["Signal"][Upper])
+
+        MalformedStates = {
+            **BlockStates,
+            Headroom: {
+                "Name": "minecraft:redstone_wall_torch",
+                "Properties": {"facing": "east"},
+            },
+        }
+        MalformedPhysical = BuildPhysicalGraphs(
+            {"Signal": set(Nodes)},
+            ActualBlocks={LowerSupport, UpperSupport, Headroom, Backing},
+            Supports={LowerSupport, UpperSupport, Backing},
+            SolidBlocks={LowerSupport, UpperSupport, Backing},
+            BlockStates=MalformedStates,
+        )
+        self.assertNotIn(Upper, MalformedPhysical["Signal"][Lower])
+        self.assertNotIn(Lower, MalformedPhysical["Signal"][Upper])
+
+    def testGraphCachesUseFrozenBlockStateSemantics(self) -> None:
+        Lower = (0, 0, 0)
+        Upper = (1, 1, 0)
+        LowerSupport = (0, -1, 0)
+        UpperSupport = (1, 0, 0)
+        Headroom = (0, 1, 0)
+        Backing = (-1, 1, 0)
+        Nodes = frozenset({Lower, Upper})
+        Edge = NormalizeRoutingEdge(Lower, Upper)
+        CallerStates = {
+            LowerSupport: {"Name": "minecraft:smooth_stone"},
+            UpperSupport: {"Name": "minecraft:smooth_stone"},
+            Headroom: {
+                "Name": "minecraft:air",
+                "Properties": {},
+            },
+            Backing: {"Name": "minecraft:smooth_stone"},
+        }
+        Graph = self.BuildGraph(
+            Actual={LowerSupport, UpperSupport, Backing},
+            Solid={LowerSupport, UpperSupport, Backing},
+            BlockStates=CallerStates,
+        )
+        Before = Graph.QueryDustStairDecision(Lower, Upper)
+        Region = Graph.BuildRegion(
+            (-1, 1, 0, 1, 0, 0),
+            AllowedAccess=Nodes,
+        )
+        Claims = Graph.BuildRouteClaims(Nodes)
+        self.assertEqual(Before.RouteClaimStatus.value, "Legal")
+        self.assertIn(Edge, Region.Edges)
+        self.assertEqual(Claims.RequiredAirCells, frozenset({Headroom}))
+
+        CallerStates[Headroom]["Name"] = "minecraft:redstone_wall_torch"
+        CallerStates[Headroom]["Properties"].update({
+            "facing": "east",
+            "lit": "true",
+        })
+        FreshGraph = self.BuildGraph(
+            Actual={LowerSupport, UpperSupport, Backing},
+            Solid={LowerSupport, UpperSupport, Backing},
+            BlockStates=CallerStates,
+        )
+        self.assertEqual(
+            FreshGraph.QueryDustStairDecision(
+                Lower,
+                Upper,
+            ).RouteClaimStatus.value,
+            "Unknown",
+        )
+
+        After = Graph.QueryDustStairDecision(Lower, Upper)
+        self.assertEqual(After, Before)
+        self.assertEqual(Graph.BlockStates[Headroom]["Name"], "minecraft:air")
+        self.assertIs(Graph.BuildRegion(
+            (-1, 1, 0, 1, 0, 0),
+            AllowedAccess=Nodes,
+        ), Region)
+        self.assertIs(Graph.BuildRouteClaims(Nodes), Claims)
+        self.assertIn(Edge, Region.Edges)
+        self.assertEqual(Claims.RequiredAirCells, frozenset({Headroom}))
+        with self.assertRaisesRegex(AttributeError, "semantics are immutable"):
+            Graph.BlockStates = CallerStates
 
     def testRegionContainsOnlyAuthoritativeLegalEdges(self) -> None:
         Graph = self.BuildGraph()

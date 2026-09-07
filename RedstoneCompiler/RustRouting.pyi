@@ -10,3 +10,8 @@ from typing import Any
 
 
 def __getattr__(Name: str) -> Any: ...
+
+
+def ObserveMchprsFixture(RequestJson: str) -> str:
+    """Observe one fresh case without expected values; return inclusive raw ticks."""
+    ...

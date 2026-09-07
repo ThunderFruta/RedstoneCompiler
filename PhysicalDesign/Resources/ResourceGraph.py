@@ -5,14 +5,71 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import cached_property
+from math import isfinite
 from collections import deque
-from typing import Callable, Iterable
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Mapping
 
 from ..Redstone.Technology import DefaultRedstoneRoutingTechnology, RepeaterInputFacing, RedstoneRoutingTechnology
 
 Position2 = tuple[int, int]
 Position3 = tuple[int, int, int]
 RoutingEdge = tuple[Position3, Position3]
+RoutingResourceGraphVersion = "routing-resource-graph-v3"
+
+
+def FreezeRoutingResourceState(Value: Any, _Seen: set[int] | None = None) -> Any:
+    """Canonicalize one finite JSON-like block state into immutable data.
+
+    This is the lower-layer owner for state semantics.  It intentionally accepts
+    only concrete mappings and sequences, so neither an iterator nor a custom
+    mapping can be consumed while a routing identity is being formed.
+    """
+    Seen = _Seen if _Seen is not None else set()
+    if Value is None or type(Value) in (bool, int, str):
+        return Value
+    if type(Value) is float:
+        if not isfinite(Value):
+            raise TypeError("routing resource states cannot contain non-finite floats")
+        return Value
+    if type(Value) in (dict, MappingProxyType):
+        if id(Value) in Seen:
+            raise TypeError("routing resource states cannot be cyclic")
+        Keys = tuple(Value)
+        if any(type(Key) is not str for Key in Keys):
+            raise TypeError("routing resource state keys must be exact strings")
+        Seen.add(id(Value))
+        try:
+            return MappingProxyType({
+                Key: FreezeRoutingResourceState(Value[Key], Seen)
+                for Key in sorted(Keys)
+            })
+        finally:
+            Seen.remove(id(Value))
+    if type(Value) in (tuple, list):
+        if id(Value) in Seen:
+            raise TypeError("routing resource states cannot be cyclic")
+        Seen.add(id(Value))
+        try:
+            return tuple(FreezeRoutingResourceState(Item, Seen) for Item in Value)
+        finally:
+            Seen.remove(id(Value))
+    raise TypeError(
+        "block-state semantic values must be JSON-like immutable data"
+    )
+
+
+def _FreezeBlockStates(
+    BlockStates: Mapping[Position3, Any],
+) -> Mapping[Position3, Any]:
+    if type(BlockStates) not in (dict, MappingProxyType):
+        raise TypeError(
+            "RoutingResourceGraph BlockStates must be exact dict or mappingproxy"
+        )
+    return MappingProxyType({
+        Position: FreezeRoutingResourceState(BlockStates[Position])
+        for Position in sorted(BlockStates)
+    })
 
 
 @dataclass(frozen=True)
@@ -286,8 +343,16 @@ class RoutingResourceGraph:
     ElectricalBlocks: frozenset[Position3]
     SolidBlocks: frozenset[Position3]
     Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology
-    GraphVersion: str = "routing-resource-graph-v2"
+    GraphVersion: str = RoutingResourceGraphVersion
     StaticKeepOutBlocks: frozenset[Position3] = frozenset()
+    BlockStates: Mapping[Position3, Any] = field(
+        default_factory=dict
+    )
+    _FrozenBlockStates: Mapping[Position3, Any] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _RegionCache: dict[
         tuple[
             tuple[int, int, int, int, int, int],
@@ -310,6 +375,23 @@ class RoutingResourceGraph:
     _RouteClaimsCacheOrder: list[
         frozenset[Position3],
     ] = field(default_factory=list, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.GraphVersion) is not str or not self.GraphVersion:
+            raise TypeError("RoutingResourceGraph GraphVersion must be a nonempty exact string")
+        Frozen = _FreezeBlockStates(self.BlockStates)
+        object.__setattr__(self, "BlockStates", Frozen)
+        object.__setattr__(self, "_FrozenBlockStates", Frozen)
+
+    def __setattr__(self, Name: str, Value: Any) -> None:
+        if (
+            Name in {"BlockStates", "_FrozenBlockStates", "GraphVersion"}
+            and "_FrozenBlockStates" in self.__dict__
+        ):
+            raise AttributeError(
+                "RoutingResourceGraph block-state semantics are immutable"
+            )
+        object.__setattr__(self, Name, Value)
 
     @cached_property
     def StaticKeepOut(self) -> frozenset[Position3]:
@@ -351,16 +433,19 @@ class RoutingResourceGraph:
     ) -> RoutingPrimitive | None:
         if Second not in self.Technology.NeighborPositions(First):
             return None
-        if not self.CanBuildNeighborPrimitive(First, Second):
-            return None
         IsVertical = First[1] != Second[1]
         RequiredAir: set[Position3] = set()
-        if IsVertical:
-            Lower = First if First[1] < Second[1] else Second
-            Headroom = (Lower[0], Lower[1] + 1, Lower[2])
-            RequiredAir.add(Headroom)
         WireCells = {First, Second}
         SupportCells = {(X, Y - 1, Z) for X, Y, Z in WireCells}
+        if IsVertical:
+            Decision = self.QueryDustStairDecision(First, Second)
+            if Decision.RouteClaimStatus.value != "Legal":
+                return None
+            if Decision.ClaimPositions is None:
+                raise ValueError("legal dust-stair decision omitted claim positions")
+            WireCells = set(Decision.ClaimPositions.WirePositions)
+            SupportCells = set(Decision.ClaimPositions.SupportPositions)
+            RequiredAir.update(Decision.ClaimPositions.RequiredAirPositions)
         ElectricalCells = self.Technology.BuildElectricalExclusions(WireCells)
         return RoutingPrimitive(
             Start=First,
@@ -382,15 +467,29 @@ class RoutingResourceGraph:
         """Check an already-enumerated neighboring edge without claim allocation."""
         if First[1] == Second[1]:
             return True
-        Lower = First if First[1] < Second[1] else Second
-        Upper = Second if First[1] < Second[1] else First
-        Headroom = (Lower[0], Lower[1] + 1, Lower[2])
-        if Headroom in self.SolidBlocks or Headroom in self.ActualBlocks:
-            return False
-        Support = (Upper[0], Upper[1] - 1, Upper[2])
-        return not (
-            Support in self.ActualBlocks
-            and Support not in self.SolidBlocks
+        return (
+            self.QueryDustStairDecision(First, Second).RouteClaimStatus.value
+            == "Legal"
+        )
+
+    def QueryDustStairDecision(
+        self,
+        First: Position3,
+        Second: Position3,
+    ):
+        """Project this graph's closed static context into the shared query."""
+        # Import lazily because Rules.Geometry owns construction of this graph
+        # and the package's public facade re-exports both APIs.
+        from ..Redstone.Rules.Stairs import QueryDustStair
+
+        return QueryDustStair(
+            First,
+            Second,
+            ActualBlocks=self.ActualBlocks,
+            ElectricalBlocks=self.ElectricalBlocks,
+            SolidBlocks=self.SolidBlocks,
+            BlockStates=self._FrozenBlockStates,
+            SupportMode="Claimable",
         )
 
     def BuildRegion(
@@ -592,8 +691,13 @@ class RoutingResourceGraph:
                 if Second not in WireCells or Second <= First:
                     continue
                 Primitive = self.BuildPrimitive(First, Second)
-                if Primitive is not None:
-                    RequiredAirCells.update(Primitive.Claims.RequiredAirCells)
+                if Primitive is None:
+                    if Second[1] != First[1]:
+                        raise ValueError(
+                            "route-claim-stair-status-is-not-legal"
+                        )
+                    continue
+                RequiredAirCells.update(Primitive.Claims.RequiredAirCells)
         Result = RoutingResourceClaims(
             WireCells=WireCells,
             SupportCells=frozenset(SupportCells),
@@ -620,8 +724,14 @@ class RoutingResourceGraph:
             ResourcePositions.update(self.Technology.NeighborPositions(Position))
         for First, Second in Region.Edges:
             if First[1] != Second[1]:
-                Lower = First if First[1] < Second[1] else Second
-                ResourcePositions.add((Lower[0], Lower[1] + 1, Lower[2]))
+                Decision = self.QueryDustStairDecision(First, Second)
+                if Decision.ClaimPositions is None:
+                    raise ValueError(
+                        "routing region contains a non-legal dust stair"
+                    )
+                ResourcePositions.update(
+                    Decision.ClaimPositions.RequiredAirPositions
+                )
         Ordered = tuple(sorted(ResourcePositions))
         return IndexedRoutingResourceGraph(
             ResourcePositions=Ordered,

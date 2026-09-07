@@ -1,0 +1,93 @@
+{
+  "Blocks": [
+    {
+      "Position": [
+        0,
+        0,
+        0
+      ],
+      "State": {
+        "Name": "minecraft:stone"
+      }
+    },
+    {
+      "Position": [
+        0,
+        1,
+        0
+      ],
+      "State": {
+        "Name": "minecraft:lever",
+        "Properties": {
+          "face": "floor",
+          "facing": "north",
+          "powered": "false"
+        }
+      }
+    },
+    {
+      "Position": [
+        1,
+        0,
+        0
+      ],
+      "State": {
+        "Name": "minecraft:stone"
+      }
+    },
+    {
+      "Position": [
+        1,
+        1,
+        0
+      ],
+      "State": {
+        "Name": "minecraft:redstone_wire",
+        "Properties": {
+          "power": "0",
+          "east": "none",
+          "west": "side",
+          "north": "none",
+          "south": "none"
+        }
+      }
+    },
+    {
+      "Position": [
+        1,
+        2,
+        0
+      ],
+      "State": {
+        "Name": "minecraft:stone"
+      }
+    },
+    {
+      "Position": [
+        2,
+        1,
+        0
+      ],
+      "State": {
+        "Name": "minecraft:stone"
+      }
+    },
+    {
+      "Position": [
+        2,
+        2,
+        0
+      ],
+      "State": {
+        "Name": "minecraft:redstone_wire",
+        "Properties": {
+          "power": "0",
+          "east": "none",
+          "west": "none",
+          "north": "none",
+          "south": "none"
+        }
+      }
+    }
+  ]
+}

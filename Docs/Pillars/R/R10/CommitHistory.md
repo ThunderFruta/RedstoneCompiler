@@ -5,4 +5,12 @@ is listed only when its scope and verification are known.
 
 | Commit | Date | Relationship to R10 |
 |---|---|---|
-| None attributed | — | No R10-specific commit has been recorded yet |
+| `f23293a` — Reject stale resource graphs missing frozen wires | 2026-09-06 | Current Physical-Rules checkpoint. It rejects a supplied graph that omits a pre-owned position from the selected claim before model identity or fabric construction. It is an exact producer consumed by Joint, not complete R10 acceptance. |
+| `1d9e899` — Enforce current selected access and add conformance coverage | 2026-09-06 | Earlier Physical-Rules checkpoint replacing historical same-parent source/test commit `dc95e349`; enforces current selected-access bindings and current resource/technology identity at the profile/fabric boundary. Supplied to Joint as a Physical checkpoint only; it is not Joint integration or full R10 acceptance. |
+| `2f69160` — Implement physical access rule contracts | 2026-09-05 | Squashed R10/N2 access checkpoint covering technology-bound templates, physical realization, legality, exact claims, proof transport, domain construction, and conflict queries. This remains a bounded access slice, not complete R10 acceptance. |
+
+The placement/access consumer contract types also support
+Joint-Physical-Design. See [N2 attribution](../../N/N2/CommitHistory.md) and
+the [R2 history](../R2/CommitHistory.md). The complete stable patch ID shared
+by `7c68af4` and the pre-rewrite `96d9604` is
+`86b9e35fa6dd9e44c9492db039d5c05f564f7222`.

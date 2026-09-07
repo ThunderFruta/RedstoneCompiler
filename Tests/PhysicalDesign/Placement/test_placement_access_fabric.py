@@ -5,12 +5,15 @@ import tempfile
 import pytest
 
 import PhysicalDesign.Placement.Access.Capacity as AccessFabricModule
+import PhysicalDesign.Placement.Access.Fabric as PlacementAccessFabricModule
 
 from Compilation.Ir.Models import Gate, GateKind, ModuleIR
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
 from PhysicalDesign.Placement.Access.Capacity import SolvePlacementAccessFabricCapacity
 from PhysicalDesign.Placement.Access.EscapePaths import _BuildDerivedPerimeterCycleRouteNodeSets, _BuildShortestFabricEscapePaths
 from PhysicalDesign.Placement.Access.Fabric import AttachPlacementAccessFabric, BuildPlacementAccessFabric
+from PhysicalDesign.Placement.Access.Catalog import EnumeratePlacedPinAccessOptionDomains
+from PhysicalDesign.Placement.Access.Capacity import SolvePlacedPinAccessOptionDomains
 from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
 from PhysicalDesign.Placement.Engine.Compactness import BuildPinAlignedPackedClusterPortfolio
@@ -247,6 +250,97 @@ def test_placement_access_fabric_freezes_catalog_pin_witness():
     assert FixedSolve["Complete"] is True
     assert FixedSolve["Success"] is True
     assert len(FixedSolve["SelectedOptionFingerprints"]) == 9
+
+
+def test_routing_aware_fabric_consumes_selected_witness_without_rebuilding(
+    monkeypatch,
+):
+    _Module, Placement = BuildGraphPortfolioSelectionFixture()
+    Resources = BuildRoutingResources(Placement.Placed)
+    Domains = EnumeratePlacedPinAccessOptionDomains(
+        Placement.Placed.PlacedGates,
+        ResourceGraph=Resources.ResourceGraph,
+        Technology=DefaultRedstoneRoutingTechnology,
+        EnabledPatternFamilies=("straight",),
+    )
+    Solve = SolvePlacedPinAccessOptionDomains(
+        Domains,
+        ResourceGraph=Resources.ResourceGraph,
+        MaximumExpansions=100_000,
+    )
+    assert Solve.Success
+    Witness = Solve.SelectedWitness
+    assert Witness is not None
+    Placement = replace(
+        Placement,
+        Placed=replace(
+            Placement.Placed,
+            SelectedPinAccessWitness=Witness,
+            PlacementAccessSolve=Solve,
+        ),
+        SelectedPinAccessWitness=Witness,
+        PlacementAccessSolve=Solve,
+    )
+
+    def RejectRebuild(*_Arguments, **_KeywordArguments):
+        raise AssertionError("legacy pin-access reconstruction was invoked")
+
+    monkeypatch.setattr(
+        PlacementAccessFabricModule,
+        "BuildPlacementPinAccessWitness",
+        RejectRebuild,
+    )
+    for BuilderName in (
+        "_BuildIndependentShortestFabricEscapePaths",
+        "_BuildSharedLegalFabricEscapePaths",
+        "_BuildShortestLegalFabricEscapePaths",
+    ):
+        monkeypatch.setattr(
+            PlacementAccessFabricModule,
+            BuilderName,
+            RejectRebuild,
+        )
+    Fabric = BuildPlacementAccessFabric(
+        Placement,
+        Resources=Resources,
+        Technology=DefaultRedstoneRoutingTechnology,
+        PinAccessWitness=Witness,
+        FixedPinAccessSolve=Solve,
+        RequireSelectedPinAccessWitness=True,
+    )
+
+    assert Fabric.PinAccessWitness is Witness
+    assert Fabric.FixedPinAccessSolve is Solve
+    assert Fabric.PinAccessDomainFingerprint == Witness.DomainFingerprint
+    assert Fabric.PinAccessWitnessFingerprint == Witness.WitnessFingerprint
+    assert Fabric.ToDictionary()["PinAccessWitnessFingerprint"] == (
+        Witness.WitnessFingerprint
+    )
+    assert Fabric.Complete is True
+    assert Fabric.LegalEscapeExpansionCount == 0
+    assert (
+        Fabric.LegalEscapeWorkLimitKind
+        == "selected-straight-first-track-v1"
+    )
+    assert Fabric.TerminalDomains
+    assert all(
+        len(Domain.EscapeStubs) == 1
+        for Domain in Fabric.TerminalDomains
+    )
+    SelectionByTerminal = {
+        (Selection.Signal, Selection.Terminal): Selection
+        for Selection in Witness.Selections
+    }
+    for Domain in Fabric.TerminalDomains:
+        Selection = SelectionByTerminal[(Domain.Signal, Domain.Terminal)]
+        Stub = Domain.EscapeStubs[0]
+        assert Stub.Path[:len(Selection.FirstLegNodes)] == (
+            Selection.FirstLegNodes
+        )
+        assert Stub.Path == Selection.FirstLegNodes
+        assert Stub.Ingress[0] == Selection.FirstTrackNode[0]
+        assert Stub.Ingress[2] == Selection.FirstTrackNode[2]
+        assert Stub.Ingress[1] == Selection.FirstTrackNode[1] + 1
 
 
 def test_access_fabric_region_contract_encloses_frozen_outer_geometry():

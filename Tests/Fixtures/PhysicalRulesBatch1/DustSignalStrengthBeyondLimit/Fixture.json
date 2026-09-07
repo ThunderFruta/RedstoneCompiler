@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "physical-rules-fixture-v1",
+  "source": {"kind": "template", "path": "Template.json", "sha256": "3f91c7cc2694a8e2154a6e668e0b8edc328446366f40c61313a1e2ab631540e9"},
+  "inputs": [{"name": "A", "position": [0, 1, 0]}],
+  "outputs": [{"name": "Y", "position": [16, 1, 0]}],
+  "routeInputs": {"A": [1, 1, 0]}
+}

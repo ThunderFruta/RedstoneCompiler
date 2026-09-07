@@ -11,6 +11,11 @@ from Formats.Litematic.Codec import LoadTemplate, NeutralDynamicState
 from PhysicalDesign.Cells.Library import CellMacros
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize, TransformBlockState, TransformLocalPosition
 from PhysicalDesign.Redstone.Technology import OppositeHorizontalFacing, ValidateRepeaterInputFacing
+from PhysicalDesign.Redstone.Rules.Stairs import (
+    ElectricalBlockNames,
+    GeometryStatus,
+    QueryDustStair,
+)
 
 TRACE_PALETTE = (
     "minecraft:light_gray_concrete", "minecraft:yellow_concrete", "minecraft:lime_concrete",
@@ -294,16 +299,17 @@ def BuildWireState(
     """Build the exact redstone-wire shape required at one routed position."""
     X, Y, Z = Position
     Connections = {}
-    NonSolidNames = {
-        None,
-        "minecraft:air",
-        "minecraft:comparator",
-        "minecraft:lever",
-        "minecraft:redstone_torch",
-        "minecraft:redstone_wall_torch",
-        "minecraft:redstone_wire",
-        "minecraft:repeater",
+    ActualBlocks = {
+        BlockPosition
+        for BlockPosition, State in Blocks.items()
+        if State.get("Name") != "minecraft:air"
     }
+    ElectricalBlocks = {
+        BlockPosition
+        for BlockPosition, State in Blocks.items()
+        if State.get("Name") in ElectricalBlockNames
+    }
+    SolidBlocks = ActualBlocks - ElectricalBlocks
     for Direction, DeltaX, DeltaZ in (
         ("north", 0, -1),
         ("south", 0, 1),
@@ -314,20 +320,42 @@ def BuildWireState(
         UpperLevel = (X + DeltaX, Y + 1, Z + DeltaZ)
         LowerLevel = (X + DeltaX, Y - 1, Z + DeltaZ)
         NeighborName = Blocks.get(SameLevel, {}).get("Name")
-        HeadName = Blocks.get((X, Y + 1, Z), {}).get("Name")
-        CanClimb = (
-            NeighborName not in NonSolidNames
-            and HeadName not in (
-                "minecraft:redstone_wire",
-                "minecraft:repeater",
+        if UpperLevel in NetCells:
+            Decision = QueryDustStair(
+                Position,
+                UpperLevel,
+                ActualBlocks=ActualBlocks,
+                ElectricalBlocks=ElectricalBlocks,
+                SolidBlocks=SolidBlocks,
+                SupportPositions=SolidBlocks,
+                DustPositions=NetCells,
+                BlockStates=Blocks,
+                SupportMode="Existing",
             )
-            and HeadName in NonSolidNames
-        )
-        if UpperLevel in NetCells and CanClimb:
-            Connections[Direction] = "up"
+            Connections[Direction] = (
+                "up"
+                if Decision.GeometryStatus is GeometryStatus.Connected
+                else "none"
+            )
+        elif LowerLevel in NetCells:
+            Decision = QueryDustStair(
+                LowerLevel,
+                Position,
+                ActualBlocks=ActualBlocks,
+                ElectricalBlocks=ElectricalBlocks,
+                SolidBlocks=SolidBlocks,
+                SupportPositions=SolidBlocks,
+                DustPositions=NetCells,
+                BlockStates=Blocks,
+                SupportMode="Existing",
+            )
+            Connections[Direction] = (
+                "side"
+                if Decision.GeometryStatus is GeometryStatus.Connected
+                else "none"
+            )
         elif (
             SameLevel in NetCells
-            or LowerLevel in NetCells
             or NeighborName == "minecraft:repeater"
         ):
             Connections[Direction] = "side"
