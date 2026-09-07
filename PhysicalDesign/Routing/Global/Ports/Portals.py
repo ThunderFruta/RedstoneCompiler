@@ -499,6 +499,33 @@ def ApplyPhysicalComponentAssemblyPortalDomains(
         Result[(Port.Signal, Port.Attachment, Layer)] = (Portal,)
     return Result
 
+def _PlacementAccessStubRoutingLayers(
+    Fabric: Any,
+    Stub: Any,
+    Technology: RedstoneRoutingTechnology,
+    MinimumY: int,
+    LayerCount: int,
+) -> tuple[int, ...]:
+    """Return routing layers reachable after one immutable access leg."""
+    if getattr(Fabric, "PinAccessDomainFingerprint", ""):
+        # The S1 stub ends at the selected physical first leg.  Its layer-zero
+        # identity constrains that leg, not the detailed route after it; the
+        # unchanged selected portal may therefore feed every admitted routing
+        # deck without creating another access option.
+        return tuple(range(LayerCount))
+    Layer = next((
+        CandidateLayer
+        for CandidateLayer in range(LayerCount)
+        if Technology.RoutingY(MinimumY, CandidateLayer)
+        == int(Stub.Ingress[1])
+    ), None)
+    if Layer is None:
+        raise ValueError(
+            "placement access escape is outside the routing layer domain"
+        )
+    return (Layer,)
+
+
 def ApplyPlacementAccessAssignmentPortalDomains(
     Portals: dict[
         tuple[str, Position3, int],
@@ -525,45 +552,42 @@ def ApplyPlacementAccessAssignmentPortalDomains(
     for Signal, Terminal, StubIndex in Assignment.SelectedStubIndices:
         Domain = Domains[(str(Signal), tuple(Terminal))]
         Stub = Domain.EscapeStubs[int(StubIndex)]
-        Layer = next((
-            CandidateLayer
-            for CandidateLayer in range(LayerCount)
-            if Technology.RoutingY(MinimumY, CandidateLayer)
-            == int(Stub.Ingress[1])
-        ), None)
-        if Layer is None:
-            raise ValueError(
-                "placement access escape is outside the routing layer domain"
-            )
         Result = {
             Key: Values
             for Key, Values in Result.items()
             if not (Key[0] == Signal and Key[1] == Terminal)
         }
         Path = tuple(Stub.Path)
-        Portal = PinAccessPortal(
-            PortalId=(
-                f"{Signal}:{Terminal}:{Layer}:AccessFabric:"
-                f"{Assignment.AssignmentFingerprint}:{StubIndex}"
-            ),
-            Signal=str(Signal),
-            Terminal=tuple(Terminal),
-            Layer=Layer,
-            Path=Path,
-            Edges=frozenset(
-                NormalizeRoutingEdge(First, Second)
-                for First, Second in zip(Path, Path[1:])
-            ),
-            Claims=ResourceGraph.BuildRouteClaims(Path),
-            Length=len(Path),
-            BendCount=_CountBends(Path),
-            ViaCount=sum(
-                First[1] != Second[1]
-                for First, Second in zip(Path, Path[1:])
-            ),
-            Cost=len(Path),
-        )
-        Result[(str(Signal), tuple(Terminal), Layer)] = (Portal,)
+        for Layer in _PlacementAccessStubRoutingLayers(
+            Fabric,
+            Stub,
+            Technology,
+            MinimumY,
+            LayerCount,
+        ):
+            Portal = PinAccessPortal(
+                PortalId=(
+                    f"{Signal}:{Terminal}:{Layer}:AccessFabric:"
+                    f"{Assignment.AssignmentFingerprint}:{StubIndex}"
+                ),
+                Signal=str(Signal),
+                Terminal=tuple(Terminal),
+                Layer=Layer,
+                Path=Path,
+                Edges=frozenset(
+                    NormalizeRoutingEdge(First, Second)
+                    for First, Second in zip(Path, Path[1:])
+                ),
+                Claims=ResourceGraph.BuildRouteClaims(Path),
+                Length=len(Path),
+                BendCount=_CountBends(Path),
+                ViaCount=sum(
+                    First[1] != Second[1]
+                    for First, Second in zip(Path, Path[1:])
+                ),
+                Cost=len(Path),
+            )
+            Result[(str(Signal), tuple(Terminal), Layer)] = (Portal,)
     return Result
 
 def ApplyPlacementAccessFabricPortalDomains(
@@ -607,45 +631,41 @@ def ApplyPlacementAccessFabricPortalDomains(
         Signal = str(Domain.Signal)
         Terminal = tuple(Domain.Terminal)
         for StubIndex, Stub in enumerate(Domain.EscapeStubs):
-            Layer = next((
-                CandidateLayer
-                for CandidateLayer in range(LayerCount)
-                if Technology.RoutingY(MinimumY, CandidateLayer)
-                == int(Stub.Ingress[1])
-            ), None)
-            if Layer is None:
-                raise ValueError(
-                    "placement access escape is outside the routing layer "
-                    "domain"
-                )
             Path = tuple(Stub.Path)
-            Portal = PinAccessPortal(
-                PortalId=(
-                    f"{Signal}:{Terminal}:{Layer}:AccessFabricDomain:"
-                    f"{Fabric.FabricFingerprint}:{StubIndex}"
-                ),
-                Signal=Signal,
-                Terminal=Terminal,
-                Layer=Layer,
-                Path=Path,
-                Edges=frozenset(
-                    NormalizeRoutingEdge(First, Second)
-                    for First, Second in zip(Path, Path[1:])
-                ),
-                Claims=ResourceGraph.BuildRouteClaims(Path),
-                Length=len(Path),
-                BendCount=_CountBends(Path),
-                ViaCount=sum(
-                    First[1] != Second[1]
-                    for First, Second in zip(Path, Path[1:])
-                ),
-                Cost=len(Path),
-            )
-            Key = (Signal, Terminal, Layer)
-            Result[Key] = tuple(sorted((
-                *Result.get(Key, ()),
-                Portal,
-            ), key=lambda Value: (Value.Cost, Value.PortalId)))
+            for Layer in _PlacementAccessStubRoutingLayers(
+                Fabric,
+                Stub,
+                Technology,
+                MinimumY,
+                LayerCount,
+            ):
+                Portal = PinAccessPortal(
+                    PortalId=(
+                        f"{Signal}:{Terminal}:{Layer}:AccessFabricDomain:"
+                        f"{Fabric.FabricFingerprint}:{StubIndex}"
+                    ),
+                    Signal=Signal,
+                    Terminal=Terminal,
+                    Layer=Layer,
+                    Path=Path,
+                    Edges=frozenset(
+                        NormalizeRoutingEdge(First, Second)
+                        for First, Second in zip(Path, Path[1:])
+                    ),
+                    Claims=ResourceGraph.BuildRouteClaims(Path),
+                    Length=len(Path),
+                    BendCount=_CountBends(Path),
+                    ViaCount=sum(
+                        First[1] != Second[1]
+                        for First, Second in zip(Path, Path[1:])
+                    ),
+                    Cost=len(Path),
+                )
+                Key = (Signal, Terminal, Layer)
+                Result[Key] = tuple(sorted((
+                    *Result.get(Key, ()),
+                    Portal,
+                ), key=lambda Value: (Value.Cost, Value.PortalId)))
     return Result
 
 def ResolvePlacementAccessFabricRegionContract(

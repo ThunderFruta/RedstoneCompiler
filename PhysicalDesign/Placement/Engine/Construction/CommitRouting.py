@@ -7,9 +7,9 @@ from typing import Any
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
 from PhysicalDesign.Geometry.Placement import PlacedDesign
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
-from PhysicalDesign.Redstone.Rules.Geometry import BuildPlacedCellGeometryWithKeepOut
+from PhysicalDesign.Redstone.Rules import BuildRoutingResources
 from PhysicalDesign.Redstone.Rules.Validation import ValidateTemplateIsolation
-from PhysicalDesign.Resources.ResourceGraph import LocalRouteClaim, NormalizeRoutingEdge, RoutingResourceGraph, ValidateLocalRouteClaims
+from PhysicalDesign.Resources.ResourceGraph import LocalRouteClaim, NormalizeRoutingEdge, ValidateLocalRouteClaims
 from ..Cache import _ClusterLocalRouteTemplateCache
 from ..Channels import AssignBoundaryDemandSides, BoundaryDemandRecord, BuildBoundaryCapacityRecords, BuildClusterBoundaryBundles, BuildClusterBoundaryLeaseRequests, BuildLegalBoundaryEscapeSlots, EvaluateCutBoundaryEscapeFeasibility, EvaluateHardBoundaryFeasibility, LocalClusterRouteCandidate, SelectJointLocalClusterCandidates, ValidateHardBoundaryFeasibility
 from ..Clusters import ClusterLocalRouteTemplate, ClusterLocalRouteTemplateCacheEntry, PackedNandCluster, PcbPlacement, TranslateClusterLocalRouteClaim
@@ -64,19 +64,19 @@ def RouteCommittedClusterTemplates(Context):
             Context.LocalRouteDiagnostics['__JointClusterPlacement__'] = Context.JointPlacementDiagnostics
         if Context.PackedAccessRepairByCluster:
             Context.LocalRouteDiagnostics['__PackedAccessRepair__'] = {str(ClusterIndex): Diagnostics for ClusterIndex, Diagnostics in sorted(Context.PackedAccessRepairByCluster.items())}
-        (
-            Context.ActualBlocks,
-            Context.ElectricalBlocks,
-            Context.SolidBlocks,
-            Context.TemplateElectricalKeepOutBlocks,
-        ) = BuildPlacedCellGeometryWithKeepOut(Context.Placed)
-        Context.LocalResourceGraph = RoutingResourceGraph(
-            ActualBlocks=frozenset(Context.ActualBlocks),
-            ElectricalBlocks=frozenset(Context.ElectricalBlocks),
-            SolidBlocks=frozenset(Context.SolidBlocks),
-            StaticKeepOutBlocks=frozenset(
-                Context.TemplateElectricalKeepOutBlocks
-            ),
+        Context.LocalRoutingResources = BuildRoutingResources(
+            Context.Placed,
+            WorkCheck=Context.WorkCheck,
+            Technology=Context.Technology,
+        )
+        Context.LocalResourceGraph = Context.LocalRoutingResources.ResourceGraph
+        Context.ActualBlocks = set(Context.LocalRoutingResources.StaticGeometry.ActualBlocks)
+        Context.ElectricalBlocks = set(
+            Context.LocalRoutingResources.StaticGeometry.ElectricalBlocks
+        )
+        Context.SolidBlocks = set(Context.LocalRoutingResources.StaticGeometry.SolidBlocks)
+        Context.TemplateElectricalKeepOutBlocks = set(
+            Context.LocalResourceGraph.StaticKeepOutBlocks
         )
         Context.ClusterByGate = {Name: ClusterIndex for ClusterIndex, Names in enumerate(Context.Clusters) for Name in Names}
         Context.GateByInputPin = {Pin: Gate.Name for Gate in Context.PlacedGates for Pin in Gate.InputPins}

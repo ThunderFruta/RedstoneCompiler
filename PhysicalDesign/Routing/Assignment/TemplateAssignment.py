@@ -274,6 +274,7 @@ class RawTrackAssignmentAttempt:
     ConflictSignals: tuple[str, ...] = ()
     ConflictResourceIndices: tuple[int, ...] = ()
     IncompleteReason: str = ""
+    FailureNet: str = ""
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -286,6 +287,7 @@ class RawTrackAssignmentAttempt:
             "ConflictSignals": list(self.ConflictSignals),
             "ConflictResourceIndices": list(self.ConflictResourceIndices),
             "IncompleteReason": self.IncompleteReason,
+            "FailureNet": self.FailureNet,
         }
 
 
@@ -552,6 +554,7 @@ def SolveRawTrackAssignmentProblem(
             ConflictSignals=ConflictSignals,
             ConflictResourceIndices=ConflictResourceIndices,
             IncompleteReason=IncompleteReason,
+            FailureNet=str(getattr(NativeResult, "FailureNet", "") or ""),
         )
         Attempts.append(Attempt)
         if not FirstConflictSignals and ConflictSignals:
@@ -803,6 +806,11 @@ def SolveRawTrackAssignmentPortfolio(
                 ConflictSignals=ConflictSignals,
                 ConflictResourceIndices=ConflictResourceIndices,
                 IncompleteReason=IncompleteReason,
+                FailureNet=str(getattr(
+                    NativeResult,
+                    "FailureNet",
+                    "",
+                ) or ""),
             ))
             if not FirstConflictSignals and ConflictSignals:
                 FirstConflictSignals = ConflictSignals

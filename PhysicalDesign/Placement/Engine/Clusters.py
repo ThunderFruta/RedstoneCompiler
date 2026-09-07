@@ -19,7 +19,14 @@ from itertools import (
 from typing import (
     Any,
     Iterable,
+    TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    from PhysicalDesign.Contracts.PlacementAccess import (
+        PlacementAccessSolveResult,
+        SelectedPlacementPinAccessWitness,
+    )
 from PhysicalDesign.Geometry.Rotation import RotatedCellSize
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedGate, PlacedDesign
 from PhysicalDesign.Placement.PreRouteInterface import DerivedPerimeterSlotAssignment, DerivedPerimeterSlotDomain
@@ -214,6 +221,8 @@ class PcbPlacement:
     InterClusterRoutingChannel: InterClusterRoutingChannel | None = None
     PlacementAccessFabric: Any | None = None
     PlacementAccessAssignment: Any | None = None
+    SelectedPinAccessWitness: SelectedPlacementPinAccessWitness | None = None
+    PlacementAccessSolve: PlacementAccessSolveResult | None = None
     DerivedPerimeterSlotDomain: Any | None = None
     DerivedPerimeterSlotAssignment: Any | None = None
     # A compact single-component candidate may publish previously materialized

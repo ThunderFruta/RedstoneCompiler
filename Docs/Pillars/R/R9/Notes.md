@@ -13,4 +13,9 @@ controls when the two disagree.
 
 ## Working notes
 
-- None recorded.
+### 2026-09-06 current frontier
+
+Current Joint `64efbe1` retains an actual controlled fanout route and its
+physical claims through compaction. No completed-candidate comparison,
+objective breakdown, route-shortening decision, or congestion-quality result
+was produced. R9 remains target behavior. See the [bounded R2 evidence](../R2/Notes.md#2026-09-06-current-bounded-frontier).

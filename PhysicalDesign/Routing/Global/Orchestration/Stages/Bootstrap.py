@@ -126,24 +126,122 @@ def RunBootstrap(State: AuthoritativeRoutingState, Services: AuthoritativeRoutin
     if State.Resources.PreparingPhysicalComponentGlobalChannels:
         ProfilePlacement = Services.replace(State.Placed, LocalRouteClaims=tuple((Claim for Claim in State.AllLocalClaims if int(getattr(Claim, 'ClusterId', 0)) >= 0)))
     ExistingPlacementAccessFabric = getattr(State.Placed, 'PlacementAccessFabric', None)
-    State.PlacementPinAccessWitness = getattr(
+    RoutingAwarePlacementAccess = bool(
+        State.Policy.PlacementAccess.Enabled
+    )
+    SelectedPlacementPinAccessWitness = getattr(
+        State.Placed,
+        'SelectedPinAccessWitness',
+        None,
+    )
+    FabricPinAccessWitness = getattr(
         ExistingPlacementAccessFabric,
         'PinAccessWitness',
         None,
-    ) or Services.BuildPlacementPinAccessWitness(
-        ProfilePlacement.PlacedGates,
-        AccessLength=State.Technology.AccessLength,
-        RequireCatalogMatch=True,
+    )
+    if RoutingAwarePlacementAccess:
+        if SelectedPlacementPinAccessWitness is None:
+            raise Services.RoutingStageError(Services.RoutingFailure(
+                Reason=(
+                    Services.RoutingFailureReason
+                    .ClusterInterfaceInvariantViolation
+                ),
+                Stage='PlacementPinAccessHandoff',
+                Detail=(
+                    'routing-aware placement did not provide its selected '
+                    'pin-access witness'
+                ),
+                Diagnostics={
+                    'Complete': False,
+                    'AccessRegenerationCount': 0,
+                    'PolicyVersion': State.Policy.PolicyVersion,
+                },
+            ))
+        if (
+            FabricPinAccessWitness is not None
+            and FabricPinAccessWitness.WitnessFingerprint
+            != SelectedPlacementPinAccessWitness.WitnessFingerprint
+        ):
+            raise Services.RoutingStageError(Services.RoutingFailure(
+                Reason=(
+                    Services.RoutingFailureReason
+                    .ClusterInterfaceInvariantViolation
+                ),
+                Stage='PlacementPinAccessHandoff',
+                Detail=(
+                    'placement and access fabric reference different '
+                    'pin-access witnesses'
+                ),
+                Diagnostics={
+                    'Complete': False,
+                    'AccessRegenerationCount': 0,
+                    'PlacementWitnessFingerprint': (
+                        SelectedPlacementPinAccessWitness.WitnessFingerprint
+                    ),
+                    'FabricWitnessFingerprint': (
+                        FabricPinAccessWitness.WitnessFingerprint
+                    ),
+                },
+            ))
+        if (
+            not SelectedPlacementPinAccessWitness.Complete
+            or SelectedPlacementPinAccessWitness.CatalogVersion
+            != State.Policy.PlacementAccess.CatalogVersion
+            or SelectedPlacementPinAccessWitness.AccessLength
+            != State.Technology.AccessLength
+        ):
+            raise Services.RoutingStageError(Services.RoutingFailure(
+                Reason=(
+                    Services.RoutingFailureReason
+                    .ClusterInterfaceInvariantViolation
+                ),
+                Stage='PlacementPinAccessHandoff',
+                Detail=(
+                    'selected pin-access witness does not match the '
+                    'routing policy and technology'
+                ),
+                Diagnostics={
+                    'Complete': False,
+                    'AccessRegenerationCount': 0,
+                    'Witness': (
+                        SelectedPlacementPinAccessWitness.ToDictionary()
+                    ),
+                    'ExpectedCatalogVersion': (
+                        State.Policy.PlacementAccess.CatalogVersion
+                    ),
+                    'ExpectedAccessLength': State.Technology.AccessLength,
+                },
+            ))
+        State.PlacementPinAccessWitness = (
+            SelectedPlacementPinAccessWitness
+        )
+    else:
+        State.PlacementPinAccessWitness = (
+            FabricPinAccessWitness
+            or Services.BuildPlacementPinAccessWitness(
+                ProfilePlacement.PlacedGates,
+                AccessLength=State.Technology.AccessLength,
+                RequireCatalogMatch=True,
+            )
+        )
+    ConsumedAccessLength = (
+        State.Technology.AccessLength
+        if RoutingAwarePlacementAccess
+        else State.Policy.Placement.PinEscapeLength
     )
     State.Profiles = Services.BuildNetRoutingProfiles(
         ProfilePlacement,
-        AccessLength=State.Policy.Placement.PinEscapeLength,
+        AccessLength=ConsumedAccessLength,
         AccessWitness=State.PlacementPinAccessWitness,
+        RequireExplicitAccessWitness=RoutingAwarePlacementAccess,
     )
     State.WorkTelemetry['PlacementPinAccessWitness'] = {
         **State.PlacementPinAccessWitness.ToDictionary(),
-        'ConsumedAccessLength': State.Policy.Placement.PinEscapeLength,
+        'ConsumedAccessLength': ConsumedAccessLength,
         'FrozenBeforeCandidateGeneration': True,
+        'RoutingAwarePlacementAccess': RoutingAwarePlacementAccess,
+        'PolicyVersion': State.Policy.PolicyVersion,
+        'AccessRegenerationCount': 0,
     }
     State.WholeDesignProfiles = dict(State.Profiles)
     State.PhysicalAssemblyPlan = State.Resources.FrozenPhysicalComponentAssemblyPlan
@@ -175,6 +273,42 @@ def RunBootstrap(State: AuthoritativeRoutingState, Services: AuthoritativeRoutin
     State.InterClusterChannel = getattr(State.Placed, 'InterClusterRoutingChannel', None)
     State.PlacementAccessFabric = getattr(State.Placed, 'PlacementAccessFabric', None)
     State.PlacementAccessAssignment = getattr(State.Placed, 'PlacementAccessAssignment', None)
+    if RoutingAwarePlacementAccess and State.PlacementAccessFabric is not None:
+        if (
+            State.PlacementAccessFabric.PinAccessWitnessFingerprint
+            != State.PlacementPinAccessWitness.WitnessFingerprint
+            or State.PlacementAccessFabric.PinAccessDomainFingerprint
+            != State.PlacementPinAccessWitness.DomainFingerprint
+        ):
+            raise Services.RoutingStageError(Services.RoutingFailure(
+                Reason=(
+                    Services.RoutingFailureReason
+                    .ClusterInterfaceInvariantViolation
+                ),
+                Stage='PlacementAccessFabricHandoff',
+                Detail=(
+                    'placement access fabric identity does not match the '
+                    'selected pin-access witness'
+                ),
+                Diagnostics={
+                    'Complete': False,
+                    'ExpectedDomainFingerprint': (
+                        State.PlacementPinAccessWitness.DomainFingerprint
+                    ),
+                    'ObservedDomainFingerprint': (
+                        State.PlacementAccessFabric
+                        .PinAccessDomainFingerprint
+                    ),
+                    'ExpectedWitnessFingerprint': (
+                        State.PlacementPinAccessWitness.WitnessFingerprint
+                    ),
+                    'ObservedWitnessFingerprint': (
+                        State.PlacementAccessFabric
+                        .PinAccessWitnessFingerprint
+                    ),
+                    'AccessRegenerationCount': 0,
+                },
+            ))
     SelectedPlacementAccessStubIndices = {(str(Signal), tuple(Terminal)): int(StubIndex) for Signal, Terminal, StubIndex in getattr(State.PlacementAccessAssignment, 'SelectedStubIndices', ())}
     State.PlacementAccessDomains = {}
     for Domain in getattr(State.PlacementAccessFabric, 'TerminalDomains', ()):
@@ -182,7 +316,21 @@ def RunBootstrap(State: AuthoritativeRoutingState, Services: AuthoritativeRoutin
         SelectedStubIndex = SelectedPlacementAccessStubIndices.get(DomainIdentity)
         State.PlacementAccessDomains[DomainIdentity] = Services.replace(Domain, EscapeStubs=(Domain.EscapeStubs[SelectedStubIndex],)) if SelectedStubIndex is not None else Domain
     _AccessContractMinimumX, _AccessContractMaximumX, _AccessContractMinimumZ, _AccessContractMaximumZ, State.PlacementAccessContractPositions, State.PlacementAccessOuterBounds = Services.ResolvePlacementAccessFabricRegionContract(0, 0, 0, 0, State.PlacementAccessFabric, State.PlacementAccessDomains)
-    State.PlacementAccessContractFingerprint = Services.BuildStableFingerprint(('placement-access-fabric-region-v1', str(getattr(State.PlacementAccessFabric, 'FabricFingerprint', '')), State.PlacementAccessOuterBounds, tuple(sorted(State.PlacementAccessContractPositions))))
+    PlacementAccessContractIdentity = (
+        'placement-access-fabric-region-v1',
+        str(getattr(State.PlacementAccessFabric, 'FabricFingerprint', '')),
+        State.PlacementAccessOuterBounds,
+        tuple(sorted(State.PlacementAccessContractPositions)),
+    )
+    if RoutingAwarePlacementAccess:
+        PlacementAccessContractIdentity = (
+            *PlacementAccessContractIdentity,
+            str(State.PlacementPinAccessWitness.DomainFingerprint),
+            State.PlacementPinAccessWitness.WitnessFingerprint,
+        )
+    State.PlacementAccessContractFingerprint = (
+        Services.BuildStableFingerprint(PlacementAccessContractIdentity)
+    )
     DeclaredInterClusterChannelSignals = frozenset((str(Signal) for Signal in getattr(State.InterClusterChannel, 'AffectedSignals', ())))
     AffectedClusterSet = frozenset((int(Cluster) for Cluster in getattr(State.InterClusterChannel, 'AffectedClusters', ())))
     State.InterClusterChannelSignals = DeclaredInterClusterChannelSignals if State.HasRoutedComponentTemplate else DeclaredInterClusterChannelSignals if not (State.CompleteClusterInterfaceAccess and AffectedClusterSet) else Services.SelectComponentIncidentSignals(BoundaryLeaseRequests, AffectedClusterSet, State.Profiles)
