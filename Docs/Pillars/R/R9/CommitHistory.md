@@ -5,4 +5,4 @@ listed only when its scope and verification are known.
 
 | Commit | Date | Relationship to R9 |
 |---|---|---|
-| None attributed | — | No R9-specific commit has been recorded yet |
+| None attributed | — | No R9-specific commit has been recorded. Current Joint `64efbe1` controlled fanout evidence is not a routed-objective or route-quality implementation. |

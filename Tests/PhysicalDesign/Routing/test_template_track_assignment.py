@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from PhysicalDesign.Routing.Global.Orchestration.RunModels import RawTrackAssignmentDomain, RawTrackAssignmentValue
+from PhysicalDesign.Routing.Global.Assignment.TrackPortfolio import BuildTrackAssignmentPreparationFromRawDomain
 from PhysicalDesign.Resources.ResourceGraph import RoutingResourceClaims
 from PhysicalDesign.Runtime.Reliability import RoutingDeadline
 from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolio, RawTrackAssignmentPortfolioTemplate, RawTrackAssignmentProblem, RawTrackAssignmentTemplate, SolveRawTrackAssignmentPortfolio, SolveRawTrackAssignmentProblem, SolveRawTrackAssignmentProblemWithContext
@@ -66,6 +67,7 @@ def NativeResult(
     DeadlineExceeded: bool = False,
     ConflictSignals: tuple[str, ...] = (),
     ConflictResourceIndices: tuple[int, ...] = (),
+    FailureNet: str = "",
 ):
     return SimpleNamespace(
         Success=Success,
@@ -77,7 +79,31 @@ def NativeResult(
         DeadlineExceeded=DeadlineExceeded,
         ConflictSignals=ConflictSignals,
         ConflictResourceIndices=ConflictResourceIndices,
+        FailureNet=FailureNet,
     )
+
+
+def test_raw_domain_promotes_pin_access_identities_into_preparation():
+    Domain = replace(
+        BuildDomain("pin-access-identity"),
+        PinAccessDomainFingerprint="pin-domain",
+        PinAccessWitnessFingerprint="pin-witness",
+    )
+    Preparation = BuildTrackAssignmentPreparationFromRawDomain(
+        Domain,
+        NativeResult(
+            Success=True,
+            ExpansionCount=1,
+            CandidateId="pin-access-identity-candidate",
+        ),
+    )
+
+    assert Domain.ToDictionary()["PinAccessDomainFingerprint"] == "pin-domain"
+    assert Domain.ToDictionary()["PinAccessWitnessFingerprint"] == "pin-witness"
+    assert Preparation.PinAccessDomainFingerprint == "pin-domain"
+    assert Preparation.PinAccessWitnessFingerprint == "pin-witness"
+    assert Preparation.ToDictionary()["PinAccessDomainFingerprint"] == "pin-domain"
+    assert Preparation.ToDictionary()["PinAccessWitnessFingerprint"] == "pin-witness"
 
 
 def test_complete_core_advances_inside_one_shared_template_selection():
@@ -121,6 +147,25 @@ def test_complete_core_advances_inside_one_shared_template_selection():
         ("Signal", "separated-candidate"),
     )
     assert Result.FirstConflictSignals == ("A", "B")
+
+
+def test_zero_expansion_empty_native_domain_retains_failure_net():
+    Result = SolveRawTrackAssignmentProblem(
+        RawTrackAssignmentProblem(
+            Templates=(BuildTemplate("only", (1,)),),
+            MaximumAssignmentExpansions=16,
+        ),
+        lambda _Domain, _Remaining: NativeResult(
+            Success=False,
+            ExpansionCount=0,
+            FailureNet="Signal",
+        ),
+    )
+
+    assert Result.Success is False
+    assert Result.Attempts[0].ExpansionCount == 0
+    assert Result.Attempts[0].FailureNet == "Signal"
+    assert Result.Attempts[0].ToDictionary()["FailureNet"] == "Signal"
 
 
 def test_fixed_portfolio_materializes_only_through_first_witness():

@@ -15,4 +15,10 @@ controls when the two disagree.
 
 ## Working notes
 
-- None recorded.
+### 2026-09-06 current frontier
+
+Current Joint `64efbe1` proves a straight-only public two-NAND fanout handoff
+through the real downstream stages. It supplies no folded, mirrored, rotated,
+serpentine, or alternative pin-facing result. R3 remains target behavior; the
+historical FullAdder/RCA diagnostics do not establish a present R3 failure or
+success. See the [bounded R2 evidence](../R2/Notes.md#2026-09-06-current-bounded-frontier).

@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from ...Geometry.Placement import BuildPlacementPinAccessWitness, PlacementPinAccessWitness
+from ...Contracts.Failures import (
+    RoutingFailure,
+    RoutingFailureReason,
+    RoutingStageError,
+)
 from ...Policy import GlobalRoutingPolicy
 from ...Resources.ResourceGraph import FindClaimConflicts, FindSelfClaimConflicts, RoutingResourceClaims, RoutingResourceGraph, RoutingResourceId, RoutingResourceKind, LocalRouteClaim
 from ...Redstone.Technology import DefaultRedstoneRoutingTechnology, RedstoneRoutingTechnology
@@ -156,7 +161,8 @@ def BuildNetRoutingProfiles(
     Placed: Any,
     RetryCounts: dict[str, int] | None = None,
     AccessLength: int | None = None,
-    AccessWitness: PlacementPinAccessWitness | None = None,
+    AccessWitness: PlacementPinAccessWitness | Any | None = None,
+    RequireExplicitAccessWitness: bool = False,
 ) -> dict[str, NetRoutingProfile]:
     """Classify nets while consuming one catalog-derived access witness."""
     RetryCounts = RetryCounts or {}
@@ -171,6 +177,11 @@ def BuildNetRoutingProfiles(
         hasattr(Gate, "Rotation") and hasattr(Gate, "MirrorX")
         for Gate in Placed.PlacedGates
     )
+    if RequireExplicitAccessWitness and AccessWitness is None:
+        raise ValueError(
+            "routing-aware profiles require the placement-selected "
+            "pin-access witness"
+        )
     AccessWitness = AccessWitness or BuildPlacementPinAccessWitness(
         Placed.PlacedGates,
         AccessLength=AccessLength,
@@ -182,6 +193,48 @@ def BuildNetRoutingProfiles(
         raise ValueError("routing profiles require a complete catalog witness")
     if AccessLength > AccessWitness.AccessLength:
         raise ValueError("routing profile exceeds its frozen access witness")
+    if (
+        RequireExplicitAccessWitness
+        and AccessLength != AccessWitness.AccessLength
+    ):
+        raise ValueError(
+            "routing-aware profiles cannot truncate their selected "
+            "pin-access witness"
+        )
+    if RequireExplicitAccessWitness:
+        from ...Placement.Access.Catalog import (
+            ValidateSelectedPlacementPinAccessBindings,
+        )
+
+        try:
+            ValidateSelectedPlacementPinAccessBindings(
+                Placed.PlacedGates,
+                AccessWitness.Selections,
+            )
+        except ValueError as Error:
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason
+                    .ClusterInterfaceInvariantViolation
+                ),
+                Stage="PlacementPinAccessHandoff",
+                Detail=(
+                    "the selected pin-access bindings do not match the "
+                    "current routing consumer"
+                ),
+                Diagnostics={
+                    "Complete": False,
+                    "AccessRegenerationCount": 0,
+                    "WitnessFingerprint": (
+                        AccessWitness.WitnessFingerprint
+                    ),
+                    "ContractErrorType": type(Error).__name__,
+                },
+            )) from Error
+
+    def SelectedPath(Selection: Any) -> tuple[Position3, ...]:
+        Path = tuple(Selection.Path)
+        return Path if RequireExplicitAccessWitness else Path[:AccessLength]
     ProducerGates = {
         Signal: Gate
         for Gate in Placed.PlacedGates
@@ -200,7 +253,7 @@ def BuildNetRoutingProfiles(
             )
             Pin = Selection.Terminal
             Targets[Signal].append(Pin)
-            TargetAccessPaths[Signal][Pin] = Selection.Path[:AccessLength]
+            TargetAccessPaths[Signal][Pin] = SelectedPath(Selection)
 
     ClaimsBySignal: dict[str, list[LocalRouteClaim]] = defaultdict(list)
     for Claim in getattr(Placed, "LocalRouteClaims", ()) or ():
@@ -219,7 +272,7 @@ def BuildNetRoutingProfiles(
             "Output0",
         )
         Root = SourceSelection.Terminal
-        SourceAccessPath = SourceSelection.Path[:AccessLength]
+        SourceAccessPath = SelectedPath(SourceSelection)
         UniqueTargets = tuple(sorted(set(Targets[Signal])))
         SignalClaims = tuple(ClaimsBySignal.get(Signal, ()))
         ConnectedTargets = {

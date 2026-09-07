@@ -552,7 +552,7 @@ def EvaluateExactPlacementStates(Context):
                 if Context.ExactCoreGeometry is None:
                     continue
                 CheckWork(Context, 'joint-exact-mandatory-access-screen', CandidateIndex=Context.SearchCandidateIndex, ScreenedCandidateCount=len(Context.ProfilesBySearchCandidate))
-                Context.Profile = MeasureMandatoryAccessConflictProfile((Geometry.BuildPlacedGate(Context.ModuleGateByNameForMandatoryScreen[Geometry.Name]) for Geometry in Context.ExactCoreGeometry), Context.MandatoryScreenSignalOrder, WorkCheck=partial(CheckMandatoryAccessScreen, Context))
+                Context.Profile = MeasureMandatoryAccessConflictProfile((Geometry.BuildPlacedGate(Context.ModuleGateByNameForMandatoryScreen[Geometry.Name]) for Geometry in Context.ExactCoreGeometry), Context.MandatoryScreenSignalOrder, WorkCheck=partial(CheckMandatoryAccessScreen, Context), Technology=Context.Technology)
                 Context.ProfilesBySearchCandidate[Context.SearchCandidateIndex] = Context.Profile
                 if not Context.EnableClusterInterfacePlacementFeasibility and (not Context.Profile.HasConflicts):
                     break

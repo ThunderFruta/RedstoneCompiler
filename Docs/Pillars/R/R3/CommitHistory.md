@@ -5,4 +5,4 @@ listed only when its scope and verification are known.
 
 | Commit | Date | Relationship to R3 |
 |---|---|---|
-| None attributed | — | No R3-specific commit has been recorded yet |
+| None attributed | — | No R3-specific commit has been recorded. Current Joint `64efbe1` controlled straight-only fanout evidence is not an R3 folded/oriented-alternative implementation. |

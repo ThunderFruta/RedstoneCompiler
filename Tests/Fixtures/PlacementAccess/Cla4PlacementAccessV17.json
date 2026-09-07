@@ -1,0 +1,41 @@
+{
+  "SchemaVersion": "cla4-placement-access-v17-fixture-v1",
+  "CatalogVersion": "physical-pin-access-catalog-v1",
+  "TechnologyVersion": "redstone-routing-v1",
+  "Description": "Real opposing CLA4 source escapes retained from the straight-ray mandatory-access failure.",
+  "Gates": [
+    {
+      "Name": "NandNet0",
+      "Kind": "NAND",
+      "Origin": [10, 1, 4],
+      "Rotation": 270,
+      "MirrorX": false,
+      "OutputSignal": "Net0",
+      "InputSignals": ["NandNet0Input0", "NandNet0Input1"],
+      "ExpectedOutputTerminal": [14, 1, 5],
+      "ExpectedOutputDirection": [1, 0, 0]
+    },
+    {
+      "Name": "Propagate0",
+      "Kind": "NAND",
+      "Origin": [20, 1, 4],
+      "Rotation": 90,
+      "MirrorX": false,
+      "OutputSignal": "Propagate",
+      "InputSignals": ["Propagate0Input0", "Propagate0Input1"],
+      "ExpectedOutputTerminal": [19, 1, 5],
+      "ExpectedOutputDirection": [-1, 0, 0]
+    }
+  ],
+  "StraightOnly": {
+    "ExpectedStatus": "Unsatisfiable",
+    "ExpectedConflictingResources": [
+      "Electrical:16,1,5",
+      "Electrical:17,1,5"
+    ]
+  },
+  "ThreeOptionCatalog": {
+    "ExpectedStatus": "Feasible",
+    "RequirePlanarJog": true
+  }
+}

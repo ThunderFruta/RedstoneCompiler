@@ -7,9 +7,14 @@ import os
 import traceback
 from typing import Any
 from PhysicalDesign.Contracts.Failures import RoutingAssignmentCut, RoutingFailure, RoutingFailureReason, RoutingStageError
+from PhysicalDesign.Contracts.PlacementAccess import PlacementAccessSolveStatus
 from PhysicalDesign.Placement.Engine.Constraints import PlacementAssignmentConstraintSet
-from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessStatus
-from PhysicalDesign.Placement.Engine.MandatoryAccess import MeasureMandatoryAccessConflictProfile, SolveFixedPlacementMandatoryAccess
+from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessStatus, SolvePlacedPinAccessOptionDomains
+from PhysicalDesign.Placement.Access.Catalog import (
+    EnumeratePlacedPinAccessOptionDomains,
+    FreezeSelectedPlacementPinAccessWitness,
+)
+from PhysicalDesign.Placement.Engine.MandatoryAccess import FindSelectedPinAccessFrozenRouteConflicts, MeasureMandatoryAccessConflictProfile, SolveFixedPlacementMandatoryAccess
 from .Demand import ApplyJointPlacementPortfolioTrigger, BuildPlacementFailureHistorySnapshot, ExactStatePlacementEvaluation, MeasurePlacementTopologyDemand, ResolveJointPlacementPortfolioTrigger
 from .Feedback import BuildPlacementFingerprint, BuildStructuredPlacementRelocationSignals, BuildTopologyCutEpochGeometryConstraints, BuildTopologyCutEpochGeometryRelocationSignals, BuildTopologyCutEpochPinBankRelocationSignals, RequiresImmediateAssignmentCutRelocation, SelectCutDrivenClusterRefinementSignals, SelectTopologyCutFrontier, ShouldUseCurrentAssignmentCutGeometry
 from .Portfolios import AddMandatoryAccessPortfolioPairwiseConstraints, AssignmentCutHasBoundedExactCore, BuildMandatoryAccessPairwiseEdges, BuildMandatoryAccessPortfolioExpectedCandidateIndices, BuildMandatoryAccessPortfolioRecipeIdentity, BuildPendingJointPlacementPortfolioFingerprint, BuildPendingJointPlacementPortfolioIdentity, BuildPendingJointPlacementStateKey, BuildTargetedPinBankPackingPolicy, BuildTopologyCutEpochIdentity, EvaluateCompleteMandatoryAccessPortfolio, HasTopologyCutEpochRoutingReserve, MandatoryAccessPortfolioEvidence, MandatoryAccessPortfolioIdentity, MandatoryAccessPortfolioIdentityMatchesCurrent, MandatoryAccessPortfolioRejection, PendingJointPlacementState, PinBankRepairOwnershipIsDistinct, PlacementAssignmentConstraintsAreActive, PlacementGenerationRequest, PlacementGenerationRoutingReserveSeconds, ShouldOpenStrongMandatoryAccessRepair, ShouldPrioritizeCurrentExactCutBeforeBroad, ShouldPrioritizePlacementConflictRelocation, ShouldPrioritizeTopologyCutEpochRelocation, ShouldRejectCutBoundaryEscapePlacement, ShouldUseMandatoryAccessPreScreen, ShouldWidenTopologyCutTerminalShell, TopologyCutEpochAdmissionReserveSeconds
@@ -182,11 +187,11 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
     try:
         CheckPlacementGeneration({'Phase': 'placement-generation-start'})
         UseMandatoryAccessPreScreen = ShouldUseMandatoryAccessPreScreen(SourceGenerator=SourceGenerator, PackingEnabled=CandidatePacking.Enabled, JointOrientationEnabled=CandidatePacking.EnableJointClusterOrientation, HasRelocationSignals=bool(EffectiveRelocationSignals), TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio, HasAssignmentCut=EffectiveAssignmentCut is not None, AssignmentConstraintsActive=PlacementAssignmentConstraintsAreActive(GeometryAssignmentConstraints)) and (not SkipMandatoryAccessPreScreen)
-        Candidate = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=CandidateSpacing, PlacementPolicy=CandidatePlacementPolicy, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=CandidatePacking, RelocationSignals=EffectiveRelocationSignals, RelocationPrioritySignals=EffectiveRelocationPrioritySignals, RequiredRelocationSignals=EffectiveRequiredRelocationSignals, RelocationVariant=RelocationVariant, JointPlacementCandidateIndex=JointPlacementCandidateIndex, AssignmentCut=GeometryAssignmentCut, AssignmentConstraints=GeometryAssignmentConstraints, CoordinatedCandidateDiversificationSignals=EffectiveCoordinatedCandidateDiversificationSignals, MandatoryAccessPreScreenOnly=UseMandatoryAccessPreScreen, PlacementScoringOnly=CandidatePacking.EnableJointClusterOrientation and Context.TopologyDemand.RequiresJointPortfolio, PreferAccessRingTerminals=IsDerivedSingleComponentPlacementSource(SourceGenerator), UseDerivedPerimeterTerminals=UsesDerivedPerimeterTerminals(SourceGenerator), DerivedTerminalLayoutVariantIndex=Request.TerminalLayoutVariantIndex, EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=CutDrivenClusterRefinementSignals, FixedConnectivityClusters=FixedConnectivityClusters, EnableInternalPinBankGeometryRepair=JointPortfolioState.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=JointPortfolioState.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=FocusedCutEpochPlacement, TopologyCutFrontier=JointPortfolioState.TopologyCutFrontier, WorkCheck=CheckPlacementGeneration)
-        PreScreenMandatoryProfile = (Candidate.MandatoryAccessPreScreenProfile if Candidate.MandatoryAccessPreScreenProfile is not None else MeasureMandatoryAccessConflictProfile(Candidate.Placed.PlacedGates, Candidate.SignalOrder, WorkCheck=CheckPlacementGeneration)) if UseMandatoryAccessPreScreen else None
+        Candidate = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=CandidateSpacing, PlacementPolicy=CandidatePlacementPolicy, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=CandidatePacking, RelocationSignals=EffectiveRelocationSignals, RelocationPrioritySignals=EffectiveRelocationPrioritySignals, RequiredRelocationSignals=EffectiveRequiredRelocationSignals, RelocationVariant=RelocationVariant, JointPlacementCandidateIndex=JointPlacementCandidateIndex, AssignmentCut=GeometryAssignmentCut, AssignmentConstraints=GeometryAssignmentConstraints, CoordinatedCandidateDiversificationSignals=EffectiveCoordinatedCandidateDiversificationSignals, MandatoryAccessPreScreenOnly=UseMandatoryAccessPreScreen, PlacementScoringOnly=CandidatePacking.EnableJointClusterOrientation and Context.TopologyDemand.RequiresJointPortfolio, PreferAccessRingTerminals=IsDerivedSingleComponentPlacementSource(SourceGenerator), UseDerivedPerimeterTerminals=UsesDerivedPerimeterTerminals(SourceGenerator), DerivedTerminalLayoutVariantIndex=Request.TerminalLayoutVariantIndex, EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=CutDrivenClusterRefinementSignals, FixedConnectivityClusters=FixedConnectivityClusters, EnableInternalPinBankGeometryRepair=JointPortfolioState.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=JointPortfolioState.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=FocusedCutEpochPlacement, TopologyCutFrontier=JointPortfolioState.TopologyCutFrontier, Technology=Context.Technology, WorkCheck=CheckPlacementGeneration)
+        PreScreenMandatoryProfile = (Candidate.MandatoryAccessPreScreenProfile if Candidate.MandatoryAccessPreScreenProfile is not None else MeasureMandatoryAccessConflictProfile(Candidate.Placed.PlacedGates, Candidate.SignalOrder, WorkCheck=CheckPlacementGeneration, Technology=Context.Technology)) if UseMandatoryAccessPreScreen else None
         PreScreenMandatoryConflicts = MandatoryConflictMap(PreScreenMandatoryProfile) if PreScreenMandatoryProfile is not None else None
         if UseMandatoryAccessPreScreen and (not PreScreenMandatoryConflicts):
-            Candidate = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=CandidateSpacing, PlacementPolicy=CandidatePlacementPolicy, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=CandidatePacking, RelocationSignals=EffectiveRelocationSignals, RelocationPrioritySignals=EffectiveRelocationPrioritySignals, RequiredRelocationSignals=EffectiveRequiredRelocationSignals, RelocationVariant=RelocationVariant, JointPlacementCandidateIndex=JointPlacementCandidateIndex, AssignmentCut=GeometryAssignmentCut, AssignmentConstraints=GeometryAssignmentConstraints, CoordinatedCandidateDiversificationSignals=EffectiveCoordinatedCandidateDiversificationSignals, PlacementScoringOnly=CandidatePacking.EnableJointClusterOrientation and Context.TopologyDemand.RequiresJointPortfolio, PreferAccessRingTerminals=IsDerivedSingleComponentPlacementSource(SourceGenerator), UseDerivedPerimeterTerminals=UsesDerivedPerimeterTerminals(SourceGenerator), DerivedTerminalLayoutVariantIndex=Request.TerminalLayoutVariantIndex, EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=CutDrivenClusterRefinementSignals, FixedConnectivityClusters=FixedConnectivityClusters, EnableInternalPinBankGeometryRepair=JointPortfolioState.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=JointPortfolioState.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=FocusedCutEpochPlacement, TopologyCutFrontier=JointPortfolioState.TopologyCutFrontier, WorkCheck=CheckPlacementGeneration)
+            Candidate = Context.Services.PlacePcbGraph(Context.Netlist, RoutingSpacing=CandidateSpacing, PlacementPolicy=CandidatePlacementPolicy, ClusterPolicy=Context.Policy.Clustering, MaximumBoundaryTerminals=Context.Policy.Organization.MaximumClusterEntrances, MaximumEntrancesPerSignal=Context.Policy.Organization.MaximumClusterEntrancesPerSignal, PackingPolicy=CandidatePacking, RelocationSignals=EffectiveRelocationSignals, RelocationPrioritySignals=EffectiveRelocationPrioritySignals, RequiredRelocationSignals=EffectiveRequiredRelocationSignals, RelocationVariant=RelocationVariant, JointPlacementCandidateIndex=JointPlacementCandidateIndex, AssignmentCut=GeometryAssignmentCut, AssignmentConstraints=GeometryAssignmentConstraints, CoordinatedCandidateDiversificationSignals=EffectiveCoordinatedCandidateDiversificationSignals, PlacementScoringOnly=CandidatePacking.EnableJointClusterOrientation and Context.TopologyDemand.RequiresJointPortfolio, PreferAccessRingTerminals=IsDerivedSingleComponentPlacementSource(SourceGenerator), UseDerivedPerimeterTerminals=UsesDerivedPerimeterTerminals(SourceGenerator), DerivedTerminalLayoutVariantIndex=Request.TerminalLayoutVariantIndex, EnableClusterBoundaryLeases=ShouldEnableClusterBoundaryLeaseInterface(ScaleGeometryPressure=Context.TopologyPressure.ScaleGeometryPressure, TopologyRequiresJointPortfolio=Context.TopologyDemand.RequiresJointPortfolio), EnableClusterInterfacePlacementFeasibility=Context.TopologyDemand.RequiresJointPortfolio, CutDrivenClusterRefinementSignals=CutDrivenClusterRefinementSignals, FixedConnectivityClusters=FixedConnectivityClusters, EnableInternalPinBankGeometryRepair=JointPortfolioState.EnableInternalPinBankGeometryRepair, InternalPinBankGeometryRepairSignals=JointPortfolioState.InternalPinBankGeometryRepairSignals, FocusedCutEpochPlacement=FocusedCutEpochPlacement, TopologyCutFrontier=JointPortfolioState.TopologyCutFrontier, Technology=Context.Technology, WorkCheck=CheckPlacementGeneration)
             PreScreenMandatoryProfile = None
             PreScreenMandatoryConflicts = None
         if IsDerivedSingleComponentPlacementSource(SourceGenerator):
@@ -223,16 +228,212 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
         ExactStatePlacementCacheKey = str(ExactStatePlacementCacheDiagnostics.get('Key', ''))
         CachedExactStateEvaluation = Context.ExactStatePlacementEvaluationCache.get(ExactStatePlacementCacheKey) if ExactStatePlacementCacheKey else None
         if CachedExactStateEvaluation is None:
-            Context.Services.ValidatePlacedCellElectricalIsolation(Candidate.Placed, WorkCheck=CheckPlacementGeneration)
+            Context.Services.ValidatePlacedCellElectricalIsolation(Candidate.Placed, WorkCheck=CheckPlacementGeneration, Technology=Context.Technology)
             CheckPlacementGeneration({'Phase': 'exact-isolation-complete'})
         else:
             CheckPlacementGeneration({'Phase': 'exact-state-evaluation-cache-hit', 'ExactStatePlacementCacheKey': ExactStatePlacementCacheKey})
         CandidateResources = None
-        MandatoryProfile = CachedExactStateEvaluation.MandatoryAccessProfile if CachedExactStateEvaluation is not None else (PreScreenMandatoryProfile if PreScreenMandatoryProfile is not None else MeasureMandatoryAccessConflictProfile(Candidate.Placed.PlacedGates, Candidate.SignalOrder, WorkCheck=CheckPlacementGeneration)) if CandidatePacking.Enabled and CandidatePacking.EnableProactiveInterClusterRelocation else None
+        PlacementAccessSolve = None
+        SelectedPinAccessWitness = None
+        RoutingAwarePlacementAccess = bool(Context.Policy.PlacementAccess.Enabled)
+        if RoutingAwarePlacementAccess:
+            CandidateResources = Context.Services.BuildRoutingResources(
+                Candidate.Placed,
+                WorkCheck=CheckPlacementGeneration,
+                Technology=Context.Technology,
+            )
+            AccessResourceGraph = CandidateResources.ResourceGraph
+            AccessDomains = EnumeratePlacedPinAccessOptionDomains(
+                Candidate.Placed.PlacedGates,
+                ResourceGraph=AccessResourceGraph,
+                Technology=Context.Technology,
+                EnabledPatternFamilies=(
+                    Context.Policy.PlacementAccess.EnabledPatternFamilies
+                ),
+                CatalogVersion=Context.Policy.PlacementAccess.CatalogVersion,
+                MaximumGenerationWork=(
+                    Context.Policy.PlacementAccess
+                    .MaximumDomainGenerationWork
+                ),
+                WorkCheck=CheckPlacementGeneration,
+                PreOwnedNodesBySignal=(
+                    Candidate.Placed.FrozenNetWires or {}
+                ),
+            )
+            PlacementAccessSolve = SolvePlacedPinAccessOptionDomains(
+                AccessDomains,
+                ResourceGraph=AccessResourceGraph,
+                MaximumExpansions=(
+                    Context.Policy.PlacementAccess.MaximumAssignmentExpansions
+                ),
+                WorkCheck=CheckPlacementGeneration,
+            )
+            PlacementAccessSolve = replace(PlacementAccessSolve, PolicyVersion=Context.Policy.PolicyVersion)
+            Context.PlacementAccessDomainsByProblemFingerprint[
+                PlacementAccessSolve.ProblemFingerprint
+            ] = AccessDomains
+            Context.PlacementAccessSolveResultsByProblemFingerprint[
+                PlacementAccessSolve.ProblemFingerprint
+            ] = PlacementAccessSolve
+            Candidate.Placed.PlacementAccessSolve = PlacementAccessSolve
+            Candidate = replace(
+                Candidate,
+                PlacementAccessSolve=PlacementAccessSolve,
+            )
+            if (
+                PlacementAccessSolve.Status
+                is PlacementAccessSolveStatus.Incomplete
+            ):
+                PlacementAccessFailure = RoutingFailure(
+                    Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+                    Stage='PlacementAccessSolve',
+                    Detail=(
+                        'the exact fixed-placement pin-access solve was '
+                        'incomplete and cannot reject this placement'
+                    ),
+                    RepairActions=(
+                        'IncreasePlacementAccessWork',
+                        'AdvancePlacementGenerator',
+                    ),
+                    Diagnostics={
+                        'Complete': False,
+                        'SourceGenerator': SourceGenerator,
+                        'RoutingSpacing': CandidateSpacing,
+                        'JointPlacementCandidateIndex': (
+                            JointPlacementCandidateIndex
+                        ),
+                        'ProblemFingerprint': (
+                            PlacementAccessSolve.ProblemFingerprint
+                        ),
+                        'DomainFingerprints': [
+                            Domain.DomainFingerprint
+                            for Domain in AccessDomains
+                        ],
+                        'PlacementAccessSolve': (
+                            PlacementAccessSolve.ToDictionary()
+                        ),
+                    },
+                )
+                Context.LastPlacementAccessIncompleteFailure = (
+                    PlacementAccessFailure
+                )
+                Context.LastStructuredPlacementFailure = (
+                    PlacementAccessFailure
+                )
+                QueueRetainedJointStates()
+                Context.PlacementGenerationDecisions.append({
+                    'SourceGenerator': SourceGenerator,
+                    'RoutingSpacing': CandidateSpacing,
+                    'Result': 'incomplete-placement-access-solve',
+                    'DecisionBoundary': 'fixed-pin-access-incomplete',
+                    'JointPlacementCandidateIndex': JointPlacementCandidateIndex,
+                    'PlacementAccessSolve': (
+                        PlacementAccessSolve.ToDictionary()
+                    ),
+                    'NextAction': (
+                        'materialize-next-retained-exact-state'
+                        if Context.PendingJointPlacementStates
+                        else 'advance-bounded-placement-generator'
+                    ),
+                })
+                return False
+            if (
+                PlacementAccessSolve.Status
+                is PlacementAccessSolveStatus.Feasible
+            ):
+                SelectedPinAccessWitness = (
+                    PlacementAccessSolve.SelectedWitness
+                )
+                if SelectedPinAccessWitness is None:
+                    raise ValueError(
+                        'feasible placement access solve omitted its witness'
+                    )
+                Candidate.Placed.SelectedPinAccessWitness = (
+                    SelectedPinAccessWitness
+                )
+                Candidate = replace(
+                    Candidate,
+                    SelectedPinAccessWitness=SelectedPinAccessWitness,
+                )
+                (
+                    FrozenAccessConflicts,
+                    FrozenAccessConflictCounts,
+                ) = FindSelectedPinAccessFrozenRouteConflicts(
+                    Candidate.Placed,
+                    SelectedPinAccessWitness,
+                    WorkCheck=CheckPlacementGeneration,
+                )
+                if FrozenAccessConflicts:
+                    QueueRetainedJointStates()
+                    Context.PlacementGenerationDecisions.append({
+                        'SourceGenerator': SourceGenerator,
+                        'RoutingSpacing': CandidateSpacing,
+                        'Result': (
+                            'rejected-selected-access-frozen-route-conflict'
+                        ),
+                        'DecisionBoundary': (
+                            'selected-access-frozen-route-compatibility'
+                        ),
+                        'JointPlacementCandidateIndex': (
+                            JointPlacementCandidateIndex
+                        ),
+                        'ConflictPositions': [
+                            list(Position)
+                            for Position in sorted(FrozenAccessConflicts)
+                        ],
+                        'ConflictCountsBySignal': dict(sorted(
+                            FrozenAccessConflictCounts.items()
+                        )),
+                        'SelectedPinAccessWitnessFingerprint': (
+                            SelectedPinAccessWitness.WitnessFingerprint
+                        ),
+                        'NextAction': (
+                            'materialize-next-retained-exact-state'
+                            if Context.PendingJointPlacementStates
+                            else 'advance-bounded-placement-generator'
+                        ),
+                    })
+                    return False
+            ProfileWitness = SelectedPinAccessWitness
+            if (
+                ProfileWitness is None
+                and all(
+                    Domain.Complete and len(Domain.Options) == 1
+                    for Domain in AccessDomains
+                )
+            ):
+                ProfileWitness = FreezeSelectedPlacementPinAccessWitness(
+                    AccessDomains,
+                    (
+                        (
+                            Domain.DomainId,
+                            Domain.Options[0].SelectionFingerprint,
+                        )
+                        for Domain in AccessDomains
+                    ),
+                )
+            MandatoryProfile = MeasureMandatoryAccessConflictProfile(
+                Candidate.Placed.PlacedGates,
+                Candidate.SignalOrder,
+                WorkCheck=CheckPlacementGeneration,
+                SelectedPinAccessWitness=ProfileWitness,
+                Technology=Context.Technology,
+            )
+        else:
+            MandatoryProfile = CachedExactStateEvaluation.MandatoryAccessProfile if CachedExactStateEvaluation is not None else (PreScreenMandatoryProfile if PreScreenMandatoryProfile is not None else MeasureMandatoryAccessConflictProfile(Candidate.Placed.PlacedGates, Candidate.SignalOrder, WorkCheck=CheckPlacementGeneration, Technology=Context.Technology)) if CandidatePacking.Enabled and CandidatePacking.EnableProactiveInterClusterRelocation else None
+        if PlacementAccessSolve is not None:
+            RecipeDiagnostics['__PlacementAccessSolve__'] = {
+                **PlacementAccessSolve.ToDictionary(),
+                'SelectedPinAccessWitnessFingerprint': (
+                    SelectedPinAccessWitness.WitnessFingerprint
+                    if SelectedPinAccessWitness is not None
+                    else ''
+                ),
+            }
         MandatoryConflicts = MandatoryConflictMap(MandatoryProfile) if MandatoryProfile is not None else {}
         if MandatoryConflicts:
             Context.JointPortfolioTriggered = ResolveJointPlacementPortfolioTrigger(Context.JointPortfolioTriggered, Context.TopologyDemand, MandatoryAccessConflictObserved=True)
-        CandidateTopologyDemand = CachedExactStateEvaluation.TopologyDemand if CachedExactStateEvaluation is not None else MeasurePlacementTopologyDemand(Context.TopologyDemand, Candidate, MandatoryConflicts=MandatoryConflicts, MandatoryProfile=MandatoryProfile)
+        CandidateTopologyDemand = CachedExactStateEvaluation.TopologyDemand if CachedExactStateEvaluation is not None and not RoutingAwarePlacementAccess else MeasurePlacementTopologyDemand(Context.TopologyDemand, Candidate, MandatoryConflicts=MandatoryConflicts, MandatoryProfile=MandatoryProfile)
         if ExactStatePlacementCacheKey and CachedExactStateEvaluation is None:
             Context.ExactStatePlacementEvaluationCache[ExactStatePlacementCacheKey] = ExactStatePlacementEvaluation(MandatoryAccessProfile=MandatoryProfile, TopologyDemand=CandidateTopologyDemand)
         if ExactStatePlacementCacheDiagnostics:
@@ -336,17 +537,98 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
             Context.PendingJointPlacementStates.insert(0, PendingJointPlacementState(Request=DynamicRequest, CandidateIndex=0, RelocationVariant=RelocationVariant, RoutingSpacing=CandidateSpacing, RelocationSignals=EffectiveRelocationSignals, RelocationPrioritySignals=EffectiveRelocationPrioritySignals, RequiredRelocationSignals=EffectiveRequiredRelocationSignals, AssignmentCut=EffectiveAssignmentCut, AssignmentConstraints=EffectiveAssignmentConstraints, CoordinatedCandidateDiversificationSignals=EffectiveCoordinatedCandidateDiversificationSignals, EnableClusterLocalRouteReuse=EnableCurrentClusterLocalRouteReuse, IsPostPinBankRepairEpoch=Context.PostPinBankRepairEpochActive, EnableInternalPinBankGeometryRepair=Context.InternalPinBankGeometryRepairActive, InternalPinBankGeometryRepairSignals=EffectiveInternalPinBankGeometryRepairSignals, RequiredDistinctPinBankOwnershipFingerprint=Context.RequiredDistinctPinBankOwnershipFingerprint, TopologyCutFrontier=EffectiveTopologyCutFrontier, PhysicalProofCoreSignals=FixedPhysicalProofCoreSignals, PhysicalProofFingerprint=FixedPhysicalProofFingerprint, FixedConnectivityClusters=FixedConnectivityClusters))
             Context.PlacementGenerationDecisions.append({'SourceGenerator': SourceGenerator, 'RoutingSpacing': CandidateSpacing, 'Result': 'mandatory-access-enabled-joint-portfolio', 'ConflictResourceCount': len(MandatoryConflicts), 'ConflictSignals': sorted(CandidateTopologyDemand.MandatoryAccessConflictSignals), 'MandatoryAccessOwnershipFingerprint': CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint, 'MandatoryAccessConflictFingerprint': CandidateTopologyDemand.MandatoryAccessConflictFingerprint, 'JointOrderKey': list(CandidateTopologyDemand.JointOrderKey), 'TopologyDemandProfile': CandidateTopologyDemand.ToDictionary(), 'MandatoryAccessProfile': MandatoryProfile.ToDictionary() if MandatoryProfile is not None else None, 'MandatoryAccessPortfolioTracking': MandatoryAccessPortfolioTracking, 'Trigger': 'mandatory-access-conflict'})
             return False
-        FixedPinAccessSolve = SolveFixedPlacementMandatoryAccess(Candidate.Placed.PlacedGates, WorkCheck=CheckPlacementGeneration)
-        FixedPinAccessRejectsCandidate = FixedPinAccessSolve.Status is FixedPlacementPinAccessStatus.Unsatisfiable
+        FixedPinAccessSolve = (
+            PlacementAccessSolve
+            if RoutingAwarePlacementAccess
+            else SolveFixedPlacementMandatoryAccess(
+                Candidate.Placed.PlacedGates,
+                WorkCheck=CheckPlacementGeneration,
+                Technology=Context.Technology,
+            )
+        )
+        if FixedPinAccessSolve is None:
+            raise ValueError('placement access solve was not constructed')
+        FixedPinAccessRejectsCandidate = (
+            FixedPinAccessSolve.Status
+            is (
+                PlacementAccessSolveStatus.Unsatisfiable
+                if RoutingAwarePlacementAccess
+                else FixedPlacementPinAccessStatus.Unsatisfiable
+            )
+        )
         if FixedPinAccessRejectsCandidate and MandatoryProfile is None:
-            MandatoryProfile = MeasureMandatoryAccessConflictProfile(Candidate.Placed.PlacedGates, Candidate.SignalOrder, WorkCheck=CheckPlacementGeneration)
+            MandatoryProfile = MeasureMandatoryAccessConflictProfile(Candidate.Placed.PlacedGates, Candidate.SignalOrder, WorkCheck=CheckPlacementGeneration, Technology=Context.Technology)
             MandatoryConflicts = MandatoryConflictMap(MandatoryProfile)
             CandidateTopologyDemand = MeasurePlacementTopologyDemand(Context.TopologyDemand, Candidate, MandatoryConflicts=MandatoryConflicts, MandatoryProfile=MandatoryProfile)
             RecipeDiagnostics['__TopologyDemandProfile__'] = CandidateTopologyDemand.ToDictionary()
             Candidate.Placed.LocalRouteDiagnostics = RecipeDiagnostics
-        if MandatoryProfile is not None and bool(MandatoryConflicts) != FixedPinAccessRejectsCandidate:
+        if not RoutingAwarePlacementAccess and MandatoryProfile is not None and bool(MandatoryConflicts) != FixedPinAccessRejectsCandidate:
             raise ValueError('fixed pin-access solve and mandatory profile disagree')
         if FixedPinAccessRejectsCandidate:
+            if RoutingAwarePlacementAccess:
+                if (
+                    Candidate.Placed.FrozenNetWires
+                    and any(not Domain.Options for Domain in AccessDomains)
+                ):
+                    Context.PendingPlacementAccessDirectOnly = True
+                    Context.PlacementGenerationDecisions.append({
+                        'SourceGenerator': SourceGenerator,
+                        'RoutingSpacing': CandidateSpacing,
+                        'Result': (
+                            'placement-access-preowned-conflict-core'
+                        ),
+                        'ProblemFingerprint': (
+                            FixedPinAccessSolve.ProblemFingerprint
+                        ),
+                        'NextAction': (
+                            'materialize-existing-direct-only-variant'
+                        ),
+                    })
+                Context.RejectedPlacementAccessProblemFingerprints.add(
+                    FixedPinAccessSolve.ProblemFingerprint
+                )
+                PlacementAccessFailure = RoutingFailure(
+                    Reason=RoutingFailureReason.NoPinAccessPattern,
+                    Stage='PlacementAccessSolve',
+                    Detail=(
+                        'the complete exact fixed-placement pin-access '
+                        'domain is unsatisfiable'
+                    ),
+                    AffectedNets=tuple(sorted({
+                        Signal
+                        for Domain in AccessDomains
+                        for Signal in (Domain.Signal,)
+                        if (
+                            FixedPinAccessSolve.ConflictCore is not None
+                            and Domain.DomainFingerprint
+                            in FixedPinAccessSolve
+                            .ConflictCore.DomainFingerprints
+                        )
+                    })),
+                    RepairActions=('AdvancePlacementGenerator',),
+                    Diagnostics={
+                        'Complete': True,
+                        'ProblemFingerprint': (
+                            FixedPinAccessSolve.ProblemFingerprint
+                        ),
+                        'RejectedPlacementAccessProblemFingerprint': (
+                            FixedPinAccessSolve.ProblemFingerprint
+                        ),
+                        'DomainFingerprints': [
+                            Domain.DomainFingerprint
+                            for Domain in AccessDomains
+                        ],
+                        'PlacementAccessSolve': (
+                            FixedPinAccessSolve.ToDictionary()
+                        ),
+                    },
+                )
+                Context.LastPlacementAccessUnsatisfiableFailure = (
+                    PlacementAccessFailure
+                )
+                Context.LastStructuredPlacementFailure = (
+                    PlacementAccessFailure
+                )
             ConflictSignals = frozenset((Signal for Owners in MandatoryConflicts.values() for Signal in Owners))
             ConflictFingerprint = CandidateTopologyDemand.MandatoryAccessConflictFingerprint
             ConflictKey = (len(MandatoryConflicts), len(ConflictSignals), int(JointDiagnostics.get('SelectedScore', 0)), JointPlacementCandidateIndex, ConflictFingerprint)
@@ -373,8 +655,8 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
             if bool(os.environ.get('RCS_DEBUG_AUTHORITATIVE')):
                 print(f'[debug] authoritative: deduplicated placement source={SourceGenerator} spacing={CandidateSpacing} duplicate_of={ExistingSourceGenerator} elapsed={Context.Services.monotonic() - PlacementStarted:.3f}s', flush=True)
             return False
-        if MaterializeRoutingResources and (not CandidatePacking.EnableJointClusterOrientation):
-            CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placed, WorkCheck=CheckPlacementGeneration)
+        if CandidateResources is None and MaterializeRoutingResources and (not CandidatePacking.EnableJointClusterOrientation):
+            CandidateResources = Context.Services.BuildRoutingResources(Candidate.Placed, WorkCheck=CheckPlacementGeneration, Technology=Context.Technology)
             CheckPlacementGeneration({'Phase': 'routing-resource-construction-complete'})
         Feedback = None
         if Context.Policy.Placement.EnableRoutingFeedback and (not bool(os.environ.get('RCS_SKIP_PLACEMENT_FEEDBACK'))) and (not JointDiagnostics) and (not IsDerivedSingleComponentPlacementSource(SourceGenerator)):
@@ -469,7 +751,7 @@ def _TakeNextDeferredRequest(Context, PreferRelocation: bool=False, PreferDirect
     if PreferDirectOnly:
         for RequestIndex, Request in enumerate(Context.GenerationPlan.DeferredRequests):
             if RequestIndex not in Context.ConsumedDeferredRequestIndexes and Request.SourceGenerator == 'row-beam-direct-only':
-                Context.PlacementGenerationDecisions.append({'Result': 'prioritize-direct-only-after-exact-cut', 'Reason': 'the primary row placement reached an exact higher-order assignment cut without boundary, guide, or pin-access pressure'})
+                Context.PlacementGenerationDecisions.append({'Result': 'prioritize-direct-only-after-exact-cut', 'Reason': 'the active exact contract requires a direct-only local-route variant before broader geometry changes'})
                 return ConsumeDeferredRequest(RequestIndex)
     if Context.TopologyDemand.RequiresJointPortfolio and ShouldPrioritizeCurrentExactCutBeforeBroad(Required=RequireExactCutBeforeBroad, PreferRelocation=PreferRelocation, HasCurrentAssignmentCut=Context.CurrentPlacementAssignmentCut is not None, HasRelocationSignals=bool(Context.PlacementRelocationSignals), TotalRelocationGenerationCount=Context.TotalRelocationGenerationCount, MaximumFeedbackRounds=MaximumFeedbackRounds) and (not Context.TopologyDemand.RequiresJointPortfolio or HasTopologyCutEpochRoutingReserve(RemainingSeconds=Context.Deadline.RemainingSeconds(), Policy=Context.Policy, RequiresDenseBoundaryRouting=Context.TopologyPressure.ScaleGeometryPressure, HasBoundedExactCutEvidence=AssignmentCutHasBoundedExactCore(Context.CurrentPlacementAssignmentCut))):
         Context.PlacementGenerationDecisions.append({'Result': 'prioritize-current-exact-cut-before-broad', 'CurrentAssignmentCut': Context.CurrentPlacementAssignmentCut.ToDictionary(), 'ActivePlacementConstraints': Context.PlacementAssignmentConstraints.ToDictionary(), 'TotalRelocationGenerationCount': Context.TotalRelocationGenerationCount, 'MaximumFeedbackRounds': MaximumFeedbackRounds})

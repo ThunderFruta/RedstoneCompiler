@@ -967,6 +967,11 @@ def BuildPlacementRetentionFingerprint(
         "MandatoryAccessOwnershipFingerprint": (
             MandatoryAccessOwnershipFingerprint
         ),
+        "SelectedPinAccessWitnessFingerprint": getattr(
+            getattr(Placement, "SelectedPinAccessWitness", None),
+            "WitnessFingerprint",
+            "",
+        ),
         "InterClusterChannelFingerprint": (
             getattr(
                 getattr(

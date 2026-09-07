@@ -33,7 +33,10 @@ from ..Contracts.Failures import RoutingStageError
 from ..Contracts.Failures import RoutingFailure, RoutingFailureReason
 from ..Resources.ResourceGraph import FindClaimConflicts, BuildRoutingEnvelope, NormalizeRoutingEdge, RoutingReservation, RoutingResourceId, RoutingResourceKind
 from .Assignment.TrackAssignment import TrackAssignment
-from ..Redstone.Technology import DefaultRedstoneRoutingTechnology
+from ..Redstone.Technology import (
+    DefaultRedstoneRoutingTechnology,
+    RedstoneRoutingTechnology,
+)
 from ..Policy import BuildRoutingAttemptPolicies, DefaultPhysicalDesignPolicy, PhysicalDesignPolicy, RoutingAttemptPolicy
 from .Execution.DetailedRouting import RoutePcbNets
 from .Global.Orchestration.RunModels import RawTrackAssignmentDomain, RawTrackAssignmentDomainPrepared
@@ -65,6 +68,8 @@ def CompactRoutedTrees(
     AccessLength: int = 3,
     Resources: Any | None = None,
     Deadline: RoutingDeadline | None = None,
+    PinAccessWitness: Any | None = None,
+    RequireSelectedPinAccessWitness: bool = False,
 ) -> RoutedDesign:
     """Remove routed loops and branches that reach no required terminal."""
     def CheckDeadline(Phase: str, **Diagnostics: object) -> None:
@@ -99,11 +104,43 @@ def CompactRoutedTrees(
         for Signal in Gate.Outputs
     }
     Targets: dict[str, list[tuple[int, int, int]]] = {}
-    PinAccessWitness = BuildPlacementPinAccessWitness(
-        Placed.PlacedGates,
-        AccessLength=AccessLength,
-        RequireCatalogMatch=True,
+    AttachedPinAccessWitness = (
+        getattr(Placement, "SelectedPinAccessWitness", None)
+        or getattr(Placed, "SelectedPinAccessWitness", None)
     )
+    if PinAccessWitness is None:
+        PinAccessWitness = AttachedPinAccessWitness
+    elif (
+        AttachedPinAccessWitness is not None
+        and PinAccessWitness.WitnessFingerprint
+        != AttachedPinAccessWitness.WitnessFingerprint
+    ):
+        raise ValueError(
+            "route compaction received a substituted pin-access witness"
+        )
+    if RequireSelectedPinAccessWitness and PinAccessWitness is None:
+        raise ValueError(
+            "routing-aware route compaction requires the placement-selected "
+            "pin-access witness"
+        )
+    if PinAccessWitness is None:
+        PinAccessWitness = BuildPlacementPinAccessWitness(
+            Placed.PlacedGates,
+            AccessLength=AccessLength,
+            RequireCatalogMatch=True,
+        )
+    if (
+        not PinAccessWitness.Complete
+        or not PinAccessWitness.CatalogMatched
+        or (
+            RequireSelectedPinAccessWitness
+            and PinAccessWitness.AccessLength != AccessLength
+        )
+    ):
+        raise ValueError(
+            "route compaction requires one complete, untruncated pin-access "
+            "witness"
+        )
     for Selection in PinAccessWitness.Selections:
         if Selection.Role == "Target":
             Targets.setdefault(Selection.Signal, []).append(
@@ -367,12 +404,34 @@ def CompactRoutedTrees(
         WorkCheck=CheckWork("repeater-materialization"),
         PruningDiagnostics=RepeaterPruningDiagnostics,
     )
+    PinnedAccessReservationsBySignal: dict[
+        str,
+        dict[tuple[int, int, int], RoutingReservation],
+    ] = defaultdict(dict)
+    for Reservation in getattr(
+        PinAccessWitness,
+        "RepeaterReservations",
+        (),
+    ):
+        if Reservation.Position not in NetWires.get(Reservation.Signal, ()):
+            # Placement-local/frozen trees are merged after detailed-route
+            # compaction. Their selected access repeaters are materialized at
+            # that boundary instead of being mistaken for detailed-route
+            # disconnections here.
+            continue
+        PinnedAccessReservationsBySignal[Reservation.Signal][
+            Reservation.Position
+        ] = Reservation
+        Repeaters[Reservation.Position] = Reservation.InputFacing
     MaterializedTracks = {}
     for Signal, Track in TrackAssignmentValue.Tracks.items():
         ExistingReservations = {
             Reservation.Position: Reservation
             for Reservation in Track.RepeaterReservations
         }
+        ExistingReservations.update(
+            PinnedAccessReservationsBySignal.get(Signal, {})
+        )
         SignalRepeaters = {
             Position: Facing
             for Position, Facing in Repeaters.items()
@@ -802,6 +861,11 @@ def RoutePcbAttempt(
                 IterationProgressCallback=ReportIteration,
                 IterationDiagnosticCallback=ReportIterationDiagnostic,
                 Policy=Policy,
+                Technology=getattr(
+                    getattr(ResourcesValue, "ResourceGraph", None),
+                    "Technology",
+                    DefaultRedstoneRoutingTechnology,
+                ),
                 SkipStrictPortalReservation=False,
                 ReservationVariant=LeaseReservationVariant,
                 PreparePortalGeometryOnly=PreparePortalGeometryOnly,
@@ -863,7 +927,16 @@ def RoutePcbAttempt(
         finally:
             CompletedRoutingPasses += LastCompleted
 
-    AccessLength = Policy.Placement.PinEscapeLength
+    RoutingAwarePlacementAccess = bool(Policy.PlacementAccess.Enabled)
+    SelectedPinAccessWitness = (
+        getattr(Placement, "SelectedPinAccessWitness", None)
+        or getattr(Placement.Placed, "SelectedPinAccessWitness", None)
+    )
+    AccessLength = (
+        int(Resources.ResourceGraph.Technology.AccessLength)
+        if RoutingAwarePlacementAccess
+        else Policy.Placement.PinEscapeLength
+    )
     ReportStatus(f"routing original placement access {AccessLength}")
     Routed = RouteWithProgress(
         Placement.Placed,
@@ -895,7 +968,9 @@ def RoutePcbAttempt(
         return Routed
     LocalNetBranches = Placement.Placed.LocalNetBranches or {}
     CompactionAccessLength = (
-        max(AccessLength, 3)
+        AccessLength
+        if RoutingAwarePlacementAccess
+        else max(AccessLength, 3)
         if (Placement.Placed.LocalRouteClaims or ())
         else AccessLength
     )
@@ -908,6 +983,8 @@ def RoutePcbAttempt(
         AccessLength=CompactionAccessLength,
         Resources=Resources,
         Deadline=Deadline,
+        PinAccessWitness=SelectedPinAccessWitness,
+        RequireSelectedPinAccessWitness=RoutingAwarePlacementAccess,
     )
     if Deadline is not None:
         Deadline.RaiseIfExpired("RouteCompaction", {"Phase": "after"})
@@ -925,6 +1002,15 @@ def RoutePcbAttempt(
                 {"Phase": "frozen-net", "Signal": Signal},
             )
             NetWires[Signal] = set(Positions)
+        if RoutingAwarePlacementAccess:
+            if SelectedPinAccessWitness is None:
+                raise ValueError(
+                    "routing-aware frozen-net merge requires its selected "
+                    "pin-access witness"
+                )
+            for Selection in SelectedPinAccessWitness.Selections:
+                if Selection.Signal in NetWires:
+                    NetWires[Selection.Signal].update(Selection.Path)
         Conflicts, _ConflictCounts = FindFlatRouteConflicts(
             NetWires,
             WorkCheck=CheckRoutingWork("FrozenNetConflictValidation"),
@@ -956,6 +1042,16 @@ def RoutePcbAttempt(
                 MergedSupports.add((X, Y - 1, Z))
         Routed.Wires = sorted(MergedWires)
         Routed.Supports = sorted(MergedSupports)
+        if RoutingAwarePlacementAccess:
+            Routed.RepeaterInputFacings = {
+                **Routed.RepeaterInputFacings,
+                **{
+                    Reservation.Position: Reservation.InputFacing
+                    for Reservation
+                    in SelectedPinAccessWitness.RepeaterReservations
+                    if Reservation.Signal in NetWires
+                },
+            }
         Routed.RoutingMetrics = MeasureRoutingStage(
             Routed.RoutingMetrics.Stage if Routed.RoutingMetrics else "Cleanup",
             NetWires,
@@ -1047,6 +1143,158 @@ def RoutePcbAttempt(
         ),
         "CompleteSignals": sorted(FrozenNetWires),
     }
+    if RoutingAwarePlacementAccess:
+        if SelectedPinAccessWitness is None:
+            raise RuntimeError(
+                "routing-aware route finalization lost its selected "
+                "pin-access witness"
+            )
+        MissingSelectedAccess = tuple(
+            (
+                Selection.Signal,
+                Selection.Terminal,
+                tuple(
+                    Position
+                    for Position in Selection.Path
+                    if Position not in Routed.NetWires.get(
+                        Selection.Signal,
+                        (),
+                    )
+                ),
+            )
+            for Selection in SelectedPinAccessWitness.Selections
+            if any(
+                Position not in Routed.NetWires.get(Selection.Signal, ())
+                for Position in Selection.Path
+            )
+        )
+        MissingSelectedRepeaters = tuple(
+            (
+                Reservation.Signal,
+                Reservation.Position,
+                Reservation.InputFacing,
+            )
+            for Reservation in (
+                SelectedPinAccessWitness.RepeaterReservations
+            )
+            if (
+                Reservation.Signal in Routed.NetWires
+                and Routed.RepeaterInputFacings.get(Reservation.Position)
+                != Reservation.InputFacing
+            )
+        )
+        if MissingSelectedAccess or MissingSelectedRepeaters:
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceInvariantViolation
+                ),
+                Stage="PlacementPinAccessFinalization",
+                AffectedNets=tuple(sorted({
+                    Signal
+                    for Signal, _Terminal, _Missing in MissingSelectedAccess
+                } | {
+                    Signal
+                    for Signal, _Position, _Facing
+                    in MissingSelectedRepeaters
+                })),
+                Detail=(
+                    "route compaction or frozen-net materialization changed "
+                    "the selected placement pin-access witness"
+                ),
+                Diagnostics={
+                    "ExpectedWitnessFingerprint": (
+                        SelectedPinAccessWitness.WitnessFingerprint
+                    ),
+                    "ExpectedDomainFingerprint": (
+                        SelectedPinAccessWitness.DomainFingerprint
+                    ),
+                    "MissingSelectedAccess": [
+                        {
+                            "Signal": Signal,
+                            "Terminal": list(Terminal),
+                            "Positions": [list(Value) for Value in Missing],
+                        }
+                        for Signal, Terminal, Missing
+                        in MissingSelectedAccess
+                    ],
+                    "MissingSelectedRepeaters": [
+                        {
+                            "Signal": Signal,
+                            "Position": list(Position),
+                            "InputFacing": Facing,
+                        }
+                        for Signal, Position, Facing
+                        in MissingSelectedRepeaters
+                    ],
+                    "AccessRegenerationCount": 0,
+                },
+            ))
+        DetailedRoutingWitness = dict(
+            Routed.RoutingControlEffectiveness.get(
+                "PlacementPinAccessWitness",
+                {},
+            )
+        )
+        ObservedWitnessFingerprint = str(
+            DetailedRoutingWitness.get("WitnessFingerprint", "")
+        )
+        if (
+            ObservedWitnessFingerprint
+            != SelectedPinAccessWitness.WitnessFingerprint
+        ):
+            raise RoutingStageError(RoutingFailure(
+                Reason=(
+                    RoutingFailureReason.ClusterInterfaceInvariantViolation
+                ),
+                Stage="PlacementPinAccessFinalization",
+                Detail=(
+                    "detailed routing did not consume the selected "
+                    "placement pin-access witness"
+                ),
+                Diagnostics={
+                    "ExpectedWitnessFingerprint": (
+                        SelectedPinAccessWitness.WitnessFingerprint
+                    ),
+                    "ObservedWitnessFingerprint": (
+                        ObservedWitnessFingerprint
+                    ),
+                    "AccessRegenerationCount": 0,
+                },
+            ))
+        PinAccessFinalization = {
+            "CatalogVersion": SelectedPinAccessWitness.CatalogVersion,
+            "TechnologyFingerprint": SelectedPinAccessWitness.TechnologyFingerprint,
+            "ResourceModelFingerprint": SelectedPinAccessWitness.ResourceModelFingerprint,
+            "PolicyVersion": Policy.PolicyVersion,
+            "ExpectedWitnessFingerprint": (
+                SelectedPinAccessWitness.WitnessFingerprint
+            ),
+            "ObservedWitnessFingerprint": ObservedWitnessFingerprint,
+            "DomainFingerprint": (
+                SelectedPinAccessWitness.DomainFingerprint
+            ),
+            "SelectedTerminalCount": len(
+                SelectedPinAccessWitness.Selections
+            ),
+            "SelectedFirstLegNodeCount": sum(
+                len(Selection.Path)
+                for Selection in SelectedPinAccessWitness.Selections
+            ),
+            "SelectedRepeaterCount": len(
+                SelectedPinAccessWitness.RepeaterReservations
+            ),
+            "MissingSelectedAccessCount": 0,
+            "MissingSelectedRepeaterCount": 0,
+            "AccessRegenerationCount": 0,
+            "CompactionPreserved": True,
+            "UnselectedPortalLeakCount": 0,
+        }
+        Routed.RoutingFootprintDiagnostics[
+            "PlacementPinAccessWitness"
+        ] = PinAccessFinalization
+        Routed.RoutingControlEffectiveness[
+            "PlacementPinAccessFinalization"
+        ] = PinAccessFinalization
     Routed.RoutingControlEffectiveness["Organization"] = {
         "Enabled": Policy.Organization.Enabled,
         "PreferredXLayer": Policy.Organization.PreferredXLayer,
@@ -1773,6 +2021,7 @@ def RoutePcbDesign(
     Resources: Any | None = None,
     RequireCompleteClusterInterfaceDomain: bool = False,
     FrozenTrackAssignmentPreparation: TrackAssignmentPreparation | None = None,
+    Technology: RedstoneRoutingTechnology = DefaultRedstoneRoutingTechnology,
 ) -> RoutedDesign:
     """Run one strict guided route and fail immediately if it is illegal."""
     Configuration = BuildPcbRoutingConfigurations(Placement)[0]
@@ -1827,6 +2076,7 @@ def RoutePcbDesign(
                 if Deadline is not None
                 else None
             ),
+            Technology=Technology,
         )
     if Deadline is not None:
         Deadline.RaiseIfExpired(

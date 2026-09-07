@@ -31,6 +31,10 @@ from PhysicalDesign.Placement.Access.Catalog import (
     EnumeratePlacedPinAccessOptionDomains,
     FreezeSelectedPlacementPinAccessWitness,
 )
+from PhysicalDesign.Placement.Engine.MandatoryAccess import (
+    BuildMandatoryAccessClaims,
+    MeasureMandatoryAccessConflictProfile,
+)
 from PhysicalDesign.Placement.Access.Fabric import BuildPlacementAccessFabric
 from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Redstone.Rules.Geometry import (
@@ -1384,3 +1388,40 @@ def testPlacementAccessSolvePreservesIncompleteDomainClassification() -> None:
     assert Result.SearchComplete is False
     assert Result.ConflictCore is None
     assert Result.IncompleteReason == "catalog-domain-generation-work-cap"
+
+
+def testMandatoryProfileConsumesSelectedWitnessClaimsDirectly() -> None:
+    GateValue = _Nand()
+    ResourceGraph = _Resources((GateValue,))
+    Domains = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=ResourceGraph,
+        Technology=Technology,
+        EnabledPatternFamilies=("straight",),
+    )
+    Result = SolvePlacedPinAccessOptionDomains(
+        Domains,
+        ResourceGraph=ResourceGraph,
+        MaximumExpansions=100,
+    )
+    assert Result.SelectedWitness is not None
+    Signals = tuple(sorted({Value.Signal for Value in Domains}))
+
+    Claims = BuildMandatoryAccessClaims(
+        (),
+        Signals,
+        SelectedPinAccessWitness=Result.SelectedWitness,
+        Technology=Technology,
+    )
+    Profile = MeasureMandatoryAccessConflictProfile(
+        (),
+        Signals,
+        SelectedPinAccessWitness=Result.SelectedWitness,
+        Technology=Technology,
+    )
+
+    assert Claims == dict(Result.SelectedWitness.ClaimsBySignal)
+    assert Profile.HasConflicts is False
+    assert Profile.ClaimCount == sum(
+        len(Value.ResourceIds) for Value in Claims.values()
+    )

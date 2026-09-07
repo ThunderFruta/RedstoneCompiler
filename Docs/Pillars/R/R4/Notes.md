@@ -13,4 +13,10 @@ controls when the two disagree.
 
 ## Working notes
 
-- None recorded.
+### 2026-09-06 current frontier
+
+Current Joint `64efbe1` has a controlled public two-NAND fanout artifact whose
+selected claims survive real raw assignment, detailed routing, and compaction.
+It does not provide a global planner result, shared-capacity proof, lease or
+portal policy, repair loop, or multi-candidate commitment. R4 remains target
+behavior. See the [bounded R2 evidence](../R2/Notes.md#2026-09-06-current-bounded-frontier).

@@ -420,7 +420,8 @@ def BuildParser() -> argparse.ArgumentParser:
         choices=tuple(Value.value for Value in RoutingStrategy),
         default=RoutingStrategy.Default.value,
         help=(
-            "Routing strategy selection. Only `default` is available."
+            "Routing strategy selection. The default uses the v17 "
+            "routing-aware placement/access policy."
         ),
     )
     Parser.add_argument(

@@ -13,7 +13,11 @@ from App.CompilerCli import BuildParser, Main, PrintFabricFailureSummary, PrintR
 from Compilation.Pipeline import CompileSvToLitematic
 from PhysicalDesign.Orchestration.Demand import BuildPlacementGenerationPlan
 from PhysicalDesign.Orchestration.Preparation import PlacementNeedsDemandDiversity
+from PhysicalDesign.Orchestration.Results import (
+    BuildPlacementPinAccessFinalizationDiagnostics,
+)
 from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb
+from PhysicalDesign.Orchestration.Setup import MaterializeInitialPlacementAccessDirectOnly, SelectEmptyPlacementFailure
 from PhysicalDesign.Placement.Engine.Clustering import BuildTopologicalLevels, FindIsomorphicNandClusterMapping, OptimizeClusterSlots, PcbGatesConflict
 from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedGate
@@ -23,7 +27,16 @@ from Validation.Fabric import FabricServerValidationResult, FabricValidationProg
 from PhysicalDesign.Routing.Planning.LocalFirst import AssignCapacityAwareGuideOptionDomains, BuildCapacityAwareGuidePlan, BuildCapacityAwareGuideOptionDomains, BuildPlacementSolution, BuildRipupPlan, DeriveRoutingBudget, RoutingDemandEstimate
 from PhysicalDesign.Routing.Planning.ChannelPlanner import BuildNetRoutingProfiles
 from PhysicalDesign.Redstone.Rules.Geometry import ValidatePlacedCellElectricalIsolation
-from PhysicalDesign.Policy import AdaptiveRoutingPolicy, GlobalRoutingPolicy, LocalFirstPhysicalDesignPolicy, RoutingStrategy
+from PhysicalDesign.Policy import (
+    AdaptiveRoutingPolicy,
+    ExecutionStrategyForRequest,
+    GlobalRoutingPolicy,
+    LocalFirstPhysicalDesignPolicy,
+    PolicyForRoutingStrategy,
+    RoutingAcceptanceProfiles,
+    RoutingAwarePlacementAccessPhysicalDesignPolicy,
+    RoutingStrategy,
+)
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from Compilation.Synthesis.Validation import ValidateNandOnlyDesign
@@ -33,6 +46,73 @@ from PhysicalDesign.Rendering.SchemWriter import LoadTemplate
 
 
 class LocalFirstRouterTests(unittest.TestCase):
+    def testPlacementPinAccessFinalizationRejectsFingerprintOnlyClaims(self) -> None:
+        # Matching strings are insufficient without the solve, domain evidence,
+        # current model, and observations checked in the real-record tests.
+        Context = SimpleNamespace(Placement=SimpleNamespace(
+            SelectedPinAccessWitness=SimpleNamespace(
+                WitnessFingerprint="witness", DomainFingerprint="domain",
+            ),
+            PlacementAccessSolve=None,
+            PlacementAccessFabric=None,
+        ), SelectedTrackPreparation=None)
+        with self.assertRaises(RoutingStageError) as Error:
+            BuildPlacementPinAccessFinalizationDiagnostics(Context)
+        self.assertIs(
+            Error.exception.Failure.Reason,
+            RoutingFailureReason.ClusterInterfaceInvariantViolation,
+        )
+
+    def testInitialAccessCorePrioritizesExistingDirectOnlyVariant(self) -> None:
+        Request = SimpleNamespace(SourceGenerator="row-beam-direct-only")
+        Context = SimpleNamespace(
+            UniquePlacements={},
+            PendingPlacementAccessDirectOnly=True,
+            Deadline=SimpleNamespace(IsExpired=lambda: False),
+            ConsumedDeferredRequestIndexes=set(),
+            GenerationPlan=SimpleNamespace(DeferredRequests=(Request,)),
+            PlacementGenerationDecisions=[],
+        )
+
+        with (
+            patch(
+                "PhysicalDesign.Orchestration.Setup._TakeNextDeferredRequest",
+                return_value=Request,
+            ) as TakeRequest,
+            patch(
+                "PhysicalDesign.Orchestration.Setup._TryPlacement",
+                return_value=True,
+            ) as TryPlacement,
+        ):
+            self.assertTrue(
+                MaterializeInitialPlacementAccessDirectOnly(Context)
+            )
+
+        TakeRequest.assert_called_once_with(Context, PreferDirectOnly=True)
+        TryPlacement.assert_called_once_with(Context, Request)
+        self.assertFalse(Context.PendingPlacementAccessDirectOnly)
+
+    def testIncompletePlacementAccessIsNeverReclassifiedAsOverlap(self) -> None:
+        Incomplete = RoutingFailure(
+            Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete,
+            Stage="PlacementAccessSolve",
+        )
+        Unsatisfiable = RoutingFailure(
+            Reason=RoutingFailureReason.NoPinAccessPattern,
+            Stage="PlacementAccessSolve",
+        )
+        Generic = RoutingFailure(
+            Reason=RoutingFailureReason.PlacementOverlap,
+            Stage="PlacementGeneration",
+        )
+        Context = SimpleNamespace(
+            LastPlacementAccessIncompleteFailure=Incomplete,
+            LastPlacementAccessUnsatisfiableFailure=Unsatisfiable,
+            LastStructuredPlacementFailure=Generic,
+        )
+
+        self.assertIs(SelectEmptyPlacementFailure(Context), Incomplete)
+
     def testNandOnlyValidationRejectsNonNandLogic(self) -> None:
         Module = ModuleIR(
             Name="Bad",
@@ -52,7 +132,7 @@ class LocalFirstRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"missing=\['N0'\]"):
             ValidateNandOnlyDesign(SimpleNamespace(PlacedGates=[]), Reference)
 
-    def testCliAliasesAndDefaultRoutingStrategyParse(self) -> None:
+    def testCliAliasesAndRoutingStrategyParse(self) -> None:
         Parsed = BuildParser().parse_args(
             [
                 "--example", "Assets/Examples/FullAdder.sv",
@@ -92,6 +172,13 @@ class LocalFirstRouterTests(unittest.TestCase):
         self.assertEqual(
             BuildParser().parse_args([]).routing_strategy,
             "default",
+        )
+        self.assertEqual(
+            BuildParser().parse_args([
+                "--routing-strategy",
+                "routing-aware-placement-access",
+            ]).routing_strategy,
+            "routing-aware-placement-access",
         )
         for InvalidDeadline in ("0", "-1", "nan", "inf"):
             with (
@@ -293,6 +380,76 @@ class LocalFirstRouterTests(unittest.TestCase):
             Text,
         )
         self.assertIn("failed-output probe", Text)
+
+    def testRoutingAwarePlacementAccessStrategyIsDefaultAndNonFallback(
+        self,
+    ) -> None:
+        DefaultPolicy = PolicyForRoutingStrategy(RoutingStrategy.Default)
+        ExplicitPolicy = PolicyForRoutingStrategy(
+            "routing-aware-placement-access"
+        )
+
+        self.assertIs(
+            DefaultPolicy,
+            RoutingAwarePlacementAccessPhysicalDesignPolicy,
+        )
+        self.assertTrue(DefaultPolicy.PlacementAccess.Enabled)
+        self.assertEqual(
+            DefaultPolicy.PolicyVersion,
+            "physical-design-v17-routing-aware-placement-access",
+        )
+        self.assertIs(
+            ExplicitPolicy,
+            RoutingAwarePlacementAccessPhysicalDesignPolicy,
+        )
+        self.assertEqual(
+            ExplicitPolicy.PolicyVersion,
+            "physical-design-v17-routing-aware-placement-access",
+        )
+        self.assertTrue(ExplicitPolicy.PlacementAccess.Enabled)
+        self.assertEqual(
+            ExplicitPolicy.PlacementAccess.CatalogVersion,
+            "physical-pin-access-catalog-v1",
+        )
+        self.assertEqual(
+            ExplicitPolicy.PlacementAccess.EnabledPatternFamilies,
+            ("straight",),
+        )
+        self.assertEqual(ExplicitPolicy.Placement, DefaultPolicy.Placement)
+        self.assertEqual(
+            ExplicitPolicy.NandPacking,
+            DefaultPolicy.NandPacking,
+        )
+        self.assertIs(
+            ExecutionStrategyForRequest(
+                "routing-aware-placement-access"
+            ),
+            RoutingStrategy.RoutingAwarePlacementAccess,
+        )
+
+        Expected = object()
+        with patch(
+            "PhysicalDesign.Orchestration.Runner._PlaceAndRoutePcbWithPolicy",
+            return_value=Expected,
+        ) as Execute:
+            Result = PlaceAndRoutePcb(
+                SimpleNamespace(),
+                Strategy="routing-aware-placement-access",
+            )
+
+        self.assertIs(Result, Expected)
+        self.assertIs(
+            Execute.call_args.kwargs["Policy"],
+            RoutingAwarePlacementAccessPhysicalDesignPolicy,
+        )
+        self.assertIs(
+            Execute.call_args.kwargs["RequestedStrategy"],
+            RoutingStrategy.RoutingAwarePlacementAccess,
+        )
+        self.assertIs(
+            Execute.call_args.kwargs["UsedStrategy"],
+            RoutingStrategy.RoutingAwarePlacementAccess,
+        )
 
     def testCapacityAwareGuidesAreDeterministicAndBounded(self) -> None:
         def Profile(Source, Target):
@@ -1207,7 +1364,7 @@ class LocalFirstRouterTests(unittest.TestCase):
                     Strategy=Strategy,
                 )
 
-    def testNewRouterFullAdderWritesCompleteDiagnostics(self) -> None:
+    def testV16ControlFullAdderWritesCompleteDiagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
             Root = Path(Directory)
             TimingEvents = []
@@ -1226,6 +1383,10 @@ class LocalFirstRouterTests(unittest.TestCase):
                 )
 
             with (
+                patch(
+                    "Compilation.Pipeline.PolicyForRoutingStrategy",
+                    return_value=LocalFirstPhysicalDesignPolicy,
+                ),
                 patch("Compilation.Pipeline.FabricServerSupervisor") as Supervisor,
                 patch(
                     "Compilation.Pipeline.CaptureServerUpdatedLitematic",

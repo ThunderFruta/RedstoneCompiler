@@ -38,6 +38,57 @@ and worktree when scheduling parallel work; do not infer active ownership from
 this inventory. `Cla4-Verification` and its uncommitted work are outside this
 documentation commit and have not been reviewed for admission.
 
+## 2026-09-06 reviewed Physical-to-Joint checkpoint
+
+The reviewed and verified Joint checkpoint is merge commit
+`2902d1dab52ea5681bc9ecc531045ff5179d1165`, whose ordered parents are exact
+Joint revision `46775f776b71d148fd261e86df8c6c59ec4edd10` and Physical revision
+`f23293a18487cde6638c8b05be18ebd71afc0d30`. Their merge base is
+`2f69160a85f1ac800243698aebec4f172164b9f8`. Physical `f23293a` is the direct
+child of original selected-access pin
+`1d9e8995d0fed2ed1afa6f2eb6b20524aa8a89ab`; its six-file binary patch digest
+is `21cf686b16ce2081c110efdf6d4db7555317f0c82992569cddcaca5b7ff65d31`.
+Independent review closed the typed-error and regeneration-observation findings,
+independently reran the focused consumer coverage, and admitted the local merge
+commit without replacing either exact tested input revision.
+
+The candidate combines Physical's complete selected-terminal, technology,
+resource-model, and stale supplied-resource-graph checks with Joint's whole
+selected paths, immutable preparation observations, candidate-specific
+envelopes, and coordinator-only commitment. Joint rebuilds the routing-resource
+graph from the current placed state at both pre-route fabric construction and
+raw descriptor materialization. It calls Physical's public binding and identity
+helpers in a narrow preflight and translates only those explicit failures to
+`ClusterInterfaceInvariantViolation` at `PlacementPinAccessHandoff` or
+`PlacementAccessFabricHandoff`. Ordinary fabric-construction `ValueError`
+continues to propagate unchanged for enabled and disabled selected access.
+
+The live `1d9e899` checkpoint and historical `dc95e349` checkpoint have the
+same parent and identical `PhysicalDesign/` and `Tests/` content; their only
+differences are the four Physical R10/N2 history and notes files. The binary
+patch digest `411ba33bf1edeea565d4aafeea99be2efd01e5ea403acf090ff7a34f8cde856e`
+belongs to the original `dc95e349` patch. It is not the digest of the later
+expanded `1d9e899` commit or its `f23293a` correction.
+
+Current candidate evidence includes the public unchanged fanout route plus
+moved-terminal, same-terminal changed-face, selected-claim foreign-wire, and
+changed-technology rejections; the exact raw materializer is also challenged
+with a foreign wire derived from an actual selected electrical claim. Guards
+at witness construction, catalog enumeration, and solving allow legitimate
+pre-mutation planning but reject any post-mutation regeneration. The integration
+module passed 8 tests, the three affected Physical suites passed 63 tests, the
+combined handoff/fingerprint/fanout set passed 69 tests, and the structural/
+schema gate passed 7 tests. Collection found 1,551 tests. The full non-scale
+suite retained exactly the inherited pre-Telemetry provenance failure and
+otherwise passed 1,546 tests with 4 skips and 257 subtests; evidence is under
+`Output/Pytest/20260906T133932.283110Z-P2/`.
+
+This Physical-to-Joint checkpoint is locally committed and independently
+verified. That establishes the tested dependency combination and controlled
+consumer behavior, not full R2 capability or production acceptance. Its
+inherited provenance failure is historical checkpoint evidence and must not be
+attributed to the later Telemetry combination.
+
 ## Capability checkpoints
 
 | ID / capability | Provider and primary code owner | Required checkpoint / relationship | Contract provided | Readiness and evidence | Remaining dependency or action |
@@ -48,6 +99,7 @@ documentation commit and have not been reviewed for admission.
 | `R1-Shared-Prerequisites` | R1 `22d112f6aea02ab7b995b562230f971ab08119e2`; global routing, with shared contracts/policy prerequisites | Existing parallel history, not a new dependency stack on R2 | [R1 history](R/R1/CommitHistory.md) records prerequisite/supporting work, not completed R1 behavior | Reconciliation pending | Map unique changes and tests before any merge or new dependent checkpoint |
 | `R10-N2-Current-Selected-Access-Validation` | `Physical-Rules`; placement-access contract, catalog identity and live validator | Reviewed producer `36413d442d989746d08a7b56c55c1018e7e6866f`, parent `e8ff123128913ba1846b7f97f18b6d428e1f19ef`, integrated as Router `0918c179741707d0b9c52a728ee85a514d89abde`; state population extended by the next row | Immutable typed re-attestation of supplied current terminals, graph semantics, technology, frozen wires and selected witness/solve; resource-model-v2 includes canonical finite block states; drift cannot publish Verified | Exact seven producer blobs; 81 focused, 8 existing envelope replay, 7 structural/schema; full 1,809 passed / 4 skipped / 378 subtests; seven MCHPRS fixture vectors passed | Narrow supplied-graph consistency only. Joint envelope and local graph consumer migration, reuse authority and full acceptance remain separate |
 | `R10-N2-Placed-Template-Routing-States` | `Physical-Rules`; public placed-template state construction and graph semantics | Reviewed producer `86d1ee5f05684b7fc042d704c8b772847ecddd12`, parent `36413d442d989746d08a7b56c55c1018e7e6866f`, integrated as Router `e6dca965f2ee944120d57ea0c4db98acb56fcf2c` | Public routing-resource construction populates canonical transformed template states, including explicit air; routing-resource-graph-v3 and current-access validation retain state-sensitive identity | Ten exact producer blobs plus one Reuse compatibility test; 90 Physical, 16 Reuse with 42 subtests, 8 envelope, 7 structural; full 1,988 passed / 4 skipped / 378 subtests; seven MCHPRS fixture vectors passed | Declared placed-template coverage only. Joint local adoption is delivered by the next row; current-access envelope, full world coverage, reuse authority and combined acceptance remain open |
+| `R2-Current-Template-State-Local-Consumer` | `Joint-Physical-Design`; committed local routing resource construction | Joint `6fac0892f148cf4f4b0641cd72c3df775a0f62a4`, parent `567f30a32a927e29309a9851aa1a8d9f0b8b48c6`; local consumer integrated as Router `234b8dc65e65427a0147bd90ee727179e86e5e51` | Actual local routing uses public BuildRoutingResources with current placement, technology and work checks; transformed states, explicit air and frozen-wire effects reach its graph | Joint: 15 exact Physical prerequisites plus three owned paths, full 1,767 passed / 4 skipped / 271 subtests. Router: two exact code/test blobs plus preserving R2 note, 68 focused with 14 subtests, full 1,989 passed / 4 skipped / 378 subtests | Source and local state adoption only. Current envelope, Ready lifecycle, three-point revalidation, native caller/emission, reuse authority and combined acceptance remain separate |
 | `R10-N2-Supported-Stair-Mchprs-Fixture` | `Physical-Rules`; declarative fixture, checker/observer regression and owner notes | Reviewed producer `61bd602acd3583f93cd23faa883aa034282712c4`, parent `86d1ee5f05684b7fc042d704c8b772847ecddd12`, integrated as Router `d1395ca31585f0803b6c838d7ec207f70200cb23` | Literal supported clear +X/+Y stair has exact static geometry and two fresh MCHPRS Boolean transfer observations; expected-answer mutation cannot alter checker or observer | Seven exact producer blobs; Router 40 source/contracts, 5 observer, 9 fixture vectors, 7 structural; full 1,992 passed / 4 skipped / 378 subtests on unchanged combined Router native | No production/API change. Only lower-root power is measured; upper analog power, blocked stair, general strength/timing/ownership, Fabric and full R10/N2 acceptance remain unproved |
 | `R10-N2-Blocked-Headroom-Fixture` | `Physical-Rules`; declarative fixture and observer provenance | Producer `73a8c653bc988799771b9adc524b1e8bb99920e6` plus correction `af4984b28025d45a53f82895f8ed55a71ef5f1bc`, integrated as Router `111de5b63c0cf29a9d4a6c851a4c14aa18acb9d4` | Literal all-stone blocked stair issues no route claim; aggregate Legal reflects the removed edge. Fresh Boolean/root observations are independent of expectations; native provenance is checked against actual imported bytes | Seven exact producer blobs; fresh Terra integration PASS; 42 source, 6 observer, 7 structural, 11 cases across 5 definitions; full 1,995 passed / 4 skipped / 378 subtests | Scoped fixture conformance only; no upper analog, general strength/timing, Fabric or full R10/N2 acceptance |
 | `R7-N1-Native-Batch-Outcomes` | `Runtime-And-Kernels`; native coarse/detailed outcome execution and proof/identity validation | Reviewed producer `cfd529e19d774e7bdf106b89628a54c8b8f3b6b4`, parent `24047bd495d73d8bb1d7613124bb13648bb0ba37`, integrated as Router `a354ed40ed532c277f227603cc05049d2d532b37` and as Joint source-only checkpoint `567f30a32a927e29309a9851aa1a8d9f0b8b48c6` | Additive v1 immutable request/receipt API; exact ordinal association, typed Found/request-scoped ProvenNoPath/Incomplete, native identities, shared route/proof expansion cap and original absolute cutoff | 22 producer-exact blobs and 2 Physical-observer-preserving facades; combined native rebuilt; 88 Rust and 1,887 Python tests passed, with 4 skips and 378 subtests; seven MCHPRS fixture vectors passed | Joint has the 24 native source paths; live identity binding and evidence emission remain separate; no persistent-worker, live-cancellation/shutdown, global infeasibility, physical acceptance or promotion claim |
@@ -206,6 +258,98 @@ Protected `main` remains `193e2838050ee111245b5431484ad44112b26156`; no push
 occurred. Recovery uses a scoped integration revert followed by rebuild and
 import verification of the restored combined source.
 
+## 2026-09-07 Runtime authority contracts and Joint native source consumption
+
+Runtime committed two independently reviewed prerequisite scopes, in order:
+
+- `fbd7c81050bb2b54c03348adeee54695b59d4474`, parent
+  `cfd529e19d774e7bdf106b89628a54c8b8f3b6b4`, tree
+  `0da368135d55cee5c163d88f9ff2d7ad9b09c7d8`: five policy documents define
+  distinct useful-work and cleanup authority, explicit force permission, and
+  capacity release only after actual worker exit. Its binary patch is
+  `173498a984a109e44d98c0aa82992ca2781416325a3ab9021a9df805484849a1`.
+- `142c288cadcad448139db63b95c193424cf23d7a`, parent the actual first commit,
+  tree `02594e516e3572f2e50a7d27ff07154de203cd3d`: the Runtime contract,
+  owning tests and factual N4 note. Its relative binary patch is
+  `80b7270292488453ab701eee98d90791f4cfa633bd8e02a0383229e0516c98b3`.
+
+The producer's combined binary patch is
+`181c998c4a6d0f3690bce7d0fa3d7a9ad3939c61c09200065fd54b44d5985d9f`.
+Both local commits were authenticated after execution. Producer verification
+retains 85 focused tests, 7 structural checks, 1,569 collected tests and a full
+result of 1,565 passed, 4 skipped and 257 subtests in 62.31 seconds. Fresh
+independent review repeated the focused and structural checks. Native
+`36c7d562` was unchanged; no native rebuild or caller/lifecycle capability is
+claimed. The original numeric-conversion rejection evidence and the later
+negative-adjacent-float/custom-numeric regression coverage remain distinct.
+
+Router imported seven complete producer blobs as
+`691daa142b5cd30e348f6c87ee07479844061cbc`, parent
+`5067b23528517285b5c066eafb9b4aae42b3a091`, tree
+`7d247dc8743eacb119010b19516a873a93ea5e1d`. Its binary patch is
+`9c7665ff6202449b8c01cde8030243683d32c522b1723205ecdb1bbbef5a7faa`;
+its full-index encoding is
+`14495bc9a6fe4b7ed7f62960f0d95b534281b2c4f3c5d9a63bc3594e8e6e98bd`.
+The five documentation preimages already matched Runtime. Router previously
+lacked `PhysicalDesign/Contracts/Runtime.py` and its owning test, so this
+integration also includes the complete existing N1 request/result/proof and
+work-product contract from producer history `f083554ee5967e69540e6647ee543c8e92747141`
+through `9f432cd2712745d2b749a5c089564844a5229368`. The new module imports
+only the standard library. Its test needs pytest and that module; no worker,
+spawned adapter, symbolic caller or package-facade change is required for this
+source contract. The complete imported module and tests received independent
+Terra/high review.
+
+All seven Router commands passed: exact import/native identity, compile and
+whitespace checks, 52 contract tests, 7 structural/schema tests, 1,943 collected
+tests and a complete deterministic result of 1,939 passed, 4 skipped and
+378 subtests in 175.69 seconds. Source hashes and the staged patch remained
+unchanged; clean commit readback matched all seven producer blobs. Router's
+existing native remains
+`d1b5cbda5ede49428cebf47af342b6153aa3d862310317c38a4aaf212ad85d1f`.
+The 35-entry seal under
+`Output/PortfolioGoal/RuntimeAuthorityToRouter/Integration/` retains exact
+commands, raw logs, source manifests, JUnit, reviews, commit readback and
+prerequisite identity clarification; its earlier 31-entry precommit seal is
+preserved. Rust/native rebuild, live MCHPRS, Fabric, scale and production
+caller integration were not run for this Python contract import.
+
+Separately, Joint consumed exactly 24 native producer `cfd529e` blobs as
+`567f30a32a927e29309a9851aa1a8d9f0b8b48c6`, parent
+`96e66797ee2f957a3279d71b0985653988bceb5e`, tree
+`cb3d2c21b6ef832470e3c567ea74651994936e07`. All 24 blobs, including the two
+producer notes, are exact. Its full-index patch is
+`4ce7ae85a2c22252ff17c888db9e275c654ed168de9fa1877f77f1c5cabfe0b2`;
+the separately recorded abbreviated-index patch is
+`61eb519f4a68eb566ca2468aefde954ceea2dda5583ca652b8163e6f1c1ecfac`.
+Joint rebuilt its own native artifact, with build/package/import SHA-256
+`36c7d5628604b4605084865a76c5172cbb208d278ac06b2efcf5c344fb836a39`.
+Fresh independent review accepted the exact source import. Retained checks
+passed formatting, 86 Rust tests, the locked release extension build, 78 native
+outcome tests, 835 routing/reliability tests with 109 subtests, 7 structural
+checks, 1,695 collected tests and full pytest with 1,691 passed, 4 skipped and
+271 subtests in 73.26 seconds. The unchanged preparation seal has 29 entries
+and is retained under Joint
+`Output/JointPhysicalDesign/RuntimeSourceConsumption/20260907T104602Z-cfd529-PREP/`.
+Parent readback is under `Output/PortfolioGoal/RuntimeToJoint/PostCommit/`.
+The earlier broad no-commit merge attempt was aborted after exceeding scope;
+the accepted candidate was reconstructed through exact producer-blob import.
+The incident and clean final scope remain recorded.
+
+These are exact path-based consumptions, not full Runtime branch ancestry.
+Joint `567f30a` has no Runtime Python contract, bounded/spawned worker module,
+or bounded symbolic adapter from that producer. Before a future adapter or
+supervisor delta is consumed, each target must verify its complete required
+module/blob closure against its actual checkout; a `cfd529e..successor` delta
+alone cannot supply prerequisites absent from the target. Joint still must bind
+native receipt echoes to current objects, consume reviewed Physical state and
+access contracts, and emit actual success/failure receipts before Telemetry
+can project them. No live worker cleanup, persistent-worker behavior, reuse
+admission authority, new seven-case acceptance, or promotion readiness follows.
+Protected `main` remains `193e2838050ee111245b5431484ad44112b26156`; no push
+occurred. Recovery uses scoped reverts of the particular local integrations,
+with their distinct source and native evidence preserved.
+
 ## 2026-09-07 placed-template routing state producer integrated into Router
 
 Physical producer `86d1ee5f05684b7fc042d704c8b772847ecddd12`, parent
@@ -258,6 +402,80 @@ revalidation, Runtime caller migration, full world coverage, certified reuse
 and combined acceptance are not established by this integration. Recovery is
 a scoped local revert of `e6dca965`; protected `main` remains
 `193e2838050ee111245b5431484ad44112b26156`, and no push occurred.
+
+## 2026-09-07 local consumer integrated and supported-stair fixture committed
+
+Joint committed `6fac0892f148cf4f4b0641cd72c3df775a0f62a4`, parent
+`567f30a32a927e29309a9851aa1a8d9f0b8b48c6`, tree
+`79cc0b55475eb04af49f42bc75571d3fccff92da`. Its eighteen paths contain
+fifteen exact Physical `86d1ee5` prerequisites plus Joint's `CommitRouting.py`,
+the actual local-consumer regression, and an R2 note. The real local path now
+uses `BuildRoutingResources` with current placement, technology and work checks.
+Fresh independent review passed 97 focused tests with 14 subtests, compilation,
+7 structural/schema tests, collection of 1,771 tests, and the full deterministic
+suite with 1,767 passed, 4 skipped and 271 subtests in 144.52 seconds. Joint's
+existing native `36c7d562` was unchanged; no native parity or backend acceptance
+is inferred. The complete precommit stream, including all six new files, is
+distinct from the actual commit diff. The latter's full-index SHA-256 is
+`0dcdf4a13ae852efeb1619c85709beb1e42e6a901f25e449390f7b0e11482717`.
+The earlier incomplete seventeen-path encoding remains diagnostic history.
+
+Router already had all fifteen Physical prerequisite blobs exactly. It consumed
+the two exact Joint code/test blobs and the producer's ten-line R2 note addition,
+preserving existing Router notes, as
+`234b8dc65e65427a0147bd90ee727179e86e5e51`, parent
+`d699df7f066d5cba75998cff3dbe598d4b46a9ed`, tree
+`004df569c2dabd3058ee14bb9669d9f804492488`. The three-path integration has
+126 additions and 15 deletions. Its binary patch SHA-256 is
+`08c9c90f036cb456aa7044abf62bc1aa481861b186ecc440f205bbdf193d192b`;
+the full-index encoding is
+`d17488e046b898a4052e16062a698fcfbaec20ced7ed9b1ea22e564de1ac2822`.
+
+All nine combined commands passed: exact native/import identity, compilation,
+whitespace, 68 focused tests with 14 subtests, 8 existing envelope replay tests,
+7 structural/schema tests, collection of 1,993 tests, seven MCHPRS vectors across
+three fixture definitions, and the full suite with 1,989 passed, 4 skipped and
+378 subtests in 182.65 seconds. Source was unchanged across the run. Fresh
+independent Terra integration review accepted the final receipts. The existing
+Router native remains `d1b5cbda`; there was no native rebuild, Fabric, scale or
+full routed acceptance run. The 59-entry precommit seal is preserved; the
+61-entry final seal under
+`Output/PortfolioGoal/JointLocalStateToRouter/Integration/` has SHA-256
+`7078629ddc3cd5c7ba9a19b1377feda6767a4d3671a3f1c8bd977e44c6584f65`.
+The expected tree, exact three paths and clean checkout were read back.
+
+Separately, Physical committed
+`61bd602acd3583f93cd23faa883aa034282712c4`, parent
+`86d1ee5f05684b7fc042d704c8b772847ecddd12`, tree
+`3193d9e0ced38150a22ba8a90ef495469a56614a`. Seven fixture/test/note paths add
+413 lines for the literal supported clear +X/+Y stair. The static checker
+requires exact bidirectional dust edges, supports and clear headroom. Fresh
+off-to-on and on-to-off native cases retain complete input vectors and ticks
+0 through 7; the comparison layer alone consumes expected answers. An
+expectation-only mutation preserves raw prediction/observation and produces a
+mismatch. Only logical Y and lower route-root power are observed; upper-dust
+analog power is not observed or inferred.
+
+Physical's unchanged-source evidence passed 40 source/contracts tests, 5 observer
+tests, all nine fixture vectors, 7 structural/schema tests, collection of 1,570
+tests, and the full deterministic suite with 1,566 passed, 4 skipped and
+257 subtests in 99.46 seconds. Fresh owner review and a separate parent audit
+passed. The existing Physical native remains `c5938ff8`; it is a distinct
+qualified artifact from Router's combined native. The fourteen-entry producer
+commit receipt seal has SHA-256
+`435b754ddc9a2b267ac03a20d5f4fa7a78e0d428aa81afb74e1a7be140eb00a3`
+at Physical `Output/PhysicalRulesBatch1Evidence/20260907T134122Z-CommitReceipt/`.
+Parent readback is retained at `Output/PortfolioGoal/PhysicalSupportedStair/PostCommit/`.
+This fixture checkpoint changes no production API and is not required for the
+Joint envelope source closure; its Router fixture intake remains a separate
+operation.
+
+Neither checkpoint establishes a current-access envelope, Ready lifecycle,
+Runtime caller receipts, cache authority, general physical-rule completeness or
+combined acceptance. All five coordinators received the exact checkpoints.
+Recovery uses scoped local reverts, with each source/native/evidence lineage
+preserved. Protected `main` remains
+`193e2838050ee111245b5431484ad44112b26156`; no push occurred.
 
 ## 2026-09-07 supported-stair fixture integrated into Router
 
