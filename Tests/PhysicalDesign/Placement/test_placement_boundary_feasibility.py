@@ -263,6 +263,46 @@ class PlacementBoundaryFeasibilityTests(unittest.TestCase):
             SecondResult.InterClusterRoutingChannel.ChannelFingerprint,
         )
 
+    def testChannelSuccessorClearsPredecessorSelectedAccessAuthority(
+        self,
+    ) -> None:
+        Source = self.BuildChannelPlacement(((0, 0), (12, 0)))
+        StaleWitness = object()
+        StaleSolve = object()
+        Source = replace(
+            Source,
+            Placed=replace(
+                Source.Placed,
+                SelectedPinAccessWitness=StaleWitness,
+                PlacementAccessSolve=StaleSolve,
+                PlacementAccessFabric=object(),
+                PlacementAccessAssignment=object(),
+            ),
+            SelectedPinAccessWitness=StaleWitness,
+            PlacementAccessSolve=StaleSolve,
+            PlacementAccessFabric=object(),
+            PlacementAccessAssignment=object(),
+        )
+
+        with patch.object(
+            ClustersModule,
+            "BuildPlacedCellGeometry",
+            return_value=(set(), set(), set()),
+        ):
+            ChannelSuccessor = BuildBoundedInterClusterRoutingChannel(Source)
+            DeckSuccessor = BuildBoundedInterClusterRoutingDeck(Source)
+
+        for Successor in (ChannelSuccessor, DeckSuccessor):
+            assert Successor is not Source
+            assert Successor.SelectedPinAccessWitness is None
+            assert Successor.PlacementAccessSolve is None
+            assert Successor.PlacementAccessFabric is None
+            assert Successor.PlacementAccessAssignment is None
+            assert Successor.Placed.SelectedPinAccessWitness is None
+            assert Successor.Placed.PlacementAccessSolve is None
+            assert Successor.Placed.PlacementAccessFabric is None
+            assert Successor.Placed.PlacementAccessAssignment is None
+
     def testBoundedInterClusterChannelRejectsBlockedLaneGeometry(
         self,
     ) -> None:

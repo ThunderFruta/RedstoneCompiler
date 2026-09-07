@@ -1146,6 +1146,14 @@ def BuildBoundedInterClusterRoutingChannel(
         CompleteClusterInterfaceAccess=True,
         MandatoryAccessPreScreenProfile=None,
         InterClusterRoutingChannel=Channel,
+        # Channel construction can translate cluster gates and terminals.  A
+        # selected access witness is authority over the predecessor's exact
+        # terminal/resource problem, never an inherited decoration of this
+        # successor.  The Joint coordinator rebuilds it before routing.
+        PlacementAccessFabric=None,
+        PlacementAccessAssignment=None,
+        SelectedPinAccessWitness=None,
+        PlacementAccessSolve=None,
         ComponentGraph=LogicalComponentGraph,
     )
 
@@ -2023,6 +2031,10 @@ def BuildBoundedInterClusterRoutingDeck(
         CompleteClusterInterfaceAccess=True,
         InterClusterRoutingChannel=Deck,
         PackedClusters=Source.PackedClusters,
+        PlacementAccessFabric=None,
+        PlacementAccessAssignment=None,
+        SelectedPinAccessWitness=None,
+        PlacementAccessSolve=None,
     )
     return replace(
         Source,
@@ -2031,4 +2043,10 @@ def BuildBoundedInterClusterRoutingDeck(
         CompleteClusterInterfaceAccess=True,
         MandatoryAccessPreScreenProfile=None,
         InterClusterRoutingChannel=Deck,
+        # A deck successor must not retain access authority from a placement
+        # whose interface geometry may have just changed.
+        PlacementAccessFabric=None,
+        PlacementAccessAssignment=None,
+        SelectedPinAccessWitness=None,
+        PlacementAccessSolve=None,
     )

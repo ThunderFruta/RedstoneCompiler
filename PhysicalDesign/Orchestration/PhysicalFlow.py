@@ -8,7 +8,10 @@ from typing import Any, Iterable
 from PhysicalDesign.Routing.Pcb import PreparePhysicalComponentEligibility, SolvePreparedPhysicalComponentEligibility
 from PhysicalDesign.Contracts.Placement import ClusterInterfacePortfolioProblem, ClusterInterfacePortfolioStateAudit, ClusterInterfacePlacementState, ClusterInterfaceRealizabilityNogood, ClusterInterfaceStateProof
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
+from PhysicalDesign.Contracts.PlacementAccess import PlacementAccessSolveStatus
 from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint, RoutingDeadline
+from PhysicalDesign.Placement.Access.Capacity import SolvePlacedPinAccessOptionDomains
+from PhysicalDesign.Placement.Access.Catalog import EnumeratePlacedPinAccessOptionDomains
 from PhysicalDesign.Placement.Engine.Clusters import BuildBoundedInterClusterRoutingChannel, BuildBoundedInterClusterRoutingDeck
 from PhysicalDesign.Routing.Regions.Proofs.NoGoods import RecordPhysicalComponentDetailedRoutingNoGood, RecordPhysicalComponentLocalCompilationNoGood, RecordPhysicalComponentSymbolicCapacityEligibilityNoGood
 from PhysicalDesign.Routing.Regions.Pipeline import AssembleClosedComponentForGlobalRouting, CompileClosedComponent
@@ -45,7 +48,105 @@ from .PhysicalAssembly import (
 )
 from .RoutingAttempts import (
     MaterializeSelectedJointPlacementLocalRouting,
+    ValidateCurrentSelectedPlacementAccessConsumer,
 )
+
+
+def _RebuildTransformedPlacementSelectedAccess(Context, Placement):
+    """Give a transformed placement only current selected-access authority.
+
+    Channel and deck construction can change physical terminals after the
+    retained placement's access problem was solved.  Rebuild both the current
+    resource graph and the exact access solve under the active policy, using
+    the already allocated interface deadline rather than granting new work.
+    """
+    if not Context.Policy.PlacementAccess.Enabled:
+        return Placement, None
+
+    def WorkCheck(Diagnostics):
+        Context.InterfaceDeadline.RaiseIfExpired(
+            'TransformedPlacementAccessRebuild',
+            Diagnostics,
+        )
+
+    Resources = Context.Services.BuildRoutingResources(
+        Placement.Placed,
+        WorkCheck=WorkCheck,
+        Technology=Context.Technology,
+    )
+    Domains = EnumeratePlacedPinAccessOptionDomains(
+        Placement.Placed.PlacedGates,
+        ResourceGraph=Resources.ResourceGraph,
+        Technology=Context.Technology,
+        EnabledPatternFamilies=(
+            Context.Policy.PlacementAccess.EnabledPatternFamilies
+        ),
+        CatalogVersion=Context.Policy.PlacementAccess.CatalogVersion,
+        MaximumGenerationWork=(
+            Context.Policy.PlacementAccess.MaximumDomainGenerationWork
+        ),
+        WorkCheck=WorkCheck,
+        PreOwnedNodesBySignal=(Placement.Placed.FrozenNetWires or {}),
+    )
+    Solve = SolvePlacedPinAccessOptionDomains(
+        Domains,
+        ResourceGraph=Resources.ResourceGraph,
+        MaximumExpansions=(
+            Context.Policy.PlacementAccess.MaximumAssignmentExpansions
+        ),
+        WorkCheck=WorkCheck,
+    )
+    Solve = replace(Solve, PolicyVersion=Context.Policy.PolicyVersion)
+    Diagnostics = {
+        'PlacementAccessSolve': Solve.ToDictionary(),
+        'PolicyVersion': Context.Policy.PolicyVersion,
+        'CurrentResourceGraphVersion': Resources.ResourceGraph.GraphVersion,
+        'Deadline': Context.InterfaceDeadline.ToDictionary(),
+    }
+    if Solve.Status is not PlacementAccessSolveStatus.Feasible:
+        raise RoutingStageError(RoutingFailure(
+            Reason=(
+                RoutingFailureReason.ClusterInterfaceSolveIncomplete
+                if Solve.Status is PlacementAccessSolveStatus.Incomplete
+                else RoutingFailureReason.NoPinAccessPattern
+            ),
+            Stage='TransformedPlacementAccessRebuild',
+            Detail=(
+                'the transformed placement has no complete current '
+                'selected pin-access solution'
+            ),
+            RepairActions=(
+                ('IncreasePlacementAccessWork',)
+                if Solve.Status is PlacementAccessSolveStatus.Incomplete
+                else ()
+            ),
+            Diagnostics=Diagnostics,
+        ))
+    Witness = Solve.SelectedWitness
+    if Witness is None:
+        raise ValueError('feasible transformed access solve omitted its witness')
+    Successor = replace(
+        Placement,
+        Placed=replace(
+            Placement.Placed,
+            PlacementAccessFabric=None,
+            PlacementAccessAssignment=None,
+            SelectedPinAccessWitness=Witness,
+            PlacementAccessSolve=Solve,
+        ),
+        PlacementAccessFabric=None,
+        PlacementAccessAssignment=None,
+        SelectedPinAccessWitness=Witness,
+        PlacementAccessSolve=Solve,
+    )
+    ValidateCurrentSelectedPlacementAccessConsumer(
+        Successor,
+        Resources=Resources,
+        Technology=Context.Technology,
+        ConsumerId='transformed-placement-access-rebuild',
+        PlacementFingerprint='',
+    )
+    return Successor, Resources
 
 
 def RunPhysicalComponentFlow(Context):
@@ -277,6 +378,10 @@ def RunPhysicalComponentFlow(Context):
             Context.RetainedPlacementResourceCacheHit = False
             try:
                 Context.MaterializedInterfacePlacement = MaterializeSelectedJointPlacementLocalRouting(Context, Context.InterfaceCandidate, lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfacePlacementMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}))
+                Context.PreTransformPlacementAccessWitness = (
+                    Context.MaterializedInterfacePlacement
+                    .SelectedPinAccessWitness
+                )
                 if Context.MaterializedInterfacePlacement is not Context.InterfaceCandidate.Placement:
                     Context.InterfaceCandidate = replace(Context.InterfaceCandidate, Placement=Context.MaterializedInterfacePlacement)
                 if Context.CapacityRepairConstraint is not None:
@@ -294,6 +399,23 @@ def RunPhysicalComponentFlow(Context):
                     Context.MaterializedInterfacePlacement = BuildBoundedInterClusterRoutingDeck(Context.MaterializedInterfacePlacement, TrackPitch=Context.Technology.TrackPitch, MaximumAffectedClusters=3, MaximumDeckLanes=12, InterfaceDeckLayer=3, ComponentVariant=Context.EffectiveComponentVariant, PreferredSignals=Context.CapacityRepairPreferredSignals, RequiredComponentGateNames=Context.CapacityRepairRequiredComponentGateNames, ForcedAffectedClusters=Context.SelectedComponentClusters)
                 except ValueError as Error:
                     raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ClusterInterfaceArchitectureUnsatisfiable, Stage='InterClusterRoutingChannelMaterialization', Detail=str(Error), RepairActions=(), Diagnostics={'CandidateId': Context.InterfaceCandidate.CandidateId, 'ComponentFabricConstructionComplete': True, 'ClusterInterfaceDomainComplete': True, 'OwnershipSearchComplete': True, 'BroadFallbackAllowed': False, 'ExecutableLegacyRepairCascade': False})) from Error
+                Context.TransformedPlacementAccessRebuilt = bool(
+                    Context.PreTransformPlacementAccessWitness is not None
+                    and Context.MaterializedInterfacePlacement
+                    .SelectedPinAccessWitness is None
+                )
+                if Context.TransformedPlacementAccessRebuilt:
+                    (
+                        Context.MaterializedInterfacePlacement,
+                        Context.InterfaceResources,
+                    ) = _RebuildTransformedPlacementSelectedAccess(
+                        Context,
+                        Context.MaterializedInterfacePlacement,
+                    )
+                    # The selected witness is part of placement identity.
+                    # Rebuild it before component selection, proof lookup, or
+                    # publication of an identity-keyed successor state.
+                    Context.RetainedPlacementResourceCacheHit = False
                 Context.Channel = Context.MaterializedInterfacePlacement.InterClusterRoutingChannel
                 Context.MissingCapacityRepairChannelSignals = tuple(sorted(
                     set(Context.CapacityRepairConstraint.Signals)
@@ -346,7 +468,8 @@ def RunPhysicalComponentFlow(Context):
                         Context.DuplicateChannelizedPlacementAdvanced = EnqueueProofGuidedPhysicalPlacement(Context, Context.GenerationFailure, Context.GenerationSourceCandidate, Context.GenerationComponentVariant)
                     Context.InterfaceAttemptDiagnostics.append({'CandidateId': Context.InterfaceCandidate.CandidateId, 'SourceCandidateId': Context.RetainedBaseInterfaceCandidate.CandidateId, 'SourcePlacementFingerprint': Context.RetainedPlacementFingerprint, 'PlacementFingerprint': Context.ChannelizedPlacementFingerprint, 'ComponentStateFingerprint': Context.ComponentStateFingerprint, 'ComponentVariant': Context.ComponentVariantForState, 'ComponentSelectionFingerprint': Context.ComponentSelectionFingerprint, 'EquivalentProofComponentStateFingerprint': getattr(Context.ChannelizedEquivalentProof, 'ComponentStateFingerprint', ''), 'PlacementAdvanced': Context.DuplicateChannelizedPlacementAdvanced, 'Result': 'duplicate-channelized-state-proof-reused'})
                     continue
-                Context.InterfaceResources, Context.RetainedPlacementResourceCacheHit = ReuseRetainedPlacementRoutingResources(Context.RoutingResourcesByRetainedPlacementFingerprint, Context.RetainedPlacementFingerprint, lambda: Context.Services.BuildRoutingResources(Context.MaterializedInterfacePlacement.Placed, WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfaceResourceMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}), Technology=Context.Technology))
+                if not Context.TransformedPlacementAccessRebuilt:
+                    Context.InterfaceResources, Context.RetainedPlacementResourceCacheHit = ReuseRetainedPlacementRoutingResources(Context.RoutingResourcesByRetainedPlacementFingerprint, Context.RetainedPlacementFingerprint, lambda: Context.Services.BuildRoutingResources(Context.MaterializedInterfacePlacement.Placed, WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfaceResourceMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}), Technology=Context.Technology))
                 Context.RoutingResourcesByFingerprint[Context.InterfaceCandidate.PlacementFingerprint] = Context.InterfaceResources
                 Context.InterfaceResources.PhysicalGlobalApertureTemplateCache = Context.PhysicalGlobalApertureTemplateCache
                 Context.InterfaceResources.PhysicalLocalSeamEligibilityCache = Context.PhysicalLocalSeamEligibilityCache
