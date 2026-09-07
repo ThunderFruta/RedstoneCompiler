@@ -362,6 +362,32 @@ def test_in_place_archive_seals_complete_inventory_and_checksums(tmp_path: Path)
     _VerifyChecksums(ArchiveRoot)
 
 
+@pytest.mark.parametrize("Target", ("manifest", "run"))
+def test_sealed_archive_rejects_non_boolean_acceptance(
+    tmp_path: Path,
+    Target: str,
+):
+    ArchiveRoot = tmp_path / Target
+    _WriteEvidence(ArchiveRoot)
+    Context = _ArchiveContext(ArchiveRoot, ArchiveRoot)
+    Manifest = _Manifest()
+    if Target == "manifest":
+        Manifest["Accepted"] = 1
+    else:
+        Manifest["Runs"][0]["Accepted"] = "false"
+
+    with pytest.raises(ValueError, match="Accepted.*exact boolean"):
+        PublishBenchmarkArchive(
+            Context,
+            Manifest,
+            CompletedAtUtc="2026-09-03T12:00:13+00:00",
+            WallSeconds=13.0,
+            ExitCode=0,
+            ExitClassification="passed",
+            SourceIdentityReader=lambda _Root: Context.Identity.Source,
+        )
+
+
 def test_archive_surface_keeps_nonobject_failure_evidence_unknown(
     tmp_path: Path,
 ) -> None:

@@ -4651,6 +4651,17 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             self.assertTrue(Circuit["Passed"])
             self.assertTrue(Circuit["SimulationBackendCompatible"])
 
+        for InvalidRunIndex in (0, 1):
+            InvalidRuns = deepcopy(CandidateRuns)
+            InvalidRuns[InvalidRunIndex]["Accepted"] = 1
+            InvalidComparison = BuildBaselineComparison(
+                Baseline=Baseline,
+                CandidateRuns=InvalidRuns,
+                Compatibility={"Compatible": True},
+                CandidateSourceProvenance=CandidateProvenance,
+            )
+            self.assertFalse(InvalidComparison["Passed"])
+
     def testLegacyV15CompatibilityStillRequiresCoreProfiles(
         self,
     ) -> None:

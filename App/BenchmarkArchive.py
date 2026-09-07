@@ -611,6 +611,29 @@ def _ReadRoutingFailureSurface(
     }
 
 
+def _FailClosedAcceptanceVerdict(Value: object) -> bool:
+    """Return true only for a literal JSON boolean true verdict."""
+    return Value is True
+
+
+def ValidateExactAcceptanceVerdicts(
+    BenchmarkManifest: Mapping[str, object],
+) -> None:
+    """Reject sealed/public acceptance data with non-boolean verdicts."""
+    if type(BenchmarkManifest.get("Accepted")) is not bool:
+        raise ValueError("manifest Accepted must be an exact boolean")
+    RawRuns = BenchmarkManifest.get("Runs", [])
+    if not isinstance(RawRuns, list):
+        raise ValueError("manifest Runs must be a list")
+    for Index, RawRun in enumerate(RawRuns):
+        if not isinstance(RawRun, dict):
+            continue
+        if type(RawRun.get("Accepted")) is not bool:
+            raise ValueError(
+                f"run {Index} Accepted must be an exact boolean"
+            )
+
+
 def BuildArchiveRunSurface(
     BenchmarkManifest: Mapping[str, object],
     ArchiveRoot: Path,
@@ -683,7 +706,9 @@ def BuildArchiveRunSurface(
             "RunName": RunName,
             "Circuit": RawRun.get("Circuit"),
             "Status": RawRun.get("Status"),
-            "Accepted": bool(RawRun.get("Accepted")),
+            "Accepted": _FailClosedAcceptanceVerdict(
+                RawRun.get("Accepted")
+            ),
             "WallRuntimeSeconds": Process.get("WallRuntimeSeconds"),
             "ReturnCode": Process.get("ReturnCode"),
             "TimedOut": Process.get("TimedOut"),
@@ -726,7 +751,9 @@ def _BuildBenchmarkResult(
     )
     return {
         "Status": BenchmarkManifest.get("Status", "UNKNOWN"),
-        "Accepted": bool(BenchmarkManifest.get("Accepted")),
+        "Accepted": _FailClosedAcceptanceVerdict(
+            BenchmarkManifest.get("Accepted")
+        ),
         "ExitCode": ExitCode,
         "PassedRuns": sum(Run.get("Status") == "PASSED" for Run in Runs),
         "FailedRuns": sum(Run.get("Status") == "FAILED" for Run in Runs),
@@ -1123,6 +1150,8 @@ def PublishBenchmarkArchive(
             "unsupported archive publication status: "
             f"{PublicationStatus}"
         )
+    if PublicationStatus == "SEALED":
+        ValidateExactAcceptanceVerdicts(BenchmarkManifest)
     Target = Path(os.path.abspath(os.fspath(Context.ArchiveDirectory)))
     Source = Path(os.path.abspath(os.fspath(Context.SourceDirectory)))
     Mirror = Source != Target

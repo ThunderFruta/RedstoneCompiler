@@ -11,11 +11,17 @@ from typing import (
 from PhysicalDesign.Cells.Library import GetCellMacro
 from PhysicalDesign.Contracts.Placement import ComponentRoutabilityCore
 from PhysicalDesign.Contracts.Results import RoutedDesign
-from PhysicalDesign.Contracts.PlacementAccess import PlacementAccessSolveResult
+from PhysicalDesign.Contracts.PlacementAccess import (
+    CurrentSelectedPlacementAccessValidationStatus,
+    PlacementAccessSolveResult,
+)
 from PhysicalDesign.Contracts.PlacementAccessHandoff import PlacementPinAccessStageObservation, ValidatePlacementPinAccessHandoff
 from PhysicalDesign.Placement.Access.Catalog import (
     BuildPinAccessTechnologyFingerprint,
     BuildPlacedPinAccessModelFingerprint,
+)
+from PhysicalDesign.Placement.Access.Validation import (
+    ValidateCurrentSelectedPlacementAccess,
 )
 from PhysicalDesign.Redstone.Rules.Geometry import BuildRoutingResources
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
@@ -1294,6 +1300,21 @@ def BuildPlacementPinAccessFinalizationDiagnostics(
             Placement.Placed, Technology=Context.Technology,
             WorkCheck=lambda Details: Context.Deadline.RaiseIfExpired("PlacementPinAccessFinalization", Details),
         )
+        CurrentValidation = ValidateCurrentSelectedPlacementAccess(
+            Placement.Placed.PlacedGates,
+            Witness,
+            Solve,
+            ResourceGraph=Resources.ResourceGraph,
+            Technology=Context.Technology,
+            FrozenNetWires=Placement.Placed.FrozenNetWires or {},
+        )
+        if CurrentValidation.Status is not (
+            CurrentSelectedPlacementAccessValidationStatus.Verified
+        ):
+            raise ValueError(
+                "the selected pin-access evidence is not current at final "
+                f"publication: {CurrentValidation.Reason.value}"
+            )
         CurrentModel = BuildPlacedPinAccessModelFingerprint(
             Placement.Placed.PlacedGates, ResourceGraph=Resources.ResourceGraph,
             PreOwnedNodesBySignal=Placement.Placed.FrozenNetWires or {},

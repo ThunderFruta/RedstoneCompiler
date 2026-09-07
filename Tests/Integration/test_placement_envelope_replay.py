@@ -28,6 +28,7 @@ from PhysicalDesign.Resources.ResourceGraph import (
     RoutingResourceKind,
 )
 import PhysicalDesign.Orchestration.PlacementAttempts as PlacementAttempts
+import PhysicalDesign.Orchestration.Results as PlacementResults
 import PhysicalDesign.Orchestration.Setup as PlacementSetup
 import PhysicalDesign.Orchestration.RoutingAttempts as RoutingAttempts
 import PhysicalDesign.Placement.Access.Fabric as AccessFabric
@@ -242,6 +243,42 @@ def _MutateSelectedAccessConsumer(Placement, Technology, Kind, Evidence):
         MutatedPlaced = Placed
 
     return replace(Placement, Placed=MutatedPlaced), Technology
+
+
+def test_public_fanout_rejects_late_selected_terminal_face_drift(monkeypatch):
+    """Final publication must re-attest the live face, not stored observations."""
+    OriginalFinalizer = (
+        PlacementResults.BuildPlacementPinAccessFinalizationDiagnostics
+    )
+    Evidence = {}
+
+    def MutateImmediatelyBeforeFinalization(Context):
+        Context.Placement, _Technology = _MutateSelectedAccessConsumer(
+            Context.Placement,
+            Context.Technology,
+            "changed-face",
+            Evidence,
+        )
+        return OriginalFinalizer(Context)
+
+    monkeypatch.setattr(
+        PlacementResults,
+        "BuildPlacementPinAccessFinalizationDiagnostics",
+        MutateImmediatelyBeforeFinalization,
+    )
+
+    with pytest.raises(RoutingStageError) as Error:
+        PlaceAndRoutePcb(
+            _BuildFanoutTwoNandNetlist(),
+            Strategy="routing-aware-placement-access",
+        )
+
+    assert Evidence["CurrentTerminal"] == Evidence["OriginalTerminal"]
+    assert Evidence["CurrentFace"] != Evidence["OriginalFace"]
+    assert Error.value.Failure.Reason is (
+        RoutingFailureReason.ClusterInterfaceInvariantViolation
+    )
+    assert Error.value.Failure.Stage == "PlacementPinAccessFinalization"
 
 
 def _GuardForbiddenSelectedAccessWork(

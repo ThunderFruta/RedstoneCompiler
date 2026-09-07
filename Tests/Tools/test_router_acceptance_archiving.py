@@ -117,6 +117,39 @@ def test_main_automatically_archives_passes_and_failures(
     assert ArchiveManifest["Benchmark"]["Accepted"] is Accepted
 
 
+@pytest.mark.parametrize("InvalidAccepted", (0, 1, "false", None))
+def test_main_fails_closed_on_non_boolean_acceptance(
+    tmp_path: Path,
+    InvalidAccepted: object,
+):
+    OutputRoot = tmp_path / f"invalid-{type(InvalidAccepted).__name__}"
+
+    def Run(Configuration: Harness.AcceptanceConfiguration):
+        Manifest = _SyntheticManifest(Configuration, Accepted=False)
+        Manifest["Status"] = "PASSED"
+        Manifest["Accepted"] = InvalidAccepted
+        Manifest["Runs"][0]["Status"] = "PASSED"
+        Manifest["Runs"][0]["Accepted"] = InvalidAccepted
+        Harness.WriteManifest(Configuration.ManifestPath, Manifest)
+        return Manifest
+
+    with patch.object(Harness, "RunAcceptance", side_effect=Run):
+        ReturnCode = Harness.Main(_Arguments(OutputRoot))
+
+    assert ReturnCode == 1
+    ArchiveManifest = json.loads(
+        (_ArchiveDirectories(OutputRoot)[0] / "ArchiveManifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert ArchiveManifest["Publication"]["Status"] == "PARTIAL"
+    assert ArchiveManifest["Benchmark"]["ExitClassification"] == (
+        "unexpected-harness-failure"
+    )
+    assert ArchiveManifest["Benchmark"]["Accepted"] is False
+    assert ArchiveManifest["Benchmark"]["Runs"][0]["Accepted"] is False
+
+
 def test_main_no_archive_preserves_disposable_recovery_layout(tmp_path: Path):
     OutputRoot = tmp_path / "disposable"
 

@@ -52,6 +52,7 @@ from App.BenchmarkArchive import (
     BuildBenchmarkArchiveIdentity,
     EnsureArchiveTargetAvailable,
     PublishBenchmarkArchive,
+    ValidateExactAcceptanceVerdicts,
 )
 from App.RunReporting import CaptureTerminalOutput, UtcTimestamp, WriteRunReport
 from PhysicalDesign.Policy import (
@@ -3419,7 +3420,7 @@ def BuildCaseBaselineSummary(
     Complete = len(MeasuredRuns) == Case.RequiredRuns
     AllRunsAccepted = (
         Complete
-        and all(bool(Run.get("Accepted")) for Run in MeasuredRuns)
+        and all(Run.get("Accepted") is True for Run in MeasuredRuns)
     )
     AccuracyAndDeterminismPassed = (
         AllRunsAccepted and Deterministic
@@ -3514,7 +3515,7 @@ def BuildBaselineReference(
     ]
     WarmupsPassed = (
         len(Warmups) == 1
-        and all(bool(Run.get("Accepted")) for Run in Warmups)
+        and all(Run.get("Accepted") is True for Run in Warmups)
     )
     Promotable = (
         WarmupsPassed
@@ -4640,7 +4641,7 @@ def BuildBaselineComparison(
         not RequireWarmup
         or (
             len(WarmupRuns) == 1
-            and all(bool(Run.get("Accepted")) for Run in WarmupRuns)
+            and all(Run.get("Accepted") is True for Run in WarmupRuns)
         )
     )
     OverallPassed = (
@@ -5956,7 +5957,7 @@ def RunAcceptance(
         Manifest["Accepted"] = (
             bool(Comparison["Passed"])
             and len(CompletedRuns) == len(PlannedRuns)
-            and all(bool(Run.get("Accepted")) for Run in CompletedRuns)
+            and all(Run.get("Accepted") is True for Run in CompletedRuns)
         )
         Manifest["Status"] = (
             "PASSED" if Manifest["Accepted"] else "FAILED"
@@ -5970,7 +5971,7 @@ def RunAcceptance(
     Manifest["Accepted"] = (
         len(CompletedRuns) == len(PlannedRuns)
         and Manifest.get("SourceProvenanceStable") is True
-        and all(bool(Run.get("Accepted")) for Run in CompletedRuns)
+        and all(Run.get("Accepted") is True for Run in CompletedRuns)
     )
     Manifest["Status"] = "PASSED" if Manifest["Accepted"] else "FAILED"
     Manifest["CompletedAtUtc"] = UtcNowProvider()
@@ -6387,6 +6388,7 @@ def Main(Arguments: list[str] | None = None) -> int:
     with Capture:
         try:
             Manifest = RunAcceptance(Configuration)
+            ValidateExactAcceptanceVerdicts(Manifest)
         except KeyboardInterrupt as Error:
             ExecutionFailure = Error
             Interrupted = True
@@ -6413,7 +6415,7 @@ def Main(Arguments: list[str] | None = None) -> int:
                 else f"{type(ExecutionFailure).__name__}: {ExecutionFailure}"
             ),
         )
-    Accepted = bool(Manifest.get("Accepted"))
+    Accepted = Manifest.get("Accepted") is True
     IsDryRun = Manifest.get("Status") == "DRY_RUN"
     Runs = Manifest.get("Runs", [])
     CompletedRuns = [
