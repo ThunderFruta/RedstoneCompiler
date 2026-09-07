@@ -610,7 +610,18 @@ def test_component_compile_rejects_local_feedback_no_goods():
             DiscoveryVariantLimit=None,
         )
 
-def test_completed_physical_template_cache_reuses_renamed_translation():
+def test_completed_physical_template_cache_reuses_renamed_translation(
+    monkeypatch,
+):
+    import PhysicalDesign.Routing.Regions.Solving.DynamicSolver as DynamicSolver
+
+    # This fixture graph intentionally uses a reduced electrical model while
+    # advertising the default technology. Keep its Python claim oracle active.
+    monkeypatch.setattr(
+        DynamicSolver,
+        "_BuildRouteClaimsBatchWithTelemetry",
+        None,
+    )
     ComponentCache._CompletedComponentTemplateCache.clear()
     Original = _BindAssemblyForLocalCompilation(
         _Assembly(_Problem("Original"))
@@ -666,6 +677,433 @@ def test_completed_physical_template_cache_reuses_renamed_translation():
         "Renamed",
         Renamed.Plan.Ports[0].Attachment,
     ),)
+    assert Second.ExpansionCount == 0
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Cold = CompileClosedComponent(
+        Renamed.Problem,
+        AssemblyPlan=Renamed.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    assert Cold.Feasible and Cold.Template is not None
+    assert Second.Template.Claims == Cold.Template.Claims
+    assert tuple(
+        Net.GenericClaims for Net in Second.Template.Nets
+    ) == tuple(Net.GenericClaims for Net in Cold.Template.Nets)
+
+
+def test_completed_template_cache_reuses_unchanged_repeater_claims(
+    monkeypatch,
+):
+    """A legal repeater route reuses without conflating claim models."""
+    import PhysicalDesign.Routing.Regions.Solving.DynamicSolver as DynamicSolver
+
+    monkeypatch.setattr(
+        DynamicSolver,
+        "_BuildRouteClaimsBatchWithTelemetry",
+        None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Assembly = _BindAssemblyForLocalCompilation(_Assembly(replace(
+        _Problem(),
+        MaximumPowerDistance=6,
+    )))
+    First = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    Warm = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Cold = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert First.Feasible and First.Template is not None
+    assert First.Template.Nets[0].RepeaterInputFacings
+    assert Warm.Feasible and Warm.Template is not None
+    assert Warm.Diagnostics["CompletedTemplateCacheHit"]
+    assert Warm.ExpansionCount == 0
+    assert Cold.Feasible and Cold.Template is not None
+    assert Warm.Template.Claims == Cold.Template.Claims
+    assert tuple(Net.Claims for Net in Warm.Template.Nets) == tuple(
+        Net.Claims for Net in Cold.Template.Nets
+    )
+
+
+@pytest.mark.parametrize("ClaimField", (
+    "WireCells",
+    "SupportCells",
+    "RequiredAirCells",
+    "ElectricalCells",
+))
+@pytest.mark.parametrize("SeedHasMarker, CurrentHasMarker", (
+    (False, True),
+    (True, False),
+))
+def test_completed_template_cache_rejects_generic_claim_expansion_and_contraction(
+    monkeypatch,
+    ClaimField,
+    SeedHasMarker,
+    CurrentHasMarker,
+):
+    """Every generic claim dimension rejects both expansion and contraction."""
+    import PhysicalDesign.Routing.Regions.Solving.DynamicSolver as DynamicSolver
+
+    monkeypatch.setattr(
+        DynamicSolver,
+        "_BuildRouteClaimsBatchWithTelemetry",
+        None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Marker = (999, 999, 999)
+
+    class MarkerGraph(_ResourceGraph):
+        def __init__(self, HasMarker):
+            self.HasMarker = HasMarker
+
+        def BuildRouteClaims(self, Nodes):
+            Base = _Claims(Nodes)
+            Values = getattr(Base, ClaimField)
+            return replace(
+                Base,
+                **{ClaimField: (
+                    Values | frozenset({Marker})
+                    if self.HasMarker and (1, 7, 0) in frozenset(Nodes)
+                    else Values
+                )},
+            )
+
+    Assembly = _BindAssemblyForLocalCompilation(_Assembly(replace(
+        _Problem(),
+        ResourceGraph=MarkerGraph(SeedHasMarker),
+    )))
+    First = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    assert First.Feasible and First.Template is not None
+    assert ComponentCache._CompletedComponentTemplateCache
+    ChangedProblem = replace(
+        Assembly.Problem,
+        ResourceGraph=MarkerGraph(CurrentHasMarker),
+    )
+    assert (
+        ComponentCache.BuildCompletedComponentTemplateCacheFingerprint(
+        Assembly.Problem
+        )
+        == ComponentCache.BuildCompletedComponentTemplateCacheFingerprint(
+            ChangedProblem
+        )
+    )
+
+    Warm = CompileClosedComponent(
+        ChangedProblem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Cold = CompileClosedComponent(
+        ChangedProblem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert Warm.Feasible and Warm.Template is not None
+    assert Cold.Feasible and Cold.Template is not None
+    assert not Warm.Diagnostics["CompletedTemplateCacheHit"]
+    assert Warm.Template.Claims == Cold.Template.Claims
+    assert (
+        Marker in getattr(Warm.Template.Nets[0].Claims, ClaimField)
+    ) is CurrentHasMarker
+
+
+@pytest.mark.parametrize("InvalidProvenance", (
+    lambda Provenance: None,
+    lambda Provenance: replace(Provenance, ComponentNets=()),
+    lambda Provenance: replace(Provenance, ComponentNets=(object(),)),
+    lambda Provenance: replace(
+        Provenance,
+        ComponentNets=(replace(
+            Provenance.ComponentNets[0],
+            WireCells=set(Provenance.ComponentNets[0].WireCells),
+        ),),
+    ),
+))
+def test_completed_template_cache_fails_closed_for_missing_or_malformed_provenance(
+    InvalidProvenance,
+):
+    """Legacy, unavailable, and ordinal-misaligned entries cannot hit."""
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Assembly = _BindAssemblyForLocalCompilation(_Assembly(_Problem()))
+    First = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    assert First.Feasible and First.Template is not None
+    CacheKey = ComponentCache.BuildCompletedComponentTemplateCacheFingerprint(
+        Assembly.Problem
+    )
+    CachedOrigin, CachedTemplate, CachedSignals, Provenance = (
+        ComponentCache._CompletedComponentTemplateCache[CacheKey]
+    )
+    Invalid = InvalidProvenance(Provenance)
+    ComponentCache._CompletedComponentTemplateCache[CacheKey] = (
+        (CachedOrigin, CachedTemplate, CachedSignals)
+        if Invalid is None
+        else (CachedOrigin, CachedTemplate, CachedSignals, Invalid)
+    )
+
+    Warm = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert Warm.Feasible and Warm.Template is not None
+    assert not Warm.Diagnostics["CompletedTemplateCacheHit"]
+
+
+def test_completed_template_cache_rejects_unusable_graph_and_net_receipt():
+    """Unusable current authority and bad produced receipts cannot be reused."""
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Assembly = _BindAssemblyForLocalCompilation(_Assembly(_Problem()))
+    First = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    assert First.Feasible and First.Template is not None
+    CacheKey = ComponentCache.BuildCompletedComponentTemplateCacheFingerprint(
+        Assembly.Problem
+    )
+    CachedOrigin, CachedTemplate, CachedSignals, Provenance = (
+        ComponentCache._CompletedComponentTemplateCache[CacheKey]
+    )
+
+    MissingReceipt = replace(
+        CachedTemplate,
+        Nets=(SimpleNamespace(Signal="Alpha"),),
+    )
+    MalformedReceipt = replace(
+        CachedTemplate,
+        Nets=(replace(
+            CachedTemplate.Nets[0],
+            GenericClaims=object(),
+        ),),
+    )
+    assert (
+        ComponentCache.CaptureCompletedTemplateGenericClaimProvenance(
+            MissingReceipt
+        )
+        is None
+    )
+    assert (
+        ComponentCache.CaptureCompletedTemplateGenericClaimProvenance(
+            MalformedReceipt
+        )
+        is None
+    )
+
+    UnusableProblem = replace(
+        Assembly.Problem,
+        ResourceGraph=SimpleNamespace(
+            Technology=Assembly.Problem.ResourceGraph.Technology,
+        ),
+    )
+    assert ComponentCache._InstantiateCachedTemplate(
+        UnusableProblem,
+        CachedOrigin,
+        CachedTemplate,
+        CachedSignals,
+        Provenance,
+        CacheKey,
+    ) is None
+
+
+def test_completed_template_cache_uses_solver_time_receipt_after_post_solve_drift(
+    monkeypatch,
+):
+    """Post-solve graph drift cannot bless an older route with newer claims."""
+    import PhysicalDesign.Routing.Regions.Pipeline as ComponentPipeline
+    import PhysicalDesign.Routing.Regions.Solving.DynamicSolver as DynamicSolver
+
+    monkeypatch.setattr(
+        DynamicSolver,
+        "_BuildRouteClaimsBatchWithTelemetry",
+        None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Marker = (991, 991, 991)
+
+    class SolverSeamChangingGraph(_ResourceGraph):
+        HasMarker = True
+
+        def BuildRouteClaims(self, Nodes):
+            Base = _Claims(Nodes)
+            return replace(
+                Base,
+                ElectricalCells=(
+                    Base.ElectricalCells | frozenset({Marker})
+                    if self.HasMarker and (1, 7, 0) in frozenset(Nodes)
+                    else Base.ElectricalCells
+                ),
+            )
+
+    Graph = SolverSeamChangingGraph()
+    Assembly = _BindAssemblyForLocalCompilation(_Assembly(replace(
+        _Problem(),
+        ResourceGraph=Graph,
+    )))
+    OriginalSolve = ComponentPipeline.SolveComponentRoutingProblem
+
+    def SolveThenDrift(Problem, **Keywords):
+        Result = OriginalSolve(Problem, **Keywords)
+        Graph.HasMarker = False
+        return Result
+
+    monkeypatch.setattr(
+        ComponentPipeline,
+        "SolveComponentRoutingProblem",
+        SolveThenDrift,
+    )
+    First = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+
+    monkeypatch.setattr(
+        ComponentPipeline,
+        "SolveComponentRoutingProblem",
+        OriginalSolve,
+    )
+    Warm = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Cold = CompileClosedComponent(
+        Assembly.Problem,
+        AssemblyPlan=Assembly.Plan,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert First.Feasible and First.Template is not None
+    assert Marker in First.Template.Nets[0].Claims.ElectricalCells
+    assert Warm.Feasible and Warm.Template is not None
+    assert not Warm.Diagnostics["CompletedTemplateCacheHit"]
+    assert Cold.Feasible and Cold.Template is not None
+    assert Warm.Template.Claims == Cold.Template.Claims
+    assert Marker not in Warm.Template.Nets[0].Claims.ElectricalCells
+
+
+def test_completed_template_cache_translates_category_ordinal_provenance():
+    """Repeated labels cannot interchange component and foreign provenance."""
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Original = _BindAssemblyForLocalCompilation(_Assembly(_Problem("Repeated")))
+    First = CompileClosedComponent(
+        Original.Problem,
+        AssemblyPlan=Original.Plan,
+        DiscoveryVariantLimit=None,
+    )
+    assert First.Feasible and First.Template is not None
+    CacheKey = ComponentCache.BuildCompletedComponentTemplateCacheFingerprint(
+        Original.Problem
+    )
+    CachedOrigin, CachedTemplate, CachedSignals, _OriginalProvenance = (
+        ComponentCache._CompletedComponentTemplateCache[CacheKey]
+    )
+
+    def Rebased(Net, Offset):
+        Nodes = frozenset(
+            (Position[0] + Offset, Position[1], Position[2])
+            for Position in Net.Nodes
+        )
+        OrderedNodes = tuple(sorted(Nodes))
+        Claims = _Claims(Nodes)
+        return replace(
+            Net,
+            Nodes=Nodes,
+            Root=(Net.Root[0] + Offset, Net.Root[1], Net.Root[2]),
+            Edges=frozenset(
+                tuple(sorted((FirstNode, SecondNode)))
+                for FirstNode, SecondNode in zip(
+                    OrderedNodes,
+                    OrderedNodes[1:],
+                )
+            ),
+            WireCells=Claims.WireCells,
+            SupportCells=Claims.SupportCells,
+            Claims=Claims,
+            GenericClaims=Claims,
+            NetFingerprint=f"repeated-provenance:{Offset}",
+        )
+
+    OriginalNet = CachedTemplate.Nets[0]
+    RepeatedTemplate = replace(
+        CachedTemplate,
+        Nets=(Rebased(OriginalNet, 0), Rebased(OriginalNet, 20)),
+        ForeignTransitReservations=(
+            Rebased(OriginalNet, 40),
+            Rebased(OriginalNet, 60),
+        ),
+    )
+    Provenance = ComponentCache.CaptureCompletedTemplateGenericClaimProvenance(
+        RepeatedTemplate,
+    )
+    assert Provenance is not None
+
+    Delta = (31, 0, 13)
+    Renamed = _BindAssemblyForLocalCompilation(
+        _Assembly(_Problem("Renamed", Delta))
+    )
+    Valid = ComponentCache._InstantiateCachedTemplate(
+        Renamed.Problem,
+        CachedOrigin,
+        RepeatedTemplate,
+        CachedSignals,
+        Provenance,
+        "repeated-provenance",
+    )
+    assert Valid is not None
+    assert [Net.Signal for Net in Valid.Nets] == ["Renamed", "Renamed"]
+    assert [Net.Signal for Net in Valid.ForeignTransitReservations] == [
+        "Renamed",
+        "Renamed",
+    ]
+
+    assert ComponentCache._InstantiateCachedTemplate(
+        Renamed.Problem,
+        CachedOrigin,
+        RepeatedTemplate,
+        CachedSignals,
+        replace(
+            Provenance,
+            ComponentNets=tuple(reversed(Provenance.ComponentNets)),
+        ),
+        "repeated-provenance",
+    ) is None
+    assert ComponentCache._InstantiateCachedTemplate(
+        Renamed.Problem,
+        CachedOrigin,
+        RepeatedTemplate,
+        CachedSignals,
+        replace(
+            Provenance,
+            ComponentNets=Provenance.ForeignTransitReservations,
+            ForeignTransitReservations=Provenance.ComponentNets,
+        ),
+        "repeated-provenance",
+    ) is None
 
 def test_local_only_net_portfolio_compiles_exhaustively_without_template_search():
     Problem = _Assembly(_Problem()).Problem

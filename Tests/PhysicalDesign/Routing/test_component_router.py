@@ -5,6 +5,9 @@ from time import monotonic
 from types import SimpleNamespace
 import unittest
 
+import pytest
+
+import PhysicalDesign.Routing.Regions.Cache as ComponentCache
 from PhysicalDesign.Routing.Regions.Boundaries.Fabric import ApplyRoutedComponentGlobalProfiles, AugmentComponentRoutingFabric, BuildCoalescedComponentAccessCandidates, CoalesceOwnedSignalAccessDomains, BuildClosedComponentInterface, BridgeDisconnectedOwnedSignalFabric, BuildClaimsAwareComponentFabricSubtree, BuildComponentRoutingFabric, BuildComponentFabricAdjacency, FilterExternalSourcePoweredSeamCandidateDomains, PruneDominatedComponentAccessCandidates, SelectClosedComponentOwnedTerminalPairs, SelectComponentIncidentSignals
 from PhysicalDesign.Routing.Regions.Boundaries.Feedthroughs import BuildDeclaredComponentFeedthroughDomains
 from PhysicalDesign.Routing.Regions.Boundaries.Problem import BuildComponentRoutingProblem
@@ -210,6 +213,7 @@ def _Net(Signal, Position):
         SupportCells=Claims.SupportCells,
         RepeaterInputFacings=(),
         Claims=Claims,
+        GenericClaims=Claims,
         CoveredTerminals=(Position,),
         ExportedPorts=(),
         NetFingerprint=f"{Signal}-{Position}",
@@ -3750,6 +3754,10 @@ def test_complete_net_portfolio_cache_reuses_rigid_translation_and_rename():
         Move(Position)
         for Position in First.Template.Nets[0].Nodes
     )
+    assert Second.Template.Nets[0].GenericClaims == MoveClaims(
+        First.Template.Nets[0].GenericClaims
+    )
+    assert "GenericClaims" not in Second.Template.ToDictionary()
 
 
 def test_complete_net_portfolio_cache_does_not_cross_resource_identity():
@@ -3920,19 +3928,24 @@ def test_reserved_blocker_provenance_separates_port_from_global_route():
 
 
 def test_completed_component_template_cache_reuses_translation():
+    ComponentCache._CompletedComponentTemplateCache.clear()
     Interface = ClosedComponentInterface(
         InterfaceFingerprint="completed-cache-interface",
         ComponentId=7,
         OwnedSignals=("Alpha",),
         Ports=(),
     )
-    FirstProblem = replace(_Problem(), Interface=Interface)
+    FirstProblem = replace(
+        _Problem(MaximumPowerDistance=1),
+        Interface=Interface,
+    )
     First = CompileClosedComponent(
         FirstProblem,
         DiscoveryVariantLimit=None,
     )
     assert First.Feasible and First.Template is not None
     assert not First.Diagnostics["CompletedTemplateCacheHit"]
+    assert First.Template.Nets[0].RepeaterInputFacings
 
     Delta = (31, 0, 13)
 
@@ -3986,6 +3999,7 @@ def test_completed_component_template_cache_reuses_translation():
 
     assert Second.Feasible and Second.Template is not None
     assert Second.Diagnostics["CompletedTemplateCacheHit"]
+    assert Second.ExpansionCount == 0
     assert (
         Second.Diagnostics["CompletedTemplateTranslationDelta"]
         == list(Delta)
@@ -3994,6 +4008,213 @@ def test_completed_component_template_cache_reuses_translation():
         Move(Position)
         for Position in First.Template.Nets[0].Nodes
     )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Cold = CompileClosedComponent(
+        Translated,
+        DiscoveryVariantLimit=None,
+    )
+    assert Cold.Feasible and Cold.Template is not None
+    assert Second.Template.Claims == Cold.Template.Claims
+    assert tuple(Net.Claims for Net in Second.Template.Nets) == tuple(
+        Net.Claims for Net in Cold.Template.Nets
+    )
+
+
+@pytest.mark.parametrize("ClaimField", (
+    "WireCells",
+    "SupportCells",
+    "RequiredAirCells",
+    "ElectricalCells",
+))
+def test_completed_component_template_cache_rejects_malformed_stored_positions(
+    ClaimField,
+):
+    """Malformed stored receipts fall through to an ordinary public solve."""
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Interface = ClosedComponentInterface(
+        InterfaceFingerprint=f"malformed-stored:{ClaimField}",
+        ComponentId=7,
+        OwnedSignals=("Alpha",),
+        Ports=(),
+    )
+    Problem = replace(
+        _Problem(),
+        ProblemFingerprint=f"malformed-stored:{ClaimField}",
+        Interface=Interface,
+    )
+    Seed = CompileClosedComponent(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+    assert Seed.Feasible and Seed.Template is not None
+    CacheKey = ComponentCache.BuildCompletedComponentTemplateCacheFingerprint(
+        Problem
+    )
+    CachedOrigin, CachedTemplate, CachedSignals, Provenance = (
+        ComponentCache._CompletedComponentTemplateCache[CacheKey]
+    )
+    GenericClaims = CachedTemplate.Nets[0].GenericClaims
+    MalformedClaims = replace(
+        GenericClaims,
+        **{ClaimField: frozenset({"bad"})},
+    )
+    CorruptedTemplate = replace(
+        CachedTemplate,
+        Nets=(replace(
+            CachedTemplate.Nets[0],
+            GenericClaims=MalformedClaims,
+        ),),
+    )
+    CorruptedProvenance = replace(
+        Provenance,
+        ComponentNets=(MalformedClaims,),
+    )
+    ComponentCache._CompletedComponentTemplateCache[CacheKey] = (
+        CachedOrigin,
+        CorruptedTemplate,
+        CachedSignals,
+        CorruptedProvenance,
+    )
+
+    Warm = CompileClosedComponent(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Cold = CompileClosedComponent(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert Warm.Feasible and Warm.Template is not None
+    assert not Warm.Diagnostics["CompletedTemplateCacheHit"]
+    assert Cold.Feasible and Cold.Template is not None
+    assert Warm.Template.Claims == Cold.Template.Claims
+    assert tuple(Net.Claims for Net in Warm.Template.Nets) == tuple(
+        Net.Claims for Net in Cold.Template.Nets
+    )
+
+
+@pytest.mark.parametrize("ClaimField", (
+    "WireCells",
+    "SupportCells",
+    "RequiredAirCells",
+    "ElectricalCells",
+))
+def test_completed_component_template_cache_rejects_malformed_current_positions(
+    ClaimField,
+):
+    """A malformed current claim falls through when the cold solve is legal."""
+    ComponentCache._CompletedComponentTemplateCache.clear()
+
+    class OneMalformedCurrentGraph:
+        GraphVersion = "one-malformed-current"
+        Technology = "one-malformed-current"
+        MalformedNext = False
+
+        def BuildRouteClaims(self, Nodes):
+            Claims = _Claims(*Nodes)
+            if not self.MalformedNext:
+                return Claims
+            self.MalformedNext = False
+            return replace(
+                Claims,
+                **{ClaimField: frozenset({"bad"})},
+            )
+
+        def BuildPrimitive(self, _First, _Second):
+            return object()
+
+    Graph = OneMalformedCurrentGraph()
+    Interface = ClosedComponentInterface(
+        InterfaceFingerprint=f"malformed-current:{ClaimField}",
+        ComponentId=7,
+        OwnedSignals=("Alpha",),
+        Ports=(),
+    )
+    Problem = replace(
+        _Problem(),
+        ProblemFingerprint=f"malformed-current:{ClaimField}",
+        ResourceGraph=Graph,
+        Interface=Interface,
+    )
+    Seed = CompileClosedComponent(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+    assert Seed.Feasible and Seed.Template is not None
+    Graph.MalformedNext = True
+
+    Warm = CompileClosedComponent(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+    ComponentCache._CompletedComponentTemplateCache.clear()
+    Cold = CompileClosedComponent(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+
+    assert Warm.Feasible and Warm.Template is not None
+    assert not Warm.Diagnostics["CompletedTemplateCacheHit"]
+    assert Cold.Feasible and Cold.Template is not None
+    assert Warm.Template.Claims == Cold.Template.Claims
+    assert tuple(Net.Claims for Net in Warm.Template.Nets) == tuple(
+        Net.Claims for Net in Cold.Template.Nets
+    )
+
+
+def test_completed_component_template_cache_does_not_mask_cold_solve_error():
+    """Cache rejection does not swallow an ordinary solver exception."""
+    ComponentCache._CompletedComponentTemplateCache.clear()
+
+    class MalformedThenFailingGraph:
+        GraphVersion = "malformed-then-failing"
+        Technology = "malformed-then-failing"
+        MalformedNext = False
+        FailCold = False
+
+        def BuildRouteClaims(self, Nodes):
+            Claims = _Claims(*Nodes)
+            if self.MalformedNext:
+                self.MalformedNext = False
+                self.FailCold = True
+                return replace(
+                    Claims,
+                    ElectricalCells=frozenset({"bad"}),
+                )
+            if self.FailCold:
+                raise RuntimeError("ordinary cold solve failure")
+            return Claims
+
+        def BuildPrimitive(self, _First, _Second):
+            return object()
+
+    Graph = MalformedThenFailingGraph()
+    Interface = ClosedComponentInterface(
+        InterfaceFingerprint="malformed-current-cold-error",
+        ComponentId=7,
+        OwnedSignals=("Alpha",),
+        Ports=(),
+    )
+    Problem = replace(
+        _Problem(),
+        ProblemFingerprint="malformed-current-cold-error",
+        ResourceGraph=Graph,
+        Interface=Interface,
+    )
+    Seed = CompileClosedComponent(
+        Problem,
+        DiscoveryVariantLimit=None,
+    )
+    assert Seed.Feasible and Seed.Template is not None
+    Graph.MalformedNext = True
+
+    with pytest.raises(RuntimeError, match="ordinary cold solve failure"):
+        CompileClosedComponent(
+            Problem,
+            DiscoveryVariantLimit=None,
+        )
 
 
 def test_complete_net_portfolio_cache_rejects_changed_fabric_topology():

@@ -31,6 +31,10 @@ from PhysicalDesign.Redstone.Rules.Geometry import BuildPlacedCellGeometry, Buil
 from .Clusters import (
     ClusterLayoutVariant,
 )
+from .Cache import (
+    EagerCurrentCellGeometryResolver,
+    OrientedCellGeometryCacheContext,
+)
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .Channels import (
@@ -971,8 +975,7 @@ def _PhysicalGateElectricalExclusions(
     )
 
 
-@lru_cache(maxsize=4096)
-def _PhysicalGateAccessSignals(
+def _BuildPhysicalGateAccessSignals(
     Kind: str,
     X: int,
     Y: int,
@@ -985,8 +988,9 @@ def _PhysicalGateAccessSignals(
     OutputPin: tuple[int, int, int] | None,
     InputDirections: tuple[tuple[int, int, int], ...],
     OutputDirection: tuple[int, int, int] | None,
+    AccessLength: int,
 ) -> tuple[tuple[tuple[int, int, int], str], ...]:
-    """Cache catalog-derived access rays for repeated slot comparisons."""
+    """Build current catalog-derived access rays for one placed gate."""
     Gate = type(
         "CachedAccessGate",
         (),
@@ -1008,7 +1012,7 @@ def _PhysicalGateAccessSignals(
     )()
     Witness = BuildPlacementPinAccessWitness(
         (Gate,),
-        AccessLength=DefaultRedstoneRoutingTechnology.AccessLength,
+        AccessLength=AccessLength,
         RequireCatalogMatch=False,
     )
     return tuple(
@@ -1017,7 +1021,48 @@ def _PhysicalGateAccessSignals(
         for Position in Selection.Path
     )
 
-def PcbGatesConflict(First: Any, Second: Any) -> bool:
+
+@lru_cache(maxsize=4096)
+def _PhysicalGateAccessSignals(
+    Kind: str,
+    X: int,
+    Y: int,
+    Z: int,
+    Rotation: int,
+    MirrorX: bool,
+    Outputs: tuple[str, ...],
+    Inputs: tuple[str, ...],
+    InputPins: tuple[tuple[int, int, int], ...],
+    OutputPin: tuple[int, int, int] | None,
+    InputDirections: tuple[tuple[int, int, int], ...],
+    OutputDirection: tuple[int, int, int] | None,
+) -> tuple[tuple[tuple[int, int, int], str], ...]:
+    """Retain legacy no-context access-ray cache behavior."""
+    return _BuildPhysicalGateAccessSignals(
+        Kind,
+        X,
+        Y,
+        Z,
+        Rotation,
+        MirrorX,
+        Outputs,
+        Inputs,
+        InputPins,
+        OutputPin,
+        InputDirections,
+        OutputDirection,
+        DefaultRedstoneRoutingTechnology.AccessLength,
+    )
+
+def PcbGatesConflict(
+    First: Any,
+    Second: Any,
+    GeometryCacheContext: (
+        OrientedCellGeometryCacheContext
+        | EagerCurrentCellGeometryResolver
+        | None
+    ) = None,
+) -> bool:
     """Reject footprint, pin-access, and template electrical conflicts."""
 
     def AccessSignals(
@@ -1026,7 +1071,7 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         # Structural fixtures sometimes use minimal synthetic gates; retain
         # their exact rays while strict production boundaries report catalog
         # matches. Slot search revisits these immutable transforms heavily.
-        return _PhysicalGateAccessSignals(
+        Arguments = (
             Gate.Kind,
             Gate.X,
             Gate.Y,
@@ -1044,6 +1089,12 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
                 else None
             ),
         )
+        if GeometryCacheContext is not None:
+            return _BuildPhysicalGateAccessSignals(
+                *Arguments,
+                DefaultRedstoneRoutingTechnology.AccessLength,
+            )
+        return _PhysicalGateAccessSignals(*Arguments)
 
     if RectanglesOverlap(First, Second):
         return True
@@ -1065,24 +1116,21 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
         < First.Z - BroadPhaseMargin
     ):
         return False
-    FirstActual, _FirstElectrical = _PhysicalGateGeometry(
-        First.Kind,
-        First.X,
-        First.Y,
-        First.Z,
-        First.Rotation,
-        First.MirrorX,
-    )
-    SecondActual, _SecondElectrical = _PhysicalGateGeometry(
-        Second.Kind,
-        Second.X,
-        Second.Y,
-        Second.Z,
-        Second.Rotation,
-        Second.MirrorX,
-    )
-    if (
-        _PhysicalGateElectricalExclusions(
+    if GeometryCacheContext is not None:
+        FirstGeometry = GeometryCacheContext.Resolve(
+            First,
+            DefaultRedstoneRoutingTechnology,
+        )
+        SecondGeometry = GeometryCacheContext.Resolve(
+            Second,
+            DefaultRedstoneRoutingTechnology,
+        )
+        FirstActual = FirstGeometry.ActualBlocks
+        SecondActual = SecondGeometry.ActualBlocks
+        FirstElectricalExclusions = FirstGeometry.ElectricalExclusions
+        SecondElectricalExclusions = SecondGeometry.ElectricalExclusions
+    else:
+        FirstActual, _FirstElectrical = _PhysicalGateGeometry(
             First.Kind,
             First.X,
             First.Y,
@@ -1090,9 +1138,7 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
             First.Rotation,
             First.MirrorX,
         )
-        & SecondActual
-    ) or (
-        _PhysicalGateElectricalExclusions(
+        SecondActual, _SecondElectrical = _PhysicalGateGeometry(
             Second.Kind,
             Second.X,
             Second.Y,
@@ -1100,6 +1146,26 @@ def PcbGatesConflict(First: Any, Second: Any) -> bool:
             Second.Rotation,
             Second.MirrorX,
         )
+        FirstElectricalExclusions = _PhysicalGateElectricalExclusions(
+            First.Kind,
+            First.X,
+            First.Y,
+            First.Z,
+            First.Rotation,
+            First.MirrorX,
+        )
+        SecondElectricalExclusions = _PhysicalGateElectricalExclusions(
+            Second.Kind,
+            Second.X,
+            Second.Y,
+            Second.Z,
+            Second.Rotation,
+            Second.MirrorX,
+        )
+    if (
+        FirstElectricalExclusions & SecondActual
+    ) or (
+        SecondElectricalExclusions
         & FirstActual
     ):
         return True

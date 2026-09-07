@@ -387,6 +387,7 @@ def _BuildNetVariant(
         SupportCells=Supports,
         RepeaterInputFacings=Repeaters,
         Claims=Claims,
+        GenericClaims=Claims,
         CoveredTerminals=CoveredTerminals,
         ExportedPorts=ExportedPorts,
         NetFingerprint=NetFingerprint,

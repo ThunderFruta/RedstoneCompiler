@@ -452,6 +452,7 @@ def _TranslateAndValidateNetPortfolio(
             for First, Second in Value.Edges
         )
         Claims = _TranslateClaims(Value.Claims, Delta)
+        GenericClaims = _TranslateClaims(Value.GenericClaims, Delta)
         Repeaters = tuple(
             (_TranslatePosition(Position, Delta), Facing)
             for Position, Facing in Value.RepeaterInputFacings
@@ -481,7 +482,10 @@ def _TranslateAndValidateNetPortfolio(
                 for First, Second in Edges
             ):
                 return None
-            if Problem.ResourceGraph.BuildRouteClaims(Nodes) != Claims:
+            if (
+                Problem.ResourceGraph.BuildRouteClaims(Nodes)
+                != GenericClaims
+            ):
                 return None
         ExportedPorts = tuple(
             _TranslatePosition(Position, Delta)
@@ -508,6 +512,7 @@ def _TranslateAndValidateNetPortfolio(
             SupportCells=Claims.SupportCells,
             RepeaterInputFacings=Repeaters,
             Claims=Claims,
+            GenericClaims=GenericClaims,
             CoveredTerminals=CoveredTerminals,
             ExportedPorts=ExportedPorts,
             NetFingerprint=NetFingerprint,
