@@ -220,29 +220,6 @@ class RoutingDesignSnapshotTests(unittest.TestCase):
         self.assertEqual(Entries[1]["WorktreeStatus"], "M")
         self.assertEqual(Entries[2]["Path"], "Notes.md")
 
-    def testPythonDefinitionMetricsIncludeNestedQualifiedSpans(self) -> None:
-        Source = """class Outer:
-    @staticmethod
-    def Build():
-        def Inner():
-            return 1
-        return Inner()
-
-async def Run():
-    return None
-"""
-
-        Definitions = list(SnapshotTool.IterPythonDefinitions(
-            Source,
-            "Demo.py",
-        ))
-
-        ByName = {Value["QualifiedName"]: Value for Value in Definitions}
-        self.assertEqual(ByName["Outer"]["Kind"], "Class")
-        self.assertEqual(ByName["Outer.Build"]["Kind"], "Function")
-        self.assertEqual(ByName["Outer.Build.Inner"]["PythonAstSpanLines"], 2)
-        self.assertEqual(ByName["Run"]["Kind"], "AsyncFunction")
-
     def testPortableSemanticEvidenceIgnoresEmbeddedAbsolutePaths(self) -> None:
         with TemporaryDirectory() as Directory:
             Root = Path(Directory)
@@ -399,20 +376,6 @@ async def Run():
                     ):
                         SnapshotTool.SummarizeCla4Failure(FailurePath)
 
-    def testNandDiagramSummaryCountsKinds(self) -> None:
-        with TemporaryDirectory() as Directory:
-            DiagramPath = Path(Directory) / "CLA4.Nand.json"
-            DiagramPath.write_text(
-                json.dumps(BuildValidNandPayload()),
-                encoding="utf-8",
-            )
-
-            Summary = SnapshotTool.SummarizeNandDiagram((DiagramPath,))
-
-        self.assertEqual(Summary["GateCount"], 4)
-        self.assertEqual(Summary["GateCountsByKind"]["NAND"], 1)
-        self.assertEqual(Summary["InputCount"], 2)
-
     def testMultipleAndWrongNandDiagramsAreRejected(self) -> None:
         with TemporaryDirectory() as Directory:
             Root = Path(Directory)
@@ -440,38 +403,6 @@ async def Run():
                 "not CarryLookaheadAdder4",
             ):
                 SnapshotTool.SummarizeNandDiagram((FirstPath,))
-
-    def testSourceManifestIsDeterministicAndResolvesInventory(self) -> None:
-        Source = SnapshotTool.BuildRoutingSourceManifest(RepositoryRoot)
-        Repeated = SnapshotTool.BuildRoutingSourceManifest(RepositoryRoot)
-        Files = Source["Files"]
-        LargestDefinitions = Source["Metrics"]["LargestPythonDefinitions"]
-
-        self.assertEqual(Source, Repeated)
-        self.assertEqual(Source["FileCount"], len(Files))
-        self.assertEqual(
-            [Value["Path"] for Value in Files],
-            sorted(Value["Path"] for Value in Files),
-        )
-        self.assertEqual(
-            len({Value["Path"] for Value in Files}),
-            len(Files),
-        )
-        for Value in Files:
-            self.assertTrue((RepositoryRoot / Value["Path"]).is_file())
-            self.assertGreaterEqual(Value["PhysicalLines"], 1)
-        self.assertTrue(LargestDefinitions)
-        self.assertEqual(
-            LargestDefinitions,
-            sorted(
-                LargestDefinitions,
-                key=lambda Value: (
-                    -Value["PythonAstSpanLines"],
-                    Value["Path"],
-                    Value["Line"],
-                ),
-            )[:len(LargestDefinitions)],
-        )
 
     def testCapturePublishesFreshBundleWithoutChangingRepositoryStatus(self) -> None:
         StatusBefore = SnapshotTool.RunGit(

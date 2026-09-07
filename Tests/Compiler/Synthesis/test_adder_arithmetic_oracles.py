@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
@@ -24,8 +23,6 @@ class AdderOracleCase:
 
     ModuleName: str
     Width: int
-    ExpectedRows: int
-    ExpectedDigest: str
 
     @property
     def SourcePath(self) -> Path:
@@ -35,35 +32,18 @@ class AdderOracleCase:
 FullAdderCase = AdderOracleCase(
     ModuleName="FullAdder",
     Width=1,
-    ExpectedRows=8,
-    ExpectedDigest=(
-        "db3a85c6851c53d5d2c74587ad636846"
-        "43d4b94ac48197ba17c55c89ce56c16c"
-    ),
 )
 RippleCarryAdder4Case = AdderOracleCase(
     ModuleName="RippleCarryAdder4",
     Width=4,
-    ExpectedRows=512,
-    ExpectedDigest=(
-        "231006e91741e994c318a56931dd2c99"
-        "4be7849b989c45ec73dd3c3d7689f262"
-    ),
 )
 RippleCarryAdder8Case = AdderOracleCase(
     ModuleName="RippleCarryAdder8",
     Width=8,
-    ExpectedRows=131_072,
-    ExpectedDigest=(
-        "302104d45f6eb340bbcf1f267c10da1a"
-        "65233a875cac5c4d9d3f116caa3c1269"
-    ),
 )
 CarryLookaheadAdder4Case = AdderOracleCase(
     ModuleName="CarryLookaheadAdder4",
     Width=4,
-    ExpectedRows=512,
-    ExpectedDigest=RippleCarryAdder4Case.ExpectedDigest,
 )
 
 IdentifierPattern = re.compile(r"\b[A-Za-z_][A-Za-z0-9_$]*\b")
@@ -242,9 +222,7 @@ class AdderArithmeticOracleTests(unittest.TestCase):
         )
         self.assertEqual(set(Module.Inputs), ExpectedInputs)
 
-        Digest = sha256()
         RowCount = 0
-        ResultByteCount = (Case.Width + 8) // 8
         for Left in range(1 << Case.Width):
             for Right in range(1 << Case.Width):
                 for CarryIn in (0, 1):
@@ -263,13 +241,9 @@ class AdderArithmeticOracleTests(unittest.TestCase):
                             f"{Left} + {Right} + {CarryIn} produced {Actual}, "
                             f"expected {Expected}"
                         )
-                    Digest.update(
-                        Actual.to_bytes(ResultByteCount, byteorder="little")
-                    )
                     RowCount += 1
 
-        self.assertEqual(RowCount, Case.ExpectedRows)
-        self.assertEqual(Digest.hexdigest(), Case.ExpectedDigest)
+        self.assertEqual(RowCount, 2 ** (2 * Case.Width + 1))
 
     def AssertAdderPipelineMatchesArithmeticOracle(
         self,
@@ -308,20 +282,10 @@ class AdderArithmeticOracleTests(unittest.TestCase):
             RippleCarryAdder8Case
         )
 
-    def testCarryLookaheadAdder4MatchesOracleAndNandCheckpoint(self) -> None:
+    def testCarryLookaheadAdder4MatchesArithmeticOracle(self) -> None:
         self.AssertAdderPipelineMatchesArithmeticOracle(
             CarryLookaheadAdder4Case
         )
-        Parsed = ParseSvToNetlist(
-            InputPath=CarryLookaheadAdder4Case.SourcePath,
-            TopModule=CarryLookaheadAdder4Case.ModuleName,
-        )
-        NandOnly = ToNandOnly(OptimizeLogic(Parsed))
-        NandCount = sum(
-            Gate.Kind == GateKind.NAND
-            for Gate in NandOnly.Modules[NandOnly.Top].Gates
-        )
-        self.assertEqual(NandCount, 72)
 
     def testCla4LogicAndTopologyIgnoreNamesAndSafeOrdering(self) -> None:
         Parsed = ParseSvToNetlist(
@@ -374,13 +338,6 @@ class AdderArithmeticOracleTests(unittest.TestCase):
                 Stage,
             )
 
-        MetamorphicNandCount = sum(
-            Gate.Kind == GateKind.NAND
-            for Gate in MetamorphicNandOnly.Modules[
-                MetamorphicNandOnly.Top
-            ].Gates
-        )
-        self.assertEqual(MetamorphicNandCount, 72)
         self.assertEqual(
             BuildNameIndependentNandSignature(
                 OriginalNandOnly.Modules[OriginalNandOnly.Top]

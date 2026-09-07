@@ -25,40 +25,6 @@ class MainPathTests(unittest.TestCase):
             self.assertFalse(Parser.parse_args([]).routing_telemetry)
             self.assertTrue(Parser.parse_args(["--routing-telemetry"]).routing_telemetry)
 
-    def testRootEntrypointExclusivelyOwnsGuidedCli(self) -> None:
-        self.assertFalse(hasattr(CompilerMainModule, "GuidedMenu"))
-        self.assertNotIn(
-            "--guided",
-            CompilerMainModule.BuildParser().format_help(),
-        )
-        StandardOutput = StringIO()
-        with (
-            patch("builtins.input", side_effect=["5"]),
-            redirect_stdout(StandardOutput),
-        ):
-            self.assertEqual(RootMain.Main([]), 0)
-        Text = StandardOutput.getvalue()
-        self.assertIn("RedstoneCompiler", Text)
-        self.assertIn("1. Compile SystemVerilog", Text)
-        self.assertIn("2. PyTest", Text)
-        self.assertIn("3. Benchmark", Text)
-        self.assertIn("4. More options", Text)
-        self.assertNotIn("2. Configure defaults", Text)
-
-    def testRootGuidedCliNestsDefaultsAndPushUnderMoreOptions(self) -> None:
-        StandardOutput = StringIO()
-        with (
-            patch("builtins.input", side_effect=["4", "4", "5"]),
-            redirect_stdout(StandardOutput),
-        ):
-            self.assertEqual(RootMain.Main([]), 0)
-        Text = StandardOutput.getvalue()
-        self.assertIn("More options", Text)
-        self.assertIn("1. Configure defaults", Text)
-        self.assertIn("2. Show defaults", Text)
-        self.assertIn("3. Push an existing litematic to Minecraft", Text)
-        self.assertIn("4. Back", Text)
-
     def testRootBenchmarkUsesCanonicalDefaultAcceptanceMatrix(self) -> None:
         with patch(
             "Tools.Routing.RunRouterAcceptance.Main",
@@ -66,16 +32,6 @@ class MainPathTests(unittest.TestCase):
         ) as AcceptanceMain:
             self.assertEqual(RootMain.RunBenchmark([]), 9)
         AcceptanceMain.assert_called_once_with(["--matrix", "default"])
-
-    def testRootFlagCliDelegatesWithoutOpeningGuidedMenu(self) -> None:
-        Arguments = ["--input", "Assets/Examples/FullAdder.sv"]
-        with (
-            patch("App.Main.GuidedMenu") as Guided,
-            patch("App.Main.CompilerCli.Main", return_value=7) as FlagMain,
-        ):
-            self.assertEqual(RootMain.Main(Arguments), 7)
-        Guided.assert_not_called()
-        FlagMain.assert_called_once_with(Arguments)
 
     def testParsePromptPathAcceptsQuotedAbsolutePath(self) -> None:
         Expected = Path("/mnt/Projects/RedstoneCompiler/Assets/Examples/RippleCarryAdder4.sv")

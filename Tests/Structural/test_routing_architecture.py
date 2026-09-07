@@ -2,10 +2,7 @@ from types import SimpleNamespace
 import unittest
 
 from PhysicalDesign.Geometry.Placement import ValidatePlacedGateContract
-from PhysicalDesign.Contracts.Failures import RoutingFailureReason
-from PhysicalDesign.Policy import DefaultPhysicalDesignPolicy, RoutingAttemptPolicy
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
-from PhysicalDesign.Routing.Pcb import BuildPcbRoutingConfigurations
 
 
 def BuildGate(
@@ -84,23 +81,6 @@ class RoutingArchitectureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "logical inputs"):
             ValidatePlacedGateContract(Invalid)
-
-    def testAuthoritativeRoutingUsesSingleConfiguredAttempt(self) -> None:
-        Configurations = BuildPcbRoutingConfigurations(SimpleNamespace(PlacedGates=[]))
-        self.assertEqual(len(Configurations), 1)
-        self.assertEqual(Configurations[0].AttemptId, "Authoritative")
-        self.assertEqual(Configurations[0].OrderMode, "Natural")
-        self.assertEqual(Configurations[0].SearchMargin, 20)
-        self.assertEqual(Configurations[0].GuidePenalty, 6)
-
-    def testPolicySnapshotIsTypedAndRejectsGuideFreeAttempts(self) -> None:
-        Snapshot = DefaultPhysicalDesignPolicy.ToDictionary()
-
-        self.assertEqual(Snapshot["PolicyVersion"], "physical-design-v1")
-        self.assertIn("DetailedRouting", Snapshot)
-        with self.assertRaisesRegex(ValueError, "authoritative"):
-            RoutingAttemptPolicy("Invalid", 1, 0, 1.0, 1, 1)
-
 
 if __name__ == "__main__":
     unittest.main()

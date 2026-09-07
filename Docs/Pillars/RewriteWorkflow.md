@@ -15,10 +15,13 @@ certify existing work, or change runtime defaults.
 | `Router-Refactor(R10-N5)` | Existing shared rewrite integration branch; do not create a duplicate integration branch | Commit-ready changes plus the relevant cross-feature integration checks |
 | Pillar/capability branches | Parallel development in separate worktrees; umbrella branches may contain multiple bounded checkpoints | Declared scope, dependencies, tests, and known gaps |
 
-`main` and `Router-Refactor(R10-N5)` share the base checkout at
-`/mnt/Projects/RedstoneCompiler`, one checked out at a time; neither owns a
-feature bucket. Use the [five dependency-aligned buckets](WorktreeBuckets.md)
-for primary R/N ownership, worktree locations, and shared-file coordination.
+`main` uses the protected base checkout at `/mnt/Projects/RedstoneCompiler`.
+`Router-Refactor(R10-N5)` uses the permanent integration checkout at
+`/mnt/Projects/RedstoneCompiler-Worktrees/Router-Integration/RedstoneCompiler`.
+Do not switch the protected base checkout to Router for integration. Neither
+branch owns a feature bucket. Use the
+[five dependency-aligned buckets](WorktreeBuckets.md) for primary R/N
+ownership, worktree locations, and shared-file coordination.
 
 Integration means compatible, verified development progress, not a finished
 router. A correctly classified missing experimental capability can remain open

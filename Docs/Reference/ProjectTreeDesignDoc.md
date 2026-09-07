@@ -182,8 +182,12 @@ The executable gates preserve retired-path/import exclusions, the established
 dependency restrictions, concrete public owners, and physical contract schemas.
 Both historical retired paths and their corresponding new locations stay banned.
 `Tests/Structural/test_source_structure.py` owns the structural checks;
-`Tests/PhysicalDesign/Routing/test_routing_contract_schema.py` owns field order,
-defaults, signatures, aliases, and serialization.
+`Tests/PhysicalDesign/Routing/test_routing_contract_schema.py` owns the neutral
+contract package's one-way dependency boundary. Versioned serialization is
+owned by behavior tests that construct a public contract, emit its document,
+and exercise the consuming boundary. Exact class counts, introspected
+signatures, defaults, and aggregate implementation hashes are not compatibility
+contracts.
 
 Source size and definition spans remain advisory review signals, reported by
 `Tools/Routing/ReviewSourceStructure.py`. They are not new migration gates.

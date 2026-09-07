@@ -11,13 +11,15 @@ of its shared mechanism, not exclusive applicability: all relevant N1-N6
 constraints still apply in every bucket. A bucket is a coordination boundary,
 not a claim that its code is independent of the rest of the router.
 
-## Base checkout: no feature bucket
+## Base and integration checkouts: no feature bucket
 
-`/mnt/Projects/RedstoneCompiler` is the shared base checkout for `main` and
-`Router-Refactor(R10-N5)`. Git checks out only one of them there at a time;
-switch deliberately for release or integration work after checking local state.
-Neither branch owns an R/N feature bucket. The historical `(R10-N5)` suffix is
-not an assignment of R10 and N5 to the base checkout.
+`/mnt/Projects/RedstoneCompiler` is the protected base checkout for `main`.
+`Router-Refactor(R10-N5)` uses the permanent integration checkout at
+`/mnt/Projects/RedstoneCompiler-Worktrees/Router-Integration/RedstoneCompiler`.
+Perform Router integration work only in that permanent checkout; do not switch
+the protected base checkout to Router for integration. Neither branch owns an
+R/N feature bucket. The historical `(R10-N5)` suffix is not an assignment of
+R10 and N5 to either checkout.
 
 The capability-owned histories were rebuilt from the shared architectural
 checkpoint `b82b8ee`; Router Refactor retains the cross-cutting workflow,
@@ -48,11 +50,16 @@ authority. Keep heavily coupled capabilities serial within their bucket.
 
 | Branch | Worktree |
 |---|---|
-| `Physical-Rules` | `/mnt/Projects/RedstoneCompiler-Worktrees/Physical-Rules` |
-| `Joint-Physical-Design` | `/home/bananawewe/.codex/worktrees/634f/RedstoneCompiler` (existing worktree reused) |
-| `Reuse-And-Salvage` | `/mnt/Projects/RedstoneCompiler-Worktrees/Reuse-And-Salvage` |
-| `Runtime-And-Kernels` | `/mnt/Projects/RedstoneCompiler-Worktrees/Runtime-And-Kernels` |
-| `Telemetry-And-Acceptance` | `/mnt/Projects/RedstoneCompiler-Worktrees/Telemetry-And-Acceptance` |
+| `Physical-Rules` | `/mnt/Projects/RedstoneCompiler-Worktrees/Physical-Rules/RedstoneCompiler` |
+| `Joint-Physical-Design` | `/mnt/Projects/RedstoneCompiler-Worktrees/Joint-Physical-Design/RedstoneCompiler` |
+| `Reuse-And-Salvage` | `/mnt/Projects/RedstoneCompiler-Worktrees/Reuse-And-Salvage/RedstoneCompiler` |
+| `Runtime-And-Kernels` | `/mnt/Projects/RedstoneCompiler-Worktrees/Runtime-And-Kernels/RedstoneCompiler` |
+| `Telemetry-And-Acceptance` | `/mnt/Projects/RedstoneCompiler-Worktrees/Telemetry-And-Acceptance/RedstoneCompiler` |
+
+The permanent integration checkout is
+`/mnt/Projects/RedstoneCompiler-Worktrees/Router-Integration/RedstoneCompiler`
+on `Router-Refactor(R10-N5)`. It is not a sixth feature bucket and must consume
+only exact independently verified bucket checkpoints.
 
 All five start from the same capability-neutral Router Refactor tip, including
 the common workflow, bucket map, and worktree setup. Capability commits are

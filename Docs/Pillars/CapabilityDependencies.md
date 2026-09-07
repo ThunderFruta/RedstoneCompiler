@@ -9,8 +9,10 @@ identify ongoing work. An entry is not merge approval or production acceptance.
 
 The [bucket map](WorktreeBuckets.md) is the canonical assignment of all ten R
 and six N requirements to five primary workstreams, including exact worktree
-paths and shared-file boundaries. `main` and `Router-Refactor(R10-N5)` use the
-base checkout at `/mnt/Projects/RedstoneCompiler`, outside feature buckets.
+paths and shared-file boundaries. `main` remains in the protected base checkout
+at `/mnt/Projects/RedstoneCompiler`. `Router-Refactor(R10-N5)` uses the permanent
+integration worktree at
+`/mnt/Projects/RedstoneCompiler-Worktrees/Router-Integration/RedstoneCompiler`.
 The five bucket branches share one capability-neutral Router Refactor tip. R2
 source and evidence are owned
 by `Joint-Physical-Design`, while the exact access catalog is owned by
@@ -61,9 +63,9 @@ pillar numbering.
   stable patch IDs. Similar subjects do not establish equivalent behavior.
 - Patch equivalence does not establish runtime compatibility or authorize a
   merge. Inspect the complete ancestry, relevant differences, and tests first.
-- The v17-default behavior is committed only on `Joint-Physical-Design`. It is
-  not part of capability-neutral Router history and does not
-  establish production acceptance.
+- The v17-default behavior enters Router only through the exact reviewed
+  `c6d6a81` dependency checkpoint. It remains an experimental development
+  default and does not establish production acceptance.
 
 These facts are reproducible with `git merge-base`, `git log --left-right`,
 and `git show <revision> | git patch-id --stable`. No branch was moved,
@@ -78,3 +80,4 @@ this register and link the detailed evidence from the owning pillar. Preserve
 historical test inputs and snapshots; never relabel old evidence as a test of a
 new combination. Mark a checkpoint integrated only after that operation and its
 combined verification actually succeed.
+

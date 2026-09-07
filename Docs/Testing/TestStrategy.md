@@ -2,8 +2,9 @@
 
 ## Layers
 
-1. Objective structural tests cover dependency direction, imports, API owners,
-   and serialized contracts.
+1. Objective structural tests cover documented dependency direction, forbidden
+   imports, and public API owners. Versioned serialization is tested through
+   emitted documents and their consumers, never an introspected source hash.
 2. Contract tests cover policies, failures, claims, and deterministic ordering.
 3. Placement tests cover boundary capacity, relocation cuts, and area limits.
 4. Router tests cover provisional overlap, history costs, branch retention,
@@ -17,6 +18,12 @@ Source size, local helper order, variable names, and internal call placement are
 review signals rather than pass/fail contracts. Correctness-sensitive ordering
 must be tested through observable results, typed failures, collaborator calls,
 or event sequences.
+
+The outcome-first disposition and retained ownership for every active test file
+are recorded in [OutcomeFirstTestAudit.md](OutcomeFirstTestAudit.md). A test
+name is expected to state its unique contract. New tests must identify the
+independent oracle, artifact, typed outcome, or documented boundary that would
+fail; collection count is never a quality target.
 
 ## Required negotiated-router regressions
 

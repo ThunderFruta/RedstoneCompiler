@@ -25,8 +25,11 @@ python3 -m pytest -q \
 python3 -m pytest --collect-only -q
 ```
 
-These gates enforce objective dependency, import, API-owner, and schema
-contracts. Source size and implementation shape are advisory review signals:
+These gates enforce objective dependency, forbidden-import, and public-owner
+contracts. The routing-contract module checks one-way package dependencies; it
+does not freeze dataclass counts, signatures, defaults, or hashes. Versioned
+documents are covered by their producer/consumer behavior suites. Source size
+and implementation shape are advisory review signals:
 
 ```bash
 python3 Tools/Routing/ReviewSourceStructure.py
@@ -147,7 +150,7 @@ does not prove the rebuilt native code was exercised.
 ## Validation harness
 
 ```bash
-gradle -p Validation/Fabric/ServerHarness test
+./Validation/Fabric/ServerHarness/gradlew -p Validation/Fabric/ServerHarness test build
 ```
 
 Harness unit tests do not substitute for a live Fabric acceptance run.

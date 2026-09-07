@@ -14,6 +14,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install pytest
 .venv/bin/python -m pip install -e .
 RC_WORKTREE_SETUP_VERIFY=1 .venv/bin/python -m pytest -q Tests/WorktreeSetup
+./Validation/Fabric/ServerHarness/gradlew -p Validation/Fabric/ServerHarness test build
 '''
 
 [cleanup]
