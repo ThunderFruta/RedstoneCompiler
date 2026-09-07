@@ -17,4 +17,10 @@ controls when the two disagree.
 
 ## Working notes
 
-- None recorded.
+- Reconciliation `0cbb17916fe3239adee04762c0fddd7cea3d2a4c` documents why legacy
+  R1-associated history is not selective salvage. Current tip
+  `5cd445621d492e1b62fa72d63c3d021945edbc8a` is outcome-first test cleanup;
+  neither commit is an N6 implementation, test, or Router-consumed checkpoint.
+- Strict rejection of stale results remains an ordinary direct-identity boundary.
+  It does not prove a lazy expansion, topology-reuse, certificate, or
+  revalidation path.

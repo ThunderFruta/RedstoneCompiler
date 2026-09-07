@@ -13,6 +13,10 @@ from PhysicalDesign.Geometry.Rotation import RotatedCellSize
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedDesign
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
 from .Cache import (
+    BuildOrientedGeometryPortfolioCacheIdentity,
+    EagerCurrentCellGeometryResolver,
+    OrientedCellGeometryCacheContext,
+    OrientedGeometryCacheBuildReceipt,
     _PinAlignedPackedClusterPortfolioCache,
 )
 from .Clustering import (
@@ -61,6 +65,7 @@ def BuildPinAlignedPackedCluster(
     BeamWidth: int,
     CandidateIndex: int = 0,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    UseOrientedGeometryCache: bool = True,
 ) -> tuple[
     dict[str, tuple[int, int]],
     dict[str, int],
@@ -74,11 +79,12 @@ def BuildPinAlignedPackedCluster(
     """
     if CandidateIndex < 0:
         raise ValueError("packed cluster candidate index cannot be negative")
-    States = _BuildPinAlignedPackedClusterStates(
+    States, _BuildReceipt = _BuildPinAlignedPackedClusterStates(
         Names,
         InternalByName,
         BeamWidth,
         WorkCheck=WorkCheck,
+        UseOrientedGeometryCache=UseOrientedGeometryCache,
     )
     if not States:
         return None
@@ -94,6 +100,7 @@ def BuildPinAlignedPackedClusterPortfolio(
     InternalByName: dict[str, Any],
     BeamWidth: int,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    UseOrientedGeometryCache: bool = True,
 ) -> PinAlignedPackedClusterPortfolio:
     """Materialize the finite non-dominated graph-core domain up front.
 
@@ -101,11 +108,12 @@ def BuildPinAlignedPackedClusterPortfolio(
     to invoke :func:`BuildPinAlignedPackedCluster` later must use that explicit
     index, rather than enumerating a guessed contiguous range.
     """
-    States = _BuildPinAlignedPackedClusterStates(
+    States, BuildReceipt = _BuildPinAlignedPackedClusterStates(
         Names,
         InternalByName,
         BeamWidth,
         WorkCheck=WorkCheck,
+        UseOrientedGeometryCache=UseOrientedGeometryCache,
     )
     NonDominatedStates = tuple(
         State
@@ -119,6 +127,7 @@ def BuildPinAlignedPackedClusterPortfolio(
     return PinAlignedPackedClusterPortfolio(
         States=NonDominatedStates,
         RawCandidateCount=len(States),
+        BuildReceipt=BuildReceipt,
     )
 
 def CountPinAlignedPackedClusterPortfolio(
@@ -126,6 +135,7 @@ def CountPinAlignedPackedClusterPortfolio(
     InternalByName: dict[str, Any],
     BeamWidth: int,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    UseOrientedGeometryCache: bool = True,
 ) -> int:
     """Return the exact finite count of valid graph-core portfolio states."""
     return BuildPinAlignedPackedClusterPortfolio(
@@ -133,6 +143,7 @@ def CountPinAlignedPackedClusterPortfolio(
         InternalByName,
         BeamWidth,
         WorkCheck=WorkCheck,
+        UseOrientedGeometryCache=UseOrientedGeometryCache,
     ).CandidateCount
 
 def _PinAlignedPackedClusterStateDominates(
@@ -156,28 +167,74 @@ def _BuildPinAlignedPackedClusterStates(
     InternalByName: dict[str, Any],
     BeamWidth: int,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
-) -> tuple[PinAlignedPackedClusterState, ...]:
+    UseOrientedGeometryCache: bool = True,
+) -> tuple[
+    tuple[PinAlignedPackedClusterState, ...],
+    OrientedGeometryCacheBuildReceipt,
+]:
     """Build and cache the raw bounded graph beam without selecting a state."""
     if BeamWidth < 1:
         raise ValueError("packed cluster beam width must be positive")
+    try:
+        ProducerContextIdentity = (
+            BuildOrientedGeometryPortfolioCacheIdentity(
+                DefaultRedstoneRoutingTechnology
+            )
+        )
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        ProducerContextIdentity = None
     PortfolioKey = (
         tuple(Names),
         tuple(
             (
                 Name,
+                str(InternalByName[Name].Kind.value),
                 tuple(map(str, InternalByName[Name].Inputs)),
                 tuple(map(str, InternalByName[Name].Outputs)),
             )
             for Name in sorted(Names)
         ),
         BeamWidth,
-        repr(DefaultRedstoneRoutingTechnology),
+        ProducerContextIdentity,
     )
-    CachedPortfolio = _PinAlignedPackedClusterPortfolioCache.get(
-        PortfolioKey
+    CachedPortfolio = (
+        _PinAlignedPackedClusterPortfolioCache.get(PortfolioKey)
+        if ProducerContextIdentity is not None
+        else None
     )
     if CachedPortfolio is not None:
-        return CachedPortfolio
+        return (
+            CachedPortfolio,
+            OrientedGeometryCacheBuildReceipt.ForPortfolioCacheHit(),
+        )
+    GeometryResolver = (
+        OrientedCellGeometryCacheContext(
+            DefaultRedstoneRoutingTechnology,
+            ExpectedPortfolioIdentity=ProducerContextIdentity,
+        )
+        if UseOrientedGeometryCache
+        else EagerCurrentCellGeometryResolver(
+            DefaultRedstoneRoutingTechnology,
+            ExpectedPortfolioIdentity=ProducerContextIdentity,
+        )
+    )
+
+    def StoreCurrentPortfolio(
+        States: tuple[PinAlignedPackedClusterState, ...],
+    ) -> None:
+        if ProducerContextIdentity is None:
+            return
+        if not GeometryResolver.ProducerContextAttested:
+            return
+        try:
+            CurrentIdentity = BuildOrientedGeometryPortfolioCacheIdentity(
+                DefaultRedstoneRoutingTechnology
+            )
+        except (AttributeError, RecursionError, TypeError, ValueError):
+            return
+        if CurrentIdentity == ProducerContextIdentity:
+            _PinAlignedPackedClusterPortfolioCache[PortfolioKey] = States
+
     NameSet = set(Names)
     ProducerBySignal = {
         Signal: Gate.Name
@@ -228,7 +285,11 @@ def _BuildPinAlignedPackedClusterStates(
         Key = (ConflictKey(First), ConflictKey(Second))
         Cached = ConflictCache.get(Key)
         if Cached is None:
-            Cached = PcbGatesConflict(First, Second)
+            Cached = PcbGatesConflict(
+                First,
+                Second,
+                GeometryCacheContext=GeometryResolver,
+            )
             ConflictCache[Key] = Cached
         return Cached
 
@@ -433,7 +494,19 @@ def _BuildPinAlignedPackedClusterStates(
                 CandidateState[Name] = Candidate
                 NextBeam.append((Score(CandidateState), CandidateState))
         if not NextBeam:
-            return ()
+            CachedPortfolio = ()
+            StoreCurrentPortfolio(CachedPortfolio)
+            return (
+                CachedPortfolio,
+                (
+                    GeometryResolver.BuildReceipt()
+                    if isinstance(
+                        GeometryResolver,
+                        OrientedCellGeometryCacheContext,
+                    )
+                    else OrientedGeometryCacheBuildReceipt()
+                ),
+            )
         NextBeam.sort(key=lambda Value: Value[0])
         Beam = [State for _Key, State in NextBeam[:BeamWidth]]
         PlacedNames.add(Name)
@@ -475,8 +548,18 @@ def _BuildPinAlignedPackedClusterStates(
             )
         )
     CachedPortfolio = tuple(Portfolio)
-    _PinAlignedPackedClusterPortfolioCache[PortfolioKey] = CachedPortfolio
-    return CachedPortfolio
+    StoreCurrentPortfolio(CachedPortfolio)
+    return (
+        CachedPortfolio,
+        (
+            GeometryResolver.BuildReceipt()
+            if isinstance(
+                GeometryResolver,
+                OrientedCellGeometryCacheContext,
+            )
+            else OrientedGeometryCacheBuildReceipt()
+        ),
+    )
 
 def CompactWeightedPlacement(
     Module: Any,

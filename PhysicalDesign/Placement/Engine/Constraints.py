@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import (
     dataclass,
+    field,
 )
 from hashlib import (
     sha256,
@@ -14,6 +15,7 @@ from typing import (
 )
 from PhysicalDesign.Geometry.Placement import BuildPlacedGate, PlacedGate
 from PhysicalDesign.Contracts.Failures import RoutingAssignmentCut
+from .Cache import OrientedGeometryCacheBuildReceipt
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,10 @@ class PinAlignedPackedClusterPortfolio:
 
     States: tuple[PinAlignedPackedClusterState, ...]
     RawCandidateCount: int
+    BuildReceipt: OrientedGeometryCacheBuildReceipt = field(
+        default_factory=OrientedGeometryCacheBuildReceipt,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         CandidateIndexes = tuple(State.CandidateIndex for State in self.States)

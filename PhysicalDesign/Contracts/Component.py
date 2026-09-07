@@ -930,6 +930,7 @@ class RoutedComponentNet:
     SupportCells: frozenset[Position3]
     RepeaterInputFacings: tuple[tuple[Position3, str], ...]
     Claims: RoutingResourceClaims
+    GenericClaims: RoutingResourceClaims
     CoveredTerminals: tuple[Position3, ...]
     ExportedPorts: tuple[Position3, ...]
     NetFingerprint: str

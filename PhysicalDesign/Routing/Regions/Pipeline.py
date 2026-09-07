@@ -33,6 +33,7 @@ from .Solving.Solver import MaterializeRoutedComponentTemplate, SolveComponentRo
 from .Cache import (
     _CompletedComponentTemplateCache,
     BuildCompletedComponentTemplateCacheFingerprint,
+    CaptureCompletedTemplateGenericClaimProvenance,
     _InstantiateCachedTemplate,
 )
 from .Proofs.Validation import _Origin, _SignalStructuralIdentities, _ValidatePhysicalProblemContract, _ValidatePhysicalTemplate
@@ -145,27 +146,30 @@ def CompileClosedComponent(
         else None
     )
     if Cached is not None:
-        (
-            CachedOrigin,
-            CachedTemplate,
-            CachedSignalIdentities,
-        ) = Cached
-        Instantiated = _InstantiateCachedTemplate(
-            Problem,
-            CachedOrigin,
-            CachedTemplate,
-            CachedSignalIdentities,
-            CacheFingerprint,
-        )
-        if Instantiated is not None:
-            _ValidatePhysicalTemplate(Problem, Instantiated)
-            return ComponentRoutingSolveResult(
-                Status="feasible",
-                Template=Instantiated,
-                ProofFingerprint=Instantiated.ProofFingerprint,
-                ExpansionCount=0,
-                Diagnostics=Instantiated.Diagnostics,
+        if isinstance(Cached, tuple) and len(Cached) == 4:
+            (
+                CachedOrigin,
+                CachedTemplate,
+                CachedSignalIdentities,
+                CachedGenericClaimProvenance,
+            ) = Cached
+            Instantiated = _InstantiateCachedTemplate(
+                Problem,
+                CachedOrigin,
+                CachedTemplate,
+                CachedSignalIdentities,
+                CachedGenericClaimProvenance,
+                CacheFingerprint,
             )
+            if Instantiated is not None:
+                _ValidatePhysicalTemplate(Problem, Instantiated)
+                return ComponentRoutingSolveResult(
+                    Status="feasible",
+                    Template=Instantiated,
+                    ProofFingerprint=Instantiated.ProofFingerprint,
+                    ExpansionCount=0,
+                    Diagnostics=Instantiated.Diagnostics,
+                )
     Result = SolveComponentRoutingProblem(
         Problem,
         DeadlineSeconds=DeadlineSeconds,
@@ -212,11 +216,18 @@ def CompileClosedComponent(
             Template=Template,
             Diagnostics=TemplateDiagnostics,
         )
-        _CompletedComponentTemplateCache[CacheKey] = (
-            _Origin(Problem),
-            Template,
-            _SignalStructuralIdentities(Problem),
+        GenericClaimProvenance = (
+            CaptureCompletedTemplateGenericClaimProvenance(
+                Template,
+            )
         )
+        if GenericClaimProvenance is not None:
+            _CompletedComponentTemplateCache[CacheKey] = (
+                _Origin(Problem),
+                Template,
+                _SignalStructuralIdentities(Problem),
+                GenericClaimProvenance,
+            )
     return Result
 
 

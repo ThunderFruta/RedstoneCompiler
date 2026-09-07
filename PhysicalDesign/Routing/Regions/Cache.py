@@ -20,6 +20,7 @@ from ...Contracts.PhysicalInterface import PhysicalComponentLocalFactorProjectio
 from ...Constraints import BoundaryRelations
 from ...Constraints.BoundaryRelations import BuildPhysicalPortGlobalContractFingerprint, ProjectPhysicalComponentSignalGlobalProfile
 from ...Constraints.PhysicalClaims import ComponentClaimsConflict
+from ...Redstone.Technology import DefaultRedstoneRoutingTechnology
 from ...Resources.ResourceGraph import RoutingResourceClaims
 from ...Runtime.Reliability import BuildStableFingerprint
 from .Planning.InterfacePlanning import BuildComponentCapacityGuide, ComponentCapacityGuide, ComponentCapacityGuideOption, ComponentInterfaceContract, ComponentPlanningResult, ComponentPlanningStatus, IterClosedComponentContracts, PlanClosedComponent, SolveComponentInterfaceCsp
@@ -31,14 +32,105 @@ from .Planning.Portfolios import BuildCompleteOpposingNetAccessContractDomain, B
 from .Solving.Solver import MaterializeRoutedComponentTemplate, SolveComponentRoutingProblem, ValidateRoutedComponentHandoff
 
 from .Proofs.Validation import _BuildSignalTranslation, _Fingerprint, _Move, _MoveClaims, _Normalize, _NormalizedClaimsIdentity, _Origin, _SignalStructuralIdentities
+@dataclass(frozen=True)
+class _CompletedTemplateGenericClaimProvenance:
+    """Original generic claims, kept in template category/ordinal order."""
+
+    ComponentNets: tuple[RoutingResourceClaims, ...]
+    ForeignTransitReservations: tuple[RoutingResourceClaims, ...]
+
+
 _CompletedComponentTemplateCache: dict[
     str,
     tuple[
         Position3,
         RoutedComponentTemplate,
         tuple[tuple[str, str], ...],
+        _CompletedTemplateGenericClaimProvenance,
     ],
 ] = {}
+
+
+def _IsImmutableClaims(Value: object) -> bool:
+    """Reject an incomplete or mutable cache-provenance claim."""
+    return (
+        isinstance(Value, RoutingResourceClaims)
+        and all(
+            isinstance(Cells, frozenset)
+            and all(
+                type(Position) is tuple
+                and len(Position) == 3
+                and all(type(Coordinate) is int for Coordinate in Position)
+                for Position in Cells
+            )
+            for Cells in (
+                Value.WireCells,
+                Value.SupportCells,
+                Value.RequiredAirCells,
+                Value.ElectricalCells,
+            )
+        )
+    )
+
+
+def _BuildCurrentGenericClaims(
+    Problem: ComponentRoutingProblem,
+    Values: tuple[RoutedComponentNet, ...],
+) -> tuple[RoutingResourceClaims, ...] | None:
+    """Read one complete, immutable supplied-graph claim category."""
+    ResourceGraph = Problem.ResourceGraph
+    BuildClaims = getattr(ResourceGraph, "BuildRouteClaims", None)
+    if ResourceGraph is not None and not callable(BuildClaims):
+        return None
+    Claims = []
+    for Value in Values:
+        if not Value.Nodes:
+            return None
+        try:
+            Generic = (
+                BuildClaims(Value.Nodes)
+                if ResourceGraph is not None
+                else RoutingResourceClaims(
+                    WireCells=Value.Nodes,
+                    SupportCells=frozenset(
+                        (X, Y - 1, Z) for X, Y, Z in Value.Nodes
+                    ),
+                    ElectricalCells=frozenset(
+                        DefaultRedstoneRoutingTechnology
+                        .BuildElectricalExclusions(set(Value.Nodes))
+                    ),
+                )
+            )
+        except Exception:
+            return None
+        if not _IsImmutableClaims(Generic):
+            return None
+        Claims.append(Generic)
+    return tuple(Claims)
+
+
+def CaptureCompletedTemplateGenericClaimProvenance(
+    Template: RoutedComponentTemplate,
+) -> _CompletedTemplateGenericClaimProvenance | None:
+    """Copy solver-created generic receipts in category/ordinal order."""
+    OriginalCategories = (
+        tuple(Template.Nets),
+        tuple(Template.ForeignTransitReservations),
+    )
+    ProvenanceCategories = tuple(
+        tuple(getattr(Value, "GenericClaims", None) for Value in Values)
+        for Values in OriginalCategories
+    )
+    if any(
+        not all(_IsImmutableClaims(Claims) for Claims in Provenance)
+        for Provenance in ProvenanceCategories
+    ):
+        return None
+    ComponentClaims, ForeignTransitClaims = ProvenanceCategories
+    return _CompletedTemplateGenericClaimProvenance(
+        ComponentNets=ComponentClaims,
+        ForeignTransitReservations=ForeignTransitClaims,
+    )
 
 def BuildCompletedComponentTemplateCacheFingerprint(
     Problem: ComponentRoutingProblem,
@@ -211,6 +303,7 @@ def _MoveNet(
     Signal: str | None = None,
 ) -> RoutedComponentNet:
     Claims = _MoveClaims(Value.Claims, Delta)
+    GenericClaims = _MoveClaims(Value.GenericClaims, Delta)
     Nodes = frozenset(_Move(Position, Delta) for Position in Value.Nodes)
     Edges = frozenset(
         tuple(sorted((_Move(First, Delta), _Move(Second, Delta))))
@@ -238,6 +331,7 @@ def _MoveNet(
         SupportCells=Claims.SupportCells,
         RepeaterInputFacings=Repeaters,
         Claims=Claims,
+        GenericClaims=GenericClaims,
         CoveredTerminals=CoveredTerminals,
         ExportedPorts=ExportedPorts,
         NetFingerprint=_Fingerprint((
@@ -254,6 +348,7 @@ def _InstantiateCachedTemplate(
     CachedOrigin: Position3,
     Cached: RoutedComponentTemplate,
     CachedSignalIdentities: tuple[tuple[str, str], ...],
+    CachedGenericClaimProvenance: _CompletedTemplateGenericClaimProvenance,
     CacheFingerprint: str,
 ) -> RoutedComponentTemplate | None:
     if (
@@ -271,6 +366,37 @@ def _InstantiateCachedTemplate(
         _SignalStructuralIdentities(Problem),
     )
     if SignalTranslation is None:
+        return None
+    CachedCategories = (
+        tuple(Cached.Nets),
+        tuple(Cached.ForeignTransitReservations),
+    )
+    if not isinstance(
+        CachedGenericClaimProvenance,
+        _CompletedTemplateGenericClaimProvenance,
+    ):
+        return None
+    ProvenanceCategories = (
+        CachedGenericClaimProvenance.ComponentNets,
+        CachedGenericClaimProvenance.ForeignTransitReservations,
+    )
+    if any(
+        len(Values) != len(Provenance)
+        or not all(
+            _IsImmutableClaims(CachedClaim)
+            and getattr(Value, "GenericClaims", None) == CachedClaim
+            for Value, CachedClaim in zip(
+                Values,
+                Provenance,
+                strict=True,
+            )
+        )
+        for Values, Provenance in zip(
+            CachedCategories,
+            ProvenanceCategories,
+            strict=True,
+        )
+    ):
         return None
     Nets = tuple(
         _MoveNet(
@@ -302,6 +428,7 @@ def _InstantiateCachedTemplate(
         )
         for Value in Cached.ForeignTransitReservations
     )
+    TranslatedCategories = (Nets, ForeignTransits)
     Claims = RoutingResourceClaims(
         WireCells=frozenset().union(*(
             Value.Claims.WireCells
@@ -320,24 +447,20 @@ def _InstantiateCachedTemplate(
             for Value in (*Nets, *ForeignTransits)
         )),
     )
-    if Problem.ResourceGraph is not None:
-        for Value in (*Nets, *ForeignTransits):
-            ExpectedClaims = Problem.ResourceGraph.BuildRouteClaims(
-                Value.Nodes
-            )
-            # Repeater materialization intentionally replaces the generic
-            # dust electrical exclusions while retaining the same physical
-            # wire, support, and required-air ownership.  Comparing the full
-            # generic claim would therefore reject a valid translated cached
-            # template whenever it contains a repeater.
-            if (
-                ExpectedClaims.WireCells != Value.Claims.WireCells
-                or ExpectedClaims.SupportCells
-                != Value.Claims.SupportCells
-                or ExpectedClaims.RequiredAirCells
-                != Value.Claims.RequiredAirCells
-            ):
-                return None
+    for Values, Provenance in zip(
+        TranslatedCategories,
+        ProvenanceCategories,
+        strict=True,
+    ):
+        MovedProvenance = tuple(
+            _MoveClaims(CachedClaim, Delta)
+            for CachedClaim in Provenance
+        )
+        if tuple(Value.GenericClaims for Value in Values) != MovedProvenance:
+            return None
+        Current = _BuildCurrentGenericClaims(Problem, Values)
+        if Current is None or Current != MovedProvenance:
+            return None
     ExportedPorts = tuple(sorted(
         (Net.Signal, Position)
         for Net in Nets
