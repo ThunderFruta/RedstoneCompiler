@@ -13,9 +13,19 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ....Contracts.Component import ClosedComponentInterface, ComponentFeedthroughContract, ComponentForeignTransitDomain, ComponentInterfacePort, ComponentRoutingFabric, ComponentRoutingProblem, ComponentRoutingSolveResult, ComponentTerminalAccessCandidate, ComponentTerminalAccessDomain, RoutedComponentNet, RoutedComponentTemplate
 from ....Contracts.Core import Position3
+from ....Contracts.Runtime import (
+    RuntimeClaimStrength,
+    RuntimeSearchOutcome,
+    RuntimeTerminalReason,
+    RuntimeWorkExecution,
+    RuntimeWorkProduct,
+    RuntimeWorkRequest,
+)
 from ....Constraints.PhysicalClaims import _MergeClaims, ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
 from ....Resources.ResourceGraph import FindSelfClaimConflicts, LocalRouteClaim, PinAccessPortal, RoutingEdge, RoutingReservation, RoutingResourceId, RoutingResourceKind, RoutingResourceClaims
 from ....Redstone.Technology import DefaultRedstoneRoutingTechnology
+from ....Runtime.BoundedWork import ExecuteBoundedRuntimeWork, RuntimeWorkControl
+from ....Runtime.Reliability import RoutingDeadline
 
 try:
     from RedstoneCompiler.RustRouting import (
@@ -139,6 +149,83 @@ def CompilePreparedComponentSymbolicNetStates(
         CacheHit=False,
         ExpansionCount=Result.ExpansionCount,
         Diagnostics=Diagnostics,
+    )
+
+
+def CompilePreparedComponentSymbolicNetStatesBounded(
+    Context: PreparedComponentSymbolicNetStateContext,
+    Problem: ComponentRoutingProblem,
+    *,
+    Request: RuntimeWorkRequest,
+    Deadline: RoutingDeadline,
+    CancellationCheck: Callable[[], bool] | None = None,
+    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    SymbolicNetStateCache: dict[str, Any] | None = None,
+    ForbiddenExportPorts: tuple[Position3, ...] = (),
+) -> RuntimeWorkExecution[PreparedComponentSymbolicNetStateCompilation]:
+    """Compile one symbolic state domain through the bounded N1 adapter."""
+
+    def Compile(
+        Control: RuntimeWorkControl,
+    ) -> RuntimeWorkProduct[PreparedComponentSymbolicNetStateCompilation]:
+        def CheckWork(Diagnostics: dict[str, object]) -> None:
+            Control.Checkpoint()
+            if WorkCheck is not None:
+                WorkCheck(Diagnostics)
+
+        Compilation = CompilePreparedComponentSymbolicNetStates(
+            Context,
+            Problem,
+            DeadlineSeconds=Deadline.RemainingSeconds(),
+            WorkCheck=CheckWork,
+            SymbolicNetStateCache=SymbolicNetStateCache,
+            ForbiddenExportPorts=ForbiddenExportPorts,
+        )
+        # The current symbolic solver exposes its performed expansion count
+        # only on return.  This is truthful post-hoc observation, not a hard
+        # pre-admission guarantee for every individual expansion.
+        Control.ObservePerformedWork(
+            max(0, int(Compilation.ExpansionCount))
+        )
+        IsPrepared = bool(
+            Compilation.Complete and Compilation.States is not None
+        )
+        return RuntimeWorkProduct(
+            Value=Compilation,
+            SearchOutcome=(
+                RuntimeSearchOutcome.Prepared
+                if IsPrepared
+                else RuntimeSearchOutcome.Unresolved
+            ),
+            ClaimStrength=(
+                RuntimeClaimStrength.Complete
+                if IsPrepared
+                else RuntimeClaimStrength.Continuation
+            ),
+            TerminalReason=(
+                RuntimeTerminalReason.Prepared
+                if IsPrepared
+                else RuntimeTerminalReason.IncompleteExploration
+            ),
+            CandidateIdentity=(
+                Compilation.CacheKey
+                if Compilation.States is not None
+                else None
+            ),
+            Diagnostics=(
+                ("Complete", "true" if Compilation.Complete else "false"),
+                (
+                    "StateCount",
+                    str(len(Compilation.States or ())),
+                ),
+            ),
+        )
+
+    return ExecuteBoundedRuntimeWork(
+        Request,
+        Deadline,
+        Compile,
+        CancellationCheck=CancellationCheck,
     )
 
 
