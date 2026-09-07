@@ -7,6 +7,7 @@ from hashlib import sha256
 from io import StringIO
 import json
 from math import nextafter
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -14,7 +15,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from Tools.Routing.RunRouterAcceptance import AcceptanceCase, AcceptanceCases, AcceptanceCommandResult, AcceptanceConfiguration, AcceptedPolicyVersion, AuthoritativeServerBackends, BaselinePolicyVersion, BaselineSchemaVersion, BaselineCompatibilityCaseNames, BuildBaselineComparison, BuildComparisonCompatibility, BuildEmittedDesignDigest, BuildParser, BuildLitematicCompositionEvidence, BuildRunArtifacts, BuildResolvedTemplateInputManifest, BuildSourceProvenance, BuildSubprocessTimeoutSeconds, BuildTruthTableSemanticEvidence, CalculateRuntimeStatistics, ExtendedCaseNames, CandidatePolicyVersion, CanonicalArithmeticDigests, CompareCompatibility, CurrentPolicyVersion, DefaultRoutingPublicationReserveSeconds, DefaultPythonExecutable, DeterministicEvidenceFields, EvaluateRun, EvaluateExactInterfaceProofCheckpoint, ExpandedCaseNames, MaximumDeadlineOverrunSeconds, MaximumRuntimeRegressionFraction, MaximumRuntimeSpreadFraction, NormalizeLegacyFullAdderCeilingCompatibility, RegressionCaseNames, ReadBaselineReference, ReadCgroupCpuQuotaProfile, ReadCpuProfile, RequiredRegressionRoutingThreads, RunAcceptance, RunCompilerCommand, SubprocessDeadlineGraceSeconds, SubprocessFinalizationGraceSeconds
+import Tools.Routing.RunRouterAcceptance as AcceptanceModule
+from Tools.Routing.RunRouterAcceptance import AcceptanceCase, AcceptanceCases, AcceptanceCommandResult, AcceptanceConfiguration, AcceptedPolicyVersion, AuthoritativeServerBackends, BaselinePolicyVersion, BaselineSchemaVersion, BaselineCompatibilityCaseNames, BuildBaselineComparison, BuildComparisonCompatibility, BuildEmittedDesignDigest, BuildParser, BuildLitematicCompositionEvidence, BuildPolicyProvenanceRecord, BuildPolicySnapshotIdentity, BuildRunArtifacts, BuildResolvedTemplateInputManifest, BuildSourceProvenance, BuildSubprocessTimeoutSeconds, BuildTruthTableSemanticEvidence, CalculateRuntimeStatistics, ExtendedCaseNames, CandidatePolicyVersion, CanonicalArithmeticDigests, CompareCompatibility, CurrentPolicyVersion, DefaultRoutingPublicationReserveSeconds, DefaultPythonExecutable, DeterministicEvidenceFields, EvaluateRun, EvaluateExactInterfaceProofCheckpoint, ExpandedCaseNames, MaximumDeadlineOverrunSeconds, MaximumRuntimeRegressionFraction, MaximumRuntimeSpreadFraction, NormalizeLegacyFullAdderCeilingCompatibility, RegressionCaseNames, ReadBaselineReference, ReadCgroupCpuQuotaProfile, ReadCpuProfile, RequiredRegressionRoutingThreads, RunAcceptance, RunCompilerCommand, SubprocessDeadlineGraceSeconds, SubprocessFinalizationGraceSeconds
+from PhysicalDesign.Policy import PolicyForRoutingStrategy, RoutingStrategy
 from PhysicalDesign.Rendering.SchemWriter import WriteLitematic
 
 FrozenRouterRegressionBaselineSha256 = (
@@ -29,6 +32,7 @@ def BuildPhysicalDesign(
     CandidateFingerprint: str = "candidate-stable",
     ResourceGraphFingerprint: str = "resource-graph-stable",
     EffectiveWorkFingerprint: str | None = None,
+    RequestedStrategy: str = "default",
     UsedStrategy: str = "default",
     FallbackUsed: bool = False,
     RuntimeSeconds: float = 1.0,
@@ -48,21 +52,25 @@ def BuildPhysicalDesign(
     Footprint: int = 200,
     FullFootprint: int = 800,
     ExactNonAirBlocks: int = 300,
+    PolicyChanges: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if TruthTableRows is None:
         TruthTableRows = Case.TruthTableRows
     if UnresolvedClaims is None:
         UnresolvedClaims = []
+    PolicySnapshot = deepcopy(
+        BuildPolicyProvenanceRecord(RequestedStrategy)["Snapshot"]
+    )
+    PolicySnapshot["PolicyVersion"] = PolicyVersion
+    PolicySnapshot["Seed"] = 0
+    PolicySnapshot.update(PolicyChanges or {})
     return {
         "Strategy": {
-            "Requested": "default",
+            "Requested": RequestedStrategy,
             "Used": UsedStrategy,
             "FallbackUsed": FallbackUsed,
         },
-        "Policy": {
-            "PolicyVersion": PolicyVersion,
-            "Seed": 0,
-        },
+        "Policy": PolicySnapshot,
         "RouterReliability": {
             "SchemaVersion": "router-reliability-v1",
             "RunVerdict": "ROUTED_AND_FABRIC_SERVER_VALIDATED",
@@ -230,6 +238,101 @@ def WriteSuccessfulArtifacts(
     )
 
 
+def BuildTestAcceptanceCommand(
+    Case: AcceptanceCase,
+    Artifacts: dict[str, Path],
+) -> list[str]:
+    return [
+        "python",
+        "Main.py",
+        "--input",
+        str((Path(__file__).resolve().parents[2] / Case.ExamplePath).resolve()),
+        "--topmodule",
+        Case.TopModule,
+        "--output",
+        str(Artifacts["RunDirectory"].resolve()),
+        "--outputname",
+        Artifacts["Schematic"].stem,
+        "--diagram",
+        str(Artifacts["Diagram"].resolve()),
+        "--workdir",
+        str(Artifacts["Workdir"].resolve()),
+        "--routing-strategy",
+        "default",
+        "--routing-deadline-seconds",
+        str(Case.RoutingDeadlineSeconds),
+    ]
+
+
+def WriteNestedRoutingFailureArtifact(
+    Case: AcceptanceCase,
+    Artifacts: dict[str, Path],
+    *,
+    RunDirectoryName: str | None,
+    SourceRevision: str = "revision",
+    FallbackUsed: object = False,
+    Failure: dict[str, object] | None = None,
+    ExpectedCommand: list[str] | None = None,
+    ReproductionCommand: list[str] | None = None,
+    DeclaredOutputPath: Path | None = None,
+    PolicyRuntimeSeconds: float | None = None,
+) -> Path:
+    RunDirectory = (
+        Artifacts["RunDirectory"]
+        if RunDirectoryName is None
+        else Artifacts["RunDirectory"] / "Runs" / RunDirectoryName
+    )
+    RunDirectory.mkdir(parents=True, exist_ok=True)
+    OutputPath = (
+        DeclaredOutputPath
+        if DeclaredOutputPath is not None
+        else RunDirectory / Artifacts["Schematic"].name
+    )
+    OutputIdentity = {
+        "Path": str(OutputPath),
+        "Directory": str(RunDirectory),
+        "Name": OutputPath.name,
+        "Stem": OutputPath.stem,
+        "Format": "litematic",
+    }
+    Policy = deepcopy(BuildPolicyProvenanceRecord("default")["Snapshot"])
+    EffectiveRuntime = (
+        Case.RoutingDeadlineSeconds
+        if PolicyRuntimeSeconds is None
+        else PolicyRuntimeSeconds
+    )
+    Policy["RuntimeBudgetSeconds"] = EffectiveRuntime
+    Policy["AdaptiveRouting"]["MaximumRuntimeSeconds"] = EffectiveRuntime
+    if ExpectedCommand is None:
+        ExpectedCommand = BuildTestAcceptanceCommand(Case, Artifacts)
+    FailurePath = RunDirectory / Artifacts["RoutingFailure"].name
+    FailurePath.write_text(
+        json.dumps({
+            "SchemaVersion": "routing-failure-v1",
+            "Strategy": {
+                "Requested": "default",
+                "Used": "default",
+                "FallbackUsed": FallbackUsed,
+            },
+            "Policy": Policy,
+            "SourceState": {"Revision": SourceRevision},
+            "Reproduction": {
+                "Output": OutputIdentity,
+                "RequestedStrategy": "default",
+                "Command": (
+                    ExpectedCommand
+                    if ReproductionCommand is None
+                    else ReproductionCommand
+                ),
+            },
+            "OutputIdentity": OutputIdentity,
+            "Failure": Failure or {"Reason": "fixture"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    return FailurePath
+
+
 def DigestFixture(Value: Path) -> str:
     return BuildEmittedDesignDigest(Value)
 
@@ -261,6 +364,12 @@ def SourceProvenanceFixture(
     SourceDigest: str = "source-digest",
     NativeDigest: str = "native-digest",
 ) -> dict[str, object]:
+    PolicyIdentity = BuildPolicyProvenanceRecord(
+        Configuration.RequestedRoutingStrategy
+    )
+    PolicySnapshot = deepcopy(PolicyIdentity["Snapshot"])
+    PolicySnapshot["PolicyVersion"] = Configuration.ExpectedPolicyVersion
+    PolicyIdentity.update(BuildPolicySnapshotIdentity(PolicySnapshot))
     return {
         "SchemaVersion": "router-source-provenance-v1",
         "Git": SourceState,
@@ -285,6 +394,13 @@ def SourceProvenanceFixture(
             "SizeBytes": 10,
             "Sha256": NativeDigest,
         },
+        "Policy": PolicyIdentity,
+        "RequestedRoutingStrategy": (
+            Configuration.RequestedRoutingStrategy
+        ),
+        "ExpectedUsedRoutingStrategy": PolicyIdentity[
+            "UsedRoutingStrategy"
+        ],
         "ExpectedPolicyVersion": Configuration.ExpectedPolicyVersion,
     }
 
@@ -295,6 +411,702 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             AuthoritativeServerBackends,
             frozenset({"fabric-26.2", "fabric-26.2-canary"}),
         )
+
+    def testCla4FabricCanaryCountIsDistinctFromMchprsTruthTableRows(
+        self,
+    ) -> None:
+        Case = next(
+            Value
+            for Value in AcceptanceCases
+            if Value.Name == "CarryLookaheadAdder4"
+        )
+        ExpectedFabricCanaries = 2 + 2 * 9
+        self.assertEqual(Case.TruthTableRows, 512)
+
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            CorrectArtifacts = BuildRunArtifacts(
+                Root / "correct",
+                "CarryLookaheadAdder4Run1",
+            )
+            WriteSuccessfulArtifacts(Case, CorrectArtifacts)
+            CorrectPhysicalDesign = json.loads(
+                CorrectArtifacts["PhysicalDesign"].read_text(
+                    encoding="utf-8"
+                )
+            )
+            CorrectPhysicalDesign["RunSummary"]["FabricServerValidation"][
+                "Diagnostics"
+            ]["TestedVectors"] = ExpectedFabricCanaries
+            CorrectArtifacts["PhysicalDesign"].write_text(
+                json.dumps(CorrectPhysicalDesign) + "\n",
+                encoding="utf-8",
+            )
+            CorrectEvaluation, _CorrectEvidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=CorrectArtifacts,
+                ExpectedSeed=0,
+                DesignDigestBuilder=DigestFixture,
+            )
+
+            WrongArtifacts = BuildRunArtifacts(
+                Root / "wrong",
+                "CarryLookaheadAdder4Run1",
+            )
+            WriteSuccessfulArtifacts(Case, WrongArtifacts)
+            WrongPhysicalDesign = json.loads(
+                WrongArtifacts["PhysicalDesign"].read_text(
+                    encoding="utf-8"
+                )
+            )
+            WrongPhysicalDesign["RunSummary"]["FabricServerValidation"][
+                "Diagnostics"
+            ]["TestedVectors"] = Case.TruthTableRows
+            WrongArtifacts["PhysicalDesign"].write_text(
+                json.dumps(WrongPhysicalDesign) + "\n",
+                encoding="utf-8",
+            )
+            WrongEvaluation, _WrongEvidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=WrongArtifacts,
+                ExpectedSeed=0,
+                DesignDigestBuilder=DigestFixture,
+            )
+
+        self.assertTrue(CorrectEvaluation["Accepted"])
+        self.assertFalse(WrongEvaluation["Accepted"])
+        self.assertIn(
+            "Fabric validation vector count mismatch: 512 != 20",
+            WrongEvaluation["Failures"],
+        )
+
+    def testNestedFailureArtifactIsBoundToTheCurrentInvocationAndExactProof(
+        self,
+    ) -> None:
+        Case = next(
+            Value
+            for Value in AcceptanceCases
+            if Value.Name == "CarryLookaheadAdder4"
+        )
+        FixturePath = (
+            Path(__file__).parent.parent
+            / "Fixtures"
+            / "CompatibilityExactInterfaceProof.json"
+        )
+        Fixture = json.loads(FixturePath.read_text(encoding="utf-8"))
+        ExactProof = deepcopy(Fixture["ExactProof"])
+        ExactProof.update({
+            "Result": "exact-cluster-interface-solve",
+            "ExecutableRepairAllowed": False,
+        })
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Artifacts = BuildRunArtifacts(
+                Path(DirectoryValue) / "CarryLookaheadAdder4Run1",
+                "CarryLookaheadAdder4Run1",
+            )
+            FailurePath = WriteNestedRoutingFailureArtifact(
+                Case,
+                Artifacts,
+                RunDirectoryName="20260907T024300.000000Z-P1",
+                Failure={"Diagnostics": {"InterfaceSolve": ExactProof}},
+            )
+            Evaluation, _Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(1, "", "", 1.0),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                ExpectedSourceRevision="revision",
+                PriorNestedRunDirectoryNames=frozenset(),
+                ExpectedCommand=BuildTestAcceptanceCommand(Case, Artifacts),
+                DesignDigestBuilder=DigestFixture,
+            )
+            ExactArtifacts = dict(Artifacts)
+            ExactArtifacts["RoutingFailure"] = FailurePath
+            ExactCheckpoint = EvaluateExactInterfaceProofCheckpoint(
+                ExactArtifacts,
+                FixturePath,
+            )
+
+        self.assertFalse(Evaluation["Accepted"])
+        self.assertEqual(
+            Evaluation["Observed"]["FailureArtifactResolution"],
+            {
+                "Status": "nested",
+                "Path": str(FailurePath.resolve()),
+                "CandidatePath": str(FailurePath.resolve()),
+                "Diagnostic": None,
+            },
+        )
+        self.assertTrue(
+            Evaluation["Observed"]["RoutingIdentityChecks"][
+                "FailureArtifactPresent"
+            ]
+        )
+        self.assertEqual(
+            Evaluation["Artifacts"]["RoutingFailure"]["Path"],
+            str(FailurePath.resolve()),
+        )
+        self.assertTrue(ExactCheckpoint["Accepted"])
+
+    def testNestedFailureArtifactRejectsStaleAndUnboundEvidence(self) -> None:
+        Case = next(
+            Value for Value in AcceptanceCases if Value.Name == "FullAdder"
+        )
+        Scenarios = (
+            ("stale", {"Prior": frozenset({"old-run"})}, "ambiguous"),
+            ("source", {"SourceRevision": "other"}, "rejected"),
+            ("fallback", {"FallbackUsed": 0}, "rejected"),
+            ("malformed", {"Malformed": True}, "rejected"),
+            ("multiple", {"Multiple": True}, "ambiguous"),
+            ("out-of-root", {"OutOfRoot": True}, "rejected"),
+            ("wrong-input", {"CommandOption": ("--input", "wrong.sv")}, "rejected"),
+            ("wrong-top", {"CommandOption": ("--topmodule", "Wrong")}, "rejected"),
+            ("wrong-output", {"CommandOption": ("--output", "/tmp/wrong")}, "rejected"),
+            ("wrong-deadline", {"CommandOption": ("--routing-deadline-seconds", "12")}, "rejected"),
+            ("wrong-policy", {"PolicyRuntimeSeconds": 120.0}, "rejected"),
+            ("wrong-interpreter", {"CommandMutation": "interpreter"}, "rejected"),
+            ("wrong-entrypoint", {"CommandMutation": "entrypoint"}, "rejected"),
+            ("extra-flag", {"CommandMutation": "extra"}, "rejected"),
+            ("missing-token", {"CommandMutation": "missing"}, "rejected"),
+            ("duplicate-option", {"CommandMutation": "duplicate"}, "rejected"),
+            ("reordered-options", {"CommandMutation": "reorder"}, "rejected"),
+        )
+        for Name, Options, ExpectedStatus in Scenarios:
+            with self.subTest(Name=Name), tempfile.TemporaryDirectory() as DirectoryValue:
+                Artifacts = BuildRunArtifacts(
+                    Path(DirectoryValue) / "FullAdderRun1",
+                    "FullAdderRun1",
+                )
+                RunName = "old-run" if Name == "stale" else "new-run"
+                ExpectedCommand = BuildTestAcceptanceCommand(Case, Artifacts)
+                ReproductionCommand = list(ExpectedCommand)
+                CommandOption = Options.get("CommandOption")
+                if isinstance(CommandOption, tuple):
+                    Option, Value = CommandOption
+                    ReproductionCommand[
+                        ReproductionCommand.index(Option) + 1
+                    ] = Value
+                CommandMutation = Options.get("CommandMutation")
+                if CommandMutation == "interpreter":
+                    ReproductionCommand[0] = "/wrong/.venv/bin/python"
+                elif CommandMutation == "entrypoint":
+                    ReproductionCommand[1] = "/wrong/OtherMain.py"
+                elif CommandMutation == "extra":
+                    ReproductionCommand.append("--push")
+                elif CommandMutation == "missing":
+                    ReproductionCommand.pop()
+                elif CommandMutation == "duplicate":
+                    ReproductionCommand.extend([
+                        "--input",
+                        str((Path(__file__).resolve().parents[2] / Case.ExamplePath).resolve()),
+                    ])
+                elif CommandMutation == "reorder":
+                    InputIndex = ReproductionCommand.index("--input")
+                    TopIndex = ReproductionCommand.index("--topmodule")
+                    InputPair = ReproductionCommand[InputIndex:InputIndex + 2]
+                    TopPair = ReproductionCommand[TopIndex:TopIndex + 2]
+                    ReproductionCommand[InputIndex:TopIndex + 2] = [
+                        *TopPair,
+                        *InputPair,
+                    ]
+                FailurePath = WriteNestedRoutingFailureArtifact(
+                    Case,
+                    Artifacts,
+                    RunDirectoryName=RunName,
+                    SourceRevision=str(Options.get("SourceRevision", "revision")),
+                    FallbackUsed=Options.get("FallbackUsed", False),
+                    ExpectedCommand=ExpectedCommand,
+                    ReproductionCommand=ReproductionCommand,
+                    DeclaredOutputPath=(
+                        Path("/tmp")
+                        / Artifacts["RunDirectory"].name
+                        / "Runs"
+                        / RunName
+                        / Artifacts["Schematic"].name
+                        if Options.get("OutOfRoot") is True
+                        else None
+                    ),
+                    PolicyRuntimeSeconds=Options.get("PolicyRuntimeSeconds"),
+                )
+                if Options.get("Malformed") is True:
+                    FailurePath.write_text("{not-json\n", encoding="utf-8")
+                if Options.get("Multiple") is True:
+                    WriteNestedRoutingFailureArtifact(
+                        Case,
+                        Artifacts,
+                        RunDirectoryName="another-new-run",
+                    )
+                Evaluation, _Evidence = EvaluateRun(
+                    Case=Case,
+                    Process=AcceptanceCommandResult(1, "", "", 1.0),
+                    Artifacts=Artifacts,
+                    ExpectedSeed=0,
+                    ExpectedSourceRevision="revision",
+                    PriorNestedRunDirectoryNames=Options.get(
+                        "Prior",
+                        frozenset(),
+                    ),
+                    ExpectedCommand=ExpectedCommand,
+                    DesignDigestBuilder=DigestFixture,
+                )
+
+                self.assertFalse(Evaluation["Accepted"])
+                self.assertEqual(
+                    Evaluation["Observed"]["FailureArtifactResolution"][
+                        "Status"
+                    ],
+                    ExpectedStatus,
+                )
+                self.assertFalse(
+                    Evaluation["Observed"]["RoutingIdentityChecks"][
+                        "FailureArtifactPresent"
+                    ]
+                )
+
+    def testRunnerUsesOnlyTheNestedArtifactCreatedByItsInvocation(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Configuration = self.Configuration(Root)
+            StaleArtifacts = BuildRunArtifacts(
+                Configuration.RecoveryRoot / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            WriteNestedRoutingFailureArtifact(
+                next(Value for Value in AcceptanceCases if Value.Name == "FullAdder"),
+                StaleArtifacts,
+                RunDirectoryName="stale-same-source-and-policy",
+            )
+
+            def Runner(**Options):
+                Command = Options["Command"]
+                RunDirectory = Path(Command[Command.index("--output") + 1])
+                RunName = Command[Command.index("--outputname") + 1]
+                Artifacts = BuildRunArtifacts(RunDirectory, RunName)
+                WriteNestedRoutingFailureArtifact(
+                    next(
+                        Value
+                        for Value in AcceptanceCases
+                        if Value.Name == RunName.removesuffix("Run1")
+                    ),
+                    Artifacts,
+                    RunDirectoryName=f"fresh-{RunName}",
+                    ExpectedCommand=Command,
+                )
+                return AcceptanceCommandResult(1, "", "fixture failure", 1.0)
+
+            Manifest = RunAcceptance(
+                Configuration,
+                CommandRunner=Runner,
+                SourceStateProvider=lambda _Root: {
+                    "Revision": "revision",
+                    "Dirty": False,
+                },
+                SourceProvenanceProvider=SourceProvenanceFixture,
+                UtcNowProvider=lambda: "2026-09-07T02:43:00+00:00",
+            )
+
+        self.assertFalse(Manifest["Accepted"])
+        self.assertTrue(all(
+            Run["Evaluation"]["Observed"]["FailureArtifactResolution"]
+            ["Status"] == "nested"
+            for Run in Manifest["Runs"]
+        ))
+        FullAdder = Manifest["Runs"][0]["Evaluation"]
+        self.assertIn(
+            "fresh-FullAdderRun1",
+            FullAdder["Artifacts"]["RoutingFailure"]["Path"],
+        )
+        self.assertNotIn(
+            "stale-same-source-and-policy",
+            FullAdder["Artifacts"]["RoutingFailure"]["Path"],
+        )
+
+    def testDirectFailureArtifactUsesTheSameInvocationValidation(self) -> None:
+        Case = next(
+            Value for Value in AcceptanceCases if Value.Name == "FullAdder"
+        )
+        Scenarios = (
+            ("valid", {}, "direct", True),
+            ("stale", {"Fresh": False}, "unbound", False),
+            ("source", {"SourceRevision": "other"}, "rejected", False),
+            ("fallback", {"FallbackUsed": 0}, "rejected", False),
+            ("malformed", {"Malformed": True}, "rejected", False),
+            ("output", {"OutOfRoot": True}, "rejected", False),
+            ("policy", {"PolicyRuntimeSeconds": 120.0}, "rejected", False),
+            ("symlink", {"Symlink": True}, "rejected", False),
+            ("broken-symlink", {"BrokenSymlink": True}, "rejected", False),
+            ("directory", {"Directory": True}, "rejected", False),
+            ("fifo", {"Fifo": True}, "rejected", False),
+        )
+        for Name, Options, ExpectedStatus, ExpectedPresent in Scenarios:
+            with self.subTest(Name=Name), tempfile.TemporaryDirectory() as DirectoryValue:
+                Artifacts = BuildRunArtifacts(
+                    Path(DirectoryValue) / "FullAdderRun1",
+                    "FullAdderRun1",
+                )
+                ExpectedCommand = BuildTestAcceptanceCommand(Case, Artifacts)
+                FailurePath = WriteNestedRoutingFailureArtifact(
+                    Case,
+                    Artifacts,
+                    RunDirectoryName=None,
+                    SourceRevision=str(Options.get("SourceRevision", "revision")),
+                    FallbackUsed=Options.get("FallbackUsed", False),
+                    ExpectedCommand=ExpectedCommand,
+                    DeclaredOutputPath=(
+                        Path("/tmp") / Artifacts["Schematic"].name
+                        if Options.get("OutOfRoot") is True
+                        else None
+                    ),
+                    PolicyRuntimeSeconds=Options.get("PolicyRuntimeSeconds"),
+                )
+                if Options.get("Malformed") is True:
+                    FailurePath.write_text("[]\n", encoding="utf-8")
+                if Options.get("Symlink") is True:
+                    Target = Path(DirectoryValue) / "external-secret.bin"
+                    Target.write_bytes(b"out-of-root-secret-bytes\n")
+                    FailurePath.unlink()
+                    FailurePath.symlink_to(Target)
+                if Options.get("BrokenSymlink") is True:
+                    FailurePath.unlink()
+                    FailurePath.symlink_to(
+                        Path(DirectoryValue) / "missing-secret.bin"
+                    )
+                if Options.get("Directory") is True:
+                    FailurePath.unlink()
+                    FailurePath.mkdir()
+                if Options.get("Fifo") is True:
+                    FailurePath.unlink()
+                    os.mkfifo(FailurePath)
+                Evaluation, _Evidence = EvaluateRun(
+                    Case=Case,
+                    Process=AcceptanceCommandResult(1, "", "", 1.0),
+                    Artifacts=Artifacts,
+                    ExpectedSeed=0,
+                    ExpectedSourceRevision="revision",
+                    DirectArtifactAbsentBeforeInvocation=Options.get(
+                        "Fresh",
+                        True,
+                    ),
+                    PriorNestedRunDirectoryNames=frozenset(),
+                    ExpectedCommand=ExpectedCommand,
+                    DesignDigestBuilder=DigestFixture,
+                )
+
+                self.assertFalse(Evaluation["Accepted"])
+                self.assertEqual(
+                    Evaluation["Observed"]["FailureArtifactResolution"][
+                        "Status"
+                    ],
+                    ExpectedStatus,
+                )
+                self.assertIs(
+                    Evaluation["Observed"]["RoutingIdentityChecks"][
+                        "FailureArtifactPresent"
+                    ],
+                    ExpectedPresent,
+                )
+                if Name == "malformed":
+                    RawRecord = Evaluation["Artifacts"]["RoutingFailure"]
+                    self.assertTrue(RawRecord["Exists"])
+                    self.assertEqual(RawRecord["SizeBytes"], 3)
+                    self.assertEqual(
+                        RawRecord["Sha256"],
+                        sha256(b"[]\n").hexdigest(),
+                    )
+                    self.assertIsNone(
+                        Evaluation["Observed"]["FailureRoutingIdentity"]
+                    )
+                if Name in {
+                    "symlink",
+                    "broken-symlink",
+                    "directory",
+                    "fifo",
+                }:
+                    RawRecord = Evaluation["Artifacts"]["RoutingFailure"]
+                    self.assertFalse(RawRecord["Exists"])
+                    self.assertNotIn("SizeBytes", RawRecord)
+                    self.assertNotIn("Sha256", RawRecord)
+                    self.assertEqual(
+                        RawRecord["Path"],
+                        str(FailurePath.absolute()),
+                    )
+                    if Name in {"symlink", "broken-symlink"}:
+                        self.assertTrue(RawRecord["IsSymlink"])
+                        self.assertNotIn("secret", json.dumps(RawRecord))
+
+    def testNestedFailureInventoryDoesNotFollowParentOrLeafSymlinks(
+        self,
+    ) -> None:
+        Case = next(
+            Value for Value in AcceptanceCases if Value.Name == "FullAdder"
+        )
+        for Name in ("parent", "leaf"):
+            with self.subTest(Name=Name), tempfile.TemporaryDirectory() as DirectoryValue:
+                Root = Path(DirectoryValue)
+                Artifacts = BuildRunArtifacts(
+                    Root / "FullAdderRun1",
+                    "FullAdderRun1",
+                )
+                RunsRoot = Artifacts["RunDirectory"] / "Runs"
+                RunsRoot.mkdir(parents=True)
+                External = Root / "external"
+                External.mkdir()
+                Secret = External / Artifacts["RoutingFailure"].name
+                Secret.write_bytes(b"nested-secret-bytes\n")
+                RunPath = RunsRoot / "new-run"
+                if Name == "parent":
+                    RunPath.symlink_to(External, target_is_directory=True)
+                    CandidatePath = RunPath / Artifacts["RoutingFailure"].name
+                else:
+                    RunPath.mkdir()
+                    CandidatePath = RunPath / Artifacts["RoutingFailure"].name
+                    CandidatePath.symlink_to(Secret)
+                ExpectedCommand = BuildTestAcceptanceCommand(Case, Artifacts)
+
+                Evaluation, _Evidence = EvaluateRun(
+                    Case=Case,
+                    Process=AcceptanceCommandResult(1, "", "", 1.0),
+                    Artifacts=Artifacts,
+                    ExpectedSeed=0,
+                    ExpectedSourceRevision="revision",
+                    DirectArtifactAbsentBeforeInvocation=True,
+                    PriorNestedRunDirectoryNames=frozenset(),
+                    ExpectedCommand=ExpectedCommand,
+                    DesignDigestBuilder=DigestFixture,
+                )
+
+                Resolution = Evaluation["Observed"][
+                    "FailureArtifactResolution"
+                ]
+                RawRecord = Evaluation["Artifacts"]["RoutingFailure"]
+                self.assertEqual(Resolution["Status"], "rejected")
+                self.assertEqual(
+                    Resolution["CandidatePath"],
+                    str(CandidatePath.absolute()),
+                )
+                self.assertFalse(RawRecord["Exists"])
+                self.assertTrue(RawRecord["IsSymlink"])
+                self.assertNotIn("SizeBytes", RawRecord)
+                self.assertNotIn("Sha256", RawRecord)
+                self.assertNotIn("external", json.dumps(RawRecord))
+
+    def testNestedFailureRejectsIntermediateDirectorySwapAfterInspection(
+        self,
+    ) -> None:
+        """A checked parent cannot redirect validation to outside bytes."""
+        Case = next(
+            Value for Value in AcceptanceCases if Value.Name == "FullAdder"
+        )
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Artifacts = BuildRunArtifacts(
+                Root / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            ExpectedCommand = BuildTestAcceptanceCommand(Case, Artifacts)
+            InsidePath = WriteNestedRoutingFailureArtifact(
+                Case,
+                Artifacts,
+                RunDirectoryName="new-run",
+                ExpectedCommand=ExpectedCommand,
+            )
+            InsideDocument = json.loads(InsidePath.read_text(encoding="utf-8"))
+            InsideDocument["Marker"] = "inside"
+            InsideBytes = (json.dumps(InsideDocument) + "\n").encode("utf-8")
+            InsidePath.write_bytes(InsideBytes)
+            InsideDirectory = InsidePath.parent
+            RunsRoot = InsideDirectory.parent
+            OutsideDirectory = Root / "outside-run"
+            OutsideDirectory.mkdir()
+            OutsideDocument = deepcopy(InsideDocument)
+            OutsideDocument["Marker"] = "outside"
+            OutsideBytes = (json.dumps(OutsideDocument) + "\n").encode("utf-8")
+            (OutsideDirectory / InsidePath.name).write_bytes(OutsideBytes)
+            RealInspect = AcceptanceModule.InspectPathWithoutFollowing
+            Swapped = False
+
+            def RacingInspect(PathValue):
+                nonlocal Swapped
+                Result = RealInspect(PathValue)
+                if (
+                    Path(PathValue) == InsidePath
+                    and Result[1] == "regular"
+                    and not Swapped
+                ):
+                    Swapped = True
+                    InsideDirectory.rename(RunsRoot / "original-run")
+                    InsideDirectory.symlink_to(
+                        OutsideDirectory,
+                        target_is_directory=True,
+                    )
+                return Result
+
+            with patch.object(
+                AcceptanceModule,
+                "InspectPathWithoutFollowing",
+                RacingInspect,
+            ):
+                Evaluation, _Evidence = EvaluateRun(
+                    Case=Case,
+                    Process=AcceptanceCommandResult(1, "", "", 1.0),
+                    Artifacts=Artifacts,
+                    ExpectedSeed=0,
+                    ExpectedSourceRevision="revision",
+                    DirectArtifactAbsentBeforeInvocation=True,
+                    PriorNestedRunDirectoryNames=frozenset(),
+                    ExpectedCommand=ExpectedCommand,
+                    DesignDigestBuilder=DigestFixture,
+                )
+
+            assert Swapped
+            Resolution = Evaluation["Observed"]["FailureArtifactResolution"]
+            assert Resolution["Status"] == "rejected"
+            assert Evaluation["Observed"]["RoutingIdentityChecks"][
+                "FailureArtifactPresent"
+            ] is False
+            RawRecord = Evaluation["Artifacts"]["RoutingFailure"]
+            assert RawRecord.get("Sha256") != sha256(OutsideBytes).hexdigest()
+
+    def testRunnerArtifactRecordKeepsOpenedLeafBytesAfterReplacement(
+        self,
+    ) -> None:
+        """Hash and size come from the verified descriptor, not a reopened path."""
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Candidate = Root / "evidence.bin"
+            Replacement = Root / "replacement.bin"
+            Candidate.write_bytes(b"inside")
+            Replacement.write_bytes(b"outside")
+            OriginalOpen = AcceptanceModule.os.open
+            Swapped = False
+
+            def RacingOpen(PathValue, Flags, *Arguments, **Keywords):
+                nonlocal Swapped
+                Descriptor = OriginalOpen(
+                    PathValue,
+                    Flags,
+                    *Arguments,
+                    **Keywords,
+                )
+                if Path(PathValue).name == Candidate.name and not Swapped:
+                    Swapped = True
+                    Candidate.rename(Root / "original.bin")
+                    Replacement.rename(Candidate)
+                return Descriptor
+
+            with (
+                patch.object(AcceptanceModule.os, "open", RacingOpen),
+                patch.object(
+                    AcceptanceModule,
+                    "SafeOpenPrimitivesAvailable",
+                    return_value=True,
+                ),
+            ):
+                Record = AcceptanceModule.BuildFileRecord(Candidate)
+
+            assert Swapped
+            assert Record["Exists"] is True
+            assert Record["SizeBytes"] == len(b"inside")
+            assert Record["Sha256"] == sha256(b"inside").hexdigest()
+
+    def testNestedFailureCarriesVerifiedBytesAcrossLeafReplacement(
+        self,
+    ) -> None:
+        """Validation and evaluator recording share the originally opened bytes."""
+        Case = next(
+            Value for Value in AcceptanceCases if Value.Name == "FullAdder"
+        )
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Artifacts = BuildRunArtifacts(
+                Root / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            ExpectedCommand = BuildTestAcceptanceCommand(Case, Artifacts)
+            FailurePath = WriteNestedRoutingFailureArtifact(
+                Case,
+                Artifacts,
+                RunDirectoryName="new-run",
+                ExpectedCommand=ExpectedCommand,
+            )
+            InsideDocument = json.loads(FailurePath.read_text(encoding="utf-8"))
+            InsideDocument["Marker"] = "inside"
+            InsideBytes = (json.dumps(InsideDocument) + "\n").encode("utf-8")
+            FailurePath.write_bytes(InsideBytes)
+            Replacement = FailurePath.with_name("replacement.json")
+            OutsideDocument = deepcopy(InsideDocument)
+            OutsideDocument["Marker"] = "outside"
+            OutsideBytes = (json.dumps(OutsideDocument) + "\n").encode("utf-8")
+            Replacement.write_bytes(OutsideBytes)
+            OriginalOpen = AcceptanceModule.os.open
+            Swapped = False
+
+            def RacingOpen(PathValue, Flags, *Arguments, **Keywords):
+                nonlocal Swapped
+                Descriptor = OriginalOpen(
+                    PathValue,
+                    Flags,
+                    *Arguments,
+                    **Keywords,
+                )
+                if Path(PathValue).name == FailurePath.name and not Swapped:
+                    Swapped = True
+                    FailurePath.rename(FailurePath.with_name("original.json"))
+                    Replacement.rename(FailurePath)
+                return Descriptor
+
+            with (
+                patch.object(AcceptanceModule.os, "open", RacingOpen),
+                patch.object(
+                    AcceptanceModule,
+                    "SafeOpenPrimitivesAvailable",
+                    return_value=True,
+                ),
+            ):
+                Evaluation, _Evidence = EvaluateRun(
+                    Case=Case,
+                    Process=AcceptanceCommandResult(1, "", "", 1.0),
+                    Artifacts=Artifacts,
+                    ExpectedSeed=0,
+                    ExpectedSourceRevision="revision",
+                    DirectArtifactAbsentBeforeInvocation=True,
+                    PriorNestedRunDirectoryNames=frozenset(),
+                    ExpectedCommand=ExpectedCommand,
+                    DesignDigestBuilder=DigestFixture,
+                )
+
+            assert Swapped
+            assert Evaluation["Observed"]["FailureArtifactResolution"][
+                "Status"
+            ] == "nested"
+            assert Evaluation["Observed"]["RoutingIdentityChecks"][
+                "FailureArtifactPresent"
+            ] is True
+            Record = Evaluation["Artifacts"]["RoutingFailure"]
+            assert Record["Exists"] is True
+            assert Record["SizeBytes"] == len(InsideBytes)
+            assert Record["Sha256"] == sha256(InsideBytes).hexdigest()
+            assert Record["Sha256"] != sha256(OutsideBytes).hexdigest()
+            assert json.loads(FailurePath.read_text())["Marker"] == "outside"
+
+    def testRunnerArtifactReadFailsClosedWithoutSafeOpenPrimitives(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Candidate = Path(DirectoryValue) / "evidence.bin"
+            Candidate.write_bytes(b"inside")
+            with patch.object(
+                AcceptanceModule.os,
+                "supports_dir_fd",
+                frozenset(),
+            ):
+                Record = AcceptanceModule.BuildFileRecord(Candidate)
+
+        assert Record["Exists"] is False
+        assert Record["EntryType"] == "safe-open-unavailable"
+        assert "Sha256" not in Record
 
     def test_compatibility_exact_interface_checkpoint_accepts_frozen_proof(self):
         FixturePath = (
@@ -440,6 +1252,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         BaselineMode: str | None = None,
         BaselinePath: Path | None = None,
         ExpectedPolicyVersion: str | None = None,
+        RequestedRoutingStrategy: str = RoutingStrategy.Default.value,
         MatrixMode: str = "default",
         IncludeCla4: bool = False,
     ) -> AcceptanceConfiguration:
@@ -447,7 +1260,11 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
             ExpectedPolicyVersion = (
                 BaselinePolicyVersion
                 if BaselineMode == "capture"
-                else AcceptedPolicyVersion
+                else CurrentPolicyVersion
+                if BaselineMode == "compare"
+                else PolicyForRoutingStrategy(
+                    RequestedRoutingStrategy
+                ).PolicyVersion
             )
         return AcceptanceConfiguration(
             RepositoryRoot=Path(__file__).resolve().parents[2],
@@ -460,6 +1277,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 if BaselineMode is not None
                 else 3
             ),
+            RequestedRoutingStrategy=RequestedRoutingStrategy,
             BaselineMode=BaselineMode,
             BaselinePath=BaselinePath,
             ExpectedPolicyVersion=ExpectedPolicyVersion,
@@ -511,12 +1329,22 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 if RunName.startswith(Value.Name)
             )
             Runtime = RuntimeByRun.get(RunName, 1.0)
+            StrategyIndex = Command.index("--routing-strategy")
+            RequestedStrategy = Command[StrategyIndex + 1]
+            PhysicalChanges = dict(
+                PhysicalChangesByRun.get(RunName, {})
+            )
+            PhysicalChanges.setdefault(
+                "RequestedStrategy",
+                RequestedStrategy,
+            )
+            PhysicalChanges.setdefault("UsedStrategy", RequestedStrategy)
             WriteSuccessfulArtifacts(
                 Case,
                 Artifacts,
                 PolicyVersion=PolicyVersion,
                 RuntimeSeconds=Runtime,
-                **PhysicalChangesByRun.get(RunName, {}),
+                **PhysicalChanges,
             )
             return AcceptanceCommandResult(0, "", "", Runtime)
 
@@ -692,6 +1520,61 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 MaximumDeadlineOverrunSeconds,
             )
             self.assertTrue(Configuration.ManifestPath.is_file())
+
+    def testRoutingAwareDryRunRecordsExactStrategyAndPolicy(self) -> None:
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Root = Path(DirectoryValue)
+            Strategy = RoutingStrategy.RoutingAwarePlacementAccess.value
+            Configuration = self.Configuration(
+                Root,
+                DryRun=True,
+                RequestedRoutingStrategy=Strategy,
+            )
+            Manifest = RunAcceptance(
+                Configuration,
+                CommandRunner=lambda **_Options: self.fail(
+                    "dry-run launched a compiler"
+                ),
+                SourceStateProvider=lambda _Root: {
+                    "Revision": "revision",
+                    "Dirty": True,
+                },
+                SourceProvenanceProvider=SourceProvenanceFixture,
+                UtcNowProvider=lambda: "2026-07-21T12:00:00+00:00",
+            )
+
+        ExpectedPolicy = PolicyForRoutingStrategy(Strategy)
+        self.assertEqual(Manifest["Status"], "DRY_RUN")
+        self.assertEqual(Manifest["RoutingStrategy"], Strategy)
+        self.assertEqual(
+            Configuration.ExpectedPolicyVersion,
+            ExpectedPolicy.PolicyVersion,
+        )
+        self.assertEqual(
+            Manifest["SourceProvenance"]["RequestedRoutingStrategy"],
+            Strategy,
+        )
+        for Run in Manifest["Runs"]:
+            Command = Run["Command"]
+            StrategyIndex = Command.index("--routing-strategy")
+            self.assertEqual(Command[StrategyIndex + 1], Strategy)
+
+        Provenance = BuildPolicyProvenanceRecord(Strategy)
+        self.assertEqual(Provenance["RoutingStrategy"], Strategy)
+        self.assertEqual(
+            Provenance["PolicyVersion"],
+            "physical-design-v17-routing-aware-placement-access",
+        )
+        self.assertEqual(
+            Provenance["Snapshot"]["PlacementAccess"],
+            {
+                "Enabled": True,
+                "CatalogVersion": "physical-pin-access-catalog-v1",
+                "EnabledPatternFamilies": ["straight"],
+                "MaximumDomainGenerationWork": 100_000,
+                "MaximumAssignmentExpansions": 100_000,
+            },
+        )
 
     def testDryRunWithIncludeCla4IncludesExtendedCase(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
@@ -1263,7 +2146,7 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 {"UsedStrategy": "compatibility"},
                 AcceptanceCommandResult(0, "", "", 1.0),
                 None,
-                "used strategy is not default",
+                "used strategy mismatch",
             ),
             (
                 "missing-artifact",
@@ -1381,6 +2264,274 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                         ExpectedFailure in Failure
                         for Failure in Evaluation["Failures"]
                     ))
+
+    def testEvaluatorAcceptsMatchingRoutingAwareStrategyAndPolicy(
+        self,
+    ) -> None:
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
+        Strategy = RoutingStrategy.RoutingAwarePlacementAccess.value
+        PolicyVersion = PolicyForRoutingStrategy(Strategy).PolicyVersion
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Artifacts = BuildRunArtifacts(
+                Path(DirectoryValue) / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            WriteSuccessfulArtifacts(
+                Case,
+                Artifacts,
+                RequestedStrategy=Strategy,
+                UsedStrategy=Strategy,
+                PolicyVersion=PolicyVersion,
+            )
+            Evaluation, _Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                ExpectedPolicyVersion=PolicyVersion,
+                ExpectedRoutingStrategy=Strategy,
+                DesignDigestBuilder=DigestFixture,
+            )
+
+        self.assertTrue(Evaluation["Accepted"], Evaluation["Failures"])
+        DefaultProvenance = BuildPolicyProvenanceRecord("default")
+        ExplicitProvenance = BuildPolicyProvenanceRecord(Strategy)
+        self.assertNotEqual(
+            DefaultProvenance["RequestedRoutingStrategy"],
+            ExplicitProvenance["RequestedRoutingStrategy"],
+        )
+        self.assertEqual(
+            DefaultProvenance["Sha256"],
+            ExplicitProvenance["Sha256"],
+        )
+
+    def testEvaluatorRejectsInternallyInconsistentSourcePolicyIdentity(
+        self,
+    ) -> None:
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
+        ForgedProvenance = BuildPolicyProvenanceRecord("default")
+        ForgedProvenance["Sha256"] = "0" * 64
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Artifacts = BuildRunArtifacts(
+                Path(DirectoryValue) / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            WriteSuccessfulArtifacts(Case, Artifacts)
+            Evaluation, _Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                ExpectedPolicyProvenance=ForgedProvenance,
+                ExpectedCommand=[
+                    "python",
+                    "Main.py",
+                    "--routing-strategy",
+                    "default",
+                ],
+                DesignDigestBuilder=DigestFixture,
+            )
+
+        self.assertFalse(Evaluation["Accepted"])
+        self.assertIn(
+            "configured strategy and source policy provenance disagree",
+            Evaluation["Failures"],
+        )
+        self.assertFalse(
+            Evaluation["Observed"]["RoutingIdentityChecks"]
+            ["ConfiguredSourcePolicyMatches"]
+        )
+
+    def testEvaluatorRejectsSameVersionPolicyMutationByCompleteIdentity(
+        self,
+    ) -> None:
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
+        ExpectedPolicy = BuildPolicyProvenanceRecord("default")
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Artifacts = BuildRunArtifacts(
+                Path(DirectoryValue) / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            WriteSuccessfulArtifacts(
+                Case,
+                Artifacts,
+                PolicyChanges={"RuntimeBudgetSeconds": 119.0},
+            )
+            Evaluation, _Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(0, "", "", 1.0),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                ExpectedPolicyProvenance=ExpectedPolicy,
+                ExpectedCommand=[
+                    "python",
+                    "Main.py",
+                    "--routing-strategy",
+                    "default",
+                ],
+                DesignDigestBuilder=DigestFixture,
+            )
+
+        self.assertFalse(Evaluation["Accepted"])
+        self.assertIn(
+            "complete policy snapshot does not match source provenance",
+            Evaluation["Failures"],
+        )
+        Checks = Evaluation["Observed"]["RoutingIdentityChecks"]
+        self.assertTrue(Checks["ActualRequestedStrategyMatches"])
+        self.assertTrue(Checks["ActualUsedStrategyMatches"])
+        self.assertTrue(Checks["ActualFallbackDisabled"])
+        self.assertFalse(Checks["ActualPolicySnapshotMatches"])
+        self.assertFalse(Checks["ActualPolicyIdentityMatches"])
+        self.assertEqual(
+            Evaluation["Observed"]["ActualRoutingIdentity"]
+            ["PolicyIdentity"]["PolicyVersion"],
+            ExpectedPolicy["PolicyVersion"],
+        )
+
+    def testEvaluatorSeparatesRequestedCommandUsedAndFallbackGates(
+        self,
+    ) -> None:
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
+        Strategy = RoutingStrategy.RoutingAwarePlacementAccess.value
+        Scenarios = (
+            (
+                "requested",
+                {"RequestedStrategy": "default", "UsedStrategy": Strategy},
+                Strategy,
+                "ActualRequestedStrategyMatches",
+            ),
+            (
+                "used",
+                {"RequestedStrategy": Strategy, "UsedStrategy": "default"},
+                Strategy,
+                "ActualUsedStrategyMatches",
+            ),
+            (
+                "fallback",
+                {
+                    "RequestedStrategy": Strategy,
+                    "UsedStrategy": Strategy,
+                    "FallbackUsed": True,
+                },
+                Strategy,
+                "ActualFallbackDisabled",
+            ),
+            (
+                "command",
+                {"RequestedStrategy": Strategy, "UsedStrategy": Strategy},
+                "default",
+                "ConfiguredCommandMatches",
+            ),
+        )
+        for Name, Changes, CommandStrategy, FailedCheck in Scenarios:
+            with self.subTest(Name=Name):
+                with tempfile.TemporaryDirectory() as DirectoryValue:
+                    Artifacts = BuildRunArtifacts(
+                        Path(DirectoryValue) / "FullAdderRun1",
+                        "FullAdderRun1",
+                    )
+                    WriteSuccessfulArtifacts(Case, Artifacts, **Changes)
+                    Evaluation, _Evidence = EvaluateRun(
+                        Case=Case,
+                        Process=AcceptanceCommandResult(0, "", "", 1.0),
+                        Artifacts=Artifacts,
+                        ExpectedSeed=0,
+                        ExpectedRoutingStrategy=Strategy,
+                        ExpectedPolicyProvenance=(
+                            BuildPolicyProvenanceRecord(Strategy)
+                        ),
+                        ExpectedCommand=[
+                            "python",
+                            "Main.py",
+                            "--routing-strategy",
+                            CommandStrategy,
+                        ],
+                        DesignDigestBuilder=DigestFixture,
+                    )
+
+                self.assertFalse(Evaluation["Accepted"])
+                Checks = Evaluation["Observed"]["RoutingIdentityChecks"]
+                self.assertFalse(Checks[FailedCheck])
+                for CheckName in (
+                    "ConfiguredCommandMatches",
+                    "ConfiguredSourcePolicyMatches",
+                    "ActualRequestedStrategyMatches",
+                    "ActualUsedStrategyMatches",
+                    "ActualFallbackDisabled",
+                    "ActualPolicySnapshotMatches",
+                    "ActualPolicyIdentityMatches",
+                ):
+                    if CheckName != FailedCheck:
+                        self.assertTrue(
+                            Checks[CheckName],
+                            f"{Name} also failed {CheckName}",
+                        )
+
+    def testEvaluatorKeepsConfiguredIdentityWhenActualArtifactsAreMissing(
+        self,
+    ) -> None:
+        Case = next(
+            Case for Case in AcceptanceCases if Case.Name == "FullAdder"
+        )
+        PolicyIdentity = BuildPolicyProvenanceRecord("default")
+        with tempfile.TemporaryDirectory() as DirectoryValue:
+            Artifacts = BuildRunArtifacts(
+                Path(DirectoryValue) / "FullAdderRun1",
+                "FullAdderRun1",
+            )
+            Evaluation, Evidence = EvaluateRun(
+                Case=Case,
+                Process=AcceptanceCommandResult(
+                    124,
+                    "",
+                    "",
+                    Case.RuntimeCeilingSeconds,
+                    TimedOut=True,
+                ),
+                Artifacts=Artifacts,
+                ExpectedSeed=0,
+                ExpectedPolicyProvenance=PolicyIdentity,
+                ExpectedCommand=[
+                    "python",
+                    "Main.py",
+                    "--routing-strategy",
+                    "default",
+                ],
+                DesignDigestBuilder=DigestFixture,
+            )
+
+        self.assertFalse(Evaluation["Accepted"])
+        self.assertIsNone(Evidence)
+        Observed = Evaluation["Observed"]
+        self.assertEqual(
+            Observed["ConfiguredRoutingIdentity"]["PolicyIdentity"],
+            PolicyIdentity,
+        )
+        self.assertEqual(
+            Observed["ActualRoutingIdentity"],
+            {
+                "RequestedStrategy": None,
+                "UsedStrategy": None,
+                "FallbackUsed": None,
+                "PolicyIdentity": None,
+            },
+        )
+        self.assertFalse(
+            Observed["RoutingIdentityChecks"]["ActualArtifactPresent"]
+        )
+        self.assertIsNone(
+            Observed["RoutingIdentityChecks"]
+            ["ActualPolicyIdentityMatches"]
+        )
 
     def testEvaluatorRecordsAndEnforcesSubsecondDeadlineOverrun(self) -> None:
         Case = next(
@@ -1873,6 +3024,9 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 for Record in Provenance["SourceContent"]["Files"]
             }
             self.assertIn("Assets/Templates/__init__.py", SourcePaths)
+            self.assertIn("App/BenchmarkArchive.py", SourcePaths)
+            self.assertIn("Compilation/Pipeline.py", SourcePaths)
+            self.assertIn("Formats/SystemVerilog/Sv.py", SourcePaths)
             self.assertEqual(
                 set(Provenance["PhysicalTemplates"]["Templates"]),
                 {"Input", "Nand", "Output"},
@@ -3162,6 +4316,26 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 BaselinePath=Path("/baseline.json"),
                 IncludeCla4=True,
             )
+        for BaselineMode in ("capture", "compare"):
+            with (
+                self.subTest(BaselineMode=BaselineMode),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "baseline capture/compare requires routing strategy default",
+                ),
+            ):
+                AcceptanceConfiguration(
+                    RepositoryRoot=Path("/repo"),
+                    OutputRoot=Path("/output"),
+                    DateLabel="2026-07-25",
+                    PythonExecutable=Path("/python"),
+                    RoutingThreads=RequiredRegressionRoutingThreads,
+                    RequestedRoutingStrategy=(
+                        RoutingStrategy.RoutingAwarePlacementAccess.value
+                    ),
+                    BaselineMode=BaselineMode,
+                    BaselinePath=Path("/baseline.json"),
+                )
 
     def testDefaultPythonExecutablePreservesVenvLauncherPath(self) -> None:
         with tempfile.TemporaryDirectory() as Directory:
@@ -3210,6 +4384,14 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
         self.assertEqual(
             Standalone.ManifestPath,
             Path("/output/Acceptance/2026-07-25/AcceptanceManifest.json"),
+        )
+        ArchivedStandalone = replace(
+            Standalone,
+            ArchiveSessionRoot=Path("/output/Acceptance/2026-07-25/Archives/id"),
+        )
+        self.assertEqual(
+            ArchivedStandalone.RecoveryRoot,
+            Path("/output/Acceptance/2026-07-25/Archives/id"),
         )
         self.assertEqual(Capture.RecoveryRoot.name, "BaselineCapture")
         self.assertEqual(Comparison.RecoveryRoot.name, "CandidateComparison")
@@ -4120,13 +5302,21 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                 RunDirectory = Path(Command[Command.index("--output") + 1])
                 RunName = Command[Command.index("--outputname") + 1]
                 Artifacts = BuildRunArtifacts(RunDirectory, RunName)
-                Artifacts["RunDirectory"].mkdir(parents=True, exist_ok=True)
-                Artifacts["RoutingFailure"].write_text(
-                    json.dumps({
-                        "SchemaVersion": "routing-failure-v1",
-                        "Failure": {"Reason": "RuntimeBudgetExceeded"},
-                    }) + "\n",
-                    encoding="utf-8",
+                Case = next(
+                    Value
+                    for Value in sorted(
+                        AcceptanceCases,
+                        key=lambda Candidate: len(Candidate.Name),
+                        reverse=True,
+                    )
+                    if RunName.startswith(Value.Name)
+                )
+                WriteNestedRoutingFailureArtifact(
+                    Case,
+                    Artifacts,
+                    RunDirectoryName=None,
+                    Failure={"Reason": "RuntimeBudgetExceeded"},
+                    ExpectedCommand=Command,
                 )
                 return AcceptanceCommandResult(
                     ReturnCode=1,
@@ -4173,6 +5363,14 @@ class RouterAcceptanceHarnessTests(unittest.TestCase):
                     self.assertTrue(all(
                         Run["Evaluation"]["Artifacts"]
                         ["RoutingFailure"]["Exists"]
+                        for Run in Manifest["Runs"]
+                    ))
+                    self.assertTrue(all(
+                        Run["Evaluation"]["Observed"]
+                        ["FailureArtifactResolution"]["Status"] == "direct"
+                        and Run["Evaluation"]["Observed"]
+                        ["RoutingIdentityChecks"]["FailureArtifactPresent"]
+                        is True
                         for Run in Manifest["Runs"]
                     ))
 

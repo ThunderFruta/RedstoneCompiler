@@ -17,10 +17,12 @@ import platform
 import runpy
 import signal
 import shlex
+import stat
 from statistics import median
 import subprocess
 import sys
 from time import monotonic
+import traceback
 from typing import Any, Callable
 
 
@@ -44,7 +46,19 @@ RequiredRegressionRoutingThreads = 16
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 
+from App.BenchmarkArchive import (
+    BenchmarkArchiveContext,
+    BuildBenchmarkArchiveDirectory,
+    BuildBenchmarkArchiveIdentity,
+    EnsureArchiveTargetAvailable,
+    PublishBenchmarkArchive,
+)
 from App.RunReporting import CaptureTerminalOutput, UtcTimestamp, WriteRunReport
+from PhysicalDesign.Policy import (
+    ExecutionStrategyForRequest,
+    PolicyForRoutingStrategy,
+    RoutingStrategy,
+)
 
 
 @dataclass(frozen=True)
@@ -168,6 +182,7 @@ AcceptanceCases = (
         TruthTableRows=512,
         RuntimeCeilingSeconds=120.0,
         NeedsExactInterfaceProof=True,
+        ValidationVectorCount=20,
     ),
 )
 
@@ -245,6 +260,8 @@ DimensionMetricFields = (
     "Depth",
 )
 DeterministicEvidenceFields = (
+    "RoutingIdentity",
+    "PolicyIdentity",
     "PlacementFingerprint",
     "CandidateFingerprint",
     "ResourceGraphFingerprint",
@@ -267,7 +284,9 @@ PerfBlockSchemaVersion = "router-performance-v1"
 # Baseline capture remains pinned to the frozen pre-change policy. Ordinary
 # acceptance and comparison target the current implementation policy.
 BaselinePolicyVersion = "physical-design-v15-compact-boundaries"
-CurrentPolicyVersion = "physical-design-v16-reconvergent-access"
+CurrentPolicyVersion = PolicyForRoutingStrategy(
+    RoutingStrategy.Default
+).PolicyVersion
 # Backwards-compatible constants for callers of the earlier harness surface.
 AcceptedPolicyVersion = CurrentPolicyVersion
 CandidatePolicyVersion = CurrentPolicyVersion
@@ -376,18 +395,40 @@ class AcceptanceConfiguration:
     DryRun: bool = False
     RoutingThreads: int | None = None
     ExpectedSeed: int = 0
+    RequestedRoutingStrategy: str = RoutingStrategy.Default.value
     BaselineMode: str | None = None
     BaselinePath: Path | None = None
     ExpectedPolicyVersion: str | None = None
     CaptureTimeoutGraceSeconds: float = 0.0
     MatrixMode: str = "default"
+    ArchiveSessionRoot: Path | None = None
     # Read-only compatibility for existing baseline tests and callers. The
     # public CLI now selects `--matrix default|expanded`.
     IncludeCla4: bool = False
 
     def __post_init__(self) -> None:
+        try:
+            RequestedRoutingStrategy = RoutingStrategy.Parse(
+                self.RequestedRoutingStrategy
+            )
+        except ValueError as Error:
+            raise ValueError(
+                f"unknown routing strategy: {self.RequestedRoutingStrategy}"
+            ) from Error
+        object.__setattr__(
+            self,
+            "RequestedRoutingStrategy",
+            RequestedRoutingStrategy.value,
+        )
         if self.BaselineMode not in {None, "capture", "compare"}:
             raise ValueError("baseline mode must be capture, compare, or None")
+        if (
+            self.BaselineMode is not None
+            and RequestedRoutingStrategy is not RoutingStrategy.Default
+        ):
+            raise ValueError(
+                "baseline capture/compare requires routing strategy default"
+            )
         if self.MatrixMode not in {"default", "expanded"}:
             raise ValueError("matrix mode must be default or expanded")
         if self.MatrixMode == "expanded" and self.BaselineMode is not None:
@@ -424,6 +465,10 @@ class AcceptanceConfiguration:
                 BaselinePolicyVersion
                 if self.BaselineMode == "capture"
                 else CurrentPolicyVersion
+                if self.BaselineMode == "compare"
+                else PolicyForRoutingStrategy(
+                    RequestedRoutingStrategy
+                ).PolicyVersion
             )
             object.__setattr__(
                 self,
@@ -441,11 +486,18 @@ class AcceptanceConfiguration:
         RequiredPolicyVersion = {
             "capture": BaselinePolicyVersion,
             "compare": CurrentPolicyVersion,
-            None: ExpectedPolicyVersion,
+            None: PolicyForRoutingStrategy(
+                RequestedRoutingStrategy
+            ).PolicyVersion,
         }[self.BaselineMode]
         if ExpectedPolicyVersion != RequiredPolicyVersion:
+            PolicyOwner = (
+                f"{self.BaselineMode} mode"
+                if self.BaselineMode is not None
+                else f"{RequestedRoutingStrategy.value} strategy"
+            )
             raise ValueError(
-                f"{self.BaselineMode} mode requires policy version "
+                f"{PolicyOwner} requires policy version "
                 f"{RequiredPolicyVersion}"
             )
         if not ExpectedPolicyVersion:
@@ -453,6 +505,8 @@ class AcceptanceConfiguration:
 
     @property
     def RecoveryRoot(self) -> Path:
+        if self.ArchiveSessionRoot is not None:
+            return self.ArchiveSessionRoot.resolve(strict=False)
         DateRoot = (self.OutputRoot / self.DateLabel).resolve(strict=False)
         SessionName = {
             "capture": "BaselineCapture",
@@ -1225,7 +1279,7 @@ def BuildCompilerCommand(
         "--workdir",
         str(Artifacts["Workdir"]),
         "--routing-strategy",
-        "default",
+        Configuration.RequestedRoutingStrategy,
         "--routing-deadline-seconds",
         str(Case.RoutingDeadlineSeconds),
     ]
@@ -1236,16 +1290,160 @@ def BuildCompilerCommand(
     return Command
 
 
+def LexicalAbsolutePath(Value: Path) -> Path:
+    """Return an absolute location without resolving any symlink."""
+    return Path(os.path.abspath(os.fspath(Value)))
+
+
+@dataclass(frozen=True)
+class VerifiedRegularFile:
+    """Bytes and descriptor-derived identity from one safe artifact open."""
+
+    Data: bytes
+    SizeBytes: int
+    Sha256: str
+
+
+def SafeOpenPrimitivesAvailable() -> bool:
+    """Require fd-relative, non-following primitives with no unsafe fallback."""
+    return (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_NONBLOCK")
+        and os.open in getattr(os, "supports_dir_fd", frozenset())
+    )
+
+
+def ReadVerifiedRegularFileWithoutFollowing(
+    Value: Path,
+) -> VerifiedRegularFile | None:
+    """Read one artifact through stable non-following directory handles."""
+    if not SafeOpenPrimitivesAvailable():
+        return None
+    Absolute = LexicalAbsolutePath(Value)
+    Anchor = Path(Absolute.anchor)
+    Parts = Absolute.parts[1:] if Absolute.anchor else Absolute.parts
+    if not Parts:
+        return None
+    DirectoryFlags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    FileFlags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    DirectoryDescriptors: list[int] = []
+    Descriptor: int | None = None
+    try:
+        try:
+            CurrentDescriptor = os.open(Anchor, DirectoryFlags)
+        except OSError:
+            return None
+        DirectoryDescriptors.append(CurrentDescriptor)
+        for Part in Parts[:-1]:
+            try:
+                CurrentDescriptor = os.open(
+                    Part,
+                    DirectoryFlags,
+                    dir_fd=CurrentDescriptor,
+                )
+            except OSError:
+                return None
+            DirectoryDescriptors.append(CurrentDescriptor)
+        try:
+            Descriptor = os.open(
+                Parts[-1],
+                FileFlags,
+                dir_fd=CurrentDescriptor,
+            )
+        except OSError:
+            return None
+        DescriptorStat = os.fstat(Descriptor)
+        if not stat.S_ISREG(DescriptorStat.st_mode):
+            return None
+        Chunks: list[bytes] = []
+        while True:
+            Chunk = os.read(Descriptor, 1024 * 1024)
+            if not Chunk:
+                break
+            Chunks.append(Chunk)
+        Data = b"".join(Chunks)
+        if len(Data) != DescriptorStat.st_size:
+            return None
+        return VerifiedRegularFile(
+            Data=Data,
+            SizeBytes=DescriptorStat.st_size,
+            Sha256=sha256(Data).hexdigest(),
+        )
+    finally:
+        if Descriptor is not None:
+            os.close(Descriptor)
+        for DirectoryDescriptor in reversed(DirectoryDescriptors):
+            os.close(DirectoryDescriptor)
+
+
+def InspectPathWithoutFollowing(Value: Path) -> tuple[Path, str]:
+    """Classify one path without traversing a symlink component."""
+    Absolute = LexicalAbsolutePath(Value)
+    Current = Path(Absolute.anchor)
+    Parts = Absolute.parts[1:] if Absolute.anchor else Absolute.parts
+    for Index, Part in enumerate(Parts):
+        Current /= Part
+        try:
+            Mode = Current.lstat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return Absolute, "missing"
+        if stat.S_ISLNK(Mode):
+            return Absolute, (
+                "symlink" if Index == len(Parts) - 1 else "symlink-parent"
+            )
+        if Index != len(Parts) - 1 and not stat.S_ISDIR(Mode):
+            return Absolute, "non-directory-parent"
+    if not Parts:
+        Mode = Current.lstat().st_mode
+    if stat.S_ISREG(Mode):
+        return Absolute, "regular"
+    if stat.S_ISDIR(Mode):
+        return Absolute, "directory"
+    if stat.S_ISFIFO(Mode):
+        return Absolute, "fifo"
+    if stat.S_ISSOCK(Mode):
+        return Absolute, "socket"
+    if stat.S_ISBLK(Mode):
+        return Absolute, "block-device"
+    if stat.S_ISCHR(Mode):
+        return Absolute, "character-device"
+    return Absolute, "non-regular"
+
+
 def BuildFileRecord(Value: Path) -> dict[str, object]:
+    Absolute, EntryType = InspectPathWithoutFollowing(Value)
     Result: dict[str, object] = {
-        "Path": str(Value.resolve(strict=False)),
-        "Exists": Value.is_file(),
+        "Path": str(Absolute),
+        "Exists": EntryType == "regular",
     }
-    if Value.is_file():
-        Data = Value.read_bytes()
+    if EntryType == "regular":
+        if not SafeOpenPrimitivesAvailable():
+            Result.update({
+                "Exists": False,
+                "PathEntryExists": True,
+                "EntryType": "safe-open-unavailable",
+                "IsSymlink": False,
+            })
+        else:
+            Verified = ReadVerifiedRegularFileWithoutFollowing(Absolute)
+            if Verified is None:
+                Result.update({
+                    "Exists": False,
+                    "PathEntryExists": True,
+                    "EntryType": "unreadable-or-changed",
+                    "IsSymlink": False,
+                })
+            else:
+                Result.update({
+                    "SizeBytes": Verified.SizeBytes,
+                    "Sha256": Verified.Sha256,
+                })
+    elif EntryType != "missing":
         Result.update({
-            "SizeBytes": len(Data),
-            "Sha256": sha256(Data).hexdigest(),
+            "PathEntryExists": EntryType != "symlink-parent",
+            "EntryType": EntryType,
+            "IsSymlink": EntryType in {"symlink", "symlink-parent"},
         })
     return Result
 
@@ -1267,7 +1465,8 @@ def BuildSourceContentManifest(
     CandidatePaths: set[Path] = set()
     for RelativeRoot, Pattern in (
         (Path("App"), "*.py"),
-        (Path("Compiler"), "*.py"),
+        (Path("Compilation"), "*.py"),
+        (Path("Formats"), "*.py"),
         (Path("PhysicalDesign"), "*.py"),
         (Path("Validation"), "*.py"),
         (Path("Kernels/Routing/Src"), "*.rs"),
@@ -1539,23 +1738,318 @@ except Exception as Error:
     return Record
 
 
-def BuildPolicyProvenanceRecord() -> dict[str, object]:
-    """Fingerprint the complete immutable policy selected by ``default``."""
-    from PhysicalDesign.Policy import PolicyForRoutingStrategy, RoutingStrategy
-
-    Policy = PolicyForRoutingStrategy(RoutingStrategy.Default)
-    Snapshot = Policy.ToDictionary()
-    Encoded = json.dumps(
+def BuildPolicySnapshotIdentity(
+    Snapshot: dict[str, object],
+) -> dict[str, object]:
+    """Identify every field of one emitted physical-design policy."""
+    CanonicalSnapshot = json.loads(json.dumps(
         Snapshot,
+        sort_keys=True,
+        separators=(",", ":"),
+    ))
+    Encoded = json.dumps(
+        CanonicalSnapshot,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return {
-        "PolicyVersion": Policy.PolicyVersion,
-        "Seed": Policy.Seed,
+        "PolicyVersion": CanonicalSnapshot.get("PolicyVersion"),
+        "Seed": CanonicalSnapshot.get("Seed"),
         "Sha256": sha256(Encoded).hexdigest(),
-        "Snapshot": Snapshot,
+        "Snapshot": CanonicalSnapshot,
     }
+
+
+def BuildPolicyProvenanceRecord(
+    RequestedRoutingStrategy: RoutingStrategy | str = RoutingStrategy.Default,
+) -> dict[str, object]:
+    """Fingerprint the policy selected by one explicit routing strategy."""
+    RequestedStrategy = RoutingStrategy.Parse(RequestedRoutingStrategy)
+    UsedStrategy = ExecutionStrategyForRequest(RequestedStrategy)
+    Policy = PolicyForRoutingStrategy(UsedStrategy)
+    Snapshot = Policy.ToDictionary()
+    return {
+        "RoutingStrategy": RequestedStrategy.value,
+        "RequestedRoutingStrategy": RequestedStrategy.value,
+        "UsedRoutingStrategy": UsedStrategy.value,
+        **BuildPolicySnapshotIdentity(Snapshot),
+    }
+
+
+def ReadCommandRoutingStrategy(Command: object) -> str | None:
+    """Read one exact --routing-strategy value without inferring execution."""
+    if not isinstance(Command, (list, tuple)):
+        return None
+    Values = [
+        str(Command[Index + 1])
+        for Index, Value in enumerate(Command[:-1])
+        if Value == "--routing-strategy"
+    ]
+    if len(Values) != 1:
+        return None
+    try:
+        return RoutingStrategy.Parse(Values[0]).value
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class RoutingFailureArtifactResolution:
+    """One current-run failure artifact, or an honest reason none can be used."""
+
+    Path: Path | None
+    CandidatePath: Path | None
+    Status: str
+    Diagnostic: str | None
+    VerifiedFile: VerifiedRegularFile | None = None
+
+
+def BuildEffectiveRoutingPolicyIdentity(
+    CanonicalPolicySnapshot: dict[str, object],
+    RoutingDeadlineSeconds: float,
+) -> dict[str, object]:
+    """Apply the invocation's exact deadline overrides to source policy."""
+    Snapshot = deepcopy(CanonicalPolicySnapshot)
+    AdaptiveRouting = Snapshot.get("AdaptiveRouting")
+    if not isinstance(AdaptiveRouting, dict):
+        raise ValueError("canonical policy has no AdaptiveRouting object")
+    Snapshot["RuntimeBudgetSeconds"] = RoutingDeadlineSeconds
+    AdaptiveRouting["MaximumRuntimeSeconds"] = RoutingDeadlineSeconds
+    return BuildPolicySnapshotIdentity(Snapshot)
+
+
+def BuildAcceptanceInvocationIdentity(Command: object) -> tuple[str, ...]:
+    """Retain the complete lexical command vector as invocation identity."""
+    if not isinstance(Command, (list, tuple)):
+        raise ValueError("acceptance command is not a sequence")
+    if not Command or any(not isinstance(Value, str) for Value in Command):
+        raise ValueError("acceptance command must contain only string tokens")
+    return tuple(Command)
+
+
+def ValidateRoutingFailureArtifact(
+    CandidateBytes: bytes,
+    *,
+    ExpectedOutputPath: Path,
+    ExpectedSourceRevision: str | None,
+    ExpectedRoutingStrategy: str,
+    ExpectedUsedRoutingStrategy: str,
+    ExpectedEffectivePolicyIdentity: dict[str, object],
+    ExpectedCommand: object,
+) -> str | None:
+    """Return a diagnostic unless one artifact matches the exact invocation."""
+    try:
+        Document = json.loads(CandidateBytes.decode("utf-8"))
+        if not isinstance(Document, dict):
+            raise ValueError("routing failure root is not an object")
+        OutputIdentity = Document.get("OutputIdentity")
+        Reproduction = Document.get("Reproduction")
+        SourceState = Document.get("SourceState")
+        Strategy = Document.get("Strategy")
+        Policy = Document.get("Policy")
+        if not isinstance(OutputIdentity, dict):
+            raise ValueError("routing failure has no OutputIdentity object")
+        if not isinstance(Reproduction, dict):
+            raise ValueError("routing failure has no Reproduction object")
+        if Reproduction.get("Output") != OutputIdentity:
+            raise ValueError("routing failure reproduction output disagrees")
+        if not isinstance(SourceState, dict):
+            raise ValueError("routing failure has no SourceState object")
+        if (
+            ExpectedSourceRevision is not None
+            and SourceState.get("Revision") != ExpectedSourceRevision
+        ):
+            raise ValueError("routing failure source revision does not match")
+        if not isinstance(Strategy, dict):
+            raise ValueError("routing failure has no Strategy object")
+        if (
+            Strategy.get("Requested") != ExpectedRoutingStrategy
+            or Strategy.get("Used") != ExpectedUsedRoutingStrategy
+            or Strategy.get("FallbackUsed") is not False
+        ):
+            raise ValueError("routing failure strategy identity does not match")
+        if not isinstance(Policy, dict):
+            raise ValueError("routing failure has no Policy object")
+        if BuildPolicySnapshotIdentity(Policy) != ExpectedEffectivePolicyIdentity:
+            raise ValueError("routing failure effective policy identity does not match")
+        RecordedDirectory = Path(str(OutputIdentity.get("Directory", "")))
+        RecordedOutput = Path(str(OutputIdentity.get("Path", "")))
+        if (
+            OutputIdentity.get("Name") != ExpectedOutputPath.name
+            or OutputIdentity.get("Stem") != ExpectedOutputPath.stem
+            or OutputIdentity.get("Format") != "litematic"
+            or LexicalAbsolutePath(RecordedDirectory)
+            != LexicalAbsolutePath(ExpectedOutputPath.parent)
+            or LexicalAbsolutePath(RecordedOutput)
+            != LexicalAbsolutePath(ExpectedOutputPath)
+        ):
+            raise ValueError("routing failure output identity does not bind this run")
+        if Reproduction.get("RequestedStrategy") != ExpectedRoutingStrategy:
+            raise ValueError("routing failure reproduction strategy does not match")
+        if BuildAcceptanceInvocationIdentity(
+            Reproduction.get("Command")
+        ) != BuildAcceptanceInvocationIdentity(ExpectedCommand):
+            raise ValueError("routing failure reproduction command does not match")
+    except (UnicodeError, json.JSONDecodeError, ValueError) as Error:
+        return str(Error)
+    return None
+
+
+def ResolveRoutingFailureArtifact(
+    Artifacts: dict[str, Path],
+    *,
+    DirectArtifactAbsentBeforeInvocation: bool | None,
+    PriorNestedRunDirectoryNames: frozenset[str] | None,
+    ExpectedSourceRevision: str | None,
+    ExpectedRoutingStrategy: str,
+    ExpectedUsedRoutingStrategy: str,
+    ExpectedEffectivePolicyIdentity: dict[str, object],
+    ExpectedCommand: object,
+) -> RoutingFailureArtifactResolution:
+    """Resolve one fresh direct or nested, invocation-bound failure artifact."""
+    RunDirectory = Artifacts["RunDirectory"]
+    ExpectedOutput = Artifacts["Schematic"]
+    Direct = Artifacts["RoutingFailure"]
+    Candidate: Path | None = None
+    ExpectedCandidateOutput: Path | None = None
+
+    DirectPath, DirectType = InspectPathWithoutFollowing(Direct)
+    if DirectType != "missing":
+        if DirectType != "regular":
+            return RoutingFailureArtifactResolution(
+                Path=None,
+                CandidatePath=DirectPath,
+                Status="rejected",
+                Diagnostic=(
+                    "direct routing failure artifact is not a regular file: "
+                    + DirectType
+                ),
+            )
+        if DirectArtifactAbsentBeforeInvocation is not True:
+            return RoutingFailureArtifactResolution(
+                Path=None,
+                CandidatePath=DirectPath,
+                Status="unbound",
+                Diagnostic="direct routing failure artifact is not bound to this invocation",
+            )
+        Candidate = DirectPath
+        ExpectedCandidateOutput = ExpectedOutput
+
+    RunsRoot = RunDirectory / "Runs"
+    RunsRootPath, RunsRootType = InspectPathWithoutFollowing(RunsRoot)
+    if Candidate is None and RunsRootType != "missing":
+        if RunsRootType != "directory":
+            return RoutingFailureArtifactResolution(
+                Path=None,
+                CandidatePath=RunsRootPath,
+                Status="rejected",
+                Diagnostic="current Runs root is not a directory: " + RunsRootType,
+            )
+        elif PriorNestedRunDirectoryNames is None:
+            return RoutingFailureArtifactResolution(
+                Path=None,
+                CandidatePath=None,
+                Status="unbound",
+                Diagnostic=(
+                    "nested routing failure artifact has no current invocation "
+                    "directory snapshot"
+                ),
+            )
+        else:
+            NewRunPaths = [
+                RunPath
+                for RunPath in sorted(
+                    RunsRootPath.iterdir(), key=lambda Value: Value.name
+                )
+                if RunPath.name not in PriorNestedRunDirectoryNames
+            ]
+            if len(NewRunPaths) != 1:
+                return RoutingFailureArtifactResolution(
+                    Path=None,
+                    CandidatePath=None,
+                    Status="ambiguous",
+                    Diagnostic=(
+                        "current invocation did not create exactly one nested "
+                        "run directory"
+                    ),
+                )
+            RunPath = NewRunPaths[0]
+            CandidatePath, CandidateType = InspectPathWithoutFollowing(
+                RunPath / Direct.name
+            )
+            Candidate = CandidatePath
+            ExpectedCandidateOutput = RunPath / ExpectedOutput.name
+            if CandidateType != "regular":
+                return RoutingFailureArtifactResolution(
+                    Path=None,
+                    CandidatePath=CandidatePath,
+                    Status=(
+                        "missing" if CandidateType == "missing" else "rejected"
+                    ),
+                    Diagnostic=(
+                        "nested routing failure artifact is not a regular in-root file: "
+                        + CandidateType
+                        if CandidateType != "missing"
+                        else None
+                    ),
+                )
+
+    if Candidate is None or ExpectedCandidateOutput is None:
+        return RoutingFailureArtifactResolution(
+            Path=None,
+            CandidatePath=None,
+            Status="missing",
+            Diagnostic=None,
+        )
+    VerifiedFile = ReadVerifiedRegularFileWithoutFollowing(Candidate)
+    if VerifiedFile is None:
+        return RoutingFailureArtifactResolution(
+            Path=None,
+            CandidatePath=Candidate,
+            Status="rejected",
+            Diagnostic=(
+                "routing failure artifact changed or safe read is unavailable"
+            ),
+        )
+    Diagnostic = ValidateRoutingFailureArtifact(
+        VerifiedFile.Data,
+        ExpectedOutputPath=ExpectedCandidateOutput,
+        ExpectedSourceRevision=ExpectedSourceRevision,
+        ExpectedRoutingStrategy=ExpectedRoutingStrategy,
+        ExpectedUsedRoutingStrategy=ExpectedUsedRoutingStrategy,
+        ExpectedEffectivePolicyIdentity=ExpectedEffectivePolicyIdentity,
+        ExpectedCommand=ExpectedCommand,
+    )
+    if Diagnostic is not None:
+        return RoutingFailureArtifactResolution(
+            Path=None,
+            CandidatePath=Candidate,
+            Status="rejected",
+            Diagnostic=Diagnostic,
+            VerifiedFile=VerifiedFile,
+        )
+    return RoutingFailureArtifactResolution(
+        Path=Candidate,
+        CandidatePath=Candidate,
+        Status="direct" if Candidate == DirectPath else "nested",
+        Diagnostic=None,
+        VerifiedFile=VerifiedFile,
+    )
+
+
+def CaptureNestedRunDirectoryNames(
+    Artifacts: dict[str, Path],
+) -> frozenset[str]:
+    """Snapshot existing child-run names before one compiler invocation."""
+    RunsRoot = Artifacts["RunDirectory"] / "Runs"
+    RunsRootPath, RunsRootType = InspectPathWithoutFollowing(RunsRoot)
+    if RunsRootType != "directory":
+        return frozenset()
+    return frozenset(
+        Value.name
+        for Value in RunsRootPath.iterdir()
+        if InspectPathWithoutFollowing(Value)[1] == "directory"
+    )
 
 
 def BuildSourceProvenance(
@@ -1563,6 +2057,9 @@ def BuildSourceProvenance(
     SourceState: dict[str, object],
 ) -> dict[str, object]:
     """Capture source, benchmark, native, and policy provenance."""
+    PolicyIdentity = BuildPolicyProvenanceRecord(
+        Configuration.RequestedRoutingStrategy
+    )
     return {
         "SchemaVersion": "router-source-provenance-v1",
         "Git": SourceState,
@@ -1580,7 +2077,11 @@ def BuildSourceProvenance(
             Configuration.RepositoryRoot,
             Configuration.PythonExecutable,
         ),
-        "Policy": BuildPolicyProvenanceRecord(),
+        "Policy": PolicyIdentity,
+        "RequestedRoutingStrategy": Configuration.RequestedRoutingStrategy,
+        "ExpectedUsedRoutingStrategy": PolicyIdentity[
+            "UsedRoutingStrategy"
+        ],
         "ExpectedPolicyVersion": Configuration.ExpectedPolicyVersion,
     }
 
@@ -1731,6 +2232,12 @@ def EvaluateRun(
     Artifacts: dict[str, Path],
     ExpectedSeed: int,
     ExpectedPolicyVersion: str = CurrentPolicyVersion,
+    ExpectedRoutingStrategy: str = RoutingStrategy.Default.value,
+    ExpectedPolicyProvenance: dict[str, object] | None = None,
+    ExpectedSourceRevision: str | None = None,
+    DirectArtifactAbsentBeforeInvocation: bool | None = None,
+    PriorNestedRunDirectoryNames: frozenset[str] | None = None,
+    ExpectedCommand: list[str] | tuple[str, ...] | None = None,
     DesignDigestBuilder: Callable[[Path], str] = BuildEmittedDesignDigest,
     LitematicCompositionEvidenceBuilder: Callable[
         [Path], dict[str, int]
@@ -1740,7 +2247,90 @@ def EvaluateRun(
     ] = BuildTruthTableSemanticEvidence,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
     """Judge one completed process solely from its result and durable artifacts."""
+    ExpectedRoutingStrategy = RoutingStrategy.Parse(
+        ExpectedRoutingStrategy
+    ).value
+    ExpectedUsedRoutingStrategy = ExecutionStrategyForRequest(
+        ExpectedRoutingStrategy
+    ).value
     Failures: list[str] = []
+    PolicyProvenance = deepcopy(
+        ExpectedPolicyProvenance
+        if ExpectedPolicyProvenance is not None
+        else BuildPolicyProvenanceRecord(ExpectedRoutingStrategy)
+    )
+    ExpectedPolicySnapshot = PolicyProvenance.get("Snapshot")
+    if not isinstance(ExpectedPolicySnapshot, dict):
+        ExpectedPolicySnapshot = {}
+        Failures.append("configured policy provenance has no snapshot")
+    ComputedConfiguredPolicyIdentity = BuildPolicySnapshotIdentity(
+        ExpectedPolicySnapshot
+    )
+    ExpectedCommandRoutingStrategy = ReadCommandRoutingStrategy(
+        ExpectedCommand
+    )
+    ConfiguredCommandMatches = (
+        ExpectedCommand is None
+        or ExpectedCommandRoutingStrategy == ExpectedRoutingStrategy
+    )
+    if not ConfiguredCommandMatches:
+        Failures.append(
+            "configured command routing strategy mismatch: "
+            f"{ExpectedCommandRoutingStrategy!r} != "
+            f"{ExpectedRoutingStrategy!r}"
+        )
+    ConfiguredSourcePolicyMatches = not (
+        PolicyProvenance.get("RoutingStrategy")
+        != ExpectedRoutingStrategy
+        or PolicyProvenance.get("RequestedRoutingStrategy")
+        != ExpectedRoutingStrategy
+        or PolicyProvenance.get("UsedRoutingStrategy")
+        != ExpectedUsedRoutingStrategy
+        or PolicyProvenance.get("PolicyVersion")
+        != ExpectedPolicyVersion
+        or PolicyProvenance.get("PolicyVersion")
+        != ComputedConfiguredPolicyIdentity["PolicyVersion"]
+        or PolicyProvenance.get("Seed") != ExpectedSeed
+        or PolicyProvenance.get("Seed")
+        != ComputedConfiguredPolicyIdentity["Seed"]
+        or PolicyProvenance.get("Sha256")
+        != ComputedConfiguredPolicyIdentity["Sha256"]
+        or PolicyProvenance.get("Snapshot")
+        != ComputedConfiguredPolicyIdentity["Snapshot"]
+    )
+    if not ConfiguredSourcePolicyMatches:
+        Failures.append(
+            "configured strategy and source policy provenance disagree"
+        )
+    ConfiguredRoutingIdentity = {
+        "RequestedStrategy": ExpectedRoutingStrategy,
+        "UsedStrategy": ExpectedUsedRoutingStrategy,
+        "CommandRoutingStrategy": ExpectedCommandRoutingStrategy,
+        "PolicyIdentity": PolicyProvenance,
+    }
+    ExpectedEffectivePolicyIdentity = BuildEffectiveRoutingPolicyIdentity(
+        ExpectedPolicySnapshot,
+        Case.RoutingDeadlineSeconds,
+    )
+    FailureArtifactResolution = ResolveRoutingFailureArtifact(
+        Artifacts,
+        DirectArtifactAbsentBeforeInvocation=(
+            DirectArtifactAbsentBeforeInvocation
+        ),
+        PriorNestedRunDirectoryNames=PriorNestedRunDirectoryNames,
+        ExpectedSourceRevision=ExpectedSourceRevision,
+        ExpectedRoutingStrategy=ExpectedRoutingStrategy,
+        ExpectedUsedRoutingStrategy=ExpectedUsedRoutingStrategy,
+        ExpectedEffectivePolicyIdentity=ExpectedEffectivePolicyIdentity,
+        ExpectedCommand=ExpectedCommand,
+    )
+    ResolvedRoutingFailurePath = FailureArtifactResolution.Path
+    VerifiedRoutingFailure = FailureArtifactResolution.VerifiedFile
+    if FailureArtifactResolution.Diagnostic is not None:
+        Failures.append(
+            "routing failure artifact resolution rejected: "
+            + FailureArtifactResolution.Diagnostic
+        )
     ProcessEnvelopeSeconds = (
         Case.RoutingDeadlineSeconds + Case.PublicationReserveSeconds
     )
@@ -1783,7 +2373,10 @@ def EvaluateRun(
     for Name in ("Schematic", "FabricFixture", "PhysicalDesign"):
         if not Artifacts[Name].is_file():
             Failures.append(f"missing required artifact: {Name}")
-    if Artifacts["RoutingFailure"].is_file():
+    if (
+        ResolvedRoutingFailurePath is not None
+        and VerifiedRoutingFailure is not None
+    ):
         Failures.append("routing failure artifact exists")
 
     PhysicalDocument: dict[str, object] | None = None
@@ -1800,7 +2393,135 @@ def EvaluateRun(
 
     Evidence: dict[str, object] | None = None
     RouterReliability: dict[str, object] = {}
-    Observed: dict[str, object] = {}
+    Observed: dict[str, object] = {
+        "ConfiguredRoutingIdentity": ConfiguredRoutingIdentity,
+        "ActualRoutingIdentity": {
+            "RequestedStrategy": None,
+            "UsedStrategy": None,
+            "FallbackUsed": None,
+            "PolicyIdentity": None,
+        },
+        "FailureRoutingIdentity": None,
+        "FailureArtifactResolution": {
+            "Status": FailureArtifactResolution.Status,
+            "Path": (
+                str(LexicalAbsolutePath(FailureArtifactResolution.Path))
+                if FailureArtifactResolution.Path is not None
+                else None
+            ),
+            "CandidatePath": (
+                str(LexicalAbsolutePath(FailureArtifactResolution.CandidatePath))
+                if FailureArtifactResolution.CandidatePath is not None
+                else None
+            ),
+            "Diagnostic": FailureArtifactResolution.Diagnostic,
+        },
+        "RoutingIdentityChecks": {
+            "ConfiguredCommandMatches": ConfiguredCommandMatches,
+            "ConfiguredSourcePolicyMatches": ConfiguredSourcePolicyMatches,
+            "ActualArtifactPresent": False,
+            "ActualRequestedStrategyMatches": None,
+            "ActualUsedStrategyMatches": None,
+            "ActualFallbackDisabled": None,
+            "ActualPolicySnapshotMatches": None,
+            "ActualPolicyIdentityMatches": None,
+            "FailureArtifactPresent": False,
+            "FailureStrategyMatches": None,
+            "FailureReproductionMatches": None,
+            "FailurePolicyIdentityMatches": None,
+        },
+    }
+    if (
+        ResolvedRoutingFailurePath is not None
+        and VerifiedRoutingFailure is not None
+    ):
+        try:
+            FailureDocument = json.loads(
+                VerifiedRoutingFailure.Data.decode("utf-8")
+            )
+            if not isinstance(FailureDocument, dict):
+                raise ValueError("routing failure root is not an object")
+            FailureStrategy = FailureDocument.get("Strategy")
+            FailurePolicy = FailureDocument.get("Policy")
+            FailureReproduction = FailureDocument.get("Reproduction")
+            if not isinstance(FailureStrategy, dict):
+                raise ValueError("routing failure has no Strategy object")
+            if not isinstance(FailurePolicy, dict):
+                raise ValueError("routing failure has no Policy object")
+            if not isinstance(FailureReproduction, dict):
+                raise ValueError("routing failure has no Reproduction object")
+            FailurePolicyIdentity = BuildPolicySnapshotIdentity(FailurePolicy)
+            FailureRoutingIdentity = {
+                "RequestedStrategy": FailureStrategy.get("Requested"),
+                "UsedStrategy": FailureStrategy.get("Used"),
+                "FallbackUsed": FailureStrategy.get("FallbackUsed"),
+                "PolicyIdentity": FailurePolicyIdentity,
+                "ReproductionRequestedStrategy": (
+                    FailureReproduction.get("RequestedStrategy")
+                ),
+                "ReproductionCommandRoutingStrategy": (
+                    ReadCommandRoutingStrategy(
+                        FailureReproduction.get("Command")
+                    )
+                ),
+            }
+            Observed["FailureRoutingIdentity"] = FailureRoutingIdentity
+            Observed["RoutingIdentityChecks"].update({
+                "FailureArtifactPresent": True,
+                "FailureStrategyMatches": (
+                    FailureRoutingIdentity["RequestedStrategy"]
+                    == ExpectedRoutingStrategy
+                    and FailureRoutingIdentity["UsedStrategy"]
+                    == ExpectedUsedRoutingStrategy
+                    and FailureRoutingIdentity["FallbackUsed"] is False
+                ),
+                "FailureReproductionMatches": (
+                    FailureRoutingIdentity["ReproductionRequestedStrategy"]
+                    == ExpectedRoutingStrategy
+                    and FailureRoutingIdentity[
+                        "ReproductionCommandRoutingStrategy"
+                    ]
+                    == ExpectedRoutingStrategy
+                ),
+                "FailurePolicyIdentityMatches": (
+                    FailurePolicyIdentity["Snapshot"]
+                    == ExpectedEffectivePolicyIdentity["Snapshot"]
+                    and FailurePolicyIdentity.get("Sha256")
+                    == ExpectedEffectivePolicyIdentity.get("Sha256")
+                ),
+            })
+            if (
+                FailureRoutingIdentity["RequestedStrategy"]
+                != ExpectedRoutingStrategy
+                or FailureRoutingIdentity["UsedStrategy"]
+                != ExpectedUsedRoutingStrategy
+                or FailureRoutingIdentity["FallbackUsed"] is not False
+            ):
+                Failures.append(
+                    "routing failure strategy identity mismatch"
+                )
+            if (
+                FailureRoutingIdentity["ReproductionRequestedStrategy"]
+                != ExpectedRoutingStrategy
+                or FailureRoutingIdentity[
+                    "ReproductionCommandRoutingStrategy"
+                ]
+                != ExpectedRoutingStrategy
+            ):
+                Failures.append(
+                    "routing failure reproduction strategy mismatch"
+                )
+            if (
+                FailurePolicyIdentity["Snapshot"]
+                != ExpectedEffectivePolicyIdentity["Snapshot"]
+                or FailurePolicyIdentity.get("Sha256")
+                != ExpectedEffectivePolicyIdentity.get("Sha256")
+            ):
+                Failures.append(
+                    "routing failure policy identity mismatch"
+                )
+        except (UnicodeError, json.JSONDecodeError, ValueError) as Error:
+            Failures.append(f"invalid RoutingFailure JSON: {Error}")
     FabricValidationBackend: str | None = None
     CandidateFingerprint: str | None = None
     ResourceGraphFingerprint: str | None = None
@@ -1812,14 +2533,58 @@ def EvaluateRun(
             Strategy = {}
         RequestedStrategy = Strategy.get("Requested")
         UsedStrategy = Strategy.get("Used")
-        if RequestedStrategy != "default":
-            Failures.append("requested strategy is not default")
-        if UsedStrategy != "default":
-            Failures.append("used strategy is not default")
-        if Strategy.get("FallbackUsed") is not False:
+        FallbackUsed = Strategy.get("FallbackUsed")
+        if RequestedStrategy != ExpectedRoutingStrategy:
+            Failures.append(
+                "requested strategy mismatch: "
+                f"{RequestedStrategy!r} != {ExpectedRoutingStrategy!r}"
+            )
+        if UsedStrategy != ExpectedUsedRoutingStrategy:
+            Failures.append(
+                "used strategy mismatch: "
+                f"{UsedStrategy!r} != {ExpectedUsedRoutingStrategy!r}"
+            )
+        if FallbackUsed is not False:
             Failures.append(
                 "fallback was used or not explicitly disabled"
             )
+
+        PhysicalPolicy = ReadNested(PhysicalDocument, "Policy")
+        if not isinstance(PhysicalPolicy, dict):
+            Failures.append("missing complete Policy evidence")
+            PhysicalPolicy = {}
+        ActualPolicyIdentity = BuildPolicySnapshotIdentity(PhysicalPolicy)
+        if ActualPolicyIdentity["Snapshot"] != ExpectedPolicySnapshot:
+            Failures.append(
+                "complete policy snapshot does not match source provenance"
+            )
+        if ActualPolicyIdentity.get("Sha256") != PolicyProvenance.get("Sha256"):
+            Failures.append(
+                "policy snapshot identity does not match source provenance"
+            )
+        Observed["ActualRoutingIdentity"] = {
+            "RequestedStrategy": RequestedStrategy,
+            "UsedStrategy": UsedStrategy,
+            "FallbackUsed": FallbackUsed,
+            "PolicyIdentity": ActualPolicyIdentity,
+        }
+        Observed["RoutingIdentityChecks"].update({
+            "ActualArtifactPresent": True,
+            "ActualRequestedStrategyMatches": (
+                RequestedStrategy == ExpectedRoutingStrategy
+            ),
+            "ActualUsedStrategyMatches": (
+                UsedStrategy == ExpectedUsedRoutingStrategy
+            ),
+            "ActualFallbackDisabled": FallbackUsed is False,
+            "ActualPolicySnapshotMatches": (
+                ActualPolicyIdentity["Snapshot"] == ExpectedPolicySnapshot
+            ),
+            "ActualPolicyIdentityMatches": (
+                ActualPolicyIdentity.get("Sha256")
+                == PolicyProvenance.get("Sha256")
+            ),
+        })
 
         RouterReliability = ReadNested(PhysicalDocument, "RouterReliability")
         if not isinstance(RouterReliability, dict):
@@ -1831,12 +2596,8 @@ def EvaluateRun(
         }:
             Failures.append("successful router reliability verdict is missing")
 
-        PolicySeed = ReadNested(PhysicalDocument, "Policy", "Seed")
-        PolicyVersion = ReadNested(
-            PhysicalDocument,
-            "Policy",
-            "PolicyVersion",
-        )
+        PolicySeed = PhysicalPolicy.get("Seed")
+        PolicyVersion = PhysicalPolicy.get("PolicyVersion")
         if PolicyVersion != ExpectedPolicyVersion:
             Failures.append(
                 f"policy version is not {ExpectedPolicyVersion}"
@@ -2056,7 +2817,7 @@ def EvaluateRun(
                     f"could not measure emitted litematic composition: {Error}"
                 )
 
-        Observed = {
+        Observed.update({
             "ReportedRuntimeSeconds": PhysicalRuntime,
             "FabricValidationStatus": FabricValidation.get("Status"),
             "FabricValidationVectors": Diagnostics.get("TestedVectors"),
@@ -2067,6 +2828,7 @@ def EvaluateRun(
             "OverflowPeak": OverflowPeak,
             "PolicySeed": PolicySeed,
             "PolicyVersion": PolicyVersion,
+            "PolicyIdentity": ActualPolicyIdentity,
             "FabricValidationBackend": FabricValidationBackend,
             "Fingerprints": {
                 "Placement": PlacementFingerprint,
@@ -2077,7 +2839,7 @@ def EvaluateRun(
             "FabricFixtureSha256": FixtureSha256,
             "FootprintMetrics": FootprintMetrics,
             "LitematicComposition": LitematicComposition,
-        }
+        })
         if (
             isinstance(PlacementFingerprint, str)
             and PlacementFingerprint
@@ -2101,6 +2863,8 @@ def EvaluateRun(
                 "EmittedDesignSemantic": DesignDigest,
             }
             Evidence = {
+                "RoutingIdentity": Observed["ActualRoutingIdentity"],
+                "PolicyIdentity": ActualPolicyIdentity,
                 "PlacementFingerprint": PlacementFingerprint,
                 "CandidateFingerprint": CandidateFingerprint,
                 "ResourceGraphFingerprint": ResourceGraphFingerprint,
@@ -2119,11 +2883,28 @@ def EvaluateRun(
         RouterReliability if isinstance(RouterReliability, dict) else None
     )
 
+    ArtifactPathsForRecords = dict(Artifacts)
+    if FailureArtifactResolution.CandidatePath is not None:
+        ArtifactPathsForRecords["RoutingFailure"] = (
+            FailureArtifactResolution.CandidatePath
+        )
     ArtifactRecords = {
         Name: BuildFileRecord(PathValue)
-        for Name, PathValue in Artifacts.items()
+        for Name, PathValue in ArtifactPathsForRecords.items()
         if Name != "RunDirectory"
     }
+    if (
+        FailureArtifactResolution.CandidatePath is not None
+        and VerifiedRoutingFailure is not None
+    ):
+        ArtifactRecords["RoutingFailure"] = {
+            "Path": str(LexicalAbsolutePath(
+                FailureArtifactResolution.CandidatePath
+            )),
+            "Exists": True,
+            "SizeBytes": VerifiedRoutingFailure.SizeBytes,
+            "Sha256": VerifiedRoutingFailure.Sha256,
+        }
     Result = {
         "Accepted": not Failures,
         "Failures": Failures,
@@ -2436,7 +3217,10 @@ def BuildComparisonCompatibility(
             "Count": 1,
             "MeasurementIncluded": False,
         },
-        "RoutingStrategy": "default",
+        "RoutingStrategy": SourceProvenance.get(
+            "RequestedRoutingStrategy",
+            RoutingStrategy.Default.value,
+        ),
         "RoutingThreads": RequiredRegressionRoutingThreads,
         "PolicySeed": 0,
         "CanonicalArithmeticDigests": dict(
@@ -4238,6 +5022,16 @@ def RunAcceptance(
         "Status": "DRY_RUN" if Configuration.DryRun else "RUNNING",
         "Accepted": False,
         "ExecutionMode": "sequential",
+        "RoutingStrategy": Configuration.RequestedRoutingStrategy,
+        "RoutingIdentity": {
+            "ConfiguredRequestedStrategy": (
+                Configuration.RequestedRoutingStrategy
+            ),
+            "ExpectedUsedStrategy": SourceProvenance.get(
+                "ExpectedUsedRoutingStrategy"
+            ),
+            "PolicyIdentity": SourceProvenance.get("Policy"),
+        },
         "MatrixMode": Configuration.MatrixMode,
         "FailFast": False,
         "BaselineMode": Configuration.BaselineMode,
@@ -4510,6 +5304,9 @@ def RunAcceptance(
         Artifacts = BuildRunArtifacts(RunDirectory, RunName)
         RunDirectory.mkdir(parents=True, exist_ok=True)
         ClearPriorRunArtifacts(Artifacts)
+        PriorNestedRunDirectoryNames = CaptureNestedRunDirectoryNames(
+            Artifacts
+        )
         Command = list(Planned["Command"])
         StartedAtUtc = UtcNowProvider()
         try:
@@ -4537,6 +5334,22 @@ def RunAcceptance(
             Artifacts=Artifacts,
             ExpectedSeed=Configuration.ExpectedSeed,
             ExpectedPolicyVersion=Configuration.ExpectedPolicyVersion,
+            ExpectedRoutingStrategy=(
+                Configuration.RequestedRoutingStrategy
+            ),
+            ExpectedPolicyProvenance=(
+                SourceProvenance.get("Policy")
+                if isinstance(SourceProvenance.get("Policy"), dict)
+                else None
+            ),
+            ExpectedSourceRevision=(
+                str(SourceState["Revision"])
+                if isinstance(SourceState.get("Revision"), str)
+                else None
+            ),
+            DirectArtifactAbsentBeforeInvocation=True,
+            PriorNestedRunDirectoryNames=PriorNestedRunDirectoryNames,
+            ExpectedCommand=Command,
             DesignDigestBuilder=DesignDigestBuilder,
             LitematicCompositionEvidenceBuilder=(
                 LitematicCompositionEvidenceBuilder
@@ -4548,8 +5361,22 @@ def RunAcceptance(
             Case.NeedsExactInterfaceProof
             and Case.Name in ExtendedCaseNames
         ):
+            ExactInterfaceArtifacts = dict(Artifacts)
+            ResolvedFailurePath = ReadNested(
+                Evaluation,
+                "Observed",
+                "FailureArtifactResolution",
+                "Path",
+            )
+            ExactInterfaceArtifacts["RoutingFailure"] = (
+                Path(ResolvedFailurePath)
+                if isinstance(ResolvedFailurePath, str)
+                else RunDirectory / ".Unresolved.RoutingFailure.json"
+            )
             ExactInterfaceProofCheckpoint = (
-                EvaluateExactInterfaceProofCheckpoint(Artifacts)
+                EvaluateExactInterfaceProofCheckpoint(
+                    ExactInterfaceArtifacts
+                )
             )
             Evaluation[ExactInterfaceProofCheckpointField] = (
                 ExactInterfaceProofCheckpoint
@@ -5214,6 +6041,17 @@ def BuildParser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
+    Parser.add_argument(
+        "--routing-strategy",
+        dest="RequestedRoutingStrategy",
+        choices=tuple(Value.value for Value in RoutingStrategy),
+        default=RoutingStrategy.Default.value,
+        help=(
+            "explicit router request; default and "
+            "routing-aware-placement-access both select the nonfallback "
+            "v17 policy while retaining the requested alias in evidence"
+        ),
+    )
     BaselineModes = Parser.add_mutually_exclusive_group()
     BaselineModes.add_argument(
         "--capture-baseline",
@@ -5242,7 +6080,7 @@ def BuildParser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "required physical policy version (capture defaults to v15; "
-            "comparison defaults to v16)"
+            "comparison defaults to the selected current policy)"
         ),
     )
     Parser.add_argument(
@@ -5277,6 +6115,16 @@ def BuildParser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the complete sequential plan without launching the compiler",
     )
+    Parser.add_argument(
+        "--no-archive",
+        dest="ArchiveEnabled",
+        action="store_false",
+        default=True,
+        help=(
+            "run without creating the automatic timestamped, commit-stamped "
+            "benchmark archive"
+        ),
+    )
     return Parser
 
 
@@ -5293,6 +6141,48 @@ def GuidedArguments() -> list[str]:
     if Choice == "2":
         return []
     raise ValueError("choose 1 or 2")
+
+
+def _LoadIncompleteAcceptanceManifest(
+    Configuration: AcceptanceConfiguration,
+    *,
+    Status: str,
+    Failure: str,
+) -> dict[str, object]:
+    """Retain on-disk progress when an acceptance session exits unexpectedly."""
+    Manifest: dict[str, object] = {}
+    try:
+        Loaded = json.loads(
+            Configuration.ManifestPath.read_text(encoding="utf-8")
+        )
+        if isinstance(Loaded, dict):
+            Manifest = Loaded
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    Manifest.update({
+        "SchemaVersion": Manifest.get(
+            "SchemaVersion",
+            AcceptanceManifestSchemaVersion,
+        ),
+        "Status": Status,
+        "Accepted": False,
+        "CompletedAtUtc": UtcTimestamp(),
+        "RecoveryRoot": str(Configuration.RecoveryRoot),
+        "ManifestPath": str(Configuration.ManifestPath),
+        "ArchiveRecoveryFailure": Failure,
+    })
+    Manifest.setdefault(
+        "RoutingStrategy",
+        Configuration.RequestedRoutingStrategy,
+    )
+    Manifest.setdefault("MatrixMode", Configuration.MatrixMode)
+    Manifest.setdefault("BaselineMode", Configuration.BaselineMode)
+    Manifest.setdefault("Runs", [])
+    try:
+        WriteManifest(Configuration.ManifestPath, Manifest)
+    except OSError:
+        pass
+    return Manifest
 
 
 def Main(Arguments: list[str] | None = None) -> int:
@@ -5316,6 +6206,16 @@ def Main(Arguments: list[str] | None = None) -> int:
         if Parsed.CompareBaseline is not None
         else None
     )
+    RequestedRoutingStrategy = RoutingStrategy.Parse(
+        Parsed.RequestedRoutingStrategy
+    )
+    if (
+        BaselineMode is not None
+        and RequestedRoutingStrategy is not RoutingStrategy.Default
+    ):
+        raise SystemExit(
+            "baseline capture/compare requires --routing-strategy default"
+        )
     if (
         not isfinite(Parsed.CaptureTimeoutGraceSeconds)
         or Parsed.CaptureTimeoutGraceSeconds < 0.0
@@ -5394,18 +6294,50 @@ def Main(Arguments: list[str] | None = None) -> int:
             BaselinePolicyVersion
             if BaselineMode == "capture"
             else CurrentPolicyVersion
+            if BaselineMode == "compare"
+            else PolicyForRoutingStrategy(
+                RequestedRoutingStrategy
+            ).PolicyVersion
         )
     )
     RequiredModePolicyVersion = {
         "capture": BaselinePolicyVersion,
         "compare": CurrentPolicyVersion,
-        None: ExpectedPolicyVersion,
+        None: PolicyForRoutingStrategy(
+            RequestedRoutingStrategy
+        ).PolicyVersion,
     }[BaselineMode]
     if ExpectedPolicyVersion != RequiredModePolicyVersion:
+        PolicyOwner = (
+            f"{BaselineMode} mode"
+            if BaselineMode is not None
+            else f"{RequestedRoutingStrategy.value} strategy"
+        )
         raise SystemExit(
-            f"{BaselineMode} mode requires --expected-policy-version "
+            f"{PolicyOwner} requires --expected-policy-version "
             f"{RequiredModePolicyVersion}"
         )
+    ArchiveIdentity = None
+    ArchiveDirectory = None
+    if Parsed.ArchiveEnabled and not Parsed.DryRun:
+        try:
+            ArchiveIdentity = BuildBenchmarkArchiveIdentity(RepoRoot)
+            ArchiveDirectory = BuildBenchmarkArchiveDirectory(
+                OutputRoot,
+                Parsed.DateLabel,
+                ArchiveIdentity,
+            )
+            EnsureArchiveTargetAvailable(ArchiveDirectory)
+        except (OSError, RuntimeError, FileExistsError) as Error:
+            print("RESULT: FAILURE — Archiving: identity-failed")
+            print("TIME: wall=0.000s")
+            print(
+                "OUTPUT: Benchmark was not launched because a unique Git-"
+                f"stamped archive could not be reserved: {Error}"
+            )
+            if ArchiveDirectory is not None:
+                print(f"ARCHIVE: {ArchiveDirectory}")
+            return 1
     Configuration = AcceptanceConfiguration(
         RepositoryRoot=RepoRoot,
         OutputRoot=OutputRoot,
@@ -5413,6 +6345,7 @@ def Main(Arguments: list[str] | None = None) -> int:
         PythonExecutable=PythonExecutable,
         DryRun=Parsed.DryRun,
         RoutingThreads=RoutingThreads,
+        RequestedRoutingStrategy=RequestedRoutingStrategy.value,
         BaselineMode=BaselineMode,
         BaselinePath=BaselinePath,
         ExpectedPolicyVersion=ExpectedPolicyVersion,
@@ -5421,13 +6354,65 @@ def Main(Arguments: list[str] | None = None) -> int:
         ),
         MatrixMode=Parsed.MatrixMode,
         IncludeCla4=Parsed.IncludeCla4,
+        ArchiveSessionRoot=(
+            ArchiveDirectory
+            if ArchiveDirectory is not None and BaselineMode is None
+            else None
+        ),
     )
     SessionStartedAtUtc = UtcTimestamp()
+    ArchiveContext = (
+        BenchmarkArchiveContext(
+            Identity=ArchiveIdentity,
+            ArchiveDirectory=ArchiveDirectory,
+            SourceDirectory=Configuration.RecoveryRoot,
+            Command=(
+                sys.executable,
+                str(Path(__file__).resolve()),
+                *RawArguments,
+            ),
+            WorkingDirectory=RepoRoot,
+            MatrixMode=Configuration.MatrixMode,
+            RoutingThreads=Configuration.RoutingThreads,
+            BaselineMode=Configuration.BaselineMode,
+            StartedAtUtc=SessionStartedAtUtc,
+        )
+        if ArchiveIdentity is not None and ArchiveDirectory is not None
+        else None
+    )
     SessionStartedAt = monotonic()
     Capture = CaptureTerminalOutput()
+    ExecutionFailure: BaseException | None = None
+    Interrupted = False
     with Capture:
-        Manifest = RunAcceptance(Configuration)
+        try:
+            Manifest = RunAcceptance(Configuration)
+        except KeyboardInterrupt as Error:
+            ExecutionFailure = Error
+            Interrupted = True
+            print(
+                "Router acceptance interrupted; preserving partial evidence.",
+                file=sys.stderr,
+            )
+        except Exception as Error:
+            ExecutionFailure = Error
+            print(
+                "Router acceptance failed unexpectedly; preserving partial "
+                "evidence.",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
     SessionWallSeconds = monotonic() - SessionStartedAt
+    if ExecutionFailure is not None:
+        Manifest = _LoadIncompleteAcceptanceManifest(
+            Configuration,
+            Status="INTERRUPTED" if Interrupted else "PARTIAL",
+            Failure=(
+                "KeyboardInterrupt"
+                if Interrupted
+                else f"{type(ExecutionFailure).__name__}: {ExecutionFailure}"
+            ),
+        )
     Accepted = bool(Manifest.get("Accepted"))
     IsDryRun = Manifest.get("Status") == "DRY_RUN"
     Runs = Manifest.get("Runs", [])
@@ -5457,6 +6442,8 @@ def Main(Arguments: list[str] | None = None) -> int:
             f"{SkippedCount} skipped."
         )
     )
+    SessionReport = None
+    ReportingError: OSError | None = None
     try:
         SessionReport = WriteRunReport(
             RunDirectory=Configuration.RecoveryRoot,
@@ -5472,7 +6459,11 @@ def Main(Arguments: list[str] | None = None) -> int:
             Stdout=Capture.StdoutText,
             Stderr=Capture.StderrText,
             FailureType=(
-                None
+                "Acceptance: interrupted"
+                if Interrupted
+                else "Acceptance: unexpected-failure"
+                if ExecutionFailure is not None
+                else None
                 if Accepted or IsDryRun
                 else "Acceptance: session-failed"
             ),
@@ -5484,23 +6475,90 @@ def Main(Arguments: list[str] | None = None) -> int:
                 "FailedRuns": FailedCount,
                 "SkippedRuns": SkippedCount,
                 "Runs": CompletedRuns,
+                "UnexpectedFailure": (
+                    None
+                    if ExecutionFailure is None
+                    else f"{type(ExecutionFailure).__name__}: {ExecutionFailure}"
+                ),
             },
         )
     except OSError as Error:
+        ReportingError = Error
+
+    BenchmarkExitCode = (
+        130
+        if Interrupted
+        else 1
+        if ExecutionFailure is not None or ReportingError is not None
+        else 0
+        if IsDryRun or Accepted
+        else 1
+    )
+    ExitClassification = (
+        "interrupted"
+        if Interrupted
+        else "unexpected-harness-failure"
+        if ExecutionFailure is not None
+        else "reporting-failure"
+        if ReportingError is not None
+        else "dry-run"
+        if IsDryRun
+        else "passed"
+        if Accepted
+        else "benchmark-failed"
+    )
+    PublishedArchive = None
+    if ArchiveContext is not None:
+        PublicationStatus = (
+            "INTERRUPTED"
+            if Interrupted
+            else "PARTIAL"
+            if ExecutionFailure is not None or ReportingError is not None
+            else "SEALED"
+        )
+        PublicationFailure = (
+            f"Reporting: write-failed: {ReportingError}"
+            if ReportingError is not None
+            else f"{type(ExecutionFailure).__name__}: {ExecutionFailure}"
+            if ExecutionFailure is not None
+            else None
+        )
+        try:
+            PublishedArchive = PublishBenchmarkArchive(
+                ArchiveContext,
+                Manifest,
+                CompletedAtUtc=UtcTimestamp(),
+                WallSeconds=SessionWallSeconds,
+                ExitCode=BenchmarkExitCode,
+                ExitClassification=ExitClassification,
+                PublicationStatus=PublicationStatus,
+                PublicationFailure=PublicationFailure,
+            )
+        except Exception as Error:
+            print("RESULT: FAILURE — Archiving: write-failed")
+            print(f"TIME: wall={SessionWallSeconds:.3f}s")
+            print(
+                "OUTPUT: Benchmark evidence could not be sealed in its "
+                f"archive: {Error}"
+            )
+            print(f"ARCHIVE: {ArchiveContext.ArchiveDirectory}")
+            return 1
+
+    if ReportingError is not None:
         print("RESULT: FAILURE — Reporting: write-failed")
         print(f"TIME: wall={SessionWallSeconds:.3f}s")
         print(
             "OUTPUT: Acceptance finished, but its session report could not "
-            f"be saved: {Error}"
+            f"be saved: {ReportingError}"
         )
         print(f"RAW REPORT: {Configuration.RecoveryRoot / 'RawDump.txt'}")
-        return 1
-    print("\n".join(SessionReport.ResultLines))
+    elif SessionReport is not None:
+        print("\n".join(SessionReport.ResultLines))
     print(f"Acceptance manifest: {Configuration.ManifestPath}")
-    print(f"Acceptance status: {Manifest['Status']}")
-    if Configuration.DryRun:
-        return 0
-    return 0 if Manifest["Accepted"] else 1
+    print(f"Acceptance status: {Manifest.get('Status', 'UNKNOWN')}")
+    if PublishedArchive is not None:
+        print(f"ARCHIVE: {PublishedArchive}")
+    return BenchmarkExitCode
 
 
 if __name__ == "__main__":
