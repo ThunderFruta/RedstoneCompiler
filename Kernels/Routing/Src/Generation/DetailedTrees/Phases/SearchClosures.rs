@@ -12,6 +12,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
         $ForbiddenRepeaterPositions:ident,
         $DebugLabel:ident,
         $MaximumExpansionCount:ident,
+        $ExpansionAdmission:ident,
         $Deadline:ident,
         $BlockedNodes:ident,
         $AdditionalNodeCosts:ident,
@@ -145,6 +146,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
                     $ForbiddenRepeaterPositions,
                     TargetContinuation,
                     0,
+                    $ExpansionAdmission,
                     &$Deadline,
                 ) {
                     ConsumedExpansionCount = GeometryResult.$ExpansionCount;
@@ -261,6 +263,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
                 $ForbiddenRepeaterPositions,
                 TargetContinuation,
                 0,
+                $ExpansionAdmission,
                 &$Deadline,
             );
             if let Some(Value) = Result.as_mut() {
@@ -368,6 +371,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
                     $ForbiddenRepeaterPositions,
                     &[],
                     0,
+                    $ExpansionAdmission,
                     &$Deadline,
                 )
             };
@@ -482,6 +486,7 @@ macro_rules! BuildPreparedDetailedRouteClosures {
                     $ForbiddenRepeaterPositions,
                     &[],
                     0,
+                    $ExpansionAdmission,
                     &$Deadline,
                 );
                 Result

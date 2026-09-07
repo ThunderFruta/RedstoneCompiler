@@ -115,13 +115,13 @@ mod Tests {
     fn ForeignClaimKeepoutCoversExactBlockAndVerticalHeadroomConflicts() {
         let VerticalLower = (0, 0, 0);
         let VerticalUpper = (1, 1, 0);
-        let Context = RoutingContext {
-            Adjacency: HashMap::from([
+        let Context = RoutingContext::FromMaps(
+            HashMap::from([
                 (VerticalLower, vec![VerticalUpper]),
                 (VerticalUpper, vec![VerticalLower]),
             ]),
-            NodesByColumn: HashMap::new(),
-        };
+            HashMap::new(),
+        );
         let Claims = ExactSelectedWorldRouteClaims {
             Wire: HashSet::from([(4, 0, 0), VerticalUpper]),
             Support: HashSet::from([(5, 0, 0), VerticalUpper]),
@@ -142,10 +142,10 @@ mod Tests {
     fn LinearContext() -> RoutingContext {
         let A = (0, 0, 0);
         let B = (1, 0, 0);
-        RoutingContext {
-            Adjacency: HashMap::from([(A, vec![B]), (B, vec![A])]),
-            NodesByColumn: HashMap::from([((0, 0), vec![A]), ((1, 0), vec![B])]),
-        }
+        RoutingContext::FromMaps(
+            HashMap::from([(A, vec![B]), (B, vec![A])]),
+            HashMap::from([((0, 0), vec![A]), ((1, 0), vec![B])]),
+        )
     }
 
     #[test]
@@ -201,10 +201,10 @@ mod Tests {
         let A = (0, 0, 0);
         let B = (1, 0, 0);
         let C = (2, 0, 0);
-        let Context = RoutingContext {
-            Adjacency: HashMap::from([(A, vec![B]), (B, vec![A, C]), (C, vec![B])]),
-            NodesByColumn: HashMap::from([((0, 0), vec![A]), ((1, 0), vec![B]), ((2, 0), vec![C])]),
-        };
+        let Context = RoutingContext::FromMaps(
+            HashMap::from([(A, vec![B]), (B, vec![A, C]), (C, vec![B])]),
+            HashMap::from([((0, 0), vec![A]), ((1, 0), vec![B]), ((2, 0), vec![C])]),
+        );
         let Request = (
             vec![(0, 0), (1, 0), (2, 0)],
             0,
@@ -376,20 +376,20 @@ mod Tests {
         let B = (1, 0, 0);
         let C = (0, 0, 1);
         let D = (1, 0, 1);
-        let Context = RoutingContext {
-            Adjacency: HashMap::from([
+        let Context = RoutingContext::FromMaps(
+            HashMap::from([
                 (A, vec![B, C]),
                 (B, vec![A, D]),
                 (C, vec![A, D]),
                 (D, vec![B, C]),
             ]),
-            NodesByColumn: HashMap::from([
+            HashMap::from([
                 ((0, 0), vec![A]),
                 ((1, 0), vec![B]),
                 ((0, 1), vec![C]),
                 ((1, 1), vec![D]),
             ]),
-        };
+        );
         let AllowedColumns = vec![(0, 0), (1, 0), (0, 1), (1, 1)];
         let Result = GenerateRouteTreesNative(
             &Context,
@@ -463,15 +463,15 @@ mod Tests {
         let B = (1, 0, 0);
         let C = (0, 0, 1);
         let D = (1, 0, 1);
-        let Context = RoutingContext {
-            Adjacency: HashMap::from([
+        let Context = RoutingContext::FromMaps(
+            HashMap::from([
                 (A, vec![B, C]),
                 (B, vec![A, D]),
                 (C, vec![A, D]),
                 (D, vec![B, C]),
             ]),
-            NodesByColumn: HashMap::new(),
-        };
+            HashMap::new(),
+        );
         let Result = Context.GenerateRouteTreeClaimAwareDetailedNative(
             vec![A],
             vec![vec![D]],

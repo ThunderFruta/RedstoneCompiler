@@ -161,12 +161,41 @@ pub(in crate::Generation) fn EraseCanonicalRoutePathLoops(
     Result
 }
 
+pub(in crate::Generation) enum DeadlineAwareElectricalResult<T> {
+    Complete(T),
+    DeadlineExhausted,
+}
+
 pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithParents(
     Root: Position,
     Nodes: &HashSet<Position>,
     Repeaters: &HashMap<Position, String>,
     Adjacency: &HashMap<Position, Vec<Position>>,
 ) -> (HashMap<Position, u8>, HashMap<Position, Position>) {
+    match PropagateCanonicalRoutePowerWithParentsWithDeadline(
+        Root,
+        Nodes,
+        Repeaters,
+        Adjacency,
+        &RuntimeDeadline::Unlimited(),
+    ) {
+        DeadlineAwareElectricalResult::Complete(Result) => Result,
+        DeadlineAwareElectricalResult::DeadlineExhausted => {
+            unreachable!("an unlimited electrical validation deadline cannot expire")
+        }
+    }
+}
+
+fn PropagateCanonicalRoutePowerWithParentsWithDeadline(
+    Root: Position,
+    Nodes: &HashSet<Position>,
+    Repeaters: &HashMap<Position, String>,
+    Adjacency: &HashMap<Position, Vec<Position>>,
+    Deadline: &RuntimeDeadline,
+) -> DeadlineAwareElectricalResult<(HashMap<Position, u8>, HashMap<Position, Position>)> {
+    if Deadline.Check() {
+        return DeadlineAwareElectricalResult::DeadlineExhausted;
+    }
     let OutputDelta = |Facing: &str| match Facing {
         "west" => Some((1, 0, 0)),
         "east" => Some((-1, 0, 0)),
@@ -177,12 +206,27 @@ pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithParents(
     let mut Powers = HashMap::from([(Root, MAXIMUM_UNREFRESHED_DUST_LENGTH)]);
     let mut Parents = HashMap::new();
     let mut Pending = BinaryHeap::from([(MAXIMUM_UNREFRESHED_DUST_LENGTH, Root)]);
+    let mut Steps = 0usize;
+    macro_rules! ElectricalStep {
+        () => {
+            Steps = match Steps.checked_add(1) {
+                Some(Value) => Value,
+                None => return DeadlineAwareElectricalResult::DeadlineExhausted,
+            };
+            if Steps % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return DeadlineAwareElectricalResult::DeadlineExhausted;
+            }
+        };
+    }
     while let Some((Power, Current)) = Pending.pop() {
+        ElectricalStep!();
         if Powers.get(&Current).copied() != Some(Power) {
             continue;
         }
-        let Candidates = if let Some(Facing) = Repeaters.get(&Current) {
-            OutputDelta(Facing)
+        let mut Candidates = Vec::new();
+        if let Some(Facing) = Repeaters.get(&Current) {
+            ElectricalStep!();
+            if let Some(Value) = OutputDelta(Facing)
                 .map(|Delta| {
                     (
                         Current.0 + Delta.0,
@@ -191,38 +235,46 @@ pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithParents(
                     )
                 })
                 .filter(|Value| Nodes.contains(Value))
-                .filter(|Value| {
-                    Adjacency
-                        .get(&Current)
-                        .is_some_and(|Neighbors| Neighbors.contains(Value))
-                })
-                .map(|Value| (Value, MAXIMUM_UNREFRESHED_DUST_LENGTH))
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            Adjacency
-                .get(&Current)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|Value| Nodes.contains(Value))
-                .filter_map(|Neighbor| {
-                    if let Some(Facing) = Repeaters.get(&Neighbor) {
-                        let Delta = OutputDelta(Facing)?;
-                        let Input = (
-                            Neighbor.0 - Delta.0,
-                            Neighbor.1 - Delta.1,
-                            Neighbor.2 - Delta.2,
-                        );
-                        (Current == Input && Power > 0)
-                            .then_some((Neighbor, MAXIMUM_UNREFRESHED_DUST_LENGTH))
-                    } else {
-                        (Power > 1).then_some((Neighbor, Power - 1))
+            {
+                let mut Adjacent = false;
+                for Neighbor in Adjacency.get(&Current).into_iter().flatten() {
+                    ElectricalStep!();
+                    if *Neighbor == Value {
+                        Adjacent = true;
+                        break;
                     }
-                })
-                .collect::<Vec<_>>()
-        };
+                }
+                if Adjacent {
+                    Candidates.push((Value, MAXIMUM_UNREFRESHED_DUST_LENGTH));
+                }
+            }
+        } else {
+            for Neighbor in Adjacency.get(&Current).into_iter().flatten().copied() {
+                ElectricalStep!();
+                if !Nodes.contains(&Neighbor) {
+                    continue;
+                }
+                let Candidate = if let Some(Facing) = Repeaters.get(&Neighbor) {
+                    let Some(Delta) = OutputDelta(Facing) else {
+                        continue;
+                    };
+                    let Input = (
+                        Neighbor.0 - Delta.0,
+                        Neighbor.1 - Delta.1,
+                        Neighbor.2 - Delta.2,
+                    );
+                    (Current == Input && Power > 0)
+                        .then_some((Neighbor, MAXIMUM_UNREFRESHED_DUST_LENGTH))
+                } else {
+                    (Power > 1).then_some((Neighbor, Power - 1))
+                };
+                if let Some(Candidate) = Candidate {
+                    Candidates.push(Candidate);
+                }
+            }
+        }
         for (Neighbor, CandidatePower) in Candidates {
+            ElectricalStep!();
             if CandidatePower <= Powers.get(&Neighbor).copied().unwrap_or(0) {
                 continue;
             }
@@ -231,7 +283,11 @@ pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithParents(
             Pending.push((CandidatePower, Neighbor));
         }
     }
-    (Powers, Parents)
+    if Deadline.Check() {
+        DeadlineAwareElectricalResult::DeadlineExhausted
+    } else {
+        DeadlineAwareElectricalResult::Complete((Powers, Parents))
+    }
 }
 
 pub(in crate::Generation) fn PropagateCanonicalRoutePower(
@@ -243,11 +299,68 @@ pub(in crate::Generation) fn PropagateCanonicalRoutePower(
     PropagateCanonicalRoutePowerWithParents(Root, Nodes, Repeaters, Adjacency).0
 }
 
+pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithDeadline(
+    Root: Position,
+    Nodes: &HashSet<Position>,
+    Repeaters: &HashMap<Position, String>,
+    Adjacency: &HashMap<Position, Vec<Position>>,
+    Deadline: &RuntimeDeadline,
+) -> DeadlineAwareElectricalResult<HashMap<Position, u8>> {
+    match PropagateCanonicalRoutePowerWithParentsWithDeadline(
+        Root, Nodes, Repeaters, Adjacency, Deadline,
+    ) {
+        DeadlineAwareElectricalResult::Complete((Powers, _Parents)) => {
+            DeadlineAwareElectricalResult::Complete(Powers)
+        }
+        DeadlineAwareElectricalResult::DeadlineExhausted => {
+            DeadlineAwareElectricalResult::DeadlineExhausted
+        }
+    }
+}
+
 pub(in crate::Generation) fn FindSelfExcitingRepeaterCycles(
     Nodes: &HashSet<Position>,
     RepeaterValues: &[(Position, String)],
 ) -> Vec<(Position, Vec<Position>)> {
-    let Repeaters = RepeaterValues.iter().cloned().collect::<HashMap<_, _>>();
+    match FindSelfExcitingRepeaterCyclesWithDeadline(
+        Nodes,
+        RepeaterValues,
+        &RuntimeDeadline::Unlimited(),
+    ) {
+        DeadlineAwareElectricalResult::Complete(Result) => Result,
+        DeadlineAwareElectricalResult::DeadlineExhausted => {
+            unreachable!("an unlimited electrical validation deadline cannot expire")
+        }
+    }
+}
+
+pub(in crate::Generation) fn FindSelfExcitingRepeaterCyclesWithDeadline(
+    Nodes: &HashSet<Position>,
+    RepeaterValues: &[(Position, String)],
+    Deadline: &RuntimeDeadline,
+) -> DeadlineAwareElectricalResult<Vec<(Position, Vec<Position>)>> {
+    if Deadline.Check() {
+        return DeadlineAwareElectricalResult::DeadlineExhausted;
+    }
+    let mut Steps = 0usize;
+    macro_rules! ElectricalStep {
+        () => {
+            Steps = match Steps.checked_add(1) {
+                Some(Value) => Value,
+                None => return DeadlineAwareElectricalResult::DeadlineExhausted,
+            };
+            if Steps % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return DeadlineAwareElectricalResult::DeadlineExhausted;
+            }
+        };
+    }
+    let mut Repeaters = HashMap::with_capacity(RepeaterValues.len());
+    let mut OrderedRepeaters = std::collections::BTreeSet::new();
+    for Value in RepeaterValues.iter().cloned() {
+        ElectricalStep!();
+        Repeaters.insert(Value.0, Value.1.clone());
+        OrderedRepeaters.insert(Value);
+    }
     let OutputDelta = |Facing: &str| match Facing {
         "west" => Some((1, 0, 0)),
         "east" => Some((-1, 0, 0)),
@@ -255,46 +368,9 @@ pub(in crate::Generation) fn FindSelfExcitingRepeaterCycles(
         "south" => Some((0, 0, -1)),
         _ => None,
     };
-    let DirectedNeighbors = |Current: Position| {
-        if let Some(Facing) = Repeaters.get(&Current) {
-            return OutputDelta(Facing)
-                .map(|Delta| {
-                    (
-                        Current.0 + Delta.0,
-                        Current.1 + Delta.1,
-                        Current.2 + Delta.2,
-                    )
-                })
-                .filter(|Value| Nodes.contains(Value))
-                .into_iter()
-                .collect::<Vec<_>>();
-        }
-        let mut Values = RedstoneNeighborPositions(Current)
-            .into_iter()
-            .filter(|Value| Nodes.contains(Value))
-            .filter(|Neighbor| {
-                let Some(Facing) = Repeaters.get(Neighbor) else {
-                    return true;
-                };
-                let Some(Delta) = OutputDelta(Facing) else {
-                    return false;
-                };
-                Current
-                    == (
-                        Neighbor.0 - Delta.0,
-                        Neighbor.1 - Delta.1,
-                        Neighbor.2 - Delta.2,
-                    )
-            })
-            .collect::<Vec<_>>();
-        Values.sort_unstable();
-        Values
-    };
-
-    let mut OrderedRepeaters = RepeaterValues.to_vec();
-    OrderedRepeaters.sort_unstable();
     let mut Result = Vec::new();
     for (Repeater, Facing) in OrderedRepeaters {
+        ElectricalStep!();
         let Some(Delta) = OutputDelta(&Facing) else {
             continue;
         };
@@ -314,10 +390,52 @@ pub(in crate::Generation) fn FindSelfExcitingRepeaterCycles(
         let mut Pending = VecDeque::from([Output]);
         let mut Parent = HashMap::from([(Output, None::<Position>)]);
         while let Some(Current) = Pending.pop_front() {
+            ElectricalStep!();
             if Current == Input {
                 break;
             }
-            for Neighbor in DirectedNeighbors(Current) {
+            let mut DirectedNeighbors = Vec::new();
+            if let Some(Facing) = Repeaters.get(&Current) {
+                ElectricalStep!();
+                if let Some(Value) = OutputDelta(Facing)
+                    .map(|NeighborDelta| {
+                        (
+                            Current.0 + NeighborDelta.0,
+                            Current.1 + NeighborDelta.1,
+                            Current.2 + NeighborDelta.2,
+                        )
+                    })
+                    .filter(|Value| Nodes.contains(Value))
+                {
+                    DirectedNeighbors.push(Value);
+                }
+            } else {
+                for Neighbor in RedstoneNeighborPositions(Current) {
+                    ElectricalStep!();
+                    if !Nodes.contains(&Neighbor) {
+                        continue;
+                    }
+                    let Permitted = if let Some(Facing) = Repeaters.get(&Neighbor) {
+                        let Some(NeighborDelta) = OutputDelta(Facing) else {
+                            continue;
+                        };
+                        Current
+                            == (
+                                Neighbor.0 - NeighborDelta.0,
+                                Neighbor.1 - NeighborDelta.1,
+                                Neighbor.2 - NeighborDelta.2,
+                            )
+                    } else {
+                        true
+                    };
+                    if Permitted {
+                        DirectedNeighbors.push(Neighbor);
+                    }
+                }
+                DirectedNeighbors.sort_unstable();
+            }
+            for Neighbor in DirectedNeighbors {
+                ElectricalStep!();
                 if Neighbor == Repeater || Parent.contains_key(&Neighbor) {
                     continue;
                 }
@@ -328,15 +446,23 @@ pub(in crate::Generation) fn FindSelfExcitingRepeaterCycles(
         if !Parent.contains_key(&Input) {
             continue;
         }
-        let mut Cycle = vec![Repeater];
+        let mut Cycle = std::collections::BTreeSet::from([Repeater]);
         let mut Cursor = Some(Input);
         while let Some(Value) = Cursor {
-            Cycle.push(Value);
+            ElectricalStep!();
+            Cycle.insert(Value);
             Cursor = Parent[&Value];
         }
-        Cycle.sort_unstable();
-        Cycle.dedup();
-        Result.push((Repeater, Cycle));
+        let mut OrderedCycle = Vec::with_capacity(Cycle.len());
+        for Value in Cycle {
+            ElectricalStep!();
+            OrderedCycle.push(Value);
+        }
+        Result.push((Repeater, OrderedCycle));
     }
-    Result
+    if Deadline.Check() {
+        DeadlineAwareElectricalResult::DeadlineExhausted
+    } else {
+        DeadlineAwareElectricalResult::Complete(Result)
+    }
 }

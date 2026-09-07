@@ -50,6 +50,9 @@ documentation commit and have not been reviewed for admission.
 | `R10-N2-Placed-Template-Routing-States` | `Physical-Rules`; public placed-template state construction and graph semantics | Reviewed producer `86d1ee5f05684b7fc042d704c8b772847ecddd12`, parent `36413d442d989746d08a7b56c55c1018e7e6866f`, integrated as Router `e6dca965f2ee944120d57ea0c4db98acb56fcf2c` | Public routing-resource construction populates canonical transformed template states, including explicit air; routing-resource-graph-v3 and current-access validation retain state-sensitive identity | Ten exact producer blobs plus one Reuse compatibility test; 90 Physical, 16 Reuse with 42 subtests, 8 envelope, 7 structural; full 1,988 passed / 4 skipped / 378 subtests; seven MCHPRS fixture vectors passed | Declared placed-template coverage only. Joint local adoption is delivered by the next row; current-access envelope, full world coverage, reuse authority and combined acceptance remain open |
 | `R10-N2-Supported-Stair-Mchprs-Fixture` | `Physical-Rules`; declarative fixture, checker/observer regression and owner notes | Reviewed producer `61bd602acd3583f93cd23faa883aa034282712c4`, parent `86d1ee5f05684b7fc042d704c8b772847ecddd12`, integrated as Router `d1395ca31585f0803b6c838d7ec207f70200cb23` | Literal supported clear +X/+Y stair has exact static geometry and two fresh MCHPRS Boolean transfer observations; expected-answer mutation cannot alter checker or observer | Seven exact producer blobs; Router 40 source/contracts, 5 observer, 9 fixture vectors, 7 structural; full 1,992 passed / 4 skipped / 378 subtests on unchanged combined Router native | No production/API change. Only lower-root power is measured; upper analog power, blocked stair, general strength/timing/ownership, Fabric and full R10/N2 acceptance remain unproved |
 | `R10-N2-Blocked-Headroom-Fixture` | `Physical-Rules`; declarative fixture and observer provenance | Producer `73a8c653bc988799771b9adc524b1e8bb99920e6` plus correction `af4984b28025d45a53f82895f8ed55a71ef5f1bc`, integrated as Router `111de5b63c0cf29a9d4a6c851a4c14aa18acb9d4` | Literal all-stone blocked stair issues no route claim; aggregate Legal reflects the removed edge. Fresh Boolean/root observations are independent of expectations; native provenance is checked against actual imported bytes | Seven exact producer blobs; fresh Terra integration PASS; 42 source, 6 observer, 7 structural, 11 cases across 5 definitions; full 1,995 passed / 4 skipped / 378 subtests | Scoped fixture conformance only; no upper analog, general strength/timing, Fabric or full R10/N2 acceptance |
+| `R7-N1-Native-Batch-Outcomes` | `Runtime-And-Kernels`; native coarse/detailed outcome execution and proof/identity validation | Reviewed producer `cfd529e19d774e7bdf106b89628a54c8b8f3b6b4`, parent `24047bd495d73d8bb1d7613124bb13648bb0ba37`, integrated as Router `a354ed40ed532c277f227603cc05049d2d532b37` and as Joint source-only checkpoint `567f30a32a927e29309a9851aa1a8d9f0b8b48c6` | Additive v1 immutable request/receipt API; exact ordinal association, typed Found/request-scoped ProvenNoPath/Incomplete, native identities, shared route/proof expansion cap and original absolute cutoff | 22 producer-exact blobs and 2 Physical-observer-preserving facades; combined native rebuilt; 88 Rust and 1,887 Python tests passed, with 4 skips and 378 subtests; seven MCHPRS fixture vectors passed | Joint has the 24 native source paths; live identity binding and evidence emission remain separate; no persistent-worker, live-cancellation/shutdown, global infeasibility, physical acceptance or promotion claim |
+| `N1-N4-Runtime-Work-Authority-Contracts` | `Runtime-And-Kernels`; work/result contracts and cleanup authority policy | Policy `fbd7c81050bb2b54c03348adeee54695b59d4474` then contract `142c288cadcad448139db63b95c193424cf23d7a`; seven full blobs integrated as Router `691daa142b5cd30e348f6c87ee07479844061cbc` | Independent N1 state axes; immutable explicit useful-work and cleanup cutoffs, exact Boolean force grant; closed authority codec without defaults or ordering policy | Full imported module and tests independently reviewed; 52 contract tests, 7 structural/schema, full 1,939 passed / 4 skipped / 378 subtests on unchanged Router native | Source contracts only. Bounded/spawned adapters, actual authority propagation, process supervision and R6/R7/N4 lifecycle behavior remain separate; Joint native import does not include this Python closure |
+| `R6-N4-Owned-OneShot-Supervision` | `Runtime-And-Kernels`; explicit one-shot process and resource ownership | Producer `a264da03033120d54c05c375bbd28a0b57fdb154` plus test correction `880a1a359f5569c940eb218abeb8020c5c23bfc5`, integrated as Router `86ee2206ebd47458f541e745a7cd36c917192930` | Bounded encoded-byte transport, per-invocation result binding, explicit cancellation/force/reap/close and retained uncertain ownership; corrected test proves body entry and the same live child across the original cleanup cutoff | Exact two postimages; fresh independent Router review; single regression, 40 owning cases, 7 structural and full 2,060 passed / 5 skipped / 378 subtests; all observed resources closed without fallback | Linux/spawn supervision after Process.start only; startup bound, live caller, pools, persistent workers, full R6/N4 and physical acceptance remain open |
 | `R10-N2-DustStrength-Boundary-Fixtures` | `Physical-Rules`; literal at-limit and beyond-limit fixture conformance | Producer `3de1dbf9ee78c6ab9e84832422a7f385296aed98`, parent `af4984b28025d45a53f82895f8ed55a71ef5f1bc`; Router intake pending | F15 transfers Boolean on to the endpoint, F16 does not; both off transitions retain false, with independently observed root power | Ten exact owner paths; independent review and parent authentication passed; 44 source, 7 observer, 15 cases across 7 definitions; source-bound full 1,572 passed / 4 skipped / 257 subtests | Finite literal Boolean endpoint/root observations only; overlapping later full runs/JUnit are functional corroboration, with no performance or general physical/Fabric acceptance claim |
 
 Only code dependencies with actual recorded providers are asserted above. New
@@ -129,6 +132,79 @@ pass count. Protected `main` remains
 `193e2838050ee111245b5431484ad44112b26156`; no push or promotion occurred.
 Recovery uses a scoped revert of the Router integration, retaining source-bound
 evidence and both original producer commits.
+
+## 2026-09-07 bounded native batch outcomes integrated with the Physical observer
+
+Runtime producer `cfd529e19d774e7bdf106b89628a54c8b8f3b6b4`, parent
+`24047bd495d73d8bb1d7613124bb13648bb0ba37`, tree
+`b968e058a26bd20890fcacd7b1ba990ac4836d1a`, was integrated as Router
+`a354ed40ed532c277f227603cc05049d2d532b37`, parent
+`b6eccc778fb42677a23d437a19a5cbbda305e0f4`, tree
+`edd3248aeecfd28440e482d9f3c722f3d155f006`. Their merge base is
+`c0aaf5f00bbba7c0aefe6733c7d1150a3bb76a1d`. The canonical producer patch is
+`c737a5f35be89737e49535f501ca9b3ffbce9dbf667db9ffc81cd979cc3c32ae`;
+the reviewed ordered five-part patch is
+`ded71f4f14886b858899167f80f2ddf04f451e1fa58a0b74c2fc3e0b9ca4cf67`.
+The Router patch is
+`153753fa69a38114c0f44808a164bde886c18f5e4084711e7925a2c0e2546fc6`.
+All 24 intended paths were transferred. Twenty-two blobs are producer-exact;
+the Python bindings and stub carry the exact Runtime logical changes while
+preserving Physical's observation exports. Physical's observer implementation
+and module remain unchanged. At this integration boundary, the seven inherited Runtime authority/policy files
+were separate uncommitted owner work and were not imported by `a354ed4`.
+Their subsequent committed contract integration is recorded below.
+
+The additive `native-route-batch-outcomes/v1` coarse and detailed entrypoints
+accept an exact built-in batch string, immutable request tuple and one absolute
+monotonic cutoff. Receipts preserve original ordinal association and duplicate
+request IDs. `Found` is a validated native candidate with no commitment authority.
+`ProvenNoPath` requires a complete closed relaxed-connectivity proof for one exact
+admitted request/domain; it does not prove global placement infeasibility.
+`Incomplete` carries no candidate or proof. Native canonical JSON/digest pairs
+and explicit availability states preserve authentic completed work and prevent
+unavailable or contradictory evidence from acquiring claim authority.
+Route and proof share the exact `ExpandedSearchState` cap; other validation and
+identity work uses the same cutoff but is not an expansion unit. Cancellation
+is a captured pre-start request, not a live cancellation or shutdown protocol.
+Caller-echo strings remain supplied bindings which Joint must validate against
+its actual current objects.
+
+Independent Runtime source review and Joint's exact source-contract suitability
+decision passed. The latter is retained with SHA-256
+`71fad2b90a97de773f056b3b84a8b7ae2463b54432fbd811914b437e1c13591f`.
+Producer evidence includes 86 Rust tests, 78 native Python tests, 219 routing
+tests with 29 subtests, and an outcome-only scratch run of 86 Rust and 297 Python
+tests with 29 subtests. Its full 1,560-pass/4-skip/257-subtest result includes
+the seven protected inherited changes; full outcome-only scratch pytest was
+not run. These source-specific evidence scopes remain distinct.
+
+Router rebuilt the combined source using its resolved Cargo target directory.
+The release artifact and actual imported extension both have SHA-256
+`d1b5cbda5ede49428cebf47af342b6153aa3d862310317c38a4aaf212ad85d1f`.
+Both outcome entrypoints and `ObserveMchprsFixture`/`ValidateMchprsFixture` were
+verified. The Runtime-only `36c7d562` native remains separate producer evidence.
+All 16 Router commands passed: formatting/build, 88 Rust tests, 78 native outcome
+tests, 221 routing tests with 29 subtests, 44 observer tests with 5 subtests,
+8 existing envelope tests, 7 structural/schema tests, and 1,891 collected tests.
+The full deterministic suite passed 1,887 tests with 4 skips and 378 subtests
+in 176.11 seconds. Seven vectors across three fixtures passed fresh MCHPRS
+observations on the combined native. Fresh Terra/high integration review found
+no material finding, and source hashes remained unchanged throughout verification.
+
+Exact commands, raw output, full-suite XML, build inputs, native publication and
+import identities, fixture observations, review and clean commit receipt are
+retained in 91 sealed artifacts under
+`Output/PortfolioGoal/RuntimeOutcomesToRouter/Integration/`. This establishes
+the combined bounded native source contract. Joint's actual source consumption,
+current Physical binding/CommitRouting migration and deterministic success/failure
+receipt emission remain subsequent consumer work; Telemetry projection depends
+on that real emitted record. Each later consumer must retain its own exact
+source and rebuilt native identity, not reuse the Router hash as a constant.
+No full R6/N4 lifecycle, Joint routing capability, new seven-case acceptance
+matrix, live Fabric, scale, performance or promotion result is claimed.
+Protected `main` remains `193e2838050ee111245b5431484ad44112b26156`; no push
+occurred. Recovery uses a scoped integration revert followed by rebuild and
+import verification of the restored combined source.
 
 ## 2026-09-07 placed-template routing state producer integrated into Router
 
@@ -216,3 +292,53 @@ full R10/N2 acceptance remain outside the claim. All five coordinators received
 the immutable checkpoint. Recovery is a scoped local revert of `d1395ca3`;
 protected `main` remains `193e2838050ee111245b5431484ad44112b26156` with no push.
 
+## 2026-09-07 owned process supervision integrated
+
+Router `86ee2206ebd47458f541e745a7cd36c917192930`, parent
+`38b137faac34b6467628ad2fe9e7b6c7c158b968`, has tree
+`f956c12f00d935f404c2d843ead67dde7914affb`. Its two added paths are the exact
+production `OneShotProcess.py` from Runtime `a264da03` and the corrected owner
+test from `880a1a35`. The existing Runtime contract blob remained identical in
+both producers and Router; no contract reconciliation or caller migration was
+included. The canonical combined full-index patch SHA-256 is
+`0d7f4181ff2d74464e81fd4008e5bbb6d9d03d1d18d8e4ea6dd5526eed0ea9c5`.
+
+The first Router intake exposed a missing test precondition: readiness did not
+prove that the uncooperative operation entered before the 100 ms work deadline.
+That failed source-bound packet remains sealed separately. The test correction
+uses a flushed/fsynced operation-entry marker, exact PID/start liveness, an
+initial three-second work allowance and the original cleanup cutoff 0.15 seconds
+later. It never renews either cutoff and records actual facts before assertions.
+The production implementation remained unchanged through the test repair.
+
+Fresh independent integration review passed. All eight corrected Router commands
+returned zero: imports/compile/diff checks, seven structural/schema tests,
+collection of 2,065 tests, the single corrected regression, 40 owning cases, and
+the full suite of 2,060 passed, five skipped and 378 subtests in 213.46 seconds.
+Actual verification ran from 18:51:13.272066 to 18:55:06.125181 UTC. The regression,
+owning file and full suite retained 1/40/40 closed ownership witnesses with no
+fallback and clean final watchdog, script and GNU-time exits. Source, imported
+Router native and protected main remained unchanged during verification.
+
+The final ignored evidence root is
+`Output/PortfolioGoal/RuntimeOneShotIntegration-CleanupBreachCorrection`; its
+56-entry manifest SHA-256 is
+`5cd4cace9d58628fb97a4a8fa26a88dc88f27dafc9923183d70d1f74f3c10f99`.
+The preserved failed 50-entry packet under `RuntimeOneShotIntegration` has
+manifest SHA-256
+`d268ec2eaaf9d68760573213d9d4811c457e91c3d5c447df48367e3f3ed5cdc4`.
+The owner 120-second and Router 420-second watchdog limits identify separate
+verification runs; neither establishes a performance acceptance result.
+
+This delivers a standalone Linux/spawn supervision primitive after Process.start.
+It does not bound startup or integrate a live caller, pool, persistent scheduler,
+native cancellation, Fabric, scale or routed acceptance. Recovery is a scoped
+revert of `86ee2206`; protected main remains
+`193e2838050ee111245b5431484ad44112b26156`, with no push.
+
+The same milestone also authenticated Physical producer `3de1dbf9` at tree
+`819eb395df1406113b7c166fdd2d20f3d047c93f`; its ten fixture/test/note paths remain
+unconsumed by Router. Joint's six-path policy correction is frozen and its direct
+policy regressions passed independent review, but it is uncommitted and has a
+separate exact-cluster `MissingReadyPredecessor` handoff finding. Neither is
+silently included in this Runtime integration or treated as full acceptance.

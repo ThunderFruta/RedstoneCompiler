@@ -3,3 +3,4 @@
 pub(crate) mod Deadline;
 pub(crate) mod Models;
 pub(crate) mod Runtime;
+pub(crate) mod WorkAdmission;

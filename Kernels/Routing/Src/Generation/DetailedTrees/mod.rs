@@ -3,6 +3,7 @@ use crate::Core::Models::{
     PortalCandidate, Position, RouteTreeSearchResult, RoutingContext, SearchState,
 };
 use crate::Core::Runtime::RoutingThreadPool;
+use crate::Core::WorkAdmission::{ExpansionWorkPhase, RequestExpansionAdmissionV1};
 use crate::Path::PathRouting::{
     BuildPortalCandidate, FindPathFromStatesDetailedWithDeadline, FindPathWithDeadline,
     ManhattanDistance, NormalizeEdge, BLOCKED_EDGE_COST, MAXIMUM_UNREFRESHED_DUST_LENGTH,

@@ -12,6 +12,7 @@ macro_rules! RoutePreparedDetailedTargets {
         $ForbiddenRepeaterPositions:ident,
         $DebugLabel:ident,
         $MaximumExpansionCount:ident,
+        $ExpansionAdmission:ident,
         $Deadline:ident,
         $Failure:ident,
         $BlockedNodes:ident,
@@ -522,6 +523,7 @@ macro_rules! RoutePreparedDetailedTargets {
                             $ForbiddenRepeaterPositions,
                             &[],
                             0,
+                            $ExpansionAdmission,
                             &$Deadline,
                         ) else {
                             continue;

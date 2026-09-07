@@ -5,4 +5,4 @@ listed only when its scope and verification are known.
 
 | Commit | Date | Relationship to R7 |
 |---|---|---|
-| None attributed | — | No R7-specific commit has been recorded yet |
+| Runtime frontier `f083554` → `9f432cd` → `f5ffd47` | 2026-09-06 | Scoped boundary record only: immutable runtime documents, a synchronous Python adapter, Python-owned spawned admission, and child-exit normalization. No `Kernels/Routing` source or native interface changed, so this is not a direct R7 implementation or acceptance checkpoint. |
