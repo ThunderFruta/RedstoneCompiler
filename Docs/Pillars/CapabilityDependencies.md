@@ -89,6 +89,151 @@ consumer behavior, not full R2 capability or production acceptance. Its
 inherited provenance failure is historical checkpoint evidence and must not be
 attributed to the later Telemetry combination.
 
+## 2026-09-06 reviewed Telemetry-to-Joint checkpoint
+
+The reviewed and verified combined Joint checkpoint is merge commit
+`c6d6a81d5bbdf920a51b8a899748671d731cecea`, whose ordered parents are exact
+Joint-plus-Physical checkpoint `2902d1dab52ea5681bc9ecc531045ff5179d1165`
+and exact Telemetry revision
+`502cc8f6817f1f829afc1bab5368f78fb4a7069e`. Telemetry already contains the
+narrow Joint policy dependency `ce96cde0567d823aca6898fd8a6068f9b362397e`
+to `47be889a51e80a8d75a49606b0169914f800c87b`; this checkpoint does not create
+another Joint-to-Telemetry policy merge. Its thirteen reviewed paths match the
+frozen candidate manifest, whose binary patch SHA-256 is
+`69ccbb7975e4421e6d7abb1b491b14847568255c6a00c6c00325ccac678daff4`.
+
+The combined tooling retains the requested strategy alias, exact command alias,
+independently resolved used strategy, explicit nonfallback state, and complete
+canonical policy snapshot/version/seed/SHA-256 through source provenance,
+evaluation, archive publication, and routing-design snapshots. A bounded public
+fanout exercises both `default` and `routing-aware-placement-access`; both select
+the v17 policy without fallback while retaining distinct requested aliases.
+Failed Fabric or infrastructure verdicts remain failed and may still carry a
+complete, independently consistent routing receipt. Timeout, skipped, and
+planned runs keep actual and failure receipts unknown. Aggregate source/template
+identities, per-run receipts, end-source observations, and archive checksums are
+validated rather than inferred.
+
+The combined full non-scale suite passes 1,589 tests with 4 skips and 267
+subtests; collection finds 1,593 tests, and the structural/schema gate passes 7
+tests. The final-source retained real-fanout chain passes 3 tests. Independent
+review reran 12 tests with 4 subtests, closed all four findings, and confirmed
+that the committed content matches the frozen candidate. These results establish
+a locally committed, independently reviewed dependency checkpoint, not
+production acceptance. No live Fabric fixture, scale routing, full physical
+acceptance, Reuse merge, or promotion to `main` is claimed.
+
+## 2026-09-06 Joint-to-Router integration checkpoint
+
+The Router integration checkpoint is an ordinary no-fast-forward merge of exact
+combined Joint revision `c6d6a81d5bbdf920a51b8a899748671d731cecea`
+into exact Router parent
+`0c9cdb42a45e59811b757fddd4a4ef5b727e23d8`. Their merge base is
+`c0aaf5f00bbba7c0aefe6733c7d1150a3bb76a1d`. The integrated production and
+test blobs are byte-identical to the reviewed Joint checkpoint. The only code-
+tree differences from Joint are Router's four checked-in Gradle wrapper files;
+Router's worktree environment, `AGENTS.md`, setup documentation, and wrapper
+test/build instructions are also preserved. Related cleanup commits were
+reconciled by resulting behavior and stable patch identity rather than replayed
+or cherry-picked.
+
+The integrated policy keeps v17
+`physical-design-v17-routing-aware-placement-access` as the experimental
+default without fallback, while retaining the explicitly injected v16
+FullAdder control. It also retains the complete selected-access paths, current
+terminal/resource/technology identity checks, typed stale-input rejection, and
+the complete requested-command-used-policy-source-evaluator-archive evidence
+chain from the reviewed Joint checkpoint.
+
+On the Router combination, the affected fanout, stale-input, Telemetry,
+archive, harness, snapshot, pipeline-artifact, and local-first suite passes 231
+tests with 88 subtests. Compileall passes; the structural/schema gate passes 7
+tests; collection finds 1,593 tests; and the full non-scale suite passes 1,589
+tests with 4 skips and 267 subtests. Worktree setup verification passes 4 tests,
+and the checked-in Gradle 9.5.1 wrapper completes `test build` with Java 25.
+Evidence is retained under
+`Output/RouterIntegration/20260906T153846Z-PreCommitCandidate/`.
+
+This checkpoint is commit-ready development integration and preserves the
+bounded capabilities already proved on controlled consumers. It is not full
+physical-design acceptance or promotion-ready evidence: live Fabric fixture
+validation, scale routing, expanded acceptance, and production performance
+acceptance remain not-run.
+
+The independent Runtime checkpoint is
+`9f432cd2712745d2b749a5c089564844a5229368`, direct child of recorded Runtime
+revision `f083554ee5967e69540e6647ee543c8e92747141`. It remains unconsumed by this
+Joint-to-Router dependency chain and is tracked separately. Reuse remains
+deferred at `5cd445621d492e1b62fa72d63c3d021945edbc8a`, whose completed R1 history
+reconciliation at `0cbb17916fe3239adee04762c0fddd7cea3d2a4c` does not constitute
+R1/R5/N6 implementation. Protected `main` remains outside this operation at
+`193e2838050ee111245b5431484ad44112b26156`.
+
+## 2026-09-06 reviewed reporting and Runtime repairs
+
+The committed Telemetry-owned reporting repair is
+`b8c1d4f6f75c3a29a931aeeea4205951fe80a7e2`, whose sole parent is exact audited
+Joint checkpoint `c6d6a81d5bbdf920a51b8a899748671d731cecea`. The repair changes
+only archive and routing-snapshot reporting, their specification-first tests,
+and the R8/N5 records; `RunRouterAcceptance.py` retains its strict evaluator.
+
+Archive source-content stability is tri-state over two complete observations:
+missing, empty, incomplete, malformed, or wrongly typed content remains unknown;
+matching valid SHA-256 and file-count observations are stable; and a complete
+hash or count contradiction is unstable. Public routing-snapshot consistency
+requires exact boolean `false` no-fallback evidence for actual and typed-failure
+receipts, preserves applicable explicit evaluator rejections, and independently
+rejects raw-receipt contradictions even when an evaluator check claims success.
+
+The original specification cases failed against unchanged production source at
+`c6d6a81` with 14 failures and 3 passes, then passed after the production
+correction with 17 passes and 4 subtests. Independent review found that malformed
+newest provenance checks could still be skipped in favor of older valid content.
+The source-bound extension reproduced that gap with 5 failures and 3 controls
+passing, then passed all 9 newest-observation cases after correction. The
+corrected archive/harness/snapshot/real-chain set passed 149 tests and 83
+subtests, the structural/schema gate passed 7 tests, and the full deterministic
+non-scale suite passed 1,613 tests with 4 expected skips and 271 subtests.
+Evidence is retained under `Output/TelemetryReportingRepair/20260906T181331Z/`
+and `Output/TelemetryReportingRepair/20260906T183031Z-ReviewerCorrection/`.
+
+The reviewed Joint consumer checkpoint is merge commit
+`64efbe13c14c8c7445cba6dd6111256ce06f9a36`, whose ordered parents are exact
+audited Joint revision `c6d6a81d5bbdf920a51b8a899748671d731cecea` and exact
+Telemetry repair `b8c1d4f6f75c3a29a931aeeea4205951fe80a7e2`. Its imported
+source and test blobs are byte-identical to the reviewed Telemetry producer;
+the only Joint-side addition is the dependency-consumer record. The focused
+Joint set passed 192 tests with 92 subtests, the structural/schema gate passed
+7 tests, and collection found 1,617 tests. Joint evidence is retained under
+`Output/TelemetryRepairToJoint/20260906T184442Z-FrozenCandidate/`.
+
+The Router consumer prepares an explicit no-fast-forward merge of exact Joint
+checkpoint `64efbe13c14c8c7445cba6dd6111256ce06f9a36` into exact Router
+revision `ba21000cecea2d921e1f696c2cc8a58e5e9c20b1`. It retains the protected
+`main` checkout instructions, permanent Router integration worktree, checked-in
+Gradle wrapper, worktree setup, v17 default, v16 controls, and Physical/Joint
+contracts. Router source and test blobs remain byte-identical to the Joint
+producer. The focused eight-file consumer set passes 192 tests with 92 subtests,
+the structural/schema gate passes 7 tests, collection finds 1,617 tests, and the
+full non-scale suite passes 1,613 tests with 4 skips and 271 subtests. Worktree
+setup verification passes 4 tests, and the checked-in Gradle wrapper completes
+an incremental `test build` with all 7 actionable tasks up to date. Router
+evidence is retained under
+`Output/RouterRepairIntegration/20260906T185255Z-FrozenCandidate/`. Independent
+review remains required before a local integration commit.
+
+Runtime remains a separate, unconsumed checkpoint at
+`f5ffd47dd35071f6b1dab2e665e407c4d24d1ac2`, whose sole parent is
+`9f432cd2712745d2b749a5c089564844a5229368`. Its full non-scale suite passed
+1,455 tests with 4 skips and 257 subtests; retained evidence is under
+`Output/RuntimeAndKernels/N1-Bounded-Admission/20260906T181841Z-AuthorityCorrection/`
+and `Output/RuntimeAndKernels/N1-Bounded-Admission/20260906T184020Z-PostCommitReplay/`.
+No Runtime merge is implied by this record.
+
+These are bounded reporting and execution repairs, not production acceptance.
+Protected `main` remains unchanged, and the nine missing historical assignments
+remain `UNVERIFIED`.
+
 ## Capability checkpoints
 
 | ID / capability | Provider and primary code owner | Required checkpoint / relationship | Contract provided | Readiness and evidence | Remaining dependency or action |
@@ -99,6 +244,7 @@ attributed to the later Telemetry combination.
 | `R1-Shared-Prerequisites` | R1 `22d112f6aea02ab7b995b562230f971ab08119e2`; global routing, with shared contracts/policy prerequisites | Existing parallel history, not a new dependency stack on R2 | [R1 history](R/R1/CommitHistory.md) records prerequisite/supporting work, not completed R1 behavior | History reconciliation completed at `0cbb17916fe3239adee04762c0fddd7cea3d2a4c`; no R1/R5/N6 implementation claim | Keep Reuse consumer integration deferred until a concrete certified-salvage adapter and tested dependency checkpoint exist |
 | `R1-Exact-Current-Static-Geometry` | `Reuse-And-Salvage`; `BuildRoutingResources` and its fork consumer boundary | Reviewed producer `75a62f87d2df127c46c08ee27b892e59432fb735`, integrated by scoped cherry-pick as Router `4c9bfdb0e9119f5bbc88a36b6e663a4b960d9842` | Within one unchanged eager placement lineage, siblings share immutable `RoutingStaticGeometry` sets and the same current-lineage mutable resource graph; its private pure region/claim memoization is intentionally graph-owned and shared, while every other top-level field starts at its dataclass default and populated native/proof/portal/candidate/assignment/prepared state is not inherited | Independent nonempty public-template transform, frozen-wire, region/claim, and populated-state mutation-isolation coverage; observed current `WorkCheck` output is retained only as diagnostic evidence | Integrated conformance only; deferred expansion, quantitative copying reduction, cross-placement or topology reuse, R5, N6, physical acceptance, and promotion readiness remain unproved |
 | `R1-Portfolio-Oriented-Geometry` | `Reuse-And-Salvage`; Placement Engine cache, packed-cluster portfolio and conflict consumer | Reviewed producer `10fafc5c30cef12817e6bb81584be263a77bd6b8`, parent `75a62f87d2df127c46c08ee27b892e59432fb735`, integrated as Router `30dfda0dd95040c57eb18df14c46b1a8b724e75e`; consumes the public Physical producer/technology without changing them; patches `23537ac8` and `0aaed23b` are rejected history only | The complete deterministic macro/technology/schema value plus exact key/class/Size/full Blocks/state for every loaded template and exact loaded mapping/object generation bind every process-global portfolio key before lookup. Extra templates are permitted but never ignored. Cached and eager portfolio misses use identity-attesting current resolvers that bypass legacy transform-only geometry/exclusion/access LRUs; only attested results may publish. A true same-context global hit performs zero oriented work. The cached resolver stores four immutable relative masks and returns a strict non-semantic receipt | Source-bound reconvergent Joint controls cover in-place extra-template content, reversed-mode all-air NAND change without clearing global/helper LRUs, current eager/cached parity, current AccessLength failure, exact raw/state/index/objective/fingerprint/materialization/final validation, and restored zero-work hits; prior macro/template/schema/technology/recursive/receipt/full-domain evidence is reverified at `Output/ReuseBatch3/20260907T055754Z/` | Bounded reconstruction reuse only. No route/proof/ownership laziness, topology reuse, stale salvage, coordinator migration, wall-time/copy-volume claim, independent acceptance, or promotion readiness |
+| `R8-N5-Sealed-Acceptance-Snapshots` | `Telemetry-And-Acceptance`; archive publisher, acceptance runner and snapshot exporter | Reviewed producer `e274e79a2798513aafcd186976206816f19544cc`, integrated as Router `7c7b52b0107bd5e6d4e28af8fce37a9ec3bbacf0` | Snapshot V3 preserves legacy-four and expanded-seven profiles, exact sealed selected-failure authority, producer/exporter provenance and descriptor-bound artifact observations | Combined 1,787 passed / 4 skipped / 378 subtests; public seven-case snapshot replay preserves all 110 original archive members and verifies 6 output seal entries | Reporting/archive capability only; full lifecycle telemetry, a successful physical matrix and promotion remain open |
 | `R10-N2-Current-Selected-Access-Validation` | `Physical-Rules`; placement-access contract, catalog identity and live validator | Reviewed producer `36413d442d989746d08a7b56c55c1018e7e6866f`, parent `e8ff123128913ba1846b7f97f18b6d428e1f19ef`, integrated as Router `0918c179741707d0b9c52a728ee85a514d89abde`; state population extended by the next row | Immutable typed re-attestation of supplied current terminals, graph semantics, technology, frozen wires and selected witness/solve; resource-model-v2 includes canonical finite block states; drift cannot publish Verified | Exact seven producer blobs; 81 focused, 8 existing envelope replay, 7 structural/schema; full 1,809 passed / 4 skipped / 378 subtests; seven MCHPRS fixture vectors passed | Narrow supplied-graph consistency only. Joint envelope and local graph consumer migration, reuse authority and full acceptance remain separate |
 | `R10-N2-Placed-Template-Routing-States` | `Physical-Rules`; public placed-template state construction and graph semantics | Reviewed producer `86d1ee5f05684b7fc042d704c8b772847ecddd12`, parent `36413d442d989746d08a7b56c55c1018e7e6866f`, integrated as Router `e6dca965f2ee944120d57ea0c4db98acb56fcf2c` | Public routing-resource construction populates canonical transformed template states, including explicit air; routing-resource-graph-v3 and current-access validation retain state-sensitive identity | Ten exact producer blobs plus one Reuse compatibility test; 90 Physical, 16 Reuse with 42 subtests, 8 envelope, 7 structural; full 1,988 passed / 4 skipped / 378 subtests; seven MCHPRS fixture vectors passed | Declared placed-template coverage only. Joint local adoption is delivered by the next row; current-access envelope, full world coverage, reuse authority and combined acceptance remain open |
 | `R2-Current-Template-State-Local-Consumer` | `Joint-Physical-Design`; committed local routing resource construction | Joint `6fac0892f148cf4f4b0641cd72c3df775a0f62a4`, parent `567f30a32a927e29309a9851aa1a8d9f0b8b48c6`; local consumer integrated as Router `234b8dc65e65427a0147bd90ee727179e86e5e51` | Actual local routing uses public BuildRoutingResources with current placement, technology and work checks; transformed states, explicit air and frozen-wire effects reach its graph | Joint: 15 exact Physical prerequisites plus three owned paths, full 1,767 passed / 4 skipped / 271 subtests. Router: two exact code/test blobs plus preserving R2 note, 68 focused with 14 subtests, full 1,989 passed / 4 skipped / 378 subtests | Source and local state adoption only. Current envelope, Ready lifecycle, three-point revalidation, native caller/emission, reuse authority and combined acceptance remain separate |
@@ -255,6 +401,64 @@ pass count. Protected `main` remains
 Recovery uses a scoped revert of the Router integration, retaining source-bound
 evidence and both original producer commits.
 
+## 2026-09-07 static-geometry conformance and failure-accounting integrations
+
+Two exact reviewed producer commits were consumed sequentially in Router:
+
+| Capability | Producer and parent | Router integration and parent | Router tree |
+|---|---|---|---|
+| Nonempty static-geometry sharing conformance, R1 prerequisite | `75a62f87d2df127c46c08ee27b892e59432fb735`, parent `e4609e7f96a65a437ff33c04300f1111204e4081` | `4c9bfdb0e9119f5bbc88a36b6e663a4b960d9842`, parent `2ac045f106ddcf3abb2f53773c233f7ef0db4649` | `509cdd7fd7e80bc729122a4bf2a52e8b1bcdad56` |
+| Current-invocation failure accounting and CLA4 canary count, R8/N5 | `b048c8163f3ac6a3a8466a49a12c867dc19f7a79`, parent `7a1078bb555032df93c3deb018772f8db9899561` | `ffb7b19a896397d1127a21e14697790fede17e8f`, parent `4c9bfdb0e9119f5bbc88a36b6e663a4b960d9842` | `1a672d42e54989103ba0f5c55c6cc32b5d7de977` |
+
+The R1 integration changes exactly five files. The owning test and three R1
+documents are byte-identical to the producer. Its sole register conflict was
+resolved by preserving Router's completed reconciliation row and adding the
+reviewed geometry-sharing row. The integrated patch SHA-256 is
+`e14b024bae65985410a8034230d03408a51f162f5c637d67f0365044e923ecfe`.
+The producer's canonical committed patch is `0750287d...a372b`; its reviewed
+`c82c73d4...09844` packet differs only by two empty separators outside hunks,
+with identical file contents. Both identities remain in the retained receipts.
+Fresh Router verification passed 2 owning tests, 7 structural/schema tests,
+collection of 1,732 tests, and the full deterministic suite with 1,728 passed,
+4 skipped, and 271 subtests in 73.56 seconds. Independent integration review
+found no material scope, conflict-resolution, or evidence findings.
+
+The R8/N5 integration changes exactly eight files. All six code/test blobs are
+byte-identical to Telemetry; each of the two owning notes adds the reviewed
+40-line record without deleting Router history. The integrated patch SHA-256 is
+`d44be88b193438bc77c41e3b2ccf17420376b6ec6b934a57d09c7a779341caec`.
+Fresh combined Router verification passed 137 owning tests and 117 subtests,
+compileall, 7 structural/schema tests, collection of 1,743 tests, and the full
+deterministic suite with 1,739 passed, 4 skipped, and 305 subtests in 74.66
+seconds. Independent integration review found no material findings. Effective
+policy checking verifies the existing invocation deadline; it does not change
+routing policy or grant authority to merely retained rejected failure bytes.
+
+Exact commands, raw logs, source/patch identities, independent reviews,
+post-commit clean readbacks, and checksums are retained under
+`Output/PortfolioGoal/ReuseBatch2ToRouter/` and
+`Output/PortfolioGoal/TelemetryToRouter/`. Both contain `Commands.json`,
+`IntegratedCandidate.patch`, `Full.log`, `Full.xml`, `IndependentReview.json`,
+`CommitReceipt.json`, and `SHA256SUMS`. The imported and release native library
+remained unchanged at SHA-256
+`c5938ff83eadb6a814ecd430d24687687689db439025855a714855adfe099fc2`.
+Neither transfer changes native source; no Rust rebuild/release suite or live
+Fabric validation was run for these two transfers.
+
+Readiness is integrated conformance and reporting source contracts. The R1
+notes retain their frozen producer-candidate context; this entry records the
+later actual commits and consumer verification. Lazy physical expansion,
+measured copying reduction, cross-context reuse, and N6 salvage remain open.
+Telemetry's corrected producer matrix remains 0 passed / 7 failed / 0 skipped,
+with no detailed routing or backend case validation; this transfer does not
+claim a new combined acceptance matrix. Full R8 lifecycle, full N5 physical
+acceptance, and seven-case whole-manifest snapshot support remain unproved.
+The latter still has a separate historical four-case authority profile.
+
+Protected `main` remains `193e2838050ee111245b5431484ad44112b26156`; no push or
+promotion occurred. Recovery uses a scoped revert of the relevant integration
+commit while preserving producer commits and sealed evidence.
+
 ## 2026-09-07 state-aware stair and oriented-geometry integrations
 
 Two further reviewed producer checkpoints were consumed sequentially:
@@ -324,6 +528,145 @@ Protected `main` remains `193e2838050ee111245b5431484ad44112b26156`. No push or
 promotion occurred. Recovery uses a scoped revert of the relevant integration
 while preserving the original producers and their distinct sealed evidence.
 
+
+## 2026-09-07 sealed snapshot and artifact-read checkpoint integrated into Router
+
+Telemetry producer `e274e79a2798513aafcd186976206816f19544cc`, parent
+`b048c8163f3ac6a3a8466a49a12c867dc19f7a79`, tree
+`62d4d2b2b5170a542248dd85b3269c5afde9b76b`, was integrated as Router
+`7c7b52b0107bd5e6d4e28af8fce37a9ec3bbacf0`, parent
+`0415b5999f2783d0a400b388e89ed2d950e96a6d`, tree
+`948bff30cbc185a311406299bee6845b2e8c3aad`. Their merge base is
+`c6d6a81d5bbdf920a51b8a899748671d731cecea`. The producer patch SHA-256 is
+`4d4ad2ecf2ba7b329eb51a15afecc2c6b57e0b050e2d307375733914bdef23a8`;
+the integrated patch is
+`6beb3624b1cf93bfb8bbb13e1db5c81eb780e09d0a617f18fca6613ca7513d58`.
+All nine intended paths were transferred. Seven blobs are producer-identical;
+the R8/N5 notes apply the exact producer additions/removals while preserving
+Router history. No manual conflict resolution was needed.
+
+Snapshot V3 records the complete historical four-case or expanded seven-case
+profile as an exporter interpretation, preserves separate producer/exporter
+provenance, and accepts selected typed failures only from a verified sealed
+inventory with exact path, size and hash. Missing evidence stays unknown;
+downstream not-run requires a proved earlier failure. Descriptor observations
+supply the bytes used for validation, projection, copying and hashing.
+The source-root, pathname-reopen and staging-cleanup findings described in the
+preceding record are closed for this reviewed checkpoint. A rejected legacy
+mirror may retain its original private unsealed staging directory; it does not
+remove a replacement directory through the stale pathname.
+
+Fresh Router verification passed compilation, 161 owning tests with 148 subtests,
+20 artifact integration tests, 7 structural/schema tests and collection of 1,791
+tests. The full deterministic suite passed 1,787 tests with 4 skips and 378
+subtests in 173.33 seconds. Independent Terra/high integration review found no
+material compatibility findings. The producer's separate 1,648-pass full run is
+supported by original settled task records copied into an explicitly labeled
+reconstruction; that receipt is not presented as a contemporaneous log file or
+a later rerun of the original test session.
+
+The public Router CLI replay produced snapshot
+`20260907T081248Z-e95c942b15eb2e71`, with exact evidence SHA-256
+`6ff444b380c358e218a8b0b05ba0700ae68cb63d32b5ad9a939b0c8ab8e6c1fd`
+and portable semantic evidence SHA-256
+`e95c942b15eb2e71509b90ac609846261f7e2de7df7b200624a6b55c4f925d56`.
+All 110 original archive members and key hashes remained unchanged, and all six
+generated seal entries verified. The replay remains FAILED / Accepted=false:
+zero accepted, seven failed, seven selected failure artifacts with matching
+size/hash, and seven downstream not-run states. It records the historical
+`7a1078bb555032df93c3deb018772f8db9899561` producer separately from the actual
+`0415b59` plus staged-patch verification exporter. Current routing-source,
+build-input and native-extension mismatches are retained as historical-source
+differences, not suppressed or relabeled as acceptance success.
+
+Exact source identities, commands, raw logs, full-suite XML, review, replay
+inputs/verification, clean commit receipt and checksums are retained under
+`Output/PortfolioGoal/TelemetrySnapshotToRouter/Integration/`. The loaded native
+library remains `c5938ff83eadb6a814ecd430d24687687689db439025855a714855adfe099fc2`.
+No new acceptance matrix, native build, MCHPRS, live Fabric or performance run
+was performed. Full R8 lifecycle coverage and N5 physical acceptance remain
+open; bounded native batch receipts do not provide queued/stale/discarded/reaping
+lifecycle events. Protected `main` remains
+`193e2838050ee111245b5431484ad44112b26156`, with no push or promotion. Recovery
+uses a scoped revert of the Router integration while preserving producer and
+distinct historical evidence.
+
+## 2026-09-07 current-access receipt and snapshot owner documentation integrated
+
+Physical producer `36413d442d989746d08a7b56c55c1018e7e6866f`, parent
+`e8ff123128913ba1846b7f97f18b6d428e1f19ef`, tree
+`d4fe3eeca9ca419097b199e2f6bf0bd66eb09aa1`, was integrated as Router
+`0918c179741707d0b9c52a728ee85a514d89abde`, parent
+`ee4c588df065a011bb01b85b3b5fd40a307830be`, tree
+`f77a6ae93317f87ed08ff1ce37d6db1e8c70ac56`. All seven result blobs match
+the producer exactly; every preimage matches its Physical parent. The common
+producer/Router merge base is `1d9e8995d0fed2ed1afa6f2eb6b20524aa8a89ab`.
+The producer and integration patch SHA-256 is
+`b265938ba1cc3da2b1e76a0f960484f6acf6a02c0e414f4b1ab48041727c0d07`.
+
+`ValidateCurrentSelectedPlacementAccess` returns an immutable typed current-input
+receipt with `Verified`, `Mismatch` or `Unresolved` status and a typed reason.
+It owns a current observation and re-observes before publication. Resource-model
+schema `pin-access-resource-model-v2` includes complete canonical finite state
+entries from the supplied graph. Duplicate frozen-wire positions or custom
+mapping signal entries are rejected before normalization can collapse them;
+non-reattestable one-shot inputs and malformed states remain errors. Drift uses
+`CurrentInputChangedDuringValidation` and requires the actual final observation
+fingerprint. Validation performs zero access regeneration. Decoding a receipt
+checks its internal consistency and cannot replace a fresh validation call.
+
+Combined Router verification passed compilation, 81 focused tests, 8 existing
+public envelope replay tests, 7 structural/schema tests and collection of 1,813
+tests. The full deterministic suite passed 1,809 tests with 4 skips and 378
+subtests in 171.31 seconds. All eight planned commands exited successfully.
+Seven vectors across three declarative fixtures passed with fresh MCHPRS world
+and compiler observations on the existing native library
+`c5938ff83eadb6a814ecd430d24687687689db439025855a714855adfe099fc2`.
+This was a bounded fixture replay, not a native rebuild or a full routed-circuit
+matrix. The earlier stair table's fixture count is corrected to the same precise
+vector/definition distinction from its retained result manifest.
+
+Fresh independent Terra/high integration review found no material compatibility
+gap. Exact commands, raw logs, full-suite XML, source identities, fixture
+observations, review, clean commit receipt and 44 sealed artifacts are retained
+under `Output/PortfolioGoal/PhysicalCurrentAccessToRouter/Integration/`.
+This delivery supersedes the earlier proposed-current-access status only for the
+narrow supplied-graph contract. At that checkpoint, normal `BuildRoutingResources`
+and the separate `CommitRouting` local graph did not populate placed-template
+block states. The later placed-template integration below supersedes the global
+construction limitation only.
+An empty supplied mapping is observable current input, not evidence of complete
+placed-template or world-state coverage. The next Physical producer owns state
+population and an explicit graph semantic version; Joint must consume its public
+snapshot helper at the applicable global and local graph boundaries before
+claiming the planned routing-readiness envelope. Synthetic empty graph uses are
+distinct. No Joint ReadyForRouting, FrozenPhysicalPlacementContract, R5/N6 reuse
+authority, route feasibility or full physical acceptance is established here.
+
+Telemetry owner-documentation producer
+`86a651fc5a25d823866f26b8aeffb76498fb09e3`, parent
+`e274e79a2798513aafcd186976206816f19544cc`, tree
+`ce86891b1426f3aaf89a22f00dbf4f7831da2f7b`, was then integrated as Router
+`247fc510f43ab92d6d74b2309877bbd3fd37458b`, parent `0918c179`, tree
+`9c6978362924f6a96a563260a461f16b795a0eb8`. Its six Markdown files comprise
+the R8/N5 pillar pages, notes and commit histories. Four blobs are producer-exact;
+the two notes retain Router history with identical producer additions/removals.
+Producer patch `f74aea8f6994bee0fe84a32dae7dcb4961fd68ccfa8cbfa51145693e6a154c53`
+becomes integration patch
+`eca02f6cffcee9c64b5ad875236f2adbc92a6c8352614394d2351976547fc5c6`.
+The documentation records the exact `e274e79` to `7c7b52b` source integration and
+`ee4c588` register closure; prior `b8c1d4f` remains historical. Independent
+Terra/high factual review, exact scope/delta checks and post-commit readback
+passed. Nine sealed documentation-integration artifacts are retained under
+`Output/PortfolioGoal/TelemetryOwnerDocsToRouter/Integration/`. No source tests
+or backend runs were repeated for this Markdown-only transfer.
+
+The failed seven-case acceptance archive remains unchanged. These integrations
+do not establish full R8 lifecycle coverage, N5 physical acceptance, live Fabric,
+scale routing, performance improvement or promotion readiness. Protected `main`
+remains `193e2838050ee111245b5431484ad44112b26156`; no push occurred. Recovery
+uses a scoped revert of the relevant Router integration while preserving exact
+producer commits and their distinct source-bound evidence.
 
 ## 2026-09-07 bounded native batch outcomes integrated with the Physical observer
 

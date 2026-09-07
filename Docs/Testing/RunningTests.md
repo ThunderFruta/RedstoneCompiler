@@ -180,10 +180,31 @@ ceilings and require exact MCHPRS truth tables, the required Fabric canaries,
 zero conflicts/unresolved claims, no fallback, and stable repeated
 fingerprints.
 
-The acceptance harness defaults to `Output/Acceptance/<date>/`. Each executed
-circuit retains `Summary.txt`, `RawDump.txt`, `stdout.log`, and `stderr.log`;
-the dated directory also contains an overall report and
-`AcceptanceManifest.json`.
+Real ordinary acceptance runs use a fresh commit-stamped archive beneath
+`Output/Acceptance/<date>/Archives/<UTC timestamp>-<commit>[-dirty-<status hash>]/`.
+Each circuit retains `Summary.txt`, `RawDump.txt`, `stdout.log`, `stderr.log`,
+and its compiler-run artifacts. The archive root retains the session reports,
+`AcceptanceManifest.json`, `ArchiveManifest.json`, and `SHA256SUMS`.
+Passed, failed, partial, and interrupted outcomes remain distinct.
+
+The per-run snapshot surface retains `RunName`, status, acceptance, command
+strategy, configured identity, actual or typed-failure receipt, original
+identity checks, and an independently computed tri-state consistency result.
+`true` means a complete receipt agrees with the current request-to-used mapping
+and full policy identity; `false` means a claimed receipt is partial or
+contradictory; `null` means timeout, skipped, planned, or otherwise absent
+evidence did not establish an actual result.
+This per-run classification validates the identity recorded by that manifest.
+The separate `CurrentSelectedPolicyMatches` cross-check says whether the
+recorded policy also matches the policy selected by the checkout performing the
+snapshot; historical consistency does not imply current-policy equivalence.
+
+`--dry-run` writes a plan without creating an archive. Use `--no-archive` only
+for deliberately disposable execution. Historical capture/compare modes retain
+their fixed recovery paths and receive a separate archive mirror; their policy
+and interpreter checks are unchanged. See [benchmark archives](Benchmarks.md#immutable-benchmark-archives)
+for identity, collision, symlink, and checksum rules. Archive sealing does not
+turn a routing failure into acceptance.
 
 ## Evidence
 
