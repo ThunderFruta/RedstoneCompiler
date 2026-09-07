@@ -1,12 +1,14 @@
 //! Native route generation, batching, and factorized assignment.
 
 mod Api;
+mod BatchOutcomes;
 mod Batches;
 mod DetailedTrees;
 mod Factorized;
 mod SelectedWorldClaims;
 
 pub(crate) use Api::GenerateRouteTreesNative;
+pub(crate) use BatchOutcomes::*;
 pub(crate) use Batches::{
     GeneratePortalCandidateBatchesNative, GenerateRouteTreeClaimAwareDetailedBatchNative,
     GenerateRouteTreeDetailedBatchNative,

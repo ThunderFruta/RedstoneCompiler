@@ -2,6 +2,8 @@
 
 use crate::Core::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use pyo3::prelude::*;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -599,10 +601,55 @@ pub(crate) struct TemplateRoutingAssignmentResult {
     pub(crate) CompactMaskTelemetry: Vec<(String, usize)>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RoutingContextIdentityV1 {
+    pub(crate) CanonicalJson: Arc<str>,
+    pub(crate) Sha256: Arc<str>,
+}
+
 #[pyclass]
 pub(crate) struct RoutingContext {
     pub(crate) Adjacency: HashMap<Position, Vec<Position>>,
     pub(crate) NodesByColumn: HashMap<(i32, i32), Vec<Position>>,
+    pub(crate) AuthoritativeIdentityV1: Arc<RoutingContextIdentityV1>,
+}
+
+impl RoutingContext {
+    pub(crate) fn FromMaps(
+        Adjacency: HashMap<Position, Vec<Position>>,
+        NodesByColumn: HashMap<(i32, i32), Vec<Position>>,
+    ) -> Self {
+        let AuthoritativeIdentityV1 = Self::BuildAuthoritativeIdentityV1(&Adjacency);
+        Self {
+            Adjacency,
+            NodesByColumn,
+            AuthoritativeIdentityV1,
+        }
+    }
+
+    fn BuildAuthoritativeIdentityV1(
+        Adjacency: &HashMap<Position, Vec<Position>>,
+    ) -> Arc<RoutingContextIdentityV1> {
+        let Nodes: BTreeSet<_> = Adjacency.keys().copied().collect();
+        let mut Edges = BTreeSet::new();
+        for (First, Neighbors) in Adjacency {
+            for Second in Neighbors {
+                Edges.insert(if First <= Second {
+                    (*First, *Second)
+                } else {
+                    (*Second, *First)
+                });
+            }
+        }
+        let CanonicalJson =
+            serde_json::to_string(&json!(["native-route-context-v1", Nodes, Edges,]))
+                .expect("routing context JSON values are serializable");
+        let Sha256 = format!("{:x}", Sha256::digest(CanonicalJson.as_bytes()));
+        Arc::new(RoutingContextIdentityV1 {
+            CanonicalJson: Arc::from(CanonicalJson),
+            Sha256: Arc::from(Sha256),
+        })
+    }
 }
 
 #[cfg(test)]

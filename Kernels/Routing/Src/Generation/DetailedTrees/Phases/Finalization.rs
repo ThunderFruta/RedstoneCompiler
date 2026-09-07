@@ -9,6 +9,7 @@ macro_rules! FinalizePreparedDetailedRoute {
         $ForbiddenRepeaterPositions:ident,
         $DebugLabel:ident,
         $MaximumExpansionCount:ident,
+        $ExpansionAdmission:ident,
         $Deadline:ident,
         $Failure:ident,
         $Root:ident,
@@ -176,7 +177,20 @@ macro_rules! FinalizePreparedDetailedRoute {
                             continue;
                         }
                         for (Facing, OutputDelta) in FacingValues {
-                            if $Deadline.Check() || $ExpansionCount >= $MaximumExpansionCount {
+                            if $Deadline.Check()
+                                || $ExpansionCount >= $MaximumExpansionCount
+                            {
+                                return $Failure(
+                                    "NoPath",
+                                    "SearchLimitReached",
+                                    1,
+                                    1,
+                                    $ExpansionCount,
+                                );
+                            }
+                            if $ExpansionAdmission.is_some_and(|Admission| {
+                                !Admission.TryAdmitOne(ExpansionWorkPhase::Route)
+                            }) {
                                 return $Failure(
                                     "NoPath",
                                     "SearchLimitReached",

@@ -100,6 +100,7 @@ impl RoutingContext {
                 &ForbiddenRepeaterPositions,
                 DebugLabel,
                 SearchExpansionCount,
+                None,
                 Deadline,
             );
             TotalExpansions += Result.ExpansionCount;

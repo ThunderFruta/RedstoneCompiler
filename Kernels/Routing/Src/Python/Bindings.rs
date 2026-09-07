@@ -15,9 +15,12 @@ use crate::Escape::{
     SolveLayeredAccessGuideFactorCatalogWithDeadline,
 };
 use crate::Generation::{
+    BuildDeadlineFromPythonMonotonicCutoff, FinalizeRouteTreeBatchOutcomesV1,
     GenerateAndAssignRouteTreesFactorizedNative, GeneratePortalCandidateBatchesNative,
-    GenerateRouteTreeClaimAwareDetailedBatchNative, GenerateRouteTreeDetailedBatchNative,
-    GenerateRouteTreesFactorizedNative, GenerateRouteTreesNative,
+    GenerateRouteTreeBatchOutcomesNativeV1, GenerateRouteTreeClaimAwareDetailedBatchNative,
+    GenerateRouteTreeDetailedBatchNative, GenerateRouteTreesFactorizedNative,
+    GenerateRouteTreesNative, RegisterBatchOutcomeTypes, RetainedBatchIdentityV1,
+    RouteTreeBatchOutcomesV1, RouteTreeCoarseRequestV1, RouteTreeDetailedRequestV1,
 };
 use crate::Geometry::ExteriorConnectors::{
     BuildFabricSubtreesBatchWithTelemetry, SearchExteriorConnectorsBatchWithTelemetry,
@@ -41,6 +44,7 @@ use crate::Planning::LeasePlanning::{
     LeaseCandidate, LeaseDomain, LeaseSolveStatus, SolveLeaseDomainsWithDeadline,
 };
 use pyo3::prelude::*;
+use pyo3::types::{PyString, PyTuple};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
@@ -267,6 +271,7 @@ fn ExtractTemplateAssignmentDomainsWithDeadline(
 }
 
 pub(crate) fn Register(Module: &Bound<'_, PyModule>) -> PyResult<()> {
+    RegisterBatchOutcomeTypes(Module)?;
     Module.add_class::<RoutingContext>()?;
     Module.add_class::<PortalCandidate>()?;
     Module.add_class::<PortalCandidateBatchResult>()?;
@@ -695,10 +700,7 @@ impl RoutingContext {
         for Values in NodesByColumn.values_mut() {
             Values.sort_unstable();
         }
-        Ok(Self {
-            Adjacency,
-            NodesByColumn,
-        })
+        Ok(Self::FromMaps(Adjacency, NodesByColumn))
     }
 
     fn AddRegion(
@@ -706,33 +708,36 @@ impl RoutingContext {
         NodeValues: Vec<Position>,
         EdgeValues: Vec<Edge>,
     ) -> PyResult<(usize, usize)> {
+        let mut Adjacency = self.Adjacency.clone();
+        let mut NodesByColumn = self.NodesByColumn.clone();
         for PositionValue in NodeValues {
-            if self.Adjacency.contains_key(&PositionValue) {
+            if Adjacency.contains_key(&PositionValue) {
                 continue;
             }
-            self.Adjacency.insert(PositionValue, Vec::new());
-            self.NodesByColumn
+            Adjacency.insert(PositionValue, Vec::new());
+            NodesByColumn
                 .entry((PositionValue.0, PositionValue.2))
                 .or_default()
                 .push(PositionValue);
         }
-        for Values in self.NodesByColumn.values_mut() {
+        for Values in NodesByColumn.values_mut() {
             Values.sort_unstable();
             Values.dedup();
         }
         for (First, Second) in EdgeValues {
-            if !self.Adjacency.contains_key(&First) || !self.Adjacency.contains_key(&Second) {
+            if !Adjacency.contains_key(&First) || !Adjacency.contains_key(&Second) {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "resource graph edge references a missing node",
                 ));
             }
-            self.Adjacency.get_mut(&First).unwrap().push(Second);
-            self.Adjacency.get_mut(&Second).unwrap().push(First);
+            Adjacency.get_mut(&First).unwrap().push(Second);
+            Adjacency.get_mut(&Second).unwrap().push(First);
         }
-        for Values in self.Adjacency.values_mut() {
+        for Values in Adjacency.values_mut() {
             Values.sort_unstable();
             Values.dedup();
         }
+        *self = Self::FromMaps(Adjacency, NodesByColumn);
         Ok((self.NodeCount(), self.EdgeCount()))
     }
 
@@ -1013,6 +1018,100 @@ impl RoutingContext {
     ) -> RouteTreeDetailedBatchResult {
         PythonValue.allow_threads(|| {
             GenerateRouteTreeDetailedBatchNative(self, Requests, MaximumRuntimeMilliseconds)
+        })
+    }
+
+    /// Returns one versioned authoritative receipt for every original coarse
+    /// request. `DeadlineAtMonotonicSeconds` is an absolute caller-clock cutoff.
+    #[pyo3(signature=(BatchIdentity, Requests, DeadlineAtMonotonicSeconds))]
+    fn GenerateRouteTreesBatchOutcomesV1(
+        &self,
+        PythonValue: Python<'_>,
+        BatchIdentity: Py<PyString>,
+        Requests: Py<PyTuple>,
+        DeadlineAtMonotonicSeconds: f64,
+    ) -> PyResult<RouteTreeBatchOutcomesV1> {
+        let (Deadline, NativeSample, BoundarySample, RemainingNanoseconds) =
+            BuildDeadlineFromPythonMonotonicCutoff(PythonValue, DeadlineAtMonotonicSeconds)?;
+        let BatchIdentity =
+            RetainedBatchIdentityV1::FromPython(PythonValue, BatchIdentity, &Deadline)?;
+        if !Requests.bind(PythonValue).is_exact_instance_of::<PyTuple>() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "authoritative requests must be an exact immutable tuple",
+            ));
+        }
+        let RequestList = Requests.bind(PythonValue);
+        let mut SealedRequests = Vec::with_capacity(RequestList.len());
+        for (Index, Request) in RequestList.iter().enumerate() {
+            if Index > 0 && Index % DEADLINE_CHECK_INTERVAL == 0 {
+                Deadline.Check();
+            }
+            SealedRequests.push(
+                Request
+                    .extract::<Py<RouteTreeCoarseRequestV1>>()?
+                    .borrow(PythonValue)
+                    .AuthoritativeRequest(),
+            );
+        }
+        PythonValue.allow_threads(|| {
+            let Pending = GenerateRouteTreeBatchOutcomesNativeV1(
+                self,
+                BatchIdentity,
+                SealedRequests,
+                DeadlineAtMonotonicSeconds,
+                BoundarySample,
+                RemainingNanoseconds,
+                Deadline,
+                NativeSample,
+            );
+            FinalizeRouteTreeBatchOutcomesV1(Pending, self)
+        })
+    }
+
+    /// Returns one versioned authoritative receipt for every original detailed
+    /// request. `DeadlineAtMonotonicSeconds` is an absolute caller-clock cutoff.
+    #[pyo3(signature=(BatchIdentity, Requests, DeadlineAtMonotonicSeconds))]
+    fn GenerateRouteTreeDetailedBatchOutcomesV1(
+        &self,
+        PythonValue: Python<'_>,
+        BatchIdentity: Py<PyString>,
+        Requests: Py<PyTuple>,
+        DeadlineAtMonotonicSeconds: f64,
+    ) -> PyResult<RouteTreeBatchOutcomesV1> {
+        let (Deadline, NativeSample, BoundarySample, RemainingNanoseconds) =
+            BuildDeadlineFromPythonMonotonicCutoff(PythonValue, DeadlineAtMonotonicSeconds)?;
+        let BatchIdentity =
+            RetainedBatchIdentityV1::FromPython(PythonValue, BatchIdentity, &Deadline)?;
+        if !Requests.bind(PythonValue).is_exact_instance_of::<PyTuple>() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "authoritative requests must be an exact immutable tuple",
+            ));
+        }
+        let RequestList = Requests.bind(PythonValue);
+        let mut SealedRequests = Vec::with_capacity(RequestList.len());
+        for (Index, Request) in RequestList.iter().enumerate() {
+            if Index > 0 && Index % DEADLINE_CHECK_INTERVAL == 0 {
+                Deadline.Check();
+            }
+            SealedRequests.push(
+                Request
+                    .extract::<Py<RouteTreeDetailedRequestV1>>()?
+                    .borrow(PythonValue)
+                    .AuthoritativeRequest(),
+            );
+        }
+        PythonValue.allow_threads(|| {
+            let Pending = GenerateRouteTreeBatchOutcomesNativeV1(
+                self,
+                BatchIdentity,
+                SealedRequests,
+                DeadlineAtMonotonicSeconds,
+                BoundarySample,
+                RemainingNanoseconds,
+                Deadline,
+                NativeSample,
+            );
+            FinalizeRouteTreeBatchOutcomesV1(Pending, self)
         })
     }
 

@@ -57,23 +57,69 @@ impl RoutingContext {
         MaximumExpansionCount: usize,
         Deadline: &RuntimeDeadline,
     ) -> RouteTreeSearchResult {
-        let Some(Guide) = self.PrepareDetailedRouteGuide(
+        self.GenerateRouteTreeDetailedWithAdmissionNative(
+            &Starts,
+            &TargetBranches,
             &AllowedNodeValues,
+            &BlockedNodeValues,
             &PreferredColumns,
             &ExternalNodeCostValues,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            EnforceSignalStrength,
+            MaximumExpansionCount,
+            None,
+            Deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::Generation) fn GenerateRouteTreeDetailedWithAdmissionNative(
+        &self,
+        Starts: &[Position],
+        TargetBranches: &[Vec<Position>],
+        AllowedNodeValues: &[Position],
+        BlockedNodeValues: &[Position],
+        PreferredColumns: &[(i32, i32)],
+        ExternalNodeCostValues: &[(Position, i32)],
+        PreferredRoutingY: i32,
+        GuidePenalty: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        EnforceSignalStrength: bool,
+        MaximumExpansionCount: usize,
+        ExpansionAdmission: Option<&RequestExpansionAdmissionV1>,
+        Deadline: &RuntimeDeadline,
+    ) -> RouteTreeSearchResult {
+        let Some(Guide) = self.PrepareDetailedRouteGuide(
+            AllowedNodeValues,
+            PreferredColumns,
+            ExternalNodeCostValues,
             GuidePenalty,
             Deadline,
         ) else {
             return DetailedRouteTreeBudgetExpiredResult();
         };
+        let mut BaseBlockedNodes = HashSet::with_capacity(BlockedNodeValues.len());
+        for (Index, PositionValue) in BlockedNodeValues.iter().copied().enumerate() {
+            if Index > 0 && Index % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {
+                return DetailedRouteTreeBudgetExpiredResult();
+            }
+            BaseBlockedNodes.insert(PositionValue);
+        }
+        if Deadline.Check() {
+            return DetailedRouteTreeBudgetExpiredResult();
+        }
         self.GenerateRouteTreeDetailedPreparedWithDeadlineNative(
-            &Starts,
-            &TargetBranches,
-            &TargetBranches,
+            Starts,
+            TargetBranches,
+            TargetBranches,
             &Guide,
             &HashSet::new(),
             &HashSet::new(),
-            &BlockedNodeValues.into_iter().collect(),
+            &BaseBlockedNodes,
             PreferredRoutingY,
             BendPenalty,
             ViaPenalty,
@@ -82,6 +128,7 @@ impl RoutingContext {
             &HashSet::new(),
             "",
             MaximumExpansionCount,
+            ExpansionAdmission,
             Deadline,
         )
     }
@@ -104,6 +151,7 @@ impl RoutingContext {
         ForbiddenRepeaterPositions: &HashSet<Position>,
         DebugLabel: &str,
         MaximumExpansionCount: usize,
+        ExpansionAdmission: Option<&RequestExpansionAdmissionV1>,
         Deadline: &RuntimeDeadline,
     ) -> RouteTreeSearchResult {
         InitializePreparedDetailedRouteSearch!(
@@ -146,6 +194,7 @@ impl RoutingContext {
             ForbiddenRepeaterPositions,
             DebugLabel,
             MaximumExpansionCount,
+            ExpansionAdmission,
             Deadline,
             BlockedNodes,
             AdditionalNodeCosts,
@@ -202,6 +251,7 @@ impl RoutingContext {
             ForbiddenRepeaterPositions,
             DebugLabel,
             MaximumExpansionCount,
+            ExpansionAdmission,
             Deadline,
             Failure,
             BlockedNodes,
@@ -232,6 +282,7 @@ impl RoutingContext {
             ForbiddenRepeaterPositions,
             DebugLabel,
             MaximumExpansionCount,
+            ExpansionAdmission,
             Deadline,
             Failure,
             BlockedNodes,
@@ -256,6 +307,7 @@ impl RoutingContext {
             ForbiddenRepeaterPositions,
             DebugLabel,
             MaximumExpansionCount,
+            ExpansionAdmission,
             Deadline,
             Failure,
             Root,

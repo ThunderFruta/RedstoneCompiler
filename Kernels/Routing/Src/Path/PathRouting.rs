@@ -2,6 +2,7 @@
 
 use crate::Core::Deadline::{RuntimeDeadline, DEADLINE_CHECK_INTERVAL};
 use crate::Core::Models::{Direction, Edge, PortalCandidate, Position, SearchState};
+use crate::Core::WorkAdmission::{ExpansionWorkPhase, RequestExpansionAdmissionV1};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
@@ -287,6 +288,7 @@ pub(crate) fn FindPathDetailedWithDeadline(
         &HashSet::new(),
         &[],
         0,
+        None,
         Deadline,
     )
 }
@@ -361,6 +363,7 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
     ForbiddenRepeaterPositions: &HashSet<Position>,
     TargetContinuation: &[Position],
     RejectedCountHint: usize,
+    ExpansionAdmission: Option<&RequestExpansionAdmissionV1>,
     Deadline: &RuntimeDeadline,
 ) -> Option<PathSearchResult> {
     let Failure = |Status: &str,
@@ -483,15 +486,30 @@ pub(crate) fn FindPathFromStatesDetailedWithDeadline(
         if Costs.get(&CurrentState).copied() != Some(Item.Cost) {
             continue;
         }
-        Expanded += 1;
-        if Expanded >= MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS) {
-            return Some(Failure(
-                "NoPath",
-                "SearchLimitReached",
-                RepeaterRejectedCount,
-                RepeaterConstraintFailures,
-                Expanded,
-            ));
+        if let Some(Admission) = ExpansionAdmission {
+            if Expanded >= MaximumExpansionCount.min(MAXIMUM_EXPANSIONS)
+                || !Admission.TryAdmitOne(ExpansionWorkPhase::Route)
+            {
+                return Some(Failure(
+                    "NoPath",
+                    "SearchLimitReached",
+                    RepeaterRejectedCount,
+                    RepeaterConstraintFailures,
+                    Expanded,
+                ));
+            }
+            Expanded += 1;
+        } else {
+            Expanded += 1;
+            if Expanded >= MaximumExpansionCount.clamp(1, MAXIMUM_EXPANSIONS) {
+                return Some(Failure(
+                    "NoPath",
+                    "SearchLimitReached",
+                    RepeaterRejectedCount,
+                    RepeaterConstraintFailures,
+                    Expanded,
+                ));
+            }
         }
         if Current == Target {
             let Some(TargetContinuationRepeaters) = BuildTargetContinuationRepeaterReservations(
@@ -779,4 +797,66 @@ pub(crate) fn FindPath(
         false,
         &RuntimeDeadline::Unlimited(),
     )
+}
+
+#[cfg(test)]
+mod Tests {
+    use super::*;
+
+    fn LinearAdjacency() -> HashMap<Position, Vec<Position>> {
+        HashMap::from([
+            ((0, 0, 0), vec![(1, 0, 0)]),
+            ((1, 0, 0), vec![(0, 0, 0), (2, 0, 0)]),
+            ((2, 0, 0), vec![(1, 0, 0)]),
+        ])
+    }
+
+    fn StrictSearch(
+        LocalMaximum: usize,
+        Admission: &RequestExpansionAdmissionV1,
+    ) -> PathSearchResult {
+        FindPathFromStatesDetailedWithDeadline(
+            &LinearAdjacency(),
+            None,
+            None,
+            &[((0, 0, 0), (0, 0, 0), MAXIMUM_UNREFRESHED_DUST_LENGTH)],
+            (2, 0, 0),
+            0,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0,
+            0,
+            0,
+            LocalMaximum,
+            false,
+            &HashSet::new(),
+            &[],
+            0,
+            Some(Admission),
+            &RuntimeDeadline::Unlimited(),
+        )
+        .expect("the bounded path search returns a typed result")
+    }
+
+    #[test]
+    fn StrictLocalZeroDoesNotWidenToOneExpansion() {
+        let Admission = RequestExpansionAdmissionV1::New(4);
+        let Result = StrictSearch(0, &Admission);
+        assert_eq!(Result.NoPathReason, "SearchLimitReached");
+        assert_eq!(Result.ExpansionCount, 0);
+        assert_eq!(Admission.TotalCount(), 0);
+    }
+
+    #[test]
+    fn SharedAdmissionStopsASecondStageExpansionExactly() {
+        let Admission = RequestExpansionAdmissionV1::New(1);
+        let Result = StrictSearch(8, &Admission);
+        assert_eq!(Result.NoPathReason, "SearchLimitReached");
+        assert_eq!(Result.ExpansionCount, 1);
+        assert_eq!(Admission.RouteCount(), 1);
+        assert_eq!(Admission.TotalCount(), 1);
+    }
 }

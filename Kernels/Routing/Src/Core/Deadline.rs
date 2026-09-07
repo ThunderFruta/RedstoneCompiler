@@ -1,5 +1,7 @@
 //! Shared absolute-deadline contract for every native routing domain.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,6 +12,8 @@ pub(crate) const DEADLINE_CHECK_INTERVAL: usize = 32;
 pub(crate) struct RuntimeDeadline {
     EndsAt: Option<Instant>,
     Exceeded: Arc<AtomicBool>,
+    #[cfg(test)]
+    ChecksBeforeExpiry: Option<Arc<AtomicUsize>>,
 }
 
 impl RuntimeDeadline {
@@ -17,6 +21,8 @@ impl RuntimeDeadline {
         Self {
             EndsAt: None,
             Exceeded: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            ChecksBeforeExpiry: None,
         }
     }
 
@@ -48,12 +54,53 @@ impl RuntimeDeadline {
         Ok(Self {
             EndsAt: Some(EndsAt),
             Exceeded: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            ChecksBeforeExpiry: None,
         })
+    }
+
+    /// Maps a caller-clock remaining duration onto an earlier native sample.
+    /// The caller supplies a duration rounded down in its own clock domain, so
+    /// time spent sampling and converting the cutoff is conservatively charged.
+    pub(crate) fn FromEarlierSample(
+        SampledAt: Instant,
+        Remaining: Duration,
+    ) -> Result<Self, &'static str> {
+        let EndsAt = SampledAt
+            .checked_add(Remaining)
+            .ok_or("maximum runtime is out of range")?;
+        Ok(Self {
+            EndsAt: Some(EndsAt),
+            Exceeded: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            ChecksBeforeExpiry: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn FromCheckBudget(SuccessfulChecks: usize) -> Self {
+        Self {
+            EndsAt: None,
+            Exceeded: Arc::new(AtomicBool::new(false)),
+            ChecksBeforeExpiry: Some(Arc::new(AtomicUsize::new(SuccessfulChecks))),
+        }
     }
 
     pub(crate) fn Check(&self) -> bool {
         if self.Exceeded.load(AtomicOrdering::Relaxed) {
             return true;
+        }
+        #[cfg(test)]
+        if let Some(ChecksBeforeExpiry) = &self.ChecksBeforeExpiry {
+            let Previous = ChecksBeforeExpiry
+                .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |Value| {
+                    Value.checked_sub(1)
+                })
+                .unwrap_or(0);
+            if Previous == 0 {
+                self.Exceeded.store(true, AtomicOrdering::Relaxed);
+                return true;
+            }
         }
         let IsExceeded = self
             .EndsAt

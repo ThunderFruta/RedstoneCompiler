@@ -13,6 +13,7 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
         $ForbiddenRepeaterPositions:ident,
         $DebugLabel:ident,
         $MaximumExpansionCount:ident,
+        $ExpansionAdmission:ident,
         $Deadline:ident,
         $Failure:ident,
         $BlockedNodes:ident,
@@ -643,6 +644,7 @@ macro_rules! IntegratePreparedDetailedFrozenBranches {
                     $ForbiddenRepeaterPositions,
                     &Branch[BypassTargetIndex..],
                     0,
+                    $ExpansionAdmission,
                     &$Deadline,
                 ) else {
                     continue;
