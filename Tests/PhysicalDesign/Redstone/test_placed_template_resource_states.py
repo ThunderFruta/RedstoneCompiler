@@ -181,6 +181,25 @@ def test_replaced_gate_collection_during_workcheck_cannot_publish_resources(monk
         BuildRoutingResources(Placed, WorkCheck=ReplaceCollection)
 
 
+def test_frozen_wire_mutation_during_workcheck_cannot_publish_resources(monkeypatch):
+    Template = CellTemplate(
+        Size=(1, 1, 1), Blocks={(0, 0, 0): {"Name": "minecraft:stone"}},
+    )
+    Templates = {"NAND": Template}
+    monkeypatch.setattr(Geometry, "LoadRoutingTemplates", lambda: Templates)
+    Placed = _Placed((_TemplateGate("Only", "NAND", 0),))
+    OriginalPosition = (4, 1, 4)
+    ReplacementPosition = (9, 1, 9)
+    Placed.FrozenNetWires = {"A": (OriginalPosition,)}
+
+    def ReplaceFrozenWire(Diagnostics):
+        if Diagnostics.get("Phase") == "routing-resources-frozen-net":
+            Placed.FrozenNetWires["A"] = (ReplacementPosition,)
+
+    with pytest.raises(ValueError, match="frozen-wire inputs changed"):
+        BuildRoutingResources(Placed, WorkCheck=ReplaceFrozenWire)
+
+
 def test_valid_template_state_mutation_cannot_publish_snapshot(monkeypatch):
     Template = CellTemplate(
         Size=(1, 1, 1),
