@@ -13,6 +13,7 @@ from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Placement.Engine.Constraints import PlacementAssignmentConstraintSet
 from .Demand import BuildPlacementGenerationPlan, BuildTopologyDemandPressureProfile, BuildTopologyDemandProfile, ComputeInterfaceStateCountBound, ExactStatePlacementEvaluation, ResolveJointPlacementPortfolioTrigger
 from .Feedback import (
+    BuildPlacementFingerprint,
     BuildSignalLocalIncidenceFingerprints,
     BuildSignalTopologyFingerprints,
 )
@@ -53,6 +54,9 @@ def InitializePlacementFlow(Context):
     Context.LastPlacementAccessUnsatisfiableFailure: RoutingFailure | None = None
     Context.PlacementAccessDomainsByProblemFingerprint: dict[str, tuple[Any, ...]] = {}
     Context.PlacementAccessSolveResultsByProblemFingerprint: dict[str, Any] = {}
+    Context.PlacementAccessSolveBindingsByPlacementFingerprint: dict[
+        str, tuple[Any, ...]
+    ] = {}
     Context.RejectedPlacementAccessProblemFingerprints: set[str] = set()
     Context.PendingPlacementAccessDirectOnly = False
     Context.UniquePlacements: dict[str, tuple[str, int, PcbPlacement]] = {}
@@ -68,6 +72,9 @@ def InitializePlacementFlow(Context):
     Context.MaterializedPlacementByFingerprint: dict[str, PcbPlacement] = {}
     Context.TopologyDemandByFingerprint: dict[str, TopologyDemandProfile] = {}
     Context.PlacementRetentionFingerprintByFingerprint: dict[str, str] = {}
+    Context.PlacementFingerprintIncludesLocalClaimsByFingerprint: dict[
+        str, bool
+    ] = {}
     Context.RetainedPlacementTopologyFingerprints: dict[str, tuple[str, str]] = {}
     Context.RejectedPlacementRetentionFingerprints: set[str] = set()
     Context.SeenTransactionalEndpointRepairFingerprints: set[str] = set()
@@ -146,9 +153,18 @@ from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint
 from PhysicalDesign.Placement.PreRouteInterface import DerivedRoutingEnvelope, PlacementAccessDemand
 from PhysicalDesign.Placement.Access.Fabric import AttachPlacementAccessFabric, BuildPlacementAccessFabric
 from PhysicalDesign.Placement.Access.Geometry import BuildDerivedPerimeterFabricShell, DerivedPerimeterFabricShell
-from .Candidates import PcbPlacementCandidate, PreRouteFabricDescriptor
+from .Candidates import (
+    BuildCandidateCurrentSelectedAccessEnvelope,
+    PcbPlacementCandidate,
+    PreRouteFabricDescriptor,
+)
+from .AccessEnvelope import (
+    CurrentSelectedAccessEnvelopePhase,
+    CurrentSelectedAccessTransition,
+    RequireCurrentSelectedAccessEnvelopeReady,
+)
 from .Demand import SelectDerivedPrimaryPlacementRequests
-from .Preparation import BuildDerivedRoutingEnvelopeDomain, BuildPlacementAccessDemand, IsDerivedSingleComponentPlacementSource, PrepareDerivedPlacementForFrozenAccessContract
+from .Preparation import BuildDerivedRoutingEnvelopeDomain, BuildPlacementAccessDemand, BuildPlacementRetentionFingerprint, IsDerivedSingleComponentPlacementSource, PrepareDerivedPlacementForFrozenAccessContract
 from .Results import PcbProgress
 from functools import partial
 from .State import (
@@ -284,6 +300,55 @@ def SelectEmptyPlacementFailure(Context) -> RoutingFailure:
     )
 
 
+def _AttachCurrentSelectedAccessInitial(Context, Candidate, Resources):
+    """Attach one fresh initial envelope without claiming track selection."""
+    ValidateCurrentSelectedPlacementAccessConsumer(
+        Candidate.Placement,
+        Resources=Resources,
+        Technology=Context.Technology,
+        ConsumerId=Candidate.CandidateId,
+        PlacementFingerprint=Candidate.PlacementFingerprint,
+    )
+    Result = BuildCandidateCurrentSelectedAccessEnvelope(
+        Candidate,
+        Phase=CurrentSelectedAccessEnvelopePhase.BeforeRawMaterialization,
+        Transition=CurrentSelectedAccessTransition.InitialCandidate,
+        Resources=Resources,
+        Technology=Context.Technology,
+        Policy=Context.Policy,
+        ObservedPlacementFingerprint=BuildPlacementFingerprint(
+            Candidate.Placement,
+            Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+            if Candidate.TopologyDemand is not None else "",
+            IncludeLocalClaims=(
+                Candidate.PlacementFingerprintIncludesLocalClaims
+                if type(Candidate.PlacementFingerprintIncludesLocalClaims)
+                is bool else True
+            ),
+        ),
+        ObservedPlacementRetentionFingerprint=(
+            BuildPlacementRetentionFingerprint(
+                Candidate.Placement,
+                Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                if Candidate.TopologyDemand is not None else "",
+                IncludeLocalClaims=(
+                    Candidate.PlacementFingerprintIncludesLocalClaims
+                    if type(Candidate.PlacementFingerprintIncludesLocalClaims)
+                    is bool else True
+                ),
+            )
+        ),
+    )
+    RequireCurrentSelectedAccessEnvelopeReady(
+        Result,
+        Stage="CurrentSelectedAccessBeforeRawMaterialization",
+    )
+    return replace(
+        Candidate,
+        CurrentSelectedAccessEnvelopeResult=Result,
+    )
+
+
 def GeneratePlacementCandidates(Context):
     if Context.ProgressCallback is not None:
         Context.ProgressCallback(PcbProgress(Completed=0, Total=1, Workers=0, Valid=0, BestBlocks=None, BestWidth=None, BestDepth=None, BestFootprint=None, Failed=0, Stage=f'spacing {Context.RoutingSpacing} | placing clustered NAND graph'))
@@ -327,7 +392,37 @@ def GeneratePlacementCandidates(Context):
         if len(Context.Candidate.Placement.Clusters) != 1:
             Context.ExistingLayerCount = max(Context.Demand.MinimumRoutingLayerCount, min(Context.Demand.MaximumRoutingLayerCount, int(Context.Candidate.Placement.LayerCount)))
             Context.Envelope = next((Value for Value in Context.Envelopes if Value.RoutingLayerCount == Context.ExistingLayerCount))
-            Context.FabricCandidateRecords.append(replace(Context.Candidate, RoutingEnvelope=Context.Envelope))
+            Context.DescriptorCandidate = replace(
+                Context.Candidate,
+                RoutingEnvelope=Context.Envelope,
+            )
+            Context.CandidateResources = (
+                Context.RoutingResourcesByFingerprint.get(
+                    Context.Candidate.PlacementFingerprint
+                )
+            )
+            if Context.CandidateResources is None:
+                Context.CandidateResources = Context.Services.BuildRoutingResources(
+                    Context.Candidate.Placement.Placed,
+                    Technology=Context.Technology,
+                    WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired(
+                        "PrePlacementAccessCurrentResources",
+                        Diagnostics,
+                    ),
+                )
+            if Context.Policy.PlacementAccess.Enabled:
+                Context.DescriptorCandidate = _AttachCurrentSelectedAccessInitial(
+                    Context,
+                    Context.DescriptorCandidate,
+                    Context.CandidateResources,
+                )
+            Context.FabricCandidateRecords.append(Context.DescriptorCandidate)
+            Context.RoutingResourcesByCandidateId[
+                Context.DescriptorCandidate.CandidateId
+            ] = Context.CandidateResources
+            Context.RoutingResourcesByFingerprint[
+                Context.DescriptorCandidate.PlacementFingerprint
+            ] = Context.CandidateResources
             continue
         Context.CandidateResources = Context.RoutingResourcesByFingerprint.get(Context.Candidate.PlacementFingerprint)
         if Context.CandidateResources is None:
@@ -373,14 +468,16 @@ def GeneratePlacementCandidates(Context):
             Context.Fabric = Context.AccessByEnvelopeIdentity.get(Context.AccessDomainKey)
             if Context.Fabric is None:
                 if Context.Policy.PlacementAccess.Enabled:
-                    ValidateCurrentSelectedPlacementAccessConsumer(
-                        Context.AccessFabricPlacement,
-                        Resources=Context.EnvelopeResources,
-                        Technology=Context.Technology,
-                        ConsumerId=Context.EnvelopeCandidateId,
-                        PlacementFingerprint=(
-                            Context.DescriptorCandidate.PlacementFingerprint
-                        ),
+                    Context.DescriptorCandidate = (
+                        _AttachCurrentSelectedAccessInitial(
+                            Context,
+                            Context.DescriptorCandidate,
+                            Context.EnvelopeResources,
+                        )
+                    )
+                    Context.CurrentSelectedAccessBeforeRaw = (
+                        Context.DescriptorCandidate
+                        .CurrentSelectedAccessEnvelopeResult
                     )
                 Context.Fabric = BuildPlacementAccessFabric(
                     Context.AccessFabricPlacement,
@@ -417,7 +514,12 @@ def GeneratePlacementCandidates(Context):
                 Context.AccessByEnvelopeIdentity[Context.AccessDomainKey] = Context.Fabric
             Context.PlacementAccessEvidenceByCandidateId[Context.EnvelopeCandidateId] = (Context.Fabric, None)
             Context.AttachedPlacement = AttachPlacementAccessFabric(Context.AccessFabricPlacement if Context.IsDerivedPerimeterCandidate else Context.FabricPlacement, Context.Fabric)
-            Context.FabricCandidateRecords.append(replace(Context.Candidate, CandidateId=Context.EnvelopeCandidateId, Placement=Context.AttachedPlacement, RoutingEnvelope=Context.Envelope))
+            Context.FabricCandidateRecords.append(replace(
+                Context.DescriptorCandidate,
+                CandidateId=Context.EnvelopeCandidateId,
+                Placement=Context.AttachedPlacement,
+                RoutingEnvelope=Context.Envelope,
+            ))
             Context.RoutingResourcesByCandidateId[Context.EnvelopeCandidateId] = Context.EnvelopeResources
         Context.RoutingResourcesByFingerprint[Context.Candidate.PlacementFingerprint] = Context.CandidateResources
     Context.CandidateRecords = Context.FabricCandidateRecords
@@ -520,6 +622,59 @@ def PreparePlacementRouting(Context):
         )
     ):
         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='SelectedPreRouteTrackPreparation', AffectedNets=Context.SelectedTrackPreparation.ConflictSignals, Resources=tuple(map(str, Context.SelectedTrackPreparation.ConflictResourceIndices)), Detail='the selected fixed local-access contract has no complete authoritative portal/track witness', RepairActions=(), Diagnostics={'PreRouteInterfaceSelection': Context.PreRouteInterfaceResult.ToDictionary(), 'RawTrackAssignmentSelection': Context.RawTrackAssignmentResult.ToDictionary() if Context.RawTrackAssignmentResult is not None else None, 'SelectedCandidate': Context.SelectedPreRouteCandidate.ToDictionary(), 'SelectedAuthoritativeTrackPreparation': Context.SelectedTrackPreparation.ToDictionary(), 'PrePlacementTrackPreparations': Context.PrePlacementTrackPreparations, 'PlacementDomainComplete': False}))
+    if (
+        Context.Policy.PlacementAccess.Enabled
+        and Context.SelectedTrackPreparation is not None
+    ):
+        Context.CurrentSelectedAccessAfterTrackSelection = (
+            BuildCandidateCurrentSelectedAccessEnvelope(
+                Context.SelectedPreRouteCandidate,
+                Phase=(
+                    CurrentSelectedAccessEnvelopePhase.SelectedTrackSuccessor
+                ),
+                Transition=(
+                    CurrentSelectedAccessTransition.SelectedTrackAssignment
+                ),
+                Resources=Context.SelectedCandidateResources,
+                Technology=Context.Technology,
+                Policy=Context.Policy,
+                ObservedPlacementFingerprint=BuildPlacementFingerprint(
+                    Context.SelectedPreRouteCandidate.Placement,
+                    Context.SelectedPreRouteCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                    if Context.SelectedPreRouteCandidate.TopologyDemand is not None else "",
+                    IncludeLocalClaims=(
+                        Context.SelectedPreRouteCandidate.PlacementFingerprintIncludesLocalClaims
+                        if type(Context.SelectedPreRouteCandidate.PlacementFingerprintIncludesLocalClaims)
+                        is bool else True
+                    ),
+                ),
+                ObservedPlacementRetentionFingerprint=(
+                    BuildPlacementRetentionFingerprint(
+                        Context.SelectedPreRouteCandidate.Placement,
+                        Context.SelectedPreRouteCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                        if Context.SelectedPreRouteCandidate.TopologyDemand is not None else "",
+                        IncludeLocalClaims=(
+                            Context.SelectedPreRouteCandidate.PlacementFingerprintIncludesLocalClaims
+                            if type(Context.SelectedPreRouteCandidate.PlacementFingerprintIncludesLocalClaims)
+                            is bool else True
+                        ),
+                    )
+                ),
+                TrackPreparation=Context.SelectedTrackPreparation,
+                RawTrackAssignment=Context.RawTrackAssignmentResult,
+                RawTrackAssignmentApplicable=Context.SinglePackedComponent,
+            )
+        )
+        RequireCurrentSelectedAccessEnvelopeReady(
+            Context.CurrentSelectedAccessAfterTrackSelection,
+            Stage="CurrentSelectedAccessAfterTrackSelection",
+        )
+        Context.SelectedPreRouteCandidate = replace(
+            Context.SelectedPreRouteCandidate,
+            CurrentSelectedAccessEnvelopeResult=(
+                Context.CurrentSelectedAccessAfterTrackSelection
+            ),
+        )
     if Context.SelectedTrackPreparation is not None:
         Context.PrePlacementTrackPreparationWitnesses[
             Context.SelectedPreRouteCandidate.CandidateId

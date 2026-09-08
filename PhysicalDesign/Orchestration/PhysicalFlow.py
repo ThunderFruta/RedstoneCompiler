@@ -10,18 +10,24 @@ from PhysicalDesign.Contracts.Placement import ClusterInterfacePortfolioProblem,
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Contracts.PlacementAccess import PlacementAccessSolveStatus
 from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint, RoutingDeadline
-from PhysicalDesign.Placement.Access.Capacity import SolvePlacedPinAccessOptionDomains
-from PhysicalDesign.Placement.Access.Catalog import EnumeratePlacedPinAccessOptionDomains
 from PhysicalDesign.Placement.Engine.Clusters import BuildBoundedInterClusterRoutingChannel, BuildBoundedInterClusterRoutingDeck
 from PhysicalDesign.Routing.Regions.Proofs.NoGoods import RecordPhysicalComponentDetailedRoutingNoGood, RecordPhysicalComponentLocalCompilationNoGood, RecordPhysicalComponentSymbolicCapacityEligibilityNoGood
 from PhysicalDesign.Routing.Regions.Pipeline import AssembleClosedComponentForGlobalRouting, CompileClosedComponent
 from PhysicalDesign.Routing.Regions.Symbolic.SymbolicDomains import CompilePhysicalComponentForeignPortalUnaryApertureClauses, CompilePhysicalComponentSymbolicPortPairDomain, CompilePhysicalComponentSymbolicUnaryApertureDomain, ProjectCompletePhysicalPortPairCertificateToApertureClauses, ProveClosedComponentSymbolicCapacityEligibility
-from .Candidates import BuildClusterInterfaceStageSchedule, BuildComponentAccessFeedbackPlacementScore, BuildLocalComponentCompilationAdmissionFailure, BuildPhysicalAssemblyPlanningIncompleteFailure, BuildRetainedComponentPlacementSearchDomain, HasDistinctRetainedPhysicalEligibilityState, PcbPlacementCandidate, QueuedPhysicalEligibilityPlacementFingerprints, ReuseRetainedPlacementRoutingResources, SelectFocusedPlacementInterfacePressureSignals
+from .Candidates import BuildCandidateCurrentSelectedAccessEnvelope, BuildClusterInterfaceStageSchedule, BuildComponentAccessFeedbackPlacementScore, BuildLocalComponentCompilationAdmissionFailure, BuildPhysicalAssemblyPlanningIncompleteFailure, BuildRetainedComponentPlacementSearchDomain, HasDistinctRetainedPhysicalEligibilityState, PcbPlacementCandidate, QueuedPhysicalEligibilityPlacementFingerprints, SelectFocusedPlacementInterfacePressureSignals
+from .AccessEnvelope import (
+    CurrentSelectedAccessEnvelopePhase,
+    CurrentSelectedAccessTransition,
+    RequireCurrentSelectedAccessEnvelopeReady,
+)
 from .Feedback import BuildPlacementFingerprint, SelectInterfaceDiversePlacementStates
-from .Preparation import BuildClusterInterfaceComponentStateFingerprint, BuildClusterInterfacePlacementTopologyFingerprint, BuildClusterInterfaceUnsatProof, BuildPlacementRetentionFingerprint
+from .Preparation import BuildClusterInterfaceComponentStateFingerprint, BuildClusterInterfacePlacementTopologyFingerprint, BuildClusterInterfaceUnsatProof, BuildDerivedRoutingEnvelopeDomain, BuildPlacementAccessDemand, BuildPlacementRetentionFingerprint
 from .Portfolios import (
     ApplyCoordinatedCandidateDiversificationProfile,
     SelectExhaustedRepeaterAccessCutSignals,
+)
+from .RuntimePolicy import (
+    CompilePhysicalComponentUnarySupportWithRuntimeAuthority,
 )
 from .Results import BuildCapacityRepairEndpointClosureClusters, BuildCapacityRepairGeometryFingerprint, BuildComponentRoutabilityCore, BuildPhysicalInterfaceRepairCore, BuildPhysicalOwnedFrontierTopologyRepairCore, BuildSymbolicCapacityRepairEvidence, FreezePhysicalAssemblyGlobalChannels, IsClusterInterfaceStateIncomplete, IsCompletePhysicalAssemblyUnsatisfiable, IsComponentKeepoutGlobalFailure, PhysicalComponentPlacementFeedback, PreparedEligibilityHasDisjointCapacitySeams
 from functools import partial
@@ -48,105 +54,11 @@ from .PhysicalAssembly import (
 )
 from .RoutingAttempts import (
     MaterializeSelectedJointPlacementLocalRouting,
-    ValidateCurrentSelectedPlacementAccessConsumer,
+    RebuildCurrentCandidateTrackPreparation,
 )
-
-
-def _RebuildTransformedPlacementSelectedAccess(Context, Placement):
-    """Give a transformed placement only current selected-access authority.
-
-    Channel and deck construction can change physical terminals after the
-    retained placement's access problem was solved.  Rebuild both the current
-    resource graph and the exact access solve under the active policy, using
-    the already allocated interface deadline rather than granting new work.
-    """
-    if not Context.Policy.PlacementAccess.Enabled:
-        return Placement, None
-
-    def WorkCheck(Diagnostics):
-        Context.InterfaceDeadline.RaiseIfExpired(
-            'TransformedPlacementAccessRebuild',
-            Diagnostics,
-        )
-
-    Resources = Context.Services.BuildRoutingResources(
-        Placement.Placed,
-        WorkCheck=WorkCheck,
-        Technology=Context.Technology,
-    )
-    Domains = EnumeratePlacedPinAccessOptionDomains(
-        Placement.Placed.PlacedGates,
-        ResourceGraph=Resources.ResourceGraph,
-        Technology=Context.Technology,
-        EnabledPatternFamilies=(
-            Context.Policy.PlacementAccess.EnabledPatternFamilies
-        ),
-        CatalogVersion=Context.Policy.PlacementAccess.CatalogVersion,
-        MaximumGenerationWork=(
-            Context.Policy.PlacementAccess.MaximumDomainGenerationWork
-        ),
-        WorkCheck=WorkCheck,
-        PreOwnedNodesBySignal=(Placement.Placed.FrozenNetWires or {}),
-    )
-    Solve = SolvePlacedPinAccessOptionDomains(
-        Domains,
-        ResourceGraph=Resources.ResourceGraph,
-        MaximumExpansions=(
-            Context.Policy.PlacementAccess.MaximumAssignmentExpansions
-        ),
-        WorkCheck=WorkCheck,
-    )
-    Solve = replace(Solve, PolicyVersion=Context.Policy.PolicyVersion)
-    Diagnostics = {
-        'PlacementAccessSolve': Solve.ToDictionary(),
-        'PolicyVersion': Context.Policy.PolicyVersion,
-        'CurrentResourceGraphVersion': Resources.ResourceGraph.GraphVersion,
-        'Deadline': Context.InterfaceDeadline.ToDictionary(),
-    }
-    if Solve.Status is not PlacementAccessSolveStatus.Feasible:
-        raise RoutingStageError(RoutingFailure(
-            Reason=(
-                RoutingFailureReason.ClusterInterfaceSolveIncomplete
-                if Solve.Status is PlacementAccessSolveStatus.Incomplete
-                else RoutingFailureReason.NoPinAccessPattern
-            ),
-            Stage='TransformedPlacementAccessRebuild',
-            Detail=(
-                'the transformed placement has no complete current '
-                'selected pin-access solution'
-            ),
-            RepairActions=(
-                ('IncreasePlacementAccessWork',)
-                if Solve.Status is PlacementAccessSolveStatus.Incomplete
-                else ()
-            ),
-            Diagnostics=Diagnostics,
-        ))
-    Witness = Solve.SelectedWitness
-    if Witness is None:
-        raise ValueError('feasible transformed access solve omitted its witness')
-    Successor = replace(
-        Placement,
-        Placed=replace(
-            Placement.Placed,
-            PlacementAccessFabric=None,
-            PlacementAccessAssignment=None,
-            SelectedPinAccessWitness=Witness,
-            PlacementAccessSolve=Solve,
-        ),
-        PlacementAccessFabric=None,
-        PlacementAccessAssignment=None,
-        SelectedPinAccessWitness=Witness,
-        PlacementAccessSolve=Solve,
-    )
-    ValidateCurrentSelectedPlacementAccessConsumer(
-        Successor,
-        Resources=Resources,
-        Technology=Context.Technology,
-        ConsumerId='transformed-placement-access-rebuild',
-        PlacementFingerprint='',
-    )
-    return Successor, Resources
+from .PlacementAttempts import (
+    RebuildCurrentCandidatePlacementAccess,
+)
 
 
 def RunPhysicalComponentFlow(Context):
@@ -378,14 +290,121 @@ def RunPhysicalComponentFlow(Context):
             Context.RetainedPlacementResourceCacheHit = False
             try:
                 Context.MaterializedInterfacePlacement = MaterializeSelectedJointPlacementLocalRouting(Context, Context.InterfaceCandidate, lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfacePlacementMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}))
-                Context.PreTransformPlacementAccessWitness = (
-                    Context.MaterializedInterfacePlacement
-                    .SelectedPinAccessWitness
-                )
                 if Context.MaterializedInterfacePlacement is not Context.InterfaceCandidate.Placement:
-                    Context.InterfaceCandidate = replace(Context.InterfaceCandidate, Placement=Context.MaterializedInterfacePlacement)
+                    Context.InterfaceCandidate = replace(
+                        Context.InterfaceCandidate,
+                        Placement=Context.MaterializedInterfacePlacement,
+                        PlacementFingerprintIncludesLocalClaims=False,
+                    )
+                if Context.Policy.PlacementAccess.Enabled:
+                    Context.ChannelTransitionSourceDemand = (
+                        BuildPlacementAccessDemand(
+                            Context.MaterializedInterfacePlacement,
+                            int(getattr(
+                                Context.InterfaceCandidate.TopologyDemand,
+                                "PeakBoundaryDemand",
+                                0,
+                            )),
+                            Context.Technology,
+                        )
+                    )
+                    Context.ChannelTransitionSourceRoutingEnvelope = next(
+                        Envelope
+                        for Envelope in BuildDerivedRoutingEnvelopeDomain(
+                            Context.ChannelTransitionSourceDemand,
+                            Context.MaterializedInterfacePlacement,
+                        )
+                        if Envelope.RoutingLayerCount
+                        == Context.MaterializedInterfacePlacement.LayerCount
+                    )
+                    Context.InterfaceCandidate = replace(
+                        Context.InterfaceCandidate,
+                        RoutingEnvelope=(
+                            Context.ChannelTransitionSourceRoutingEnvelope
+                        ),
+                    )
+                    Context.ChannelTransitionSourceResources = (
+                        Context.Services.BuildRoutingResources(
+                            Context.MaterializedInterfacePlacement.Placed,
+                            WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired(
+                                "ClusterInterfaceSourceAccessResources",
+                                {"CandidateId": Candidate.CandidateId, **Diagnostics},
+                            ),
+                            Technology=Context.Technology,
+                        )
+                    )
+                    Context.InterfaceCandidate = (
+                        RebuildCurrentCandidatePlacementAccess(
+                            Context,
+                            Context.InterfaceCandidate,
+                            Resources=Context.ChannelTransitionSourceResources,
+                            WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired(
+                                "ClusterInterfaceSourceAccessRefresh",
+                                {"CandidateId": Candidate.CandidateId, **Diagnostics},
+                            ),
+                        )
+                    )
+                    Context.MaterializedInterfacePlacement = (
+                        Context.InterfaceCandidate.Placement
+                    )
+                    Context.ChannelTransitionSourceAccessEnvelope = (
+                        BuildCandidateCurrentSelectedAccessEnvelope(
+                            Context.InterfaceCandidate,
+                            Phase=(
+                                CurrentSelectedAccessEnvelopePhase
+                                .BeforeRawMaterialization
+                            ),
+                            Transition=(
+                                CurrentSelectedAccessTransition.InitialCandidate
+                            ),
+                            Resources=Context.ChannelTransitionSourceResources,
+                            Technology=Context.Technology,
+                            Policy=Context.Policy,
+                            ObservedPlacementFingerprint=(
+                                BuildPlacementFingerprint(
+                                    Context.InterfaceCandidate.Placement,
+                                    Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                                    if Context.InterfaceCandidate.TopologyDemand is not None else "",
+                                    IncludeLocalClaims=(
+                                        Context.InterfaceCandidate
+                                        .PlacementFingerprintIncludesLocalClaims
+                                        if type(
+                                            Context.InterfaceCandidate
+                                            .PlacementFingerprintIncludesLocalClaims
+                                        ) is bool else True
+                                    ),
+                                )
+                            ),
+                            ObservedPlacementRetentionFingerprint=(
+                                BuildPlacementRetentionFingerprint(
+                                    Context.InterfaceCandidate.Placement,
+                                    Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                                    if Context.InterfaceCandidate.TopologyDemand is not None else "",
+                                    IncludeLocalClaims=(
+                                        Context.InterfaceCandidate
+                                        .PlacementFingerprintIncludesLocalClaims
+                                        if type(
+                                            Context.InterfaceCandidate
+                                            .PlacementFingerprintIncludesLocalClaims
+                                        ) is bool else True
+                                    ),
+                                )
+                            ),
+                        )
+                    )
+                    RequireCurrentSelectedAccessEnvelopeReady(
+                        Context.ChannelTransitionSourceAccessEnvelope,
+                        Stage="CurrentSelectedAccessBeforeChannelReplacement",
+                    )
+                    Context.InterfaceCandidate = replace(
+                        Context.InterfaceCandidate,
+                        CurrentSelectedAccessEnvelopeResult=(
+                            Context.ChannelTransitionSourceAccessEnvelope
+                        ),
+                    )
                 if Context.CapacityRepairConstraint is not None:
                     Context.CapacityRepairPortfolioDiagnostics.append({'Result': 'capacity-pair-repair-local-materialized', 'CandidateId': Context.InterfaceCandidate.CandidateId, 'PlacementFingerprint': Context.RetainedPlacementFingerprint, 'SourceProofFingerprint': Context.CapacityRepairConstraint.SourceProofFingerprint, 'Signals': list(Context.CapacityRepairConstraint.Signals), 'ElapsedSeconds': round(Context.Services.monotonic() - Context.Deadline.StartedAt, 6)})
+                Context.ChannelTransitionSourceCandidate = Context.InterfaceCandidate
                 try:
                     Context.CapacityRepairPreferredSignals = Context.CapacityRepairConstraint.Signals if Context.CapacityRepairConstraint is not None else ()
                     Context.CapacityRepairRequiredComponentGateNames = Context.CapacityRepairConstraint.ComponentGateNames if Context.CapacityRepairConstraint is not None else ()
@@ -395,27 +414,10 @@ def RunPhysicalComponentFlow(Context):
                     if Context.PreviewChannel is None:
                         raise ValueError('component envelope preview produced no channel')
                     Context.SelectedComponentClusters = tuple(Context.PreviewChannel.AffectedClusters)
-                    Context.MaterializedInterfacePlacement = BuildBoundedInterClusterRoutingChannel(Context.MaterializedInterfacePlacement, TrackPitch=Context.Technology.TrackPitch * 2, MaximumAffectedClusters=3, MaximumBoundaryStrips=2, RoutingLayerCount=3, RequiredComponentGateNames=Context.CapacityRepairRequiredComponentGateNames, ForcedAffectedClusters=Context.SelectedComponentClusters, ChannelClearanceTracks=1 if Context.CapacityRepairConstraint is not None and Context.CapacityRepairConstraint.RepairLevel == 'channel-capacity' else 0, ChannelTopologyVariant=1 if Context.OwnedFrontierTopologyRepairKind == 'relocate-endpoint-cluster' else 0)
-                    Context.MaterializedInterfacePlacement = BuildBoundedInterClusterRoutingDeck(Context.MaterializedInterfacePlacement, TrackPitch=Context.Technology.TrackPitch, MaximumAffectedClusters=3, MaximumDeckLanes=12, InterfaceDeckLayer=3, ComponentVariant=Context.EffectiveComponentVariant, PreferredSignals=Context.CapacityRepairPreferredSignals, RequiredComponentGateNames=Context.CapacityRepairRequiredComponentGateNames, ForcedAffectedClusters=Context.SelectedComponentClusters)
+                    Context.ChannelPlacement = BuildBoundedInterClusterRoutingChannel(Context.MaterializedInterfacePlacement, TrackPitch=Context.Technology.TrackPitch * 2, MaximumAffectedClusters=3, MaximumBoundaryStrips=2, RoutingLayerCount=3, RequiredComponentGateNames=Context.CapacityRepairRequiredComponentGateNames, ForcedAffectedClusters=Context.SelectedComponentClusters, ChannelClearanceTracks=1 if Context.CapacityRepairConstraint is not None and Context.CapacityRepairConstraint.RepairLevel == 'channel-capacity' else 0, ChannelTopologyVariant=1 if Context.OwnedFrontierTopologyRepairKind == 'relocate-endpoint-cluster' else 0)
+                    Context.MaterializedInterfacePlacement = BuildBoundedInterClusterRoutingDeck(Context.ChannelPlacement, TrackPitch=Context.Technology.TrackPitch, MaximumAffectedClusters=3, MaximumDeckLanes=12, InterfaceDeckLayer=3, ComponentVariant=Context.EffectiveComponentVariant, PreferredSignals=Context.CapacityRepairPreferredSignals, RequiredComponentGateNames=Context.CapacityRepairRequiredComponentGateNames, ForcedAffectedClusters=Context.SelectedComponentClusters)
                 except ValueError as Error:
                     raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ClusterInterfaceArchitectureUnsatisfiable, Stage='InterClusterRoutingChannelMaterialization', Detail=str(Error), RepairActions=(), Diagnostics={'CandidateId': Context.InterfaceCandidate.CandidateId, 'ComponentFabricConstructionComplete': True, 'ClusterInterfaceDomainComplete': True, 'OwnershipSearchComplete': True, 'BroadFallbackAllowed': False, 'ExecutableLegacyRepairCascade': False})) from Error
-                Context.TransformedPlacementAccessRebuilt = bool(
-                    Context.PreTransformPlacementAccessWitness is not None
-                    and Context.MaterializedInterfacePlacement
-                    .SelectedPinAccessWitness is None
-                )
-                if Context.TransformedPlacementAccessRebuilt:
-                    (
-                        Context.MaterializedInterfacePlacement,
-                        Context.InterfaceResources,
-                    ) = _RebuildTransformedPlacementSelectedAccess(
-                        Context,
-                        Context.MaterializedInterfacePlacement,
-                    )
-                    # The selected witness is part of placement identity.
-                    # Rebuild it before component selection, proof lookup, or
-                    # publication of an identity-keyed successor state.
-                    Context.RetainedPlacementResourceCacheHit = False
                 Context.Channel = Context.MaterializedInterfacePlacement.InterClusterRoutingChannel
                 Context.MissingCapacityRepairChannelSignals = tuple(sorted(
                     set(Context.CapacityRepairConstraint.Signals)
@@ -451,13 +453,66 @@ def RunPhysicalComponentFlow(Context):
                         continue
                 if Context.InterfaceWorkPhase == 'prepare-eligibility':
                     Context.SeenComponentSelections.add(Context.ComponentSelectionFingerprint)
-                Context.ChannelizedPlacementFingerprint = BuildPlacementFingerprint(Context.MaterializedInterfacePlacement, Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint if Context.InterfaceCandidate.TopologyDemand is not None else '')
+                Context.ChannelTransitionDeckPlacement = (
+                    Context.MaterializedInterfacePlacement
+                )
+                Context.InterfaceResources = Context.Services.BuildRoutingResources(
+                    Context.ChannelTransitionDeckPlacement.Placed,
+                    WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired(
+                        'ClusterInterfaceResourceMaterialization',
+                        {'CandidateId': Candidate.CandidateId, **Diagnostics},
+                    ),
+                    Technology=Context.Technology,
+                )
+                Context.InterfaceCandidate = RebuildCurrentCandidatePlacementAccess(
+                    Context,
+                    replace(
+                        Context.InterfaceCandidate,
+                        Placement=Context.ChannelTransitionDeckPlacement,
+                    ),
+                    Resources=Context.InterfaceResources,
+                    WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired(
+                        'ClusterInterfacePlacementAccessRefresh',
+                        {'CandidateId': Candidate.CandidateId, **Diagnostics},
+                    ),
+                )
+                Context.MaterializedInterfacePlacement = (
+                    Context.InterfaceCandidate.Placement
+                )
+                Context.ChannelizedPlacementFingerprint = BuildPlacementFingerprint(
+                    Context.MaterializedInterfacePlacement,
+                    Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint if Context.InterfaceCandidate.TopologyDemand is not None else '',
+                    IncludeLocalClaims=True,
+                )
+                Context.ChannelizedPlacementRetentionFingerprint = BuildPlacementRetentionFingerprint(
+                    Context.MaterializedInterfacePlacement,
+                    Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint if Context.InterfaceCandidate.TopologyDemand is not None else '',
+                    IncludeLocalClaims=True,
+                )
+                Context.ChannelizedInterfaceTopologyFingerprint = BuildClusterInterfacePlacementTopologyFingerprint(
+                    Context.MaterializedInterfacePlacement,
+                    Context.SignalTopologyFingerprints,
+                )
+                Context.ChannelAccessDemand = BuildPlacementAccessDemand(
+                    Context.MaterializedInterfacePlacement,
+                    int(getattr(Context.InterfaceCandidate.TopologyDemand, 'PeakBoundaryDemand', 0)),
+                    Context.Technology,
+                )
+                Context.ChannelRoutingEnvelope = next(
+                    Envelope
+                    for Envelope in BuildDerivedRoutingEnvelopeDomain(
+                        Context.ChannelAccessDemand,
+                        Context.MaterializedInterfacePlacement,
+                    )
+                    if Envelope.RoutingLayerCount
+                    == Context.MaterializedInterfacePlacement.LayerCount
+                )
                 if Context.CapacityRepairConstraint is not None:
                     Context.CapacityRepairConstraintByPlacementFingerprint[Context.ChannelizedPlacementFingerprint] = Context.CapacityRepairConstraint
                     Context.CapacityRepairGeometryConstraintByPlacementFingerprint[Context.ChannelizedPlacementFingerprint] = Context.CapacityRepairGeometryConstraint
                     if Context.CapacityRepairGeometryFocus is not None:
                         Context.CapacityRepairGeometryFocusByPlacementFingerprint[Context.ChannelizedPlacementFingerprint] = Context.CapacityRepairGeometryFocus
-                Context.InterfaceCandidate = replace(Context.InterfaceCandidate, CandidateId=f'ChannelPlacement-{Context.ChannelizedPlacementFingerprint[:12]}', PlacementFingerprint=Context.ChannelizedPlacementFingerprint, Placement=Context.MaterializedInterfacePlacement, PlacementRetentionFingerprint=BuildPlacementRetentionFingerprint(Context.MaterializedInterfacePlacement, Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint if Context.InterfaceCandidate.TopologyDemand is not None else ''), InterfaceTopologyFingerprint=BuildClusterInterfacePlacementTopologyFingerprint(Context.MaterializedInterfacePlacement, Context.SignalTopologyFingerprints))
+                Context.InterfaceCandidate = replace(Context.InterfaceCandidate, CandidateId=f'ChannelPlacement-{Context.ChannelizedPlacementFingerprint[:12]}', PlacementFingerprint=Context.ChannelizedPlacementFingerprint, Placement=Context.MaterializedInterfacePlacement, PlacementFingerprintIncludesLocalClaims=True, PlacementRetentionFingerprint=Context.ChannelizedPlacementRetentionFingerprint, InterfaceTopologyFingerprint=Context.ChannelizedInterfaceTopologyFingerprint, RoutingEnvelope=Context.ChannelRoutingEnvelope)
                 Context.ChannelizedEquivalentProof = next((Proof for Proof in reversed(Context.InterfaceStateProofs) if Proof.PlacementStateFingerprint == Context.ChannelizedPlacementFingerprint and Proof.ComponentSelectionFingerprint == Context.ComponentSelectionFingerprint and Proof.ComponentVariant == Context.ComponentVariantForState and Proof.Exhaustive), None)
                 Context.ProofGuidedGenerationSource = Context.ProofGuidedGenerationSourceByPlacementFingerprint.pop(Context.RetainedPlacementFingerprint, None)
                 if Context.InterfaceWorkPhase == 'prepare-eligibility' and Context.ChannelizedEquivalentProof is not None:
@@ -468,9 +523,9 @@ def RunPhysicalComponentFlow(Context):
                         Context.DuplicateChannelizedPlacementAdvanced = EnqueueProofGuidedPhysicalPlacement(Context, Context.GenerationFailure, Context.GenerationSourceCandidate, Context.GenerationComponentVariant)
                     Context.InterfaceAttemptDiagnostics.append({'CandidateId': Context.InterfaceCandidate.CandidateId, 'SourceCandidateId': Context.RetainedBaseInterfaceCandidate.CandidateId, 'SourcePlacementFingerprint': Context.RetainedPlacementFingerprint, 'PlacementFingerprint': Context.ChannelizedPlacementFingerprint, 'ComponentStateFingerprint': Context.ComponentStateFingerprint, 'ComponentVariant': Context.ComponentVariantForState, 'ComponentSelectionFingerprint': Context.ComponentSelectionFingerprint, 'EquivalentProofComponentStateFingerprint': getattr(Context.ChannelizedEquivalentProof, 'ComponentStateFingerprint', ''), 'PlacementAdvanced': Context.DuplicateChannelizedPlacementAdvanced, 'Result': 'duplicate-channelized-state-proof-reused'})
                     continue
-                if not Context.TransformedPlacementAccessRebuilt:
-                    Context.InterfaceResources, Context.RetainedPlacementResourceCacheHit = ReuseRetainedPlacementRoutingResources(Context.RoutingResourcesByRetainedPlacementFingerprint, Context.RetainedPlacementFingerprint, lambda: Context.Services.BuildRoutingResources(Context.MaterializedInterfacePlacement.Placed, WorkCheck=lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfaceResourceMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}), Technology=Context.Technology))
+                Context.RetainedPlacementResourceCacheHit = False
                 Context.RoutingResourcesByFingerprint[Context.InterfaceCandidate.PlacementFingerprint] = Context.InterfaceResources
+                Context.RoutingResourcesByCandidateId[Context.InterfaceCandidate.CandidateId] = Context.InterfaceResources
                 Context.InterfaceResources.PhysicalGlobalApertureTemplateCache = Context.PhysicalGlobalApertureTemplateCache
                 Context.InterfaceResources.PhysicalLocalSeamEligibilityCache = Context.PhysicalLocalSeamEligibilityCache
                 Context.InterfaceResources.PhysicalBoundaryPairSupportCache = Context.PhysicalBoundaryPairSupportCache
@@ -486,7 +541,89 @@ def RunPhysicalComponentFlow(Context):
                 Context.LocalRouteFingerprint = BuildStableFingerprint(tuple(sorted((str(Template.LocalClaimFingerprint) for Template in getattr(Context.MaterializedInterfacePlacement.Placed, 'ClusterLocalRouteTemplates', ())))) + (Context.ChannelFingerprint,))
                 Context.ChangedClusterCount = sum((Context.Transforms.get(Key) != Context.PrimaryTransforms.get(Key) for Key in set(Context.Transforms) | set(Context.PrimaryTransforms)))
                 Context.Demand = Context.InterfaceCandidate.TopologyDemand
+                if Context.Policy.PlacementAccess.Enabled:
+                    Context.CurrentChannelPlacementAccessSolve = (
+                        Context.InterfaceCandidate.Placement.PlacementAccessSolve
+                    )
+                    Context.SelectedTrackPreparation = (
+                        RebuildCurrentCandidateTrackPreparation(
+                            Context,
+                            Context.InterfaceCandidate,
+                            Resources=Context.InterfaceResources,
+                        )
+                        if Context.CurrentChannelPlacementAccessSolve is not None
+                        and Context.CurrentChannelPlacementAccessSolve.Status
+                        is PlacementAccessSolveStatus.Feasible
+                        else None
+                    )
                 Context.InterfacePlacementStatesByFingerprint[Context.InterfaceCandidate.PlacementFingerprint] = ClusterInterfacePlacementState(StateFingerprint=Context.InterfaceCandidate.PlacementFingerprint, ClusterTransforms=Context.NormalizedTransforms, ChangedClusterCount=Context.ChangedClusterCount, LocalRouteFingerprint=Context.LocalRouteFingerprint, Footprint=Context.Demand.GateFootprint if Context.Demand is not None else 0, Hpwl=Context.Demand.Hpwl if Context.Demand is not None else 0, PeakBoundaryPressure=Context.Demand.PeakBoundaryDemand if Context.Demand is not None else 0, TotalBoundaryPressure=Context.Demand.InputTerminalCount + Context.Demand.OutputTerminalCount if Context.Demand is not None else 0, InterfaceTopologyFingerprint=Context.InterfaceCandidate.InterfaceTopologyFingerprint, ChannelFingerprint=Context.ChannelFingerprint, InterClusterChannel=Context.Channel)
+                if Context.Policy.PlacementAccess.Enabled:
+                    Context.ChannelCurrentSelectedAccessEnvelope = (
+                        BuildCandidateCurrentSelectedAccessEnvelope(
+                            Context.InterfaceCandidate,
+                            Phase=(
+                                CurrentSelectedAccessEnvelopePhase.
+                                SelectedTrackSuccessor
+                            ),
+                            Transition=(
+                                CurrentSelectedAccessTransition.ChannelReplacement
+                            ),
+                            Resources=Context.InterfaceResources,
+                            Technology=Context.Technology,
+                            Policy=Context.Policy,
+                            ObservedPlacementFingerprint=(
+                                BuildPlacementFingerprint(
+                                    Context.InterfaceCandidate.Placement,
+                                    Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                                    if Context.InterfaceCandidate.TopologyDemand is not None else "",
+                                    IncludeLocalClaims=(
+                                        Context.InterfaceCandidate.PlacementFingerprintIncludesLocalClaims
+                                        if type(Context.InterfaceCandidate.PlacementFingerprintIncludesLocalClaims)
+                                        is bool else True
+                                    ),
+                                )
+                            ),
+                            ObservedPlacementRetentionFingerprint=(
+                                BuildPlacementRetentionFingerprint(
+                                    Context.InterfaceCandidate.Placement,
+                                    Context.InterfaceCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                                    if Context.InterfaceCandidate.TopologyDemand is not None else "",
+                                    IncludeLocalClaims=(
+                                        Context.InterfaceCandidate.PlacementFingerprintIncludesLocalClaims
+                                        if type(Context.InterfaceCandidate.PlacementFingerprintIncludesLocalClaims)
+                                        is bool else True
+                                    ),
+                                )
+                            ),
+                            TrackPreparation=Context.SelectedTrackPreparation,
+                            RawTrackAssignment=Context.RawTrackAssignmentResult,
+                            RawTrackAssignmentApplicable=(
+                                Context.SinglePackedComponent
+                            ),
+                            TransitionSourceCandidate=(
+                                Context.ChannelTransitionSourceCandidate
+                            ),
+                            ChannelPlacement=Context.ChannelPlacement,
+                            TransitionDeckPlacement=(
+                                Context.ChannelTransitionDeckPlacement
+                            ),
+                            TransitionState=(
+                                Context.InterfacePlacementStatesByFingerprint[
+                                    Context.InterfaceCandidate.PlacementFingerprint
+                                ]
+                            ),
+                        )
+                    )
+                    RequireCurrentSelectedAccessEnvelopeReady(
+                        Context.ChannelCurrentSelectedAccessEnvelope,
+                        Stage="CurrentSelectedAccessAfterChannelReplacement",
+                    )
+                    Context.InterfaceCandidate = replace(
+                        Context.InterfaceCandidate,
+                        CurrentSelectedAccessEnvelopeResult=(
+                            Context.ChannelCurrentSelectedAccessEnvelope
+                        ),
+                    )
                 if Context.InterfaceDeadline.IsExpired():
                     raise RoutingStageError(BuildPhysicalAssemblyPlanningIncompleteFailure(Context.InterfaceStageSchedule, RemainingSeconds=Context.InterfaceDeadline.RemainingSeconds(), GlobalPlanningEntered=False))
                 Context.InterfaceRemainingSeconds = Context.InterfaceDeadline.RemainingSeconds()
@@ -562,7 +699,7 @@ def RunPhysicalComponentFlow(Context):
                         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ComponentPortAssignmentUnsatisfiable, Stage='PhysicalSymbolicCapacityPlacementFeedback', AffectedNets=Context.ProofFirstSignals, Detail='complete proof-first local capacity core requires geometry repair', Diagnostics={'SymbolicCapacityPlacementFeedback': True, 'PlacementInterfacePressureSignals': list(Context.ProofFirstSignals), 'SelectedComponentClusters': list(Context.SelectedComponentClusters), 'SelectedComponentSignals': sorted(map(str, getattr(Context.Channel, 'AffectedSignals', ()))), **BuildSymbolicCapacityRepairEvidence(Context.ProofFirstDiagnostics, Context.ProofFirstSignals), 'GlobalPlanningEntered': False, 'LocalCompilationEntered': False}))
                 Context.UnarySupportStartedAt = Context.Services.monotonic()
                 Context.UnarySupportSignals = tuple((Signal for Signal, _Factors in Context.PreparedEligibility.LocalAccessFactorsBySignal))
-                Context.UnarySupportClauses, Context.UnarySupportDiagnostics = CompilePhysicalComponentSymbolicUnaryApertureDomain(Context.PreparedEligibility.Problem, Context.PreparedEligibility, Context.UnarySupportSignals, DeadlineSeconds=Context.InterfaceDeadline.RemainingSeconds(), WorkCheck=lambda Diagnostics: Context.InterfaceDeadline.RaiseIfExpired('PhysicalComponentUnarySupportCompilation', Diagnostics), NetStateCache=Context.InterfaceResources.PhysicalComponentSymbolicNetStateCache, CompletedClauseCache=Context.InterfaceResources.PhysicalComponentSymbolicUnaryApertureClauseCache, RouteClaimsConstructionCache=Context.ComponentRouteClaimsConstructionCache)
+                Context.UnarySupportClauses, Context.UnarySupportDiagnostics = CompilePhysicalComponentUnarySupportWithRuntimeAuthority(Context.Policy, Context.InterfaceDeadline, Context.PreparedEligibility.Problem, Context.PreparedEligibility, Context.UnarySupportSignals, ObservedAt=float(Context.Services.monotonic()), WorkCheck=lambda Diagnostics: Context.InterfaceDeadline.RaiseIfExpired('PhysicalComponentUnarySupportCompilation', Diagnostics), NetStateCache=Context.InterfaceResources.PhysicalComponentSymbolicNetStateCache, CompletedClauseCache=Context.InterfaceResources.PhysicalComponentSymbolicUnaryApertureClauseCache, RouteClaimsConstructionCache=Context.ComponentRouteClaimsConstructionCache)
                 RecordPhysicalComponentStageTiming(Context, 'PhysicalComponentUnarySupportCompilation', Context.UnarySupportStartedAt, Result='complete' if Context.UnarySupportDiagnostics.get('Complete', False) else 'incomplete')
                 if not Context.UnarySupportDiagnostics.get('Complete', False):
                     raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PhysicalComponentAssemblyIncomplete, Stage='PhysicalComponentUnarySupportCompilation', Detail='the complete physical port domain did not finish unary local-support compilation', Diagnostics={**Context.UnarySupportDiagnostics, 'DomainFingerprint': Context.PreparedEligibility.DomainFingerprint, 'GlobalPlanningEntered': False, 'LocalCompilationEntered': False, 'ImplicitForeignTransitDomainCount': 0}))

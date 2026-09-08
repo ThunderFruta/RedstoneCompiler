@@ -1122,3 +1122,68 @@ unconsumed by Router. Joint's six-path policy correction is frozen and its direc
 policy regressions passed independent review, but it is uncommitted and has a
 separate exact-cluster `MissingReadyPredecessor` handoff finding. Neither is
 silently included in this Runtime integration or treated as full acceptance.
+
+## 2026-09-08 frozen-wire, bounded-Runtime, and current-envelope Router candidate
+
+Router first consumed Physical producer
+`88dc22b378bb561e1da9908fc5e3b24d663166bc`, parent
+`32cdcc3488d4b7355f46c1a8db3228b11fb4c9d2`, as ordinary no-fast-forward merge
+`b7d697a0caf3b43607abf86397f931e046304357`, whose first parent is exact Router
+revision `06fb31377fe79b9bd9b499e77c55dab02041fea1`. Before that merge, Router's
+only two working-tree modifications were authenticated as the exact Physical
+postimages and then restored only to the Router parent. Their SHA-256 values were
+`fd8cb628e634bd51c88972f9a0f7aa11194c756389a1b2ba11ff5544bd53b10a`
+for `PhysicalDesign/Redstone/Rules/Geometry.py` and
+`0827c479bfc6306b9f33c7079c54b451f31038de1d8b79bba1feaed8a2404158`
+for its owning placed-template resource-state test. The merge therefore retains
+the reviewed Physical rule that frozen-wire mapping identity, type, and complete
+normalized entries are re-attested before resource publication.
+
+Router then consumed Runtime producer
+`31385012e4d05532d69a85139c107ec6a3ea5ba9`, tree
+`352b4971863b8290fbb2e5325a9103546fafe2e2`, as ordinary no-fast-forward merge
+`edb808bc3be36d0adf3351ae17364b5460db03a9`, whose first parent is `b7d697a`.
+The resulting fourteen-path Runtime closure preserves explicit useful-work and
+cleanup cutoffs, bounded symbolic work, exact request/result authority, retained
+uncertain process ownership, cleanup escalation policy, and the tests for the
+complete Runtime ancestry required by this Router consumer.
+
+Joint producer `00fc924612f39a331ecfbcd9a5268a834654c986`, parent
+`e0a5d3016d14b67e1f58a1a3421433c2b2bed3bc`, tree
+`551ee72020447bd08840b398b0d19169b7502634`, is prepared as a no-fast-forward,
+no-commit merge into `edb808b`; it is not yet an integrated revision. The pending
+sixteen-path candidate preserves Router's final selected-access re-attestation
+and its public regression while adopting Joint's exact current-envelope and
+production Runtime-authority policy. After a channel and deck transform, the
+candidate always rebuilds routing resources, the selected-access solve, track
+preparation, and the causal envelope from the transformed placement. It never
+reuses a retained pre-transform resource graph. Current Router channel
+construction clears predecessor access evidence, so the combined transition
+validator admits only a synchronized fresh solve: an unrebound deck is
+`Stale/PhysicalInputMismatch`, malformed placement transitions remain
+`Stale/PlacementTransitionMismatch`, and fresh incomplete or unsatisfiable
+solves retain their distinct typed classifications.
+
+The superseded private transformed-access rebuild helper and its two direct
+helper tests are removed. They carried no distinct public oracle: the real
+seventeen-NAND channel/deck path observes the fresh transformed successor, while
+the current-envelope contract tests independently distinguish feasible,
+incomplete, unsatisfiable, unrebound, and malformed transition outcomes.
+
+Verification on the exact staged code candidate passed 154 Physical/current-
+envelope conflict tests, 345 Runtime tests with one expected skip, and 852
+focused Router tests with 109 subtests. Compileall passed; the structural/schema
+gate passed 7 tests; collection found 2,338 tests; and the full deterministic
+suite passed 2,333 tests with 5 expected skips and 378 subtests in 325.80 seconds.
+No Rust, native binding, or native-consumer source changed. The checkout-local
+imported extension remained SHA-256
+`d1b5cbda5ede49428cebf47af342b6153aa3d862310317c38a4aaf212ad85d1f`,
+so a native rebuild was not required for this Python, test, and documentation
+combination.
+
+The pending Joint merge still requires independent review and an authorized
+commit before it may be marked integrated. These results establish a combined
+commit-ready development candidate, not persistent workers, unified native
+cancellation, N6 salvage, a successful seven-case physical acceptance matrix,
+Fabric acceptance, performance acceptance, promotion readiness, a push, or a
+change to protected `main`.

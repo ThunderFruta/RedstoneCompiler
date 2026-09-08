@@ -29,6 +29,13 @@ from PhysicalDesign.Policy import PhysicalDesignPolicy
 from PhysicalDesign.Placement.PreRouteInterface import DerivedRoutingEnvelope
 from PhysicalDesign.Placement.Access.Geometry import DerivedPerimeterFabricShell
 from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
+from .AccessEnvelope import (
+    BuildCurrentSelectedAccessEnvelope,
+    CurrentSelectedAccessEnvelopePhase,
+    CurrentSelectedAccessEnvelopeResult,
+    CurrentSelectedAccessSolveBinding,
+    CurrentSelectedAccessTransition,
+)
 @dataclass(frozen=True)
 class PcbPlacementCandidate:
     """One deterministic legal placement retained for authoritative routing."""
@@ -47,6 +54,7 @@ class PcbPlacementCandidate:
     EstimatedGlobalExtensionNets: int
     PreOwnedNodeCount: int
     Placement: PcbPlacement
+    PlacementFingerprintIncludesLocalClaims: bool | None = None
     JointExactScore: tuple[int, ...] = ()
     TopologyDemand: TopologyDemandProfile | None = None
     JointPortfolioCandidate: bool = False
@@ -64,6 +72,10 @@ class PcbPlacementCandidate:
         compare=False,
     )
     RoutingEnvelope: DerivedRoutingEnvelope | None = None
+    PlacementAccessSolveBinding: CurrentSelectedAccessSolveBinding | None = None
+    CurrentSelectedAccessEnvelopeResult: (
+        CurrentSelectedAccessEnvelopeResult | None
+    ) = None
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -71,6 +83,9 @@ class PcbPlacementCandidate:
             "SourceGenerator": self.SourceGenerator,
             "RoutingSpacing": self.RoutingSpacing,
             "PlacementFingerprint": self.PlacementFingerprint,
+            "PlacementFingerprintIncludesLocalClaims": (
+                self.PlacementFingerprintIncludesLocalClaims
+            ),
             "PlacementRetentionFingerprint": (
                 self.PlacementRetentionFingerprint
             ),
@@ -113,7 +128,102 @@ class PcbPlacementCandidate:
             "LocalClaimCount": len(
                 self.Placement.Placed.LocalRouteClaims or ()
             ),
+            "PlacementAccessSolveBinding": (
+                self.PlacementAccessSolveBinding.ToDictionary()
+                if self.PlacementAccessSolveBinding is not None
+                else None
+            ),
+            "CurrentSelectedAccessEnvelope": (
+                self.CurrentSelectedAccessEnvelopeResult.ToDictionary()
+                if self.CurrentSelectedAccessEnvelopeResult is not None
+                else None
+            ),
         }
+
+
+def BuildCandidateCurrentSelectedAccessEnvelope(
+    Candidate: PcbPlacementCandidate,
+    *,
+    Phase: CurrentSelectedAccessEnvelopePhase,
+    Transition: CurrentSelectedAccessTransition,
+    Resources: Any,
+    Technology: Any,
+    Policy: PhysicalDesignPolicy,
+    ObservedPlacementFingerprint: str,
+    ObservedPlacementRetentionFingerprint: str,
+    Placement: PcbPlacement | None = None,
+    TrackPreparation: Any = None,
+    RawTrackAssignment: Any = None,
+    RawTrackAssignmentApplicable: bool = False,
+    Predecessor: CurrentSelectedAccessEnvelopeResult | None = None,
+    TransitionSourceCandidate: PcbPlacementCandidate | None = None,
+    ChannelPlacement: PcbPlacement | None = None,
+    TransitionDeckPlacement: PcbPlacement | None = None,
+    TransitionState: Any = None,
+) -> CurrentSelectedAccessEnvelopeResult:
+    """Build a fresh typed result from one live orchestration candidate."""
+    LivePlacement = Placement if Placement is not None else Candidate.Placement
+    return BuildCurrentSelectedAccessEnvelope(
+        Phase=Phase,
+        Transition=Transition,
+        CandidateId=Candidate.CandidateId,
+        SourceGenerator=Candidate.SourceGenerator,
+        RoutingSpacing=Candidate.RoutingSpacing,
+        PlacementFingerprint=Candidate.PlacementFingerprint,
+        PlacementRetentionFingerprint=Candidate.PlacementRetentionFingerprint,
+        InterfaceTopologyFingerprint=Candidate.InterfaceTopologyFingerprint,
+        ObservedPlacementFingerprint=ObservedPlacementFingerprint,
+        ObservedPlacementRetentionFingerprint=(
+            ObservedPlacementRetentionFingerprint
+        ),
+        PlacementFingerprintIncludesLocalClaims=(
+            Candidate.PlacementFingerprintIncludesLocalClaims
+        ),
+        Placement=LivePlacement,
+        ResourceGraph=Resources.ResourceGraph,
+        Technology=Technology,
+        Policy=Policy,
+        RoutingEnvelope=Candidate.RoutingEnvelope,
+        SolveBinding=Candidate.PlacementAccessSolveBinding,
+        TrackPreparation=TrackPreparation,
+        RawTrackAssignment=RawTrackAssignment,
+        RawTrackAssignmentApplicable=RawTrackAssignmentApplicable,
+        Predecessor=(
+            Predecessor
+            if Predecessor is not None
+            else None
+            if Phase is CurrentSelectedAccessEnvelopePhase.BeforeRawMaterialization
+            else Candidate.CurrentSelectedAccessEnvelopeResult
+        ),
+        TransitionSourceCandidateId=(
+            TransitionSourceCandidate.CandidateId
+            if TransitionSourceCandidate is not None
+            else ""
+        ),
+        TransitionSourcePlacementFingerprint=(
+            TransitionSourceCandidate.PlacementFingerprint
+            if TransitionSourceCandidate is not None
+            else ""
+        ),
+        TransitionSourcePlacementRetentionFingerprint=(
+            TransitionSourceCandidate.PlacementRetentionFingerprint
+            if TransitionSourceCandidate is not None
+            else ""
+        ),
+        TransitionSourcePlacementFingerprintIncludesLocalClaims=(
+            TransitionSourceCandidate.PlacementFingerprintIncludesLocalClaims
+            if TransitionSourceCandidate is not None
+            else None
+        ),
+        TransitionSourcePlacement=(
+            TransitionSourceCandidate.Placement
+            if TransitionSourceCandidate is not None
+            else None
+        ),
+        ChannelPlacement=ChannelPlacement,
+        TransitionDeckPlacement=TransitionDeckPlacement,
+        TransitionState=TransitionState,
+    )
 
 @dataclass(frozen=True)
 class PreRouteFabricDescriptor:

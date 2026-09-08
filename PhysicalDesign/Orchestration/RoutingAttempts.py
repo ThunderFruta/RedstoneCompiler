@@ -7,6 +7,7 @@ import os
 from typing import Any, Callable, Iterable
 from PhysicalDesign.Routing.Pcb import PrepareRawTrackAssignmentDomain, PrepareTrackAssignment
 from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolioTemplate
+from PhysicalDesign.Contracts.Placement import TrackAssignmentPreparation
 from PhysicalDesign.Contracts.Results import RoutedDesign
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint, RoutingDeadline
@@ -20,7 +21,16 @@ from PhysicalDesign.Placement.Access.Catalog import (
 )
 from PhysicalDesign.Placement.Engine.Clusters import PcbPlacement
 from PhysicalDesign.Placement.Engine.MandatoryAccess import MeasureMandatoryAccessConflictProfile
-from .Candidates import PcbPlacementCandidate
+from .Candidates import (
+    BuildCandidateCurrentSelectedAccessEnvelope,
+    PcbPlacementCandidate,
+)
+from .AccessEnvelope import (
+    CurrentSelectedAccessEnvelopePhase,
+    CurrentSelectedAccessTransition,
+    RequireCurrentSelectedAccessEnvelopeReady,
+    SelectUnambiguousCurrentSelectedAccessSolveBinding,
+)
 from .Demand import MeasurePlacementTopologyDemand
 from .Feedback import BuildPlacementFingerprint, ExtractCandidateStarvationSignals, ExtractPlacementRelocationSignals, FailurePrefersDirectOnlyPlacement, FailureRequestsPlacementAdvance, RequiresImmediateAssignmentCutRelocation, SelectCutDrivenClusterRefinementSignals, SelectReleasableLocalClaimSignals
 from .Portfolios import ApplyActivePlacementAssignmentConstraints, ApplyCoordinatedCandidateDiversificationProfile, BuildPendingJointPlacementPortfolioFingerprint, BuildPendingJointPlacementPortfolioIdentity, BuildPendingJointPlacementStateKey, BuildSamePlacementRoutingControlRetryState, HasActiveMaterializedJointPlacementCandidate, HasCurrentMaterializedJointPlacementCandidate, HasCurrentPendingJointPlacementState, PendingJointPlacementState, PendingJointPlacementStateMatchesIdentity, PlacementAssignmentConstraintsAreActive, PlacementCandidateMatchesActiveJointPortfolio, PlacementConstraintFingerprintMatchesIdentity, RebindTerminalJointPlacementConstraintEpoch, RetainUnmaterializedJointPlacementStates, RoutingControlAttemptIdentity, SelectNewPendingJointPlacementPortfolioFingerprint, ShouldDeferSamePlacementRoutingControlRetry, ShouldRefreshTerminalActiveJointPlacementConstraintEpoch, ShouldRetrySamePlacementRoutingControl
@@ -40,6 +50,30 @@ from .PlacementAttempts import (
     _TakeNextDeferredRequest,
     _TryPlacement,
 )
+
+
+def RebuildCurrentCandidateTrackPreparation(
+    Context,
+    Candidate: PcbPlacementCandidate,
+    *,
+    Resources: Any,
+) -> TrackAssignmentPreparation:
+    """Prepare track facts from one transformed candidate's fresh authority."""
+    CandidatePolicy = (
+        BuildFrozenEnvelopeRoutingPolicy(
+            Context.Policy,
+            Candidate.RoutingEnvelope,
+        )
+        if Candidate.RoutingEnvelope is not None
+        else Context.Policy
+    )
+    return PrepareTrackAssignment(
+        Candidate.Placement,
+        Resources=Resources,
+        Policy=CandidatePolicy,
+        Deadline=Context.InterfaceDeadline,
+        DeferClusterBoundaryLeaseUntilCapacityPrecheck=False,
+    )
 
 
 def _SelectedAccessInvariant(
@@ -366,6 +400,50 @@ def MaterializeRawTemplate(Context, Descriptor: RawTrackAssignmentPortfolioTempl
             ConsumerId=Candidate.CandidateId,
             PlacementFingerprint=Candidate.PlacementFingerprint,
         )
+        CurrentAccessResult = BuildCandidateCurrentSelectedAccessEnvelope(
+            Candidate,
+            Phase=(
+                CurrentSelectedAccessEnvelopePhase.BeforeRawMaterialization
+            ),
+            Transition=CurrentSelectedAccessTransition.InitialCandidate,
+            Resources=CandidateResources,
+            Technology=Context.Technology,
+            Policy=Context.Policy,
+            ObservedPlacementFingerprint=BuildPlacementFingerprint(
+                Candidate.Placement,
+                Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                if Candidate.TopologyDemand is not None else "",
+                IncludeLocalClaims=(
+                    Candidate.PlacementFingerprintIncludesLocalClaims
+                    if type(Candidate.PlacementFingerprintIncludesLocalClaims)
+                    is bool else True
+                ),
+            ),
+            ObservedPlacementRetentionFingerprint=(
+                BuildPlacementRetentionFingerprint(
+                    Candidate.Placement,
+                    Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                    if Candidate.TopologyDemand is not None else "",
+                    IncludeLocalClaims=(
+                        Candidate.PlacementFingerprintIncludesLocalClaims
+                        if type(Candidate.PlacementFingerprintIncludesLocalClaims)
+                        is bool else True
+                    ),
+                )
+            ),
+        )
+        RequireCurrentSelectedAccessEnvelopeReady(
+            CurrentAccessResult,
+            Stage="CurrentSelectedAccessBeforeRawMaterialization",
+        )
+        Candidate = replace(
+            Candidate,
+            CurrentSelectedAccessEnvelopeResult=CurrentAccessResult,
+        )
+        Context.CandidateById[Candidate.CandidateId] = Candidate
+        Context.CandidateRecords[
+            Context.CandidateIndexById[Candidate.CandidateId]
+        ] = Candidate
     try:
         Fabric = BuildPlacementAccessFabric(
             Candidate.Placement,
@@ -918,7 +996,18 @@ def _BuildCandidateRecords(Context) -> list[PcbPlacementCandidate]:
             if Feedback is None:
                 raise RoutingStageError(_PlacementFailureWithHistory(Context, RoutingFailure(Reason=RoutingFailureReason.Stagnated, Stage='PlacementFeedback', Detail='retained placement was missing its bounded routing-feedback record', RepairActions=('AdvancePlacementGenerator',), Diagnostics={'PlacementFingerprint': Fingerprint, 'SourceGenerator': SourceGenerator})))
         FeedbackScore = Feedback.Score if Feedback is not None else (CandidateIndex,)
-        CandidateRecords.append(PcbPlacementCandidate(CandidateId=f'Placement-{Fingerprint[:12]}', SourceGenerator=SourceGenerator, RoutingSpacing=CandidateSpacing, PlacementFingerprint=Fingerprint, FeedbackScore=tuple(FeedbackScore), BoundaryOverflow=Feedback.BoundaryOverflow if Feedback is not None else 0, PinScarcityCount=Feedback.PinScarcityCount if Feedback is not None else 0, GuideOverflowPeak=Feedback.GuideOverflowPeak if Feedback is not None else 0, GuideOverflowCells=Feedback.GuideOverflowCells if Feedback is not None else 0, PinEscapeConflictCount=Feedback.PinEscapeConflictCount if Feedback is not None else 0, EstimatedGlobalExtensionNodes=Feedback.EstimatedGlobalExtensionNodes if Feedback is not None else 0, EstimatedGlobalExtensionNets=Feedback.EstimatedGlobalExtensionNets if Feedback is not None else 0, PreOwnedNodeCount=Feedback.PreOwnedNodeCount if Feedback is not None else 0, Placement=Candidate, PlacementRetentionFingerprint=Context.PlacementRetentionFingerprintByFingerprint.get(Fingerprint, ''), InterfaceTopologyFingerprint=BuildClusterInterfacePlacementTopologyFingerprint(Candidate, Context.SignalTopologyFingerprints), JointPlacementState=Context.JointPlacementStateByPlacementFingerprint.get(Fingerprint), AssignmentCutFingerprint=str(CandidateRecipe.get('AssignmentCutFingerprint', '')), AssignmentConstraintFingerprint=str(CandidateRecipe.get('AssignmentConstraintFingerprint', '')), JointPortfolioIdentityFingerprint=str(CandidateRecipe.get('JointPortfolioIdentityFingerprint', '')), JointExactScore=JointExactScore(Candidate), TopologyDemand=CandidateTopologyDemand, JointPortfolioCandidate=JointPortfolioCandidate, Feedback=Feedback))
+        PlacementAccessSolveBinding = SelectUnambiguousCurrentSelectedAccessSolveBinding(
+            getattr(
+                Context,
+                "PlacementAccessSolveBindingsByPlacementFingerprint",
+                {},
+            ).get(
+                Fingerprint,
+                (),
+            ),
+            Candidate.PlacementAccessSolve,
+        )
+        CandidateRecords.append(PcbPlacementCandidate(CandidateId=f'Placement-{Fingerprint[:12]}', SourceGenerator=SourceGenerator, RoutingSpacing=CandidateSpacing, PlacementFingerprint=Fingerprint, FeedbackScore=tuple(FeedbackScore), BoundaryOverflow=Feedback.BoundaryOverflow if Feedback is not None else 0, PinScarcityCount=Feedback.PinScarcityCount if Feedback is not None else 0, GuideOverflowPeak=Feedback.GuideOverflowPeak if Feedback is not None else 0, GuideOverflowCells=Feedback.GuideOverflowCells if Feedback is not None else 0, PinEscapeConflictCount=Feedback.PinEscapeConflictCount if Feedback is not None else 0, EstimatedGlobalExtensionNodes=Feedback.EstimatedGlobalExtensionNodes if Feedback is not None else 0, EstimatedGlobalExtensionNets=Feedback.EstimatedGlobalExtensionNets if Feedback is not None else 0, PreOwnedNodeCount=Feedback.PreOwnedNodeCount if Feedback is not None else 0, Placement=Candidate, PlacementFingerprintIncludesLocalClaims=Context.PlacementFingerprintIncludesLocalClaimsByFingerprint.get(Fingerprint), PlacementRetentionFingerprint=Context.PlacementRetentionFingerprintByFingerprint.get(Fingerprint, ''), InterfaceTopologyFingerprint=BuildClusterInterfacePlacementTopologyFingerprint(Candidate, Context.SignalTopologyFingerprints), JointPlacementState=Context.JointPlacementStateByPlacementFingerprint.get(Fingerprint), AssignmentCutFingerprint=str(CandidateRecipe.get('AssignmentCutFingerprint', '')), AssignmentConstraintFingerprint=str(CandidateRecipe.get('AssignmentConstraintFingerprint', '')), JointPortfolioIdentityFingerprint=str(CandidateRecipe.get('JointPortfolioIdentityFingerprint', '')), JointExactScore=JointExactScore(Candidate), TopologyDemand=CandidateTopologyDemand, JointPortfolioCandidate=JointPortfolioCandidate, Feedback=Feedback, PlacementAccessSolveBinding=PlacementAccessSolveBinding))
     CandidateRecords.sort(key=lambda Value: PlacementCandidateOrder(Value, Context.ConfiguredRoutingSpacing))
     ActiveCut = Context.CurrentPlacementAssignmentCut
     ReferencePlacement = Context.CutSourcePlacementByFingerprint.get(ActiveCut.ConflictFingerprint) if ActiveCut is not None else None
@@ -1000,6 +1089,7 @@ def _PublishTransactionalClusterEndpointRepair(Context, SourceCandidate: PcbPlac
         return False
     Context.UniquePlacements[Fingerprint] = ('transactional-cluster-endpoint-repair', SourceCandidate.RoutingSpacing, Candidate)
     Context.PlacementRetentionFingerprintByFingerprint[Fingerprint] = RetentionFingerprint
+    Context.PlacementFingerprintIncludesLocalClaimsByFingerprint[Fingerprint] = False
     Context.RetainedPlacementTopologyFingerprints[RetentionFingerprint] = (Fingerprint, 'transactional-cluster-endpoint-repair')
     Context.TopologyDemandByFingerprint[Fingerprint] = CandidateTopologyDemand
     Context.RoutingResourcesByFingerprint[Fingerprint] = CandidateResources
