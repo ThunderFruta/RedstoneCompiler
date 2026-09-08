@@ -22,10 +22,8 @@ from PhysicalDesign.Routing.Regions.Boundaries.Fabric import _PlanTreeRepeaters
 from PhysicalDesign.Routing.Regions.Solving.LegacySolver import _SolveComponentRoutingProblemLegacy
 from PhysicalDesign.Constraints.PhysicalClaims import ComponentClaimsCompatibleForOwners, ComponentClaimsConflict
 import PhysicalDesign.Routing.Regions.Solving.DynamicSolver as DynamicSolverModule
-import PhysicalDesign.Routing.Regions.Symbolic.SymbolicDomains as SymbolicDomainsModule
 from PhysicalDesign.Routing.Regions.Pipeline import CompileClosedComponent
 from PhysicalDesign.Routing.Regions.Proofs.Validation import BuildPhysicalPortLocalContractFingerprint
-from PhysicalDesign.Routing.Regions.Symbolic.SymbolicDomains import CompilePhysicalComponentSymbolicUnaryApertureDomain
 from PhysicalDesign.Contracts.Component import ClosedComponentInterface, ComponentFeedthroughContract, ComponentForeignTransitDomain, ComponentInterfacePort, ComponentRoutingFabric, ComponentRoutingProblem, ComponentTerminalAccessCandidate, ComponentTerminalAccessDomain, PhysicalComponentAssemblyPlan, PhysicalComponentPortReservation, RoutedComponentNet
 from PhysicalDesign.Resources.ResourceGraph import LocalRouteClaim, PinAccessPortal, RoutingResourceGraph, RoutingResourceClaims, FindSelfClaimConflicts
 from PhysicalDesign.Routing.Planning.ChannelPlanner import NetRoutingProfile
@@ -2937,89 +2935,6 @@ def _LoadCla4TreeDpFixture():
         ),
     )
     return Data, Problem
-
-
-def test_parallel_unary_workers_merge_symbolic_state_cache_into_parent():
-    Problem = _Problem()
-    FactorDomain = SimpleNamespace(
-        Complete=True,
-        Feasible=True,
-        PlacementFingerprint=Problem.PlacementFingerprint,
-        DomainFingerprint="parallel-unary-cache-fixture",
-        LocalAccessFactorsBySignal=(
-            ("Alpha", ()),
-            ("Beta", ()),
-        ),
-    )
-
-    class Future:
-        def __init__(self, Result):
-            self.Result = Result
-
-        def result(self, timeout=None):
-            return self.Result
-
-    class Executor:
-        def __init__(self, **_Arguments):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_Arguments):
-            return False
-
-        def submit(
-            self,
-            _TelemetryWorker,
-            _TaskId,
-            _Worker,
-            _Problem,
-            _FactorDomain,
-            Signal,
-            _Deadline,
-        ):
-            Clause = frozenset(((Signal, f"aperture-{Signal}"),))
-            return Future((
-                Signal,
-                frozenset((Clause,)),
-                {
-                    "Complete": True,
-                    "CompiledAccessCount": 1,
-                    "UnsupportedLocalAccessCount": 0,
-                    "UnsupportedApertureOptionCount": 0,
-                    "UnsupportedLocalApertureSupportCount": 0,
-                    "UnaryLocalAccessClauseCount": 1,
-                    "UnarySeamClauseCount": 0,
-                },
-                {f"symbolic-state:{Signal}": Signal},
-            ))
-
-    OriginalExecutor = SymbolicDomainsModule.ProcessPoolExecutor
-    SymbolicDomainsModule.ProcessPoolExecutor = Executor
-    try:
-        NetStateCache = {}
-        Clauses, Diagnostics = (
-            CompilePhysicalComponentSymbolicUnaryApertureDomain(
-                Problem,
-                FactorDomain,
-                ("Alpha", "Beta"),
-                DeadlineSeconds=1.0,
-                NetStateCache=NetStateCache,
-            )
-        )
-    finally:
-        SymbolicDomainsModule.ProcessPoolExecutor = OriginalExecutor
-
-    assert Clauses == frozenset((
-        frozenset((("Alpha", "aperture-Alpha"),)),
-        frozenset((("Beta", "aperture-Beta"),)),
-    ))
-    assert NetStateCache == {
-        "symbolic-state:Alpha": "Alpha",
-        "symbolic-state:Beta": "Beta",
-    }
-    assert Diagnostics["UnarySignalProcessStatus"] == "complete"
 
 
 def test_captured_cla4_tree_frontier_fixture_completes_under_gate():

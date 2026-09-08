@@ -47,8 +47,11 @@ def _Request() -> RuntimeWorkRequest:
 def _Authority() -> RuntimeWorkAuthority:
     return RuntimeWorkAuthority(
         WorkDeadlineAt=1234.5,
-        CleanupCutoffAt=1234.5,
+        CleanupCutoffAt=1235.5,
+        MaximumCooperativeGraceSeconds=0.25,
         ForceTerminationAuthorized=False,
+        PolicyIdentity="runtime-policy-v2:test",
+        PressureIdentity="pressure-snapshot:test",
     )
 
 
@@ -123,12 +126,18 @@ def test_runtime_work_authority_is_frozen_snapshot_with_boolean_polarity():
     Authority = _Authority()
 
     assert Authority.WorkDeadlineAt == 1234.5
-    assert Authority.CleanupCutoffAt == 1234.5
+    assert Authority.CleanupCutoffAt == 1235.5
+    assert Authority.MaximumCooperativeGraceSeconds == 0.25
     assert Authority.ForceTerminationAuthorized is False
+    assert Authority.PolicyIdentity == "runtime-policy-v2:test"
+    assert Authority.PressureIdentity == "pressure-snapshot:test"
     assert Authority != RuntimeWorkAuthority(
         WorkDeadlineAt=1234.5,
-        CleanupCutoffAt=1234.5,
+        CleanupCutoffAt=1235.5,
+        MaximumCooperativeGraceSeconds=0.25,
         ForceTerminationAuthorized=True,
+        PolicyIdentity="runtime-policy-v2:test",
+        PressureIdentity="pressure-snapshot:test",
     )
 
     with pytest.raises(FrozenInstanceError):
@@ -163,8 +172,11 @@ def test_runtime_work_authority_rejects_float_subclasses_without_conversion(Fiel
     Trap = ConversionTrapFloat(1234.5)
     KeywordArguments = {
         "WorkDeadlineAt": 1234.5,
-        "CleanupCutoffAt": 1000.0,
+        "CleanupCutoffAt": 1235.5,
+        "MaximumCooperativeGraceSeconds": 0.25,
         "ForceTerminationAuthorized": False,
+        "PolicyIdentity": "runtime-policy-v2:test",
+        "PressureIdentity": "pressure-snapshot:test",
     }
     KeywordArguments[Field] = Trap
 
@@ -173,7 +185,7 @@ def test_runtime_work_authority_rejects_float_subclasses_without_conversion(Fiel
     assert Trap.ConversionCalls == 0
 
     Document = {
-        "SchemaVersion": "runtime-work-authority-v1",
+        "SchemaVersion": "runtime-work-authority-v2",
         **KeywordArguments,
     }
     with pytest.raises(TypeError):
@@ -193,8 +205,11 @@ def test_runtime_work_authority_rejects_custom_numeric_without_conversion(Field)
     Trap = ConversionTrapNumeric()
     KeywordArguments = {
         "WorkDeadlineAt": 1234.5,
-        "CleanupCutoffAt": 1000.0,
+        "CleanupCutoffAt": 1235.5,
+        "MaximumCooperativeGraceSeconds": 0.25,
         "ForceTerminationAuthorized": False,
+        "PolicyIdentity": "runtime-policy-v2:test",
+        "PressureIdentity": "pressure-snapshot:test",
     }
     KeywordArguments[Field] = Trap
 
@@ -203,7 +218,7 @@ def test_runtime_work_authority_rejects_custom_numeric_without_conversion(Field)
     assert Trap.ConversionCalls == 0
 
     Document = {
-        "SchemaVersion": "runtime-work-authority-v1",
+        "SchemaVersion": "runtime-work-authority-v2",
         **KeywordArguments,
     }
     with pytest.raises(TypeError):
@@ -230,16 +245,22 @@ def test_runtime_work_authority_decoder_rejects_integer_timestamps(Field, Timest
 
 def test_runtime_work_authority_true_false_literal_documents_round_trip():
     FalseDocument = {
-        "SchemaVersion": "runtime-work-authority-v1",
+        "SchemaVersion": "runtime-work-authority-v2",
         "WorkDeadlineAt": 1234.5,
-        "CleanupCutoffAt": 1000.0,
+        "CleanupCutoffAt": 1235.5,
+        "MaximumCooperativeGraceSeconds": 0.25,
         "ForceTerminationAuthorized": False,
+        "PolicyIdentity": "runtime-policy-v2:test",
+        "PressureIdentity": "pressure-snapshot:test",
     }
     TrueDocument = {
-        "SchemaVersion": "runtime-work-authority-v1",
+        "SchemaVersion": "runtime-work-authority-v2",
         "WorkDeadlineAt": 1234.5,
-        "CleanupCutoffAt": 1000.0,
+        "CleanupCutoffAt": 1235.5,
+        "MaximumCooperativeGraceSeconds": 0.25,
         "ForceTerminationAuthorized": True,
+        "PolicyIdentity": "runtime-policy-v2:test",
+        "PressureIdentity": "pressure-snapshot:test",
     }
 
     DecodedFalse = RuntimeWorkAuthority.FromDictionary(FalseDocument)
@@ -247,14 +268,20 @@ def test_runtime_work_authority_true_false_literal_documents_round_trip():
 
     assert DecodedFalse == RuntimeWorkAuthority(
         WorkDeadlineAt=1234.5,
-        CleanupCutoffAt=1000.0,
+        CleanupCutoffAt=1235.5,
+        MaximumCooperativeGraceSeconds=0.25,
         ForceTerminationAuthorized=False,
+        PolicyIdentity="runtime-policy-v2:test",
+        PressureIdentity="pressure-snapshot:test",
     )
     assert DecodedFalse.ToDictionary() == FalseDocument
     assert DecodedTrue == RuntimeWorkAuthority(
         WorkDeadlineAt=1234.5,
-        CleanupCutoffAt=1000.0,
+        CleanupCutoffAt=1235.5,
+        MaximumCooperativeGraceSeconds=0.25,
         ForceTerminationAuthorized=True,
+        PolicyIdentity="runtime-policy-v2:test",
+        PressureIdentity="pressure-snapshot:test",
     )
     assert DecodedTrue.ToDictionary() == TrueDocument
 
@@ -264,8 +291,11 @@ def test_runtime_work_authority_constructor_rejects_non_boolean_force_authority(
     with pytest.raises(TypeError):
         RuntimeWorkAuthority(
             WorkDeadlineAt=1234.5,
-            CleanupCutoffAt=1000.0,
+            CleanupCutoffAt=1235.5,
+            MaximumCooperativeGraceSeconds=0.25,
             ForceTerminationAuthorized=Force,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
         )
 
 
@@ -275,6 +305,9 @@ def test_runtime_work_authority_constructor_rejects_non_boolean_force_authority(
         lambda Document: Document.pop("SchemaVersion"),
         lambda Document: Document.pop("WorkDeadlineAt"),
         lambda Document: Document.pop("CleanupCutoffAt"),
+        lambda Document: Document.pop("MaximumCooperativeGraceSeconds"),
+        lambda Document: Document.pop("PolicyIdentity"),
+        lambda Document: Document.pop("PressureIdentity"),
         lambda Document: Document.__setitem__("ForceTerminationAuthorized", 0),
         lambda Document: Document.__setitem__("WorkDeadlineAt", None),
         lambda Document: Document.__setitem__("CleanupCutoffAt", "never"),
@@ -289,7 +322,14 @@ def test_runtime_work_authority_rejects_malformed_documents(Mutation):
         RuntimeWorkAuthority.FromDictionary(Document)
 
 
-@pytest.mark.parametrize("Scheme", ("runtime-work-authority-v0", "runtime-work-request-v1"))
+@pytest.mark.parametrize(
+    "Scheme",
+    (
+        "runtime-work-authority-v0",
+        "runtime-work-authority-v1",
+        "runtime-work-request-v1",
+    ),
+)
 def test_runtime_work_authority_rejects_unknown_schema_version(Scheme):
     Document = _Authority().ToDictionary()
     Document["SchemaVersion"] = Scheme
@@ -298,40 +338,23 @@ def test_runtime_work_authority_rejects_unknown_schema_version(Scheme):
         RuntimeWorkAuthority.FromDictionary(Document)
 
 
-def test_runtime_work_authority_accepts_equal_and_expired_cutoff_values():
-    assert RuntimeWorkAuthority(
-        WorkDeadlineAt=500.0,
-        CleanupCutoffAt=500.0,
-        ForceTerminationAuthorized=True,
-    ) == RuntimeWorkAuthority.FromDictionary(
-        {
-            "SchemaVersion": "runtime-work-authority-v1",
-            "WorkDeadlineAt": 500.0,
-            "CleanupCutoffAt": 500.0,
-            "ForceTerminationAuthorized": True,
-        }
-    )
-
-    assert RuntimeWorkAuthority(
-        WorkDeadlineAt=1000.0,
-        CleanupCutoffAt=999.0,
-        ForceTerminationAuthorized=False,
-    ) == RuntimeWorkAuthority.FromDictionary(
-        {
-            "SchemaVersion": "runtime-work-authority-v1",
-            "WorkDeadlineAt": 1000.0,
-            "CleanupCutoffAt": 999.0,
-            "ForceTerminationAuthorized": False,
-        }
-    )
+@pytest.mark.parametrize("CleanupCutoffAt", (500.0, 499.0))
+def test_runtime_work_authority_rejects_non_later_cleanup_cutoff(
+    CleanupCutoffAt,
+):
+    with pytest.raises(ValueError):
+        replace(_Authority(), WorkDeadlineAt=500.0, CleanupCutoffAt=CleanupCutoffAt)
 
 
-def test_runtime_work_authority_round_trips_negative_reverse_order_adjacent_floats():
+def test_runtime_work_authority_round_trips_negative_adjacent_cutoffs():
     Document = {
-        "SchemaVersion": "runtime-work-authority-v1",
+        "SchemaVersion": "runtime-work-authority-v2",
         "WorkDeadlineAt": -1.0000000000000002,
         "CleanupCutoffAt": -1.0,
+        "MaximumCooperativeGraceSeconds": 0.0,
         "ForceTerminationAuthorized": True,
+        "PolicyIdentity": "runtime-policy-v2:test",
+        "PressureIdentity": "pressure-snapshot:test",
     }
 
     Decoded = RuntimeWorkAuthority.FromDictionary(Document)
@@ -342,24 +365,96 @@ def test_runtime_work_authority_round_trips_negative_reverse_order_adjacent_floa
     assert Decoded.ToDictionary() == Document
 
 
+@pytest.mark.parametrize(
+    ("Value", "ExpectedError"),
+    (
+        (-0.0001, ValueError),
+        (0, TypeError),
+        (False, TypeError),
+        (float("inf"), TypeError),
+        (float("nan"), TypeError),
+    ),
+)
+def test_runtime_work_authority_rejects_malformed_cooperative_grace(
+    Value,
+    ExpectedError,
+):
+    with pytest.raises(ExpectedError):
+        replace(_Authority(), MaximumCooperativeGraceSeconds=Value)
+
+    Document = _Authority().ToDictionary()
+    Document["MaximumCooperativeGraceSeconds"] = Value
+    with pytest.raises(ExpectedError):
+        RuntimeWorkAuthority.FromDictionary(Document)
+
+
+@pytest.mark.parametrize(
+    "Field",
+    ("PolicyIdentity", "PressureIdentity"),
+)
+@pytest.mark.parametrize("Value", ("", 0, None))
+def test_runtime_work_authority_rejects_missing_or_non_text_identity(
+    Field,
+    Value,
+):
+    with pytest.raises(TypeError):
+        replace(_Authority(), **{Field: Value})
+
+    Document = _Authority().ToDictionary()
+    Document[Field] = Value
+    with pytest.raises(TypeError):
+        RuntimeWorkAuthority.FromDictionary(Document)
+
+
+def test_runtime_work_authority_force_boundary_uses_cancellation_not_work_time():
+    Authority = replace(
+        _Authority(),
+        WorkDeadlineAt=100.0,
+        CleanupCutoffAt=120.0,
+        MaximumCooperativeGraceSeconds=3.0,
+    )
+
+    assert Authority.ForceTerminationEligibleAt(40.0) == 43.0
+    assert Authority.ForceTerminationEligibleAt(119.0) == 120.0
+    assert replace(
+        Authority,
+        MaximumCooperativeGraceSeconds=0.0,
+    ).ForceTerminationEligibleAt(40.0) == 40.0
+
+
+@pytest.mark.parametrize("Value", (40, False, float("inf"), float("nan")))
+def test_runtime_work_authority_force_boundary_rejects_inexact_observation(Value):
+    with pytest.raises(TypeError):
+        _Authority().ForceTerminationEligibleAt(Value)
+
+
 def test_runtime_work_authority_rejects_non_finite_cutoff_values():
     with pytest.raises(TypeError):
         RuntimeWorkAuthority(
             WorkDeadlineAt=float("inf"),
             CleanupCutoffAt=10.0,
+            MaximumCooperativeGraceSeconds=0.0,
             ForceTerminationAuthorized=False,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
         )
     with pytest.raises(TypeError):
         RuntimeWorkAuthority(
             WorkDeadlineAt=1.0,
             CleanupCutoffAt=float("nan"),
+            MaximumCooperativeGraceSeconds=0.0,
             ForceTerminationAuthorized=False,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
         )
     with pytest.raises(TypeError):
         RuntimeWorkAuthority(
             WorkDeadlineAt=float("nan"),
             CleanupCutoffAt=1.0,
+            MaximumCooperativeGraceSeconds=0.0,
             ForceTerminationAuthorized=False,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
         )
 
 

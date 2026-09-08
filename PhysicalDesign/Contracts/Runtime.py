@@ -221,11 +221,14 @@ class RuntimeCancellationSnapshot:
 class RuntimeWorkAuthority:
     """Immutable authority snapshot for deadline, cleanup, and force policy."""
 
-    SchemaVersion = "runtime-work-authority-v1"
+    SchemaVersion = "runtime-work-authority-v2"
 
     WorkDeadlineAt: float
     CleanupCutoffAt: float
+    MaximumCooperativeGraceSeconds: float
     ForceTerminationAuthorized: bool
+    PolicyIdentity: str
+    PressureIdentity: str
 
     def __post_init__(self) -> None:
         if (
@@ -238,15 +241,52 @@ class RuntimeWorkAuthority:
             or not isfinite(self.CleanupCutoffAt)
         ):
             raise TypeError("CleanupCutoffAt must be a finite absolute timestamp")
+        if self.CleanupCutoffAt <= self.WorkDeadlineAt:
+            raise ValueError("CleanupCutoffAt must be later than WorkDeadlineAt")
+        if (
+            type(self.MaximumCooperativeGraceSeconds) is not float
+            or not isfinite(self.MaximumCooperativeGraceSeconds)
+        ):
+            raise TypeError(
+                "MaximumCooperativeGraceSeconds must be a finite "
+                "non-negative duration"
+            )
+        if self.MaximumCooperativeGraceSeconds < 0.0:
+            raise ValueError(
+                "MaximumCooperativeGraceSeconds must be non-negative"
+            )
         if type(self.ForceTerminationAuthorized) is not bool:
             raise TypeError("ForceTerminationAuthorized must be a boolean")
+        if type(self.PolicyIdentity) is not str or not self.PolicyIdentity:
+            raise TypeError("PolicyIdentity must be a non-empty exact string")
+        if type(self.PressureIdentity) is not str or not self.PressureIdentity:
+            raise TypeError("PressureIdentity must be a non-empty exact string")
+
+    def ForceTerminationEligibleAt(self, CancellationObservedAt: float) -> float:
+        """Return the exact caller-granted force boundary for cancellation."""
+        if (
+            type(CancellationObservedAt) is not float
+            or not isfinite(CancellationObservedAt)
+        ):
+            raise TypeError(
+                "CancellationObservedAt must be a finite absolute timestamp"
+            )
+        return min(
+            CancellationObservedAt + self.MaximumCooperativeGraceSeconds,
+            self.CleanupCutoffAt,
+        )
 
     def ToDictionary(self) -> dict[str, object]:
         return {
             "SchemaVersion": self.SchemaVersion,
             "WorkDeadlineAt": self.WorkDeadlineAt,
             "CleanupCutoffAt": self.CleanupCutoffAt,
+            "MaximumCooperativeGraceSeconds": (
+                self.MaximumCooperativeGraceSeconds
+            ),
             "ForceTerminationAuthorized": self.ForceTerminationAuthorized,
+            "PolicyIdentity": self.PolicyIdentity,
+            "PressureIdentity": self.PressureIdentity,
         }
 
     @classmethod
@@ -259,7 +299,10 @@ class RuntimeWorkAuthority:
                 "SchemaVersion",
                 "WorkDeadlineAt",
                 "CleanupCutoffAt",
+                "MaximumCooperativeGraceSeconds",
                 "ForceTerminationAuthorized",
+                "PolicyIdentity",
+                "PressureIdentity",
             )),
             "runtime work authority",
         )
@@ -271,13 +314,30 @@ class RuntimeWorkAuthority:
         CleanupCutoffAt = Document["CleanupCutoffAt"]
         if type(CleanupCutoffAt) is not float:
             raise TypeError("CleanupCutoffAt must be a finite absolute timestamp")
+        MaximumCooperativeGraceSeconds = Document[
+            "MaximumCooperativeGraceSeconds"
+        ]
+        if type(MaximumCooperativeGraceSeconds) is not float:
+            raise TypeError(
+                "MaximumCooperativeGraceSeconds must be a finite "
+                "non-negative duration"
+            )
         ForceTerminationAuthorized = Document["ForceTerminationAuthorized"]
         if type(ForceTerminationAuthorized) is not bool:
             raise TypeError("ForceTerminationAuthorized must be a boolean")
+        PolicyIdentity = Document["PolicyIdentity"]
+        if type(PolicyIdentity) is not str or not PolicyIdentity:
+            raise TypeError("PolicyIdentity must be a non-empty exact string")
+        PressureIdentity = Document["PressureIdentity"]
+        if type(PressureIdentity) is not str or not PressureIdentity:
+            raise TypeError("PressureIdentity must be a non-empty exact string")
         return cls(
             WorkDeadlineAt=WorkDeadlineAt,
             CleanupCutoffAt=CleanupCutoffAt,
+            MaximumCooperativeGraceSeconds=MaximumCooperativeGraceSeconds,
             ForceTerminationAuthorized=ForceTerminationAuthorized,
+            PolicyIdentity=PolicyIdentity,
+            PressureIdentity=PressureIdentity,
         )
 
 
