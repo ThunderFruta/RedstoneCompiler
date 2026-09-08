@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from types import MappingProxyType
@@ -72,6 +73,9 @@ class _PlacedTemplateSourceCapture:
     TemplateDomain: tuple[str, ...]
     UsedTemplateKeys: tuple[str, ...]
     TemplatesByKey: tuple[_CapturedRoutingTemplate, ...]
+    FrozenNetWireMapping: Any
+    FrozenNetWireMappingClass: type
+    FrozenNetWireEntries: tuple[tuple[str, tuple[Position3, ...]], ...]
 
 
 def _PlacedTemplateGateObservation(Gate: Any) -> tuple[object, ...]:
@@ -192,6 +196,39 @@ def _CaptureRoutingTemplate(Key: str, Template: Any) -> _CapturedRoutingTemplate
     )
 
 
+def _CaptureFrozenNetWireSources(
+    Placed: Any,
+) -> tuple[Any, type, tuple[tuple[str, tuple[Position3, ...]], ...]]:
+    Source = getattr(Placed, "FrozenNetWires", None)
+    if Source is None:
+        return None, type(None), ()
+    if not isinstance(Source, Mapping):
+        raise TypeError("placed frozen wires must be a mapping or None")
+    RawEntries = tuple(Source.items())
+    Signals = tuple(Signal for Signal, _Positions in RawEntries)
+    if any(type(Signal) is not str for Signal in Signals):
+        raise TypeError("placed frozen-wire signals must be exact strings")
+    if len(Signals) != len(set(Signals)):
+        raise ValueError("placed frozen wires repeat a signal")
+    CapturedEntries = []
+    for Signal, Positions in RawEntries:
+        Materialized = tuple(Positions)
+        if any(
+            type(Position) not in (tuple, list)
+            or len(Position) != 3
+            or any(type(Component) is not int for Component in Position)
+            for Position in Materialized
+        ):
+            raise TypeError(
+                "placed frozen-wire positions must be exact three-integer positions"
+            )
+        Normalized = tuple(tuple(Position) for Position in Materialized)
+        if len(Normalized) != len(set(Normalized)):
+            raise ValueError("placed frozen wires repeat a position")
+        CapturedEntries.append((Signal, tuple(sorted(Normalized))))
+    return Source, type(Source), tuple(sorted(CapturedEntries))
+
+
 def _CapturePlacedTemplateSources(Placed: Any) -> _PlacedTemplateSourceCapture:
     GateCollection = Placed.PlacedGates
     if type(GateCollection) not in (list, tuple):
@@ -201,6 +238,9 @@ def _CapturePlacedTemplateSources(Placed: Any) -> _PlacedTemplateSourceCapture:
     Identities = tuple(Observation[0] for Observation in GateObservations)
     if len(Identities) != len(set(Identities)):
         raise ValueError("placed template snapshot repeats a gate identity")
+    FrozenNetWireMapping, FrozenNetWireMappingClass, FrozenNetWireEntries = (
+        _CaptureFrozenNetWireSources(Placed)
+    )
     Templates = LoadRoutingTemplates()
     if type(Templates) is not dict:
         raise TypeError("routing templates must be an exact re-attestable dict")
@@ -221,6 +261,9 @@ def _CapturePlacedTemplateSources(Placed: Any) -> _PlacedTemplateSourceCapture:
         TemplateDomain=tuple(sorted(Templates)),
         UsedTemplateKeys=UsedTemplateKeys,
         TemplatesByKey=tuple(Captured),
+        FrozenNetWireMapping=FrozenNetWireMapping,
+        FrozenNetWireMappingClass=FrozenNetWireMappingClass,
+        FrozenNetWireEntries=FrozenNetWireEntries,
     )
 
 
@@ -230,6 +273,12 @@ def _ReattestPlacedTemplateSources(
 ) -> None:
     """Reject collection, template, or deep block drift before publication."""
     Current = _CapturePlacedTemplateSources(Placed)
+    if (
+        Current.FrozenNetWireMapping is not Capture.FrozenNetWireMapping
+        or Current.FrozenNetWireMappingClass is not Capture.FrozenNetWireMappingClass
+        or Current.FrozenNetWireEntries != Capture.FrozenNetWireEntries
+    ):
+        raise ValueError("placed frozen-wire inputs changed before publication")
     SourceIdentityChanged = (
         Current.GateCollection is not Capture.GateCollection
         or Current.GateCollectionClass is not Capture.GateCollectionClass
@@ -443,11 +492,9 @@ def BuildRoutingResources(
     TemplateElectricalBlocks = frozenset(ElectricalBlocks)
     # Complete local nets are immutable obstacles to every remaining signal.
     # Partial claims are carried inside their signal's route candidates.
-    FrozenNetWires = getattr(Placed, "FrozenNetWires", None) or {}
+    FrozenNetWires = Snapshot._SourceCapture.FrozenNetWireEntries
     FrozenPositionCount = 0
-    for SignalIndex, (Signal, Positions) in enumerate(
-        sorted(FrozenNetWires.items())
-    ):
+    for SignalIndex, (Signal, Positions) in enumerate(FrozenNetWires):
         if WorkCheck is not None:
             WorkCheck({
                 "Phase": "routing-resources-frozen-net",
