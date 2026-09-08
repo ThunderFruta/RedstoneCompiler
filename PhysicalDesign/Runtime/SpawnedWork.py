@@ -624,6 +624,44 @@ def ExecuteBoundedSpawnedWorkBatch(
             raise
         RequireCleanupAuthority()
 
+    def ForceEligibilityAt(
+        Index: int,
+        Receipt: RuntimeOneShotProcessReceipt,
+    ) -> float | None:
+        if (
+            not Items[Index].Authority.ForceTerminationAuthorized
+            or not getattr(Receipt, "OutstandingOwnership", False)
+            or getattr(Receipt, "ProcessExitObserved", False)
+            or getattr(Receipt, "ForceSignalSent", False)
+        ):
+            return None
+        CancellationRequestedAt = getattr(
+            Receipt,
+            "CancellationRequestedAt",
+            None,
+        )
+        if type(CancellationRequestedAt) is not float:
+            return None
+        return Items[Index].Authority.ForceTerminationEligibleAt(
+            CancellationRequestedAt
+        )
+
+    def ForceIfEligible(
+        Handle: RuntimeOneShotProcessHandle,
+        Index: int,
+        Receipt: RuntimeOneShotProcessReceipt,
+        *,
+        PropagateParentControl: bool = True,
+    ) -> RuntimeOneShotProcessReceipt:
+        EligibleAt = ForceEligibilityAt(Index, Receipt)
+        if EligibleAt is None or monotonic() < EligibleAt:
+            return Receipt
+        return CallHandleAction(
+            Handle,
+            "ForceTerminate",
+            PropagateParentControl=PropagateParentControl,
+        )
+
     def SettleExitedHandle(
         Handle: RuntimeOneShotProcessHandle,
         Index: int,
@@ -803,16 +841,12 @@ def ExecuteBoundedSpawnedWorkBatch(
                     "RequestCancellation",
                     PropagateParentControl=False,
                 )
-                if (
-                    Items[Index].Authority.ForceTerminationAuthorized
-                    and Receipt.OutstandingOwnership
-                    and not Receipt.ProcessExitObserved
-                ):
-                    CallHandleAction(
-                        Handle,
-                        "ForceTerminate",
-                        PropagateParentControl=False,
-                    )
+                ForceIfEligible(
+                    Handle,
+                    Index,
+                    Receipt,
+                    PropagateParentControl=False,
+                )
             except RuntimeSpawnedWorkCleanupIncomplete as Error:
                 CaptureParentControl(Error)
                 return RecoveryOutcome(Error.OwnedContinuations)
@@ -831,6 +865,12 @@ def ExecuteBoundedSpawnedWorkBatch(
                     Receipt = CallHandleAction(
                         Handle,
                         "Observe",
+                        PropagateParentControl=False,
+                    )
+                    Receipt = ForceIfEligible(
+                        Handle,
+                        Index,
+                        Receipt,
                         PropagateParentControl=False,
                     )
                     if Receipt.ProcessExitObserved:
@@ -856,9 +896,23 @@ def ExecuteBoundedSpawnedWorkBatch(
             CleanupCutoff = EarliestCleanupCutoff()
             if CleanupCutoff is None or Now >= CleanupCutoff:
                 return RecoveryOutcome()
+            FutureForceEligibility = tuple(
+                EligibleAt
+                for Handle, Index in Handles.items()
+                for EligibleAt in (
+                    ForceEligibilityAt(Index, ReceiptsByHandle[Handle]),
+                )
+                if EligibleAt is not None and EligibleAt > Now
+            )
+            NextBoundaryAt = CleanupCutoff
+            if FutureForceEligibility:
+                NextBoundaryAt = min(
+                    NextBoundaryAt,
+                    min(FutureForceEligibility),
+                )
             sleep(max(0.0, min(
                 0.005,
-                CleanupCutoff - Now,
+                NextBoundaryAt - Now,
             )))
         return RecoveryOutcome(())
 
@@ -1033,15 +1087,11 @@ def ExecuteBoundedSpawnedWorkBatch(
                             Handle,
                             "RequestCancellation",
                         )
-                        if (
-                            Items[Index].Authority.ForceTerminationAuthorized
-                            and Receipt.OutstandingOwnership
-                            and not Receipt.ProcessExitObserved
-                        ):
-                            Receipt = CallHandleAction(
-                                Handle,
-                                "ForceTerminate",
-                            )
+                        Receipt = ForceIfEligible(
+                            Handle,
+                            Index,
+                            Receipt,
+                        )
                         if Receipt.ProcessExitObserved:
                             Progressed = SettleExitedHandle(Handle, Index) or Progressed
                 if Progressed or not Handles:
@@ -1067,6 +1117,19 @@ def ExecuteBoundedSpawnedWorkBatch(
                     SleepSeconds = min(
                         SleepSeconds,
                         min(FutureWorkDeadlines) - Now,
+                    )
+                FutureForceEligibility = tuple(
+                    EligibleAt
+                    for Handle, Index in Handles.items()
+                    for EligibleAt in (
+                        ForceEligibilityAt(Index, ReceiptsByHandle[Handle]),
+                    )
+                    if EligibleAt is not None and EligibleAt > Now
+                )
+                if FutureForceEligibility:
+                    SleepSeconds = min(
+                        SleepSeconds,
+                        min(FutureForceEligibility) - Now,
                     )
                 sleep(max(0.0, SleepSeconds))
         except RuntimeSpawnedWorkCleanupIncomplete:

@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from itertools import product
-from math import prod
+from math import isfinite, prod
 import os
 from time import monotonic
 from types import SimpleNamespace
@@ -1280,6 +1280,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
     SignalDomain: Iterable[str],
     *,
     DeadlineSeconds: float | None,
+    AbsoluteDeadlineAt: float | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
     NetStateCache: dict[str, Any] | None = None,
     CompletedClauseCache: dict[
@@ -1303,6 +1304,27 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
     dict[str, Any],
 ]:
     """Compile a requested signal domain and project complete unary cuts."""
+    if DeadlineSeconds is not None and AbsoluteDeadlineAt is not None:
+        raise ValueError(
+            "supply DeadlineSeconds or AbsoluteDeadlineAt, not both"
+        )
+    if (
+        AbsoluteDeadlineAt is not None
+        and (
+            type(AbsoluteDeadlineAt) is not float
+            or not isfinite(AbsoluteDeadlineAt)
+        )
+    ):
+        raise TypeError("AbsoluteDeadlineAt must be an exact finite float")
+    ExecutionDeadlineAt = (
+        AbsoluteDeadlineAt
+        if AbsoluteDeadlineAt is not None
+        else (
+            None
+            if DeadlineSeconds is None
+            else monotonic() + max(0.0, DeadlineSeconds)
+        )
+    )
     if not FactorDomain.Complete or not FactorDomain.Feasible:
         raise ValueError(
             "symbolic unary compilation requires a complete feasible domain"
@@ -1384,10 +1406,9 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         AllowParallelSignalCompilation
         and len(Signals) > 1
         and not NetStateCache
-        and DeadlineSeconds is not None
+        and ExecutionDeadlineAt is not None
         and RuntimeAuthorityFactory is not None
     ):
-        DeadlineAt = monotonic() + max(0.0, DeadlineSeconds)
         StartedParallelAt = monotonic()
         TaskIds = {
             Signal: f"unary:{StartedParallelAt}:{Signal}"
@@ -1424,7 +1445,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
                 ),
                 Lifecycle=RuntimeLifecycle.Queued,
                 Freshness=RuntimeFreshness.Current,
-                DeadlineAt=DeadlineAt,
+                DeadlineAt=ExecutionDeadlineAt,
                 WorkCap=BaseWork + int(SignalIndex < ExtraWork),
                 Cancellation=RuntimeCancellationSnapshot(
                     Requested=False,
@@ -1603,7 +1624,6 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         in FactorDomain.LocalApertureSupportBySignal
     }
     RelaxedProblem = replace(Problem, ReservedGlobalClaimsBySignal=())
-    StartedAt = monotonic()
     PerformedWork = 0
 
     def ObserveWork(Units: int) -> None:
@@ -1642,11 +1662,8 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         }
         RemainingDeadline = (
             None
-            if DeadlineSeconds is None
-            else max(
-                0.0,
-                DeadlineSeconds - (monotonic() - StartedAt),
-            )
+            if ExecutionDeadlineAt is None
+            else max(0.0, ExecutionDeadlineAt - monotonic())
         )
         CompilationsByAccess = (
             CompilePreparedComponentPhysicalFactorStateBatch(

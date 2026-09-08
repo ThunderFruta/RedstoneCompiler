@@ -241,7 +241,10 @@ def _RuntimeAuthority(Request: RuntimeWorkRequest) -> RuntimeWorkAuthority:
     return RuntimeWorkAuthority(
         WorkDeadlineAt=Request.DeadlineAt,
         CleanupCutoffAt=Request.DeadlineAt + 1.0,
+        MaximumCooperativeGraceSeconds=0.0,
         ForceTerminationAuthorized=True,
+        PolicyIdentity="runtime-policy-v2:test",
+        PressureIdentity="pressure-snapshot:test",
     )
 
 
@@ -274,6 +277,74 @@ def test_real_unary_without_authority_factory_stays_serial(monkeypatch):
     assert Clauses
     assert Diagnostics["Complete"] is True
     assert "UnarySignalSubmittedTaskCount" not in Diagnostics
+
+
+def test_real_unary_spawned_surface_preserves_caller_absolute_deadline(
+    monkeypatch,
+):
+    Problem, FactorDomain, Signals = _RealUnaryInputs(monkeypatch)
+    DeadlineAt = monotonic() + 30.0
+    CleanupCutoffAt = DeadlineAt + 2.0
+    CapturedRequests = []
+
+    def AuthorityFor(Request):
+        CapturedRequests.append(Request)
+        return RuntimeWorkAuthority(
+            WorkDeadlineAt=Request.DeadlineAt,
+            CleanupCutoffAt=CleanupCutoffAt,
+            MaximumCooperativeGraceSeconds=0.125,
+            ForceTerminationAuthorized=True,
+            PolicyIdentity="runtime-policy-v2:production-test",
+            PressureIdentity="pressure-snapshot:normal-test",
+        )
+
+    Clauses, Diagnostics = CompilePhysicalComponentSymbolicUnaryApertureDomain(
+        Problem,
+        FactorDomain,
+        Signals,
+        DeadlineSeconds=None,
+        AbsoluteDeadlineAt=DeadlineAt,
+        NetStateCache={},
+        RuntimeLimits=_UnaryLimits(Queued=0, InFlight=3),
+        RuntimeAuthorityFactory=AuthorityFor,
+    )
+
+    assert Clauses
+    assert Diagnostics["Complete"] is True
+    assert len(CapturedRequests) == len(Signals)
+    assert all(Request.DeadlineAt is DeadlineAt for Request in CapturedRequests)
+
+
+@pytest.mark.parametrize("AbsoluteDeadlineAt", (123, False, float("inf")))
+def test_real_unary_absolute_deadline_rejects_inexact_values(
+    monkeypatch,
+    AbsoluteDeadlineAt,
+):
+    Problem, FactorDomain, Signals = _RealUnaryInputs(monkeypatch)
+
+    with pytest.raises(TypeError):
+        CompilePhysicalComponentSymbolicUnaryApertureDomain(
+            Problem,
+            FactorDomain,
+            Signals,
+            DeadlineSeconds=None,
+            AbsoluteDeadlineAt=AbsoluteDeadlineAt,
+        )
+
+
+def test_real_unary_rejects_competing_relative_and_absolute_deadlines(
+    monkeypatch,
+):
+    Problem, FactorDomain, Signals = _RealUnaryInputs(monkeypatch)
+
+    with pytest.raises(ValueError):
+        CompilePhysicalComponentSymbolicUnaryApertureDomain(
+            Problem,
+            FactorDomain,
+            Signals,
+            DeadlineSeconds=1.0,
+            AbsoluteDeadlineAt=monotonic() + 1.0,
+        )
 
 
 def test_real_unary_spawned_workers_match_serial_and_worker_count_controls(

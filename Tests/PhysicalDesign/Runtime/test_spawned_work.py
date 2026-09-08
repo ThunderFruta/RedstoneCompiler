@@ -81,13 +81,22 @@ def _EchoProduct(Payload, Request):
     )
 
 
-def _Item(Request, Payload, *, CleanupSeconds: float = 1.0):
+def _Item(
+    Request,
+    Payload,
+    *,
+    CleanupSeconds: float = 1.0,
+    GraceSeconds: float = 0.0,
+):
     return RuntimeSpawnedWorkItem(
         Request=Request,
         Authority=RuntimeWorkAuthority(
             WorkDeadlineAt=Request.DeadlineAt,
             CleanupCutoffAt=Request.DeadlineAt + CleanupSeconds,
+            MaximumCooperativeGraceSeconds=GraceSeconds,
             ForceTerminationAuthorized=True,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
         ),
         Payload=Payload,
     )
@@ -227,7 +236,9 @@ class _UnreleasableControlledHandle:
             ReleaseAcknowledged=False,
             WorkDeadlineObserved=False,
             CancellationRequested=False,
+            CancellationRequestedAt=None,
             ForceTerminationRequested=False,
+            ForceTerminationRequestedAt=None,
             ForceTerminationDenied=False,
             ForceSignalSent=False,
             OutstandingOwnership=True,
@@ -243,13 +254,17 @@ class _UnreleasableControlledHandle:
         return self.Receipt
 
     def RequestCancellation(self):
-        self.Receipt.CancellationRequested = True
+        if not self.Receipt.CancellationRequested:
+            self.Receipt.CancellationRequested = True
+            self.Receipt.CancellationRequestedAt = self.Clock.Read()
         if self.ReleaseOnCancellation:
             self.Receipt.ProcessExitObserved = True
         return self.Receipt
 
     def ForceTerminate(self):
-        self.Receipt.ForceTerminationRequested = True
+        if not self.Receipt.ForceTerminationRequested:
+            self.Receipt.ForceTerminationRequested = True
+            self.Receipt.ForceTerminationRequestedAt = self.Clock.Read()
         if self.ForceOutcome == "denied":
             self.Receipt.ForceTerminationDenied = True
         else:
@@ -1164,6 +1179,135 @@ def test_cleanup_cutoff_failure_returns_every_exact_owned_continuation(
         )
 
 
+def test_batch_force_waits_from_early_cancellation_and_retains_policy_provenance(
+    monkeypatch,
+):
+    Clock = _ControlledClock(300.0)
+    Handles = _InstallUnreleasableControlledHandles(monkeypatch, Clock)
+    Request = _Request(0, DeadlineAt=300.01)
+    Item = _Item(
+        Request,
+        (0.0, "value"),
+        CleanupSeconds=0.04,
+        GraceSeconds=0.02,
+    )
+
+    with pytest.raises(
+        SpawnedWork.RuntimeSpawnedWorkCleanupIncomplete
+    ) as Caught:
+        ExecuteBoundedSpawnedWorkBatch(
+            (Item,),
+            _EchoProduct,
+            _Limits(Queued=0, InFlight=1),
+        )
+
+    Continuation = Caught.value.OwnedContinuations[0]
+    assert Handles[0].Receipt.CancellationRequestedAt == pytest.approx(300.01)
+    assert Handles[0].Receipt.ForceTerminationRequestedAt == pytest.approx(300.03)
+    assert Handles[0].Receipt.ForceTerminationRequestedAt < 300.05
+    assert Continuation.Handle is Handles[0]
+    assert Continuation.Receipt is Handles[0].Receipt
+    assert Item.Authority.PolicyIdentity == "runtime-policy-v2:test"
+    assert Item.Authority.PressureIdentity == "pressure-snapshot:test"
+    assert Continuation.Receipt.OutstandingOwnership
+    assert not Continuation.Receipt.ReleaseAcknowledged
+    assert Continuation.Receipt.PublishedResult is None
+
+
+def test_force_eligibility_at_cleanup_cutoff_retains_owned_continuation(
+    monkeypatch,
+):
+    Clock = _ControlledClock(400.0)
+    Handles = _InstallUnreleasableControlledHandles(monkeypatch, Clock)
+    Item = _Item(
+        _Request(0, DeadlineAt=400.01),
+        (0.0, "value"),
+        CleanupSeconds=0.04,
+        GraceSeconds=1.0,
+    )
+
+    with pytest.raises(
+        SpawnedWork.RuntimeSpawnedWorkCleanupIncomplete
+    ) as Caught:
+        ExecuteBoundedSpawnedWorkBatch(
+            (Item,),
+            _EchoProduct,
+            _Limits(Queued=0, InFlight=1),
+        )
+
+    Continuation = Caught.value.OwnedContinuations[0]
+    assert Clock.Read() == pytest.approx(400.05)
+    assert Handles[0].Receipt.CancellationRequestedAt == pytest.approx(400.01)
+    assert not Handles[0].Receipt.ForceTerminationRequested
+    assert Handles[0].Receipt.ForceTerminationRequestedAt is None
+    assert Continuation.Receipt.OutstandingOwnership
+    assert not Continuation.Receipt.ReleaseAcknowledged
+    assert Continuation.Receipt.PublishedResult is None
+
+
+def test_cleanup_continuation_preserves_exact_authority_snapshot(monkeypatch):
+    Clock = _ControlledClock(600.0)
+    Handles = []
+
+    class ControlledProcess:
+        pass
+
+    def StartControlled(Request, Authority, *_Arguments, **_KeywordArguments):
+        Handle = OneShotProcess.RuntimeOneShotProcessHandle(
+            Request,
+            Authority,
+            _OneShotLimits(_OneShotEchoBytes, b""),
+            0,
+            b"p" * 32,
+        )
+        Handle._Process = ControlledProcess()
+        Handle._OutstandingOwnership = True
+        Handle.Observe = Handle._Receipt
+        Handle._Receipt()
+        Handles.append(Handle)
+        return Handle
+
+    monkeypatch.setattr(SpawnedWork, "monotonic", Clock.Read)
+    monkeypatch.setattr(SpawnedWork, "sleep", Clock.Sleep)
+    monkeypatch.setattr(OneShotProcess, "monotonic", Clock.Read)
+    monkeypatch.setattr(
+        SpawnedWork,
+        "StartRuntimeOneShotProcess",
+        StartControlled,
+    )
+    Request = _Request(0, DeadlineAt=600.01)
+    Authority = RuntimeWorkAuthority(
+        WorkDeadlineAt=600.01,
+        CleanupCutoffAt=600.03,
+        MaximumCooperativeGraceSeconds=0.01,
+        ForceTerminationAuthorized=False,
+        PolicyIdentity="runtime-policy-v2:continuation",
+        PressureIdentity="pressure-snapshot:critical",
+    )
+
+    with pytest.raises(
+        SpawnedWork.RuntimeSpawnedWorkCleanupIncomplete
+    ) as Caught:
+        ExecuteBoundedSpawnedWorkBatch(
+            (RuntimeSpawnedWorkItem(Request, Authority, None),),
+            _EchoProduct,
+            _Limits(Queued=0, InFlight=1),
+        )
+
+    Continuation = Caught.value.OwnedContinuations[0]
+    Receipt = Continuation.Receipt
+    assert Continuation.Handle is Handles[0]
+    assert Receipt.WorkDeadlineAt == 600.01
+    assert Receipt.CleanupCutoffAt == 600.03
+    assert Receipt.MaximumCooperativeGraceSeconds == 0.01
+    assert Receipt.PolicyIdentity == "runtime-policy-v2:continuation"
+    assert Receipt.PressureIdentity == "pressure-snapshot:critical"
+    assert Receipt.ForceTerminationEligibleAt is None
+    assert Receipt.OutstandingOwnership
+    assert not Receipt.ReleaseAcknowledged
+    assert Receipt.PublishedResult is None
+
+
 @pytest.mark.parametrize("Interrupt", (KeyboardInterrupt, SystemExit))
 def test_parent_base_exception_surfaces_cleanup_ownership_at_original_cutoff(
     monkeypatch,
@@ -1223,12 +1367,28 @@ def test_exact_queue_and_in_flight_limits_apply_backpressure():
 
 def test_batch_requires_explicit_positive_cleanup_allowance():
     Request = _Request(0)
+    with pytest.raises(ValueError):
+        RuntimeWorkAuthority(
+            WorkDeadlineAt=Request.DeadlineAt,
+            CleanupCutoffAt=Request.DeadlineAt,
+            MaximumCooperativeGraceSeconds=0.0,
+            ForceTerminationAuthorized=True,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
+        )
+
+
+def test_batch_rejects_authority_for_a_different_request_deadline():
+    Request = _Request(0, DeadlineAt=500.0)
     Item = RuntimeSpawnedWorkItem(
         Request=Request,
         Authority=RuntimeWorkAuthority(
-            WorkDeadlineAt=Request.DeadlineAt,
-            CleanupCutoffAt=Request.DeadlineAt,
+            WorkDeadlineAt=501.0,
+            CleanupCutoffAt=502.0,
+            MaximumCooperativeGraceSeconds=0.0,
             ForceTerminationAuthorized=True,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
         ),
         Payload=(0.0, "value"),
     )
@@ -1249,7 +1409,10 @@ def test_false_force_authority_allows_natural_exit_before_cleanup_cutoff():
         Authority=RuntimeWorkAuthority(
             WorkDeadlineAt=Request.DeadlineAt,
             CleanupCutoffAt=StartedAt + 0.50,
+            MaximumCooperativeGraceSeconds=0.0,
             ForceTerminationAuthorized=False,
+            PolicyIdentity="runtime-policy-v2:test",
+            PressureIdentity="pressure-snapshot:test",
         ),
         Payload=(0.20, "late"),
     )
@@ -1280,7 +1443,10 @@ def test_false_force_authority_retains_capacity_and_queued_work_at_cutoff(
             Authority=RuntimeWorkAuthority(
                 WorkDeadlineAt=FirstRequest.DeadlineAt,
                 CleanupCutoffAt=StartedAt + 0.30,
+                MaximumCooperativeGraceSeconds=0.0,
                 ForceTerminationAuthorized=False,
+                PolicyIdentity="runtime-policy-v2:test",
+                PressureIdentity="pressure-snapshot:test",
             ),
             Payload=(str(tmp_path), 0.50, "first"),
         ),
@@ -2718,6 +2884,9 @@ def test_external_action_control_crossing_is_published_before_rethrow(
         Handle._CancellationSocket = ControlledSocket()
     elif Action == "observe":
         Handle._ReadinessSocket = ControlledSocket()
+    elif Action == "force":
+        Handle._CancellationRequested = True
+        Handle._CancellationRequestedAt = Clock.Read()
     elif Action == "reap":
         Handle._ProcessExitObserved = True
     Handle._Receipt()
@@ -2891,7 +3060,10 @@ def test_observe_crossing_cutoff_blocks_force_and_reap_followup(
     )
     Handle._Process = ControlledProcess()
     Handle._OutstandingOwnership = True
-    if Action == "reap":
+    if Action == "force":
+        Handle._CancellationRequested = True
+        Handle._CancellationRequestedAt = Clock.Read()
+    else:
         Handle._ProcessExitObserved = True
     Handle._Receipt()
     monkeypatch.setattr(OneShotProcess, "monotonic", Clock.Read)

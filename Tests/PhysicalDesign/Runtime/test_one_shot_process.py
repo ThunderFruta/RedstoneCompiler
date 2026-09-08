@@ -13,6 +13,7 @@ import socket
 from struct import pack_into
 from threading import Event, Thread
 from time import monotonic, sleep
+from types import SimpleNamespace
 
 import pytest
 
@@ -178,11 +179,15 @@ def _Authority(
     CleanupCutoffAt: float,
     *,
     Force: bool = True,
+    GraceSeconds: float = 0.0,
 ) -> RuntimeWorkAuthority:
     return RuntimeWorkAuthority(
         WorkDeadlineAt=WorkDeadlineAt,
         CleanupCutoffAt=CleanupCutoffAt,
+        MaximumCooperativeGraceSeconds=GraceSeconds,
         ForceTerminationAuthorized=Force,
+        PolicyIdentity="runtime-policy-v2:test",
+        PressureIdentity="pressure-snapshot:test",
     )
 
 
@@ -717,7 +722,7 @@ def test_expired_work_is_exact_unstarted_without_allocation():
     Payload = b"never-start"
     Handle = _StartOwned(
         _Request(DeadlineAt),
-        _Authority(DeadlineAt, DeadlineAt),
+        _Authority(DeadlineAt, DeadlineAt + 0.5),
         Payload,
         _EchoBytes,
         _Limits(_EchoBytes, Payload),
@@ -741,12 +746,12 @@ def test_expired_work_is_exact_unstarted_without_allocation():
     _IndependentCloseWitness(Handle, UsedFallback=False)
 
 
-def test_equal_cutoffs_and_zero_byte_envelopes_succeed():
+def test_zero_byte_envelopes_succeed_with_explicit_later_cleanup_cutoff():
     Payload = b""
     DeadlineAt = monotonic() + 3.0
     Handle = _StartOwned(
         _Request(DeadlineAt),
-        _Authority(DeadlineAt, DeadlineAt),
+        _Authority(DeadlineAt, DeadlineAt + 1.0),
         Payload,
         _EchoBytes,
         _Limits(
@@ -1385,6 +1390,97 @@ def test_force_denial_retains_child_and_does_not_touch_sibling():
         Sibling.close()
 
 
+def test_early_cancellation_waits_for_exact_cooperative_force_boundary(
+    monkeypatch,
+):
+    Clock = SimpleNamespace(Now=10.0)
+    KillObservations = []
+
+    class ControlledProcess:
+        def kill(self):
+            KillObservations.append(Clock.Now)
+
+    Authority = RuntimeWorkAuthority(
+        WorkDeadlineAt=50.0,
+        CleanupCutoffAt=60.0,
+        MaximumCooperativeGraceSeconds=2.0,
+        ForceTerminationAuthorized=True,
+        PolicyIdentity="runtime-policy-v2:early-cancel",
+        PressureIdentity="pressure-snapshot:low",
+    )
+    Handle = OneShotProcess.RuntimeOneShotProcessHandle(
+        _Request(50.0, TaskIdentity="early-cancel"),
+        Authority,
+        _Limits(_EchoBytes, b""),
+        0,
+        b"g" * 32,
+    )
+    Handle._Process = ControlledProcess()
+    Handle._OutstandingOwnership = True
+    monkeypatch.setattr(OneShotProcess, "monotonic", lambda: Clock.Now)
+    Handle.Observe = Handle._Receipt
+
+    Receipt = Handle.RequestCancellation()
+    assert Receipt.CancellationRequestedAt == 10.0
+    assert Receipt.ForceTerminationEligibleAt == 12.0
+    assert Receipt.WorkDeadlineAt == 50.0
+    assert Receipt.MaximumCooperativeGraceSeconds == 2.0
+    assert Receipt.PolicyIdentity == "runtime-policy-v2:early-cancel"
+    assert Receipt.PressureIdentity == "pressure-snapshot:low"
+
+    Clock.Now = 11.999
+    Receipt = Handle.ForceTerminate()
+    assert Receipt.ForceTerminationDenied
+    assert not Receipt.ForceSignalSent
+    assert KillObservations == []
+
+    Clock.Now = 12.0
+    Receipt = Handle.ForceTerminate()
+    assert Receipt.ForceSignalSent
+    assert Receipt.ForceSignalSentAt == 12.0
+    assert KillObservations == [12.0]
+
+
+def test_authorized_force_without_observed_cancellation_sends_no_signal(
+    monkeypatch,
+):
+    Clock = SimpleNamespace(Now=10.0)
+    KillObservations = []
+
+    class ControlledProcess:
+        def kill(self):
+            KillObservations.append(Clock.Now)
+
+    Handle = OneShotProcess.RuntimeOneShotProcessHandle(
+        _Request(50.0, TaskIdentity="force-before-cancellation"),
+        RuntimeWorkAuthority(
+            WorkDeadlineAt=50.0,
+            CleanupCutoffAt=60.0,
+            MaximumCooperativeGraceSeconds=5.0,
+            ForceTerminationAuthorized=True,
+            PolicyIdentity="runtime-policy-v2:no-cancellation",
+            PressureIdentity="pressure-snapshot:normal",
+        ),
+        _Limits(_EchoBytes, b""),
+        0,
+        b"h" * 32,
+    )
+    Handle._Process = ControlledProcess()
+    Handle._OutstandingOwnership = True
+    monkeypatch.setattr(OneShotProcess, "monotonic", lambda: Clock.Now)
+    Handle.Observe = Handle._Receipt
+
+    Receipt = Handle.ForceTerminate()
+
+    assert Receipt.CancellationRequestedAt is None
+    assert Receipt.ForceTerminationEligibleAt is None
+    assert Receipt.ForceTerminationRequested
+    assert Receipt.ForceTerminationDenied
+    assert not Receipt.ForceSignalSent
+    assert Receipt.OutstandingOwnership
+    assert KillObservations == []
+
+
 def test_explicit_authorized_force_kills_only_owned_child():
     Context = multiprocessing.get_context("spawn")
     SiblingRelease = Context.Event()
@@ -1410,6 +1506,8 @@ def test_explicit_authorized_force_kills_only_owned_child():
         OwnedPid = Receipt.StartedPid
         assert _PidExists(OwnedPid)
 
+        Receipt = Handle.RequestCancellation()
+        assert Receipt.CancellationRequested
         Receipt = Handle.ForceTerminate()
         assert Receipt.ForceSignalSent
         assert Receipt.OutstandingOwnership
@@ -1520,7 +1618,12 @@ def test_cleanup_breach_remains_after_explicit_recovery(tmp_path):
     CleanupAt = DeadlineAt + 0.15
     Handle = _StartOwned(
         _Request(DeadlineAt),
-        _Authority(DeadlineAt, CleanupAt, Force=True),
+        _Authority(
+            DeadlineAt,
+            CleanupAt,
+            Force=True,
+            GraceSeconds=CleanupAt - DeadlineAt,
+        ),
         FixturePayload,
         _PublishEntryThenIgnoreCancellationUntilFixtureExpiry,
         _Limits(
@@ -1611,6 +1714,10 @@ def test_cleanup_breach_remains_after_explicit_recovery(tmp_path):
         assert Receipt.CleanupCutoffObservedAt >= CleanupAt
         assert Receipt.WorkDeadlineAt == DeadlineAt
         assert Receipt.CleanupCutoffAt == CleanupAt
+        assert Receipt.MaximumCooperativeGraceSeconds == pytest.approx(0.15)
+        assert Receipt.PolicyIdentity == "runtime-policy-v2:test"
+        assert Receipt.PressureIdentity == "pressure-snapshot:test"
+        assert Receipt.ForceTerminationEligibleAt == CleanupAt
         assert Receipt.WorkDeadlineObserved
         assert Receipt.CancellationRequested
         ReturnedPidExists = _PidExists(Receipt.StartedPid)
@@ -1873,7 +1980,7 @@ def test_retained_closed_handle_releases_all_synchronization_resources():
     Before = _OpenSocketInodes()
     Handle = _StartOwned(
         _Request(SharedCutoffAt, TaskIdentity="retained-close-resources"),
-        _Authority(SharedCutoffAt, SharedCutoffAt),
+        _Authority(SharedCutoffAt, SharedCutoffAt + 1.0),
         Payload,
         _EchoBytes,
         _Limits(_EchoBytes, Payload),

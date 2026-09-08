@@ -108,10 +108,14 @@ class RuntimeOneShotProcessReceipt:
     ResultDiagnostic: str | None
     WorkDeadlineAt: float
     CleanupCutoffAt: float
+    MaximumCooperativeGraceSeconds: float
+    PolicyIdentity: str
+    PressureIdentity: str
     WorkDeadlineObserved: bool
     WorkDeadlineObservedAt: float | None
     CancellationRequested: bool
     CancellationRequestedAt: float | None
+    ForceTerminationEligibleAt: float | None
     ForceTerminationAuthorized: bool
     ForceTerminationRequested: bool
     ForceTerminationDenied: bool
@@ -419,10 +423,25 @@ class RuntimeOneShotProcessHandle:
             ResultDiagnostic=self._ResultDiagnostic,
             WorkDeadlineAt=self._Authority.WorkDeadlineAt,
             CleanupCutoffAt=self._Authority.CleanupCutoffAt,
+            MaximumCooperativeGraceSeconds=(
+                self._Authority.MaximumCooperativeGraceSeconds
+            ),
+            PolicyIdentity=self._Authority.PolicyIdentity,
+            PressureIdentity=self._Authority.PressureIdentity,
             WorkDeadlineObserved=self._WorkDeadlineObserved,
             WorkDeadlineObservedAt=self._WorkDeadlineObservedAt,
             CancellationRequested=self._CancellationRequested,
             CancellationRequestedAt=self._CancellationRequestedAt,
+            ForceTerminationEligibleAt=(
+                None
+                if (
+                    self._CancellationRequestedAt is None
+                    or not self._Authority.ForceTerminationAuthorized
+                )
+                else self._Authority.ForceTerminationEligibleAt(
+                    self._CancellationRequestedAt
+                )
+            ),
             ForceTerminationAuthorized=(
                 self._Authority.ForceTerminationAuthorized
             ),
@@ -931,6 +950,16 @@ class RuntimeOneShotProcessHandle:
                     self._CleanupCutoffObservedAt = Current
                     return self._Receipt()
                 return self.LastReceipt
+            CurrentReceipt = self.LastReceipt
+            if (
+                self._Authority.ForceTerminationAuthorized
+                and CurrentReceipt.ForceTerminationEligibleAt is not None
+                and Current >= CurrentReceipt.ForceTerminationEligibleAt
+                and not CurrentReceipt.ForceSignalSent
+                and CurrentReceipt.OutstandingOwnership
+                and not CurrentReceipt.ProcessExitObserved
+            ):
+                return CurrentReceipt
             PreviousReceipt = self.LastReceipt
             Receipt = self.Observe()
             Current = monotonic()
@@ -943,6 +972,15 @@ class RuntimeOneShotProcessHandle:
                     self._CleanupCutoffObservedAt = Current
                     return self._Receipt()
                 return PreviousReceipt
+            if (
+                self._Authority.ForceTerminationAuthorized
+                and Receipt.ForceTerminationEligibleAt is not None
+                and Current >= Receipt.ForceTerminationEligibleAt
+                and not Receipt.ForceSignalSent
+                and Receipt.OutstandingOwnership
+                and not Receipt.ProcessExitObserved
+            ):
+                return Receipt
             if Receipt.ProcessExitObserved or not Receipt.OutstandingOwnership:
                 return Receipt
             Current = monotonic()
@@ -951,6 +989,14 @@ class RuntimeOneShotProcessHandle:
             NextStopAt = EffectiveCutoffAt
             if not self._WorkDeadlineObserved:
                 NextStopAt = min(NextStopAt, self._Authority.WorkDeadlineAt)
+            if (
+                Receipt.ForceTerminationEligibleAt is not None
+                and Current < Receipt.ForceTerminationEligibleAt
+            ):
+                NextStopAt = min(
+                    NextStopAt,
+                    Receipt.ForceTerminationEligibleAt,
+                )
             try:
                 Sentinel = self._Process.sentinel
             except (AssertionError, OSError, ValueError):
@@ -995,6 +1041,16 @@ class RuntimeOneShotProcessHandle:
             not self._Authority.ForceTerminationAuthorized
             or not sys.platform.startswith("linux")
         ):
+            self._ForceTerminationDenied = True
+            return self.Observe()
+        ForceEligibleAt = (
+            None
+            if self._CancellationRequestedAt is None
+            else self._Authority.ForceTerminationEligibleAt(
+                self._CancellationRequestedAt
+            )
+        )
+        if ForceEligibleAt is None or RequestedAt < ForceEligibleAt:
             self._ForceTerminationDenied = True
             return self.Observe()
         if self._Process is None or self._Reaped:
@@ -1197,7 +1253,7 @@ def StartRuntimeOneShotProcess(
     Operation: Callable[[bytes, Callable[[], bool]], bytes],
     Limits: RuntimeOneShotProcessLimits,
 ) -> RuntimeOneShotProcessHandle:
-    """Allocate and start one owned spawned process under exact v1 authority."""
+    """Allocate and start one owned spawned process under exact v2 authority."""
     if not sys.platform.startswith("linux"):
         raise NotImplementedError("one-shot process supervision is Linux-only")
     OperationReference = _ValidateBoundary(
