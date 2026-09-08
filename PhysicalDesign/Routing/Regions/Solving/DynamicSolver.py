@@ -49,7 +49,7 @@ except ImportError:
 from ..Core import _ClaimsFingerprint, _NormalizedEdge, _RelativeGeometry, _StableFingerprint
 from ..Boundaries.Fabric import BuildClaimsAwareComponentFabricSubtree, BuildComponentEgressPaths, _BuildAdjacency, _PlanTreeRepeaters, _UniqueFabricSubtree
 from ..Symbolic.SymbolicState import BuildComponentSymbolicNetStateCacheKey, ComponentTreeDpNetState, PreparedComponentSymbolicNetStateContext, PreparedComponentSymbolicTerminalFrontier, SelectComponentSymbolicPhysicalPort, _BuildPreparedComponentSymbolicNetStateContextFingerprint
-def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, DeadlineSeconds: float | None=None, WorkCheck: Callable[[dict[str, object]], None] | None=None, ForbiddenAssignmentFingerprints: frozenset[str]=frozenset(), ForbiddenExportPortsBySignal: dict[str, tuple[Position3, ...]] | None=None, ForbiddenForeignCandidateFingerprintsBySignal: dict[str, frozenset[str]] | None=None, ForbiddenForeignAssignmentPairs: tuple[frozenset[tuple[str, Position3, str]], ...]=(), RequiredForeignTransitSignals: frozenset[str]=frozenset(), RouteClaimsConstructionCache: dict[frozenset[Position3], RoutingResourceClaims] | None=None, SymbolicNetStateCache: dict[str, Any] | None=None, RequestedSymbolicStateSignals: frozenset[str] | None=None, PreparedSymbolicNetStateContext: PreparedComponentSymbolicNetStateContext | None=None, PreparedPhysicalPortVariants: tuple[Any, ...]=(), StopAfterOwnedSignalFrontierProof: bool=False, StopAfterSymbolicCapacityProof: bool=False) -> ComponentRoutingSolveResult:
+def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, DeadlineSeconds: float | None=None, WorkCheck: Callable[[dict[str, object]], None] | None=None, ForbiddenAssignmentFingerprints: frozenset[str]=frozenset(), ForbiddenExportPortsBySignal: dict[str, tuple[Position3, ...]] | None=None, ForbiddenForeignCandidateFingerprintsBySignal: dict[str, frozenset[str]] | None=None, ForbiddenForeignAssignmentPairs: tuple[frozenset[tuple[str, Position3, str]], ...]=(), RequiredForeignTransitSignals: frozenset[str]=frozenset(), RouteClaimsConstructionCache: dict[frozenset[Position3], RoutingResourceClaims] | None=None, SymbolicNetStateCache: dict[str, Any] | None=None, RequestedSymbolicStateSignals: frozenset[str] | None=None, PreparedSymbolicNetStateContext: PreparedComponentSymbolicNetStateContext | None=None, PreparedPhysicalPortVariants: tuple[Any, ...]=(), StopAfterOwnedSignalFrontierProof: bool=False, StopAfterSymbolicCapacityProof: bool=False, MaximumWorkOverride: int | None=None, WorkAdmissionCheck: Callable[[], None] | None=None) -> ComponentRoutingSolveResult:
     """Solve a complete tree fabric through canonical frontier states.
 
     Access domains are folded one terminal at a time.  Because the component
@@ -59,6 +59,20 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
     routed-net object is materialized.
     """
     Started = monotonic()
+    if (
+        MaximumWorkOverride is not None
+        and (
+            isinstance(MaximumWorkOverride, bool)
+            or not isinstance(MaximumWorkOverride, int)
+            or MaximumWorkOverride < 0
+        )
+    ):
+        raise ValueError("MaximumWorkOverride must be a non-negative integer or None")
+    EffectiveMaximumWork = (
+        Problem.MaximumWork
+        if MaximumWorkOverride is None
+        else min(Problem.MaximumWork, MaximumWorkOverride)
+    )
     ForbiddenExportPortsBySignal = ForbiddenExportPortsBySignal or {}
     ForbiddenForeignCandidateFingerprintsBySignal = ForbiddenForeignCandidateFingerprintsBySignal or {}
     RouteClaimsCache = PreparedSymbolicNetStateContext.RouteClaimsConstructionCache if PreparedSymbolicNetStateContext is not None else RouteClaimsConstructionCache if RouteClaimsConstructionCache is not None else {}
@@ -74,11 +88,21 @@ def SolveComponentRoutingProblemDynamic(Problem: ComponentRoutingProblem, *, Dea
 
     def Advance(Phase: str) -> bool:
         nonlocal ExpansionCount, ExploredStateCount, HitLimit
+        if WorkAdmissionCheck is not None:
+            WorkAdmissionCheck()
+        if ExpansionCount >= EffectiveMaximumWork:
+            HitLimit = True
+            return False
         ExpansionCount += 1
         ExploredStateCount += 1
-        if WorkCheck is not None and ExpansionCount % 128 == 0:
+        if WorkCheck is not None:
             WorkCheck({'Phase': Phase, 'SolverKind': 'tree-frontier-dp-v1', 'ExpansionCount': ExpansionCount, 'ExploredStateCount': ExploredStateCount, 'PeakFrontierStateCount': PeakFrontierStateCount, 'DominatedStateCount': DominatedStateCount, 'CompleteTreesMaterialized': 0})
-        HitLimit = bool(ExpansionCount > Problem.MaximumWork or (DeadlineSeconds is not None and monotonic() - Started >= DeadlineSeconds))
+        HitLimit = bool(
+            (
+                DeadlineSeconds is not None
+                and monotonic() - Started >= DeadlineSeconds
+            )
+        )
         return not HitLimit
 
     def FinishDiagnostics() -> dict[str, object]:
