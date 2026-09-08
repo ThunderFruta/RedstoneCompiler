@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "redstonecompiler_harness",
+  "version": "${version}",
+  "name": "RedstoneCompiler Harness",
+  "environment": "server",
+  "entrypoints": {
+    "server": [
+      "dev.redstonecompiler.harness.RedstoneCompilerHarness"
+    ]
+  },
+  "mixins": [
+    "redstonecompiler-harness.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "26.2"
+  }
+}

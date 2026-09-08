@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import os
 import traceback
-from typing import Any
+from typing import Any, Callable
 from PhysicalDesign.Contracts.Failures import RoutingAssignmentCut, RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Contracts.PlacementAccess import PlacementAccessSolveStatus
 from PhysicalDesign.Placement.Engine.Constraints import PlacementAssignmentConstraintSet
@@ -29,6 +29,94 @@ from .AttemptHistory import (
     _PackedGateArea,
     _PlacementFailureWithHistory,
 )
+from .Candidates import PcbPlacementCandidate
+from .AccessEnvelope import BuildCurrentSelectedAccessSolveBinding
+
+
+def RebuildCurrentCandidatePlacementAccess(
+    Context,
+    Candidate: PcbPlacementCandidate,
+    *,
+    Resources: Any,
+    WorkCheck: Callable[[dict[str, object]], None],
+) -> PcbPlacementCandidate:
+    """Solve access once for a newly transformed current candidate.
+
+    The transformed placement is a new physical candidate.  Its predecessor's
+    selected witness, solve, fabric, and assignment are historical inputs, not
+    reusable authority for the new terminal bindings or resource graph.
+    """
+    if not Context.Policy.PlacementAccess.Enabled:
+        return Candidate
+    Placement = replace(
+        Candidate.Placement,
+        PlacementAccessFabric=None,
+        PlacementAccessAssignment=None,
+        SelectedPinAccessWitness=None,
+        PlacementAccessSolve=None,
+        Placed=replace(
+            Candidate.Placement.Placed,
+            PlacementAccessFabric=None,
+            PlacementAccessAssignment=None,
+            SelectedPinAccessWitness=None,
+            PlacementAccessSolve=None,
+        ),
+    )
+    AccessDomains = EnumeratePlacedPinAccessOptionDomains(
+        Placement.Placed.PlacedGates,
+        ResourceGraph=Resources.ResourceGraph,
+        Technology=Context.Technology,
+        EnabledPatternFamilies=(
+            Context.Policy.PlacementAccess.EnabledPatternFamilies
+        ),
+        CatalogVersion=Context.Policy.PlacementAccess.CatalogVersion,
+        MaximumGenerationWork=(
+            Context.Policy.PlacementAccess.MaximumDomainGenerationWork
+        ),
+        WorkCheck=WorkCheck,
+        PreOwnedNodesBySignal=Placement.Placed.FrozenNetWires or {},
+    )
+    Solve = SolvePlacedPinAccessOptionDomains(
+        AccessDomains,
+        ResourceGraph=Resources.ResourceGraph,
+        MaximumExpansions=(
+            Context.Policy.PlacementAccess.MaximumAssignmentExpansions
+        ),
+        WorkCheck=WorkCheck,
+    )
+    Solve = replace(Solve, PolicyVersion=Context.Policy.PolicyVersion)
+    SolveBinding = BuildCurrentSelectedAccessSolveBinding(
+        Context.Policy,
+        Solve,
+    )
+    Context.PlacementAccessDomainsByProblemFingerprint[
+        Solve.ProblemFingerprint
+    ] = AccessDomains
+    Context.PlacementAccessSolveResultsByProblemFingerprint[
+        Solve.ProblemFingerprint
+    ] = Solve
+    Witness = (
+        Solve.SelectedWitness
+        if Solve.Status is PlacementAccessSolveStatus.Feasible
+        else None
+    )
+    if Solve.Status is PlacementAccessSolveStatus.Feasible and Witness is None:
+        raise ValueError("feasible placement access solve omitted its witness")
+    Placement = replace(
+        Placement,
+        SelectedPinAccessWitness=Witness,
+        PlacementAccessSolve=Solve,
+        Placed=replace(
+            Placement.Placed,
+            SelectedPinAccessWitness=Witness,
+            PlacementAccessSolve=Solve,
+        ),
+    )
+    return replace(
+        Candidate,
+        Placement=Placement,
+        PlacementAccessSolveBinding=SolveBinding,
+    )
 
 
 def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCandidateIndex: int=0, FixedRelocationVariant: int | None=None, FixedCandidateSpacing: int | None=None, FixedRelocationSignals: frozenset[str] | None=None, FixedRelocationPrioritySignals: frozenset[str] | None=None, FixedRequiredRelocationSignals: frozenset[str] | None=None, FixedAssignmentCut: object=_PlacementFlowDefault, FixedAssignmentConstraints: object=_PlacementFlowDefault, FixedCoordinatedCandidateDiversificationSignals: object=_PlacementFlowDefault, FixedTopologyCutFrontier: object=_PlacementFlowDefault, FixedPhysicalProofCoreSignals: frozenset[str]=frozenset(), FixedPhysicalProofFingerprint: str='', FixedConnectivityClusters: tuple[tuple[str, ...], ...]=(), MaterializeRoutingResources: bool=True, SkipMandatoryAccessPreScreen: bool=False, PlacementGenerationNotAfter: float | None=None, CountPlacementGenerationAttempt: bool=True, QueueRetainedJointPortfolioStates: bool=True, UseCompletePlacementGenerationBudget: bool=False, AllowCapacityPairRepair: bool=False) -> bool:
@@ -234,6 +322,7 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
             CheckPlacementGeneration({'Phase': 'exact-state-evaluation-cache-hit', 'ExactStatePlacementCacheKey': ExactStatePlacementCacheKey})
         CandidateResources = None
         PlacementAccessSolve = None
+        PlacementAccessSolveBinding = None
         SelectedPinAccessWitness = None
         RoutingAwarePlacementAccess = bool(Context.Policy.PlacementAccess.Enabled)
         if RoutingAwarePlacementAccess:
@@ -269,6 +358,10 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
                 WorkCheck=CheckPlacementGeneration,
             )
             PlacementAccessSolve = replace(PlacementAccessSolve, PolicyVersion=Context.Policy.PolicyVersion)
+            PlacementAccessSolveBinding = BuildCurrentSelectedAccessSolveBinding(
+                Context.Policy,
+                PlacementAccessSolve,
+            )
             Context.PlacementAccessDomainsByProblemFingerprint[
                 PlacementAccessSolve.ProblemFingerprint
             ] = AccessDomains
@@ -642,8 +735,19 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
             Context.ProactiveRelocationRequested = Context.ProactiveRelocationRequested or CandidateSelectedForRelocation
             Context.PlacementGenerationDecisions.append({'SourceGenerator': SourceGenerator, 'RoutingSpacing': CandidateSpacing, 'Result': 'rejected-mandatory-access-conflict', 'DecisionBoundary': 'fixed-pin-access-unsatisfiable', 'FixedPinAccessStatus': FixedPinAccessSolve.Status.value, 'JointPlacementCandidateIndex': JointPlacementCandidateIndex, 'ConflictSignals': sorted(ConflictSignals), 'ConflictResourceCount': len(MandatoryConflicts), 'ConflictFingerprint': ConflictFingerprint, 'MandatoryAccessOwnershipFingerprint': CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint, 'JointOrderKey': list(CandidateTopologyDemand.JointOrderKey), 'TopologyDemandProfile': CandidateTopologyDemand.ToDictionary(), 'MandatoryAccessProfile': MandatoryProfile.ToDictionary() if MandatoryProfile is not None else None, 'FixedPinAccessSolve': FixedPinAccessSolve.ToDictionary(), 'MandatoryAccessPortfolioTracking': MandatoryAccessPortfolioTracking, 'MandatoryAccessPortfolioIdentity': ({**MandatoryAccessPortfolioIdentityDiagnostics, 'EvidenceFound': PortfolioEvidence is not None} if MandatoryAccessPortfolioIdentityDiagnostics is not None else None), 'SelectedForRelocation': CandidateSelectedForRelocation, 'ElapsedSeconds': round(Context.Services.monotonic() - PlacementStarted, 6)})
             return False
-        Fingerprint = BuildPlacementFingerprint(Candidate, CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint, IncludeLocalClaims=not CandidatePacking.EnableJointClusterOrientation)
-        RetentionFingerprint = BuildPlacementRetentionFingerprint(Candidate, CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint, IncludeLocalClaims=not CandidatePacking.EnableJointClusterOrientation)
+        PlacementFingerprintIncludesLocalClaims = (
+            not CandidatePacking.EnableJointClusterOrientation
+        )
+        Fingerprint = BuildPlacementFingerprint(
+            Candidate,
+            CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint,
+            IncludeLocalClaims=PlacementFingerprintIncludesLocalClaims,
+        )
+        RetentionFingerprint = BuildPlacementRetentionFingerprint(
+            Candidate,
+            CandidateTopologyDemand.MandatoryAccessOwnershipFingerprint,
+            IncludeLocalClaims=PlacementFingerprintIncludesLocalClaims,
+        )
         CheckPlacementGeneration({'Phase': 'placement-fingerprint-complete'})
         if Fingerprint in Context.RejectedPlacementFingerprints or RetentionFingerprint in Context.RejectedPlacementRetentionFingerprints:
             Context.PlacementGenerationDecisions.append({'SourceGenerator': SourceGenerator, 'RoutingSpacing': CandidateSpacing, 'Result': 'rejected-placement-repeat', 'PlacementFingerprint': Fingerprint, 'PlacementRetentionFingerprint': RetentionFingerprint, 'ExactStatePlacementEvaluationCacheHit': CachedExactStateEvaluation is not None, 'ElapsedSeconds': round(Context.Services.monotonic() - PlacementStarted, 6)})
@@ -663,7 +767,22 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
             Feedback = Context.Services.MeasurePlacementRoutingFeedback(Candidate, CandidateSpacing, Context.Policy, Context.Technology, CheckPlacementGeneration)
             CheckPlacementGeneration({'Phase': 'placement-feedback-complete'})
         Context.UniquePlacements[Fingerprint] = (SourceGenerator, CandidateSpacing, Candidate)
+        if PlacementAccessSolveBinding is not None:
+            ExistingBindings = Context.PlacementAccessSolveBindingsByPlacementFingerprint.get(
+                Fingerprint,
+                (),
+            )
+            if PlacementAccessSolveBinding not in ExistingBindings:
+                Context.PlacementAccessSolveBindingsByPlacementFingerprint[
+                    Fingerprint
+                ] = tuple(sorted(
+                    (*ExistingBindings, PlacementAccessSolveBinding),
+                    key=lambda Binding: Binding.BindingFingerprint,
+                ))
         Context.PlacementRetentionFingerprintByFingerprint[Fingerprint] = RetentionFingerprint
+        Context.PlacementFingerprintIncludesLocalClaimsByFingerprint[
+            Fingerprint
+        ] = PlacementFingerprintIncludesLocalClaims
         Context.RetainedPlacementTopologyFingerprints[RetentionFingerprint] = (Fingerprint, SourceGenerator)
         Context.TopologyDemandByFingerprint[Fingerprint] = CandidateTopologyDemand
         if JointDiagnostics:

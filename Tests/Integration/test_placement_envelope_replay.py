@@ -29,6 +29,7 @@ from PhysicalDesign.Resources.ResourceGraph import (
 )
 import PhysicalDesign.Orchestration.PlacementAttempts as PlacementAttempts
 import PhysicalDesign.Orchestration.Results as PlacementResults
+import PhysicalDesign.Orchestration.PhysicalFlow as PhysicalFlow
 import PhysicalDesign.Orchestration.Setup as PlacementSetup
 import PhysicalDesign.Orchestration.RoutingAttempts as RoutingAttempts
 import PhysicalDesign.Placement.Access.Fabric as AccessFabric
@@ -62,6 +63,28 @@ def _BuildSingleNandNetlist() -> NetlistIR:
             Gate("InputB", GateKind.INPUT, ["B"]),
             Gate("Nand0", GateKind.NAND, ["Y"], ["A", "B"]),
             Gate("OutputY", GateKind.OUTPUT, [], ["Y"]),
+        ],
+    )
+    return NetlistIR(Top=Module.Name, Modules={Module.Name: Module})
+
+
+def _BuildSeventeenNandChainNetlist() -> NetlistIR:
+    Module = ModuleIR(
+        Name="SeventeenNandSelectedAccess",
+        Inputs=["s0"],
+        Outputs=["s17"],
+        Gates=[
+            Gate("InputA", GateKind.INPUT, ["s0"], []),
+            *(
+                Gate(
+                    f"Nand{Index}",
+                    GateKind.NAND,
+                    [f"s{Index + 1}"],
+                    [f"s{Index}", f"s{Index}"],
+                )
+                for Index in range(17)
+            ),
+            Gate("OutputY", GateKind.OUTPUT, [], ["s17"]),
         ],
     )
     return NetlistIR(Top=Module.Name, Modules={Module.Name: Module})
@@ -891,3 +914,286 @@ def test_public_fanout_replays_selected_envelope_candidate_values(
         assert Observation["CompactionPreserved"] is (
             True if Observation["Stage"] == "Compaction" else None
         )
+
+    CurrentEnvelopeResult = Result.PlanningContracts[
+        "CurrentSelectedAccessEnvelope"
+    ]
+    assert CurrentEnvelopeResult["Status"] == "Ready"
+    assert CurrentEnvelopeResult["Reason"] == "Current"
+    assert CurrentEnvelopeResult["HistoricalOnly"] is True
+    CurrentEnvelope = CurrentEnvelopeResult["Envelope"]
+    assert CurrentEnvelope["Phase"] == "BeforePublication"
+    assert CurrentEnvelope["PhysicalValidation"]["Status"] == "Verified"
+    assert CurrentEnvelope["PhysicalValidation"]["Reason"] == "Current"
+    assert CurrentEnvelope["Candidate"][
+        "PlacementFingerprintIncludesLocalClaims"
+    ] is False
+    assert CurrentEnvelope["SolveResult"] == PublishedSolve.ToDictionary()
+    assert CurrentEnvelope["SelectedWitness"] == PublishedWitness.ToDictionary()
+    assert CurrentEnvelope["Domains"] == PublishedSolve.ToDictionary()["Domains"]
+    assert CurrentEnvelope["SolveBinding"]["ProblemFingerprint"] == (
+        PublishedSolve.ProblemFingerprint
+    )
+    assert CurrentEnvelope["SolveBinding"]["WitnessFingerprint"] == (
+        PublishedWitness.WitnessFingerprint
+    )
+    assert CurrentEnvelope["SolveBinding"]["Policy"]["PolicyFingerprint"] == (
+        CurrentEnvelope["Policy"]["PolicyFingerprint"]
+    )
+    assert CurrentEnvelope["Policy"]["PlacementAccessEnabled"] is True
+    assert CurrentEnvelope["Policy"]["CatalogVersion"] == (
+        Result.Policy.PlacementAccess.CatalogVersion
+    )
+    assert CurrentEnvelope["Policy"]["MaximumDomainGenerationWork"] == (
+        Result.Policy.PlacementAccess.MaximumDomainGenerationWork
+    )
+    assert CurrentEnvelope["Policy"]["MaximumAssignmentExpansions"] == (
+        Result.Policy.PlacementAccess.MaximumAssignmentExpansions
+    )
+    assert CurrentEnvelope["Routing"]["InclusiveRoutingBoundsXZ"] == (
+        CurrentEnvelope["Routing"]["RoutingEnvelope"]["EnvelopeBounds"]
+    )
+    assert CurrentEnvelope["Routing"]["TrackPreparation"]["Complete"] is True
+    assert CurrentEnvelope["Routing"]["TrackPreparation"][
+        "PinAccessDomainFingerprint"
+    ] == PublishedWitness.DomainFingerprint
+    assert CurrentEnvelope["Routing"]["TrackPreparation"][
+        "PinAccessWitnessFingerprint"
+    ] == PublishedWitness.WitnessFingerprint
+    assert CurrentEnvelope["Routing"]["RawTrackAssignmentApplicable"] is False
+    assert CurrentEnvelope["Routing"]["RawTrackAssignment"] is None
+    assert "RawTrackAssignment" in CurrentEnvelope["Routing"]["OutOfScopeFields"]
+    EnvelopePhases = tuple(
+        Observation["Phase"]
+        for Observation in CurrentEnvelopeResult["Observations"]
+    )
+    assert EnvelopePhases == (
+        "BeforeRawMaterialization",
+        "SelectedTrackSuccessor",
+        "BeforePublication",
+    )
+    EnvelopeObservations = CurrentEnvelopeResult["Observations"]
+    assert EnvelopeObservations[0]["PredecessorEnvelopeFingerprint"] == ""
+    assert EnvelopeObservations[1]["PredecessorEnvelopeFingerprint"]
+    assert EnvelopeObservations[2]["PredecessorEnvelopeFingerprint"] == (
+        CurrentEnvelope["PredecessorEnvelopeFingerprint"]
+    )
+    assert len({
+        EnvelopeObservations[1]["PredecessorEnvelopeFingerprint"],
+        EnvelopeObservations[2]["PredecessorEnvelopeFingerprint"],
+        CurrentEnvelope["EnvelopeFingerprint"],
+    }) == 3
+
+
+def test_public_multicluster_flow_publishes_initial_before_selected_track() -> None:
+    Stages = []
+    Result = PlaceAndRoutePcb(
+        _BuildSeventeenNandChainNetlist(),
+        Strategy="routing-aware-placement-access",
+        StageCallback=Stages.append,
+    )
+
+    assert "physical component interface planning" in Stages
+    assert "PlacementAccess" not in Result.PlanningContracts
+    CurrentResult = Result.PlanningContracts["CurrentSelectedAccessEnvelope"]
+    assert CurrentResult["Status"] == "Ready"
+    assert CurrentResult["Reason"] == "Current"
+    assert tuple(
+        Observation["Transition"]
+        for Observation in CurrentResult["Observations"]
+    ) == (
+        "InitialCandidate",
+        "SelectedTrackAssignment",
+        "PostRoutingCompaction",
+    )
+
+
+def test_public_forced_multicluster_flow_rebuilds_access_after_channel_deck(
+    monkeypatch,
+) -> None:
+    """Emit only a freshly rebuilt selected-access channel successor."""
+    Stages = []
+    ChannelObservations = []
+    DeckObservations = []
+    ChannelEnvelopeRecords = []
+    OriginalChannel = PhysicalFlow.BuildBoundedInterClusterRoutingChannel
+    OriginalDeck = PhysicalFlow.BuildBoundedInterClusterRoutingDeck
+    OriginalEnvelopeBuilder = (
+        PhysicalFlow.BuildCandidateCurrentSelectedAccessEnvelope
+    )
+
+    def GateOrigins(Placement):
+        return tuple(sorted(
+            (
+                GateValue.Name,
+                GateValue.X,
+                GateValue.Y,
+                GateValue.Z,
+            )
+            for GateValue in Placement.Placed.PlacedGates
+        ))
+
+    def ObserveChannel(Placement, **Options):
+        Result = OriginalChannel(Placement, **Options)
+        ChannelObservations.append({
+            "SourceOrigins": GateOrigins(Placement),
+            "ChannelOrigins": GateOrigins(Result),
+            "ChannelFingerprint": (
+                Result.InterClusterRoutingChannel.ChannelFingerprint
+            ),
+        })
+        return Result
+
+    def ObserveDeck(Placement, **Options):
+        Result = OriginalDeck(Placement, **Options)
+        if Placement.InterClusterRoutingChannel is None:
+            return Result
+        DeckObservations.append({
+            "ChannelOrigins": GateOrigins(Placement),
+            "DeckOrigins": GateOrigins(Result),
+            "ChannelCompleteAccess": (
+                Placement.CompleteClusterInterfaceAccess
+            ),
+            "DeckCompleteAccess": Result.CompleteClusterInterfaceAccess,
+            "ChannelLeaseRequests": tuple(
+                Value.ToDictionary()
+                for Value in Placement.ClusterBoundaryLeaseRequests
+            ),
+            "DeckLeaseRequests": tuple(
+                Value.ToDictionary()
+                for Value in Result.ClusterBoundaryLeaseRequests
+            ),
+            "InputChannelFingerprint": (
+                Placement.InterClusterRoutingChannel.ChannelFingerprint
+            ),
+            "DeckChannelFingerprint": (
+                Result.InterClusterRoutingChannel.ChannelFingerprint
+            ),
+        })
+        return Result
+
+    def ObserveEnvelope(Candidate, **Options):
+        Result = OriginalEnvelopeBuilder(Candidate, **Options)
+        if Options["Transition"].value == "ChannelReplacement":
+            ChannelEnvelopeRecords.append((
+                Candidate.Placement.PlacementAccessSolve,
+                Result,
+            ))
+        return Result
+
+    monkeypatch.setattr(
+        PhysicalFlow,
+        "BuildBoundedInterClusterRoutingChannel",
+        ObserveChannel,
+    )
+    monkeypatch.setattr(
+        PhysicalFlow,
+        "BuildBoundedInterClusterRoutingDeck",
+        ObserveDeck,
+    )
+    monkeypatch.setattr(
+        PhysicalFlow,
+        "BuildCandidateCurrentSelectedAccessEnvelope",
+        ObserveEnvelope,
+    )
+    monkeypatch.setattr(
+        PlacementSetup,
+        "RequiresExactClusterInterfaceSolve",
+        lambda *_Args, **_Options: (
+            "physical component interface planning" not in Stages
+        ),
+    )
+    monkeypatch.setattr(
+        RoutingAttempts,
+        "RequiresExactClusterInterfaceSolve",
+        lambda *_Args, **_Options: (
+            "physical component interface planning" not in Stages
+        ),
+    )
+
+    with pytest.raises(RoutingStageError) as Error:
+        PlaceAndRoutePcb(
+            _BuildSeventeenNandChainNetlist(),
+            Strategy="routing-aware-placement-access",
+            StageCallback=Stages.append,
+        )
+
+    assert "physical component interface planning" in Stages
+    assert ChannelObservations
+    assert DeckObservations
+    assert any(
+        Value["SourceOrigins"] != Value["ChannelOrigins"]
+        for Value in ChannelObservations
+    )
+    assert any(
+        Value["ChannelCompleteAccess"] != Value["DeckCompleteAccess"]
+        or Value["ChannelLeaseRequests"] != Value["DeckLeaseRequests"]
+        for Value in DeckObservations
+    )
+    assert {
+        Value["ChannelFingerprint"] for Value in ChannelObservations
+    }.intersection(
+        Value["InputChannelFingerprint"] for Value in DeckObservations
+    )
+    Ready = tuple(
+        Result
+        for Solve, Result in ChannelEnvelopeRecords
+        if Solve is not None
+        and Solve.Status is PlacementAccessSolveStatus.Feasible
+        if Result.Status.value == "Ready"
+    )
+    assert Ready
+    Envelope = Ready[0].Envelope
+    assert Envelope is not None
+    assert Envelope.Phase.value == "SelectedTrackSuccessor"
+    assert Envelope.Transition.value == "ChannelReplacement"
+    assert Envelope.PhysicalValidation.Status.value == "Verified"
+    assert Envelope.PhysicalValidation.Reason.value == "Current"
+    assert Envelope.Routing.TrackPreparation is not None
+    assert Envelope.Routing.TrackPreparation.Success
+    assert Envelope.Routing.TrackPreparation.Complete
+    assert Envelope.Routing.TrackPreparation.PinAccessDomainFingerprint == (
+        Envelope.SelectedWitness.DomainFingerprint
+    )
+    assert Envelope.Routing.TrackPreparation.PinAccessWitnessFingerprint == (
+        Envelope.SelectedWitness.WitnessFingerprint
+    )
+    assert tuple(
+        Observation.Transition.value for Observation in Ready[0].Observations
+    ) == ("InitialCandidate", "ChannelReplacement")
+    assert Envelope.PredecessorEnvelopeFingerprint == (
+        Ready[0].Observations[-1].PredecessorEnvelopeFingerprint
+    )
+    Unsatisfiable = tuple(
+        Result
+        for Solve, Result in ChannelEnvelopeRecords
+        if Solve is not None
+        and Solve.Status is PlacementAccessSolveStatus.Unsatisfiable
+        and Solve.SearchComplete
+    )
+    assert Unsatisfiable
+    assert all(
+        Result.Status.value == "Unsatisfiable"
+        and Result.Reason.value == "AccessSolveUnsatisfiable"
+        and Result.Envelope is None
+        and Result.Observations[-1].PhysicalValidation is not None
+        and Result.Observations[-1].PhysicalValidation.Status.value
+        == "Unresolved"
+        and Result.Observations[-1].PhysicalValidation.Reason.value
+        == "UnsatisfiableSolve"
+        for Result in Unsatisfiable
+    )
+    assert Error.value.Failure.Reason is (
+        RoutingFailureReason.ClusterInterfaceSolveIncomplete
+    )
+    assert Error.value.Failure.Diagnostics[
+        "CurrentSelectedAccessStatus"
+    ] == "Unsatisfiable"
+    assert Error.value.Failure.Diagnostics[
+        "CurrentSelectedAccessReason"
+    ] == "AccessSolveUnsatisfiable"
+    assert Error.value.Failure.Diagnostics["InterfaceSolve"]["Complete"] is False
+    assert all(
+        Result.Reason.value != "MissingReadyPredecessor"
+        for _Solve, Result in ChannelEnvelopeRecords
+    )

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
+from hashlib import sha256
+import json
+from math import isfinite
 
 
 class RoutingStrategy(str, Enum):
@@ -87,6 +91,163 @@ class PlacementAccessPolicy:
             raise ValueError(
                 "enabled placement access requires at least one pattern family"
             )
+
+
+def _RuntimePolicyIdentity(Prefix: str, Value: object) -> str:
+    Encoded = json.dumps(
+        Value,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{Prefix}:{sha256(Encoded).hexdigest()[:16]}"
+
+
+@dataclass(frozen=True)
+class RuntimeExecutionPolicy:
+    """Versioned Joint policy for bounded symbolic-worker admission."""
+
+    SchemaVersion: str = "joint-runtime-execution-policy-v1"
+    Enabled: bool = False
+    ExecutionMode: str = "bounded-spawn"
+    PressureMode: str = "admit"
+    CleanupReserveSeconds: float = 1.0
+    MaximumCooperativeGraceSeconds: float = 0.1
+    ForceTerminationAuthorized: bool = True
+    UnifiedNativeAuthority: bool = False
+    PolicyIdentity: str = field(init=False)
+    PressureIdentity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.SchemaVersion != "joint-runtime-execution-policy-v1":
+            raise ValueError("unsupported Joint runtime execution policy schema")
+        if type(self.Enabled) is not bool:
+            raise TypeError("RuntimeExecutionPolicy.Enabled must be a boolean")
+        for Name in ("ExecutionMode", "PressureMode"):
+            Value = getattr(self, Name)
+            if type(Value) is not str or not Value:
+                raise TypeError(
+                    f"RuntimeExecutionPolicy.{Name} must be a non-empty string"
+                )
+        if (
+            type(self.CleanupReserveSeconds) is not float
+            or not isfinite(self.CleanupReserveSeconds)
+        ):
+            raise TypeError(
+                "RuntimeExecutionPolicy.CleanupReserveSeconds must be a "
+                "finite exact float"
+            )
+        if self.CleanupReserveSeconds <= 0.0:
+            raise ValueError(
+                "RuntimeExecutionPolicy.CleanupReserveSeconds must be positive"
+            )
+        if (
+            type(self.MaximumCooperativeGraceSeconds) is not float
+            or not isfinite(self.MaximumCooperativeGraceSeconds)
+        ):
+            raise TypeError(
+                "RuntimeExecutionPolicy.MaximumCooperativeGraceSeconds must "
+                "be a finite exact float"
+            )
+        if self.MaximumCooperativeGraceSeconds < 0.0:
+            raise ValueError(
+                "RuntimeExecutionPolicy.MaximumCooperativeGraceSeconds cannot "
+                "be negative"
+            )
+        if self.MaximumCooperativeGraceSeconds > self.CleanupReserveSeconds:
+            raise ValueError(
+                "RuntimeExecutionPolicy cooperative grace cannot exceed its "
+                "cleanup reserve"
+            )
+        if type(self.ForceTerminationAuthorized) is not bool:
+            raise TypeError(
+                "RuntimeExecutionPolicy.ForceTerminationAuthorized must be a "
+                "boolean"
+            )
+        if type(self.UnifiedNativeAuthority) is not bool:
+            raise TypeError(
+                "RuntimeExecutionPolicy.UnifiedNativeAuthority must be a boolean"
+            )
+        object.__setattr__(
+            self,
+            "PolicyIdentity",
+            _RuntimePolicyIdentity(
+                "joint-runtime-policy-v1",
+                {
+                    "SchemaVersion": self.SchemaVersion,
+                    "Enabled": self.Enabled,
+                    "ExecutionMode": self.ExecutionMode,
+                    "CleanupReserveSeconds": self.CleanupReserveSeconds,
+                    "MaximumCooperativeGraceSeconds": (
+                        self.MaximumCooperativeGraceSeconds
+                    ),
+                    "ForceTerminationAuthorized": (
+                        self.ForceTerminationAuthorized
+                    ),
+                    "UnifiedNativeAuthority": self.UnifiedNativeAuthority,
+                },
+            ),
+        )
+        object.__setattr__(
+            self,
+            "PressureIdentity",
+            _RuntimePolicyIdentity(
+                "joint-runtime-pressure-v1",
+                {
+                    "SchemaVersion": self.SchemaVersion,
+                    "PressureMode": self.PressureMode,
+                },
+            ),
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def FromDictionary(cls, Document: object) -> "RuntimeExecutionPolicy":
+        if not isinstance(Document, Mapping):
+            raise TypeError("Joint runtime execution policy must be a mapping")
+        Expected = frozenset((
+            "SchemaVersion",
+            "Enabled",
+            "ExecutionMode",
+            "PressureMode",
+            "CleanupReserveSeconds",
+            "MaximumCooperativeGraceSeconds",
+            "ForceTerminationAuthorized",
+            "UnifiedNativeAuthority",
+            "PolicyIdentity",
+            "PressureIdentity",
+        ))
+        if frozenset(map(str, Document.keys())) != Expected:
+            raise ValueError("invalid Joint runtime execution policy fields")
+        Result = cls(
+            SchemaVersion=Document["SchemaVersion"],
+            Enabled=Document["Enabled"],
+            ExecutionMode=Document["ExecutionMode"],
+            PressureMode=Document["PressureMode"],
+            CleanupReserveSeconds=Document["CleanupReserveSeconds"],
+            MaximumCooperativeGraceSeconds=Document[
+                "MaximumCooperativeGraceSeconds"
+            ],
+            ForceTerminationAuthorized=Document[
+                "ForceTerminationAuthorized"
+            ],
+            UnifiedNativeAuthority=Document["UnifiedNativeAuthority"],
+        )
+        if Document["PolicyIdentity"] != Result.PolicyIdentity:
+            raise ValueError("Joint runtime policy identity mismatch")
+        if Document["PressureIdentity"] != Result.PressureIdentity:
+            raise ValueError("Joint runtime pressure identity mismatch")
+        return Result
+
+
+# Production v1 reserves one second of the enclosing interface deadline for
+# cleanup.  The first 100 ms is the maximum cooperative cancellation grace;
+# the remaining 900 ms is retained for forced termination, exit observation,
+# reap, and resource release.  These named values are coordinator policy, not
+# an allowance invented by the Runtime provider.
+PhysicalUnaryRuntimeCleanupReserveSecondsV1 = 1.0
+PhysicalUnaryRuntimeMaximumCooperativeGraceSecondsV1 = 0.1
 
 
 @dataclass(frozen=True)
@@ -449,6 +610,9 @@ class PhysicalDesignPolicy:
     PlacementAccess: PlacementAccessPolicy = field(
         default_factory=PlacementAccessPolicy
     )
+    RuntimeExecution: RuntimeExecutionPolicy | None = field(
+        default_factory=RuntimeExecutionPolicy
+    )
     NandPacking: NandPackingPolicy = field(default_factory=NandPackingPolicy)
     MaterialObjective: MaterialObjectivePolicy = field(
         default_factory=MaterialObjectivePolicy
@@ -603,6 +767,17 @@ LocalFirstPhysicalDesignPolicy = PhysicalDesignPolicy(
 RoutingAwarePlacementAccessPhysicalDesignPolicy = replace(
     LocalFirstPhysicalDesignPolicy,
     PolicyVersion="physical-design-v17-routing-aware-placement-access",
+    RuntimeExecution=RuntimeExecutionPolicy(
+        Enabled=True,
+        ExecutionMode="bounded-spawn",
+        PressureMode="admit",
+        CleanupReserveSeconds=PhysicalUnaryRuntimeCleanupReserveSecondsV1,
+        MaximumCooperativeGraceSeconds=(
+            PhysicalUnaryRuntimeMaximumCooperativeGraceSecondsV1
+        ),
+        ForceTerminationAuthorized=True,
+        UnifiedNativeAuthority=False,
+    ),
     PlacementAccess=PlacementAccessPolicy(
         Enabled=True,
         CatalogVersion="physical-pin-access-catalog-v1",
