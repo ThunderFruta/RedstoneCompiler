@@ -41,6 +41,15 @@ controls when the two disagree.
 - Admit only the straight access family in the current slice. Non-straight
   alternatives must pass the same exact physical checks before joining the
   production domain.
+- The v17 coordinator enables bounded spawned work only for symbolic unary
+  support. It derives the useful-work deadline from the enclosing absolute
+  interface deadline and reserves one named second for cleanup: at most 100 ms
+  for cooperative cancellation, followed by 900 ms retained for forced
+  termination, exit observation, reap, and release. Runtime does not invent or
+  extend this allowance. Disabled, denied-pressure, future, missing, and
+  unsupported-native modes use a diagnosed serial fallback; an enabled window
+  that cannot fund useful work fails before child admission. Native work is
+  explicitly outside this versioned authority.
 
 ## Open questions
 
