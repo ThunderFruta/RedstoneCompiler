@@ -520,7 +520,10 @@ def _RecoverAndClose(Handle) -> None:
             Receipt = Handle.ReapIfExited()
         if (
             Receipt is not None
-            and not Receipt.OutstandingOwnership
+            and (
+                Receipt.Reaped
+                or not Receipt.OutstandingOwnership
+            )
             and not Receipt.ChildExistenceUncertain
         ):
             Handle.CloseReleased()
@@ -550,11 +553,18 @@ def _ReapAndClose(Handle):
     assert Receipt is not None and Receipt.ProcessExitObserved
     Receipt = Handle.ReapIfExited()
     assert Receipt.Reaped
-    assert Receipt.ReleaseAcknowledged
+    assert not Receipt.ReleaseAcknowledged
+    assert Receipt.ReleaseAcknowledgedAt is None
+    assert Receipt.OutstandingOwnership
+    assert not Receipt.ResourcesClosed
     Pid = Receipt.StartedPid
     RequestName = Receipt.RequestSharedMemoryName
     ResultName = Receipt.ResultSharedMemoryName
     Handle.CloseReleased()
+    Receipt = Handle.LastReceipt
+    assert Receipt.ReleaseAcknowledged
+    assert not Receipt.OutstandingOwnership
+    assert Receipt.ResourcesClosed
     assert not _PidExists(Pid)
     _AssertSharedMemoryAbsent(RequestName)
     _AssertSharedMemoryAbsent(ResultName)
@@ -576,11 +586,18 @@ def _ReapAndClose(Handle):
 
 def _CloseAlreadyReaped(Handle, Receipt) -> None:
     assert Receipt.Reaped
-    assert Receipt.ReleaseAcknowledged
+    assert not Receipt.ReleaseAcknowledged
+    assert Receipt.ReleaseAcknowledgedAt is None
+    assert Receipt.OutstandingOwnership
+    assert not Receipt.ResourcesClosed
     Pid = Receipt.StartedPid
     RequestName = Receipt.RequestSharedMemoryName
     ResultName = Receipt.ResultSharedMemoryName
     Handle.CloseReleased()
+    Released = Handle.LastReceipt
+    assert Released.ReleaseAcknowledged
+    assert not Released.OutstandingOwnership
+    assert Released.ResourcesClosed
     assert not _PidExists(Pid)
     _AssertSharedMemoryAbsent(RequestName)
     _AssertSharedMemoryAbsent(ResultName)
@@ -1186,7 +1203,7 @@ def test_oversized_completion_datagram_is_not_a_valid_token(monkeypatch):
         _RecoverAndClose(Handle)
 
 
-def test_release_timestamp_follows_bounded_validation_and_reap():
+def test_release_timestamp_follows_bounded_validation_reap_and_close():
     ResultBytes = 32 * 1024 * 1024
     Payload = str(ResultBytes).encode("ascii")
     DeadlineAt = monotonic() + 3.0
@@ -1221,9 +1238,10 @@ def test_release_timestamp_follows_bounded_validation_and_reap():
 
         assert DeadlineAt <= ReapReturnedAt
         assert Receipt.Reaped
-        assert Receipt.ReleaseAcknowledged
-        assert Receipt.ReleaseAcknowledgedAt is not None
-        assert Receipt.ReleaseAcknowledgedAt >= DeadlineAt
+        assert not Receipt.ReleaseAcknowledged
+        assert Receipt.ReleaseAcknowledgedAt is None
+        assert Receipt.OutstandingOwnership
+        assert not Receipt.ResourcesClosed
         assert Receipt.ResultValid
         assert Receipt.ResultDiagnostic == "LateResultDiscarded"
         assert Receipt.PublishedResult is None
@@ -1232,6 +1250,12 @@ def test_release_timestamp_follows_bounded_validation_and_reap():
         RequestName = Receipt.RequestSharedMemoryName
         ResultName = Receipt.ResultSharedMemoryName
         Handle.CloseReleased()
+        Released = Handle.LastReceipt
+        assert Released.ReleaseAcknowledged
+        assert Released.ReleaseAcknowledgedAt is not None
+        assert Released.ReleaseAcknowledgedAt >= ReapReturnedAt
+        assert not Released.OutstandingOwnership
+        assert Released.ResourcesClosed
         assert not _PidExists(Pid)
         _AssertSharedMemoryAbsent(RequestName)
         _AssertSharedMemoryAbsent(ResultName)
@@ -1857,7 +1881,8 @@ def test_retained_closed_handle_releases_all_synchronization_resources():
     try:
         Handle.AdvanceUntil(float(SharedCutoffAt))
         Receipt = Handle.ReapIfExited()
-        assert Receipt.Reaped and Receipt.ReleaseAcknowledged
+        assert Receipt.Reaped and not Receipt.ReleaseAcknowledged
+        assert Receipt.OutstandingOwnership
         assert monotonic() < SharedCutoffAt
         Identities = Receipt.SynchronizationResourceIdentities
         assert len(Identities) == 3
@@ -1908,7 +1933,8 @@ def test_retained_closed_handle_has_no_backend_sync_resource_or_mutation():
 
         Handle.AdvanceUntil(float(DeadlineAt))
         Receipt = Handle.ReapIfExited()
-        assert Receipt.Reaped and Receipt.ReleaseAcknowledged
+        assert Receipt.Reaped and not Receipt.ReleaseAcknowledged
+        assert Receipt.OutstandingOwnership
         _CloseAlreadyReaped(Handle, Receipt)
 
         Closed = Handle.Observe()

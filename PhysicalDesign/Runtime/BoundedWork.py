@@ -73,6 +73,14 @@ class RuntimeWorkControl:
                 RuntimeLifecycle.Completed,
             )
 
+    def StopIfWorkCapReached(self) -> None:
+        """Classify an incomplete operation that consumed its full allowance."""
+        if self.WorkUnits >= self.Request.WorkCap:
+            raise _BoundedWorkStop(
+                RuntimeTerminalReason.WorkCapExhausted,
+                RuntimeLifecycle.Completed,
+            )
+
 
 Payload = TypeVar("Payload")
 

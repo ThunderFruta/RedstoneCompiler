@@ -50,6 +50,30 @@ class RuntimeOneShotProcessLimits:
                 raise ValueError(f"{Name} must be at least {Minimum}")
 
 
+def BuildRuntimeOneShotProcessLimits(
+    Operation: Callable[[bytes, Callable[[], bool]], bytes],
+    EncodedPayloadBytes: int,
+    MaximumResultPayloadBytes: int,
+) -> RuntimeOneShotProcessLimits:
+    """Build exact transport capacities around caller-bounded payload bytes."""
+    if type(EncodedPayloadBytes) is not int or EncodedPayloadBytes < 0:
+        raise ValueError("EncodedPayloadBytes must be a non-negative integer")
+    if type(MaximumResultPayloadBytes) is not int or MaximumResultPayloadBytes < 0:
+        raise ValueError(
+            "MaximumResultPayloadBytes must be a non-negative integer"
+        )
+    return RuntimeOneShotProcessLimits(
+        MaximumRequestBytes=(
+            _REQUEST_HEADER.size
+            + len(_OperationReference(Operation))
+            + EncodedPayloadBytes
+        ),
+        MaximumResultBytes=(
+            _RESULT_HEADER.size + MaximumResultPayloadBytes
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeOneShotProcessReceipt:
     """One immutable public observation of a caller-owned child handle."""
@@ -64,9 +88,12 @@ class RuntimeOneShotProcessReceipt:
     StartExceptionObserved: bool
     ChildExistenceUncertain: bool
     OperationalFailure: str | None
+    ParentControl: BaseException | None
     InvocationBindingIdentity: str
     SynchronizationResourceIdentities: tuple[int, ...]
     SynchronizationCleanupFailures: tuple[str, ...]
+    AllocationCleanupFailures: tuple[str, ...]
+    ResourceCleanupFailures: tuple[str, ...]
     RequestSharedMemoryName: str | None
     ResultSharedMemoryName: str | None
     RequestEnvelopeBytes: int
@@ -288,6 +315,9 @@ class RuntimeOneShotProcessHandle:
         self._CompletionSocket: socket.socket | None = None
         self._ChildSocketCopies: tuple[socket.socket, ...] = ()
         self._SynchronizationCleanupFailures: tuple[str, ...] = ()
+        self._AllocationCleanupFailures: tuple[str, ...] = ()
+        self._ResourceCleanupFailures: tuple[str, ...] = ()
+        self._AllocationResources: list[tuple[str, str, object]] = []
 
         self._StartRequested = False
         self._StartedPid: int | None = None
@@ -298,6 +328,7 @@ class RuntimeOneShotProcessHandle:
         self._StartExceptionObserved = False
         self._ChildExistenceUncertain = False
         self._OperationalFailure: str | None = None
+        self._ParentControl: BaseException | None = None
         self._ResultCompletionObserved = False
         self._ResultCompletionObservedAt: float | None = None
         self._ResultAvailable = False
@@ -327,6 +358,9 @@ class RuntimeOneShotProcessHandle:
         self._OutstandingOwnership = False
         self._ResourcesClosed = False
         self._PublishedResult: bytes | None = None
+        self._LastReceipt: RuntimeOneShotProcessReceipt | None = None
+        self._Receipt()
+        self._AdmissionReceipt = self._LastReceipt
 
     def _SynchronizationResourceIdentities(self) -> tuple[int, ...]:
         Identities = []
@@ -346,7 +380,7 @@ class RuntimeOneShotProcessHandle:
         return tuple(Identities)
 
     def _Receipt(self) -> RuntimeOneShotProcessReceipt:
-        return RuntimeOneShotProcessReceipt(
+        Receipt = RuntimeOneShotProcessReceipt(
             TaskIdentity=self._Request.TaskIdentity,
             StartRequested=self._StartRequested,
             StartedPid=self._StartedPid,
@@ -357,6 +391,7 @@ class RuntimeOneShotProcessHandle:
             StartExceptionObserved=self._StartExceptionObserved,
             ChildExistenceUncertain=self._ChildExistenceUncertain,
             OperationalFailure=self._OperationalFailure,
+            ParentControl=self._ParentControl,
             InvocationBindingIdentity=self._InvocationBinding.hex(),
             SynchronizationResourceIdentities=(
                 self._SynchronizationResourceIdentities()
@@ -364,6 +399,8 @@ class RuntimeOneShotProcessHandle:
             SynchronizationCleanupFailures=(
                 self._SynchronizationCleanupFailures
             ),
+            AllocationCleanupFailures=self._AllocationCleanupFailures,
+            ResourceCleanupFailures=self._ResourceCleanupFailures,
             RequestSharedMemoryName=(
                 None if self._RequestMemory is None else self._RequestMemory.name
             ),
@@ -406,20 +443,287 @@ class RuntimeOneShotProcessHandle:
             ResourcesClosed=self._ResourcesClosed,
             PublishedResult=self._PublishedResult,
         )
+        self._LastReceipt = Receipt
+        return Receipt
 
-    def _CloseChildSocketCopiesAfterStart(self) -> None:
-        Remaining = []
-        for SynchronizationSocket in self._ChildSocketCopies:
+    @property
+    def LastReceipt(self) -> RuntimeOneShotProcessReceipt:
+        """Return the last receipt captured by an in-authority handle action."""
+        if self._LastReceipt is None:
+            return self._Receipt()
+        return self._LastReceipt
+
+    @property
+    def AdmissionReceipt(self) -> RuntimeOneShotProcessReceipt:
+        """Return the receipt captured before the latest startup action."""
+        return self._AdmissionReceipt
+
+    def _CaptureAdmissionReceipt(self) -> None:
+        self._AdmissionReceipt = self._Receipt()
+
+    def _CleanupAllocationResources(self) -> None:
+        """Attempt every pre-start cleanup and retain any unproved ownership."""
+        CleanupOrder = list(reversed(self._AllocationResources))
+        for Kind, Name, Resource in CleanupOrder:
+            if monotonic() >= self._Authority.CleanupCutoffAt:
+                return
+            Released = True
+            CloseFailure = None
+            CloseParentControl = None
+            try:
+                Resource.close()
+            except BaseException as Error:
+                Released = False
+                CloseFailure = f"{Name}.close:{type(Error).__name__}"
+                if not isinstance(Error, Exception) and self._ParentControl is None:
+                    self._ParentControl = Error
+                    CloseParentControl = Error
+            Current = monotonic()
+            if Current >= self._Authority.CleanupCutoffAt:
+                if CloseParentControl is not None:
+                    self._AllocationCleanupFailures += (CloseFailure,)
+                    self._CleanupCutoffBreached = True
+                    self._CleanupCutoffObservedAt = Current
+                    self._Receipt()
+                return
+            if CloseFailure is not None:
+                self._AllocationCleanupFailures += (CloseFailure,)
+                self._Receipt()
+            if Kind == "memory":
+                UnlinkFailure = None
+                UnlinkParentControl = None
+                try:
+                    Resource.unlink()
+                except FileNotFoundError:
+                    pass
+                except BaseException as Error:
+                    Released = False
+                    UnlinkFailure = f"{Name}.unlink:{type(Error).__name__}"
+                    if (
+                        not isinstance(Error, Exception)
+                        and self._ParentControl is None
+                    ):
+                        self._ParentControl = Error
+                        UnlinkParentControl = Error
+                Current = monotonic()
+                if Current >= self._Authority.CleanupCutoffAt:
+                    if UnlinkParentControl is not None:
+                        self._AllocationCleanupFailures += (UnlinkFailure,)
+                        self._CleanupCutoffBreached = True
+                        self._CleanupCutoffObservedAt = Current
+                        self._Receipt()
+                    return
+                if UnlinkFailure is not None:
+                    self._AllocationCleanupFailures += (UnlinkFailure,)
+                    self._Receipt()
+            if Released:
+                RetainedResourceIdentities = {
+                    id(OwnedResource)
+                    for _OwnedKind, _OwnedName, OwnedResource
+                    in self._AllocationResources
+                    if id(OwnedResource) != id(Resource)
+                }
+                self._ApplyRetainedResourceLedger(
+                    RetainedResourceIdentities
+                )
+                self._Receipt()
+
+        if monotonic() >= self._Authority.CleanupCutoffAt:
+            return
+        self._OutstandingOwnership = bool(self._AllocationResources)
+        self._ResourcesClosed = not self._AllocationResources
+        if self._ResourcesClosed:
+            self._ReleaseAcknowledged = True
+            self._ReleaseAcknowledgedAt = monotonic()
+        self._Receipt()
+
+    def _EnsureResourceLedger(self) -> None:
+        if self._AllocationResources:
+            return
+        Seen = set()
+        for Kind, Name, Resource in (
+            ("memory", "RequestSharedMemory", self._RequestMemory),
+            ("memory", "ResultSharedMemory", self._ResultMemory),
+            ("socket", "ReadinessParentSocket", self._ReadinessSocket),
+            ("socket", "CancellationParentSocket", self._CancellationSocket),
+            ("socket", "CompletionParentSocket", self._CompletionSocket),
+            *(
+                ("socket", f"ChildSocket{Index}", Resource)
+                for Index, Resource in enumerate(self._ChildSocketCopies)
+            ),
+            ("process", "Process", self._Process),
+        ):
+            if Resource is None or id(Resource) in Seen:
+                continue
+            Seen.add(id(Resource))
+            self._AllocationResources.append((Kind, Name, Resource))
+
+    def _ApplyRetainedResourceLedger(
+        self,
+        RetainedResourceIdentities: set[int],
+    ) -> None:
+        self._AllocationResources = [
+            Resource
+            for Resource in self._AllocationResources
+            if id(Resource[2]) in RetainedResourceIdentities
+        ]
+        self._RequestMemory = None
+        self._ResultMemory = None
+        self._ReadinessSocket = None
+        self._CancellationSocket = None
+        self._CompletionSocket = None
+        self._Process = None
+        ChildSockets = []
+        for _Kind, Name, Resource in self._AllocationResources:
+            if Name == "RequestSharedMemory":
+                self._RequestMemory = Resource
+            elif Name == "ResultSharedMemory":
+                self._ResultMemory = Resource
+            elif Name == "ReadinessParentSocket":
+                self._ReadinessSocket = Resource
+            elif Name == "CancellationParentSocket":
+                self._CancellationSocket = Resource
+            elif Name == "CompletionParentSocket":
+                self._CompletionSocket = Resource
+            elif Name == "Process":
+                self._Process = Resource
+            else:
+                ChildSockets.append(Resource)
+        self._ChildSocketCopies = tuple(ChildSockets)
+
+    def _CleanupReleasedResources(self) -> None:
+        """Exhaust a released handle's resources within cleanup authority."""
+        RecoveryAfterBreach = self._CleanupCutoffBreached
+        self._EnsureResourceLedger()
+        CleanupOrder = list(self._AllocationResources)
+        for Kind, Name, Resource in CleanupOrder:
+            if (
+                not RecoveryAfterBreach
+                and monotonic() >= self._Authority.CleanupCutoffAt
+            ):
+                raise RuntimeError("one-shot cleanup cutoff reached")
+            Released = True
+            CloseFailure = None
+            CloseParentControl = None
+            try:
+                Resource.close()
+            except BaseException as Error:
+                Released = False
+                CloseFailure = f"{Name}.close:{type(Error).__name__}"
+                if not isinstance(Error, Exception) and self._ParentControl is None:
+                    self._ParentControl = Error
+                    CloseParentControl = Error
+            Current = monotonic()
+            if (
+                not RecoveryAfterBreach
+                and Current >= self._Authority.CleanupCutoffAt
+            ):
+                if CloseParentControl is not None:
+                    self._ResourceCleanupFailures += (CloseFailure,)
+                    self._CleanupCutoffBreached = True
+                    self._CleanupCutoffObservedAt = Current
+                    self._Receipt()
+                raise RuntimeError("one-shot cleanup cutoff crossed")
+            if CloseFailure is not None:
+                self._ResourceCleanupFailures += (CloseFailure,)
+                self._Receipt()
+            if Kind == "memory":
+                UnlinkFailure = None
+                UnlinkParentControl = None
+                try:
+                    Resource.unlink()
+                except FileNotFoundError:
+                    pass
+                except BaseException as Error:
+                    Released = False
+                    UnlinkFailure = f"{Name}.unlink:{type(Error).__name__}"
+                    if (
+                        not isinstance(Error, Exception)
+                        and self._ParentControl is None
+                    ):
+                        self._ParentControl = Error
+                        UnlinkParentControl = Error
+                Current = monotonic()
+                if (
+                    not RecoveryAfterBreach
+                    and Current >= self._Authority.CleanupCutoffAt
+                ):
+                    if UnlinkParentControl is not None:
+                        self._ResourceCleanupFailures += (UnlinkFailure,)
+                        self._CleanupCutoffBreached = True
+                        self._CleanupCutoffObservedAt = Current
+                        self._Receipt()
+                    raise RuntimeError("one-shot cleanup cutoff crossed")
+                if UnlinkFailure is not None:
+                    self._ResourceCleanupFailures += (UnlinkFailure,)
+                    self._Receipt()
+            if Released:
+                RetainedResourceIdentities = {
+                    id(OwnedResource)
+                    for _OwnedKind, _OwnedName, OwnedResource
+                    in self._AllocationResources
+                    if id(OwnedResource) != id(Resource)
+                }
+                self._ApplyRetainedResourceLedger(
+                    RetainedResourceIdentities
+                )
+                self._Receipt()
+        if (
+            not RecoveryAfterBreach
+            and monotonic() >= self._Authority.CleanupCutoffAt
+        ):
+            raise RuntimeError("one-shot cleanup cutoff crossed")
+        self._ResourcesClosed = not self._AllocationResources
+        self._OutstandingOwnership = bool(self._AllocationResources)
+        if self._ResourcesClosed:
+            if not self._ReleaseAcknowledged:
+                self._ReleaseAcknowledged = True
+                self._ReleaseAcknowledgedAt = monotonic()
+        self._Receipt()
+        if self._AllocationResources:
+            raise RuntimeError("one-shot resource cleanup remains incomplete")
+
+    def _CloseChildSocketCopiesAfterStart(self) -> bool:
+        OriginalCopies = self._ChildSocketCopies
+        for SynchronizationSocket in OriginalCopies:
+            if monotonic() >= self._Authority.CleanupCutoffAt:
+                return False
+            Failure = None
+            ParentControl = None
             try:
                 SynchronizationSocket.close()
             except BaseException as Error:
-                Remaining.append(SynchronizationSocket)
-                self._SynchronizationCleanupFailures += (
-                    type(Error).__name__,
-                )
-        self._ChildSocketCopies = tuple(Remaining)
-        if Remaining and self._OperationalFailure is None:
+                Failure = type(Error).__name__
+                if not isinstance(Error, Exception) and self._ParentControl is None:
+                    self._ParentControl = Error
+                    ParentControl = Error
+            Current = monotonic()
+            if Current >= self._Authority.CleanupCutoffAt:
+                if ParentControl is not None:
+                    self._SynchronizationCleanupFailures += (Failure,)
+                    self._CleanupCutoffBreached = True
+                    self._CleanupCutoffObservedAt = Current
+                    self._Receipt()
+                return False
+            if Failure is not None:
+                self._SynchronizationCleanupFailures += (Failure,)
+                self._Receipt()
+                continue
+            self._ChildSocketCopies = tuple(
+                Resource
+                for Resource in self._ChildSocketCopies
+                if id(Resource) != id(SynchronizationSocket)
+            )
+            self._AllocationResources = [
+                Resource
+                for Resource in self._AllocationResources
+                if id(Resource[2]) != id(SynchronizationSocket)
+            ]
+            self._Receipt()
+        if self._ChildSocketCopies and self._OperationalFailure is None:
             self._OperationalFailure = "SynchronizationCleanupFailure"
+            self._Receipt()
+        return True
 
     def _RequestCancellationAt(self, ObservedAt: float) -> None:
         if self._ResourcesClosed or self._CancellationRequested:
@@ -431,17 +735,16 @@ class RuntimeOneShotProcessHandle:
                 SentBytes = self._CancellationSocket.send(b"C")
             except (BlockingIOError, OSError):
                 SentBytes = 0
+            except BaseException as Error:
+                self._RecordExternalActionControl(
+                    "CancellationSignalFailure",
+                    Error,
+                )
+                raise
             if SentBytes != 1:
                 self._OperationalFailure = "CancellationSignalUnavailable"
 
     def _ObserveCutoffs(self, ObservedAt: float) -> None:
-        if (
-            not self._WorkDeadlineObserved
-            and ObservedAt >= self._Authority.WorkDeadlineAt
-        ):
-            self._WorkDeadlineObserved = True
-            self._WorkDeadlineObservedAt = ObservedAt
-            self._RequestCancellationAt(ObservedAt)
         if (
             not self._CleanupCutoffBreached
             and self._OutstandingOwnership
@@ -449,6 +752,42 @@ class RuntimeOneShotProcessHandle:
         ):
             self._CleanupCutoffBreached = True
             self._CleanupCutoffObservedAt = ObservedAt
+            return
+        if (
+            not self._WorkDeadlineObserved
+            and ObservedAt >= self._Authority.WorkDeadlineAt
+        ):
+            self._WorkDeadlineObserved = True
+            self._WorkDeadlineObservedAt = ObservedAt
+            self._RequestCancellationAt(ObservedAt)
+
+    def _OriginalCleanupAuthorityCrossed(
+        self,
+        RecoveryAfterBreach: bool,
+    ) -> bool:
+        if RecoveryAfterBreach:
+            return False
+        Current = monotonic()
+        if Current < self._Authority.CleanupCutoffAt:
+            return False
+        if not self._CleanupCutoffBreached:
+            self._CleanupCutoffBreached = True
+            self._CleanupCutoffObservedAt = Current
+        return True
+
+    def _RecordExternalActionControl(
+        self,
+        Action: str,
+        Error: BaseException,
+    ) -> None:
+        if not isinstance(Error, Exception) and self._ParentControl is None:
+            self._ParentControl = Error
+        self._OperationalFailure = f"{Action}:{type(Error).__name__}"
+        Current = monotonic()
+        if Current >= self._Authority.CleanupCutoffAt:
+            self._CleanupCutoffBreached = True
+            self._CleanupCutoffObservedAt = Current
+        self._Receipt()
 
     @staticmethod
     def _ReceiveControlToken(
@@ -469,8 +808,13 @@ class RuntimeOneShotProcessHandle:
         """Return a nonblocking public state snapshot."""
         if self._ResourcesClosed:
             return self._Receipt()
+        RecoveryAfterBreach = self._CleanupCutoffBreached
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         ObservedAt = monotonic()
         self._ObserveCutoffs(ObservedAt)
+        if self._CleanupCutoffBreached and not RecoveryAfterBreach:
+            return self._Receipt()
         if self._Process is None:
             return self._Receipt()
 
@@ -478,15 +822,29 @@ class RuntimeOneShotProcessHandle:
             Pid = self._Process.pid
         except (AssertionError, ValueError):
             Pid = None
+        except BaseException as Error:
+            self._RecordExternalActionControl("ProcessPidObservation", Error)
+            raise
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         if Pid is not None:
             self._StartedPid = Pid
             self._ChildExistenceUncertain = False
 
         if not self._ReadinessObserved:
-            ReadinessObserved = self._ReceiveControlToken(
-                self._ReadinessSocket,
-                b"R",
-            )
+            try:
+                ReadinessObserved = self._ReceiveControlToken(
+                    self._ReadinessSocket,
+                    b"R",
+                )
+            except BaseException as Error:
+                self._RecordExternalActionControl(
+                    "ReadinessObservation",
+                    Error,
+                )
+                raise
+            if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+                return self._Receipt()
             if ReadinessObserved is True:
                 self._ReadinessObserved = True
                 self._ReadinessObservedAt = ObservedAt
@@ -498,18 +856,49 @@ class RuntimeOneShotProcessHandle:
             SentinelReady = bool(wait((self._Process.sentinel,), timeout=0))
         except (AssertionError, OSError, ValueError):
             SentinelReady = False
+        except BaseException as Error:
+            self._RecordExternalActionControl("ProcessSentinelObservation", Error)
+            raise
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         if SentinelReady and not self._ProcessExitObserved:
             self._ProcessExitObserved = True
             self._ProcessExitObservedAt = ObservedAt
-            self._ExitCode = self._Process.exitcode
+            try:
+                self._ExitCode = self._Process.exitcode
+            except BaseException as Error:
+                self._RecordExternalActionControl(
+                    "ProcessExitCodeObservation",
+                    Error,
+                )
+                raise
         elif self._ProcessExitObserved:
-            self._ExitCode = self._Process.exitcode
+            try:
+                self._ExitCode = self._Process.exitcode
+            except BaseException as Error:
+                self._RecordExternalActionControl(
+                    "ProcessExitCodeObservation",
+                    Error,
+                )
+                raise
+
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
 
         if self._ProcessExitObserved and not self._ResultCompletionObserved:
-            CompletionObserved = self._ReceiveControlToken(
-                self._CompletionSocket,
-                b"D",
-            )
+            try:
+                CompletionObserved = self._ReceiveControlToken(
+                    self._CompletionSocket,
+                    b"D",
+                )
+            except BaseException as Error:
+                self._RecordExternalActionControl(
+                    "CompletionObservation",
+                    Error,
+                )
+                raise
+            if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+                return self._Receipt()
             if CompletionObserved is True:
                 self._ResultCompletionObserved = True
                 self._ResultCompletionObservedAt = ObservedAt
@@ -532,12 +921,33 @@ class RuntimeOneShotProcessHandle:
             self._Authority.CleanupCutoffAt,
         )
         while True:
+            Current = monotonic()
+            if Current >= EffectiveCutoffAt:
+                if (
+                    Current >= self._Authority.CleanupCutoffAt
+                    and not self._CleanupCutoffBreached
+                ):
+                    self._CleanupCutoffBreached = True
+                    self._CleanupCutoffObservedAt = Current
+                    return self._Receipt()
+                return self.LastReceipt
+            PreviousReceipt = self.LastReceipt
             Receipt = self.Observe()
+            Current = monotonic()
+            if Current >= EffectiveCutoffAt:
+                if (
+                    Current >= self._Authority.CleanupCutoffAt
+                    and not self._CleanupCutoffBreached
+                ):
+                    self._CleanupCutoffBreached = True
+                    self._CleanupCutoffObservedAt = Current
+                    return self._Receipt()
+                return PreviousReceipt
             if Receipt.ProcessExitObserved or not Receipt.OutstandingOwnership:
                 return Receipt
             Current = monotonic()
             if Current >= EffectiveCutoffAt:
-                return self.Observe()
+                return Receipt
             NextStopAt = EffectiveCutoffAt
             if not self._WorkDeadlineObserved:
                 NextStopAt = min(NextStopAt, self._Authority.WorkDeadlineAt)
@@ -545,18 +955,39 @@ class RuntimeOneShotProcessHandle:
                 Sentinel = self._Process.sentinel
             except (AssertionError, OSError, ValueError):
                 return self._Receipt()
-            wait((Sentinel,), timeout=max(0.0, NextStopAt - Current))
+            except BaseException as Error:
+                self._RecordExternalActionControl(
+                    "ProcessSentinelObservation",
+                    Error,
+                )
+                raise
+            try:
+                wait((Sentinel,), timeout=max(0.0, NextStopAt - Current))
+            except BaseException as Error:
+                self._RecordExternalActionControl(
+                    "ProcessWaitFailure",
+                    Error,
+                )
+                raise
 
     def RequestCancellation(self) -> RuntimeOneShotProcessReceipt:
         """Request cooperative cancellation without releasing ownership."""
         if self._ResourcesClosed:
             return self._Receipt()
+        RecoveryAfterBreach = self._CleanupCutoffBreached
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         self._RequestCancellationAt(monotonic())
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         return self.Observe()
 
     def ForceTerminate(self) -> RuntimeOneShotProcessReceipt:
         """Explicitly kill only this Linux child when exact authority permits."""
         if self._ResourcesClosed:
+            return self._Receipt()
+        RecoveryAfterBreach = self._CleanupCutoffBreached
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
             return self._Receipt()
         RequestedAt = monotonic()
         self._ForceTerminationRequested = True
@@ -569,13 +1000,27 @@ class RuntimeOneShotProcessHandle:
         if self._Process is None or self._Reaped:
             return self.Observe()
         Receipt = self.Observe()
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
+        if self._CleanupCutoffBreached and not RecoveryAfterBreach:
+            return Receipt
         if Receipt.ProcessExitObserved:
             return Receipt
         try:
             self._Process.kill()
         except (AssertionError, OSError, ValueError) as Error:
+            if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+                return self._Receipt()
             self._OperationalFailure = type(Error).__name__
             return self.Observe()
+        except BaseException as Error:
+            self._RecordExternalActionControl(
+                "ForceTerminationFailure",
+                Error,
+            )
+            raise
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         self._ForceSignalSent = True
         self._ForceSignalSentAt = RequestedAt
         return self.Observe()
@@ -631,25 +1076,51 @@ class RuntimeOneShotProcessHandle:
 
     def ReapIfExited(self) -> RuntimeOneShotProcessReceipt:
         """Decode terminal output, then nonblockingly reap an observed exit."""
+        if self._ResourcesClosed:
+            return self._Receipt()
+        RecoveryAfterBreach = self._CleanupCutoffBreached
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         Receipt = self.Observe()
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
+        if self._CleanupCutoffBreached and not RecoveryAfterBreach:
+            return Receipt
         if self._Reaped or not Receipt.ProcessExitObserved:
             return Receipt
         self._DecodeResultBeforeReap(monotonic())
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         try:
             self._Process.join(timeout=0)
         except (AssertionError, OSError, ValueError) as Error:
             self._OperationalFailure = type(Error).__name__
             return self._Receipt()
-        self._ExitCode = self._Process.exitcode
-        if self._ExitCode is None:
+        except BaseException as Error:
+            self._RecordExternalActionControl("ProcessReapFailure", Error)
+            raise
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
+        try:
+            ExitCode = self._Process.exitcode
+        except BaseException as Error:
+            self._RecordExternalActionControl(
+                "ProcessExitCodeObservation",
+                Error,
+            )
+            raise
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
+        self._ExitCode = ExitCode
+        if ExitCode is None:
             return self._Receipt()
         ReleasedAt = monotonic()
+        if self._OriginalCleanupAuthorityCrossed(RecoveryAfterBreach):
+            return self._Receipt()
         self._ObserveCutoffs(ReleasedAt)
         self._Reaped = True
         self._ReapedAt = ReleasedAt
-        self._ReleaseAcknowledged = True
-        self._ReleaseAcknowledgedAt = ReleasedAt
-        self._OutstandingOwnership = False
+        self._OutstandingOwnership = not self._ResourcesClosed
         if (
             self._CandidateResult is not None
             and self._ResultValid
@@ -673,37 +1144,24 @@ class RuntimeOneShotProcessHandle:
         """Close/unlink resources only after absence or explicit reap/release."""
         if self._ResourcesClosed:
             return
-        if self._ChildExistenceUncertain or self._OutstandingOwnership:
+        if (
+            self._ExactUnstarted
+            and self._UnstartedReason == "AllocationFailure"
+            and self._Process is None
+            and self._AllocationResources
+        ):
+            self._CleanupAllocationResources()
+            if self._AllocationResources:
+                raise RuntimeError("one-shot allocation cleanup remains incomplete")
+            return
+        if (
+            self._ChildExistenceUncertain
+            or (self._OutstandingOwnership and not self._Reaped)
+        ):
             raise RuntimeError("one-shot process ownership is still outstanding")
         if self._Process is not None and not self._Reaped:
             raise RuntimeError("one-shot process has not been reaped")
-        self._CloseChildSocketCopiesAfterStart()
-        if self._ChildSocketCopies:
-            raise RuntimeError("synchronization resources remain owned")
-        for Memory in (self._RequestMemory, self._ResultMemory):
-            if Memory is None:
-                continue
-            Memory.close()
-            try:
-                Memory.unlink()
-            except FileNotFoundError:
-                pass
-        for SynchronizationSocket in (
-            self._ReadinessSocket,
-            self._CancellationSocket,
-            self._CompletionSocket,
-        ):
-            if SynchronizationSocket is not None:
-                SynchronizationSocket.close()
-        if self._Process is not None:
-            self._Process.close()
-        self._RequestMemory = None
-        self._ResultMemory = None
-        self._ReadinessSocket = None
-        self._CancellationSocket = None
-        self._CompletionSocket = None
-        self._Process = None
-        self._ResourcesClosed = True
+        self._CleanupReleasedResources()
 
 
 def _ValidateBoundary(
@@ -762,6 +1220,24 @@ def StartRuntimeOneShotProcess(
         RequestEnvelopeBytes,
         InvocationBinding,
     )
+
+    def StartupCutoffReached() -> bool:
+        CurrentAt = monotonic()
+        if CurrentAt < Authority.CleanupCutoffAt:
+            return False
+        if not Handle._StartRequested:
+            Handle._ExactUnstarted = True
+            Handle._UnstartedReason = "CleanupCutoffExpired"
+        Handle._CleanupCutoffBreached = True
+        Handle._CleanupCutoffObservedAt = CurrentAt
+        Handle._OutstandingOwnership = bool(Handle._AllocationResources)
+        Handle._ResourcesClosed = not Handle._AllocationResources
+        if Handle._ResourcesClosed:
+            Handle._ReleaseAcknowledged = True
+            Handle._ReleaseAcknowledgedAt = CurrentAt
+        Handle._Receipt()
+        return True
+
     Current = monotonic()
     if Current >= Authority.WorkDeadlineAt:
         Handle._ExactUnstarted = True
@@ -769,52 +1245,114 @@ def StartRuntimeOneShotProcess(
         Handle._WorkDeadlineObserved = True
         Handle._WorkDeadlineObservedAt = Current
         Handle._ResourcesClosed = True
+        Handle._ReleaseAcknowledged = True
+        Handle._ReleaseAcknowledgedAt = Current
+        Handle._Receipt()
         return Handle
     if Request.WorkCap == 0:
         Handle._ExactUnstarted = True
         Handle._UnstartedReason = "WorkCapExhausted"
         Handle._ResourcesClosed = True
+        Handle._ReleaseAcknowledged = True
+        Handle._ReleaseAcknowledgedAt = Current
+        Handle._Receipt()
         return Handle
 
     Context = multiprocessing.get_context("spawn")
-    CreatedMemory = []
-    CreatedSockets = []
     try:
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         RequestMemory = SharedMemory(
             create=True,
             size=Limits.MaximumRequestBytes,
         )
-        CreatedMemory.append(RequestMemory)
+        Handle._RequestMemory = RequestMemory
+        Handle._AllocationResources.append((
+            "memory",
+            "RequestSharedMemory",
+            RequestMemory,
+        ))
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         ResultMemory = SharedMemory(
             create=True,
             size=Limits.MaximumResultBytes,
         )
-        CreatedMemory.append(ResultMemory)
+        Handle._ResultMemory = ResultMemory
+        Handle._AllocationResources.append((
+            "memory",
+            "ResultSharedMemory",
+            ResultMemory,
+        ))
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         RequestMemory.buf[:Limits.MaximumRequestBytes] = (
             b"\x00" * Limits.MaximumRequestBytes
         )
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         ResultMemory.buf[:Limits.MaximumResultBytes] = (
             b"\x00" * Limits.MaximumResultBytes
         )
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         ReadinessParent, ReadinessChild = socket.socketpair(
             socket.AF_UNIX,
             socket.SOCK_DGRAM,
         )
-        CreatedSockets.extend((ReadinessParent, ReadinessChild))
+        Handle._ReadinessSocket = ReadinessParent
+        Handle._ChildSocketCopies += (ReadinessChild,)
+        Handle._AllocationResources.extend((
+            ("socket", "ReadinessParentSocket", ReadinessParent),
+            ("socket", "ReadinessChildSocket", ReadinessChild),
+        ))
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         CancellationParent, CancellationChild = socket.socketpair(
             socket.AF_UNIX,
             socket.SOCK_DGRAM,
         )
-        CreatedSockets.extend((CancellationParent, CancellationChild))
+        Handle._CancellationSocket = CancellationParent
+        Handle._ChildSocketCopies += (CancellationChild,)
+        Handle._AllocationResources.extend((
+            ("socket", "CancellationParentSocket", CancellationParent),
+            ("socket", "CancellationChildSocket", CancellationChild),
+        ))
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         CompletionParent, CompletionChild = socket.socketpair(
             socket.AF_UNIX,
             socket.SOCK_DGRAM,
         )
-        CreatedSockets.extend((CompletionParent, CompletionChild))
-        for SynchronizationSocket in CreatedSockets:
+        Handle._CompletionSocket = CompletionParent
+        Handle._ChildSocketCopies += (CompletionChild,)
+        Handle._AllocationResources.extend((
+            ("socket", "CompletionParentSocket", CompletionParent),
+            ("socket", "CompletionChildSocket", CompletionChild),
+        ))
+        if StartupCutoffReached():
+            return Handle
+        for _Kind, _Name, SynchronizationSocket in (
+            Resource
+            for Resource in Handle._AllocationResources
+            if Resource[0] == "socket"
+        ):
+            if StartupCutoffReached():
+                return Handle
+            Handle._CaptureAdmissionReceipt()
             SynchronizationSocket.setblocking(False)
+            if StartupCutoffReached():
+                return Handle
         DeadlineBytes = pack("!d", Authority.WorkDeadlineAt)
         Body = OperationReference + EncodedPayload
+        Handle._CaptureAdmissionReceipt()
         _REQUEST_HEADER.pack_into(
             RequestMemory.buf,
             0,
@@ -826,19 +1364,15 @@ def StartRuntimeOneShotProcess(
             InvocationBinding,
             sha256(DeadlineBytes + InvocationBinding + Body).digest(),
         )
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         RequestMemory.buf[
             _REQUEST_HEADER.size:RequestEnvelopeBytes
         ] = Body
-        Handle._RequestMemory = RequestMemory
-        Handle._ResultMemory = ResultMemory
-        Handle._ReadinessSocket = ReadinessParent
-        Handle._CancellationSocket = CancellationParent
-        Handle._CompletionSocket = CompletionParent
-        Handle._ChildSocketCopies = (
-            ReadinessChild,
-            CancellationChild,
-            CompletionChild,
-        )
+        if StartupCutoffReached():
+            return Handle
+        Handle._CaptureAdmissionReceipt()
         Handle._Process = Context.Process(
             target=_RunRuntimeOneShotChild,
             args=(
@@ -853,43 +1387,66 @@ def StartRuntimeOneShotProcess(
             name="RuntimeOneShot",
             daemon=False,
         )
+        Handle._AllocationResources.append((
+            "process",
+            "Process",
+            Handle._Process,
+        ))
         Handle._OutstandingOwnership = True
+        if StartupCutoffReached():
+            return Handle
     except BaseException as Error:
-        for SynchronizationSocket in reversed(CreatedSockets):
-            SynchronizationSocket.close()
-        for Memory in reversed(CreatedMemory):
-            Memory.close()
-            try:
-                Memory.unlink()
-            except FileNotFoundError:
-                pass
-        Handle._RequestMemory = None
-        Handle._ResultMemory = None
-        Handle._ReadinessSocket = None
-        Handle._CancellationSocket = None
-        Handle._CompletionSocket = None
-        Handle._ChildSocketCopies = ()
         Handle._Process = None
         Handle._ExactUnstarted = True
         Handle._UnstartedReason = "AllocationFailure"
         Handle._OperationalFailure = type(Error).__name__
-        Handle._OutstandingOwnership = False
-        Handle._ResourcesClosed = True
         if not isinstance(Error, Exception):
-            raise
+            Handle._ParentControl = Error
+        Current = monotonic()
+        if Current >= Authority.CleanupCutoffAt:
+            Handle._CleanupCutoffBreached = True
+            Handle._CleanupCutoffObservedAt = Current
+        Handle._OutstandingOwnership = bool(Handle._AllocationResources)
+        Handle._ResourcesClosed = not Handle._AllocationResources
+        Handle._Receipt()
+        Handle._CleanupAllocationResources()
         return Handle
 
+    if StartupCutoffReached():
+        return Handle
     Handle._StartRequested = True
+    Handle._Receipt()
+    Handle._CaptureAdmissionReceipt()
     try:
         Handle._Process.start()
     except BaseException as Error:
         Handle._OperationalFailure = type(Error).__name__
         Handle._StartExceptionObserved = True
         Handle._ChildExistenceUncertain = True
-        return Handle
-    finally:
+        if not isinstance(Error, Exception):
+            Handle._ParentControl = Error
+        if StartupCutoffReached():
+            return Handle
+        Handle._Receipt()
+        Handle._CaptureAdmissionReceipt()
         Handle._CloseChildSocketCopiesAfterStart()
-    Handle._StartedPid = Handle._Process.pid
+        return Handle
+    if StartupCutoffReached():
+        return Handle
+    Handle._CaptureAdmissionReceipt()
+    ChildSocketCleanupWithinAuthority = (
+        Handle._CloseChildSocketCopiesAfterStart()
+    )
+    if not ChildSocketCleanupWithinAuthority:
+        return Handle
+    if StartupCutoffReached():
+        return Handle
+    Handle._CaptureAdmissionReceipt()
+    StartedPid = Handle._Process.pid
+    if StartupCutoffReached():
+        return Handle
+    Handle._StartedPid = StartedPid
     Current = monotonic()
     Handle._ObserveCutoffs(Current)
+    Handle._Receipt()
     return Handle

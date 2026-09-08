@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
-import multiprocessing
 import pickle
-from time import monotonic
+from time import monotonic, sleep
 from typing import Callable, Generic, TypeVar
 
 from ..Contracts.Runtime import (
@@ -16,10 +14,17 @@ from ..Contracts.Runtime import (
     RuntimeLifecycle,
     RuntimeSearchOutcome,
     RuntimeTerminalReason,
+    RuntimeWorkAuthority,
     RuntimeWorkExecution,
     RuntimeWorkProduct,
     RuntimeWorkRequest,
     RuntimeWorkResult,
+)
+from .OneShotProcess import (
+    BuildRuntimeOneShotProcessLimits,
+    RuntimeOneShotProcessHandle,
+    RuntimeOneShotProcessReceipt,
+    StartRuntimeOneShotProcess,
 )
 
 
@@ -55,9 +60,10 @@ class RuntimeSpawnedWorkLimits:
 
 @dataclass(frozen=True)
 class RuntimeSpawnedWorkItem(Generic[Payload]):
-    """One immutable request and the exact payload sent to its child."""
+    """One immutable request, authority grant, and exact child payload."""
 
     Request: RuntimeWorkRequest
+    Authority: RuntimeWorkAuthority
     Payload: Payload
 
 
@@ -77,6 +83,53 @@ class RuntimeSpawnedWorkBatch(Generic[ResultPayload]):
 
 
 @dataclass(frozen=True)
+class RuntimeSpawnedWorkOwnedContinuation:
+    """One exact still-owned handle and its latest public receipt."""
+
+    TaskIdentity: str
+    Handle: RuntimeOneShotProcessHandle
+    Receipt: RuntimeOneShotProcessReceipt
+
+
+class RuntimeSpawnedWorkCleanupIncomplete(RuntimeError):
+    """Surface every continuation that could not be released by its cutoff."""
+
+    def __init__(
+        self,
+        OwnedContinuations: tuple[RuntimeSpawnedWorkOwnedContinuation, ...],
+    ) -> None:
+        if not OwnedContinuations:
+            raise ValueError("cleanup-incomplete requires owned continuations")
+        self.OwnedContinuations = OwnedContinuations
+        super().__init__(
+            "spawned work cleanup cutoff expired before release: "
+            + ",".join(
+                Continuation.TaskIdentity
+                for Continuation in OwnedContinuations
+            )
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeSpawnedWorkProduct(
+    RuntimeWorkProduct[ResultPayload],
+    Generic[ResultPayload],
+):
+    """Spawn-safe product with authoritative performed-work accounting."""
+
+    WorkUnits: int = 0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (
+            isinstance(self.WorkUnits, bool)
+            or not isinstance(self.WorkUnits, int)
+            or self.WorkUnits < 0
+        ):
+            raise ValueError("WorkUnits must be a non-negative integer")
+
+
+@dataclass(frozen=True)
 class _SpawnedChildReturn(Generic[ResultPayload]):
     Execution: RuntimeWorkExecution[ResultPayload]
     ResultBytes: int
@@ -88,6 +141,7 @@ def _UnresolvedExecution(
     Lifecycle: RuntimeLifecycle = RuntimeLifecycle.Completed,
     *,
     Diagnostics: tuple[tuple[str, str], ...] = (),
+    WorkUnits: int = 0,
 ) -> RuntimeWorkExecution:
     return RuntimeWorkExecution(
         Result=RuntimeWorkResult(
@@ -100,11 +154,61 @@ def _UnresolvedExecution(
             ClaimStrength=RuntimeClaimStrength.Continuation,
             CommitEligibility=RuntimeCommitEligibility.Ineligible,
             TerminalReason=Reason,
-            WorkUnits=0,
+            WorkUnits=WorkUnits,
             Diagnostics=Diagnostics,
         ),
         Value=None,
     )
+
+
+def _ValidateChildExecution(
+    Request: RuntimeWorkRequest,
+    Execution: object,
+    RemainingBatchWork: int,
+) -> tuple[RuntimeWorkExecution | None, str | None]:
+    """Bind decoded child output to its exact admitted request and grant."""
+    if type(Execution) is not RuntimeWorkExecution:
+        return None, "ExecutionType"
+    Result = Execution.Result
+    if type(Result) is not RuntimeWorkResult:
+        return None, "ResultType"
+    if Result.TaskIdentity != Request.TaskIdentity:
+        return None, "TaskIdentity"
+    if Result.Operation != Request.Operation:
+        return None, "Operation"
+    if Result.Scope != Request.Scope:
+        return None, "Scope"
+    if Result.Freshness is not Request.Freshness:
+        return None, "Freshness"
+    if Result.CommitEligibility is not RuntimeCommitEligibility.Ineligible:
+        return None, "CommitEligibility"
+    if (
+        isinstance(Result.WorkUnits, bool)
+        or not isinstance(Result.WorkUnits, int)
+        or Result.WorkUnits < 0
+        or Result.WorkUnits > Request.WorkCap
+    ):
+        return None, "WorkUnits"
+    if Result.WorkUnits > RemainingBatchWork:
+        return None, "AggregateWorkUnits"
+    if Result.SearchOutcome is RuntimeSearchOutcome.Prepared:
+        if Execution.Value is None:
+            return None, "PreparedValue"
+        if Result.CandidateIdentity is None or Result.ProofIdentity is not None:
+            return None, "PreparedClaim"
+    elif Result.SearchOutcome is RuntimeSearchOutcome.Infeasible:
+        if Execution.Value is not None:
+            return None, "InfeasibleValue"
+        if Result.ProofIdentity is None or Result.CandidateIdentity is not None:
+            return None, "InfeasibleProof"
+    elif Result.SearchOutcome is RuntimeSearchOutcome.Unresolved:
+        if Execution.Value is not None:
+            return None, "UnresolvedValue"
+        if Result.ProofIdentity is not None:
+            return None, "UnresolvedProof"
+    else:
+        return None, "SearchOutcome"
+    return Execution, None
 
 
 def _ExecuteSpawnedWorkItem(
@@ -114,6 +218,7 @@ def _ExecuteSpawnedWorkItem(
     ],
     Item: RuntimeSpawnedWorkItem[Payload],
     MaximumResultBytes: int,
+    CancellationCheck: Callable[[], bool] | None = None,
 ) -> _SpawnedChildReturn[ResultPayload]:
     """Run one already-admitted item and bound what crosses to the parent."""
     Request = Item.Request
@@ -122,7 +227,9 @@ def _ExecuteSpawnedWorkItem(
             _UnresolvedExecution(Request, RuntimeTerminalReason.DeadlineExhausted),
             0,
         )
-    if Request.Cancellation.Requested:
+    if Request.Cancellation.Requested or (
+        CancellationCheck is not None and CancellationCheck()
+    ):
         return _SpawnedChildReturn(
             _UnresolvedExecution(
                 Request,
@@ -140,11 +247,30 @@ def _ExecuteSpawnedWorkItem(
         Product = Operation(Item.Payload, Request)
         if not isinstance(Product, RuntimeWorkProduct):
             raise TypeError("spawned operation must return RuntimeWorkProduct")
+        WorkUnits = getattr(Product, "WorkUnits", 0)
+        if (
+            isinstance(WorkUnits, bool)
+            or not isinstance(WorkUnits, int)
+            or WorkUnits < 0
+            or WorkUnits > Request.WorkCap
+        ):
+            raise ValueError("spawned work units exceed the request allowance")
         if monotonic() >= Request.DeadlineAt:
             return _SpawnedChildReturn(
                 _UnresolvedExecution(
                     Request,
                     RuntimeTerminalReason.DeadlineExhausted,
+                    WorkUnits=WorkUnits,
+                ),
+                0,
+            )
+        if CancellationCheck is not None and CancellationCheck():
+            return _SpawnedChildReturn(
+                _UnresolvedExecution(
+                    Request,
+                    RuntimeTerminalReason.Cancelled,
+                    RuntimeLifecycle.TerminatedGracefully,
+                    WorkUnits=WorkUnits,
                 ),
                 0,
             )
@@ -161,7 +287,7 @@ def _ExecuteSpawnedWorkItem(
                 TerminalReason=Product.TerminalReason,
                 CandidateIdentity=Product.CandidateIdentity,
                 ProofIdentity=Product.ProofIdentity,
-                WorkUnits=0,
+                WorkUnits=WorkUnits,
                 Diagnostics=Product.Diagnostics,
             ),
             Value=Product.Value,
@@ -176,6 +302,7 @@ def _ExecuteSpawnedWorkItem(
                         ("MaximumResultBytes", str(MaximumResultBytes)),
                         ("ObservedResultBytes", str(ResultBytes)),
                     ),
+                    WorkUnits=WorkUnits,
                 ),
                 ResultBytes,
             )
@@ -192,6 +319,24 @@ def _ExecuteSpawnedWorkItem(
         )
 
 
+def _ExecuteSpawnedWorkEnvelope(
+    EncodedPayload: bytes,
+    CancellationCheck: Callable[[], bool],
+) -> bytes:
+    """Decode one bounded batch item and return its exact encoded execution."""
+    Operation, Item, MaximumResultBytes = pickle.loads(EncodedPayload)
+    ChildReturn = _ExecuteSpawnedWorkItem(
+        Operation,
+        Item,
+        MaximumResultBytes,
+        CancellationCheck,
+    )
+    return pickle.dumps(
+        ChildReturn.Execution,
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+
+
 def ExecuteBoundedSpawnedWorkBatch(
     Items: tuple[RuntimeSpawnedWorkItem[Payload], ...],
     Operation: Callable[
@@ -202,10 +347,19 @@ def ExecuteBoundedSpawnedWorkBatch(
     *,
     WaitObserver: Callable[[str, str], None] | None = None,
 ) -> RuntimeSpawnedWorkBatch[ResultPayload]:
-    """Admit a finite batch and submit only as child capacity becomes free."""
+    """Admit finite one-shot work and release capacity only after child reap."""
     TaskIdentities = tuple(Item.Request.TaskIdentity for Item in Items)
     if len(set(TaskIdentities)) != len(TaskIdentities):
         raise ValueError("spawned work task identities must be unique")
+    for Item in Items:
+        if type(Item.Authority) is not RuntimeWorkAuthority:
+            raise TypeError("spawned work authority must be exact")
+        if Item.Authority.WorkDeadlineAt != Item.Request.DeadlineAt:
+            raise ValueError("spawned work authority must carry the request deadline")
+        if Item.Authority.CleanupCutoffAt <= Item.Request.DeadlineAt:
+            raise ValueError(
+                "spawned work requires a positive caller-owned cleanup allowance"
+            )
 
     Executions: list[RuntimeWorkExecution[ResultPayload] | None] = [
         None for _Item in Items
@@ -218,6 +372,13 @@ def ExecuteBoundedSpawnedWorkBatch(
             Executions[Index] = _UnresolvedExecution(
                 Request,
                 RuntimeTerminalReason.DeadlineExhausted,
+            )
+            continue
+        if Request.Cancellation.Requested:
+            Executions[Index] = _UnresolvedExecution(
+                Request,
+                RuntimeTerminalReason.Cancelled,
+                RuntimeLifecycle.TerminatedGracefully,
             )
             continue
         if Request.WorkCap == 0:
@@ -268,110 +429,656 @@ def ExecuteBoundedSpawnedWorkBatch(
     Submitted = 0
     CompletionOrder = []
     MaximumObservedResultBytes = 0
-    Futures: dict[object, int] = {}
+    Handles: dict[RuntimeOneShotProcessHandle, int] = {}
+    ReceiptsByHandle: dict[
+        RuntimeOneShotProcessHandle,
+        RuntimeOneShotProcessReceipt,
+    ] = {}
+    WaitBegun: set[RuntimeOneShotProcessHandle] = set()
+    BatchWorkGrant = sum(
+        Items[Index].Request.WorkCap for Index in AdmittedIndexes
+    )
+    AcceptedWorkUnits = 0
+
+    def RememberReceipt(
+        Handle: RuntimeOneShotProcessHandle,
+        Receipt: RuntimeOneShotProcessReceipt,
+    ) -> RuntimeOneShotProcessReceipt:
+        ReceiptsByHandle[Handle] = Receipt
+        return Receipt
+
+    def OwnedContinuations(
+    ) -> tuple[RuntimeSpawnedWorkOwnedContinuation, ...]:
+        Continuations = []
+        for Handle, Index in sorted(
+            Handles.items(),
+            key=lambda Entry: Entry[1],
+        ):
+            Receipt = ReceiptsByHandle.get(Handle)
+            if Receipt is None:
+                Receipt = getattr(Handle, "LastReceipt", None)
+                if Receipt is not None:
+                    RememberReceipt(Handle, Receipt)
+            if Receipt is None:
+                raise RuntimeError(
+                    "spawned work lost the receipt for an owned continuation"
+                )
+            if (
+                not getattr(Receipt, "OutstandingOwnership", False)
+                and getattr(Receipt, "ResourcesClosed", False)
+            ):
+                continue
+            Continuations.append(RuntimeSpawnedWorkOwnedContinuation(
+                TaskIdentity=Items[Index].Request.TaskIdentity,
+                Handle=Handle,
+                Receipt=Receipt,
+            ))
+        return tuple(Continuations)
+
+    def EarliestCleanupCutoff() -> float | None:
+        OwnedIndexes = tuple(
+            Index
+            for Handle, Index in Handles.items()
+            if (
+                getattr(
+                    ReceiptsByHandle.get(
+                        Handle,
+                        getattr(Handle, "LastReceipt", None),
+                    ),
+                    "OutstandingOwnership",
+                    False,
+                )
+                or not getattr(
+                    ReceiptsByHandle.get(
+                        Handle,
+                        getattr(Handle, "LastReceipt", None),
+                    ),
+                    "ResourcesClosed",
+                    False,
+                )
+            )
+        )
+        if not OwnedIndexes:
+            return None
+        return min(
+            Items[Index].Authority.CleanupCutoffAt
+            for Index in OwnedIndexes
+        )
+
+    def RequireCleanupAuthority() -> None:
+        Cutoff = EarliestCleanupCutoff()
+        if Cutoff is not None and monotonic() >= Cutoff:
+            CleanupError = RuntimeSpawnedWorkCleanupIncomplete(
+                OwnedContinuations()
+            )
+            ParentControl = next((
+                getattr(Continuation.Receipt, "ParentControl", None)
+                for Continuation in CleanupError.OwnedContinuations
+                if getattr(Continuation.Receipt, "ParentControl", None)
+                is not None
+            ), None)
+            if ParentControl is not None:
+                raise CleanupError from ParentControl
+            raise CleanupError
+
+    def CallHandleAction(
+        Handle: RuntimeOneShotProcessHandle,
+        Action: str,
+        *,
+        PropagateParentControl: bool = True,
+    ):
+        RequireCleanupAuthority()
+        PreviousReceipt = ReceiptsByHandle.get(Handle)
+        if PreviousReceipt is None:
+            PreviousReceipt = getattr(Handle, "LastReceipt", None)
+            if PreviousReceipt is None:
+                raise RuntimeError("owned handle has no public receipt")
+            RememberReceipt(Handle, PreviousReceipt)
+        try:
+            Receipt = getattr(Handle, Action)()
+        except BaseException as Error:
+            Cutoff = EarliestCleanupCutoff()
+            if Cutoff is not None and monotonic() >= Cutoff:
+                LatestReceipt = getattr(Handle, "LastReceipt", None)
+                LatestParentControl = getattr(
+                    LatestReceipt,
+                    "ParentControl",
+                    None,
+                )
+                if LatestParentControl is not None:
+                    RememberReceipt(Handle, LatestReceipt)
+                ParentControl = getattr(
+                    PreviousReceipt,
+                    "ParentControl",
+                    None,
+                ) or LatestParentControl
+                CleanupError = RuntimeSpawnedWorkCleanupIncomplete(
+                    OwnedContinuations()
+                )
+                if ParentControl is not None:
+                    raise CleanupError from ParentControl
+                raise RuntimeSpawnedWorkCleanupIncomplete(
+                    OwnedContinuations()
+                ) from Error
+            LatestReceipt = getattr(Handle, "LastReceipt", None)
+            if LatestReceipt is not None:
+                RememberReceipt(Handle, LatestReceipt)
+                ParentControl = getattr(
+                    LatestReceipt,
+                    "ParentControl",
+                    None,
+                )
+                if PropagateParentControl and ParentControl is not None:
+                    raise ParentControl
+            raise
+        Cutoff = EarliestCleanupCutoff()
+        if Cutoff is not None and monotonic() >= Cutoff:
+            ReturnedParentControl = getattr(
+                Receipt,
+                "ParentControl",
+                None,
+            )
+            if ReturnedParentControl is not None:
+                RememberReceipt(Handle, Receipt)
+            ParentControl = (
+                ReturnedParentControl
+                or getattr(PreviousReceipt, "ParentControl", None)
+            )
+            CleanupError = RuntimeSpawnedWorkCleanupIncomplete(
+                OwnedContinuations()
+            )
+            if ParentControl is not None:
+                raise CleanupError from ParentControl
+            raise CleanupError
+        if Receipt is not None:
+            Receipt = RememberReceipt(Handle, Receipt)
+            ParentControl = getattr(Receipt, "ParentControl", None)
+            if PropagateParentControl and ParentControl is not None:
+                raise ParentControl
+            return Receipt
+        Receipt = getattr(Handle, "LastReceipt", None)
+        if Receipt is not None:
+            Receipt = RememberReceipt(Handle, Receipt)
+            ParentControl = getattr(Receipt, "ParentControl", None)
+            if PropagateParentControl and ParentControl is not None:
+                raise ParentControl
+            return Receipt
+        return PreviousReceipt
+
+    def CallWaitObserver(
+        Handle: RuntimeOneShotProcessHandle,
+        Index: int,
+        Action: str,
+    ) -> None:
+        if WaitObserver is None:
+            return
+        RequireCleanupAuthority()
+        try:
+            WaitObserver(Items[Index].Request.TaskIdentity, Action)
+        except BaseException as Error:
+            Cutoff = EarliestCleanupCutoff()
+            if Cutoff is not None and monotonic() >= Cutoff:
+                raise RuntimeSpawnedWorkCleanupIncomplete(
+                    OwnedContinuations()
+                ) from Error
+            raise
+        RequireCleanupAuthority()
+
+    def SettleExitedHandle(
+        Handle: RuntimeOneShotProcessHandle,
+        Index: int,
+        *,
+        PropagateParentControl: bool = True,
+    ) -> bool:
+        nonlocal MaximumObservedResultBytes, AcceptedWorkUnits
+        Receipt = CallHandleAction(
+            Handle,
+            "ReapIfExited",
+            PropagateParentControl=PropagateParentControl,
+        )
+        if not Receipt.Reaped:
+            return False
+        Request = Items[Index].Request
+        AcceptedExecutionWorkUnits = 0
+        ObservedResultBytes = 0
+        try:
+            RequireCleanupAuthority()
+            if (
+                Receipt.WorkDeadlineObserved
+                or Receipt.CancellationRequested
+                or Receipt.ForceSignalSent
+                or monotonic() >= Request.DeadlineAt
+            ):
+                Execution = _UnresolvedExecution(
+                    Request,
+                    RuntimeTerminalReason.DeadlineExhausted,
+                )
+            elif Receipt.PublishedResult is None:
+                Execution = _UnresolvedExecution(
+                    Request,
+                    RuntimeTerminalReason.WorkerFailure,
+                    RuntimeLifecycle.Failed,
+                    Diagnostics=((
+                        "ProcessDiagnostic",
+                        Receipt.ResultDiagnostic
+                        or Receipt.OperationalFailure
+                        or "ResultUnavailable",
+                    ),),
+                )
+            else:
+                Execution = pickle.loads(Receipt.PublishedResult)
+                RequireCleanupAuthority()
+                Execution, ValidationFailure = _ValidateChildExecution(
+                    Request,
+                    Execution,
+                    BatchWorkGrant - AcceptedWorkUnits,
+                )
+                if ValidationFailure is not None:
+                    Execution = _UnresolvedExecution(
+                        Request,
+                        RuntimeTerminalReason.WorkerFailure,
+                        RuntimeLifecycle.Failed,
+                        Diagnostics=((
+                            "ChildExecutionValidation",
+                            ValidationFailure,
+                        ),),
+                    )
+                else:
+                    AcceptedExecutionWorkUnits = Execution.Result.WorkUnits
+                ResultBytes = len(Receipt.PublishedResult)
+                ObservedResultBytes = int(
+                    dict(Execution.Result.Diagnostics).get(
+                        "ObservedResultBytes",
+                        ResultBytes,
+                    )
+                )
+            RequireCleanupAuthority()
+        except BaseException:
+            raise
+        Receipt = CallHandleAction(
+            Handle,
+            "CloseReleased",
+            PropagateParentControl=PropagateParentControl,
+        )
+        if (
+            not Receipt.ResourcesClosed
+            or not Receipt.ReleaseAcknowledged
+            or Receipt.OutstandingOwnership
+        ):
+            return False
+        AcceptedWorkUnits += AcceptedExecutionWorkUnits
+        MaximumObservedResultBytes = max(
+            MaximumObservedResultBytes,
+            ObservedResultBytes,
+        )
+        Executions[Index] = Execution
+        CompletionOrder.append(Request.TaskIdentity)
+        Handles.pop(Handle, None)
+        ReceiptsByHandle.pop(Handle, None)
+        if Handle in WaitBegun:
+            WaitBegun.remove(Handle)
+            CallWaitObserver(Handle, Index, "end")
+        return True
+
+    def RecoverHandles(
+    ) -> tuple[
+        tuple[RuntimeSpawnedWorkOwnedContinuation, ...],
+        BaseException | None,
+    ]:
+        ParentControl = None
+
+        def CaptureParentControl(Error: BaseException | None = None) -> None:
+            nonlocal ParentControl
+            if ParentControl is not None:
+                return
+            Candidates = []
+            if Error is not None:
+                if not isinstance(Error, Exception):
+                    Candidates.append(Error)
+                Cause = getattr(Error, "__cause__", None)
+                if Cause is not None and not isinstance(Cause, Exception):
+                    Candidates.append(Cause)
+            Candidates.extend(
+                getattr(Receipt, "ParentControl", None)
+                for Receipt in ReceiptsByHandle.values()
+            )
+            ParentControl = next(
+                (
+                    Candidate
+                    for Candidate in Candidates
+                    if Candidate is not None
+                    and not isinstance(Candidate, Exception)
+                ),
+                None,
+            )
+
+        def RecoveryOutcome(
+            Owned: tuple[RuntimeSpawnedWorkOwnedContinuation, ...] | None = None,
+        ) -> tuple[
+            tuple[RuntimeSpawnedWorkOwnedContinuation, ...],
+            BaseException | None,
+        ]:
+            CaptureParentControl()
+            return (
+                OwnedContinuations() if Owned is None else Owned,
+                ParentControl,
+            )
+
+        CaptureParentControl()
+        for Handle in tuple(Handles):
+            Receipt = ReceiptsByHandle.get(Handle)
+            if Receipt is None:
+                continue
+            if (
+                not getattr(Receipt, "OutstandingOwnership", False)
+                and getattr(Receipt, "ResourcesClosed", False)
+            ):
+                Handles.pop(Handle, None)
+                ReceiptsByHandle.pop(Handle, None)
+                WaitBegun.discard(Handle)
+        try:
+            RequireCleanupAuthority()
+        except RuntimeSpawnedWorkCleanupIncomplete as Error:
+            CaptureParentControl(Error)
+            return RecoveryOutcome(Error.OwnedContinuations)
+        for Handle in tuple(Handles):
+            try:
+                Index = Handles[Handle]
+                Existing = ReceiptsByHandle[Handle]
+                if (
+                    getattr(Existing, "ExactUnstarted", False)
+                    and getattr(Existing, "UnstartedReason", None)
+                    == "AllocationFailure"
+                ):
+                    CallHandleAction(
+                        Handle,
+                        "CloseReleased",
+                        PropagateParentControl=False,
+                    )
+                    Handles.pop(Handle, None)
+                    ReceiptsByHandle.pop(Handle, None)
+                    continue
+                Receipt = CallHandleAction(
+                    Handle,
+                    "RequestCancellation",
+                    PropagateParentControl=False,
+                )
+                if (
+                    Items[Index].Authority.ForceTerminationAuthorized
+                    and Receipt.OutstandingOwnership
+                    and not Receipt.ProcessExitObserved
+                ):
+                    CallHandleAction(
+                        Handle,
+                        "ForceTerminate",
+                        PropagateParentControl=False,
+                    )
+            except RuntimeSpawnedWorkCleanupIncomplete as Error:
+                CaptureParentControl(Error)
+                return RecoveryOutcome(Error.OwnedContinuations)
+            except BaseException as Error:
+                CaptureParentControl(Error)
+                continue
+        while Handles:
+            try:
+                RequireCleanupAuthority()
+            except RuntimeSpawnedWorkCleanupIncomplete as Error:
+                CaptureParentControl(Error)
+                return RecoveryOutcome(Error.OwnedContinuations)
+            Progressed = False
+            for Handle, Index in tuple(Handles.items()):
+                try:
+                    Receipt = CallHandleAction(
+                        Handle,
+                        "Observe",
+                        PropagateParentControl=False,
+                    )
+                    if Receipt.ProcessExitObserved:
+                        Progressed = (
+                            SettleExitedHandle(
+                                Handle,
+                                Index,
+                                PropagateParentControl=False,
+                            )
+                            or Progressed
+                        )
+                except RuntimeSpawnedWorkCleanupIncomplete as Error:
+                    CaptureParentControl(Error)
+                    return RecoveryOutcome(Error.OwnedContinuations)
+                except BaseException as Error:
+                    CaptureParentControl(Error)
+                    continue
+            if not Handles:
+                return RecoveryOutcome(())
+            Now = monotonic()
+            if Progressed:
+                continue
+            CleanupCutoff = EarliestCleanupCutoff()
+            if CleanupCutoff is None or Now >= CleanupCutoff:
+                return RecoveryOutcome()
+            sleep(max(0.0, min(
+                0.005,
+                CleanupCutoff - Now,
+            )))
+        return RecoveryOutcome(())
 
     if Ready:
         try:
-            Context = multiprocessing.get_context("spawn")
-            with ProcessPoolExecutor(
-                max_workers=min(Limits.MaximumInFlightTasks, len(Ready)),
-                mp_context=Context,
-            ) as Executor:
-                while Ready or Futures:
-                    while Ready and len(Futures) < Limits.MaximumInFlightTasks:
-                        Index = Ready.popleft()
-                        Item = Items[Index]
-                        if monotonic() >= Item.Request.DeadlineAt:
-                            Executions[Index] = _UnresolvedExecution(
-                                Item.Request,
-                                RuntimeTerminalReason.DeadlineExhausted,
-                            )
-                            continue
-                        Future = Executor.submit(
-                            _ExecuteSpawnedWorkItem,
-                            Operation,
-                            Item,
-                            Limits.MaximumResultBytes,
+            while Ready or Handles:
+                while Ready and len(Handles) < Limits.MaximumInFlightTasks:
+                    RequireCleanupAuthority()
+                    Index = Ready.popleft()
+                    Item = Items[Index]
+                    if monotonic() >= Item.Request.DeadlineAt:
+                        Executions[Index] = _UnresolvedExecution(
+                            Item.Request,
+                            RuntimeTerminalReason.DeadlineExhausted,
                         )
-                        Futures[Future] = Index
-                        Submitted += 1
-                        PeakInFlight = max(PeakInFlight, len(Futures))
-                    if not Futures:
                         continue
-                    Now = monotonic()
-                    UnexpiredDeadlines = tuple(
-                        Items[Index].Request.DeadlineAt
-                        for Index in Futures.values()
-                        if Items[Index].Request.DeadlineAt > Now
-                    )
-                    Remaining = (
-                        None
-                        if not UnexpiredDeadlines
-                        else max(0.0, min(UnexpiredDeadlines) - Now)
-                    )
-                    WaitingTaskIdentities = tuple(
-                        Items[Index].Request.TaskIdentity
-                        for Index in sorted(Futures.values())
-                    )
-                    if WaitObserver is not None:
-                        for TaskIdentity in WaitingTaskIdentities:
-                            WaitObserver(TaskIdentity, "begin")
+                    Handle = None
                     try:
-                        Done, _Pending = wait(
-                            tuple(Futures),
-                            timeout=Remaining,
-                            return_when=FIRST_COMPLETED,
+                        EncodedPayload = pickle.dumps(
+                            (Operation, Item, Limits.MaximumResultBytes),
+                            protocol=pickle.HIGHEST_PROTOCOL,
                         )
-                    finally:
-                        if WaitObserver is not None:
-                            for TaskIdentity in WaitingTaskIdentities:
-                                WaitObserver(TaskIdentity, "end")
-                    if not Done:
-                        Now = monotonic()
-                        for Future, Index in tuple(Futures.items()):
-                            if (
-                                Items[Index].Request.DeadlineAt <= Now
-                                and Future.cancel()
-                            ):
+                        Handle = StartRuntimeOneShotProcess(
+                            Item.Request,
+                            Item.Authority,
+                            EncodedPayload,
+                            _ExecuteSpawnedWorkEnvelope,
+                            BuildRuntimeOneShotProcessLimits(
+                                _ExecuteSpawnedWorkEnvelope,
+                                len(EncodedPayload),
+                                Limits.MaximumResultBytes,
+                            ),
+                        )
+                        Handles[Handle] = Index
+                        LatestReceipt = getattr(Handle, "LastReceipt", None)
+                        InitialReceipt = (
+                            LatestReceipt
+                            if getattr(LatestReceipt, "ParentControl", None)
+                            is not None
+                            else (
+                            getattr(Handle, "AdmissionReceipt", None)
+                            or LatestReceipt
+                            if getattr(
+                                LatestReceipt,
+                                "CleanupCutoffBreached",
+                                False,
+                            )
+                            else LatestReceipt
+                            )
+                        )
+                        if InitialReceipt is None:
+                            raise RuntimeError(
+                                "started one-shot handle has no initial receipt"
+                            )
+                        Receipt = RememberReceipt(Handle, InitialReceipt)
+                        if (
+                            getattr(Receipt, "ExactUnstarted", False)
+                            and Receipt.ResourcesClosed
+                            and not getattr(
+                                Receipt,
+                                "OutstandingOwnership",
+                                False,
+                            )
+                        ):
+                            Handles.pop(Handle, None)
+                            ReceiptsByHandle.pop(Handle, None)
+                            ParentControl = getattr(
+                                Receipt,
+                                "ParentControl",
+                                None,
+                            )
+                            if ParentControl is not None:
+                                raise ParentControl
+                            if Receipt.UnstartedReason == "WorkDeadlineExpired":
                                 Executions[Index] = _UnresolvedExecution(
-                                    Items[Index].Request,
+                                    Item.Request,
                                     RuntimeTerminalReason.DeadlineExhausted,
                                 )
-                                del Futures[Future]
+                            else:
+                                Executions[Index] = _UnresolvedExecution(
+                                    Item.Request,
+                                    RuntimeTerminalReason.WorkerFailure,
+                                    RuntimeLifecycle.Failed,
+                                    Diagnostics=tuple(
+                                        (Name, Value)
+                                        for Name, Value in (
+                                            (
+                                                "OperationalFailure",
+                                                Receipt.OperationalFailure,
+                                            ),
+                                            (
+                                                "UnstartedReason",
+                                                Receipt.UnstartedReason,
+                                            ),
+                                        )
+                                        if Value is not None
+                                    ),
+                                )
+                            continue
+                        RequireCleanupAuthority()
+                        Receipt = CallHandleAction(Handle, "Observe")
+                        if (
+                            getattr(Receipt, "ExactUnstarted", False)
+                            and getattr(Receipt, "UnstartedReason", None)
+                            == "AllocationFailure"
+                            and not Receipt.ResourcesClosed
+                        ):
+                            Receipt = CallHandleAction(
+                                Handle,
+                                "CloseReleased",
+                            )
+                        if Receipt.ResourcesClosed:
+                            Handles.pop(Handle, None)
+                            ReceiptsByHandle.pop(Handle, None)
+                            if Receipt.UnstartedReason == "WorkDeadlineExpired":
+                                Executions[Index] = _UnresolvedExecution(
+                                    Item.Request,
+                                    RuntimeTerminalReason.DeadlineExhausted,
+                                )
+                            else:
+                                Executions[Index] = _UnresolvedExecution(
+                                    Item.Request,
+                                    RuntimeTerminalReason.WorkerFailure,
+                                    RuntimeLifecycle.Failed,
+                                    Diagnostics=tuple(
+                                        (Name, Value)
+                                        for Name, Value in (
+                                            (
+                                                "OperationalFailure",
+                                                Receipt.OperationalFailure,
+                                            ),
+                                            (
+                                                "UnstartedReason",
+                                                Receipt.UnstartedReason,
+                                            ),
+                                        )
+                                        if Value is not None
+                                    ),
+                                )
+                            continue
+                        Submitted += 1
+                        PeakInFlight = max(PeakInFlight, len(Handles))
+                        ParentControl = getattr(Receipt, "ParentControl", None)
+                        if ParentControl is not None:
+                            raise ParentControl
+                    except Exception as Error:
+                        if Handle is not None and Handle in Handles:
+                            raise
+                        Executions[Index] = _UnresolvedExecution(
+                            Item.Request,
+                            RuntimeTerminalReason.WorkerFailure,
+                            RuntimeLifecycle.Failed,
+                            Diagnostics=(("ExceptionType", type(Error).__name__),),
+                        )
+                if not Handles:
+                    continue
+                for Handle, Index in tuple(Handles.items()):
+                    if Handle not in WaitBegun:
+                        CallWaitObserver(Handle, Index, "begin")
+                        WaitBegun.add(Handle)
+                Progressed = False
+                for Handle, Index in tuple(Handles.items()):
+                    Receipt = CallHandleAction(Handle, "Observe")
+                    ParentControl = getattr(Receipt, "ParentControl", None)
+                    if ParentControl is not None:
+                        raise ParentControl
+                    if Receipt.ProcessExitObserved:
+                        Progressed = SettleExitedHandle(Handle, Index) or Progressed
                         continue
-                    for Future in sorted(Done, key=lambda Value: Futures[Value]):
-                        Index = Futures.pop(Future)
-                        Request = Items[Index].Request
-                        try:
-                            if monotonic() >= Request.DeadlineAt:
-                                Executions[Index] = _UnresolvedExecution(
-                                    Request,
-                                    RuntimeTerminalReason.DeadlineExhausted,
-                                )
-                                CompletionOrder.append(Request.TaskIdentity)
-                                continue
-                            ChildReturn = Future.result()
-                            if not isinstance(ChildReturn, _SpawnedChildReturn):
-                                raise TypeError(
-                                    "spawned worker returned an invalid envelope"
-                                )
-                            Executions[Index] = ChildReturn.Execution
-                            MaximumObservedResultBytes = max(
-                                MaximumObservedResultBytes,
-                                ChildReturn.ResultBytes,
+                    if monotonic() >= Items[Index].Request.DeadlineAt:
+                        Receipt = CallHandleAction(
+                            Handle,
+                            "RequestCancellation",
+                        )
+                        if (
+                            Items[Index].Authority.ForceTerminationAuthorized
+                            and Receipt.OutstandingOwnership
+                            and not Receipt.ProcessExitObserved
+                        ):
+                            Receipt = CallHandleAction(
+                                Handle,
+                                "ForceTerminate",
                             )
-                        except Exception as Error:
-                            Executions[Index] = _UnresolvedExecution(
-                                Request,
-                                RuntimeTerminalReason.WorkerFailure,
-                                RuntimeLifecycle.Failed,
-                                Diagnostics=((
-                                    "ExceptionType",
-                                    type(Error).__name__,
-                                ),),
-                            )
-                        CompletionOrder.append(Request.TaskIdentity)
+                        if Receipt.ProcessExitObserved:
+                            Progressed = SettleExitedHandle(Handle, Index) or Progressed
+                if Progressed or not Handles:
+                    continue
+                Now = monotonic()
+                CleanupCutoff = EarliestCleanupCutoff()
+                if CleanupCutoff is None:
+                    continue
+                if Now >= CleanupCutoff:
+                    raise RuntimeSpawnedWorkCleanupIncomplete(
+                        OwnedContinuations()
+                    )
+                FutureWorkDeadlines = tuple(
+                    Items[Index].Request.DeadlineAt
+                    for Index in Handles.values()
+                    if Items[Index].Request.DeadlineAt > Now
+                )
+                SleepSeconds = min(
+                    0.005,
+                    CleanupCutoff - Now,
+                )
+                if FutureWorkDeadlines:
+                    SleepSeconds = min(
+                        SleepSeconds,
+                        min(FutureWorkDeadlines) - Now,
+                    )
+                sleep(max(0.0, SleepSeconds))
+        except RuntimeSpawnedWorkCleanupIncomplete:
+            raise
         except Exception as Error:
+            Owned, CleanupParentControl = RecoverHandles()
+            if Owned:
+                raise RuntimeSpawnedWorkCleanupIncomplete(Owned) from (
+                    CleanupParentControl or Error
+                )
+            if CleanupParentControl is not None:
+                raise CleanupParentControl
             for Index in AdmittedIndexes:
                 if Executions[Index] is None:
                     Executions[Index] = _UnresolvedExecution(
@@ -380,6 +1087,11 @@ def ExecuteBoundedSpawnedWorkBatch(
                         RuntimeLifecycle.Failed,
                         Diagnostics=(("ExceptionType", type(Error).__name__),),
                     )
+        except BaseException as Error:
+            Owned, CleanupParentControl = RecoverHandles()
+            if Owned:
+                raise RuntimeSpawnedWorkCleanupIncomplete(Owned) from Error
+            raise
 
     if any(Execution is None for Execution in Executions):
         raise RuntimeError("spawned work batch did not settle every request")

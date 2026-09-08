@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from itertools import combinations, islice, product
@@ -65,6 +66,67 @@ from .SymbolicState import (
     _BuildPreparedComponentSymbolicNetStateContextFingerprint,
     _BuildPreparedComponentSymbolicNetStateContextIdentity,
 )
+
+
+@dataclass(frozen=True)
+class _PreparedSymbolicMutableTransaction:
+    OriginalContext: PreparedComponentSymbolicNetStateContext
+    WorkingContext: PreparedComponentSymbolicNetStateContext
+    OriginalNetStateCache: dict[str, Any] | None
+    WorkingNetStateCache: dict[str, Any]
+
+    def Commit(self) -> None:
+        Original = self.OriginalContext
+        Working = self.WorkingContext
+        for Name in (
+            "FabricParentCache",
+            "RouteClaimsConstructionCache",
+            "TerminalFrontierCache",
+            "TreeRepeaterSubproblemCache",
+            "TreeRepeaterCacheStatistics",
+        ):
+            OriginalValue = getattr(Original, Name)
+            OriginalValue.clear()
+            OriginalValue.update(getattr(Working, Name))
+        Original.TerminalFrontierBuildCount = (
+            Working.TerminalFrontierBuildCount
+        )
+        Original.TerminalFrontierCacheHitCount = (
+            Working.TerminalFrontierCacheHitCount
+        )
+        if self.OriginalNetStateCache is not None:
+            self.OriginalNetStateCache.clear()
+            self.OriginalNetStateCache.update(self.WorkingNetStateCache)
+
+
+def _BeginPreparedSymbolicMutableTransaction(
+    Context: PreparedComponentSymbolicNetStateContext,
+    NetStateCache: dict[str, Any] | None,
+) -> _PreparedSymbolicMutableTransaction:
+    WorkingContext = replace(
+        Context,
+        FabricParentCache=deepcopy(Context.FabricParentCache),
+        RouteClaimsConstructionCache=deepcopy(
+            Context.RouteClaimsConstructionCache
+        ),
+        TerminalFrontierCache=deepcopy(Context.TerminalFrontierCache),
+        TreeRepeaterSubproblemCache=deepcopy(
+            Context.TreeRepeaterSubproblemCache
+        ),
+        TreeRepeaterCacheStatistics=deepcopy(
+            Context.TreeRepeaterCacheStatistics
+        ),
+    )
+    return _PreparedSymbolicMutableTransaction(
+        OriginalContext=Context,
+        WorkingContext=WorkingContext,
+        OriginalNetStateCache=NetStateCache,
+        WorkingNetStateCache=deepcopy(
+            NetStateCache if NetStateCache is not None else {}
+        ),
+    )
+
+
 def CompilePreparedComponentSymbolicNetStates(
     Context: PreparedComponentSymbolicNetStateContext,
     Problem: ComponentRoutingProblem,
@@ -73,6 +135,8 @@ def CompilePreparedComponentSymbolicNetStates(
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
     SymbolicNetStateCache: dict[str, Any] | None = None,
     ForbiddenExportPorts: tuple[Position3, ...] = (),
+    MaximumWork: int | None = None,
+    WorkAdmissionCheck: Callable[[], None] | None = None,
 ) -> PreparedComponentSymbolicNetStateCompilation:
     """Compile one access-bound state domain using reusable static tree data."""
     Signal = Context.Signal
@@ -130,6 +194,8 @@ def CompilePreparedComponentSymbolicNetStates(
         RequestedSymbolicStateSignals=frozenset((Signal,)),
         PreparedSymbolicNetStateContext=Context,
         StopAfterOwnedSignalFrontierProof=True,
+        MaximumWorkOverride=MaximumWork,
+        WorkAdmissionCheck=WorkAdmissionCheck,
     )
     Cached = Cache.get(CacheKey)
     Complete = bool(Result.Status != "incomplete" and Cached is not None)
@@ -164,29 +230,47 @@ def CompilePreparedComponentSymbolicNetStatesBounded(
     ForbiddenExportPorts: tuple[Position3, ...] = (),
 ) -> RuntimeWorkExecution[PreparedComponentSymbolicNetStateCompilation]:
     """Compile one symbolic state domain through the bounded N1 adapter."""
+    Transaction = _BeginPreparedSymbolicMutableTransaction(
+        Context,
+        SymbolicNetStateCache,
+    )
+    ObservedExpansionCount = 0
 
     def Compile(
         Control: RuntimeWorkControl,
     ) -> RuntimeWorkProduct[PreparedComponentSymbolicNetStateCompilation]:
         def CheckWork(Diagnostics: dict[str, object]) -> None:
-            Control.Checkpoint()
+            nonlocal ObservedExpansionCount
+            ExpansionCount = int(Diagnostics["ExpansionCount"])
+            if ExpansionCount < ObservedExpansionCount:
+                raise ValueError("symbolic expansion count moved backwards")
+            Control.ObservePerformedWork(
+                ExpansionCount - ObservedExpansionCount
+            )
+            ObservedExpansionCount = ExpansionCount
             if WorkCheck is not None:
                 WorkCheck(Diagnostics)
 
         Compilation = CompilePreparedComponentSymbolicNetStates(
-            Context,
+            Transaction.WorkingContext,
             Problem,
             DeadlineSeconds=Deadline.RemainingSeconds(),
             WorkCheck=CheckWork,
-            SymbolicNetStateCache=SymbolicNetStateCache,
+            SymbolicNetStateCache=Transaction.WorkingNetStateCache,
             ForbiddenExportPorts=ForbiddenExportPorts,
+            MaximumWork=Request.WorkCap,
+            WorkAdmissionCheck=Control.Checkpoint,
         )
-        # The current symbolic solver exposes its performed expansion count
-        # only on return.  This is truthful post-hoc observation, not a hard
-        # pre-admission guarantee for every individual expansion.
+        # The request cap is enforced before each new dynamic-solver expansion;
+        # the returned count records the work actually admitted.
+        FinalExpansionCount = max(0, int(Compilation.ExpansionCount))
+        if FinalExpansionCount < ObservedExpansionCount:
+            raise ValueError("symbolic expansion result moved backwards")
         Control.ObservePerformedWork(
-            max(0, int(Compilation.ExpansionCount))
+            FinalExpansionCount - ObservedExpansionCount
         )
+        if not Compilation.Complete:
+            Control.StopIfWorkCapReached()
         IsPrepared = bool(
             Compilation.Complete and Compilation.States is not None
         )
@@ -221,12 +305,15 @@ def CompilePreparedComponentSymbolicNetStatesBounded(
             ),
         )
 
-    return ExecuteBoundedRuntimeWork(
+    Execution = ExecuteBoundedRuntimeWork(
         Request,
         Deadline,
         Compile,
         CancellationCheck=CancellationCheck,
     )
+    if Execution.Result.SearchOutcome is RuntimeSearchOutcome.Prepared:
+        Transaction.Commit()
+    return Execution
 
 
 def CompilePreparedComponentPhysicalFactorStateBatch(
@@ -236,6 +323,8 @@ def CompilePreparedComponentPhysicalFactorStateBatch(
     DeadlineSeconds: float | None = None,
     WorkCheck: Callable[[dict[str, object]], None] | None = None,
     SymbolicNetStateCache: dict[str, Any] | None = None,
+    MaximumWork: int | None = None,
+    WorkObserver: Callable[[int], None] | None = None,
 ) -> dict[str, PreparedComponentSymbolicNetStateCompilation]:
     """Compile exact physical egress factors in shared frontier batches.
 
@@ -243,11 +332,36 @@ def CompilePreparedComponentPhysicalFactorStateBatch(
     solver invocation.  Results are then partitioned by the immutable local
     egress path and stored under the unchanged per-factor cache identities.
     """
+    if (
+        MaximumWork is not None
+        and (
+            isinstance(MaximumWork, bool)
+            or not isinstance(MaximumWork, int)
+            or MaximumWork < 0
+        )
+    ):
+        raise ValueError("MaximumWork must be a non-negative integer or None")
     Cache = (
         SymbolicNetStateCache
         if SymbolicNetStateCache is not None
         else {}
     )
+    ProblemMaximumWork = min(
+        (
+            max(0, int(Problem.MaximumWork))
+            for Problem in ProblemsByAccess.values()
+        ),
+        default=0,
+    )
+    EffectiveMaximumWork = (
+        ProblemMaximumWork
+        if MaximumWork is None
+        else min(ProblemMaximumWork, MaximumWork)
+    )
+    Transaction = _BeginPreparedSymbolicMutableTransaction(Context, Cache)
+    Context = Transaction.WorkingContext
+    Cache = Transaction.WorkingNetStateCache
+    PerformedWork = 0
     StartedAt = monotonic()
     Results: dict[str, PreparedComponentSymbolicNetStateCompilation] = {}
     MissesByCertifiedDomain: dict[
@@ -425,7 +539,17 @@ def CompilePreparedComponentPhysicalFactorStateBatch(
                 Member[3] for Member in Members
             ),
             StopAfterOwnedSignalFrontierProof=True,
+            MaximumWorkOverride=max(
+                0,
+                EffectiveMaximumWork - PerformedWork,
+            ),
         )
+        ResultWork = max(0, int(Result.ExpansionCount))
+        if ResultWork > EffectiveMaximumWork - PerformedWork:
+            raise RuntimeError("physical factor batch exceeded MaximumWork")
+        PerformedWork += ResultWork
+        if WorkObserver is not None:
+            WorkObserver(ResultWork)
         RepresentativeCacheKey = BuildComponentSymbolicNetStateCacheKey(
             RepresentativeProblem,
             Context.Signal,
@@ -501,4 +625,9 @@ def CompilePreparedComponentPhysicalFactorStateBatch(
                 },
             )
         )
+    if (
+        len(Results) == len(ProblemsByAccess)
+        and all(Compilation.Complete for Compilation in Results.values())
+    ):
+        Transaction.Commit()
     return Results

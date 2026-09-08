@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from itertools import product
@@ -23,6 +24,7 @@ from ....Contracts.Runtime import (
     RuntimeLifecycle,
     RuntimeSearchOutcome,
     RuntimeTerminalReason,
+    RuntimeWorkAuthority,
     RuntimeWorkProduct,
     RuntimeWorkRequest,
     RuntimeWorkScope,
@@ -36,6 +38,7 @@ from ....Runtime.SpawnedWork import (
     ExecuteBoundedSpawnedWorkBatch,
     RuntimeSpawnedWorkItem,
     RuntimeSpawnedWorkLimits,
+    RuntimeSpawnedWorkProduct,
 )
 from ..Planning.InterfacePlanning import BuildComponentCapacityGuide, ComponentCapacityGuide, ComponentCapacityGuideOption, ComponentInterfaceContract, ComponentPlanningResult, ComponentPlanningStatus, IterClosedComponentContracts, PlanClosedComponent, SolveComponentInterfaceCsp
 
@@ -71,11 +74,33 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
     FactorsBySignal, SeamFingerprintByLocalAccess = _SelectPhysicalComponentSymbolicPortPairFactors(FactorDomain, Signals)
     Context = _BuildPhysicalComponentSymbolicPortPairContext(Problem, FactorDomain, Signals, FactorsBySignal, SeamFingerprintByLocalAccess)
     DomainFingerprint = Context['DomainFingerprint']
-    EffectiveNetStateCache = NetStateCache if NetStateCache is not None else {}
+    OriginalNetStateCache = NetStateCache if NetStateCache is not None else {}
     Cached = CompletedCertificateCache.get(DomainFingerprint) if CompletedCertificateCache is not None else None
     if Cached is not None:
-        ValidatePhysicalComponentSymbolicPortPairCertificate(Cached, Problem, FactorDomain, Signals, NetStateCache=EffectiveNetStateCache)
+        ValidatePhysicalComponentSymbolicPortPairCertificate(Cached, Problem, FactorDomain, Signals, NetStateCache=OriginalNetStateCache)
         return Cached
+    EffectiveNetStateCache = deepcopy(OriginalNetStateCache)
+    EffectiveRouteClaimsConstructionCache = deepcopy(
+        RouteClaimsConstructionCache
+        if RouteClaimsConstructionCache is not None
+        else {}
+    )
+    EffectiveCompatibilityIndexCache = deepcopy(
+        CompleteCompatibilityIndexCache
+        if CompleteCompatibilityIndexCache is not None
+        else {}
+    )
+    EffectiveMaximumWork = max(
+        0,
+        int(getattr(Problem, "MaximumWork", 2**63 - 1)),
+    )
+    PerformedWork = 0
+
+    def ObserveWork(WorkUnits: int) -> None:
+        nonlocal PerformedWork
+        if WorkUnits > EffectiveMaximumWork - PerformedWork:
+            raise RuntimeError("port-pair relation exceeded MaximumWork")
+        PerformedWork += WorkUnits
     StartedAt = monotonic()
     AbsoluteDeadline = (
         None
@@ -87,7 +112,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
         )
     )
     RelaxedProblem = replace(FactorDomain.Problem, ReservedGlobalClaimsBySignal=())
-    PreparedNetStateContexts = {Signal: PrepareComponentSymbolicNetStateContext(RelaxedProblem, Signal, RouteClaimsConstructionCache=RouteClaimsConstructionCache) for Signal in Signals}
+    PreparedNetStateContexts = {Signal: PrepareComponentSymbolicNetStateContext(RelaxedProblem, Signal, RouteClaimsConstructionCache=EffectiveRouteClaimsConstructionCache) for Signal in Signals}
     StatesBySignalAndLocalAccess: dict[tuple[str, str], tuple[Any, ...]] = {}
     NetStateCacheKeys = []
     NetStateBindings = []
@@ -99,7 +124,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
             if AbsoluteDeadline is None
             else AbsoluteDeadline.RemainingSeconds()
         )
-        CompilationsByAccess = CompilePreparedComponentPhysicalFactorStateBatch(PreparedNetStateContexts[Signal], VariantProblemsByAccess, DeadlineSeconds=RemainingDeadline, WorkCheck=WorkCheck, SymbolicNetStateCache=EffectiveNetStateCache)
+        CompilationsByAccess = CompilePreparedComponentPhysicalFactorStateBatch(PreparedNetStateContexts[Signal], VariantProblemsByAccess, DeadlineSeconds=RemainingDeadline, WorkCheck=WorkCheck, SymbolicNetStateCache=EffectiveNetStateCache, MaximumWork=max(0, EffectiveMaximumWork - PerformedWork), WorkObserver=ObserveWork)
         for LocalAccessFingerprint in sorted(VariantProblemsByAccess):
             Compilation = CompilationsByAccess[LocalAccessFingerprint]
             CacheKey = Compilation.CacheKey
@@ -119,7 +144,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
     if Complete:
         for OtherSignal in (Signal for Signal in sorted(Problem.ComponentSignals) if str(Signal) not in Signals):
             OtherFactors = {str(Factor.LocalAccessFingerprint): Factor for Factor in AllLocalFactorsBySignal.get(OtherSignal, ()) if str(Factor.LocalAccessFingerprint) in SupportedAccessesBySignal.get(OtherSignal, frozenset())}
-            OtherContext = PrepareComponentSymbolicNetStateContext(RelaxedProblem, OtherSignal, RouteClaimsConstructionCache=RouteClaimsConstructionCache)
+            OtherContext = PrepareComponentSymbolicNetStateContext(RelaxedProblem, OtherSignal, RouteClaimsConstructionCache=EffectiveRouteClaimsConstructionCache)
             RemainingDeadline = (
                 None
                 if AbsoluteDeadline is None
@@ -127,7 +152,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
             )
             if OtherFactors:
                 OtherProblems = {LocalAccessFingerprint: _BuildPhysicalComponentSymbolicPortPairVariantProblem(RelaxedProblem, OtherSignal, LocalAccessFingerprint, Factor) for LocalAccessFingerprint, Factor in sorted(OtherFactors.items())}
-                OtherCompilations = CompilePreparedComponentPhysicalFactorStateBatch(OtherContext, OtherProblems, DeadlineSeconds=RemainingDeadline, WorkCheck=WorkCheck, SymbolicNetStateCache={})
+                OtherCompilations = CompilePreparedComponentPhysicalFactorStateBatch(OtherContext, OtherProblems, DeadlineSeconds=RemainingDeadline, WorkCheck=WorkCheck, SymbolicNetStateCache={}, MaximumWork=max(0, EffectiveMaximumWork - PerformedWork), WorkObserver=ObserveWork)
                 OtherStates = []
                 for LocalAccessFingerprint in sorted(OtherProblems):
                     Compilation = OtherCompilations[LocalAccessFingerprint]
@@ -143,7 +168,9 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
                         DeadlineSeconds=None,
                         WorkCheck=WorkCheck,
                         SymbolicNetStateCache={},
+                        MaximumWork=max(0, EffectiveMaximumWork - PerformedWork),
                     )
+                    ObserveWork(Compilation.ExpansionCount)
                     IsPrepared = bool(
                         Compilation.Complete
                         and Compilation.States is not None
@@ -173,7 +200,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
                         Lifecycle=RuntimeLifecycle.Queued,
                         Freshness=RuntimeFreshness.Current,
                         DeadlineAt=AbsoluteDeadline.ExpiresAt,
-                        WorkCap=int(getattr(Problem, "MaximumWork", 0)),
+                        WorkCap=max(0, EffectiveMaximumWork - PerformedWork),
                         Cancellation=RuntimeCancellationSnapshot(
                             Requested=False,
                             Identity=f"{TaskIdentity}:cancellation",
@@ -197,6 +224,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
                             ),
                         })
                     Compilation = Execution.Value
+                    ObserveWork(Execution.Result.WorkUnits)
                     IsPrepared = bool(
                         Execution.Result.SearchOutcome
                         is RuntimeSearchOutcome.Prepared
@@ -301,7 +329,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
                     Mask |= 1 << StateIndexByFingerprint[SignalIndex][str(State.NetFingerprint)]
                 AccessMasks[Signal, Access] = Mask
         CompatibilityIndexFingerprint = _Fingerprint(('complete-component-compatibility-index-v2', Problem.PlacementFingerprint, FactorDomain.DomainFingerprint, tuple(((Signal, tuple((State.NetFingerprint for State in Domain))) for Signal, Domain in zip(CanonicalSignals, DomainsToSearch)))))
-        CachedCompatibilityIndex = CompleteCompatibilityIndexCache.get(CompatibilityIndexFingerprint) if CompleteCompatibilityIndexCache is not None else None
+        CachedCompatibilityIndex = EffectiveCompatibilityIndexCache.get(CompatibilityIndexFingerprint)
         if CachedCompatibilityIndex is None:
             PairCompatibleStateMasks: dict[tuple[int, int, int], int] = {}
             for FirstDomainIndex in range(len(DomainsToSearch)):
@@ -328,8 +356,7 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
             UnsupportedRestrictionMasks: dict[tuple[int, int], list[tuple[int, int]]] = {}
             ArcConsistencyCache: dict[tuple[int, tuple[int, ...]], tuple[int, ...] | None] = {}
             CachedCompatibilityIndex = {'PairCompatibleStateMasks': PairCompatibleStateMasks, 'FailedCompatibilityResiduals': FailedCompatibilityResiduals, 'CompleteCompatibilityWitnesses': CompleteCompatibilityWitnesses, 'UnsupportedRestrictionMasks': UnsupportedRestrictionMasks, 'ArcConsistencyCache': ArcConsistencyCache}
-            if CompleteCompatibilityIndexCache is not None:
-                CompleteCompatibilityIndexCache[CompatibilityIndexFingerprint] = CachedCompatibilityIndex
+            EffectiveCompatibilityIndexCache[CompatibilityIndexFingerprint] = CachedCompatibilityIndex
             CompatibilityIndexCacheHit = False
         else:
             PairCompatibleStateMasks = CachedCompatibilityIndex['PairCompatibleStateMasks']
@@ -463,8 +490,22 @@ def CompilePhysicalComponentSymbolicPortPairDomain(Problem: ComponentRoutingProb
     ProofFingerprint = _Fingerprint(('physical-symbolic-port-pair-proof-v2', DomainFingerprint, LocalAccessFingerprintsBySignal, UnsupportedUnaryLocalAccess, tuple(UnsupportedLocalAccessPairs), UnsupportedUnarySeams, tuple(UnsupportedSeamPairs), NetStateDomainFingerprint, Complete))
     Certificate = PhysicalComponentSymbolicPortPairCertificate(DomainFingerprint=DomainFingerprint, PreparedDomainFingerprint=Context['PreparedDomainFingerprint'], PlacementFingerprint=Context['PlacementFingerprint'], ComponentGraphFingerprint=Context['ComponentGraphFingerprint'], FabricFingerprint=Context['FabricFingerprint'], ResourceGraphFingerprint=Context['ResourceGraphFingerprint'], TechnologyFingerprint=Context['TechnologyFingerprint'], AccessCertificateFingerprint=Context['AccessCertificateFingerprint'], InterfaceFingerprint=Context['InterfaceFingerprint'], LocalAccessDomainFingerprint=Context['LocalAccessDomainFingerprint'], SeamDomainFingerprint=Context['SeamDomainFingerprint'], SignalPair=Signals, LocalAccessFingerprintsBySignal=LocalAccessFingerprintsBySignal, SeamFingerprintByLocalAccess=tuple(sorted(((Signal, LocalAccessFingerprint, SeamFingerprint) for (Signal, LocalAccessFingerprint), SeamFingerprint in SeamFingerprintByLocalAccess.items()))), SeamFingerprintsBySignal=tuple(((Signal, tuple(sorted({SeamFingerprintByLocalAccess[Signal, LocalAccessFingerprint] for LocalAccessFingerprint in FactorsBySignal[Signal]}))) for Signal in Signals)), UnsupportedUnaryLocalAccess=UnsupportedUnaryLocalAccess, UnsupportedLocalAccessPairs=tuple(UnsupportedLocalAccessPairs), UnsupportedUnarySeams=UnsupportedUnarySeams, UnsupportedSeamPairs=tuple(UnsupportedSeamPairs), NetStateCacheKeys=tuple(sorted(NetStateCacheKeys)), NetStateBindings=NetStateBindingsTuple, NetStateDomainFingerprint=NetStateDomainFingerprint, ProofFingerprint=ProofFingerprint, Complete=Complete)
     ValidatePhysicalComponentSymbolicPortPairCertificate(Certificate, Problem, FactorDomain, Signals, NetStateCache=EffectiveNetStateCache)
-    if Complete and CompletedCertificateCache is not None:
-        CompletedCertificateCache[DomainFingerprint] = Certificate
+    if Complete:
+        if NetStateCache is not None:
+            NetStateCache.clear()
+            NetStateCache.update(EffectiveNetStateCache)
+        if RouteClaimsConstructionCache is not None:
+            RouteClaimsConstructionCache.clear()
+            RouteClaimsConstructionCache.update(
+                EffectiveRouteClaimsConstructionCache
+            )
+        if CompleteCompatibilityIndexCache is not None:
+            CompleteCompatibilityIndexCache.clear()
+            CompleteCompatibilityIndexCache.update(
+                EffectiveCompatibilityIndexCache
+            )
+        if CompletedCertificateCache is not None:
+            CompletedCertificateCache[DomainFingerprint] = Certificate
     return Certificate
 
 
@@ -654,9 +695,7 @@ def CompilePhysicalComponentSymbolicHigherOrderDomain(
         SeamFingerprintByLocalAccess,
     )
     DomainFingerprint = Context["DomainFingerprint"]
-    EffectiveNetStateCache = (
-        NetStateCache if NetStateCache is not None else {}
-    )
+    OriginalNetStateCache = NetStateCache if NetStateCache is not None else {}
     Cached = (
         CompletedCertificateCache.get(DomainFingerprint)
         if CompletedCertificateCache is not None
@@ -668,9 +707,27 @@ def CompilePhysicalComponentSymbolicHigherOrderDomain(
             Problem,
             FactorDomain,
             Signals,
-            NetStateCache=EffectiveNetStateCache,
+            NetStateCache=OriginalNetStateCache,
         )
         return Cached
+
+    EffectiveNetStateCache = deepcopy(OriginalNetStateCache)
+    EffectiveRouteClaimsConstructionCache = deepcopy(
+        RouteClaimsConstructionCache
+        if RouteClaimsConstructionCache is not None
+        else {}
+    )
+    EffectiveMaximumWork = max(
+        0,
+        int(getattr(Problem, "MaximumWork", 2**63 - 1)),
+    )
+    PerformedWork = 0
+
+    def ObserveWork(WorkUnits: int) -> None:
+        nonlocal PerformedWork
+        if WorkUnits > EffectiveMaximumWork - PerformedWork:
+            raise RuntimeError("higher-order relation exceeded MaximumWork")
+        PerformedWork += WorkUnits
 
     StartedAt = monotonic()
     RelaxedProblem = replace(Problem, ReservedGlobalClaimsBySignal=())
@@ -678,7 +735,7 @@ def CompilePhysicalComponentSymbolicHigherOrderDomain(
         Signal: PrepareComponentSymbolicNetStateContext(
             RelaxedProblem,
             Signal,
-            RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+            RouteClaimsConstructionCache=EffectiveRouteClaimsConstructionCache,
         )
         for Signal in Signals
     }
@@ -713,6 +770,8 @@ def CompilePhysicalComponentSymbolicHigherOrderDomain(
                 DeadlineSeconds=RemainingDeadline,
                 WorkCheck=WorkCheck,
                 SymbolicNetStateCache=EffectiveNetStateCache,
+                MaximumWork=max(0, EffectiveMaximumWork - PerformedWork),
+                WorkObserver=ObserveWork,
             )
         )
         for LocalAccessFingerprint in sorted(VariantProblemsByAccess):
@@ -1110,8 +1169,17 @@ def CompilePhysicalComponentSymbolicHigherOrderDomain(
         Signals,
         NetStateCache=EffectiveNetStateCache,
     )
-    if Complete and CompletedCertificateCache is not None:
-        CompletedCertificateCache[DomainFingerprint] = Certificate
+    if Complete:
+        if NetStateCache is not None:
+            NetStateCache.clear()
+            NetStateCache.update(EffectiveNetStateCache)
+        if RouteClaimsConstructionCache is not None:
+            RouteClaimsConstructionCache.clear()
+            RouteClaimsConstructionCache.update(
+                EffectiveRouteClaimsConstructionCache
+            )
+        if CompletedCertificateCache is not None:
+            CompletedCertificateCache[DomainFingerprint] = Certificate
     return Certificate
 
 
@@ -1154,6 +1222,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureSignalWorker(
                 DeadlineSeconds=RemainingDeadline,
                 NetStateCache=SymbolicNetStateCache,
                 AllowParallelSignalCompilation=False,
+                MaximumWork=Request.WorkCap,
             )
         )
     except BaseException:
@@ -1165,7 +1234,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureSignalWorker(
         Task=Request.TaskIdentity,
         State="completed" if Complete else "incomplete",
     )
-    return RuntimeWorkProduct(
+    return RuntimeSpawnedWorkProduct(
         Value=(
             (str(Signal), Clauses, Diagnostics, SymbolicNetStateCache)
             if Complete
@@ -1201,6 +1270,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureSignalWorker(
             ("Complete", "true" if Complete else "false"),
             ("Signal", str(Signal)),
         ),
+        WorkUnits=max(0, int(Diagnostics.get("UnarySignalWorkUnits", 0))),
     )
 
 
@@ -1224,6 +1294,10 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
     ] | None = None,
     AllowParallelSignalCompilation: bool = True,
     RuntimeLimits: RuntimeSpawnedWorkLimits = DefaultSymbolicUnaryRuntimeLimits,
+    RuntimeAuthorityFactory: Callable[
+        [RuntimeWorkRequest], RuntimeWorkAuthority
+    ] | None = None,
+    MaximumWork: int | None = None,
 ) -> tuple[
     frozenset[frozenset[tuple[str, str]]],
     dict[str, Any],
@@ -1260,8 +1334,40 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         Clauses, Diagnostics = Cached
         return Clauses, {**Diagnostics, "UnaryCertificateCacheHit": True}
 
-    EffectiveNetStateCache = (
+    EffectiveNetStateCache = deepcopy(
         NetStateCache if NetStateCache is not None else {}
+    )
+    EffectiveRouteClaimsConstructionCache = deepcopy(
+        RouteClaimsConstructionCache
+        if RouteClaimsConstructionCache is not None
+        else {}
+    )
+
+    def CommitMutableCaches() -> None:
+        if NetStateCache is not None:
+            NetStateCache.clear()
+            NetStateCache.update(EffectiveNetStateCache)
+        if RouteClaimsConstructionCache is not None:
+            RouteClaimsConstructionCache.clear()
+            RouteClaimsConstructionCache.update(
+                EffectiveRouteClaimsConstructionCache
+            )
+    if (
+        MaximumWork is not None
+        and (
+            isinstance(MaximumWork, bool)
+            or not isinstance(MaximumWork, int)
+            or MaximumWork < 0
+        )
+    ):
+        raise ValueError("MaximumWork must be a non-negative integer or None")
+    EffectiveMaximumWork = min(
+        max(0, int(getattr(Problem, "MaximumWork", 0))),
+        (
+            max(0, int(getattr(Problem, "MaximumWork", 0)))
+            if MaximumWork is None
+            else MaximumWork
+        ),
     )
 
     # Each signal's local access factors are immutable after physical factor
@@ -1279,6 +1385,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         and len(Signals) > 1
         and not NetStateCache
         and DeadlineSeconds is not None
+        and RuntimeAuthorityFactory is not None
     ):
         DeadlineAt = monotonic() + max(0.0, DeadlineSeconds)
         StartedParallelAt = monotonic()
@@ -1294,36 +1401,42 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
             Workers=WorkerCount,
             Mode="bounded-spawn",
         )
-        Items = tuple(
-            RuntimeSpawnedWorkItem(
-                Request=RuntimeWorkRequest(
-                    TaskIdentity=TaskIds[Signal],
-                    Operation="compile-physical-symbolic-unary-aperture",
-                    Scope=RuntimeWorkScope(
-                        DomainIdentity=BuildStableFingerprint((
-                            "physical-symbolic-unary-signal-domain-v1",
-                            CacheKey,
-                            Signal,
-                        )),
-                        DependencyIdentities=(
-                            str(FactorDomain.DomainFingerprint),
-                            str(Problem.Fabric.FabricFingerprint),
-                            str(Problem.ProblemFingerprint),
-                        ),
-                    ),
-                    Lifecycle=RuntimeLifecycle.Queued,
-                    Freshness=RuntimeFreshness.Current,
-                    DeadlineAt=DeadlineAt,
-                    WorkCap=max(0, int(getattr(Problem, "MaximumWork", 0))),
-                    Cancellation=RuntimeCancellationSnapshot(
-                        Requested=False,
-                        Identity=TaskIds[Signal] + ":cancellation",
+        Items = []
+        BaseWork, ExtraWork = divmod(
+            EffectiveMaximumWork,
+            len(Signals),
+        )
+        for SignalIndex, Signal in enumerate(Signals):
+            Request = RuntimeWorkRequest(
+                TaskIdentity=TaskIds[Signal],
+                Operation="compile-physical-symbolic-unary-aperture",
+                Scope=RuntimeWorkScope(
+                    DomainIdentity=BuildStableFingerprint((
+                        "physical-symbolic-unary-signal-domain-v1",
+                        CacheKey,
+                        Signal,
+                    )),
+                    DependencyIdentities=(
+                        str(FactorDomain.DomainFingerprint),
+                        str(Problem.Fabric.FabricFingerprint),
+                        str(Problem.ProblemFingerprint),
                     ),
                 ),
-                Payload=(Problem, FactorDomain, Signal),
+                Lifecycle=RuntimeLifecycle.Queued,
+                Freshness=RuntimeFreshness.Current,
+                DeadlineAt=DeadlineAt,
+                WorkCap=BaseWork + int(SignalIndex < ExtraWork),
+                Cancellation=RuntimeCancellationSnapshot(
+                    Requested=False,
+                    Identity=TaskIds[Signal] + ":cancellation",
+                ),
             )
-            for Signal in Signals
-        )
+            Items.append(RuntimeSpawnedWorkItem(
+                Request=Request,
+                Authority=RuntimeAuthorityFactory(Request),
+                Payload=(Problem, FactorDomain, Signal),
+            ))
+        Items = tuple(Items)
         Batch = ExecuteBoundedSpawnedWorkBatch(
             Items,
             CompilePhysicalComponentSymbolicUnaryApertureSignalWorker,
@@ -1373,6 +1486,10 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
             ),
             "UnarySignalMaximumObservedResultBytes": (
                 Batch.MaximumObservedResultBytes
+            ),
+            "UnarySignalWorkUnits": sum(
+                Execution.Result.WorkUnits
+                for Execution in ExecutionsBySignal.values()
             ),
             "UnarySignalCompletionOrder": list(Batch.CompletionOrder),
         }
@@ -1473,6 +1590,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
             }
             if CompletedClauseCache is not None:
                 CompletedClauseCache[CacheKey] = (Result, Diagnostics)
+            CommitMutableCaches()
             return Result, Diagnostics
 
     EmitTelemetryEvent("pool", Pool="unary-proof", Workers=1, Mode="parent-cache" if NetStateCache else "serial")
@@ -1486,6 +1604,12 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
     }
     RelaxedProblem = replace(Problem, ReservedGlobalClaimsBySignal=())
     StartedAt = monotonic()
+    PerformedWork = 0
+
+    def ObserveWork(Units: int) -> None:
+        nonlocal PerformedWork
+        PerformedWork += Units
+
     UnsupportedAccesses: set[tuple[str, str]] = set()
     CompiledStatesByAccess: dict[
         tuple[str, str], tuple[Any, ...]
@@ -1501,7 +1625,9 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         PreparedContext = PrepareComponentSymbolicNetStateContext(
             RelaxedProblem,
             Signal,
-            RouteClaimsConstructionCache=RouteClaimsConstructionCache,
+            RouteClaimsConstructionCache=(
+                EffectiveRouteClaimsConstructionCache
+            ),
         )
         VariantProblemsByAccess = {
             LocalAccessFingerprint: (
@@ -1529,6 +1655,8 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
                 DeadlineSeconds=RemainingDeadline,
                 WorkCheck=WorkCheck,
                 SymbolicNetStateCache=EffectiveNetStateCache,
+                MaximumWork=max(0, EffectiveMaximumWork - PerformedWork),
+                WorkObserver=ObserveWork,
             )
         )
         for LocalAccessFingerprint in sorted(VariantProblemsByAccess):
@@ -1539,6 +1667,7 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
                     "Signal": Signal,
                     "CompiledAccessCount": CompiledAccessCount,
                     "UnaryCertificateCacheHit": False,
+                    "UnarySignalWorkUnits": PerformedWork,
                 }
             CompiledAccessCount += 1
             CompiledStatesByAccess[(
@@ -1672,10 +1801,12 @@ def CompilePhysicalComponentSymbolicUnaryApertureDomain(
         ),
         "UnaryApertureClauseCount": len(Result),
         "UnaryCertificateCacheHit": False,
+        "UnarySignalWorkUnits": PerformedWork,
         "DomainFingerprint": CacheKey,
     }
     if CompletedClauseCache is not None:
         CompletedClauseCache[CacheKey] = (Result, Diagnostics)
+    CommitMutableCaches()
     return Result, Diagnostics
 
 
