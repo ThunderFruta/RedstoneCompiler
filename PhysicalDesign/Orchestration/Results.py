@@ -29,7 +29,15 @@ from PhysicalDesign.Geometry.Placement import PlacedDesign
 from PhysicalDesign.Routing.Regions.Planning.PhysicalPlanning import SelectPhysicalAssemblyGlobalBoundaryPorts, SelectPhysicalComponentExactGlobalChannelSignals
 from .Preparation import (
     BuildClusterInterfacePlacementTopologyFingerprint,
+    BuildPlacementRetentionFingerprint,
     SummarizePrePlacementCapacityResults,
+)
+from .Feedback import BuildPlacementFingerprint
+from .Candidates import BuildCandidateCurrentSelectedAccessEnvelope
+from .AccessEnvelope import (
+    CurrentSelectedAccessEnvelopePhase,
+    CurrentSelectedAccessTransition,
+    RequireCurrentSelectedAccessEnvelopeReady,
 )
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -1361,7 +1369,10 @@ def PublishPlacementFlowResult(Context):
     Context.Services.ValidateNandOnlyDesign(Context.Placement.Placed, Context.Netlist)
     Context.PlacementPinAccessFinalization = (
         BuildPlacementPinAccessFinalizationDiagnostics(Context)
-        if Context.Policy.PlacementAccess.Enabled
+        if (
+            Context.Policy.PlacementAccess.Enabled
+            and Context.Placement.PlacementAccessFabric is not None
+        )
         else None
     )
     if Context.PlacementPinAccessFinalization is not None:
@@ -1413,6 +1424,72 @@ def PublishPlacementFlowResult(Context):
     else:
         Context.Deadline.RaiseIfExpired('RoutingFinalization')
     Context.Routed.RoutingControlEffectiveness['Deadline'] = Context.Deadline.ToDictionary()
+    if Context.Policy.PlacementAccess.Enabled:
+        Context.PublicationCurrentSelectedAccessResources = (
+            Context.Services.BuildRoutingResources(
+                Context.Placement.Placed,
+                Technology=Context.Technology,
+                WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired(
+                    "CurrentSelectedAccessBeforePublication",
+                    Diagnostics,
+                ),
+            )
+        )
+        Context.PublicationCurrentSelectedAccessResult = (
+            BuildCandidateCurrentSelectedAccessEnvelope(
+                Context.SelectedCandidate,
+                Phase=CurrentSelectedAccessEnvelopePhase.BeforePublication,
+                Transition=(
+                    CurrentSelectedAccessTransition.PostRoutingCompaction
+                ),
+                Resources=Context.PublicationCurrentSelectedAccessResources,
+                Technology=Context.Technology,
+                Policy=Context.Policy,
+                ObservedPlacementFingerprint=BuildPlacementFingerprint(
+                    Context.Placement,
+                    Context.SelectedCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                    if Context.SelectedCandidate.TopologyDemand is not None else "",
+                    IncludeLocalClaims=(
+                        Context.SelectedCandidate.PlacementFingerprintIncludesLocalClaims
+                        if type(Context.SelectedCandidate.PlacementFingerprintIncludesLocalClaims)
+                        is bool else True
+                    ),
+                ),
+                ObservedPlacementRetentionFingerprint=(
+                    BuildPlacementRetentionFingerprint(
+                        Context.Placement,
+                        Context.SelectedCandidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+                        if Context.SelectedCandidate.TopologyDemand is not None else "",
+                        IncludeLocalClaims=(
+                            Context.SelectedCandidate.PlacementFingerprintIncludesLocalClaims
+                            if type(Context.SelectedCandidate.PlacementFingerprintIncludesLocalClaims)
+                            is bool else True
+                        ),
+                    )
+                ),
+                Placement=Context.Placement,
+                TrackPreparation=Context.SelectedTrackPreparation,
+                RawTrackAssignment=Context.RawTrackAssignmentResult,
+                RawTrackAssignmentApplicable=Context.SinglePackedComponent,
+            )
+        )
+        Context.Deadline.RaiseIfExpired(
+            "CurrentSelectedAccessBeforePublication",
+            {"Phase": "after-current-selected-access-capture"},
+        )
+        RequireCurrentSelectedAccessEnvelopeReady(
+            Context.PublicationCurrentSelectedAccessResult,
+            Stage="CurrentSelectedAccessBeforePublication",
+        )
+        Context.SelectedCandidate = replace(
+            Context.SelectedCandidate,
+            CurrentSelectedAccessEnvelopeResult=(
+                Context.PublicationCurrentSelectedAccessResult
+            ),
+        )
+        Context.PlanningContracts["CurrentSelectedAccessEnvelope"] = (
+            Context.PublicationCurrentSelectedAccessResult.ToDictionary()
+        )
     Context.Result = PcbResult(Placed=Context.Placement.Placed, Routed=Context.Routed, Footprint=Context.Footprint, EstimatedBlocks=Context.EstimatedBlocks, Width=Context.Width, Depth=Context.Depth, Policy=Context.Policy, Technology=Context.Technology, RequestedStrategy=Context.RequestedStrategy.value, UsedStrategy=Context.UsedStrategy.value, PlanningContracts=Context.PlanningContracts)
     if Context.ProgressCallback is not None:
         Context.ProgressCallback(PcbProgress(Completed=1, Total=1, Workers=0, Valid=1, BestBlocks=Context.EstimatedBlocks, BestWidth=Context.Width, BestDepth=Context.Depth, BestFootprint=Context.Footprint, Failed=0, Stage='routing complete'))

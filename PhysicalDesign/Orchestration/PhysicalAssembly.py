@@ -2275,12 +2275,15 @@ def EnqueueOwnedFrontierTopologyRepair(Context, Failure: RoutingFailure, SourceC
             continue
         Context.UniquePlacements[Fingerprint] = ('proof-driven-owned-frontier-topology-repair', SourceCandidate.RoutingSpacing, Candidate)
         Context.PlacementRetentionFingerprintByFingerprint[Fingerprint] = RetentionFingerprint
+        Context.PlacementFingerprintIncludesLocalClaimsByFingerprint[
+            Fingerprint
+        ] = False
         Context.RetainedPlacementTopologyFingerprints[RetentionFingerprint] = (Fingerprint, 'proof-driven-owned-frontier-topology-repair')
         Context.TopologyDemandByFingerprint[Fingerprint] = CandidateTopologyDemand
         Context.MaterializedPlacementByFingerprint[Fingerprint] = Candidate
         ExistingFingerprints = frozenset((*ExistingFingerprints, Fingerprint))
         ExistingTopologyFingerprints = frozenset((*ExistingTopologyFingerprints, CandidateTopologyFingerprint))
-        CandidateRecord = PcbPlacementCandidate(CandidateId=f'Placement-{Fingerprint[:12]}', SourceGenerator='proof-driven-owned-frontier-topology-repair', RoutingSpacing=SourceCandidate.RoutingSpacing, PlacementFingerprint=Fingerprint, FeedbackScore=(Variant,), BoundaryOverflow=0, PinScarcityCount=0, GuideOverflowPeak=0, GuideOverflowCells=0, PinEscapeConflictCount=0, EstimatedGlobalExtensionNodes=0, EstimatedGlobalExtensionNets=0, PreOwnedNodeCount=0, Placement=Candidate, TopologyDemand=CandidateTopologyDemand, PlacementRetentionFingerprint=RetentionFingerprint, InterfaceTopologyFingerprint=CandidateTopologyFingerprint)
+        CandidateRecord = PcbPlacementCandidate(CandidateId=f'Placement-{Fingerprint[:12]}', SourceGenerator='proof-driven-owned-frontier-topology-repair', RoutingSpacing=SourceCandidate.RoutingSpacing, PlacementFingerprint=Fingerprint, FeedbackScore=(Variant,), BoundaryOverflow=0, PinScarcityCount=0, GuideOverflowPeak=0, GuideOverflowCells=0, PinEscapeConflictCount=0, EstimatedGlobalExtensionNodes=0, EstimatedGlobalExtensionNets=0, PreOwnedNodeCount=0, Placement=Candidate, PlacementFingerprintIncludesLocalClaims=False, TopologyDemand=CandidateTopologyDemand, PlacementRetentionFingerprint=RetentionFingerprint, InterfaceTopologyFingerprint=CandidateTopologyFingerprint)
         Context.OwnedFrontierTopologyRepairCandidateByPlacementFingerprint[Fingerprint] = CandidateRecord
         Context.OwnedFrontierTopologyRepairKindByPlacementFingerprint[Fingerprint] = Kind
         Context.OwnedFrontierTopologyRepairSignalsByPlacementFingerprint[Fingerprint] = tuple(sorted(RepairSignals))

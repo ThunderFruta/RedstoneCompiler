@@ -166,7 +166,7 @@ wires, claims, policy/technology identities, and zero resource conflicts. The
 controlled stale cases fail before regeneration, raw assignment, detailed
 routing, compaction, fallback, or successful commitment. The final Joint
 focused set is **192 passed, 92 subtests in 46.53 s**; its evidence is
-[Joint verification](/mnt/Projects/RedstoneCompiler-Worktrees/Joint-Physical-Design/RedstoneCompiler/Output/TelemetryRepairToJoint/20260906T184442Z-FrozenCandidate/Summary.txt) and the
+[Joint verification](../../../../Output/TelemetryRepairToJoint/20260906T184442Z-FrozenCandidate/Summary.txt) and the
 final repair closure is
 [closure report](/mnt/Projects/RedstoneCompiler-Worktrees/Router-Integration/RedstoneCompiler/Output/RepairClosure/20260906T180628Z/Report.md).
 
@@ -481,6 +481,58 @@ through the same public Physical resource construction path used for global
 materialization. This is only a local/global state-adoption candidate: it makes
 no Ready/current-envelope, Runtime caller, acceptance, promotion, cache, or
 reuse-authority claim.
+
+## Current selected-access envelope candidate
+
+The Joint orchestration candidate adds a typed
+`current-selected-access-envelope-v1` record at three causal boundaries:
+before raw/fabric materialization, after selected track or declared channel
+successor construction, and immediately before public result publication.
+Only a fresh `Ready` result whose Physical receipt is exactly
+`Verified`/`Current` carries a usable envelope.  It deeply owns the complete
+solve, witness and domain evidence; candidate fingerprint mode; current policy
+and access work controls; routing envelope and inclusive XZ/logical-layer
+bounds; and the applicable selected/raw track facts.  Legitimate declared
+successors retain their predecessor identity and receive a new phase identity;
+unexpected drift yields `Stale`, while incomplete or unavailable inputs never
+retain an older Ready envelope.  Bounded-incomplete and complete-unsatisfiable
+solves retain distinct non-Ready classifications.
+
+A channel/deck placement is a new selected-access candidate rather than a
+replay of its predecessor's chosen access.  Joint therefore rebuilds the v3
+resource graph from the final transformed placement, enumerates and solves
+access under the current policy and bounded interface deadline, attaches only
+that fresh policy-bound solve/witness, recomputes placement/retention/topology
+and routing-envelope identities, and prepares new selected track facts before
+the successor gate.  The separately retained pre-rebind deck proves the exact
+source-to-channel-to-deck geometry relation; it does not authorize stale access.
+Production discards predecessor selected-access authority before any transformed
+consumer, then independently re-enumerates and solves the transformed terminal
+geometry.  A direct stale-before-refresh contract control separately proves
+that the predecessor witness mismatches that geometry; production does not use
+that stale receipt as a gate.
+The public 17-NAND multi-cluster control completes with the exact
+`InitialCandidate` → `SelectedTrackAssignment` → `PostRoutingCompaction`
+chain.  Its forced exact-cluster variant reaches real channel/deck construction
+and emits a Ready `InitialCandidate` → `ChannelReplacement` successor with
+complete rebuilt track binding; a later complete solve is explicitly
+`Unsatisfiable/AccessSolveUnsatisfiable`; its direct Ready requirement maps to
+`NoPinAccessPattern`.  The forced public run still reports
+`ClusterInterfaceSolveIncomplete` because the wider retained state portfolio is
+not proven complete, while retaining the candidate's unsatisfiable envelope
+status and reason in diagnostics.  No successful final exact-cluster artifact
+is claimed.
+
+This is a bounded current-consumer candidate, not a claim that serialized
+records provide authority.  Runtime batch callers and receipts, Telemetry,
+Reuse/cache admission, global feasibility, leases beyond the declared inputs,
+native/Fabric validation, full routing acceptance, and promotion remain
+separate and not run by this change.
+The final envelope re-attests selected-access authority after compaction.  On
+paths with a materialized placement-access fabric, the existing handoff
+evidence, rather than this envelope, owns the separate routed-design and
+compaction-preservation claims; deferred exact-cluster paths do not fabricate
+that fabric-specific receipt.
 
 [contracts]: ../../../../PhysicalDesign/Contracts/PlacementAccess.py
 [catalog]: ../../../../PhysicalDesign/Placement/Access/Catalog.py
