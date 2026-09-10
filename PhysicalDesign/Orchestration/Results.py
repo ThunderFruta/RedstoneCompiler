@@ -41,6 +41,7 @@ from .Preparation import (
 from .Feedback import BuildPlacementFingerprint
 from .Candidates import BuildCandidateCurrentSelectedAccessEnvelope
 from .AccessEnvelope import (
+    BuildPlacementAccessEvaluationControls,
     CurrentSelectedAccessEnvelopePhase,
     CurrentSelectedAccessTransition,
     RequireCurrentSelectedAccessEnvelopeReady,
@@ -1315,6 +1316,9 @@ def BuildPlacementPinAccessFinalizationDiagnostics(
             ResourceGraph=Resources.ResourceGraph,
             Technology=Context.Technology,
             FrozenNetWires=Placement.Placed.FrozenNetWires or {},
+            CurrentControls=BuildPlacementAccessEvaluationControls(
+                Context.Policy.PlacementAccess
+            ),
         )
         if CurrentValidation.Status is not (
             CurrentSelectedPlacementAccessValidationStatus.Verified

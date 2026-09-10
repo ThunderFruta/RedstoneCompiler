@@ -525,7 +525,7 @@ def GeneratePlacementCandidates(Context):
     Context.CandidateRecords = Context.FabricCandidateRecords
 import os
 from PhysicalDesign.Routing.Pcb import PrepareTrackAssignment
-from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolio, RawTrackAssignmentPortfolioTemplate, RawTrackAssignmentSelection, SolveRawTrackAssignmentPortfolioWithContext
+from PhysicalDesign.Routing.Assignment.TemplateAssignment import BuildRawTrackAssignmentWorkControlsFingerprint, RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolio, RawTrackAssignmentPortfolioTemplate, RawTrackAssignmentSelection, SolveRawTrackAssignmentPortfolioWithContext
 from PhysicalDesign.Contracts.Results import RoutedDesign
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Runtime.Reliability import BuildStableFingerprint
@@ -539,6 +539,7 @@ from .State import (
     SetPlacementFlowState,
 )
 from .RoutingAttempts import (
+    BuildRawTemplateMaterializationInputManifest,
     MaterializeRawTemplate,
     PublishPreRouteTemplate,
     SolvePrePlacementCapacityProblem,
@@ -570,8 +571,15 @@ def PreparePlacementRouting(Context):
                 Context.FabricDescriptor = Context.PreRouteFabricDescriptorsByCandidateId.get(Context.Candidate.CandidateId)
                 if Context.FabricDescriptor is None:
                     raise RuntimeError('pre-route candidate is missing its fixed fabric descriptor')
-                Context.RawPortfolioTemplates.append(RawTrackAssignmentPortfolioTemplate(TemplateId=Context.Candidate.CandidateId, Objective=Context.FabricDescriptor.ObjectivePrefix, MaterializationInputFingerprint=BuildStableFingerprint({'FabricDescriptor': Context.FabricDescriptor.MaterializationInputFingerprint, 'TrackAssignmentExpansionCap': Context.Policy.TrackAssignment.MaximumAssignmentExpansions})))
-            Context.RawTrackAssignmentResult = SolveRawTrackAssignmentPortfolioWithContext(RawTrackAssignmentPortfolio(Templates=tuple(Context.RawPortfolioTemplates), MaximumAssignmentExpansions=Context.Policy.TrackAssignment.MaximumAssignmentExpansions, NonExhaustiveTemplateDomain=True), partial(MaterializeRawTemplate, Context), Deadline=Context.Deadline, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('PreRouteInterfaceSelection', Diagnostics))
+                Context.MaterializationInputManifest = BuildRawTemplateMaterializationInputManifest(
+                    Context,
+                    Context.Candidate,
+                    Context.FabricDescriptor,
+                    Resources=Context.FabricDescriptor.StaticResources,
+                )
+                Context.RawPortfolioTemplates.append(RawTrackAssignmentPortfolioTemplate(TemplateId=Context.Candidate.CandidateId, Objective=Context.FabricDescriptor.ObjectivePrefix, MaterializationInputFingerprint=Context.MaterializationInputManifest.ManifestFingerprint, MaterializationInputManifest=Context.MaterializationInputManifest))
+            Context.RawTrackAssignmentWorkControlsFingerprint = BuildRawTrackAssignmentWorkControlsFingerprint(Context.Policy.TrackAssignment.MaximumAssignmentExpansions, Context.Deadline)
+            Context.RawTrackAssignmentResult = SolveRawTrackAssignmentPortfolioWithContext(RawTrackAssignmentPortfolio(Templates=tuple(Context.RawPortfolioTemplates), MaximumAssignmentExpansions=Context.Policy.TrackAssignment.MaximumAssignmentExpansions, WorkControlsFingerprint=Context.RawTrackAssignmentWorkControlsFingerprint, NonExhaustiveTemplateDomain=True), partial(MaterializeRawTemplate, Context), Deadline=Context.Deadline, WorkCheck=lambda Diagnostics: Context.Deadline.RaiseIfExpired('PreRouteInterfaceSelection', Diagnostics))
             Context.SelectedTemplate = Context.TemplateById.get(Context.RawTrackAssignmentResult.SelectedTemplateId)
             Context.SelectedWitness = Context.SelectedTemplate.Witnesses[0] if Context.SelectedTemplate is not None and len(Context.SelectedTemplate.Witnesses) == 1 else None
             Context.PreRouteInterfaceResult = PreRouteInterfaceSelection(ProblemFingerprint=Context.RawTrackAssignmentResult.ProblemFingerprint, SelectionFingerprint=Context.RawTrackAssignmentResult.SelectionFingerprint, SelectedTemplateIds=(('__placement__', Context.SelectedTemplate.TemplateId),) if Context.RawTrackAssignmentResult.Success and Context.SelectedTemplate is not None else (), SelectedWitnessIds=(('__placement__', Context.SelectedWitness.WitnessId),) if Context.RawTrackAssignmentResult.Success and Context.SelectedWitness is not None else (), Objective=Context.RawTrackAssignmentResult.SelectedObjective, ExpansionCount=Context.RawTrackAssignmentResult.ExpansionCount, Success=Context.RawTrackAssignmentResult.Success, Complete=Context.RawTrackAssignmentResult.Complete, Unsatisfiable=Context.RawTrackAssignmentResult.Unsatisfiable, IncompleteReason=Context.RawTrackAssignmentResult.IncompleteReason, FirstConflictResourceIds=tuple(map(str, Context.RawTrackAssignmentResult.FirstConflictResourceIndices)))
@@ -597,9 +605,44 @@ def PreparePlacementRouting(Context):
         )
     )
     if Context.SinglePackedComponent:
-        if Context.RawTrackAssignmentResult is None or Context.RawTrackAssignmentResult.Preparation is None:
+        if Context.RawTrackAssignmentResult is None:
             raise RuntimeError('selected raw pre-route result is missing its frozen track-assignment witness')
-        Context.SelectedTrackPreparation = Context.RawTrackAssignmentResult.Preparation
+        Context.SelectedRawPortfolioDescriptor = next(
+            Descriptor
+            for Descriptor in Context.RawPortfolioTemplates
+            if Descriptor.TemplateId == Context.SelectedPreRouteCandidate.CandidateId
+        )
+        Context.SelectedFabricDescriptor = (
+            Context.PreRouteFabricDescriptorsByCandidateId[
+                Context.SelectedPreRouteCandidate.CandidateId
+            ]
+        )
+        Context.SelectedCandidateInputManifest = (
+            BuildRawTemplateMaterializationInputManifest(
+                Context,
+                Context.SelectedPreRouteCandidate,
+                Context.SelectedFabricDescriptor,
+                Resources=Context.SelectedCandidateResources,
+            )
+        )
+        Context.SelectedCandidatePreparationResult = (
+            Context.RawTrackAssignmentResult.RequireSelectedCandidatePreparation(
+                CandidateId=Context.SelectedPreRouteCandidate.CandidateId,
+                CandidateInputFingerprint=(
+                    Context.SelectedRawPortfolioDescriptor
+                    .MaterializationInputFingerprint
+                ),
+                CandidateInputManifest=(
+                    Context.SelectedCandidateInputManifest
+                ),
+                WorkControlsFingerprint=(
+                    Context.RawTrackAssignmentWorkControlsFingerprint
+                ),
+            )
+        )
+        Context.SelectedTrackPreparation = (
+            Context.SelectedCandidatePreparationResult.Preparation
+        )
     else:
         Context.SelectedTrackPreparation = Context.PrePlacementTrackPreparationWitnesses.get(Context.SelectedPreRouteCandidate.CandidateId)
         if Context.SelectedTrackPreparation is None:

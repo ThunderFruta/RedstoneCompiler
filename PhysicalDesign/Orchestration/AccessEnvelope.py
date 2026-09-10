@@ -28,6 +28,7 @@ from PhysicalDesign.Contracts.PlacementAccess import (
     CurrentSelectedPlacementAccessValidation,
     CurrentSelectedPlacementAccessValidationReason,
     CurrentSelectedPlacementAccessValidationStatus,
+    PlacementAccessEvaluationControls,
     PlacementAccessSolveResult,
     PlacementAccessSolveStatus,
     PlacedPinAccessOptionDomain,
@@ -107,6 +108,28 @@ class CurrentSelectedAccessEnvelopeReason(str, Enum):
     TrackPreparationMismatch = "TrackPreparationMismatch"
     RawTrackAssignmentMismatch = "RawTrackAssignmentMismatch"
     PlacementTransitionMismatch = "PlacementTransitionMismatch"
+
+
+def BuildPlacementAccessEvaluationControls(
+    PlacementAccess: Any,
+) -> PlacementAccessEvaluationControls:
+    """Build the producer-owned current-validation controls from Joint policy."""
+    Families = PlacementAccess.EnabledPatternFamilies
+    # The policy permits a duplicate-free, noncanonical family order.  Sort
+    # only exact strings; malformed values remain producer-owned validation
+    # errors instead of being coerced or silently discarded here.
+    if type(Families) is tuple and all(
+        type(Family) is str for Family in Families
+    ):
+        Families = tuple(sorted(Families))
+    return PlacementAccessEvaluationControls(
+        EnabledPatternFamilies=Families,
+        CatalogVersion=PlacementAccess.CatalogVersion,
+        MaximumGenerationWork=PlacementAccess.MaximumDomainGenerationWork,
+        MaximumAssignmentExpansions=(
+            PlacementAccess.MaximumAssignmentExpansions
+        ),
+    )
 
 
 def _FreezeAuthorityValue(
@@ -1710,6 +1733,9 @@ def BuildCurrentSelectedAccessEnvelope(
         ResourceGraph=ResourceGraph,
         Technology=Technology,
         FrozenNetWires=Placement.Placed.FrozenNetWires or {},
+        CurrentControls=BuildPlacementAccessEvaluationControls(
+            Policy.PlacementAccess
+        ),
     )
     AfterJointPayload = {
         "Policy": Policy,
@@ -2127,6 +2153,7 @@ def RequireCurrentSelectedAccessEnvelopeReady(
 
 __all__ = [
     "BuildCurrentSelectedAccessEnvelope",
+    "BuildPlacementAccessEvaluationControls",
     "CurrentSelectedAccessEnvelope",
     "CurrentSelectedAccessEnvelopePhase",
     "CurrentSelectedAccessEnvelopeReason",

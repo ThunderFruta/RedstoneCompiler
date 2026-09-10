@@ -543,6 +543,87 @@ evidence, rather than this envelope, owns the separate routed-design and
 compaction-preservation claims; deferred exact-cluster paths do not fabricate
 that fabric-specific receipt.
 
+## Candidate-specific preparation-result candidate
+
+The current uncommitted Joint candidate preserves every evaluated lazy
+pre-route member as an immutable
+`raw-track-assignment-candidate-preparation-result-v1`.  A result is exactly one
+of `CompleteFeasible`, `CompleteFailed`, or `Incomplete`; a complete failed
+member has no selected witness but remains a complete candidate result.  Each
+result binds its candidate id, materialization-input identity, portfolio
+identity, resolved objective, admitted and observed work, and the exact
+work-control identity.  The production boundary includes both the shared
+assignment cap and the original caller-owned absolute deadline in that control
+identity.
+
+The candidate input is a transparent, canonical
+`raw-track-assignment-candidate-input-v1` manifest rather than a caller-supplied
+opaque label.  It records current placement and retention observations, the
+complete placement-core identity, selected solve/witness binding, full policy
+and frozen-envelope routing policy, technology and current resource-model
+identity, routing envelope, fabric topology/shell, portfolio mode, and every
+declared or resolved-objective input.  Deadline and cap authority remain in the
+separate work-controls identity.  The manifest is recomputed against live
+inputs before materialization, before returning a cached materialization, and
+again at the selected Setup consumer.
+
+The lazy selector now chooses only through the retained complete-feasible
+result, and Joint's pre-route consumer requires the selected candidate id,
+materialization input, and work controls to match that exact result before it
+uses the frozen track preparation.  A cached or previous-candidate
+materialization with a different input identity is rejected.  Complete failed
+siblings remain available for diagnosis and capacity-core reasoning; an
+incomplete sibling remains unresolved and cannot become unsatisfiability.
+`OuterPortfolioComplete` separately records whether the declared outer domain
+is exhaustive, so several completely failed candidates in a non-exhaustive
+portfolio do not become a global negative proof.
+
+`CompleteFeasible` also requires a complete selected witness.  Joint directly
+enumerates the required signals and allowed ordinary/local-claim choices from
+the immutable raw domain before constructing a preparation.  Success must name
+exactly one allowed choice for every required signal.  Empty, partial,
+duplicate, multi-choice, unknown, or non-string selections are rejected;
+failed native outcomes may retain exact allowed partial selections only as
+non-authoritative diagnostics, with no preparation or feasible result.
+
+All feasibility, completeness, deadline, exhaustion, unsatisfiability, and
+outer-completeness axes require exact Boolean values.  Caps, objectives,
+expansion counts, cumulative work and conflict-resource indices require exact
+non-Boolean integers.  The boundary rejects malformed native values before
+updating cumulative work or constructing a candidate result.  Candidate input
+and selected-preparation payloads are deeply detached into canonical immutable
+trees; later mutation of caller-owned lists, dictionaries or sets cannot alter
+the serialized result or its fingerprint.
+
+The canonical tree is explicitly tagged as map, sequence, set, scalar, or null.
+Map entries, ordered sequence items, repeated pair values, empty containers and
+nested container kinds therefore remain distinct in both serialization and
+fingerprints.  Sets are ordered by their complete tagged canonical encoding,
+not a shortened hash.  Preparation selected-ID, candidate-count and diagnostic
+pair sequences use the same lossless representation without dictionary
+inference or repeated-key collapse.
+
+The independent finite-table regression covers failed-then-feasible siblings,
+multiple complete failures in a non-exhaustive portfolio, an exhaustive
+all-failed portfolio, complete failure mixed with incompleteness, candidate
+order permutations, input/control substitution, malformed numeric/Boolean
+values, deep-mutation adversaries, and the real deadline-bound context adapter.
+A direct domain oracle additionally covers empty, partial, duplicate,
+multi-choice, unknown and non-string success selections, plus failure carrying
+partial diagnostic selections without authority.  Canonical collision tests
+distinguish maps from pair sequences, repeated pairs, empty map/sequence/set
+values, nested forms and set construction order.
+A public single-NAND production regression reaches the real lazy producer and
+Setup consumer, then separately proves same-id technology, policy,
+placement/resource, selected-access binding, routing-envelope and objective
+changes produce directly unequal manifests and fail before routing; selected
+input/control/missing-result substitution also fails at that consumer.  This is
+candidate-result transport and selection hardening;
+it does not add Physical legality, convert incomplete evidence to
+unsatisfiability, expand search controls, establish global optimality, or claim
+R2 acceptance.  FullAdder's prior `incomplete-template-domain` observation is
+acceptance evidence only and adds no circuit-specific production behavior.
+
 [contracts]: ../../../../PhysicalDesign/Contracts/PlacementAccess.py
 [catalog]: ../../../../PhysicalDesign/Placement/Access/Catalog.py
 [handoff]: ../../../../PhysicalDesign/Contracts/PlacementAccessHandoff.py
