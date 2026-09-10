@@ -9,8 +9,12 @@ import pytest
 
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
 from PhysicalDesign.Contracts.PlacementAccess import (
-    PlacementAccessConflictCore, PlacementAccessSolveResult, PlacementAccessSolveStatus,
-    PlacedPinAccessOption, SelectedPlacementPinAccessWitness,
+    BuildPlacementAccessDomainControlsFingerprint,
+    PlacementAccessConflictCore,
+    PlacementAccessSolveResult, PlacementAccessSolveStatus,
+    PlacedPinAccessOptionDomain,
+    PlacedPinAccessOption, PlacementAccessPatternAttemptReason,
+    PlacementAccessPatternAttemptStatus, SelectedPlacementPinAccessWitness,
 )
 from PhysicalDesign.Contracts.PlacementAccessHandoff import (
     PlacementPinAccessStageObservation, PlacementPinAccessStages,
@@ -62,7 +66,24 @@ def _Changed(Value):
 def test_solve_and_witness_round_trip_every_status(Access):
     _Gate, Graph, Domains, Solve = Access
     IncompleteDomain = replace(Domains[0], Complete=False, IncompleteReason="catalog-domain-generation-work-cap")
-    EmptyDomain = replace(Domains[0], Options=(), GeneratedOptionCount=0)
+    EmptyDomain = replace(
+        Domains[0],
+        Options=(),
+        PatternAttempts=tuple(
+            replace(
+                Attempt,
+                Status=PlacementAccessPatternAttemptStatus.Rejected,
+                Reason=(
+                    PlacementAccessPatternAttemptReason.
+                    TerminalOrBridgeUnavailable
+                ),
+                OptionFingerprint=None,
+            )
+            for Attempt in Domains[0].PatternAttempts
+        ),
+        GeneratedOptionCount=0,
+        RejectedOptionCount=len(Domains[0].PatternAttempts),
+    )
     Results = (
         Solve,
         SolvePlacedPinAccessOptionDomains((IncompleteDomain, *Domains[1:]), ResourceGraph=Graph),
@@ -77,6 +98,147 @@ def test_solve_and_witness_round_trip_every_status(Access):
     assert SelectedPlacementPinAccessWitness.FromDictionary(_Json(Witness)) == Witness
     for Option in Witness.Selections:
         assert PlacedPinAccessOption.FromDictionary(_Json(Option)) == Option
+
+
+def _RichDomain(Access):
+    Gate, Graph, _Domains, _Solve = Access
+    Domains = EnumeratePlacedPinAccessOptionDomains(
+        (Gate,),
+        ResourceGraph=Graph,
+        Technology=Technology,
+    )
+    return Graph, next(Domain for Domain in Domains if Domain.Role == "Source")
+
+
+def test_complete_domain_requires_exact_manifest_and_bijective_legal_links(Access):
+    _Graph, Domain = _RichDomain(Access)
+    Removed = next(
+        Attempt
+        for Attempt in Domain.PatternAttempts
+        if Attempt.PatternFamily == "planar-jog"
+    )
+    RemainingAttempts = tuple(
+        Attempt for Attempt in Domain.PatternAttempts if Attempt != Removed
+    )
+    RemainingOptions = tuple(
+        Option
+        for Option in Domain.Options
+        if Option.PlacedBindingFingerprint != Removed.OptionFingerprint
+    )
+
+    with pytest.raises(ValueError, match="manifest"):
+        replace(
+            Domain,
+            PatternAttempts=RemainingAttempts,
+            Options=RemainingOptions,
+            GeneratedOptionCount=len(RemainingAttempts),
+        )
+
+    First, Second, *_Rest = Domain.PatternAttempts
+    AliasedAttempts = tuple(
+        replace(Second, OptionFingerprint=First.OptionFingerprint)
+        if Attempt is Second else Attempt
+        for Attempt in Domain.PatternAttempts
+    )
+    AliasedOptions = tuple(
+        Option
+        for Option in Domain.Options
+        if Option.PlacedBindingFingerprint != Second.OptionFingerprint
+    )
+    with pytest.raises(ValueError, match="one legal attempt"):
+        replace(
+            Domain,
+            PatternAttempts=AliasedAttempts,
+            Options=AliasedOptions,
+        )
+
+
+def test_complete_domain_controls_and_global_work_are_not_self_declared(Access):
+    Graph, Domain = _RichDomain(Access)
+    StraightAttempts = tuple(
+        Attempt
+        for Attempt in Domain.PatternAttempts
+        if Attempt.PatternFamily == "straight"
+    )
+    StraightManifest = tuple(
+        Requirement
+        for Requirement in Domain.RequiredPatternManifest
+        if Requirement.PatternFamily == "straight"
+    )
+    StraightOptions = tuple(
+        Option
+        for Option in Domain.Options
+        if Option.PatternFamily == "straight"
+    )
+
+    with pytest.raises(ValueError, match="control"):
+        replace(
+            Domain,
+            EnabledPatternFamilies=("straight",),
+            RequiredPatternManifest=StraightManifest,
+            PatternAttempts=StraightAttempts,
+            Options=StraightOptions,
+            GeneratedOptionCount=1,
+        )
+    with pytest.raises(ValueError, match="work"):
+        replace(
+            Domain,
+            MaximumGenerationWork=1,
+            EvaluationControlsFingerprint=(
+                BuildPlacementAccessDomainControlsFingerprint(
+                    EnabledPatternFamilies=Domain.EnabledPatternFamilies,
+                    CatalogVersion=Domain.CatalogVersion,
+                    MaximumGenerationWork=1,
+                )
+            ),
+        )
+
+    Gate, _Graph, _Domains, _Solve = Access
+    Domains = EnumeratePlacedPinAccessOptionDomains(
+        (Gate,),
+        ResourceGraph=Graph,
+        Technology=Technology,
+    )
+    ForgedSharedCap = tuple(
+        replace(
+            Value,
+            MaximumGenerationWork=4,
+            EvaluationControlsFingerprint=(
+                BuildPlacementAccessDomainControlsFingerprint(
+                    EnabledPatternFamilies=Value.EnabledPatternFamilies,
+                    CatalogVersion=Value.CatalogVersion,
+                    MaximumGenerationWork=4,
+                )
+            ),
+        )
+        for Value in Domains
+    )
+    with pytest.raises(ValueError, match="global generation work"):
+        SolvePlacedPinAccessOptionDomains(
+            ForgedSharedCap,
+            ResourceGraph=Graph,
+        )
+
+
+def test_strict_domain_codec_rejects_truncated_required_pattern_evidence(Access):
+    _Graph, Domain = _RichDomain(Access)
+    Payload = _Json(Domain)
+    Removed = Payload["PatternAttempts"].pop()
+    Payload["RequiredPatternManifest"] = [
+        Requirement
+        for Requirement in Payload["RequiredPatternManifest"]
+        if Requirement["AttemptId"] != Removed["AttemptId"]
+    ]
+    Payload["Options"] = [
+        Option
+        for Option in Payload["Options"]
+        if Option["PlacedBindingFingerprint"] != Removed["OptionFingerprint"]
+    ]
+    Payload["OptionCount"] = len(Payload["Options"])
+    Payload["GeneratedOptionCount"] -= 1
+
+    with pytest.raises(ValueError):
+        PlacedPinAccessOptionDomain.FromDictionary(Payload)
 
 
 def test_each_serialized_option_field_rejects_single_field_corruption(Access):
@@ -186,7 +348,12 @@ def test_stage_one_generation_and_search_deadlines_never_publish_a_core(Access):
             Stage="PlacementAccessSolve", Detail="deadline expired",
         ))
     with pytest.raises(RoutingStageError):
-        EnumeratePlacedPinAccessOptionDomains((Gate,), ResourceGraph=Graph, Technology=Technology, WorkCheck=Expired)
+        EnumeratePlacedPinAccessOptionDomains(
+            (Gate,),
+            ResourceGraph=Graph,
+            Technology=Technology,
+            WorkCheck=Expired,
+        )
     Capped = SolvePlacedPinAccessOptionDomains(Domains, ResourceGraph=Graph, MaximumExpansions=1)
     assert Capped.Status is PlacementAccessSolveStatus.Incomplete
     assert Capped.ConflictCore is None
