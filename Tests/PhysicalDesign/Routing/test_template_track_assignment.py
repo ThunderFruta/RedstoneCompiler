@@ -9,7 +9,7 @@ from PhysicalDesign.Routing.Global.Orchestration.RunModels import RawTrackAssign
 from PhysicalDesign.Routing.Global.Assignment.TrackPortfolio import BuildTrackAssignmentPreparationFromRawDomain
 from PhysicalDesign.Resources.ResourceGraph import RoutingResourceClaims
 from PhysicalDesign.Runtime.Reliability import RoutingDeadline
-from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolio, RawTrackAssignmentPortfolioTemplate, RawTrackAssignmentProblem, RawTrackAssignmentTemplate, SolveRawTrackAssignmentPortfolio, SolveRawTrackAssignmentProblem, SolveRawTrackAssignmentProblemWithContext
+from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentCandidateInputManifest, RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolio, RawTrackAssignmentPortfolioTemplate, RawTrackAssignmentProblem, RawTrackAssignmentTemplate, SolveRawTrackAssignmentPortfolio, SolveRawTrackAssignmentProblem, SolveRawTrackAssignmentProblemWithContext
 
 
 def BuildDomain(
@@ -55,6 +55,22 @@ def BuildTemplate(
         TemplateId=TemplateId,
         Objective=Objective,
         Domain=BuildDomain(TemplateId, **DomainArguments),
+    )
+
+
+def BuildPortfolioTemplate(
+    TemplateId: str,
+    Objective: tuple[int, ...],
+) -> RawTrackAssignmentPortfolioTemplate:
+    Manifest = RawTrackAssignmentCandidateInputManifest.Capture({
+        "CandidateId": TemplateId,
+        "Fixture": "template-track-assignment",
+    })
+    return RawTrackAssignmentPortfolioTemplate(
+        TemplateId=TemplateId,
+        Objective=Objective,
+        MaterializationInputFingerprint=Manifest.ManifestFingerprint,
+        MaterializationInputManifest=Manifest,
     )
 
 
@@ -170,11 +186,7 @@ def test_zero_expansion_empty_native_domain_retains_failure_net():
 
 def test_fixed_portfolio_materializes_only_through_first_witness():
     Descriptors = tuple(
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId=TemplateId,
-            Objective=(Index,),
-            MaterializationInputFingerprint=f"input-{TemplateId}",
-        )
+        BuildPortfolioTemplate(TemplateId, (Index,))
         for Index, TemplateId in enumerate(("compact", "incumbent", "worse"))
     )
     Materialized: list[str] = []
@@ -184,6 +196,12 @@ def test_fixed_portfolio_materializes_only_through_first_witness():
         Materialized.append(Descriptor.TemplateId)
         return RawTrackAssignmentMaterialization(
             TemplateId=Descriptor.TemplateId,
+            MaterializationInputFingerprint=(
+                Descriptor.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=(
+                Descriptor.MaterializationInputManifest
+            ),
             Domain=BuildDomain(Descriptor.TemplateId),
             Complete=True,
         )
@@ -224,11 +242,7 @@ def test_fixed_portfolio_materializes_only_through_first_witness():
 
 def test_incomplete_portfolio_materialization_is_terminal():
     Descriptors = tuple(
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId=TemplateId,
-            Objective=(Index,),
-            MaterializationInputFingerprint=f"input-{TemplateId}",
-        )
+        BuildPortfolioTemplate(TemplateId, (Index,))
         for Index, TemplateId in enumerate(("compact", "incumbent"))
     )
     Materialized: list[str] = []
@@ -237,6 +251,12 @@ def test_incomplete_portfolio_materialization_is_terminal():
         Materialized.append(Descriptor.TemplateId)
         return RawTrackAssignmentMaterialization(
             TemplateId=Descriptor.TemplateId,
+            MaterializationInputFingerprint=(
+                Descriptor.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=(
+                Descriptor.MaterializationInputManifest
+            ),
             Domain=None,
             Complete=False,
             IncompleteReason="fixed-domain-work-cap",
@@ -265,21 +285,9 @@ def test_incomplete_portfolio_materialization_is_terminal():
 def test_equal_objective_incomplete_member_prevents_early_commit():
     """A tied partial member cannot be hidden behind an earlier witness."""
     Descriptors = (
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="compact",
-            Objective=(4, 8),
-            MaterializationInputFingerprint="input-compact",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="compact-tie",
-            Objective=(4, 8),
-            MaterializationInputFingerprint="input-compact-tie",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="worse",
-            Objective=(5, 7),
-            MaterializationInputFingerprint="input-worse",
-        ),
+        BuildPortfolioTemplate("compact", (4, 8)),
+        BuildPortfolioTemplate("compact-tie", (4, 8)),
+        BuildPortfolioTemplate("worse", (5, 7)),
     )
     Materialized: list[str] = []
     NativeCalls: list[str] = []
@@ -289,12 +297,24 @@ def test_equal_objective_incomplete_member_prevents_early_commit():
         if Descriptor.TemplateId == "compact-tie":
             return RawTrackAssignmentMaterialization(
                 TemplateId=Descriptor.TemplateId,
+                MaterializationInputFingerprint=(
+                    Descriptor.MaterializationInputFingerprint
+                ),
+                MaterializationInputManifest=(
+                    Descriptor.MaterializationInputManifest
+                ),
                 Domain=None,
                 Complete=False,
                 IncompleteReason="fixed-domain-work-cap",
             )
         return RawTrackAssignmentMaterialization(
             TemplateId=Descriptor.TemplateId,
+            MaterializationInputFingerprint=(
+                Descriptor.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=(
+                Descriptor.MaterializationInputManifest
+            ),
             Domain=BuildDomain(Descriptor.TemplateId),
             Complete=True,
         )
@@ -329,21 +349,9 @@ def test_equal_objective_incomplete_member_prevents_early_commit():
 def test_equal_prefix_uses_resolved_material_access_objective():
     """Geometry/layer ties resolve only after every fixed factor is built."""
     Descriptors = (
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="more-access-material",
-            Objective=(4, 8, 2),
-            MaterializationInputFingerprint="input-more-access-material",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="less-access-material",
-            Objective=(4, 8, 2),
-            MaterializationInputFingerprint="input-less-access-material",
-        ),
-        RawTrackAssignmentPortfolioTemplate(
-            TemplateId="worse-footprint",
-            Objective=(5, 7, 1),
-            MaterializationInputFingerprint="input-worse-footprint",
-        ),
+        BuildPortfolioTemplate("more-access-material", (4, 8, 2)),
+        BuildPortfolioTemplate("less-access-material", (4, 8, 2)),
+        BuildPortfolioTemplate("worse-footprint", (5, 7, 1)),
     )
     Materialized: list[str] = []
 
@@ -356,6 +364,12 @@ def test_equal_prefix_uses_resolved_material_access_objective():
         )
         return RawTrackAssignmentMaterialization(
             TemplateId=Descriptor.TemplateId,
+            MaterializationInputFingerprint=(
+                Descriptor.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=(
+                Descriptor.MaterializationInputManifest
+            ),
             Domain=BuildDomain(Descriptor.TemplateId),
             Complete=True,
             ResolvedObjective=(4, 8, 2, AccessMaterial, 3, 0),
@@ -392,11 +406,7 @@ def test_equal_prefix_uses_resolved_material_access_objective():
 
 
 def test_resolved_objective_cannot_change_declared_selection_prefix():
-    Descriptor = RawTrackAssignmentPortfolioTemplate(
-        TemplateId="compact",
-        Objective=(4, 8, 2),
-        MaterializationInputFingerprint="input-compact",
-    )
+    Descriptor = BuildPortfolioTemplate("compact", (4, 8, 2))
 
     with pytest.raises(ValueError, match="retain its declared selection prefix"):
         SolveRawTrackAssignmentPortfolio(
@@ -406,6 +416,12 @@ def test_resolved_objective_cannot_change_declared_selection_prefix():
             ),
             lambda Value: RawTrackAssignmentMaterialization(
                 TemplateId=Value.TemplateId,
+                MaterializationInputFingerprint=(
+                    Value.MaterializationInputFingerprint
+                ),
+                MaterializationInputManifest=(
+                    Value.MaterializationInputManifest
+                ),
                 Domain=BuildDomain(Value.TemplateId),
                 Complete=True,
                 ResolvedObjective=(3, 8, 2, 0),

@@ -6,7 +6,7 @@ from dataclasses import replace
 import os
 from typing import Any, Callable, Iterable
 from PhysicalDesign.Routing.Pcb import PrepareRawTrackAssignmentDomain, PrepareTrackAssignment
-from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolioTemplate
+from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentCandidateInputManifest, RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolioTemplate
 from PhysicalDesign.Contracts.Placement import TrackAssignmentPreparation
 from PhysicalDesign.Contracts.Results import RoutedDesign
 from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
@@ -26,6 +26,7 @@ from .Candidates import (
     PcbPlacementCandidate,
 )
 from .AccessEnvelope import (
+    _PlacementCorePayload,
     CurrentSelectedAccessEnvelopePhase,
     CurrentSelectedAccessTransition,
     RequireCurrentSelectedAccessEnvelopeReady,
@@ -74,6 +75,158 @@ def RebuildCurrentCandidateTrackPreparation(
         Deadline=Context.InterfaceDeadline,
         DeferClusterBoundaryLeaseUntilCapacityPrecheck=False,
     )
+
+
+def BuildRawTemplateMaterializationInputManifest(
+    Context,
+    Candidate: PcbPlacementCandidate,
+    FabricDescriptor,
+    *,
+    Resources: Any,
+) -> RawTrackAssignmentCandidateInputManifest:
+    """Capture every semantic input used to materialize one raw candidate."""
+    if type(Candidate) is not PcbPlacementCandidate:
+        raise TypeError("raw materialization candidate must be exact")
+    if type(Candidate.EstimatedGlobalExtensionNodes) is not int:
+        raise TypeError(
+            "candidate estimated extension nodes must be an exact int"
+        )
+    if type(Context.Policy) is not PhysicalDesignPolicy:
+        raise TypeError("raw materialization policy must be exact")
+    MandatoryAccessOwnershipFingerprint = (
+        Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+        if Candidate.TopologyDemand is not None
+        else ""
+    )
+    IncludeLocalClaims = (
+        Candidate.PlacementFingerprintIncludesLocalClaims
+        if type(Candidate.PlacementFingerprintIncludesLocalClaims) is bool
+        else True
+    )
+    CandidatePolicy = (
+        BuildFrozenEnvelopeRoutingPolicy(
+            Context.Policy,
+            Candidate.RoutingEnvelope,
+        )
+        if Candidate.RoutingEnvelope is not None
+        else Context.Policy
+    )
+    ResourceModelFingerprint = BuildPlacedPinAccessModelFingerprint(
+        Candidate.Placement.Placed.PlacedGates,
+        ResourceGraph=Resources.ResourceGraph,
+        PreOwnedNodesBySignal=(
+            Candidate.Placement.Placed.FrozenNetWires or {}
+        ),
+    )
+    PlacementSolve = Candidate.Placement.PlacementAccessSolve
+    SelectedWitness = Candidate.Placement.SelectedPinAccessWitness
+    SolveBinding = Candidate.PlacementAccessSolveBinding
+    RoutingEnvelope = Candidate.RoutingEnvelope
+    Shell = FabricDescriptor.Shell
+    return RawTrackAssignmentCandidateInputManifest.Capture({
+        "Candidate": {
+            "CandidateId": Candidate.CandidateId,
+            "SourceGenerator": Candidate.SourceGenerator,
+            "RoutingSpacing": Candidate.RoutingSpacing,
+            "PlacementFingerprint": Candidate.PlacementFingerprint,
+            "ObservedPlacementFingerprint": BuildPlacementFingerprint(
+                Candidate.Placement,
+                MandatoryAccessOwnershipFingerprint,
+                IncludeLocalClaims=IncludeLocalClaims,
+            ),
+            "PlacementRetentionFingerprint": (
+                Candidate.PlacementRetentionFingerprint
+            ),
+            "ObservedPlacementRetentionFingerprint": (
+                BuildPlacementRetentionFingerprint(
+                    Candidate.Placement,
+                    MandatoryAccessOwnershipFingerprint,
+                    IncludeLocalClaims=IncludeLocalClaims,
+                )
+            ),
+            "PlacementFingerprintIncludesLocalClaims": (
+                Candidate.PlacementFingerprintIncludesLocalClaims
+            ),
+            "InterfaceTopologyFingerprint": (
+                Candidate.InterfaceTopologyFingerprint
+            ),
+            "MandatoryAccessOwnershipFingerprint": (
+                MandatoryAccessOwnershipFingerprint
+            ),
+            "PlacementCoreFingerprint": BuildStableFingerprint(
+                _PlacementCorePayload(Candidate.Placement)
+            ),
+            "PlacementCorePayload": _PlacementCorePayload(
+                Candidate.Placement
+            ),
+        },
+        "SelectedAccess": {
+            "SolveBinding": (
+                SolveBinding.ToDictionary()
+                if SolveBinding is not None
+                else None
+            ),
+            "SolveResult": (
+                PlacementSolve.ToDictionary()
+                if PlacementSolve is not None
+                else None
+            ),
+            "SelectedWitness": (
+                SelectedWitness.ToDictionary()
+                if SelectedWitness is not None
+                else None
+            ),
+        },
+        "Policy": Context.Policy.ToDictionary(),
+        "FrozenEnvelopeRoutingPolicy": CandidatePolicy.ToDictionary(),
+        "TechnologyFingerprint": BuildPinAccessTechnologyFingerprint(
+            Context.Technology
+        ),
+        "ResourceModelFingerprint": ResourceModelFingerprint,
+        "RoutingEnvelope": (
+            RoutingEnvelope.ToDictionary()
+            if RoutingEnvelope is not None
+            else None
+        ),
+        "FabricDescriptor": {
+            "CandidateId": FabricDescriptor.CandidateId,
+            "TopologyKind": FabricDescriptor.TopologyKind,
+            "AccessRingTrackCount": FabricDescriptor.AccessRingTrackCount,
+            "DeriveLegalEscapeWorkLimit": (
+                FabricDescriptor.DeriveLegalEscapeWorkLimit
+            ),
+            "ObjectivePrefix": FabricDescriptor.ObjectivePrefix,
+            "DescriptorConstructionFingerprint": (
+                FabricDescriptor.MaterializationInputFingerprint
+            ),
+            "ShellFingerprint": (
+                Shell.ShellFingerprint if Shell is not None else ""
+            ),
+            "ShellBounds": (
+                Shell.OuterBounds if Shell is not None else None
+            ),
+            "ShellActiveFaces": (
+                Shell.ActiveFaces if Shell is not None else ()
+            ),
+        },
+        "ResolvedObjectiveInputs": {
+            "ObjectivePrefix": FabricDescriptor.ObjectivePrefix,
+            "EstimatedGlobalExtensionNodes": (
+                Candidate.EstimatedGlobalExtensionNodes
+            ),
+            "AccessLength": (
+                Context.Technology.AccessLength
+                if Context.Policy.PlacementAccess.Enabled
+                else RoutingEnvelope.AccessLength
+                if RoutingEnvelope is not None
+                else None
+            ),
+            "AccessMaterialSource": "placement-access-fabric-physical-claims",
+        },
+        "PortfolioMode": {
+            "SinglePackedComponent": Context.SinglePackedComponent,
+        },
+    })
 
 
 def _SelectedAccessInvariant(
@@ -375,9 +528,6 @@ def MaterializeRawTemplate(Context, Descriptor: RawTrackAssignmentPortfolioTempl
     Candidate = Context.CandidateById.get(Descriptor.TemplateId)
     if Candidate is None:
         raise RuntimeError('raw pre-route portfolio is missing its candidate')
-    Existing = Context.RawTrackAssignmentMaterializations.get(Descriptor.TemplateId)
-    if Existing is not None:
-        return Existing
     FabricDescriptor = Context.PreRouteFabricDescriptorsByCandidateId.get(Descriptor.TemplateId)
     if FabricDescriptor is None:
         raise RuntimeError('raw pre-route portfolio is missing its fixed fabric descriptor')
@@ -389,6 +539,33 @@ def MaterializeRawTemplate(Context, Descriptor: RawTrackAssignmentPortfolioTempl
             Diagnostics,
         ),
     )
+    CurrentInputManifest = BuildRawTemplateMaterializationInputManifest(
+        Context,
+        Candidate,
+        FabricDescriptor,
+        Resources=CandidateResources,
+    )
+    if CurrentInputManifest != Descriptor.MaterializationInputManifest:
+        if Context.Policy.PlacementAccess.Enabled:
+            ValidateCurrentSelectedPlacementAccessConsumer(
+                Candidate.Placement,
+                Resources=CandidateResources,
+                Technology=Context.Technology,
+                ConsumerId=Candidate.CandidateId,
+                PlacementFingerprint=Candidate.PlacementFingerprint,
+            )
+        raise ValueError(
+            "raw pre-route candidate inputs changed before materialization"
+        )
+    Existing = Context.RawTrackAssignmentMaterializations.get(
+        Descriptor.TemplateId
+    )
+    if Existing is not None:
+        if Existing.MaterializationInputManifest != CurrentInputManifest:
+            raise ValueError(
+                "cached raw pre-route materialization has stale inputs"
+            )
+        return Existing
     RoutingAwarePlacementAccess = bool(
         Context.Policy.PlacementAccess.Enabled
     )
@@ -472,7 +649,7 @@ def MaterializeRawTemplate(Context, Descriptor: RawTrackAssignmentPortfolioTempl
             RequireSelectedPinAccessWitness=RoutingAwarePlacementAccess,
         )
     except RoutingStageError as Error:
-        Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, Domain=None, Complete=False, IncompleteReason=Error.Failure.Reason.value if hasattr(Error.Failure.Reason, 'value') else str(Error.Failure.Reason), Diagnostics=(('Candidate', Candidate.ToDictionary()), ('PlacementAccessFabricFailure', Error.Failure.ToDictionary()), ('FabricDescriptor', FabricDescriptor.ToDictionary())))
+        Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, MaterializationInputFingerprint=Descriptor.MaterializationInputFingerprint, MaterializationInputManifest=CurrentInputManifest, Domain=None, Complete=False, IncompleteReason=Error.Failure.Reason.value if hasattr(Error.Failure.Reason, 'value') else str(Error.Failure.Reason), Diagnostics=(('Candidate', Candidate.ToDictionary()), ('PlacementAccessFabricFailure', Error.Failure.ToDictionary()), ('FabricDescriptor', FabricDescriptor.ToDictionary())))
         Context.RawTrackAssignmentMaterializations[Descriptor.TemplateId] = Result
         return Result
     AttachedPlacement = AttachPlacementAccessFabric(Candidate.Placement, Fabric)
@@ -485,17 +662,17 @@ def MaterializeRawTemplate(Context, Descriptor: RawTrackAssignmentPortfolioTempl
     Template = PublishPreRouteTemplate(Context, Candidate, Fabric, None)
     Context.TemplateById[Candidate.CandidateId] = Template
     if Fabric is None or not Fabric.Complete:
-        Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, Domain=None, Complete=False, IncompleteReason=Fabric.IncompleteReason if Fabric is not None and Fabric.IncompleteReason else 'missing-access-fabric', Diagnostics=(('PlacementAccessFabric', SummarizePreRouteAccessFabric(Fabric)), ('FabricDescriptor', FabricDescriptor.ToDictionary())), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
+        Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, MaterializationInputFingerprint=Descriptor.MaterializationInputFingerprint, MaterializationInputManifest=CurrentInputManifest, Domain=None, Complete=False, IncompleteReason=Fabric.IncompleteReason if Fabric is not None and Fabric.IncompleteReason else 'missing-access-fabric', Diagnostics=(('PlacementAccessFabric', SummarizePreRouteAccessFabric(Fabric)), ('FabricDescriptor', FabricDescriptor.ToDictionary())), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
         Context.RawTrackAssignmentMaterializations[Descriptor.TemplateId] = Result
         return Result
     CandidatePolicy = BuildFrozenEnvelopeRoutingPolicy(Context.Policy, Candidate.RoutingEnvelope) if Candidate.RoutingEnvelope is not None else Context.Policy
     try:
         RawDomain = PrepareRawTrackAssignmentDomain(Candidate.Placement, Resources=CandidateResources, Policy=CandidatePolicy, Deadline=Context.Deadline)
     except RoutingStageError as Error:
-        Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, Domain=None, Complete=False, IncompleteReason=Error.Failure.Reason.value if hasattr(Error.Failure.Reason, 'value') else str(Error.Failure.Reason), Diagnostics=(('Candidate', Candidate.ToDictionary()), ('RawDomainFailure', Error.Failure.ToDictionary()), ('FabricDescriptor', FabricDescriptor.ToDictionary())), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
+        Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, MaterializationInputFingerprint=Descriptor.MaterializationInputFingerprint, MaterializationInputManifest=CurrentInputManifest, Domain=None, Complete=False, IncompleteReason=Error.Failure.Reason.value if hasattr(Error.Failure.Reason, 'value') else str(Error.Failure.Reason), Diagnostics=(('Candidate', Candidate.ToDictionary()), ('RawDomainFailure', Error.Failure.ToDictionary()), ('FabricDescriptor', FabricDescriptor.ToDictionary())), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
         Context.RawTrackAssignmentMaterializations[Descriptor.TemplateId] = Result
         return Result
-    Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, Domain=RawDomain, Complete=RawDomain.Complete, IncompleteReason=RawDomain.IncompleteReason, Diagnostics=(('PlacementAccessFabric', SummarizePreRouteAccessFabric(Fabric)),), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
+    Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, MaterializationInputFingerprint=Descriptor.MaterializationInputFingerprint, MaterializationInputManifest=CurrentInputManifest, Domain=RawDomain, Complete=RawDomain.Complete, IncompleteReason=RawDomain.IncompleteReason, Diagnostics=(('PlacementAccessFabric', SummarizePreRouteAccessFabric(Fabric)),), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
     Context.RawTrackAssignmentMaterializations[Descriptor.TemplateId] = Result
     return Result
 
