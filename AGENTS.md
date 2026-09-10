@@ -55,3 +55,7 @@ Do not switch the protected base checkout to Router for integration; neither
 branch is a feature owner.
 
 Follow recent history with short, imperative subjects such as `Add MCHPRS validation harness and Fabric canary gate`. Keep commits scoped to one coherent change. Pull requests should explain behavior and architecture impact, list exact verification commands and results, link relevant issues, and identify generated evidence. Do not commit `Output/`, `Cache/`, `.venv/`, `RustRouting/target/`, native `.so` files, or `Runtime/FabricServer/` secrets, worlds, logs, and downloaded JARs.
+
+When resolving merge conflicts, write the commit message as plain prose. Do not
+use Markdown `#` headings or retain Git's generated `# Conflicts:` and `# <path>`
+comment block; inspect the final commit message before committing.

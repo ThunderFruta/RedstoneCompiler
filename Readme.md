@@ -40,3 +40,7 @@ The project was built and tested with:
 - Minecraft and Fabric 26.2
 
 Setup and usage instructions are in [the documentation](Docs/Readme.md).
+
+When resolving merge conflicts, write the commit message as plain prose. Do not
+use Markdown `#` headings or retain Git's generated `# Conflicts:` and `# <path>`
+comment block; inspect the final commit message before committing.

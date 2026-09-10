@@ -255,6 +255,8 @@ remain `UNVERIFIED`.
 | `N1-N4-Runtime-Work-Authority-Contracts` | `Runtime-And-Kernels`; work/result contracts and cleanup authority policy | Policy `fbd7c81050bb2b54c03348adeee54695b59d4474` then contract `142c288cadcad448139db63b95c193424cf23d7a`; seven full blobs integrated as Router `691daa142b5cd30e348f6c87ee07479844061cbc` | Independent N1 state axes; immutable explicit useful-work and cleanup cutoffs, exact Boolean force grant; closed authority codec without defaults or ordering policy | Full imported module and tests independently reviewed; 52 contract tests, 7 structural/schema, full 1,939 passed / 4 skipped / 378 subtests on unchanged Router native | Source contracts only. Bounded/spawned adapters, actual authority propagation, process supervision and R6/R7/N4 lifecycle behavior remain separate; Joint native import does not include this Python closure |
 | `R6-N4-Owned-OneShot-Supervision` | `Runtime-And-Kernels`; explicit one-shot process and resource ownership | Producer `a264da03033120d54c05c375bbd28a0b57fdb154` plus test correction `880a1a359f5569c940eb218abeb8020c5c23bfc5`, integrated as Router `86ee2206ebd47458f541e745a7cd36c917192930` | Bounded encoded-byte transport, per-invocation result binding, explicit cancellation/force/reap/close and retained uncertain ownership; corrected test proves body entry and the same live child across the original cleanup cutoff | Exact two postimages; fresh independent Router review; single regression, 40 owning cases, 7 structural and full 2,060 passed / 5 skipped / 378 subtests; all observed resources closed without fallback | Linux/spawn supervision after Process.start only; startup bound, live caller, pools, persistent workers, full R6/N4 and physical acceptance remain open |
 | `R10-N2-DustStrength-Boundary-Fixtures` | `Physical-Rules`; literal at-limit and beyond-limit fixture conformance | Producer `3de1dbf9ee78c6ab9e84832422a7f385296aed98`, parent `af4984b28025d45a53f82895f8ed55a71ef5f1bc`; Router intake pending | F15 transfers Boolean on to the endpoint, F16 does not; both off transitions retain false, with independently observed root power | Ten exact owner paths; independent review and parent authentication passed; 44 source, 7 observer, 15 cases across 7 definitions; source-bound full 1,572 passed / 4 skipped / 257 subtests | Finite literal Boolean endpoint/root observations only; overlapping later full runs/JUnit are functional corroboration, with no performance or general physical/Fabric acceptance claim |
+| `R10-N2-Complete-Access-Domain-Evaluation` | `Physical-Rules`; access-domain construction and current validation | Producer `088a005c024d7da22ea8bd9f2028d96bd0015d7c`, parent `ea2e22d8f8743417691fdb25a642bb6427e8955f`; integrated by Router merge `6a102e4a98e2d080c5171fc7e5bd378f799609d7` | Frozen live evaluation controls and an exact required-pattern manifest make feasible or scoped-unsatisfiable evidence authoritative only after every required pattern is evaluated under one re-attested input; exhaustion, missing controls, malformed evidence and drift remain typed non-success | Eleven exact producer postimages; fresh combined Router boundary 65, Physical 182, structural/schema 7, 2,455 collected and full 2,450 passed / 5 skipped / 378 subtests | Integrated bounded producer contract. Fresh expanded acceptance remained 0/7: HalfAdder, RCA4 and DecimalToBinary4 reported complete typed access unsatisfiability; no physical design or backend phase was reached. Full R10/N2 and promotion readiness remain open |
+| `R2-N3-Candidate-Preparation-Results` | `Joint-Physical-Design`; lazy pre-route result transport and selected Setup consumer | Producer `7f1a97dfc07fdba05056c49a52a5ab4a5b00c02e`, parent `ea2e22d8f8743417691fdb25a642bb6427e8955f`; integrated by Router merge `a40f86a4f0f8eb7c1027ec5e96186a9c4c18cee8` after the Physical merge above | Immutable candidate-specific `CompleteFeasible`, `CompleteFailed` and `Incomplete` outcomes retain exact candidate input, portfolio and work-control identities; only the matching feasible result may supply selected preparation, while outer-portfolio completeness remains separate | Nine exact producer postimages; fresh combined Router candidate/pre-route 110, explicit dual-caller/generator 2, structural/schema 7 and full 2,450 passed / 5 skipped / 378 subtests | Integrated deterministic result/selection boundary. Fresh acceptance retained incomplete-template-domain for FullAdder/TFlipFlopLatch and produced no physical/backend case; no worker commitment, reuse authority, global optimality, backend acceptance or promotion claim |
 
 Only code dependencies with actual recorded providers are asserted above. New
 joint-selection, alternate-access, worker, or capacity branches are not implied
@@ -1203,3 +1205,120 @@ matrix, Fabric acceptance, performance acceptance, promotion readiness, a
 push, or a change to protected `main`. Independent review remains a separate
 readiness gate, and the preserved capability-proven claims retain their
 original scopes.
+
+## 2026-09-10 access-domain and candidate-preparation checkpoints integrated
+
+The authenticated Router starting revision was
+`85a494318e50415f22aba53095a9a0d15dcbeb80`, tree
+`6ac6ce6acc027a4e79f75d92f5ba61bfddb9caf5`, with ordered parents
+`edb808bc3be36d0adf3351ae17364b5460db03a9` and
+`00fc924612f39a331ecfbcd9a5268a834654c986`. Its tree deliberately retained a
+later correction to this register and 21 checked-in Fabric harness `bin/`
+outputs that were absent from sibling merge `ea2e22d8`; neither difference was
+discarded or attributed to an unrelated task.
+
+Physical producer `088a005c024d7da22ea8bd9f2028d96bd0015d7c`, parent
+`ea2e22d8f8743417691fdb25a642bb6427e8955f`, tree
+`05038a5ebf5b69b7c42761989d6f6f517a437027`, entered Router through ordinary
+two-parent merge `6a102e4a98e2d080c5171fc7e5bd378f799609d7`, tree
+`d8e65bceb6f56b3324c84e9c5967cb7bc3704209`. Its ordered parents are the exact
+Router start and Physical producer above. The sole merge conflict was this
+register's stale pending-versus-integrated account; it was resolved by retaining
+the current Router record. All eleven Physical postimages remain byte-identical
+to the producer.
+
+Joint producer `7f1a97dfc07fdba05056c49a52a5ab4a5b00c02e`, parent
+`ea2e22d8f8743417691fdb25a642bb6427e8955f`, tree
+`a797f283460ce2171f5aaa761979f2eafecbffb4`, then entered through ordinary
+two-parent merge `a40f86a4f0f8eb7c1027ec5e96186a9c4c18cee8`, tree
+`bc1aa63d582e8ee5ce53835eda9e4577fcb57553`. Its ordered parents are the exact
+Physical-integrated Router merge and Joint producer. All nine Joint postimages
+remain byte-identical. The owner pathsets are disjoint; the final tree preserves
+all 20 owner postimages and all 22 pre-existing Router-only postimages, with no
+new harness `bin/` output introduced by these merges.
+
+The Physical contract freezes the live pattern families, catalog version and
+positive generation and assignment caps, binds them to the current-validation
+identity, and requires one exact typed attempt for every certified required
+pattern. Feasible and scoped-unsatisfiable outcomes therefore require complete,
+stable, re-attested evaluation. Missing controls, incomplete work, malformed
+links, unknown decisions and input drift cannot acquire conflict-core or routing
+authority. Joint preserves each lazy pre-route member as an immutable
+candidate-specific result with exact materialization, portfolio, objective,
+deadline and work-cap identity. Complete failure is distinct from incomplete
+work, outer-portfolio completeness remains separate, and only the matching
+complete-feasible result may supply Setup's selected track preparation.
+
+Fresh verification ran in the actual clean Router checkout with Python 3.12.3.
+All changed production modules resolved beneath that checkout. The unchanged
+imported native extension was 7,090,592 bytes with SHA-256
+`d1b5cbda5ede49428cebf47af342b6153aa3d862310317c38a4aaf212ad85d1f`;
+no native rebuild or parity claim was needed. The real current-selected-access
+boundary passed 65 tests; the four-file Physical suite passed 182; the Joint
+candidate/preparation/pre-route suite passed 110; and the two explicit
+dual-caller and generator controls passed. Compile-all passed, structural/schema
+passed 7 tests, collection found 2,455 tests, and the complete deterministic
+suite with `RC_RUN_SCALE_TESTS` unset passed 2,450 tests with 5 skips and 378
+subtests in 337.25 seconds. JUnit evidence is retained under
+`Output/RouterFirstWaveIntegration/20260910T141456Z/`.
+
+The fresh expanded seven-case command was:
+
+```bash
+env -u RC_RUN_SCALE_TESTS -u PYTHONHOME -u PYTHONPATH \
+  PYTHONNOUSERSITE=1 \
+  .venv/bin/python Tools/Routing/RunRouterAcceptance.py \
+  --date 2026-09-10 \
+  --output-root Output/RouterFirstWaveIntegration/20260910T141456Z/AcceptanceActual \
+  --python .venv/bin/python \
+  --matrix expanded
+```
+
+The command retained default v17 policy, seed zero, one run per case, no routing
+thread override, unchanged 8/13/23/28/28/13/118-second routing deadlines and
+10/15/25/30/30/15/120-second wall ceilings, a two-second publication reserve,
+the one-second maximum wall overrun and non-fail-fast execution. It completed
+all seven cases in 213.425 seconds and returned **0 passed / 7 failed / 0
+skipped**:
+
+| Case | Wall / ceiling | Authoritative outcome |
+|---|---:|---|
+| HalfAdder | 3.051 / 10 s | `PlacementAccessSolve:NoPinAccessPattern`; complete exact unsatisfiability, including stable `ForeignStaticExclusion` rejections for Sum, B and A domains |
+| FullAdder | 7.595 / 15 s | `PreRouteInterfaceSelection:ClusterInterfaceSolveIncomplete`; `incomplete-template-domain`, not unsatisfiable |
+| RCA4 | 19.382 / 25 s | `PlacementAccessSolve:NoPinAccessPattern`; complete exact unsatisfiability with stable B0-B3 self-claim conflicts |
+| RCA8 | 18.334 / 30 s | `PlacementGeneration:Stagnated`; the first row-beam direct-only candidate stopped after 65,536 assignment expansions and retained the typed next-generator outcome |
+| DecimalToBinary4 | 28.645 / 30 s | `PlacementAccessSolve:NoPinAccessPattern`; 95 stable complete domains and a complete two-resource conflict core; the final diagnostic observed the routing deadline expired |
+| TFlipFlopLatch | 14.899 / 15 s | `PreRouteInterfaceSelection:ClusterInterfaceSolveIncomplete`; `incomplete-template-domain`, not unsatisfiable |
+| CLA4 | 120.578 / 120 s | `Placement:RuntimeBudgetExceeded` during attempt 2 row-beam conflict relocation; the 0.578-second wall overrun remained within the one-second policy |
+
+The archive is retained under
+`Output/RouterFirstWaveIntegration/20260910T141456Z/AcceptanceActual/2026-09-10/Archives/20260910T144024.411357Z-a40f86a4f0f8/`.
+Its 110 `SHA256SUMS` entries verify. `AcceptanceManifest.json` and
+`BenchmarkResult.json` have SHA-256
+`a9c3257cb55e610e96e0ca4f97b1dcaccb1f355899bbf07afd00cd8b3f307dd0`;
+the archive manifest is
+`f3030e8f9d808ef86c1ecde7866bd0a41095e05031b9ede46e7db92d973b3766`.
+The manifest binds clean source `a40f86a4`, stable 294-file source aggregate
+`2fcadfc45ef36c2199f73a427345ab55782f29a6b4bee59ee90ea4ccbea395f7`,
+policy SHA-256 `e109f81fbd0596f33cb4243cbddd79d100f03889b37e1468ff1f50f1ba344fe3`
+and the unchanged imported native above.
+
+Every case stopped before physical publication. No `.PhysicalDesign.json`,
+schematic or physical fixture was produced, so MCHPRS and Fabric were
+**not reached**, not additional failures. The historical `ea2e22d8` 0/7
+archive remains distinct:
+RCA4 and DecimalToBinary4 now expose complete access-domain unsatisfiability
+rather than their earlier Runtime budget failures, and the current CLA4 wall
+observation is within the permitted overrun; these are frontier observations,
+not successful physical or performance acceptance.
+
+A live remote read later observed `origin/Router-Refactor(R10-N5)` at exact
+`a40f86a4f0f8eb7c1027ec5e96186a9c4c18cee8`. This integration task did not
+perform or attribute that push. Physical and Joint owner refs and protected
+`main` remained unchanged. This checkpoint is integrated and regression-green
+for the bounded contracts above, but the fresh routed-circuit matrix failed and
+MCHPRS, Fabric, scale, performance and promotion acceptance remain **not run**
+or unproved. Current work remains at Physical access alternatives/exclusions for
+HalfAdder, RCA4 and DecimalToBinary4; Joint template-domain completion for
+FullAdder/TFlipFlopLatch; deterministic placement advancement for RCA8; and
+bounded CLA4 placement under the existing deadline.
