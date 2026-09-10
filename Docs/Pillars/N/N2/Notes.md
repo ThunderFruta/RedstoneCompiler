@@ -347,3 +347,109 @@ not enter either executor.
 This is a narrow R10/N2 fixture-conformance candidate, not a claim about
 remote analog power, general timing, fanout, ownership, arbitrary materials,
 devices, Fabric, scale, router acceptance, or complete N2 acceptance.
+
+### 2026-09-09 placement-access domain completion candidate
+
+- **Capability packet and source.** `Physical-Placement-Access-Domain-Completion-v1`
+  starts from `Physical-Rules` commit
+  `ea2e22d8f8743417691fdb25a642bb6427e8955f`, tree
+  `de2e8e777b3f209f8d5e7554ce9fc12faab538df`. The shared Physical contract now
+  distinguishes a complete finite access domain from an empty or interrupted
+  enumeration: every enabled certified template/layer must have one canonical,
+  identity-bound attempt before the domain can support feasibility or scoped
+  unsatisfiability.
+- **Contract behavior.** Each attempt records its semantic identifier, domain,
+  template/family/layer, catalog, technology and resource-model identities,
+  typed status and closed reason, plus exact option linkage when legal or
+  deduplicated. Domain construction validates attempt ordering, uniqueness,
+  family coverage, counts, options, exact Boolean/integer types, and input-drift
+  evidence. Work-cap, cooperative deadline, missing-pattern, unknown-decision,
+  and drift outcomes remain incomplete and cannot publish a conflict core.
+  Raised outer deadline failures retain their existing typed propagation.
+- **Independent oracle and failure shields.** A literal three-pattern INPUT
+  oracle proves one legal domain and one domain where all patterns are blocked;
+  separate controls stop before the final pattern by work cap or deadline,
+  mutate the terminal before publication, reverse enumeration order, and remove
+  certified terminal patterns. These controls fail generated-count completion,
+  index-based identity, stale publication, and the former zero-options shortcut.
+- **Scope and limits.** The candidate changes the Physical producer contract and
+  only the integration fixtures needed to express truthful all-rejected domains.
+  It does not add a physical rule, enable a pattern family, change Joint
+  orchestration, recover candidates, relax legality, or alter any work bound.
+  It is uncommitted and does not establish Joint consumption, full N2 acceptance,
+  Router integration, native parity, MCHPRS, Fabric, scale, or promotion
+  readiness.
+- **Verification evidence.** The required focused suite passed **154 tests**;
+  the selected-access envelope consumer module passed **63 tests**; the
+  structural/schema gate passed **7 tests**; compile-all passed; collection
+  reported **2,346 tests**; and the final deterministic suite passed **2,341
+  tests, 5 skipped, and 378 subtests** in 401.92 seconds. Fresh retained logs
+  are under `Output/PhysicalAccessDomainCompletion/20260909T215543Z/`.
+
+### 2026-09-09 placement-access completion review correction
+
+Independent review rejected the preserved first candidate diff
+`625794c5d66098e71e201ca593bc04d9135e5db33ed8fd9eb32a6bffaea8c050`:
+its supplied family set did not prove the full per-terminal catalog universe,
+its aggregate counts admitted ambiguous legal-option linkage and forged work
+caps, and a stable final observation was indistinguishable from no observation.
+
+- **Corrected manifest and linkage.** Each domain carries the exact ordered
+  certified template/layer manifest and a one-for-one attempt set. Legal and
+  deduplicated links must agree with the retained option's template, family,
+  fingerprint, layer, catalog, technology, and resource-model identities;
+  legal links are bijective. The complete domain-set boundary validates shared
+  controls and total evaluated work under the original global cap.
+- **Corrected observation and currentness.** Every returned domain carries both
+  nonempty initial and final input fingerprints. Equality is required without
+  drift; inequality is required for typed input drift. Current Physical
+  validation recomputes the required manifest and evaluation identity before
+  classifying feasible or unsatisfiable evidence, preventing truncated or
+  invented portable domains from becoming current authority.
+- **Cross-owner dependency.** Physical cannot infer the current policy's family,
+  catalog, generation-cap, and assignment-cap values from its existing
+  validation arguments. The Joint-owned envelope and final-publication callers
+  already possess them but require a separately routed controls contract and
+  consumer change. This repair remains dependency-blocked and is not
+  capability-proven or commit-ready until that exact boundary is integrated and
+  independently reviewed.
+- **Repair evidence.** The repair root is
+  `Output/PhysicalAccessDomainCompletionRepair/20260909T230914Z/`; the rejected
+  first-candidate evidence remains immutable.
+- **Provisional verification.** The repaired Physical suite passed **160
+  tests**, the selected-envelope consumer module passed **65 tests**, the
+  structural/schema gate passed **7 tests**, compile-all passed, collection
+  reported **2,354 tests**, and the deterministic suite passed **2,349 tests,
+  5 skipped, and 378 subtests** in 326.09 seconds. The live-policy controls
+  dependency remains open, so these results are not a full N2 capability or
+  commit-readiness claim.
+
+### 2026-09-10 evaluation-controls producer migration
+
+The Physical contract now owns frozen `PlacementAccessEvaluationControls` with
+normalized enabled families, catalog version, exact positive generation cap,
+exact positive assignment cap, and a deterministic fingerprint retained by the
+v2 current-validation input identity. Lists, unsorted or repeated families,
+unknown families, empty/non-string catalog versions, Boolean integers,
+non-integers, and nonpositive caps fail closed.
+
+`ValidateCurrentSelectedPlacementAccess` remains the one public producer
+entrypoint. Its optional Python signature preserves import/call compatibility,
+not authority: omitted controls always produce
+`Unresolved/EvaluationControlsMissing`; exact supplied controls are checked
+against all domains, solve work controls, and the current recomputed catalog
+before feasible or unsatisfiable evidence can be current. A mismatch is typed
+and cannot authorize routing.
+
+Both Joint-owned live callers still omit this record on the Physical branch.
+Their migration is separately authorized and owned by Joint; until the exact
+consumer change is frozen and later verified with this producer, the current
+Physical branch deliberately blocks those consumers. No combined-source run,
+commit, integration, or N2 acceptance is claimed here.
+
+The expanded Physical producer suite passed **181 tests with 1 known
+Joint-caller test deselected**; structural/schema passed **7 tests**;
+compile-all passed; and collection reported **2,376 tests**. Direct probes of
+the unchanged current-envelope and final-publication callers both failed closed
+with missing controls. The full suite is dependency-blocked and was not run;
+the prior 2,349-pass result belongs only to the pre-controls Physical slice.

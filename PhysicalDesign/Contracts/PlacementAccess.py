@@ -548,6 +548,352 @@ class PlacedPinAccessOption:
         }
 
 
+class PlacementAccessPatternAttemptStatus(str, Enum):
+    """Typed disposition of one required catalog-pattern evaluation."""
+
+    Legal = "Legal"
+    Rejected = "Rejected"
+    Deduplicated = "Deduplicated"
+    NotEvaluated = "NotEvaluated"
+    Unknown = "Unknown"
+
+
+class PlacementAccessPatternAttemptReason(str, Enum):
+    """Closed reasons retained for one catalog-pattern disposition."""
+
+    Legal = "Legal"
+    DuplicateOption = "DuplicateOption"
+    TerminalOrBridgeUnavailable = "TerminalOrBridgeUnavailable"
+    FirstLegOccupied = "FirstLegOccupied"
+    PrimitiveUnavailable = "PrimitiveUnavailable"
+    ClaimOccupancyConflict = "ClaimOccupancyConflict"
+    SelfClaimConflict = "SelfClaimConflict"
+    ForeignClaimConflict = "ForeignClaimConflict"
+    StaticKeepOut = "StaticKeepOut"
+    ForeignStaticExclusion = "ForeignStaticExclusion"
+    WorkCap = "WorkCap"
+    Deadline = "Deadline"
+    InputDrift = "InputDrift"
+    UnknownPhysicalDecision = "UnknownPhysicalDecision"
+
+
+def BuildPlacementAccessPatternAttemptId(
+    *,
+    DomainId: str,
+    TemplateId: str,
+    PatternFamily: str,
+    TemplateFingerprint: str,
+    Layer: int,
+    CatalogVersion: str,
+    TechnologyFingerprint: str,
+    ResourceModelFingerprint: str,
+) -> str:
+    """Identify a required semantic pattern evaluation without list position."""
+    return BuildStableFingerprint({
+        "Kind": "placed-pin-access-pattern-attempt-v1",
+        "DomainId": DomainId,
+        "TemplateId": TemplateId,
+        "PatternFamily": PatternFamily,
+        "TemplateFingerprint": TemplateFingerprint,
+        "Layer": Layer,
+        "CatalogVersion": CatalogVersion,
+        "TechnologyFingerprint": TechnologyFingerprint,
+        "ResourceModelFingerprint": ResourceModelFingerprint,
+    })
+
+
+def BuildPlacementAccessDomainControlsFingerprint(
+    *,
+    EnabledPatternFamilies: tuple[str, ...],
+    CatalogVersion: str,
+    MaximumGenerationWork: int,
+) -> str:
+    """Bind the portable domain to its exact producer controls."""
+    if (
+        not EnabledPatternFamilies
+        or EnabledPatternFamilies
+        != tuple(sorted(set(EnabledPatternFamilies)))
+        or any(
+            type(Value) is not str
+            or Value not in {"straight", "planar-jog"}
+            for Value in EnabledPatternFamilies
+        )
+    ):
+        raise ValueError("placed pin-access enabled families are invalid")
+    if type(CatalogVersion) is not str or not CatalogVersion:
+        raise ValueError("placed pin-access catalog version is invalid")
+    if type(MaximumGenerationWork) is not int or MaximumGenerationWork < 1:
+        raise ValueError("placed pin-access generation cap must be positive")
+    return BuildStableFingerprint({
+        "Kind": "placed-pin-access-domain-controls-v1",
+        "EnabledPatternFamilies": EnabledPatternFamilies,
+        "CatalogVersion": CatalogVersion,
+        "MaximumGenerationWork": MaximumGenerationWork,
+    })
+
+
+@dataclass(frozen=True)
+class PlacementAccessEvaluationControls:
+    """Exact current policy controls required for access authority."""
+
+    EnabledPatternFamilies: tuple[str, ...]
+    CatalogVersion: str
+    MaximumGenerationWork: int
+    MaximumAssignmentExpansions: int
+    SchemaVersion: str = "placement-access-evaluation-controls-v1"
+
+    @classmethod
+    def FromDictionary(
+        cls,
+        Value: dict[str, object],
+    ) -> PlacementAccessEvaluationControls:
+        from .PlacementAccessCodec import ReadContract
+        return ReadContract(cls, Value)
+
+    def __post_init__(self) -> None:
+        if self.SchemaVersion != "placement-access-evaluation-controls-v1":
+            raise ValueError("unsupported placement-access evaluation controls")
+        BuildPlacementAccessDomainControlsFingerprint(
+            EnabledPatternFamilies=self.EnabledPatternFamilies,
+            CatalogVersion=self.CatalogVersion,
+            MaximumGenerationWork=self.MaximumGenerationWork,
+        )
+        if (
+            type(self.MaximumAssignmentExpansions) is not int
+            or self.MaximumAssignmentExpansions < 1
+        ):
+            raise ValueError(
+                "placement-access assignment cap must be a positive exact integer"
+            )
+
+    @property
+    def ControlsFingerprint(self) -> str:
+        return BuildStableFingerprint({
+            "Kind": self.SchemaVersion,
+            "EnabledPatternFamilies": self.EnabledPatternFamilies,
+            "CatalogVersion": self.CatalogVersion,
+            "MaximumGenerationWork": self.MaximumGenerationWork,
+            "MaximumAssignmentExpansions": self.MaximumAssignmentExpansions,
+        })
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": self.SchemaVersion,
+            "ControlsFingerprint": self.ControlsFingerprint,
+            "EnabledPatternFamilies": list(self.EnabledPatternFamilies),
+            "CatalogVersion": self.CatalogVersion,
+            "MaximumGenerationWork": self.MaximumGenerationWork,
+            "MaximumAssignmentExpansions": self.MaximumAssignmentExpansions,
+        }
+
+
+@dataclass(frozen=True)
+class PlacedPinAccessPatternRequirement:
+    """One exact template/layer member of a terminal's required universe."""
+
+    AttemptId: str
+    DomainId: str
+    TemplateId: str
+    PatternFamily: str
+    TemplateFingerprint: str
+    Layer: int
+    CatalogVersion: str
+    TechnologyFingerprint: str
+    ResourceModelFingerprint: str
+
+    @classmethod
+    def FromDictionary(
+        cls,
+        Value: dict[str, object],
+    ) -> PlacedPinAccessPatternRequirement:
+        from .PlacementAccessCodec import ReadContract
+        return ReadContract(cls, Value)
+
+    def __post_init__(self) -> None:
+        if not all((
+            self.AttemptId,
+            self.DomainId,
+            self.TemplateId,
+            self.PatternFamily,
+            self.TemplateFingerprint,
+            self.CatalogVersion,
+            self.TechnologyFingerprint,
+            self.ResourceModelFingerprint,
+        )):
+            raise ValueError("pin-access pattern requirement requires identities")
+        if self.PatternFamily not in {"straight", "planar-jog"}:
+            raise ValueError("pin-access pattern requirement family is unsupported")
+        if type(self.Layer) is not int or self.Layer < 0:
+            raise ValueError("pin-access pattern requirement layer is invalid")
+        ExpectedId = BuildPlacementAccessPatternAttemptId(
+            DomainId=self.DomainId,
+            TemplateId=self.TemplateId,
+            PatternFamily=self.PatternFamily,
+            TemplateFingerprint=self.TemplateFingerprint,
+            Layer=self.Layer,
+            CatalogVersion=self.CatalogVersion,
+            TechnologyFingerprint=self.TechnologyFingerprint,
+            ResourceModelFingerprint=self.ResourceModelFingerprint,
+        )
+        if self.AttemptId != ExpectedId:
+            raise ValueError("pin-access pattern requirement identity mismatch")
+
+    def RankKey(self) -> tuple[object, ...]:
+        return self.TemplateId, self.Layer, self.AttemptId
+
+    def SemanticIdentity(self) -> tuple[object, ...]:
+        return (
+            self.AttemptId,
+            self.DomainId,
+            self.TemplateId,
+            self.PatternFamily,
+            self.TemplateFingerprint,
+            self.Layer,
+            self.CatalogVersion,
+            self.TechnologyFingerprint,
+            self.ResourceModelFingerprint,
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "AttemptId": self.AttemptId,
+            "DomainId": self.DomainId,
+            "TemplateId": self.TemplateId,
+            "PatternFamily": self.PatternFamily,
+            "TemplateFingerprint": self.TemplateFingerprint,
+            "Layer": self.Layer,
+            "CatalogVersion": self.CatalogVersion,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "ResourceModelFingerprint": self.ResourceModelFingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class PlacedPinAccessPatternAttempt:
+    """One identity-bound required pattern and its exact evaluation result."""
+
+    AttemptId: str
+    DomainId: str
+    TemplateId: str
+    PatternFamily: str
+    TemplateFingerprint: str
+    Layer: int
+    CatalogVersion: str
+    TechnologyFingerprint: str
+    ResourceModelFingerprint: str
+    Status: PlacementAccessPatternAttemptStatus
+    Reason: PlacementAccessPatternAttemptReason
+    OptionFingerprint: str | None
+
+    @classmethod
+    def FromDictionary(cls, Value: dict[str, object]) -> PlacedPinAccessPatternAttempt:
+        from .PlacementAccessCodec import ReadContract
+        return ReadContract(cls, Value)
+
+    def __post_init__(self) -> None:
+        if not all((
+            self.AttemptId,
+            self.DomainId,
+            self.TemplateId,
+            self.PatternFamily,
+            self.TemplateFingerprint,
+            self.CatalogVersion,
+            self.TechnologyFingerprint,
+            self.ResourceModelFingerprint,
+        )):
+            raise ValueError("pin-access pattern attempt requires identities")
+        if self.PatternFamily not in {"straight", "planar-jog"}:
+            raise ValueError("pin-access pattern attempt family is unsupported")
+        if type(self.Layer) is not int or self.Layer < 0:
+            raise ValueError("pin-access pattern attempt layer is invalid")
+        if type(self.Status) is not PlacementAccessPatternAttemptStatus:
+            raise ValueError("pin-access pattern attempt status must be typed")
+        if type(self.Reason) is not PlacementAccessPatternAttemptReason:
+            raise ValueError("pin-access pattern attempt reason must be typed")
+        ExpectedId = BuildPlacementAccessPatternAttemptId(
+            DomainId=self.DomainId,
+            TemplateId=self.TemplateId,
+            PatternFamily=self.PatternFamily,
+            TemplateFingerprint=self.TemplateFingerprint,
+            Layer=self.Layer,
+            CatalogVersion=self.CatalogVersion,
+            TechnologyFingerprint=self.TechnologyFingerprint,
+            ResourceModelFingerprint=self.ResourceModelFingerprint,
+        )
+        if self.AttemptId != ExpectedId:
+            raise ValueError("pin-access pattern attempt identity mismatch")
+        ExpectedReasons = {
+            PlacementAccessPatternAttemptStatus.Legal: {
+                PlacementAccessPatternAttemptReason.Legal,
+            },
+            PlacementAccessPatternAttemptStatus.Deduplicated: {
+                PlacementAccessPatternAttemptReason.DuplicateOption,
+            },
+            PlacementAccessPatternAttemptStatus.NotEvaluated: {
+                PlacementAccessPatternAttemptReason.WorkCap,
+                PlacementAccessPatternAttemptReason.Deadline,
+                PlacementAccessPatternAttemptReason.InputDrift,
+            },
+            PlacementAccessPatternAttemptStatus.Unknown: {
+                PlacementAccessPatternAttemptReason.UnknownPhysicalDecision,
+            },
+            PlacementAccessPatternAttemptStatus.Rejected: {
+                PlacementAccessPatternAttemptReason.TerminalOrBridgeUnavailable,
+                PlacementAccessPatternAttemptReason.FirstLegOccupied,
+                PlacementAccessPatternAttemptReason.PrimitiveUnavailable,
+                PlacementAccessPatternAttemptReason.ClaimOccupancyConflict,
+                PlacementAccessPatternAttemptReason.SelfClaimConflict,
+                PlacementAccessPatternAttemptReason.ForeignClaimConflict,
+                PlacementAccessPatternAttemptReason.StaticKeepOut,
+                PlacementAccessPatternAttemptReason.ForeignStaticExclusion,
+            },
+        }
+        if self.Reason not in ExpectedReasons[self.Status]:
+            raise ValueError("pin-access pattern attempt status and reason disagree")
+        HasOption = self.OptionFingerprint is not None
+        if HasOption != (
+            self.Status in {
+                PlacementAccessPatternAttemptStatus.Legal,
+                PlacementAccessPatternAttemptStatus.Deduplicated,
+            }
+        ):
+            raise ValueError("pin-access pattern attempt option evidence disagrees")
+        if HasOption and not self.OptionFingerprint:
+            raise ValueError("pin-access pattern attempt option identity is empty")
+
+    def RankKey(self) -> tuple[object, ...]:
+        return self.TemplateId, self.Layer, self.AttemptId
+
+    def SemanticIdentity(self) -> tuple[object, ...]:
+        return (
+            self.AttemptId,
+            self.DomainId,
+            self.TemplateId,
+            self.PatternFamily,
+            self.TemplateFingerprint,
+            self.Layer,
+            self.CatalogVersion,
+            self.TechnologyFingerprint,
+            self.ResourceModelFingerprint,
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "AttemptId": self.AttemptId,
+            "DomainId": self.DomainId,
+            "TemplateId": self.TemplateId,
+            "PatternFamily": self.PatternFamily,
+            "TemplateFingerprint": self.TemplateFingerprint,
+            "Layer": self.Layer,
+            "CatalogVersion": self.CatalogVersion,
+            "TechnologyFingerprint": self.TechnologyFingerprint,
+            "ResourceModelFingerprint": self.ResourceModelFingerprint,
+            "Status": self.Status.value,
+            "Reason": self.Reason.value,
+            "OptionFingerprint": self.OptionFingerprint,
+        }
+
+
 @dataclass(frozen=True)
 class PlacedPinAccessOptionDomain:
     """Complete-or-explicitly-incomplete option domain for one terminal."""
@@ -564,6 +910,12 @@ class PlacedPinAccessOptionDomain:
     CatalogVersion: str
     TechnologyFingerprint: str
     ResourceModelFingerprint: str
+    EnabledPatternFamilies: tuple[str, ...]
+    RequiredPatternManifest: tuple[PlacedPinAccessPatternRequirement, ...]
+    PatternAttempts: tuple[PlacedPinAccessPatternAttempt, ...]
+    EvaluationControlsFingerprint: str
+    EvaluationInputFingerprint: str
+    FinalInputFingerprint: str
     GeneratedOptionCount: int
     RejectedOptionCount: int
     DeduplicatedOptionCount: int
@@ -586,16 +938,126 @@ class PlacedPinAccessOptionDomain:
             self.ResourceModelFingerprint,
         )):
             raise ValueError("placed pin-access domain requires identities")
+        if type(self.Complete) is not bool:
+            raise TypeError("placed pin-access domain completeness must be Boolean")
         if self.Complete == bool(self.IncompleteReason):
             raise ValueError("placed pin-access domain completeness disagrees")
-        if self.MaximumGenerationWork < 1:
+        if (
+            type(self.MaximumGenerationWork) is not int
+            or self.MaximumGenerationWork < 1
+        ):
             raise ValueError("placed pin-access generation cap must be positive")
-        if min(
+        Counts = (
             self.GeneratedOptionCount,
             self.RejectedOptionCount,
             self.DeduplicatedOptionCount,
-        ) < 0:
+        )
+        if any(type(Value) is not int or Value < 0 for Value in Counts):
             raise ValueError("placed pin-access domain counts cannot be negative")
+        if (
+            not self.EnabledPatternFamilies
+            or self.EnabledPatternFamilies
+            != tuple(sorted(set(self.EnabledPatternFamilies)))
+            or any(
+                type(Value) is not str
+                or Value not in {"straight", "planar-jog"}
+                for Value in self.EnabledPatternFamilies
+            )
+        ):
+            raise ValueError("placed pin-access enabled families are invalid")
+        ExpectedControlsFingerprint = (
+            BuildPlacementAccessDomainControlsFingerprint(
+                EnabledPatternFamilies=self.EnabledPatternFamilies,
+                CatalogVersion=self.CatalogVersion,
+                MaximumGenerationWork=self.MaximumGenerationWork,
+            )
+        )
+        if self.EvaluationControlsFingerprint != ExpectedControlsFingerprint:
+            raise ValueError("placed pin-access control identity mismatch")
+        if not self.EvaluationInputFingerprint:
+            raise ValueError("placed pin-access domain requires an input identity")
+        if not self.FinalInputFingerprint:
+            raise ValueError("placed pin-access domain requires a final input identity")
+        IsDrift = self.IncompleteReason == "catalog-domain-input-drift"
+        if IsDrift == (
+            self.FinalInputFingerprint == self.EvaluationInputFingerprint
+        ):
+            raise ValueError("placed pin-access drift evidence disagrees")
+        OrderedManifest = tuple(sorted(
+            self.RequiredPatternManifest,
+            key=lambda Value: Value.RankKey(),
+        ))
+        if self.RequiredPatternManifest != OrderedManifest:
+            raise ValueError("placed pin-access required manifest must be sorted")
+        ManifestAttemptIds = tuple(
+            Value.AttemptId for Value in self.RequiredPatternManifest
+        )
+        if len(ManifestAttemptIds) != len(set(ManifestAttemptIds)):
+            raise ValueError("placed pin-access required manifest repeats a pattern")
+        for Requirement in self.RequiredPatternManifest:
+            Requirement.__post_init__()
+            if (
+                Requirement.DomainId != self.DomainId
+                or Requirement.CatalogVersion != self.CatalogVersion
+                or Requirement.TechnologyFingerprint
+                != self.TechnologyFingerprint
+                or Requirement.ResourceModelFingerprint
+                != self.ResourceModelFingerprint
+                or Requirement.PatternFamily not in self.EnabledPatternFamilies
+            ):
+                raise ValueError("required pattern belongs to another access domain")
+        OrderedAttempts = tuple(sorted(
+            self.PatternAttempts,
+            key=lambda Value: Value.RankKey(),
+        ))
+        if self.PatternAttempts != OrderedAttempts:
+            raise ValueError("placed pin-access pattern attempts must be sorted")
+        AttemptIds = tuple(Value.AttemptId for Value in self.PatternAttempts)
+        if len(AttemptIds) != len(set(AttemptIds)):
+            raise ValueError("placed pin-access domain repeats a pattern attempt")
+        if AttemptIds != ManifestAttemptIds:
+            raise ValueError("pattern attempts do not match the required manifest")
+        if any(
+            Attempt.SemanticIdentity() != Requirement.SemanticIdentity()
+            for Requirement, Attempt in zip(
+                self.RequiredPatternManifest,
+                self.PatternAttempts,
+                strict=True,
+            )
+        ):
+            raise ValueError("pattern attempt disagrees with its required manifest")
+        for Attempt in self.PatternAttempts:
+            Attempt.__post_init__()
+            if (
+                Attempt.DomainId != self.DomainId
+                or Attempt.CatalogVersion != self.CatalogVersion
+                or Attempt.TechnologyFingerprint != self.TechnologyFingerprint
+                or Attempt.ResourceModelFingerprint
+                != self.ResourceModelFingerprint
+                or Attempt.PatternFamily not in self.EnabledPatternFamilies
+            ):
+                raise ValueError("pattern attempt belongs to another access domain")
+        AttemptFamilies = {
+            Value.PatternFamily for Value in self.RequiredPatternManifest
+        }
+        if AttemptFamilies != set(self.EnabledPatternFamilies) and (
+            self.IncompleteReason
+            != "catalog-domain-missing-certified-patterns"
+        ):
+            raise ValueError("pattern attempts do not cover enabled families")
+        Unfinished = {
+            PlacementAccessPatternAttemptStatus.NotEvaluated,
+            PlacementAccessPatternAttemptStatus.Unknown,
+        }
+        if self.Complete and (
+            not self.PatternAttempts
+            or any(Value.Status in Unfinished for Value in self.PatternAttempts)
+        ):
+            raise ValueError("complete access domain lacks complete pattern evidence")
+        if not self.PatternAttempts and self.IncompleteReason != (
+            "catalog-domain-missing-certified-patterns"
+        ):
+            raise ValueError("empty access evidence lacks a missing-pattern reason")
         Ordered = tuple(sorted(self.Options, key=lambda Value: Value.RankKey()))
         if self.Options != Ordered:
             raise ValueError("placed pin-access options must be canonically sorted")
@@ -620,11 +1082,77 @@ class PlacedPinAccessOptionDomain:
                 != self.ResourceModelFingerprint
             ):
                 raise ValueError("placed pin-access option belongs to another domain")
+        LegalAttempts = tuple(
+            Value
+            for Value in self.PatternAttempts
+            if Value.Status is PlacementAccessPatternAttemptStatus.Legal
+        )
+        RejectedAttempts = tuple(
+            Value
+            for Value in self.PatternAttempts
+            if Value.Status is PlacementAccessPatternAttemptStatus.Rejected
+        )
+        DeduplicatedAttempts = tuple(
+            Value
+            for Value in self.PatternAttempts
+            if Value.Status is PlacementAccessPatternAttemptStatus.Deduplicated
+        )
+        EvaluatedAttemptCount = sum(
+            Value.Status is not PlacementAccessPatternAttemptStatus.NotEvaluated
+            for Value in self.PatternAttempts
+        )
+        if EvaluatedAttemptCount > self.MaximumGenerationWork:
+            raise ValueError("placed pin-access evaluated work exceeds its cap")
+        if (
+            self.GeneratedOptionCount != len(LegalAttempts)
+            or self.RejectedOptionCount != len(RejectedAttempts)
+            or self.DeduplicatedOptionCount != len(DeduplicatedAttempts)
+        ):
+            raise ValueError("placed pin-access counts disagree with attempts")
+        LegalFingerprints = tuple(
+            Value.OptionFingerprint for Value in LegalAttempts
+        )
+        if (
+            len(LegalFingerprints) != len(set(LegalFingerprints))
+            or set(LegalFingerprints) != set(Fingerprints)
+            or len(LegalFingerprints) != len(Fingerprints)
+        ):
+            raise ValueError(
+                "every option requires exactly one legal attempt"
+            )
+        OptionsByFingerprint = {
+            Value.PlacedBindingFingerprint: Value for Value in self.Options
+        }
+        for Attempt in (*LegalAttempts, *DeduplicatedAttempts):
+            Option = OptionsByFingerprint.get(Attempt.OptionFingerprint)
+            if Option is None or (
+                Attempt.TemplateId != Option.TemplateId
+                or Attempt.PatternFamily != Option.PatternFamily
+                or Attempt.TemplateFingerprint != Option.TemplateFingerprint
+                or Attempt.Layer != Option.Layer
+                or Attempt.CatalogVersion != Option.CatalogVersion
+                or Attempt.TechnologyFingerprint
+                != Option.TechnologyFingerprint
+                or Attempt.ResourceModelFingerprint
+                != Option.ResourceModelFingerprint
+            ):
+                raise ValueError(
+                    "pattern attempt and retained option identities disagree"
+                )
+        if {
+            Value.OptionFingerprint for Value in LegalAttempts
+        } != set(Fingerprints):
+            raise ValueError("placed pin-access legal attempts disagree with options")
+        if any(
+            Value.OptionFingerprint not in set(Fingerprints)
+            for Value in DeduplicatedAttempts
+        ):
+            raise ValueError("deduplicated attempt has no retained option")
 
     @property
     def DomainFingerprint(self) -> str:
         return BuildStableFingerprint({
-            "Kind": "placed-pin-access-option-domain-v1",
+            "Kind": "placed-pin-access-option-domain-v3",
             "DomainId": self.DomainId,
             "Signal": self.Signal,
             "GateName": self.GateName,
@@ -639,6 +1167,18 @@ class PlacedPinAccessOptionDomain:
             "CatalogVersion": self.CatalogVersion,
             "TechnologyFingerprint": self.TechnologyFingerprint,
             "ResourceModelFingerprint": self.ResourceModelFingerprint,
+            "EnabledPatternFamilies": self.EnabledPatternFamilies,
+            "RequiredPatternManifest": [
+                Value.ToDictionary() for Value in self.RequiredPatternManifest
+            ],
+            "PatternAttempts": [
+                Value.ToDictionary() for Value in self.PatternAttempts
+            ],
+            "EvaluationControlsFingerprint": (
+                self.EvaluationControlsFingerprint
+            ),
+            "EvaluationInputFingerprint": self.EvaluationInputFingerprint,
+            "FinalInputFingerprint": self.FinalInputFingerprint,
             "GeneratedOptionCount": self.GeneratedOptionCount,
             "RejectedOptionCount": self.RejectedOptionCount,
             "DeduplicatedOptionCount": self.DeduplicatedOptionCount,
@@ -661,6 +1201,18 @@ class PlacedPinAccessOptionDomain:
             "CatalogVersion": self.CatalogVersion,
             "TechnologyFingerprint": self.TechnologyFingerprint,
             "ResourceModelFingerprint": self.ResourceModelFingerprint,
+            "EnabledPatternFamilies": list(self.EnabledPatternFamilies),
+            "RequiredPatternManifest": [
+                Value.ToDictionary() for Value in self.RequiredPatternManifest
+            ],
+            "PatternAttempts": [
+                Value.ToDictionary() for Value in self.PatternAttempts
+            ],
+            "EvaluationControlsFingerprint": (
+                self.EvaluationControlsFingerprint
+            ),
+            "EvaluationInputFingerprint": self.EvaluationInputFingerprint,
+            "FinalInputFingerprint": self.FinalInputFingerprint,
             "GeneratedOptionCount": self.GeneratedOptionCount,
             "RejectedOptionCount": self.RejectedOptionCount,
             "DeduplicatedOptionCount": self.DeduplicatedOptionCount,
@@ -672,8 +1224,31 @@ def _ValidateDomainOrder(Domains: tuple[PlacedPinAccessOptionDomain, ...]) -> No
     Ids = tuple(Domain.DomainId for Domain in Domains)
     if not isinstance(Domains, tuple) or Ids != tuple(sorted(set(Ids))):
         raise ValueError("problem domains must be sorted and unique")
+    for Domain in Domains:
+        Domain.__post_init__()
     if len({(Domain.CatalogVersion, Domain.TechnologyFingerprint, Domain.ResourceModelFingerprint) for Domain in Domains}) != 1:
         raise ValueError("problem domains have mixed dependencies")
+    Controls = {
+        (
+            Domain.EnabledPatternFamilies,
+            Domain.CatalogVersion,
+            Domain.MaximumGenerationWork,
+            Domain.EvaluationControlsFingerprint,
+            Domain.EvaluationInputFingerprint,
+            Domain.FinalInputFingerprint,
+        )
+        for Domain in Domains
+    }
+    if len(Controls) != 1:
+        raise ValueError("problem domains have mixed evaluation controls")
+    MaximumGenerationWork = Domains[0].MaximumGenerationWork
+    EvaluatedWork = sum(
+        Attempt.Status is not PlacementAccessPatternAttemptStatus.NotEvaluated
+        for Domain in Domains
+        for Attempt in Domain.PatternAttempts
+    )
+    if EvaluatedWork > MaximumGenerationWork:
+        raise ValueError("problem exceeds global generation work cap")
 
 
 def BuildPlacementAccessProblemFingerprint(Domains: tuple[PlacedPinAccessOptionDomain, ...]) -> str:
@@ -911,6 +1486,10 @@ class CurrentSelectedPlacementAccessValidationReason(str, Enum):
     SolveWitnessMismatch = "SolveWitnessMismatch"
     SolveDomainEvidenceMismatch = "SolveDomainEvidenceMismatch"
     SolveProblemFingerprintMismatch = "SolveProblemFingerprintMismatch"
+    RequiredPatternManifestMismatch = "RequiredPatternManifestMismatch"
+    DomainEvaluationInputMismatch = "DomainEvaluationInputMismatch"
+    EvaluationControlsMissing = "EvaluationControlsMissing"
+    EvaluationControlsMismatch = "EvaluationControlsMismatch"
     CurrentInputChangedDuringValidation = "CurrentInputChangedDuringValidation"
     IncompleteSolve = "IncompleteSolve"
     UnsatisfiableSolve = "UnsatisfiableSolve"
@@ -926,15 +1505,16 @@ class CurrentSelectedPlacementAccessInputIdentity:
     WitnessFingerprint: str | None
     DomainFingerprint: str | None
     SolveResultFingerprint: str
+    EvaluationControlsFingerprint: str | None
     WitnessCatalogVersion: str | None
     TechnologyFingerprint: str
     ResourceModelFingerprint: str
     CurrentObservationFingerprint: str
     FinalObservationFingerprint: str | None = None
-    SchemaVersion: str = "current-selected-placement-access-input-v1"
+    SchemaVersion: str = "current-selected-placement-access-input-v2"
 
     def __post_init__(self) -> None:
-        if self.SchemaVersion != "current-selected-placement-access-input-v1":
+        if self.SchemaVersion != "current-selected-placement-access-input-v2":
             raise ValueError("unsupported current selected-access input schema")
         for Value in (
             self.TerminalBindingFingerprint,
@@ -949,6 +1529,7 @@ class CurrentSelectedPlacementAccessInputIdentity:
             self.WitnessFingerprint,
             self.DomainFingerprint,
             self.WitnessCatalogVersion,
+            self.EvaluationControlsFingerprint,
             self.FinalObservationFingerprint,
         ):
             if Value is not None and (type(Value) is not str or not Value):
@@ -971,6 +1552,9 @@ class CurrentSelectedPlacementAccessInputIdentity:
             "WitnessFingerprint": self.WitnessFingerprint,
             "DomainFingerprint": self.DomainFingerprint,
             "SolveResultFingerprint": self.SolveResultFingerprint,
+            "EvaluationControlsFingerprint": (
+                self.EvaluationControlsFingerprint
+            ),
             "WitnessCatalogVersion": self.WitnessCatalogVersion,
             "TechnologyFingerprint": self.TechnologyFingerprint,
             "ResourceModelFingerprint": self.ResourceModelFingerprint,
@@ -985,6 +1569,9 @@ class CurrentSelectedPlacementAccessInputIdentity:
             "WitnessFingerprint": self.WitnessFingerprint,
             "DomainFingerprint": self.DomainFingerprint,
             "SolveResultFingerprint": self.SolveResultFingerprint,
+            "EvaluationControlsFingerprint": (
+                self.EvaluationControlsFingerprint
+            ),
             "WitnessCatalogVersion": self.WitnessCatalogVersion,
             "TechnologyFingerprint": self.TechnologyFingerprint,
             "ResourceModelFingerprint": self.ResourceModelFingerprint,
@@ -1032,6 +1619,9 @@ class CurrentSelectedPlacementAccessValidation:
             CurrentSelectedPlacementAccessValidationReason.SolveWitnessMismatch,
             CurrentSelectedPlacementAccessValidationReason.SolveDomainEvidenceMismatch,
             CurrentSelectedPlacementAccessValidationReason.SolveProblemFingerprintMismatch,
+            CurrentSelectedPlacementAccessValidationReason.RequiredPatternManifestMismatch,
+            CurrentSelectedPlacementAccessValidationReason.DomainEvaluationInputMismatch,
+            CurrentSelectedPlacementAccessValidationReason.EvaluationControlsMismatch,
             CurrentSelectedPlacementAccessValidationReason.CurrentInputChangedDuringValidation,
         }
         UnresolvedReasons = {
@@ -1039,6 +1629,7 @@ class CurrentSelectedPlacementAccessValidation:
             CurrentSelectedPlacementAccessValidationReason.UnsatisfiableSolve,
             CurrentSelectedPlacementAccessValidationReason.MissingDomainEvidence,
             CurrentSelectedPlacementAccessValidationReason.IncompleteDomainEvidence,
+            CurrentSelectedPlacementAccessValidationReason.EvaluationControlsMissing,
         }
         if self.Status is CurrentSelectedPlacementAccessValidationStatus.Verified:
             if self.Reason is not CurrentSelectedPlacementAccessValidationReason.Current:
@@ -1620,6 +2211,8 @@ class FrozenPhysicalPlacementContract:
 
 
 __all__ = [
+    "BuildPlacementAccessDomainControlsFingerprint",
+    "BuildPlacementAccessPatternAttemptId",
     "CurrentSelectedPlacementAccessInputIdentity",
     "CurrentSelectedPlacementAccessValidation",
     "CurrentSelectedPlacementAccessValidationReason",
@@ -1628,12 +2221,17 @@ __all__ = [
     "PhysicalPinAccessTemplate",
     "PlacedPinAccessOption",
     "PlacedPinAccessOptionDomain",
+    "PlacedPinAccessPatternAttempt",
+    "PlacedPinAccessPatternRequirement",
     "PlacementAccessBoundaryLease",
     "PlacementAccessCellTransform",
     "PlacementAccessChannelReservation",
     "PlacementAccessConflictCore",
     "PlacementAccessEnvelope",
+    "PlacementAccessEvaluationControls",
     "PlacementAccessPinMapping",
+    "PlacementAccessPatternAttemptReason",
+    "PlacementAccessPatternAttemptStatus",
     "PlacementAccessSolveResult",
     "PlacementAccessSolveStatus",
     "SelectedPlacementPinAccessWitness",

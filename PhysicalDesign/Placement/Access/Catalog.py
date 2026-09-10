@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
@@ -9,9 +10,16 @@ from typing import Any, Callable, Iterable, Mapping
 from PhysicalDesign.Cells.Library import CellMacros, PinAccessPattern
 from PhysicalDesign.Contracts.Core import Position3
 from PhysicalDesign.Contracts.PlacementAccess import (
+    BuildPlacementAccessDomainControlsFingerprint,
+    BuildPlacementAccessPatternAttemptId,
     PhysicalPinAccessTemplate,
+    PlacementAccessEvaluationControls,
     PlacedPinAccessOption,
     PlacedPinAccessOptionDomain,
+    PlacedPinAccessPatternAttempt,
+    PlacedPinAccessPatternRequirement,
+    PlacementAccessPatternAttemptReason,
+    PlacementAccessPatternAttemptStatus,
     SelectedPlacementPinAccessWitness,
 )
 from PhysicalDesign.Geometry.Placement import GetGateInputAccess
@@ -586,28 +594,28 @@ def _AdmitPlacedGeometry(
     ],
     UnownedStaticExclusions: frozenset[Position3],
     PreOwnedClaimsBySignal: Mapping[str, RoutingResourceClaims],
-) -> bool:
+) -> PlacementAccessPatternAttemptReason | None:
     Terminal = FirstLegNodes[0]
     if (
         Terminal in ResourceGraph.ActualBlocks
         or BridgePosition not in ResourceGraph.ActualBlocks
         or BridgePosition not in ResourceGraph.ElectricalBlocks
     ):
-        return False
+        return PlacementAccessPatternAttemptReason.TerminalOrBridgeUnavailable
     if (
         set(FirstLegNodes[1:])
         & set(ResourceGraph.ActualBlocks)
     ):
-        return False
+        return PlacementAccessPatternAttemptReason.FirstLegOccupied
     for First, Second in zip(FirstLegNodes, FirstLegNodes[1:]):
         if ResourceGraph.BuildPrimitive(First, Second) is None:
-            return False
+            return PlacementAccessPatternAttemptReason.PrimitiveUnavailable
     Claims = ResourceGraph.BuildRouteClaims(FirstLegNodes)
     if (
         Claims.SupportCells & ResourceGraph.ActualBlocks
         or Claims.RequiredAirCells & ResourceGraph.ActualBlocks
     ):
-        return False
+        return PlacementAccessPatternAttemptReason.ClaimOccupancyConflict
     ExistingSignalClaims = PreOwnedClaimsBySignal.get(Signal)
     CombinedSignalClaims = (
         ResourceGraph.BuildRouteClaims(
@@ -617,7 +625,7 @@ def _AdmitPlacedGeometry(
         else Claims
     )
     if FindSelfClaimConflicts({Signal: CombinedSignalClaims}):
-        return False
+        return PlacementAccessPatternAttemptReason.SelfClaimConflict
     if any(
         FindClaimConflicts({
             Signal: CombinedSignalClaims,
@@ -626,17 +634,17 @@ def _AdmitPlacedGeometry(
         for ForeignSignal, ForeignClaims in PreOwnedClaimsBySignal.items()
         if ForeignSignal != Signal
     ):
-        return False
+        return PlacementAccessPatternAttemptReason.ForeignClaimConflict
     for Position in FirstLegNodes:
         if (
             Position in ResourceGraph.StaticKeepOutBlocks
             or Position in UnownedStaticExclusions
         ):
-            return False
+            return PlacementAccessPatternAttemptReason.StaticKeepOut
         Owners = StaticExclusionOwnersByPosition.get(Position, frozenset())
         if Owners and Owners != frozenset({Signal}):
-            return False
-    return True
+            return PlacementAccessPatternAttemptReason.ForeignStaticExclusion
+    return None
 
 
 def _MaterializeOption(
@@ -657,9 +665,9 @@ def _MaterializeOption(
     ],
     UnownedStaticExclusions: frozenset[Position3],
     PreOwnedClaimsBySignal: Mapping[str, RoutingResourceClaims],
-) -> PlacedPinAccessOption | None:
+) -> tuple[PlacedPinAccessOption | None, PlacementAccessPatternAttemptReason]:
     if Template.PinId != PinId or Template.CellKind != str(Gate.Kind).upper():
-        return None
+        raise ValueError("pin-access attempt uses a template from another pin")
     CatalogTerminal = _TransformTemplatePosition(
         Template.ConnectionPosition,
         Gate,
@@ -674,7 +682,7 @@ def _MaterializeOption(
             f"placed pin {Gate.Name}:{PinId} does not match its catalog seed"
         )
     if Layer not in Template.AllowedRoutingLayers:
-        return None
+        raise ValueError("pin-access attempt uses a disallowed routing layer")
     FirstLegNodes = tuple(
         _TransformTemplatePosition(Position, Gate)
         for Position in Template.FirstLegNodes
@@ -687,7 +695,7 @@ def _MaterializeOption(
         Template.BridgePosition,
         Gate,
     )
-    if not _AdmitPlacedGeometry(
+    RejectionReason = _AdmitPlacedGeometry(
         ResourceGraph=ResourceGraph,
         Technology=Technology,
         FirstLegNodes=FirstLegNodes,
@@ -699,8 +707,9 @@ def _MaterializeOption(
         ),
         UnownedStaticExclusions=UnownedStaticExclusions,
         PreOwnedClaimsBySignal=PreOwnedClaimsBySignal,
-    ):
-        return None
+    )
+    if RejectionReason is not None:
+        return None, RejectionReason
     BlockRoles = tuple(
         (_TransformTemplatePosition(Position, Gate), BlockRole)
         for Position, BlockRole in Template.BlockRoles
@@ -753,6 +762,124 @@ def _MaterializeOption(
         Claims=ResourceGraph.BuildRouteClaims(FirstLegNodes),
         RepeaterReservations=(RepeaterReservation,),
         Template=Template,
+    ), PlacementAccessPatternAttemptReason.Legal
+
+
+def _SnapshotRoutingResourceGraph(
+    ResourceGraph: RoutingResourceGraph,
+) -> RoutingResourceGraph:
+    """Detach enumeration from later mutation of its live graph input."""
+    if type(ResourceGraph) is not RoutingResourceGraph:
+        raise TypeError("ResourceGraph must be an exact RoutingResourceGraph")
+    return RoutingResourceGraph(
+        ActualBlocks=frozenset(ResourceGraph.ActualBlocks),
+        ElectricalBlocks=frozenset(ResourceGraph.ElectricalBlocks),
+        SolidBlocks=frozenset(ResourceGraph.SolidBlocks),
+        Technology=RedstoneRoutingTechnology(**asdict(ResourceGraph.Technology)),
+        GraphVersion=ResourceGraph.GraphVersion,
+        StaticKeepOutBlocks=frozenset(ResourceGraph.StaticKeepOutBlocks),
+        BlockStates=dict(CanonicalizeRoutingResourceBlockStates(ResourceGraph)),
+    )
+
+
+def _BuildDomainEvaluationInputFingerprint(
+    Gates: tuple[Any, ...],
+    *,
+    Catalog: tuple[PhysicalPinAccessTemplate, ...],
+    Families: tuple[str, ...],
+    CatalogVersion: str,
+    MaximumGenerationWork: int,
+    TechnologyFingerprint: str,
+    ResourceModelFingerprint: str,
+) -> str:
+    """Bind one finite catalog evaluation to current semantic inputs."""
+    return BuildStableFingerprint({
+        "Kind": "placed-pin-access-domain-evaluation-input-v2",
+        "TerminalBindings": _CurrentSelectedPlacementPinAccessBindings(Gates),
+        "CatalogVersion": CatalogVersion,
+        "EnabledPatternFamilies": Families,
+        "MaximumGenerationWork": MaximumGenerationWork,
+        "EvaluationControlsFingerprint": (
+            BuildPlacementAccessDomainControlsFingerprint(
+                EnabledPatternFamilies=Families,
+                CatalogVersion=CatalogVersion,
+                MaximumGenerationWork=MaximumGenerationWork,
+            )
+        ),
+        "CatalogTemplateFingerprints": sorted(
+            Value.TemplateFingerprint for Value in Catalog
+        ),
+        "TechnologyFingerprint": TechnologyFingerprint,
+        "ResourceModelFingerprint": ResourceModelFingerprint,
+    })
+
+
+def _BuildPatternAttempt(
+    *,
+    DomainId: str,
+    Template: PhysicalPinAccessTemplate,
+    Layer: int,
+    CatalogVersion: str,
+    TechnologyFingerprint: str,
+    ResourceModelFingerprint: str,
+    Status: PlacementAccessPatternAttemptStatus,
+    Reason: PlacementAccessPatternAttemptReason,
+    OptionFingerprint: str | None,
+) -> PlacedPinAccessPatternAttempt:
+    return PlacedPinAccessPatternAttempt(
+        AttemptId=BuildPlacementAccessPatternAttemptId(
+            DomainId=DomainId,
+            TemplateId=Template.TemplateId,
+            PatternFamily=Template.PatternFamily,
+            TemplateFingerprint=Template.TemplateFingerprint,
+            Layer=Layer,
+            CatalogVersion=CatalogVersion,
+            TechnologyFingerprint=TechnologyFingerprint,
+            ResourceModelFingerprint=ResourceModelFingerprint,
+        ),
+        DomainId=DomainId,
+        TemplateId=Template.TemplateId,
+        PatternFamily=Template.PatternFamily,
+        TemplateFingerprint=Template.TemplateFingerprint,
+        Layer=Layer,
+        CatalogVersion=CatalogVersion,
+        TechnologyFingerprint=TechnologyFingerprint,
+        ResourceModelFingerprint=ResourceModelFingerprint,
+        Status=Status,
+        Reason=Reason,
+        OptionFingerprint=OptionFingerprint,
+    )
+
+
+def _BuildPatternRequirement(
+    *,
+    DomainId: str,
+    Template: PhysicalPinAccessTemplate,
+    Layer: int,
+    CatalogVersion: str,
+    TechnologyFingerprint: str,
+    ResourceModelFingerprint: str,
+) -> PlacedPinAccessPatternRequirement:
+    AttemptId = BuildPlacementAccessPatternAttemptId(
+        DomainId=DomainId,
+        TemplateId=Template.TemplateId,
+        PatternFamily=Template.PatternFamily,
+        TemplateFingerprint=Template.TemplateFingerprint,
+        Layer=Layer,
+        CatalogVersion=CatalogVersion,
+        TechnologyFingerprint=TechnologyFingerprint,
+        ResourceModelFingerprint=ResourceModelFingerprint,
+    )
+    return PlacedPinAccessPatternRequirement(
+        AttemptId=AttemptId,
+        DomainId=DomainId,
+        TemplateId=Template.TemplateId,
+        PatternFamily=Template.PatternFamily,
+        TemplateFingerprint=Template.TemplateFingerprint,
+        Layer=Layer,
+        CatalogVersion=CatalogVersion,
+        TechnologyFingerprint=TechnologyFingerprint,
+        ResourceModelFingerprint=ResourceModelFingerprint,
     )
 
 
@@ -767,15 +894,22 @@ def EnumeratePlacedPinAccessOptionDomains(
     ),
     CatalogVersion: str = PhysicalPinAccessCatalogVersion,
     MaximumGenerationWork: int = 100_000,
-    WorkCheck: Callable[[dict[str, object]], None] | None = None,
+    WorkCheck: Callable[[dict[str, object]], bool | None] | None = None,
     PreOwnedNodesBySignal: Mapping[
         str, Iterable[Position3]
     ] | None = None,
 ) -> tuple[PlacedPinAccessOptionDomain, ...]:
     """Enumerate deterministic exact option domains for placed logical pins."""
-    if MaximumGenerationWork < 1:
+    if type(MaximumGenerationWork) is not int or MaximumGenerationWork < 1:
         raise ValueError("pin-access generation work cap must be positive")
     Families = _NormalizeFamilies(EnabledPatternFamilies)
+    LiveGates = tuple(PlacedGates)
+    LiveResourceGraph = ResourceGraph
+    LiveTechnology = Technology
+    LivePreOwnedNodes = PreOwnedNodesBySignal or {}
+    Gates = tuple(deepcopy(Gate) for Gate in LiveGates)
+    Technology = RedstoneRoutingTechnology(**asdict(LiveTechnology))
+    ResourceGraph = _SnapshotRoutingResourceGraph(LiveResourceGraph)
     ExpectedTechnologyFingerprint = BuildPinAccessTechnologyFingerprint(
         Technology
     )
@@ -789,7 +923,7 @@ def EnumeratePlacedPinAccessOptionDomains(
         CatalogVersion=CatalogVersion,
     )
     PreOwnedNodes = _ValidateAndNormalizePreOwnedNodesBySignal(
-        PreOwnedNodesBySignal or {},
+        LivePreOwnedNodes,
         ResourceGraph=ResourceGraph,
     )
     TemplatesByPin = {}
@@ -798,7 +932,6 @@ def EnumeratePlacedPinAccessOptionDomains(
             (Template.CellKind, Template.PinId),
             [],
         ).append(Template)
-    Gates = tuple(PlacedGates)
     (
         StaticExclusionOwnersByPosition,
         UnownedStaticExclusions,
@@ -817,8 +950,77 @@ def EnumeratePlacedPinAccessOptionDomains(
         PreOwnedNodes,
         ResourceGraph,
     )
+    EvaluationInputFingerprint = _BuildDomainEvaluationInputFingerprint(
+        Gates,
+        Catalog=Catalog,
+        Families=Families,
+        CatalogVersion=CatalogVersion,
+        MaximumGenerationWork=MaximumGenerationWork,
+        TechnologyFingerprint=ExpectedTechnologyFingerprint,
+        ResourceModelFingerprint=ResourceModelFingerprint,
+    )
+    EvaluationControlsFingerprint = (
+        BuildPlacementAccessDomainControlsFingerprint(
+            EnabledPatternFamilies=Families,
+            CatalogVersion=CatalogVersion,
+            MaximumGenerationWork=MaximumGenerationWork,
+        )
+    )
+
+    def ObserveLiveInput() -> str:
+        try:
+            CurrentPreOwnedNodes = _ValidateAndNormalizePreOwnedNodesBySignal(
+                LivePreOwnedNodes,
+                ResourceGraph=LiveResourceGraph,
+            )
+            (
+                CurrentOwners,
+                CurrentUnowned,
+            ) = _BuildPlacedStaticExclusionOwnership(
+                LiveGates,
+                ResourceGraph=LiveResourceGraph,
+                Technology=LiveTechnology,
+                PreOwnedNodesBySignal=CurrentPreOwnedNodes,
+            )
+            CurrentResourceModelFingerprint = _ResourceModelFingerprint(
+                LiveResourceGraph,
+                CurrentOwners,
+                CurrentUnowned,
+            )
+            CurrentCatalog = BuildPhysicalPinAccessCatalog(
+                Technology=LiveTechnology,
+                EnabledPatternFamilies=Families,
+                CatalogVersion=CatalogVersion,
+            )
+            return _BuildDomainEvaluationInputFingerprint(
+                LiveGates,
+                Catalog=CurrentCatalog,
+                Families=Families,
+                CatalogVersion=CatalogVersion,
+                MaximumGenerationWork=MaximumGenerationWork,
+                TechnologyFingerprint=BuildPinAccessTechnologyFingerprint(
+                    LiveTechnology
+                ),
+                ResourceModelFingerprint=CurrentResourceModelFingerprint,
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as Error:
+            return BuildStableFingerprint({
+                "Kind": "invalid-placed-pin-access-domain-live-input-v1",
+                "ErrorType": type(Error).__name__,
+            })
+
+    def CheckWorkControl(Details: dict[str, object]) -> bool | None:
+        if WorkCheck is None:
+            return None
+        Result = WorkCheck(Details)
+        if Result is not None and type(Result) is not bool:
+            raise TypeError("pin-access work check must return exact Boolean or None")
+        return Result
+
     Work = 0
-    Domains = []
+    DomainRecords = []
+    DeadlineReached = False
+    DriftFingerprint = ""
     for (
         Gate,
         Signal,
@@ -827,63 +1029,7 @@ def EnumeratePlacedPinAccessOptionDomains(
         PhysicalTerminal,
         PhysicalFace,
     ) in _PlacedTerminalBindings(Gates):
-        Generated = 0
-        Rejected = 0
-        Deduplicated = 0
         OptionsByFingerprint = {}
-        Complete = True
-        IncompleteReason = ""
-        Templates = tuple(TemplatesByPin.get(
-            (str(Gate.Kind).upper(), PinId),
-            (),
-        ))
-        for Template in Templates:
-            for Layer in Template.AllowedRoutingLayers:
-                if Work >= MaximumGenerationWork:
-                    Complete = False
-                    IncompleteReason = "catalog-domain-generation-work-cap"
-                    break
-                Work += 1
-                Option = _MaterializeOption(
-                    Template,
-                    Gate=Gate,
-                    Signal=Signal,
-                    Role=Role,
-                    PinId=PinId,
-                    PhysicalTerminal=PhysicalTerminal,
-                    PhysicalFace=PhysicalFace,
-                    Layer=Layer,
-                    ResourceGraph=ResourceGraph,
-                    Technology=Technology,
-                    ResourceModelFingerprint=ResourceModelFingerprint,
-                    StaticExclusionOwnersByPosition=(
-                        StaticExclusionOwnersByPosition
-                    ),
-                    UnownedStaticExclusions=UnownedStaticExclusions,
-                    PreOwnedClaimsBySignal=PreOwnedClaimsBySignal,
-                )
-                if Option is None:
-                    Rejected += 1
-                elif Option.PlacedBindingFingerprint in OptionsByFingerprint:
-                    Deduplicated += 1
-                else:
-                    OptionsByFingerprint[
-                        Option.PlacedBindingFingerprint
-                    ] = Option
-                    Generated += 1
-                if WorkCheck is not None and Work % 64 == 0:
-                    WorkCheck({
-                        "Phase": "pin-access-domain-generation",
-                        "CompletedWork": Work,
-                        "MaximumGenerationWork": MaximumGenerationWork,
-                        "CompletedDomainCount": len(Domains),
-                        "GateName": str(Gate.Name),
-                        "PinId": PinId,
-                    })
-            if not Complete:
-                break
-        if not Templates and Work < MaximumGenerationWork:
-            Rejected += 1
         DomainId = BuildStableFingerprint({
             "Kind": "placed-pin-access-terminal-v1",
             "Signal": Signal,
@@ -892,36 +1038,373 @@ def EnumeratePlacedPinAccessOptionDomains(
             "PinId": PinId,
             "Terminal": PhysicalTerminal,
         })
-        Domains.append(PlacedPinAccessOptionDomain(
-            DomainId=DomainId,
-            Signal=Signal,
-            GateName=str(Gate.Name),
-            Role=Role,
-            PinId=PinId,
-            Terminal=PhysicalTerminal,
-            Options=tuple(sorted(
+        Templates = tuple(sorted(TemplatesByPin.get(
+            (str(Gate.Kind).upper(), PinId),
+            (),
+        ), key=lambda Value: Value.StructuralIdentity()))
+        Plans = tuple(sorted(
+            (
+                (Template, Layer)
+                for Template in Templates
+                for Layer in Template.AllowedRoutingLayers
+            ),
+            key=lambda Value: (
+                Value[0].TemplateId,
+                Value[1],
+                Value[0].TemplateFingerprint,
+            ),
+        ))
+        RequiredPatternManifest = tuple(
+            _BuildPatternRequirement(
+                DomainId=DomainId,
+                Template=Template,
+                Layer=Layer,
+                CatalogVersion=CatalogVersion,
+                TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                ResourceModelFingerprint=ResourceModelFingerprint,
+            )
+            for Template, Layer in Plans
+        )
+        Attempts = []
+        CoversEnabledFamilies = {
+            Template.PatternFamily for Template, _Layer in Plans
+        } == set(Families)
+        Complete = bool(Plans) and CoversEnabledFamilies
+        IncompleteReason = (
+            "" if Complete else "catalog-domain-missing-certified-patterns"
+        )
+        for Template, Layer in Plans:
+            if DriftFingerprint:
+                Complete = False
+                IncompleteReason = "catalog-domain-input-drift"
+                Attempts.append(_BuildPatternAttempt(
+                    DomainId=DomainId,
+                    Template=Template,
+                    Layer=Layer,
+                    CatalogVersion=CatalogVersion,
+                    TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                    ResourceModelFingerprint=ResourceModelFingerprint,
+                    Status=PlacementAccessPatternAttemptStatus.NotEvaluated,
+                    Reason=PlacementAccessPatternAttemptReason.InputDrift,
+                    OptionFingerprint=None,
+                ))
+                continue
+            if DeadlineReached:
+                Complete = False
+                IncompleteReason = "catalog-domain-generation-deadline"
+                Attempts.append(_BuildPatternAttempt(
+                    DomainId=DomainId,
+                    Template=Template,
+                    Layer=Layer,
+                    CatalogVersion=CatalogVersion,
+                    TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                    ResourceModelFingerprint=ResourceModelFingerprint,
+                    Status=PlacementAccessPatternAttemptStatus.NotEvaluated,
+                    Reason=PlacementAccessPatternAttemptReason.Deadline,
+                    OptionFingerprint=None,
+                ))
+                continue
+            if Work >= MaximumGenerationWork:
+                Complete = False
+                IncompleteReason = "catalog-domain-generation-work-cap"
+                Attempts.append(_BuildPatternAttempt(
+                    DomainId=DomainId,
+                    Template=Template,
+                    Layer=Layer,
+                    CatalogVersion=CatalogVersion,
+                    TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                    ResourceModelFingerprint=ResourceModelFingerprint,
+                    Status=PlacementAccessPatternAttemptStatus.NotEvaluated,
+                    Reason=PlacementAccessPatternAttemptReason.WorkCap,
+                    OptionFingerprint=None,
+                ))
+                continue
+            if WorkCheck is not None:
+                WorkControl = CheckWorkControl({
+                    "Phase": "pin-access-domain-generation",
+                    "CompletedWork": Work,
+                    "NextWork": Work + 1,
+                    "MaximumGenerationWork": MaximumGenerationWork,
+                    "CompletedDomainCount": len(DomainRecords),
+                    "GateName": str(Gate.Name),
+                    "PinId": PinId,
+                    "PatternAttemptId": BuildPlacementAccessPatternAttemptId(
+                        DomainId=DomainId,
+                        TemplateId=Template.TemplateId,
+                        PatternFamily=Template.PatternFamily,
+                        TemplateFingerprint=Template.TemplateFingerprint,
+                        Layer=Layer,
+                        CatalogVersion=CatalogVersion,
+                        TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                        ResourceModelFingerprint=ResourceModelFingerprint,
+                    ),
+                })
+                if WorkControl is False:
+                    DeadlineReached = True
+                    Complete = False
+                    IncompleteReason = "catalog-domain-generation-deadline"
+                    Attempts.append(_BuildPatternAttempt(
+                        DomainId=DomainId,
+                        Template=Template,
+                        Layer=Layer,
+                        CatalogVersion=CatalogVersion,
+                        TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                        ResourceModelFingerprint=ResourceModelFingerprint,
+                        Status=PlacementAccessPatternAttemptStatus.NotEvaluated,
+                        Reason=PlacementAccessPatternAttemptReason.Deadline,
+                        OptionFingerprint=None,
+                    ))
+                    continue
+                CurrentInputFingerprint = ObserveLiveInput()
+                if CurrentInputFingerprint != EvaluationInputFingerprint:
+                    DriftFingerprint = CurrentInputFingerprint
+                    Complete = False
+                    IncompleteReason = "catalog-domain-input-drift"
+                    Attempts.append(_BuildPatternAttempt(
+                        DomainId=DomainId,
+                        Template=Template,
+                        Layer=Layer,
+                        CatalogVersion=CatalogVersion,
+                        TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                        ResourceModelFingerprint=ResourceModelFingerprint,
+                        Status=PlacementAccessPatternAttemptStatus.NotEvaluated,
+                        Reason=PlacementAccessPatternAttemptReason.InputDrift,
+                        OptionFingerprint=None,
+                    ))
+                    continue
+            Work += 1
+            Option, Reason = _MaterializeOption(
+                Template,
+                Gate=Gate,
+                Signal=Signal,
+                Role=Role,
+                PinId=PinId,
+                PhysicalTerminal=PhysicalTerminal,
+                PhysicalFace=PhysicalFace,
+                Layer=Layer,
+                ResourceGraph=ResourceGraph,
+                Technology=Technology,
+                ResourceModelFingerprint=ResourceModelFingerprint,
+                StaticExclusionOwnersByPosition=(
+                    StaticExclusionOwnersByPosition
+                ),
+                UnownedStaticExclusions=UnownedStaticExclusions,
+                PreOwnedClaimsBySignal=PreOwnedClaimsBySignal,
+            )
+            if Option is None:
+                Status = PlacementAccessPatternAttemptStatus.Rejected
+                OptionFingerprint = None
+            elif Option.PlacedBindingFingerprint in OptionsByFingerprint:
+                Status = PlacementAccessPatternAttemptStatus.Deduplicated
+                Reason = PlacementAccessPatternAttemptReason.DuplicateOption
+                OptionFingerprint = Option.PlacedBindingFingerprint
+            else:
+                OptionsByFingerprint[Option.PlacedBindingFingerprint] = Option
+                Status = PlacementAccessPatternAttemptStatus.Legal
+                OptionFingerprint = Option.PlacedBindingFingerprint
+            Attempts.append(_BuildPatternAttempt(
+                DomainId=DomainId,
+                Template=Template,
+                Layer=Layer,
+                CatalogVersion=CatalogVersion,
+                TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                ResourceModelFingerprint=ResourceModelFingerprint,
+                Status=Status,
+                Reason=Reason,
+                OptionFingerprint=OptionFingerprint,
+            ))
+        DomainRecords.append({
+            "DomainId": DomainId,
+            "Signal": Signal,
+            "GateName": str(Gate.Name),
+            "Role": Role,
+            "PinId": PinId,
+            "Terminal": PhysicalTerminal,
+            "Options": tuple(sorted(
                 OptionsByFingerprint.values(),
                 key=lambda Value: Value.RankKey(),
             )),
+            "Complete": Complete,
+            "IncompleteReason": IncompleteReason,
+            "RequiredPatternManifest": RequiredPatternManifest,
+            "PatternAttempts": tuple(sorted(
+                Attempts,
+                key=lambda Value: Value.RankKey(),
+            )),
+        })
+    FinalWorkControl = None
+    if WorkCheck is not None:
+        FinalWorkControl = CheckWorkControl({
+            "Phase": "pin-access-domain-generation-complete",
+            "CompletedWork": Work,
+            "MaximumGenerationWork": MaximumGenerationWork,
+            "DomainCount": len(DomainRecords),
+            "Complete": all(Value["Complete"] for Value in DomainRecords),
+        })
+    FinalInputFingerprint = ObserveLiveInput()
+    if FinalInputFingerprint != EvaluationInputFingerprint:
+        DriftFingerprint = FinalInputFingerprint
+    Domains = []
+    for Record in DomainRecords:
+        Complete = bool(Record["Complete"])
+        IncompleteReason = str(Record["IncompleteReason"])
+        if DriftFingerprint:
+            Complete = False
+            IncompleteReason = "catalog-domain-input-drift"
+        elif FinalWorkControl is False and Complete:
+            Complete = False
+            IncompleteReason = "catalog-domain-generation-deadline"
+        Attempts = Record["PatternAttempts"]
+        Domains.append(PlacedPinAccessOptionDomain(
+            DomainId=Record["DomainId"],
+            Signal=Record["Signal"],
+            GateName=Record["GateName"],
+            Role=Record["Role"],
+            PinId=Record["PinId"],
+            Terminal=Record["Terminal"],
+            Options=Record["Options"],
             Complete=Complete,
             IncompleteReason=IncompleteReason,
             CatalogVersion=CatalogVersion,
             TechnologyFingerprint=ExpectedTechnologyFingerprint,
             ResourceModelFingerprint=ResourceModelFingerprint,
-            GeneratedOptionCount=Generated,
-            RejectedOptionCount=Rejected,
-            DeduplicatedOptionCount=Deduplicated,
+            EnabledPatternFamilies=Families,
+            RequiredPatternManifest=Record["RequiredPatternManifest"],
+            PatternAttempts=Attempts,
+            EvaluationControlsFingerprint=EvaluationControlsFingerprint,
+            EvaluationInputFingerprint=EvaluationInputFingerprint,
+            FinalInputFingerprint=FinalInputFingerprint,
+            GeneratedOptionCount=sum(
+                Value.Status is PlacementAccessPatternAttemptStatus.Legal
+                for Value in Attempts
+            ),
+            RejectedOptionCount=sum(
+                Value.Status is PlacementAccessPatternAttemptStatus.Rejected
+                for Value in Attempts
+            ),
+            DeduplicatedOptionCount=sum(
+                Value.Status
+                is PlacementAccessPatternAttemptStatus.Deduplicated
+                for Value in Attempts
+            ),
             MaximumGenerationWork=MaximumGenerationWork,
         ))
-    if WorkCheck is not None:
-        WorkCheck({
-            "Phase": "pin-access-domain-generation-complete",
-            "CompletedWork": Work,
-            "MaximumGenerationWork": MaximumGenerationWork,
-            "DomainCount": len(Domains),
-            "Complete": all(Value.Complete for Value in Domains),
-        })
     return tuple(sorted(Domains, key=lambda Value: Value.DomainId))
+
+
+def ValidateCurrentPlacedPinAccessDomainEvidence(
+    PlacedGates: Iterable[Any],
+    Domains: Iterable[PlacedPinAccessOptionDomain],
+    *,
+    Technology: RedstoneRoutingTechnology,
+    ResourceModelFingerprint: str,
+    CurrentControls: PlacementAccessEvaluationControls,
+) -> str:
+    """Return an empty string only for the exact current catalog universe.
+
+    This validates Physical producer evidence against exact caller-supplied
+    current controls.  Constructing those controls from a live Joint policy
+    remains the responsibility of the current-policy consumer boundary.
+    """
+    OrderedDomains = tuple(sorted(Domains, key=lambda Value: Value.DomainId))
+    if not OrderedDomains:
+        return "RequiredPatternManifestMismatch"
+    if type(CurrentControls) is not PlacementAccessEvaluationControls:
+        raise TypeError(
+            "CurrentControls must be exact PlacementAccessEvaluationControls"
+        )
+    CurrentControls.__post_init__()
+    First = OrderedDomains[0]
+    if any(
+        Domain.EnabledPatternFamilies
+        != CurrentControls.EnabledPatternFamilies
+        or Domain.CatalogVersion != CurrentControls.CatalogVersion
+        or Domain.MaximumGenerationWork
+        != CurrentControls.MaximumGenerationWork
+        for Domain in OrderedDomains
+    ):
+        return "EvaluationControlsMismatch"
+    Families = _NormalizeFamilies(CurrentControls.EnabledPatternFamilies)
+    Catalog = BuildPhysicalPinAccessCatalog(
+        Technology=Technology,
+        EnabledPatternFamilies=Families,
+        CatalogVersion=CurrentControls.CatalogVersion,
+    )
+    TemplatesByPin = {}
+    for Template in Catalog:
+        TemplatesByPin.setdefault(
+            (Template.CellKind, Template.PinId),
+            [],
+        ).append(Template)
+    ExpectedManifests = {}
+    Gates = tuple(PlacedGates)
+    for Gate, Signal, Role, PinId, PhysicalTerminal, _Face in (
+        _PlacedTerminalBindings(Gates)
+    ):
+        DomainId = BuildStableFingerprint({
+            "Kind": "placed-pin-access-terminal-v1",
+            "Signal": Signal,
+            "GateName": str(Gate.Name),
+            "Role": Role,
+            "PinId": PinId,
+            "Terminal": PhysicalTerminal,
+        })
+        Plans = tuple(sorted(
+            (
+                (Template, Layer)
+                for Template in TemplatesByPin.get(
+                    (str(Gate.Kind).upper(), PinId),
+                    (),
+                )
+                for Layer in Template.AllowedRoutingLayers
+            ),
+            key=lambda Value: (
+                Value[0].TemplateId,
+                Value[1],
+                Value[0].TemplateFingerprint,
+            ),
+        ))
+        ExpectedManifests[DomainId] = tuple(
+            _BuildPatternRequirement(
+                DomainId=DomainId,
+                Template=Template,
+                Layer=Layer,
+                CatalogVersion=CurrentControls.CatalogVersion,
+                TechnologyFingerprint=BuildPinAccessTechnologyFingerprint(
+                    Technology
+                ),
+                ResourceModelFingerprint=ResourceModelFingerprint,
+            )
+            for Template, Layer in Plans
+        )
+    if set(ExpectedManifests) != {
+        Domain.DomainId for Domain in OrderedDomains
+    }:
+        return "RequiredPatternManifestMismatch"
+    if any(
+        Domain.RequiredPatternManifest
+        != ExpectedManifests[Domain.DomainId]
+        for Domain in OrderedDomains
+    ):
+        return "RequiredPatternManifestMismatch"
+    ExpectedInputFingerprint = _BuildDomainEvaluationInputFingerprint(
+        Gates,
+        Catalog=Catalog,
+        Families=Families,
+        CatalogVersion=CurrentControls.CatalogVersion,
+        MaximumGenerationWork=CurrentControls.MaximumGenerationWork,
+        TechnologyFingerprint=BuildPinAccessTechnologyFingerprint(
+            Technology
+        ),
+        ResourceModelFingerprint=ResourceModelFingerprint,
+    )
+    if any(
+        Domain.EvaluationInputFingerprint != ExpectedInputFingerprint
+        or Domain.FinalInputFingerprint != ExpectedInputFingerprint
+        for Domain in OrderedDomains
+    ):
+        return "DomainEvaluationInputMismatch"
+    return ""
 
 
 def FreezeSelectedPlacementPinAccessWitness(
@@ -1031,5 +1514,6 @@ __all__ = [
     "NormalizeFrozenNetWires",
     "NormalizeFrozenNetWireEntries",
     "SupportedPinAccessPatternFamilies",
+    "ValidateCurrentPlacedPinAccessDomainEvidence",
     "ValidateSelectedPlacementPinAccessBindings",
 ]

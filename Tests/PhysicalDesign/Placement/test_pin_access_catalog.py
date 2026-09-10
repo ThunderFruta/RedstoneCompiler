@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import PhysicalDesign.Placement.Access.Catalog as PinAccessCatalog
 from Compilation.Ir.Models import Gate, GateKind
 from PhysicalDesign.Cells.Library import CellMacros
 from PhysicalDesign.Contracts.PlacementAccess import (
@@ -86,6 +87,19 @@ def _Nand(
         *Origin,
         Rotation,
         MirrorX,
+    )
+
+
+def _InputSource(
+    Name="InputSource",
+    Output="A",
+    Origin=(0, 1, 0),
+):
+    return BuildPlacedGate(
+        Gate(Name, GateKind.INPUT, [Output], []),
+        *Origin,
+        0,
+        False,
     )
 
 
@@ -803,6 +817,235 @@ def testDomainGenerationCapIsIncompleteRatherThanEmptyUnsat() -> None:
     } == {"catalog-domain-generation-work-cap"}
 
 
+def testAccessDomainAttemptEvidenceMatchesIndependentFiniteOracle() -> None:
+    GateValue = _InputSource()
+    ExpectedPatterns = (
+        ("INPUT:Output0PlanarJogNegative", "planar-jog", 0),
+        ("INPUT:Output0PlanarJogPositive", "planar-jog", 0),
+        ("INPUT:Output0Straight", "straight", 0),
+    )
+
+    Domain, = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=_Resources((GateValue,)),
+        Technology=Technology,
+    )
+
+    assert Domain.Complete is True
+    assert Domain.FinalInputFingerprint == Domain.EvaluationInputFingerprint
+    assert tuple(
+        (
+            Requirement.TemplateId,
+            Requirement.PatternFamily,
+            Requirement.Layer,
+        )
+        for Requirement in Domain.RequiredPatternManifest
+    ) == ExpectedPatterns
+    assert tuple(
+        Requirement.AttemptId
+        for Requirement in Domain.RequiredPatternManifest
+    ) == tuple(
+        Attempt.AttemptId for Attempt in Domain.PatternAttempts
+    )
+    assert tuple(
+        (Attempt.TemplateId, Attempt.PatternFamily, Attempt.Layer)
+        for Attempt in Domain.PatternAttempts
+    ) == ExpectedPatterns
+    assert all(Attempt.Status.value == "Legal" for Attempt in Domain.PatternAttempts)
+    assert {
+        Attempt.OptionFingerprint for Attempt in Domain.PatternAttempts
+    } == {
+        Option.PlacedBindingFingerprint for Option in Domain.Options
+    }
+
+
+def testCompleteAllBlockedDomainRetainsEveryTypedRejection() -> None:
+    GateValue = _InputSource()
+    Base = _Resources((GateValue,))
+    Terminal = tuple(GateValue.OutputPin)
+    Blocked = RoutingResourceGraph(
+        ActualBlocks=Base.ActualBlocks | {Terminal},
+        ElectricalBlocks=Base.ElectricalBlocks,
+        SolidBlocks=Base.SolidBlocks | {Terminal},
+        Technology=Base.Technology,
+        GraphVersion=Base.GraphVersion,
+        StaticKeepOutBlocks=Base.StaticKeepOutBlocks,
+        BlockStates=Base.BlockStates,
+    )
+
+    Domain, = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=Blocked,
+        Technology=Technology,
+    )
+    Solve = SolvePlacedPinAccessOptionDomains(
+        (Domain,),
+        ResourceGraph=Blocked,
+    )
+
+    assert Domain.Complete is True
+    assert Domain.Options == ()
+    assert len(Domain.PatternAttempts) == 3
+    assert all(
+        Attempt.Status.value == "Rejected"
+        and Attempt.Reason.value == "TerminalOrBridgeUnavailable"
+        and Attempt.OptionFingerprint is None
+        for Attempt in Domain.PatternAttempts
+    )
+    assert Solve.Status is PlacementAccessSolveStatus.Unsatisfiable
+
+
+@pytest.mark.parametrize("Exhaustion", ("work-cap", "deadline"))
+def testAccessDomainExhaustionBeforeFinalPatternIsIncomplete(
+    Exhaustion: str,
+) -> None:
+    GateValue = _InputSource()
+    WorkCheck = None
+    MaximumGenerationWork = 2
+    if Exhaustion == "deadline":
+        MaximumGenerationWork = 100
+
+        def WorkCheck(Details):
+            if (
+                Details["Phase"] == "pin-access-domain-generation"
+                and Details["NextWork"] == 3
+            ):
+                return False
+            return None
+
+    Domain, = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=_Resources((GateValue,)),
+        Technology=Technology,
+        MaximumGenerationWork=MaximumGenerationWork,
+        WorkCheck=WorkCheck,
+    )
+    Solve = SolvePlacedPinAccessOptionDomains((Domain,))
+
+    assert Domain.Complete is False
+    assert Domain.IncompleteReason == (
+        "catalog-domain-generation-work-cap"
+        if Exhaustion == "work-cap"
+        else "catalog-domain-generation-deadline"
+    )
+    assert tuple(
+        Attempt.Status.value for Attempt in Domain.PatternAttempts
+    ).count("NotEvaluated") == 1
+    assert Solve.Status is PlacementAccessSolveStatus.Incomplete
+    assert Solve.ConflictCore is None
+
+
+def testAccessDomainWorkControlsRequireExactTypes() -> None:
+    GateValue = _InputSource()
+    Graph = _Resources((GateValue,))
+
+    with pytest.raises(ValueError, match="work cap"):
+        EnumeratePlacedPinAccessOptionDomains(
+            (GateValue,),
+            ResourceGraph=Graph,
+            Technology=Technology,
+            MaximumGenerationWork=True,
+        )
+    with pytest.raises(TypeError, match="exact Boolean or None"):
+        EnumeratePlacedPinAccessOptionDomains(
+            (GateValue,),
+            ResourceGraph=Graph,
+            Technology=Technology,
+            WorkCheck=lambda _Details: 0,
+        )
+
+
+def testAccessDomainRejectsInputMutationBeforePublication() -> None:
+    GateValue = _InputSource()
+
+    def MutateBeforePublication(Details):
+        if Details["Phase"] == "pin-access-domain-generation-complete":
+            GateValue.OutputPin = (
+                GateValue.OutputPin[0] + 1,
+                GateValue.OutputPin[1],
+                GateValue.OutputPin[2],
+            )
+        return None
+
+    Domain, = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=_Resources((GateValue,)),
+        Technology=Technology,
+        WorkCheck=MutateBeforePublication,
+    )
+
+    assert Domain.Complete is False
+    assert Domain.IncompleteReason == "catalog-domain-input-drift"
+    assert Domain.FinalInputFingerprint
+    assert Domain.FinalInputFingerprint != Domain.EvaluationInputFingerprint
+
+
+def testAccessDomainAttemptIdentityIgnoresCatalogEnumerationOrder(
+    monkeypatch,
+) -> None:
+    GateValue = _InputSource()
+    Graph = _Resources((GateValue,))
+    First, = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=Graph,
+        Technology=Technology,
+    )
+    Original = PinAccessCatalog.BuildPhysicalPinAccessCatalog
+    monkeypatch.setattr(
+        PinAccessCatalog,
+        "BuildPhysicalPinAccessCatalog",
+        lambda **Values: tuple(reversed(Original(**Values))),
+    )
+
+    Second, = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=Graph,
+        Technology=Technology,
+    )
+
+    assert First.ToDictionary() == Second.ToDictionary()
+
+
+def testZeroGeneratedOptionsWithoutCertifiedPatternEvaluationIsIncomplete(
+    monkeypatch,
+) -> None:
+    GateValue = _InputSource()
+    Graph = _Resources((GateValue,))
+    Original = PinAccessCatalog.BuildPhysicalPinAccessCatalog
+
+    def CatalogWithoutThePlacedTerminalPatterns(**Values):
+        return tuple(
+            Template
+            for Template in Original(**Values)
+            if not (
+                Template.CellKind == "INPUT"
+                and Template.PinId == "Output0"
+            )
+        )
+
+    monkeypatch.setattr(
+        PinAccessCatalog,
+        "BuildPhysicalPinAccessCatalog",
+        CatalogWithoutThePlacedTerminalPatterns,
+    )
+    Domain, = EnumeratePlacedPinAccessOptionDomains(
+        (GateValue,),
+        ResourceGraph=Graph,
+        Technology=Technology,
+    )
+    Solve = SolvePlacedPinAccessOptionDomains(
+        (Domain,),
+        ResourceGraph=Graph,
+    )
+
+    assert Domain.Options == ()
+    assert Domain.PatternAttempts == ()
+    assert Domain.Complete is False
+    assert Domain.IncompleteReason == "catalog-domain-missing-certified-patterns"
+    assert Solve.Status is PlacementAccessSolveStatus.Incomplete
+    assert Solve.ConflictCore is None
+
+
 def testStaticObstructionRejectsOnlyAffectedCatalogOption() -> None:
     GateValue = _Nand()
     Base = _Resources((GateValue,))
@@ -1298,16 +1541,14 @@ def testCla4OpposingStraightRaysBecomeFeasibleWithAPlanarJog() -> None:
     )
 
     StraightDomains = tuple(
-        replace(
-            Value,
-            Options=tuple(
-                Option
-                for Option in Value.Options
-                if Option.PatternFamily == "straight"
-            ),
-            GeneratedOptionCount=1,
+        Value
+        for Value in EnumeratePlacedPinAccessOptionDomains(
+            Gates,
+            ResourceGraph=ResourceGraph,
+            Technology=Technology,
+            EnabledPatternFamilies=("straight",),
         )
-        for Value in RichDomains
+        if Value.Role == "Source"
     )
 
     Straight = SolveFixedPlacementPinAccessDomains(

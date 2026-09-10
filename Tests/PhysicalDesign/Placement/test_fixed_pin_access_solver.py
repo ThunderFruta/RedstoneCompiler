@@ -4,8 +4,14 @@ from itertools import product
 import pytest
 
 from PhysicalDesign.Contracts.PlacementAccess import (
+    BuildPlacementAccessDomainControlsFingerprint,
+    BuildPlacementAccessPatternAttemptId,
     PlacedPinAccessOption,
     PlacedPinAccessOptionDomain,
+    PlacedPinAccessPatternAttempt,
+    PlacedPinAccessPatternRequirement,
+    PlacementAccessPatternAttemptReason,
+    PlacementAccessPatternAttemptStatus,
     PlacementAccessSolveStatus,
 )
 from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessDomain, FixedPlacementPinAccessStatus, ReplayFixedPlacementPinAccessUnsatisfiableCore, ReplayPlacedPinAccessConflictCore, SolveFixedPlacementPinAccessDomains, SolvePlacedPinAccessOptionDomains
@@ -170,6 +176,76 @@ def BuildExactDomain(
         key=lambda Value: Value.RankKey(),
     ))
     Terminal = OrderedOptions[0].Terminal if OrderedOptions else (0, 1, 0)
+    Attempts = tuple(sorted((
+        PlacedPinAccessPatternAttempt(
+            AttemptId=BuildPlacementAccessPatternAttemptId(
+                DomainId=DomainId,
+                TemplateId=Option.TemplateId,
+                PatternFamily=Option.PatternFamily,
+                TemplateFingerprint=Option.TemplateFingerprint,
+                Layer=Option.Layer,
+                CatalogVersion=CatalogVersion,
+                TechnologyFingerprint=TechnologyFingerprint,
+                ResourceModelFingerprint=ResourceModelFingerprint,
+            ),
+            DomainId=DomainId,
+            TemplateId=Option.TemplateId,
+            PatternFamily=Option.PatternFamily,
+            TemplateFingerprint=Option.TemplateFingerprint,
+            Layer=Option.Layer,
+            CatalogVersion=CatalogVersion,
+            TechnologyFingerprint=TechnologyFingerprint,
+            ResourceModelFingerprint=ResourceModelFingerprint,
+            Status=PlacementAccessPatternAttemptStatus.Legal,
+            Reason=PlacementAccessPatternAttemptReason.Legal,
+            OptionFingerprint=Option.PlacedBindingFingerprint,
+        )
+        for Option in OrderedOptions
+    ), key=lambda Value: Value.RankKey()))
+    if not Attempts:
+        TemplateId = f"{DomainId}:UnevaluatedStraight"
+        TemplateFingerprint = f"template:{DomainId}:unevaluated-straight"
+        Attempts = (PlacedPinAccessPatternAttempt(
+            AttemptId=BuildPlacementAccessPatternAttemptId(
+                DomainId=DomainId,
+                TemplateId=TemplateId,
+                PatternFamily="straight",
+                TemplateFingerprint=TemplateFingerprint,
+                Layer=0,
+                CatalogVersion=CatalogVersion,
+                TechnologyFingerprint=TechnologyFingerprint,
+                ResourceModelFingerprint=ResourceModelFingerprint,
+            ),
+            DomainId=DomainId,
+            TemplateId=TemplateId,
+            PatternFamily="straight",
+            TemplateFingerprint=TemplateFingerprint,
+            Layer=0,
+            CatalogVersion=CatalogVersion,
+            TechnologyFingerprint=TechnologyFingerprint,
+            ResourceModelFingerprint=ResourceModelFingerprint,
+            Status=PlacementAccessPatternAttemptStatus.NotEvaluated,
+            Reason=PlacementAccessPatternAttemptReason.WorkCap,
+            OptionFingerprint=None,
+        ),)
+    Manifest = tuple(
+        PlacedPinAccessPatternRequirement(
+            AttemptId=Attempt.AttemptId,
+            DomainId=Attempt.DomainId,
+            TemplateId=Attempt.TemplateId,
+            PatternFamily=Attempt.PatternFamily,
+            TemplateFingerprint=Attempt.TemplateFingerprint,
+            Layer=Attempt.Layer,
+            CatalogVersion=Attempt.CatalogVersion,
+            TechnologyFingerprint=Attempt.TechnologyFingerprint,
+            ResourceModelFingerprint=Attempt.ResourceModelFingerprint,
+        )
+        for Attempt in Attempts
+    )
+    EnabledFamilies = tuple(sorted({
+        Attempt.PatternFamily for Attempt in Attempts
+    }))
+    EvaluationInputFingerprint = "evaluation:synthetic-problem"
     return PlacedPinAccessOptionDomain(
         DomainId=DomainId,
         Signal=f"Signal{DomainId}",
@@ -183,6 +259,18 @@ def BuildExactDomain(
         CatalogVersion=CatalogVersion,
         TechnologyFingerprint=TechnologyFingerprint,
         ResourceModelFingerprint=ResourceModelFingerprint,
+        EnabledPatternFamilies=EnabledFamilies,
+        RequiredPatternManifest=Manifest,
+        PatternAttempts=Attempts,
+        EvaluationControlsFingerprint=(
+            BuildPlacementAccessDomainControlsFingerprint(
+                EnabledPatternFamilies=EnabledFamilies,
+                CatalogVersion=CatalogVersion,
+                MaximumGenerationWork=100,
+            )
+        ),
+        EvaluationInputFingerprint=EvaluationInputFingerprint,
+        FinalInputFingerprint=EvaluationInputFingerprint,
         GeneratedOptionCount=len(OrderedOptions),
         RejectedOptionCount=0,
         DeduplicatedOptionCount=0,

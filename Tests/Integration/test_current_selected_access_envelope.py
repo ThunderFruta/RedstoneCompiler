@@ -12,8 +12,11 @@ from PhysicalDesign.Contracts.Failures import (
     RoutingStageError,
 )
 from PhysicalDesign.Contracts.PlacementAccess import (
+    BuildPlacementAccessProblemFingerprint,
     CurrentSelectedPlacementAccessValidationReason,
     CurrentSelectedPlacementAccessValidationStatus,
+    PlacementAccessPatternAttemptReason,
+    PlacementAccessPatternAttemptStatus,
     PlacementAccessSolveStatus,
 )
 from PhysicalDesign.Contracts.Placement import (
@@ -99,6 +102,30 @@ class _RawTrackFacts:
             "Success": self.Success,
             "Complete": self.Complete,
         }
+
+
+def _AllPlacementAccessPatternsRejected(Domains):
+    return tuple(
+        replace(
+            Domain,
+            Options=(),
+            PatternAttempts=tuple(
+                replace(
+                    Attempt,
+                    Status=PlacementAccessPatternAttemptStatus.Rejected,
+                    Reason=(
+                        PlacementAccessPatternAttemptReason.
+                        TerminalOrBridgeUnavailable
+                    ),
+                    OptionFingerprint=None,
+                )
+                for Attempt in Domain.PatternAttempts
+            ),
+            GeneratedOptionCount=0,
+            RejectedOptionCount=len(Domain.PatternAttempts),
+        )
+        for Domain in Domains
+    )
 
 
 def _Fixture(
@@ -1185,15 +1212,14 @@ def test_channel_successor_classifies_current_solve_before_track_requirements(
             IncompleteReason="work-cap",
         )
     elif Outcome == "unsatisfiable":
-        EmptyDomains = tuple(
-            replace(Domain, Options=(), GeneratedOptionCount=0)
-            for Domain in Solve.Domains
-        )
+        EmptyDomains = _AllPlacementAccessPatternsRejected(Solve.Domains)
         Solve = replace(
             SolvePlacedPinAccessOptionDomains(
                 EmptyDomains,
                 ResourceGraph=Resources.ResourceGraph,
-                MaximumExpansions=100,
+                MaximumExpansions=(
+                    Policy.PlacementAccess.MaximumAssignmentExpansions
+                ),
             ),
             PolicyVersion=Policy.PolicyVersion,
         )
@@ -1698,15 +1724,16 @@ def test_nonfeasible_fresh_access_solve_remains_typed_non_ready(
             IncompleteReason="work-cap",
         )
     else:
-        EmptyDomains = tuple(
-            replace(Domain, Options=(), GeneratedOptionCount=0)
-            for Domain in Placement.PlacementAccessSolve.Domains
+        EmptyDomains = _AllPlacementAccessPatternsRejected(
+            Placement.PlacementAccessSolve.Domains
         )
         Solve = replace(
             SolvePlacedPinAccessOptionDomains(
                 EmptyDomains,
                 ResourceGraph=Resources.ResourceGraph,
-                MaximumExpansions=100,
+                MaximumExpansions=(
+                    Policy.PlacementAccess.MaximumAssignmentExpansions
+                ),
             ),
             PolicyVersion=Policy.PolicyVersion,
         )
@@ -1723,6 +1750,128 @@ def test_nonfeasible_fresh_access_solve_remains_typed_non_ready(
     assert Result.Reason is ExpectedReason
     assert Result.Observations[-1].PhysicalValidation.Reason is ExpectedPhysicalReason
     assert Result.Envelope is None
+
+
+@pytest.mark.parametrize("Outcome", ("feasible", "unsatisfiable"))
+def test_truncated_same_family_manifest_cannot_authorize_current_access(
+    Outcome,
+):
+    RichPolicy = _ChangedAccessPolicy("EnabledPatternFamilies")
+    _Gates, Placement, Resources, Envelope, _Preparation = _Fixture(
+        PolicyValue=RichPolicy,
+    )
+    OriginalSolve = Placement.PlacementAccessSolve
+    TruncatedDomains = []
+    for Domain in OriginalSolve.Domains:
+        Manifest = tuple(
+            Requirement
+            for Requirement in Domain.RequiredPatternManifest
+            if not Requirement.TemplateId.endswith("PlanarJogPositive")
+        )
+        AttemptIds = {Value.AttemptId for Value in Manifest}
+        Attempts = tuple(
+            Attempt
+            for Attempt in Domain.PatternAttempts
+            if Attempt.AttemptId in AttemptIds
+        )
+        Options = tuple(
+            Option
+            for Option in Domain.Options
+            if Option.TemplateId != (
+                f"{Option.GateKind}:"
+                f"{Option.PinId}PlanarJogPositive"
+            )
+        )
+        if Outcome == "unsatisfiable":
+            Attempts = tuple(
+                replace(
+                    Attempt,
+                    Status=PlacementAccessPatternAttemptStatus.Rejected,
+                    Reason=(
+                        PlacementAccessPatternAttemptReason.
+                        TerminalOrBridgeUnavailable
+                    ),
+                    OptionFingerprint=None,
+                )
+                for Attempt in Attempts
+            )
+            Options = ()
+        TruncatedDomains.append(replace(
+            Domain,
+            RequiredPatternManifest=Manifest,
+            PatternAttempts=Attempts,
+            Options=Options,
+            GeneratedOptionCount=(len(Options) if Outcome == "feasible" else 0),
+            RejectedOptionCount=(
+                len(Attempts) if Outcome == "unsatisfiable" else 0
+            ),
+        ))
+    TruncatedDomains = tuple(sorted(
+        TruncatedDomains,
+        key=lambda Value: Value.DomainId,
+    ))
+    if Outcome == "feasible":
+        Witness = replace(
+            OriginalSolve.SelectedWitness,
+            Domains=TruncatedDomains,
+            DomainFingerprints=tuple(sorted(
+                Domain.DomainFingerprint for Domain in TruncatedDomains
+            )),
+        )
+        Solve = replace(
+            OriginalSolve,
+            Domains=TruncatedDomains,
+            ProblemFingerprint=BuildPlacementAccessProblemFingerprint(
+                TruncatedDomains
+            ),
+            SelectedWitness=Witness,
+        )
+    else:
+        Solve = replace(
+            SolvePlacedPinAccessOptionDomains(
+                TruncatedDomains,
+                ResourceGraph=Resources.ResourceGraph,
+                MaximumExpansions=(
+                    RichPolicy.PlacementAccess.MaximumAssignmentExpansions
+                ),
+            ),
+            PolicyVersion=RichPolicy.PolicyVersion,
+        )
+        assert Solve.Status is PlacementAccessSolveStatus.Unsatisfiable
+    Current = replace(
+        Placement,
+        SelectedPinAccessWitness=Solve.SelectedWitness,
+        PlacementAccessSolve=Solve,
+    )
+
+    Result = _Build(
+        Current,
+        Resources,
+        Envelope,
+        PolicyValue=RichPolicy,
+        SolveBinding=BuildCurrentSelectedAccessSolveBinding(
+            RichPolicy,
+            Solve,
+        ),
+    )
+
+    assert Result.Status not in {
+        CurrentSelectedAccessEnvelopeStatus.Ready,
+        CurrentSelectedAccessEnvelopeStatus.Unsatisfiable,
+    }
+    assert Result.Envelope is None
+    Physical = Result.Observations[-1].PhysicalValidation
+    assert Physical.Status is CurrentSelectedPlacementAccessValidationStatus.Mismatch
+    assert Physical.Reason is (
+        CurrentSelectedPlacementAccessValidationReason.
+        RequiredPatternManifestMismatch
+    )
+    with pytest.raises(RoutingStageError) as Error:
+        RequireCurrentSelectedAccessEnvelopeReady(
+            Result,
+            Stage="truncated-pattern-manifest",
+        )
+    assert Error.value.Failure.Reason is not RoutingFailureReason.NoPinAccessPattern
 
 
 def test_final_candidate_access_refresh_propagates_deadline_failure():
