@@ -53,7 +53,7 @@ from .PhysicalAssembly import (
     SelectCompletePhysicalEligibilityRepairEndpointGateNames,
 )
 from .RoutingAttempts import (
-    MaterializeSelectedJointPlacementLocalRouting,
+    MaterializeSelectedJointPlacementLocalRoutingHandoff,
     RebuildCurrentCandidateTrackPreparation,
 )
 from .PlacementAttempts import (
@@ -289,13 +289,25 @@ def RunPhysicalComponentFlow(Context):
             Context.RoutedComponentHandoffEntered = False
             Context.RetainedPlacementResourceCacheHit = False
             try:
-                Context.MaterializedInterfacePlacement = MaterializeSelectedJointPlacementLocalRouting(Context, Context.InterfaceCandidate, lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfacePlacementMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}))
-                if Context.MaterializedInterfacePlacement is not Context.InterfaceCandidate.Placement:
-                    Context.InterfaceCandidate = replace(
-                        Context.InterfaceCandidate,
-                        Placement=Context.MaterializedInterfacePlacement,
-                        PlacementFingerprintIncludesLocalClaims=False,
-                    )
+                Context.DeferredLocalRoutingHandoff = MaterializeSelectedJointPlacementLocalRoutingHandoff(Context, Context.InterfaceCandidate, lambda Diagnostics, Candidate=Context.InterfaceCandidate: Context.InterfaceDeadline.RaiseIfExpired('ClusterInterfacePlacementMaterialization', {'CandidateId': Candidate.CandidateId, **Diagnostics}))
+                if (
+                    Context.DeferredLocalRoutingHandoff.OriginalStartedAt
+                    != Context.Deadline.StartedAt
+                    or Context.DeferredLocalRoutingHandoff.OriginalExpiresAt
+                    != Context.Deadline.ExpiresAt
+                ):
+                    raise RoutingStageError(RoutingFailure(
+                        Reason=RoutingFailureReason.ClusterInterfaceInvariantViolation,
+                        Stage='DeferredLocalRoutingRuntimeAuthority',
+                        Detail='deferred local-route materialization changed the original runtime authority',
+                        Diagnostics=Context.DeferredLocalRoutingHandoff.ToDictionary(),
+                    ))
+                Context.InterfaceCandidate = (
+                    Context.DeferredLocalRoutingHandoff.Candidate
+                )
+                Context.MaterializedInterfacePlacement = (
+                    Context.InterfaceCandidate.Placement
+                )
                 if Context.Policy.PlacementAccess.Enabled:
                     Context.ChannelTransitionSourceDemand = (
                         BuildPlacementAccessDemand(
