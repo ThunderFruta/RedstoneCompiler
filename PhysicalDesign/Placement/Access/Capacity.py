@@ -20,6 +20,7 @@ from typing import (
 )
 from PhysicalDesign.Contracts.Placement import PlacementAccessAssignment, PlacementAccessFabric
 from PhysicalDesign.Contracts.PlacementAccess import (
+    BuildPlacementAccessProblemFingerprint,
     PlacedPinAccessOption,
     PlacedPinAccessOptionDomain,
     PlacementAccessConflictCore,
@@ -878,6 +879,7 @@ def _ConvertPlacedPinAccessDomains(
         raise ValueError("placed pin-access solve requires terminal domains")
     if len({Value.DomainId for Value in OrderedDomains}) != len(OrderedDomains):
         raise ValueError("placed pin-access solve repeats a domain id")
+    BuildPlacementAccessProblemFingerprint(OrderedDomains)
     Dependencies = {
         (
             Value.CatalogVersion,

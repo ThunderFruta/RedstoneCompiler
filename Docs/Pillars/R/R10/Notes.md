@@ -416,3 +416,117 @@ stability, repeater, fanout, ownership, alternate-material, Fabric, scale,
 router-acceptance, or full R10 claim. The prior four raw diagnostics establish
 stability through ticks `0..16` for these exact layouts only; fixture timing
 uses the established conservative `4 + 3` comparison horizon.
+
+### 2026-09-09 placement-access domain completion candidate
+
+- **Capability packet and source.** `Physical-Placement-Access-Domain-Completion-v1`
+  starts from `Physical-Rules` commit
+  `ea2e22d8f8743417691fdb25a642bb6427e8955f`, tree
+  `de2e8e777b3f209f8d5e7554ce9fc12faab538df`. For an exact placed terminal,
+  a domain is complete only when every enabled certified template/layer has a
+  deterministic semantic attempt under one terminal, catalog, technology,
+  resource-model, block-state, and frozen-wire identity. At least one legal
+  attempt permits feasibility; zero legal options is candidate-local
+  unsatisfiable only when every required attempt has a typed rejection.
+- **Typed evidence and incomplete boundaries.** The versioned domain identity
+  now retains enabled families, canonical per-pattern attempt identifiers,
+  legal/rejected/deduplicated/not-evaluated/unknown status, closed reasons,
+  exact option linkage, initial evaluation identity, and final drift identity.
+  Work-cap or cooperatively reported deadline exhaustion leaves the unattempted
+  patterns explicit and makes the solve incomplete. A raised outer typed
+  deadline still propagates unchanged. Missing certified patterns, unknown
+  physical decisions, or valid input mutation before publication cannot become
+  a complete domain, conflict core, or `NoPinAccessPattern` proof.
+- **Independent oracle and challenges.** The controlled one-terminal oracle
+  fixes the three literal INPUT `Output0` pattern identities and layer zero,
+  then independently checks one all-legal domain, an occupied-terminal domain
+  with all three typed rejections, exhaustion before the third pattern,
+  mutation at publication, reversed catalog enumeration, and removal of every
+  certified terminal pattern. The last case specifically rejects the former
+  aggregate shortcut that treated zero generated options as complete evidence.
+- **Scope and limits.** No new pattern family, named circuit/signal behavior,
+  Joint orchestration, recovery, bound increase, retry, worker, beam, or
+  physical-legality relaxation is included. HalfAdder remains acceptance
+  evidence only. This is a source-local uncommitted Physical producer candidate,
+  not Joint integration, a Router checkpoint, full R10 acceptance, or promotion
+  readiness. Native rebuild/parity, MCHPRS, Fabric, scale, and acceptance-matrix
+  runs remain not-run because no native or backend behavior changed.
+- **Verification evidence.** The required focused suite passed **154 tests**;
+  the selected-access envelope consumer module passed **63 tests**; the
+  structural/schema gate passed **7 tests**; compile-all passed; collection
+  reported **2,346 tests**; and the final deterministic suite passed **2,341
+  tests, 5 skipped, and 378 subtests** in 401.92 seconds. Fresh retained logs
+  are under `Output/PhysicalAccessDomainCompletion/20260909T215543Z/`.
+
+### 2026-09-09 placement-access completion review correction
+
+The first candidate diff
+`625794c5d66098e71e201ca593bc04d9135e5db33ed8fd9eb32a6bffaea8c050`
+is preserved as rejected evidence. Independent review proved that family-set
+coverage and aggregate option counts did not establish the exact certified
+template/layer universe, permitted many-to-one legal links and global-cap
+forgeries, and omitted the stable final input observation.
+
+- **Corrected Physical contract.** Every terminal now retains an ordered exact
+  required-pattern manifest with template ID, family, template fingerprint,
+  layer, and dependency-bound attempt ID. Attempts must match it one-for-one;
+  each legal attempt must map uniquely to a retained option with identical
+  template/layer/catalog/technology/resource identity. Complete problem evidence
+  validates total evaluated work against the one shared original generation
+  cap. Stable results retain equal nonempty initial/final observations; drift
+  retains unequal observations and remains incomplete.
+- **Current Physical re-attestation.** Current validation recomputes the exact
+  manifest and evaluation input from current placed terminals, catalog,
+  technology, resource model, block states, and frozen wires before accepting
+  either feasible or unsatisfiable evidence. Same-family truncation and
+  catalog-absent invented requirements therefore produce typed mismatch and
+  cannot reach the current selected-access envelope's `Ready`, `Unsatisfiable`,
+  or `NoPinAccessPattern` outcomes.
+- **Remaining dependency.** A fully self-consistent portable record that changes
+  its own families, catalog version, generation cap, or assignment cap can be
+  compared with the *live* policy only when the Joint-owned current-envelope
+  and final-publication callers supply those controls explicitly. That
+  producer/consumer contract is pending parent routing. Until it is integrated
+  and reviewed, this repair is not capability-proven or commit-ready even when
+  its Physical checks pass.
+- **Repair evidence.** Red evidence, pre-verification source/test hashes, and
+  subsequent checks are retained under
+  `Output/PhysicalAccessDomainCompletionRepair/20260909T230914Z/`. The rejected
+  first-candidate root remains unchanged.
+- **Provisional verification.** The repaired Physical suite passed **160
+  tests**, the selected-envelope consumer module passed **65 tests**, the
+  structural/schema gate passed **7 tests**, compile-all passed, collection
+  reported **2,354 tests**, and the deterministic suite passed **2,349 tests,
+  5 skipped, and 378 subtests** in 326.09 seconds. These checks establish the
+  independent Physical slice only; they do not discharge the live-policy
+  consumer dependency above.
+
+### 2026-09-10 evaluation-controls producer migration
+
+`PlacementAccessEvaluationControls` is the frozen Physical record for the
+current policy's normalized enabled families, catalog version, exact positive
+generation cap, and exact positive assignment cap. Its deterministic controls
+fingerprint is retained in the v2 current-validation input identity.
+
+The existing `ValidateCurrentSelectedPlacementAccess` entry point accepts
+keyword-only `CurrentControls=None` for Python call compatibility, but the
+compatibility path has no authority: omission returns typed
+`Unresolved/EvaluationControlsMissing` before feasible, incomplete, or
+unsatisfiable classification. Supplied controls must be the exact frozen type
+and must match every domain, the solve assignment cap, and the recomputed
+current catalog manifest; mismatch is typed
+`Mismatch/EvaluationControlsMismatch`. No validation path regenerates access or
+changes a solve result.
+
+The Joint-owned current-envelope and final-publication callers have not yet
+migrated in this worktree, so their existing tests and the complete suite are
+expected blocked rather than relabeled green. Combined producer/consumer
+verification is outside this step and remains not-run.
+
+The independently valid expanded producer suite passed **181 tests with 1
+Joint-caller test deselected**; the structural/schema gate passed **7 tests**;
+compile-all passed; and collection reported **2,376 tests**. Two explicit
+unchanged-caller probes failed with `EvaluationControlsMissing`, one at the
+current-envelope boundary and one at final publication. The complete suite was
+not run because it would repeat those known absent-caller failures and the user
+did not authorize combined-source verification.

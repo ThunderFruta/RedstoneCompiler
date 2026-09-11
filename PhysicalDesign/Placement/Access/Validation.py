@@ -18,6 +18,7 @@ from PhysicalDesign.Contracts.PlacementAccess import (
     CurrentSelectedPlacementAccessValidationStatus,
     PlacementAccessSolveResult,
     PlacementAccessSolveStatus,
+    PlacementAccessEvaluationControls,
     SelectedPlacementPinAccessWitness,
 )
 from PhysicalDesign.Geometry.Placement import PlacedGate, ValidatePlacedGateContract
@@ -30,6 +31,7 @@ from PhysicalDesign.Placement.Access.Catalog import (
     CanonicalizeRoutingResourceBlockStates,
     CollectFrozenNetWireEntries,
     NormalizeFrozenNetWireEntries,
+    ValidateCurrentPlacedPinAccessDomainEvidence,
     ValidateSelectedPlacementPinAccessBindings,
 )
 from PhysicalDesign.Redstone.Technology import RedstoneRoutingTechnology
@@ -272,6 +274,7 @@ def _InputIdentity(
     SolveResultFingerprint: str,
     Witness: SelectedPlacementPinAccessWitness | None,
     *,
+    CurrentControls: PlacementAccessEvaluationControls | None,
     FinalObservationFingerprint: str | None = None,
 ) -> CurrentSelectedPlacementAccessInputIdentity:
     return CurrentSelectedPlacementAccessInputIdentity(
@@ -281,6 +284,10 @@ def _InputIdentity(
         ),
         DomainFingerprint=(Witness.DomainFingerprint if Witness is not None else None),
         SolveResultFingerprint=SolveResultFingerprint,
+        EvaluationControlsFingerprint=(
+            CurrentControls.ControlsFingerprint
+            if CurrentControls is not None else None
+        ),
         WitnessCatalogVersion=(Witness.CatalogVersion if Witness is not None else None),
         TechnologyFingerprint=Snapshot.TechnologyFingerprint,
         ResourceModelFingerprint=Snapshot.ResourceModelFingerprint or "",
@@ -315,6 +322,9 @@ def _Publish(
             WitnessFingerprint=Identity.WitnessFingerprint,
             DomainFingerprint=Identity.DomainFingerprint,
             SolveResultFingerprint=Identity.SolveResultFingerprint,
+            EvaluationControlsFingerprint=(
+                Identity.EvaluationControlsFingerprint
+            ),
             WitnessCatalogVersion=Identity.WitnessCatalogVersion,
             TechnologyFingerprint=Identity.TechnologyFingerprint,
             ResourceModelFingerprint=Identity.ResourceModelFingerprint,
@@ -343,11 +353,14 @@ def ValidateCurrentSelectedPlacementAccess(
     ResourceGraph: RoutingResourceGraph,
     Technology: RedstoneRoutingTechnology,
     FrozenNetWires: Mapping[str, Iterable[tuple[int, int, int]]],
+    CurrentControls: PlacementAccessEvaluationControls | None = None,
 ) -> CurrentSelectedPlacementAccessValidation:
     """Re-attest supplied source evidence against one immutable current snapshot.
 
     A decoded or stored receipt is never sufficient: every consumer must call
-    this function again with the full witness, solve result, and current inputs.
+    this function again with the full witness, solve result, current inputs,
+    and exact live evaluation controls.  Omitted controls are unresolved and
+    never retain the authority of the pre-controls compatibility call.
     """
     if type(SolveResult) is not PlacementAccessSolveResult:
         raise TypeError("SolveResult must be an exact PlacementAccessSolveResult")
@@ -385,13 +398,48 @@ def ValidateCurrentSelectedPlacementAccess(
         return _Publish(
             Status,
             Reason,
-            _InputIdentity(Snapshot, SolveFingerprint, Witness),
+            _InputIdentity(
+                Snapshot,
+                SolveFingerprint,
+                Witness,
+                CurrentControls=CurrentControls,
+            ),
             LiveGates=LiveGates,
             ResourceGraph=ResourceGraph,
             Technology=Technology,
             FrozenNetWires=FrozenNetWires,
         )
 
+    if CurrentControls is None:
+        return Publish(
+            CurrentSelectedPlacementAccessValidationStatus.Unresolved,
+            CurrentSelectedPlacementAccessValidationReason.EvaluationControlsMissing,
+            SelectedWitness,
+        )
+    if type(CurrentControls) is not PlacementAccessEvaluationControls:
+        raise TypeError(
+            "CurrentControls must be exact PlacementAccessEvaluationControls"
+        )
+    CurrentControls.__post_init__()
+    ControlsMatch = (
+        SolveResult.MaximumExpansions
+        == CurrentControls.MaximumAssignmentExpansions
+        and bool(SolveResult.Domains)
+        and all(
+            Domain.EnabledPatternFamilies
+            == CurrentControls.EnabledPatternFamilies
+            and Domain.CatalogVersion == CurrentControls.CatalogVersion
+            and Domain.MaximumGenerationWork
+            == CurrentControls.MaximumGenerationWork
+            for Domain in SolveResult.Domains
+        )
+    )
+    if not ControlsMatch:
+        return Publish(
+            CurrentSelectedPlacementAccessValidationStatus.Mismatch,
+            CurrentSelectedPlacementAccessValidationReason.EvaluationControlsMismatch,
+            SelectedWitness,
+        )
     if SolveResult.Status is PlacementAccessSolveStatus.Incomplete:
         if SelectedWitness is not None:
             raise ValueError("incomplete solve requires no selected witness")
@@ -399,6 +447,65 @@ def ValidateCurrentSelectedPlacementAccess(
             CurrentSelectedPlacementAccessValidationStatus.Unresolved,
             CurrentSelectedPlacementAccessValidationReason.IncompleteSolve,
             None,
+        )
+    if not SolveResult.Domains:
+        return Publish(
+            CurrentSelectedPlacementAccessValidationStatus.Unresolved,
+            CurrentSelectedPlacementAccessValidationReason.MissingDomainEvidence,
+            SelectedWitness,
+        )
+    if SelectedWitness is not None:
+        SelectedBindingFingerprint = (
+            _BuildSelectedPlacementPinAccessBindingFingerprint(
+                _SelectedPlacementPinAccessBindings(
+                    SelectedWitness.Selections
+                )[0]
+            )
+        )
+        if SelectedBindingFingerprint != Snapshot.TerminalBindingFingerprint:
+            return Publish(
+                CurrentSelectedPlacementAccessValidationStatus.Mismatch,
+                CurrentSelectedPlacementAccessValidationReason.TerminalBindingsMismatch,
+                SelectedWitness,
+            )
+    if Snapshot.ResourceGraph.Technology != Snapshot.Technology:
+        return Publish(
+            CurrentSelectedPlacementAccessValidationStatus.Mismatch,
+            CurrentSelectedPlacementAccessValidationReason.ResourceGraphTechnologyMismatch,
+            SelectedWitness,
+        )
+    DomainTechnologyFingerprints = {
+        Domain.TechnologyFingerprint for Domain in SolveResult.Domains
+    }
+    if DomainTechnologyFingerprints != {Snapshot.TechnologyFingerprint}:
+        return Publish(
+            CurrentSelectedPlacementAccessValidationStatus.Mismatch,
+            CurrentSelectedPlacementAccessValidationReason.TechnologyFingerprintMismatch,
+            SelectedWitness,
+        )
+    DomainResourceModelFingerprints = {
+        Domain.ResourceModelFingerprint for Domain in SolveResult.Domains
+    }
+    if DomainResourceModelFingerprints != {Snapshot.ResourceModelFingerprint}:
+        return Publish(
+            CurrentSelectedPlacementAccessValidationStatus.Mismatch,
+            CurrentSelectedPlacementAccessValidationReason.ResourceModelFingerprintMismatch,
+            SelectedWitness,
+        )
+    DomainEvidenceFailure = ValidateCurrentPlacedPinAccessDomainEvidence(
+        Snapshot.Gates,
+        SolveResult.Domains,
+        Technology=Snapshot.Technology,
+        ResourceModelFingerprint=Snapshot.ResourceModelFingerprint,
+        CurrentControls=CurrentControls,
+    )
+    if DomainEvidenceFailure:
+        return Publish(
+            CurrentSelectedPlacementAccessValidationStatus.Mismatch,
+            CurrentSelectedPlacementAccessValidationReason(
+                DomainEvidenceFailure
+            ),
+            SelectedWitness,
         )
     if SolveResult.Status is PlacementAccessSolveStatus.Unsatisfiable:
         if SelectedWitness is not None:
