@@ -1,4 +1,5 @@
 .vscode/
+/Validation/Fabric/ServerHarness/bin/
 .codex/*
 !.codex/environments/
 !.codex/environments/redstonecompiler-worktree.toml
