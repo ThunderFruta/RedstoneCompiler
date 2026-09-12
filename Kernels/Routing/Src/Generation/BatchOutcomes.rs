@@ -187,6 +187,8 @@ pub(crate) struct SealedCoarseRequestV1 {
     BendPenalty: i32,
     ViaPenalty: i32,
     MaximumExpansionCount: usize,
+    NativePayloadCanonicalJson: Arc<str>,
+    NativePayloadSha256: Arc<str>,
     ImmutableInputCanonicalJson: Arc<str>,
     ImmutableInputSha256: Arc<str>,
     RawCallerEchoScopeCanonicalJson: Arc<str>,
@@ -212,6 +214,8 @@ pub(crate) struct SealedDetailedRequestV1 {
     ViaPenalty: i32,
     EnforceSignalStrength: bool,
     MaximumExpansionCount: usize,
+    NativePayloadCanonicalJson: Arc<str>,
+    NativePayloadSha256: Arc<str>,
     ImmutableInputCanonicalJson: Arc<str>,
     ImmutableInputSha256: Arc<str>,
     RawCallerEchoScopeCanonicalJson: Arc<str>,
@@ -263,6 +267,34 @@ impl RouteTreeCoarseRequestV1 {
     #[getter]
     fn ContractVersion(&self) -> &'static str {
         CONTRACT_VERSION
+    }
+
+    #[getter]
+    fn RequestKind(&self) -> &'static str {
+        COARSE_REQUEST_KIND
+    }
+
+    #[getter]
+    fn NativePayloadCanonicalJson(&self) -> &str {
+        &self.Sealed.NativePayloadCanonicalJson
+    }
+
+    #[getter]
+    fn NativePayloadSha256(&self) -> &str {
+        &self.Sealed.NativePayloadSha256
+    }
+
+    #[getter]
+    fn ImmutableInputSha256(&self) -> &str {
+        &self.Sealed.ImmutableInputSha256
+    }
+
+    #[getter]
+    fn CallerEchoScopeSha256(&self) -> &str {
+        self.Sealed
+            .CanonicalCallerEchoScopeSha256
+            .as_deref()
+            .unwrap_or(&self.Sealed.RawCallerEchoScopeSha256)
     }
 
     #[new]
@@ -370,6 +402,34 @@ impl RouteTreeDetailedRequestV1 {
     #[getter]
     fn ContractVersion(&self) -> &'static str {
         CONTRACT_VERSION
+    }
+
+    #[getter]
+    fn RequestKind(&self) -> &'static str {
+        DETAILED_REQUEST_KIND
+    }
+
+    #[getter]
+    fn NativePayloadCanonicalJson(&self) -> &str {
+        &self.Sealed.NativePayloadCanonicalJson
+    }
+
+    #[getter]
+    fn NativePayloadSha256(&self) -> &str {
+        &self.Sealed.NativePayloadSha256
+    }
+
+    #[getter]
+    fn ImmutableInputSha256(&self) -> &str {
+        &self.Sealed.ImmutableInputSha256
+    }
+
+    #[getter]
+    fn CallerEchoScopeSha256(&self) -> &str {
+        self.Sealed
+            .CanonicalCallerEchoScopeSha256
+            .as_deref()
+            .unwrap_or(&self.Sealed.RawCallerEchoScopeSha256)
     }
 
     #[new]
@@ -509,6 +569,8 @@ pub(crate) struct RouteTreeRequestReceiptV1 {
     pub(crate) ProofExpansionCount: usize,
     #[pyo3(get)]
     pub(crate) TotalExpansionCount: usize,
+    pub(crate) NativePayloadCanonicalJson: Arc<str>,
+    pub(crate) NativePayloadSha256: Arc<str>,
     #[pyo3(get)]
     pub(crate) RawInputRetentionStatus: String,
     #[pyo3(get)]
@@ -626,6 +688,16 @@ impl RouteTreeRequestReceiptV1 {
     #[getter]
     fn ImmutableInputSha256(&self) -> Option<&str> {
         self.ImmutableInputSha256.as_deref()
+    }
+
+    #[getter]
+    fn NativePayloadCanonicalJson(&self) -> &str {
+        &self.NativePayloadCanonicalJson
+    }
+
+    #[getter]
+    fn NativePayloadSha256(&self) -> &str {
+        &self.NativePayloadSha256
     }
 
     #[getter]
@@ -1073,6 +1145,46 @@ fn SealCoarseRequestV1(
     ViaPenalty: i32,
     MaximumExpansionCount: usize,
 ) -> Arc<SealedCoarseRequestV1> {
+    let CanonicalAllowedColumns: Vec<_> = AllowedColumns
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let CanonicalRequiredNodes: Vec<_> = RequiredNodes
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let CanonicalBlockedNodes: Vec<_> = BlockedNodeValues
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let CanonicalPreferredColumns: Vec<_> = PreferredColumns
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let NativePayloadCanonicalJson = serde_json::to_string(&json!([
+        "native-coarse-route-request-payload-v1",
+        Starts,
+        TargetBranches,
+        CanonicalAllowedColumns,
+        CanonicalRequiredNodes,
+        CanonicalBlockedNodes,
+        CanonicalPreferredColumns,
+        PreferredRoutingY,
+        GuidePenalty,
+        BendPenalty,
+        ViaPenalty,
+        MaximumExpansionCount,
+        CancellationRequestedBeforeStart,
+    ]))
+    .expect("native coarse payload JSON values are serializable");
     let ImmutableInputCanonicalJson = serde_json::to_string(&json!([
         "raw-native-coarse-route-request-v1",
         RequestId,
@@ -1122,6 +1234,8 @@ fn SealCoarseRequestV1(
         BendPenalty,
         ViaPenalty,
         MaximumExpansionCount,
+        NativePayloadSha256: Arc::from(NativeSha256(&NativePayloadCanonicalJson)),
+        NativePayloadCanonicalJson: Arc::from(NativePayloadCanonicalJson),
         ImmutableInputSha256: Arc::from(NativeSha256(&ImmutableInputCanonicalJson)),
         ImmutableInputCanonicalJson: Arc::from(ImmutableInputCanonicalJson),
         RawCallerEchoScopeSha256: Arc::from(NativeSha256(&RawCallerEchoScopeCanonicalJson)),
@@ -1153,6 +1267,47 @@ fn SealDetailedRequestV1(
     EnforceSignalStrength: bool,
     MaximumExpansionCount: usize,
 ) -> Arc<SealedDetailedRequestV1> {
+    let CanonicalAllowedNodes: Vec<_> = AllowedNodeValues
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let CanonicalBlockedNodes: Vec<_> = BlockedNodeValues
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let CanonicalPreferredColumns: Vec<_> = PreferredColumns
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let CanonicalNodeCosts: Vec<_> = NodeCostValues
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    let NativePayloadCanonicalJson = serde_json::to_string(&json!([
+        "native-detailed-route-request-payload-v1",
+        Starts,
+        TargetBranches,
+        CanonicalAllowedNodes,
+        CanonicalBlockedNodes,
+        CanonicalPreferredColumns,
+        CanonicalNodeCosts,
+        PreferredRoutingY,
+        GuidePenalty,
+        BendPenalty,
+        ViaPenalty,
+        EnforceSignalStrength,
+        MaximumExpansionCount,
+        CancellationRequestedBeforeStart,
+    ]))
+    .expect("native detailed payload JSON values are serializable");
     let ImmutableInputCanonicalJson = serde_json::to_string(&json!([
         "raw-native-detailed-route-request-v1",
         RequestId,
@@ -1204,6 +1359,8 @@ fn SealDetailedRequestV1(
         ViaPenalty,
         EnforceSignalStrength,
         MaximumExpansionCount,
+        NativePayloadSha256: Arc::from(NativeSha256(&NativePayloadCanonicalJson)),
+        NativePayloadCanonicalJson: Arc::from(NativePayloadCanonicalJson),
         ImmutableInputSha256: Arc::from(NativeSha256(&ImmutableInputCanonicalJson)),
         ImmutableInputCanonicalJson: Arc::from(ImmutableInputCanonicalJson),
         RawCallerEchoScopeSha256: Arc::from(NativeSha256(&RawCallerEchoScopeCanonicalJson)),
@@ -1231,6 +1388,20 @@ fn ImmutableInputSha256(Request: &AuthoritativeRouteRequestV1) -> Arc<str> {
     match Request {
         AuthoritativeRouteRequestV1::Coarse(Value) => Value.ImmutableInputSha256.clone(),
         AuthoritativeRouteRequestV1::Detailed(Value) => Value.ImmutableInputSha256.clone(),
+    }
+}
+
+fn NativePayloadCanonicalJson(Request: &AuthoritativeRouteRequestV1) -> Arc<str> {
+    match Request {
+        AuthoritativeRouteRequestV1::Coarse(Value) => Value.NativePayloadCanonicalJson.clone(),
+        AuthoritativeRouteRequestV1::Detailed(Value) => Value.NativePayloadCanonicalJson.clone(),
+    }
+}
+
+fn NativePayloadSha256(Request: &AuthoritativeRouteRequestV1) -> Arc<str> {
+    match Request {
+        AuthoritativeRouteRequestV1::Coarse(Value) => Value.NativePayloadSha256.clone(),
+        AuthoritativeRouteRequestV1::Detailed(Value) => Value.NativePayloadSha256.clone(),
     }
 }
 
@@ -2851,6 +3022,8 @@ pub(crate) fn FinalizeRouteTreeBatchOutcomesV1(
             ImmutableInputCanonicalJson(&OriginalRequest),
             ImmutableInputSha256(&OriginalRequest),
         );
+        let NativePayloadCanonicalJson = NativePayloadCanonicalJson(&OriginalRequest);
+        let NativePayloadSha256 = NativePayloadSha256(&OriginalRequest);
         let ExpectedCallerEchoIdentity = ProducerFacts
             .CanonicalRequest
             .as_ref()
@@ -3061,6 +3234,8 @@ pub(crate) fn FinalizeRouteTreeBatchOutcomesV1(
             RouteExpansionCount: Value.RouteExpansionCount,
             ProofExpansionCount: Value.ProofExpansionCount,
             TotalExpansionCount,
+            NativePayloadCanonicalJson,
+            NativePayloadSha256,
             RawInputRetentionStatus: "SealedCanonicalBytes".to_string(),
             CancellationSnapshotStatus: "Captured".to_string(),
             OutcomePhase: Value.OutcomePhase.to_string(),

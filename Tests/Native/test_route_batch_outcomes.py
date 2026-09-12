@@ -271,6 +271,186 @@ def test_duplicate_ids_preserve_original_ordinals_and_aggregate_actual_work():
     )
 
 
+def test_native_payload_identity_excludes_logical_metadata_and_covers_every_control():
+    BaseArguments = [
+        "logical-alpha",
+        _bindings("alpha"),
+        (0, 0, 0, 2, 0, 0),
+        (0, 0, 2, 0),
+        False,
+        [A],
+        [[C]],
+        [(0, 0), (1, 0), (2, 0)],
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        32,
+    ]
+
+    MetadataVariant = list(BaseArguments)
+    MetadataVariant[0] = "logical-beta"
+    MetadataVariant[1] = _bindings("beta")
+    MetadataVariant[2] = (-100, -100, -100, 100, 100, 100)
+    MetadataVariant[3] = (-100, -100, 100, 100)
+
+    PayloadVariants = []
+    for Index, Value in (
+        (4, True),
+        (5, [B]),
+        (6, [[B]]),
+        (7, [(0, 0), (1, 0)]),
+        (8, [C]),
+        (9, [B]),
+        (10, [(1, 0)]),
+        (11, 1),
+        (12, 1),
+        (13, 1),
+        (14, 1),
+        (15, 31),
+    ):
+        Arguments = list(BaseArguments)
+        Arguments[Index] = Value
+        PayloadVariants.append(RustRouting.RouteTreeCoarseRequestV1(*Arguments))
+
+    Requests = (
+        RustRouting.RouteTreeCoarseRequestV1(*BaseArguments),
+        RustRouting.RouteTreeCoarseRequestV1(*MetadataVariant),
+        *PayloadVariants,
+    )
+    Receipts = _context().GenerateRouteTreesBatchOutcomesV1(
+        "native-payload-identity",
+        Requests,
+        monotonic() + 10,
+    ).Receipts
+
+    Base = Receipts[0]
+    assert Base.NativePayloadSha256 == sha256(
+        Base.NativePayloadCanonicalJson.encode()
+    ).hexdigest()
+    assert Receipts[1].NativePayloadCanonicalJson == Base.NativePayloadCanonicalJson
+    assert Receipts[1].NativePayloadSha256 == Base.NativePayloadSha256
+    assert Receipts[1].ImmutableInputSha256 != Base.ImmutableInputSha256
+    assert all(
+        Receipt.NativePayloadSha256 != Base.NativePayloadSha256
+        for Receipt in Receipts[2:]
+    )
+
+    Permuted = _context().GenerateRouteTreesBatchOutcomesV1(
+        "native-payload-canonical-sets",
+        (
+            _coarse(
+                AllowedColumns=((2, 0), (0, 0), (1, 0), (0, 0)),
+                RequiredNodes=(C, C),
+                BlockedNodeValues=(B, B),
+                PreferredColumns=((2, 0), (1, 0), (2, 0)),
+            ),
+            _coarse(
+                AllowedColumns=((0, 0), (1, 0), (2, 0)),
+                RequiredNodes=(C,),
+                BlockedNodeValues=(B,),
+                PreferredColumns=((1, 0), (2, 0)),
+            ),
+        ),
+        monotonic() + 10,
+    ).Receipts
+    assert Permuted[0].NativePayloadCanonicalJson == (
+        Permuted[1].NativePayloadCanonicalJson
+    )
+    assert Permuted[0].NativePayloadSha256 == Permuted[1].NativePayloadSha256
+
+
+def test_detailed_native_payload_identity_canonicalizes_sets_and_covers_controls():
+    Base = [
+        "detailed-logical-alpha",
+        _bindings("alpha"),
+        (0, 0, 0, 2, 0, 0),
+        (0, 0, 2, 0),
+        False,
+        [A],
+        [[C]],
+        [A, B, C],
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        False,
+        32,
+    ]
+    PayloadVariants = []
+    for Index, Value in (
+        (4, True),
+        (5, [B]),
+        (6, [[B]]),
+        (7, [A, B]),
+        (8, [B]),
+        (9, [(1, 0)]),
+        (10, [(B, 1)]),
+        (11, 1),
+        (12, 1),
+        (13, 1),
+        (14, 1),
+        (15, True),
+        (16, 31),
+    ):
+        Arguments = list(Base)
+        Arguments[Index] = Value
+        PayloadVariants.append(RustRouting.RouteTreeDetailedRequestV1(*Arguments))
+    MetadataVariant = list(Base)
+    MetadataVariant[0] = "detailed-logical-beta"
+    MetadataVariant[1] = _bindings("beta")
+    MetadataVariant[2] = (-10, -10, -10, 10, 10, 10)
+    MetadataVariant[3] = (-10, -10, 10, 10)
+    Requests = (
+        RustRouting.RouteTreeDetailedRequestV1(*Base),
+        RustRouting.RouteTreeDetailedRequestV1(*MetadataVariant),
+        *PayloadVariants,
+    )
+    Receipts = _context().GenerateRouteTreeDetailedBatchOutcomesV1(
+        "detailed-native-payload-controls",
+        Requests,
+        monotonic() + 10,
+    ).Receipts
+
+    assert Receipts[0].NativePayloadSha256 == Receipts[1].NativePayloadSha256
+    assert Receipts[0].ImmutableInputSha256 != Receipts[1].ImmutableInputSha256
+    assert all(
+        Receipt.NativePayloadSha256 != Receipts[0].NativePayloadSha256
+        for Receipt in Receipts[2:]
+    )
+
+    CanonicalNodeCosts = list(Base)
+    CanonicalNodeCosts[7] = [C, A, B, A]
+    CanonicalNodeCosts[8] = [B, B]
+    CanonicalNodeCosts[9] = [(2, 0), (1, 0), (2, 0)]
+    CanonicalNodeCosts[10] = [(B, 4), (A, 1), (B, 7)]
+    NormalizedNodeCosts = list(Base)
+    NormalizedNodeCosts[7] = [A, B, C]
+    NormalizedNodeCosts[8] = [B]
+    NormalizedNodeCosts[9] = [(1, 0), (2, 0)]
+    NormalizedNodeCosts[10] = [(A, 1), (B, 7)]
+    CanonicalReceipts = _context().GenerateRouteTreeDetailedBatchOutcomesV1(
+        "detailed-native-payload-canonical-sets",
+        (
+            RustRouting.RouteTreeDetailedRequestV1(*CanonicalNodeCosts),
+            RustRouting.RouteTreeDetailedRequestV1(*NormalizedNodeCosts),
+        ),
+        monotonic() + 10,
+    ).Receipts
+    assert CanonicalReceipts[0].NativePayloadCanonicalJson == (
+        CanonicalReceipts[1].NativePayloadCanonicalJson
+    )
+    assert CanonicalReceipts[0].NativePayloadSha256 == (
+        CanonicalReceipts[1].NativePayloadSha256
+    )
+
+
 def test_proof_frontier_exhaustion_on_final_admitted_unit_wins_exact_cap():
     Context = _context(Edges=())
 
