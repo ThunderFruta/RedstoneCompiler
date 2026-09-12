@@ -11,6 +11,14 @@ from typing import Any, Sequence
 
 class RouteTreeCoarseRequestV1:
     ContractVersion: str
+    RequestKind: str
+    NativePayloadCanonicalJson: str
+    NativePayloadSha256: str
+    ImmutableInputSha256: str
+    CallerEchoScopeSha256: str
+    RequestId: str
+    CancellationRequestedBeforeStart: bool
+    MaximumExpansionCount: int
 
     def __init__(
         self,
@@ -35,6 +43,14 @@ class RouteTreeCoarseRequestV1:
 
 class RouteTreeDetailedRequestV1:
     ContractVersion: str
+    RequestKind: str
+    NativePayloadCanonicalJson: str
+    NativePayloadSha256: str
+    ImmutableInputSha256: str
+    CallerEchoScopeSha256: str
+    RequestId: str
+    CancellationRequestedBeforeStart: bool
+    MaximumExpansionCount: int
 
     def __init__(
         self,
@@ -96,6 +112,8 @@ class RouteTreeRequestReceiptV1:
     RouteExpansionCount: int
     ProofExpansionCount: int
     TotalExpansionCount: int
+    NativePayloadCanonicalJson: str
+    NativePayloadSha256: str
     RawInputRetentionStatus: str
     CancellationSnapshotStatus: str
     OutcomePhase: str
@@ -146,6 +164,8 @@ class RouteTreeBatchOutcomesV1:
 
 
 class RoutingContext:
+    AuthoritativeContextGraphSha256: str
+
     def GenerateRouteTreesBatchOutcomesV1(
         self,
         BatchIdentity: str,
