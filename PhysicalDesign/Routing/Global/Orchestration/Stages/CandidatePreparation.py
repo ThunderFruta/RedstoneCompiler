@@ -55,45 +55,6 @@ def BuildProtectedRoutingNodesBySignal(
     return Result
 
 
-def BuildForeignSelectedPinAccessClaimsBySignal(
-    Signals,
-    SelectedPinAccessWitness=None,
-):
-    """Bind each routed signal to every foreign selected-access claim."""
-    SelectedClaimsBySignal = {
-        str(Signal): Claims
-        for Signal, Claims in getattr(
-            SelectedPinAccessWitness,
-            "ClaimsBySignal",
-            (),
-        )
-    }
-    return {
-        str(Signal): tuple(
-            (Owner, Claims)
-            for Owner, Claims in sorted(SelectedClaimsBySignal.items())
-            if Owner != str(Signal)
-        )
-        for Signal in sorted(map(str, Signals))
-    }
-
-
-def FindForeignSelectedPinAccessConflictSignals(
-    Signal,
-    Claims,
-    ForeignClaimsBySignal,
-    ConflictPredicate,
-):
-    """Return exact immutable access owners conflicting with one claim set."""
-    return tuple(
-        Owner
-        for Owner, ForeignClaims in ForeignClaimsBySignal.get(
-            str(Signal),
-            (),
-        )
-        if ConflictPredicate(Claims, ForeignClaims)
-    )
-
 def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
     """Run the CandidatePreparation phase against shared routing state."""
     State.CandidateRequestCount = 0
@@ -230,17 +191,31 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     State.CandidateLimitsBySignal: dict[str, int] = {}
     State.CandidateDiagnostics: dict[str, dict[str, object]] = {}
     State.RawTrackAssignmentExtractionIncompleteReasons: dict[str, str] = {}
-    State.ForeignSelectedPinAccessClaimsBySignal = (
-        BuildForeignSelectedPinAccessClaimsBySignal(
-            State.Profiles,
-            State.PlacementPinAccessWitness,
+    if State.ForeignSelectedPinAccessClaimsBySignal is None:
+        State.ForeignSelectedPinAccessClaimsBySignal = (
+            Services.BuildForeignSelectedPinAccessClaimsBySignal(
+                State.Profiles,
+                State.PlacementPinAccessWitness,
+            )
+            if State.Policy.PlacementAccess.Enabled
+            else {
+                str(Signal): ()
+                for Signal in sorted(State.Profiles)
+            }
         )
-        if State.Policy.PlacementAccess.Enabled
-        else {
-            str(Signal): ()
-            for Signal in sorted(State.Profiles)
-        }
-    )
+    if State.ForeignSelectedPinAccessBlockedWireNodesBySignal is None:
+        State.ForeignSelectedPinAccessBlockedWireNodesBySignal = (
+            Services.BuildForeignSelectedPinAccessBlockedWireNodesBySignal(
+                State.Profiles,
+                State.PlacementPinAccessWitness,
+                Services.ImmutableRoutingClaimsBlockedWireNodes,
+            )
+            if State.Policy.PlacementAccess.Enabled
+            else {
+                str(Signal): frozenset()
+                for Signal in sorted(State.Profiles)
+            }
+        )
     State.ForeignSelectedAccessRequiredClaimConflictBySignal = (
         Services.Counter()
     )
@@ -295,7 +270,7 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
             if Candidate is None:
                 raise Services.RoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='PlacementAccessWitnessRealization', AffectedNets=(Signal,), Detail='the frozen placement-access tree failed exact materialization', Diagnostics={'Complete': False, 'Rejections': dict(RejectionCounts), 'FabricFingerprint': State.PlacementAccessFabric.FabricFingerprint, 'AssignmentFingerprint': State.PlacementAccessAssignment.AssignmentFingerprint}))
             ForeignAccessConflicts = (
-                FindForeignSelectedPinAccessConflictSignals(
+                Services.FindForeignSelectedPinAccessConflictSignals(
                     Signal,
                     Candidate.Claims,
                     State.ForeignSelectedPinAccessClaimsBySignal,
@@ -352,18 +327,6 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     )
     ForeignExclusionStarted = Services.monotonic()
     State.ForeignBlockedNodesBySignal = Services.BuildForeignElectricalExclusionsBySignal(ProtectedNodesBySignal, State.Technology, DeferredPairwiseSignals=State.Resources.PhysicalComponentExactGlobalChannelSignals if State.Resources.PreparingPhysicalComponentGlobalChannels else frozenset())
-    State.ForeignSelectedPinAccessBlockedWireNodesBySignal = {
-        Signal: Services.ImmutableRoutingClaimsBlockedWireNodes(
-            Claims
-            for _Owner, Claims in (
-                State.ForeignSelectedPinAccessClaimsBySignal.get(
-                    Signal,
-                    (),
-                )
-            )
-        )
-        for Signal in ProtectedNodesBySignal
-    }
     if State.Policy.PlacementAccess.Enabled:
         State.ForeignBlockedNodesBySignal = {
             Signal: frozenset((
@@ -740,7 +703,7 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
                 (State.RetainedCandidateMetadata or {}).get(Signal, {})
             )
             for Candidate in Values:
-                ConflictSignals = FindForeignSelectedPinAccessConflictSignals(
+                ConflictSignals = Services.FindForeignSelectedPinAccessConflictSignals(
                     Signal,
                     Candidate.Claims,
                     State.ForeignSelectedPinAccessClaimsBySignal,

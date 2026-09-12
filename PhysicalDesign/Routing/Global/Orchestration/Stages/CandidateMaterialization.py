@@ -1,12 +1,11 @@
 """CandidateMaterialization phase of authoritative routing."""
 from __future__ import annotations
 from ..RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
-from .CandidatePreparation import FindForeignSelectedPinAccessConflictSignals
 
 def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
     """Run the CandidateMaterialization phase against shared routing state."""
     def SelectedAccessConflictSignals(Signal: str, Claims) -> tuple[str, ...]:
-        return FindForeignSelectedPinAccessConflictSignals(
+        return Services.FindForeignSelectedPinAccessConflictSignals(
             Signal,
             Claims,
             State.ForeignSelectedPinAccessClaimsBySignal,

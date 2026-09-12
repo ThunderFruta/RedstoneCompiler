@@ -105,6 +105,45 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
                     'AccessRegenerationCount': 0,
                 },
             ))
+    State.ForeignSelectedPinAccessClaimsBySignal = (
+        Services.BuildForeignSelectedPinAccessClaimsBySignal(
+            State.Profiles,
+            State.PlacementPinAccessWitness,
+        )
+        if RoutingAwarePlacementAccess
+        else {
+            str(Signal): ()
+            for Signal in sorted(State.Profiles)
+        }
+    )
+    State.ForeignSelectedPinAccessBlockedWireNodesBySignal = (
+        Services.BuildForeignSelectedPinAccessBlockedWireNodesBySignal(
+            State.Profiles,
+            State.PlacementPinAccessWitness,
+            Services.ImmutableRoutingClaimsBlockedWireNodes,
+        )
+        if RoutingAwarePlacementAccess
+        else {
+            str(Signal): frozenset()
+            for Signal in sorted(State.Profiles)
+        }
+    )
+    State.WorkTelemetry['SelectedPinAccessPortalSearchConstraint'] = {
+        'Enabled': RoutingAwarePlacementAccess,
+        'WitnessFingerprint': str(getattr(
+            State.PlacementPinAccessWitness,
+            'WitnessFingerprint',
+            '',
+        )),
+        'BlockedWireNodeCountBySignal': {
+            Signal: len(Nodes)
+            for Signal, Nodes in sorted(
+                State.ForeignSelectedPinAccessBlockedWireNodesBySignal.items()
+            )
+        },
+        'Projection': 'shared-immutable-routing-claims',
+        'AppliedBeforeTargetSelection': True,
+    }
     ReusableRawPortalEntries = State.RawPortalCache.PortalEntries if State.RawPortalCache is not None else ()
     (PortableValidatedCompletePortalDomainKeys): frozenset[tuple[str, Services.Position3, int]] = frozenset()
     (PortableValidatedPolicyCompleteEmptyPortalDomainKeys): frozenset[tuple[str, Services.Position3, int]] = frozenset()
@@ -492,6 +531,41 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
                         AllowedNodeSet.update(ChannelIngressTargets)
                         AllowedNodes = sorted(AllowedNodeSet)
                     AccessFabricIngressTargets = sorted({tuple(Stub.Ingress) for Stub in AccessFabricDomain.EscapeStubs if int(Stub.Ingress[1]) == RoutingY and tuple(Stub.Ingress) in RegionNodeSet}) if AccessFabricDomain is not None else []
+                    ForeignSelectedAccessBlockedNodes = (
+                        State.ForeignSelectedPinAccessBlockedWireNodesBySignal.get(
+                            str(Signal),
+                            (),
+                        )
+                    )
+                    AllowedNodeSet, MandatorySelectedAccessOverlap = (
+                        Services.ConstrainPortalSearchNodesForSelectedAccess(
+                            AllowedNodeSet,
+                            AccessPath,
+                            ForeignSelectedAccessBlockedNodes,
+                        )
+                    )
+                    AllowedNodeSet = set(AllowedNodeSet)
+                    AllowedNodes = sorted(AllowedNodeSet)
+                    ChannelIngressTargets = [
+                        Position
+                        for Position in ChannelIngressTargets
+                        if Position in AllowedNodeSet
+                    ]
+                    AccessFabricIngressTargets = [
+                        Position
+                        for Position in AccessFabricIngressTargets
+                        if Position in AllowedNodeSet
+                    ]
+                    if MandatorySelectedAccessOverlap:
+                        State.WorkTelemetry.setdefault(
+                            'SelectedPinAccessPortalMandatoryOverlap',
+                            {},
+                        )[f'{Signal}:{Terminal}'] = [
+                            list(Position)
+                            for Position in sorted(
+                                MandatorySelectedAccessOverlap
+                            )
+                        ]
                     PortalStarts = list(Services.SelectGraphAccessStarts(AccessPath, RegionNodeSet, PreferOutermost=Signal in State.TransactionalLeasePrescreenSignals))
                     PortalAllowedNodes = list(AllowedNodes)
                     PortalTargets = sorted((Position for Position in AllowedNodes if Position[1] == RoutingY), key=lambda Position: (min((abs(Position[0] - AccessPosition[0]) + abs(Position[1] - AccessPosition[1]) + abs(Position[2] - AccessPosition[2]) for AccessPosition in AccessPath)), abs(Position[0] - AccessPath[-1][0]), abs(Position[2] - AccessPath[-1][2]), Position))
@@ -502,7 +576,14 @@ def RunPortalPreparation(State: AuthoritativeRoutingState, Services: Authoritati
                         AccessFabricTargetSet = frozenset(AccessFabricIngressTargets)
                         PortalTargets = [*AccessFabricIngressTargets, *(Position for Position in PortalTargets if Position not in AccessFabricTargetSet)]
                     if len(PortalTargets) == 0:
-                        GlobalLayerTargets = list(NodesByLayer.get(RoutingY, ()))
+                        GlobalLayerNodeSet, _MandatoryGlobalOverlap = (
+                            Services.ConstrainPortalSearchNodesForSelectedAccess(
+                                NodesByLayer.get(RoutingY, ()),
+                                AccessPath,
+                                ForeignSelectedAccessBlockedNodes,
+                            )
+                        )
+                        GlobalLayerTargets = list(sorted(GlobalLayerNodeSet))
                         if GlobalLayerTargets:
                             AccessTerminal = AccessPath[-1]
                             PortalAllowedNodes = list(sorted(set(PortalAllowedNodes) | set(GlobalLayerTargets)))

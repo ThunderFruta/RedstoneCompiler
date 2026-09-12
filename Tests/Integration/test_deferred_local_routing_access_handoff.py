@@ -29,8 +29,12 @@ from PhysicalDesign.Orchestration.Preparation import (
     BuildPlacementRetentionFingerprint,
 )
 from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb
+from PhysicalDesign.Redstone.Rules import BuildRoutingResources
+from PhysicalDesign.Routing.Pcb import PrepareTrackAssignment
+from PhysicalDesign.Runtime.Reliability import RoutingDeadline
 import PhysicalDesign.Orchestration.PhysicalFlow as PhysicalFlow
 import PhysicalDesign.Orchestration.RoutingAttempts as RoutingAttempts
+import PhysicalDesign.Routing.Global.Orchestration.Flow as RoutingFlow
 
 
 def _BuildFanoutDepthSeventeenNetlist() -> NetlistIR:
@@ -82,6 +86,11 @@ def ProductionHandoff():
         PhysicalFlow.MaterializeSelectedJointPlacementLocalRoutingHandoff
     )
     OriginalDemand = PhysicalFlow.BuildPlacementAccessDemand
+    OriginalTrackPreparation = (
+        PhysicalFlow.RebuildCurrentCandidateTrackPreparation
+    )
+    OriginalEligibility = PhysicalFlow.PreparePhysicalComponentEligibility
+    OriginalPhaseRunner = RoutingFlow.RunAuthoritativeRoutingPhases
 
     def ObserveHandoff(Context, Candidate, WorkCheck):
         Result = OriginalHandoff(Context, Candidate, WorkCheck)
@@ -96,10 +105,165 @@ def ProductionHandoff():
             Captured["ConsumerCandidate"] = Captured["Context"].InterfaceCandidate
         return OriginalDemand(Placement, *Arguments, **Options)
 
+    def ObservePhaseRunner(State, Services, Phases=None):
+        if Phases is None:
+            Phases = OriginalPhaseRunner.__defaults__[0]
+        for RunPhase in Phases:
+            IsTrackCandidateMaterialization = (
+                RunPhase.__name__ == "RunCandidateMaterialization"
+                and State.PrepareTrackAssignmentOnly
+                and "Handoff" in Captured
+            )
+            if (
+                IsTrackCandidateMaterialization
+                and "PortalEvidence" not in Captured
+            ):
+                Signal = "b0d2"
+                Profile = State.Profiles[Signal]
+                Portals = State.LegalPortalTuplesBySignalLayer[
+                    Signal,
+                    0,
+                ][0]
+                SourcePortal, TargetPortal = Portals
+                PortalIds = tuple(Portal.PortalId for Portal in Portals)
+                TupleClaims = State.PortalTupleClaimsBySignal[Signal][PortalIds]
+                ForeignClaims = (
+                    State.ForeignSelectedPinAccessClaimsBySignal[Signal]
+                )
+                OriginalTargetPath = (
+                    Profile.TargetAccessPaths[Profile.Targets[0]][-1],
+                    (16, 2, 23),
+                )
+                OriginalTargetClaims = (
+                    State.Resources.ResourceGraph.BuildRouteClaims(
+                        OriginalTargetPath
+                    )
+                )
+                Captured["PortalEvidence"] = SimpleNamespace(
+                    Signal=Signal,
+                    SourceAccessPath=tuple(Profile.SourceAccessPath),
+                    TargetAccessPath=tuple(
+                        Profile.TargetAccessPaths[Profile.Targets[0]]
+                    ),
+                    SourcePortal=SourcePortal,
+                    TargetPortal=TargetPortal,
+                    OriginalTargetPath=OriginalTargetPath,
+                    OriginalTargetConflictOwners=tuple(
+                        Owner
+                        for Owner, Claims in ForeignClaims
+                        if Services.ComponentClaimsConflict(
+                            OriginalTargetClaims,
+                            Claims,
+                        )
+                    ),
+                    CompatiblePortalConflictOwners=tuple(
+                        Owner
+                        for Owner, Claims in ForeignClaims
+                        if Services.ComponentClaimsConflict(
+                            TargetPortal.Claims,
+                            Claims,
+                        )
+                    ),
+                    CompatibleTupleConflictOwners=tuple(
+                        Owner
+                        for Owner, Claims in ForeignClaims
+                        if Services.ComponentClaimsConflict(
+                            TupleClaims,
+                            Claims,
+                        )
+                    ),
+                    PortalSelfConflicts=tuple(
+                        Services.FindSelfClaimConflicts({Signal: TupleClaims})
+                    ),
+                    PortalPathsWithinSupportedNodes=all(
+                        frozenset(Portal.Path) <= State.Region.Nodes
+                        for Portal in Portals
+                    ),
+                    PortalEdgesWithinSupportedEdges=all(
+                        frozenset(Portal.Edges) <= State.Region.Edges
+                        for Portal in Portals
+                    ),
+                    WitnessFingerprint=(
+                        State.PlacementPinAccessWitness.WitnessFingerprint
+                    ),
+                    ConstraintTelemetry=dict(
+                        State.WorkTelemetry[
+                            "SelectedPinAccessPortalSearchConstraint"
+                        ]
+                    ),
+                )
+            try:
+                Outcome = RunPhase(State, Services)
+            finally:
+                if (
+                    IsTrackCandidateMaterialization
+                    and "CandidateEvidence" not in Captured
+                ):
+                    Signal = "b0d2"
+                    Profile = State.Profiles[Signal]
+                    Candidates = tuple(State.CandidatesBySignal.get(Signal, ()))
+                    Captured["CandidateEvidence"] = SimpleNamespace(
+                        RouteRequestCount=len(
+                            State.RouteRequestsBySignal.get(Signal, ())
+                        ),
+                        CandidateCount=len(Candidates),
+                        CandidateSourcePortalIds=tuple(
+                            Candidate.SourcePortalId
+                            for Candidate in Candidates
+                        ),
+                        CandidateTargetPortalIds=tuple(
+                            Candidate.TargetPortalIds[Profile.Targets[0]]
+                            for Candidate in Candidates
+                        ),
+                        CandidateConflictOwners=tuple(
+                            tuple(
+                                Owner
+                                for Owner, Claims in (
+                                    State.ForeignSelectedPinAccessClaimsBySignal[
+                                        Signal
+                                    ]
+                                )
+                                if Services.ComponentClaimsConflict(
+                                    Candidate.Claims,
+                                    Claims,
+                                )
+                            )
+                            for Candidate in Candidates
+                        ),
+                        Diagnostics=dict(
+                            State.CandidateDiagnostics.get(Signal, {})
+                        ),
+                    )
+            if Outcome.Returned:
+                return Outcome.Value
+        raise RuntimeError(
+            "authoritative routing phases completed without a result"
+        )
+
+    def ObserveTrackPreparation(Context, Candidate, *, Resources):
+        Captured["TrackCandidate"] = Candidate
+        Captured["TrackResources"] = Resources
+        Result = OriginalTrackPreparation(
+            Context,
+            Candidate,
+            Resources=Resources,
+        )
+        Captured["TrackPreparation"] = Result
+        return Result
+
+    def ObserveEligibility(*Arguments, **Options):
+        Captured["EligibilityEntered"] = True
+        return OriginalEligibility(*Arguments, **Options)
+
     PhysicalFlow.MaterializeSelectedJointPlacementLocalRoutingHandoff = (
         ObserveHandoff
     )
     PhysicalFlow.BuildPlacementAccessDemand = ObserveFirstConsumer
+    PhysicalFlow.RebuildCurrentCandidateTrackPreparation = (
+        ObserveTrackPreparation
+    )
+    PhysicalFlow.PreparePhysicalComponentEligibility = ObserveEligibility
+    RoutingFlow.RunAuthoritativeRoutingPhases = ObservePhaseRunner
     try:
         with pytest.raises(RoutingStageError) as Error:
             PlaceAndRoutePcb(
@@ -111,13 +275,22 @@ def ProductionHandoff():
             OriginalHandoff
         )
         PhysicalFlow.BuildPlacementAccessDemand = OriginalDemand
+        PhysicalFlow.RebuildCurrentCandidateTrackPreparation = (
+            OriginalTrackPreparation
+        )
+        PhysicalFlow.PreparePhysicalComponentEligibility = OriginalEligibility
+        RoutingFlow.RunAuthoritativeRoutingPhases = OriginalPhaseRunner
 
     assert Error.value.Failure.Stage == "CurrentSelectedAccessAfterChannelReplacement"
     assert Error.value.Failure.Reason is (
         RoutingFailureReason.ClusterInterfaceSolveIncomplete
     )
     assert "Handoff" in Captured
+    assert "PortalEvidence" in Captured
+    assert "CandidateEvidence" in Captured
+    assert "TrackPreparation" in Captured
     Captured["LaterFailure"] = Error.value.Failure
+    Captured.setdefault("EligibilityEntered", False)
     return SimpleNamespace(**Captured)
 
 
@@ -225,6 +398,239 @@ def test_real_production_caller_consumes_current_successor(ProductionHandoff):
     assert ProductionHandoff.LaterFailure.Stage != (
         "PlacementLocalRoutingMaterialization"
     )
+    Portal = ProductionHandoff.PortalEvidence
+    assert Portal.SourceAccessPath == (
+        (60, 1, 13),
+        (61, 1, 13),
+        (62, 1, 13),
+    )
+    assert Portal.TargetAccessPath == (
+        (19, 1, 23),
+        (18, 1, 23),
+        (17, 1, 23),
+    )
+    assert Portal.SourcePortal.Path == ((60, 1, 13), (60, 2, 12))
+    assert Portal.OriginalTargetPath == ((17, 1, 23), (16, 2, 23))
+    assert Portal.OriginalTargetConflictOwners == ("b3d0",)
+    assert Portal.TargetPortal.Path == ((17, 1, 23), (17, 2, 24))
+    assert Portal.CompatiblePortalConflictOwners == ()
+    assert Portal.CompatibleTupleConflictOwners == ()
+    assert Portal.PortalSelfConflicts == ()
+    assert Portal.PortalPathsWithinSupportedNodes
+    assert Portal.PortalEdgesWithinSupportedEdges
+    assert Portal.ConstraintTelemetry["AppliedBeforeTargetSelection"] is True
+    assert Portal.ConstraintTelemetry["Projection"] == (
+        "shared-immutable-routing-claims"
+    )
+    Candidate = ProductionHandoff.CandidateEvidence
+    assert Candidate.RouteRequestCount == 8
+    assert Candidate.CandidateCount == 1
+    assert Candidate.CandidateSourcePortalIds == (Portal.SourcePortal.PortalId,)
+    assert Candidate.CandidateTargetPortalIds == (Portal.TargetPortal.PortalId,)
+    assert Candidate.CandidateConflictOwners == ((),)
+
+    Track = ProductionHandoff.TrackPreparation
+    assert Track.Complete
+    assert not Track.Success
+    assert dict(Track.CandidateCounts)["b0d2"] == 1
+    assert dict(Track.Diagnostics)["FailureNet"] == "a"
+    assert ProductionHandoff.EligibilityEntered is False
+
+
+def test_mandatory_selected_access_overlap_remains_typed_incomplete(
+    ProductionHandoff,
+    monkeypatch,
+):
+    Candidate = ProductionHandoff.TrackCandidate
+    Placement = Candidate.Placement
+    Resources = BuildRoutingResources(Placement.Placed)
+    Deadline = RoutingDeadline.Start(10.0)
+    Captured = {
+        "PortalRuns": 0,
+        "CandidateRuns": 0,
+    }
+    OriginalPhaseRunner = RoutingFlow.RunAuthoritativeRoutingPhases
+
+    class WitnessWithOverlappingForeignClaim:
+        def __init__(self, Base, ClaimsBySignal):
+            self.Base = Base
+            self.ClaimsBySignal = ClaimsBySignal
+
+        def __getattr__(self, Name):
+            return getattr(self.Base, Name)
+
+    def RunWithMandatoryForeignOverlap(State, Services, Phases=None):
+        if Phases is None:
+            Phases = OriginalPhaseRunner.__defaults__[0]
+        for RunPhase in Phases:
+            if RunPhase.__name__ == "RunPortalPreparation":
+                Captured["PortalRuns"] += 1
+                Signal = "b0d2"
+                Owner = "b3d0"
+                Profile = State.Profiles[Signal]
+                State.Profiles = {Signal: Profile}
+                State.RawPortalVariantCounts = {
+                    Signal: State.RawPortalVariantCounts[Signal]
+                }
+                State.RoutePortalVariantCounts = {
+                    Signal: State.RoutePortalVariantCounts[Signal]
+                }
+                MandatoryNode = Profile.TargetAccessPaths[
+                    Profile.Targets[0]
+                ][-1]
+                OriginalWitness = State.PlacementPinAccessWitness
+                ChangedClaimsBySignal = []
+                ChangedOwnerClaims = None
+                for ClaimSignal, Claims in OriginalWitness.ClaimsBySignal:
+                    if ClaimSignal == Owner:
+                        ChangedOwnerClaims = replace(
+                            Claims,
+                            WireCells=Claims.WireCells | {MandatoryNode},
+                            ElectricalCells=(
+                                Claims.ElectricalCells | {MandatoryNode}
+                            ),
+                        )
+                        Claims = ChangedOwnerClaims
+                    ChangedClaimsBySignal.append((ClaimSignal, Claims))
+                assert ChangedOwnerClaims is not None
+                State.PlacementPinAccessWitness = (
+                    WitnessWithOverlappingForeignClaim(
+                        OriginalWitness,
+                        tuple(ChangedClaimsBySignal),
+                    )
+                )
+                MandatoryClaims = State.Resources.ResourceGraph.BuildRouteClaims(
+                    (
+                        *Profile.SourceAccessPath,
+                        *(
+                            Position
+                            for TargetPath in Profile.TargetAccessPaths.values()
+                            for Position in TargetPath
+                        ),
+                    )
+                )
+                Captured.update({
+                    "Signal": Signal,
+                    "Owner": Owner,
+                    "MandatoryNode": MandatoryNode,
+                    "SourceAccessPath": tuple(Profile.SourceAccessPath),
+                    "TargetAccessPath": tuple(
+                        Profile.TargetAccessPaths[Profile.Targets[0]]
+                    ),
+                    "SharedConflict": Services.ComponentClaimsConflict(
+                        MandatoryClaims,
+                        ChangedOwnerClaims,
+                    ),
+                    "SharedConflictOwners": (
+                        Services.FindForeignSelectedPinAccessConflictSignals(
+                            Signal,
+                            MandatoryClaims,
+                            {Signal: ((Owner, ChangedOwnerClaims),)},
+                            Services.ComponentClaimsConflict,
+                        )
+                    ),
+                    "PortalLimit": State.PortalLimit,
+                    "RawPortalVariantCount": (
+                        State.RawPortalVariantCounts[Signal]
+                    ),
+                    "StrictMaximumExpansions": (
+                        State.Policy.DetailedRouting.StrictMaximumExpansions
+                    ),
+                    "DeadlineIsOriginal": State.Deadline is Deadline,
+                })
+            Outcome = RunPhase(State, Services)
+            if RunPhase.__name__ == "RunPortalPreparation":
+                Cache = State.EffectiveRawPortalCache
+                SignalRequests = tuple(
+                    Request
+                    for (Signal, _Terminal, _Layer), Request in zip(
+                        Cache.ConfiguredPortalRequestMetadata,
+                        Cache.ConfiguredPortalRequests,
+                    )
+                    if Signal == Captured["Signal"]
+                )
+                Captured["MandatoryOverlapTelemetry"] = tuple(
+                    tuple(Position)
+                    for Positions in State.WorkTelemetry.get(
+                        "SelectedPinAccessPortalMandatoryOverlap",
+                        {},
+                    ).values()
+                    for Position in Positions
+                )
+                Captured["MandatoryNodeRetainedInStarts"] = any(
+                    Captured["MandatoryNode"] in Starts
+                    for Starts, _Targets, _Allowed, _Y, _Limit, _Work in (
+                        SignalRequests
+                    )
+                )
+                Captured["MandatoryNodeRetainedInAllowed"] = any(
+                    Captured["MandatoryNode"] in Allowed
+                    for _Starts, _Targets, Allowed, _Y, _Limit, _Work in (
+                        SignalRequests
+                    )
+                )
+                Captured["PortalLimitAfterConstraint"] = State.PortalLimit
+                Captured["RawPortalVariantCountAfterConstraint"] = (
+                    State.RawPortalVariantCounts[Captured["Signal"]]
+                )
+                Captured["StrictMaximumExpansionsAfterConstraint"] = (
+                    State.Policy.DetailedRouting.StrictMaximumExpansions
+                )
+            if RunPhase.__name__ == "RunCandidateMaterialization":
+                Captured["CandidateRuns"] += 1
+            if Outcome.Returned:
+                return Outcome.Value
+        raise RuntimeError(
+            "authoritative routing phases completed without a result"
+        )
+
+    monkeypatch.setattr(
+        RoutingFlow,
+        "RunAuthoritativeRoutingPhases",
+        RunWithMandatoryForeignOverlap,
+    )
+    Preparation = PrepareTrackAssignment(
+        Placement,
+        Resources=Resources,
+        Policy=ProductionHandoff.Context.Policy,
+        Deadline=Deadline,
+    )
+
+    assert not Deadline.IsExpired()
+    assert Deadline.RemainingSeconds() > 0.0
+    assert Captured["SharedConflict"]
+    assert Captured["SharedConflictOwners"] == ("b3d0",)
+    assert Captured["MandatoryNode"] in Captured["MandatoryOverlapTelemetry"]
+    assert Captured["MandatoryNodeRetainedInStarts"]
+    assert Captured["MandatoryNodeRetainedInAllowed"]
+    assert Captured["SourceAccessPath"] == (
+        (60, 1, 13),
+        (61, 1, 13),
+        (62, 1, 13),
+    )
+    assert Captured["TargetAccessPath"] == (
+        (19, 1, 23),
+        (18, 1, 23),
+        (17, 1, 23),
+    )
+    assert Captured["PortalLimit"] == Captured["PortalLimitAfterConstraint"]
+    assert Captured["RawPortalVariantCount"] == (
+        Captured["RawPortalVariantCountAfterConstraint"]
+    )
+    assert Captured["StrictMaximumExpansions"] == (
+        Captured["StrictMaximumExpansionsAfterConstraint"]
+    )
+    assert Captured["PortalLimit"] > 0
+    assert Captured["RawPortalVariantCount"] > 0
+    assert Captured["StrictMaximumExpansions"] > 0
+    assert Captured["DeadlineIsOriginal"]
+    assert Captured["PortalRuns"] == 1
+    assert Captured["CandidateRuns"] == 0
+    assert not Preparation.Success
+    assert not Preparation.Complete
+    assert Preparation.IncompleteReason == "fixed-domain-exhausted"
+    assert dict(Preparation.CandidateCounts) == {"b0d2": 0}
+    assert Preparation.ConflictSignals == ("b0d2",)
 
 
 def test_same_geometry_changed_ownership_cannot_reuse_authority(

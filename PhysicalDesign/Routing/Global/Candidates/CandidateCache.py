@@ -769,6 +769,19 @@ def SelectRawPortalGeometryReusePlan(
             )
         }
 
+    def SelectedAccessConstraintIdentity(
+        Fingerprint: tuple[object, ...],
+    ) -> tuple[object, ...]:
+        return tuple(
+            Entry
+            for Entry in Fingerprint
+            if (
+                isinstance(Entry, tuple)
+                and len(Entry) >= 1
+                and Entry[0] == 'placement-access-fabric-region-v1'
+            )
+        )
+
     def GeometryTransform(
         Cached: object,
         Requested: object,
@@ -837,10 +850,20 @@ def SelectRawPortalGeometryReusePlan(
     RequestedGeometryBySignal = SignalGeometryByName(
         AccessGeometryFingerprint
     )
+    RequestedSelectedAccessConstraintIdentity = (
+        SelectedAccessConstraintIdentity(AccessGeometryFingerprint)
+    )
     for Value in reversed(Caches):
         if not isinstance(Value, RawPortalGeometryCache):
             continue
         Cache = Value
+        if (
+            SelectedAccessConstraintIdentity(
+                Cache.AccessGeometryFingerprint
+            )
+            != RequestedSelectedAccessConstraintIdentity
+        ):
+            continue
         if (
             PhysicalGlobalKeepoutFingerprint
             and Cache.PhysicalGlobalKeepoutFingerprint
