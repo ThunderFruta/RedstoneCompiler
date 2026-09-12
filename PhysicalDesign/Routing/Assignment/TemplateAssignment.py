@@ -601,6 +601,11 @@ class RawTrackAssignmentPortfolio:
     MaximumAssignmentExpansions: int
     WorkControlsFingerprint: str = ""
     NonExhaustiveTemplateDomain: bool = True
+    _ProblemFingerprint: str = field(
+        init=False,
+        repr=False,
+        compare=True,
+    )
 
     def __post_init__(self) -> None:
         if type(self.Templates) is not tuple or any(
@@ -630,25 +635,34 @@ class RawTrackAssignmentPortfolio:
         TemplateIds = tuple(Value.TemplateId for Value in self.Templates)
         if len(TemplateIds) != len(set(TemplateIds)):
             raise ValueError("raw template portfolio repeats a template id")
+        object.__setattr__(
+            self,
+            "_ProblemFingerprint",
+            BuildStableFingerprint({
+                "Kind": "raw-template-track-assignment-portfolio-v1",
+                "Templates": [
+                    Value.ToDictionary()
+                    for Value in sorted(
+                        self.Templates,
+                        key=lambda Value: (
+                            Value.Objective,
+                            Value.TemplateId,
+                        ),
+                    )
+                ],
+                "MaximumAssignmentExpansions": (
+                    self.MaximumAssignmentExpansions
+                ),
+                "NonExhaustiveTemplateDomain": (
+                    self.NonExhaustiveTemplateDomain
+                ),
+            }),
+        )
 
     @property
     def ProblemFingerprint(self) -> str:
-        return BuildStableFingerprint({
-            "Kind": "raw-template-track-assignment-portfolio-v1",
-            "Templates": [
-                Value.ToDictionary()
-                for Value in sorted(
-                    self.Templates,
-                    key=lambda Value: (Value.Objective, Value.TemplateId),
-                )
-            ],
-            "MaximumAssignmentExpansions": (
-                self.MaximumAssignmentExpansions
-            ),
-            "NonExhaustiveTemplateDomain": (
-                self.NonExhaustiveTemplateDomain
-            ),
-        })
+        """Return the immutable identity captured before lazy materialization."""
+        return self._ProblemFingerprint
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -755,6 +769,60 @@ class RawTrackAssignmentMaterialization:
             ),
             "Diagnostics": dict(self.Diagnostics),
             "ResolvedObjective": list(self.ResolvedObjective),
+        }
+
+    def ToBoundedFailureDictionary(self) -> dict[str, object]:
+        """Project one materialization without replaying its frozen inputs."""
+        Domain = self.Domain
+        return {
+            "TemplateId": self.TemplateId,
+            "CandidateInputFingerprint": (
+                self.MaterializationInputFingerprint
+            ),
+            "Complete": self.Complete,
+            "IncompleteReason": self.IncompleteReason,
+            "ResolvedObjective": list(self.ResolvedObjective),
+            "Domain": {
+                "Present": Domain is not None,
+                "Complete": Domain.Complete if Domain is not None else False,
+                "ResourceCount": (
+                    len(Domain.ResourcePositions) if Domain is not None else 0
+                ),
+                "ValueCount": len(Domain.Values) if Domain is not None else 0,
+                "CandidateCounts": (
+                    [list(Value) for Value in Domain.CandidateCounts]
+                    if Domain is not None
+                    else []
+                ),
+                "CandidateDomainFingerprint": (
+                    Domain.CandidateDomainFingerprint
+                    if Domain is not None
+                    else ""
+                ),
+                "LocalClaimDomainFingerprint": (
+                    Domain.LocalClaimDomainFingerprint
+                    if Domain is not None
+                    else ""
+                ),
+                "PlacementFingerprint": (
+                    Domain.PlacementFingerprint if Domain is not None else ""
+                ),
+                "ResourceGraphFingerprint": (
+                    Domain.ResourceGraphFingerprint
+                    if Domain is not None
+                    else ""
+                ),
+                "PortalDomainFingerprint": (
+                    Domain.PortalDomainFingerprint
+                    if Domain is not None
+                    else ""
+                ),
+            },
+            "EvidenceCompleteness": {
+                "FullInputManifestIncluded": False,
+                "FullMaterializationDiagnosticsIncluded": False,
+                "RawDomainValuesAndClaimsIncluded": False,
+            },
         }
 
 
@@ -1169,6 +1237,7 @@ class RawTrackAssignmentSelection:
     FirstConflictResourceIndices: tuple[int, ...] = ()
     MaterializedTemplateCount: int = 0
     SkippedDominatedTemplateCount: int = 0
+    PortfolioTemplateCount: int = 0
     CandidatePreparationResults: tuple[
         RawTrackAssignmentCandidatePreparationResult, ...
     ] = ()
@@ -1219,6 +1288,14 @@ class RawTrackAssignmentSelection:
             self.SkippedDominatedTemplateCount,
             "Selection.SkippedDominatedTemplateCount",
         )
+        _RequireExactNonBooleanInteger(
+            self.PortfolioTemplateCount,
+            "Selection.PortfolioTemplateCount",
+        )
+        if self.MaterializedTemplateCount > self.PortfolioTemplateCount:
+            raise ValueError(
+                "selection materialized template count exceeds its portfolio"
+            )
         if type(self.CandidatePreparationResults) is not tuple or any(
             type(Value) is not RawTrackAssignmentCandidatePreparationResult
             for Value in self.CandidatePreparationResults
@@ -1359,11 +1436,84 @@ class RawTrackAssignmentSelection:
             "SkippedDominatedTemplateCount": (
                 self.SkippedDominatedTemplateCount
             ),
+            "PortfolioTemplateCount": self.PortfolioTemplateCount,
             "CandidatePreparationResults": [
                 Value.ToDictionary()
                 for Value in self.CandidatePreparationResults
             ],
             "OuterPortfolioComplete": self.OuterPortfolioComplete,
+        }
+
+    def ToBoundedFailureEnvelope(self) -> dict[str, object]:
+        """Publish failure semantics without recursive raw-input duplication."""
+        SourceIdentities = [
+            {
+                "CandidateId": Result.CandidateId,
+                "CandidateInputFingerprint": Result.CandidateInputFingerprint,
+            }
+            for Result in sorted(
+                self.CandidatePreparationResults,
+                key=lambda Result: Result.CandidateId,
+            )
+        ]
+        UnattemptedTemplateCount = max(
+            0,
+            self.PortfolioTemplateCount - self.MaterializedTemplateCount,
+        )
+        return {
+            "SchemaVersion": "raw-track-assignment-failure-envelope-v1",
+            "SemanticResult": {
+                "ProblemFingerprint": self.ProblemFingerprint,
+                "SelectionFingerprint": self.SelectionFingerprint,
+                "SelectedTemplateId": self.SelectedTemplateId,
+                "SelectedObjective": list(self.SelectedObjective),
+                "Success": self.Success,
+                "Complete": self.Complete,
+                "Unsatisfiable": self.Unsatisfiable,
+                "IncompleteReason": self.IncompleteReason,
+                "FirstConflictSignals": list(self.FirstConflictSignals),
+                "FirstConflictResourceIndices": list(
+                    self.FirstConflictResourceIndices
+                ),
+            },
+            "SourceIdentities": SourceIdentities,
+            "WorkIdentity": {
+                "WorkControlsFingerprint": (
+                    self.CandidatePreparationResults[0]
+                    .WorkControlsFingerprint
+                    if self.CandidatePreparationResults
+                    else ""
+                ),
+                "ExpansionCount": self.ExpansionCount,
+            },
+            "Counts": {
+                "PortfolioTemplateCount": self.PortfolioTemplateCount,
+                "MaterializedTemplateCount": self.MaterializedTemplateCount,
+                "AttemptCount": len(self.Attempts),
+                "CandidatePreparationResultCount": len(
+                    self.CandidatePreparationResults
+                ),
+                "SkippedDominatedTemplateCount": (
+                    self.SkippedDominatedTemplateCount
+                ),
+                "UnattemptedTemplateCount": UnattemptedTemplateCount,
+            },
+            "EvidenceCompleteness": {
+                "SemanticSelectionComplete": self.Complete,
+                "OuterPortfolioComplete": self.OuterPortfolioComplete,
+                "FullInputManifestIncluded": False,
+                "FullMaterializationDiagnosticsIncluded": False,
+                "UnattemptedDescriptorsDominated": (
+                    UnattemptedTemplateCount > 0
+                    and self.SkippedDominatedTemplateCount
+                    == UnattemptedTemplateCount
+                ),
+            },
+            "Omissions": [
+                "full-frozen-candidate-input-manifests",
+                "full-materialization-diagnostics",
+                "raw-domain-values-and-claims",
+            ],
         }
 
 
@@ -1373,6 +1523,52 @@ RawTrackAssignmentMaterializer = Callable[
     [RawTrackAssignmentPortfolioTemplate],
     RawTrackAssignmentMaterialization,
 ]
+
+
+def _BuildRawTemplateMaterializationObservation(
+    Portfolio: RawTrackAssignmentPortfolio,
+    Descriptor: RawTrackAssignmentPortfolioTemplate,
+    Materialization: RawTrackAssignmentMaterialization,
+    *,
+    MaterializedTemplateCount: int,
+    AttemptCount: int,
+    ExpansionCount: int,
+) -> dict[str, object]:
+    """Record a completed raw result before later deadline-sensitive work."""
+    return {
+        "Phase": "raw-template-materialization-observed",
+        "SemanticResult": Materialization.ToBoundedFailureDictionary(),
+        "TemplateId": Descriptor.TemplateId,
+        "SourceIdentity": {
+            "CandidateInputFingerprint": (
+                Descriptor.MaterializationInputFingerprint
+            ),
+            "PortfolioFingerprint": Portfolio.ProblemFingerprint,
+        },
+        "WorkIdentity": {
+            "WorkControlsFingerprint": Portfolio.WorkControlsFingerprint,
+            "MaximumAssignmentExpansions": (
+                Portfolio.MaximumAssignmentExpansions
+            ),
+        },
+        "Counts": {
+            "PortfolioTemplateCount": len(Portfolio.Templates),
+            "MaterializedTemplateCount": MaterializedTemplateCount,
+            "AttemptCount": AttemptCount,
+            "ExpansionCount": ExpansionCount,
+        },
+        "EvidenceCompleteness": {
+            "MaterializationReturned": True,
+            "MaterializationComplete": Materialization.Complete,
+            "FullInputManifestIncluded": False,
+            "FullMaterializationDiagnosticsIncluded": False,
+        },
+        "Omissions": [
+            "full-frozen-candidate-input-manifest",
+            "full-materialization-diagnostics",
+            "raw-domain-values-and-claims",
+        ],
+    }
 
 
 def _NativeExactBoolean(Result: object, Name: str) -> bool:
@@ -1599,6 +1795,7 @@ def _BuildSelection(
         FirstConflictResourceIndices=FirstConflictResourceIndices,
         MaterializedTemplateCount=MaterializedTemplateCount,
         SkippedDominatedTemplateCount=SkippedDominatedTemplateCount,
+        PortfolioTemplateCount=len(Problem.Templates),
         CandidatePreparationResults=CandidateResultValues,
         OuterPortfolioComplete=(
             not Problem.NonExhaustiveTemplateDomain
@@ -1933,6 +2130,15 @@ def SolveRawTrackAssignmentPortfolio(
                     ),
                 })
             Materialization = Materialize(Descriptor)
+            if WorkCheck is not None:
+                WorkCheck(_BuildRawTemplateMaterializationObservation(
+                    Portfolio,
+                    Descriptor,
+                    Materialization,
+                    MaterializedTemplateCount=TemplateIndex + 1,
+                    AttemptCount=len(Attempts),
+                    ExpansionCount=Spent,
+                ))
             if Materialization.TemplateId != Descriptor.TemplateId:
                 raise ValueError(
                     "raw template materializer returned a mismatched "
@@ -1990,9 +2196,7 @@ def SolveRawTrackAssignmentPortfolio(
                         FirstConflictResourceIndices
                     ),
                     MaterializedTemplateCount=TemplateIndex + 1,
-                    SkippedDominatedTemplateCount=(
-                        len(OrderedDescriptors) - TemplateIndex - 1
-                    ),
+                    SkippedDominatedTemplateCount=0,
                     CandidatePreparationResults=CandidateResults,
                 )
             ResolvedObjective = (
@@ -2075,9 +2279,7 @@ def SolveRawTrackAssignmentPortfolio(
                         FirstConflictResourceIndices
                     ),
                     MaterializedTemplateCount=TemplateIndex + 1,
-                    SkippedDominatedTemplateCount=(
-                        len(OrderedDescriptors) - TemplateIndex - 1
-                    ),
+                    SkippedDominatedTemplateCount=0,
                     CandidatePreparationResults=CandidateResults,
                 )
             NativeResult = NativeSolve(Domain, Remaining)
@@ -2171,9 +2373,7 @@ def SolveRawTrackAssignmentPortfolio(
                         FirstConflictResourceIndices
                     ),
                     MaterializedTemplateCount=TemplateIndex + 1,
-                    SkippedDominatedTemplateCount=(
-                        len(OrderedDescriptors) - TemplateIndex - 1
-                    ),
+                    SkippedDominatedTemplateCount=0,
                     CandidatePreparationResults=CandidateResults,
                 )
             Preparation = None
