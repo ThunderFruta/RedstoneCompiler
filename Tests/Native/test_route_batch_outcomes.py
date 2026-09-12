@@ -71,6 +71,36 @@ def _coarse(
     )
 
 
+def _coarse_start_connection(
+    RequestId="coarse-starts-alpha",
+    MaximumExpansionCount=32,
+    AllowedColumns=((0, 0), (1, 0), (2, 0)),
+    RequiredNodes=(),
+    BlockedNodeValues=(),
+    CancellationRequestedBeforeStart=False,
+    Starts=(A,),
+    Bindings=None,
+    PreferredColumns=(),
+):
+    return RustRouting.RouteTreeCoarseRequestV1.ConnectStartsOnlyV1(
+        RequestId,
+        _bindings() if Bindings is None else Bindings,
+        (0, 0, 0, 2, 0, 0),
+        (0, 0, 2, 0),
+        CancellationRequestedBeforeStart,
+        list(Starts),
+        list(AllowedColumns),
+        list(RequiredNodes),
+        list(BlockedNodeValues),
+        list(PreferredColumns),
+        0,
+        0,
+        0,
+        0,
+        MaximumExpansionCount,
+    )
+
+
 def _detailed(
     RequestId="detailed-alpha",
     MaximumExpansionCount=32,
@@ -101,6 +131,145 @@ def _detailed(
         False,
         MaximumExpansionCount,
     )
+
+
+def test_explicit_start_connection_preserves_legacy_targetless_semantics():
+    Context = _context()
+    Targetless, Ordinary = Context.GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-single",
+        (
+            _coarse_start_connection(RequiredNodes=(C,)),
+            _coarse(RequestId="ordinary-target", TargetBranches=((C,),)),
+        ),
+        monotonic() + 10,
+    ).Receipts
+
+    assert Targetless.RequestKind == "CoarseStartConnectionV1"
+    assert Targetless.SearchOutcome == "Found"
+    assert Targetless.TerminalReason == "Found"
+    assert Targetless.Candidate.Nodes == [A]
+    assert Targetless.Candidate.TargetPaths == []
+    assert Targetless.NoPathProof is None
+    assert Ordinary.RequestKind == "CoarseColumnsV1"
+    assert Ordinary.Candidate.Nodes == [A, B, C]
+    _assert_valid_route(Ordinary, ((A, B), (B, C)), (A,), C)
+
+
+def test_start_connection_spans_connected_starts_and_keeps_disconnection_unresolved():
+    Connected = _context().GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-connected",
+        (_coarse_start_connection(Starts=(A, C)),),
+        monotonic() + 10,
+    ).Receipts[0]
+    Disconnected = _context(Edges=(), Nodes=(A, C)).GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-disconnected",
+        (
+            _coarse_start_connection(
+                Starts=(A, C),
+                AllowedColumns=((0, 0), (2, 0)),
+            ),
+        ),
+        monotonic() + 10,
+    ).Receipts[0]
+
+    assert Connected.SearchOutcome == "Found"
+    assert Connected.Candidate.Nodes == [A, B, C]
+    assert Connected.Candidate.TargetPaths == []
+    assert Disconnected.SearchOutcome == "Incomplete"
+    assert Disconnected.TerminalReason == "StartConnectionIncomplete"
+    assert Disconnected.RuntimeSearchOutcome == "Unresolved"
+    assert Disconnected.Candidate is None
+    assert Disconnected.NoPathProof is None
+
+
+@pytest.mark.parametrize(
+    "Request",
+    (
+        _coarse_start_connection(Starts=()),
+        _coarse_start_connection(BlockedNodeValues=(A,)),
+        _coarse_start_connection(
+            AllowedColumns=((1, 0), (2, 0)),
+            RequiredNodes=(C,),
+        ),
+        _coarse(TargetBranches=((),)),
+    ),
+)
+def test_start_connection_and_ordinary_requests_reject_invalid_roots_or_branches(Request):
+    Receipt = _context().GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-invalid",
+        (Request,),
+        monotonic() + 10,
+    ).Receipts[0]
+
+    assert Receipt.SearchOutcome == "Incomplete"
+    assert Receipt.TerminalReason == "UnsupportedRequest"
+    assert Receipt.Candidate is None
+    assert Receipt.NoPathProof is None
+
+
+def test_start_connection_preserves_cap_cancellation_and_deadline_outcomes():
+    Context = _context()
+    Zero = Context.GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-zero",
+        (_coarse_start_connection(MaximumExpansionCount=0),),
+        monotonic() + 10,
+    ).Receipts[0]
+    Tiny = Context.GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-tiny",
+        (_coarse_start_connection(Starts=(A, C), MaximumExpansionCount=1),),
+        monotonic() + 10,
+    ).Receipts[0]
+    Cancelled = Context.GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-cancelled",
+        (_coarse_start_connection(CancellationRequestedBeforeStart=True),),
+        monotonic() + 10,
+    ).Receipts[0]
+    Expired = Context.GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-expired",
+        (_coarse_start_connection(),),
+        monotonic() - 1,
+    ).Receipts[0]
+
+    assert (Zero.TerminalReason, Zero.TotalExpansionCount) == ("WorkCapExhausted", 0)
+    assert Tiny.SearchOutcome == "Incomplete"
+    assert Tiny.TerminalReason == "WorkCapExhausted"
+    assert Tiny.TotalExpansionCount == 1
+    assert Tiny.NoPathProof is None
+    assert (Cancelled.TerminalReason, Cancelled.TotalExpansionCount) == ("Cancelled", 0)
+    assert Cancelled.CancellationAcknowledged is True
+    assert (Expired.TerminalReason, Expired.TotalExpansionCount) == (
+        "DeadlineExhaustedAtEntry",
+        0,
+    )
+
+
+def test_start_connection_intent_is_bound_and_set_inputs_remain_canonical():
+    Context = _context()
+    First, Permuted, Ordinary = Context.GenerateRouteTreesBatchOutcomesV1(
+        "start-connection-identities",
+        (
+            _coarse_start_connection(
+                AllowedColumns=((0, 0), (1, 0), (2, 0)),
+                RequiredNodes=(C,),
+                PreferredColumns=((1, 0), (2, 0)),
+            ),
+            _coarse_start_connection(
+                RequestId="permuted",
+                AllowedColumns=((2, 0), (0, 0), (1, 0), (0, 0)),
+                RequiredNodes=(C, C),
+                PreferredColumns=((2, 0), (1, 0), (2, 0)),
+            ),
+            _coarse(RequestId="ordinary", TargetBranches=((C,),)),
+        ),
+        monotonic() + 10,
+    ).Receipts
+
+    assert First.NativePayloadSha256 == Permuted.NativePayloadSha256
+    assert First.RouteDomainScopeSha256 == Permuted.RouteDomainScopeSha256
+    assert First.NativePayloadSha256 != Ordinary.NativePayloadSha256
+    assert First.ImmutableInputSha256 != Ordinary.ImmutableInputSha256
+    assert First.RouteDomainScopeSha256 != Ordinary.RouteDomainScopeSha256
+    assert First.ReceiptScopeSha256 != Ordinary.ReceiptScopeSha256
 
 
 def _reachable(Nodes, Edges, Starts):

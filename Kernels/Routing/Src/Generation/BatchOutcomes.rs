@@ -27,7 +27,10 @@ use std::time::{Duration, Instant};
 
 const CONTRACT_VERSION: &str = "native-route-batch-outcomes/v1";
 const COARSE_REQUEST_KIND: &str = "CoarseColumnsV1";
+const COARSE_START_CONNECTION_REQUEST_KIND: &str = "CoarseStartConnectionV1";
 const DETAILED_REQUEST_KIND: &str = "DetailedNodesV1";
+const REQUIRED_TARGET_BRANCHES_INTENT: &str = "RequiredTargetBranchesV1";
+const CONNECT_STARTS_ONLY_INTENT: &str = "ConnectStartsOnlyV1";
 const VERIFIED: &str = "Verified";
 const UNCOMPUTED_DEADLINE: &str = "UncomputedDueToDeadline";
 const UNSUPPORTED_INPUT: &str = "UnavailableUnsupportedInput";
@@ -173,6 +176,7 @@ impl RetainedBatchIdentityV1 {
 
 #[derive(Clone)]
 pub(crate) struct SealedCoarseRequestV1 {
+    ConnectionIntent: &'static str,
     RequestId: Arc<str>,
     CallerEchoBindings: Arc<Vec<(String, String)>>,
     CancellationRequestedBeforeStart: bool,
@@ -271,7 +275,16 @@ impl RouteTreeCoarseRequestV1 {
 
     #[getter]
     fn RequestKind(&self) -> &'static str {
-        COARSE_REQUEST_KIND
+        if self.Sealed.ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+            COARSE_START_CONNECTION_REQUEST_KIND
+        } else {
+            COARSE_REQUEST_KIND
+        }
+    }
+
+    #[getter]
+    fn ConnectionIntent(&self) -> &'static str {
+        self.Sealed.ConnectionIntent
     }
 
     #[getter]
@@ -318,6 +331,7 @@ impl RouteTreeCoarseRequestV1 {
         MaximumExpansionCount: usize,
     ) -> Self {
         let Sealed = SealCoarseRequestV1(
+            REQUIRED_TARGET_BRANCHES_INTENT,
             &RequestId,
             &CallerEchoBindings,
             DeclaredBounds,
@@ -354,6 +368,65 @@ impl RouteTreeCoarseRequestV1 {
             ViaPenalty,
             MaximumExpansionCount,
         }
+    }
+
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    fn ConnectStartsOnlyV1(
+        RequestId: String,
+        CallerEchoBindings: Vec<(String, String)>,
+        DeclaredBounds: Bounds3d,
+        DeclaredPlacementBounds: Bounds2d,
+        CancellationRequestedBeforeStart: bool,
+        Starts: Vec<Position>,
+        AllowedColumns: Vec<(i32, i32)>,
+        RequiredNodes: Vec<Position>,
+        BlockedNodeValues: Vec<Position>,
+        PreferredColumns: Vec<(i32, i32)>,
+        PreferredRoutingY: i32,
+        GuidePenalty: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        MaximumExpansionCount: usize,
+    ) -> Self {
+        let mut Request = Self::New(
+            RequestId,
+            CallerEchoBindings,
+            DeclaredBounds,
+            DeclaredPlacementBounds,
+            CancellationRequestedBeforeStart,
+            Starts,
+            Vec::new(),
+            AllowedColumns,
+            RequiredNodes,
+            BlockedNodeValues,
+            PreferredColumns,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            MaximumExpansionCount,
+        );
+        Request.Sealed = SealCoarseRequestV1(
+            CONNECT_STARTS_ONLY_INTENT,
+            &Request.RequestId,
+            &Request.CallerEchoBindings,
+            Request.DeclaredBounds,
+            Request.DeclaredPlacementBounds,
+            Request.CancellationRequestedBeforeStart,
+            &Request.Starts,
+            &Request.TargetBranches,
+            &Request.AllowedColumns,
+            &Request.RequiredNodes,
+            &Request.BlockedNodeValues,
+            &Request.PreferredColumns,
+            Request.PreferredRoutingY,
+            Request.GuidePenalty,
+            Request.BendPenalty,
+            Request.ViaPenalty,
+            Request.MaximumExpansionCount,
+        );
+        Request
     }
 }
 
@@ -407,6 +480,11 @@ impl RouteTreeDetailedRequestV1 {
     #[getter]
     fn RequestKind(&self) -> &'static str {
         DETAILED_REQUEST_KIND
+    }
+
+    #[getter]
+    fn ConnectionIntent(&self) -> &'static str {
+        REQUIRED_TARGET_BRANCHES_INTENT
     }
 
     #[getter]
@@ -760,6 +838,7 @@ impl RouteTreeDetailedRequestV1 {
 #[derive(Clone, PartialEq, Eq)]
 struct CanonicalRouteRequestV1 {
     RequestKind: &'static str,
+    ConnectionIntent: &'static str,
     RequestId: Arc<str>,
     CancellationRequestedBeforeStart: bool,
     Starts: Arc<Vec<Position>>,
@@ -1128,6 +1207,7 @@ fn CallerEchoCanonicalJson(
 
 #[allow(clippy::too_many_arguments)]
 fn SealCoarseRequestV1(
+    ConnectionIntent: &'static str,
     RequestId: &str,
     CallerEchoBindings: &[(String, String)],
     DeclaredBounds: Bounds3d,
@@ -1169,41 +1249,81 @@ fn SealCoarseRequestV1(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let NativePayloadCanonicalJson = serde_json::to_string(&json!([
-        "native-coarse-route-request-payload-v1",
-        Starts,
-        TargetBranches,
-        CanonicalAllowedColumns,
-        CanonicalRequiredNodes,
-        CanonicalBlockedNodes,
-        CanonicalPreferredColumns,
-        PreferredRoutingY,
-        GuidePenalty,
-        BendPenalty,
-        ViaPenalty,
-        MaximumExpansionCount,
-        CancellationRequestedBeforeStart,
-    ]))
+    let NativePayloadCanonicalJson = if ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+        serde_json::to_string(&json!([
+            "native-coarse-start-connection-request-payload-v1",
+            ConnectionIntent,
+            Starts,
+            CanonicalAllowedColumns,
+            CanonicalRequiredNodes,
+            CanonicalBlockedNodes,
+            CanonicalPreferredColumns,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            MaximumExpansionCount,
+            CancellationRequestedBeforeStart,
+        ]))
+    } else {
+        serde_json::to_string(&json!([
+            "native-coarse-route-request-payload-v1",
+            Starts,
+            TargetBranches,
+            CanonicalAllowedColumns,
+            CanonicalRequiredNodes,
+            CanonicalBlockedNodes,
+            CanonicalPreferredColumns,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            MaximumExpansionCount,
+            CancellationRequestedBeforeStart,
+        ]))
+    }
     .expect("native coarse payload JSON values are serializable");
-    let ImmutableInputCanonicalJson = serde_json::to_string(&json!([
-        "raw-native-coarse-route-request-v1",
-        RequestId,
-        Starts,
-        TargetBranches,
-        AllowedColumns,
-        RequiredNodes,
-        BlockedNodeValues,
-        PreferredColumns,
-        PreferredRoutingY,
-        GuidePenalty,
-        BendPenalty,
-        ViaPenalty,
-        MaximumExpansionCount,
-        CancellationRequestedBeforeStart,
-        CallerEchoBindings,
-        DeclaredBounds,
-        DeclaredPlacementBounds,
-    ]))
+    let ImmutableInputCanonicalJson = if ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+        serde_json::to_string(&json!([
+            "raw-native-coarse-start-connection-request-v1",
+            ConnectionIntent,
+            RequestId,
+            Starts,
+            AllowedColumns,
+            RequiredNodes,
+            BlockedNodeValues,
+            PreferredColumns,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            MaximumExpansionCount,
+            CancellationRequestedBeforeStart,
+            CallerEchoBindings,
+            DeclaredBounds,
+            DeclaredPlacementBounds,
+        ]))
+    } else {
+        serde_json::to_string(&json!([
+            "raw-native-coarse-route-request-v1",
+            RequestId,
+            Starts,
+            TargetBranches,
+            AllowedColumns,
+            RequiredNodes,
+            BlockedNodeValues,
+            PreferredColumns,
+            PreferredRoutingY,
+            GuidePenalty,
+            BendPenalty,
+            ViaPenalty,
+            MaximumExpansionCount,
+            CancellationRequestedBeforeStart,
+            CallerEchoBindings,
+            DeclaredBounds,
+            DeclaredPlacementBounds,
+        ]))
+    }
     .expect("raw request JSON values are serializable");
     let RawCallerEchoScopeCanonicalJson = serde_json::to_string(&json!([
         "raw-native-route-caller-echo-scope-v1",
@@ -1220,6 +1340,7 @@ fn SealCoarseRequestV1(
                 (Arc::<str>::from(Canonical), Arc::<str>::from(Digest))
             });
     Arc::new(SealedCoarseRequestV1 {
+        ConnectionIntent,
         RequestId: Arc::from(RequestId),
         CallerEchoBindings: Arc::new(CallerEchoBindings.to_vec()),
         CancellationRequestedBeforeStart,
@@ -1527,6 +1648,7 @@ fn NormalizeRequest(
     }
     let (
         RequestKind,
+        ConnectionIntent,
         RequestId,
         CancellationRequestedBeforeStart,
         Starts,
@@ -1601,7 +1723,12 @@ fn NormalizeRequest(
                 .clone()
                 .ok_or(RequestNormalizationErrorV1::Unsupported)?;
             (
-                COARSE_REQUEST_KIND,
+                if Value.ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+                    COARSE_START_CONNECTION_REQUEST_KIND
+                } else {
+                    COARSE_REQUEST_KIND
+                },
+                Value.ConnectionIntent,
                 Value.RequestId.clone(),
                 Value.CancellationRequestedBeforeStart,
                 Value.Starts.clone(),
@@ -1637,6 +1764,7 @@ fn NormalizeRequest(
                 .ok_or(RequestNormalizationErrorV1::Unsupported)?;
             (
                 DETAILED_REQUEST_KIND,
+                REQUIRED_TARGET_BRANCHES_INTENT,
                 Value.RequestId.clone(),
                 Value.CancellationRequestedBeforeStart,
                 Value.Starts.clone(),
@@ -1675,7 +1803,14 @@ fn NormalizeRequest(
     if ValidationItemCount >= DEADLINE_CHECK_INTERVAL && Deadline.Check() {
         return Err(RequestNormalizationErrorV1::DeadlineExhausted);
     }
-    if Starts.is_empty() || TargetBranches.is_empty() {
+    if Starts.is_empty()
+        || (ConnectionIntent == REQUIRED_TARGET_BRANCHES_INTENT && TargetBranches.is_empty())
+        || (ConnectionIntent == CONNECT_STARTS_ONLY_INTENT && !TargetBranches.is_empty())
+        || !matches!(
+            ConnectionIntent,
+            REQUIRED_TARGET_BRANCHES_INTENT | CONNECT_STARTS_ONLY_INTENT
+        )
+    {
         return Err(RequestNormalizationErrorV1::Unsupported);
     }
     let PositionIsAllowed = |PositionValue: &Position| {
@@ -1727,29 +1862,52 @@ fn NormalizeRequest(
             *Branch.last().expect("validated nonempty branch"),
         ));
     }
-    let DomainDocument = (
-        "native-route-domain-scope-v1",
-        Starts.as_ref(),
-        TargetBranches.as_ref(),
-        &BranchRoles,
-        AllowedNodes.as_ref(),
-        BlockedNodes.as_ref(),
-        PreferredColumns.as_ref(),
-        NodeCosts.as_ref(),
-        PreferredRoutingY,
-        GuidePenalty,
-        BendPenalty,
-        ViaPenalty,
-        EnforceSignalStrength,
-        MaximumExpansionCount,
-    );
-    let (RouteDomainScopeCanonicalJson, RouteDomainScopeSha256) = CanonicalJsonAndShaWithDeadline(
-        &DomainDocument,
-        Deadline,
-        ValidationItemCount >= DEADLINE_CHECK_INTERVAL,
-    )?;
+    let (RouteDomainScopeCanonicalJson, RouteDomainScopeSha256) =
+        if ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+            CanonicalJsonAndShaWithDeadline(
+                &(
+                    "native-route-start-connection-domain-scope-v1",
+                    ConnectionIntent,
+                    Starts.as_ref(),
+                    AllowedNodes.as_ref(),
+                    BlockedNodes.as_ref(),
+                    PreferredColumns.as_ref(),
+                    NodeCosts.as_ref(),
+                    PreferredRoutingY,
+                    GuidePenalty,
+                    BendPenalty,
+                    ViaPenalty,
+                    EnforceSignalStrength,
+                    MaximumExpansionCount,
+                ),
+                Deadline,
+                ValidationItemCount >= DEADLINE_CHECK_INTERVAL,
+            )?
+        } else {
+            CanonicalJsonAndShaWithDeadline(
+                &(
+                    "native-route-domain-scope-v1",
+                    Starts.as_ref(),
+                    TargetBranches.as_ref(),
+                    &BranchRoles,
+                    AllowedNodes.as_ref(),
+                    BlockedNodes.as_ref(),
+                    PreferredColumns.as_ref(),
+                    NodeCosts.as_ref(),
+                    PreferredRoutingY,
+                    GuidePenalty,
+                    BendPenalty,
+                    ViaPenalty,
+                    EnforceSignalStrength,
+                    MaximumExpansionCount,
+                ),
+                Deadline,
+                ValidationItemCount >= DEADLINE_CHECK_INTERVAL,
+            )?
+        };
     Ok(CanonicalRouteRequestV1 {
         RequestKind,
+        ConnectionIntent,
         RequestId,
         CancellationRequestedBeforeStart,
         Starts,
@@ -1874,6 +2032,93 @@ fn CandidateEdgeIsValidWithDeadline(
     Ok(false)
 }
 
+fn ValidateStartConnectionCandidateWithDeadline(
+    Context: &RoutingContext,
+    Request: &CanonicalRouteRequestV1,
+    Result: &RouteTreeSearchResult,
+    ExpectedRouteExpansionCount: usize,
+    Deadline: &RuntimeDeadline,
+) -> FinalValidationResultV1 {
+    if Deadline.Check() {
+        return FinalValidationResultV1::DeadlineExhausted;
+    }
+    if Request.ConnectionIntent != CONNECT_STARTS_ONLY_INTENT
+        || !Request.TargetBranches.is_empty()
+        || !Result.IsRouted
+        || Result.IsBudgetExpired
+        || Result.Status != "Routed"
+        || !Result.NoPathReason.is_empty()
+        || Result.Nodes.is_empty()
+        || !Result.TargetPaths.is_empty()
+        || !Result.RepeaterReservations.is_empty()
+        || !Result.ConflictResources.is_empty()
+        || Result.ExpansionCount != ExpectedRouteExpansionCount
+    {
+        return FinalValidationResultV1::Invalid;
+    }
+    let mut ValidationSteps = 0usize;
+    macro_rules! ValidateStep {
+        () => {
+            if let Err(Result) = AdvanceValidationStep(&mut ValidationSteps, Deadline) {
+                return Result;
+            }
+        };
+    }
+    let mut Allowed = HashSet::with_capacity(Request.AllowedNodes.len());
+    for Value in Request.AllowedNodes.iter().copied() {
+        ValidateStep!();
+        Allowed.insert(Value);
+    }
+    let mut Blocked = HashSet::with_capacity(Request.BlockedNodes.len());
+    for Value in Request.BlockedNodes.iter().copied() {
+        ValidateStep!();
+        Blocked.insert(Value);
+    }
+    let mut NodeSet = HashSet::with_capacity(Result.Nodes.len());
+    for Value in Result.Nodes.iter().copied() {
+        ValidateStep!();
+        if !NodeSet.insert(Value) || !Allowed.contains(&Value) || Blocked.contains(&Value) {
+            return FinalValidationResultV1::Invalid;
+        }
+    }
+    for Start in Request.Starts.iter() {
+        ValidateStep!();
+        if !NodeSet.contains(Start) {
+            return FinalValidationResultV1::Invalid;
+        }
+    }
+    let Some(Root) = Request.Starts.first().copied() else {
+        return FinalValidationResultV1::Invalid;
+    };
+    let mut Reached = HashSet::from([Root]);
+    let mut Pending = VecDeque::from([Root]);
+    while let Some(Current) = Pending.pop_front() {
+        ValidateStep!();
+        for Neighbor in Context.Adjacency.get(&Current).into_iter().flatten() {
+            ValidateStep!();
+            if NodeSet.contains(Neighbor) && Reached.insert(*Neighbor) {
+                Pending.push_back(*Neighbor);
+            }
+        }
+    }
+    if Reached.len() != NodeSet.len() || Request.Starts.iter().any(|Start| !Reached.contains(Start))
+    {
+        return FinalValidationResultV1::Invalid;
+    }
+    let mut BoundaryFrontierNodes = HashSet::with_capacity(Result.BoundaryFrontierNodes.len());
+    for Value in Result.BoundaryFrontierNodes.iter().copied() {
+        ValidateStep!();
+        if !BoundaryFrontierNodes.insert(Value) || !NodeSet.contains(&Value) {
+            return FinalValidationResultV1::Invalid;
+        }
+    }
+    if Deadline.Check() {
+        FinalValidationResultV1::DeadlineExhausted
+    } else {
+        FinalValidationResultV1::Valid
+    }
+}
+
 fn ValidateFoundCandidateWithDeadline(
     Context: &RoutingContext,
     Request: &CanonicalRouteRequestV1,
@@ -1881,6 +2126,15 @@ fn ValidateFoundCandidateWithDeadline(
     ExpectedRouteExpansionCount: usize,
     Deadline: &RuntimeDeadline,
 ) -> FinalValidationResultV1 {
+    if Request.ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+        return ValidateStartConnectionCandidateWithDeadline(
+            Context,
+            Request,
+            Result,
+            ExpectedRouteExpansionCount,
+            Deadline,
+        );
+    }
     if Deadline.Check() {
         return FinalValidationResultV1::DeadlineExhausted;
     }
@@ -2523,6 +2777,9 @@ fn ExecuteCanonicalRequest(
         Receipt.TerminalReason = "DeadlineExhausted".to_string();
     } else if Admission.TotalCount() >= Admission.Maximum() {
         Receipt.TerminalReason = "WorkCapExhausted".to_string();
+    } else if Request.ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+        Receipt.TerminalReason = "StartConnectionIncomplete".to_string();
+        Receipt.OutcomePhase = "Search";
     } else {
         match RelaxedConnectivityProof(Context, &Request, Admission, Deadline) {
             RelaxedConnectivityResultV1::Disconnected(Proof, ReachedNodes) => {
@@ -2575,7 +2832,11 @@ fn MinimalRequestIdentity(Request: &AuthoritativeRouteRequestV1) -> (&str, &'sta
     match Request {
         AuthoritativeRouteRequestV1::Coarse(Value) => (
             &Value.RequestId,
-            COARSE_REQUEST_KIND,
+            if Value.ConnectionIntent == CONNECT_STARTS_ONLY_INTENT {
+                COARSE_START_CONNECTION_REQUEST_KIND
+            } else {
+                COARSE_REQUEST_KIND
+            },
             Value.MaximumExpansionCount,
         ),
         AuthoritativeRouteRequestV1::Detailed(Value) => (
@@ -2948,6 +3209,18 @@ fn ProducerReceiptStateIsCoherent(
             Facts.OutcomePhase == "Proof"
                 && Facts.Started
                 && Facts.CanonicalRequest.is_some()
+                && !Facts.CancellationRequested
+                && !Facts.CancellationAcknowledged
+                && !Facts.SearchStopped
+                && Facts.CleanupDisposition == "NotApplicableNoProcess"
+        }
+        ("Incomplete", "StartConnectionIncomplete") => {
+            Facts.OutcomePhase == "Search"
+                && Facts.Started
+                && Facts.CanonicalRequest.as_ref().is_some_and(|Request| {
+                    Request.ConnectionIntent == CONNECT_STARTS_ONLY_INTENT
+                        && Request.TargetBranches.is_empty()
+                })
                 && !Facts.CancellationRequested
                 && !Facts.CancellationAcknowledged
                 && !Facts.SearchStopped
@@ -3496,6 +3769,7 @@ mod Tests {
         let CallerEchoScopeCanonicalJson: Arc<str> = Arc::from("[]");
         CanonicalRouteRequestV1 {
             RequestKind: DETAILED_REQUEST_KIND,
+            ConnectionIntent: REQUIRED_TARGET_BRANCHES_INTENT,
             RequestId: Arc::from("request"),
             CancellationRequestedBeforeStart: false,
             Starts: Arc::new(vec![A]),
@@ -3659,6 +3933,36 @@ mod Tests {
             NativeSha256("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         );
+    }
+
+    #[test]
+    fn StartConnectionCandidateRequiresOneConnectedTreeSpanningEveryStart() {
+        let Context = LinearContext();
+        let mut Request = CanonicalRequest(vec![A, B, C]);
+        Request.RequestKind = COARSE_START_CONNECTION_REQUEST_KIND;
+        Request.ConnectionIntent = CONNECT_STARTS_ONLY_INTENT;
+        Request.Starts = Arc::new(vec![A, C]);
+        Request.TargetBranches = Arc::new(Vec::new());
+        let mut Candidate = ValidCandidate();
+        Candidate.TargetPaths.clear();
+
+        assert!(ValidateFoundCandidate(&Context, &Request, &Candidate));
+
+        let mut MissingStart = Candidate.clone();
+        MissingStart.Nodes.pop();
+        assert!(!ValidateFoundCandidate(&Context, &Request, &MissingStart));
+
+        let mut FabricatedTargetPath = Candidate.clone();
+        FabricatedTargetPath.TargetPaths.push((C, vec![A, B, C]));
+        assert!(!ValidateFoundCandidate(
+            &Context,
+            &Request,
+            &FabricatedTargetPath,
+        ));
+
+        let mut Disconnected = Candidate;
+        Disconnected.Nodes = vec![A, C];
+        assert!(!ValidateFoundCandidate(&Context, &Request, &Disconnected));
     }
 
     #[test]

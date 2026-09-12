@@ -12,6 +12,7 @@ from typing import Any, Sequence
 class RouteTreeCoarseRequestV1:
     ContractVersion: str
     RequestKind: str
+    ConnectionIntent: str
     NativePayloadCanonicalJson: str
     NativePayloadSha256: str
     ImmutableInputSha256: str
@@ -40,10 +41,30 @@ class RouteTreeCoarseRequestV1:
         MaximumExpansionCount: int,
     ) -> None: ...
 
+    @staticmethod
+    def ConnectStartsOnlyV1(
+        RequestId: str,
+        CallerEchoBindings: Sequence[tuple[str, str]],
+        DeclaredBounds: tuple[int, int, int, int, int, int],
+        DeclaredPlacementBounds: tuple[int, int, int, int],
+        CancellationRequestedBeforeStart: bool,
+        Starts: Sequence[tuple[int, int, int]],
+        AllowedColumns: Sequence[tuple[int, int]],
+        RequiredNodes: Sequence[tuple[int, int, int]],
+        BlockedNodeValues: Sequence[tuple[int, int, int]],
+        PreferredColumns: Sequence[tuple[int, int]],
+        PreferredRoutingY: int,
+        GuidePenalty: int,
+        BendPenalty: int,
+        ViaPenalty: int,
+        MaximumExpansionCount: int,
+    ) -> "RouteTreeCoarseRequestV1": ...
+
 
 class RouteTreeDetailedRequestV1:
     ContractVersion: str
     RequestKind: str
+    ConnectionIntent: str
     NativePayloadCanonicalJson: str
     NativePayloadSha256: str
     ImmutableInputSha256: str

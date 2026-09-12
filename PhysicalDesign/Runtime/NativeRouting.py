@@ -329,6 +329,13 @@ def _AdaptNativeRouteBatchOutcomesV1(
             raise ValueError("native route receipt context graph mismatch")
         if Receipt.RequestKind != ExpectedRequest.RequestKind:
             raise ValueError("native route receipt request kind mismatch")
+        ExpectedIntent = (
+            "ConnectStartsOnlyV1"
+            if Receipt.RequestKind == "CoarseStartConnectionV1"
+            else "RequiredTargetBranchesV1"
+        )
+        if ExpectedRequest.ConnectionIntent != ExpectedIntent:
+            raise ValueError("native route receipt connection intent mismatch")
         if Receipt.RequestId != ExpectedRequest.RequestId:
             raise ValueError("native route receipt request identity mismatch")
         if Receipt.MaximumExpansionCount != ExpectedRequest.MaximumExpansionCount:
@@ -546,14 +553,18 @@ def ExecuteNativeRouteBatchOutcomesV1(
         raise TypeError("Requests must be an exact immutable tuple")
     if type(Detailed) is not bool:
         raise TypeError("Detailed must be an exact bool")
-    ExpectedKind = "DetailedNodesV1" if Detailed else "CoarseColumnsV1"
+    ExpectedKinds = (
+        frozenset(("DetailedNodesV1",))
+        if Detailed
+        else frozenset(("CoarseColumnsV1", "CoarseStartConnectionV1"))
+    )
     ExpectedRequestType = (
         RustRouting.RouteTreeDetailedRequestV1
         if Detailed
         else RustRouting.RouteTreeCoarseRequestV1
     )
     if any(
-        type(Request) is not ExpectedRequestType or Request.RequestKind != ExpectedKind
+        type(Request) is not ExpectedRequestType or Request.RequestKind not in ExpectedKinds
         for Request in Requests
     ):
         raise TypeError("request kind does not match the selected native entrypoint")
