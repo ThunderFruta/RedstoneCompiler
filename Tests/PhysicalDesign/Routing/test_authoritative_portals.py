@@ -1553,6 +1553,31 @@ class AuthoritativePortalsTests(AuthoritativePlannerTestBase):
             [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
         )
 
+    def testCandidatePortalShapeRanksCoverRetainedTupleDomainWithinCap(
+        self,
+    ) -> None:
+        def CoveredTupleIndices(RequestWindowOffset: int) -> set[int]:
+            return {
+                CandidatePortalTupleIndex(
+                    Variant=CandidatePortalShapeRank(
+                        Variant,
+                        AxisIndex,
+                        LaneIndex=0,
+                        LayerIndex=0,
+                        PortalVariantCount=8,
+                        LaneCount=1,
+                        RequestWindowOffset=RequestWindowOffset,
+                    ),
+                    PortalPhase=0,
+                    PortalTupleCount=16,
+                )
+                for AxisIndex in range(2)
+                for Variant in range(8)
+            }
+
+        self.assertEqual(CoveredTupleIndices(0), set(range(16)))
+        self.assertEqual(CoveredTupleIndices(5), set(range(16)))
+
     def testBoundaryPortalReservationUsesDisjointForeignSlots(self) -> None:
         First = self.BuildPortal("A", (0, 1, 0), (1, 1, 0))
         Second = self.BuildPortal("A", (0, 1, 0), (2, 1, 0))

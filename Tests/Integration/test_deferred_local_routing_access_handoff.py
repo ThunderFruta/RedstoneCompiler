@@ -30,11 +30,23 @@ from PhysicalDesign.Orchestration.Preparation import (
 )
 from PhysicalDesign.Orchestration.Runner import PlaceAndRoutePcb
 from PhysicalDesign.Redstone.Rules import BuildRoutingResources
-from PhysicalDesign.Routing.Pcb import PrepareTrackAssignment
+from PhysicalDesign.Routing.Pcb import (
+    BuildPcbRoutingConfigurations,
+    PrepareTrackAssignment,
+    RoutePcbAttempt,
+)
 from PhysicalDesign.Runtime.Reliability import RoutingDeadline
 import PhysicalDesign.Orchestration.PhysicalFlow as PhysicalFlow
 import PhysicalDesign.Orchestration.RoutingAttempts as RoutingAttempts
 import PhysicalDesign.Routing.Global.Orchestration.Flow as RoutingFlow
+
+
+class _EligibilityBoundaryReached(BaseException):
+    """Stop the regression after proving physical eligibility was entered."""
+
+
+class _CandidateMaterializationBoundaryReached(BaseException):
+    """Stop after observing one ordinary candidate-domain producer."""
 
 
 def _BuildFanoutDepthSeventeenNetlist() -> NetlistIR:
@@ -234,6 +246,87 @@ def ProductionHandoff():
                             State.CandidateDiagnostics.get(Signal, {})
                         ),
                     )
+                    RootSignal = "root"
+                    RootProfile = State.Profiles[RootSignal]
+                    RootTarget = (4, 1, 6)
+                    RootCandidates = tuple(
+                        State.CandidatesBySignal.get(RootSignal, ())
+                    )
+                    RootShapes = tuple(
+                        State.PhysicalCandidateRequestShapesBySignal.get(
+                            RootSignal,
+                            (),
+                        )
+                    )
+                    Captured["RootCandidateEvidence"] = SimpleNamespace(
+                        Target=RootTarget,
+                        RouteRequestCount=len(
+                            State.RouteRequestsBySignal.get(RootSignal, ())
+                        ),
+                        CandidateCount=len(RootCandidates),
+                        CandidateIds=tuple(
+                            Candidate.CandidateId
+                            for Candidate in RootCandidates
+                        ),
+                        CandidateTargetPortalIds=tuple(
+                            Candidate.TargetPortalIds[RootTarget]
+                            for Candidate in RootCandidates
+                        ),
+                        CandidateAdmissionConflicts=tuple(
+                            (
+                                tuple(
+                                    Services.FindForeignSelectedPinAccessConflictSignals(
+                                        RootSignal,
+                                        Candidate.Claims,
+                                        State.ForeignSelectedPinAccessClaimsBySignal,
+                                        Services.ComponentClaimsConflict,
+                                    )
+                                ),
+                                tuple(
+                                    Claim.Signal
+                                    for Claim in State.FrozenComponentClaims
+                                    if Claim.Signal != RootSignal
+                                    and Services.ComponentClaimsConflict(
+                                        Candidate.Claims,
+                                        Claim.Claims,
+                                    )
+                                ),
+                                tuple(
+                                    State.AssemblySpecificSiblingApertureConflictSignals(
+                                        RootSignal,
+                                        Candidate.Claims,
+                                    )
+                                ),
+                            )
+                            for Candidate in RootCandidates
+                        ),
+                        RequestShapeCount=len(RootShapes),
+                        GuideExpansions=tuple(sorted({
+                            Shape.GuideExpansion for Shape in RootShapes
+                        })),
+                        RoutePortalVariantCount=(
+                            State.RoutePortalVariantCounts[RootSignal]
+                        ),
+                        LegalTupleTargetPortalIds=tuple(sorted({
+                            Portals[
+                                1 + RootProfile.Targets.index(RootTarget)
+                            ].PortalId
+                            for Layer in range(State.LayerCount)
+                            for Portals in State.LegalPortalTuplesBySignalLayer.get(
+                                (RootSignal, Layer),
+                                (),
+                            )
+                        })),
+                        Scheduler=dict(
+                            State.WorkTelemetry[
+                                "MatureStagedInitialCandidateScheduler"
+                            ]
+                        ),
+                        UnreservedPortalMode=State.UnreservedPortalMode,
+                        CoordinatedSignals=tuple(sorted(
+                            State.CoordinatedCandidateDiversificationSignals
+                        )),
+                    )
             if Outcome.Returned:
                 return Outcome.Value
         raise RuntimeError(
@@ -253,7 +346,7 @@ def ProductionHandoff():
 
     def ObserveEligibility(*Arguments, **Options):
         Captured["EligibilityEntered"] = True
-        return OriginalEligibility(*Arguments, **Options)
+        raise _EligibilityBoundaryReached()
 
     PhysicalFlow.MaterializeSelectedJointPlacementLocalRoutingHandoff = (
         ObserveHandoff
@@ -265,7 +358,7 @@ def ProductionHandoff():
     PhysicalFlow.PreparePhysicalComponentEligibility = ObserveEligibility
     RoutingFlow.RunAuthoritativeRoutingPhases = ObservePhaseRunner
     try:
-        with pytest.raises(RoutingStageError) as Error:
+        with pytest.raises(_EligibilityBoundaryReached):
             PlaceAndRoutePcb(
                 _BuildFanoutDepthSeventeenNetlist(),
                 Strategy="routing-aware-placement-access",
@@ -281,16 +374,12 @@ def ProductionHandoff():
         PhysicalFlow.PreparePhysicalComponentEligibility = OriginalEligibility
         RoutingFlow.RunAuthoritativeRoutingPhases = OriginalPhaseRunner
 
-    assert Error.value.Failure.Stage == "CurrentSelectedAccessAfterChannelReplacement"
-    assert Error.value.Failure.Reason is (
-        RoutingFailureReason.ClusterInterfaceSolveIncomplete
-    )
     assert "Handoff" in Captured
     assert "PortalEvidence" in Captured
     assert "CandidateEvidence" in Captured
+    assert "RootCandidateEvidence" in Captured
     assert "TrackPreparation" in Captured
-    Captured["LaterFailure"] = Error.value.Failure
-    Captured.setdefault("EligibilityEntered", False)
+    assert Captured["EligibilityEntered"] is True
     return SimpleNamespace(**Captured)
 
 
@@ -395,9 +484,7 @@ def test_real_production_caller_consumes_current_successor(ProductionHandoff):
             Selection.Claims
         )
     assert ProductionHandoff.ConsumerCandidate == Successor
-    assert ProductionHandoff.LaterFailure.Stage != (
-        "PlacementLocalRoutingMaterialization"
-    )
+    assert ProductionHandoff.EligibilityEntered is True
     Portal = ProductionHandoff.PortalEvidence
     assert Portal.SourceAccessPath == (
         (60, 1, 13),
@@ -424,17 +511,230 @@ def test_real_production_caller_consumes_current_successor(ProductionHandoff):
     )
     Candidate = ProductionHandoff.CandidateEvidence
     assert Candidate.RouteRequestCount == 8
-    assert Candidate.CandidateCount == 1
-    assert Candidate.CandidateSourcePortalIds == (Portal.SourcePortal.PortalId,)
-    assert Candidate.CandidateTargetPortalIds == (Portal.TargetPortal.PortalId,)
-    assert Candidate.CandidateConflictOwners == ((),)
+    assert Candidate.CandidateCount == 8
+    assert set(Candidate.CandidateSourcePortalIds) == {
+        Portal.SourcePortal.PortalId,
+    }
+    assert set(Candidate.CandidateTargetPortalIds) == {
+        Portal.TargetPortal.PortalId,
+    }
+    assert set(Candidate.CandidateConflictOwners) == {()}
+
+    Root = ProductionHandoff.RootCandidateEvidence
+    assert Root.RouteRequestCount == 64
+    assert Root.RequestShapeCount == Root.RouteRequestCount
+    assert Root.GuideExpansions == (3,)
+    assert Root.CandidateCount > 1
+    assert Root.RoutePortalVariantCount == 8
+    assert Root.UnreservedPortalMode is True
+    assert Root.CoordinatedSignals == ()
+    assert "root:(4, 1, 6):0:Portal:3,2,7" in (
+        Root.LegalTupleTargetPortalIds
+    )
+    assert "root:(4, 1, 6):0:Portal:3,2,7" in (
+        Root.CandidateTargetPortalIds
+    )
+    assert set(Root.CandidateAdmissionConflicts) == {((), (), ())}
+    assert Root.Scheduler["PlannedRequestCount"] == 328
+    assert Root.Scheduler["ExecutedRequestCount"] == 328
+    assert Root.Scheduler["FullPoolGenerated"] is True
+    assert Root.Scheduler["EverySignalHasTree"] is True
 
     Track = ProductionHandoff.TrackPreparation
     assert Track.Complete
-    assert not Track.Success
-    assert dict(Track.CandidateCounts)["b0d2"] == 1
-    assert dict(Track.Diagnostics)["FailureNet"] == "a"
-    assert ProductionHandoff.EligibilityEntered is False
+    assert Track.Success
+    assert dict(Track.CandidateCounts)["b0d2"] == 8
+    assert dict(Track.Diagnostics)["FailureNet"] == ""
+    SelectedBySignal = dict(Track.SelectedCandidateIds)
+    assert SelectedBySignal["root"] in Root.CandidateIds
+    assert "Troot:(4, 1, 6):0:Portal:3,2,7" in SelectedBySignal["root"]
+
+
+def test_ordinary_caller_keeps_staged_seed_as_an_early_stop(
+    ProductionHandoff,
+    monkeypatch,
+):
+    Placement = ProductionHandoff.TrackCandidate.Placement
+    Resources = BuildRoutingResources(Placement.Placed)
+    Deadline = RoutingDeadline.Start(60.0)
+    Captured = {}
+    OriginalPhaseRunner = RoutingFlow.RunAuthoritativeRoutingPhases
+
+    def StopAfterOrdinaryCandidateDomain(State, Services, Phases=None):
+        if Phases is None:
+            Phases = OriginalPhaseRunner.__defaults__[0]
+        for RunPhase in Phases:
+            Outcome = RunPhase(State, Services)
+            if RunPhase.__name__ == "RunCandidateMaterialization":
+                Captured.update({
+                    "PrepareTrackAssignmentOnly": (
+                        State.PrepareTrackAssignmentOnly
+                    ),
+                    "PreparingPhysicalComponentGlobalChannels": (
+                        State.Resources.PreparingPhysicalComponentGlobalChannels
+                    ),
+                    "Scheduler": dict(
+                        State.WorkTelemetry[
+                            "MatureStagedInitialCandidateScheduler"
+                        ]
+                    ),
+                    "UnreservedPortalMode": State.UnreservedPortalMode,
+                    "CoordinatedSignals": tuple(sorted(
+                        State.CoordinatedCandidateDiversificationSignals
+                    )),
+                    "DistinctTupleCountsByVariant": {
+                        Signal: {
+                            Variant: len({
+                                (
+                                    SourcePortal.PortalId,
+                                    tuple(
+                                        Portal.PortalId
+                                        for Portal in TargetPortals
+                                    ),
+                                )
+                                for SourcePortal, TargetPortals,
+                                _Guide, _Layer, _Axis, _Lane, MetadataVariant
+                                in State.RouteMetadataBySignal[Signal]
+                                if MetadataVariant == Variant
+                            })
+                            for Variant in {
+                                Metadata[-1]
+                                for Metadata
+                                in State.RouteMetadataBySignal[Signal]
+                            }
+                        }
+                        for Signal in State.RouteMetadataBySignal
+                    },
+                })
+                raise _CandidateMaterializationBoundaryReached()
+            if Outcome.Returned:
+                return Outcome.Value
+        raise RuntimeError(
+            "authoritative routing phases completed without a result"
+        )
+
+    monkeypatch.setattr(
+        RoutingFlow,
+        "RunAuthoritativeRoutingPhases",
+        StopAfterOrdinaryCandidateDomain,
+    )
+    with pytest.raises(_CandidateMaterializationBoundaryReached):
+        RoutePcbAttempt(
+            Placement,
+            BuildPcbRoutingConfigurations(Placement)[0],
+            Resources=Resources,
+            Policy=ProductionHandoff.Context.Policy,
+            Deadline=Deadline,
+        )
+
+    Scheduler = Captured["Scheduler"]
+    assert Captured["PrepareTrackAssignmentOnly"] is False
+    assert Captured["PreparingPhysicalComponentGlobalChannels"] is False
+    assert Captured["UnreservedPortalMode"] is False
+    assert Captured["CoordinatedSignals"] == ()
+    assert any(
+        Count > 1
+        for Counts in Captured["DistinctTupleCountsByVariant"].values()
+        for Count in Counts.values()
+    )
+    assert Scheduler["EverySignalHasTree"] is True
+    assert Scheduler["FullPoolGenerated"] is False
+    assert Scheduler["ExecutedRequestCount"] == 6
+    assert Scheduler["PlannedRequestCount"] == 24
+    assert not Deadline.IsExpired()
+
+
+def test_coordinated_caller_requests_retained_tuple_tail_within_domain(
+    ProductionHandoff,
+    monkeypatch,
+):
+    Placement = ProductionHandoff.TrackCandidate.Placement
+    Resources = BuildRoutingResources(Placement.Placed)
+    Deadline = RoutingDeadline.Start(60.0)
+    Captured = {}
+    OriginalPhaseRunner = RoutingFlow.RunAuthoritativeRoutingPhases
+
+    def ObserveCoordinatedCandidateDomain(State, Services, Phases=None):
+        if Phases is None:
+            Phases = OriginalPhaseRunner.__defaults__[0]
+        for RunPhase in Phases:
+            if RunPhase.__name__ == "RunCandidateMaterialization":
+                State.CoordinatedCandidateDiversificationSignals = frozenset({
+                    "root",
+                })
+                State.ConfiguredCoordinatedCandidateDiversityFixedLevel = 1
+            try:
+                Outcome = RunPhase(State, Services)
+            finally:
+                if (
+                    RunPhase.__name__ == "RunCandidateMaterialization"
+                    and "RequestCount" not in Captured
+                ):
+                    Signal = "root"
+                    Target = (4, 1, 6)
+                    Captured.update({
+                        "UnreservedPortalMode": State.UnreservedPortalMode,
+                        "CoordinatedSignals": tuple(sorted(
+                            State.CoordinatedCandidateDiversificationSignals
+                        )),
+                        "RequestCount": len(
+                            State.RouteRequestsBySignal[Signal]
+                        ),
+                        "RequestShapeCount": len(
+                            State.PhysicalCandidateRequestShapesBySignal[Signal]
+                        ),
+                        "RoutePortalVariantCount": (
+                            State.RoutePortalVariantCounts[Signal]
+                        ),
+                        "RequestedTargetPortalIds": tuple(sorted({
+                            TargetPortals[
+                                State.Profiles[Signal].Targets.index(Target)
+                            ].PortalId
+                            for _SourcePortal, TargetPortals, *_Rest
+                            in State.RouteMetadataBySignal[Signal]
+                        })),
+                        "CandidateTargetPortalIds": tuple(sorted({
+                            Candidate.TargetPortalIds[Target]
+                            for Candidate in State.CandidatesBySignal[Signal]
+                        })),
+                        "Scheduler": dict(
+                            State.WorkTelemetry[
+                                "MatureStagedInitialCandidateScheduler"
+                            ]
+                        ),
+                    })
+            if Outcome.Returned:
+                return Outcome.Value
+        raise RuntimeError(
+            "authoritative routing phases completed without a result"
+        )
+
+    monkeypatch.setattr(
+        RoutingFlow,
+        "RunAuthoritativeRoutingPhases",
+        ObserveCoordinatedCandidateDomain,
+    )
+    PrepareTrackAssignment(
+        Placement,
+        Resources=Resources,
+        Policy=ProductionHandoff.Context.Policy,
+        Deadline=Deadline,
+    )
+
+    assert Captured["UnreservedPortalMode"] is False
+    assert Captured["CoordinatedSignals"] == ("root",)
+    assert Captured["RequestCount"] == 187
+    assert Captured["RequestShapeCount"] == Captured["RequestCount"]
+    assert Captured["RoutePortalVariantCount"] == 8
+    assert Captured["Scheduler"]["FullPoolGenerated"] is True
+    assert Captured["Scheduler"]["ExecutedRequestCount"] == (
+        Captured["Scheduler"]["PlannedRequestCount"]
+    )
+    assert "root:(4, 1, 6):0:Portal:3,2,7" in (
+        Captured["RequestedTargetPortalIds"]
+    )
+    assert Captured["CandidateTargetPortalIds"]
+    assert not Deadline.IsExpired()
 
 
 def test_mandatory_selected_access_overlap_remains_typed_incomplete(

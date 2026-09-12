@@ -132,7 +132,11 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                         LaneValues = LaneValues[:1]
                     for LaneIndex, Lane in enumerate(LaneValues):
                         UsePhysicalGlobalLazyRequestDomain = bool(State.Resources.PreparingPhysicalComponentGlobalChannels and Signal not in State.PhysicalPortSignals)
-                        PortalShapeRank = Services.CandidatePortalShapeRank(Variant, AxisIndex, LaneIndex, Layer, PhysicalPortalVariantCount, len(LaneValues), RequestWindowOffset + SignalPortalPhase) if State.UnreservedPortalMode or ApplyCoordinatedPortalWindow or UsePhysicalGlobalLazyRequestDomain else Variant
+                        # Reserved-mode request priority may intentionally group
+                        # every axis and lane under ``Variant``.  Tuple coverage
+                        # must still use the complete deterministic shape rank.
+                        PortalTupleCoverageRank = Services.CandidatePortalShapeRank(Variant, AxisIndex, LaneIndex, Layer, PhysicalPortalVariantCount, len(LaneValues), RequestWindowOffset + SignalPortalPhase)
+                        PortalShapeRank = PortalTupleCoverageRank if State.UnreservedPortalMode or ApplyCoordinatedPortalWindow or UsePhysicalGlobalLazyRequestDomain else Variant
                         SparseBootstrapRanks = tuple((Services.CandidatePortalShapeRank(Variant, AxisIndex, LaneIndex, Layer, PhysicalPortalVariantCount, len(LaneValues), 0 + SignalPortalPhase) for BootstrapLevel in range(6))) if State.UseSparseCandidateBootstrap else ()
                         InitiallyDeferredRequestShape = Services.ShouldDeferUnreservedCandidateRequestShape(UnreservedPortalMode=State.UnreservedPortalMode or UsePhysicalGlobalLazyRequestDomain, UseSparseCandidateBootstrap=State.UseSparseCandidateBootstrap, SparseBootstrapRanks=SparseBootstrapRanks, PortalShapeRank=PortalShapeRank, UnreservedPerLayerRequestLimit=UnreservedPerLayerRequestLimit, CompleteCoordinatedSignalWindow=Services.ShouldCompletePhysicalCandidateRequestWindow(State.Resources.PreparingPhysicalComponentGlobalChannels, ApplyCoordinatedPortalWindow, SignalCandidateDiversityLevel, State.CandidateDiversityLevel, Signal in State.PhysicalPortSignals))
                         if InitiallyDeferredRequestShape:
@@ -147,8 +151,13 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                             _SeedLayer, SourcePortal, TargetPortals = PortalSeed
                             PortalSeedPending = False
                         else:
-                            PortalPhase = 1 + AxisIndex * 3 + LaneIndex
-                            SourcePortal, *TargetPortalValues = LegalPortalTuples[Services.CandidatePortalTupleIndex(Variant, PortalPhase, len(LegalPortalTuples), CoordinatedRequestWindowOffset)]
+                            SourcePortal, *TargetPortalValues = LegalPortalTuples[
+                                Services.CandidatePortalTupleIndex(
+                                    Variant=PortalTupleCoverageRank,
+                                    PortalPhase=0,
+                                    PortalTupleCount=len(LegalPortalTuples),
+                                )
+                            ]
                             TargetPortals = tuple(TargetPortalValues)
                         PortalNodes = frozenset({Position for Portal in (SourcePortal, *TargetPortals) for Position in Portal.Path})
                         if PortalNodes & State.ForeignBlockedNodesBySignal[Signal]:
@@ -546,7 +555,7 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         print(f'[debug] authoritative: initial native batch requests={len(BatchedInitialRequests)} fingerprint={Services.BuildStableFingerprint(BatchedInitialRequests)}', flush=True)
     (StagedInitialResult): Services.StagedInitialRouteTreeResult | None = None
     if UseMatureStagedInitialCandidateScheduler:
-        StagedInitialResult = Services.GenerateStagedInitialRouteTrees(State.CandidateSignalOrder, InitialRequestsBySignal, State.GenerateRouteTreesWithDeadline, lambda Signal: Services.MayAdvanceStagedCandidateOnExhaustion(State.ApplyMaturePortfolioSearchCaps, State.ExactLegalRetainedJointStateCount, Signal, State.JointHigherOrderConstraintSignals), WorkCheck=lambda Details: None if State.RouteTreeNativeDeadlineExceeded else State.CheckRuntimeBudget('MatureStagedInitialCandidateScheduler', Details), StopAfterEverySignalHasTree=bool(State.CoordinatedCandidateDiversificationSignals or State.ApplyTopologyPressurePortfolioStagedProof or (State.PhysicalAssemblyPlan is not None and (not State.HasExactPhysicalAssemblyChannels))))
+        StagedInitialResult = Services.GenerateStagedInitialRouteTrees(State.CandidateSignalOrder, InitialRequestsBySignal, State.GenerateRouteTreesWithDeadline, lambda Signal: Services.MayAdvanceStagedCandidateOnExhaustion(State.ApplyMaturePortfolioSearchCaps, State.ExactLegalRetainedJointStateCount, Signal, State.JointHigherOrderConstraintSignals), WorkCheck=lambda Details: None if State.RouteTreeNativeDeadlineExceeded else State.CheckRuntimeBudget('MatureStagedInitialCandidateScheduler', Details), StopAfterEverySignalHasTree=bool((not State.PrepareTrackAssignmentOnly) and (State.CoordinatedCandidateDiversificationSignals or State.ApplyTopologyPressurePortfolioStagedProof or (State.PhysicalAssemblyPlan is not None and (not State.HasExactPhysicalAssemblyChannels)))))
         BatchedInitialTrees = list(StagedInitialResult.RouteTrees)
         State.RouteTreeBatchCount = StagedInitialResult.BatchCount
         State.WorkTelemetry['MatureStagedInitialCandidateScheduler'] = {'Applied': True, 'FullPoolGenerated': StagedInitialResult.FullPoolGenerated, 'EverySignalHasTree': StagedInitialResult.EverySignalHasTree, 'ExhaustedSignals': list(StagedInitialResult.ExhaustedSignals), 'ExecutedRequestCount': StagedInitialResult.ExecutedRequestCount, 'PlannedRequestCount': StagedInitialResult.PlannedRequestCount, 'BatchCount': StagedInitialResult.BatchCount, 'ExecutedRequestCountsBySignal': dict(StagedInitialResult.ExecutedRequestCountsBySignal), 'FirstSuccessfulRequestIndicesBySignal': dict(StagedInitialResult.FirstSuccessfulRequestIndicesBySignal)}
