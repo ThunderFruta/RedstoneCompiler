@@ -530,3 +530,59 @@ unchanged-caller probes failed with `EvaluationControlsMissing`, one at the
 current-envelope boundary and one at final publication. The complete suite was
 not run because it would repeat those known absent-caller failures and the user
 did not authorize combined-source verification.
+
+### 2026-09-12 immutable rejected pin-access evidence candidate
+
+The Physical producer now retains one immutable explanation for the existing
+first decisive catalog rejection. It binds the unchanged semantic attempt ID
+to the exact evaluation-input fingerprint; transformed terminal, face, bridge,
+leg, track and typed block roles; the proposed claims available at that
+predicate; exact typed proposed/conflicting resource slices; and only owners
+and provenance directly supplied at that decision boundary. The existing
+foreign-static ownership index supplies a conflicting signal, but not its
+originating gate/static role or frozen node. The producer retains that known
+signal, marks provenance `Partial`/`Unavailable`, and performs no post-rejection
+placed-gate or frozen-node traversal to reconstruct it. Unknown occupancy
+ownership and facts unavailable before claim construction remain explicit
+`Partial`; a missing record is `Unavailable`. Neither state is reported as a
+complete explanation.
+
+The admission predicate order, first rejection, catalog/templates, technology,
+resource-model identity, control/input identities, attempt IDs, option
+fingerprints, legal-option order, work counts, budgets, domain completeness and
+solve classification are unchanged. Rejected geometry is evidence only and is
+never inserted into the selectable option tuple. Pairwise option
+`BlockingResources` retain their old meaning; rejected-attempt resources are a
+separate core projection with a separate explanation status.
+
+The evidence-bearing attempt/domain/problem/core/witness/solve/frozen-contract
+serializers are deliberately versioned rather than defaulting historical
+records into invented explanations. Table-driven current/historical decoder
+coverage spans attempt, domain, conflict core, selected witness, solve result,
+and frozen contract and proves rejected historical records remain rejected
+without payload enrichment. Joint still owns envelope/schema consumption and
+feedback, and Telemetry still owns artifact projection. The current Physical
+worktree therefore proves only the producer contract; it does not reproduce or
+repair the seven-circuit benchmark, validate the physical rule independently,
+enable another pattern, relax legality, or establish full R10 acceptance.
+
+Independent evidence coverage passes 12 tests, including an adversarial
+post-decision traversal guard; the focused producer set passes 193 tests with
+the known Joint finalization caller deselected; structural/schema passes 7
+tests. Two exact baseline/candidate runs retain 300 raw wall and CPU samples per
+fixture per run. Their pooled 600-sample comparison preserves every required
+identity/outcome, remains below 4 KiB per attempt, and passes the unchanged 5%
+median-wall guard for all fixtures. The dense 32-rejection case is 4.748%
+faster than exact baseline after memoizing immutable template fingerprints and
+reusing its already-built attempt ID.
+
+The exact unfiltered deterministic suite remains a blocking failure rather than
+a claimed pass: 2,328 passed, 55 failed, 5 skipped, and 378 subtests for
+`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q Tests`. Exact-parent
+comparison reproduces every failing node ID, including each of the prior eight
+replay/telemetry cases, with zero candidate-only failure IDs. That proves
+inheritance but does not satisfy the authorized P1 green-suite condition. The
+repaired packet is under
+`Output/PhysicalRules/RejectionEvidence/20260912T225854Z-58e45c4-repaired-candidate/`.
+This candidate remains uncommitted, is not commit-ready, and requires fresh
+independent review after the full-suite blocker is resolved.

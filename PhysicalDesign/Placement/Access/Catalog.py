@@ -18,8 +18,15 @@ from PhysicalDesign.Contracts.PlacementAccess import (
     PlacedPinAccessOptionDomain,
     PlacedPinAccessPatternAttempt,
     PlacedPinAccessPatternRequirement,
+    PlacedPinAccessRejectionEvidence,
+    PlacedPinAccessRejectionFact,
+    PlacedPinAccessRejectionOwner,
     PlacementAccessPatternAttemptReason,
     PlacementAccessPatternAttemptStatus,
+    PlacementAccessRejectionCompleteness,
+    PlacementAccessRejectionOwnerProvenance,
+    PlacementAccessRejectionRelation,
+    PlacementAccessUnavailableInformation,
     SelectedPlacementPinAccessWitness,
 )
 from PhysicalDesign.Geometry.Placement import GetGateInputAccess
@@ -494,7 +501,10 @@ def _BuildPlacedStaticExclusionOwnership(
     ResourceGraph: RoutingResourceGraph,
     Technology: RedstoneRoutingTechnology,
     PreOwnedNodesBySignal: Mapping[str, Iterable[Position3]],
-) -> tuple[dict[Position3, frozenset[str]], frozenset[Position3]]:
+) -> tuple[
+    dict[Position3, frozenset[str]],
+    frozenset[Position3],
+]:
     """Index static exclusions by their explicit logical signal owners."""
     OwnersByStaticPosition: dict[Position3, set[str]] = {}
     for Gate in sorted(PlacedGates, key=lambda Value: str(Value.Name)):
@@ -581,41 +591,251 @@ def _TransformTemplatePosition(
     return _Translate(Local, (int(Gate.X), int(Gate.Y), int(Gate.Z)))
 
 
+def _ClaimResourcesAtPosition(
+    Claims: RoutingResourceClaims | None,
+    Position: Position3,
+    *,
+    Kinds: frozenset[RoutingResourceKind] | None = None,
+) -> tuple[RoutingResourceId, ...]:
+    if Claims is None:
+        return ()
+    Resources = tuple(
+        RoutingResourceId(Kind, Position)
+        for Kind, Positions in (
+            (RoutingResourceKind.Wire, Claims.WireCells),
+            (RoutingResourceKind.Support, Claims.SupportCells),
+            (RoutingResourceKind.Air, Claims.RequiredAirCells),
+            (RoutingResourceKind.Electrical, Claims.ElectricalCells),
+        )
+        if Position in Positions and (Kinds is None or Kind in Kinds)
+    )
+    return tuple(sorted(
+        Resources,
+        key=lambda Value: (Value.Kind.value, Value.Position),
+    ))
+
+
+def _BuildRejectionEvidence(
+    *,
+    AttemptId: str,
+    EvaluationInputFingerprint: str,
+    Reason: PlacementAccessPatternAttemptReason,
+    Terminal: Position3,
+    Face: Position3,
+    BridgePosition: Position3,
+    FirstLegNodes: tuple[Position3, ...],
+    FirstTrackNode: Position3,
+    BlockRoles: tuple[tuple[Position3, str], ...],
+    ProposedClaims: RoutingResourceClaims | None,
+    Fact: PlacedPinAccessRejectionFact,
+    UnavailableInformation: Iterable[PlacementAccessUnavailableInformation] = (),
+) -> PlacedPinAccessRejectionEvidence:
+    Unavailable = tuple(sorted(
+        set(UnavailableInformation),
+        key=lambda Value: Value.value,
+    ))
+    return PlacedPinAccessRejectionEvidence(
+        AttemptId=AttemptId,
+        EvaluationInputFingerprint=EvaluationInputFingerprint,
+        Reason=Reason,
+        Terminal=Terminal,
+        Face=Face,
+        BridgePosition=BridgePosition,
+        FirstLegNodes=FirstLegNodes,
+        FirstTrackNode=FirstTrackNode,
+        BlockRoles=BlockRoles,
+        ProposedClaims=ProposedClaims,
+        Fact=Fact,
+        Completeness=(
+            PlacementAccessRejectionCompleteness.Partial
+            if Unavailable
+            else PlacementAccessRejectionCompleteness.Complete
+        ),
+        UnavailableInformation=Unavailable,
+    )
+
+
 def _AdmitPlacedGeometry(
     *,
+    AttemptId: str,
+    EvaluationInputFingerprint: str,
     ResourceGraph: RoutingResourceGraph,
-    Technology: RedstoneRoutingTechnology,
     FirstLegNodes: tuple[Position3, ...],
     FirstTrackNode: Position3,
     BridgePosition: Position3,
+    Face: Position3,
+    BlockRoles: tuple[tuple[Position3, str], ...],
     Signal: str,
     StaticExclusionOwnersByPosition: Mapping[
         Position3, frozenset[str]
     ],
     UnownedStaticExclusions: frozenset[Position3],
     PreOwnedClaimsBySignal: Mapping[str, RoutingResourceClaims],
-) -> PlacementAccessPatternAttemptReason | None:
+) -> tuple[
+    PlacementAccessPatternAttemptReason | None,
+    PlacedPinAccessRejectionEvidence | None,
+]:
     Terminal = FirstLegNodes[0]
-    if (
-        Terminal in ResourceGraph.ActualBlocks
-        or BridgePosition not in ResourceGraph.ActualBlocks
-        or BridgePosition not in ResourceGraph.ElectricalBlocks
-    ):
-        return PlacementAccessPatternAttemptReason.TerminalOrBridgeUnavailable
-    if (
-        set(FirstLegNodes[1:])
-        & set(ResourceGraph.ActualBlocks)
-    ):
-        return PlacementAccessPatternAttemptReason.FirstLegOccupied
+
+    def Reject(
+        Reason: PlacementAccessPatternAttemptReason,
+        Fact: PlacedPinAccessRejectionFact,
+        *,
+        ProposedClaims: RoutingResourceClaims | None,
+        UnavailableInformation: Iterable[
+            PlacementAccessUnavailableInformation
+        ] = (),
+    ) -> tuple[
+        PlacementAccessPatternAttemptReason,
+        PlacedPinAccessRejectionEvidence,
+    ]:
+        return Reason, _BuildRejectionEvidence(
+            AttemptId=AttemptId,
+            EvaluationInputFingerprint=EvaluationInputFingerprint,
+            Reason=Reason,
+            Terminal=Terminal,
+            Face=Face,
+            BridgePosition=BridgePosition,
+            FirstLegNodes=FirstLegNodes,
+            FirstTrackNode=FirstTrackNode,
+            BlockRoles=BlockRoles,
+            ProposedClaims=ProposedClaims,
+            Fact=Fact,
+            UnavailableInformation=UnavailableInformation,
+        )
+
+    Reason = PlacementAccessPatternAttemptReason.TerminalOrBridgeUnavailable
+    if Terminal in ResourceGraph.ActualBlocks:
+        Fact = PlacedPinAccessRejectionFact(
+            Relation=PlacementAccessRejectionRelation.Occupancy,
+            Position=Terminal,
+            RelatedPosition=None,
+            ProposedResources=(
+                RoutingResourceId(RoutingResourceKind.Wire, Terminal),
+            ),
+            ConflictingResources=(),
+            Owners=(),
+        )
+        return Reject(
+            Reason,
+            Fact,
+            ProposedClaims=None,
+            UnavailableInformation=(
+                PlacementAccessUnavailableInformation.ProposedClaims,
+                PlacementAccessUnavailableInformation.ConflictingClaims,
+                PlacementAccessUnavailableInformation.ConflictingOwner,
+                PlacementAccessUnavailableInformation.OwnerProvenance,
+            ),
+        )
+    if BridgePosition not in ResourceGraph.ActualBlocks:
+        Fact = PlacedPinAccessRejectionFact(
+            Relation=PlacementAccessRejectionRelation.Availability,
+            Position=BridgePosition,
+            RelatedPosition=None,
+            ProposedResources=(),
+            ConflictingResources=(),
+            Owners=(),
+        )
+        return Reject(
+            Reason,
+            Fact,
+            ProposedClaims=None,
+            UnavailableInformation=(
+                PlacementAccessUnavailableInformation.ProposedClaims,
+            ),
+        )
+    if BridgePosition not in ResourceGraph.ElectricalBlocks:
+        Fact = PlacedPinAccessRejectionFact(
+            Relation=PlacementAccessRejectionRelation.Availability,
+            Position=BridgePosition,
+            RelatedPosition=None,
+            ProposedResources=(),
+            ConflictingResources=(),
+            Owners=(),
+        )
+        return Reject(
+            Reason,
+            Fact,
+            ProposedClaims=None,
+            UnavailableInformation=(
+                PlacementAccessUnavailableInformation.ProposedClaims,
+            ),
+        )
+    Occupied = set(FirstLegNodes[1:]) & set(ResourceGraph.ActualBlocks)
+    if Occupied:
+        Position = min(Occupied)
+        Reason = PlacementAccessPatternAttemptReason.FirstLegOccupied
+        Fact = PlacedPinAccessRejectionFact(
+            Relation=PlacementAccessRejectionRelation.Occupancy,
+            Position=Position,
+            RelatedPosition=None,
+            ProposedResources=(
+                RoutingResourceId(RoutingResourceKind.Wire, Position),
+            ),
+            ConflictingResources=(),
+            Owners=(),
+        )
+        return Reject(
+            Reason,
+            Fact,
+            ProposedClaims=None,
+            UnavailableInformation=(
+                PlacementAccessUnavailableInformation.ProposedClaims,
+                PlacementAccessUnavailableInformation.ConflictingClaims,
+                PlacementAccessUnavailableInformation.ConflictingOwner,
+                PlacementAccessUnavailableInformation.OwnerProvenance,
+            ),
+        )
     for First, Second in zip(FirstLegNodes, FirstLegNodes[1:]):
         if ResourceGraph.BuildPrimitive(First, Second) is None:
-            return PlacementAccessPatternAttemptReason.PrimitiveUnavailable
+            Reason = PlacementAccessPatternAttemptReason.PrimitiveUnavailable
+            Fact = PlacedPinAccessRejectionFact(
+                Relation=PlacementAccessRejectionRelation.Connectivity,
+                Position=First,
+                RelatedPosition=Second,
+                ProposedResources=(),
+                ConflictingResources=(),
+                Owners=(),
+            )
+            return Reject(
+                Reason,
+                Fact,
+                ProposedClaims=None,
+                UnavailableInformation=(
+                    PlacementAccessUnavailableInformation.ProposedClaims,
+                ),
+            )
     Claims = ResourceGraph.BuildRouteClaims(FirstLegNodes)
-    if (
-        Claims.SupportCells & ResourceGraph.ActualBlocks
-        or Claims.RequiredAirCells & ResourceGraph.ActualBlocks
-    ):
-        return PlacementAccessPatternAttemptReason.ClaimOccupancyConflict
+    SupportOccupancy = Claims.SupportCells & ResourceGraph.ActualBlocks
+    RequiredAirOccupancy = Claims.RequiredAirCells & ResourceGraph.ActualBlocks
+    if SupportOccupancy or RequiredAirOccupancy:
+        if SupportOccupancy:
+            Position = min(SupportOccupancy)
+            Relation = PlacementAccessRejectionRelation.Support
+            Kind = RoutingResourceKind.Support
+        else:
+            Position = min(RequiredAirOccupancy)
+            Relation = PlacementAccessRejectionRelation.RequiredAir
+            Kind = RoutingResourceKind.Air
+        Reason = PlacementAccessPatternAttemptReason.ClaimOccupancyConflict
+        Fact = PlacedPinAccessRejectionFact(
+            Relation=Relation,
+            Position=Position,
+            RelatedPosition=None,
+            ProposedResources=(RoutingResourceId(Kind, Position),),
+            ConflictingResources=(),
+            Owners=(),
+        )
+        return Reject(
+            Reason,
+            Fact,
+            ProposedClaims=Claims,
+            UnavailableInformation=(
+                PlacementAccessUnavailableInformation.ConflictingClaims,
+                PlacementAccessUnavailableInformation.ConflictingOwner,
+                PlacementAccessUnavailableInformation.OwnerProvenance,
+            ),
+        )
     ExistingSignalClaims = PreOwnedClaimsBySignal.get(Signal)
     CombinedSignalClaims = (
         ResourceGraph.BuildRouteClaims(
@@ -624,32 +844,215 @@ def _AdmitPlacedGeometry(
         if ExistingSignalClaims is not None
         else Claims
     )
-    if FindSelfClaimConflicts({Signal: CombinedSignalClaims}):
-        return PlacementAccessPatternAttemptReason.SelfClaimConflict
-    if any(
-        FindClaimConflicts({
+    SelfConflicts = FindSelfClaimConflicts({Signal: CombinedSignalClaims})
+    if SelfConflicts:
+        Resource = min(
+            SelfConflicts,
+            key=lambda Value: (Value.Kind.value, Value.Position),
+        )
+        RelevantKinds = {
+            RoutingResourceKind.Support: frozenset({
+                RoutingResourceKind.Support,
+                RoutingResourceKind.Wire,
+                RoutingResourceKind.Air,
+            }),
+            RoutingResourceKind.Air: frozenset({
+                RoutingResourceKind.Wire,
+                RoutingResourceKind.Air,
+            }),
+        }[Resource.Kind]
+        ProposedResources = _ClaimResourcesAtPosition(
+            Claims,
+            Resource.Position,
+            Kinds=RelevantKinds,
+        )
+        ExistingResources = _ClaimResourcesAtPosition(
+            ExistingSignalClaims,
+            Resource.Position,
+            Kinds=RelevantKinds,
+        )
+        Owners = [PlacedPinAccessRejectionOwner(
+            Signal=Signal,
+            Provenance=(
+                PlacementAccessRejectionOwnerProvenance.ProposedAccess
+            ),
+        )]
+        if ExistingResources:
+            Owners.append(PlacedPinAccessRejectionOwner(
+                Signal=Signal,
+                Provenance=(
+                    PlacementAccessRejectionOwnerProvenance.
+                    PreOwnedFrozenRouteClaims
+                ),
+            ))
+        Reason = PlacementAccessPatternAttemptReason.SelfClaimConflict
+        Fact = PlacedPinAccessRejectionFact(
+            Relation=(
+                PlacementAccessRejectionRelation.Support
+                if Resource.Kind is RoutingResourceKind.Support
+                else PlacementAccessRejectionRelation.RequiredAir
+            ),
+            Position=Resource.Position,
+            RelatedPosition=None,
+            ProposedResources=ProposedResources,
+            ConflictingResources=(ExistingResources or ProposedResources),
+            Owners=tuple(sorted(Owners, key=lambda Value: Value.RankKey())),
+        )
+        return Reject(
+            Reason,
+            Fact,
+            ProposedClaims=Claims,
+        )
+    for ForeignSignal, ForeignClaims in PreOwnedClaimsBySignal.items():
+        if ForeignSignal == Signal:
+            continue
+        ForeignConflicts = FindClaimConflicts({
             Signal: CombinedSignalClaims,
             ForeignSignal: ForeignClaims,
         })
-        for ForeignSignal, ForeignClaims in PreOwnedClaimsBySignal.items()
-        if ForeignSignal != Signal
-    ):
-        return PlacementAccessPatternAttemptReason.ForeignClaimConflict
+        if not ForeignConflicts:
+            continue
+        Resource = min(
+            ForeignConflicts,
+            key=lambda Value: (Value.Kind.value, Value.Position),
+        )
+        CurrentResources = _ClaimResourcesAtPosition(
+            CombinedSignalClaims,
+            Resource.Position,
+        )
+        ForeignResources = _ClaimResourcesAtPosition(
+            ForeignClaims,
+            Resource.Position,
+        )
+        Owners = [
+            PlacedPinAccessRejectionOwner(
+                Signal=Signal,
+                Provenance=(
+                    PlacementAccessRejectionOwnerProvenance.ProposedAccess
+                ),
+            ),
+            PlacedPinAccessRejectionOwner(
+                Signal=ForeignSignal,
+                Provenance=(
+                    PlacementAccessRejectionOwnerProvenance.
+                    PreOwnedFrozenRouteClaims
+                ),
+            ),
+        ]
+        if ExistingSignalClaims is not None:
+            Owners.append(PlacedPinAccessRejectionOwner(
+                Signal=Signal,
+                Provenance=(
+                    PlacementAccessRejectionOwnerProvenance.
+                    PreOwnedFrozenRouteClaims
+                ),
+            ))
+        Reason = PlacementAccessPatternAttemptReason.ForeignClaimConflict
+        Fact = PlacedPinAccessRejectionFact(
+            Relation={
+                RoutingResourceKind.Electrical: (
+                    PlacementAccessRejectionRelation.ElectricalInfluence
+                ),
+                RoutingResourceKind.Support: (
+                    PlacementAccessRejectionRelation.Support
+                ),
+                RoutingResourceKind.Air: (
+                    PlacementAccessRejectionRelation.RequiredAir
+                ),
+            }[Resource.Kind],
+            Position=Resource.Position,
+            RelatedPosition=None,
+            ProposedResources=CurrentResources,
+            ConflictingResources=ForeignResources,
+            Owners=tuple(sorted(Owners, key=lambda Value: Value.RankKey())),
+        )
+        return Reject(
+            Reason,
+            Fact,
+            ProposedClaims=Claims,
+        )
     for Position in FirstLegNodes:
-        if (
-            Position in ResourceGraph.StaticKeepOutBlocks
-            or Position in UnownedStaticExclusions
-        ):
-            return PlacementAccessPatternAttemptReason.StaticKeepOut
+        if Position in ResourceGraph.StaticKeepOutBlocks:
+            Reason = PlacementAccessPatternAttemptReason.StaticKeepOut
+            Fact = PlacedPinAccessRejectionFact(
+                Relation=PlacementAccessRejectionRelation.StaticKeepOut,
+                Position=Position,
+                RelatedPosition=None,
+                ProposedResources=_ClaimResourcesAtPosition(Claims, Position),
+                ConflictingResources=(),
+                Owners=(),
+            )
+            return Reject(
+                Reason,
+                Fact,
+                ProposedClaims=Claims,
+                UnavailableInformation=(
+                    PlacementAccessUnavailableInformation.ConflictingClaims,
+                    PlacementAccessUnavailableInformation.ConflictingOwner,
+                    PlacementAccessUnavailableInformation.OwnerProvenance,
+                ),
+            )
+        if Position in UnownedStaticExclusions:
+            Reason = PlacementAccessPatternAttemptReason.StaticKeepOut
+            Fact = PlacedPinAccessRejectionFact(
+                Relation=(
+                    PlacementAccessRejectionRelation.ElectricalInfluence
+                ),
+                Position=Position,
+                RelatedPosition=None,
+                ProposedResources=_ClaimResourcesAtPosition(Claims, Position),
+                ConflictingResources=(RoutingResourceId(
+                    RoutingResourceKind.Electrical,
+                    Position,
+                ),),
+                Owners=(),
+            )
+            return Reject(
+                Reason,
+                Fact,
+                ProposedClaims=Claims,
+            )
         Owners = StaticExclusionOwnersByPosition.get(Position, frozenset())
         if Owners and Owners != frozenset({Signal}):
-            return PlacementAccessPatternAttemptReason.ForeignStaticExclusion
-    return None
+            Reason = PlacementAccessPatternAttemptReason.ForeignStaticExclusion
+            ConflictOwners = tuple(
+                PlacedPinAccessRejectionOwner(
+                    Signal=Owner,
+                    Provenance=(
+                        PlacementAccessRejectionOwnerProvenance.Unavailable
+                    ),
+                )
+                for Owner in sorted(Owners - {Signal})
+            )
+            Fact = PlacedPinAccessRejectionFact(
+                Relation=(
+                    PlacementAccessRejectionRelation.ElectricalInfluence
+                ),
+                Position=Position,
+                RelatedPosition=None,
+                ProposedResources=_ClaimResourcesAtPosition(Claims, Position),
+                ConflictingResources=(RoutingResourceId(
+                    RoutingResourceKind.Electrical,
+                    Position,
+                ),),
+                Owners=ConflictOwners,
+            )
+            return Reject(
+                Reason,
+                Fact,
+                ProposedClaims=Claims,
+                UnavailableInformation=(
+                    PlacementAccessUnavailableInformation.OwnerProvenance,
+                ),
+            )
+    return None, None
 
 
 def _MaterializeOption(
     Template: PhysicalPinAccessTemplate,
     *,
+    AttemptId: str,
+    EvaluationInputFingerprint: str,
     Gate: Any,
     Signal: str,
     Role: str,
@@ -658,14 +1061,17 @@ def _MaterializeOption(
     PhysicalFace: Position3,
     Layer: int,
     ResourceGraph: RoutingResourceGraph,
-    Technology: RedstoneRoutingTechnology,
     ResourceModelFingerprint: str,
     StaticExclusionOwnersByPosition: Mapping[
         Position3, frozenset[str]
     ],
     UnownedStaticExclusions: frozenset[Position3],
     PreOwnedClaimsBySignal: Mapping[str, RoutingResourceClaims],
-) -> tuple[PlacedPinAccessOption | None, PlacementAccessPatternAttemptReason]:
+) -> tuple[
+    PlacedPinAccessOption | None,
+    PlacementAccessPatternAttemptReason,
+    PlacedPinAccessRejectionEvidence | None,
+]:
     if Template.PinId != PinId or Template.CellKind != str(Gate.Kind).upper():
         raise ValueError("pin-access attempt uses a template from another pin")
     CatalogTerminal = _TransformTemplatePosition(
@@ -695,12 +1101,19 @@ def _MaterializeOption(
         Template.BridgePosition,
         Gate,
     )
-    RejectionReason = _AdmitPlacedGeometry(
+    BlockRoles = tuple(
+        (_TransformTemplatePosition(Position, Gate), BlockRole)
+        for Position, BlockRole in Template.BlockRoles
+    )
+    RejectionReason, RejectionEvidence = _AdmitPlacedGeometry(
+        AttemptId=AttemptId,
+        EvaluationInputFingerprint=EvaluationInputFingerprint,
         ResourceGraph=ResourceGraph,
-        Technology=Technology,
         FirstLegNodes=FirstLegNodes,
         FirstTrackNode=FirstTrackNode,
         BridgePosition=BridgePosition,
+        Face=PhysicalFace,
+        BlockRoles=BlockRoles,
         Signal=Signal,
         StaticExclusionOwnersByPosition=(
             StaticExclusionOwnersByPosition
@@ -709,11 +1122,9 @@ def _MaterializeOption(
         PreOwnedClaimsBySignal=PreOwnedClaimsBySignal,
     )
     if RejectionReason is not None:
-        return None, RejectionReason
-    BlockRoles = tuple(
-        (_TransformTemplatePosition(Position, Gate), BlockRole)
-        for Position, BlockRole in Template.BlockRoles
-    )
+        if RejectionEvidence is None:
+            raise ValueError("rejected pin-access attempt omitted evidence")
+        return None, RejectionReason, RejectionEvidence
     RepeaterPosition = BlockRoles[Template.RepeaterPathIndex][0]
     if Role == "Source":
         NextPosition = (
@@ -762,7 +1173,7 @@ def _MaterializeOption(
         Claims=ResourceGraph.BuildRouteClaims(FirstLegNodes),
         RepeaterReservations=(RepeaterReservation,),
         Template=Template,
-    ), PlacementAccessPatternAttemptReason.Legal
+    ), PlacementAccessPatternAttemptReason.Legal, None
 
 
 def _SnapshotRoutingResourceGraph(
@@ -816,6 +1227,7 @@ def _BuildDomainEvaluationInputFingerprint(
 
 def _BuildPatternAttempt(
     *,
+    AttemptId: str | None = None,
     DomainId: str,
     Template: PhysicalPinAccessTemplate,
     Layer: int,
@@ -825,17 +1237,22 @@ def _BuildPatternAttempt(
     Status: PlacementAccessPatternAttemptStatus,
     Reason: PlacementAccessPatternAttemptReason,
     OptionFingerprint: str | None,
+    RejectionEvidence: PlacedPinAccessRejectionEvidence | None = None,
 ) -> PlacedPinAccessPatternAttempt:
     return PlacedPinAccessPatternAttempt(
-        AttemptId=BuildPlacementAccessPatternAttemptId(
-            DomainId=DomainId,
-            TemplateId=Template.TemplateId,
-            PatternFamily=Template.PatternFamily,
-            TemplateFingerprint=Template.TemplateFingerprint,
-            Layer=Layer,
-            CatalogVersion=CatalogVersion,
-            TechnologyFingerprint=TechnologyFingerprint,
-            ResourceModelFingerprint=ResourceModelFingerprint,
+        AttemptId=(
+            AttemptId
+            if AttemptId is not None
+            else BuildPlacementAccessPatternAttemptId(
+                DomainId=DomainId,
+                TemplateId=Template.TemplateId,
+                PatternFamily=Template.PatternFamily,
+                TemplateFingerprint=Template.TemplateFingerprint,
+                Layer=Layer,
+                CatalogVersion=CatalogVersion,
+                TechnologyFingerprint=TechnologyFingerprint,
+                ResourceModelFingerprint=ResourceModelFingerprint,
+            )
         ),
         DomainId=DomainId,
         TemplateId=Template.TemplateId,
@@ -848,6 +1265,7 @@ def _BuildPatternAttempt(
         Status=Status,
         Reason=Reason,
         OptionFingerprint=OptionFingerprint,
+        RejectionEvidence=RejectionEvidence,
     )
 
 
@@ -1173,8 +1591,20 @@ def EnumeratePlacedPinAccessOptionDomains(
                     ))
                     continue
             Work += 1
-            Option, Reason = _MaterializeOption(
+            AttemptId = BuildPlacementAccessPatternAttemptId(
+                DomainId=DomainId,
+                TemplateId=Template.TemplateId,
+                PatternFamily=Template.PatternFamily,
+                TemplateFingerprint=Template.TemplateFingerprint,
+                Layer=Layer,
+                CatalogVersion=CatalogVersion,
+                TechnologyFingerprint=ExpectedTechnologyFingerprint,
+                ResourceModelFingerprint=ResourceModelFingerprint,
+            )
+            Option, Reason, RejectionEvidence = _MaterializeOption(
                 Template,
+                AttemptId=AttemptId,
+                EvaluationInputFingerprint=EvaluationInputFingerprint,
                 Gate=Gate,
                 Signal=Signal,
                 Role=Role,
@@ -1183,7 +1613,6 @@ def EnumeratePlacedPinAccessOptionDomains(
                 PhysicalFace=PhysicalFace,
                 Layer=Layer,
                 ResourceGraph=ResourceGraph,
-                Technology=Technology,
                 ResourceModelFingerprint=ResourceModelFingerprint,
                 StaticExclusionOwnersByPosition=(
                     StaticExclusionOwnersByPosition
@@ -1203,6 +1632,7 @@ def EnumeratePlacedPinAccessOptionDomains(
                 Status = PlacementAccessPatternAttemptStatus.Legal
                 OptionFingerprint = Option.PlacedBindingFingerprint
             Attempts.append(_BuildPatternAttempt(
+                AttemptId=AttemptId,
                 DomainId=DomainId,
                 Template=Template,
                 Layer=Layer,
@@ -1212,6 +1642,7 @@ def EnumeratePlacedPinAccessOptionDomains(
                 Status=Status,
                 Reason=Reason,
                 OptionFingerprint=OptionFingerprint,
+                RejectionEvidence=RejectionEvidence,
             ))
         DomainRecords.append({
             "DomainId": DomainId,

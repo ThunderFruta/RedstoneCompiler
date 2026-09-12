@@ -453,3 +453,59 @@ compile-all passed; and collection reported **2,376 tests**. Direct probes of
 the unchanged current-envelope and final-publication callers both failed closed
 with missing controls. The full suite is dependency-blocked and was not run;
 the prior 2,349-pass result belongs only to the pre-controls Physical slice.
+
+### 2026-09-12 immutable rejected pin-access evidence candidate
+
+Every rejection emitted by the Physical catalog now has a distinct diagnostic
+evidence status: `Complete`, `Partial`, or `Unavailable`. A complete record is
+scoped only to the existing first decisive predicate. It retains unchanged
+attempt and evaluation-input identities, transformed proposed geometry and
+block roles, available proposed claims, exact typed conflict resource slices,
+and only owner/provenance facts directly supplied at that predicate. The
+foreign-static predicate's existing ownership index exposes the conflicting
+signal but not its originating gate, static role, or frozen node, so the
+producer retains the signal and reports provenance `Partial`/`Unavailable`.
+It does not retraverse or sort placed gates or frozen nodes after rejection.
+Actual-block ownership absent from the resource graph is likewise unavailable;
+neither ownership nor provenance is reconstructed from geometry.
+
+Search/core completeness remains independent of diagnostic completeness.
+Rejected evidence never creates an option or selection fingerprint. Existing
+pairwise option `BlockingResources` remain distinct from the new derived
+rejected-attempt resource projection. Admission order, legality, catalog and
+template identities, technology/resource/control/input identities, option and
+attempt identities, ordering, counts, work/deadline controls, and solve outcome
+are unchanged.
+
+The nested serializer change advances the attempt, domain, exact problem,
+conflict-core, witness, solve-result, selected-domain-set, and frozen-placement
+identities. Table-driven decoder coverage rejects historical attempt, domain,
+core, selected-witness, solve-result, and frozen-contract records rather than
+adding reconstructed evidence. Joint owns corresponding envelope/binding
+migration, and Telemetry owns any retained-artifact interpretation. Until those
+exact consumers merge and pass their own boundary tests, this is only a
+Physical producer candidate, not combined capability proof or full N2
+acceptance.
+
+Independent owner coverage passes 12 tests, including an adversarial guard that
+raises on post-decision static-role traversal. The focused producer set passes
+193 tests with one known Joint finalization caller deselected, and
+structural/schema passes 7 tests. Two exact 300-sample runs per side retain raw
+wall/CPU vectors and canonical byte counts. All three pooled 600-sample fixtures
+preserve the required identities/outcomes, remain below 4 KiB per rejection,
+and pass the unchanged 5% median-wall guard; the dense 32-rejection fixture is
+4.748% faster than exact baseline. Immutable template proof/fingerprint values
+are memoized and the already-built attempt ID is reused without changing their
+values.
+
+The required unfiltered deterministic suite is not green: exact command
+`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q Tests` reports 2,328
+passed, 55 failed, 5 skipped, and 378 subtests. All 55 failing node IDs,
+including the prior eight replay/telemetry cases, reproduce at exact parent
+`58e45c4`; there are no candidate-only failure IDs. This attribution does not
+satisfy the authorized P1 full-suite gate, so commit readiness remains blocked.
+Repaired evidence is retained under
+`Output/PhysicalRules/RejectionEvidence/20260912T225854Z-58e45c4-repaired-candidate/`.
+No native rebuild, MCHPRS, Fabric, scale, seven-circuit acceptance, Joint
+migration, or Telemetry migration is claimed. The candidate is uncommitted and
+requires fresh independent review after the blocker is resolved.

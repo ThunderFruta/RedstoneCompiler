@@ -1468,6 +1468,9 @@ def testFreezeBuildsDeeplyImmutableSelectedWitnessAndContract() -> None:
         OptimalityProven=False,
     )
 
+    assert Witness.SchemaVersion == "selected-placement-pin-access-witness-v2"
+    assert Contract.SchemaVersion == "frozen-physical-placement-contract-v2"
+
     assert Contract.ContractFingerprint
     assert Contract.ToDictionary()["SelectedPinAccessWitness"][
         "WitnessFingerprint"

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import cached_property
 
 from .Core import Position3
 from ..Resources.ResourceGraph import (
     RoutingReservation,
     RoutingResourceClaims,
+    RoutingResourceId,
     RoutingResourceKind,
 )
 from ..Runtime.Reliability import BuildStableFingerprint
@@ -76,6 +78,21 @@ def _ReservationDictionary(
         "Position": list(Reservation.Position),
         "Purpose": Reservation.Purpose,
         "InputFacing": Reservation.InputFacing,
+    }
+
+
+def _ResourceRankKey(
+    Resource: RoutingResourceId,
+) -> tuple[str, Position3]:
+    return Resource.Kind.value, Resource.Position
+
+
+def _ResourceDictionary(
+    Resource: RoutingResourceId,
+) -> dict[str, object]:
+    return {
+        "Kind": Resource.Kind.value,
+        "Position": list(Resource.Position),
     }
 
 
@@ -197,7 +214,7 @@ class PhysicalPinAccessTemplate:
             for Index in range(3)
         )
 
-    @property
+    @cached_property
     def ProofFingerprint(self) -> str:
         return BuildStableFingerprint({
             "Kind": "physical-pin-access-template-proof-v1",
@@ -213,7 +230,7 @@ class PhysicalPinAccessTemplate:
             "TechnologyFingerprint": self.TechnologyFingerprint,
         })
 
-    @property
+    @cached_property
     def TemplateFingerprint(self) -> str:
         return BuildStableFingerprint({
             "Kind": "physical-pin-access-template-v1",
@@ -577,6 +594,358 @@ class PlacementAccessPatternAttemptReason(str, Enum):
     UnknownPhysicalDecision = "UnknownPhysicalDecision"
 
 
+class PlacementAccessRejectionCompleteness(str, Enum):
+    """How completely one retained decisive rejection is explained."""
+
+    Complete = "Complete"
+    Partial = "Partial"
+
+
+class PlacementAccessRejectionStatus(str, Enum):
+    """Attempt-level availability without borrowing solve completeness."""
+
+    NotApplicable = "NotApplicable"
+    Complete = "Complete"
+    Partial = "Partial"
+    Unavailable = "Unavailable"
+
+
+class PlacementAccessRejectionRelation(str, Enum):
+    """Physical relationship established by the decisive rejection fact."""
+
+    Availability = "Availability"
+    Occupancy = "Occupancy"
+    Connectivity = "Connectivity"
+    ElectricalInfluence = "ElectricalInfluence"
+    Support = "Support"
+    RequiredAir = "RequiredAir"
+    StaticKeepOut = "StaticKeepOut"
+
+
+class PlacementAccessRejectionOwnerProvenance(str, Enum):
+    """Existing input that supplied one known conflicting logical owner."""
+
+    ProposedAccess = "ProposedAccess"
+    PreOwnedFrozenRouteClaims = "PreOwnedFrozenRouteClaims"
+    PlacedTemplateStaticRole = "PlacedTemplateStaticRole"
+    PreOwnedFrozenNode = "PreOwnedFrozenNode"
+    Unavailable = "Unavailable"
+
+
+class PlacementAccessUnavailableInformation(str, Enum):
+    """Requested explanatory information absent at the decision boundary."""
+
+    ProposedClaims = "ProposedClaims"
+    ConflictingClaims = "ConflictingClaims"
+    ConflictingOwner = "ConflictingOwner"
+    OwnerProvenance = "OwnerProvenance"
+
+
+@dataclass(frozen=True)
+class PlacedPinAccessRejectionOwner:
+    """One non-inferred logical owner and the input that established it."""
+
+    Signal: str
+    Provenance: PlacementAccessRejectionOwnerProvenance
+    SourcePosition: Position3 | None = None
+    GateName: str | None = None
+    StaticRole: str | None = None
+
+    @classmethod
+    def FromDictionary(
+        cls,
+        Value: dict[str, object],
+    ) -> PlacedPinAccessRejectionOwner:
+        from .PlacementAccessCodec import ReadContract
+        return ReadContract(cls, Value)
+
+    def __post_init__(self) -> None:
+        if type(self.Signal) is not str or not self.Signal:
+            raise ValueError("pin-access rejection owner requires a signal")
+        if type(self.Provenance) is not PlacementAccessRejectionOwnerProvenance:
+            raise TypeError("pin-access rejection owner provenance must be typed")
+        if self.Provenance is (
+            PlacementAccessRejectionOwnerProvenance.PlacedTemplateStaticRole
+        ):
+            if (
+                self.SourcePosition is None
+                or type(self.GateName) is not str
+                or not self.GateName
+                or type(self.StaticRole) is not str
+                or not self.StaticRole
+            ):
+                raise ValueError(
+                    "placed-static rejection owner requires exact source facts"
+                )
+        elif self.Provenance is (
+            PlacementAccessRejectionOwnerProvenance.PreOwnedFrozenNode
+        ):
+            if (
+                self.SourcePosition is None
+                or self.GateName is not None
+                or self.StaticRole is not None
+            ):
+                raise ValueError(
+                    "frozen-node rejection owner has invalid source facts"
+                )
+        elif (
+            self.SourcePosition is not None
+            or self.GateName is not None
+            or self.StaticRole is not None
+        ):
+            raise ValueError(
+                "frozen-claim rejection owner cannot invent source identity"
+            )
+
+    def RankKey(self) -> tuple[object, ...]:
+        return (
+            self.Signal,
+            self.Provenance.value,
+            self.SourcePosition is None,
+            self.SourcePosition or (0, 0, 0),
+            self.GateName or "",
+            self.StaticRole or "",
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Signal": self.Signal,
+            "Provenance": self.Provenance.value,
+            "SourcePosition": (
+                list(self.SourcePosition)
+                if self.SourcePosition is not None
+                else None
+            ),
+            "GateName": self.GateName,
+            "StaticRole": self.StaticRole,
+        }
+
+
+@dataclass(frozen=True)
+class PlacedPinAccessRejectionFact:
+    """One exact resource or edge fact for the first rejecting predicate."""
+
+    Relation: PlacementAccessRejectionRelation
+    Position: Position3
+    RelatedPosition: Position3 | None
+    ProposedResources: tuple[RoutingResourceId, ...]
+    ConflictingResources: tuple[RoutingResourceId, ...]
+    Owners: tuple[PlacedPinAccessRejectionOwner, ...]
+
+    @classmethod
+    def FromDictionary(
+        cls,
+        Value: dict[str, object],
+    ) -> PlacedPinAccessRejectionFact:
+        from .PlacementAccessCodec import ReadContract
+        return ReadContract(cls, Value)
+
+    def __post_init__(self) -> None:
+        if type(self.Relation) is not PlacementAccessRejectionRelation:
+            raise TypeError("pin-access rejection relation must be typed")
+        if self.Relation is PlacementAccessRejectionRelation.Connectivity:
+            if self.RelatedPosition is None:
+                raise ValueError("connectivity rejection requires an exact edge")
+        elif self.RelatedPosition is not None:
+            raise ValueError("only connectivity rejection may retain an edge")
+        for Name, Resources in (
+            ("proposed", self.ProposedResources),
+            ("conflicting", self.ConflictingResources),
+        ):
+            if (
+                any(type(Resource) is not RoutingResourceId for Resource in Resources)
+                or Resources
+                != tuple(sorted(Resources, key=_ResourceRankKey))
+                or len(Resources) != len(set(Resources))
+                or any(Resource.Position != self.Position for Resource in Resources)
+            ):
+                raise ValueError(
+                    f"pin-access rejection {Name} resources are not canonical"
+                )
+        if (
+            any(
+                type(Owner) is not PlacedPinAccessRejectionOwner
+                for Owner in self.Owners
+            )
+            or self.Owners
+            != tuple(sorted(self.Owners, key=lambda Value: Value.RankKey()))
+            or len(self.Owners) != len(set(self.Owners))
+        ):
+            raise ValueError("pin-access rejection owners are not canonical")
+
+    def RankKey(self) -> tuple[object, ...]:
+        return (
+            self.Relation.value,
+            self.Position,
+            self.RelatedPosition is None,
+            self.RelatedPosition or (0, 0, 0),
+            tuple(_ResourceRankKey(Value) for Value in self.ProposedResources),
+            tuple(_ResourceRankKey(Value) for Value in self.ConflictingResources),
+            tuple(Value.RankKey() for Value in self.Owners),
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "Relation": self.Relation.value,
+            "Position": list(self.Position),
+            "RelatedPosition": (
+                list(self.RelatedPosition)
+                if self.RelatedPosition is not None
+                else None
+            ),
+            "ProposedResources": [
+                _ResourceDictionary(Value) for Value in self.ProposedResources
+            ],
+            "ConflictingResources": [
+                _ResourceDictionary(Value) for Value in self.ConflictingResources
+            ],
+            "Owners": [Value.ToDictionary() for Value in self.Owners],
+        }
+
+
+@dataclass(frozen=True)
+class PlacedPinAccessRejectionEvidence:
+    """Immutable evidence for the existing first decisive rejection only."""
+
+    AttemptId: str
+    EvaluationInputFingerprint: str
+    Reason: PlacementAccessPatternAttemptReason
+    Terminal: Position3
+    Face: Position3
+    BridgePosition: Position3
+    FirstLegNodes: tuple[Position3, ...]
+    FirstTrackNode: Position3
+    BlockRoles: tuple[tuple[Position3, str], ...]
+    ProposedClaims: RoutingResourceClaims | None
+    Fact: PlacedPinAccessRejectionFact
+    Completeness: PlacementAccessRejectionCompleteness
+    UnavailableInformation: tuple[PlacementAccessUnavailableInformation, ...]
+    Scope: str = "FirstDecisivePredicate"
+    SchemaVersion: str = "placed-pin-access-rejection-evidence-v1"
+
+    @classmethod
+    def FromDictionary(
+        cls,
+        Value: dict[str, object],
+    ) -> PlacedPinAccessRejectionEvidence:
+        from .PlacementAccessCodec import ReadContract
+        return ReadContract(cls, Value)
+
+    def __post_init__(self) -> None:
+        if self.SchemaVersion != "placed-pin-access-rejection-evidence-v1":
+            raise ValueError("unsupported pin-access rejection evidence schema")
+        if self.Scope != "FirstDecisivePredicate":
+            raise ValueError("pin-access rejection evidence scope is unsupported")
+        if not self.AttemptId or not self.EvaluationInputFingerprint:
+            raise ValueError("pin-access rejection evidence requires identities")
+        if type(self.Reason) is not PlacementAccessPatternAttemptReason:
+            raise TypeError("pin-access rejection reason must be typed")
+        if type(self.Completeness) is not PlacementAccessRejectionCompleteness:
+            raise TypeError("pin-access rejection completeness must be typed")
+        if (
+            self.ProposedClaims is not None
+            and type(self.ProposedClaims) is not RoutingResourceClaims
+        ):
+            raise TypeError("pin-access rejection proposed claims must be exact")
+        if self.Reason in {
+            PlacementAccessPatternAttemptReason.Legal,
+            PlacementAccessPatternAttemptReason.DuplicateOption,
+            PlacementAccessPatternAttemptReason.WorkCap,
+            PlacementAccessPatternAttemptReason.Deadline,
+            PlacementAccessPatternAttemptReason.InputDrift,
+            PlacementAccessPatternAttemptReason.UnknownPhysicalDecision,
+        }:
+            raise ValueError("non-rejection reason cannot carry rejection evidence")
+        if (
+            not self.FirstLegNodes
+            or self.FirstLegNodes[0] != self.Terminal
+            or tuple(Position for Position, _Role in self.BlockRoles)
+            != self.FirstLegNodes
+            or any(
+                Role not in {"dust", "repeater"}
+                for _Position, Role in self.BlockRoles
+            )
+        ):
+            raise ValueError("pin-access rejection geometry is malformed")
+        if (
+            self.Face[1] != 0
+            or sum(abs(Value) for Value in self.Face) != 1
+        ):
+            raise ValueError("pin-access rejection face must be horizontal")
+        if type(self.Fact) is not PlacedPinAccessRejectionFact:
+            raise TypeError("pin-access rejection fact must be exact")
+        if (
+            self.UnavailableInformation
+            != tuple(sorted(
+                set(self.UnavailableInformation),
+                key=lambda Value: Value.value,
+            ))
+            or any(
+                type(Value) is not PlacementAccessUnavailableInformation
+                for Value in self.UnavailableInformation
+            )
+        ):
+            raise ValueError(
+                "pin-access unavailable information must be typed and canonical"
+            )
+        ClaimsUnavailable = (
+            PlacementAccessUnavailableInformation.ProposedClaims
+            in self.UnavailableInformation
+        )
+        if (self.ProposedClaims is None) != ClaimsUnavailable:
+            raise ValueError("pin-access proposed-claim availability disagrees")
+        if (
+            self.Completeness is PlacementAccessRejectionCompleteness.Complete
+        ) != (not self.UnavailableInformation):
+            raise ValueError("pin-access rejection completeness overclaims evidence")
+
+    def _IdentityDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": self.SchemaVersion,
+            "Scope": self.Scope,
+            "AttemptId": self.AttemptId,
+            "EvaluationInputFingerprint": self.EvaluationInputFingerprint,
+            "Reason": self.Reason.value,
+            "Terminal": list(self.Terminal),
+            "Face": list(self.Face),
+            "BridgePosition": list(self.BridgePosition),
+            "FirstLegNodes": [list(Value) for Value in self.FirstLegNodes],
+            "FirstTrackNode": list(self.FirstTrackNode),
+            "BlockRoles": [
+                {"Position": list(Position), "Role": Role}
+                for Position, Role in self.BlockRoles
+            ],
+            "ProposedClaims": (
+                _ClaimsDictionary(self.ProposedClaims)
+                if self.ProposedClaims is not None
+                else None
+            ),
+            "Fact": self.Fact.ToDictionary(),
+            "Completeness": self.Completeness.value,
+            "UnavailableInformation": [
+                Value.value for Value in self.UnavailableInformation
+            ],
+        }
+
+    @property
+    def EvidenceFingerprint(self) -> str:
+        return BuildStableFingerprint(self._IdentityDictionary())
+
+    @property
+    def BlockingResources(self) -> tuple[str, ...]:
+        return tuple(sorted({
+            str(Resource)
+            for Resource in self.Fact.ConflictingResources
+        }))
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            **self._IdentityDictionary(),
+            "EvidenceFingerprint": self.EvidenceFingerprint,
+            "BlockingResources": list(self.BlockingResources),
+        }
+
+
 def BuildPlacementAccessPatternAttemptId(
     *,
     DomainId: str,
@@ -784,6 +1153,8 @@ class PlacedPinAccessPatternAttempt:
     Status: PlacementAccessPatternAttemptStatus
     Reason: PlacementAccessPatternAttemptReason
     OptionFingerprint: str | None
+    RejectionEvidence: PlacedPinAccessRejectionEvidence | None = None
+    SchemaVersion: str = "placed-pin-access-pattern-attempt-v2"
 
     @classmethod
     def FromDictionary(cls, Value: dict[str, object]) -> PlacedPinAccessPatternAttempt:
@@ -791,6 +1162,8 @@ class PlacedPinAccessPatternAttempt:
         return ReadContract(cls, Value)
 
     def __post_init__(self) -> None:
+        if self.SchemaVersion != "placed-pin-access-pattern-attempt-v2":
+            raise ValueError("unsupported pin-access pattern attempt schema")
         if not all((
             self.AttemptId,
             self.DomainId,
@@ -860,6 +1233,31 @@ class PlacedPinAccessPatternAttempt:
             raise ValueError("pin-access pattern attempt option evidence disagrees")
         if HasOption and not self.OptionFingerprint:
             raise ValueError("pin-access pattern attempt option identity is empty")
+        if self.Status is not PlacementAccessPatternAttemptStatus.Rejected:
+            if self.RejectionEvidence is not None:
+                raise ValueError(
+                    "non-rejected pin-access attempt cannot carry rejection evidence"
+                )
+        elif self.RejectionEvidence is not None:
+            if type(self.RejectionEvidence) is not PlacedPinAccessRejectionEvidence:
+                raise TypeError("pin-access rejection evidence must be exact")
+            if (
+                self.RejectionEvidence.AttemptId != self.AttemptId
+                or self.RejectionEvidence.Reason is not self.Reason
+            ):
+                raise ValueError(
+                    "pin-access rejection evidence belongs to another attempt"
+                )
+
+    @property
+    def RejectionEvidenceStatus(self) -> PlacementAccessRejectionStatus:
+        if self.Status is not PlacementAccessPatternAttemptStatus.Rejected:
+            return PlacementAccessRejectionStatus.NotApplicable
+        if self.RejectionEvidence is None:
+            return PlacementAccessRejectionStatus.Unavailable
+        return PlacementAccessRejectionStatus(
+            self.RejectionEvidence.Completeness.value
+        )
 
     def RankKey(self) -> tuple[object, ...]:
         return self.TemplateId, self.Layer, self.AttemptId
@@ -879,6 +1277,7 @@ class PlacedPinAccessPatternAttempt:
 
     def ToDictionary(self) -> dict[str, object]:
         return {
+            "SchemaVersion": self.SchemaVersion,
             "AttemptId": self.AttemptId,
             "DomainId": self.DomainId,
             "TemplateId": self.TemplateId,
@@ -891,6 +1290,12 @@ class PlacedPinAccessPatternAttempt:
             "Status": self.Status.value,
             "Reason": self.Reason.value,
             "OptionFingerprint": self.OptionFingerprint,
+            "RejectionEvidenceStatus": self.RejectionEvidenceStatus.value,
+            "RejectionEvidence": (
+                self.RejectionEvidence.ToDictionary()
+                if self.RejectionEvidence is not None
+                else None
+            ),
         }
 
 
@@ -920,6 +1325,7 @@ class PlacedPinAccessOptionDomain:
     RejectedOptionCount: int
     DeduplicatedOptionCount: int
     MaximumGenerationWork: int
+    SchemaVersion: str = "placed-pin-access-option-domain-v4"
 
     @classmethod
     def FromDictionary(cls, Value: dict[str, object]) -> PlacedPinAccessOptionDomain:
@@ -927,6 +1333,8 @@ class PlacedPinAccessOptionDomain:
         return ReadContract(cls, Value)
 
     def __post_init__(self) -> None:
+        if self.SchemaVersion != "placed-pin-access-option-domain-v4":
+            raise ValueError("unsupported placed pin-access domain schema")
         if not all((
             self.DomainId,
             self.Signal,
@@ -1037,6 +1445,14 @@ class PlacedPinAccessOptionDomain:
                 or Attempt.PatternFamily not in self.EnabledPatternFamilies
             ):
                 raise ValueError("pattern attempt belongs to another access domain")
+            if (
+                Attempt.RejectionEvidence is not None
+                and Attempt.RejectionEvidence.EvaluationInputFingerprint
+                != self.EvaluationInputFingerprint
+            ):
+                raise ValueError(
+                    "pattern rejection evidence uses another evaluation input"
+                )
         AttemptFamilies = {
             Value.PatternFamily for Value in self.RequiredPatternManifest
         }
@@ -1152,7 +1568,7 @@ class PlacedPinAccessOptionDomain:
     @property
     def DomainFingerprint(self) -> str:
         return BuildStableFingerprint({
-            "Kind": "placed-pin-access-option-domain-v3",
+            "Kind": self.SchemaVersion,
             "DomainId": self.DomainId,
             "Signal": self.Signal,
             "GateName": self.GateName,
@@ -1187,6 +1603,7 @@ class PlacedPinAccessOptionDomain:
 
     def ToDictionary(self) -> dict[str, object]:
         return {
+            "SchemaVersion": self.SchemaVersion,
             "DomainId": self.DomainId,
             "DomainFingerprint": self.DomainFingerprint,
             "Signal": self.Signal,
@@ -1273,7 +1690,7 @@ def BuildPlacementAccessProblemFingerprint(Domains: tuple[PlacedPinAccessOptionD
         Identity.pop("Kind")
         FixedDomains.append({**Identity, "DomainFingerprint": Fingerprint, "OptionCount": len(Domain.Options)})
     return BuildStableFingerprint({
-        "Kind": "fixed-placement-pin-access-problem-v2",
+        "Kind": "fixed-placement-pin-access-problem-v3",
         "Domains": FixedDomains,
         "CatalogVersions": sorted({Domain.CatalogVersion for Domain in Domains}),
         "TechnologyFingerprints": sorted({Domain.TechnologyFingerprint for Domain in Domains}),
@@ -1295,7 +1712,7 @@ class SelectedPlacementPinAccessWitness:
     RepeaterReservations: tuple[RoutingReservation, ...]
     Complete: bool = True
     IncompleteReason: str = ""
-    SchemaVersion: str = "selected-placement-pin-access-witness-v1"
+    SchemaVersion: str = "selected-placement-pin-access-witness-v2"
     Domains: tuple[PlacedPinAccessOptionDomain, ...] = ()
 
     @classmethod
@@ -1307,7 +1724,7 @@ class SelectedPlacementPinAccessWitness:
         return Result
 
     def __post_init__(self) -> None:
-        if self.SchemaVersion != "selected-placement-pin-access-witness-v1":
+        if self.SchemaVersion != "selected-placement-pin-access-witness-v2":
             raise ValueError("unsupported selected pin-access witness schema")
         if not all((
             self.CatalogVersion,
@@ -1382,7 +1799,7 @@ class SelectedPlacementPinAccessWitness:
     @property
     def DomainFingerprint(self) -> str:
         return BuildStableFingerprint({
-            "Kind": "selected-pin-access-domain-set-v1",
+            "Kind": "selected-pin-access-domain-set-v2",
             "DomainFingerprints": self.DomainFingerprints,
         })
 
@@ -1681,6 +2098,77 @@ class CurrentSelectedPlacementAccessValidation:
         return ReadContract(cls, Value)
 
 
+def _PlacementAccessCoreRejectionProjection(
+    DomainFingerprints: tuple[str, ...],
+    ProblemDomains: tuple[PlacedPinAccessOptionDomain, ...],
+) -> tuple[PlacementAccessRejectionStatus, tuple[str, ...]]:
+    CoreDomains = tuple(
+        Domain
+        for Domain in ProblemDomains
+        if Domain.DomainFingerprint in DomainFingerprints
+    )
+    RejectedAttempts = tuple(
+        Attempt
+        for Domain in CoreDomains
+        for Attempt in Domain.PatternAttempts
+        if Attempt.Status is PlacementAccessPatternAttemptStatus.Rejected
+    )
+    if not RejectedAttempts:
+        return PlacementAccessRejectionStatus.NotApplicable, ()
+    Statuses = tuple(
+        Attempt.RejectionEvidenceStatus for Attempt in RejectedAttempts
+    )
+    if all(
+        Status is PlacementAccessRejectionStatus.Unavailable
+        for Status in Statuses
+    ):
+        Status = PlacementAccessRejectionStatus.Unavailable
+    elif all(
+        Status is PlacementAccessRejectionStatus.Complete
+        for Status in Statuses
+    ):
+        Status = PlacementAccessRejectionStatus.Complete
+    else:
+        Status = PlacementAccessRejectionStatus.Partial
+    Resources = tuple(sorted({
+        Resource
+        for Attempt in RejectedAttempts
+        if Attempt.RejectionEvidence is not None
+        for Resource in Attempt.RejectionEvidence.BlockingResources
+    }))
+    return Status, Resources
+
+
+def BuildPlacementAccessConflictCoreFingerprint(
+    *,
+    ProblemFingerprint: str,
+    DomainFingerprints: tuple[str, ...],
+    SelectionLiterals: tuple[tuple[str, str], ...],
+    BlockingResources: tuple[str, ...],
+    Complete: bool,
+    Minimal: bool,
+    ProblemDomains: tuple[PlacedPinAccessOptionDomain, ...],
+) -> str:
+    """Bind proof completeness and rejection-explanation scope separately."""
+    RejectionStatus, RejectionResources = (
+        _PlacementAccessCoreRejectionProjection(
+            DomainFingerprints,
+            ProblemDomains,
+        )
+    )
+    return BuildStableFingerprint({
+        "Kind": "placement-access-conflict-core-v2",
+        "ProblemFingerprint": ProblemFingerprint,
+        "DomainFingerprints": DomainFingerprints,
+        "SelectionLiterals": SelectionLiterals,
+        "BlockingResources": BlockingResources,
+        "RejectionEvidenceStatus": RejectionStatus.value,
+        "RejectionBlockingResources": RejectionResources,
+        "Complete": Complete,
+        "Minimal": Minimal,
+    })
+
+
 @dataclass(frozen=True)
 class PlacementAccessConflictCore:
     """One complete problem-scoped access conflict suitable for repair."""
@@ -1724,16 +2212,30 @@ class PlacementAccessConflictCore:
                 raise ValueError("placement-access core domain scope mismatch")
             if self.SelectionLiterals != tuple(sorted((Domain.DomainId, Option.SelectionFingerprint) for Domain in CoreDomains for Option in Domain.Options)):
                 raise ValueError("placement-access core selection scope mismatch")
-            if self.CoreFingerprint != BuildStableFingerprint({
-                "Kind": "placement-access-conflict-core-v1",
-                "ProblemFingerprint": self.ProblemFingerprint,
-                "DomainFingerprints": self.DomainFingerprints,
-                "SelectionLiterals": self.SelectionLiterals,
-                "BlockingResources": self.BlockingResources,
-                "Complete": self.Complete,
-                "Minimal": self.Minimal,
-            }):
+            if self.CoreFingerprint != BuildPlacementAccessConflictCoreFingerprint(
+                ProblemFingerprint=self.ProblemFingerprint,
+                DomainFingerprints=self.DomainFingerprints,
+                SelectionLiterals=self.SelectionLiterals,
+                BlockingResources=self.BlockingResources,
+                Complete=self.Complete,
+                Minimal=self.Minimal,
+                ProblemDomains=self.ProblemDomains,
+            ):
                 raise ValueError("placement-access core fingerprint mismatch")
+
+    @property
+    def RejectionEvidenceStatus(self) -> PlacementAccessRejectionStatus:
+        return _PlacementAccessCoreRejectionProjection(
+            self.DomainFingerprints,
+            self.ProblemDomains,
+        )[0]
+
+    @property
+    def RejectionBlockingResources(self) -> tuple[str, ...]:
+        return _PlacementAccessCoreRejectionProjection(
+            self.DomainFingerprints,
+            self.ProblemDomains,
+        )[1]
 
     def ToDictionary(self) -> dict[str, object]:
         return {
@@ -1742,6 +2244,10 @@ class PlacementAccessConflictCore:
             "DomainFingerprints": list(self.DomainFingerprints),
             "SelectionLiterals": [list(Value) for Value in self.SelectionLiterals],
             "BlockingResources": list(self.BlockingResources),
+            "RejectionEvidenceStatus": self.RejectionEvidenceStatus.value,
+            "RejectionBlockingResources": list(
+                self.RejectionBlockingResources
+            ),
             "Complete": self.Complete,
             "Minimal": self.Minimal,
             "ProblemDomains": [Domain.ToDictionary() for Domain in self.ProblemDomains],
@@ -1761,7 +2267,7 @@ class PlacementAccessSolveResult:
     SelectedWitness: SelectedPlacementPinAccessWitness | None = None
     ConflictCore: PlacementAccessConflictCore | None = None
     IncompleteReason: str = ""
-    SchemaVersion: str = "placement-access-solve-result-v1"
+    SchemaVersion: str = "placement-access-solve-result-v2"
     Domains: tuple[PlacedPinAccessOptionDomain, ...] = ()
     PolicyVersion: str = ""
 
@@ -1774,7 +2280,7 @@ class PlacementAccessSolveResult:
         return Result
 
     def __post_init__(self) -> None:
-        if self.SchemaVersion != "placement-access-solve-result-v1":
+        if self.SchemaVersion != "placement-access-solve-result-v2":
             raise ValueError("unsupported placement-access solve schema")
         if not isinstance(self.Status, PlacementAccessSolveStatus):
             raise ValueError("placement-access status must be typed")
@@ -2048,9 +2554,19 @@ class FrozenPhysicalPlacementContract:
     DomainComplete: bool
     SearchComplete: bool
     OptimalityProven: bool
-    SchemaVersion: str = "frozen-physical-placement-contract-v1"
+    SchemaVersion: str = "frozen-physical-placement-contract-v2"
+
+    @classmethod
+    def FromDictionary(
+        cls,
+        Value: dict[str, object],
+    ) -> FrozenPhysicalPlacementContract:
+        from .PlacementAccessCodec import ReadContract
+        return ReadContract(cls, Value)
 
     def __post_init__(self) -> None:
+        if self.SchemaVersion != "frozen-physical-placement-contract-v2":
+            raise ValueError("unsupported frozen physical placement schema")
         if not all((
             self.ModuleFingerprint,
             self.PolicyVersion,
@@ -2211,6 +2727,7 @@ class FrozenPhysicalPlacementContract:
 
 
 __all__ = [
+    "BuildPlacementAccessConflictCoreFingerprint",
     "BuildPlacementAccessDomainControlsFingerprint",
     "BuildPlacementAccessPatternAttemptId",
     "CurrentSelectedPlacementAccessInputIdentity",
@@ -2223,6 +2740,9 @@ __all__ = [
     "PlacedPinAccessOptionDomain",
     "PlacedPinAccessPatternAttempt",
     "PlacedPinAccessPatternRequirement",
+    "PlacedPinAccessRejectionEvidence",
+    "PlacedPinAccessRejectionFact",
+    "PlacedPinAccessRejectionOwner",
     "PlacementAccessBoundaryLease",
     "PlacementAccessCellTransform",
     "PlacementAccessChannelReservation",
@@ -2232,7 +2752,12 @@ __all__ = [
     "PlacementAccessPinMapping",
     "PlacementAccessPatternAttemptReason",
     "PlacementAccessPatternAttemptStatus",
+    "PlacementAccessRejectionCompleteness",
+    "PlacementAccessRejectionOwnerProvenance",
+    "PlacementAccessRejectionRelation",
+    "PlacementAccessRejectionStatus",
     "PlacementAccessSolveResult",
     "PlacementAccessSolveStatus",
+    "PlacementAccessUnavailableInformation",
     "SelectedPlacementPinAccessWitness",
 ]
