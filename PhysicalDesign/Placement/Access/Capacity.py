@@ -20,6 +20,7 @@ from typing import (
 )
 from PhysicalDesign.Contracts.Placement import PlacementAccessAssignment, PlacementAccessFabric
 from PhysicalDesign.Contracts.PlacementAccess import (
+    BuildPlacementAccessConflictCoreFingerprint,
     BuildPlacementAccessProblemFingerprint,
     PlacedPinAccessOption,
     PlacedPinAccessOptionDomain,
@@ -510,7 +511,7 @@ def _BuildFixedPinAccessProblemFingerprint(
         )
     ProblemIdentity = {
         "Kind": (
-            "fixed-placement-pin-access-problem-v2"
+            "fixed-placement-pin-access-problem-v3"
             if UsesExactOptions
             else "fixed-placement-pin-access-problem-v1"
         ),
@@ -830,7 +831,11 @@ def SolveFixedPlacementPinAccessDomains(
             )
         )
         CoreFingerprint = BuildStableFingerprint({
-            "Kind": "fixed-placement-pin-access-unsat-core-v1",
+            "Kind": (
+                "fixed-placement-pin-access-unsat-core-v2"
+                if any(Value.UsesExactOptions for Value in CoreDomains)
+                else "fixed-placement-pin-access-unsat-core-v1"
+            ),
             "Domains": [Value.ToDictionary() for Value in CoreDomains],
             "Conflicts": [Value.ToDictionary() for Value in CoreConflicts],
         })
@@ -968,15 +973,16 @@ def AdaptFixedPlacementPinAccessSolveResult(
         for Conflict in Result.UnsatisfiableCore.Conflicts
         for Resource in Conflict.ResourceIds
     }))
-    CoreFingerprint = BuildStableFingerprint({
-        "Kind": "placement-access-conflict-core-v1",
-        "ProblemFingerprint": Result.ProblemFingerprint,
-        "DomainFingerprints": CoreDomainFingerprints,
-        "SelectionLiterals": SelectionLiterals,
-        "BlockingResources": BlockingResources,
-        "Complete": True,
-        "Minimal": False,
-    })
+    CoreProblemDomains = OrderedDomains
+    CoreFingerprint = BuildPlacementAccessConflictCoreFingerprint(
+        ProblemFingerprint=Result.ProblemFingerprint,
+        DomainFingerprints=CoreDomainFingerprints,
+        SelectionLiterals=SelectionLiterals,
+        BlockingResources=BlockingResources,
+        Complete=True,
+        Minimal=False,
+        ProblemDomains=CoreProblemDomains,
+    )
     return PlacementAccessSolveResult(
         Status=PlacementAccessSolveStatus.Unsatisfiable,
         ProblemFingerprint=Result.ProblemFingerprint,
@@ -992,7 +998,7 @@ def AdaptFixedPlacementPinAccessSolveResult(
             BlockingResources=BlockingResources,
             Complete=True,
             Minimal=False,
-            ProblemDomains=OrderedDomains,
+            ProblemDomains=CoreProblemDomains,
         ),
         Domains=OrderedDomains,
     )
