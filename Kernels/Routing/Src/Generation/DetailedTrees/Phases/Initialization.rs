@@ -11,6 +11,8 @@ macro_rules! InitializePreparedDetailedRouteSearch {
         $FrozenSourceBranch:ident,
         $ForbiddenRepeaterPositions:ident,
         $DebugLabel:ident,
+        $MaximumExpansionCount:ident,
+        $ExpansionAdmission:ident,
         $Deadline:ident,
         $Failure:ident,
         $BlockedNodes:ident,
@@ -43,6 +45,7 @@ macro_rules! InitializePreparedDetailedRouteSearch {
                 Status: EffectiveStatus.to_string(),
                 NoPathReason: NoPathReason.to_string(),
                 Nodes: Vec::new(),
+                SourcePaths: Vec::new(),
                 $TargetPaths: Vec::new(),
                 BoundaryFrontierNodes: Vec::new(),
                 RepeaterReservations: Vec::new(),
@@ -141,14 +144,18 @@ macro_rules! InitializePreparedDetailedRouteSearch {
         // native invocation.
         if $FrozenSourceBranch.is_some() && !$Guide.CertifiedPaths.is_empty() {
             let CertifiedGeometryComplete = $Guide.CertifiedPaths.iter().all(|Path| {
-                Path.first().copied() == Some($Root)
+                !$Deadline.Check()
+                    && Path.first().copied() == Some($Root)
                     && Path.windows(2).all(|Values| {
-                        $SelfContext.Adjacency
-                            .get(&Values[0])
-                            .is_some_and(|Neighbors| Neighbors.contains(&Values[1]))
+                        !$Deadline.Check()
+                            && $SelfContext
+                                .Adjacency
+                                .get(&Values[0])
+                                .is_some_and(|Neighbors| Neighbors.contains(&Values[1]))
                     })
                     && Path.iter().all(|PositionValue| {
-                        $SelfContext.Adjacency.contains_key(PositionValue)
+                        !$Deadline.Check()
+                            && $SelfContext.Adjacency.contains_key(PositionValue)
                             && (!$BlockedNodes.contains(PositionValue)
                                 || $UnblockedAdditionalNodes.contains(PositionValue))
                             && IsPreparedRouteNodeAllowed(
@@ -158,17 +165,18 @@ macro_rules! InitializePreparedDetailedRouteSearch {
                             )
                     })
             });
-            let CertifiedRepeaterMap = $Guide
-                .CertifiedRepeaters
-                .iter()
-                .cloned()
-                .collect::<HashMap<_, _>>();
-            let CertifiedRepeaterComplete = CertifiedRepeaterMap.len()
-                == $Guide.CertifiedRepeaters.len()
-                && CertifiedRepeaterMap.iter().all(|(PositionValue, Facing)| {
-                    !$ForbiddenRepeaterPositions.contains(PositionValue)
-                        && matches!(Facing.as_str(), "west" | "east" | "north" | "south")
-                });
+            let mut CertifiedRepeaterMap = HashMap::new();
+            let mut CertifiedRepeaterComplete = true;
+            for (PositionValue, Facing) in $Guide.CertifiedRepeaters.iter().cloned() {
+                if $Deadline.Check()
+                    || $ForbiddenRepeaterPositions.contains(&PositionValue)
+                    || !matches!(Facing.as_str(), "west" | "east" | "north" | "south")
+                    || CertifiedRepeaterMap.insert(PositionValue, Facing).is_some()
+                {
+                    CertifiedRepeaterComplete = false;
+                    break;
+                }
+            }
             if std::env::var("RCS_DEBUG_CERTIFIED_WARM_SIGNAL")
                 .ok()
                 .is_some_and(|Signal| Signal == $DebugLabel)
@@ -196,30 +204,75 @@ macro_rules! InitializePreparedDetailedRouteSearch {
                 );
             }
             if CertifiedGeometryComplete && CertifiedRepeaterComplete {
-                let CertifiedNodes = $Guide
+                let mut CertifiedNodes = HashSet::new();
+                for PositionValue in $Guide
                     .CertifiedPaths
                     .iter()
                     .flatten()
                     .copied()
                     .chain($FrozenReservedAccessNodes.iter().copied())
-                    .collect::<HashSet<_>>();
+                {
+                    if $Deadline.Check() {
+                        return $Failure("NoPath", "SearchLimitReached", 0, 0, 0);
+                    }
+                    CertifiedNodes.insert(PositionValue);
+                }
                 let CertifiedRepeaterValues = $Guide.CertifiedRepeaters.clone();
-                let CertifiedPowers = PropagateCanonicalRoutePower(
-                    $Root,
-                    &CertifiedNodes,
-                    &CertifiedRepeaterMap,
-                    &$SelfContext.Adjacency,
-                );
+                let (CertifiedPowers, CertifiedParents) =
+                    match PropagateCanonicalRoutePowerWithParentsWithDeadline(
+                        $Root,
+                        &CertifiedNodes,
+                        &CertifiedRepeaterMap,
+                        &$SelfContext.Adjacency,
+                        $Deadline,
+                    ) {
+                        DeadlineAwareElectricalResult::Complete(Value) => Value,
+                        DeadlineAwareElectricalResult::DeadlineExhausted => {
+                            return $Failure("NoPath", "SearchLimitReached", 0, 0, 0)
+                        }
+                    };
+                let mut CertifiedSourcePaths = Vec::with_capacity($Starts.len());
+                let mut CertifiedSourcePathsComplete = true;
+                for Start in $Starts.iter().copied() {
+                    let mut Path = vec![Start];
+                    let mut Cursor = Start;
+                    while Cursor != $Root {
+                        if $Deadline.Check() || Path.len() > CertifiedNodes.len() {
+                            CertifiedSourcePathsComplete = false;
+                            break;
+                        }
+                        let Some(Previous) = CertifiedParents.get(&Cursor).copied() else {
+                            CertifiedSourcePathsComplete = false;
+                            break;
+                        };
+                        Path.push(Previous);
+                        Cursor = Previous;
+                    }
+                    if !CertifiedSourcePathsComplete {
+                        break;
+                    }
+                    Path.reverse();
+                    CertifiedSourcePaths.push(Path);
+                }
                 let RequiredTargetsPowered = $TargetBranches
                     .iter()
                     .filter_map(|Branch| Branch.last())
-                    .all(|Target| CertifiedPowers.contains_key(Target));
+                    .all(|Target| !$Deadline.Check() && CertifiedPowers.contains_key(Target));
                 let FrozenClaimsPresent = $FrozenReservedAccessNodes
                     .iter()
-                    .all(|PositionValue| CertifiedNodes.contains(PositionValue));
-                let NoSelfExcitingCycle =
-                    FindSelfExcitingRepeaterCycles(&CertifiedNodes, &CertifiedRepeaterValues)
-                        .is_empty();
+                    .all(|PositionValue| {
+                        !$Deadline.Check() && CertifiedNodes.contains(PositionValue)
+                    });
+                let NoSelfExcitingCycle = match FindSelfExcitingRepeaterCyclesWithDeadline(
+                    &CertifiedNodes,
+                    &CertifiedRepeaterValues,
+                    $Deadline,
+                ) {
+                    DeadlineAwareElectricalResult::Complete(Cycles) => Cycles.is_empty(),
+                    DeadlineAwareElectricalResult::DeadlineExhausted => {
+                        return $Failure("NoPath", "SearchLimitReached", 0, 0, 0)
+                    }
+                };
                 if std::env::var("RCS_DEBUG_CERTIFIED_WARM_SIGNAL")
                     .ok()
                     .is_some_and(|Signal| Signal == $DebugLabel)
@@ -241,25 +294,66 @@ macro_rules! InitializePreparedDetailedRouteSearch {
                             .collect::<Vec<_>>(),
                     );
                 }
-                if RequiredTargetsPowered && FrozenClaimsPresent && NoSelfExcitingCycle {
+                if RequiredTargetsPowered
+                    && FrozenClaimsPresent
+                    && NoSelfExcitingCycle
+                    && CertifiedSourcePathsComplete
+                {
+                    let mut TargetPaths = Vec::with_capacity($Guide.CertifiedPaths.len());
+                    let mut CertifiedExpansionCount = 0usize;
+                    for Path in &$Guide.CertifiedPaths {
+                        if $Deadline.Check() {
+                            return $Failure("NoPath", "SearchLimitReached", 0, 0, 0);
+                        }
+                        let Some(Target) = Path.last().copied() else {
+                            return $Failure("NoPath", "NoPathGeometry", 0, 0, 0);
+                        };
+                        CertifiedExpansionCount = match CertifiedExpansionCount
+                            .checked_add(Path.len())
+                        {
+                            Some(Value) => Value,
+                            None => {
+                                return $Failure("NoPath", "SearchLimitReached", 0, 0, 0)
+                            }
+                        };
+                        TargetPaths.push((Target, Path.clone()));
+                    }
+                    if CertifiedExpansionCount > $MaximumExpansionCount {
+                        let mut Result = DetailedRouteTreeBudgetExpiredResult();
+                        Result.NoPathReason = "SearchLimitReached".to_string();
+                        return Result;
+                    }
+                    if let Some(Admission) = $ExpansionAdmission {
+                        for _ in 0..CertifiedExpansionCount {
+                            if $Deadline.Check()
+                                || !Admission.TryAdmitOne(ExpansionWorkPhase::Route)
+                            {
+                                let mut Result = DetailedRouteTreeBudgetExpiredResult();
+                                Result.NoPathReason = "SearchLimitReached".to_string();
+                                Result.ExpansionCount = $ExpansionCount;
+                                return Result;
+                            }
+                            $ExpansionCount += 1;
+                        }
+                    } else {
+                        $ExpansionCount = CertifiedExpansionCount;
+                    }
                     let mut Nodes = CertifiedNodes.into_iter().collect::<Vec<_>>();
                     Nodes.sort_unstable();
                     let mut RepeaterReservations = CertifiedRepeaterValues;
                     RepeaterReservations.sort_unstable();
+                    if $Deadline.Check() {
+                        return $Failure("NoPath", "SearchLimitReached", 0, 0, 0);
+                    }
                     return RouteTreeSearchResult {
                         Status: "Routed".to_string(),
                         NoPathReason: String::new(),
                         Nodes,
-                        $TargetPaths: $Guide
-                            .CertifiedPaths
-                            .iter()
-                            .filter_map(|Path| {
-                                Path.last().copied().map(|Target| (Target, Path.clone()))
-                            })
-                            .collect(),
+                        SourcePaths: CertifiedSourcePaths,
+                        $TargetPaths: TargetPaths,
                         BoundaryFrontierNodes: Vec::new(),
                         RepeaterReservations,
-                        $ExpansionCount: $Guide.CertifiedPaths.iter().map(Vec::len).sum(),
+                        $ExpansionCount,
                         RepeaterRejectedCount: 0,
                         RepeaterConstraintFailureCount: 0,
                         ConflictResources: Vec::new(),
@@ -271,6 +365,9 @@ macro_rules! InitializePreparedDetailedRouteSearch {
                     };
                 }
             }
+        }
+        if $Deadline.Check() {
+            return $Failure("NoPath", "SearchLimitReached", 0, 0, 0);
         }
     };
 }

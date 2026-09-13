@@ -166,6 +166,8 @@ impl RoutingContext {
             FrozenSourceBranch,
             ForbiddenRepeaterPositions,
             DebugLabel,
+            MaximumExpansionCount,
+            ExpansionAdmission,
             Deadline,
             Failure,
             BlockedNodes,
@@ -234,6 +236,7 @@ impl RoutingContext {
             RetainedMandatorySourceNodes,
             FrozenSourceFrontierState,
             RootedFrozenPortalNodes,
+            SourcePaths,
             TargetPaths,
             GlobalRoutingNodes,
             RetainedMandatoryTargetNodes
@@ -318,6 +321,7 @@ impl RoutingContext {
             ExpansionCount,
             FrozenReservedAccessNodes,
             RetainedMandatorySourceNodes,
+            SourcePaths,
             TargetPaths,
             RetainedMandatoryTargetNodes
         )
