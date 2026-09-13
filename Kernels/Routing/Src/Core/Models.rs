@@ -395,6 +395,8 @@ pub(crate) struct RouteTreeSearchResult {
     #[pyo3(get)]
     pub(crate) Nodes: Vec<Position>,
     #[pyo3(get)]
+    pub(crate) SourcePaths: Vec<Vec<Position>>,
+    #[pyo3(get)]
     pub(crate) TargetPaths: Vec<(Position, Vec<Position>)>,
     #[pyo3(get)]
     pub(crate) BoundaryFrontierNodes: Vec<Position>,

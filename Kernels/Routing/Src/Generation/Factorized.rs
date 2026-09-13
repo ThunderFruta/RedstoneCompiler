@@ -178,9 +178,14 @@ pub(crate) fn GenerateRouteTreesFactorizedNative(
                                 &Access.MandatoryAir,
                                 "",
                             );
-                        let Completed = !SearchResult.IsBudgetExpired;
-                        let RouteTree = SearchResult.IsRouted.then_some(SearchResult.Nodes);
-                        (RouteTree, SearchResult.RepeaterReservations, Completed)
+                        let Timely = !Deadline.Check();
+                        let Completed = !SearchResult.IsBudgetExpired && Timely;
+                        let RoutedTimely = SearchResult.IsRouted && Timely;
+                        let RouteTree = RoutedTimely.then_some(SearchResult.Nodes);
+                        let Repeaters = RoutedTimely
+                            .then_some(SearchResult.RepeaterReservations)
+                            .unwrap_or_default();
+                        (RouteTree, Repeaters, Completed)
                     },
                 )
                 .collect()
@@ -194,6 +199,16 @@ pub(crate) fn GenerateRouteTreesFactorizedNative(
         .into_iter()
         .map(|(RouteTree, Repeaters, _Completed)| (RouteTree, Repeaters))
         .unzip();
+    if Deadline.Check() {
+        return Ok(RouteTreeBatchResult {
+            RouteTrees: vec![None; TotalWork],
+            RepeaterReservations: vec![Vec::new(); TotalWork],
+            CompletionMask: vec![false; TotalWork],
+            DeadlineExceeded: true,
+            CompletedWork: 0,
+            TotalWork,
+        });
+    }
     Ok(RouteTreeBatchResult {
         RouteTrees,
         RepeaterReservations,
@@ -452,8 +467,8 @@ pub(crate) fn GenerateAndAssignRouteTreesFactorizedNative(
                             SearchResult.NoGoodCount,
                         );
                     }
-                    let Complete = !SearchResult.IsBudgetExpired;
-                    let Candidate = SearchResult.IsRouted.then(|| {
+                    let Timely = !Deadline.Check();
+                    let Candidate = (SearchResult.IsRouted && Timely).then(|| {
                         let Claims = BuildExactSelectedWorldRouteClaims(
                             Context,
                             &SearchResult.Nodes,
@@ -466,6 +481,9 @@ pub(crate) fn GenerateAndAssignRouteTreesFactorizedNative(
                             Claims,
                         }
                     });
+                    let Timely = Timely && !Deadline.Check();
+                    let Candidate = Timely.then_some(Candidate).flatten();
+                    let Complete = !SearchResult.IsBudgetExpired && Timely;
                     (
                         *GroupIndex,
                         *RequestIndex,
@@ -547,6 +565,38 @@ pub(crate) fn GenerateAndAssignRouteTreesFactorizedNative(
                 SelectedRequestIndices.push(Candidate.RequestIndex);
             }
             let CompletedWork = CompletionMask.iter().filter(|Value| **Value).count();
+            let GeneratedRequestCountsBySignal = SignalRequestIndices
+                .iter()
+                .enumerate()
+                .map(|(GroupIndex, (Signal, _Requests))| {
+                    (Signal.clone(), NextRequestOffsetByGroup[GroupIndex])
+                })
+                .collect();
+            let CandidateCountsBySignal = SignalRequestIndices
+                .iter()
+                .enumerate()
+                .map(|(GroupIndex, (Signal, _Requests))| {
+                    (Signal.clone(), CandidateGroups[GroupIndex].len())
+                })
+                .collect();
+            if Deadline.Check() {
+                return Ok(FactorizedRouteTreeSelectionResult {
+                    RouteTrees: vec![None; TotalWork],
+                    RepeaterReservations: vec![Vec::new(); TotalWork],
+                    CompletionMask: vec![false; TotalWork],
+                    SelectedRequestIndices: Vec::new(),
+                    Success: false,
+                    Complete: false,
+                    DeadlineExceeded: true,
+                    WorkCapExceeded: false,
+                    AssignmentExpansionCount,
+                    GeneratedRequestCount,
+                    GeneratedRequestCountsBySignal,
+                    CandidateCountsBySignal,
+                    CompletedWork: 0,
+                    TotalWork,
+                });
+            }
             return Ok(FactorizedRouteTreeSelectionResult {
                 RouteTrees,
                 RepeaterReservations,
@@ -558,20 +608,8 @@ pub(crate) fn GenerateAndAssignRouteTreesFactorizedNative(
                 WorkCapExceeded: false,
                 AssignmentExpansionCount,
                 GeneratedRequestCount,
-                GeneratedRequestCountsBySignal: SignalRequestIndices
-                    .iter()
-                    .enumerate()
-                    .map(|(GroupIndex, (Signal, _Requests))| {
-                        (Signal.clone(), NextRequestOffsetByGroup[GroupIndex])
-                    })
-                    .collect(),
-                CandidateCountsBySignal: SignalRequestIndices
-                    .iter()
-                    .enumerate()
-                    .map(|(GroupIndex, (Signal, _Requests))| {
-                        (Signal.clone(), CandidateGroups[GroupIndex].len())
-                    })
-                    .collect(),
+                GeneratedRequestCountsBySignal,
+                CandidateCountsBySignal,
                 CompletedWork,
                 TotalWork,
             });
@@ -975,9 +1013,17 @@ pub(crate) fn GenerateAndAssignRouteTreesFactorizedNative(
                 SawIncompleteRequest = true;
                 break;
             }
+            if Deadline.Check() {
+                SawIncompleteRequest = true;
+                break;
+            }
             if SearchResult.IsRouted {
                 let Claims =
                     BuildExactSelectedWorldRouteClaims(Context, &SearchResult.Nodes, Access);
+                if Deadline.Check() {
+                    SawIncompleteRequest = true;
+                    break;
+                }
                 let NewCandidate = ExactSelectedWorldRouteCandidate {
                     RequestIndex,
                     Nodes: SearchResult.Nodes,
@@ -1140,9 +1186,17 @@ pub(crate) fn GenerateAndAssignRouteTreesFactorizedNative(
                     SawIncompleteRequest = true;
                     break;
                 }
+                if Deadline.Check() {
+                    SawIncompleteRequest = true;
+                    break;
+                }
                 if SearchResult.IsRouted {
                     let Claims =
                         BuildExactSelectedWorldRouteClaims(Context, &SearchResult.Nodes, Access);
+                    if Deadline.Check() {
+                        SawIncompleteRequest = true;
+                        break;
+                    }
                     let NewCandidate = ExactSelectedWorldRouteCandidate {
                         RequestIndex,
                         Nodes: SearchResult.Nodes,

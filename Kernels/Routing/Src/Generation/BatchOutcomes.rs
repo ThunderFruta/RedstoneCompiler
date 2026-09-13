@@ -2032,6 +2032,58 @@ fn CandidateEdgeIsValidWithDeadline(
     Ok(false)
 }
 
+fn ValidateSourcePathsWithDeadline(
+    Context: &RoutingContext,
+    Request: &CanonicalRouteRequestV1,
+    Result: &RouteTreeSearchResult,
+    NodeSet: &HashSet<Position>,
+    Allowed: &HashSet<Position>,
+    Blocked: &HashSet<Position>,
+    Deadline: &RuntimeDeadline,
+    ValidationSteps: &mut usize,
+) -> Result<HashSet<Position>, FinalValidationResultV1> {
+    let Some(Root) = Request.Starts.first().copied() else {
+        return Err(FinalValidationResultV1::Invalid);
+    };
+    if Result.SourcePaths.len() != Request.Starts.len() {
+        return Err(FinalValidationResultV1::Invalid);
+    }
+    let mut SourcePathNodes = HashSet::with_capacity(Result.Nodes.len());
+    for (ExpectedStart, Path) in Request.Starts.iter().zip(Result.SourcePaths.iter()) {
+        if Path.is_empty()
+            || Path.first().copied() != Some(Root)
+            || Path.last().copied() != Some(*ExpectedStart)
+        {
+            return Err(FinalValidationResultV1::Invalid);
+        }
+        let mut UniquePathNodes = HashSet::with_capacity(Path.len());
+        for Value in Path.iter().copied() {
+            AdvanceValidationStep(ValidationSteps, Deadline)?;
+            if !UniquePathNodes.insert(Value)
+                || !NodeSet.contains(&Value)
+                || !Allowed.contains(&Value)
+                || Blocked.contains(&Value)
+            {
+                return Err(FinalValidationResultV1::Invalid);
+            }
+            SourcePathNodes.insert(Value);
+        }
+        for Pair in Path.windows(2) {
+            AdvanceValidationStep(ValidationSteps, Deadline)?;
+            if !CandidateEdgeIsValidWithDeadline(
+                Context,
+                Pair[0],
+                Pair[1],
+                Deadline,
+                ValidationSteps,
+            )? {
+                return Err(FinalValidationResultV1::Invalid);
+            }
+        }
+    }
+    Ok(SourcePathNodes)
+}
+
 fn ValidateStartConnectionCandidateWithDeadline(
     Context: &RoutingContext,
     Request: &CanonicalRouteRequestV1,
@@ -2081,28 +2133,20 @@ fn ValidateStartConnectionCandidateWithDeadline(
             return FinalValidationResultV1::Invalid;
         }
     }
-    for Start in Request.Starts.iter() {
-        ValidateStep!();
-        if !NodeSet.contains(Start) {
-            return FinalValidationResultV1::Invalid;
-        }
-    }
-    let Some(Root) = Request.Starts.first().copied() else {
-        return FinalValidationResultV1::Invalid;
+    let SourcePathNodes = match ValidateSourcePathsWithDeadline(
+        Context,
+        Request,
+        Result,
+        &NodeSet,
+        &Allowed,
+        &Blocked,
+        Deadline,
+        &mut ValidationSteps,
+    ) {
+        Ok(Value) => Value,
+        Err(Result) => return Result,
     };
-    let mut Reached = HashSet::from([Root]);
-    let mut Pending = VecDeque::from([Root]);
-    while let Some(Current) = Pending.pop_front() {
-        ValidateStep!();
-        for Neighbor in Context.Adjacency.get(&Current).into_iter().flatten() {
-            ValidateStep!();
-            if NodeSet.contains(Neighbor) && Reached.insert(*Neighbor) {
-                Pending.push_back(*Neighbor);
-            }
-        }
-    }
-    if Reached.len() != NodeSet.len() || Request.Starts.iter().any(|Start| !Reached.contains(Start))
-    {
+    if SourcePathNodes != NodeSet {
         return FinalValidationResultV1::Invalid;
     }
     let mut BoundaryFrontierNodes = HashSet::with_capacity(Result.BoundaryFrontierNodes.len());
@@ -2256,14 +2300,22 @@ fn ValidateFoundCandidateWithDeadline(
             return FinalValidationResultV1::Invalid;
         }
     }
-    if PathNodes.len() != NodeSet.len() {
+    let SourcePathNodes = match ValidateSourcePathsWithDeadline(
+        Context,
+        Request,
+        Result,
+        &NodeSet,
+        &Allowed,
+        &Blocked,
+        Deadline,
+        &mut ValidationSteps,
+    ) {
+        Ok(Value) => Value,
+        Err(Result) => return Result,
+    };
+    PathNodes.extend(SourcePathNodes);
+    if PathNodes != NodeSet {
         return FinalValidationResultV1::Invalid;
-    }
-    for Value in &NodeSet {
-        ValidateStep!();
-        if !PathNodes.contains(Value) {
-            return FinalValidationResultV1::Invalid;
-        }
     }
     let mut BoundaryFrontierNodes = HashSet::with_capacity(Result.BoundaryFrontierNodes.len());
     for Value in Result.BoundaryFrontierNodes.iter().copied() {
@@ -2322,7 +2374,12 @@ fn ValidateFoundCandidateWithDeadline(
     for (Repeater, Facing) in &RepeaterMap {
         ValidateStep!();
         let mut ValidOccurrence = false;
-        for (_Target, Path) in &Result.TargetPaths {
+        for Path in Result.SourcePaths.iter().map(Vec::as_slice).chain(
+            Result
+                .TargetPaths
+                .iter()
+                .map(|(_Target, Path)| Path.as_slice()),
+        ) {
             ValidateStep!();
             for (Index, PositionValue) in Path.iter().enumerate() {
                 ValidateStep!();
@@ -2334,10 +2391,10 @@ fn ValidateFoundCandidateWithDeadline(
                     .and_then(|Value| Path.get(Value))
                     .copied()
                 else {
-                    return FinalValidationResultV1::Invalid;
+                    continue;
                 };
                 let Some(Next) = Path.get(Index + 1).copied() else {
-                    return FinalValidationResultV1::Invalid;
+                    continue;
                 };
                 let OutputDelta = (
                     Next.0 - Repeater.0,
@@ -3796,6 +3853,7 @@ mod Tests {
             Status: "Routed".to_string(),
             NoPathReason: String::new(),
             Nodes: vec![A, B, C],
+            SourcePaths: vec![vec![A]],
             TargetPaths: vec![(C, vec![A, B, C])],
             BoundaryFrontierNodes: Vec::new(),
             RepeaterReservations: Vec::new(),
@@ -3944,6 +4002,7 @@ mod Tests {
         Request.Starts = Arc::new(vec![A, C]);
         Request.TargetBranches = Arc::new(Vec::new());
         let mut Candidate = ValidCandidate();
+        Candidate.SourcePaths = vec![vec![A], vec![A, B, C]];
         Candidate.TargetPaths.clear();
 
         assert!(ValidateFoundCandidate(&Context, &Request, &Candidate));
@@ -4029,6 +4088,14 @@ mod Tests {
             &MissingPathNode
         ));
 
+        let mut MissingSourceWitness = Candidate.clone();
+        MissingSourceWitness.SourcePaths.clear();
+        assert!(!ValidateFoundCandidate(
+            &Context,
+            &Request,
+            &MissingSourceWitness,
+        ));
+
         let mut ExtraPath = Candidate.clone();
         ExtraPath.TargetPaths.push((B, vec![A, B]));
         assert!(!ValidateFoundCandidate(&Context, &Request, &ExtraPath));
@@ -4043,18 +4110,98 @@ mod Tests {
     }
 
     #[test]
-    fn CompleteCandidateValidatorRejectsForestRootedAtMultipleAllowedStarts() {
-        let D = (10, 0, 0);
-        let mut Context = LinearContext();
-        Context.Adjacency.insert(D, Vec::new());
-        Context.NodesByColumn.insert((10, 0), vec![D]);
-        let mut Request = CanonicalRequest(vec![A, B, C, D]);
+    fn CompleteCandidateValidatorAcceptsSourceIntegrationAndRejectsForgedBranches() {
+        let D = (3, 0, 0);
+        let E = (1, 0, 1);
+        let F = (2, 0, 1);
+        let G = (3, 0, 1);
+        let Context = RoutingContext::FromMaps(
+            HashMap::from([
+                (A, vec![B]),
+                (B, vec![A, C]),
+                (C, vec![B, D]),
+                (D, vec![C, E, G]),
+                (E, vec![D, F]),
+                (F, vec![E, G]),
+                (G, vec![F, D]),
+            ]),
+            HashMap::from([
+                ((0, 0), vec![A]),
+                ((1, 0), vec![B]),
+                ((2, 0), vec![C]),
+                ((3, 0), vec![D]),
+                ((1, 1), vec![E]),
+                ((2, 1), vec![F]),
+                ((3, 1), vec![G]),
+            ]),
+        );
+        let mut Request = CanonicalRequest(vec![A, B, C, D, E, F, G]);
         Request.Starts = Arc::new(vec![A, D]);
-        Request.TargetBranches = Arc::new(vec![vec![C], vec![D]]);
+        Request.TargetBranches = Arc::new(vec![vec![C]]);
         let mut Candidate = ValidCandidate();
         Candidate.Nodes.push(D);
-        Candidate.TargetPaths.push((D, vec![D]));
+        Candidate.SourcePaths = vec![vec![A], vec![A, B, C, D]];
 
+        assert!(ValidateFoundCandidate(&Context, &Request, &Candidate));
+
+        let mut ForgedBranch = Candidate.clone();
+        ForgedBranch.Nodes.push(E);
+        assert!(!ValidateFoundCandidate(&Context, &Request, &ForgedBranch));
+
+        let mut ForgedCycle = Candidate.clone();
+        ForgedCycle.Nodes.extend([E, F, G]);
+        assert!(!ValidateFoundCandidate(&Context, &Request, &ForgedCycle));
+
+        let mut DisconnectedContext = Context;
+        DisconnectedContext
+            .Adjacency
+            .get_mut(&C)
+            .unwrap()
+            .retain(|Node| *Node != D);
+        DisconnectedContext.Adjacency.get_mut(&D).unwrap().clear();
+        assert!(!ValidateFoundCandidate(
+            &DisconnectedContext,
+            &Request,
+            &Candidate,
+        ));
+    }
+
+    #[test]
+    fn CompleteCandidateValidatorAcceptsSourceIntegrationRepeater() {
+        let Nodes = (0..=16).map(|X| (X, 0, 0)).collect::<Vec<_>>();
+        let mut Adjacency = HashMap::<Position, Vec<Position>>::new();
+        for PositionValue in Nodes.iter().copied() {
+            Adjacency.insert(PositionValue, Vec::new());
+        }
+        for Pair in Nodes.windows(2) {
+            Adjacency.get_mut(&Pair[0]).unwrap().push(Pair[1]);
+            Adjacency.get_mut(&Pair[1]).unwrap().push(Pair[0]);
+        }
+        let Context = RoutingContext::FromMaps(
+            Adjacency,
+            Nodes
+                .iter()
+                .copied()
+                .map(|PositionValue| ((PositionValue.0, PositionValue.2), vec![PositionValue]))
+                .collect(),
+        );
+        let mut Request = CanonicalRequest(Nodes.clone());
+        Request.Starts = Arc::new(vec![Nodes[0], Nodes[16], Nodes[14]]);
+        Request.TargetBranches = Arc::new(vec![vec![Nodes[1]]]);
+        Request.EnforceSignalStrength = true;
+        let mut Candidate = ValidCandidate();
+        Candidate.Nodes = Nodes.clone();
+        Candidate.SourcePaths = vec![
+            vec![Nodes[0]],
+            Nodes.clone(),
+            Nodes.iter().copied().take(15).collect(),
+        ];
+        Candidate.TargetPaths = vec![(Nodes[1], vec![Nodes[0], Nodes[1]])];
+        Candidate.RepeaterReservations = vec![(Nodes[14], "west".to_string())];
+
+        assert!(ValidateFoundCandidate(&Context, &Request, &Candidate));
+
+        Candidate.RepeaterReservations = vec![(Nodes[14], "north".to_string())];
         assert!(!ValidateFoundCandidate(&Context, &Request, &Candidate));
     }
 
@@ -5028,6 +5175,7 @@ mod Tests {
             Status: "Routed".to_string(),
             NoPathReason: String::new(),
             Nodes: Nodes.clone(),
+            SourcePaths: vec![vec![A]],
             TargetPaths: vec![((NodeCount - 1, 0, 0), Nodes)],
             BoundaryFrontierNodes: Vec::new(),
             RepeaterReservations: Vec::new(),

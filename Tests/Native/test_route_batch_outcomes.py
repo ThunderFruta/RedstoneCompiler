@@ -6,6 +6,7 @@ from collections import deque
 from hashlib import sha256
 from json import loads
 from math import inf, nan
+from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
@@ -16,6 +17,9 @@ from RedstoneCompiler import RustRouting
 A = (0, 0, 0)
 B = (1, 0, 0)
 C = (2, 0, 0)
+ROOT_ORDINARY_FIXTURE = (
+    Path(__file__).parents[1] / "Fixtures" / "JointRootOrdinaryInvalidProducerR1c.json"
+)
 
 
 def _bindings(Suffix: str = "alpha") -> list[tuple[str, str]]:
@@ -180,6 +184,393 @@ def test_start_connection_spans_connected_starts_and_keeps_disconnection_unresol
     assert Disconnected.RuntimeSearchOutcome == "Unresolved"
     assert Disconnected.Candidate is None
     assert Disconnected.NoPathProof is None
+
+
+def test_ordinary_multi_start_candidate_retains_source_connection_nodes():
+    D = (3, 0, 0)
+    Nodes = (A, B, C, D)
+    Edges = ((A, B), (B, C), (C, D))
+    Context = RustRouting.RoutingContext(
+        (0, 0, 0, 3, 0, 0),
+        (0, 0, 3, 0),
+        list(Nodes),
+        list(Edges),
+    )
+    LegacyArguments = (
+        [A, D],
+        [[B], [C]],
+        [(0, 0), (1, 0), (2, 0), (3, 0)],
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        64,
+    )
+    Legacy = Context.GenerateRouteTreesBounded([LegacyArguments], 1_000)
+    Raw = Context.GenerateRouteTreeDetailedBounded(
+        [A, D],
+        [[B], [C]],
+        list(Nodes),
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        False,
+        64,
+        1_000,
+    )
+    Request = RustRouting.RouteTreeCoarseRequestV1(
+        "ordinary-connected-starts",
+        _bindings(),
+        (0, 0, 0, 3, 0, 0),
+        (0, 0, 3, 0),
+        False,
+        *LegacyArguments,
+    )
+    Receipt = Context.GenerateRouteTreesBatchOutcomesV1(
+        "ordinary-connected-starts-batch",
+        (Request,),
+        monotonic() + 10,
+    ).Receipts[0]
+
+    assert Legacy.RouteTrees == [list(Nodes)]
+    assert Raw.IsRouted is True
+    assert Raw.Nodes == list(Nodes)
+    assert Raw.SourcePaths == [[A], [A, B, C, D]]
+    assert Raw.TargetPaths == [(B, [A, B]), (C, [A, B, C])]
+    assert D not in {Node for _Target, Path in Raw.TargetPaths for Node in Path}
+    assert _reachable(Raw.Nodes, Edges, (A,)) == set(Nodes)
+    assert set((A, D)) <= set(Raw.Nodes)
+
+    assert Receipt.SearchOutcome == "Found"
+    assert Receipt.TerminalReason == "Found"
+    assert Receipt.Candidate.Nodes == Raw.Nodes
+    assert Receipt.Candidate.SourcePaths == Raw.SourcePaths
+    assert Receipt.Candidate.TargetPaths == Raw.TargetPaths
+    assert Receipt.RouteExpansionCount == Raw.ExpansionCount
+
+    StartConnection = RustRouting.RouteTreeCoarseRequestV1.ConnectStartsOnlyV1(
+        "connected-starts-control",
+        _bindings("start-control"),
+        (0, 0, 0, 3, 0, 0),
+        (0, 0, 3, 0),
+        False,
+        [A, D],
+        LegacyArguments[2],
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        64,
+    )
+    Control = Context.GenerateRouteTreesBatchOutcomesV1(
+        "connected-starts-control-batch",
+        (StartConnection,),
+        monotonic() + 10,
+    ).Receipts[0]
+    assert Control.SearchOutcome == "Found"
+    assert Control.Candidate.Nodes == list(Nodes)
+    assert Control.Candidate.SourcePaths == [[A], [A, B, C, D]]
+    assert Control.Candidate.TargetPaths == []
+
+
+def test_ordinary_multi_start_candidate_validates_source_connection_repeater():
+    Nodes = tuple((Index, 0, 0) for Index in range(17))
+    Edges = tuple(zip(Nodes, Nodes[1:]))
+    Context = RustRouting.RoutingContext(
+        (0, 0, 0, 16, 0, 0),
+        (0, 0, 16, 0),
+        list(Nodes),
+        list(Edges),
+    )
+    Request = RustRouting.RouteTreeDetailedRequestV1(
+        "ordinary-source-repeater",
+        _bindings("source-repeater"),
+        (0, 0, 0, 16, 0, 0),
+        (0, 0, 16, 0),
+        False,
+        [Nodes[0], Nodes[-1], Nodes[14]],
+        [[Nodes[1]]],
+        list(Nodes),
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        True,
+        256,
+    )
+    Receipt = Context.GenerateRouteTreeDetailedBatchOutcomesV1(
+        "ordinary-source-repeater-batch",
+        (Request,),
+        monotonic() + 10,
+    ).Receipts[0]
+
+    assert Receipt.SearchOutcome == "Found"
+    assert Receipt.Candidate.Nodes == list(Nodes)
+    assert Receipt.Candidate.SourcePaths == [
+        [Nodes[0]],
+        list(Nodes),
+        list(Nodes[:15]),
+    ]
+    assert Receipt.Candidate.TargetPaths == [(Nodes[1], [Nodes[0], Nodes[1]])]
+    assert Receipt.Candidate.RepeaterReservations == [(Nodes[14], "west")]
+    assert Nodes[14] not in Receipt.Candidate.TargetPaths[0][1]
+
+
+def test_ordinary_source_witness_reconstruction_observes_original_deadline():
+    NodeCount = 2_500
+    Nodes = tuple((Index, 0, 0) for Index in range(NodeCount))
+    Context = RustRouting.RoutingContext(
+        (0, 0, 0, NodeCount - 1, 0, 0),
+        (0, 0, NodeCount - 1, 0),
+        list(Nodes),
+        list(zip(Nodes, Nodes[1:])),
+    )
+    Starts = [Nodes[0], Nodes[-1], *Nodes[1:-1]]
+
+    Result = Context.GenerateRouteTreeDetailedBounded(
+        Starts,
+        [[Nodes[1]]],
+        list(Nodes),
+        [],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        False,
+        10_000,
+        20,
+    )
+
+    assert Result.Status == "BudgetExpired"
+    assert Result.IsRouted is False
+    assert Result.IsBudgetExpired is True
+    assert Result.Nodes == []
+    assert Result.SourcePaths == []
+    assert Result.TargetPaths == []
+    assert Result.ExpansionCount <= 10_000
+
+
+def test_certified_warm_factorized_route_observes_cap_and_keeps_valid_control():
+    Context = _context()
+    Access = (
+        [A],
+        [A],
+        [[C]],
+        [[C]],
+        [A, C],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    Guide = (
+        [(0, 0), (1, 0), (2, 0)],
+        [],
+        [],
+        [[A, B, C]],
+        [],
+    )
+
+    Limited = Context.GenerateRouteTreesFactorizedBounded(
+        [Access],
+        [Guide],
+        [(0, 0, 0, 0, 0, 0, 1)],
+        1_000,
+    )
+    Valid = Context.GenerateRouteTreesFactorizedBounded(
+        [Access],
+        [Guide],
+        [(0, 0, 0, 0, 0, 0, 3)],
+        1_000,
+    )
+
+    assert Limited.RouteTrees == [None]
+    assert Limited.CompletionMask == [False]
+    assert Limited.CompletedWork == 0
+    assert Limited.DeadlineExceeded is False
+    assert Valid.RouteTrees == [[A, B, C]]
+    assert Valid.CompletionMask == [True]
+    assert Valid.CompletedWork == 1
+    assert Valid.DeadlineExceeded is False
+
+
+def test_factorized_claim_audit_cannot_publish_after_deadline():
+    Context = _context()
+    MandatorySupport = [(Index, 100, 0) for Index in range(300_000)]
+    Access = (
+        [A],
+        [A],
+        [[C]],
+        [[C]],
+        [A, C],
+        [],
+        [],
+        MandatorySupport,
+        [],
+        [],
+    )
+    Guide = (
+        [(0, 0), (1, 0), (2, 0)],
+        [],
+        [],
+        [[A, B, C]],
+        [],
+    )
+
+    Result = Context.GenerateRouteTreesFactorizedBounded(
+        [Access],
+        [Guide],
+        [(0, 0, 0, 0, 0, 0, 32)],
+        7,
+    )
+
+    assert Result.RouteTrees == [None]
+    assert Result.CompletionMask == [False]
+    assert Result.CompletedWork == 0
+    assert Result.DeadlineExceeded is True
+
+
+def test_real_joint_root_ordinary_candidate_passes_independent_graph_oracle():
+    Record = loads(ROOT_ORDINARY_FIXTURE.read_text())
+    ContextDocument = Record["Context"]
+    RequestDocument = Record["Request"]
+    Node = lambda Value: tuple(Value)
+    Nodes = [Node(Value) for Value in ContextDocument["Nodes"]]
+    Edges = [
+        (Node(First), Node(Second))
+        for First, Second in ContextDocument["Edges"]
+    ]
+    Starts = [Node(Value) for Value in RequestDocument["Starts"]]
+    TargetBranches = [
+        [Node(Value) for Value in Branch]
+        for Branch in RequestDocument["TargetBranches"]
+    ]
+    AllowedColumns = [tuple(Value) for Value in RequestDocument["AllowedColumns"]]
+    RequiredNodes = [Node(Value) for Value in RequestDocument["RequiredNodes"]]
+    BlockedNodes = [Node(Value) for Value in RequestDocument["BlockedNodes"]]
+    PreferredColumns = [
+        tuple(Value) for Value in RequestDocument["PreferredColumns"]
+    ]
+    Context = RustRouting.RoutingContext(
+        tuple(ContextDocument["Bounds"]),
+        tuple(ContextDocument["PlacementBounds"]),
+        Nodes,
+        Edges,
+    )
+    LegacyArguments = (
+        Starts,
+        TargetBranches,
+        AllowedColumns,
+        RequiredNodes,
+        BlockedNodes,
+        PreferredColumns,
+        RequestDocument["PreferredRoutingY"],
+        RequestDocument["GuidePenalty"],
+        RequestDocument["BendPenalty"],
+        RequestDocument["ViaPenalty"],
+        RequestDocument["MaximumExpansionCount"],
+    )
+    Request = RustRouting.RouteTreeCoarseRequestV1(
+        RequestDocument["RequestId"],
+        [tuple(Value) for Value in RequestDocument["CallerEchoBindings"]],
+        tuple(ContextDocument["Bounds"]),
+        tuple(ContextDocument["PlacementBounds"]),
+        False,
+        *LegacyArguments,
+    )
+
+    assert Record["PublicTypedOutcome"]["NativeReceipt"]["TerminalReason"] == (
+        "InvalidProducerResult"
+    )
+    assert Record["IndependentLegacyValidity"][
+        "LegacyGraphAndTargetContractValid"
+    ] is True
+    assert Context.AuthoritativeContextGraphSha256 == ContextDocument[
+        "AuthoritativeContextGraphSha256"
+    ]
+    assert Request.NativePayloadSha256 == RequestDocument["NativePayloadSha256"]
+
+    Receipt = Context.GenerateRouteTreesBatchOutcomesV1(
+        "joint-root-ordinary-r1c-replay",
+        (Request,),
+        monotonic() + 30,
+    ).Receipts[0]
+    Legacy = Context.GenerateRouteTreesBounded([LegacyArguments], 30_000)
+
+    assert Receipt.SearchOutcome == Receipt.TerminalReason == "Found"
+    assert Receipt.Candidate is not None
+    assert Receipt.NoPathProof is None
+    assert Receipt.RouteExpansionCount == Receipt.Candidate.ExpansionCount == 228
+    assert Receipt.ProofExpansionCount == 0
+    assert Receipt.TotalExpansionCount <= Receipt.MaximumExpansionCount == 25_000
+    assert Receipt.NativePayloadSha256 == RequestDocument["NativePayloadSha256"]
+    assert Receipt.ContextGraphSha256 == ContextDocument[
+        "AuthoritativeContextGraphSha256"
+    ]
+
+    CandidateNodes = set(Receipt.Candidate.Nodes)
+    EdgeSet = {frozenset(Edge) for Edge in Edges}
+    AllowedColumnSet = set(AllowedColumns)
+    assert set(Starts) <= CandidateNodes
+    assert set(RequiredNodes) <= CandidateNodes
+    assert not CandidateNodes.intersection(BlockedNodes)
+    assert all((X, Z) in AllowedColumnSet for X, _Y, Z in CandidateNodes)
+    CandidateEdges = [
+        (First, Second)
+        for First, Second in Edges
+        if First in CandidateNodes and Second in CandidateNodes
+    ]
+    assert _reachable(CandidateNodes, CandidateEdges, (Starts[0],)) == CandidateNodes
+    assert len(Receipt.Candidate.TargetPaths) == len(TargetBranches)
+    MatchedBranches = set()
+    PathNodes = set()
+    for Target, Path in Receipt.Candidate.TargetPaths:
+        assert Path[0] in Starts
+        assert Path[-1] == Target
+        assert all(frozenset(Pair) in EdgeSet for Pair in zip(Path, Path[1:]))
+        assert all(Value in CandidateNodes for Value in Path)
+        PathNodes.update(Path)
+        Matches = [
+            Index
+            for Index, Branch in enumerate(TargetBranches)
+            if Branch[-1] == Target and Path[-len(Branch) :] == Branch
+        ]
+        assert len(Matches) == 1
+        MatchedBranches.add(Matches[0])
+    assert MatchedBranches == set(range(len(TargetBranches)))
+    assert CandidateNodes - PathNodes == set(Starts[1:])
+    assert len(Receipt.Candidate.SourcePaths) == len(Starts)
+    SourcePathNodes = set()
+    for ExpectedStart, Path in zip(Starts, Receipt.Candidate.SourcePaths):
+        assert Path[0] == Starts[0]
+        assert Path[-1] == ExpectedStart
+        assert len(Path) == len(set(Path))
+        assert all(frozenset(Pair) in EdgeSet for Pair in zip(Path, Path[1:]))
+        SourcePathNodes.update(Path)
+    assert SourcePathNodes.union(PathNodes) == CandidateNodes
+
+    ExpectedLegacy = [Node(Value) for Value in Record["LegacyBatch"]["RouteTree"]]
+    assert Legacy.CompletedWork == 1
+    assert Legacy.DeadlineExceeded is False
+    assert Legacy.RouteTrees == [ExpectedLegacy]
+    assert len(ExpectedLegacy) == 71
+    assert len(CandidateNodes) == 70
 
 
 @pytest.mark.parametrize(

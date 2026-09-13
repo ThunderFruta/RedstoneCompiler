@@ -35,6 +35,19 @@ impl RoutingContext {
         let mut NoGoodCount = 0usize;
         let mut LastConflictResources = Vec::new();
         let mut ForbiddenRepeaterPositions = HashSet::new();
+        macro_rules! ClaimDeadline {
+            () => {
+                if Deadline.Check() {
+                    let mut Result = DetailedRouteTreeBudgetExpiredResult();
+                    Result.ExpansionCount = TotalExpansions;
+                    Result.ConflictResources = LastConflictResources;
+                    Result.RejectedPathCount = RejectedPathCount;
+                    Result.NoGoodCount = NoGoodCount;
+                    Result.ElapsedMilliseconds = Started.elapsed().as_millis() as u64;
+                    return Result;
+                }
+            };
+        }
         let StrictHintNodes = MandatoryWire
             .union(&Guide.ExactHintNodes)
             .copied()
@@ -273,7 +286,12 @@ impl RoutingContext {
             }
             UseStrictMandatoryGuide = false;
 
-            let RouteWire: HashSet<_> = Result.Nodes.iter().copied().collect();
+            ClaimDeadline!();
+            let mut RouteWire = HashSet::with_capacity(Result.Nodes.len());
+            for PositionValue in Result.Nodes.iter().copied() {
+                ClaimDeadline!();
+                RouteWire.insert(PositionValue);
+            }
             let mut InvalidRepeaterPositions = Result
                 .RepeaterReservations
                 .iter()
@@ -328,7 +346,9 @@ impl RoutingContext {
                         .then_some(*PositionValue)
                 })
                 .collect::<Vec<_>>();
+            ClaimDeadline!();
             InvalidRepeaterPositions.sort_unstable();
+            ClaimDeadline!();
             InvalidRepeaterPositions.dedup();
             if !InvalidRepeaterPositions.is_empty() {
                 if std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {
@@ -350,6 +370,7 @@ impl RoutingContext {
                     Result.Status = "NoPath".to_string();
                     Result.NoPathReason = "SelfClaimConflict".to_string();
                     Result.Nodes.clear();
+                    Result.SourcePaths.clear();
                     Result.TargetPaths.clear();
                     Result.RepeaterReservations.clear();
                     Result.IsRouted = false;
@@ -363,12 +384,14 @@ impl RoutingContext {
                 NoGoodCount += 1;
                 continue;
             }
-            let RouteSupport: HashSet<_> = RouteWire
-                .iter()
-                .map(|Value| (Value.0, Value.1 - 1, Value.2))
-                .collect();
+            let mut RouteSupport = HashSet::with_capacity(RouteWire.len());
+            for Value in &RouteWire {
+                ClaimDeadline!();
+                RouteSupport.insert((Value.0, Value.1 - 1, Value.2));
+            }
             let mut RouteAir = HashSet::new();
             for First in &RouteWire {
+                ClaimDeadline!();
                 for (DeltaX, DeltaZ) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     for DeltaY in [-1, 1] {
                         let Second = (First.0 + DeltaX, First.1 + DeltaY, First.2 + DeltaZ);
@@ -380,17 +403,27 @@ impl RoutingContext {
                     }
                 }
             }
-            let CombinedWire: HashSet<_> = MandatoryWire.union(&RouteWire).copied().collect();
-            let CombinedSupport: HashSet<_> =
-                MandatorySupport.union(&RouteSupport).copied().collect();
+            let mut CombinedWire = HashSet::new();
+            for Value in MandatoryWire.iter().chain(RouteWire.iter()) {
+                ClaimDeadline!();
+                CombinedWire.insert(*Value);
+            }
+            let mut CombinedSupport = HashSet::new();
+            for Value in MandatorySupport.iter().chain(RouteSupport.iter()) {
+                ClaimDeadline!();
+                CombinedSupport.insert(*Value);
+            }
             // A legal vertical primitive may be formed by one immutable
             // access node and one newly-routed node.  Unioning air claims
             // computed independently for those two sets misses that exact
             // cross-boundary headroom.  Recompute over the physical union,
             // matching RoutingResourceGraph.BuildRouteClaims.
             let mut CombinedAir = MandatoryAir.clone();
+            ClaimDeadline!();
             for First in &CombinedWire {
+                ClaimDeadline!();
                 for Second in self.Adjacency.get(First).into_iter().flatten() {
+                    ClaimDeadline!();
                     if Second <= First || Second.1 == First.1 || !CombinedWire.contains(Second) {
                         continue;
                     }
@@ -398,12 +431,23 @@ impl RoutingContext {
                     CombinedAir.insert((Lower.0, Lower.1 + 1, Lower.2));
                 }
             }
-            let WireOrAir: HashSet<_> = CombinedWire.union(&CombinedAir).copied().collect();
-            let SupportConflicts: HashSet<_> =
-                CombinedSupport.intersection(&WireOrAir).copied().collect();
-            let AirConflicts: HashSet<_> =
-                CombinedAir.intersection(&CombinedWire).copied().collect();
+            let mut WireOrAir = HashSet::new();
+            for Value in CombinedWire.iter().chain(CombinedAir.iter()) {
+                ClaimDeadline!();
+                WireOrAir.insert(*Value);
+            }
+            let mut SupportConflicts = HashSet::new();
+            for Value in CombinedSupport.intersection(&WireOrAir) {
+                ClaimDeadline!();
+                SupportConflicts.insert(*Value);
+            }
+            let mut AirConflicts = HashSet::new();
+            for Value in CombinedAir.intersection(&CombinedWire) {
+                ClaimDeadline!();
+                AirConflicts.insert(*Value);
+            }
             if SupportConflicts.is_empty() && AirConflicts.is_empty() {
+                ClaimDeadline!();
                 Result.ConflictResources.clear();
                 Result.RejectedPathCount = RejectedPathCount;
                 Result.NoGoodCount = NoGoodCount;
@@ -475,6 +519,7 @@ impl RoutingContext {
                 Result.Status = "NoPath".to_string();
                 Result.NoPathReason = "SelfClaimConflict".to_string();
                 Result.Nodes.clear();
+                Result.SourcePaths.clear();
                 Result.TargetPaths.clear();
                 Result.RepeaterReservations.clear();
                 Result.IsRouted = false;
@@ -529,6 +574,7 @@ impl RoutingContext {
                 Result.Status = "NoPath".to_string();
                 Result.NoPathReason = "SelfClaimConflict".to_string();
                 Result.Nodes.clear();
+                Result.SourcePaths.clear();
                 Result.TargetPaths.clear();
                 Result.RepeaterReservations.clear();
                 Result.IsRouted = false;
