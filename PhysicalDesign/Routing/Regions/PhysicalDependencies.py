@@ -230,6 +230,8 @@ class RegionDependencyComparison:
 Well-formed matching declarations can be unverified or invented. Revision
 syntax is checked, but source existence, producer issuance, identity contents
 and current physical compatibility are never established by this operation.
+When otherwise valid declarations have incomplete category coverage,
+``Unresolved`` can coexist with known differences from their common scope.
 """
 
     Status: str
@@ -248,13 +250,22 @@ def CompareRegionPhysicalDependencies(
     RightTopology: NormalizedRegionTopology,
     RightDependencies: RegionPhysicalDependencies,
 ) -> RegionDependencyComparison:
-    """Compare full structures and complete declarations, never hash fields."""
+    """Compare valid declared structures without using hash fields.
+
+    Valid supported declarations compare topology, context and every category
+    present on both sides even when coverage is incomplete. Missing categories
+    are unresolved evidence rather than differences, so ``Unresolved`` may
+    retain known differences. Malformed payloads and unsupported scopes remain
+    conservative: they report unresolved reasons and no extracted comparison.
+    """
     Unknown: list[str] = []
+    Conservative = False
     for Side, Topology, Manifest in (
         ("Left", LeftTopology, LeftDependencies), ("Right", RightTopology, RightDependencies),
     ):
         if type(Topology) is not NormalizedRegionTopology or type(Manifest) is not RegionPhysicalDependencies:
             Unknown.append(f"{Side}.MalformedPayload")
+            Conservative = True
             continue
         try:
             Topology.Validate()
@@ -262,13 +273,15 @@ def CompareRegionPhysicalDependencies(
             Manifest.Boundary.ValidateTopology(Topology)
         except (ValueError, TypeError, AttributeError):
             Unknown.append(f"{Side}.MalformedPayload")
+            Conservative = True
             continue
         if Manifest.Scope != RegionPhysicalDependencyScope:
             Unknown.append(f"{Side}.UnsupportedScope")
+            Conservative = True
         Present = {Value.Category for Value in Manifest.Dependencies}
         Unknown.extend(f"{Side}.Missing.{Category}"
                        for Category in RequiredRegionDependencyCategories if Category not in Present)
-    if Unknown:
+    if Conservative:
         return RegionDependencyComparison("Unresolved", Unresolved=tuple(sorted(Unknown)))
     Differences: list[str] = []
     if LeftTopology != RightTopology:
@@ -278,7 +291,11 @@ def CompareRegionPhysicalDependencies(
             Differences.append(Field)
     Left = {Value.Category: Value.Identity for Value in LeftDependencies.Dependencies}
     Right = {Value.Category: Value.Identity for Value in RightDependencies.Dependencies}
-    Differences.extend(Category for Category in RequiredRegionDependencyCategories if Left[Category] != Right[Category])
+    Differences.extend(
+        Category for Category in RequiredRegionDependencyCategories
+        if Category in Left and Category in Right and Left[Category] != Right[Category]
+    )
     return RegionDependencyComparison(
-        "DependenciesDiffer" if Differences else "DependenciesMatch", tuple(Differences),
+        "Unresolved" if Unknown else "DependenciesDiffer" if Differences else "DependenciesMatch",
+        tuple(Differences), tuple(sorted(Unknown)),
     )

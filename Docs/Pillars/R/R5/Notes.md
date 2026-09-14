@@ -44,6 +44,12 @@ controls when the two disagree.
   unowned exclusions and current foreign wires. Boundary-binding identity must
   cover ordered signal/gate/kind/role/pin/terminal/face bindings. Full paths and
   claims cannot be replaced by endpoint or bounding-box summaries.
+- For otherwise well-formed supported declarations, comparison retains known
+  topology, subject, snapshot, boundary and shared-category differences when
+  either side is missing required coverage.  The result is still `Unresolved`,
+  with sorted side-specific missing reasons; absence is never reported as a
+  difference. Malformed payloads and unsupported scopes remain conservative
+  empty-difference outcomes and are not mined for comparison facts.
 - Boundary counts follow extraction's distinct-consumer convention; repeated
   gate pin edges remain distinct in topology. Capacity and external counts are
   separate dependency data. Missing net declarations use scalar IR defaults;

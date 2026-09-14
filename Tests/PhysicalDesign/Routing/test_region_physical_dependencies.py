@@ -44,6 +44,19 @@ def Declare(Module, Component):
     return Topology, Manifest
 
 
+def AlterDeclaration(Manifest, *, Changed=(), Missing=(), ChangePrefix="changed-", Reversed=False):
+    """Build an explicit synthetic comparison declaration from named facts."""
+    Changed = frozenset(Changed)
+    Missing = frozenset(Missing)
+    Dependencies = tuple(
+        replace(Value, Identity=Identity(ChangePrefix + Value.Category))
+        if Value.Category in Changed else Value
+        for Value in Manifest.Dependencies
+        if Value.Category not in Missing
+    )
+    return replace(Manifest, Dependencies=tuple(reversed(Dependencies)) if Reversed else Dependencies)
+
+
 def test_complete_equal_declarations_compare_without_granting_physical_authority(tmp_path):
     Topology, Manifest = Declare(*BuildExtracted(MultiOutput))
     Reordered = replace(Manifest, Dependencies=tuple(reversed(Manifest.Dependencies)))
@@ -98,6 +111,90 @@ def test_each_changed_or_missing_required_dependency_prevents_match(Category, tm
         "Differences": Difference.Differences, "Unresolved": Incomplete.Unresolved,
         "Original": Manifest.ToDictionary(), "Changed": Changed.ToDictionary(),
     }, indent=2) + "\n")
+
+
+def test_known_common_dependency_differences_survive_incomplete_coverage():
+    """Missing coverage is uncertainty, not a reason to discard known differences."""
+    Topology, Manifest = Declare(*BuildExtracted(MultiOutput))
+    Right = AlterDeclaration(Manifest, Changed=("Support",), Missing=("AccessWitness",))
+    Result = CompareRegionPhysicalDependencies(Topology, Manifest, Topology, Right)
+    assert Result.Status == "Unresolved"
+    assert Result.Differences == ("Support",)
+    assert Result.Unresolved == ("Right.Missing.AccessWitness",)
+    assert Result.ProducerValidation == "NotPerformed"
+
+
+def test_incomplete_coverage_compares_all_shared_context_topology_and_categories():
+    LeftTopology, Left = Declare(*BuildExtracted(MultiOutput))
+    RightTopology, Right = Declare(*BuildExtracted(DegreeTwin))
+    Left = AlterDeclaration(Left, Changed=("RequiredAir", "Support"), Missing=("Domain",))
+    Right = replace(
+        AlterDeclaration(Right, Changed=("RequiredAir", "Support"),
+                         Missing=("AccessWitness",), ChangePrefix="right-"),
+        Subject=Identity("right-subject"), Snapshot=Identity("right-snapshot"),
+    )
+    Result = CompareRegionPhysicalDependencies(LeftTopology, Left, RightTopology, Right)
+    # The separate real extracted regions have distinct topology/boundary facts;
+    # changed shared categories retain the producer's established category order.
+    assert Result.Status == "Unresolved"
+    assert Result.Differences == (
+        "Topology", "Subject", "Snapshot", "Boundary", "RequiredAir", "Support",
+    )
+    assert Result.Unresolved == ("Left.Missing.Domain", "Right.Missing.AccessWitness")
+
+
+@pytest.mark.parametrize(("LeftMissing", "RightMissing", "ExpectedUnresolved"), (
+    (("AccessWitness",), (), ("Left.Missing.AccessWitness",)),
+    ((), ("AccessWitness",), ("Right.Missing.AccessWitness",)),
+    (("AccessWitness",), ("AccessWitness",),
+     ("Left.Missing.AccessWitness", "Right.Missing.AccessWitness")),
+))
+def test_missing_only_coverage_is_unresolved_without_inventing_differences(
+    LeftMissing, RightMissing, ExpectedUnresolved,
+):
+    """Side-specific absence is uncertainty even when every common fact agrees."""
+    Topology, Manifest = Declare(*BuildExtracted(MultiOutput))
+    Left = AlterDeclaration(Manifest, Missing=LeftMissing)
+    Right = AlterDeclaration(Manifest, Missing=RightMissing)
+    Result = CompareRegionPhysicalDependencies(Topology, Left, Topology, Right)
+    assert Result.Status == "Unresolved"
+    assert Result.Differences == ()
+    assert Result.Unresolved == ExpectedUnresolved
+
+
+def test_incomplete_comparison_is_declaration_order_independent_and_side_symmetric():
+    Topology, Manifest = Declare(*BuildExtracted(MultiOutput))
+    Right = AlterDeclaration(Manifest, Changed=("Support", "RequiredAir"), Missing=("AccessWitness",))
+    Forward = CompareRegionPhysicalDependencies(Topology, Manifest, Topology, Right)
+    Reordered = CompareRegionPhysicalDependencies(
+        Topology, AlterDeclaration(Manifest, Reversed=True), Topology,
+        AlterDeclaration(Manifest, Changed=("Support", "RequiredAir"),
+                         Missing=("AccessWitness",), Reversed=True),
+    )
+    Reverse = CompareRegionPhysicalDependencies(Topology, Right, Topology, Manifest)
+    assert Forward == Reordered
+    assert Forward.Differences == ("RequiredAir", "Support")
+    assert Forward.Unresolved == ("Right.Missing.AccessWitness",)
+    assert Reverse.Differences == Forward.Differences
+    assert Reverse.Unresolved == ("Left.Missing.AccessWitness",)
+
+
+@pytest.mark.parametrize("Invalid", ("malformed", "unsupported"))
+def test_invalid_or_unsupported_declarations_suppress_even_apparent_known_differences(Invalid):
+    Topology, Manifest = Declare(*BuildExtracted(MultiOutput))
+    Right = AlterDeclaration(Manifest, Changed=("Support",))
+    if Invalid == "malformed":
+        Left = deepcopy(Manifest)
+        object.__setattr__(Left.Dependencies[0].Identity, "Value", "unknown")
+        ExpectedUnresolved = ("Left.MalformedPayload",)
+    else:
+        Left = replace(AlterDeclaration(Manifest, Missing=("AccessWitness",)),
+                       Scope="future-physical-work")
+        ExpectedUnresolved = ("Left.Missing.AccessWitness", "Left.UnsupportedScope")
+    Result = CompareRegionPhysicalDependencies(Topology, Left, Topology, Right)
+    assert Result.Status == "Unresolved"
+    assert Result.Differences == ()
+    assert Result.Unresolved == ExpectedUnresolved
 
 
 @pytest.mark.parametrize("Signal,AddedConsumers", [("A", 2), ("T", 1)])
