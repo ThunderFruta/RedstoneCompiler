@@ -1628,7 +1628,7 @@ class RoutingDesignSnapshotTests(unittest.TestCase):
             ArchiveRoot.mkdir()
 
             with patch.object(
-                SnapshotTool.shutil,
+                __import__("shutil"),
                 "copyfile",
                 side_effect=AssertionError(
                     "snapshot staging reopened an archive pathname"

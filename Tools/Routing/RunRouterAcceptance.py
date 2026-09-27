@@ -55,6 +55,8 @@ from App.BenchmarkArchive import (
     ValidateExactAcceptanceVerdicts,
 )
 from App.RunReporting import CaptureTerminalOutput, UtcTimestamp, WriteRunReport
+from App.RoutingFailureArtifacts import (ObserveReportPair, ReportName, ReceiptName,
+    DiscoverReportMembers, UniqueReportMembers)
 from PhysicalDesign.Policy import (
     ExecutionStrategyForRequest,
     PolicyForRoutingStrategy,
@@ -1017,6 +1019,8 @@ def BuildRunArtifacts(RunDirectory: Path, RunName: str) -> dict[str, Path]:
         "FabricFixture": OutputPath.with_suffix(".PhysicalFixture.json"),
         "PhysicalDesign": OutputPath.with_suffix(".PhysicalDesign.json"),
         "RoutingFailure": OutputPath.with_suffix(".RoutingFailure.json"),
+        "RoutingFailureReport": RunDirectory / ReportName,
+        "RoutingFailureReportReceipt": RunDirectory / ReceiptName,
         "Diagram": OutputPath.with_suffix(".Nand.json"),
         "Stdout": RunDirectory / "stdout.log",
         "Stderr": RunDirectory / "stderr.log",
@@ -2906,6 +2910,25 @@ def EvaluateRun(
             "SizeBytes": VerifiedRoutingFailure.SizeBytes,
             "Sha256": VerifiedRoutingFailure.Sha256,
         }
+    ReportEvidence = {"Status": "NotRun" if Process.ReturnCode == 0 else "Unavailable",
+                      "Reason": "no authoritative routing failure selected"}
+    if ResolvedRoutingFailurePath is not None and VerifiedRoutingFailure is not None:
+        ReportEvidence = ObserveReportPair(ResolvedRoutingFailurePath, VerifiedRoutingFailure.Data)
+        for MemberName, Key in ((ReportName, "RoutingFailureReport"),
+                                (ReceiptName, "RoutingFailureReportReceipt")):
+            Record = ReportEvidence["Artifacts"].get(MemberName)
+            if Record is not None:
+                ArtifactRecords[Key] = Record
+    try:
+        Members = DiscoverReportMembers(Artifacts["RunDirectory"])
+        Selected = str(ResolvedRoutingFailurePath.relative_to(LexicalAbsolutePath(Artifacts["RunDirectory"]))) if ResolvedRoutingFailurePath else None
+        if not UniqueReportMembers(Members, Selected):
+            ReportEvidence = {"Status": "Rejected", "Reason": "unlisted or duplicate report members in run"}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        ReportEvidence = {"Status": "Rejected", "Reason": "unsafe report membership"}
+    Observed["RoutingFailureReport"] = ReportEvidence
     Result = {
         "Accepted": not Failures,
         "Failures": Failures,
@@ -2942,9 +2965,12 @@ def ClearPriorRunArtifacts(Artifacts: dict[str, Path]) -> None:
         "FabricFixture",
         "PhysicalDesign",
         "RoutingFailure",
+        "RoutingFailureReport",
+        "RoutingFailureReportReceipt",
         "Diagram",
     ):
-        Artifacts[Name].unlink(missing_ok=True)
+        if Name in Artifacts:
+            Artifacts[Name].unlink(missing_ok=True)
 
 
 def EncodeManifest(Manifest: dict[str, object]) -> bytes:
@@ -5453,6 +5479,7 @@ def RunAcceptance(
         )
         try:
             Report = WriteRunReport(
+                RetainedRoutingFailureReport=Evaluation.get("Observed", {}).get("RoutingFailureReport"),
                 RunDirectory=RunDirectory,
                 Result=(
                     "SUCCESS" if Completed["Accepted"] else "FAILURE"
