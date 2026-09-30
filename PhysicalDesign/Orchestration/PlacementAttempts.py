@@ -7,7 +7,13 @@ import os
 import traceback
 from typing import Any, Callable
 from PhysicalDesign.Contracts.Failures import RoutingAssignmentCut, RoutingFailure, RoutingFailureReason, RoutingStageError
-from PhysicalDesign.Contracts.PlacementAccess import PlacementAccessSolveStatus
+from PhysicalDesign.Contracts.PlacementAccess import (
+    PlacementAccessPatternAttemptStatus,
+    PlacementAccessRejectionCompleteness,
+    PlacementAccessRejectionOwnerProvenance,
+    PlacementAccessRejectionStatus,
+    PlacementAccessSolveStatus,
+)
 from PhysicalDesign.Placement.Engine.Constraints import PlacementAssignmentConstraintSet
 from PhysicalDesign.Placement.Access.Capacity import FixedPlacementPinAccessStatus, SolvePlacedPinAccessOptionDomains
 from PhysicalDesign.Placement.Access.Catalog import (
@@ -31,6 +37,66 @@ from .AttemptHistory import (
 )
 from .Candidates import PcbPlacementCandidate
 from .AccessEnvelope import BuildCurrentSelectedAccessSolveBinding
+
+
+def PlacementAccessCoreProvesPreOwnedFrozenRouteConflict(
+    Solve,
+    FrozenNetWires,
+) -> bool:
+    """Require complete P1 owner/provenance evidence before direct-only repair."""
+    Core = getattr(Solve, "ConflictCore", None)
+    if (
+        Core is None
+        or Core.Complete is not True
+        or not Core.ProblemDomains
+        or Core.RejectionEvidenceStatus
+        is not PlacementAccessRejectionStatus.Complete
+        or not Core.RejectionBlockingResources
+        or not FrozenNetWires
+    ):
+        return False
+    FrozenSignals = frozenset(str(Signal) for Signal in FrozenNetWires)
+    CoreDomains = tuple(
+        Domain
+        for Domain in Core.ProblemDomains
+        if Domain.DomainFingerprint in Core.DomainFingerprints
+    )
+    EmptyCoreDomains = tuple(
+        Domain for Domain in CoreDomains if not Domain.Options
+    )
+    if not EmptyCoreDomains:
+        return False
+    for Domain in EmptyCoreDomains:
+        if not Domain.PatternAttempts:
+            return False
+        for Attempt in Domain.PatternAttempts:
+            Evidence = Attempt.RejectionEvidence
+            if (
+                Attempt.Status
+                is not PlacementAccessPatternAttemptStatus.Rejected
+                or Evidence is None
+                or Evidence.Completeness
+                is not PlacementAccessRejectionCompleteness.Complete
+                or not Evidence.Fact.ConflictingResources
+            ):
+                return False
+            PreOwnedOwners = tuple(
+                Owner
+                for Owner in Evidence.Fact.Owners
+                if Owner.Provenance
+                in {
+                    PlacementAccessRejectionOwnerProvenance.
+                    PreOwnedFrozenRouteClaims,
+                    PlacementAccessRejectionOwnerProvenance.
+                    PreOwnedFrozenNode,
+                }
+            )
+            if (
+                not PreOwnedOwners
+                or any(Owner.Signal not in FrozenSignals for Owner in PreOwnedOwners)
+            ):
+                return False
+    return True
 
 
 def RebuildCurrentCandidatePlacementAccess(
@@ -660,8 +726,10 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
         if FixedPinAccessRejectsCandidate:
             if RoutingAwarePlacementAccess:
                 if (
-                    Candidate.Placed.FrozenNetWires
-                    and any(not Domain.Options for Domain in AccessDomains)
+                    PlacementAccessCoreProvesPreOwnedFrozenRouteConflict(
+                        FixedPinAccessSolve,
+                        Candidate.Placed.FrozenNetWires,
+                    )
                 ):
                     Context.PendingPlacementAccessDirectOnly = True
                     Context.PlacementGenerationDecisions.append({
@@ -672,6 +740,17 @@ def _TryPlacement(Context, Request: PlacementGenerationRequest, JointPlacementCa
                         ),
                         'ProblemFingerprint': (
                             FixedPinAccessSolve.ProblemFingerprint
+                        ),
+                        'ConflictCoreFingerprint': (
+                            FixedPinAccessSolve.ConflictCore.CoreFingerprint
+                        ),
+                        'RejectionBlockingResources': list(
+                            FixedPinAccessSolve.ConflictCore
+                            .RejectionBlockingResources
+                        ),
+                        'RejectionEvidenceStatus': (
+                            FixedPinAccessSolve.ConflictCore
+                            .RejectionEvidenceStatus.value
                         ),
                         'NextAction': (
                             'materialize-existing-direct-only-variant'

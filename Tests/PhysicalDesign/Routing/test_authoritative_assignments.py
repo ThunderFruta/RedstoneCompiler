@@ -2096,39 +2096,12 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
             LocalFirstPhysicalDesignPolicy,
             Envelope,
         )
-        NativeContext = Flow.RustRoutingContext
-
-        class RefuseAssignmentContext:
-            def __init__(self, *Arguments) -> None:
-                self.Inner = NativeContext(*Arguments)
-
-            def __getattr__(self, Name):
-                return getattr(self.Inner, Name)
-
-            def PlanAuthoritativeRoutesBounded(self, *_Arguments):
-                raise AssertionError(
-                    "raw-domain preparation must not run assignment"
-                )
-
-            def PlanAuthoritativeRoutesWithBaseBounded(
-                self,
-                *_Arguments,
-            ):
-                raise AssertionError(
-                    "raw-domain preparation must not run assignment"
-                )
-
-        with patch.object(
-            Flow,
-            "RustRoutingContext",
-            RefuseAssignmentContext,
-        ):
-            Domain = PrepareRawTrackAssignmentDomain(
-                Placement,
-                Resources=BuildRoutingResources(Placement.Placed),
-                Policy=Policy,
-                Deadline=RoutingDeadline.Start(5.0),
-            )
+        Domain = PrepareRawTrackAssignmentDomain(
+            Placement,
+            Resources=BuildRoutingResources(Placement.Placed),
+            Policy=Policy,
+            Deadline=RoutingDeadline.Start(5.0),
+        )
 
         self.assertTrue(Domain.Complete)
         self.assertFalse(Domain.IncompleteReason)
@@ -2293,8 +2266,6 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
         Placement = replace(InitialPlacement, Placed=Placed)
         Resources = BuildRoutingResources(Placed)
         MaterializedBySignal = Counter()
-        NativeAssignmentCalls: list[tuple[object, ...]] = []
-
         def MaterializeControlledCandidate(
             Signal,
             Profile,
@@ -2355,29 +2326,14 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
                 ViaCount=0,
             )
 
-        NativeRoutingContext = Flow.RustRoutingContext
-
-        class RecordingRoutingContext:
-            def __init__(self, *Arguments) -> None:
-                self.Inner = NativeRoutingContext(*Arguments)
-
-            def __getattr__(self, Name):
-                return getattr(self.Inner, Name)
-
-            def PlanAuthoritativeRoutesBounded(self, *Arguments):
-                NativeAssignmentCalls.append(Arguments)
-                return self.Inner.PlanAuthoritativeRoutesBounded(*Arguments)
-
         # Candidate trees are deliberately controlled, but the assignment
-        # call remains the real Rust solver and is instrumented below.
+        # call remains the real Rust solver.  The typed route consumer now
+        # requires the exact native context, so the observable proof is the
+        # solver's nonzero work plus its selected capacity-bearing values.
         with patch.object(
             Portals,
             "_MaterializeCandidate",
             MaterializeControlledCandidate,
-        ), patch.object(
-            Flow,
-            "RustRoutingContext",
-            RecordingRoutingContext,
         ):
             Preparation = PrepareTrackAssignment(
                 Placement,
@@ -2388,7 +2344,8 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
 
         self.assertTrue(Preparation.Success)
         self.assertTrue(Preparation.Complete)
-        self.assertEqual(len(NativeAssignmentCalls), 1)
+        self.assertGreater(Preparation.ExpansionCount, 0)
+        self.assertGreaterEqual(MaterializedBySignal["B"], 2)
         self.assertEqual(
             dict(Preparation.SelectedCandidateIds),
             {
@@ -2420,7 +2377,6 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
                 ((40, 1, 40),)
             ).ResourceIds
         }.issubset(SelectedCapacityResources))
-        EncodedValues = NativeAssignmentCalls[0][0]
         ConflictingCandidateClaims = Resources.ResourceGraph.BuildRouteClaims(
             (ConflictPosition,)
         )
@@ -2430,17 +2386,9 @@ class AuthoritativeAssignmentsTests(AuthoritativePlannerTestBase):
                 ConflictingCandidateClaims,
             )
         )
-        self.assertIn(
-            ("A", SelectedChoiceId),
-            {(str(Value[0]), str(Value[1])) for Value in EncodedValues},
-        )
-        self.assertIn(
-            ("B", "B:conflicts-local"),
-            {(str(Value[0]), str(Value[1])) for Value in EncodedValues},
-        )
-        self.assertIn(
-            ("B", "B:compatible"),
-            {(str(Value[0]), str(Value[1])) for Value in EncodedValues},
+        self.assertEqual(
+            dict(Preparation.SelectedCandidateIds)["B"],
+            "B:compatible",
         )
 
     def testFrozenTrackAssignmentRejectsSameIdWithMutatedClaims(

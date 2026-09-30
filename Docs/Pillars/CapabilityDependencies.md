@@ -1187,3 +1187,16 @@ commit-ready development candidate, not persistent workers, unified native
 cancellation, N6 salvage, a successful seven-case physical acceptance matrix,
 Fabric acceptance, performance acceptance, promotion readiness, a push, or a
 change to protected `main`.
+
+
+## 2026-09-30 Joint typed coarse receipt consumer
+
+The [bounded consumer checkpoint](../Routing/Active/TypedNativeCoarseReceiptConsumer.md)
+starts from exact Joint `f64c92f21bb64ce22a5340cbbb78576e7e633198`, including
+Runtime `553d09665e9004292027a746c7902060ce40cf7f`. It completes the existing
+coarse-path WIP under coordinator-only physical acceptance, re-attests current
+authority, and preserves incomplete work without promoting it to a no-good.
+The original snapshot is retained; parser and regression-CI deliveries are not
+implicit dependencies. Detailed negotiation, live physical/backend acceptance,
+performance promotion, Router integration and public publication remain outside
+this checkpoint. Exact review/commit receipts live with the source-bound evidence.

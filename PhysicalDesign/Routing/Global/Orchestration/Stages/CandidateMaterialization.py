@@ -1,14 +1,60 @@
 """CandidateMaterialization phase of authoritative routing."""
 from __future__ import annotations
+from PhysicalDesign.Routing.Global.TypedRouteConsumer import (
+    BuildTypedRouteOriginDescriptor,
+    CanonicalAuthority,
+    CanonicalJson,
+    TypedRouteAdmissionRecord,
+    TypedRouteBatchCounters,
+    TypedRouteOriginDescriptor,
+    TypedRoutePhysicalEvidence,
+)
+from ..TypedRouteAuthority import (
+    ValidateTypedRouteMaterializationPublication,
+    ValidateTypedRouteOriginBeforeMaterialization,
+)
 from ..RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
 
+
+def PublishTypedPhysicalAdmissions(State):
+    """Publish provisional per-origin outcomes only after the live-state gate."""
+    for OriginIdentity, (Record, CandidateProduced) in State.TypedNativePendingPhysicalAdmissions.items():
+        State.TypedNativeRouteAdmissionByOriginIdentity[OriginIdentity] = Record
+        State.TypedNativeRouteAdmissionRecords.append(Record)
+        Batch = State.TypedNativeRouteBatchByOriginIdentity.get(OriginIdentity)
+        if isinstance(Batch, dict) and isinstance(Batch.get("Counters"), dict):
+            Counters = Batch["Counters"]
+            Counters["CandidateProduced"] += int(CandidateProduced)
+            Counters["PhysicallyAccepted" if Record.Admitted else "PhysicallyRejected"] += 1
+            TypedRouteBatchCounters.FromDictionary(Counters)
+            Batch["Admissions"].append(Record.ToDictionary())
+    State.TypedNativePendingPhysicalAdmissions.clear()
+
+
 def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
-    """Run the CandidateMaterialization phase against shared routing state."""
-    def SelectedAccessConflictSignals(Signal: str, Claims) -> tuple[str, ...]:
+    """Keep candidate work provisional until current authority is re-attested.
+
+    This boundary covers both ordinary outcomes and control-flow publications
+    such as prepared assignments and complete candidate-starvation failures.
+    """
+    try:
+        Outcome = _RunCandidateMaterialization(State, Services)
+    except Exception:
+        ValidateTypedRouteMaterializationPublication(State, Services)
+        PublishTypedPhysicalAdmissions(State)
+        raise
+    ValidateTypedRouteMaterializationPublication(State, Services)
+    PublishTypedPhysicalAdmissions(State)
+    return Outcome
+
+
+def _RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
+    """Construct candidates using sealed physical inputs for typed origins."""
+    def SelectedAccessConflictSignals(Signal: str, Claims, Inputs=None) -> tuple[str, ...]:
         return Services.FindForeignSelectedPinAccessConflictSignals(
             Signal,
             Claims,
-            State.ForeignSelectedPinAccessClaimsBySignal,
+            (State if Inputs is None else Inputs).ForeignSelectedPinAccessClaimsBySignal,
             Services.ComponentClaimsConflict,
         )
 
@@ -16,8 +62,9 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         Signal: str,
         Claims,
         RejectionCounts=None,
+        Inputs=None,
     ) -> tuple[str, ...]:
-        ConflictSignals = SelectedAccessConflictSignals(Signal, Claims)
+        ConflictSignals = SelectedAccessConflictSignals(Signal, Claims, Inputs)
         if not ConflictSignals:
             return ()
         State.ForeignSelectedAccessCandidateConflictBySignal[Signal] += 1
@@ -49,6 +96,96 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                 )
             ),
         }
+
+    def BuildTypedPhysicalEvidence(
+        RoutedTree,
+        *,
+        Accepted: bool,
+        Signal: str,
+        Profile,
+        Metadata: tuple[object, ...],
+        Reason: str,
+        MaterializationDiagnostics: dict[str, object],
+        ConflictResources=(),
+        ConflictingOwners=(),
+    ) -> TypedRoutePhysicalEvidence | None:
+        Origin = State.TypedNativeRouteNodeOriginRecords.get(id(RoutedTree))
+        if Origin is None:
+            return None
+        ResourceDocuments = tuple(sorted(
+            (
+                CanonicalAuthority(Resource)
+                for Resource in ConflictResources
+            ),
+            key=CanonicalJson,
+        ))
+        OwnerValues = tuple(sorted({str(Owner) for Owner in ConflictingOwners}))
+        _Scope, _Descriptors, _Nodes, Epoch = State.TypedNativeRouteOriginAuthorities[Origin.OriginIdentity]
+        if (Signal != Origin.OriginDescriptor.Signal
+                or Profile is not Epoch.Profiles[Signal]
+                or Metadata is not Epoch.Metadata[Origin.OriginalOrdinal]):
+            raise ValueError("typed route origin escaped its owned physical inputs")
+        # These exact owned objects were checked against this immutable
+        # descriptor before dispatch. Reuse its identity, while the physical
+        # predicates still produce a distinct result for every origin.
+        Descriptor = Origin.OriginDescriptor
+        return TypedRoutePhysicalEvidence(
+            Status="Accepted" if Accepted else "Rejected",
+            Reason=Reason,
+            Signal=Signal,
+            ConflictResources=ResourceDocuments,
+            ConflictingOwners=OwnerValues,
+            ResourceEvidenceAvailable=bool(ResourceDocuments),
+            OwnerEvidenceAvailable=bool(OwnerValues),
+            ProvenanceEvidenceAvailable=(Reason != "P1SelfClaimConflict"),
+            OriginDescriptorIdentity=Descriptor.Identity,
+            ImmutableFragmentIdentity=Descriptor.ImmutableFragmentIdentity,
+            MaterializationDiagnostics=CanonicalAuthority(
+                MaterializationDiagnostics
+            ),
+        )
+
+    def RecordTypedAdmission(
+        RoutedTree,
+        *,
+        Accepted: bool,
+        Evidence: TypedRoutePhysicalEvidence | None,
+        CandidateProduced: bool,
+    ) -> None:
+        """Attach one physical result to its typed native origin, if any.
+
+        Legacy and cached trees intentionally have no typed origin record.  A
+        typed result remains request-scoped; the physical materializer supplies
+        a separate per-origin admission outcome rather than modifying the
+        native receipt or borrowing another origin's result.
+        """
+        Origin = State.TypedNativeRouteNodeOriginRecords.get(id(RoutedTree))
+        if Origin is None:
+            return
+        if Evidence is None:
+            raise ValueError("typed routed origin is missing physical evidence")
+        if (Origin.OriginIdentity in State.TypedNativeRouteAdmissionByOriginIdentity
+                or Origin.OriginIdentity in State.TypedNativePendingPhysicalAdmissions):
+            raise ValueError("typed routed origin entered physical admission twice")
+        Record = TypedRouteAdmissionRecord(
+            OriginIdentity=Origin.OriginIdentity,
+            NativeKind=Origin.NativeKind,
+            Admitted=Accepted,
+            PhysicalEvidence=Evidence,
+            RecoveryAttribution=None,
+        )
+        State.TypedNativePendingPhysicalAdmissions[Origin.OriginIdentity] = (
+            Record, CandidateProduced,
+        )
+
+    def SelfConflictEvidence(Diagnostics, Signal):
+        """Read the first decisive predicate's bounded evidence, without rerunning it."""
+        Capture = Diagnostics.get("SelfClaimConflictEvidence", {})
+        Resources = tuple(
+            {"Kind": Value["Kind"], "Position": Value["Position"]}
+            for Value in Capture.get("Conflicts", ())
+        )
+        return Resources, ((Signal,) if Resources else ())
 
     for Signal in State.PhysicalCandidateConstructionOrder:
         if Signal in State.RegenerateSignals and State.CandidatesBySignal.get(Signal):
@@ -310,8 +447,15 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         if PhysicalPort is not None and PhysicalChannel is not None:
             State.PortableRouteDomainPreparationBySignal[Signal] = Services.PreparePortablePhysicalSignalRouteDomain(State.PhysicalAssemblyPlan, Signal, RouteShapeDescriptors, FixedRequiredNodes, SortedBlockedNodeBase, SeedStarts, DetachedSeedAnchors)
         State.PhysicalRequestDescriptorFingerprintsBySignal[Signal] = tuple((Services.BuildStableFingerprint(Descriptor.DomainIdentity()) for Descriptor in RouteShapeDescriptors))
-        for Request, DescriptorFingerprint in zip(RouteRequests, State.PhysicalRequestDescriptorFingerprintsBySignal[Signal]):
+        for Request, Metadata, DescriptorFingerprint in zip(
+            RouteRequests,
+            RouteMetadata,
+            State.PhysicalRequestDescriptorFingerprintsBySignal[Signal],
+        ):
             State.PhysicalDescriptorOwnerByRequestId[id(Request)] = (Signal, DescriptorFingerprint)
+            State.TypedNativeRouteRequestOriginDescriptorsById[id(Request)] = (
+                BuildTypedRouteOriginDescriptor(Signal, Profile, Metadata)
+            )
         if State.Resources.PreparingPhysicalComponentGlobalChannels and Signal in State.CachedCertifiedEmptySignals and (Signal in State.ApertureCandidateDomainIdentityBySignal):
             EarlyContinuation = Services.SelectReplayablePhysicalSignalRouteDomainContinuation(State.Resources.PhysicalSignalRouteDomainContinuationCache, State.ApertureCandidateDomainIdentityBySignal[Signal].StableDomainFingerprint, Signal, State.PhysicalRequestDomainFingerprintsBySignal[Signal], State.PhysicalRequestDescriptorFingerprintsBySignal[Signal])
             if EarlyContinuation is not None and Services.PhysicalSignalRouteDomainIsCertifiedEmpty(EarlyContinuation, Signal=Signal, PreSiblingDomainFingerprint=State.ApertureCandidateDomainIdentityBySignal[Signal].StableDomainFingerprint, RequestDomainFingerprint=State.PhysicalRequestDomainFingerprintsBySignal[Signal]):
@@ -555,7 +699,7 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         print(f'[debug] authoritative: initial native batch requests={len(BatchedInitialRequests)} fingerprint={Services.BuildStableFingerprint(BatchedInitialRequests)}', flush=True)
     (StagedInitialResult): Services.StagedInitialRouteTreeResult | None = None
     if UseMatureStagedInitialCandidateScheduler:
-        StagedInitialResult = Services.GenerateStagedInitialRouteTrees(State.CandidateSignalOrder, InitialRequestsBySignal, State.GenerateRouteTreesWithDeadline, lambda Signal: Services.MayAdvanceStagedCandidateOnExhaustion(State.ApplyMaturePortfolioSearchCaps, State.ExactLegalRetainedJointStateCount, Signal, State.JointHigherOrderConstraintSignals), WorkCheck=lambda Details: None if State.RouteTreeNativeDeadlineExceeded else State.CheckRuntimeBudget('MatureStagedInitialCandidateScheduler', Details), StopAfterEverySignalHasTree=bool((not State.PrepareTrackAssignmentOnly) and (State.CoordinatedCandidateDiversificationSignals or State.ApplyTopologyPressurePortfolioStagedProof or (State.PhysicalAssemblyPlan is not None and (not State.HasExactPhysicalAssemblyChannels)))))
+        StagedInitialResult = Services.GenerateStagedInitialRouteTrees(State.CandidateSignalOrder, InitialRequestsBySignal, State.GenerateRouteTreesWithDeadline, lambda Signal: not State.TypedNativeIncompleteKindsBySignal.get(Signal) and Services.MayAdvanceStagedCandidateOnExhaustion(State.ApplyMaturePortfolioSearchCaps, State.ExactLegalRetainedJointStateCount, Signal, State.JointHigherOrderConstraintSignals), WorkCheck=lambda Details: None if State.RouteTreeNativeDeadlineExceeded else State.CheckRuntimeBudget('MatureStagedInitialCandidateScheduler', Details), StopAfterEverySignalHasTree=bool((not State.PrepareTrackAssignmentOnly) and (State.CoordinatedCandidateDiversificationSignals or State.ApplyTopologyPressurePortfolioStagedProof or (State.PhysicalAssemblyPlan is not None and (not State.HasExactPhysicalAssemblyChannels)))))
         BatchedInitialTrees = list(StagedInitialResult.RouteTrees)
         State.RouteTreeBatchCount = StagedInitialResult.BatchCount
         State.WorkTelemetry['MatureStagedInitialCandidateScheduler'] = {'Applied': True, 'FullPoolGenerated': StagedInitialResult.FullPoolGenerated, 'EverySignalHasTree': StagedInitialResult.EverySignalHasTree, 'ExhaustedSignals': list(StagedInitialResult.ExhaustedSignals), 'ExecutedRequestCount': StagedInitialResult.ExecutedRequestCount, 'PlannedRequestCount': StagedInitialResult.PlannedRequestCount, 'BatchCount': StagedInitialResult.BatchCount, 'ExecutedRequestCountsBySignal': dict(StagedInitialResult.ExecutedRequestCountsBySignal), 'FirstSuccessfulRequestIndicesBySignal': dict(StagedInitialResult.FirstSuccessfulRequestIndicesBySignal)}
@@ -586,8 +730,16 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
     if bool(Services.os.environ.get('RCS_DEBUG_AUTHORITATIVE')):
         print(f'[debug] authoritative: initial native batch result routed={sum((Value is not None for Value in BatchedInitialTrees))} fingerprint={Services.BuildStableFingerprint(BatchedInitialTrees)}', flush=True)
     State.WorkTelemetry['InitialNativeCandidateBatchSeconds'] = round(Services.monotonic() - InitialNativeBatchStarted, 6)
-    if StagedInitialResult is not None and StagedInitialResult.ExhaustedSignals:
-        ExhaustedSignals = StagedInitialResult.ExhaustedSignals
+    if (
+        StagedInitialResult is not None
+        and StagedInitialResult.ExhaustedSignals
+        and not any(State.TypedNativeIncompleteKindsBySignal.get(Signal)
+                    for Signal in StagedInitialResult.ExhaustedSignals)
+    ):
+        ExhaustedSignals = tuple(
+            Signal for Signal in StagedInitialResult.ExhaustedSignals
+            if not State.TypedNativeIncompleteKindsBySignal.get(Signal)
+        )
         (ExhaustedSignalDiagnostics): dict[str, dict[str, object]] = {}
         for Signal in ExhaustedSignals:
             Profile = State.Profiles[Signal]
@@ -616,33 +768,178 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
             for RoutedTree, Metadata in zip(RoutedTrees, MetadataValues):
                 if RoutedTree is None:
                     continue
+                Epoch = ValidateTypedRouteOriginBeforeMaterialization(State, Services, RoutedTree)
+                Inputs = State if Epoch is None else Epoch
+                if Epoch is not None:
+                    Origin = State.TypedNativeRouteNodeOriginRecords[id(RoutedTree)]
+                    Metadata = Epoch.Metadata[Origin.OriginalOrdinal]
+                    Profile = Epoch.Profiles[Signal]
                 SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant = Metadata
                 (RejectionCounts): Services.Counter[str] = Services.Counter()
-                Candidate = Services.PortalOperations._MaterializeCandidate(Signal, Profile, SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant, RoutedTree, State.Region, State.Resources, State.Technology, State.Policy.DetailedRouting.LengthPenalty, State.Policy.DetailedRouting.CandidateBendWeight, State.Policy.DetailedRouting.CandidateViaWeight, State.Policy.DetailedRouting.LayerPenalty, 0 if State.CoarsePlan is None else (len(Guide.symmetric_difference(State.CoarsePlan.Guides[Signal])) + (0 if Layer == State.CoarsePlan.Layers[Signal] else State.Policy.GlobalRouting.OverflowPenalty)) * State.Policy.GlobalRouting.ExistingGuideHintWeight, State.Policy.DetailedRouting.RepeaterPenalty, RejectionCounts=RejectionCounts)
+                MaterializationDiagnostics: dict[str, object] = {}
+                Candidate = Services.PortalOperations._MaterializeCandidate(
+                    Signal,
+                    Profile,
+                    SourcePortal,
+                    TargetPortals,
+                    Guide,
+                    Layer,
+                    Axis,
+                    Lane,
+                    Variant,
+                    RoutedTree,
+                    Inputs.Region,
+                    Inputs.Resources,
+                    Inputs.Technology,
+                    Inputs.Policy.DetailedRouting.LengthPenalty,
+                    Inputs.Policy.DetailedRouting.CandidateBendWeight,
+                    Inputs.Policy.DetailedRouting.CandidateViaWeight,
+                    Inputs.Policy.DetailedRouting.LayerPenalty,
+                    0 if Inputs.CoarsePlan is None else (
+                        len(Guide.symmetric_difference(Inputs.CoarsePlan.Guides[Signal]))
+                        + (
+                            0
+                            if Layer == Inputs.CoarsePlan.Layers[Signal]
+                            else Inputs.Policy.GlobalRouting.OverflowPenalty
+                        )
+                    ) * Inputs.Policy.GlobalRouting.ExistingGuideHintWeight,
+                    Inputs.Policy.DetailedRouting.RepeaterPenalty,
+                    RejectionCounts=RejectionCounts,
+                    MaterializationDiagnostics=MaterializationDiagnostics,
+                )
                 if Candidate is None:
+                    SelfResources, SelfOwners = SelfConflictEvidence(
+                        MaterializationDiagnostics, Signal,
+                    )
+                    Evidence = BuildTypedPhysicalEvidence(
+                        RoutedTree,
+                        Accepted=False,
+                        Signal=Signal,
+                        Profile=Profile,
+                        Metadata=Metadata,
+                        Reason=(
+                            "P1SelfClaimConflict"
+                            if SelfResources
+                            else str(MaterializationDiagnostics.get(
+                                "Status",
+                                "MaterializationRejected",
+                            ))
+                        ),
+                        MaterializationDiagnostics=MaterializationDiagnostics,
+                        ConflictResources=SelfResources,
+                        ConflictingOwners=SelfOwners,
+                    )
+                    RecordTypedAdmission(
+                        RoutedTree,
+                        Accepted=False,
+                        Evidence=Evidence,
+                        CandidateProduced=False,
+                    )
                     continue
-                if RecordSelectedAccessCandidateConflict(
+                SelectedConflictSignals = RecordSelectedAccessCandidateConflict(
                     Signal,
                     Candidate.Claims,
                     RejectionCounts,
-                ):
+                    Inputs,
+                )
+                if SelectedConflictSignals:
+                    Evidence = BuildTypedPhysicalEvidence(
+                        RoutedTree,
+                        Accepted=False,
+                        Signal=Signal,
+                        Profile=Profile,
+                        Metadata=Metadata,
+                        Reason="ForeignSelectedAccessConflict",
+                        MaterializationDiagnostics=MaterializationDiagnostics,
+                        ConflictingOwners=SelectedConflictSignals,
+                    )
+                    RecordTypedAdmission(
+                        RoutedTree,
+                        Accepted=False,
+                        Evidence=Evidence,
+                        CandidateProduced=True,
+                    )
                     continue
-                if any((Claim.Signal != Signal and Services.ComponentClaimsConflict(Candidate.Claims, Claim.Claims) for Claim in State.FrozenComponentClaims)):
+                FrozenConflictOwners = tuple(sorted({
+                    str(Claim.Signal)
+                    for Claim in Inputs.FrozenComponentClaims
+                    if Claim.Signal != Signal
+                    and Services.ComponentClaimsConflict(
+                        Candidate.Claims,
+                        Claim.Claims,
+                    )
+                }))
+                if FrozenConflictOwners:
                     RejectionCounts['FrozenComponentConflict'] += 1
+                    Evidence = BuildTypedPhysicalEvidence(
+                        RoutedTree,
+                        Accepted=False,
+                        Signal=Signal,
+                        Profile=Profile,
+                        Metadata=Metadata,
+                        Reason="FrozenComponentConflict",
+                        MaterializationDiagnostics=MaterializationDiagnostics,
+                        ConflictingOwners=FrozenConflictOwners,
+                    )
+                    RecordTypedAdmission(
+                        RoutedTree,
+                        Accepted=False,
+                        Evidence=Evidence,
+                        CandidateProduced=True,
+                    )
                     continue
                 if Candidate.CandidateId not in State.PreSiblingCandidateIdsBySignal[Signal]:
                     State.PreSiblingCandidateIdsBySignal[Signal].add(Candidate.CandidateId)
                     State.PreSiblingCandidatesBySignal[Signal].append(Candidate)
                     State.PreSiblingCandidateMetadataBySignal[Signal][Candidate.CandidateId] = (Axis, Lane, Layer, Candidate.SeedNodeCount)
-                SiblingApertureConflictSignals = State.AssemblySpecificSiblingApertureConflictSignals(Signal, Candidate.Claims)
+                SiblingApertureConflictSignals = State.AssemblySpecificSiblingApertureConflictSignals(Signal, Candidate.Claims, AperturesBySignal=Inputs.AssemblySpecificSiblingAperturesBySignal)
                 if SiblingApertureConflictSignals:
                     RejectionCounts['SiblingApertureConflict'] += 1
                     State.CandidateDiagnostics.setdefault(Signal, {}).setdefault('SiblingApertureConflictSignals', [])[:] = sorted({*State.CandidateDiagnostics.get(Signal, {}).get('SiblingApertureConflictSignals', ()), *SiblingApertureConflictSignals})
+                    Evidence = BuildTypedPhysicalEvidence(
+                        RoutedTree,
+                        Accepted=False,
+                        Signal=Signal,
+                        Profile=Profile,
+                        Metadata=Metadata,
+                        Reason="SiblingApertureConflict",
+                        MaterializationDiagnostics=MaterializationDiagnostics,
+                        ConflictingOwners=SiblingApertureConflictSignals,
+                    )
+                    RecordTypedAdmission(
+                        RoutedTree,
+                        Accepted=False,
+                        Evidence=Evidence,
+                        CandidateProduced=True,
+                    )
                     continue
-                State.CandidatesBySignal[Signal].append(Candidate)
-                State.CandidateAxisLaneBySignal.setdefault(Signal, {})[Candidate.CandidateId] = (Axis, Lane, Layer, Candidate.SeedNodeCount)
-                SeedPoolPreMaterializedSignals.append(Signal)
-                break
+                if Signal not in SeedPoolPreMaterializedSignals:
+                    State.CandidatesBySignal[Signal].append(Candidate)
+                    State.CandidateAxisLaneBySignal.setdefault(
+                        Signal,
+                        {},
+                    )[Candidate.CandidateId] = (
+                        Axis,
+                        Lane,
+                        Layer,
+                        Candidate.SeedNodeCount,
+                    )
+                    SeedPoolPreMaterializedSignals.append(Signal)
+                Evidence = BuildTypedPhysicalEvidence(
+                    RoutedTree,
+                    Accepted=True,
+                    Signal=Signal,
+                    Profile=Profile,
+                    Metadata=Metadata,
+                    Reason="P1PhysicalAdmissionAccepted",
+                    MaterializationDiagnostics=MaterializationDiagnostics,
+                )
+                RecordTypedAdmission(
+                    RoutedTree,
+                    Accepted=True,
+                    Evidence=Evidence,
+                    CandidateProduced=True,
+                )
         State.WorkTelemetry['CoordinatedSeedPoolPreMaterialization'] = {'Applied': True, 'MaterializedSignalCount': len(SeedPoolPreMaterializedSignals), 'MaterializedSignals': sorted(SeedPoolPreMaterializedSignals), 'UnmaterializedSignals': sorted(set(State.CandidateSignalOrder) - set(SeedPoolPreMaterializedSignals) - {Signal for Signal in State.CandidateSignalOrder if State.CandidatesBySignal.get(Signal)})}
     CandidateSignalRank = {Signal: Index for Index, Signal in enumerate(State.CandidateSignalOrder)}
 
@@ -677,30 +974,228 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
 
         def MaterializeBatch(Trees: list[Any], MetadataValues: list[tuple[Any, ...]], *, SignalValue: str=Signal, ProfileValue: Any=Profile, RejectionCountsValue: Counter[str]=RejectionCounts) -> None:
             for RoutedTree, Metadata in zip(Trees, MetadataValues):
+                if RoutedTree is None:
+                    RejectionCountsValue["NoTree"] += 1
+                    continue
+                Origin = State.TypedNativeRouteNodeOriginRecords.get(id(RoutedTree))
+                PriorAdmission = (
+                    None if Origin is None else
+                    State.TypedNativeRouteAdmissionByOriginIdentity.get(Origin.OriginIdentity)
+                    or (State.TypedNativePendingPhysicalAdmissions.get(Origin.OriginIdentity) or (None,))[0]
+                )
+                if PriorAdmission is not None:
+                    # The seed pass already evaluated this exact origin. Do not
+                    # invent a second admission when its physical result was rejection.
+                    Status = PriorAdmission.PhysicalEvidence.MaterializationDiagnostics.get("Status")
+                    PriorReason = {
+                        "self-claim-conflict": "SelfClaimConflict",
+                        "no-repeater": "NoRepeater",
+                    }.get(Status, PriorAdmission.PhysicalEvidence.Reason)
+                    RejectionCountsValue[PriorReason] += 1
+                    continue
+                Epoch = ValidateTypedRouteOriginBeforeMaterialization(State, Services, RoutedTree)
+                Inputs = State if Epoch is None else Epoch
+                if Epoch is not None:
+                    Metadata = Epoch.Metadata[Origin.OriginalOrdinal]
+                    ProfileValue = Epoch.Profiles[SignalValue]
                 SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant = Metadata
-                Candidate = Services.PortalOperations._MaterializeCandidate(SignalValue, ProfileValue, SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant, RoutedTree, State.Region, State.Resources, State.Technology, State.Policy.DetailedRouting.LengthPenalty, State.Policy.DetailedRouting.CandidateBendWeight, State.Policy.DetailedRouting.CandidateViaWeight, State.Policy.DetailedRouting.LayerPenalty, 0 if State.CoarsePlan is None else (len(Guide.symmetric_difference(State.CoarsePlan.Guides[Signal])) + (0 if Layer == State.CoarsePlan.Layers[Signal] else State.Policy.GlobalRouting.OverflowPenalty)) * State.Policy.GlobalRouting.ExistingGuideHintWeight, State.Policy.DetailedRouting.RepeaterPenalty, RejectionCounts=RejectionCountsValue)
+                MaterializationDiagnostics: dict[str, object] = {}
+                def CrossConflictEvidence(OtherClaimsByOwner):
+                    ConflictResources = set()
+                    ConflictOwners = set()
+                    for Owner, OtherClaims in OtherClaimsByOwner:
+                        OwnerValue = str(Owner)
+                        if OwnerValue == SignalValue:
+                            continue
+                        Conflicts = Services.FindClaimConflicts({
+                            SignalValue: Candidate.Claims,
+                            OwnerValue: OtherClaims,
+                        })
+                        if Conflicts:
+                            ConflictResources.update(Conflicts)
+                            for Owners in Conflicts.values():
+                                ConflictOwners.update(Owners)
+                    return ConflictResources, ConflictOwners
+
+                Candidate = Services.PortalOperations._MaterializeCandidate(
+                    SignalValue,
+                    ProfileValue,
+                    SourcePortal,
+                    TargetPortals,
+                    Guide,
+                    Layer,
+                    Axis,
+                    Lane,
+                    Variant,
+                    RoutedTree,
+                    Inputs.Region,
+                    Inputs.Resources,
+                    Inputs.Technology,
+                    Inputs.Policy.DetailedRouting.LengthPenalty,
+                    Inputs.Policy.DetailedRouting.CandidateBendWeight,
+                    Inputs.Policy.DetailedRouting.CandidateViaWeight,
+                    Inputs.Policy.DetailedRouting.LayerPenalty,
+                    0 if Inputs.CoarsePlan is None else (
+                        len(Guide.symmetric_difference(Inputs.CoarsePlan.Guides[Signal]))
+                        + (
+                            0
+                            if Layer == Inputs.CoarsePlan.Layers[Signal]
+                            else Inputs.Policy.GlobalRouting.OverflowPenalty
+                        )
+                    ) * Inputs.Policy.GlobalRouting.ExistingGuideHintWeight,
+                    Inputs.Policy.DetailedRouting.RepeaterPenalty,
+                    RejectionCounts=RejectionCountsValue,
+                    MaterializationDiagnostics=MaterializationDiagnostics,
+                )
+                if Candidate is None:
+                    SelfResources, SelfOwners = SelfConflictEvidence(
+                        MaterializationDiagnostics, SignalValue,
+                    )
+                    Evidence = BuildTypedPhysicalEvidence(
+                        RoutedTree,
+                        Accepted=False,
+                        Signal=SignalValue,
+                        Profile=ProfileValue,
+                        Metadata=Metadata,
+                        Reason=(
+                            "P1SelfClaimConflict"
+                            if SelfResources
+                            else str(
+                                MaterializationDiagnostics.get(
+                                    "Status",
+                                    "MaterializationRejected",
+                                )
+                            )
+                        ),
+                        MaterializationDiagnostics=MaterializationDiagnostics,
+                        ConflictResources=SelfResources,
+                        ConflictingOwners=SelfOwners,
+                    )
+                    RecordTypedAdmission(
+                        RoutedTree,
+                        Accepted=False,
+                        Evidence=Evidence,
+                        CandidateProduced=False,
+                    )
+                    continue
                 if Candidate is not None:
-                    if RecordSelectedAccessCandidateConflict(
+                    SelectedAccessConflictOwners = RecordSelectedAccessCandidateConflict(
                         SignalValue,
                         Candidate.Claims,
                         RejectionCountsValue,
-                    ):
+                        Inputs,
+                    )
+                    if SelectedAccessConflictOwners:
+                        ConflictResources, ConflictOwners = CrossConflictEvidence(
+                            Inputs.ForeignSelectedPinAccessClaimsBySignal.get(SignalValue, ())
+                        )
+                        Evidence = BuildTypedPhysicalEvidence(
+                            RoutedTree,
+                            Accepted=False,
+                            Signal=SignalValue,
+                            Profile=ProfileValue,
+                            Metadata=Metadata,
+                            Reason="ForeignSelectedAccessConflict",
+                            MaterializationDiagnostics=MaterializationDiagnostics,
+                            ConflictResources=ConflictResources,
+                            ConflictingOwners=(
+                                ConflictOwners
+                                or set(SelectedAccessConflictOwners)
+                            ),
+                        )
+                        RecordTypedAdmission(
+                            RoutedTree,
+                            Accepted=False,
+                            Evidence=Evidence,
+                            CandidateProduced=True,
+                        )
                         continue
-                    if any((Claim.Signal != SignalValue and Services.ComponentClaimsConflict(Candidate.Claims, Claim.Claims) for Claim in State.FrozenComponentClaims)):
+                    FrozenConflicts = tuple(
+                        Claim
+                        for Claim in Inputs.FrozenComponentClaims
+                        if Claim.Signal != SignalValue
+                        and Services.ComponentClaimsConflict(
+                            Candidate.Claims,
+                            Claim.Claims,
+                        )
+                    )
+                    if FrozenConflicts:
                         RejectionCountsValue['FrozenComponentConflict'] += 1
+                        ConflictResources, ConflictOwners = CrossConflictEvidence(
+                            (Claim.Signal, Claim.Claims)
+                            for Claim in FrozenConflicts
+                        )
+                        Evidence = BuildTypedPhysicalEvidence(
+                            RoutedTree,
+                            Accepted=False,
+                            Signal=SignalValue,
+                            Profile=ProfileValue,
+                            Metadata=Metadata,
+                            Reason="FrozenComponentConflict",
+                            MaterializationDiagnostics=MaterializationDiagnostics,
+                            ConflictResources=ConflictResources,
+                            ConflictingOwners=ConflictOwners,
+                        )
+                        RecordTypedAdmission(
+                            RoutedTree,
+                            Accepted=False,
+                            Evidence=Evidence,
+                            CandidateProduced=True,
+                        )
                         continue
                     if Candidate.CandidateId not in State.PreSiblingCandidateIdsBySignal[SignalValue]:
                         State.PreSiblingCandidateIdsBySignal[SignalValue].add(Candidate.CandidateId)
                         State.PreSiblingCandidatesBySignal[SignalValue].append(Candidate)
                         State.PreSiblingCandidateMetadataBySignal[SignalValue][Candidate.CandidateId] = (Axis, Lane, Layer, Candidate.SeedNodeCount)
-                    SiblingApertureConflictSignals = State.AssemblySpecificSiblingApertureConflictSignals(SignalValue, Candidate.Claims)
+                    SiblingApertureConflictSignals = State.AssemblySpecificSiblingApertureConflictSignals(SignalValue, Candidate.Claims, AperturesBySignal=Inputs.AssemblySpecificSiblingAperturesBySignal)
                     if SiblingApertureConflictSignals:
                         RejectionCountsValue['SiblingApertureConflict'] += 1
                         State.CandidateDiagnostics[SignalValue]['SiblingApertureConflictSignals'] = sorted({*State.CandidateDiagnostics[SignalValue].get('SiblingApertureConflictSignals', ()), *SiblingApertureConflictSignals})
+                        ConflictResources, ConflictOwners = CrossConflictEvidence(
+                            Inputs.AssemblySpecificSiblingAperturesBySignal.get(
+                                SignalValue,
+                                (),
+                            )
+                        )
+                        Evidence = BuildTypedPhysicalEvidence(
+                            RoutedTree,
+                            Accepted=False,
+                            Signal=SignalValue,
+                            Profile=ProfileValue,
+                            Metadata=Metadata,
+                            Reason="SiblingApertureConflict",
+                            MaterializationDiagnostics=MaterializationDiagnostics,
+                            ConflictResources=ConflictResources,
+                            ConflictingOwners=(
+                                ConflictOwners
+                                or set(SiblingApertureConflictSignals)
+                            ),
+                        )
+                        RecordTypedAdmission(
+                            RoutedTree,
+                            Accepted=False,
+                            Evidence=Evidence,
+                            CandidateProduced=True,
+                        )
                         continue
                     State.CandidatesBySignal[SignalValue].append(Candidate)
                     State.CandidateDiagnostics[SignalValue]['Materialized'] += 1
                     State.CandidateAxisLaneBySignal.setdefault(SignalValue, {})[Candidate.CandidateId] = (Axis, Lane, Layer, Candidate.SeedNodeCount)
+                    Evidence = BuildTypedPhysicalEvidence(
+                        RoutedTree,
+                        Accepted=True,
+                        Signal=SignalValue,
+                        Profile=ProfileValue,
+                        Metadata=Metadata,
+                        Reason="P1PhysicalAdmissionAccepted",
+                        MaterializationDiagnostics=MaterializationDiagnostics,
+                    )
+                    RecordTypedAdmission(
+                        RoutedTree,
+                        Accepted=True,
+                        Evidence=Evidence,
+                        CandidateProduced=True,
+                    )
         if State.Resources.PreparingPhysicalComponentGlobalChannels:
 
             def ConsumePhysicalGlobalCandidateSuffix(MaximumRequestCount: int, *, SignalValue: str=Signal, RouteRequestsValue: list[Any]=RouteRequests, RouteMetadataValue: list[tuple[Any, ...]]=RouteMetadata, MaterializeBatchValue: Callable[[list[Any], list[tuple[Any, ...]]], None]=MaterializeBatch, RejectionCountsValue: Counter[str]=RejectionCounts) -> dict[str, object]:
@@ -721,6 +1216,8 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                     Diagnostics['DeferredRequests'] = max(0, int(Diagnostics['DeferredRequests']) - len(Requests))
                     Diagnostics['Rejections'] = dict(RejectionCountsValue)
                     ProgressIdentity = State.ApertureCandidateDomainIdentityBySignal[SignalValue]
+                    ValidateTypedRouteMaterializationPublication(State, Services)
+                    PublishTypedPhysicalAdmissions(State)
                     Progress, StrictlyAdvanced = Services.RetainPhysicalSignalRouteDomainDescriptorProgress(State.Resources.PhysicalSignalRouteDomainContinuationCache, PreSiblingDomainFingerprint=ProgressIdentity.StableDomainFingerprint, Signal=SignalValue, RequestDomainFingerprint=State.PhysicalRequestDomainFingerprintsBySignal[SignalValue], RequestDescriptorFingerprints=State.PhysicalRequestDescriptorFingerprintsBySignal[SignalValue], CompletedDescriptorFingerprints=State.CompletedPhysicalDescriptorFingerprintsBySignal[SignalValue], Candidates=State.PreSiblingCandidatesBySignal[SignalValue], CandidateMetadata=State.PreSiblingCandidateMetadataBySignal[SignalValue])
                     Diagnostics['DeferredRequests'] = len(Progress.RemainingDescriptorFingerprints)
                     State.WorkTelemetry.setdefault('PhysicalSignalRouteDomainDescriptorProgress', {})[SignalValue] = {**Progress.ToProgressDictionary(), 'StrictlyAdvanced': StrictlyAdvanced}
@@ -767,8 +1264,9 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
             State.CandidatesBySignal[Signal].append(Candidate)
         State.CandidateDiagnostics[Signal]['PriorCandidates'] = len(PriorValues)
         State.CandidateDiagnostics[Signal]['Rejections'] = dict(RejectionCounts)
+        TypedIncompleteKinds = State.TypedNativeIncompleteKindsBySignal.get(Signal, ())
         InitialRoutedTreeCountValue = int(State.CandidateDiagnostics[Signal]['RoutedTrees'])
-        InitialFixedLegalityRejectedEveryRoutedTree = bool(State.PlacementWasRelocated and InitialRoutedTreeCountValue > 0 and (sum((int(RejectionCounts.get(Reason, 0)) for Reason in ('SelfClaimConflict', 'NoRepeater'))) >= InitialRoutedTreeCountValue))
+        InitialFixedLegalityRejectedEveryRoutedTree = bool(not TypedIncompleteKinds and State.PlacementWasRelocated and InitialRoutedTreeCountValue > 0 and (sum((int(RejectionCounts.get(Reason, 0)) for Reason in ('SelfClaimConflict', 'NoRepeater'))) >= InitialRoutedTreeCountValue))
         CutScopedFixedLegalityContinuationApplied = False
         CutScopedFixedLegalityContinuationExhausted = False
         if Services.ShouldContinueCutScopedFixedLegalityWindow(PlacementWasRelocated=State.PlacementWasRelocated, ExactLegalRetainedJointStateCount=State.ExactLegalRetainedJointStateCount, HasCumulativeAssignmentConstraints=State.HasCumulativeAssignmentConstraints, CandidateDiversityLevel=State.CandidateDiversityLevel, ReservationVariant=State.ReservationVariant, LaneDiversityLevel=State.LaneDiversityLevel, SkipStrictPortalReservation=State.SkipStrictPortalReservation, Signal=Signal, JointAssignmentConstraintSignals=State.JointAssignmentConstraintSignals, RoutedTreeCount=InitialRoutedTreeCountValue, MaterializedCandidateCount=len(State.CandidatesBySignal[Signal]), AllRoutedTreesRejectedByFixedLegality=InitialFixedLegalityRejectedEveryRoutedTree, DeferredRequestCount=int(State.CandidateDiagnostics[Signal]['DeferredRequests']), HasCompleteClusterBoundaryLease=bool(State.BoundaryLeaseReservations)):
@@ -808,14 +1306,15 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                 ContinuationStart = ContinuationEnd
             State.WorkTelemetry.setdefault('PhysicalComponentGlobalCandidateContinuations', []).append({'Signal': Signal, 'ExecutedRequestCount': int(State.CandidateDiagnostics[Signal]['Requests']), 'RemainingRequestCount': int(State.CandidateDiagnostics[Signal]['DeferredRequests']), 'MaterializedCandidateCount': len(State.CandidatesBySignal[Signal]), 'ContinuationRequestLimit': ZeroWitnessContinuationRequestLimit, 'RecursiveRetryCount': 0})
         State.CandidateDiagnostics[Signal]['Rejections'] = dict(RejectionCounts)
-        if State.CoarsePlan is None:
+        SelectionInputs = State.TypedNativeMaterializationEpochBySignal.get(Signal, State)
+        if SelectionInputs.CoarsePlan is None:
 
             def CandidateOrder(Value: NetRouteCandidate) -> tuple[Any, ...]:
                 return (Value.MaterialCost, Value.FootprintGrowth, -State.CandidateAxisLaneBySignal[Signal][Value.CandidateId][3], Value.IncrementalMaterialCost, Value.IncrementalLength, Value.Length, Value.BendCount, Value.ViaCount, Value.CandidateId)
         else:
-            PlannedAxis = State.CoarsePlan.Axes[Signal]
-            PlannedLane = State.CoarsePlan.Lanes[Signal]
-            PlannedLayer = State.CoarsePlan.Layers[Signal]
+            PlannedAxis = SelectionInputs.CoarsePlan.Axes[Signal]
+            PlannedLane = SelectionInputs.CoarsePlan.Lanes[Signal]
+            PlannedLayer = SelectionInputs.CoarsePlan.Layers[Signal]
 
             def CandidateOrder(Value: NetRouteCandidate) -> tuple[Any, ...]:
                 CandidateAxis, CandidateLane, CandidateLayer, SeedNodes = State.CandidateAxisLaneBySignal[Signal][Value.CandidateId]
@@ -826,23 +1325,24 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
             CandidatesByTrack[Key].append(Candidate)
         for Values in CandidatesByTrack.values():
             Values.sort(key=CandidateOrder)
-        State.MaximumCandidates = min(State.Policy.TrackAssignment.MaximumRouteCandidatesPerNet, State.AdaptiveBudget.CandidatesPerNet) if State.Policy.AdaptiveRouting.Enabled else State.Policy.TrackAssignment.MaximumRouteCandidatesPerNet
-        if State.Policy.AdaptiveRouting.Enabled:
-            ClaimWork = max(1, Profile.Span) * max(1, len(Profile.Targets))
-            WorkScale = max(1, Services.ceil(Services.sqrt(ClaimWork / State.Policy.AdaptiveRouting.CandidateClaimWorkQuantum)))
-            SignalMaximumCandidates = max(State.Policy.AdaptiveRouting.MinimumCandidatesPerNet, min(State.MaximumCandidates * max(1, WorkScale), State.Policy.TrackAssignment.MaximumRouteCandidatesPerNet))
+        State.MaximumCandidates = min(SelectionInputs.Policy.TrackAssignment.MaximumRouteCandidatesPerNet, SelectionInputs.AdaptiveBudget.CandidatesPerNet) if SelectionInputs.Policy.AdaptiveRouting.Enabled else SelectionInputs.Policy.TrackAssignment.MaximumRouteCandidatesPerNet
+        if SelectionInputs.Policy.AdaptiveRouting.Enabled:
+            SelectionProfile = SelectionInputs.Profiles[Signal]
+            ClaimWork = max(1, SelectionProfile.Span) * max(1, len(SelectionProfile.Targets))
+            WorkScale = max(1, Services.ceil(Services.sqrt(ClaimWork / SelectionInputs.Policy.AdaptiveRouting.CandidateClaimWorkQuantum)))
+            SignalMaximumCandidates = max(SelectionInputs.Policy.AdaptiveRouting.MinimumCandidatesPerNet, min(State.MaximumCandidates * max(1, WorkScale), SelectionInputs.Policy.TrackAssignment.MaximumRouteCandidatesPerNet))
         else:
-            SignalMaximumCandidates = min(len(State.CandidatesBySignal[Signal]), State.Policy.TrackAssignment.MaximumRouteCandidatesPerNet)
+            SignalMaximumCandidates = min(len(State.CandidatesBySignal[Signal]), SelectionInputs.Policy.TrackAssignment.MaximumRouteCandidatesPerNet)
         State.CandidateLimitsBySignal[Signal] = SignalMaximumCandidates
-        PerLayer = max(1, SignalMaximumCandidates // State.LayerCount)
+        PerLayer = max(1, SignalMaximumCandidates // SelectionInputs.LayerCount)
         DiverseCandidates = []
-        if State.UnreservedPortalMode:
-            for Layer in range(State.LayerCount):
+        if SelectionInputs.UnreservedPortalMode:
+            for Layer in range(SelectionInputs.LayerCount):
                 LayerTracks = sorted((Values for (TrackLayer, _Guide), Values in CandidatesByTrack.items() if TrackLayer == Layer), key=lambda Values: CandidateOrder(Values[0]))
                 for Values in LayerTracks:
                     DiverseCandidates.extend(Values)
         else:
-            for Layer in range(State.LayerCount):
+            for Layer in range(SelectionInputs.LayerCount):
                 LayerTracks = sorted((Values for (TrackLayer, _Guide), Values in CandidatesByTrack.items() if TrackLayer == Layer), key=lambda Values: CandidateOrder(Values[0]))
                 LayerValues = []
                 VariantIndex = 0
@@ -861,6 +1361,7 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         State.CandidatesBySignal[Signal] = Services.SelectBoundedDiverseCandidatePool(DiverseCandidates, SignalMaximumCandidates, PriorCandidateIds)
         if State.Resources.PreparingPhysicalComponentGlobalChannels and Signal in State.ApertureCandidateDomainIdentityBySignal:
             ProgressIdentity = State.ApertureCandidateDomainIdentityBySignal[Signal]
+            ValidateTypedRouteMaterializationPublication(State, Services)
             Progress, ProgressStrictlyAdvanced = Services.RetainPhysicalSignalRouteDomainDescriptorProgress(State.Resources.PhysicalSignalRouteDomainContinuationCache, PreSiblingDomainFingerprint=ProgressIdentity.StableDomainFingerprint, Signal=Signal, RequestDomainFingerprint=State.PhysicalRequestDomainFingerprintsBySignal[Signal], RequestDescriptorFingerprints=State.PhysicalRequestDescriptorFingerprintsBySignal[Signal], CompletedDescriptorFingerprints=State.CompletedPhysicalDescriptorFingerprintsBySignal[Signal], Candidates=State.PreSiblingCandidatesBySignal[Signal], CandidateMetadata=State.PreSiblingCandidateMetadataBySignal[Signal])
             RemainingDescriptorCount = len(Progress.RemainingDescriptorFingerprints)
             State.CandidateDiagnostics[Signal]['DeferredRequests'] = RemainingDescriptorCount
@@ -868,19 +1369,36 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
             if Progress.Complete:
                 State.CompleteExteriorRouteDomainSignals.add(Signal)
                 State.IncompletePreSiblingDomainSignals.discard(Signal)
+        State.CandidateDiagnostics[Signal]["TypedNativeIncompleteKinds"] = sorted(
+            State.TypedNativeIncompleteKindsBySignal.get(Signal, ())
+        )
+        TypedP1Evidence = [
+            Record.PhysicalEvidence.ToDictionary()
+            for Record in (*State.TypedNativeRouteAdmissionRecords,
+                           *(Value[0] for Value in State.TypedNativePendingPhysicalAdmissions.values()))
+            if Record.PhysicalEvidence is not None
+            and Record.PhysicalEvidence.Signal == Signal
+        ]
+        if TypedP1Evidence:
+            State.CandidateDiagnostics[Signal][
+                "TypedNativeRouteP1Evidence"
+            ] = TypedP1Evidence
         if not State.CandidatesBySignal[Signal] and (not State.PreRouteLocalClaimChoicesBySignal.get(Signal)) and (not State.RouteTreeNativeDeadlineExceeded or Signal in State.CompleteExteriorRouteDomainSignals):
+            TypedIncompleteKinds = State.TypedNativeIncompleteKindsBySignal.get(Signal, ())
             Rejections = State.CandidateDiagnostics[Signal].get('Rejections', {})
             RoutedTreeCount = int(State.CandidateDiagnostics[Signal].get('RoutedTrees', 0))
-            FixedLegalityRejectedEveryRoutedTree = bool(State.PlacementWasRelocated and RoutedTreeCount > 0 and (sum((int(Rejections.get(Reason, 0)) for Reason in ('SelfClaimConflict', 'NoRepeater'))) >= RoutedTreeCount))
+            FixedLegalityRejectedEveryRoutedTree = bool(not TypedIncompleteKinds and State.PlacementWasRelocated and RoutedTreeCount > 0 and (sum((int(Rejections.get(Reason, 0)) for Reason in ('SelfClaimConflict', 'NoRepeater'))) >= RoutedTreeCount))
             SeedRejectedEveryRoutedTree = bool(FixedLegalityRejectedEveryRoutedTree and State.LocalClaimsBySignal.get(Signal))
             CandidateFailureFingerprint = Services.BuildStableFingerprint({'Signal': Signal, 'Diagnostics': State.CandidateDiagnostics[Signal], 'PortalReservations': [Value.ToDictionary() for Value in State.PortalReservations], 'LayerCount': State.LayerCount, 'LaneCount': State.RouteLaneCount})
             CandidateRequestDomainFingerprint = State.CandidateRequestShapeDomainFingerprintBySignal.get(Signal) if State.Resources.PreparingPhysicalComponentGlobalChannels else Services.BuildStableFingerprint(('native-route-request-domain-v1', Signal, tuple(State.RouteRequestsBySignal.get(Signal, ())[:State.InitialRequestLimit]), tuple(State.RouteMetadataBySignal.get(Signal, ())[:State.InitialRequestLimit]), State.LayerCount, State.RouteLaneCount))
             if State.Resources.PreparingPhysicalComponentGlobalChannels:
                 RemainingRequestCounts = Services.BuildPhysicalRouteDescriptorRemainingCounts(State.Resources.PhysicalSignalRouteDomainContinuationCache, State.ApertureCandidateDomainIdentityBySignal, State.PhysicalRequestDomainFingerprintsBySignal, State.PhysicalRequestDescriptorFingerprintsBySignal)
+                ValidateTypedRouteMaterializationPublication(State, Services)
                 CapturedCorridorDomains = Services.CaptureCompletePhysicalPortCorridorDomains(State.PhysicalAssemblyPlan, State.PreSiblingCandidatesBySignal, State.CandidateRequestShapeDomainFingerprintBySignal, RemainingRequestCounts, State.Resources)
+                ValidateTypedRouteMaterializationPublication(State, Services)
                 CapturedExteriorContinuations = Services.RetainCompletePhysicalSignalRouteDomainContinuations(State.Resources.PhysicalSignalRouteDomainContinuationCache, State.ApertureCandidateDomainIdentityBySignal, State.PhysicalRequestDescriptorFingerprintsBySignal, State.PhysicalRequestDomainFingerprintsBySignal, RemainingRequestCounts, State.PreSiblingCandidatesBySignal, State.PreSiblingCandidateMetadataBySignal)
                 CapturedPortableExteriorContinuations = Services.RetainCompletePortablePhysicalSignalRouteDomains(State.Resources.PhysicalGlobalApertureTemplateCache, State.PortableRouteDomainPreparationBySignal, RemainingRequestCounts, State.PreSiblingCandidatesBySignal, State.PreSiblingCandidateMetadataBySignal)
-                GlobalCandidateDomainComplete = Services.IsPhysicalCandidateRequestDomainComplete(int(State.CandidateDiagnostics[Signal].get('DeferredRequests', 0)), State.Deadline.IsExpired())
+                GlobalCandidateDomainComplete = not TypedIncompleteKinds and Services.IsPhysicalCandidateRequestDomainComplete(int(State.CandidateDiagnostics[Signal].get('DeferredRequests', 0)), State.Deadline.IsExpired())
                 IndependentEmptyCandidateDomainSignals = (Signal,) if GlobalCandidateDomainComplete and (not tuple(State.PreSiblingCandidatesBySignal.get(Signal, ()))) else ()
                 RequestApertureFactorNoGood = frozenset()
                 RequestAperturePortNoGood = frozenset()
@@ -892,6 +1410,7 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                     if RequestApertureFactorNoGood:
                         DependencyComponents = State.CandidateRequestDependencyComponentsBySignal.get(Signal, {})
                         SignalLocalRequestFactorProofComplete = Services.PhysicalSignalLocalCandidateRequestFactorProofComplete(Signal, DependencyComponents, State.Resources.PhysicalComponentExactGlobalChannelSignals, State.PhysicalPortGuidesBySignal, State.CertifiedApertureDomain)
+                        ValidateTypedRouteMaterializationPublication(State, Services)
                         State.Resources.RejectedPhysicalGlobalRequestApertureFactorSets.add(RequestApertureFactorNoGood)
                         RequestAperturePortNoGood = Services.BuildPhysicalRequestAperturePortNoGood(State.PhysicalAssemblyPlan, RequestApertureFactorNoGood, SignalLocalRequestFactorProofComplete=SignalLocalRequestFactorProofComplete, PortSolverCacheKey=Services.BuildPhysicalComponentPortSolverCacheKey(str(getattr(State.Resources.PreparedPhysicalComponentPortFactorDomain, 'DomainFingerprint', ''))) if getattr(State.Resources, 'PreparedPhysicalComponentPortFactorDomain', None) is not None else '')
                         if RequestAperturePortNoGood:
@@ -903,9 +1422,9 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                             State.Resources.RejectedPhysicalComponentPortReservationSets.update(AlternativeAperturePortNoGoods)
                 State.CandidateDiagnostics[Signal]['SiblingApertureSeamOwnership'] = dict(State.SiblingApertureSeamOwnershipBySignal.get(Signal, {}))
                 raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.TrackAssignmentConflict if GlobalCandidateDomainComplete else Services.RoutingFailureReason.DetailedSearchExhausted, Stage='PhysicalComponentGlobalCandidateDomain', AffectedNets=tuple(dict.fromkeys((Signal, *map(str, State.CandidateDiagnostics[Signal].get('SiblingApertureConflictSignals', ()))))), RepairActions=(), Detail='the fixed physical assembly produced no route in its current finite global candidate domain', Diagnostics={'PhysicalComponentGlobalPlanning': True, 'GlobalPlanDomainComplete': GlobalCandidateDomainComplete, 'CompleteAssignmentCutProof': GlobalCandidateDomainComplete, 'IndependentEmptyCandidateDomainSignals': list(IndependentEmptyCandidateDomainSignals), 'CandidateDomainFingerprint': CandidateRequestDomainFingerprint, 'CandidateDiagnostics': State.CandidateDiagnostics[Signal], 'RemainingRequestCounts': RemainingRequestCounts, 'PhysicalPortCorridorDomains': [Domain.ToDictionary() for Domain in CapturedCorridorDomains], 'PhysicalPortCorridorDomainCacheSize': len(State.Resources.PhysicalPortCorridorDomainCache), 'PhysicalExteriorRouteDomains': [{'Signal': Value.Signal, 'StableDomainFingerprint': Value.PreSiblingDomainFingerprint, 'CandidateCount': len(Value.Candidates), 'Complete': Value.Complete} for Value in CapturedExteriorContinuations], 'PortablePhysicalExteriorRouteDomainsPublished': [{'Signal': Value.Signal, 'PortableDomainFingerprint': Value.PortableDomainFingerprint, 'CandidateCount': len(Value.Candidates), 'Complete': Value.Complete} for Value in CapturedPortableExteriorContinuations], 'PortablePhysicalExteriorRouteDomainBucketCount': sum((str(Key).startswith('portable-route-domain-bucket:') for Key in State.Resources.PhysicalGlobalApertureTemplateCache)), 'RequestApertureFactorProofComplete': bool(RequestApertureFactorNoGood), 'SignalLocalRequestFactorProofComplete': SignalLocalRequestFactorProofComplete, 'RequestApertureFactorNoGood': [list(Key) for Key in sorted(RequestApertureFactorNoGood)], 'RequestAperturePortNoGood': [list(Key) for Key in sorted(RequestAperturePortNoGood)], 'AlternativeAperturePortNoGoods': [[list(Key) for Key in sorted(Clause)] for Clause in AlternativeAperturePortNoGoods], 'ExecutableLegacyRepairCascade': False}))
-            if State.HasPhysicalComponentRoutingContract and RoutedTreeCount == 0 and (int(State.CandidateDiagnostics[Signal].get('Requests', 0)) > 0):
+            if not TypedIncompleteKinds and State.HasPhysicalComponentRoutingContract and RoutedTreeCount == 0 and (int(State.CandidateDiagnostics[Signal].get('Requests', 0)) > 0):
                 raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.DetailedSearchExhausted, Stage='Candidate', AffectedNets=(Signal,), RepairActions=(), Detail='the immutable routed-component state blocked a complete bounded global candidate window', Diagnostics={'Action': 'advance-routed-component-global-starvation', 'CandidateDiagnostics': State.CandidateDiagnostics[Signal], 'CandidateFailureFingerprint': CandidateFailureFingerprint, 'CandidateDiversityLevel': State.CandidateDiversityLevel, 'RoutedComponentGlobalHandoff': {'Enabled': True, 'Disposition': 'advance-access-distinct-component-state'}}))
-            if Services.ShouldRejectRoutedComponentForeignEscape(HasRoutedComponentTemplate=State.HasRoutedComponentTemplate, IsSelectedForeignEscape=Signal in State.RoutedComponentForeignEscapeSignals, CandidateDiversityLevel=State.CandidateDiversityLevel, CandidateCount=len(State.CandidatesBySignal[Signal])):
+            if not TypedIncompleteKinds and Services.ShouldRejectRoutedComponentForeignEscape(HasRoutedComponentTemplate=State.HasRoutedComponentTemplate, IsSelectedForeignEscape=Signal in State.RoutedComponentForeignEscapeSignals, CandidateDiversityLevel=State.CandidateDiversityLevel, CandidateCount=len(State.CandidatesBySignal[Signal])):
                 raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.TrackAssignmentConflict, Stage='Candidate', AffectedNets=(Signal,), RepairActions=(), Detail='the selected routed-component foreign escape has no legal global continuation after the bounded handoff windows', Diagnostics={'Action': 'reject-routed-component-foreign-escape', 'CandidateDiagnostics': State.CandidateDiagnostics[Signal], 'CandidateFailureFingerprint': CandidateFailureFingerprint, 'CandidateDiversityLevel': State.CandidateDiversityLevel, 'SelectedForeignEscapeSignal': True, 'RoutedComponentGlobalHandoff': {'Enabled': True, 'Disposition': 'return-selected-escape-no-good-to-component-csp'}}))
 
             def RaiseTerminalCandidateIncomplete(Action: str) -> None:
@@ -915,10 +1434,14 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
                 if State.PrepareTrackAssignmentOnly:
                     raise Services.TrackAssignmentPrepared(Services.TrackAssignmentPreparation(Success=False, SelectedCandidateIds=(), CandidateCounts=tuple(sorted(((str(CandidateSignal), len(CandidateValues)) for CandidateSignal, CandidateValues in State.CandidatesBySignal.items()))), ConflictSignals=(str(Signal),), ConflictResourceIndices=(), ExpansionCount=0, Complete=False, IncompleteReason=Action, Diagnostics=tuple(sorted(((str(Key), Value) for Key, Value in {**State.CandidateDiagnostics[Signal], 'PortalTupleFeasibility': State.PortalTupleFeasibilityBySignal.get(Signal, ())}.items())))))
                 raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='Candidate', AffectedNets=(str(Signal),), RepairActions=(), Detail='the one fixed candidate domain produced no legal route; automatic relaunch is disabled', Diagnostics={'Action': 'terminal-fixed-domain-incomplete', 'RejectedAutomaticAction': Action, 'Complete': False, 'CandidateFailureFingerprint': CandidateFailureFingerprint, 'CandidateDiagnostics': State.CandidateDiagnostics[Signal], 'PortalTupleFeasibility': State.PortalTupleFeasibilityBySignal.get(Signal, ())}))
-            RaiseTerminalCandidateIncomplete('fixed-domain-exhausted')
+            RaiseTerminalCandidateIncomplete(
+                "typed-native-incomplete:" + ",".join(sorted(TypedIncompleteKinds))
+                if TypedIncompleteKinds else "fixed-domain-exhausted"
+            )
         if not State.RouteTreeNativeDeadlineExceeded:
             State.CheckRuntimeBudget('Candidate')
     if State.FrozenPreparedPortalCache is not None and (not State.PrepareClusterInterfaceAssignmentOnly) and (not State.ValidateClusterInterfaceForeignAccessOnly) and all((State.CandidatesBySignal.get(Signal) or State.PreRouteLocalClaimChoicesBySignal.get(Signal) for Signal in State.Profiles)):
+        ValidateTypedRouteMaterializationPublication(State, Services)
         State.Resources.FrozenInterfaceGlobalCandidateCache = {Signal: tuple(Values) for Signal, Values in State.CandidatesBySignal.items()}
         State.Resources.FrozenInterfaceGlobalCandidateMetadata = {Signal: dict(Values) for Signal, Values in State.CandidateAxisLaneBySignal.items()}
         State.Resources.FrozenInterfaceGlobalCandidatePlacementIdentity = id(State.Placed)
@@ -928,6 +1451,19 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
         if PreparedAssignment is None:
             raise State.StructuredRoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ClusterInterfaceUnsatisfiable, Stage='ClusterInterfaceUnsatisfiable', Detail='the qualifying placement produced no complete cluster-interface ownership assignment', Diagnostics={'InterfaceAssignment': None, 'ClusterBoundaryLeases': dict(State.WorkTelemetry.get('ClusterBoundaryLeases', {}))}))
         raise Services.ClusterInterfaceAssignmentPrepared(PreparedAssignment)
+    MissingTypedAdmissions = tuple(
+        Record.OriginIdentity
+        for Record in State.TypedNativeRouteOriginRecords
+        if Record.NativeKind == "Routed"
+        and Record.OriginIdentity
+        not in State.TypedNativeRouteAdmissionByOriginIdentity
+        and Record.OriginIdentity not in State.TypedNativePendingPhysicalAdmissions
+    )
+    if MissingTypedAdmissions:
+        raise ValueError(
+            "typed routed origins did not all enter physical admission: "
+            + ",".join(MissingTypedAdmissions)
+        )
     NativeDeadlineIncompleteSignals = tuple(sorted((Signal for Signal in State.Profiles if not State.CandidatesBySignal.get(Signal) and (not State.PreRouteLocalClaimChoicesBySignal.get(Signal)) and (Signal not in State.CompleteExteriorRouteDomainSignals))))
     if State.RouteTreeNativeDeadlineExceeded and NativeDeadlineIncompleteSignals:
         Services.EnforceRoutingRuntimeLimit(Deadline=State.Deadline, AdaptiveStartedAt=State.RoutingStarted, AdaptiveExpiresAt=State.AdaptiveExpiresAt, Stage='Candidate', Diagnostics={**State.CurrentRuntimeBudgetDiagnostics(), 'PhysicalSignalRouteDomainDescriptorProgress': dict(State.WorkTelemetry.get('PhysicalSignalRouteDomainDescriptorProgress', {})), 'DescriptorProgressPublished': True, 'NativeDeadlineIncompleteSignals': list(NativeDeadlineIncompleteSignals), 'RawResultCacheAuthoritative': False, 'GlobalPlanDomainComplete': False, 'CompleteAssignmentCutProof': False}, NativeDeadlineExceeded=True)

@@ -69,13 +69,31 @@ def FailurePrefersDirectOnlyPlacement(
     ConflictGraph = (Failure.Diagnostics or {}).get("ConflictGraph", {})
     if not isinstance(ConflictGraph, dict):
         return False
+    StarvationSignals = ExtractCandidateStarvationSignals(Failure)
+    PreOwnedConflictSignals = ExtractAuthoritativePreOwnedConflictSignals(Failure)
     return (
         ConflictGraph.get("Classification")
         == "higher-order-placement-conflict"
         and not ConflictGraph.get("NoCandidateSignals")
         and not ConflictGraph.get("PairwiseIncompatibleEdges")
-        and bool(ExtractCandidateStarvationSignals(Failure))
+        and bool(StarvationSignals)
+        and StarvationSignals <= PreOwnedConflictSignals
     )
+
+
+def ExtractAuthoritativePreOwnedConflictSignals(
+    Failure: RoutingFailure,
+) -> frozenset[str]:
+    """Do not infer pre-owned contributors from a route-level self-conflict.
+
+    Current P1 capture identifies conflicting claim kinds and the signal, but
+    explicitly lacks contributor provenance. Descriptor/fragment hashes bind
+    the origin; they do not prove that releasing pre-owned local claims can
+    resolve this conflict. Keep this recovery unavailable until its producer
+    supplies that causal evidence.
+    """
+    return frozenset()
+
 
 def ExtractCandidateStarvationSignals(
     Failure: RoutingFailure,

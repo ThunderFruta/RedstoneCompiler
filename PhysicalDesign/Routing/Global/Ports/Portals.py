@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .MaterializationEvidence import CaptureMaterializationSelfConflict
+
 from ....Redstone.Rules import PropagateRoutePower
 
 from ....Redstone.Rules import PruneRedundantRepeaterReservations
@@ -1247,6 +1249,9 @@ def _MaterializeCandidate(
     RejectionCounts: Counter[str] | None = None,
     MaterializationDiagnostics: dict[str, object] | None = None,
 ) -> NetRouteCandidate | None:
+    if MaterializationDiagnostics is not None:
+        MaterializationDiagnostics.pop("SelfClaimConflictEvidence", None)
+
     def RecordMaterialization(
         Reason: str,
         **Diagnostics: object,
@@ -1290,9 +1295,28 @@ def _MaterializeCandidate(
             )
         if RejectionCounts is not None:
             RejectionCounts["SelfClaimConflict"] += 1
+        EvidenceDiagnostics: dict[str, object] = {}
+        if MaterializationDiagnostics is not None:
+            try:
+                EvidenceDiagnostics["SelfClaimConflictEvidence"] = (
+                    CaptureMaterializationSelfConflict(
+                        Signal, Nodes, Claims, SelfClaimConflicts,
+                    ).ToDictionary()
+                )
+            except Exception as Error:
+                # Reporting failure cannot replace physical rejection. Control
+                # flow exceptions (including cancellation) still propagate.
+                EvidenceDiagnostics["SelfClaimConflictEvidence"] = {
+                    "SchemaVersion": "materialization-self-conflict-evidence-v1",
+                    "Scope": "FirstDecisiveMaterializationSelfClaimPredicate",
+                    "CaptureStatus": "Unavailable",
+                    "Omissions": ["CaptureError"],
+                    "ErrorType": type(Error).__name__,
+                }
         RecordMaterialization(
             "self-claim-conflict",
             ConflictCount=len(SelfClaimConflicts),
+            **EvidenceDiagnostics,
         )
         return None
     Graph = _BuildCandidateGraph(Nodes, Resources.ResourceGraph)

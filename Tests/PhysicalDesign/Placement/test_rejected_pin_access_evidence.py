@@ -53,6 +53,9 @@ from PhysicalDesign.Redstone.Rules.Geometry import BuildRoutingResources
 from PhysicalDesign.Redstone.Technology import (
     DefaultRedstoneRoutingTechnology,
 )
+from PhysicalDesign.Orchestration.PlacementAttempts import (
+    PlacementAccessCoreProvesPreOwnedFrozenRouteConflict,
+)
 
 
 Technology = DefaultRedstoneRoutingTechnology
@@ -423,7 +426,7 @@ def test_foreign_static_rejection_never_retraverses_static_role_sources(
 
 
 def test_self_claim_rejection_retains_support_wire_roles_and_real_provenance():
-    _Source, _Graph, _Frozen, Domains, Domain, Attempt = _SelfClaimFixture()
+    _Source, _Graph, Frozen, Domains, Domain, Attempt = _SelfClaimFixture()
 
     assert Domain.Options == ()
     assert Attempt.Status is PlacementAccessPatternAttemptStatus.Rejected
@@ -469,6 +472,25 @@ def test_self_claim_rejection_retains_support_wire_roles_and_real_provenance():
     assert Solve.ConflictCore.RejectionBlockingResources == (
         "Support:0,1,4",
     )
+    assert PlacementAccessCoreProvesPreOwnedFrozenRouteConflict(
+        Solve,
+        Frozen,
+    ) is True
+
+
+def test_access_domain_rejection_is_not_a_preowned_route_conflict_core():
+    _Gates, _Graph, Domains, Domain, Attempt = _ForeignStaticFixture()
+    assert Domain.Options == ()
+    assert Attempt.Reason is (
+        PlacementAccessPatternAttemptReason.ForeignStaticExclusion
+    )
+    Solve = SolvePlacedPinAccessOptionDomains(Domains)
+    assert Solve.Status is PlacementAccessSolveStatus.Unsatisfiable
+
+    assert PlacementAccessCoreProvesPreOwnedFrozenRouteConflict(
+        Solve,
+        {"A": ((99, 1, 99),)},
+    ) is False
 
 
 def test_occupancy_electrical_support_and_air_relations_remain_distinct():
