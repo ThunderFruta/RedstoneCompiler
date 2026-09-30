@@ -2,10 +2,8 @@
 
 from copy import deepcopy
 import json
-import os
 from pathlib import Path
 import runpy
-import subprocess
 import sys
 
 import pytest
@@ -184,3 +182,18 @@ def test_ci_environment_removes_ambient_routing_controls(monkeypatch):
     assert not any(Name in Environment for Name in ("RC_RUN_SCALE_TESTS", "RC_UNRELATED_TOKEN", "RCS_PRIVATE", "PYTHONPATH"))
     assert Environment["RC_TEMPLATE_ROOT"] == str(RepositoryRoot / "Assets/Templates")
     assert Environment["PYTHONHASHSEED"] == "0"
+
+
+def test_ci_hash_locked_oracle_matches_owner_dependency_pins():
+    Expected = {
+        Line.strip() for Line in (RepositoryRoot / "Tests/Compiler/Synthesis/oracle-requirements.txt").read_text().splitlines()
+        if Line.strip() and not Line.startswith("#")
+    }
+    Locked = {
+        Line.split(" --hash=sha256:")[0] for Line in (RepositoryRoot / "Tools/CI/requirements.txt").read_text().splitlines()
+        if " --hash=sha256:" in Line
+    }
+    assert Expected <= Locked
+    Environment = CleanEnvironment()
+    assert Environment["RC_REQUIRE_SOURCE_ORACLE"] == "1"
+    assert Environment["RC_YOSYS"] == str(Path(sys.executable).parent / "yowasp-yosys")
