@@ -9,7 +9,10 @@ acceptance or promotion readiness.
 - **Python and Rust (no physical acceptance)**: clean exact-commit checkout,
   Rust format and locked release tests, a fresh release extension build,
   compile-all, structural/schema tests, complete test collection and deterministic
-  pytest. Ambient scale/routing controls and Python import overrides are removed.
+  pytest. The independent source-to-NAND Yosys oracle is installed from the
+  hash-locked CI requirements and required, so missing semantic proofs fail
+  instead of silently skipping. Ambient scale/routing controls and Python import
+  overrides are removed.
 - **Java harness unit tests (no live Fabric)**: checksum-verified Gradle wrapper,
   harness `test build`, dependency report, Java and Gradle identity.
 - **Seven-case physical acceptance**: separate manual workflow, unavailable by
@@ -137,7 +140,8 @@ subset contains every original archive file. No environment dump, tokens,
 private configuration, server directory, world, build cache, downloaded JAR,
 native binary or unrelated file belongs in an artifact. Ambient `RC_*`/`RCS_*`
 variables are removed before the existing harness can record them, except the
-controlled canonical template and dedicated runtime roots.
+controlled canonical template/dedicated runtime roots and required independent
+source-oracle executable settings.
 
 Ordinary command failure preserves its exit/log and makes the tier fail; a
 native build/provenance failure prevents stale-native Python testing. Command logs stream directly to evidence files; setup failures retain a distinct

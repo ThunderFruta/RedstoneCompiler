@@ -39,6 +39,8 @@ def CleanEnvironment() -> dict[str, str]:
         "PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1",
         "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
         "RC_TEMPLATE_ROOT": str(RepositoryRoot / "Assets/Templates"),
+        "RC_REQUIRE_SOURCE_ORACLE": "1",
+        "RC_YOSYS": str(Path(sys.executable).parent / "yowasp-yosys"),
         "PYO3_PYTHON": sys.executable,
         "VIRTUAL_ENV": sys.prefix,
         "CARGO_TARGET_DIR": str(RepositoryRoot / "Cache/Rust/target"),
@@ -114,7 +116,8 @@ def Main() -> int:
         "DependencyFiles": {
             Name: FileHash(RepositoryRoot / Name)
             for Name in (
-                "Tools/CI/requirements.txt", "Kernels/Routing/Cargo.lock", "pyproject.toml",
+                "Tools/CI/requirements.txt", "Tests/Compiler/Synthesis/oracle-requirements.txt",
+                "Kernels/Routing/Cargo.lock", "pyproject.toml",
                 "Validation/Fabric/ServerHarness/gradle.properties",
                 "Validation/Fabric/ServerHarness/gradle/wrapper/gradle-wrapper.properties",
                 "Validation/Fabric/ServerHarness/build.gradle",
