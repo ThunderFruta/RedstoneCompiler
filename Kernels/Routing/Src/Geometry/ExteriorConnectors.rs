@@ -34,6 +34,8 @@ fn SearchExteriorConnector(
     Field: &FrozenExteriorConnectorField,
     Values: ExteriorConnectorRequestValues,
 ) -> ExteriorConnectorResultValues {
+    #[cfg(test)]
+    crate::Core::Runtime::BatchExecutionWitness::RecordItem();
     let (_FieldIndex, Start, BlockedLocalNodes) = Values;
     let mut Targets = Field.Targets.clone();
     Targets.sort_unstable_by_key(|Target| {
@@ -250,6 +252,8 @@ fn BuildFabricSubtreeValues(
     Adjacency: &HashMap<Position, Vec<Position>>,
     Attachments: Vec<Position>,
 ) -> FabricSubtreeValues {
+    #[cfg(test)]
+    crate::Core::Runtime::BatchExecutionWitness::RecordItem();
     let Required = Attachments.into_iter().collect::<BTreeSet<_>>();
     let Root = *Required.iter().next()?;
     let mut Parents = HashMap::new();
@@ -366,4 +370,91 @@ pub(crate) fn BuildFabricSubtreesBatchWithTelemetry(
 ) -> (Vec<FabricSubtreeValues>, usize) {
     PythonValue
         .allow_threads(|| BuildFabricSubtreesBatchNative(NodeValues, EdgeValues, AttachmentSets))
+}
+
+#[cfg(test)]
+pub(crate) fn AssertNativeBatchExecution(Capacity: usize) {
+    use crate::Core::Runtime::BatchExecutionWitness::{AssertBatch, BatchSizes};
+
+    for Count in BatchSizes(Capacity) {
+        let mut Fields = Vec::new();
+        let mut Requests = Vec::new();
+        let mut Expected = Vec::new();
+        for Index in (0..Count).rev() {
+            let X = 4 * Index as i32;
+            let (First, Middle, Last) = ((X, 0, 0), (X + 1, 0, 0), (X + 2, 0, 0));
+            let FieldIndex = Fields.len();
+            Fields.push((
+                vec![Last],
+                First,
+                Last,
+                vec![],
+                (X, X + 2, 0, 0),
+                vec![First, Middle, Last],
+                vec![(First, Middle), (Middle, Last)],
+            ));
+            match Index % 3 {
+                0 => {
+                    Requests.push((FieldIndex, First, vec![]));
+                    Expected.push((vec![First, Middle, Last], true, false, 0));
+                }
+                1 => {
+                    Requests.push((FieldIndex, First, vec![Middle]));
+                    Expected.push((vec![], false, true, 1));
+                }
+                _ => {
+                    Requests.push((FieldIndex, Last, vec![]));
+                    Expected.push((vec![Last], true, false, 0));
+                }
+            }
+        }
+        AssertBatch("frozen exterior", Capacity, Count, || {
+            let (Results, Active) = SearchExteriorConnectorsBatchNative(Fields, Requests);
+            assert_eq!(
+                Results, Expected,
+                "ordered exterior results for {Count} inputs"
+            );
+            assert_eq!(Active, Capacity.min(Count), "exterior active telemetry");
+        });
+
+        let mut Nodes = Vec::new();
+        let mut Edges = Vec::new();
+        let mut Attachments = Vec::new();
+        let mut Expected = Vec::new();
+        for Index in (0..Count).rev() {
+            let X = 4 * Index as i32;
+            let (First, Middle, Last) = ((X, 0, 0), (X + 1, 0, 0), (X + 2, 0, 0));
+            Nodes.extend([First, Middle, Last]);
+            Edges.extend([(First, Middle), (Middle, Last)]);
+            match Index % 4 {
+                0 => {
+                    Attachments.push(vec![Last, First, Last]);
+                    Expected.push(Some((
+                        vec![First, Middle, Last],
+                        vec![(First, Middle), (Middle, Last)],
+                    )));
+                }
+                1 => {
+                    Attachments.push(vec![Middle, Middle]);
+                    Expected.push(Some((vec![Middle], vec![])));
+                }
+                2 => {
+                    Attachments.push(vec![]);
+                    Expected.push(None);
+                }
+                _ => {
+                    Attachments.push(vec![First, (X + 3, 0, 0)]);
+                    Expected.push(None);
+                }
+            }
+        }
+        AssertBatch("fabric subtrees", Capacity, Count, || {
+            let (Results, Active) = BuildFabricSubtreesBatchNative(Nodes, Edges, Attachments);
+            assert_eq!(
+                Results, Expected,
+                "ordered fabric subtrees for {Count} inputs"
+            );
+            assert_eq!(Active, Capacity.min(Count), "fabric active telemetry");
+        });
+    }
 }

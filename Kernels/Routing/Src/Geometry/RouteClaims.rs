@@ -79,6 +79,8 @@ fn BuildRouteClaimValues(
     ActualBlocks: &std::collections::HashSet<Position>,
     SolidBlocks: &std::collections::HashSet<Position>,
 ) -> RouteClaimValues {
+    #[cfg(test)]
+    crate::Core::Runtime::BatchExecutionWitness::RecordItem();
     let Wire: std::collections::BTreeSet<Position> = Values.into_iter().collect();
     let mut Support = std::collections::BTreeSet::new();
     let mut Air = std::collections::BTreeSet::new();
@@ -305,4 +307,45 @@ pub(crate) fn BuildDeferredRouteClaimsBatchWithTelemetry(
     NodeSets: Vec<Vec<Position>>,
 ) -> (Vec<DeferredRouteClaimValues>, usize) {
     PythonValue.allow_threads(|| BuildDeferredRouteClaimsBatchNative(NodeSets))
+}
+
+#[cfg(test)]
+pub(crate) fn AssertNativeBatchExecution(Capacity: usize) {
+    use crate::Core::Runtime::BatchExecutionWitness::{AssertBatch, BatchSizes};
+
+    for Count in BatchSizes(Capacity) {
+        let mut Inputs = Vec::new();
+        let mut Expected = Vec::new();
+        for Index in (0..Count).rev() {
+            let X = 4 * Index as i32;
+            Inputs.push(vec![(X, 1, 0), (X, 1, 0)]);
+            // A single wire occupies itself, needs the block directly below,
+            // has no vertical-edge headroom, and excludes its twelve neighbors.
+            Expected.push((
+                vec![(X, 1, 0)],
+                vec![(X, 0, 0)],
+                vec![],
+                vec![
+                    (X - 1, 0, 0),
+                    (X - 1, 1, 0),
+                    (X - 1, 2, 0),
+                    (X, 0, -1),
+                    (X, 0, 1),
+                    (X, 1, -1),
+                    (X, 1, 0),
+                    (X, 1, 1),
+                    (X, 2, -1),
+                    (X, 2, 1),
+                    (X + 1, 0, 0),
+                    (X + 1, 1, 0),
+                    (X + 1, 2, 0),
+                ],
+            ));
+        }
+        AssertBatch("route claims", Capacity, Count, || {
+            let (Results, Active) = BuildRouteClaimsBatchNative(Inputs, vec![], vec![]);
+            assert_eq!(Results, Expected, "ordered route claims for {Count} inputs");
+            assert_eq!(Active, Capacity.min(Count), "route claim active telemetry");
+        });
+    }
 }
