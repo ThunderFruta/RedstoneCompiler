@@ -1,0 +1,97 @@
+name: Deterministic checks
+
+on:
+  push:
+    branches: [main, 'Router-Refactor(R10-N5)']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deterministic-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONNOUSERSITE: '1'
+  PYTHONHASHSEED: '0'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  deterministic:
+    name: Python and Rust (no physical acceptance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+      - name: Install fixed toolchain and hash-locked Python dependencies
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+          rustup override set 1.96.0
+          python -m venv .venv
+          .venv/bin/python -m pip install --only-binary=:all: --require-hashes -r Tools/CI/requirements.txt
+      - name: Run deterministic checks and attest the imported extension
+        run: |
+          source .venv/bin/activate
+          python Tools/CI/RunChecks.py --tier deterministic --expected-commit "$GITHUB_SHA" --output Output/CI/deterministic
+      - name: Retain incomplete setup receipt
+        if: always()
+        run: |
+          if [[ ! -f Output/CI/deterministic/Run.json ]]; then
+            mkdir -p Output/CI/deterministic
+            printf '{"Status":"incomplete","Failure":"Setup did not produce a run receipt","ExpectedCommit":"%s"}\n' "$GITHUB_SHA" > Output/CI/deterministic/Bootstrap.json
+          fi
+      - name: Retain only generated deterministic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deterministic-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: Output/CI/deterministic/
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7
+
+  harness:
+    name: Java harness unit tests (no live Fabric)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '25.0.4.1+1'
+      - name: Run checksum-verified Gradle wrapper, unit tests and build
+        run: python Tools/CI/RunChecks.py --tier harness --expected-commit "$GITHUB_SHA" --output Output/CI/harness
+      - name: Retain incomplete setup receipt
+        if: always()
+        run: |
+          if [[ ! -f Output/CI/harness/Run.json ]]; then
+            mkdir -p Output/CI/harness
+            printf '{"Status":"incomplete","Failure":"Setup did not produce a run receipt","ExpectedCommit":"%s"}\n' "$GITHUB_SHA" > Output/CI/harness/Bootstrap.json
+          fi
+      - name: Retain only generated harness evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harness-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: Output/CI/harness/
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7

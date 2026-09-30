@@ -20,6 +20,11 @@ def ToNandOnly(Netlist: NetlistIR) -> NetlistIR:
     )
     GateIndex = 0
     NetIndex = 0
+    ReservedSignals = set(Module.Nets) | set(Module.Inputs) | set(Module.Outputs)
+    ReservedSignals.update(
+        Signal for SourceGate in SourceModule.Gates
+        for Signal in SourceGate.Inputs + SourceGate.Outputs
+    )
     Aliases: dict[str, str] = {}
     MemoizedNands: dict[tuple[str, str], str] = {}
     Inversions: dict[str, str] = {}
@@ -38,6 +43,7 @@ def ToNandOnly(Netlist: NetlistIR) -> NetlistIR:
         if SourceGate.Kind == GateKind.OR
         for Input in SourceGate.Inputs
         if Input in Producers
+        and Input not in SourceModule.Outputs
         and Producers[Input].Kind == GateKind.AND
         and Consumers[Input] == 1
     }
@@ -71,8 +77,12 @@ def ToNandOnly(Netlist: NetlistIR) -> NetlistIR:
             return Existing
 
         if Output is None:
-            Output = f"NandNet{NetIndex}"
-            NetIndex += 1
+            while True:
+                Output = f"NandNet{NetIndex}"
+                NetIndex += 1
+                if Output not in ReservedSignals:
+                    break
+        ReservedSignals.add(Output)
         Module.Nets.setdefault(Output, NetIR(Name=Output))
         Module.Gates.append(
             Gate(

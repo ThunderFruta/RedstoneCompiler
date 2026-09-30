@@ -1,0 +1,67 @@
+name: Physical acceptance (blocked on personal repository)
+
+# A Router push requests hosted registration/reporting without physical execution.
+on:
+  push:
+    branches: ['Router-Refactor(R10-N5)']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redstone-physical-admission
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  admission:
+    name: Hosted reporting only (physical acceptance unavailable)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Record blocked physical acceptance and registration status
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_REF: ${{ github.ref }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p Output/CI/physical-admission
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          receipt = {
+              "Status": "blocked",
+              "PhysicalAcceptance": "not-run",
+              "Accepted": False,
+              "HostedReportingOnly": True,
+              "ExpectedCommit": os.environ["EXPECTED_COMMIT"],
+              "RequestedRef": os.environ["REQUESTED_REF"],
+              "Event": os.environ["EVENT_NAME"],
+              "Reason": "No authorized isolated physical execution environment is configured for this personal repository.",
+          }
+          Path("Output/CI/physical-admission/Run.json").write_text(
+              json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
+          )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write("## Physical acceptance: not run\n\nHosted registration/reporting only. Physical admission is blocked; this run cannot establish physical acceptance.\n")
+          PYTHON
+          if [[ "$EVENT_NAME" == push && "$REQUESTED_REF" == 'refs/heads/Router-Refactor(R10-N5)' ]]; then
+            echo '::notice::Hosted workflow registration/reporting only; PhysicalAcceptance=not-run, Accepted=false.'
+          else
+            echo '::error::Physical acceptance is blocked. No runner is scheduled and no Fabric simulation runs. Follow Docs/Testing/ContinuousIntegration.md.'
+            exit 1
+          fi
+      - name: Retain blocked admission receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: physical-admission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: Output/CI/physical-admission/
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7

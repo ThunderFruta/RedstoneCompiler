@@ -7,3 +7,5 @@ Contains test strategy and execution guidance.
 - [Benchmarks and acceptance gates](Benchmarks.md)
 - [Test-suite cleanup evidence](TestSuiteCleanup.md)
 - [Outcome-first active-test audit](OutcomeFirstTestAudit.md)
+
+- [Commit-addressed continuous integration](ContinuousIntegration.md)
