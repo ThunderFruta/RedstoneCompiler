@@ -67,13 +67,15 @@ def ValidateProvenance(
 
 def FabricPrerequisites(RuntimeRoot: Path) -> dict:
     """Inspect an already-authorized runtime; never create it or accept its EULA."""
+    if RuntimeRoot.is_symlink() or any(Parent.is_symlink() for Parent in RuntimeRoot.parents):
+        raise ValueError("Fabric runtime must not traverse symlinks")
     RuntimeRoot = RuntimeRoot.resolve()
     Required = {
         "Launcher": RuntimeRoot / "fabric-server-launch.jar",
         "Harness": RuntimeRoot / "mods/redstonecompiler-harness.jar",
     }
     for Name, PathValue in Required.items():
-        if not PathValue.is_file() or PathValue.is_symlink():
+        if not PathValue.is_file() or PathValue.is_symlink() or any(Parent.is_symlink() for Parent in PathValue.parents):
             raise ValueError(f"missing preprovisioned Fabric prerequisite: {Name}")
     Eula = RuntimeRoot / "eula.txt"
     if not Eula.is_file() or Eula.is_symlink():
@@ -81,11 +83,43 @@ def FabricPrerequisites(RuntimeRoot: Path) -> dict:
     Values = [Line.strip().lower() for Line in Eula.read_text().splitlines()]
     if "eula=true" not in Values:
         raise ValueError("Minecraft EULA has not been accepted by the runtime owner")
-    return {Name: {"Sha256": FileHash(PathValue)} for Name, PathValue in Required.items()}
+    LockPath = RuntimeRoot.parent / "runtime-lock.json"
+    if not LockPath.is_file() or LockPath.is_symlink():
+        raise ValueError("missing administrator-verified Fabric runtime inventory")
+    Lock = json.loads(LockPath.read_text())
+    if not isinstance(Lock, dict) or (
+        Lock.get("ProvisioningValidated") is not True
+        or Lock.get("MinecraftVersion") != "26.2"
+        or Lock.get("FabricLoaderVersion") != "0.19.3"
+    ):
+        raise ValueError("Fabric inventory requires validated fixed runtime versions")
+    ExpectedJars = Lock.get("Jars")
+    if not isinstance(ExpectedJars, dict) or len(ExpectedJars) < 2 or "fabric-server-launch.jar" not in ExpectedJars:
+        raise ValueError("Fabric inventory is incomplete")
+    if any(PathValue.is_symlink() for PathValue in RuntimeRoot.rglob("*")):
+        raise ValueError("dedicated Fabric runtime must not contain symlinks")
+    ActualJars = {}
+    for Jar in sorted(RuntimeRoot.rglob("*.jar")):
+        if Jar.is_symlink() or any(Parent.is_symlink() for Parent in Jar.parents):
+            raise ValueError("Fabric dependency JARs must not traverse symlinks")
+        Relative = Jar.relative_to(RuntimeRoot).as_posix()
+        if Relative == "mods/redstonecompiler-harness.jar":
+            continue  # The current-commit harness has its own separately verified identity.
+        if not Jar.is_file():
+            raise ValueError("Fabric dependency JAR is not a regular file")
+        ActualJars[Relative] = FileHash(Jar)
+    if ActualJars != ExpectedJars:
+        raise ValueError("Fabric dependency JARs differ from the provisioned inventory")
+    return {
+        **{Name: {"Sha256": FileHash(PathValue)} for Name, PathValue in Required.items()},
+        "RuntimeLockSha256": FileHash(LockPath), "RuntimeJars": ActualJars,
+    }
 
 
 def CollectAcceptanceEvidence(Source: Path, Destination: Path) -> list[str]:
     """Copy only bounded, allowlisted run evidence, refusing symlink traversal."""
+    if Source.is_symlink() or any(Parent.is_symlink() for Parent in Source.parents):
+        raise ValueError("acceptance evidence source must not traverse symlinks")
     Source = Source.resolve()
     Copied = []
     TotalBytes = 0

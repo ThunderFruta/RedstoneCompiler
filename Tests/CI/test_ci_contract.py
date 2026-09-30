@@ -124,6 +124,8 @@ def test_missing_fabric_prerequisite_fails_without_creating_runtime(tmp_path):
 
 
 def test_fabric_eula_is_never_accepted_implicitly(tmp_path):
+    tmp_path = tmp_path / "runtime"
+    tmp_path.mkdir()
     (tmp_path / "mods").mkdir()
     (tmp_path / "fabric-server-launch.jar").write_bytes(b"launcher")
     (tmp_path / "mods/redstonecompiler-harness.jar").write_bytes(b"harness")
@@ -133,7 +135,19 @@ def test_fabric_eula_is_never_accepted_implicitly(tmp_path):
         FabricPrerequisites(tmp_path)
     assert Eula.read_text() == "# eula=true\neula=false\n"
     Eula.write_text("eula=true\n")
-    assert set(FabricPrerequisites(tmp_path)) == {"Launcher", "Harness"}
+    with pytest.raises(ValueError, match="inventory"):
+        FabricPrerequisites(tmp_path)
+    (tmp_path / "server.jar").write_bytes(b"verified server")
+    Inventory = {
+        "ProvisioningValidated": True, "MinecraftVersion": "26.2", "FabricLoaderVersion": "0.19.3",
+        "Jars": {Name: FileHash(tmp_path / Name) for Name in ("fabric-server-launch.jar", "server.jar")},
+    }
+    (tmp_path.parent / "runtime-lock.json").write_text(json.dumps(Inventory))
+    Receipt = FabricPrerequisites(tmp_path)
+    assert Receipt["RuntimeJars"] == Inventory["Jars"]
+    (tmp_path / "server.jar").write_bytes(b"unexpected different server")
+    with pytest.raises(ValueError, match="inventory"):
+        FabricPrerequisites(tmp_path)
 
 
 def test_all_seven_physical_cases_are_scheduled_once_without_baseline(tmp_path):
@@ -197,3 +211,36 @@ def test_ci_hash_locked_oracle_matches_owner_dependency_pins():
     Environment = CleanEnvironment()
     assert Environment["RC_REQUIRE_SOURCE_ORACLE"] == "1"
     assert Environment["RC_YOSYS"] == str(Path(sys.executable).parent / "yowasp-yosys")
+
+
+def test_fabric_symlink_root_is_rejected_before_resolving(tmp_path):
+    Actual = tmp_path / "actual"
+    Actual.mkdir()
+    Link = tmp_path / "runtime"
+    Link.symlink_to(Actual, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlinks"):
+        FabricPrerequisites(Link)
+
+
+def test_fabric_symlink_mod_directory_is_rejected_before_reading_or_replacing(tmp_path):
+    Runtime = tmp_path / "runtime"
+    Runtime.mkdir()
+    External = tmp_path / "personal-mods"
+    External.mkdir()
+    (External / "redstonecompiler-harness.jar").write_bytes(b"must remain untouched")
+    (Runtime / "mods").symlink_to(External, target_is_directory=True)
+    (Runtime / "fabric-server-launch.jar").write_bytes(b"launcher")
+    with pytest.raises(ValueError, match="prerequisite"):
+        FabricPrerequisites(Runtime)
+    assert (External / "redstonecompiler-harness.jar").read_bytes() == b"must remain untouched"
+
+
+def test_evidence_rejects_symlink_source_root(tmp_path):
+    External = tmp_path / "external"
+    External.mkdir()
+    (External / "Summary.txt").write_text("private unrelated content")
+    Link = tmp_path / "acceptance"
+    Link.symlink_to(External, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlinks"):
+        CollectAcceptanceEvidence(Link, tmp_path / "publish")
+    assert not (tmp_path / "publish").exists()

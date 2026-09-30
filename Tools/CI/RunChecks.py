@@ -99,6 +99,7 @@ def Main() -> int:
     Output = Arguments.output.resolve()
     Output.mkdir(parents=True, exist_ok=False)
     Environment = CleanEnvironment()
+    Environment["RC_SOURCE_ORACLE_EVIDENCE"] = str(Output / "SourceOracle")
     # The reused provenance probe and acceptance parent must see the same controls.
     os.environ.clear()
     os.environ.update(Environment)
@@ -117,7 +118,7 @@ def Main() -> int:
             Name: FileHash(RepositoryRoot / Name)
             for Name in (
                 "Tools/CI/requirements.txt", "Tests/Compiler/Synthesis/oracle-requirements.txt",
-                "Kernels/Routing/Cargo.lock", "pyproject.toml",
+                "Kernels/Routing/Cargo.lock", "pyproject.toml", ".cargo/config.toml",
                 "Validation/Fabric/ServerHarness/gradle.properties",
                 "Validation/Fabric/ServerHarness/gradle/wrapper/gradle-wrapper.properties",
                 "Validation/Fabric/ServerHarness/build.gradle",
@@ -188,6 +189,8 @@ def Main() -> int:
                 try:
                     if not Step("fabric-start", [Python, "Tools/Fabric/ControlFabricServer.py", "start"]):
                         raise ValueError("Fabric failed authenticated readiness; acceptance was not run")
+                    if FabricPrerequisites(RuntimeRoot) != RuntimeIdentity:
+                        raise ValueError("Fabric runtime identity changed during startup")
                     Passed = Step("acceptance", [
                         Python, "Tools/Routing/RunRouterAcceptance.py", "--matrix", "expanded",
                         "--python", Python, "--output-root", str(AcceptanceOutput),
@@ -195,8 +198,13 @@ def Main() -> int:
                     ])
                     Receipt["PhysicalAcceptance"] = "passed" if Passed else "failed"
                 finally:
-                    Step("fabric-stop", [Python, "Tools/Fabric/ControlFabricServer.py", "stop"])
+                    Stopped = Step("fabric-stop", [Python, "Tools/Fabric/ControlFabricServer.py", "stop"])
                     CollectAcceptanceEvidence(AcceptanceOutput, Output / "Acceptance")
+                    if not Stopped:
+                        raise ValueError("Fabric cleanup command failed")
+                    StopReceipt = json.loads((Output / "fabric-stop.stdout.log").read_text())
+                    if not isinstance(StopReceipt, dict) or StopReceipt.get("Status") != "stopped":
+                        raise ValueError("Fabric cleanup did not establish a stopped runtime")
             After = Provenance(Arguments.expected_commit)
             WriteJson(Output / "Provenance.after.json", After)
             if Before != After:
@@ -207,6 +215,10 @@ def Main() -> int:
         Receipt["Failure"] = f"{type(Error).__name__}: {Error}"
         print(Receipt["Failure"], file=sys.stderr)
     finally:
+        Receipt["FinalSourceState"] = ReadSourceState(RepositoryRoot)
+        if Receipt["FinalSourceState"] != {"Revision": Arguments.expected_commit, "Dirty": False}:
+            Receipt["Status"] = "failed"
+            Receipt["FinalSourceFailure"] = "source changed during CI execution"
         Receipt["CompletedAtUtc"] = datetime.now(timezone.utc).isoformat()
         WriteJson(Output / "Run.json", Receipt)
         SealEvidence(Output)
