@@ -1539,7 +1539,7 @@ def BuildResolvedTemplateInputManifest(
     if PythonExecutable is not None and PythonExecutable.is_file():
         ProbeSource = """
 import json
-from Templates import LitematicTemplates
+from Assets.Templates import LitematicTemplates
 
 print(json.dumps({
     str(Name): str(PathValue)
