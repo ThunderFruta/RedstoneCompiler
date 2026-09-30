@@ -362,8 +362,11 @@ def BuildTruthTableCandidate(
         Key = Kind, KeyInputs
         if Key in Expressions:
             return Expressions[Key]
-        Output = f"MinimizedNet{NetIndex}"
-        NetIndex += 1
+        while True:
+            Output = f"MinimizedNet{NetIndex}"
+            NetIndex += 1
+            if Output not in Module.Nets and Output not in Module.Inputs and Output not in Module.Outputs:
+                break
         Module.Nets[Output] = NetIR(Name=Output)
         Module.Gates.append(
             Gate(

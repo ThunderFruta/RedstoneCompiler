@@ -20,7 +20,7 @@ from Formats.SystemVerilog.Sv import ParseSvToNetlist
             "module Top(input logic a, output logic y); "
             "always_comb y = a; endmodule",
             None,
-            "Output ports are not assigned: y",
+            "Unsupported module item: always_comb",
         ),
         (
             "module Top(input logic a, b, output logic y); "
