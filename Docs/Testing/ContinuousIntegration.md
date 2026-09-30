@@ -15,11 +15,10 @@ acceptance or promotion readiness.
   overrides are removed.
 - **Java harness unit tests (no live Fabric)**: checksum-verified Gradle wrapper,
   harness `test build`, dependency report, Java and Gradle identity.
-- **Seven-case physical acceptance**: separate manual workflow, unavailable by
-  default. It uses the existing expanded, non-fail-fast acceptance harness, fresh
-  output, canonical tracked templates, current-commit native and Java harness,
-  authenticated Fabric startup and best-effort owned-server teardown. Missing
-  prerequisites are failures, never successful physical checks.
+- **Physical admission report (no simulation)**: a hosted registration/manual
+  workflow that records physical acceptance as blocked and not run. The existing
+  seven-case engine remains available only for separately approved disposable
+  infrastructure; no hosted physical execution or acceptance is established.
 
 The deterministic workflow runs on pull requests, pushes to `main` or
 `Router-Refactor(R10-N5)`, and explicit manual dispatch. Feature-branch pushes
@@ -66,70 +65,75 @@ fail instead of falling back. Without the override, existing local template
 preference remains unchanged. The configured-child provenance probe imports
 the current `Assets.Templates` namespace.
 
-## Physical infrastructure admission: not provisioned by these workflows
+## Physical admission and first workflow registration
 
-Do not set `RC_PHYSICAL_RUNNER_READY` until an administrator has authorized and
-verified every item below. No paid runner, credentials, EULA acceptance,
-network/security setting, or GitHub runner grant is created by this change.
-Standard hosted runners on this public repository are free under
-[GitHub's billing policy](https://docs.github.com/en/billing/concepts/product-billing/github-actions);
-no larger/paid hosted runner is selected. Artifact storage is quota-governed and
-retained for only seven days. Physical infrastructure capacity/cost remains an
-explicit administrator decision.
+This repository belongs to a personal GitHub account. Its current branches are
+unprotected, and organization/enterprise runner groups are unavailable here.
+The earlier organization-only runner-group scaffold did not provide a usable
+physical lane. Repository variables, runner labels and YAML ref guards cannot
+supply the missing external isolation or restrict a public repository's runner
+against an edited workflow. No physical runner is configured or scheduled by
+`physical-acceptance.yml`; setting a readiness variable cannot enable execution.
 
-1. Review the exact Router integration commit and the workflow. Restrict the
-   `redstone-physical` runner group **outside workflow YAML** to this repository's
-   exact `physical-acceptance.yml` workflow on the protected
-   `Router-Refactor(R10-N5)` ref. A YAML branch guard alone is not a security
-   boundary: an untrusted branch could edit it. If the GitHub plan cannot enforce
-   a workflow/ref restriction, do not attach this runner and leave the lane off.
-2. Create the `physical-acceptance` environment with mandatory independent
-   approval, no self-approval, and a deployment-branch restriction to that exact
-   protected ref. Review source changes before allowing each run. Never grant
-   fork/PR workflows access to the physical runner, its network or runtime.
-3. Supply a single-job ephemeral Linux x86_64 VM, labels `self-hosted`, `linux`,
-   `x64`, `redstone-fabric-ephemeral`, unprivileged user and no unrelated secrets,
-   cloud identity, service account, private mounts, Docker socket, personal world
-   or shared Fabric server. Destroy the VM and its disks after success, failure,
-   timeout or cancellation. Job cleanup is only best effort; infrastructure
-   destruction must not depend on repository code. No persistent runner is safe.
-4. Use Actions Runner 2.327.1 or newer; preinstall rustup and normal build tools. Supply a fresh, stopped Fabric 26.2 /
-   Loader 0.19.3 runtime at `/opt/redstone-fabric/runtime`, with verified launcher
-   and server dependency JARs and an existing harness JAR. The runtime owner must
-   already have accepted the Minecraft EULA (`eula=true`). There must be no
-   legacy `/opt/redstone-fabric/build/libs/validation-server-harness-1.0.0.jar`.
-   Supply `/opt/redstone-fabric/runtime-lock.json` from the trusted provisioning
-   process, with `ProvisioningValidated: true`, `MinecraftVersion: "26.2"`,
-   `FabricLoaderVersion: "0.19.3"`, and `Jars` mapping **every** runtime-relative
-   dependency/launcher JAR path to its SHA-256. Exclude only
-   `mods/redstonecompiler-harness.jar`, whose current-build identity the job
-   verifies separately. Generate this inventory only after validating a complete
-   offline startup and stopping the image; it is the owner's provisioning
-   attestation, not a new acceptance verdict. Empty/partial or mismatched inventory,
-   changed JARs and symlink roots/files fail before acceptance. JAR bytes and runtime
-   configuration are never published.
-   Use the supported manager's loopback-only server configuration and a dedicated
-   disposable void world. Do not expose a system/user service shared with others.
-   The job does not accept an EULA or provision a server runtime. The trusted image
-   must include all runtime dependencies; startup may not change its JAR inventory.
-5. Approve the infrastructure/cost boundary and set repository variable
-   `RC_PHYSICAL_RUNNER_READY=ephemeral-v1`. Dispatch only the reviewed Router ref.
-   Missing admission fails on a small hosted job before a physical runner is
-   scheduled. A missing/offline approved runner remains queued; it is not a pass.
+The workflow uses only a small `ubuntu-24.04` hosted reporting job. An exact
+`Router-Refactor(R10-N5)` push requests a registration/reporting run that, if
+executed, records
+`Status=blocked`, `PhysicalAcceptance=not-run`, `Accepted=false` and
+`HostedReportingOnly=true`. A successful registration job is only a reporting
+result, never a physical acceptance pass. An accepted manual dispatch records the same
+blocked receipt and exits nonzero. There is no checkout, reusable fast-lane call,
+self-hosted job or simulation command in this scaffold. The deterministic
+Python/Rust and Java workflows remain independently runnable.
 
-After admission, the physical workflow requires both clean hosted fast checks
-for the exact commit before scheduling the protected physical job.
-The physical job rebuilds both native and Java code, rejects an already-running
-server, installs the just-built harness in the dedicated runtime, starts it
-through the existing manager and waits for authenticated readiness. It rechecks
-the provisioning inventory after startup,
-then runs all seven existing scheduled cases once. A failed case does not stop
-later cases. After the run, cleanup must report `stopped`, not merely exit zero.
-Failure reports and any typed artifacts are retained. Missing Fabric
-infrastructure stops before execution with `PhysicalAcceptance=not-run`.
-There is no performance baseline in this workflow. Any future baseline comparison
-must use the existing environment-compatibility and measurement-validity gates;
-shared-host timing is not a stable performance reference.
+GitHub documents both a default-branch prerequisite for `workflow_dispatch` and
+CLI/API dispatch against another branch or tag after a workflow has run at least
+once. This workflow is currently absent from default `main`. A Router push only
+requests its hosted registration/reporting run; it does not establish that later
+manual dispatch is available for this repository. After an approved exact Router
+push, verify the actual run SHA and workflow registry. Only an independently
+authorized attempt can establish whether dispatch by filename against Router is
+accepted:
+
+```sh
+gh workflow run physical-acceptance.yml \
+  --repo ThunderFruta/RedstoneCompiler --ref 'Router-Refactor(R10-N5)'
+```
+
+This command, if accepted, requests only the blocked admission report; it does
+not request or grant physical infrastructure. Registry presence or a successful
+Router push alone is not proof of dispatch eligibility. If GitHub rejects the
+request, retain the concrete registration/dispatch error and keep issue #4 open.
+Do not promote or change default `main` to work around it. Registering or
+dispatching the workflow is a separate approved publication action, not a side
+effect of local testing. See GitHub's
+[workflow dispatch documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
+and [runner group scope](https://docs.github.com/en/actions/concepts/runners/runner-groups).
+
+Issue #4 remains incomplete for an executed, accepted physical lane. A future
+implementation needs an explicitly approved execution boundary compatible with
+this account, external control of exact reviewed code admission and teardown,
+and independent review before enabling any job. No runner, credential,
+protection rule, environment grant, paid capacity, EULA acceptance or network
+policy is created by this change. If that boundary cannot be enforced, leave
+hosted physical acceptance unavailable. Do not attach this workstation, its
+personal world or its shared Fabric runtime as a repository runner.
+
+The existing `Tools/CI/RunChecks.py --tier physical` remains a separately gated
+engine for a trusted disposable environment, not an enabled workflow. It requires
+its fixed `/opt/redstone-fabric/runtime` root, a previously accepted EULA, a
+trusted complete runtime-JAR inventory, a stopped dedicated runtime, a fresh
+current-commit harness/native build and exact clean source. It does not provision
+that environment. Its tests exercise synthetic controls, not live acceptance.
+
+Actual physical acceptance still requires all seven expanded cases with the
+existing non-fail-fast scheduler, canonical tracked templates, capacity-one
+claims, exact MCHPRS truth tables, required live Fabric canaries and observed
+settling, fresh retained artifacts, startup/native/harness/source provenance and
+owned stopped cleanup. Missing infrastructure, typed failures, partial runs and
+failed cases remain non-passing. Performance claims need the existing compatible
+baseline and measurement-validity gates; shared-host timing is not a stable
+performance reference. Local controlled acceptance on a disposable runtime is
+separate from hosted CI and cannot establish that the hosted physical lane ran.
 
 ## Evidence, privacy, retention and failure handling
 

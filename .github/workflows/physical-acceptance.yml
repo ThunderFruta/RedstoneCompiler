@@ -1,14 +1,16 @@
-name: Physical acceptance (explicit infrastructure required)
+name: Physical acceptance (blocked on personal repository)
 
-# Never schedule PR/fork code on self-hosted infrastructure.
+# A Router push requests hosted registration/reporting without physical execution.
 on:
+  push:
+    branches: ['Router-Refactor(R10-N5)']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: redstone-physical-acceptance
+  group: redstone-physical-admission
   cancel-in-progress: false
 
 defaults:
@@ -17,67 +19,49 @@ defaults:
 
 jobs:
   admission:
-    name: Verify physical infrastructure admission
+    name: Hosted reporting only (physical acceptance unavailable)
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
-      - name: Require administrator-authorized disposable infrastructure
+      - name: Record blocked physical acceptance and registration status
         env:
-          READY: ${{ vars.RC_PHYSICAL_RUNNER_READY }}
+          EVENT_NAME: ${{ github.event_name }}
           REQUESTED_REF: ${{ github.ref }}
+          EXPECTED_COMMIT: ${{ github.sha }}
         run: |
-          if [[ "$READY" != ephemeral-v1 || "$REQUESTED_REF" != 'refs/heads/Router-Refactor(R10-N5)' ]]; then
-            echo '::error::Physical acceptance is unavailable. Follow Docs/Testing/ContinuousIntegration.md; provision and authorize an isolated ephemeral runner, protected environment, and prior EULA setup. Dispatch only the reviewed Router integration ref.'
+          mkdir -p Output/CI/physical-admission
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          receipt = {
+              "Status": "blocked",
+              "PhysicalAcceptance": "not-run",
+              "Accepted": False,
+              "HostedReportingOnly": True,
+              "ExpectedCommit": os.environ["EXPECTED_COMMIT"],
+              "RequestedRef": os.environ["REQUESTED_REF"],
+              "Event": os.environ["EVENT_NAME"],
+              "Reason": "No authorized isolated physical execution environment is configured for this personal repository.",
+          }
+          Path("Output/CI/physical-admission/Run.json").write_text(
+              json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
+          )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write("## Physical acceptance: not run\n\nHosted registration/reporting only. Physical admission is blocked; this run cannot establish physical acceptance.\n")
+          PYTHON
+          if [[ "$EVENT_NAME" == push && "$REQUESTED_REF" == 'refs/heads/Router-Refactor(R10-N5)' ]]; then
+            echo '::notice::Hosted workflow registration/reporting only; PhysicalAcceptance=not-run, Accepted=false.'
+          else
+            echo '::error::Physical acceptance is blocked. No runner is scheduled and no Fabric simulation runs. Follow Docs/Testing/ContinuousIntegration.md.'
             exit 1
           fi
-
-  fast-checks:
-    needs: admission
-    uses: ./.github/workflows/deterministic.yml
-
-  physical:
-    name: Seven-case physical acceptance
-    needs: [admission, fast-checks]
-    environment: physical-acceptance
-    runs-on:
-      group: redstone-physical
-      labels: [self-hosted, linux, x64, redstone-fabric-ephemeral]
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12.14'
-      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
-        with:
-          distribution: temurin
-          java-version: '25.0.4.1+1'
-      - name: Prepare isolated pinned build tools
-        run: |
-          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
-          rustup override set 1.96.0
-          python -m venv .venv
-          .venv/bin/python -m pip install --only-binary=:all: --require-hashes -r Tools/CI/requirements.txt
-      - name: Run existing expanded physical acceptance with provenance checks
-        run: |
-          source .venv/bin/activate
-          python Tools/CI/RunChecks.py --tier physical --expected-commit "$GITHUB_SHA" --output Output/CI/physical
-      - name: Retain incomplete setup receipt
-        if: always()
-        run: |
-          if [[ ! -f Output/CI/physical/Run.json ]]; then
-            mkdir -p Output/CI/physical
-            printf '{"Status":"incomplete","Failure":"Setup did not produce a run receipt","ExpectedCommit":"%s"}\n' "$GITHUB_SHA" > Output/CI/physical/Bootstrap.json
-          fi
-      - name: Publish the allowlisted evidence subset
+      - name: Retain blocked admission receipt
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: physical-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: Output/CI/physical/
+          name: physical-admission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: Output/CI/physical-admission/
           if-no-files-found: warn
           include-hidden-files: false
           retention-days: 7
