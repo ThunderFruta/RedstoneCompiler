@@ -1020,48 +1020,141 @@ def test_success_requires_terminal_observation_reap_and_release():
         _RecoverAndClose(Handle)
 
 
-def test_work_expiry_is_cooperative_and_late_result_is_not_published():
-    DeadlineAt = monotonic() + 0.25
-    Handle = _StartOwned(
-        _Request(DeadlineAt),
-        _Authority(DeadlineAt, DeadlineAt + 1.0, Force=False),
-        b"",
-        _WaitForCancellation,
-        _Limits(_WaitForCancellation, b""),
+def test_work_expiry_is_cooperative_and_late_result_is_not_published(
+    monkeypatch,
+    tmp_path,
+):
+    from Tests.PhysicalDesign.Runtime.ProcessSynchronizationFixtures import (
+        CooperativeBytesAfterEntry,
+        InstallSharedRuntimeClock,
+        OperationGate,
     )
-    try:
-        Receipt = Handle.AdvanceUntil(float(DeadlineAt + 1.0))
-        assert Receipt.ProcessExitObserved
-        Receipt = _ReapAndClose(Handle)
-        assert Receipt.WorkDeadlineObserved
-        assert Receipt.CancellationRequested
-        assert Receipt.ResultCompletionObserved
-        assert Receipt.ResultValid
-        assert Receipt.ResultDiagnostic == "LateResultDiscarded"
-        assert Receipt.PublishedResult is None
-    finally:
-        _RecoverAndClose(Handle)
 
-
-def test_complete_late_output_keeps_only_diagnostics():
-    Payload = b"0.30\x00late-value"
-    DeadlineAt = monotonic() + 0.15
+    Clock = InstallSharedRuntimeClock(monkeypatch, tmp_path)
+    Gate = OperationGate(tmp_path / "cooperative-operation")
+    Payload = str(Gate.Directory).encode("utf-8")
+    DeadlineAt = Clock.Read() + 0.25
     Handle = _StartOwned(
         _Request(DeadlineAt),
         _Authority(DeadlineAt, DeadlineAt + 1.0, Force=False),
         Payload,
-        _IgnoreCancellationThenEcho,
-        _Limits(_IgnoreCancellationThenEcho, Payload),
+        CooperativeBytesAfterEntry,
+        _Limits(CooperativeBytesAfterEntry, Payload),
     )
+    Watchdog = None
     try:
-        Handle.AdvanceUntil(float(DeadlineAt + 1.0))
+        Entry = Gate.WaitForEntry()
+        assert Entry["clock_at"] == 1000.0
+        assert _PidExists(Entry["pid"])
+        Watchdog = Gate.StartReleaseWatchdog(Entry["real_entered_at"], 1.25)
+        Clock.Set(DeadlineAt)
         Receipt = _ReapAndClose(Handle)
-        assert Receipt.ExitCode == 0
+        Watchdog.cancel()
+        Watchdog.join()
+        assert not Gate.WatchdogPath.exists()
+        assert Receipt.ProcessExitObserved
+        assert Gate.WaitForCancellation() == {
+            "pid": Entry["pid"],
+            "clock_at": DeadlineAt,
+            "production_callback_returned": True,
+        }
+        assert Receipt.StartedPid == Entry["pid"]
+        assert Receipt.WorkDeadlineAt == DeadlineAt
+        assert Receipt.CleanupCutoffAt == DeadlineAt + 1.0
+        assert Receipt.WorkDeadlineObserved
+        assert Receipt.CancellationRequested
+        assert Receipt.ResultCompletionObserved
         assert Receipt.ResultValid
-        assert Receipt.ResultPayloadBytesObserved == len(b"late-value")
+        assert Receipt.ResultPayloadBytesObserved == len(b"cancelled")
         assert Receipt.ResultDiagnostic == "LateResultDiscarded"
         assert Receipt.PublishedResult is None
+        assert not Receipt.ForceTerminationRequested
+        assert not Receipt.ForceSignalSent
     finally:
+        if Watchdog is not None:
+            Watchdog.cancel()
+            Watchdog.join()
+        Gate.Release()
+        _RecoverAndClose(Handle)
+
+
+def test_gated_output_before_original_deadline_publishes_exact_bytes(
+    monkeypatch,
+    tmp_path,
+):
+    from Tests.PhysicalDesign.Runtime.ProcessSynchronizationFixtures import (
+        GatedEchoBytes,
+        InstallSharedRuntimeClock,
+        OperationGate,
+    )
+
+    Clock = InstallSharedRuntimeClock(monkeypatch, tmp_path)
+    Gate = OperationGate(tmp_path / "timely-operation")
+    Value = b"known-gated-value"
+    Payload = str(Gate.Directory).encode("utf-8") + b"\x00" + Value
+    DeadlineAt = Clock.Read() + 0.15
+    Handle = _StartOwned(
+        _Request(DeadlineAt),
+        _Authority(DeadlineAt, DeadlineAt + 1.0, Force=False),
+        Payload,
+        GatedEchoBytes,
+        _Limits(GatedEchoBytes, Payload),
+    )
+    try:
+        Entry = Gate.WaitForEntry()
+        assert Entry["clock_at"] == 1000.0
+        assert _PidExists(Entry["pid"])
+        Gate.Release()
+        Receipt = _ReapAndClose(Handle)
+        assert Receipt.StartedPid == Entry["pid"]
+        assert Receipt.WorkDeadlineAt == DeadlineAt
+        assert Receipt.CleanupCutoffAt == DeadlineAt + 1.0
+        assert Receipt.ExitCode == 0
+        assert Receipt.ResultValid
+        assert Receipt.PublishedResult == Value
+        assert Gate.CompletedPath.exists()
+    finally:
+        Gate.Release()
+        _RecoverAndClose(Handle)
+
+
+def test_complete_late_output_keeps_only_diagnostics(monkeypatch, tmp_path):
+    from Tests.PhysicalDesign.Runtime.ProcessSynchronizationFixtures import (
+        GatedEchoBytes,
+        InstallSharedRuntimeClock,
+        OperationGate,
+    )
+
+    Clock = InstallSharedRuntimeClock(monkeypatch, tmp_path)
+    Gate = OperationGate(tmp_path / "late-operation")
+    Value = b"late-value"
+    Payload = str(Gate.Directory).encode("utf-8") + b"\x00" + Value
+    DeadlineAt = Clock.Read() + 0.15
+    Handle = _StartOwned(
+        _Request(DeadlineAt),
+        _Authority(DeadlineAt, DeadlineAt + 1.0, Force=False),
+        Payload,
+        GatedEchoBytes,
+        _Limits(GatedEchoBytes, Payload),
+    )
+    try:
+        Entry = Gate.WaitForEntry()
+        assert Entry["clock_at"] == 1000.0
+        assert _PidExists(Entry["pid"])
+        Clock.Set(DeadlineAt)
+        Gate.Release()
+        Receipt = _ReapAndClose(Handle)
+        assert Receipt.StartedPid == Entry["pid"]
+        assert Receipt.WorkDeadlineAt == DeadlineAt
+        assert Receipt.CleanupCutoffAt == DeadlineAt + 1.0
+        assert Receipt.ExitCode == 0
+        assert Receipt.ResultValid
+        assert Receipt.ResultPayloadBytesObserved == len(Value)
+        assert Receipt.ResultDiagnostic == "LateResultDiscarded"
+        assert Receipt.PublishedResult is None
+        assert Gate.CompletedPath.exists()
+    finally:
+        Gate.Release()
         _RecoverAndClose(Handle)
 
 
