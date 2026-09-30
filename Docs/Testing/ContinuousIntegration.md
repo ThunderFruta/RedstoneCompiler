@@ -27,7 +27,9 @@ alone do not launch it. PR execution uses GitHub's merge commit; `Run.json` and
 artifact names record the actual tested SHA. There is no `pull_request_target`,
 write permission, supplied secret, shared dependency cache, or privileged runner
 in the fast lane. Checkout does not persist its credential. Action references
-are full reviewed commit SHAs.
+are full verified release commit SHAs: checkout 7.0.1, setup-python 7.0.0,
+setup-java 6.0.1 and upload-artifact 7.0.1. Their Node 24 runtime requires
+Actions Runner 2.327.1 or newer.
 
 ## Dependency and native identity
 
@@ -91,14 +93,25 @@ explicit administrator decision.
    or shared Fabric server. Destroy the VM and its disks after success, failure,
    timeout or cancellation. Job cleanup is only best effort; infrastructure
    destruction must not depend on repository code. No persistent runner is safe.
-4. Preinstall rustup and normal build tools. Supply a fresh, stopped Fabric 26.2 /
+4. Use Actions Runner 2.327.1 or newer; preinstall rustup and normal build tools. Supply a fresh, stopped Fabric 26.2 /
    Loader 0.19.3 runtime at `/opt/redstone-fabric/runtime`, with verified launcher
    and server dependency JARs and an existing harness JAR. The runtime owner must
    already have accepted the Minecraft EULA (`eula=true`). There must be no
    legacy `/opt/redstone-fabric/build/libs/validation-server-harness-1.0.0.jar`.
+   Supply `/opt/redstone-fabric/runtime-lock.json` from the trusted provisioning
+   process, with `ProvisioningValidated: true`, `MinecraftVersion: "26.2"`,
+   `FabricLoaderVersion: "0.19.3"`, and `Jars` mapping **every** runtime-relative
+   dependency/launcher JAR path to its SHA-256. Exclude only
+   `mods/redstonecompiler-harness.jar`, whose current-build identity the job
+   verifies separately. Generate this inventory only after validating a complete
+   offline startup and stopping the image; it is the owner's provisioning
+   attestation, not a new acceptance verdict. Empty/partial or mismatched inventory,
+   changed JARs and symlink roots/files fail before acceptance. JAR bytes and runtime
+   configuration are never published.
    Use the supported manager's loopback-only server configuration and a dedicated
    disposable void world. Do not expose a system/user service shared with others.
-   The job fails rather than accepting an EULA or downloading a server runtime.
+   The job does not accept an EULA or provision a server runtime. The trusted image
+   must include all runtime dependencies; startup may not change its JAR inventory.
 5. Approve the infrastructure/cost boundary and set repository variable
    `RC_PHYSICAL_RUNNER_READY=ephemeral-v1`. Dispatch only the reviewed Router ref.
    Missing admission fails on a small hosted job before a physical runner is
@@ -108,9 +121,11 @@ After admission, the physical workflow requires both clean hosted fast checks
 for the exact commit before scheduling the protected physical job.
 The physical job rebuilds both native and Java code, rejects an already-running
 server, installs the just-built harness in the dedicated runtime, starts it
-through the existing manager and waits for authenticated readiness. It then
-runs all seven existing scheduled cases once. A failed case does not stop later
-cases. Failure reports and any typed artifacts are retained. Missing Fabric
+through the existing manager and waits for authenticated readiness. It rechecks
+the provisioning inventory after startup,
+then runs all seven existing scheduled cases once. A failed case does not stop
+later cases. After the run, cleanup must report `stopped`, not merely exit zero.
+Failure reports and any typed artifacts are retained. Missing Fabric
 infrastructure stops before execution with `PhysicalAcceptance=not-run`.
 There is no performance baseline in this workflow. Any future baseline comparison
 must use the existing environment-compatibility and measurement-validity gates;
@@ -145,7 +160,10 @@ source-oracle executable settings.
 
 Ordinary command failure preserves its exit/log and makes the tier fail; a
 native build/provenance failure prevents stale-native Python testing. Command logs stream directly to evidence files; setup failures retain a distinct
-incomplete bootstrap receipt when an always-run step can execute. Upload
+incomplete bootstrap receipt when an always-run step can execute. The source
+oracle writes its replayable HDL/IR/miter/proof scripts, hashes, counterexamples
+and Yosys logs beneath the fresh deterministic evidence directory, so its
+failures survive runner disposal. Every tier rechecks exact clean source at exit. Upload
 steps run after ordinary failures. Cancellation or runner loss may interrupt
 publication and must be labeled incomplete; absence of an artifact is not a
 successful check. Prior/historical results are never copied into new evidence.
