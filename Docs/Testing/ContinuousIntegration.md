@@ -41,6 +41,22 @@ transitive Python dependency are exact-version, wheel-hash locked in
 build-isolation environment. Cargo uses the tracked `Cargo.lock` and `--locked`,
 including the pinned MCHPRS Git revision. No lockfile is regenerated in CI.
 
+The hosted Java selector is `25.0.4+101.0.LTS`, exactly the `version_data.semver`
+published by the [Adoptium Linux x64 JDK GA metadata](https://api.adoptium.net/v3/assets/feature_releases/25/ga?architecture=x64&image_type=jdk&jvm_impl=hotspot&os=linux&vendor=eclipse)
+for [Temurin `jdk-25.0.4.1+1`](https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.4.1%2B1).
+It selects that release, rather than a guessed conversion of its Java version.
+The pinned [setup-java action](https://github.com/actions/setup-java/blob/de7274f081f381c8f8158605e0321c36c376e2e6/src/util.ts)
+compares explicit SemVer build metadata exactly. Its raw four-field-plus-build
+input `25.0.4.1+1` is invalid and caused the initial hosted setup failure.
+`force-download: true` requires a fresh vendor download, whose authoritative
+archive checksum the pinned action verifies. The inspected Linux x64 archive
+SHA-256 is `dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e`.
+Before Gradle, `Tools/CI/JavaToolchain.py` requires the exact action resolution
+and installed release-file identity: Eclipse Adoptium, Java `25.0.4.1`, runtime
+`25.0.4.1+1-LTS`, and architecture `x86_64`. A wrong or missing identity fails
+before harness tests can run. Local Ubuntu OpenJDK evidence does not establish
+Temurin distribution parity; hosted success must be observed separately.
+
 This is a version-pinned profile, not a hermetic toolchain: hosted OS images and
 JDK/Python distribution availability can change, and Gradle's transitive Maven
 artifacts do not yet have a checked-in dependency-verification checksum set.
