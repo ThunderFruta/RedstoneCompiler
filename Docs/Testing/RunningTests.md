@@ -50,6 +50,15 @@ disables `RC_RUN_SCALE_TESTS`, streams output, and retains `Summary.txt` and
 result is headed by `RESULT`, `TIME`, optional `CPU`, and `OUTPUT`; the saved
 report also records runtime provenance, Git identity, and artifact evidence.
 
+## Source-to-NAND semantic gate
+
+The [pinned independent Yosys/SAT gate](../../Tests/Compiler/Synthesis/SourceOracle.md)
+checks the actual SystemVerilog frontend, Boolean optimization and NAND lowering.
+Install its test-only requirements and run it with `RC_REQUIRE_SOURCE_ORACLE=1`.
+An ordinary suite run with a missing oracle skips those proofs and must not be
+reported as establishing source equivalence. Existing structural, deterministic,
+and physical acceptance gates still apply.
+
 ## Routing CPU telemetry
 
 Detailed routing telemetry is enabled by default for CLI compiles, including
