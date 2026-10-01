@@ -12,6 +12,9 @@ from PhysicalDesign.Resources.ResourceGraph import (
 )
 
 
+_MaximumImmutableForestCertificates = 2048
+
+
 def _IsExactImmutableMaterializationForest(Value: object, Cache: dict) -> bool:
     """Certify only concrete immutable builtin trees, retaining strong keys.
 
@@ -20,11 +23,11 @@ def _IsExactImmutableMaterializationForest(Value: object, Cache: dict) -> bool:
     become shareable merely because their outer tuple/frozenset is immutable.
     """
     Kind = type(Value)
-    if Value is None or Kind in (bool, int, str):
+    if Value is None or Kind is bool or Kind is int or Kind is str:
         return True
     if Kind is float:
         return isfinite(Value)
-    if Kind not in (tuple, frozenset):
+    if Kind is not tuple and Kind is not frozenset:
         return False
     Cached = Cache.get(id(Value))
     if Cached is Value:
@@ -33,7 +36,7 @@ def _IsExactImmutableMaterializationForest(Value: object, Cache: dict) -> bool:
         return True
     if not all(_IsExactImmutableMaterializationForest(Item, Cache) for Item in Value):
         return False
-    if len(Value) > 3:
+    if len(Value) > 3 and len(Cache) < _MaximumImmutableForestCertificates:
         Cache[id(Value)] = Value
     return True
 
@@ -41,7 +44,7 @@ def _IsExactImmutableMaterializationForest(Value: object, Cache: dict) -> bool:
 def _FreezeMaterializationValue(Value: object, Name: str, Active: set[int], ImmutableCache: dict) -> object:
     """Copy concrete value trees without calling opaque copy/projection hooks."""
     Kind = type(Value)
-    if Value is None or Kind in (bool, int, str):
+    if Value is None or Kind is bool or Kind is int or Kind is str:
         return Value
     if Kind is float:
         if not isfinite(Value):
@@ -51,23 +54,23 @@ def _FreezeMaterializationValue(Value: object, Name: str, Active: set[int], Immu
         # These named primitive resource tags are the only enum atoms consumed
         # by profiles and claims. Do not admit arbitrary enum payloads.
         return Value
-    if Kind in (tuple, frozenset) and _IsExactImmutableMaterializationForest(Value, ImmutableCache):
+    if (Kind is tuple or Kind is frozenset) and _IsExactImmutableMaterializationForest(Value, ImmutableCache):
         return Value
     if id(Value) in Active:
         raise TypeError(f"{Name} cannot contain a cyclic materialization value")
     Active.add(id(Value))
     try:
-        if Kind in (tuple, list):
+        if Kind is tuple or Kind is list:
             return tuple(
                 _FreezeMaterializationValue(Item, f"{Name}[{Index}]", Active, ImmutableCache)
                 for Index, Item in enumerate(Value)
             )
-        if Kind in (set, frozenset):
+        if Kind is set or Kind is frozenset:
             return frozenset(
                 _FreezeMaterializationValue(Item, f"{Name} member", Active, ImmutableCache)
                 for Item in Value
             )
-        if Kind in (dict, MappingProxyType):
+        if Kind is dict or Kind is MappingProxyType:
             return MappingProxyType({
                 _FreezeMaterializationValue(Key, f"{Name} key", Active, ImmutableCache):
                 _FreezeMaterializationValue(Item, f"{Name}[{Key!r}]", Active, ImmutableCache)
@@ -142,11 +145,15 @@ class FrozenTypedRouteMaterializationInputs:
 def BuildTypedRouteMaterializationEpoch(
     State: object,
     OriginMetadata: tuple[tuple[object, ...], ...],
+    *,
+    _ImmutableForestCache: dict[int, object] | None = None,
 ) -> FrozenTypedRouteMaterializationInputs:
     """Capture only physical consumers' inputs; never clone routing state.
 
     All ownership is local to this capture. A later capture observes current
-    values again, with no mutable-object identity cache or copied graph caches.
+    mutable values again, with no mutable-object identity cache or copied graph
+    caches. The coordinator may retain only certificates for exact immutable
+    builtin forests in its private, bounded preparation-local cache.
     The caller separately binds and validates current selected-access authority.
     """
     if type(OriginMetadata) is not tuple or any(
@@ -166,7 +173,9 @@ def BuildTypedRouteMaterializationEpoch(
     if type(State.UnreservedPortalMode) is not bool:
         raise TypeError("UnreservedPortalMode must be an exact bool")
 
-    ImmutableCache = {}
+    ImmutableCache = {} if _ImmutableForestCache is None else _ImmutableForestCache
+    if type(ImmutableCache) is not dict:
+        raise TypeError("immutable forest certificates require an exact private dict")
 
     def Freeze(Value: object, Name: str) -> object:
         return _FreezeMaterializationValue(Value, Name, set(), ImmutableCache)

@@ -22,15 +22,60 @@ impl RoutingContext {
         MandatoryAir: &HashSet<Position>,
         DebugLabel: &str,
     ) -> RouteTreeSearchResult {
+        self.GenerateRouteTreeClaimAwarePreparedWithAdmissionNative(
+            Starts,
+            TargetBranches,
+            FrozenTargetBranches,
+            Guide,
+            AdditionalAllowedNodes,
+            BaseBlockedNodes,
+            PreferredRoutingY,
+            BendPenalty,
+            ViaPenalty,
+            EnforceSignalStrength,
+            FrozenSourceBranch,
+            MaximumExpansionCount,
+            Deadline,
+            MandatoryWire,
+            MandatorySupport,
+            MandatoryAir,
+            DebugLabel,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::Generation) fn GenerateRouteTreeClaimAwarePreparedWithAdmissionNative(
+        &self,
+        Starts: &[Position],
+        TargetBranches: &[Vec<Position>],
+        FrozenTargetBranches: &[Vec<Position>],
+        Guide: &PreparedDetailedRouteGuide,
+        AdditionalAllowedNodes: &HashSet<Position>,
+        BaseBlockedNodes: &HashSet<Position>,
+        PreferredRoutingY: i32,
+        BendPenalty: i32,
+        ViaPenalty: i32,
+        EnforceSignalStrength: bool,
+        FrozenSourceBranch: Option<&[Position]>,
+        MaximumExpansionCount: usize,
+        Deadline: &RuntimeDeadline,
+        MandatoryWire: &HashSet<Position>,
+        MandatorySupport: &HashSet<Position>,
+        MandatoryAir: &HashSet<Position>,
+        DebugLabel: &str,
+        ExpansionAdmission: Option<&RequestExpansionAdmissionV1>,
+        mut InitialCandidate: Option<RouteTreeSearchResult>,
+    ) -> RouteTreeSearchResult {
         let Started = Instant::now();
         // Only immutable conductors are retained route nodes.  Mandatory air
         // is an exclusion: if a generated path occupies one of those cells,
         // that mutable wire position must remain eligible for an exact
         // no-good cut.
-        let MandatoryNodes: HashSet<_> = MandatoryWire.iter().copied().collect();
-        let mut SearchBlocked = BaseBlockedNodes.clone();
+        let MandatoryNodes = MandatoryWire;
         let mut PendingSearchStates = Vec::new();
-        let mut TotalExpansions = 0usize;
+        let mut TotalExpansions = ExpansionAdmission.map_or(0, |Value| Value.RouteCount());
         let mut RejectedPathCount = 0usize;
         let mut NoGoodCount = 0usize;
         let mut LastConflictResources = Vec::new();
@@ -48,28 +93,68 @@ impl RoutingContext {
                 }
             };
         }
-        let StrictHintNodes = MandatoryWire
-            .union(&Guide.ExactHintNodes)
-            .copied()
-            .collect::<HashSet<_>>();
+        macro_rules! CloneClaimNodes {
+            ($Values:expr) => {{
+                let mut Copied = HashSet::with_capacity($Values.len());
+                for Value in $Values {
+                    ClaimDeadline!();
+                    Copied.insert(*Value);
+                }
+                Copied
+            }};
+        }
+        ClaimDeadline!();
+        let mut SearchBlocked = CloneClaimNodes!(BaseBlockedNodes);
+        // A supplied candidate already searched the original guide.  Repair
+        // only its exact claim conflicts, without restarting in a narrower
+        // mandatory-only domain or charging a second initial search.
+        let StrictHintNodes = if InitialCandidate.is_none() {
+            MandatoryWire
+                .union(&Guide.ExactHintNodes)
+                .copied()
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
         let StrictMandatoryGuide = PreparedDetailedRouteGuide {
             AllowedNodes: StrictHintNodes.clone(),
             AllowedColumns: HashSet::new(),
             UseColumnMembership: false,
-            BoundaryBlockedNodes: Guide.BoundaryBlockedNodes.clone(),
+            BoundaryBlockedNodes: if InitialCandidate.is_none() {
+                CloneClaimNodes!(&Guide.BoundaryBlockedNodes)
+            } else {
+                HashSet::new()
+            },
             NodeCosts: HashMap::new(),
             ColumnCosts: HashMap::new(),
-            PreferredColumns: Guide.PreferredColumns.clone(),
+            PreferredColumns: if InitialCandidate.is_none() {
+                Guide.PreferredColumns.clone()
+            } else {
+                Vec::new()
+            },
             ExactHintNodes: HashSet::new(),
             CertifiedPaths: Vec::new(),
             CertifiedRepeaters: Vec::new(),
             GuidePenalty: 0,
         };
+        ClaimDeadline!();
         let mut UseStrictMandatoryGuide = !StrictHintNodes.is_empty();
 
         loop {
-            if Deadline.Check() || TotalExpansions >= MaximumExpansionCount {
+            ClaimDeadline!();
+            // The final admitted expansion can produce a valid candidate.
+            // Examine it before testing whether another search can start.
+            if InitialCandidate.is_none()
+                && (TotalExpansions >= MaximumExpansionCount
+                    || ExpansionAdmission
+                        .is_some_and(|Value| Value.TotalCount() >= Value.Maximum()))
+            {
                 let mut Result = DetailedRouteTreeBudgetExpiredResult();
+                if ExpansionAdmission.is_some() {
+                    Result.Status = "NoPath".to_string();
+                    Result.NoPathReason = "WorkCapExhausted".to_string();
+                    Result.IsBudgetExpired = false;
+                }
                 Result.ExpansionCount = TotalExpansions;
                 Result.ConflictResources = LastConflictResources;
                 Result.RejectedPathCount = RejectedPathCount;
@@ -97,30 +182,52 @@ impl RoutingContext {
             } else {
                 AdditionalAllowedNodes
             };
-            let mut Result = self.GenerateRouteTreeDetailedPreparedWithDeadlineNative(
-                Starts,
-                TargetBranches,
-                FrozenTargetBranches,
-                SearchGuide,
-                SearchAllowedNodes,
-                MandatoryWire,
-                &SearchBlocked,
-                PreferredRoutingY,
-                BendPenalty,
-                ViaPenalty,
-                EnforceSignalStrength,
-                FrozenSourceBranch,
-                &ForbiddenRepeaterPositions,
-                DebugLabel,
-                SearchExpansionCount,
-                None,
-                Deadline,
+            let mut Result = InitialCandidate.take().unwrap_or_else(|| {
+                self.GenerateRouteTreeDetailedPreparedWithDeadlineNative(
+                    Starts,
+                    TargetBranches,
+                    FrozenTargetBranches,
+                    SearchGuide,
+                    SearchAllowedNodes,
+                    MandatoryWire,
+                    &SearchBlocked,
+                    PreferredRoutingY,
+                    BendPenalty,
+                    ViaPenalty,
+                    EnforceSignalStrength,
+                    FrozenSourceBranch,
+                    &ForbiddenRepeaterPositions,
+                    DebugLabel,
+                    SearchExpansionCount,
+                    ExpansionAdmission,
+                    Deadline,
+                )
+            });
+            TotalExpansions = ExpansionAdmission.map_or_else(
+                || TotalExpansions + Result.ExpansionCount,
+                |Value| Value.RouteCount(),
             );
-            TotalExpansions += Result.ExpansionCount;
             Result.ExpansionCount = TotalExpansions;
             Result.RejectedPathCount = RejectedPathCount;
             Result.NoGoodCount = NoGoodCount;
             Result.ElapsedMilliseconds = Started.elapsed().as_millis() as u64;
+            // Legacy prepared searches also use BudgetExpired for work
+            // limits.  Under shared admission, only the original absolute
+            // deadline can establish deadline exhaustion.
+            if let Some(Admission) = ExpansionAdmission {
+                if Result.IsBudgetExpired && !Deadline.Check() {
+                    Result.Status = "NoPath".to_string();
+                    Result.NoPathReason = if Admission.TotalCount() >= Admission.Maximum()
+                        || TotalExpansions >= MaximumExpansionCount
+                    {
+                        "WorkCapExhausted"
+                    } else {
+                        "SearchLimitReached"
+                    }
+                    .to_string();
+                    Result.IsBudgetExpired = false;
+                }
+            }
             if StrictAttempt && std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {
                 eprintln!(
                     "selected strict spine nodes={} starts={} targets={} status={} reason={} expansions={}",
@@ -187,20 +294,27 @@ impl RoutingContext {
                     if (!OrderedCutNodes.is_empty() || !RepeaterPositions.is_empty())
                         && NoGoodCount < 64
                     {
-                        let SearchBlockedBeforeNoGood = SearchBlocked.clone();
-                        let ForbiddenRepeatersBeforeNoGood = ForbiddenRepeaterPositions.clone();
+                        let SearchBlockedBeforeNoGood = CloneClaimNodes!(&SearchBlocked);
+                        let ForbiddenRepeatersBeforeNoGood =
+                            CloneClaimNodes!(&ForbiddenRepeaterPositions);
                         for RepeaterPosition in RepeaterPositions.into_iter().rev() {
-                            let mut AlternativeForbidden = ForbiddenRepeatersBeforeNoGood.clone();
+                            ClaimDeadline!();
+                            let mut AlternativeForbidden =
+                                CloneClaimNodes!(&ForbiddenRepeatersBeforeNoGood);
                             AlternativeForbidden.insert(RepeaterPosition);
-                            PendingSearchStates
-                                .push((SearchBlockedBeforeNoGood.clone(), AlternativeForbidden));
+                            PendingSearchStates.push((
+                                CloneClaimNodes!(&SearchBlockedBeforeNoGood),
+                                AlternativeForbidden,
+                            ));
                         }
                         for CutNode in OrderedCutNodes.into_iter().rev() {
-                            let mut AlternativeSearchBlocked = SearchBlockedBeforeNoGood.clone();
+                            ClaimDeadline!();
+                            let mut AlternativeSearchBlocked =
+                                CloneClaimNodes!(&SearchBlockedBeforeNoGood);
                             AlternativeSearchBlocked.insert(CutNode);
                             PendingSearchStates.push((
                                 AlternativeSearchBlocked,
-                                ForbiddenRepeatersBeforeNoGood.clone(),
+                                CloneClaimNodes!(&ForbiddenRepeatersBeforeNoGood),
                             ));
                         }
                         if let Some((NextSearchBlocked, NextForbiddenRepeaters)) =
@@ -239,8 +353,9 @@ impl RoutingContext {
                     if (!OrderedCutNodes.is_empty() || !CycleRepeaterPositions.is_empty())
                         && NoGoodCount < 64
                     {
-                        let SearchBlockedBeforeNoGood = SearchBlocked.clone();
-                        let ForbiddenRepeatersBeforeNoGood = ForbiddenRepeaterPositions.clone();
+                        let SearchBlockedBeforeNoGood = CloneClaimNodes!(&SearchBlocked);
+                        let ForbiddenRepeatersBeforeNoGood =
+                            CloneClaimNodes!(&ForbiddenRepeaterPositions);
                         // A directed-cycle no-good is the disjunction of
                         // removing one mutable cycle conductor or not placing
                         // one cycle-closing repeater.  Retain every exact
@@ -248,17 +363,23 @@ impl RoutingContext {
                         // a long parallel dust loop does not simply move its
                         // forced repeater one cell per invocation.
                         for RepeaterPosition in CycleRepeaterPositions.iter().copied().rev() {
-                            let mut AlternativeForbidden = ForbiddenRepeatersBeforeNoGood.clone();
+                            ClaimDeadline!();
+                            let mut AlternativeForbidden =
+                                CloneClaimNodes!(&ForbiddenRepeatersBeforeNoGood);
                             AlternativeForbidden.insert(RepeaterPosition);
-                            PendingSearchStates
-                                .push((SearchBlockedBeforeNoGood.clone(), AlternativeForbidden));
+                            PendingSearchStates.push((
+                                CloneClaimNodes!(&SearchBlockedBeforeNoGood),
+                                AlternativeForbidden,
+                            ));
                         }
                         for CutNode in OrderedCutNodes.iter().copied().rev() {
-                            let mut AlternativeSearchBlocked = SearchBlockedBeforeNoGood.clone();
+                            ClaimDeadline!();
+                            let mut AlternativeSearchBlocked =
+                                CloneClaimNodes!(&SearchBlockedBeforeNoGood);
                             AlternativeSearchBlocked.insert(CutNode);
                             PendingSearchStates.push((
                                 AlternativeSearchBlocked,
-                                ForbiddenRepeatersBeforeNoGood.clone(),
+                                CloneClaimNodes!(&ForbiddenRepeatersBeforeNoGood),
                             ));
                         }
                         if OrderedCutNodes.is_empty() {
@@ -295,6 +416,7 @@ impl RoutingContext {
             let mut InvalidRepeaterPositions = Result
                 .RepeaterReservations
                 .iter()
+                .take_while(|_| !Deadline.Check())
                 .filter_map(|(PositionValue, Facing)| {
                     let OutputDelta = match Facing.as_str() {
                         "west" => Some((1, 0)),
@@ -359,8 +481,10 @@ impl RoutingContext {
                 }
                 LastConflictResources = InvalidRepeaterPositions
                     .iter()
+                    .take_while(|_| !Deadline.Check())
                     .map(|Value| ("Repeater".to_string(), *Value))
                     .collect();
+                ClaimDeadline!();
                 RejectedPathCount += 1;
                 let CutNodes = InvalidRepeaterPositions
                     .into_iter()
@@ -455,13 +579,20 @@ impl RoutingContext {
                 return Result;
             }
 
-            LastConflictResources = SupportConflicts
-                .iter()
-                .map(|Value| ("Support".to_string(), *Value))
-                .chain(AirConflicts.iter().map(|Value| ("Air".to_string(), *Value)))
-                .collect();
+            LastConflictResources.clear();
+            for Value in &SupportConflicts {
+                ClaimDeadline!();
+                LastConflictResources.push(("Support".to_string(), *Value));
+            }
+            for Value in &AirConflicts {
+                ClaimDeadline!();
+                LastConflictResources.push(("Air".to_string(), *Value));
+            }
+            ClaimDeadline!();
             LastConflictResources.sort_unstable();
+            ClaimDeadline!();
             LastConflictResources.dedup();
+            ClaimDeadline!();
             if std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {
                 eprintln!(
                     "selected detailed static conflict signal={} resources={:?}",
@@ -470,29 +601,36 @@ impl RoutingContext {
             }
 
             let mut CutNodes = HashSet::new();
-            let AddAirContributorCutNodes =
-                |AirPosition: Position, Values: &mut HashSet<Position>| {
-                    for First in &CombinedWire {
-                        for Second in self.Adjacency.get(First).into_iter().flatten() {
-                            if Second <= First
-                                || Second.1 == First.1
-                                || !CombinedWire.contains(Second)
-                            {
-                                continue;
+            let AddAirContributorCutNodes = |AirPosition: Position,
+                                             Values: &mut HashSet<Position>|
+             -> bool {
+                for First in &CombinedWire {
+                    if Deadline.Check() {
+                        return false;
+                    }
+                    for Second in self.Adjacency.get(First).into_iter().flatten() {
+                        if Deadline.Check() {
+                            return false;
+                        }
+                        if Second <= First || Second.1 == First.1 || !CombinedWire.contains(Second)
+                        {
+                            continue;
+                        }
+                        let Lower = if First.1 < Second.1 { *First } else { *Second };
+                        if (Lower.0, Lower.1 + 1, Lower.2) == AirPosition {
+                            if RouteWire.contains(First) {
+                                Values.insert(*First);
                             }
-                            let Lower = if First.1 < Second.1 { *First } else { *Second };
-                            if (Lower.0, Lower.1 + 1, Lower.2) == AirPosition {
-                                if RouteWire.contains(First) {
-                                    Values.insert(*First);
-                                }
-                                if RouteWire.contains(Second) {
-                                    Values.insert(*Second);
-                                }
+                            if RouteWire.contains(Second) {
+                                Values.insert(*Second);
                             }
                         }
                     }
-                };
+                }
+                true
+            };
             for PositionValue in &SupportConflicts {
+                ClaimDeadline!();
                 if RouteWire.contains(PositionValue) {
                     CutNodes.insert(*PositionValue);
                 }
@@ -500,18 +638,24 @@ impl RoutingContext {
                 if RouteSupport.contains(PositionValue) {
                     CutNodes.insert(SupportedNode);
                 }
-                if CombinedAir.contains(PositionValue) {
-                    AddAirContributorCutNodes(*PositionValue, &mut CutNodes);
+                if CombinedAir.contains(PositionValue)
+                    && !AddAirContributorCutNodes(*PositionValue, &mut CutNodes)
+                {
+                    ClaimDeadline!();
                 }
             }
             for PositionValue in &AirConflicts {
+                ClaimDeadline!();
                 if RouteWire.contains(PositionValue) {
                     CutNodes.insert(*PositionValue);
                 }
-                if CombinedAir.contains(PositionValue) {
-                    AddAirContributorCutNodes(*PositionValue, &mut CutNodes);
+                if CombinedAir.contains(PositionValue)
+                    && !AddAirContributorCutNodes(*PositionValue, &mut CutNodes)
+                {
+                    ClaimDeadline!();
                 }
             }
+            ClaimDeadline!();
             CutNodes.retain(|Value| !MandatoryNodes.contains(Value));
             CutNodes.retain(|Value| !SearchBlocked.contains(Value));
             RejectedPathCount += 1;
@@ -541,6 +685,7 @@ impl RoutingContext {
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
+            ClaimDeadline!();
             OrderedCutNodes.sort_by_key(|PositionValue| {
                 (
                     std::cmp::Reverse(
@@ -551,19 +696,24 @@ impl RoutingContext {
                     PositionValue.2,
                 )
             });
+            ClaimDeadline!();
             if std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {
                 eprintln!(
                     "selected detailed self-conflict signal={} resources={:?} cut_nodes={:?}",
                     DebugLabel, LastConflictResources, OrderedCutNodes,
                 );
             }
-            let SearchBlockedBeforeNoGood = SearchBlocked.clone();
+            let SearchBlockedBeforeNoGood = CloneClaimNodes!(&SearchBlocked);
             for CutNode in OrderedCutNodes.iter().copied().rev() {
-                let mut AlternativeSearchBlocked = SearchBlockedBeforeNoGood.clone();
+                ClaimDeadline!();
+                let mut AlternativeSearchBlocked = CloneClaimNodes!(&SearchBlockedBeforeNoGood);
                 AlternativeSearchBlocked.insert(CutNode);
-                PendingSearchStates
-                    .push((AlternativeSearchBlocked, ForbiddenRepeaterPositions.clone()));
+                PendingSearchStates.push((
+                    AlternativeSearchBlocked,
+                    CloneClaimNodes!(&ForbiddenRepeaterPositions),
+                ));
             }
+            ClaimDeadline!();
             let (NextSearchBlocked, NextForbiddenRepeaterPositions) = PendingSearchStates
                 .pop()
                 .expect("a self-conflict has at least one movable contributor");

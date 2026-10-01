@@ -7,7 +7,7 @@ from PhysicalDesign.Routing.Global.TypedRouteConsumer import (
     BuildTypedNativeCoarseRequest,
     BuildTypedRouteExecutionPlan,
     BuildTypedRouteOriginRecordsFromResults,
-    BuildTypedRouteOriginDescriptor,
+    TypedRouteOriginMatchesCurrentInputs,
     CanonicalAuthority,
     SealTypedRouteLegacyRequests,
     TypedRouteBatchCounters,
@@ -99,6 +99,7 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     State.TypedNativeCallerSnapshotsByOrigins = {}
     State.TypedNativeCallerAuthorityObservationCache = {}
     State.TypedNativeImmutableObservationCache = {}
+    MaterializationImmutableForests = {}
     State.TypedNativeIncompleteKindsBySignal = Services.defaultdict(set)
     State.TypedNativeRouteAdmissionRecords = []
     State.TypedNativeRouteAdmissionByOriginIdentity = {}
@@ -328,13 +329,14 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
                     MaterializationEpoch = BuildTypedRouteMaterializationEpoch(
                         State,
                         ResolveTypedRouteCurrentOriginMetadata(State, NativeRequests, OriginDescriptors),
+                        _ImmutableForestCache=MaterializationImmutableForests,
                     )
                     SealedNativeRequests = SealTypedRouteLegacyRequests(NativeRequests)
                     for Descriptor, Metadata in zip(OriginDescriptors, MaterializationEpoch.Metadata):
-                        CurrentDescriptor = BuildTypedRouteOriginDescriptor(
-                            Descriptor.Signal, MaterializationEpoch.Profiles[Descriptor.Signal], Metadata,
-                        )
-                        if CurrentDescriptor != Descriptor:
+                        if not TypedRouteOriginMatchesCurrentInputs(
+                            Descriptor, Descriptor.Signal,
+                            MaterializationEpoch.Profiles[Descriptor.Signal], Metadata,
+                        ):
                             raise ValueError("typed origin fragments changed before request sealing")
                 except (AttributeError, TypeError, ValueError) as Error:
                     NativeValues, NativeCompletionMask = PublishPreNativeIncomplete(

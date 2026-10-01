@@ -2802,6 +2802,8 @@ fn ExecuteCanonicalRequest(
         Request.MaximumExpansionCount,
         Some(Admission),
         Deadline,
+        Request.RequestKind == COARSE_REQUEST_KIND
+            || Request.RequestKind == COARSE_START_CONNECTION_REQUEST_KIND,
     );
     if Result.IsRouted {
         match ValidateFoundCandidateWithDeadline(

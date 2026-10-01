@@ -1,7 +1,7 @@
 """Independent ownership and physical-behavior checks for frozen route epochs."""
 
 from dataclasses import FrozenInstanceError, dataclass, replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -293,3 +293,228 @@ def test_epoch_shares_only_certified_builtin_forests_and_reowns_mutable_descenda
     State.Resources.ResourceGraph.ActualBlocks = frozenset((Nodes[0],))
     assert Epoch.Resources.ResourceGraph.ActualBlocks == frozenset()
     assert Epoch.Resources.ResourceGraph.IsLegalNode(Nodes[0]) is True
+
+
+def test_reused_certificate_cache_recaptures_mutable_descendants_and_dataclasses():
+    State, Metadata, Nodes = Inputs()
+    Cache = {}
+    MutablePath = [Nodes[2]]
+    BackingPaths = {Nodes[2]: MutablePath}
+    Profile = replace(
+        State.Profiles["signal"], TargetAccessPaths=MappingProxyType(BackingPaths),
+    )
+    State.Profiles["signal"] = Profile
+    MutableCells = {Nodes[0]}
+    Claims = RoutingResourceClaims(WireCells=MutableCells)
+    State.ForeignSelectedPinAccessClaimsBySignal["signal"] = (("foreign", Claims),)
+    MutableTargets = list(Metadata[0][1])
+    Metadata = ((Metadata[0][0], MutableTargets, *Metadata[0][2:]),)
+    First = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+
+    MutablePath.insert(0, Nodes[1])
+    BackingPaths[Nodes[1]] = [Nodes[0], Nodes[1]]
+    MutableCells.add(Nodes[1])
+    MutableTargets.append(replace(MutableTargets[0], PortalId="new-target"))
+    Second = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+
+    assert First.Profiles["signal"].TargetAccessPaths == {Nodes[2]: (Nodes[2],)}
+    assert Second.Profiles["signal"].TargetAccessPaths == {
+        Nodes[2]: (Nodes[1], Nodes[2]), Nodes[1]: (Nodes[0], Nodes[1]),
+    }
+    assert First.ForeignSelectedPinAccessClaimsBySignal["signal"][0][1].WireCells == {Nodes[0]}
+    assert Second.ForeignSelectedPinAccessClaimsBySignal["signal"][0][1].WireCells == {
+        Nodes[0], Nodes[1],
+    }
+    assert tuple(Target.PortalId for Target in First.Metadata[0][1]) == ("selected-target",)
+    assert tuple(Target.PortalId for Target in Second.Metadata[0][1]) == (
+        "selected-target", "new-target",
+    )
+    for Epoch in (First, Second):
+        assert Epoch.Profiles["signal"] is not Profile
+        assert Epoch.Profiles["signal"].Seed is not Profile.Seed
+        assert Epoch.Profiles["signal"].TargetAccessPaths is not Profile.TargetAccessPaths
+        assert Epoch.ForeignSelectedPinAccessClaimsBySignal["signal"][0][1] is not Claims
+        assert Epoch.Metadata[0][0] is not Metadata[0][0]
+    assert First.Profiles["signal"] is not Second.Profiles["signal"]
+    assert First.Metadata[0][0] is not Second.Metadata[0][0]
+    MutablePath.clear()
+    BackingPaths.clear()
+    MutableCells.clear()
+    MutableTargets.clear()
+    assert Second.Profiles["signal"].TargetAccessPaths[Nodes[2]] == (Nodes[1], Nodes[2])
+    assert Second.ForeignSelectedPinAccessClaimsBySignal["signal"][0][1].WireCells == {
+        Nodes[0], Nodes[1],
+    }
+    assert len(Second.Metadata[0][1]) == 2
+
+
+def test_reused_certificate_cache_observes_replaced_region_and_graph_authority():
+    State, Metadata, Nodes = Inputs()
+    Cache = {}
+    First = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+    assert First.Resources.ResourceGraph.BuildRouteClaims(Nodes).WireCells == frozenset(Nodes)
+    State.Region = RoutingGraphRegion(
+        (1, 2, 1, 1, 0, 0), frozenset(Nodes[1:]), frozenset(((Nodes[1], Nodes[2]),)),
+    )
+    State.Resources.ResourceGraph = RoutingResourceGraph(
+        frozenset((Nodes[0],)), frozenset(), frozenset(), State.Technology,
+        GraphVersion="replacement-graph",
+    )
+    State.Resources.ResourceGraph._RouteClaimsCache[frozenset(Nodes)] = RoutingResourceClaims()
+    Second = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+
+    assert First.Region.Nodes == frozenset(Nodes)
+    assert First.Region.ContainsEdge(Nodes[0], Nodes[1]) is True
+    assert Second.Region.Nodes == frozenset(Nodes[1:])
+    assert Second.Region.Bounds == (1, 2, 1, 1, 0, 0)
+    assert Second.Region.ContainsEdge(Nodes[0], Nodes[1]) is False
+    assert Second.Region.ContainsEdge(Nodes[1], Nodes[2]) is True
+    assert Second.Region is not State.Region
+    assert First.Resources.ResourceGraph.IsLegalNode(Nodes[0]) is True
+    assert Second.Resources.ResourceGraph.IsLegalNode(Nodes[0]) is False
+    assert Second.Resources.ResourceGraph.GraphVersion == "replacement-graph"
+    assert Second.Resources.ResourceGraph._RouteClaimsCache == {}
+    assert Second.Resources.ResourceGraph._RouteClaimsCache is not First.Resources.ResourceGraph._RouteClaimsCache
+    assert Second.Resources.ResourceGraph.BuildRouteClaims(Nodes[1:]).WireCells == frozenset(Nodes[1:])
+
+
+def test_reused_certificate_cache_retains_exact_immutable_forests_but_reowns_records():
+    @dataclass(frozen=True)
+    class FrozenRecord:
+        Value: object
+
+    State, Metadata, _Nodes = Inputs()
+    Forest = (
+        None, True, 7, "primitive", 0.25,
+        frozenset((None, False, 2, "nested", 0.5)),
+        (("leaf",), frozenset(("a", "b", "c", "d"))),
+    )
+    Record = FrozenRecord(Forest)
+    State.Profiles["fixture"] = Record
+    Cache = {}
+    First = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+    Second = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+
+    assert First.Profiles["fixture"].Value is Forest
+    assert Second.Profiles["fixture"].Value is Forest
+    assert First.Profiles["fixture"] is not Record
+    assert Second.Profiles["fixture"] is not Record
+    assert First.Profiles["fixture"] is not Second.Profiles["fixture"]
+    assert Cache[id(Forest)] is Forest
+    assert all(Key == id(Value) for Key, Value in Cache.items())
+
+
+@pytest.fixture
+def SaturatedImmutableCache():
+    State, Metadata, _Nodes = Inputs()
+    Guides = {
+        str(Index): frozenset((Index, Offset) for Offset in range(4))
+        for Index in range(2050)
+    }
+    State.CoarsePlan = replace(State.CoarsePlan, Guides=Guides)
+    Cache = {}
+    Epoch = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+    assert Epoch.CoarsePlan.Guides == Guides
+    assert len(Cache) == 2048
+    assert all(Key == id(Value) for Key, Value in Cache.items())
+    return Cache
+
+
+def test_saturated_certificate_cache_preserves_current_values_and_owned_snapshots(SaturatedImmutableCache):
+    State, Metadata, Nodes = Inputs()
+    MutablePath = [Nodes[2]]
+    State.Profiles["signal"].TargetAccessPaths[Nodes[2]] = (MutablePath,)
+    First = BuildTypedRouteMaterializationEpoch(
+        State, Metadata, _ImmutableForestCache=SaturatedImmutableCache,
+    )
+    MutablePath.insert(0, Nodes[1])
+    Second = BuildTypedRouteMaterializationEpoch(
+        State, Metadata, _ImmutableForestCache=SaturatedImmutableCache,
+    )
+    Fresh = BuildTypedRouteMaterializationEpoch(State, Metadata)
+
+    assert First.Profiles["signal"].TargetAccessPaths[Nodes[2]] == ((Nodes[2],),)
+    assert Second.Profiles["signal"].TargetAccessPaths[Nodes[2]] == ((Nodes[1], Nodes[2]),)
+    assert Second.Profiles == Fresh.Profiles
+    assert Second.Metadata == Fresh.Metadata
+    assert Second.Region == Fresh.Region
+    assert Second.Region.Nodes is State.Region.Nodes
+    assert Second.Region.Edges is State.Region.Edges
+    assert len(SaturatedImmutableCache) == 2048
+
+
+@pytest.mark.parametrize("InvalidKind,Error", (
+    ("opaque", "unsupported materialization value"),
+    ("nan", "finite floats"),
+    ("inf", "finite floats"),
+    ("negative-inf", "finite floats"),
+    ("cycle", "cyclic"),
+    ("tuple-subclass", "unsupported materialization value"),
+    ("frozenset-subclass", "unsupported materialization value"),
+    ("int-subclass", "unsupported materialization value"),
+    ("str-subclass", "unsupported materialization value"),
+    ("float-subclass", "unsupported materialization value"),
+))
+def test_saturated_certificate_cache_preserves_rejections(SaturatedImmutableCache, InvalidKind, Error):
+    State, Metadata, Nodes = Inputs()
+    Values = {
+        "opaque": object(), "nan": float("nan"), "inf": float("inf"),
+        "negative-inf": -float("inf"),
+        "tuple-subclass": type("TupleSubclass", (tuple,), {})((1, 2, 3, 4)),
+        "frozenset-subclass": type("FrozenSetSubclass", (frozenset,), {})((1, 2, 3, 4)),
+        "int-subclass": type("IntSubclass", (int,), {})(1),
+        "str-subclass": type("StrSubclass", (str,), {})("value"),
+        "float-subclass": type("FloatSubclass", (float,), {})(0.5),
+    }
+    if InvalidKind == "cycle":
+        Value = []
+        Value.append(Value)
+    else:
+        Value = Values[InvalidKind]
+    State.Profiles["signal"].TargetAccessPaths[Nodes[2]] = (Value,)
+
+    with pytest.raises(TypeError, match=Error) as Fresh:
+        BuildTypedRouteMaterializationEpoch(State, Metadata)
+    with pytest.raises(TypeError, match=Error) as Saturated:
+        BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=SaturatedImmutableCache)
+    assert str(Saturated.value) == str(Fresh.value)
+    assert len(SaturatedImmutableCache) == 2048
+
+
+@pytest.mark.parametrize("Container", ("direct", "tuple", "frozenset"))
+def test_warm_certificate_cache_rejects_metaclass_builtin_equality_spoofing(Container):
+    Comparisons = []
+
+    class BuiltinSpoofingMeta(type):
+        __hash__ = type.__hash__
+
+        def __eq__(self, Other):
+            Comparisons.append(Other)
+            return True
+
+    class OpaqueMutableValue(metaclass=BuiltinSpoofingMeta):
+        def __init__(self, Payload):
+            self.Payload = Payload
+
+    State, Metadata, Nodes = Inputs()
+    Guide = frozenset(((0, 0), (1, 0), (2, 0), (3, 0)))
+    State.CoarsePlan.Guides["signal"] = Guide
+    Cache = {}
+    First = BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+    assert Cache
+    PreviousCertificates = dict(Cache)
+    Value = OpaqueMutableValue([Nodes[2]])
+    Wrapped = Value if Container == "direct" else (
+        (Value,) if Container == "tuple" else frozenset((Value,))
+    )
+    State.Profiles["signal"].TargetAccessPaths[Nodes[2]] = Wrapped
+
+    with pytest.raises(TypeError, match="unsupported materialization value"):
+        BuildTypedRouteMaterializationEpoch(State, Metadata, _ImmutableForestCache=Cache)
+
+    Value.Payload.clear()
+    assert Comparisons == []
+    assert Cache.keys() == PreviousCertificates.keys()
+    assert all(Cache[Key] is Certificate for Key, Certificate in PreviousCertificates.items())
+    assert First.Profiles["signal"].TargetAccessPaths == {Nodes[2]: (Nodes[2],)}
+    assert First.CoarsePlan.Guides["signal"] == Guide

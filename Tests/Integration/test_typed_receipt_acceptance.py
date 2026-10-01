@@ -705,7 +705,7 @@ def test_frozen_materialization_never_publishes_after_live_input_mutation(
                for State in States)
 
 
-@pytest.mark.parametrize("Mutation", ("metadata", "signal-association"))
+@pytest.mark.parametrize("Mutation", ("metadata", "signal-association", "source-access-path"))
 def test_changed_request_origin_before_dispatch_cannot_publish_complete_work(monkeypatch, Mutation):
     """Current signal/access provenance must agree before native work is submitted."""
     Current = ObserveCurrentState(monkeypatch)
@@ -724,6 +724,17 @@ def test_changed_request_origin_before_dispatch_cannot_publish_complete_work(mon
                 Metadata = list(State.RouteMetadataBySignal[Signal][0])
                 Metadata[-1] += 10000
                 State.RouteMetadataBySignal[Signal][0] = tuple(Metadata)
+            elif Mutation == "source-access-path":
+                Signal, _Requests = Rows[0]
+                Profile = State.Profiles[Signal]
+                Path = tuple(Profile.SourceAccessPath)
+                Added = (
+                    max(Position[0] for Position in (*Path, Profile.Root)) + 1,
+                    Profile.Root[1], Profile.Root[2],
+                )
+                State.Profiles[Signal] = replace(
+                    Profile, SourceAccessPath=(*Path, Added)
+                )
             else:
                 Signal, Requests = Rows[0]
                 Moved = Requests.pop(0)

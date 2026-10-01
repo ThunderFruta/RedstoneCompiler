@@ -55,10 +55,33 @@ persistent-worker, in-flight cancellation, reuse, or full-router claim.
   pre-owned contributors that caused a conflict. They cannot authorize direct-only
   recovery. The separate exact placement-access-core recovery remains intact
 
+## Coarse self-claim repair
+
+Typed coarse search preserves the full ordered target-branch witness. A legacy
+coarse tree can traverse a target branch backwards, so matching its geometry is
+not a substitute for that contract. The two-NAND fanout regression exposed a
+typed candidate whose newly induced vertical edges required air in a support
+cell, even though its individually searched paths were legal.
+
+Coarse receipt production now checks the initial candidate with the existing
+claim-aware search and repairs exact contributor conflicts under the same
+request admission counter and absolute deadline. It retains every start and
+ordered branch node. A legal initial candidate is reused without another search
+or a mandatory-only preliminary attempt. Repair exhaustion remains incomplete;
+only the original, uncut relaxed graph can supply a complete no-path proof.
+The detailed and factorized entry points retain their existing behavior, and
+the Python coordinator still performs the authoritative physical admission.
+
+The independent native regression enumerates a small graph's legal ordered
+paths, derives support and induced-edge air claims directly, and exercises
+repair, exact cumulative caps, cancellation, deadline expiration, multiple
+branches, and unchanged detailed directionality. Source-bound build and test
+receipts for this correction are retained under `Output/Issue3/FanoutRegression/`.
+
 ## Evidence and limitations
 
-The original unchanged WIP baseline passed 303 tests and 22 subtests. The
-source-local extension was rebuilt from this exact native source; its imported
+The original unchanged WIP baseline passed 303 tests and 22 subtests. At the
+original `4f133323` checkpoint, the source-local extension's imported
 SHA-256 is `fff276d998a534c0d00fe47119278e7a76e7253a8347e338ce54588d4a4d3bea`.
 Native boundary tests passed 55 cases, Rust release tests passed 91 cases, and
 the structural/schema gate passed 7 cases. The first Rust test link failed

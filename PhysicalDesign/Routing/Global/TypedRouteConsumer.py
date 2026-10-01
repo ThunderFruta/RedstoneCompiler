@@ -49,12 +49,41 @@ def TypedRouteTerminalCompletesRequest(Kind: str) -> bool:
 
 def CanonicalAuthority(Value: object) -> object:
     """Project immutable authority to canonical JSON-compatible named fields."""
-    if type(Value) is float and not isfinite(Value):
+    Kind = type(Value)
+    if Kind is float and not isfinite(Value):
         raise TypeError("authority float must be finite")
-    if Value is None or type(Value) in (bool, int, float, str):
+    if Value is None or Kind in (bool, int, float, str):
         return Value
-    if type(Value) in (tuple, list, _FrozenAuthorityList):
-        return [CanonicalAuthority(Item) for Item in Value]
+    if Kind in (tuple, list, _FrozenAuthorityList):
+        # Primitive leaves are already canonical. Project every other value,
+        # including floats, while retaining fresh arrays and source order.
+        return [
+            Item if Item is None or type(Item) is int or type(Item) is str or type(Item) is bool
+            else CanonicalAuthority(Item)
+            for Item in Value
+        ]
+    if Kind is dict:
+        # Exact dicts have no producer hooks. Project their entries in source
+        # order, then inspect current key types, as for general mappings below.
+        # A descendant producer may mutate the source during its projection.
+        Pairs = [
+            (Key if type(Key) is str else CanonicalAuthority(Key), CanonicalAuthority(Item))
+            for Key, Item in Value.items()
+        ]
+        if all(type(Key) is str for Key in Value):
+            return {Key: Item for Key, Item in sorted(Pairs, key=lambda Pair: Pair[0])}
+        return {
+            "SchemaVersion": "joint-canonical-authority-map-v1",
+            "Entries": [
+                {"Key": Key, "Value": Item}
+                for Key, Item in sorted(
+                    Pairs,
+                    key=lambda Pair: json.dumps(
+                        Pair[0], sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                    ),
+                )
+            ],
+        }
     if isinstance(Value, Enum):
         return Value.value
     if isinstance(Value, PurePath):
@@ -108,14 +137,19 @@ def CanonicalAuthority(Value: object) -> object:
     raise TypeError("authority has no canonical producer projection")
 
 
-def CanonicalJson(Value: object) -> str:
-    """Return the canonical JSON representation of an authority document."""
+def _EncodeCanonicalDocument(Value: object) -> str:
+    """Encode a document whose owner has already established its projection."""
     return json.dumps(
-        CanonicalAuthority(Value),
+        Value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
     )
+
+
+def CanonicalJson(Value: object) -> str:
+    """Return the canonical JSON representation of an authority document."""
+    return _EncodeCanonicalDocument(CanonicalAuthority(Value))
 
 
 def AuthorityIdentity(Value: object) -> str:
@@ -170,22 +204,75 @@ def _DocumentWithoutFrozenContainers(Value: object) -> object:
     return Value
 
 
-def _FreezeCanonicalDocument(Value: object) -> object:
+def _FreezeCanonicalDocument(Value: object, Certificate: list[bool] | None = None) -> object:
     if type(Value) is dict:
+        if Certificate is not None and any(type(Key) is not str for Key in Value):
+            Certificate[0] = False
         return MappingProxyType({
-            Key: _FreezeCanonicalDocument(Item)
+            Key: _FreezeCanonicalDocument(Item, Certificate)
             for Key, Item in Value.items()
         })
     if type(Value) is list:
-        return _FrozenAuthorityList(_FreezeCanonicalDocument(Item) for Item in Value)
+        return _FrozenAuthorityList(_FreezeCanonicalDocument(Item, Certificate) for Item in Value)
+    if Certificate is not None and not (
+        Value is None or type(Value) is bool or type(Value) is int or type(Value) is str
+        or (type(Value) is float and isfinite(Value))
+    ):
+        # The public projection accepts some enum-backed documents which need
+        # another producer pass. Preserve them, but never certify the fast path.
+        Certificate[0] = False
     return Value
 
 
-def _RequireCanonicalDocument(Value: object, Name: str) -> object:
+_UncertifiedCanonicalDocument = object()
+_MaximumFastCanonicalDocumentDepth = 64
+
+
+def _TryOwnPlainCanonicalDocument(Value: object, Active: set[int]) -> object:
+    """Own a plain canonical tree without evaluating any producer or equality hook."""
+    Kind = type(Value)
+    if Value is None or Kind is bool or Kind is int or Kind is str:
+        return Value
+    if Kind is float:
+        return Value if isfinite(Value) else _UncertifiedCanonicalDocument
+    if ((Kind is not dict and Kind is not list)
+            or id(Value) in Active or len(Active) >= _MaximumFastCanonicalDocumentDepth):
+        return _UncertifiedCanonicalDocument
+    Active.add(id(Value))
+    try:
+        if Kind is dict:
+            if any(type(Key) is not str for Key in Value):
+                return _UncertifiedCanonicalDocument
+            Owned = {}
+            for Key in sorted(Value):
+                Item = _TryOwnPlainCanonicalDocument(Value[Key], Active)
+                if Item is _UncertifiedCanonicalDocument:
+                    return _UncertifiedCanonicalDocument
+                Owned[Key] = Item
+            return MappingProxyType(Owned)
+        Owned = []
+        for ValueItem in Value:
+            Item = _TryOwnPlainCanonicalDocument(ValueItem, Active)
+            if Item is _UncertifiedCanonicalDocument:
+                return _UncertifiedCanonicalDocument
+            Owned.append(Item)
+        return _FrozenAuthorityList(Owned)
+    finally:
+        Active.remove(id(Value))
+
+
+def _RequireCanonicalDocument(
+    Value: object, Name: str, Certificate: list[bool] | None = None,
+) -> object:
+    Owned = _TryOwnPlainCanonicalDocument(Value, set())
+    if Owned is not _UncertifiedCanonicalDocument:
+        # These exact finite JSON trees are already their canonical projection.
+        # This proves equality while owning them; no second projection is needed.
+        return Owned
     Canonical = CanonicalAuthority(Value)
     if Canonical != _DocumentWithoutFrozenContainers(Value):
         raise ValueError(f"{Name} is not a canonical authority document")
-    return _FreezeCanonicalDocument(Canonical)
+    return _FreezeCanonicalDocument(Canonical, Certificate)
 
 
 def BuildDisabledSelectedAccessAuthority() -> dict[str, object]:
@@ -346,13 +433,14 @@ class TypedRouteOriginDescriptor:
 
     def __post_init__(self) -> None:
         _RequireNonEmptyString(self.Signal, "Signal")
+        CanonicalProjection = [True]
         object.__setattr__(self, "SourcePortal", _RequireCanonicalDocument(
-            self.SourcePortal, "SourcePortal"
+            self.SourcePortal, "SourcePortal", CanonicalProjection,
         ))
         if type(self.TargetPortals) is not tuple:
             raise TypeError("TargetPortals must be an exact tuple")
         object.__setattr__(self, "TargetPortals", tuple(
-            _RequireCanonicalDocument(Portal, f"TargetPortals[{Index}]")
+            _RequireCanonicalDocument(Portal, f"TargetPortals[{Index}]", CanonicalProjection)
             for Index, Portal in enumerate(self.TargetPortals)
         ))
         if type(self.Guide) is not tuple or self.Guide != tuple(sorted(self.Guide)):
@@ -370,8 +458,9 @@ class TypedRouteOriginDescriptor:
         if self.Axis not in ("X", "Z"):
             raise ValueError("origin axis must be X or Z")
         object.__setattr__(self, "ImmutableFragments", _RequireCanonicalDocument(
-            self.ImmutableFragments, "ImmutableFragments"
+            self.ImmutableFragments, "ImmutableFragments", CanonicalProjection,
         ))
+        object.__setattr__(self, "_CanonicalProjectionCertified", CanonicalProjection[0])
 
     @cached_property
     def ImmutableFragmentIdentity(self) -> str:
@@ -397,7 +486,15 @@ class TypedRouteOriginDescriptor:
 
     @cached_property
     def Identity(self) -> str:
-        return AuthorityIdentity(self.ToDictionary())
+        Document = self.ToDictionary()
+        if (type(self) is TypedRouteOriginDescriptor and type(self.Axis) is str
+                and getattr(self, "_CanonicalProjectionCertified", False) is True):
+            # This exact owner exports only validated primitive fields and
+            # freshly projected, deeply owned canonical portal/fragment data.
+            # Avoid projecting the same document a second time. Subclasses and
+            # accepted custom axis projections retain the public producer path.
+            return sha256(_EncodeCanonicalDocument(Document).encode("utf-8")).hexdigest()
+        return AuthorityIdentity(Document)
 
 
 @dataclass(frozen=True)
@@ -803,6 +900,9 @@ def BuildTypedRouteOriginRecordsFromResults(
             != ExecutionScope.DeadlineAtMonotonicSeconds
         ):
             raise ValueError("native result does not match current execution scope")
+    # The scope owns only exact immutable typed fields. Hash it once for this
+    # batch while preserving the empty-plan path's lack of identity evaluation.
+    ScopeIdentity = ExecutionScope.Identity if Plan else None
     Records = []
     for Planned, Descriptor in zip(Plan, OriginDescriptors):
         if Planned.RepresentativeIndex >= len(NativeResults):
@@ -817,7 +917,9 @@ def BuildTypedRouteOriginRecordsFromResults(
             CanonicalOriginIdentity=CanonicalPlan.OriginIdentity,
             CanonicalRequestId=Result.RequestIdentity,
             CanonicalReceiptIdentity=Result.ExecutionScope.ReceiptIdentity,
-            ExecutionScopeIdentity=ExecutionScope.Identity,
+            ExecutionScopeIdentity=(
+                ScopeIdentity if ScopeIdentity is not None else ExecutionScope.Identity
+            ),
             GeometryIdentity=Planned.GeometryIdentity,
             NativePayloadIdentity=Result.NativePayloadIdentity,
             RouteDomainIdentity=Result.ExecutionScope.RouteDomainIdentity,
@@ -1115,12 +1217,12 @@ class TypedRouteBatchCounters:
         }
 
 
-def BuildTypedRouteOriginDescriptor(
+def _ProjectTypedRouteOriginFields(
     Signal: str,
     Profile,
     Metadata: tuple[object, ...],
-) -> TypedRouteOriginDescriptor:
-    """Bind native-equivalent geometry to its distinct Joint origin fragments."""
+) -> dict[str, object]:
+    """Capture each origin producer once, in its established evaluation order."""
     SourcePortal, TargetPortals, Guide, Layer, Axis, Lane, Variant = Metadata
     TargetFragments = [
         {
@@ -1139,17 +1241,85 @@ def BuildTypedRouteOriginDescriptor(
         "SourcePortalPath": CanonicalAuthority(SourcePortal.Path),
         "TargetFragments": TargetFragments,
     }
-    return TypedRouteOriginDescriptor(
-        Signal=Signal,
-        SourcePortal=CanonicalAuthority(SourcePortal),
-        TargetPortals=tuple(
+    return {
+        "Signal": Signal,
+        "SourcePortal": CanonicalAuthority(SourcePortal),
+        "TargetPortals": tuple(
             CanonicalAuthority(Portal)
             for Portal in TargetPortals
         ),
-        Guide=tuple(sorted(Guide)),
-        Layer=Layer,
-        Axis=Axis,
-        Lane=Lane,
-        Variant=Variant,
-        ImmutableFragments=ImmutableFragments,
-    )
+        "Guide": tuple(sorted(Guide)),
+        "Layer": Layer,
+        "Axis": Axis,
+        "Lane": Lane,
+        "Variant": Variant,
+        "ImmutableFragments": ImmutableFragments,
+    }
+
+
+def BuildTypedRouteOriginDescriptor(
+    Signal: str,
+    Profile,
+    Metadata: tuple[object, ...],
+) -> TypedRouteOriginDescriptor:
+    """Bind native-equivalent geometry to its distinct Joint origin fragments."""
+    return TypedRouteOriginDescriptor(**_ProjectTypedRouteOriginFields(Signal, Profile, Metadata))
+
+
+def _MatchesOwnedCanonicalDocument(Owned: object, Current: object) -> bool:
+    """Prove equal canonical bytes only for exact builtin document values."""
+    Kind = type(Current)
+    if Current is None:
+        return Owned is None
+    if Kind is bool or Kind is int or Kind is str:
+        return type(Owned) is Kind and Owned == Current
+    if Kind is float:
+        return type(Owned) is float and isfinite(Current) and Owned.hex() == Current.hex()
+    if Kind is list:
+        return (
+            type(Owned) is _FrozenAuthorityList and len(Owned) == len(Current)
+            and all(_MatchesOwnedCanonicalDocument(Left, Right) for Left, Right in zip(Owned, Current))
+        )
+    if Kind is dict:
+        return (
+            type(Owned) is MappingProxyType
+            and all(type(Key) is str for Key in Current)
+            and Owned.keys() == Current.keys()
+            and all(_MatchesOwnedCanonicalDocument(Owned[Key], Item) for Key, Item in Current.items())
+        )
+    return False
+
+
+def TypedRouteOriginMatchesCurrentInputs(
+    Descriptor: TypedRouteOriginDescriptor,
+    Signal: str,
+    Profile,
+    Metadata: tuple[object, ...],
+) -> bool:
+    """Recheck fresh origin fields without refreezing an equal owned descriptor.
+
+    Only a proved positive uses the shortcut. Every mismatch, invalid value or
+    unusual producer takes the complete constructor from the captured fields,
+    preserving validation order and avoiding a second producer evaluation.
+    """
+    Current = _ProjectTypedRouteOriginFields(Signal, Profile, Metadata)
+    Guide = Current["Guide"]
+    if (
+        type(Descriptor) is TypedRouteOriginDescriptor
+        and getattr(Descriptor, "_CanonicalProjectionCertified", False) is True
+        and type(Descriptor.Axis) is str
+        and type(Signal) is str and Signal == Descriptor.Signal
+        and type(Current["Axis"]) is str and Current["Axis"] == Descriptor.Axis
+        and all(type(Current[Name]) is int and Current[Name] == getattr(Descriptor, Name)
+                for Name in ("Layer", "Lane", "Variant"))
+        and all(type(Position) is tuple and len(Position) == 2
+                and all(type(Value) is int for Value in Position) for Position in Guide)
+        and Guide == Descriptor.Guide
+        and _MatchesOwnedCanonicalDocument(Descriptor.SourcePortal, Current["SourcePortal"])
+        and len(Descriptor.TargetPortals) == len(Current["TargetPortals"])
+        and all(_MatchesOwnedCanonicalDocument(Owned, Projected)
+                for Owned, Projected in zip(Descriptor.TargetPortals, Current["TargetPortals"]))
+        and _MatchesOwnedCanonicalDocument(Descriptor.ImmutableFragments, Current["ImmutableFragments"])
+    ):
+        return True
+    return TypedRouteOriginDescriptor(**Current).Identity == Descriptor.Identity
