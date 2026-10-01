@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 
 import pytest
+from RedstoneCompiler.RustRouting import GetRoutingThreadCount
 
 import PhysicalDesign.Routing.Regions.Cache as ComponentCache
 from PhysicalDesign.Routing.Regions.Boundaries.Fabric import ApplyRoutedComponentGlobalProfiles, AugmentComponentRoutingFabric, BuildCoalescedComponentAccessCandidates, CoalesceOwnedSignalAccessDomains, BuildClosedComponentInterface, BridgeDisconnectedOwnedSignalFabric, BuildClaimsAwareComponentFabricSubtree, BuildComponentRoutingFabric, BuildComponentFabricAdjacency, FilterExternalSourcePoweredSeamCandidateDomains, PruneDominatedComponentAccessCandidates, SelectClosedComponentOwnedTerminalPairs, SelectComponentIncidentSignals
@@ -2937,24 +2938,54 @@ def _LoadCla4TreeDpFixture():
     return Data, Problem
 
 
-def test_captured_cla4_tree_frontier_fixture_completes_under_gate():
+def test_captured_cla4_tree_frontier_fixture_completes_under_gate(monkeypatch):
     Data, Problem = _LoadCla4TreeDpFixture()
     SymbolicNetStateCache = {}
+    ClaimBatchSizes = []
+    FabricBatchSizes = []
+
+    def ObserveBatch(Operation, Sizes, InputOrdinal):
+        def Observed(*Arguments):
+            Sizes.append(len(Arguments[InputOrdinal]))
+            return Operation(*Arguments)
+        return Observed
+
+    # Observe the actual native inputs without replacing the native computation.
+    # Last-batch active workers and aggregate work-items are distinct receipts.
     Started = monotonic()
-    First = SolveComponentRoutingProblemDynamic(
-        Problem,
-        DeadlineSeconds=30.0,
-    )
+    with monkeypatch.context() as NativeCalls:
+        for Name, Sizes, InputOrdinal in (
+            ("_BuildRouteClaimsBatchWithTelemetry", ClaimBatchSizes, 0),
+            ("_BuildFabricSubtreesBatchWithTelemetry", FabricBatchSizes, 2),
+        ):
+            Operation = getattr(DynamicSolverModule, Name)
+            if Operation is not None:
+                NativeCalls.setattr(
+                    DynamicSolverModule, Name,
+                    ObserveBatch(Operation, Sizes, InputOrdinal),
+                )
+        First = SolveComponentRoutingProblemDynamic(
+            Problem,
+            DeadlineSeconds=30.0,
+        )
     RuntimeSeconds = monotonic() - Started
     if DynamicSolverModule._BuildRouteClaimsBatchWithTelemetry is not None:
-        # The captured CLA4 tree frontier has more than eight independent
-        # physical claim sets.  Keep the native worker split honest: the
-        # bounded pool must execute one deterministic shard on every worker,
-        # rather than merely advertising an eight-thread capacity.
-        assert First.Diagnostics["NativeClaimBatchWorkerCount"] == 8
-        assert First.Diagnostics["NativeClaimBatchActiveWorkerCount"] == 8
+        # Capacity is verified independently by the Rust fresh-process matrix.
+        # Demand exact shard execution against observed inputs, not a fixed host.
+        PoolWorkers = GetRoutingThreadCount()
+        assert ClaimBatchSizes and FabricBatchSizes
+        assert First.Diagnostics["NativeClaimBatchWorkerCount"] == PoolWorkers
+        assert First.Diagnostics["NativeClaimBatchActiveWorkerCount"] == min(
+            PoolWorkers, ClaimBatchSizes[-1],
+        )
+        assert First.Diagnostics["NativeClaimBatchCount"] == len(ClaimBatchSizes)
+        assert First.Diagnostics["NativeClaimBatchWorkItems"] == sum(ClaimBatchSizes)
         assert First.Diagnostics["NativeClaimBatchWorkItems"] >= 8
-        assert First.Diagnostics["NativeFabricSubtreeBatchActiveWorkerCount"] == 8
+        assert First.Diagnostics["NativeFabricSubtreeBatchActiveWorkerCount"] == min(
+            PoolWorkers, FabricBatchSizes[-1],
+        )
+        assert First.Diagnostics["NativeFabricSubtreeBatchCount"] == len(FabricBatchSizes)
+        assert First.Diagnostics["NativeFabricSubtreeBatchWorkItems"] == sum(FabricBatchSizes)
         assert First.Diagnostics["NativeFabricSubtreeBatchWorkItems"] >= 8
     Second = SolveComponentRoutingProblemDynamic(
         Problem,

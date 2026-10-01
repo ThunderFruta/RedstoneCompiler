@@ -37,13 +37,18 @@ from PhysicalDesign.Runtime.OneShotProcess import StartRuntimeOneShotProcess
 from Tests.PhysicalDesign.Runtime.test_one_shot_process import (
     _Authority as _OneShotAuthority,
     _EchoBytes as _OneShotEchoBytes,
+    _IndependentCloseWitness,
     _Limits as _OneShotLimits,
     _OpenSocketInodes,
+    _PidMatchesWitness,
+    _PidStartTicks,
+    _PollFor,
     _PublishEntryThenIgnoreCancellationUntilFixtureExpiry,
     _RecoverAndClose,
     _Request as _OneShotRequest,
     _SharedMemoryResources,
     _StartOwned as _StartOneShotOwned,
+    _WITNESSES,
 )
 
 
@@ -158,6 +163,62 @@ def _Limits(
         MaximumPayloadBytes=PayloadBytes,
         MaximumResultBytes=ResultBytes,
     )
+
+
+def _CaptureRealOneShotStarts(monkeypatch):
+    Starts = []
+
+    def StartObserved(Request, Authority, *Arguments):
+        Handle = _StartOneShotOwned(Request, Authority, *Arguments)
+        Starts.append((Request, Authority, Handle))
+        return Handle
+
+    monkeypatch.setattr(
+        SpawnedWork,
+        "StartRuntimeOneShotProcess",
+        StartObserved,
+    )
+    return Starts
+
+
+def _AssertStartedResourcesAbsent(Handle) -> None:
+    Witness = _WITNESSES[id(Handle)]
+    assert not _PidMatchesWitness(Witness)
+    for Name in (Witness["request_shm"], Witness["result_shm"]):
+        if Name is not None:
+            assert not (Path("/dev/shm") / Name.lstrip("/")).exists()
+    assert set(Witness["sync_inodes"]).isdisjoint(_OpenSocketInodes())
+    _IndependentCloseWitness(Handle, UsedFallback=False)
+
+
+def _CloseNaturallyReleasedStarts(Starts) -> None:
+    """Recover every released fixture without granting or sending a force signal."""
+    Failures = []
+    for _, _, Handle in Starts:
+        try:
+            Receipt = _PollFor(
+                Handle.Observe,
+                lambda Value: Value.ProcessExitObserved or Value.ResourcesClosed,
+            )
+            assert Receipt is not None
+            assert Receipt.ProcessExitObserved or Receipt.ResourcesClosed
+            if not Receipt.ResourcesClosed:
+                try:
+                    Receipt = Handle.ReapIfExited()
+                    assert Receipt.Reaped
+                finally:
+                    if Handle.LastReceipt.Reaped:
+                        Handle.CloseReleased()
+            _AssertStartedResourcesAbsent(Handle)
+            print("GATED_NATURAL_RECOVERY " + str({
+                "pid": _WITNESSES[id(Handle)]["pid"],
+                "pid_and_ipc_absent": True,
+                "force_requested": Handle.LastReceipt.ForceTerminationRequested,
+            }))
+        except BaseException as Error:
+            Failures.append(Error)
+    if Failures:
+        raise Failures[0]
 
 
 class _ControlledClock:
@@ -1432,9 +1493,20 @@ def test_false_force_authority_allows_natural_exit_before_cleanup_cutoff():
 
 
 def test_false_force_authority_retains_capacity_and_queued_work_at_cutoff(
+    monkeypatch,
     tmp_path,
 ):
-    StartedAt = monotonic()
+    from Tests.PhysicalDesign.Runtime.ProcessSynchronizationFixtures import (
+        GatedObservedProduct,
+        InstallSharedRuntimeClock,
+        OperationGate,
+    )
+
+    Clock = InstallSharedRuntimeClock(monkeypatch, tmp_path)
+    StartedAt = Clock.Read()
+    FirstGate = OperationGate(tmp_path / "first-operation")
+    SecondGate = OperationGate(tmp_path / "queued-operation")
+    Starts = _CaptureRealOneShotStarts(monkeypatch)
     FirstRequest = _Request(0, DeadlineAt=StartedAt + 0.20)
     SecondRequest = _Request(1, DeadlineAt=StartedAt + 2.0)
     Items = (
@@ -1448,13 +1520,52 @@ def test_false_force_authority_retains_capacity_and_queued_work_at_cutoff(
                 PolicyIdentity="runtime-policy-v2:test",
                 PressureIdentity="pressure-snapshot:test",
             ),
-            Payload=(str(tmp_path), 0.50, "first"),
+            Payload=(str(FirstGate.Directory), "first"),
         ),
         _Item(
             SecondRequest,
-            (str(tmp_path), 0.0, "second"),
+            (str(SecondGate.Directory), "second"),
         ),
     )
+    Entry = {}
+    Watchdogs = []
+    FixtureFailures = []
+
+    def ObserveWorkEntry(TaskIdentity, Action):
+        if Action != "begin":
+            return
+        try:
+            assert TaskIdentity == FirstRequest.TaskIdentity
+            Entry.update(FirstGate.WaitForEntry())
+            assert Entry["clock_at"] == StartedAt
+            Entry["pid_start_ticks"] = _PidStartTicks(Entry["pid"])
+            assert Entry["pid_start_ticks"] is not None
+            Watchdogs.append(FirstGate.StartReleaseWatchdog(
+                Entry["real_entered_at"],
+                3.0,
+            ))
+            Clock.Set(FirstRequest.DeadlineAt)
+        except BaseException as Error:
+            FixtureFailures.append(Error)
+            Clock.Set(Items[0].Authority.CleanupCutoffAt)
+            raise
+
+    def CrossCutoffAfterActualCancellation(Seconds):
+        try:
+            assert Seconds >= 0.0
+            Cancellation = FirstGate.WaitForCancellation()
+            assert Cancellation == {
+                "pid": Entry["pid"],
+                "clock_at": FirstRequest.DeadlineAt,
+            }
+            assert not FirstGate.ReleasePath.exists()
+        except BaseException as Error:
+            FixtureFailures.append(Error)
+            raise
+        finally:
+            Clock.Set(Items[0].Authority.CleanupCutoffAt)
+
+    monkeypatch.setattr(SpawnedWork, "sleep", CrossCutoffAfterActualCancellation)
 
     try:
         with pytest.raises(
@@ -1462,32 +1573,52 @@ def test_false_force_authority_retains_capacity_and_queued_work_at_cutoff(
         ) as Caught:
             ExecuteBoundedSpawnedWorkBatch(
                 Items,
-                _ObservedProduct,
+                GatedObservedProduct,
                 _Limits(Queued=1, InFlight=1),
+                WaitObserver=ObserveWorkEntry,
             )
+        if FixtureFailures:
+            raise FixtureFailures[0]
+        assert len(Caught.value.OwnedContinuations) == 1
         Continuation = Caught.value.OwnedContinuations[0]
         Receipt = Continuation.Receipt
         assert Continuation.TaskIdentity == "spawned-0"
+        assert tuple(Request.TaskIdentity for Request, _, _ in Starts) == (
+            "spawned-0",
+        )
+        assert Continuation.Handle is Starts[0][2]
+        assert Starts[0][0] is FirstRequest
+        assert Starts[0][1] is Items[0].Authority
+        assert Receipt.WorkDeadlineAt == StartedAt + 0.20
+        assert Receipt.CleanupCutoffAt == StartedAt + 0.30
         assert Receipt.CancellationRequested
         assert not Receipt.ForceTerminationRequested
         assert not Receipt.ForceSignalSent
         assert Receipt.OutstandingOwnership
         assert not Receipt.ReleaseAcknowledged
-        assert (tmp_path / "spawned-0.started").exists()
-        assert not (tmp_path / "spawned-1.started").exists()
+        assert _PidStartTicks(Entry["pid"]) == Entry["pid_start_ticks"]
+        ProcessStat = Path(f"/proc/{Entry['pid']}/stat").read_text()
+        ProcessState = ProcessStat[ProcessStat.rfind(")") + 2:].split()[0]
+        assert ProcessState not in {"Z", "X", "x"}
+        assert FirstGate.EntryPath.exists()
+        assert not FirstGate.CompletedPath.exists()
+        assert not FirstGate.ReleasePath.exists()
+        assert not FirstGate.WatchdogPath.exists()
+        assert not SecondGate.EntryPath.exists()
+        print("GATED_FALSE_FORCE " + str({
+            "entry": Entry,
+            "cutoff_at": Clock.Read(),
+            "submitted": tuple(Request.TaskIdentity for Request, _, _ in Starts),
+            "process_state": ProcessState,
+            "owned_pid_still_alive": True,
+        }))
     finally:
-        if "Continuation" in locals():
-            Handle = Continuation.Handle
-            ReapDeadline = monotonic() + 2.0
-            while monotonic() < ReapDeadline:
-                Receipt = Handle.Observe()
-                if Receipt.ProcessExitObserved:
-                    Receipt = Handle.ReapIfExited()
-                    if Receipt.Reaped:
-                        Handle.CloseReleased()
-                        break
-                sleep(0.005)
-            assert Handle.Observe().ResourcesClosed
+        for Watchdog in Watchdogs:
+            Watchdog.cancel()
+            Watchdog.join()
+        FirstGate.Release()
+        SecondGate.Release()
+        _CloseNaturallyReleasedStarts(Starts)
 
 
 def test_capacity_plus_one_is_rejected_without_becoming_a_proof():
@@ -1663,28 +1794,84 @@ def test_forced_deadline_release_admits_the_next_queued_request(tmp_path):
     )
 
 
-def test_running_deadline_does_not_wait_for_natural_worker_completion(tmp_path):
-    StartedAt = monotonic()
+def test_running_deadline_does_not_wait_for_natural_worker_completion(
+    monkeypatch,
+    tmp_path,
+):
+    from Tests.PhysicalDesign.Runtime.ProcessSynchronizationFixtures import (
+        GatedObservedProduct,
+        InstallSharedRuntimeClock,
+        OperationGate,
+    )
+
+    Clock = InstallSharedRuntimeClock(monkeypatch, tmp_path)
+    StartedAt = Clock.Read()
+    Gate = OperationGate(tmp_path / "running-operation")
+    Starts = _CaptureRealOneShotStarts(monkeypatch)
     Item = _Item(
         _Request(0, DeadlineAt=StartedAt + 0.20),
-        (str(tmp_path), 1.20, "late"),
+        (str(Gate.Directory), "late"),
         CleanupSeconds=0.60,
     )
+    Entry = {}
+    Watchdogs = []
 
-    Batch = ExecuteBoundedSpawnedWorkBatch(
-        (Item,),
-        _ObservedProduct,
-        _Limits(Queued=0, InFlight=1),
-    )
-    ReturnedAfter = monotonic() - StartedAt
-    Execution = Batch.Executions[0][1]
+    def ObserveWorkEntry(TaskIdentity, Action):
+        if Action != "begin":
+            return
+        try:
+            assert TaskIdentity == Item.Request.TaskIdentity
+            Entry.update(Gate.WaitForEntry())
+            assert Entry["clock_at"] == StartedAt
+            assert _PidStartTicks(Entry["pid"]) is not None
+            Watchdogs.append(Gate.StartReleaseWatchdog(Entry["real_entered_at"], 0.80))
+            Clock.Set(Item.Request.DeadlineAt)
+        except BaseException:
+            Clock.Set(Item.Authority.CleanupCutoffAt)
+            raise
 
-    assert (tmp_path / "spawned-0.started").exists()
-    assert ReturnedAfter < 0.80
-    assert not (tmp_path / "spawned-0.completed").exists()
-    assert Execution.Value is None
-    assert Execution.Result.SearchOutcome is RuntimeSearchOutcome.Unresolved
-    assert Execution.Result.TerminalReason is RuntimeTerminalReason.DeadlineExhausted
+    try:
+        Batch = ExecuteBoundedSpawnedWorkBatch(
+            (Item,),
+            GatedObservedProduct,
+            _Limits(Queued=0, InFlight=1),
+            WaitObserver=ObserveWorkEntry,
+        )
+        ReturnedAfter = monotonic() - Entry["real_entered_at"]
+        for Watchdog in Watchdogs:
+            Watchdog.cancel()
+            Watchdog.join()
+        Execution = Batch.Executions[0][1]
+
+        assert ReturnedAfter < 0.80
+        assert not Gate.WatchdogPath.exists()
+        assert not Gate.ReleasePath.exists()
+        assert not Gate.CompletedPath.exists()
+        assert len(Starts) == 1
+        assert Starts[0][0] is Item.Request
+        assert Starts[0][1] is Item.Authority
+        Witness = _WITNESSES[id(Starts[0][2])]
+        assert Witness["pid"] == Entry["pid"]
+        assert Witness["request_shm"] is not None
+        assert Witness["result_shm"] is not None
+        _AssertStartedResourcesAbsent(Starts[0][2])
+        assert Execution.Value is None
+        assert Execution.Result.SearchOutcome is RuntimeSearchOutcome.Unresolved
+        assert Execution.Result.TerminalReason is RuntimeTerminalReason.DeadlineExhausted
+        print("GATED_RUNNING_DEADLINE " + str({
+            "entry": Entry,
+            "returned_after_body_entry": ReturnedAfter,
+            "work_deadline_at": Item.Request.DeadlineAt,
+            "cleanup_cutoff_at": Item.Authority.CleanupCutoffAt,
+            "pid_and_ipc_absent": True,
+        }))
+    finally:
+        for Watchdog in Watchdogs:
+            Watchdog.cancel()
+            Watchdog.join()
+        Gate.Release()
+        for _, _, Handle in Starts:
+            _RecoverAndClose(Handle)
 
 
 def test_earlier_deadline_does_not_discard_a_later_running_task():

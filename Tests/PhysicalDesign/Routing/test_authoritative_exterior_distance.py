@@ -1,6 +1,7 @@
 """PhysicalExteriorConnectorDistanceFieldTests contracts."""
 
 from ._authoritative_planner_contracts import *
+from RedstoneCompiler.RustRouting import GetRoutingThreadCount
 
 
 class PhysicalExteriorConnectorDistanceFieldTests(unittest.TestCase):
@@ -113,7 +114,9 @@ class PhysicalExteriorConnectorDistanceFieldTests(unittest.TestCase):
             for Start in Starts
         )
         self.assertEqual(Actual, Expected)
-        self.assertEqual(ActiveWorkers, 8)
+        # The Rust capacity contract independently verifies the configured pool
+        # against the OS allowance; this batch must use every admitted shard.
+        self.assertEqual(ActiveWorkers, min(len(Starts), GetRoutingThreadCount()))
 
     def testFieldExcludesKeepoutAndForeignIllegalEdges(self):
         ForbiddenEdge = frozenset(((1, 0, 0), (1, 0, -1)))
