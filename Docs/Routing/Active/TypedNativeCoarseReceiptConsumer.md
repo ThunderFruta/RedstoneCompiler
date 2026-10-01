@@ -108,3 +108,12 @@ source, scoped regression checks, and resolution of the introduced 17-NAND
 timing regression without changing its runtime bounds. Any combined integration
 with parser and regression-CI changes requires fresh review and testing of that
 combined source; this document does not establish protected-main promotion.
+
+
+## 2026-10-01 integrated development checkpoint and fresh acceptance
+
+The reviewed consumer/preparation source and native repair are now committed in Joint checkpoint `eb17b5ea3524db45d2f4be70023492787cc60920`, consuming Runtime repair `96b7a7c`. All eleven reviewed v4 postimages were retained exactly. Router consumed this dependency stack, Telemetry/CI `043f6a9`, and Reuse diagnostics `96eda1d`, then verified the combined source: 3,114 Python tests passed with 5 regular skips and 378 subtests; 92 Rust release tests and eight Java harness tests/build passed; the required pinned source oracle recorded 51 equivalence proofs and the intentional counterexample. Exact gates and source/native identities are retained in `Output/AcceptanceIntegration/20261001/` in the permanent Router checkout.
+
+Fresh clean-source acceptance ran on Router `7dac4646567b041e765dc1058fed70595b7a8e29` with canonical tracked templates, default policy/seed, unchanged deadlines and all seven cases attempted. It accepted 0/7. HalfAdder, RCA4 and DecimalToBinary4 report complete fixed-placement `NoPinAccessPattern`; FullAdder and TFlipFlopLatch report `ClusterInterfaceSolveIncomplete`; RCA8 reports `PlacementGeneration:Stagnated`; CLA4 reports `Placement:RuntimeBudgetExceeded`. CLA4's expected exact-interface checkpoint was not reached. The changed TFlipFlop failure stage is a frontier observation, not a qualified performance improvement. No circuit reached MCHPRS truth tables or Fabric canaries.
+
+The exact current-build harness was installed with a preimage backup into the existing dedicated disposable Fabric runtime. Its newly started owned process passed authenticated readiness and was stopped after the matrix. All 230 inventoried personal-runtime files stayed byte-identical. The 122 archive SHA256SUMS entries verify. This is deterministic development integration plus retained failed acceptance, not physical acceptance, issue #3 completion, performance promotion or production-main readiness.

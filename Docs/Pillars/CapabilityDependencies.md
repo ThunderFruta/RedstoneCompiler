@@ -1345,3 +1345,19 @@ The eleven approved v4 postimages are unchanged. The native coarse repair retain
 Independent final source review binds verified pre-commit index tree `a6ff1f171270101c04cb99cbd849ec3ea3be80b0` and found no blocking source issue. Fresh combined verification rebuilt and authenticated this checkout's native extension, passed Rust formatting and 92 release tests, 3,114 Python tests with 5 regular skips and 378 subtests, and Java harness tests/build (8 tests, zero failures/errors). Required Yosys/SAT evidence contains 51 proved-equivalent cases and an intentional counterexample; the oracle was required, so unavailable proofs could not silently skip. Structural/Reuse, CI/reporting, and real Joint/Runtime boundary checks also passed. Exact commands, logs, JUnit, source manifest, recovery bundle and source review are retained at `Output/AcceptanceIntegration/20261001/`.
 
 This establishes a reviewed deterministic development baseline for starting acceptance, not full physical acceptance, persistent workers, in-flight cancellation, N6 salvage, performance promotion or production readiness. The prior v4 matrix remains historical 0/7 failed evidence; CLA4 proof mismatch diagnostics reflected an absent checkpoint after deadline exhaustion rather than a published false proof. A new clean-source seven-case matrix must report every circuit and backend phase separately under unchanged policy and budgets. Joint's overlapping earlier uncommitted consumer snapshot is retained in a recovery stash and exact archive; Runtime's separate unstaged test remains byte-identical.
+
+
+### Fresh 2026-10-01 seven-case acceptance result
+
+The clean acceptance revision was `7dac4646567b041e765dc1058fed70595b7a8e29`. All seven cases ran sequentially, source/native/template provenance stayed stable, and the session accepted **0/7** in 218.177 seconds. The manifest is `Output/AcceptanceIntegration/20261001/Acceptance/2026-10-01/Archives/20261001T154314.854768Z-7dac4646567b/AcceptanceManifest.json`; all 122 archive checksums verify. Default policy, seed zero, canonical tracked templates, routing deadlines and non-fail-fast behavior were unchanged.
+
+| Cases | Current typed frontier |
+|---|---|
+| HalfAdder, RCA4, DecimalToBinary4 | `PlacementAccessSolve:NoPinAccessPattern` in the complete fixed-placement domain |
+| FullAdder, TFlipFlopLatch | `PreRouteInterfaceSelection:ClusterInterfaceSolveIncomplete` |
+| RCA8 | `PlacementGeneration:Stagnated` |
+| CLA4 | `Placement:RuntimeBudgetExceeded`; 120.586381 s wall time exceeds the nominal 120 s ceiling while remaining within the separate one-second grace; expected exact-interface proof checkpoint not reached |
+
+All cases stopped before physical fixture publication, so MCHPRS truth tables and Fabric canaries were **not reached**. The dedicated disposable Fabric process did pass authenticated readiness with the exact built harness and was stopped afterward. All 230 inventoried shared personal-runtime files remained unchanged. Failure-report observation was Available for six cases and Unavailable for CLA4; raw typed failure evidence was retained for every case. No physical pass or inherited-failure attribution is inferred from deterministic green checks.
+
+The Joint documentation checkpoint `080e7df85c3cd3c4b3b8ee9064f092fe84c20e36` records this actual integration/acceptance state; only documentation changed after the tested source. The next acceptance work remains circuit-agnostic physical access alternatives/exclusions, Joint interface-domain completion, deterministic placement advancement, and bounded CLA4 placement/checkpoint completion. The repository-wide handoff toolkit and unrelated uncommitted Runtime/CI-remediation work remain outside this integration. No remote push, GitHub issue closure or production-main promotion was performed.
