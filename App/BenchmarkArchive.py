@@ -14,6 +14,9 @@ import stat
 import subprocess
 from typing import Callable, Mapping, Sequence
 
+from App.RoutingFailureArtifacts import (ProjectListedReport, ArchiveRelativeMember,
+    UniqueReportMembers, DiscoverReportMembers)
+
 
 ArchiveSchemaVersion = "router-benchmark-archive-v1"
 ArchiveManifestName = "ArchiveManifest.json"
@@ -701,7 +704,30 @@ def BuildArchiveRunSurface(
             if AuthoritativeFailureArtifact
             else {}
         )
+        def ReadReportMember(RecordedPath: str) -> bytes | None:
+            Relative = ArchiveRelativeMember(RecordedPath, RunName)
+            Value = (VerifiedFiles.get(Relative) if VerifiedFiles is not None
+                     else _ReadVerifiedRegularFileBelow(ArchiveRoot, Relative.split("/")))
+            return Value.Data if Value is not None else None
+
+        ReportEvidence = (ProjectListedReport(ArtifactRecord, ArtifactRecords, ReadReportMember)
+                          if AuthoritativeFailureArtifact else
+                          {"Status": "NotRun" if RawRun.get("Accepted") is True else "Unavailable",
+                           "Reason": "no authoritative failure artifact"})
+        try:
+            RunPrefix = ArchiveRelativeMember(RunName + "/member", RunName).rsplit("/", 1)[0]
+            Members = ({Name for Name in VerifiedFiles if Name.startswith(RunPrefix + "/")}
+                       if VerifiedFiles is not None else
+                       {RunPrefix + "/" + Name for Name in DiscoverReportMembers(ArchiveRoot / RunPrefix)})
+            Selected = ArchiveRelativeMember(ArtifactRecord["Path"], RunName) if AuthoritativeFailureArtifact else None
+            if not UniqueReportMembers(Members, Selected):
+                ReportEvidence = {"Status": "Rejected", "Reason": "unlisted or duplicate report members in run"}
+        except FileNotFoundError:
+            pass
+        except (ValueError, OSError, TypeError):
+            ReportEvidence = {"Status": "Rejected", "Reason": "unsafe report membership"}
         Surface.append({
+            "RoutingFailureReport": ReportEvidence,
             "Sequence": RawRun.get("Sequence"),
             "RunName": RunName,
             "Circuit": RawRun.get("Circuit"),

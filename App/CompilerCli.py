@@ -1534,6 +1534,13 @@ def Main(Args: list[str] | None = None) -> int:
             ExceptionText=ExceptionText,
             Details=Details,
             ArtifactRoots=PromotedPaths,
+            RoutingFailurePath=(
+                RunOutputPath.with_suffix(".RoutingFailure.json")
+                if ReportResult == "FAILURE" and (
+                    getattr(Error, "Failure", None) is not None
+                    or RunOutputPath.with_suffix(".RoutingFailure.json").is_file()
+                ) else None
+            ),
         )
     except OSError as ReportError:
         FallbackLines = FormatResultLines(

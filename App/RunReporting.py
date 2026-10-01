@@ -17,6 +17,10 @@ import sys
 from threading import Lock
 from typing import IO, Iterable, Mapping
 
+from App.RoutingFailureReport import PublishRoutingFailureReport
+from App.RoutingFailureArtifacts import (ReportNames, ReportName, ReceiptName, ObserveReportPair,
+    OpenEvidenceDirectory, WriteEvidenceMember)
+
 
 ReportFileNames = frozenset({"Summary.txt", "RawDump.txt"})
 SafeEnvironmentNames = (
@@ -128,6 +132,8 @@ def BuildArtifactInventory(
     """Inventory regular artifact files while excluding report self-hashes."""
     Files: set[Path] = set()
     for Root in Roots:
+        if Root.name in ReportNames:
+            continue
         Resolved = Root.resolve(strict=False)
         if Resolved.is_file():
             Files.add(Resolved)
@@ -135,11 +141,11 @@ def BuildArtifactInventory(
             Files.update(
                 PathValue.resolve(strict=False)
                 for PathValue in Resolved.rglob("*")
-                if PathValue.is_file()
+                if PathValue.name not in ReportNames and PathValue.is_file()
             )
     Inventory = []
     for ArtifactPath in sorted(Files, key=str):
-        if ArtifactPath.name in ReportFileNames:
+        if ArtifactPath.name in ReportFileNames or ArtifactPath.name in ReportNames:
             continue
         try:
             Inventory.append({
@@ -314,11 +320,12 @@ def FormatResultLines(
 
 def _AtomicWriteText(PathValue: Path, Text: str) -> None:
     PathValue.parent.mkdir(parents=True, exist_ok=True)
-    TemporaryPath = PathValue.with_name(
-        f".{PathValue.name}.tmp-P{os.getpid()}"
-    )
-    TemporaryPath.write_text(Text, encoding="utf-8")
-    TemporaryPath.replace(PathValue)
+    Descriptors = OpenEvidenceDirectory(PathValue.parent)
+    try:
+        WriteEvidenceMember(Descriptors[-1], PathValue.name, Text.encode("utf-8"))
+    finally:
+        for Descriptor in reversed(Descriptors):
+            os.close(Descriptor)
 
 
 @dataclass(frozen=True)
@@ -348,6 +355,8 @@ def WriteRunReport(
     ExceptionText: str = "",
     Details: Mapping[str, object] | None = None,
     ArtifactRoots: Iterable[Path] = (),
+    RoutingFailurePath: Path | None = None,
+    RetainedRoutingFailureReport: Mapping[str, object] | None = None,
 ) -> RunReportResult:
     """Persist the concise summary and comprehensive text evidence atomically."""
     Directory = RunDirectory.resolve(strict=False)
@@ -367,6 +376,56 @@ def WriteRunReport(
     ResultLines = FormatResultLines(**ResultArguments)
     SavedLines = FormatResultLines(**ResultArguments, IncludeRoutingDetails=True)
     InventoryRoots = [Directory, *ArtifactRoots]
+    Inventory = BuildArtifactInventory(InventoryRoots)
+    ReportDetails = dict(Details or {})
+    if Result == "FAILURE" and RoutingFailurePath is not None:
+        SourcePath = RoutingFailurePath.parent.resolve() / RoutingFailurePath.name
+        SourceIdentity = next((Entry for Entry in Inventory
+                               if Entry.get("Path") == str(SourcePath)), {})
+        Publication = PublishRoutingFailureReport(
+            RunDirectory=Directory, FailurePath=SourcePath,
+            SourceIdentity=SourceIdentity,
+        )
+        if Publication["Status"] == "Published":
+            # The publisher used verified bounded source bytes. Recheck the pair
+            # after publication before granting it an inventory identity.
+            Validation = ObserveReportPair(SourcePath, SourceIdentity=Publication["Source"], RecheckSource=True)
+            Publication["Validation"] = Validation
+            if Validation["Status"] != "Available":
+                Publication["Status"] = Validation["Status"]
+                Publication["ErrorType"] = Validation["Reason"]
+        ReportDetails["RoutingFailureReport"] = Publication
+        if Publication["Status"] == "Published":
+            ReportPath = Path(str(Publication["Path"]))
+            Inventory = [Entry for Entry in Inventory
+                         if Entry.get("Path") != str(ReportPath)]
+            for Record in Validation["Artifacts"].values():
+                Inventory.append({"Path": Record["Path"], "Bytes": Record["SizeBytes"],
+                                  "Sha256": Record["Sha256"]})
+            ReportLine = f"FAILURE REPORT: {ReportPath}"
+        else:
+            ReportLine = (
+                "FAILURE REPORT: " + str(Publication["Status"]).lower() + " ("
+                + str(Publication.get("ErrorType", "unknown")) + ")"
+            )
+        ResultLines.append(ReportLine)
+        SavedLines.append(ReportLine)
+    elif Result == "FAILURE" and RetainedRoutingFailureReport is not None:
+        Evidence = dict(RetainedRoutingFailureReport)
+        ReportDetails["RoutingFailureReport"] = Evidence
+        Status = Evidence.get("Status", "Unavailable")
+        Line = "FAILURE REPORT: " + str(Status).lower()
+        if Status == "Available":
+            Records = Evidence.get("Artifacts", {})
+            for Record in Records.values():
+                Inventory.append({"Path": Record["Path"], "Bytes": Record["SizeBytes"],
+                                  "Sha256": Record["Sha256"]})
+            Line += " — " + str(Records[ReportName]["Path"])
+        else:
+            Line += " — " + str(Evidence.get("Reason", "not retained"))
+        ResultLines.append(Line)
+        SavedLines.append(Line)
+    Inventory.sort(key=lambda Entry: str(Entry.get("Path", "")))
     Sections: list[tuple[str, str]] = [
         ("RUN", "\n".join(SavedLines)),
         ("TIMESTAMPS", _JsonText({
@@ -379,11 +438,11 @@ def WriteRunReport(
         })),
         ("GIT IDENTITY", _JsonText(BuildGitIdentity(RepositoryRoot))),
         ("RUNTIME PROVENANCE", _JsonText(BuildRuntimeProvenance())),
-        ("DETAILS", _JsonText(dict(Details or {}))),
+        ("DETAILS", _JsonText(ReportDetails)),
         ("STDOUT", Stdout.rstrip()),
         ("STDERR", Stderr.rstrip()),
         ("EXCEPTION", ExceptionText.rstrip()),
-        ("ARTIFACT INVENTORY", _JsonText(BuildArtifactInventory(InventoryRoots))),
+        ("ARTIFACT INVENTORY", _JsonText(Inventory)),
     ]
     RawText = "\n\n".join(
         f"===== {Name} =====\n{Text if Text else '<empty>'}"

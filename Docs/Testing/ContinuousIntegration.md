@@ -81,6 +81,36 @@ fail instead of falling back. Without the override, existing local template
 preference remains unchanged. The configured-child provenance probe imports
 the current `Assets.Templates` namespace.
 
+## Host-independent deterministic fixtures
+
+The native worker pool keeps its existing policy: positive
+`RC_ROUTING_THREADS` requests are capped by the operating system's available
+parallelism; the default is at most eight workers. The Rust capacity contract
+runs each configuration in a fresh process, compares against an independent OS
+capacity observation, and observes distinct threads executing the pool's work.
+Test-only per-item witnesses also observe the actual claim, exterior-connector,
+and fabric-subtree computations, independently of their reported active-worker
+telemetry; a serial batch advertising parallel capacity must fail.
+Python batch checks still require exact reference results and full use of the
+permitted shards. Their expected worker count follows that verified capacity,
+not an assumption that every hosted runner has eight CPUs. The captured CLA4
+fixture retains its 30-second gate and independently records real native batch
+input sizes when checking active-worker and aggregate-work receipts.
+
+Running-work deadline fixtures must establish application entry before testing
+late completion, forced release, or ownership at a cleanup cutoff. A process
+readiness signal alone does not establish that entry. The narrowly synchronized
+fixtures use a shared test clock and explicit operation-entry/release barriers
+around real spawned processes. Their original absolute work and cleanup
+cutoffs remain fixed; they exercise the real cancellation, bounded transport,
+result validation, process termination, reap, and resource release paths.
+Independent wall-time watchdogs fail and recover a broken fixture; they never
+extend the granted cutoffs or turn missing entry into a skipped/passing test.
+These are deterministic temporal-contract tests, not startup-performance
+measurements. Separate real-clock startup and deadline tests remain required.
+No production Runtime deadline, cleanup, force, or publication policy changes
+are implied by this fixture isolation.
+
 ## Physical admission and first workflow registration
 
 This repository belongs to a personal GitHub account. Its current branches are

@@ -316,3 +316,171 @@ def test_baseline_modes_keep_fixed_recovery_and_receive_separate_archive_mirror(
     assert Archive != SeenRecoveryRoots[0]
     assert (Archive / "AcceptanceManifest.json").is_file()
     assert (SeenRecoveryRoots[0] / "AcceptanceManifest.json").is_file()
+
+# Report integrity cases use independent bytes and explicitly retained identities.
+from hashlib import sha256
+from Tests.App.test_routing_failure_artifacts import WriteLiteralPair, LITERAL_HTML, HTML_NAME, RECEIPT_NAME
+from Tests.Tools.test_router_acceptance_harness import BuildTestAcceptanceCommand, WriteNestedRoutingFailureArtifact
+from Tools.Routing import CaptureRoutingDesignSnapshot as SnapshotTool
+
+
+def test_acceptance_evaluator_observes_report_without_changing_failure(tmp_path):
+    Case = next(Value for Value in Harness.AcceptanceCases if Value.Name == "FullAdder")
+    Artifacts = Harness.BuildRunArtifacts(tmp_path / "FullAdder-Run1", "FullAdder-Run1")
+    Command = BuildTestAcceptanceCommand(Case, Artifacts)
+    Source = WriteNestedRoutingFailureArtifact(Case, Artifacts, RunDirectoryName="current",
+        Failure={"Stage": "Candidate", "Reason": "SupportConflict", "Detail": "literal rejection"})
+    Arguments = dict(Case=Case, Process=Harness.AcceptanceCommandResult(1, "", "", 1.0),
+        Artifacts=Artifacts, ExpectedSeed=0, ExpectedSourceRevision="revision",
+        ExpectedPolicyProvenance=Harness.BuildPolicyProvenanceRecord("default"),
+        DirectArtifactAbsentBeforeInvocation=True, PriorNestedRunDirectoryNames=frozenset(), ExpectedCommand=Command)
+    Missing, _ = Harness.EvaluateRun(**Arguments)
+    assert Missing["Observed"]["RoutingFailureReport"]["Status"] == "Unavailable"
+    WriteLiteralPair(Source.parent, Source.name, Source.read_bytes())
+    Present, _ = Harness.EvaluateRun(**Arguments)
+    assert Present["Observed"]["RoutingFailureReport"]["Status"] == "Available"
+    assert Present["Artifacts"]["RoutingFailureReport"]["Sha256"] == sha256(LITERAL_HTML).hexdigest()
+    assert Present["Failures"] == Missing["Failures"]
+    assert Present["Accepted"] is Missing["Accepted"] is False
+    (Source.parent / HTML_NAME).write_bytes(LITERAL_HTML + b"changed")
+    Changed, _ = Harness.EvaluateRun(**Arguments)
+    assert Changed["Observed"]["RoutingFailureReport"]["Status"] == "Rejected"
+    assert Changed["Failures"] == Missing["Failures"]
+
+
+def _RunWithReport(Configuration, Present=True):
+    Manifest = _SyntheticManifest(Configuration, Accepted=False)
+    Root = Configuration.RecoveryRoot / "FullAdder-Run1" / "Runs" / "compiler"
+    Source, Records = WriteLiteralPair(Root)
+    if not Present:
+        (Root / HTML_NAME).unlink(); (Root / RECEIPT_NAME).unlink()
+        Records = {"RoutingFailure": Records["RoutingFailure"]}
+    Evaluation = Manifest["Runs"][0]["Evaluation"]
+    Evaluation["Artifacts"] = Records
+    Evaluation["Observed"]["FailureArtifactResolution"] = {"Status": "nested", "Path": str(Source)}
+    Harness.WriteManifest(Configuration.ManifestPath, Manifest)
+    return Manifest
+
+
+@pytest.mark.parametrize("Present", [True, False])
+def test_failed_case_automatically_archives_report_pair_or_honest_absence(tmp_path, Present):
+    with patch.object(Harness, "RunAcceptance", side_effect=lambda Config: _RunWithReport(Config, Present)):
+        Code = Harness.Main(_Arguments(tmp_path))
+    assert Code == 1
+    Archive = _ArchiveDirectories(tmp_path)[0]
+    Manifest = json.loads((Archive / "ArchiveManifest.json").read_text())
+    Run = Manifest["Benchmark"]["Runs"][0]
+    assert Run["Stage"] == "Candidate" and Run["Reason"] == "SupportConflict"
+    assert Run["RoutingFailureReport"]["Status"] == ("Available" if Present else "Unavailable")
+    Sealed = SnapshotTool.BuildSealedArchiveEvidence(Archive / "AcceptanceManifest.json")
+    Members = Sealed.ObservationsByRelativePath
+    Name = "FullAdder-Run1/Runs/compiler/" + HTML_NAME
+    assert (Name in Members) == Present
+    if Present:
+        assert Members[Name].Data == LITERAL_HTML
+        assert Members[Name].Sha256 == sha256(LITERAL_HTML).hexdigest()
+        assert "FullAdder-Run1/Runs/compiler/" + RECEIPT_NAME in Members
+
+
+@pytest.mark.parametrize("Damage", ["missing", "altered", "symlink", "duplicate", "unlisted"])
+def test_sealed_archive_rejects_damaged_or_unlisted_report_members(tmp_path, Damage):
+    with patch.object(Harness, "RunAcceptance", side_effect=lambda Config: _RunWithReport(Config, Damage != "unlisted")):
+        assert Harness.Main(_Arguments(tmp_path)) == 1
+    Archive = _ArchiveDirectories(tmp_path)[0]
+    Report = Archive / "FullAdder-Run1/Runs/compiler" / HTML_NAME
+    Source = Report.parent / "Design.RoutingFailure.json"
+    Original = Source.read_bytes()
+    if Damage == "missing": Report.unlink()
+    if Damage == "altered": Report.write_bytes(LITERAL_HTML + b"tamper")
+    if Damage == "symlink":
+        Outside = tmp_path / "outside"; Outside.write_bytes(LITERAL_HTML)
+        Report.unlink(); Report.symlink_to(Outside)
+    if Damage == "unlisted": Report.write_bytes(LITERAL_HTML)
+    if Damage == "duplicate":
+        Seal = Archive / "SHA256SUMS"
+        Line = next(Line for Line in Seal.read_text().splitlines() if Line.endswith("/" + HTML_NAME))
+        Seal.write_text(Seal.read_text() + Line + "\n")
+    with pytest.raises(ValueError):
+        SnapshotTool.BuildSealedArchiveEvidence(Archive / "AcceptanceManifest.json")
+    assert Source.read_bytes() == Original
+
+
+def test_archive_mirror_preserves_pair_after_original_directory_is_moved(tmp_path):
+    from Tests.App.test_benchmark_archive import _ArchiveContext, _SourceIdentity, _Manifest
+    from App.BenchmarkArchive import PublishBenchmarkArchive, BuildArchiveRunSurface
+    SourceRoot = tmp_path / "source"
+    Source, Records = WriteLiteralPair(SourceRoot / "FullAdder-Run1" / "Runs" / "compiler")
+    Manifest = _Manifest()
+    Evaluation = Manifest["Runs"][0]["Evaluation"]
+    Evaluation["Artifacts"] = Records
+    Evaluation["Observed"]["FailureArtifactResolution"] = {"Status": "nested", "Path": str(Source)}
+    (SourceRoot / "AcceptanceManifest.json").write_text(json.dumps(Manifest))
+    Archive = tmp_path / "archive"
+    PublishBenchmarkArchive(_ArchiveContext(SourceRoot, Archive), Manifest,
+        CompletedAtUtc="2026-09-27T03:00:00+00:00", WallSeconds=1, ExitCode=1,
+        ExitClassification="acceptance-failed", SourceIdentityReader=lambda _: _SourceIdentity())
+    SourceRoot.rename(tmp_path / "original-no-longer-at-recorded-path")
+    Surface = BuildArchiveRunSurface(Manifest, Archive)
+    assert Surface[0]["RoutingFailureReport"]["Status"] == "Available"
+    assert Surface[0]["Reason"] == "SupportConflict"
+    assert (Archive / "FullAdder-Run1/Runs/compiler" / HTML_NAME).read_bytes() == LITERAL_HTML
+    assert SnapshotTool.BuildSealedArchiveEvidence(Archive / "AcceptanceManifest.json")
+
+
+@pytest.mark.parametrize("Selected", [True, False])
+def test_coherently_sealed_extra_pair_is_rejected_as_case_report_evidence(tmp_path, Selected):
+    def Run(Configuration):
+        Manifest = _RunWithReport(Configuration, True)
+        RunRoot = Configuration.RecoveryRoot / "FullAdder-Run1"
+        WriteLiteralPair(RunRoot / "Runs" / "older-compiler")
+        if not Selected:
+            Evaluation = Manifest["Runs"][0]["Evaluation"]
+            Evaluation.pop("Artifacts")
+            Evaluation["Observed"].pop("FailureArtifactResolution")
+        Harness.WriteManifest(Configuration.ManifestPath, Manifest)
+        return Manifest
+    with patch.object(Harness, "RunAcceptance", side_effect=Run):
+        assert Harness.Main(_Arguments(tmp_path)) == 1
+    Archive = _ArchiveDirectories(tmp_path)[0]
+    Sealed = SnapshotTool.BuildSealedArchiveEvidence(Archive / "AcceptanceManifest.json")
+    assert Sealed  # Every file is honestly checksummed; semantic rejection is separate.
+    Manifest = json.loads((Archive / "ArchiveManifest.json").read_text())
+    assert Manifest["Benchmark"]["Runs"][0]["RoutingFailureReport"]["Status"] == "Rejected"
+    if Selected:
+        assert Manifest["Benchmark"]["Runs"][0]["Reason"] == "SupportConflict"
+
+
+def test_captured_self_conflict_survives_real_report_publisher_and_archive(tmp_path):
+    from Tests.App.test_routing_failure_report import LiteralFailure, LiteralEvidence
+    from App.RoutingFailureReport import PublishRoutingFailureReport
+    from App.RoutingFailureArtifacts import ObserveReportPair
+    def Run(Configuration):
+        Manifest = _SyntheticManifest(Configuration, Accepted=False)
+        Root = Configuration.RecoveryRoot / "FullAdder-Run1" / "Runs" / "compiler"
+        Root.mkdir(parents=True)
+        Source = Root / "Design.RoutingFailure.json"
+        Source.write_text(json.dumps(LiteralFailure(LiteralEvidence())))
+        Data = Source.read_bytes()
+        Identity = {"Path": str(Source), "Bytes": len(Data), "Sha256": sha256(Data).hexdigest()}
+        assert PublishRoutingFailureReport(RunDirectory=Root, FailurePath=Source, SourceIdentity=Identity)["Status"] == "Published"
+        Pair = ObserveReportPair(Source, Data)
+        assert Pair["Status"] == "Available"
+        Records = {"RoutingFailure": {"Path": str(Source), "Exists": True,
+                    "SizeBytes": len(Data), "Sha256": sha256(Data).hexdigest()},
+                   "RoutingFailureReport": Pair["Artifacts"][HTML_NAME],
+                   "RoutingFailureReportReceipt": Pair["Artifacts"][RECEIPT_NAME]}
+        Evaluation = Manifest["Runs"][0]["Evaluation"]
+        Evaluation["Artifacts"] = Records
+        Evaluation["Observed"]["FailureArtifactResolution"] = {"Status": "nested", "Path": str(Source)}
+        Harness.WriteManifest(Configuration.ManifestPath, Manifest)
+        return Manifest
+    with patch.object(Harness, "RunAcceptance", side_effect=Run):
+        assert Harness.Main(_Arguments(tmp_path)) == 1
+    Archive = _ArchiveDirectories(tmp_path)[0]
+    Sealed = SnapshotTool.BuildSealedArchiveEvidence(Archive / "AcceptanceManifest.json")
+    Report = Sealed.ObservationsByRelativePath["FullAdder-Run1/Runs/compiler/" + HTML_NAME].Data
+    Source = json.loads(Sealed.ObservationsByRelativePath["FullAdder-Run1/Runs/compiler/Design.RoutingFailure.json"].Data)
+    assert Source["Failure"]["Diagnostics"]["Admission"]["SelfClaimConflictEvidence"] == LiteralEvidence()
+    assert b"(4, 2, -1)" in Report and b"Support, Air" in Report
+    assert b"ContributorProvenance" in Report and b"Unavailable" in Report
+    assert b"not a proven upstream root cause" in Report

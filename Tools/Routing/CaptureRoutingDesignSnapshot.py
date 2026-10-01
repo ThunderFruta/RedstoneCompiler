@@ -21,11 +21,10 @@ import json
 import os
 from pathlib import Path
 import platform
-import shutil
 import stat
+import secrets
 import subprocess
 import sys
-import tempfile
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -34,6 +33,12 @@ RepositoryRoot = Path(__file__).resolve().parents[2]
 GeneratorPath = Path(__file__).resolve()
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
+from App.RoutingFailureArtifacts import (
+    ReportName, ReceiptName, ReportNames, MaximumReportBytes, MaximumReceiptBytes,
+    ValidateReportPair, ProjectListedReport, UniqueReportMembers, ArchiveRelativeMember,
+    OpenEvidenceDirectory, WriteEvidenceMember, VerifyEvidenceDirectory,
+)
+
 SchemaVersion = "routing-design-snapshot-v3"
 SourceScopeVersion = "routing-implementation-source-v1"
 RuntimeProvenanceVersion = "routing-runtime-provenance-v1"
@@ -800,6 +805,7 @@ def _ReadVerifiedFileAtRoot(
     RelativePath: str,
     *,
     MissingAllowed: bool = False,
+    MaximumBytes: int | None = None,
 ) -> VerifiedFileObservation | None:
     """Read one normalized member below an already-open archive root."""
     Parts = _ValidatedRelativeParts(RelativePath)
@@ -838,12 +844,19 @@ def _ReadVerifiedFileAtRoot(
         DescriptorStat = os.fstat(Descriptor)
         if not stat.S_ISREG(DescriptorStat.st_mode):
             raise ValueError("archive evidence is not a regular file")
+        if MaximumBytes is not None and DescriptorStat.st_size > MaximumBytes:
+            raise ValueError("report member exceeds bounded reader size")
         Chunks: list[bytes] = []
+        BytesRead = 0
         while True:
-            Chunk = os.read(Descriptor, 1024 * 1024)
+            Chunk = os.read(Descriptor, 1024 * 1024 if MaximumBytes is None
+                            else min(1024 * 1024, MaximumBytes - BytesRead + 1))
             if not Chunk:
                 break
             Chunks.append(Chunk)
+            BytesRead += len(Chunk)
+            if MaximumBytes is not None and BytesRead > MaximumBytes:
+                raise ValueError("report member grew beyond reader limit")
         Data = b"".join(Chunks)
         if len(Data) != DescriptorStat.st_size:
             raise ValueError("archive evidence size changed while reading")
@@ -937,6 +950,9 @@ def BuildEvaluatorArtifactProjection(
         raise ValueError("acceptance evaluation Artifacts is not an object")
     Result: dict[str, dict[str, object]] = {}
     for Name, RawRecord in sorted(RawArtifacts.items()):
+        if Name in ("RoutingFailureReport", "RoutingFailureReportReceipt"):
+            Result[Name] = deepcopy(RawRecord) if isinstance(RawRecord, dict) else {"MalformedRecord": True}
+            continue
         if not isinstance(Name, str) or not isinstance(RawRecord, dict):
             raise ValueError("acceptance evaluator artifact is malformed")
         Exists = RawRecord.get("Exists")
@@ -1065,7 +1081,18 @@ def ReadRunFailureArtifact(
         or isinstance(ReproductionInput.get("SizeBytes"), bool)
     ):
         raise ValueError("selected failure input provenance is inconsistent")
+    def ReportBytes(PathValue: str) -> bytes | None:
+        Value = ArchiveEvidence.ObservationForPath(Path(PathValue))
+        return Value.Data if Value is not None else None
+    ReportEvidence = ProjectListedReport(FailureRecord, Artifacts, ReportBytes)
+    RunName = str(Run.get("RunName", ""))
+    SelectedRelative = Observation.Path.relative_to(ArchiveEvidence.Root).as_posix()
+    Members = [Name for Name in ArchiveEvidence.ObservationsByRelativePath
+               if Name.startswith(RunName + "/") or str(Path(Name).parent) == str(Path(SelectedRelative).parent)]
+    if not UniqueReportMembers(Members, SelectedRelative):
+        ReportEvidence = {"Status": "Rejected", "Reason": "unlisted or duplicate report members in run"}
     return {
+        "RoutingFailureReport": ReportEvidence,
         "Resolution": deepcopy(Resolution),
         "Artifact": FailureRecord,
         "Stage": Failure.get("Stage"),
@@ -1153,6 +1180,27 @@ def BuildSealedArchiveEvidence(
                     "acceptance archive file identity is invalid"
                 )
             FilesByPath[RelativePath] = Record
+        # A later-added HTML sibling must not become historical evidence merely
+        # because every older listed checksum still verifies.
+        for FailureName in sorted(Name for Name in FilesByPath if Name.endswith(".RoutingFailure.json")):
+            Parts = _ValidatedRelativeParts(FailureName)
+            Opened = []
+            ParentDescriptor = RootDescriptor
+            try:
+                for Part in Parts[:-1]:
+                    ParentDescriptor = os.open(Part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                               dir_fd=ParentDescriptor)
+                    Opened.append(ParentDescriptor)
+                Names = frozenset(os.listdir(ParentDescriptor))
+                for ReportMember in ReportNames:
+                    RelativeReport = "/".join((*Parts[:-1], ReportMember))
+                    if ReportMember in Names and RelativeReport not in FilesByPath:
+                        raise ValueError("unlisted archive report member: " + RelativeReport)
+            except OSError as Error:
+                raise ValueError("unsafe archive report directory") from Error
+            finally:
+                for Descriptor in reversed(Opened):
+                    os.close(Descriptor)
         Checksums: dict[str, str] = {}
         for Line in ChecksumText.splitlines():
             Digest, Separator, RelativePath = Line.partition("  ")
@@ -2359,6 +2407,19 @@ def BuildAcceptanceRunSummary(
             ManifestSourceState=ManifestSourceState,
             ArchiveEvidence=ArchiveEvidence,
         )
+    ReportEvidence = (FailureArtifact["RoutingFailureReport"] if FailureArtifact else
+                      {"Status": "NotRun" if Accepted else "Unavailable",
+                       "Reason": "no authoritative routing failure"})
+    if ArchiveEvidence is not None:
+        RunName = str(Run.get("RunName", ""))
+        Members = [Name for Name in ArchiveEvidence.ObservationsByRelativePath if Name.startswith(RunName + "/")]
+        Selected = (str(Path(FailureArtifact["Artifact"]["Path"]).relative_to(ArchiveEvidence.Root))
+                    if FailureArtifact else None)
+        if Selected:
+            Members.extend(Name for Name in ArchiveEvidence.ObservationsByRelativePath
+                           if str(Path(Name).parent) == str(Path(Selected).parent))
+        if not UniqueReportMembers(Members, Selected):
+            ReportEvidence = {"Status": "Rejected", "Reason": "unlisted or duplicate report members in run"}
     BackendReceiptMatches = (
         Evaluation.get("Accepted") is True
         and RoutingIdentityConsistent is True
@@ -2408,6 +2469,7 @@ def BuildAcceptanceRunSummary(
         "FailureRoutingDeadlineSeconds": FailureRoutingDeadline,
         "RoutingIdentityConsistent": RoutingIdentityConsistent,
         "FailureArtifact": FailureArtifact,
+        "RoutingFailureReport": ReportEvidence,
         "BackendState": BackendState,
         "TimedOut": Process.get("TimedOut"),
         "ReturnCode": Process.get("ReturnCode"),
@@ -3043,11 +3105,13 @@ def BuildPortableSemanticEvidence(
 
     if isinstance(AcceptanceManifest, dict):
         for Run in AcceptanceManifest.get("Runs", []):
+            Run.pop("RoutingFailureReport", None)
             for Record in dict(Run.get("Artifacts", {})).values():
                 if isinstance(Record, dict):
                     Record.pop("Path", None)
             FailureArtifact = Run.get("FailureArtifact")
             if isinstance(FailureArtifact, dict):
+                FailureArtifact.pop("RoutingFailureReport", None)
                 Resolution = FailureArtifact.get("Resolution")
                 if isinstance(Resolution, dict):
                     Resolution.pop("Path", None)
@@ -3108,6 +3172,62 @@ def BuildPortableSemanticEvidence(
     }
 
 
+def CaptureSelectedFailureReport(FailureObservation: VerifiedFileObservation,
+                                 ArchiveEvidence: VerifiedArchiveEvidence | None):
+    """Retain only the selected failure's pair; never regenerate historical HTML."""
+    Observations = {}
+    Values = {}
+    try:
+        if ArchiveEvidence is not None:
+            for Name in ReportNames:
+                Value = ArchiveEvidence.ObservationForPath(FailureObservation.Path.parent / Name)
+                Values[Name] = Value.Data if Value else None
+                if Value:
+                    Observations[Value.Path] = Value
+            Manifest = json.loads(ArchiveEvidence.AcceptanceManifest.Data)
+            Matches = [Run.get("Evaluation", {}).get("Artifacts", {})
+                       for Run in Manifest.get("Runs", [])
+                       if Run.get("Evaluation", {}).get("Artifacts", {}).get("RoutingFailure", {}).get("Path")
+                       == str(FailureObservation.Path)]
+            if len(Matches) != 1:
+                Result = {"Status": "Rejected" if any(Values.values()) else "Unavailable",
+                          "Reason": "selected report has no unique evaluator listing"}
+            else:
+                def ReadBytes(PathValue):
+                    Value = ArchiveEvidence.ObservationForPath(Path(PathValue))
+                    return Value.Data if Value else None
+                Result = ProjectListedReport(Matches[0]["RoutingFailure"], Matches[0], ReadBytes)
+                SelectedRuns = [Run for Run in Manifest.get("Runs", [])
+                                if Run.get("Evaluation", {}).get("Artifacts", {}) == Matches[0]]
+                if len(SelectedRuns) != 1:
+                    Result = {"Status": "Rejected", "Reason": "ambiguous report run"}
+                else:
+                    RunName = str(SelectedRuns[0].get("RunName", ""))
+                    Members = [Name for Name in ArchiveEvidence.ObservationsByRelativePath if Name.startswith(RunName + "/")]
+                    SelectedRelative = str(FailureObservation.Path.relative_to(ArchiveEvidence.Root))
+                    Members.extend(Name for Name in ArchiveEvidence.ObservationsByRelativePath
+                                   if str(Path(Name).parent) == str(Path(SelectedRelative).parent))
+                    if not UniqueReportMembers(Members, SelectedRelative):
+                        Result = {"Status": "Rejected", "Reason": "unlisted or duplicate report members in run"}
+        else:
+            Descriptors = _OpenAbsoluteDirectoryWithoutFollowing(FailureObservation.Path.parent)
+            try:
+                for Name, Limit in ((ReportName, MaximumReportBytes), (ReceiptName, MaximumReceiptBytes)):
+                    Value = _ReadVerifiedFileAtRoot(FailureObservation.Path.parent, Descriptors[-1], Name,
+                                                   MissingAllowed=True, MaximumBytes=Limit)
+                    Values[Name] = Value.Data if Value else None
+                    if Value:
+                        Observations[Value.Path] = Value
+            finally:
+                for Descriptor in reversed(Descriptors):
+                    os.close(Descriptor)
+            Result = ValidateReportPair(FailureName=FailureObservation.Path.name, FailureData=FailureObservation.Data,
+                                        ReportData=Values[ReportName], ReceiptData=Values[ReceiptName])
+    except (ValueError, OSError, TypeError):
+        Result = {"Status": "Rejected", "Reason": "unsafe selected report evidence"}
+    return Result, Observations if Result["Status"] == "Available" else {}
+
+
 def BuildRoutingDesignSnapshot(
     Configuration: SnapshotConfiguration,
 ) -> dict[str, object]:
@@ -3154,7 +3274,15 @@ def BuildRoutingDesignSnapshot(
             ArchiveEvidence=ArchiveEvidence,
         )
     )
-    ArtifactInputs: list[Path] = [FailureSource]
+    ReportEvidence, ReportObservations = (
+        CaptureSelectedFailureReport(FailureObservation, ArchiveEvidence)
+        if Configuration.Cla4FailurePath is not None else
+        ({"Status": "Unavailable", "Reason": "no retained compiler failure"}, {})
+    )
+    for Explicit in Configuration.ArtifactPaths:
+        if Explicit.name in ReportNames and Path(os.path.abspath(Explicit)) not in ReportObservations:
+            raise ValueError("explicit report is not bound to selected failure")
+    ArtifactInputs: list[Path] = [FailureSource, *sorted(ReportObservations, key=str)]
     if Configuration.AcceptanceManifestPath is not None:
         ArtifactInputs.append(Configuration.AcceptanceManifestPath)
         assert ArchiveEvidence is not None
@@ -3165,7 +3293,7 @@ def BuildRoutingDesignSnapshot(
     ArtifactInputs.extend(Configuration.ArtifactPaths)
     Artifacts, ArtifactObservations = CaptureArtifactManifest(
         ArtifactInputs,
-        Preverified={FailureAbsolutePath: FailureObservation},
+        Preverified={FailureAbsolutePath: FailureObservation, **ReportObservations},
         ArchiveEvidence=ArchiveEvidence,
     )
     ObservationsByOriginalPath = {
@@ -3263,6 +3391,7 @@ def BuildRoutingDesignSnapshot(
         "Source": Source,
         "CurrentRuntimeProvenance": CurrentRuntime,
         "Cla4Failure": Cla4Failure,
+        "RoutingFailureReport": ReportEvidence,
         "AcceptanceManifest": AcceptanceManifest,
         "NandDiagram": NandDiagram,
         "Artifacts": Artifacts,
@@ -3503,89 +3632,184 @@ def WriteSnapshotStaged(
     ):
         raise RuntimeError("source/provenance changed during capture")
     OutputRoot.mkdir(parents=True, exist_ok=True)
-    TemporaryDirectory = Path(tempfile.mkdtemp(
-        prefix=f".{DirectoryName}.",
-        dir=OutputRoot,
-    ))
+    OutputDescriptors = OpenEvidenceDirectory(OutputRoot)
+    StageName = f".{DirectoryName}." + secrets.token_hex(12)
+    TemporaryDirectory = OutputRoot / StageName
+    StageDescriptor = None
+    ArtifactDescriptor = None
+    Published = False
+    Written = []
     try:
-        ResolvedTemporaryDirectory = TemporaryDirectory.resolve()
-        ArtifactDirectory = TemporaryDirectory / "Artifacts"
-        ArtifactDirectory.mkdir()
-        CapturedArtifacts = getattr(
-            Snapshot,
-            "ArtifactObservationsBySnapshotPath",
-            None,
-        )
+        RootDescriptor = OutputDescriptors[-1]
+        os.mkdir(StageName, mode=0o700, dir_fd=RootDescriptor)
+        StageDescriptor = os.open(StageName, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=RootDescriptor)
+        os.mkdir("Artifacts", dir_fd=StageDescriptor)
+        ArtifactDescriptor = os.open("Artifacts", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=StageDescriptor)
+        CapturedArtifacts = getattr(Snapshot, "ArtifactObservationsBySnapshotPath", None)
         if not isinstance(CapturedArtifacts, Mapping):
-            raise RuntimeError(
-                "snapshot publication requires retained artifact observations"
-            )
+            raise RuntimeError("snapshot publication requires retained artifact observations")
+        Digests = {}
         for Artifact in Snapshot["Artifacts"]:
-            SourcePath = Path(str(Artifact["OriginalPath"]))
-            RelativeSnapshotPath = Path(str(Artifact["SnapshotPath"]))
-            if RelativeSnapshotPath.is_absolute():
-                raise ValueError(
-                    "snapshot artifact path must be relative: "
-                    f"{RelativeSnapshotPath}"
-                )
-            DestinationPath = (
-                TemporaryDirectory / RelativeSnapshotPath
-            ).resolve()
-            if not DestinationPath.is_relative_to(ResolvedTemporaryDirectory):
-                raise ValueError(
-                    "snapshot artifact path escapes temporary bundle: "
-                    f"{RelativeSnapshotPath}"
-                )
-            DestinationPath.parent.mkdir(parents=True, exist_ok=True)
-            Observation = CapturedArtifacts.get(
-                RelativeSnapshotPath.as_posix()
-            )
+            Relative = str(Artifact["SnapshotPath"])
+            Parts = _ValidatedRelativeParts(Relative)
+            if len(Parts) != 2 or Parts[0] != "Artifacts" or Relative in Digests:
+                raise ValueError("snapshot artifact path is not a unique flat member")
+            Observation = CapturedArtifacts.get(Relative)
             if not isinstance(Observation, VerifiedFileObservation) or (
-                Observation.SizeBytes != Artifact["SizeBytes"]
-                or Observation.Sha256 != Artifact["Sha256"]
-            ):
-                raise RuntimeError(
-                    f"captured artifact identity mismatch: {SourcePath}"
-                )
-            DestinationPath.write_bytes(Observation.Data)
-            if Sha256File(DestinationPath) != Artifact["Sha256"]:
-                raise RuntimeError(
-                    f"copied artifact hash mismatch: {SourcePath}"
-                )
+                    Observation.SizeBytes != Artifact["SizeBytes"] or Observation.Sha256 != Artifact["Sha256"]):
+                raise RuntimeError("captured artifact identity mismatch")
+            WriteEvidenceMember(ArtifactDescriptor, Parts[1], Observation.Data)
+            Written.append((ArtifactDescriptor, Parts[1]))
+            Copied = _ReadVerifiedFileAtRoot(TemporaryDirectory, StageDescriptor, Relative)
+            if Copied is None or Copied.Sha256 != Observation.Sha256:
+                raise RuntimeError("copied artifact hash mismatch")
+            Digests[Relative] = Copied.Sha256
+        Documents = {
+            "Snapshot.json": PrettyJsonText(Snapshot),
+            "Snapshot.md": RenderSnapshotMarkdown(Snapshot) + "\n## Routing failure report\n\nStatus: "
+                           + str(Snapshot.get("RoutingFailureReport", {}).get("Status", "Unavailable")) + "\n",
+        }
+        for Name, Text in Documents.items():
+            Data = Text.encode("utf-8")
+            WriteEvidenceMember(StageDescriptor, Name, Data)
+            Written.append((StageDescriptor, Name))
+            Digests[Name] = Sha256Bytes(Data)
+        Seal = "".join(f"{Digest}  {Name}\n" for Name, Digest in sorted(Digests.items())).encode("utf-8")
+        WriteEvidenceMember(StageDescriptor, "SHA256SUMS", Seal)
+        Written.append((StageDescriptor, "SHA256SUMS"))
+        VerifyEvidenceDirectory(OutputRoot, RootDescriptor)
+        Entry = os.stat(StageName, dir_fd=RootDescriptor, follow_symlinks=False)
+        Opened = os.fstat(StageDescriptor)
+        if not stat.S_ISDIR(Entry.st_mode) or (Entry.st_dev, Entry.st_ino) != (Opened.st_dev, Opened.st_ino):
+            raise ValueError("snapshot staging directory changed")
+        try:
+            os.stat(DirectoryName, dir_fd=RootDescriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError("snapshot target already exists")
+        os.rename(StageName, DirectoryName, src_dir_fd=RootDescriptor, dst_dir_fd=RootDescriptor)
+        Published = True
+        return TargetDirectory
+    finally:
+        if not Published:
+            for Descriptor, Name in reversed(Written):
+                try:
+                    os.unlink(Name, dir_fd=Descriptor)
+                except OSError:
+                    pass
+            if StageDescriptor is not None:
+                try:
+                    os.rmdir("Artifacts", dir_fd=StageDescriptor)
+                except OSError:
+                    pass
+            try:
+                Entry = os.stat(StageName, dir_fd=OutputDescriptors[-1], follow_symlinks=False)
+                Opened = os.fstat(StageDescriptor) if StageDescriptor is not None else None
+                if Opened and (Entry.st_dev, Entry.st_ino) == (Opened.st_dev, Opened.st_ino):
+                    os.rmdir(StageName, dir_fd=OutputDescriptors[-1])
+            except OSError:
+                pass
+        if ArtifactDescriptor is not None:
+            os.close(ArtifactDescriptor)
+        if StageDescriptor is not None:
+            os.close(StageDescriptor)
+        for Descriptor in reversed(OutputDescriptors):
+            os.close(Descriptor)
 
-        SnapshotJsonPath = TemporaryDirectory / "Snapshot.json"
-        SnapshotMarkdownPath = TemporaryDirectory / "Snapshot.md"
-        SnapshotJsonPath.write_text(
-            PrettyJsonText(Snapshot),
-            encoding="utf-8",
-            newline="\n",
-        )
-        SnapshotMarkdownPath.write_text(
-            RenderSnapshotMarkdown(Snapshot),
-            encoding="utf-8",
-            newline="\n",
-        )
 
-        HashedPaths = sorted((
-            SnapshotJsonPath,
-            SnapshotMarkdownPath,
-            *ArtifactDirectory.iterdir(),
-        ), key=lambda Value: Value.relative_to(TemporaryDirectory).as_posix())
-        ChecksumLines = [
-            f"{Sha256File(PathValue)}  "
-            f"{PathValue.relative_to(TemporaryDirectory).as_posix()}"
-            for PathValue in HashedPaths
-        ]
-        (TemporaryDirectory / "SHA256SUMS").write_text(
-            "\n".join(ChecksumLines) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        TemporaryDirectory.replace(TargetDirectory)
-    except Exception:
-        shutil.rmtree(TemporaryDirectory, ignore_errors=True)
-        raise
-    return TargetDirectory
+def ReadRoutingDesignSnapshot(Directory: Path) -> dict[str, object]:
+    """Read a sealed flat snapshot and independently expose report availability.
+
+    All bytes are observed through the retained directory descriptor. Historical
+    snapshots without a report remain unavailable; nothing is regenerated.
+    """
+    Root = Path(os.path.abspath(Directory))
+    Descriptors = _OpenAbsoluteDirectoryWithoutFollowing(Root)
+    try:
+        Seal = _ReadVerifiedFileAtRoot(Root, Descriptors[-1], "SHA256SUMS", MaximumBytes=1024 * 1024)
+        assert Seal is not None
+        Digests = {}
+        for Line in Seal.Data.decode("utf-8").splitlines():
+            Digest, Separator, Name = Line.partition("  ")
+            Parts = _ValidatedRelativeParts(Name)
+            if (Separator != "  " or not IsCanonicalSha256(Digest) or Name in Digests
+                    or (Parts not in (("Snapshot.json",), ("Snapshot.md",))
+                        and not (len(Parts) == 2 and Parts[0] == "Artifacts"))):
+                raise ValueError("invalid or duplicate snapshot checksum member")
+            Digests[Name] = Digest
+        if not {"Snapshot.json", "Snapshot.md"}.issubset(Digests):
+            raise ValueError("incomplete snapshot seal")
+        Values = {}
+        for Name, Digest in Digests.items():
+            Limit = (MaximumReportBytes if Name.endswith("/" + ReportName) else
+                     MaximumReceiptBytes if Name.endswith("/" + ReceiptName) else None)
+            Value = _ReadVerifiedFileAtRoot(Root, Descriptors[-1], Name, MaximumBytes=Limit)
+            assert Value is not None
+            if Value.Sha256 != Digest:
+                raise ValueError("snapshot checksum mismatch: " + Name)
+            Values[Name] = Value
+        ArtifactDescriptor = os.open("Artifacts", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                     dir_fd=Descriptors[-1])
+        try:
+            for Name in ReportNames:
+                if Name in os.listdir(ArtifactDescriptor) and "Artifacts/" + Name not in Digests:
+                    raise ValueError("unlisted snapshot report: " + Name)
+        finally:
+            os.close(ArtifactDescriptor)
+        Snapshot = json.loads(Values["Snapshot.json"].Data)
+        if not isinstance(Snapshot, dict) or Snapshot.get("SchemaVersion") != SchemaVersion:
+            raise ValueError("unsupported snapshot schema")
+        Artifacts = Snapshot.get("Artifacts")
+        if not isinstance(Artifacts, list):
+            raise ValueError("snapshot artifact inventory missing")
+        ByName = {}
+        for Record in Artifacts:
+            if not isinstance(Record, dict) or not isinstance(Record.get("SnapshotPath"), str):
+                raise ValueError("malformed snapshot artifact record")
+            Name = Record["SnapshotPath"]
+            if Name in ByName or Name not in Values or not Name.startswith("Artifacts/"):
+                raise ValueError("duplicate or unsealed snapshot artifact")
+            Value = Values[Name]
+            if Value.Sha256 != Record.get("Sha256") or Value.SizeBytes != Record.get("SizeBytes"):
+                raise ValueError("snapshot artifact identity mismatch")
+            ByName[Name] = Record
+        ReportValue = Values.get("Artifacts/" + ReportName)
+        ReceiptValue = Values.get("Artifacts/" + ReceiptName)
+        if ReportValue is None and ReceiptValue is None:
+            Retained = Snapshot.get("RoutingFailureReport", {})
+            if isinstance(Retained, dict) and Retained.get("Status") in ("Rejected", "Malformed", "Unavailable", "NotRun"):
+                Evidence = Retained
+            elif isinstance(Retained, dict) and Retained.get("Status") == "Available":
+                Evidence = {"Status": "Rejected", "Reason": "declared report is absent from snapshot"}
+            else:
+                Evidence = {"Status": "Unavailable", "Reason": "report not retained"}
+        else:
+            # The source identity is only a selector; the source must also be an
+            # inventoried artifact matching the snapshot's selected failure.
+            try:
+                Receipt = json.loads(ReceiptValue.Data) if ReceiptValue else {}
+                SourceName = Receipt.get("Source", {}).get("Name", "")
+                if not isinstance(SourceName, str) or Path(SourceName).name != SourceName:
+                    raise ValueError("unsafe report source")
+                SourceKey = "Artifacts/" + SourceName
+                Source = Values.get(SourceKey)
+                if Source is None or SourceKey not in ByName or (
+                        Source.Sha256 != Snapshot.get("Cla4Failure", {}).get("ArtifactSha256")):
+                    raise ValueError("report source not bound to selected snapshot failure")
+                Evidence = ValidateReportPair(
+                    FailureName=SourceName, FailureData=Source.Data,
+                    ReportData=ReportValue.Data if ReportValue else None,
+                    ReceiptData=ReceiptValue.Data if ReceiptValue else None,
+                    ExpectedReport=ByName.get("Artifacts/" + ReportName),
+                    ExpectedReceipt=ByName.get("Artifacts/" + ReceiptName), RequireInventory=True,
+                )
+            except (ValueError, TypeError, AttributeError):
+                Evidence = {"Status": "Rejected", "Reason": "report source binding unavailable"}
+        return {"Snapshot": Snapshot, "RoutingFailureReport": Evidence}
+    finally:
+        for Descriptor in reversed(Descriptors):
+            os.close(Descriptor)
 
 
 def ParseTimestamp(Value: str) -> datetime:
