@@ -1,0 +1,75 @@
+name: One-off PR9 overlap diagnostic
+
+# REVIEW GATE: publishing this branch is the activation action. No PR is needed.
+on:
+  push:
+    branches: [telemetry/overlap-diagnostic-097ba27-cloud-20261001]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONNOUSERSITE: '1'
+  PYTHONHASHSEED: '0'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  overlap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out exact PR9 subject separately from diagnostic code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 097ba27a3b261b346ca53cc5cb65e6e149dd13fd
+          path: subject
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+      - name: Install the existing fixed toolchain and hash-locked dependencies
+        working-directory: subject
+        run: |
+          mkdir -p ../Output/CI/overlap
+          exec > >(tee ../Output/CI/overlap/setup.stdout.log) 2> >(tee ../Output/CI/overlap/setup.stderr.log >&2)
+          trap 'result=$?; printf "Exit=%s ElapsedSeconds=%s\n" "$result" "$SECONDS" > ../Output/CI/overlap/setup-result.txt' EXIT
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+          rustup override set 1.96.0
+          python -m venv .venv
+          .venv/bin/python -m pip install --only-binary=:all: --require-hashes -r Tools/CI/requirements.txt
+          .venv/bin/python --version
+          rustc --version --verbose
+          cargo --version
+          .venv/bin/python -m pip freeze
+      - name: Build own native extension, attest source, run one overlap test
+        run: subject/.venv/bin/python Tools/CI/DiagnoseOverlap.py
+      - name: Stage only allowlisted regular evidence even after a failure
+        id: stage
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path('Output/CI/overlap')
+          root.mkdir(parents=True, exist_ok=True)
+          if not (root / 'Run.json').exists():
+              (root / 'Bootstrap.json').write_text(json.dumps({'Status': 'incomplete', 'Failure': 'Setup did not produce a run receipt'}) + '\n')
+          (root / 'Driver.json').write_text(json.dumps({'Commit': os.environ['GITHUB_SHA'], 'RunId': os.environ['GITHUB_RUN_ID'], 'Attempt': os.environ['GITHUB_RUN_ATTEMPT']}, sort_keys=True) + '\n')
+          PY
+          python3 Tools/CI/DiagnoseOverlap.py --stage-evidence
+      - name: Retain diagnostic evidence only
+        if: always() && steps.stage.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: overlap-097ba27-${{ github.run_id }}-${{ github.run_attempt }}
+          path: Output/CI/overlap-public/
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
