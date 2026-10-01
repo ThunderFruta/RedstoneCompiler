@@ -44,6 +44,17 @@ controls when the two disagree.
   unowned exclusions and current foreign wires. Boundary-binding identity must
   cover ordered signal/gate/kind/role/pin/terminal/face bindings. Full paths and
   claims cannot be replaced by endpoint or bounding-box summaries.
+- For otherwise well-formed supported declarations, comparison retains known
+  topology, subject, snapshot, boundary and shared-category differences when
+  either side is missing required coverage.  The result is still `Unresolved`,
+  with sorted side-specific missing reasons; absence is never reported as a
+  difference. Malformed payloads and unsupported scopes remain conservative
+  empty-difference outcomes and are not mined for comparison facts.
+  This correction originates in Reuse-And-Salvage commit
+  `96eda1d8e2e86b6ba9ab05984f44d58f6bc5ed06`. The cloud intake onto Router
+  `19812c06dc5265e03889f27f5d36dae000572634` preserves its production and test
+  postimages. It supplies declaration diagnostics only: producer authentication,
+  current physical revalidation, production reuse and issue #1 remain open.
 - Boundary counts follow extraction's distinct-consumer convention; repeated
   gate pin edges remain distinct in topology. Capacity and external counts are
   separate dependency data. Missing net declarations use scalar IR defaults;
