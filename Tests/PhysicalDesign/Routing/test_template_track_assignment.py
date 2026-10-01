@@ -7,6 +7,11 @@ import pytest
 
 from PhysicalDesign.Routing.Global.Orchestration.RunModels import RawTrackAssignmentDomain, RawTrackAssignmentValue
 from PhysicalDesign.Routing.Global.Assignment.TrackPortfolio import BuildTrackAssignmentPreparationFromRawDomain
+from PhysicalDesign.Contracts.Failures import (
+    RoutingFailure,
+    RoutingFailureReason,
+    RoutingStageError,
+)
 from PhysicalDesign.Resources.ResourceGraph import RoutingResourceClaims
 from PhysicalDesign.Runtime.Reliability import RoutingDeadline
 from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentCandidateInputManifest, RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolio, RawTrackAssignmentPortfolioTemplate, RawTrackAssignmentProblem, RawTrackAssignmentTemplate, SolveRawTrackAssignmentPortfolio, SolveRawTrackAssignmentProblem, SolveRawTrackAssignmentProblemWithContext
@@ -279,7 +284,290 @@ def test_incomplete_portfolio_materialization_is_terminal():
     assert Result.Unsatisfiable is False
     assert Result.IncompleteReason == "incomplete-template-domain"
     assert Result.MaterializedTemplateCount == 1
-    assert Result.SkippedDominatedTemplateCount == 1
+    assert Result.SkippedDominatedTemplateCount == 0
+
+
+def test_post_materialization_deadline_observation_precedes_native_and_keeps_a_bounded_semantic_record():
+    """A returned raw result is observed before any later expensive work."""
+    Descriptor = BuildPortfolioTemplate("compact", (1,))
+    Observations: list[dict[str, object]] = []
+    Materialized: list[str] = []
+
+    def Materialize(Value):
+        Materialized.append(Value.TemplateId)
+        return RawTrackAssignmentMaterialization(
+            TemplateId=Value.TemplateId,
+            MaterializationInputFingerprint=(
+                Value.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=(
+                Value.MaterializationInputManifest
+            ),
+            Domain=BuildDomain(Value.TemplateId),
+            Complete=True,
+        )
+
+    def Observe(Diagnostics):
+        Observations.append(dict(Diagnostics))
+        if Diagnostics["Phase"] == "raw-template-materialization-observed":
+            raise RoutingStageError(RoutingFailure(
+                Reason=RoutingFailureReason.RuntimeBudgetExceeded,
+                Stage="PreRouteInterfaceSelection",
+                Diagnostics=Diagnostics,
+            ))
+
+    with pytest.raises(RoutingStageError) as Error:
+        SolveRawTrackAssignmentPortfolio(
+            RawTrackAssignmentPortfolio(
+                Templates=(Descriptor,),
+                MaximumAssignmentExpansions=16,
+            ),
+            Materialize,
+            lambda _Domain, _Remaining: (_ for _ in ()).throw(
+                AssertionError("deadline observation must precede native work")
+            ),
+            WorkCheck=Observe,
+        )
+
+    assert Materialized == ["compact"]
+    Published = Error.value.Failure.Diagnostics
+    assert Published["TemplateId"] == "compact"
+    assert Published["SemanticResult"]["Complete"] is True
+    assert Published["SourceIdentity"]["CandidateInputFingerprint"] == (
+        Descriptor.MaterializationInputFingerprint
+    )
+    assert Published["WorkIdentity"]["WorkControlsFingerprint"]
+    assert Published["Counts"]["PortfolioTemplateCount"] == 1
+    assert Published["EvidenceCompleteness"]["FullInputManifestIncluded"] is False
+    assert "MaterializationInputManifest" not in Published
+    assert "Payload" not in repr(Published)
+
+
+def test_post_materialization_deadline_observation_never_retraverses_frozen_input(
+    monkeypatch,
+):
+    """The immediate deadline seam uses identity captured before materialization."""
+    Nested: object = {"Leaf": "value"}
+    for Index in range(24):
+        Nested = {f"Level{Index}": [Nested, {"Repeat": Index}]}
+    Manifest = RawTrackAssignmentCandidateInputManifest.Capture({
+        "CandidateId": "compact",
+        "LargeFrozenInput": Nested,
+    })
+    Descriptor = RawTrackAssignmentPortfolioTemplate(
+        TemplateId="compact",
+        Objective=(1,),
+        MaterializationInputFingerprint=Manifest.ManifestFingerprint,
+        MaterializationInputManifest=Manifest,
+    )
+    Portfolio = RawTrackAssignmentPortfolio(
+        Templates=(Descriptor,),
+        MaximumAssignmentExpansions=16,
+    )
+    OriginalToDictionary = RawTrackAssignmentCandidateInputManifest.ToDictionary
+    OriginalFingerprint = RawTrackAssignmentCandidateInputManifest.ManifestFingerprint
+    State = {"Armed": False, "Observed": False}
+
+    def TrapToDictionary(Value):
+        if State["Armed"]:
+            raise AssertionError(
+                "post-materialization observation traversed frozen input"
+            )
+        return OriginalToDictionary(Value)
+
+    def TrapFingerprint(Value):
+        if State["Armed"]:
+            raise AssertionError(
+                "post-materialization observation recomputed manifest identity"
+            )
+        return OriginalFingerprint.fget(Value)
+
+    monkeypatch.setattr(
+        RawTrackAssignmentCandidateInputManifest,
+        "ToDictionary",
+        TrapToDictionary,
+    )
+    monkeypatch.setattr(
+        RawTrackAssignmentCandidateInputManifest,
+        "ManifestFingerprint",
+        property(TrapFingerprint),
+    )
+
+    def Materialize(Value):
+        Result = RawTrackAssignmentMaterialization(
+            TemplateId=Value.TemplateId,
+            MaterializationInputFingerprint=(
+                Value.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=Value.MaterializationInputManifest,
+            Domain=BuildDomain(Value.TemplateId),
+            Complete=True,
+        )
+        State["Armed"] = True
+        return Result
+
+    def Observe(Diagnostics):
+        if Diagnostics["Phase"] == "raw-template-materialization-observed":
+            assert State["Armed"] is True
+            State["Observed"] = True
+            State["Armed"] = False
+
+    Result = SolveRawTrackAssignmentPortfolio(
+        Portfolio,
+        Materialize,
+        lambda _Domain, _Remaining: NativeResult(
+            Success=True,
+            ExpansionCount=1,
+            CandidateId="compact-candidate",
+        ),
+        WorkCheck=Observe,
+    )
+
+    assert State == {"Armed": False, "Observed": True}
+    assert Result.Success is True
+
+
+def test_already_expired_authority_stops_before_raw_materialization():
+    """An expired shared authority cannot enter raw construction or native work."""
+    Descriptor = BuildPortfolioTemplate("compact", (1,))
+    Deadline = RoutingDeadline(StartedAt=0.0, ExpiresAt=0.0)
+    Materialized: list[str] = []
+
+    def Materialize(Value):
+        Materialized.append(Value.TemplateId)
+        raise AssertionError("expired authority entered raw materialization")
+
+    with pytest.raises(RoutingStageError) as Error:
+        SolveRawTrackAssignmentPortfolio(
+            RawTrackAssignmentPortfolio(
+                Templates=(Descriptor,),
+                MaximumAssignmentExpansions=16,
+            ),
+            Materialize,
+            lambda _Domain, _Remaining: (_ for _ in ()).throw(
+                AssertionError("expired authority entered native assignment")
+            ),
+            WorkCheck=lambda Diagnostics: Deadline.RaiseIfExpired(
+                "PreRouteInterfaceSelection",
+                Diagnostics,
+            ),
+        )
+
+    assert Materialized == []
+    assert Error.value.Failure.Reason is (
+        RoutingFailureReason.RuntimeBudgetExceeded
+    )
+    assert Error.value.Failure.Diagnostics["Phase"] == (
+        "raw-template-domain-materialization"
+    )
+
+
+def test_incomplete_portfolio_failure_envelope_is_bounded_and_retains_semantic_identity():
+    """Failure publication keeps identities and counts, never the frozen input tree."""
+    Nested: object = {"Leaf": "value"}
+    for Index in range(32):
+        Nested = {f"Level{Index}": [Nested, {"Repeat": Index}]}
+    Manifest = RawTrackAssignmentCandidateInputManifest.Capture({
+        "CandidateId": "incomplete",
+        "LargeFrozenInput": Nested,
+    })
+    Descriptor = RawTrackAssignmentPortfolioTemplate(
+        TemplateId="incomplete",
+        Objective=(1,),
+        MaterializationInputFingerprint=Manifest.ManifestFingerprint,
+        MaterializationInputManifest=Manifest,
+    )
+    Later = BuildPortfolioTemplate("later", (2,))
+
+    Result = SolveRawTrackAssignmentPortfolio(
+        RawTrackAssignmentPortfolio(
+            Templates=(Later, Descriptor),
+            MaximumAssignmentExpansions=16,
+        ),
+        lambda Value: RawTrackAssignmentMaterialization(
+            TemplateId=Value.TemplateId,
+            MaterializationInputFingerprint=(
+                Value.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=Value.MaterializationInputManifest,
+            Domain=None,
+            Complete=False,
+            IncompleteReason="fixed-domain-work-cap",
+        ),
+        lambda _Domain, _Remaining: (_ for _ in ()).throw(
+            AssertionError("incomplete materialization must not reach native")
+        ),
+    )
+
+    Envelope = Result.ToBoundedFailureEnvelope()
+    assert Envelope["SemanticResult"]["IncompleteReason"] == (
+        "incomplete-template-domain"
+    )
+    assert Envelope["SourceIdentities"] == [{
+        "CandidateId": "incomplete",
+        "CandidateInputFingerprint": Manifest.ManifestFingerprint,
+    }]
+    assert Envelope["WorkIdentity"]["WorkControlsFingerprint"]
+    assert Envelope["Counts"] == {
+        "PortfolioTemplateCount": 2,
+        "MaterializedTemplateCount": 1,
+        "AttemptCount": 1,
+        "CandidatePreparationResultCount": 1,
+        "SkippedDominatedTemplateCount": 0,
+        "UnattemptedTemplateCount": 1,
+    }
+    assert Envelope["EvidenceCompleteness"] == {
+        "SemanticSelectionComplete": False,
+        "OuterPortfolioComplete": False,
+        "FullInputManifestIncluded": False,
+        "FullMaterializationDiagnosticsIncluded": False,
+        "UnattemptedDescriptorsDominated": False,
+    }
+    assert Envelope["Omissions"] == [
+        "full-frozen-candidate-input-manifests",
+        "full-materialization-diagnostics",
+        "raw-domain-values-and-claims",
+    ]
+    assert "Payload" not in repr(Envelope)
+    assert "LargeFrozenInput" not in repr(Envelope)
+
+
+def test_incomplete_portfolio_envelope_is_deterministic_under_input_reordering():
+    """Descriptor input order cannot change incomplete evidence or dominance."""
+    Descriptors = (
+        BuildPortfolioTemplate("later", (2,)),
+        BuildPortfolioTemplate("first", (1,)),
+        BuildPortfolioTemplate("last", (3,)),
+    )
+
+    def Materialize(Value):
+        return RawTrackAssignmentMaterialization(
+            TemplateId=Value.TemplateId,
+            MaterializationInputFingerprint=(
+                Value.MaterializationInputFingerprint
+            ),
+            MaterializationInputManifest=Value.MaterializationInputManifest,
+            Domain=None,
+            Complete=False,
+            IncompleteReason="fixed-domain-work-cap",
+        )
+
+    Envelopes = []
+    for Ordered in (Descriptors, tuple(reversed(Descriptors))):
+        Result = SolveRawTrackAssignmentPortfolio(
+            RawTrackAssignmentPortfolio(
+                Templates=Ordered,
+                MaximumAssignmentExpansions=16,
+            ),
+            Materialize,
+            lambda _Domain, _Remaining: (_ for _ in ()).throw(
+                AssertionError("incomplete materialization must not reach native")
+            ),
+        )
+        assert Result.SkippedDominatedTemplateCount == 0
+        Envelopes.append(Result.ToBoundedFailureEnvelope())
+
+    assert Envelopes[0] == Envelopes[1]
 
 
 def test_equal_objective_incomplete_member_prevents_early_commit():
@@ -343,7 +631,7 @@ def test_equal_objective_incomplete_member_prevents_early_commit():
     assert Result.Unsatisfiable is False
     assert Result.IncompleteReason == "incomplete-template-domain"
     assert Result.MaterializedTemplateCount == 2
-    assert Result.SkippedDominatedTemplateCount == 1
+    assert Result.SkippedDominatedTemplateCount == 0
 
 
 def test_equal_prefix_uses_resolved_material_access_objective():

@@ -528,4 +528,83 @@ mod Tests {
         assert_eq!(Result.RejectedPathCount, 1);
         assert!(!Result.ConflictResources.is_empty());
     }
+
+    #[test]
+    fn CertifiedWarmCandidateCannotPublishAfterSharedDeadline() {
+        let Nodes = (0..3).map(|X| (X, 0, 0)).collect::<Vec<_>>();
+        let mut Adjacency = HashMap::<Position, Vec<Position>>::new();
+        for PositionValue in Nodes.iter().copied() {
+            Adjacency.insert(PositionValue, Vec::new());
+        }
+        for Pair in Nodes.windows(2) {
+            Adjacency.get_mut(&Pair[0]).unwrap().push(Pair[1]);
+            Adjacency.get_mut(&Pair[1]).unwrap().push(Pair[0]);
+        }
+        let Context = RoutingContext::FromMaps(Adjacency, HashMap::new());
+        let Guide = PreparedDetailedRouteGuide {
+            AllowedNodes: Nodes.iter().copied().collect(),
+            AllowedColumns: HashSet::new(),
+            UseColumnMembership: false,
+            BoundaryBlockedNodes: HashSet::new(),
+            NodeCosts: HashMap::new(),
+            ColumnCosts: HashMap::new(),
+            PreferredColumns: Vec::new(),
+            ExactHintNodes: HashSet::new(),
+            CertifiedPaths: vec![Nodes.clone(); 2_000],
+            CertifiedRepeaters: Vec::new(),
+            GuidePenalty: 0,
+        };
+        let FrozenSource = [Nodes[0]];
+        let TargetBranches = vec![vec![*Nodes.last().unwrap()]];
+        let Generate =
+            |MaximumExpansionCount,
+             Admission: Option<&crate::Core::WorkAdmission::RequestExpansionAdmissionV1>,
+             Deadline: &RuntimeDeadline| {
+                Context.GenerateRouteTreeDetailedPreparedWithDeadlineNative(
+                    &[Nodes[0]],
+                    &TargetBranches,
+                    &TargetBranches,
+                    &Guide,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    0,
+                    0,
+                    0,
+                    false,
+                    Some(&FrozenSource),
+                    &HashSet::new(),
+                    "certified-deadline",
+                    MaximumExpansionCount,
+                    Admission,
+                    Deadline,
+                )
+            };
+
+        let Limited = Generate(1, None, &RuntimeDeadline::Unlimited());
+        assert!(Limited.IsBudgetExpired);
+        assert!(!Limited.IsRouted);
+        assert_eq!(Limited.ExpansionCount, 0);
+
+        let Admission = crate::Core::WorkAdmission::RequestExpansionAdmissionV1::New(1);
+        let AdmissionLimited = Generate(10_000, Some(&Admission), &RuntimeDeadline::Unlimited());
+        assert!(AdmissionLimited.IsBudgetExpired);
+        assert!(!AdmissionLimited.IsRouted);
+        assert_eq!(AdmissionLimited.ExpansionCount, 1);
+        assert_eq!(Admission.RouteCount(), 1);
+
+        let Valid = Generate(10_000, None, &RuntimeDeadline::Unlimited());
+        assert!(Valid.IsRouted);
+        assert!(!Valid.IsBudgetExpired);
+        assert_eq!(Valid.ExpansionCount, Nodes.len() * 2_000);
+        assert_eq!(Valid.SourcePaths, vec![vec![Nodes[0]]]);
+
+        let Result = Generate(10_000, None, &RuntimeDeadline::FromCheckBudget(64));
+
+        assert_eq!(Result.Status, "BudgetExpired");
+        assert!(Result.IsBudgetExpired);
+        assert!(!Result.IsRouted);
+        assert!(Result.Nodes.is_empty());
+        assert!(Result.SourcePaths.is_empty());
+    }
 }

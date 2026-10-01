@@ -28,6 +28,7 @@ macro_rules! IntegratePreparedDetailedSource {
         $RetainedMandatorySourceNodes:ident,
         $FrozenSourceFrontierState:ident,
         $RootedFrozenPortalNodes:ident,
+        $SourcePaths:ident,
         $TargetPaths:ident,
         $GlobalRoutingNodes:ident,
         $RetainedMandatoryTargetNodes:ident
@@ -295,6 +296,46 @@ macro_rules! IntegratePreparedDetailedSource {
             for (PositionValue, Facing) in Result.RepeaterReservations {
                 $Repeaters.entry(PositionValue).or_insert(Facing);
             }
+        }
+
+        let mut $SourcePaths = Vec::with_capacity($Starts.len());
+        let mut SourceWitnessSteps = 0usize;
+        for Start in $Starts.iter().copied() {
+            if $Deadline.Check() {
+                return $Failure("NoPath", "SearchLimitReached", 0, 0, $ExpansionCount);
+            }
+            let mut Path = vec![Start];
+            let mut Cursor = Start;
+            while Cursor != $Root {
+                SourceWitnessSteps = match SourceWitnessSteps.checked_add(1) {
+                    Some(Value) => Value,
+                    None => {
+                        return $Failure(
+                            "NoPath",
+                            "SearchLimitReached",
+                            0,
+                            0,
+                            $ExpansionCount,
+                        )
+                    }
+                };
+                if SourceWitnessSteps % DEADLINE_CHECK_INTERVAL == 0 && $Deadline.Check() {
+                    return $Failure("NoPath", "SearchLimitReached", 0, 0, $ExpansionCount);
+                }
+                let Some(Previous) = $ParentByNode.get(&Cursor).copied() else {
+                    return $Failure("NoPath", "NoPathGeometry", 0, 0, $ExpansionCount);
+                };
+                Path.push(Previous);
+                Cursor = Previous;
+                if Path.len() > $Tree.len() {
+                    return $Failure("NoPath", "NoPathGeometry", 0, 0, $ExpansionCount);
+                }
+            }
+            Path.reverse();
+            $SourcePaths.push(Path);
+        }
+        if $Deadline.Check() {
+            return $Failure("NoPath", "SearchLimitReached", 0, 0, $ExpansionCount);
         }
 
         // Some immutable target-side claim fragments are already connected

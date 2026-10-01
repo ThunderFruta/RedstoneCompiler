@@ -2,12 +2,14 @@
 
 from dataclasses import dataclass, replace
 from itertools import permutations
+from json import loads
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 from Compilation.Ir.Models import Gate, GateKind, ModuleIR, NetlistIR
 from PhysicalDesign.Contracts.Failures import (
+    RoutingFailure,
     RoutingFailureReason,
     RoutingStageError,
 )
@@ -40,6 +42,10 @@ import PhysicalDesign.Orchestration.RoutingAttempts as RoutingAttempts
 import PhysicalDesign.Orchestration.Setup as PlacementSetup
 import PhysicalDesign.Orchestration.AccessEnvelope as AccessEnvelope
 import PhysicalDesign.Orchestration.Results as PlacementResults
+import PhysicalDesign.Routing.Global.Orchestration.Stages.CandidatePreparation as CandidatePreparation
+import PhysicalDesign.Routing.Global.Orchestration.Stages.CandidateMaterialization as CandidateMaterialization
+import PhysicalDesign.Routing.Global.Orchestration.Flow as AuthoritativeFlow
+from RedstoneCompiler import RustRouting
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,130 @@ def BuildSingleNandNetlist() -> NetlistIR:
         ],
     )
     return NetlistIR(Top=Module.Name, Modules={Module.Name: Module})
+
+
+def BuildThreeNandChainNetlist() -> NetlistIR:
+    Module = ModuleIR(
+        Name="CandidatePreparationThreeNandChain",
+        Inputs=["s0"],
+        Outputs=["s3"],
+        Gates=[
+            Gate("InputA", GateKind.INPUT, ["s0"]),
+            Gate("Nand0", GateKind.NAND, ["s1"], ["s0", "s0"]),
+            Gate("Nand1", GateKind.NAND, ["s2"], ["s1", "s1"]),
+            Gate("Nand2", GateKind.NAND, ["s3"], ["s2", "s2"]),
+            Gate("OutputY", GateKind.OUTPUT, [], ["s3"]),
+        ],
+    )
+    return NetlistIR(Top=Module.Name, Modules={Module.Name: Module})
+
+
+class _PublicTypedBatchReached(BaseException):
+    """Stop after one real placement-to-native batch has been inspected."""
+
+
+def test_typed_context_construction_reuses_only_exact_current_scope():
+    """A frozen region is sealed once; changed bounds force reconstruction."""
+    Nodes = frozenset({(0, 0, 0), (1, 0, 0)})
+    Edges = frozenset({((0, 0, 0), (1, 0, 0))})
+    Bounds = (0, 1, 0, 0, 0, 0)
+    PlacementBounds = (0, 1, 0, 0)
+    SourceContext = RustRouting.RoutingContext(
+        Bounds,
+        PlacementBounds,
+        sorted(Nodes),
+        sorted(Edges),
+    )
+    State = SimpleNamespace(
+        Bounds=Bounds,
+        MinimumX=0,
+        MaximumX=1,
+        MinimumZ=0,
+        MaximumZ=0,
+        Region=SimpleNamespace(Nodes=Nodes, Edges=Edges),
+        Context=SourceContext,
+        TypedNativeCurrentContext=None,
+        TypedNativeCurrentContextScope=None,
+        TypedNativeCurrentContextConstructionAuthority=None,
+    )
+    ConstructionCalls = []
+
+    def Construct(*Arguments):
+        ConstructionCalls.append(Arguments)
+        return RustRouting.RoutingContext(*Arguments)
+
+    Services = SimpleNamespace(RustRoutingContext=Construct)
+    FirstContext, FirstScope, FirstReused = (
+        CandidatePreparation.ResolveTypedRouteCurrentContext(State, Services)
+    )
+    SecondContext, SecondScope, SecondReused = (
+        CandidatePreparation.ResolveTypedRouteCurrentContext(State, Services)
+    )
+
+    assert FirstReused is False
+    assert SecondReused is True
+    assert SecondContext is FirstContext
+    assert SecondScope is FirstScope
+    assert len(ConstructionCalls) == 1
+
+    State.Bounds = (0, 2, 0, 0, 0, 0)
+    State.MaximumX = 2
+    ThirdContext, ThirdScope, ThirdReused = (
+        CandidatePreparation.ResolveTypedRouteCurrentContext(State, Services)
+    )
+
+    assert ThirdReused is False
+    assert ThirdContext is not FirstContext
+    assert ThirdScope.Identity != FirstScope.Identity
+    assert len(ConstructionCalls) == 2
+
+    State.Region = SimpleNamespace(Nodes=set(Nodes), Edges=Edges)
+    with pytest.raises(TypeError, match="immutable graph region"):
+        CandidatePreparation.ResolveTypedRouteCurrentContext(State, Services)
+
+
+def test_public_three_nand_chain_constructs_real_nonempty_target_requests(
+    monkeypatch,
+):
+    """The public flow exercises ordinary coarse intent, not only start joining."""
+    Observed = []
+    Original = CandidatePreparation.ExecuteNativeRouteBatchOutcomesV1
+
+    def Observe(Context, BatchIdentity, Requests, DeadlineAt, *, Detailed):
+        Result = Original(
+            Context,
+            BatchIdentity,
+            Requests,
+            DeadlineAt,
+            Detailed=Detailed,
+        )
+        Observed.extend(zip(Requests, Result.Results))
+        raise _PublicTypedBatchReached()
+
+    monkeypatch.setattr(
+        CandidatePreparation,
+        "ExecuteNativeRouteBatchOutcomesV1",
+        Observe,
+    )
+
+    with pytest.raises(_PublicTypedBatchReached):
+        PlaceAndRoutePcb(
+            BuildThreeNandChainNetlist(),
+            Strategy="routing-aware-placement-access",
+        )
+
+    Targeted = [
+        (Request, Result)
+        for Request, Result in Observed
+        if Request.RequestKind == "CoarseColumnsV1"
+    ]
+    assert Targeted
+    assert all(
+        Request.ConnectionIntent == "RequiredTargetBranchesV1"
+        and loads(Request.NativePayloadCanonicalJson)[2]
+        and Result.RequestIdentity == Request.RequestId
+        for Request, Result in Targeted
+    )
 
 
 @pytest.mark.parametrize(
@@ -1586,3 +1716,216 @@ def test_public_materializer_revalidates_manifest_before_cached_return(
     assert Result.Routed.RoutingControlEffectiveness[
         "PrePlacementCapacitySelection"
     ]["RawTrackAssignmentSelection"]["Success"] is True
+
+
+def test_public_single_nand_uses_current_typed_native_scope_and_receipts(
+    monkeypatch,
+):
+    """The real candidate boundary uses R1b receipts, not the legacy batch API."""
+    Observed = []
+    OriginRecords = []
+    AdmissionRecords = []
+    Original = CandidatePreparation.ExecuteNativeRouteBatchOutcomesV1
+    OriginalOriginRecords = (
+        CandidatePreparation.BuildTypedRouteOriginRecordsFromResults
+    )
+    OriginalAdmissionRecord = CandidateMaterialization.TypedRouteAdmissionRecord
+
+    def ObserveTypedBatch(Context, BatchIdentity, Requests, DeadlineAt, *, Detailed):
+        Result = Original(
+            Context,
+            BatchIdentity,
+            Requests,
+            DeadlineAt,
+            Detailed=Detailed,
+        )
+        Observed.append((BatchIdentity, Requests, DeadlineAt, Detailed, Result))
+        return Result
+
+    def ObserveOriginRecords(*Arguments, **Keywords):
+        Records = OriginalOriginRecords(*Arguments, **Keywords)
+        OriginRecords.extend(Records)
+        return Records
+
+    def ObserveAdmissionRecord(*Arguments, **Keywords):
+        Record = OriginalAdmissionRecord(*Arguments, **Keywords)
+        AdmissionRecords.append(Record)
+        return Record
+
+    monkeypatch.setattr(
+        CandidatePreparation,
+        "ExecuteNativeRouteBatchOutcomesV1",
+        ObserveTypedBatch,
+    )
+    monkeypatch.setattr(
+        CandidatePreparation,
+        "BuildTypedRouteOriginRecordsFromResults",
+        ObserveOriginRecords,
+    )
+    monkeypatch.setattr(
+        CandidateMaterialization,
+        "TypedRouteAdmissionRecord",
+        ObserveAdmissionRecord,
+    )
+
+    Result = PlaceAndRoutePcb(
+        BuildSingleNandNetlist(),
+        Strategy="routing-aware-placement-access",
+    )
+
+    assert Observed
+    BatchIdentity, Requests, DeadlineAt, Detailed, Batch = Observed[0]
+    assert BatchIdentity.startswith("joint-candidate-route-batch-v1:")
+    assert type(DeadlineAt) is float
+    assert Detailed is False
+    assert tuple(Request.OriginalOrdinal for Request in Batch.Results) == tuple(
+        range(len(Batch.Results))
+    )
+    assert any(
+        Request.RequestKind == "CoarseStartConnectionV1"
+        for Request in Requests
+    )
+    assert all(
+        tuple(Name for Name, _Identity in Request.CallerEchoBindings)
+        == (
+            "ModelIdentity",
+            "TechnologyIdentity",
+            "ResourceIdentity",
+            "PlacementIdentity",
+            "SelectedAccessIdentity",
+            "PolicyIdentity",
+            "DependencySnapshotIdentity",
+        )
+        for Request in Requests
+    )
+    TargetlessResults = [
+        Value
+        for Value in Batch.Results
+        if Value.NativeReceipt.RequestKind == "CoarseStartConnectionV1"
+        and Value.Candidate is not None
+    ]
+    assert any(
+        Value.NativeReceipt.Candidate.Nodes
+        == [(1, 1, 4), (1, 1, 5), (1, 1, 6), (2, 1, 4), (3, 1, 4)]
+        for Value in TargetlessResults
+    )
+    assert OriginRecords
+    assert all(
+        Record.OriginDescriptor.ImmutableFragmentIdentity
+        and Record.OriginDescriptor.Signal
+        and Record.ExecutionScopeIdentity
+        and Record.NativePayloadIdentity
+        and type(Record.DeadlineAtMonotonicSeconds) is float
+        for Record in OriginRecords
+        if Record.NativeKind != "PreNativeIncomplete"
+    )
+    assert any(
+        Record.Admitted is True
+        and Record.PhysicalEvidence is not None
+        and Record.PhysicalEvidence.Reason == "P1PhysicalAdmissionAccepted"
+        and Record.PhysicalEvidence.ProvenanceEvidenceAvailable is True
+        and Record.RecoveryAttribution is None
+        for Record in AdmissionRecords
+    )
+    assert Result.Routed.RouteCandidateCount > 0
+
+
+def test_post_materialization_deadline_stops_before_authority_and_native(
+    monkeypatch,
+):
+    """An expired typed slice publishes pre-native records without heavy reads."""
+    OriginalPhaseRunner = AuthoritativeFlow.RunAuthoritativeRoutingPhases
+    OriginalOriginRecord = CandidatePreparation.TypedRouteOriginRecord
+    OriginRecords = []
+    CanonicalAuthorityCalls = []
+    NativeCalls = []
+    BudgetStages = []
+
+    def ObserveOriginRecord(*Arguments, **Keywords):
+        Record = OriginalOriginRecord(*Arguments, **Keywords)
+        OriginRecords.append(Record)
+        return Record
+
+    def RejectUnexpectedAuthority(Value):
+        CanonicalAuthorityCalls.append(Value)
+        raise AssertionError("authority serialization ran after typed deadline")
+
+    def RejectUnexpectedNative(*Arguments, **Keywords):
+        NativeCalls.append((Arguments, Keywords))
+        raise AssertionError("native execution ran after typed deadline")
+
+    def RunWithExpiredTypedSlice(State, Services, Phases=None):
+        EffectivePhases = (
+            AuthoritativeFlow.AUTHORITATIVE_ROUTING_PHASES
+            if Phases is None
+            else Phases
+        )
+        Wrapped = []
+        for Phase in EffectivePhases:
+            if Phase is CandidatePreparation.RunCandidatePreparation:
+                def PrepareThenExpire(
+                    StateValue,
+                    ServicesValue,
+                    PhaseValue=Phase,
+                ):
+                    Outcome = PhaseValue(StateValue, ServicesValue)
+                    OriginalCheck = StateValue.CheckRuntimeBudget
+
+                    def Check(Stage, Diagnostics=None):
+                        BudgetStages.append(Stage)
+                        if Stage == "TypedRouteCallerAuthority":
+                            raise RoutingStageError(RoutingFailure(
+                                Reason=RoutingFailureReason.RuntimeBudgetExceeded,
+                                Stage=Stage,
+                                Diagnostics=Diagnostics or {},
+                            ))
+                        return OriginalCheck(Stage, Diagnostics)
+
+                    StateValue.CheckRuntimeBudget = Check
+                    return Outcome
+
+                Wrapped.append(PrepareThenExpire)
+            else:
+                Wrapped.append(Phase)
+        return OriginalPhaseRunner(State, Services, tuple(Wrapped))
+
+    monkeypatch.setattr(
+        AuthoritativeFlow,
+        "RunAuthoritativeRoutingPhases",
+        RunWithExpiredTypedSlice,
+    )
+    monkeypatch.setattr(
+        CandidatePreparation,
+        "TypedRouteOriginRecord",
+        ObserveOriginRecord,
+    )
+    monkeypatch.setattr(
+        CandidatePreparation,
+        "CanonicalAuthority",
+        RejectUnexpectedAuthority,
+    )
+    monkeypatch.setattr(
+        CandidatePreparation,
+        "ExecuteNativeRouteBatchOutcomesV1",
+        RejectUnexpectedNative,
+    )
+
+    with pytest.raises(RoutingStageError):
+        PlaceAndRoutePcb(
+            BuildSingleNandNetlist(),
+            Strategy="routing-aware-placement-access",
+        )
+
+    assert "TypedRouteCallerAuthority" in BudgetStages
+    assert CanonicalAuthorityCalls == []
+    assert NativeCalls == []
+    assert OriginRecords
+    assert all(
+        Record.NativeKind == "PreNativeIncomplete"
+        and Record.CanonicalRequestId is None
+        and Record.CanonicalReceiptIdentity is None
+        and Record.ExecutionScopeIdentity is None
+        and Record.NativeOrdinal is None
+        and Record.ActualExpansionCount == 0
+        for Record in OriginRecords
+    )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 import os
 from typing import Any, Callable, Iterable
 from PhysicalDesign.Routing.Pcb import PrepareRawTrackAssignmentDomain, PrepareTrackAssignment
@@ -27,7 +27,10 @@ from .Candidates import (
 )
 from .AccessEnvelope import (
     _PlacementCorePayload,
+    BuildCurrentSelectedAccessSolveBinding,
     CurrentSelectedAccessEnvelopePhase,
+    CurrentSelectedAccessEnvelopeResult,
+    CurrentSelectedAccessEnvelopeStatus,
     CurrentSelectedAccessTransition,
     RequireCurrentSelectedAccessEnvelopeReady,
     SelectUnambiguousCurrentSelectedAccessSolveBinding,
@@ -48,9 +51,182 @@ from .AttemptHistory import (
     _RecordAssignmentCut,
 )
 from .PlacementAttempts import (
+    RebuildCurrentCandidatePlacementAccess,
     _TakeNextDeferredRequest,
     _TryPlacement,
 )
+
+
+def RequireCurrentDeferredLocalRoutingSelectedAccess(
+    Candidate: PcbPlacementCandidate,
+    *,
+    Resources: Any,
+    Technology: Any,
+    Policy: PhysicalDesignPolicy,
+) -> PcbPlacementCandidate:
+    """Return one candidate only after its live selected access is current."""
+    MandatoryAccessOwnershipFingerprint = (
+        Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+        if Candidate.TopologyDemand is not None
+        else ""
+    )
+    IncludeLocalClaims = (
+        Candidate.PlacementFingerprintIncludesLocalClaims
+        if type(Candidate.PlacementFingerprintIncludesLocalClaims) is bool
+        else True
+    )
+    try:
+        Result = BuildCandidateCurrentSelectedAccessEnvelope(
+            Candidate,
+            Phase=CurrentSelectedAccessEnvelopePhase.BeforeRawMaterialization,
+            Transition=CurrentSelectedAccessTransition.InitialCandidate,
+            Resources=Resources,
+            Technology=Technology,
+            Policy=Policy,
+            ObservedPlacementFingerprint=BuildPlacementFingerprint(
+                Candidate.Placement,
+                MandatoryAccessOwnershipFingerprint,
+                IncludeLocalClaims=IncludeLocalClaims,
+            ),
+            ObservedPlacementRetentionFingerprint=BuildPlacementRetentionFingerprint(
+                Candidate.Placement,
+                MandatoryAccessOwnershipFingerprint,
+                IncludeLocalClaims=IncludeLocalClaims,
+            ),
+        )
+    except ValueError as Error:
+        Witness = Candidate.Placement.SelectedPinAccessWitness
+        raise _SelectedAccessInvariant(
+            Stage="CurrentSelectedAccessAfterDeferredLocalRouting",
+            Detail="the deferred local-routing successor has invalid current access inputs",
+            WitnessFingerprint=str(getattr(Witness, "WitnessFingerprint", "")),
+            ConsumerId=Candidate.CandidateId,
+            PlacementFingerprint=Candidate.PlacementFingerprint,
+            Error=Error,
+        ) from Error
+    RequireCurrentSelectedAccessEnvelopeReady(
+        Result,
+        Stage="CurrentSelectedAccessAfterDeferredLocalRouting",
+    )
+    return replace(
+        Candidate,
+        CurrentSelectedAccessEnvelopeResult=Result,
+    )
+
+
+@dataclass(frozen=True)
+class DeferredLocalRoutingSelectedAccessHandoff:
+    """Current successor and authority returned across the consumer boundary."""
+
+    SourceCandidateId: str
+    SourcePlacementFingerprint: str
+    SourcePlacementRetentionFingerprint: str
+    RetainedRecipeFingerprint: str
+    Candidate: PcbPlacementCandidate
+    SelectedAccessResult: CurrentSelectedAccessEnvelopeResult | None
+    AuthorityDisposition: str
+    OriginalStartedAt: float
+    OriginalExpiresAt: float
+    Resources: Any = field(repr=False, compare=False, default=None)
+    SchemaVersion: str = "deferred-local-routing-selected-access-handoff-v1"
+
+    def __post_init__(self) -> None:
+        if self.SchemaVersion != "deferred-local-routing-selected-access-handoff-v1":
+            raise ValueError("unsupported deferred local-routing handoff schema")
+        if self.AuthorityDisposition not in {
+            "retained-current",
+            "rebuilt-current",
+            "not-applicable",
+        }:
+            raise ValueError("unsupported deferred local-routing authority disposition")
+        if self.AuthorityDisposition != "not-applicable":
+            if (
+                (
+                    self.AuthorityDisposition == "rebuilt-current"
+                    and not self.RetainedRecipeFingerprint
+                )
+                or type(self.SelectedAccessResult)
+                is not CurrentSelectedAccessEnvelopeResult
+                or self.SelectedAccessResult.Status
+                is not CurrentSelectedAccessEnvelopeStatus.Ready
+                or self.SelectedAccessResult.Envelope is None
+                or (
+                    self.AuthorityDisposition == "rebuilt-current"
+                    and self.Candidate.CurrentSelectedAccessEnvelopeResult
+                    != self.SelectedAccessResult
+                )
+            ):
+                raise ValueError("deferred local-routing handoff lacks Ready current authority")
+        elif self.SelectedAccessResult is not None:
+            raise ValueError("non-access handoff cannot carry selected-access authority")
+        if self.OriginalExpiresAt < self.OriginalStartedAt:
+            raise ValueError("deferred local-routing handoff runtime authority is invalid")
+
+    @property
+    def ReadyForNextStage(self) -> bool:
+        return (
+            self.SelectedAccessResult is not None
+            and self.SelectedAccessResult.Status
+            is CurrentSelectedAccessEnvelopeStatus.Ready
+        )
+
+    def ToDictionary(self) -> dict[str, object]:
+        return {
+            "SchemaVersion": self.SchemaVersion,
+            "SourceCandidateId": self.SourceCandidateId,
+            "SourcePlacementFingerprint": self.SourcePlacementFingerprint,
+            "SourcePlacementRetentionFingerprint": (
+                self.SourcePlacementRetentionFingerprint
+            ),
+            "RetainedRecipeFingerprint": self.RetainedRecipeFingerprint,
+            "SuccessorCandidateId": self.Candidate.CandidateId,
+            "SuccessorPlacementFingerprint": self.Candidate.PlacementFingerprint,
+            "SuccessorPlacementRetentionFingerprint": (
+                self.Candidate.PlacementRetentionFingerprint
+            ),
+            "AuthorityDisposition": self.AuthorityDisposition,
+            "ReadyForNextStage": self.ReadyForNextStage,
+            "SelectedAccessResult": (
+                self.SelectedAccessResult.ToDictionary()
+                if self.SelectedAccessResult is not None
+                else None
+            ),
+            "RuntimeAuthority": {
+                "StartedAt": self.OriginalStartedAt,
+                "ExpiresAt": self.OriginalExpiresAt,
+            },
+        }
+
+
+def _DeferredLocalRoutingGeometryChecks(
+    Source: PcbPlacement,
+    Successor: PcbPlacement,
+) -> tuple[bool, bool, bool]:
+    """Check exact gate/pin, cluster, and rank-bearing placement geometry."""
+    def PackedClusterRanking(Placement: PcbPlacement) -> tuple[object, ...]:
+        return tuple(
+            (
+                Cluster.BoundarySignals,
+                Cluster.BoundaryDemandRecords,
+                Cluster.BoundaryCapacityRecords,
+                Cluster.BoundaryOverflow,
+                Cluster.PinScarcityCount,
+                Cluster.LegalEscapeCandidateCounts,
+                Cluster.OrientationRotation,
+                Cluster.OrientationMirrorX,
+            )
+            for Cluster in Placement.PackedClusters
+        )
+
+    return (
+        Successor.Placed.PlacedGates == Source.Placed.PlacedGates,
+        Successor.Clusters == Source.Clusters,
+        (
+            Successor.SignalOrder == Source.SignalOrder
+            and Successor.LayerCount == Source.LayerCount
+            and PackedClusterRanking(Successor) == PackedClusterRanking(Source)
+        ),
+    )
 
 
 def RebuildCurrentCandidateTrackPreparation(
@@ -758,24 +934,164 @@ def RecordRoutedCandidate(Context, Candidate: PcbPlacementCandidate, CandidatePl
     Context.RoutedCandidates.append((Score, Candidate, CandidatePlacement, CandidateRouted, Diagnostics))
 
 
-def MaterializeSelectedJointPlacementLocalRouting(Context, Candidate: PcbPlacementCandidate, WorkCheck: Callable[[dict[str, object]], None]) -> PcbPlacement:
-    """Materialize local routes only for a ranked joint candidate."""
+def MaterializeSelectedJointPlacementLocalRoutingHandoff(
+    Context,
+    Candidate: PcbPlacementCandidate,
+    WorkCheck: Callable[[dict[str, object]], None],
+) -> DeferredLocalRoutingSelectedAccessHandoff:
+    """Materialize one selected recipe into a current typed successor."""
+    OriginalStartedAt = Context.Deadline.StartedAt
+    OriginalExpiresAt = Context.Deadline.ExpiresAt
     ScoringPlacement = Candidate.Placement
     ScoringDiagnostics = dict(ScoringPlacement.Placed.LocalRouteDiagnostics or {})
     DeferredDiagnostics = ScoringDiagnostics.get('__DeferredLocalRouting__', {})
     if not (isinstance(DeferredDiagnostics, dict) and bool(DeferredDiagnostics.get('ScoringOnly'))):
-        return ScoringPlacement
+        return DeferredLocalRoutingSelectedAccessHandoff(
+            SourceCandidateId=Candidate.CandidateId,
+            SourcePlacementFingerprint=Candidate.PlacementFingerprint,
+            SourcePlacementRetentionFingerprint=(
+                Candidate.PlacementRetentionFingerprint
+            ),
+            RetainedRecipeFingerprint="",
+            Candidate=Candidate,
+            SelectedAccessResult=None,
+            AuthorityDisposition="not-applicable",
+            OriginalStartedAt=OriginalStartedAt,
+            OriginalExpiresAt=OriginalExpiresAt,
+        )
+    State = Candidate.JointPlacementState or Context.JointPlacementStateByPlacementFingerprint.get(Candidate.PlacementFingerprint)
+    if State is None:
+        raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='PlacementLocalRoutingMaterialization', Detail='a scoring-only retained placement was missing its immutable joint recipe state', RepairActions=('InspectJointPlacementStateRetention',), Diagnostics={'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint}))
+    RetainedRecipeFingerprint = BuildStableFingerprint(State.ToDictionary())
+    ExpectedAssignmentCutFingerprint = (
+        State.AssignmentCut.ConflictFingerprint
+        if State.AssignmentCut is not None else ""
+    )
+    ExpectedAssignmentConstraintFingerprint = (
+        State.AssignmentConstraints.Fingerprint
+    )
+    ExpectedPortfolioFingerprint = (
+        BuildPendingJointPlacementPortfolioFingerprint(State)
+    )
+    JointDiagnostics = ScoringDiagnostics.get('__JointClusterPlacement__', {})
+    RecordedCandidateIndex = (
+        JointDiagnostics.get('SelectedCandidateIndex')
+        if isinstance(JointDiagnostics, dict) else None
+    )
+    if (
+        type(RecordedCandidateIndex) is not int
+        or RecordedCandidateIndex != State.CandidateIndex
+        or
+        Candidate.AssignmentCutFingerprint
+        != ExpectedAssignmentCutFingerprint
+        or Candidate.AssignmentConstraintFingerprint
+        != ExpectedAssignmentConstraintFingerprint
+        or Candidate.JointPortfolioIdentityFingerprint
+        != ExpectedPortfolioFingerprint
+    ):
+        raise RoutingStageError(RoutingFailure(
+            Reason=RoutingFailureReason.PlacementOverlap,
+            Stage='PlacementLocalRoutingMaterialization',
+            Detail='the selected placement does not match its retained joint recipe identity',
+            RepairActions=('InspectJointPlacementStateRetention',),
+            Diagnostics={
+                'CandidateId': Candidate.CandidateId,
+                'RetainedRecipeFingerprint': RetainedRecipeFingerprint,
+                'RecordedCandidateIndex': RecordedCandidateIndex,
+                'ExpectedCandidateIndex': State.CandidateIndex,
+                'AssignmentCutFingerprint': Candidate.AssignmentCutFingerprint,
+                'ExpectedAssignmentCutFingerprint': ExpectedAssignmentCutFingerprint,
+                'AssignmentConstraintFingerprint': Candidate.AssignmentConstraintFingerprint,
+                'ExpectedAssignmentConstraintFingerprint': ExpectedAssignmentConstraintFingerprint,
+                'JointPortfolioIdentityFingerprint': Candidate.JointPortfolioIdentityFingerprint,
+                'ExpectedJointPortfolioIdentityFingerprint': ExpectedPortfolioFingerprint,
+            },
+        ))
+    if Context.Policy.PlacementAccess.Enabled:
+        ScoringResources = Context.RoutingResourcesByFingerprint.get(
+            Candidate.PlacementFingerprint
+        )
+        if ScoringResources is None:
+            ScoringResources = Context.Services.BuildRoutingResources(
+                ScoringPlacement.Placed,
+                WorkCheck=WorkCheck,
+                Technology=Context.Technology,
+            )
+        RequireCurrentDeferredLocalRoutingSelectedAccess(
+            Candidate,
+            Resources=ScoringResources,
+            Technology=Context.Technology,
+            Policy=Context.Policy,
+        )
     Cached = Context.MaterializedPlacementByFingerprint.get(Candidate.PlacementFingerprint)
     if Cached is not None:
+        CachedFingerprint = BuildPlacementFingerprint(
+            Cached,
+            Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+            if Candidate.TopologyDemand is not None else "",
+            IncludeLocalClaims=False,
+        )
+        CachedRetentionFingerprint = BuildPlacementRetentionFingerprint(
+            Cached,
+            Candidate.TopologyDemand.MandatoryAccessOwnershipFingerprint
+            if Candidate.TopologyDemand is not None else "",
+            IncludeLocalClaims=False,
+        )
+        CachedCandidate = replace(
+            Candidate,
+            Placement=Cached,
+            PlacementFingerprint=CachedFingerprint,
+            PlacementRetentionFingerprint=CachedRetentionFingerprint,
+            PlacementFingerprintIncludesLocalClaims=False,
+            PlacementAccessSolveBinding=(
+                BuildCurrentSelectedAccessSolveBinding(
+                    Context.Policy,
+                    Cached.PlacementAccessSolve,
+                )
+                if Context.Policy.PlacementAccess.Enabled
+                and Cached.PlacementAccessSolve is not None
+                else Candidate.PlacementAccessSolveBinding
+            ),
+            CurrentSelectedAccessEnvelopeResult=None,
+        )
+        CachedResources = None
+        if Context.Policy.PlacementAccess.Enabled:
+            CachedResources = Context.Services.BuildRoutingResources(
+                Cached.Placed,
+                WorkCheck=WorkCheck,
+                Technology=Context.Technology,
+            )
+            CachedCandidate = RequireCurrentDeferredLocalRoutingSelectedAccess(
+                CachedCandidate,
+                Resources=CachedResources,
+                Technology=Context.Technology,
+                Policy=Context.Policy,
+            )
         ScoringRelocation = ScoringDiagnostics.get('__PlacementRelocation__', {})
         if isinstance(ScoringRelocation, dict):
             ApplyCoordinatedCandidateDiversificationProfile(Cached, frozenset(map(str, ScoringRelocation.get('CoordinatedCandidateDiversificationSignals', ()))))
         ApplyActivePlacementAssignmentConstraints(Cached, Context.PlacementAssignmentConstraints)
         Context.JointPlacementStateEvents.append({'Status': 'local-routing-materialization-cache-hit', 'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint})
-        return Cached
-    State = Candidate.JointPlacementState or Context.JointPlacementStateByPlacementFingerprint.get(Candidate.PlacementFingerprint)
-    if State is None:
-        raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='PlacementLocalRoutingMaterialization', Detail='a scoring-only retained placement was missing its immutable joint recipe state', RepairActions=('InspectJointPlacementStateRetention',), Diagnostics={'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint}))
+        return DeferredLocalRoutingSelectedAccessHandoff(
+            SourceCandidateId=Candidate.CandidateId,
+            SourcePlacementFingerprint=Candidate.PlacementFingerprint,
+            SourcePlacementRetentionFingerprint=(
+                Candidate.PlacementRetentionFingerprint
+            ),
+            RetainedRecipeFingerprint=RetainedRecipeFingerprint,
+            Candidate=CachedCandidate,
+            SelectedAccessResult=(
+                CachedCandidate.CurrentSelectedAccessEnvelopeResult
+                if Context.Policy.PlacementAccess.Enabled else None
+            ),
+            AuthorityDisposition=(
+                "retained-current"
+                if Context.Policy.PlacementAccess.Enabled else "not-applicable"
+            ),
+            OriginalStartedAt=OriginalStartedAt,
+            OriginalExpiresAt=OriginalExpiresAt,
+            Resources=CachedResources,
+        )
     MaterializationStarted = Context.Services.monotonic()
     WorkCheck({'Phase': 'local-routing-materialization-start', 'CandidateId': Candidate.CandidateId})
     PackingPolicy = State.Request.PackingPolicy
@@ -799,22 +1115,65 @@ def MaterializeSelectedJointPlacementLocalRouting(Context, Candidate: PcbPlaceme
     ExpectedTopologyDemand = Candidate.TopologyDemand
     if ExpectedTopologyDemand is None:
         raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='PlacementLocalRoutingMaterialization', Detail='selected local-route materialization lacked its retained topology proof', Diagnostics={'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint}))
+    (
+        GateGeometryMatches,
+        ClusterMembershipMatches,
+        PlacementStructureMatches,
+    ) = _DeferredLocalRoutingGeometryChecks(
+        ScoringPlacement,
+        Materialized,
+    )
+    MandatoryConflicts: dict[object, set[str]] = {}
+    Context.Services.ValidatePlacedCellElectricalIsolation(Materialized.Placed, WorkCheck=WorkCheck, Technology=Context.Technology)
+    MandatoryProfile = MeasureMandatoryAccessConflictProfile(Materialized.Placed.PlacedGates, Materialized.SignalOrder, WorkCheck=WorkCheck, Technology=Context.Technology)
+    for Resource, Owners in (*MandatoryProfile.CrossConflicts, *MandatoryProfile.SelfConflicts):
+        MandatoryConflicts.setdefault(Resource, set()).update(map(str, Owners))
+    MaterializedTopologyDemand = MeasurePlacementTopologyDemand(Context.TopologyDemand, Materialized, MandatoryConflicts=MandatoryConflicts, MandatoryProfile=MandatoryProfile)
+    RankingMatches = MaterializedTopologyDemand.JointOrderKey == ExpectedTopologyDemand.JointOrderKey
+    RawMaterializedFingerprint = BuildPlacementFingerprint(Materialized, ExpectedTopologyDemand.MandatoryAccessOwnershipFingerprint, IncludeLocalClaims=False)
+    RawMaterializedRetentionFingerprint = BuildPlacementRetentionFingerprint(Materialized, ExpectedTopologyDemand.MandatoryAccessOwnershipFingerprint, IncludeLocalClaims=False)
+    if (
+        MandatoryConflicts
+        or not RankingMatches
+        or not GateGeometryMatches
+        or not ClusterMembershipMatches
+        or not PlacementStructureMatches
+    ):
+        raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='PlacementLocalRoutingMaterialization', Detail='selected local-route materialization changed exact placement legality, ranking, or disallowed geometry', RepairActions=('InspectDeferredLocalRoutingIdentity',), Diagnostics={'CandidateId': Candidate.CandidateId, 'PlacementFingerprintExpected': Candidate.PlacementFingerprint, 'PlacementFingerprintMaterialized': RawMaterializedFingerprint, 'PlacementRetentionFingerprintExpected': Candidate.PlacementRetentionFingerprint, 'PlacementRetentionFingerprintMaterialized': RawMaterializedRetentionFingerprint, 'MandatoryAccessConflictResourceCount': len(MandatoryConflicts), 'RankingMatches': RankingMatches, 'GateGeometryMatches': GateGeometryMatches, 'ClusterMembershipMatches': ClusterMembershipMatches, 'PlacementStructureMatches': PlacementStructureMatches, 'ExpectedTopologyDemand': ExpectedTopologyDemand.ToDictionary() if ExpectedTopologyDemand is not None else None, 'MaterializedTopologyDemand': MaterializedTopologyDemand.ToDictionary()}))
+    MaterializedResources = None
+    RebuiltCandidate = replace(
+        Candidate,
+        Placement=Materialized,
+        PlacementFingerprintIncludesLocalClaims=False,
+        CurrentSelectedAccessEnvelopeResult=None,
+    )
+    if Context.Policy.PlacementAccess.Enabled:
+        MaterializedResources = Context.Services.BuildRoutingResources(
+            Materialized.Placed,
+            WorkCheck=WorkCheck,
+            Technology=Context.Technology,
+        )
+        RebuiltCandidate = RebuildCurrentCandidatePlacementAccess(
+            Context,
+            RebuiltCandidate,
+            Resources=MaterializedResources,
+            WorkCheck=WorkCheck,
+        )
+        Materialized = RebuiltCandidate.Placement
     MaterializedFingerprint = BuildPlacementFingerprint(Materialized, ExpectedTopologyDemand.MandatoryAccessOwnershipFingerprint, IncludeLocalClaims=False)
     MaterializedRetentionFingerprint = BuildPlacementRetentionFingerprint(Materialized, ExpectedTopologyDemand.MandatoryAccessOwnershipFingerprint, IncludeLocalClaims=False)
+    if Context.Policy.PlacementAccess.Enabled:
+        RebuiltCandidate = RequireCurrentDeferredLocalRoutingSelectedAccess(
+            replace(
+                RebuiltCandidate,
+                PlacementFingerprint=MaterializedFingerprint,
+                PlacementRetentionFingerprint=MaterializedRetentionFingerprint,
+            ),
+            Resources=MaterializedResources,
+            Technology=Context.Technology,
+            Policy=Context.Policy,
+        )
     IdentityMatches = MaterializedFingerprint == Candidate.PlacementFingerprint and MaterializedRetentionFingerprint == Candidate.PlacementRetentionFingerprint
-    MandatoryConflicts: dict[object, set[str]] = {}
-    if IdentityMatches:
-        MaterializedTopologyDemand = ExpectedTopologyDemand
-        RankingMatches = True
-    else:
-        Context.Services.ValidatePlacedCellElectricalIsolation(Materialized.Placed, WorkCheck=WorkCheck, Technology=Context.Technology)
-        MandatoryProfile = MeasureMandatoryAccessConflictProfile(Materialized.Placed.PlacedGates, Materialized.SignalOrder, WorkCheck=WorkCheck, Technology=Context.Technology)
-        for Resource, Owners in (*MandatoryProfile.CrossConflicts, *MandatoryProfile.SelfConflicts):
-            MandatoryConflicts.setdefault(Resource, set()).update(map(str, Owners))
-        MaterializedTopologyDemand = MeasurePlacementTopologyDemand(Context.TopologyDemand, Materialized, MandatoryConflicts=MandatoryConflicts, MandatoryProfile=MandatoryProfile)
-        RankingMatches = MaterializedTopologyDemand.JointOrderKey == ExpectedTopologyDemand.JointOrderKey
-    if MandatoryConflicts or not RankingMatches or (not IdentityMatches):
-        raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.PlacementOverlap, Stage='PlacementLocalRoutingMaterialization', Detail='selected local-route materialization changed exact placement legality, ranking, or geometry identity', RepairActions=('InspectDeferredLocalRoutingIdentity',), Diagnostics={'CandidateId': Candidate.CandidateId, 'PlacementFingerprintExpected': Candidate.PlacementFingerprint, 'PlacementFingerprintMaterialized': MaterializedFingerprint, 'PlacementRetentionFingerprintExpected': Candidate.PlacementRetentionFingerprint, 'PlacementRetentionFingerprintMaterialized': MaterializedRetentionFingerprint, 'MandatoryAccessConflictResourceCount': len(MandatoryConflicts), 'RankingMatches': RankingMatches, 'IdentityMatches': IdentityMatches, 'ExpectedTopologyDemand': ExpectedTopologyDemand.ToDictionary() if ExpectedTopologyDemand is not None else None, 'MaterializedTopologyDemand': MaterializedTopologyDemand.ToDictionary()}))
     MaterializedDiagnostics = dict(Materialized.Placed.LocalRouteDiagnostics or {})
     for DiagnosticKey in ('__PlacementRecipe__', '__TopologyDemandProfile__'):
         if DiagnosticKey in ScoringDiagnostics:
@@ -829,9 +1188,56 @@ def MaterializeSelectedJointPlacementLocalRouting(Context, Candidate: PcbPlaceme
         if PreappliedDenseProfile:
             Materialized.Placed.LocalRouteDiagnostics.setdefault('__ClusterLocalRouteTemplates__', {})['PreappliedDenseRoutingProfile'] = {'Signals': sorted(Context.PlacementCoordinatedCandidateDiversificationSignals), 'ProfileFingerprint': PreappliedDenseProfileFingerprint}
     WorkCheck({'Phase': 'local-routing-materialization-complete', 'CandidateId': Candidate.CandidateId})
+    if MaterializedResources is not None:
+        Context.RoutingResourcesByCandidateId[Candidate.CandidateId] = MaterializedResources
+        Context.RoutingResourcesByFingerprint[MaterializedFingerprint] = MaterializedResources
+        CurrentCandidate = replace(
+            RebuiltCandidate,
+            PlacementFingerprint=MaterializedFingerprint,
+            PlacementRetentionFingerprint=MaterializedRetentionFingerprint,
+        )
+    else:
+        CurrentCandidate = replace(
+            Candidate,
+            Placement=Materialized,
+            PlacementFingerprint=MaterializedFingerprint,
+            PlacementRetentionFingerprint=MaterializedRetentionFingerprint,
+            PlacementFingerprintIncludesLocalClaims=False,
+        )
     Context.MaterializedPlacementByFingerprint[Candidate.PlacementFingerprint] = Materialized
-    Context.JointPlacementStateEvents.append({'Status': 'local-routing-materialized', 'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint, 'LocalClaimCount': len(Materialized.Placed.LocalRouteClaims or ()), 'ElapsedSeconds': round(Context.Services.monotonic() - MaterializationStarted, 6), 'IdentityVerified': True, 'RankingVerified': True, 'ScoringIsolationProofReused': True, 'ScoringMandatoryAccessProofReused': True})
-    return Materialized
+    Context.JointPlacementStateEvents.append({'Status': 'local-routing-materialized', 'CandidateId': Candidate.CandidateId, 'SourcePlacementFingerprint': Candidate.PlacementFingerprint, 'PlacementFingerprint': MaterializedFingerprint, 'SourcePlacementRetentionFingerprint': Candidate.PlacementRetentionFingerprint, 'PlacementRetentionFingerprint': MaterializedRetentionFingerprint, 'LocalClaimCount': len(Materialized.Placed.LocalRouteClaims or ()), 'ElapsedSeconds': round(Context.Services.monotonic() - MaterializationStarted, 6), 'IdentityChangedByCurrentAccessRebuild': not IdentityMatches, 'GeometryVerified': True, 'RankingVerified': True, 'SelectedAccessAuthority': 'rebuilt-current' if MaterializedResources is not None else 'not-applicable', 'SelectedAccessEnvelopeFingerprint': RebuiltCandidate.CurrentSelectedAccessEnvelopeResult.Envelope.EnvelopeFingerprint if RebuiltCandidate.CurrentSelectedAccessEnvelopeResult is not None and RebuiltCandidate.CurrentSelectedAccessEnvelopeResult.Envelope is not None else ''})
+    return DeferredLocalRoutingSelectedAccessHandoff(
+        SourceCandidateId=Candidate.CandidateId,
+        SourcePlacementFingerprint=Candidate.PlacementFingerprint,
+        SourcePlacementRetentionFingerprint=(
+            Candidate.PlacementRetentionFingerprint
+        ),
+        RetainedRecipeFingerprint=RetainedRecipeFingerprint,
+        Candidate=CurrentCandidate,
+        SelectedAccessResult=(
+            CurrentCandidate.CurrentSelectedAccessEnvelopeResult
+            if Context.Policy.PlacementAccess.Enabled else None
+        ),
+        AuthorityDisposition=(
+            "rebuilt-current"
+            if Context.Policy.PlacementAccess.Enabled else "not-applicable"
+        ),
+        OriginalStartedAt=OriginalStartedAt,
+        OriginalExpiresAt=OriginalExpiresAt,
+        Resources=MaterializedResources,
+    )
+
+
+def MaterializeSelectedJointPlacementLocalRouting(Context, Candidate: PcbPlacementCandidate, WorkCheck: Callable[[dict[str, object]], None]) -> PcbPlacement:
+    """Compatibility adapter for placement-only internal consumers."""
+    Handoff = MaterializeSelectedJointPlacementLocalRoutingHandoff(
+        Context,
+        Candidate,
+        WorkCheck,
+    )
+    if getattr(Context, "CandidateRecord", None) is Candidate:
+        Context.CandidateRecord = Handoff.Candidate
+    return Handoff.Candidate.Placement
 
 
 def _PlacementCandidatesForRouting(Context):

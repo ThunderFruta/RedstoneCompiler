@@ -225,7 +225,8 @@ pub(super) fn SearchExactSelectedWorldAssignment(
         return None;
     }
     if GroupIndex >= CandidateGroups.len() {
-        return Some(SelectedCandidateIndices.clone());
+        let Result = SelectedCandidateIndices.clone();
+        return (!Deadline.Check()).then_some(Result);
     }
     for (CandidateIndex, Candidate) in CandidateGroups[GroupIndex].iter().enumerate() {
         if *ExpansionCount % DEADLINE_CHECK_INTERVAL == 0 && Deadline.Check() {

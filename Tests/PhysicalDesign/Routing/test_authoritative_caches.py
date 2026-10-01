@@ -2452,6 +2452,89 @@ class AuthoritativeCachesTests(AuthoritativePlannerTestBase):
             Placed, Resources, ExpandedRegion, 3, 9, {"A": 9}, 3, 100
         ))
 
+    def testChangedSelectedAccessInvalidatesRawPortalReuse(self) -> None:
+        Placed = object()
+        Resources = RoutingResources(
+            RoutingStaticGeometry(frozenset(), frozenset())
+        )
+        AlphaGeometry = ("Alpha", (0, 1, 0), (), ())
+        BetaGeometry = ("Beta", (3, 1, 0), (), ())
+        OriginalAccess = (
+            AlphaGeometry,
+            BetaGeometry,
+            ("placement-access-fabric-region-v1", "selected-access-a"),
+        )
+        ChangedAccess = (
+            AlphaGeometry,
+            BetaGeometry,
+            ("placement-access-fabric-region-v1", "selected-access-b"),
+        )
+        Cache = self.BuildRawPortalCache(
+            Placed,
+            Resources,
+            {"Alpha": 2, "Beta": 2},
+            AccessGeometryFingerprint=OriginalAccess,
+        )
+        Arguments = {
+            "Caches": (Cache,),
+            "Placed": Placed,
+            "Resources": Resources,
+            "LayerCount": 2,
+            "PortalLimit": 6,
+            "PortalVariantCounts": {"Alpha": 2, "Beta": 2},
+            "GuideExpansion": 3,
+            "StrictMaximumExpansions": 100,
+            "CoordinatedSignals": frozenset(),
+            "AllowPortableSignalReuse": True,
+        }
+
+        Warm = SelectRawPortalGeometryReusePlan(
+            **Arguments,
+            AccessGeometryFingerprint=OriginalAccess,
+        )
+        Changed = SelectRawPortalGeometryReusePlan(
+            **Arguments,
+            AccessGeometryFingerprint=ChangedAccess,
+        )
+        MovedAccess = (
+            ("Alpha", (5, 1, 7), (), ()),
+            ("Beta", (8, 1, 7), (), ()),
+            ("placement-access-fabric-region-v1", "selected-access-a"),
+        )
+        Portable = SelectRawPortalGeometryReusePlan(
+            **{
+                **Arguments,
+                "Placed": object(),
+            },
+            AccessGeometryFingerprint=MovedAccess,
+        )
+        ChangedPortable = SelectRawPortalGeometryReusePlan(
+            **{
+                **Arguments,
+                "Placed": object(),
+            },
+            AccessGeometryFingerprint=(
+                MovedAccess[0],
+                MovedAccess[1],
+                (
+                    "placement-access-fabric-region-v1",
+                    "selected-access-b",
+                ),
+            ),
+        )
+
+        self.assertIsNotNone(Warm)
+        self.assertTrue(Warm.ExactMatch)
+        self.assertIsNone(Changed)
+        self.assertIsNotNone(Portable)
+        self.assertFalse(Portable.ExactMatch)
+        self.assertTrue(Portable.PortableAcrossPlacement)
+        self.assertEqual(
+            Portable.ReusedSignals,
+            frozenset(("Alpha", "Beta")),
+        )
+        self.assertIsNone(ChangedPortable)
+
     def testRawPortalCacheOpaqueIdentityCannotAliasAnotherObject(
         self,
     ) -> None:

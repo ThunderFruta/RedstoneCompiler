@@ -2,10 +2,14 @@
 
 from ._authoritative_planner_contracts import *
 from PhysicalDesign.Constraints.PhysicalClaims import ComponentClaimsConflict
-from PhysicalDesign.Routing.Global.Orchestration.Stages.CandidatePreparation import (
+from PhysicalDesign.Routing.Global.Ports.Portals import (
+    BuildForeignSelectedPinAccessBlockedWireNodesBySignal,
     BuildForeignSelectedPinAccessClaimsBySignal,
-    BuildProtectedRoutingNodesBySignal,
+    ConstrainPortalSearchNodesForSelectedAccess,
     FindForeignSelectedPinAccessConflictSignals,
+)
+from PhysicalDesign.Routing.Global.Orchestration.Stages.CandidatePreparation import (
+    BuildProtectedRoutingNodesBySignal,
 )
 
 
@@ -40,6 +44,13 @@ class AuthoritativeGlobalRoutesTests(AuthoritativePlannerTestBase):
             tuple(Owner for Owner, _Claims in Foreign["Gamma"]),
             ("Alpha", "Beta"),
         )
+        BlockedBySignal = (
+            BuildForeignSelectedPinAccessBlockedWireNodesBySignal(
+                ("Alpha", "Beta", "Gamma"),
+                Witness,
+                ImmutableRoutingClaimsBlockedWireNodes,
+            )
+        )
         self.assertTrue({
             (0, 2, 3),
             (1, 1, 3),
@@ -47,9 +58,7 @@ class AuthoritativeGlobalRoutesTests(AuthoritativePlannerTestBase):
             (1, 3, 3),
             (2, 2, 3),
             (2, 3, 3),
-        }.issubset(ImmutableRoutingClaimsBlockedWireNodes(
-            Claims for _Owner, Claims in Foreign["Gamma"]
-        )))
+        }.issubset(BlockedBySignal["Gamma"]))
         CandidateClaims = RoutingResourceClaims(
             WireCells=frozenset(((1, 1, 3),)),
         )
@@ -71,6 +80,31 @@ class AuthoritativeGlobalRoutesTests(AuthoritativePlannerTestBase):
             ),
             (),
         )
+
+    def testSelectedAccessPortalConstraintKeepsMandatoryAndAlternative(
+        self,
+    ) -> None:
+        MandatoryPath = ((0, 1, 0), (1, 1, 0))
+        BlockedPreferredExit = (2, 2, 0)
+        CompatibleAlternative = (1, 2, 1)
+        AllowedNodes = frozenset((
+            *MandatoryPath,
+            BlockedPreferredExit,
+            CompatibleAlternative,
+        ))
+
+        Effective, MandatoryOverlap = (
+            ConstrainPortalSearchNodesForSelectedAccess(
+                AllowedNodes,
+                MandatoryPath,
+                (MandatoryPath[-1], BlockedPreferredExit),
+            )
+        )
+
+        self.assertEqual(MandatoryOverlap, frozenset((MandatoryPath[-1],)))
+        self.assertTrue(frozenset(MandatoryPath) <= Effective)
+        self.assertNotIn(BlockedPreferredExit, Effective)
+        self.assertIn(CompatibleAlternative, Effective)
 
     def testSelectedOnlyAccessOwnerRemainsInProtectedNodeProjection(
         self,

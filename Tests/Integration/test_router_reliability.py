@@ -17,7 +17,7 @@ from PhysicalDesign.Placement.Engine.Constraints import PlacementConstraintObser
 from PhysicalDesign.Placement.Engine.MandatoryAccess import MeasureMandatoryAccessConflictProfile
 from PhysicalDesign.Routing.Pcb import ClusterBoundaryLeaseEndgameReserveSeconds, ClusterBoundaryLeaseStateCount, ClusterBoundaryLeaseStateSliceSeconds
 from PhysicalDesign.Orchestration.Demand import BuildPlacementFailureHistorySnapshot, PlacementGenerationPlan, MeasurePlacementTopologyDemand, TopologyDemandProfile
-from PhysicalDesign.Orchestration.Feedback import BuildCandidateStarvationPlacementEvidence, BuildCurrentAssignmentCutRelocationSignals, BuildTopologyCutEpochPinBankRelocationSignals, BuildTopologyCutEpochGeometryRelocationSignals, BuildTopologyCutEpochGeometryConstraints, SelectTopologyCutFrontier, SelectRepeatedLeaseRealizabilityGeometrySignals, BuildPlacementFingerprint, BuildStructuredPlacementRelocationSignals, CandidateStarvationPlacementEvidence, ExtractPlacementRelocationSignals, ExtractCompletedEscalationRelocationSignals, ExpandAnalogousMandatoryRepairSignals, FailureRequestsPlacementAdvance, FailureRequiresPackedAccessRepair, SelectReleasableLocalClaimSignals, SelectRefinedAssignmentCutDiversificationSignals, SelectRepeatedAssignmentSubcutDiversificationSignals, SelectAssignmentCutGeometrySignals, SelectRepeatedCandidateStarvationDiversificationSignals, SelectCutDrivenClusterRefinementSignals, ShouldDiversifyRepeatedAssignmentCut, ShouldDeferTopologyCutForMaterializedSibling, ShouldPreserveCurrentStructuredAssignmentCut, ShouldUseCurrentAssignmentCutGeometry
+from PhysicalDesign.Orchestration.Feedback import BuildCandidateStarvationPlacementEvidence, BuildCurrentAssignmentCutRelocationSignals, BuildTopologyCutEpochPinBankRelocationSignals, BuildTopologyCutEpochGeometryRelocationSignals, BuildTopologyCutEpochGeometryConstraints, SelectTopologyCutFrontier, SelectRepeatedLeaseRealizabilityGeometrySignals, BuildPlacementFingerprint, BuildStructuredPlacementRelocationSignals, CandidateStarvationPlacementEvidence, ExtractPlacementRelocationSignals, ExtractCompletedEscalationRelocationSignals, ExtractAuthoritativePreOwnedConflictSignals, ExpandAnalogousMandatoryRepairSignals, FailurePrefersDirectOnlyPlacement, FailureRequestsPlacementAdvance, FailureRequiresPackedAccessRepair, SelectReleasableLocalClaimSignals, SelectRefinedAssignmentCutDiversificationSignals, SelectRepeatedAssignmentSubcutDiversificationSignals, SelectAssignmentCutGeometrySignals, SelectRepeatedCandidateStarvationDiversificationSignals, SelectCutDrivenClusterRefinementSignals, ShouldDiversifyRepeatedAssignmentCut, ShouldDeferTopologyCutForMaterializedSibling, ShouldPreserveCurrentStructuredAssignmentCut, ShouldUseCurrentAssignmentCutGeometry
 from PhysicalDesign.Orchestration.Portfolios import AccessDistinctAssignmentCutDiversificationEvidence, ApplyCoordinatedCandidateDiversificationProfile, ApplyActivePlacementAssignmentConstraints, ApplyRemainingExactLegalJointStateCount, AssignmentCutHasBoundedExactCore, AssignmentCutRepeatsAcrossDistinctPlacementOwnership, BoundedAssignmentCutRepeatsAcrossDistinctOwnership, BoundedAssignmentSignalCutRepeatsAcrossDistinctOwnership, CompleteAssignmentCutSupersedesLeasePairRetry, SelectTransactionalEndpointRepairSignals, ShouldBoundClusterPinBankRepairProbe, BuildCoordinatedCandidateDiversificationProfile, BuildTopologyCutEpochIdentity, BuildTargetedPinBankPackingPolicy, BuildSamePlacementRoutingControlRetryState, ExtractAccessDistinctLeaseOwnershipFingerprints, HasDenseBoundaryLeaseRepairEligibility, IsExactPairedLeaseCut, PlacementGenerationRequest, PlacementGenerationRoutingReserveSeconds, HasTopologyCutEpochRoutingReserve, TopologyCutEpochRoutingReserveSeconds, TopologyCutEpochAdmissionReserveSeconds, PlacementMatchesTopologyCutEpoch, PinBankRepairOwnershipIsDistinct, RoutingControlAttemptIdentity, SelectRepeatedPairedLeaseSubcutSignals, SelectRepeatedHigherOrderPinBankRepairSignals, SelectExhaustiveExactPairPinBankRepairSignals, SelectTopologyCoordinatedCandidateDiversificationSignals, SelectImmediateTopologyPinBankRepairSignals, SelectExhaustedRepeaterAccessCutSignals, SerializedPlacementAssignmentConstraintsAreActive, ShouldPrioritizeCurrentExactCutBeforeBroad, ShouldPrioritizePlacementConflictRelocation, ShouldPrioritizeTopologyCutEpochRelocation, ShouldOpenTopologyCutEpoch, ShouldWidenTopologyCutTerminalShell, ShouldRetrySamePlacementRoutingControl, ShouldContinuePostPinBankRepairEpoch, ShouldDeferSamePlacementRoutingControlRetry, TopologyCutEpochIdentity
 from PhysicalDesign.Orchestration.Preparation import IsAuthoritativeMandatoryAccessConflict, RequiresDenseBoundaryLeaseRouting, ShouldEnableClusterBoundaryLeaseInterface, PlacementCandidateIsExactAccessLegal, PlacementPortfolioGenerationNotAfter, PlacementFeedbackRoutingSlotCount, PromoteAuthoritativeMandatoryAccessConflict, RetainedPlacementRoutingSlotCount, TopologyPortfolioRoutingFraction, ShouldGiveRankedJointPortfolioLeadSlice
 from PhysicalDesign.Orchestration.Runner import _PlaceAndRoutePcbWithPolicy
@@ -28,6 +28,106 @@ from PhysicalDesign.Routing.Pcb import CompactRoutedTrees, RoutePcbAttempt
 from PhysicalDesign.Routing.Planning.LocalFirst import PlacementRoutingFeedback
 from PhysicalDesign.Runtime.Reliability import BuildRoutingDeadlineDiagnostics, BuildStableFingerprint, ChooseRoutingEscalationAction, EnforceRoutingRuntimeLimit, HasAdaptiveEscalationBudget, RemainingRoutingRuntimeMilliseconds, RetainUnaffectedCandidateCache, SelectBoundedDiverseCandidatePool, RoutingDeadline, RoutingEscalationState
 from PhysicalDesign.Redstone.Technology import DefaultRedstoneRoutingTechnology
+from PhysicalDesign.Routing.Global.TypedRouteConsumer import (
+    TypedRouteOriginDescriptor,
+    TypedRoutePhysicalEvidence,
+)
+
+
+def _DirectOnlyFixtureCandidate():
+    return SimpleNamespace(
+        SourceGenerator="row-beam",
+        Placement=SimpleNamespace(
+            Placed=SimpleNamespace(LocalRouteClaims=(object(),)),
+        ),
+        BoundaryOverflow=0,
+        PinScarcityCount=0,
+        GuideOverflowPeak=0,
+        GuideOverflowCells=0,
+        PinEscapeConflictCount=0,
+    )
+
+
+def _TypedP1Evidence(*, Reason: str) -> dict[str, object]:
+    Descriptor = TypedRouteOriginDescriptor(
+        Signal="A",
+        SourcePortal={"Path": [[0, 0, 0]], "PortalId": "source"},
+        TargetPortals=(),
+        Guide=((0, 0),),
+        Layer=0,
+        Axis="X",
+        Lane=0,
+        Variant=0,
+        ImmutableFragments={
+            "SchemaVersion": "joint-typed-route-immutable-fragments-v1",
+            "SourceAccessPath": [[0, 0, 0]],
+        },
+    )
+    return TypedRoutePhysicalEvidence(
+        Status="Rejected",
+        Reason=Reason,
+        Signal="A",
+        ConflictResources=(
+            {"Kind": "Air", "Position": [0, 0, 0]},
+        ),
+        ConflictingOwners=("A",),
+        ResourceEvidenceAvailable=True,
+        OwnerEvidenceAvailable=True,
+        ProvenanceEvidenceAvailable=True,
+        OriginDescriptorIdentity=Descriptor.Identity,
+        ImmutableFragmentIdentity=Descriptor.ImmutableFragmentIdentity,
+        MaterializationDiagnostics={"Status": "self-claim-conflict"},
+    ).ToDictionary()
+
+
+def _DirectOnlyFixtureFailure(Evidence: dict[str, object]) -> RoutingFailure:
+    return RoutingFailure(
+        Reason=RoutingFailureReason.TrackAssignmentConflict,
+        Stage="TrackAssignment",
+        AffectedNets=("A", "B", "C"),
+        RepairActions=("AdvancePlacementCandidate",),
+        Diagnostics={
+            "Action": "advance-placement-conflict-relocation",
+            "ConflictGraph": {
+                "Classification": "higher-order-placement-conflict",
+                "NoCandidateSignals": [],
+                "PairwiseIncompatibleEdges": [],
+            },
+            "EscalationHistory": ({
+                "Stage": "CandidateGeneration",
+                "AffectedSignals": ["A"],
+                "Diagnostics": {
+                    "Materialized": 0,
+                    "TypedNativeRouteP1Evidence": [Evidence],
+                },
+            },),
+        },
+    )
+
+
+def test_self_claim_receipt_without_contributor_proof_cannot_select_direct_only():
+    Failure = _DirectOnlyFixtureFailure(
+        _TypedP1Evidence(Reason="P1SelfClaimConflict")
+    )
+
+    assert ExtractAuthoritativePreOwnedConflictSignals(Failure) == frozenset()
+    assert FailurePrefersDirectOnlyPlacement(
+        Failure,
+        _DirectOnlyFixtureCandidate(),
+    ) is False
+
+
+def test_access_domain_rejection_cannot_select_direct_only_recovery():
+    Failure = _DirectOnlyFixtureFailure(
+        _TypedP1Evidence(Reason="ForeignSelectedAccessConflict")
+    )
+
+    assert ExtractAuthoritativePreOwnedConflictSignals(Failure) == frozenset()
+    assert FailurePrefersDirectOnlyPlacement(
+        Failure,
+        _DirectOnlyFixtureCandidate(),
+    ) is False
+
 
 class RouterReliabilityTests(unittest.TestCase):
     @staticmethod

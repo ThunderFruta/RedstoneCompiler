@@ -1,6 +1,33 @@
 """CandidatePreparation phase of authoritative routing."""
 from __future__ import annotations
+from PhysicalDesign.Runtime import ExecuteNativeRouteBatchOutcomesV1, NativeRouteResultKind
+from PhysicalDesign.Routing.Global.TypedRouteConsumer import (
+    AuthorityIdentity,
+    BuildDisabledSelectedAccessAuthority,
+    BuildTypedNativeCoarseRequest,
+    BuildTypedRouteExecutionPlan,
+    BuildTypedRouteOriginRecordsFromResults,
+    TypedRouteOriginMatchesCurrentInputs,
+    CanonicalAuthority,
+    SealTypedRouteLegacyRequests,
+    TypedRouteBatchCounters,
+    TypedRouteCallerSnapshot,
+    TypedRouteContextScope,
+    TypedRouteExecutionScope,
+    TypedRouteAdmissionRecord,
+    TypedRouteOriginDescriptor,
+    TypedRouteOriginRecord,
+    TypedRouteTerminalCompletesRequest,
+)
+from ..TypedRouteEpoch import BuildTypedRouteMaterializationEpoch
+from ..TypedRouteAuthority import (
+    BuildTypedRouteCurrentCallerSnapshot,
+    ResolveTypedRouteCurrentContext,
+    ResolveTypedRouteCurrentOriginMetadata,
+    ValidateTypedRouteExecutionScope,
+)
 from ..RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
+
 
 def BuildProtectedRoutingNodesBySignal(
     Profiles,
@@ -55,51 +82,33 @@ def BuildProtectedRoutingNodesBySignal(
     return Result
 
 
-def BuildForeignSelectedPinAccessClaimsBySignal(
-    Signals,
-    SelectedPinAccessWitness=None,
-):
-    """Bind each routed signal to every foreign selected-access claim."""
-    SelectedClaimsBySignal = {
-        str(Signal): Claims
-        for Signal, Claims in getattr(
-            SelectedPinAccessWitness,
-            "ClaimsBySignal",
-            (),
-        )
-    }
-    return {
-        str(Signal): tuple(
-            (Owner, Claims)
-            for Owner, Claims in sorted(SelectedClaimsBySignal.items())
-            if Owner != str(Signal)
-        )
-        for Signal in sorted(map(str, Signals))
-    }
-
-
-def FindForeignSelectedPinAccessConflictSignals(
-    Signal,
-    Claims,
-    ForeignClaimsBySignal,
-    ConflictPredicate,
-):
-    """Return exact immutable access owners conflicting with one claim set."""
-    return tuple(
-        Owner
-        for Owner, ForeignClaims in ForeignClaimsBySignal.get(
-            str(Signal),
-            (),
-        )
-        if ConflictPredicate(Claims, ForeignClaims)
-    )
-
 def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
     """Run the CandidatePreparation phase against shared routing state."""
     State.CandidateRequestCount = 0
     State.RouteTreeNativeDeadlineExceeded = False
     State.PhysicalDescriptorOwnerByRequestId: dict[int, tuple[str, str]] = {}
     State.CompletedPhysicalDescriptorFingerprintsBySignal: dict[str, set[str]] = Services.defaultdict(set)
+    State.TypedNativeInvocationSequence = 0
+    State.TypedNativeRouteOriginRecords: list[TypedRouteOriginRecord] = []
+    State.TypedNativeRouteNodeOriginRecords: dict[int, TypedRouteOriginRecord] = {}
+    State.TypedNativeRouteOriginAuthorities = {}
+    State.TypedNativeMaterializationEpochs = []
+    State.TypedNativeMaterializationEpochBySignal = {}
+    State.TypedNativePendingPhysicalAdmissions = {}
+    State.TypedNativeCallerSnapshotObservationCache = None
+    State.TypedNativeCallerSnapshotsByOrigins = {}
+    State.TypedNativeCallerAuthorityObservationCache = {}
+    State.TypedNativeImmutableObservationCache = {}
+    MaterializationImmutableForests = {}
+    State.TypedNativeIncompleteKindsBySignal = Services.defaultdict(set)
+    State.TypedNativeRouteAdmissionRecords = []
+    State.TypedNativeRouteAdmissionByOriginIdentity = {}
+    State.TypedNativeRouteRequestOriginDescriptorsById = {}
+    State.TypedNativeRouteBatches = []
+    State.TypedNativeRouteBatchByOriginIdentity = {}
+    State.TypedNativeCurrentContext = None
+    State.TypedNativeCurrentContextScope = None
+    State.TypedNativeCurrentContextConstructionAuthority = None
     State.NegotiatedPlan: Services.NegotiatedRoutePlan | None = None
     if State.UseNegotiatedRouting:
         State.RetainedCandidateCache = None
@@ -160,7 +169,393 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
                 return Values
         NativeRequests = list(MissingByKey.values()) if PhysicalRequestCache is not None else MaterializedRequests
         NativeCompletionMask: tuple[bool, ...]
-        if hasattr(State.Context, 'GenerateRouteTreesBounded'):
+        if PhysicalRequestCache is None and all(
+            type(Request) is tuple and len(Request) == 11
+            for Request in NativeRequests
+        ):
+            OriginDescriptors = tuple(
+                State.TypedNativeRouteRequestOriginDescriptorsById.get(id(Request))
+                for Request in NativeRequests
+            )
+            if any(
+                type(Descriptor) is not TypedRouteOriginDescriptor
+                for Descriptor in OriginDescriptors
+            ):
+                raise ValueError(
+                    "typed route request is missing its exact Joint origin descriptor"
+                )
+
+            State.TypedNativeInvocationSequence += 1
+            InvocationSequence = State.TypedNativeInvocationSequence
+
+            def PublishTypedBatch(
+                OriginRecords,
+                Counters,
+                *,
+                ExecutionScope=None,
+                PreNativeReason=None,
+                ContextValidation=None,
+            ):
+                Admissions = []
+                for Record in OriginRecords:
+                    if not TypedRouteTerminalCompletesRequest(Record.NativeKind):
+                        State.TypedNativeIncompleteKindsBySignal[
+                            Record.OriginDescriptor.Signal
+                        ].add(Record.NativeKind)
+                    if Record.NativeKind != "Routed":
+                        Admission = TypedRouteAdmissionRecord(
+                            OriginIdentity=Record.OriginIdentity,
+                            NativeKind=Record.NativeKind,
+                            Admitted=None,
+                            PhysicalEvidence=None,
+                            RecoveryAttribution=None,
+                        )
+                        State.TypedNativeRouteAdmissionRecords.append(Admission)
+                        State.TypedNativeRouteAdmissionByOriginIdentity[
+                            Record.OriginIdentity
+                        ] = Admission
+                        Admissions.append(Admission.ToDictionary())
+                Batch = {
+                    "SchemaVersion": "joint-typed-native-route-consumer-v3",
+                    "InvocationSequence": InvocationSequence,
+                    "ExecutionScope": (
+                        None
+                        if ExecutionScope is None
+                        else ExecutionScope.ToDictionary()
+                    ),
+                    "PreNativeReason": PreNativeReason,
+                    "ContextValidation": ContextValidation,
+                    "Counters": Counters.ToDictionary(),
+                    "Origins": [Record.ToDictionary() for Record in OriginRecords],
+                    "Admissions": Admissions,
+                }
+                State.TypedNativeRouteBatches.append(Batch)
+                State.WorkTelemetry["TypedNativeRouteBatches"] = (
+                    State.TypedNativeRouteBatches
+                )
+                State.WorkTelemetry["TypedNativeRouteBatch"] = Batch
+                for Record in OriginRecords:
+                    State.TypedNativeRouteBatchByOriginIdentity[
+                        Record.OriginIdentity
+                    ] = Batch
+                return Batch
+
+            def PublishPreNativeIncomplete(Reason: str):
+                OriginRecords = []
+                for Ordinal, (Request, Descriptor) in enumerate(
+                    zip(NativeRequests, OriginDescriptors)
+                ):
+                    GeometryIdentity = AuthorityIdentity({
+                        "SchemaVersion": "joint-typed-route-legacy-request-v1",
+                        "LegacyRequest": Request,
+                    })
+                    OriginIdentity = AuthorityIdentity({
+                        "SchemaVersion": "joint-typed-route-pre-native-origin-v1",
+                        "InvocationSequence": InvocationSequence,
+                        "OriginalOrdinal": Ordinal,
+                        "OriginDescriptorIdentity": Descriptor.Identity,
+                        "GeometryIdentity": GeometryIdentity,
+                        "Reason": Reason,
+                    })
+                    OriginRecords.append(TypedRouteOriginRecord(
+                        OriginIdentity=OriginIdentity,
+                        OriginDescriptor=Descriptor,
+                        OriginalOrdinal=Ordinal,
+                        CanonicalOriginalOrdinal=Ordinal,
+                        CanonicalOriginIdentity=OriginIdentity,
+                        CanonicalRequestId=None,
+                        CanonicalReceiptIdentity=None,
+                        ExecutionScopeIdentity=None,
+                        GeometryIdentity=GeometryIdentity,
+                        NativePayloadIdentity=None,
+                        RouteDomainIdentity=None,
+                        NativeOrdinal=None,
+                        NativeKind="PreNativeIncomplete",
+                        PreNativeReason=Reason,
+                        ExpansionCap=Request[10],
+                        ActualExpansionCount=0,
+                        CancellationRequestedBeforeStart=False,
+                        DeadlineAtMonotonicSeconds=None,
+                    ))
+                Counters = TypedRouteBatchCounters(
+                    Configured=len(Requests),
+                    Materialized=len(NativeRequests),
+                    Filtered=len(Requests) - len(MaterializedRequests),
+                    CanonicalExecuted=0,
+                    EquivalentReused=0,
+                    Routed=0,
+                    CompleteScopedNoPath=0,
+                    SearchLimitIncomplete=0,
+                    DeadlineIncomplete=0,
+                    CancellationIncomplete=0,
+                    NativeFailure=0,
+                    PreNativeIncomplete=len(NativeRequests),
+                    CandidateProduced=0,
+                    PhysicallyAccepted=0,
+                    PhysicallyRejected=0,
+                )
+                State.TypedNativeRouteOriginRecords.extend(OriginRecords)
+                PublishTypedBatch(
+                    OriginRecords,
+                    Counters,
+                    PreNativeReason=Reason,
+                )
+                if Reason.startswith("Deadline"):
+                    State.RouteTreeNativeDeadlineExceeded = True
+                return [None] * len(NativeRequests), (False,) * len(NativeRequests)
+
+            try:
+                State.CheckRuntimeBudget(
+                    "TypedRouteCallerAuthority",
+                    {"Phase": "before-current-context-construction"},
+                )
+            except Services.RoutingStageError:
+                NativeValues, NativeCompletionMask = PublishPreNativeIncomplete(
+                    "DeadlineBeforeCurrentContextConstruction"
+                )
+            else:
+                try:
+                    (
+                        CurrentContext,
+                        ContextScope,
+                        CurrentContextReused,
+                    ) = ResolveTypedRouteCurrentContext(State, Services)
+                    Bounds = ContextScope.Bounds
+                    PlacementBounds = ContextScope.PlacementBounds
+
+                    CallerSnapshot = BuildTypedRouteCurrentCallerSnapshot(
+                        State, ContextScope, OriginDescriptors,
+                    )
+                    MaterializationEpoch = BuildTypedRouteMaterializationEpoch(
+                        State,
+                        ResolveTypedRouteCurrentOriginMetadata(State, NativeRequests, OriginDescriptors),
+                        _ImmutableForestCache=MaterializationImmutableForests,
+                    )
+                    SealedNativeRequests = SealTypedRouteLegacyRequests(NativeRequests)
+                    for Descriptor, Metadata in zip(OriginDescriptors, MaterializationEpoch.Metadata):
+                        if not TypedRouteOriginMatchesCurrentInputs(
+                            Descriptor, Descriptor.Signal,
+                            MaterializationEpoch.Profiles[Descriptor.Signal], Metadata,
+                        ):
+                            raise ValueError("typed origin fragments changed before request sealing")
+                except (AttributeError, TypeError, ValueError) as Error:
+                    NativeValues, NativeCompletionMask = PublishPreNativeIncomplete(
+                        type(Error).__name__ + ":" + str(Error)
+                    )
+                else:
+                    try:
+                        State.CheckRuntimeBudget(
+                            "TypedRouteRequestSealing",
+                            {"Phase": "before-native-request-sealing"},
+                        )
+                    except Services.RoutingStageError:
+                        NativeValues, NativeCompletionMask = (
+                            PublishPreNativeIncomplete(
+                                "DeadlineBeforeNativeRequestSealing"
+                            )
+                        )
+                    else:
+                        ContextIdentity = ContextScope.Identity
+                        InvocationIdentity = AuthorityIdentity({
+                            "SchemaVersion": "joint-typed-route-invocation-v1",
+                            "Sequence": InvocationSequence,
+                            "ContextIdentity": ContextIdentity,
+                            "CallerIdentity": CallerSnapshot.Identity,
+                        })
+                        DeadlineAt = float(min(
+                            State.Deadline.ExpiresAt,
+                            State.AdaptiveExpiresAt,
+                        ))
+                        ExecutionScope = TypedRouteExecutionScope(
+                            InvocationIdentity,
+                            DeadlineAt,
+                            ContextScope,
+                            CallerSnapshot,
+                        )
+                        BatchIdentity = (
+                            "joint-candidate-route-batch-v1:"
+                            + InvocationIdentity
+                        )
+                        TypedRequests = []
+                        Plan = BuildTypedRouteExecutionPlan(
+                            InvocationIdentity,
+                            ContextIdentity,
+                            CallerSnapshot.Identity,
+                            tuple(zip(SealedNativeRequests, OriginDescriptors)),
+                        )
+                        for Planned, Request in zip(Plan, SealedNativeRequests):
+                            if not Planned.Canonical:
+                                continue
+                            RequestId = (
+                                "joint-route-request-v1:"
+                                + AuthorityIdentity({
+                                    "InvocationIdentity": InvocationIdentity,
+                                    "CanonicalOriginIdentity": (
+                                        Planned.OriginIdentity
+                                    ),
+                                    "GeometryIdentity": (
+                                        Planned.GeometryIdentity
+                                    ),
+                                })
+                            )
+                            TypedRequests.append(BuildTypedNativeCoarseRequest(
+                                RequestId,
+                                CallerSnapshot.Bindings,
+                                Bounds,
+                                PlacementBounds,
+                                Request,
+                            ))
+                        Typed = ExecuteNativeRouteBatchOutcomesV1(
+                            CurrentContext,
+                            BatchIdentity,
+                            tuple(TypedRequests),
+                            DeadlineAt,
+                            Detailed=False,
+                        )
+                        if len(Typed.Results) != len(TypedRequests):
+                            raise ValueError(
+                                "typed native result count changed after validation"
+                            )
+                        for Index, (Request, Result) in enumerate(
+                            zip(TypedRequests, Typed.Results)
+                        ):
+                            if (
+                                Result.ExecutionScope.BatchIdentity != BatchIdentity
+                                or Result.ExecutionScope.ImmutableInputIdentity
+                                != Request.ImmutableInputSha256
+                                or Result.OriginalOrdinal != Index
+                                or Result.RequestIdentity != Request.RequestId
+                                or Result.ExecutionScope.ContextGraphIdentity
+                                != ContextScope.ContextGraphIdentity
+                                or Result.ExecutionScope.CallerSourceIdentity
+                                != Request.CallerEchoScopeSha256
+                                or Result.ExecutionScope.DeadlineAtMonotonicSeconds
+                                != DeadlineAt
+                                or Result.NativePayloadIdentity
+                                != Request.NativePayloadSha256
+                            ):
+                                raise ValueError(
+                                    "typed native result escaped its sealed scope"
+                                )
+                        if any(
+                            TypedRouteTerminalCompletesRequest(Result.Kind.value)
+                            for Result in Typed.Results
+                        ):
+                            # Scope freshness protects complete no-path evidence
+                            # too. Purely incomplete batches remain diagnostic and
+                            # require no expensive post-deadline authority walk.
+                            ValidateTypedRouteExecutionScope(
+                                State, Services, ExecutionScope, OriginDescriptors,
+                            )
+                        if any(TypedRouteTerminalCompletesRequest(Result.Kind.value)
+                               for Result in Typed.Results):
+                            State.TypedNativeMaterializationEpochs.append((
+                                ExecutionScope, OriginDescriptors, MaterializationEpoch,
+                            ))
+                            for Descriptor in OriginDescriptors:
+                                State.TypedNativeMaterializationEpochBySignal.setdefault(
+                                    Descriptor.Signal, MaterializationEpoch,
+                                )
+                        OriginResults = [
+                            Typed.Results[Planned.RepresentativeIndex]
+                            for Planned in Plan
+                        ]
+                        NativeValues = []
+                        CompletionValues = []
+                        OriginRecords = BuildTypedRouteOriginRecordsFromResults(
+                            Plan,
+                            OriginDescriptors,
+                            Typed.Results,
+                            ExecutionScope,
+                        )
+                        for Record, Result in zip(
+                            OriginRecords,
+                            OriginResults,
+                        ):
+                            if Result.Kind is NativeRouteResultKind.Routed:
+                                NodesValue = tuple(Result.Candidate.Nodes)
+                                State.TypedNativeRouteOriginAuthorities[Record.OriginIdentity] = (
+                                    ExecutionScope, OriginDescriptors, NodesValue,
+                                    MaterializationEpoch,
+                                )
+                                NativeValues.append(NodesValue)
+                                State.TypedNativeRouteNodeOriginRecords[
+                                    id(NodesValue)
+                                ] = Record
+                            else:
+                                NativeValues.append(None)
+                            CompletionValues.append(
+                                TypedRouteTerminalCompletesRequest(
+                                    Result.Kind.value
+                                )
+                            )
+                        NativeCompletionMask = tuple(CompletionValues)
+                        State.TypedNativeRouteOriginRecords.extend(OriginRecords)
+                        Counts = {
+                            Kind.value: sum(
+                                Result.Kind is Kind
+                                for Result in OriginResults
+                            )
+                            for Kind in NativeRouteResultKind
+                        }
+                        Counters = TypedRouteBatchCounters(
+                            Configured=len(Requests),
+                            Materialized=len(NativeRequests),
+                            Filtered=(
+                                len(Requests) - len(MaterializedRequests)
+                            ),
+                            CanonicalExecuted=len(TypedRequests),
+                            EquivalentReused=(
+                                len(NativeRequests) - len(TypedRequests)
+                            ),
+                            Routed=Counts["Routed"],
+                            CompleteScopedNoPath=(
+                                Counts["CompleteScopedNoPath"]
+                            ),
+                            SearchLimitIncomplete=(
+                                Counts["SearchLimitIncomplete"]
+                            ),
+                            DeadlineIncomplete=Counts["DeadlineIncomplete"],
+                            CancellationIncomplete=(
+                                Counts["CancellationIncomplete"]
+                            ),
+                            NativeFailure=Counts["NativeFailure"],
+                            PreNativeIncomplete=0,
+                            CandidateProduced=0,
+                            PhysicallyAccepted=0,
+                            PhysicallyRejected=0,
+                        )
+                        CachedContextIdentity = getattr(
+                            State.Context,
+                            "AuthoritativeContextGraphSha256",
+                            None,
+                        )
+                        PublishTypedBatch(
+                            OriginRecords,
+                            Counters,
+                            ExecutionScope=ExecutionScope,
+                            ContextValidation={
+                                "SchemaVersion": (
+                                    "joint-typed-route-current-context-v1"
+                                ),
+                                "CachedContextGraphIdentity": (
+                                    CachedContextIdentity
+                                ),
+                                "CurrentContextGraphIdentity": (
+                                    ContextScope.ContextGraphIdentity
+                                ),
+                                "CurrentConstructionScopeIdentity": (
+                                    ContextScope.Identity
+                                ),
+                                "CachedContextReused": False,
+                                "ValidatedCurrentContextReused": (
+                                    CurrentContextReused
+                                ),
+                            },
+                        )
+                        if Typed.DeadlineExceeded:
+                            State.RouteTreeNativeDeadlineExceeded = True
+        elif hasattr(State.Context, 'GenerateRouteTreesBounded'):
             BatchResult = State.Context.GenerateRouteTreesBounded(NativeRequests, Services.RemainingRoutingRuntimeMilliseconds(State.Deadline, State.AdaptiveExpiresAt))
             CompletionMask = Services.ReadRouteTreeBatchCompletionMask(BatchResult, len(NativeRequests))
             State.WorkTelemetry['RouteTreeCompletedWork'] = int(State.WorkTelemetry.get('RouteTreeCompletedWork', 0)) + BatchResult.CompletedWork
@@ -230,17 +625,31 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     State.CandidateLimitsBySignal: dict[str, int] = {}
     State.CandidateDiagnostics: dict[str, dict[str, object]] = {}
     State.RawTrackAssignmentExtractionIncompleteReasons: dict[str, str] = {}
-    State.ForeignSelectedPinAccessClaimsBySignal = (
-        BuildForeignSelectedPinAccessClaimsBySignal(
-            State.Profiles,
-            State.PlacementPinAccessWitness,
+    if State.ForeignSelectedPinAccessClaimsBySignal is None:
+        State.ForeignSelectedPinAccessClaimsBySignal = (
+            Services.BuildForeignSelectedPinAccessClaimsBySignal(
+                State.Profiles,
+                State.PlacementPinAccessWitness,
+            )
+            if State.Policy.PlacementAccess.Enabled
+            else {
+                str(Signal): ()
+                for Signal in sorted(State.Profiles)
+            }
         )
-        if State.Policy.PlacementAccess.Enabled
-        else {
-            str(Signal): ()
-            for Signal in sorted(State.Profiles)
-        }
-    )
+    if State.ForeignSelectedPinAccessBlockedWireNodesBySignal is None:
+        State.ForeignSelectedPinAccessBlockedWireNodesBySignal = (
+            Services.BuildForeignSelectedPinAccessBlockedWireNodesBySignal(
+                State.Profiles,
+                State.PlacementPinAccessWitness,
+                Services.ImmutableRoutingClaimsBlockedWireNodes,
+            )
+            if State.Policy.PlacementAccess.Enabled
+            else {
+                str(Signal): frozenset()
+                for Signal in sorted(State.Profiles)
+            }
+        )
     State.ForeignSelectedAccessRequiredClaimConflictBySignal = (
         Services.Counter()
     )
@@ -295,7 +704,7 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
             if Candidate is None:
                 raise Services.RoutingStageError(Services.RoutingFailure(Reason=Services.RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='PlacementAccessWitnessRealization', AffectedNets=(Signal,), Detail='the frozen placement-access tree failed exact materialization', Diagnostics={'Complete': False, 'Rejections': dict(RejectionCounts), 'FabricFingerprint': State.PlacementAccessFabric.FabricFingerprint, 'AssignmentFingerprint': State.PlacementAccessAssignment.AssignmentFingerprint}))
             ForeignAccessConflicts = (
-                FindForeignSelectedPinAccessConflictSignals(
+                Services.FindForeignSelectedPinAccessConflictSignals(
                     Signal,
                     Candidate.Claims,
                     State.ForeignSelectedPinAccessClaimsBySignal,
@@ -352,18 +761,6 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     )
     ForeignExclusionStarted = Services.monotonic()
     State.ForeignBlockedNodesBySignal = Services.BuildForeignElectricalExclusionsBySignal(ProtectedNodesBySignal, State.Technology, DeferredPairwiseSignals=State.Resources.PhysicalComponentExactGlobalChannelSignals if State.Resources.PreparingPhysicalComponentGlobalChannels else frozenset())
-    State.ForeignSelectedPinAccessBlockedWireNodesBySignal = {
-        Signal: Services.ImmutableRoutingClaimsBlockedWireNodes(
-            Claims
-            for _Owner, Claims in (
-                State.ForeignSelectedPinAccessClaimsBySignal.get(
-                    Signal,
-                    (),
-                )
-            )
-        )
-        for Signal in ProtectedNodesBySignal
-    }
     if State.Policy.PlacementAccess.Enabled:
         State.ForeignBlockedNodesBySignal = {
             Signal: frozenset((
@@ -407,8 +804,9 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     if AssemblySpecificSiblingApertureClaimsBySignal:
         State.WorkTelemetry['AssemblySpecificSiblingApertureFilter'] = {'Exact': True, 'SeamOwnershipComparison': 'full-port-claims-vs-global-path-only', 'ClaimsFingerprintBySignal': {Signal: Services.BuildStableFingerprint(tuple((Services._BuildApertureClaimsFingerprint(Claims) for Claims in ClaimsValues))) for Signal, ClaimsValues in sorted(AssemblySpecificSiblingApertureClaimsBySignal.items())}, 'GlobalPathClaimsFingerprintBySignal': {Signal: Services.BuildStableFingerprint(tuple((Services._BuildApertureClaimsFingerprint(Claims) for _SiblingSignal, Claims in ClaimsValues))) for Signal, ClaimsValues in sorted(AssemblySpecificSiblingGlobalPathAperturesBySignal.items())}, 'FullPortClaimsFingerprintBySignal': {Signal: Services.BuildStableFingerprint(tuple((Services._BuildApertureClaimsFingerprint(Claims) for _SiblingSignal, Claims in ClaimsValues))) for Signal, ClaimsValues in sorted(AssemblySpecificSiblingFullPortAperturesBySignal.items())}, 'BlockedWireNodeCountBySignal': {Signal: len(Nodes) for Signal, Nodes in sorted(AssemblySpecificSiblingBlockedWireNodesBySignal.items())}, 'RequiredClaimConflictCountsBySignal': State.SiblingApertureRequiredClaimConflictsBySignal}
 
-    def AssemblySpecificSiblingApertureConflictSignals(Signal: str, Claims: RoutingResourceClaims) -> tuple[str, ...]:
-        ConflictSignals = tuple(sorted((SiblingSignal for SiblingSignal, SiblingClaims in State.AssemblySpecificSiblingAperturesBySignal.get(Signal, ()) if Services.ComponentClaimsConflict(Claims, SiblingClaims))))
+    def AssemblySpecificSiblingApertureConflictSignals(Signal: str, Claims: RoutingResourceClaims, *, AperturesBySignal=None) -> tuple[str, ...]:
+        Apertures = State.AssemblySpecificSiblingAperturesBySignal if AperturesBySignal is None else AperturesBySignal
+        ConflictSignals = tuple(sorted((SiblingSignal for SiblingSignal, SiblingClaims in Apertures.get(Signal, ()) if Services.ComponentClaimsConflict(Claims, SiblingClaims))))
         FullPortConflictSignals, GlobalPathConflictSignals, LocalInteriorOnlyConflictSignals = Services.ClassifySiblingApertureSeamOwnershipConflicts(Claims, AssemblySpecificSiblingFullPortAperturesBySignal.get(Signal, ()), AssemblySpecificSiblingGlobalPathAperturesBySignal.get(Signal, ()))
         OwnershipDiagnostics = State.SiblingApertureSeamOwnershipBySignal.setdefault(Signal, {'ComparedCandidateCount': 0, 'ActualGlobalApertureConflictCandidateCount': 0, 'FullPortClaimConflictCandidateCount': 0, 'GlobalPathConflictCandidateCount': 0, 'LocalInteriorOnlyConflictCandidateCount': 0, 'ActualGlobalApertureConflictSignals': [], 'FullPortClaimConflictSignals': [], 'GlobalPathConflictSignals': [], 'LocalInteriorOnlyConflictSignals': []})
         OwnershipDiagnostics['ComparedCandidateCount'] += 1
@@ -740,7 +1138,7 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
                 (State.RetainedCandidateMetadata or {}).get(Signal, {})
             )
             for Candidate in Values:
-                ConflictSignals = FindForeignSelectedPinAccessConflictSignals(
+                ConflictSignals = Services.FindForeignSelectedPinAccessConflictSignals(
                     Signal,
                     Candidate.Claims,
                     State.ForeignSelectedPinAccessClaimsBySignal,

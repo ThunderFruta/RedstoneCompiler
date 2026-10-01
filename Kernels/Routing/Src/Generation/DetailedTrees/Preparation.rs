@@ -15,6 +15,7 @@ pub(in crate::Generation) fn DetailedRouteTreeBudgetExpiredResult() -> RouteTree
         Status: "BudgetExpired".to_string(),
         NoPathReason: "BudgetExpired".to_string(),
         Nodes: Vec::new(),
+        SourcePaths: Vec::new(),
         TargetPaths: Vec::new(),
         BoundaryFrontierNodes: Vec::new(),
         RepeaterReservations: Vec::new(),
@@ -186,7 +187,7 @@ pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithParents(
     }
 }
 
-fn PropagateCanonicalRoutePowerWithParentsWithDeadline(
+pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithParentsWithDeadline(
     Root: Position,
     Nodes: &HashSet<Position>,
     Repeaters: &HashMap<Position, String>,
@@ -318,6 +319,7 @@ pub(in crate::Generation) fn PropagateCanonicalRoutePowerWithDeadline(
     }
 }
 
+#[cfg(test)]
 pub(in crate::Generation) fn FindSelfExcitingRepeaterCycles(
     Nodes: &HashSet<Position>,
     RepeaterValues: &[(Position, String)],

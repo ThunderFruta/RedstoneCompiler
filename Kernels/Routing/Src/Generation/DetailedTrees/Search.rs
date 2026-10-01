@@ -72,6 +72,7 @@ impl RoutingContext {
             MaximumExpansionCount,
             None,
             Deadline,
+            false,
         )
     }
 
@@ -92,6 +93,7 @@ impl RoutingContext {
         MaximumExpansionCount: usize,
         ExpansionAdmission: Option<&RequestExpansionAdmissionV1>,
         Deadline: &RuntimeDeadline,
+        RepairSelfClaims: bool,
     ) -> RouteTreeSearchResult {
         let Some(Guide) = self.PrepareDetailedRouteGuide(
             AllowedNodeValues,
@@ -112,7 +114,7 @@ impl RoutingContext {
         if Deadline.Check() {
             return DetailedRouteTreeBudgetExpiredResult();
         }
-        self.GenerateRouteTreeDetailedPreparedWithDeadlineNative(
+        let Result = self.GenerateRouteTreeDetailedPreparedWithDeadlineNative(
             Starts,
             TargetBranches,
             TargetBranches,
@@ -130,6 +132,43 @@ impl RoutingContext {
             MaximumExpansionCount,
             ExpansionAdmission,
             Deadline,
+        );
+        if !RepairSelfClaims || !Result.IsRouted {
+            return Result;
+        }
+        // Required starts and ordered target suffixes cannot be no-good cuts.
+        // Keep the original candidate and prepared guide so a legal route
+        // consumes exactly the same admitted search work as before repair.
+        let mut MandatoryWire = HashSet::new();
+        for Value in Starts.iter().chain(TargetBranches.iter().flatten()) {
+            if Deadline.Check() {
+                let mut Expired = DetailedRouteTreeBudgetExpiredResult();
+                Expired.ExpansionCount =
+                    ExpansionAdmission.map_or(Result.ExpansionCount, |Value| Value.RouteCount());
+                return Expired;
+            }
+            MandatoryWire.insert(*Value);
+        }
+        self.GenerateRouteTreeClaimAwarePreparedWithAdmissionNative(
+            Starts,
+            TargetBranches,
+            TargetBranches,
+            &Guide,
+            &HashSet::new(),
+            &BaseBlockedNodes,
+            PreferredRoutingY,
+            BendPenalty,
+            ViaPenalty,
+            EnforceSignalStrength,
+            None,
+            MaximumExpansionCount,
+            Deadline,
+            &MandatoryWire,
+            &HashSet::new(),
+            &HashSet::new(),
+            "",
+            ExpansionAdmission,
+            Some(Result),
         )
     }
 
@@ -166,6 +205,8 @@ impl RoutingContext {
             FrozenSourceBranch,
             ForbiddenRepeaterPositions,
             DebugLabel,
+            MaximumExpansionCount,
+            ExpansionAdmission,
             Deadline,
             Failure,
             BlockedNodes,
@@ -234,6 +275,7 @@ impl RoutingContext {
             RetainedMandatorySourceNodes,
             FrozenSourceFrontierState,
             RootedFrozenPortalNodes,
+            SourcePaths,
             TargetPaths,
             GlobalRoutingNodes,
             RetainedMandatoryTargetNodes
@@ -318,6 +360,7 @@ impl RoutingContext {
             ExpansionCount,
             FrozenReservedAccessNodes,
             RetainedMandatorySourceNodes,
+            SourcePaths,
             TargetPaths,
             RetainedMandatoryTargetNodes
         )

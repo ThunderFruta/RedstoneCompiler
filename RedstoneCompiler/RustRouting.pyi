@@ -11,6 +11,15 @@ from typing import Any, Sequence
 
 class RouteTreeCoarseRequestV1:
     ContractVersion: str
+    RequestKind: str
+    ConnectionIntent: str
+    NativePayloadCanonicalJson: str
+    NativePayloadSha256: str
+    ImmutableInputSha256: str
+    CallerEchoScopeSha256: str
+    RequestId: str
+    CancellationRequestedBeforeStart: bool
+    MaximumExpansionCount: int
 
     def __init__(
         self,
@@ -32,9 +41,37 @@ class RouteTreeCoarseRequestV1:
         MaximumExpansionCount: int,
     ) -> None: ...
 
+    @staticmethod
+    def ConnectStartsOnlyV1(
+        RequestId: str,
+        CallerEchoBindings: Sequence[tuple[str, str]],
+        DeclaredBounds: tuple[int, int, int, int, int, int],
+        DeclaredPlacementBounds: tuple[int, int, int, int],
+        CancellationRequestedBeforeStart: bool,
+        Starts: Sequence[tuple[int, int, int]],
+        AllowedColumns: Sequence[tuple[int, int]],
+        RequiredNodes: Sequence[tuple[int, int, int]],
+        BlockedNodeValues: Sequence[tuple[int, int, int]],
+        PreferredColumns: Sequence[tuple[int, int]],
+        PreferredRoutingY: int,
+        GuidePenalty: int,
+        BendPenalty: int,
+        ViaPenalty: int,
+        MaximumExpansionCount: int,
+    ) -> "RouteTreeCoarseRequestV1": ...
+
 
 class RouteTreeDetailedRequestV1:
     ContractVersion: str
+    RequestKind: str
+    ConnectionIntent: str
+    NativePayloadCanonicalJson: str
+    NativePayloadSha256: str
+    ImmutableInputSha256: str
+    CallerEchoScopeSha256: str
+    RequestId: str
+    CancellationRequestedBeforeStart: bool
+    MaximumExpansionCount: int
 
     def __init__(
         self,
@@ -96,6 +133,8 @@ class RouteTreeRequestReceiptV1:
     RouteExpansionCount: int
     ProofExpansionCount: int
     TotalExpansionCount: int
+    NativePayloadCanonicalJson: str
+    NativePayloadSha256: str
     RawInputRetentionStatus: str
     CancellationSnapshotStatus: str
     OutcomePhase: str
@@ -146,6 +185,8 @@ class RouteTreeBatchOutcomesV1:
 
 
 class RoutingContext:
+    AuthoritativeContextGraphSha256: str
+
     def GenerateRouteTreesBatchOutcomesV1(
         self,
         BatchIdentity: str,

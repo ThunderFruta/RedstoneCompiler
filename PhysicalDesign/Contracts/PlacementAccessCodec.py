@@ -68,6 +68,14 @@ def _ReadValue(Hint: object, Value: object) -> object:
         if type(Value) is not str:
             raise ValueError("contract enum must be a string")
         return Hint(Value)
+    if Hint is RoutingResourceId:
+        if type(Value) is not dict or set(Value) != {"Kind", "Position"}:
+            raise ValueError(
+                "routing resource must contain exact kind and position fields"
+            )
+        Kind = _ReadValue(RoutingResourceKind, Value["Kind"])
+        Position = _ReadValue(tuple[int, int, int], Value["Position"])
+        return RoutingResourceId(Kind=Kind, Position=Position)
     if is_dataclass(Hint):
         Reader = getattr(Hint, "FromDictionary", None)
         return Reader(Value) if Reader else ReadContract(Hint, Value)

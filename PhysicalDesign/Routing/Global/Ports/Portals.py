@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .MaterializationEvidence import CaptureMaterializationSelfConflict
+
 from ....Redstone.Rules import PropagateRoutePower
 
 from ....Redstone.Rules import PruneRedundantRepeaterReservations
@@ -54,11 +56,100 @@ from math import ceil
 
 from typing import Any
 
+from typing import Callable
+
 from typing import Iterable
 
 from typing import Mapping
 
 import os
+
+
+def BuildForeignSelectedPinAccessClaimsBySignal(
+    Signals: Iterable[str],
+    SelectedPinAccessWitness: Any = None,
+) -> dict[str, tuple[tuple[str, RoutingResourceClaims], ...]]:
+    """Bind every routed signal to the other selected-access owners."""
+    SelectedClaimsBySignal = {
+        str(Signal): Claims
+        for Signal, Claims in getattr(
+            SelectedPinAccessWitness,
+            "ClaimsBySignal",
+            (),
+        )
+    }
+    return {
+        str(Signal): tuple(
+            (Owner, Claims)
+            for Owner, Claims in sorted(SelectedClaimsBySignal.items())
+            if Owner != str(Signal)
+        )
+        for Signal in sorted(map(str, Signals))
+    }
+
+
+def BuildForeignSelectedPinAccessBlockedWireNodesBySignal(
+    Signals: Iterable[str],
+    SelectedPinAccessWitness: Any,
+    BlockedWireNodeProjector: Callable[
+        [Iterable[RoutingResourceClaims]],
+        frozenset[Position3],
+    ],
+) -> dict[str, frozenset[Position3]]:
+    """Project foreign selected claims through the shared wire legality rule."""
+    ForeignClaimsBySignal = BuildForeignSelectedPinAccessClaimsBySignal(
+        Signals,
+        SelectedPinAccessWitness,
+    )
+    return {
+        Signal: BlockedWireNodeProjector(
+            Claims for _Owner, Claims in ForeignClaimsBySignal[Signal]
+        )
+        for Signal in sorted(ForeignClaimsBySignal)
+    }
+
+
+def FindForeignSelectedPinAccessConflictSignals(
+    Signal: str,
+    Claims: RoutingResourceClaims,
+    ForeignClaimsBySignal: Mapping[
+        str,
+        Iterable[tuple[str, RoutingResourceClaims]],
+    ],
+    ConflictPredicate: Callable[
+        [RoutingResourceClaims, RoutingResourceClaims],
+        bool,
+    ],
+) -> tuple[str, ...]:
+    """Return exact immutable access owners conflicting with one claim set."""
+    return tuple(
+        Owner
+        for Owner, ForeignClaims in ForeignClaimsBySignal.get(
+            str(Signal),
+            (),
+        )
+        if ConflictPredicate(Claims, ForeignClaims)
+    )
+
+
+def ConstrainPortalSearchNodesForSelectedAccess(
+    AllowedNodes: Iterable[Position3],
+    MandatoryAccessPath: Iterable[Position3],
+    ForeignBlockedWireNodes: Iterable[Position3],
+) -> tuple[frozenset[Position3], frozenset[Position3]]:
+    """Exclude foreign selected ownership without trimming mandatory access.
+
+    The returned overlap is diagnostic evidence. Mandatory access remains in
+    the search domain so an inconsistent supplied handoff is still rejected by
+    the established exact claim checks instead of being silently rewritten.
+    """
+    MandatoryNodes = frozenset(MandatoryAccessPath)
+    BlockedNodes = frozenset(ForeignBlockedWireNodes)
+    MandatoryOverlap = MandatoryNodes & BlockedNodes
+    return (
+        frozenset(AllowedNodes) - (BlockedNodes - MandatoryNodes),
+        MandatoryOverlap,
+    )
 
 def FilterSourceConnectedTargetBranches(
     Root: Position3,
@@ -1158,6 +1249,9 @@ def _MaterializeCandidate(
     RejectionCounts: Counter[str] | None = None,
     MaterializationDiagnostics: dict[str, object] | None = None,
 ) -> NetRouteCandidate | None:
+    if MaterializationDiagnostics is not None:
+        MaterializationDiagnostics.pop("SelfClaimConflictEvidence", None)
+
     def RecordMaterialization(
         Reason: str,
         **Diagnostics: object,
@@ -1201,9 +1295,28 @@ def _MaterializeCandidate(
             )
         if RejectionCounts is not None:
             RejectionCounts["SelfClaimConflict"] += 1
+        EvidenceDiagnostics: dict[str, object] = {}
+        if MaterializationDiagnostics is not None:
+            try:
+                EvidenceDiagnostics["SelfClaimConflictEvidence"] = (
+                    CaptureMaterializationSelfConflict(
+                        Signal, Nodes, Claims, SelfClaimConflicts,
+                    ).ToDictionary()
+                )
+            except Exception as Error:
+                # Reporting failure cannot replace physical rejection. Control
+                # flow exceptions (including cancellation) still propagate.
+                EvidenceDiagnostics["SelfClaimConflictEvidence"] = {
+                    "SchemaVersion": "materialization-self-conflict-evidence-v1",
+                    "Scope": "FirstDecisiveMaterializationSelfClaimPredicate",
+                    "CaptureStatus": "Unavailable",
+                    "Omissions": ["CaptureError"],
+                    "ErrorType": type(Error).__name__,
+                }
         RecordMaterialization(
             "self-claim-conflict",
             ConflictCount=len(SelfClaimConflicts),
+            **EvidenceDiagnostics,
         )
         return None
     Graph = _BuildCandidateGraph(Nodes, Resources.ResourceGraph)

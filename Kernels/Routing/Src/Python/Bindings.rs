@@ -703,6 +703,11 @@ impl RoutingContext {
         Ok(Self::FromMaps(Adjacency, NodesByColumn))
     }
 
+    #[getter]
+    fn AuthoritativeContextGraphSha256(&self) -> &str {
+        &self.AuthoritativeIdentityV1.Sha256
+    }
+
     fn AddRegion(
         &mut self,
         NodeValues: Vec<Position>,

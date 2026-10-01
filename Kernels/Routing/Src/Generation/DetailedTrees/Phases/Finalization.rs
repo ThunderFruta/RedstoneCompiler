@@ -20,9 +20,54 @@ macro_rules! FinalizePreparedDetailedRoute {
         $ExpansionCount:ident,
         $FrozenReservedAccessNodes:ident,
         $RetainedMandatorySourceNodes:ident,
+        $SourcePaths:ident,
         $TargetPaths:ident,
         $RetainedMandatoryTargetNodes:ident
     ) => {{
+        macro_rules! FinalizationDeadline {
+            () => {
+                if $Deadline.Check() {
+                    return $Failure(
+                        "NoPath",
+                        "SearchLimitReached",
+                        0,
+                        0,
+                        $ExpansionCount,
+                    );
+                }
+            };
+        }
+        macro_rules! FinalizationPowers {
+            ($Nodes:expr, $RepeaterMap:expr) => {{
+                match PropagateCanonicalRoutePowerWithDeadline(
+                    $Root,
+                    $Nodes,
+                    $RepeaterMap,
+                    &$SelfContext.Adjacency,
+                    $Deadline,
+                ) {
+                    DeadlineAwareElectricalResult::Complete(Value) => Value,
+                    DeadlineAwareElectricalResult::DeadlineExhausted => {
+                        return $Failure("NoPath", "SearchLimitReached", 0, 0, $ExpansionCount)
+                    }
+                }
+            }};
+        }
+        macro_rules! FinalizationCycles {
+            ($Nodes:expr, $RepeaterValues:expr) => {{
+                match FindSelfExcitingRepeaterCyclesWithDeadline(
+                    $Nodes,
+                    $RepeaterValues,
+                    $Deadline,
+                ) {
+                    DeadlineAwareElectricalResult::Complete(Value) => Value,
+                    DeadlineAwareElectricalResult::DeadlineExhausted => {
+                        return $Failure("NoPath", "SearchLimitReached", 0, 0, $ExpansionCount)
+                    }
+                }
+            }};
+        }
+        FinalizationDeadline!();
         // A repeater embedded in an induced same-signal cycle can preserve a
         // transient pulse after the real source goes low.  This is not a
         // signal-strength issue: the routed node set itself supplies an
@@ -32,30 +77,41 @@ macro_rules! FinalizePreparedDetailedRoute {
         // after exact canonical propagation proves every required target
         // remains powered; an essential cycle is rejected instead of emitted
         // as a stateful combinational route.
-        $Tree.extend($RetainedMandatorySourceNodes);
-        $Tree.extend($RetainedMandatoryTargetNodes);
-        let mut PhysicalNodes = $Tree
-            .union(&$FrozenReservedAccessNodes)
-            .copied()
-            .collect::<HashSet<_>>();
-        let RequiredTargets = $TargetBranches
-            .iter()
-            .chain($FrozenTargetBranches.iter())
-            .filter_map(|Branch| Branch.last().copied())
-            .collect::<HashSet<_>>();
+        for PositionValue in $RetainedMandatorySourceNodes {
+            FinalizationDeadline!();
+            $Tree.insert(PositionValue);
+        }
+        for PositionValue in $RetainedMandatoryTargetNodes {
+            FinalizationDeadline!();
+            $Tree.insert(PositionValue);
+        }
+        let mut PhysicalNodes = HashSet::new();
+        for PositionValue in $Tree.iter().chain($FrozenReservedAccessNodes.iter()) {
+            FinalizationDeadline!();
+            PhysicalNodes.insert(*PositionValue);
+        }
+        let mut RequiredTargets = HashSet::new();
+        for Branch in $TargetBranches.iter().chain($FrozenTargetBranches.iter()) {
+            FinalizationDeadline!();
+            if let Some(Target) = Branch.last().copied() {
+                RequiredTargets.insert(Target);
+            }
+        }
         loop {
-            let mut RepeaterValues = $Repeaters
-                .iter()
-                .map(|(PositionValue, Facing)| (*PositionValue, Facing.clone()))
-                .collect::<Vec<_>>();
+            FinalizationDeadline!();
+            let mut RepeaterValues = Vec::with_capacity($Repeaters.len());
+            for (PositionValue, Facing) in &$Repeaters {
+                FinalizationDeadline!();
+                RepeaterValues.push((*PositionValue, Facing.clone()));
+            }
             RepeaterValues.sort_unstable();
-            let Cycles = FindSelfExcitingRepeaterCycles(&PhysicalNodes, &RepeaterValues);
+            FinalizationDeadline!();
+            let Cycles = FinalizationCycles!(&PhysicalNodes, &RepeaterValues);
             if Cycles.is_empty() {
                 break;
             }
             if std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {
-                let CurrentPowers =
-                    PropagateCanonicalRoutePower($Root, &PhysicalNodes, &$Repeaters, &$SelfContext.Adjacency);
+                let CurrentPowers = FinalizationPowers!(&PhysicalNodes, &$Repeaters);
                 eprintln!(
                     "selected detailed cycle target powers signal={} values={:?}",
                     $DebugLabel,
@@ -69,14 +125,12 @@ macro_rules! FinalizePreparedDetailedRoute {
             let CycleCount = Cycles.len();
             let mut Demoted = false;
             for (Repeater, _Cycle) in &Cycles {
+                FinalizationDeadline!();
                 let mut CandidateRepeaters = $Repeaters.clone();
+                FinalizationDeadline!();
                 CandidateRepeaters.remove(Repeater);
-                let CandidatePowers = PropagateCanonicalRoutePower(
-                    $Root,
-                    &PhysicalNodes,
-                    &CandidateRepeaters,
-                    &$SelfContext.Adjacency,
-                );
+                let CandidatePowers =
+                    FinalizationPowers!(&PhysicalNodes, &CandidateRepeaters);
                 if RequiredTargets
                     .iter()
                     .all(|Target| CandidatePowers.contains_key(Target))
@@ -96,10 +150,13 @@ macro_rules! FinalizePreparedDetailedRoute {
                 // rebuilding the complete route merely to break an induced
                 // loop around one repeater.
                 'CycleDustCut: for (_Repeater, Cycle) in &Cycles {
+                    FinalizationDeadline!();
                     let mut OrderedCycleNodes = Cycle.clone();
                     OrderedCycleNodes.sort_unstable();
+                    FinalizationDeadline!();
                     OrderedCycleNodes.dedup();
                     for CutNode in OrderedCycleNodes {
+                        FinalizationDeadline!();
                         if CutNode == $Root
                             || RequiredTargets.contains(&CutNode)
                             || $UnblockedAdditionalNodes.contains(&CutNode)
@@ -107,17 +164,15 @@ macro_rules! FinalizePreparedDetailedRoute {
                             continue;
                         }
                         let mut CandidatePhysicalNodes = PhysicalNodes.clone();
+                        FinalizationDeadline!();
                         if !CandidatePhysicalNodes.remove(&CutNode) {
                             continue;
                         }
                         let mut CandidateRepeaters = $Repeaters.clone();
+                        FinalizationDeadline!();
                         CandidateRepeaters.remove(&CutNode);
-                        let CandidatePowers = PropagateCanonicalRoutePower(
-                            $Root,
-                            &CandidatePhysicalNodes,
-                            &CandidateRepeaters,
-                            &$SelfContext.Adjacency,
-                        );
+                        let CandidatePowers =
+                            FinalizationPowers!(&CandidatePhysicalNodes, &CandidateRepeaters);
                         if RequiredTargets
                             .iter()
                             .any(|Target| !CandidatePowers.contains_key(Target))
@@ -131,9 +186,10 @@ macro_rules! FinalizePreparedDetailedRoute {
                             })
                             .collect::<Vec<_>>();
                         CandidateRepeaterValues.sort_unstable();
-                        if FindSelfExcitingRepeaterCycles(
+                        FinalizationDeadline!();
+                        if FinalizationCycles!(
                             &CandidatePhysicalNodes,
-                            &CandidateRepeaterValues,
+                            &CandidateRepeaterValues
                         )
                         .len()
                             >= CycleCount
@@ -165,8 +221,10 @@ macro_rules! FinalizePreparedDetailedRoute {
                     ("west", (1, 0, 0)),
                 ];
                 'CycleCompanion: for (_Repeater, Cycle) in &Cycles {
+                    FinalizationDeadline!();
                     let mut CandidatePositions = Cycle.clone();
                     CandidatePositions.sort_unstable();
+                    FinalizationDeadline!();
                     CandidatePositions.dedup();
                     for CandidatePosition in CandidatePositions {
                         if CandidatePosition == $Root
@@ -221,13 +279,10 @@ macro_rules! FinalizePreparedDetailedRoute {
                                 continue;
                             }
                             let mut CandidateRepeaters = $Repeaters.clone();
+                            FinalizationDeadline!();
                             CandidateRepeaters.insert(CandidatePosition, Facing.to_string());
-                            let CandidatePowers = PropagateCanonicalRoutePower(
-                                $Root,
-                                &PhysicalNodes,
-                                &CandidateRepeaters,
-                                &$SelfContext.Adjacency,
-                            );
+                            let CandidatePowers =
+                                FinalizationPowers!(&PhysicalNodes, &CandidateRepeaters);
                             let MissingTargets = RequiredTargets
                                 .iter()
                                 .copied()
@@ -249,11 +304,9 @@ macro_rules! FinalizePreparedDetailedRoute {
                                 })
                                 .collect::<Vec<_>>();
                             CandidateRepeaterValues.sort_unstable();
-                            let CandidateCycleCount = FindSelfExcitingRepeaterCycles(
-                                &PhysicalNodes,
-                                &CandidateRepeaterValues,
-                            )
-                            .len();
+                            FinalizationDeadline!();
+                            let CandidateCycleCount =
+                                FinalizationCycles!(&PhysicalNodes, &CandidateRepeaterValues).len();
                             if std::env::var_os("RCS_DEBUG_NATIVE_ACCESS_GUIDE").is_some() {
                                 eprintln!(
                                     "selected detailed cycle companion signal={} position={:?} facing={} cycles_before={} cycles_after={}",
@@ -277,6 +330,7 @@ macro_rules! FinalizePreparedDetailedRoute {
             if !Demoted {
                 let mut OrderedNodes = PhysicalNodes.iter().copied().collect::<Vec<_>>();
                 OrderedNodes.sort_unstable();
+                FinalizationDeadline!();
                 let FacingValues = [
                     ("east", (-1, 0, 0)),
                     ("north", (0, 0, 1)),
@@ -284,7 +338,9 @@ macro_rules! FinalizePreparedDetailedRoute {
                     ("west", (1, 0, 0)),
                 ];
                 'CycleRepeater: for (RemovedRepeater, _Cycle) in &Cycles {
+                    FinalizationDeadline!();
                     let mut BaseRepeaters = $Repeaters.clone();
+                    FinalizationDeadline!();
                     BaseRepeaters.remove(RemovedRepeater);
                     for CandidatePosition in &OrderedNodes {
                         if *CandidatePosition == $Root
@@ -295,6 +351,7 @@ macro_rules! FinalizePreparedDetailedRoute {
                             continue;
                         }
                         for (Facing, OutputDelta) in FacingValues {
+                            FinalizationDeadline!();
                             let Input = (
                                 CandidatePosition.0 - OutputDelta.0,
                                 CandidatePosition.1 - OutputDelta.1,
@@ -317,13 +374,10 @@ macro_rules! FinalizePreparedDetailedRoute {
                                 continue;
                             }
                             let mut CandidateRepeaters = BaseRepeaters.clone();
+                            FinalizationDeadline!();
                             CandidateRepeaters.insert(*CandidatePosition, Facing.to_string());
-                            let CandidatePowers = PropagateCanonicalRoutePower(
-                                $Root,
-                                &PhysicalNodes,
-                                &CandidateRepeaters,
-                                &$SelfContext.Adjacency,
-                            );
+                            let CandidatePowers =
+                                FinalizationPowers!(&PhysicalNodes, &CandidateRepeaters);
                             if RequiredTargets
                                 .iter()
                                 .any(|Target| !CandidatePowers.contains_key(Target))
@@ -337,9 +391,10 @@ macro_rules! FinalizePreparedDetailedRoute {
                                 })
                                 .collect::<Vec<_>>();
                             CandidateRepeaterValues.sort_unstable();
-                            if FindSelfExcitingRepeaterCycles(
+                            FinalizationDeadline!();
+                            if FinalizationCycles!(
                                 &PhysicalNodes,
-                                &CandidateRepeaterValues,
+                                &CandidateRepeaterValues
                             )
                             .len()
                                 >= CycleCount
@@ -354,6 +409,7 @@ macro_rules! FinalizePreparedDetailedRoute {
                 }
             }
             if !Demoted {
+                FinalizationDeadline!();
                 let SelectedCycle = Cycles.iter().min_by_key(|(Repeater, Cycle)| {
                     (
                         RequiredTargets
@@ -386,31 +442,47 @@ macro_rules! FinalizePreparedDetailedRoute {
                 return Result;
             }
         }
+        FinalizationDeadline!();
         $TargetPaths.sort_by_key(|Value| Value.0);
-        let mut RepeaterReservations: Vec<_> = $Repeaters.into_iter().collect();
+        FinalizationDeadline!();
+        let mut RepeaterReservations = Vec::with_capacity($Repeaters.len());
+        for Value in $Repeaters {
+            FinalizationDeadline!();
+            RepeaterReservations.push(Value);
+        }
         RepeaterReservations.sort_by_key(|Value| Value.0);
+        FinalizationDeadline!();
         // Boundary diagnostics are proportional to the routed tree, not the
         // entire sparse ownership region.  Scanning every allowed node for
         // every net made pass zero scale as nets times region size.
-        let mut FinalNodes: Vec<_> = $Tree.into_iter().collect();
+        let mut FinalNodes = Vec::with_capacity($Tree.len());
+        for Value in $Tree {
+            FinalizationDeadline!();
+            FinalNodes.push(Value);
+        }
         FinalNodes.sort_unstable();
-        let BoundaryFrontierNodes = FinalNodes
-            .iter()
-            .filter(|Value| {
-                $SelfContext.Adjacency
-                    .get(Value)
-                    .into_iter()
-                    .flatten()
-                    .any(|Neighbor| {
-                        !IsPreparedRouteNodeAllowed($Guide, $AdditionalAllowedNodes, Neighbor)
-                    })
-            })
-            .copied()
-            .collect();
+        FinalizationDeadline!();
+        let mut BoundaryFrontierNodes = Vec::new();
+        for Value in &FinalNodes {
+            FinalizationDeadline!();
+            let mut IsBoundary = false;
+            for Neighbor in $SelfContext.Adjacency.get(Value).into_iter().flatten() {
+                FinalizationDeadline!();
+                if !IsPreparedRouteNodeAllowed($Guide, $AdditionalAllowedNodes, Neighbor) {
+                    IsBoundary = true;
+                    break;
+                }
+            }
+            if IsBoundary {
+                BoundaryFrontierNodes.push(*Value);
+            }
+        }
+        FinalizationDeadline!();
         RouteTreeSearchResult {
             Status: "Routed".to_string(),
             NoPathReason: String::new(),
             Nodes: FinalNodes,
+            $SourcePaths,
             $TargetPaths,
             BoundaryFrontierNodes,
             RepeaterReservations,
