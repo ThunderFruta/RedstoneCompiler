@@ -1,5 +1,7 @@
 """Public authoritative-routing entrypoint and phase runner."""
 from __future__ import annotations
+from dataclasses import replace
+from PhysicalDesign.Routing.Global.NativePreparationEvidence import CaptureNativePreparationObservation
 from .Dependencies import *
 from .Stages import AUTHORITATIVE_ROUTING_PHASES
 from .RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState
@@ -21,4 +23,13 @@ def RouteAuthoritativeResources(Placed: Any, Resources: RoutingResources, Search
     """Generate portals and select complete capacity-one routes in Rust."""
     State = AuthoritativeRoutingState(Placed=Placed, Resources=Resources, SearchMarginX=SearchMarginX, SearchMarginZ=SearchMarginZ, MaximumRoutingHeight=MaximumRoutingHeight, Policy=Policy, Technology=Technology, ProgressCallback=ProgressCallback, DiagnosticCallback=DiagnosticCallback, AdaptiveLayerFloor=AdaptiveLayerFloor, SharedRoutingStarted=SharedRoutingStarted, EscalationHistory=EscalationHistory, ReservationVariant=ReservationVariant, LaneDiversityLevel=LaneDiversityLevel, CandidateDiversityLevel=CandidateDiversityLevel, SkipStrictPortalReservation=SkipStrictPortalReservation, EscalationStates=EscalationStates, Deadline=Deadline, RetainedCandidateCache=RetainedCandidateCache, RetainedCandidateMetadata=RetainedCandidateMetadata, PriorCandidateCache=PriorCandidateCache, PriorCandidateMetadata=PriorCandidateMetadata, RegenerateSignals=RegenerateSignals, RawPortalCache=RawPortalCache, PreparedPortalCache=PreparedPortalCache, PreparePortalGeometryOnly=PreparePortalGeometryOnly, PrepareTrackAssignmentOnly=PrepareTrackAssignmentOnly, PrepareRawTrackAssignmentDomainOnly=PrepareRawTrackAssignmentDomainOnly, FrozenTrackAssignmentPreparation=FrozenTrackAssignmentPreparation, ValidateClusterInterfaceForeignAccessOnly=ValidateClusterInterfaceForeignAccessOnly, ValidatePhysicalComponentForeignPortalSupportOnly=ValidatePhysicalComponentForeignPortalSupportOnly, PrepareClusterInterfaceAssignmentOnly=PrepareClusterInterfaceAssignmentOnly, PrepareComponentRoutingProblemOnly=PrepareComponentRoutingProblemOnly, PreparePhysicalComponentAssemblyOnly=PreparePhysicalComponentAssemblyOnly, PreparePhysicalComponentPortFactorDomainOnly=PreparePhysicalComponentPortFactorDomainOnly, DeferClusterBoundaryLeaseUntilCapacityPrecheck=DeferClusterBoundaryLeaseUntilCapacityPrecheck, UnboundOwnedSignalFrontierProofCallback=UnboundOwnedSignalFrontierProofCallback, RequireCompleteClusterInterfaceDomain=RequireCompleteClusterInterfaceDomain, ClusterInterfaceRealizabilityNogoods=ClusterInterfaceRealizabilityNogoods, ClusterInterfaceStateFingerprint=ClusterInterfaceStateFingerprint, ClusterInterfaceLocalRouteFingerprint=ClusterInterfaceLocalRouteFingerprint, ForbiddenClusterInterfaceAssignmentFingerprints=ForbiddenClusterInterfaceAssignmentFingerprints, ClusterInterfaceFrozenPatternFingerprints=ClusterInterfaceFrozenPatternFingerprints, ClusterInterfaceFrozenReservations=ClusterInterfaceFrozenReservations, LocalClaimReleaseHistory=LocalClaimReleaseHistory, AvoidRoutingPositions=AvoidRoutingPositions, AvoidRoutingPositionsBySignal=AvoidRoutingPositionsBySignal, ClusterLeaseCandidateDomainOffsets=ClusterLeaseCandidateDomainOffsets, ClusterLeaseCandidateRealizabilityNogoods=ClusterLeaseCandidateRealizabilityNogoods, PriorClusterLeaseSignalPatternFingerprints=PriorClusterLeaseSignalPatternFingerprints)
     Services = AuthoritativeRoutingServices.FromNamespace(globals())
-    return RunAuthoritativeRoutingPhases(State, Services)
+    try:
+        return RunAuthoritativeRoutingPhases(State, Services)
+    except Services.RoutingStageError as Error:
+        raise Services.RoutingStageError(replace(
+            Error.Failure,
+            Diagnostics={
+                **(Error.Failure.Diagnostics or {}),
+                "NativePreparationObservation": CaptureNativePreparationObservation(State),
+            },
+        )) from Error

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import os
 from typing import Any, Callable, Iterable
+from .NativePreparationEvidence import RetainCandidateNativePreparationEvidence
 from PhysicalDesign.Routing.Pcb import PrepareRawTrackAssignmentDomain, PrepareTrackAssignment
 from PhysicalDesign.Routing.Assignment.TemplateAssignment import RawTrackAssignmentCandidateInputManifest, RawTrackAssignmentMaterialization, RawTrackAssignmentPortfolioTemplate
 from PhysicalDesign.Contracts.Placement import TrackAssignmentPreparation
@@ -606,11 +607,20 @@ def SolvePrePlacementCapacityProblem(Context, Candidates: Iterable[PcbPlacementC
                     ),
                 )
             except RoutingStageError as Error:
+                RetainCandidateNativePreparationEvidence(
+                    Context, Candidate,
+                    (Error.Failure.Diagnostics or {}).get("NativePreparationObservation"),
+                )
                 if not (Error.Failure.Reason == RoutingFailureReason.ClusterInterfaceSolveIncomplete and Error.Failure.Stage == 'LocalClaimReleasePreScreen'):
                     raise
                 FailureDiagnostics = dict(Error.Failure.Diagnostics or {})
                 Preparations.append({'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint, 'Success': False, 'SelectedCandidateIds': [], 'CandidateCounts': [], 'ConflictSignals': list(Error.Failure.AffectedNets), 'ConflictResourceIndices': [], 'ExpansionCount': int(dict(FailureDiagnostics.get('LocalClaimReleaseSelection', {})).get('SearchExpansionCount', 0)), 'Complete': False, 'IncompleteReason': 'immutable-local-claim-conflict', 'LocalClaimReleaseSelection': FailureDiagnostics.get('LocalClaimReleaseSelection', {}), 'PlacementAccessFabric': Fabric.ToDictionary() if Fabric is not None else None})
                 continue
+            RetainCandidateNativePreparationEvidence(
+                Context, Candidate,
+                dict(Preparation.Diagnostics).get("NativePreparationObservation"),
+                Preparation=Preparation,
+            )
             Preparations.append({'CandidateId': Candidate.CandidateId, 'PlacementFingerprint': Candidate.PlacementFingerprint, **Preparation.ToDictionary(), 'PlacementAccessFabric': Fabric.ToDictionary() if Fabric is not None else None, 'RoutingAttemptCount': 0})
             if Preparation.Success and Preparation.Complete:
                 Context.PrePlacementTrackPreparationWitnesses[Candidate.CandidateId] = Preparation
@@ -845,10 +855,21 @@ def MaterializeRawTemplate(Context, Descriptor: RawTrackAssignmentPortfolioTempl
     try:
         RawDomain = PrepareRawTrackAssignmentDomain(Candidate.Placement, Resources=CandidateResources, Policy=CandidatePolicy, Deadline=Context.Deadline)
     except RoutingStageError as Error:
+        RetainCandidateNativePreparationEvidence(
+            Context, Candidate,
+            (Error.Failure.Diagnostics or {}).get("NativePreparationObservation"),
+            CandidateInputFingerprint=Descriptor.MaterializationInputFingerprint,
+        )
         Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, MaterializationInputFingerprint=Descriptor.MaterializationInputFingerprint, MaterializationInputManifest=CurrentInputManifest, Domain=None, Complete=False, IncompleteReason=Error.Failure.Reason.value if hasattr(Error.Failure.Reason, 'value') else str(Error.Failure.Reason), Diagnostics=(('Candidate', Candidate.ToDictionary()), ('RawDomainFailure', Error.Failure.ToDictionary()), ('FabricDescriptor', FabricDescriptor.ToDictionary())), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
         Context.RawTrackAssignmentMaterializations[Descriptor.TemplateId] = Result
         return Result
-    Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, MaterializationInputFingerprint=Descriptor.MaterializationInputFingerprint, MaterializationInputManifest=CurrentInputManifest, Domain=RawDomain, Complete=RawDomain.Complete, IncompleteReason=RawDomain.IncompleteReason, Diagnostics=(('PlacementAccessFabric', SummarizePreRouteAccessFabric(Fabric)),), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
+    NativeEvidence = RetainCandidateNativePreparationEvidence(
+        Context, Candidate,
+        dict(RawDomain.Diagnostics).get("NativePreparationObservation"),
+        CandidateInputFingerprint=Descriptor.MaterializationInputFingerprint,
+        Domain=RawDomain,
+    )
+    Result = RawTrackAssignmentMaterialization(TemplateId=Descriptor.TemplateId, MaterializationInputFingerprint=Descriptor.MaterializationInputFingerprint, MaterializationInputManifest=CurrentInputManifest, Domain=RawDomain, Complete=RawDomain.Complete, IncompleteReason=RawDomain.IncompleteReason, Diagnostics=(('PlacementAccessFabric', SummarizePreRouteAccessFabric(Fabric)), ('NativePreparationEvidence', NativeEvidence)), ResolvedObjective=Template.Witnesses[0].Objective if Template.Witnesses else ())
     Context.RawTrackAssignmentMaterializations[Descriptor.TemplateId] = Result
     return Result
 

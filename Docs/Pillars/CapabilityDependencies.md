@@ -1361,3 +1361,57 @@ The clean acceptance revision was `7dac4646567b041e765dc1058fed70595b7a8e29`. Al
 All cases stopped before physical fixture publication, so MCHPRS truth tables and Fabric canaries were **not reached**. The dedicated disposable Fabric process did pass authenticated readiness with the exact built harness and was stopped afterward. All 230 inventoried shared personal-runtime files remained unchanged. Failure-report observation was Available for six cases and Unavailable for CLA4; raw typed failure evidence was retained for every case. No physical pass or inherited-failure attribution is inferred from deterministic green checks.
 
 The Joint documentation checkpoint `080e7df85c3cd3c4b3b8ee9064f092fe84c20e36` records this actual integration/acceptance state; only documentation changed after the tested source. The next acceptance work remains circuit-agnostic physical access alternatives/exclusions, Joint interface-domain completion, deterministic placement advancement, and bounded CLA4 placement/checkpoint completion. The repository-wide handoff toolkit and unrelated uncommitted Runtime/CI-remediation work remain outside this integration. No remote push, GitHub issue closure or production-main promotion was performed.
+
+## 2026-10-02 native preparation observation intake
+
+The authorized Router intake combines exact Joint producer
+`59cd948fe738359b939ed201502b7d2c1d9c6e50` (parent
+`080e7df85c3cd3c4b3b8ee9064f092fe84c20e36`) and exact Telemetry observer
+`4d4985d51d0d5e2917071f45820cdc8ed290b17a` (parent
+`043f6a96b39e5384adc864032591ea8ec22ce4db`) into Router parent
+`9db4acfa1d00c07653dfe463d90c50e9e27d3b47`. Both producer bases are already
+ancestors of that Router parent. All twelve imported source/test blobs match
+their reviewed owner commits exactly; the dependency record is the only
+additional Router-owned path.
+
+Joint retains actual native terminal reasons, Runtime outcome/claim/eligibility
+axes, lifecycle, original and canonical ordinals, identity observations,
+original caps/cutoffs, and published admission facts through immutable
+candidate-specific preparation results and coordinator failure diagnostics.
+The additive `native-preparation-evidence-v1` companion is observational and
+has no commitment or current-world re-attestation authority. Its coverage is
+independent of semantic domain and outer portfolio completeness. Telemetry
+projects the exact sealed, evaluator-selected records with explicit partial,
+absent, unsupported, and malformed states while preserving the original
+routing and backend verdicts. Existing selected access, native contracts,
+search ordering, budgets, and raw-assignment failure envelope are unchanged.
+
+The scoped owner checks and independent source/test reviews are retained in
+`Output/FrontierOrchestration/20261001-01a0fa92/FinalReport.json`. Joint passed
+2,806 deterministic tests with five skips and 378 subtests; Telemetry passed
+2,657 with 57 classified skips and 378 subtests. These are separate owner
+results, not combined Router evidence.
+
+Fresh combined Router verification passed 186 focused/boundary/structural
+tests with 46 subtests, and 3,138 deterministic tests with 57 skips and 378
+subtests. Source, native and index observations remained stable. The 52
+unavailable pinned independent Yosys source-equivalence proofs are explicitly
+unestablished; the remaining skips are three disabled scale cases, one
+independent watchdog diagnostic, and one setup-hook-only check. No native
+source changed, and no new Rust rebuild or cross-owner binary parity claim is
+made. Exact commands, JUnit, source observations and recovery evidence are
+under `Output/FrontierCommitIntegration/20261002T112300.182718Z/`.
+
+The ordinary combined Router TFlipFlopLatch subset uses the unchanged
+13-second routing deadline, 15-second wall ceiling and five-second process
+finalization allowance. It stops at
+`PreRouteInterfaceSelection:RuntimeBudgetExceeded` in 14.715 seconds of child
+wall time and publishes an observed companion with 112 origins and 18 actual
+canonical outcomes, all `DeadlineExhaustedAtEntry` in this invocation. That
+source-bound result is retained without substituting the earlier Joint
+`DetailedSearchIncomplete` observations. It produces no physical artifact;
+physical publication, MCHPRS and Fabric acceptance remain Not-run. This
+checkpoint establishes bounded runtime observation transport and deterministic
+development integration, not a completed router, physical acceptance,
+performance promotion, or production-main readiness. No remote push or
+production-main promotion is included.

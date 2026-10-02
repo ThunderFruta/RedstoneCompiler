@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import importlib
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import platform
@@ -986,6 +987,515 @@ def BuildEvaluatorArtifactProjection(
     return Result
 
 
+def _DiagnosticFields(
+    Value: object, Types: Mapping[str, tuple[type, ...]], *, Closed: bool = False,
+) -> dict:
+    """Check recorded JSON types without coercion or missing-field defaults."""
+    if type(Value) is not dict:
+        raise ValueError("diagnostic section is not an object")
+    if Closed and set(Value) != set(Types):
+        raise ValueError("diagnostic section has missing or undeclared fields")
+    for Name, Allowed in Types.items():
+        if Name not in Value or type(Value[Name]) not in Allowed:
+            raise ValueError(f"diagnostic field {Name} has a missing or invalid type")
+    return Value
+
+
+def _DiagnosticCounts(Value: object, Names: Sequence[str]) -> dict:
+    Record = _DiagnosticFields(Value, {Name: (int,) for Name in Names})
+    if any(Record[Name] < 0 for Name in Names):
+        raise ValueError("diagnostic counts must be nonnegative")
+    return Record
+
+
+def _DiagnosticStrings(Value: object, *, AllowEmpty: bool = True) -> None:
+    if type(Value) is not list or any(
+        type(Item) is not str or (not AllowEmpty and not Item) for Item in Value
+    ):
+        raise ValueError("diagnostic string sequence is malformed")
+
+
+def _DiagnosticDeadline(Value: object) -> None:
+    if type(Value) not in (int, float) or not isfinite(Value) or Value < 0:
+        raise ValueError("diagnostic cutoff is not a finite nonnegative number")
+
+
+def _ValidateRawAssignmentObservation(Record: dict) -> None:
+    _DiagnosticFields(Record, {
+        "SchemaVersion": (str,),
+        "SemanticResult": (dict,), "SourceIdentities": (list,),
+        "WorkIdentity": (dict,), "Counts": (dict,),
+        "EvidenceCompleteness": (dict,), "Omissions": (list,),
+    }, Closed=True)
+    Semantic = _DiagnosticFields(Record["SemanticResult"], {
+        **{Name: (str,) for Name in (
+            "ProblemFingerprint", "SelectionFingerprint", "SelectedTemplateId",
+            "IncompleteReason",
+        )},
+        **{Name: (bool,) for Name in ("Success", "Complete", "Unsatisfiable")},
+        **{Name: (list,) for Name in (
+            "SelectedObjective", "FirstConflictSignals", "FirstConflictResourceIndices",
+        )},
+    }, Closed=True)
+    if not Semantic["ProblemFingerprint"]:
+        raise ValueError("raw assignment problem identity is empty")
+    _DiagnosticStrings(Semantic["FirstConflictSignals"])
+    for Name in ("SelectedObjective", "FirstConflictResourceIndices"):
+        if any(type(Item) is not int for Item in Semantic[Name]):
+            raise ValueError(f"raw assignment {Name} requires exact integers")
+    CandidateIds = []
+    for Source in Record["SourceIdentities"]:
+        _DiagnosticFields(Source, {
+            "CandidateId": (str,), "CandidateInputFingerprint": (str,),
+        }, Closed=True)
+        if not Source["CandidateId"] or not Source["CandidateInputFingerprint"]:
+            raise ValueError("raw assignment candidate identity is empty")
+        CandidateIds.append(Source["CandidateId"])
+    if CandidateIds != sorted(set(CandidateIds)):
+        raise ValueError("raw assignment candidate identities are repeated or unordered")
+    _DiagnosticFields(Record["WorkIdentity"], {
+        "WorkControlsFingerprint": (str,), "ExpansionCount": (int,),
+    }, Closed=True)
+    _DiagnosticCounts(Record["WorkIdentity"], ("ExpansionCount",))
+    CountNames = (
+        "PortfolioTemplateCount", "MaterializedTemplateCount", "AttemptCount",
+        "CandidatePreparationResultCount", "SkippedDominatedTemplateCount",
+        "UnattemptedTemplateCount",
+    )
+    _DiagnosticFields(Record["Counts"], {Name: (int,) for Name in CountNames}, Closed=True)
+    _DiagnosticCounts(Record["Counts"], CountNames)
+    _DiagnosticFields(Record["EvidenceCompleteness"], {Name: (bool,) for Name in (
+        "SemanticSelectionComplete", "OuterPortfolioComplete",
+        "FullInputManifestIncluded", "FullMaterializationDiagnosticsIncluded",
+        "UnattemptedDescriptorsDominated",
+    )}, Closed=True)
+    _DiagnosticStrings(Record["Omissions"])
+    if (
+        Record["EvidenceCompleteness"]["FullInputManifestIncluded"] is not False
+        or Record["EvidenceCompleteness"]["FullMaterializationDiagnosticsIncluded"] is not False
+        or Record["Omissions"] != [
+            "full-frozen-candidate-input-manifests", "full-materialization-diagnostics",
+            "raw-domain-values-and-claims",
+        ]
+    ):
+        raise ValueError("raw assignment evidence contradicts declared v1 omissions")
+
+
+def _ValidateNativeOutcome(Outcome: object) -> dict:
+    Record = _DiagnosticFields(Outcome, {
+        **{Name: (str,) for Name in (
+            "RequestIdentity", "Kind", "Reason", "SearchOutcome", "ClaimStrength",
+            "CommitEligibility", "OutcomePhase", "CleanupDisposition",
+        )},
+        **{Name: (bool,) for Name in (
+            "Started", "Settled", "CancellationRequested",
+            "CancellationAcknowledged", "SearchStopped",
+        )},
+        "DeadlineAtMonotonicSeconds": (int, float),
+        "Identity": (dict,), "Availability": (dict,),
+        **{Name: (int,) for Name in (
+            "NativeOrdinal", "ExpansionCap", "ActualExpansionCount",
+            "RouteExpansionCount", "ProofExpansionCount",
+        )},
+    }, Closed=True)
+    _DiagnosticCounts(Record, (
+        "NativeOrdinal", "ExpansionCap", "ActualExpansionCount",
+        "RouteExpansionCount", "ProofExpansionCount",
+    ))
+    _DiagnosticDeadline(Record["DeadlineAtMonotonicSeconds"])
+    if (
+        not Record["RequestIdentity"] or not Record["Reason"]
+        or Record["CommitEligibility"] != "Ineligible"
+        or Record["SearchOutcome"] not in ("Prepared", "Infeasible", "Unresolved")
+        or Record["ClaimStrength"] not in (
+            "Candidate", "Feasible", "Complete", "Optimal", "InfeasibilityProof", "Continuation",
+        )
+        or Record["Kind"] not in (
+            "Routed", "CompleteScopedNoPath", "SearchLimitIncomplete",
+            "DeadlineIncomplete", "CancellationIncomplete", "NativeFailure",
+        )
+        or Record["ActualExpansionCount"] > Record["ExpansionCap"]
+    ):
+        raise ValueError("native outcome has invalid identity, kind, authority or work")
+    Identity = _DiagnosticFields(Record["Identity"], {
+        "BatchIdentity": (str,),
+        **{Name: (str,) for Name in (
+            "ContextGraphIdentity", "CallerSourceIdentity", "ImmutableInputIdentity",
+            "NativePayloadIdentity",
+        )},
+        "RouteDomainIdentity": (str, type(None)),
+        "ReceiptIdentity": (str, type(None)),
+    }, Closed=True)
+    if any(Value == "" for Value in Identity.values()):
+        raise ValueError("native outcome identity is an empty recorded string")
+    Availability = _DiagnosticFields(Record["Availability"], {
+        **{Name: (str,) for Name in (
+            "ContextGraph", "RouteDomain", "ImmutableInput", "Receipt", "CallerEcho",
+        )},
+        "ReceiptDependency": (str, type(None)),
+    }, Closed=True)
+    for Axis, IdentityName in (
+        ("ContextGraph", "ContextGraphIdentity"),
+        ("RouteDomain", "RouteDomainIdentity"),
+        ("ImmutableInput", "ImmutableInputIdentity"),
+        ("Receipt", "ReceiptIdentity"),
+        ("CallerEcho", "CallerSourceIdentity"),
+    ):
+        if (Availability[Axis] == "Verified") != (Identity[IdentityName] is not None):
+            raise ValueError("native availability contradicts its recorded identity")
+    return Record
+
+
+def _ValidateNativeBatch(Batch: object) -> tuple[int, int]:
+    Record = _DiagnosticFields(Batch, {
+        "SchemaVersion": (str,), "ExecutionScope": (dict, type(None)),
+        "PreNativeReason": (str, type(None)),
+        "ContextValidation": (dict, type(None)), "Counters": (dict,),
+        "Origins": (list,), "Admissions": (list,), "NativeOutcomes": (list,),
+        "InvocationSequence": (int,),
+    }, Closed=True)
+    if Record["SchemaVersion"] != "joint-typed-native-route-consumer-v3":
+        raise ValueError("native preparation batch schema is unsupported")
+    _DiagnosticCounts(Record, ("InvocationSequence",))
+    _DiagnosticFields(Record["Counters"], {"SchemaVersion": (str,)})
+    if Record["Counters"]["SchemaVersion"] != "joint-typed-route-batch-counters-v2":
+        raise ValueError("native preparation counter schema is unsupported")
+    CounterNames = (
+        "Configured", "Materialized", "Filtered", "CanonicalExecuted",
+        "EquivalentReused", "Routed", "CompleteScopedNoPath", "SearchLimitIncomplete",
+        "DeadlineIncomplete", "CancellationIncomplete", "NativeFailure",
+        "PreNativeIncomplete", "CandidateProduced", "PhysicallyAccepted",
+        "PhysicallyRejected",
+    )
+    _DiagnosticFields(Record["Counters"], {
+        "SchemaVersion": (str,), **{Name: (int,) for Name in CounterNames},
+    }, Closed=True)
+    _DiagnosticCounts(Record["Counters"], CounterNames)
+    Scope = Record["ExecutionScope"]
+    if Scope is not None:
+        _DiagnosticFields(Scope, {
+            "SchemaVersion": (str,), "InvocationIdentity": (str,),
+            "DeadlineAtMonotonicSeconds": (int, float),
+            "Context": (dict,), "CallerSnapshot": (dict,),
+        }, Closed=True)
+        if Scope["SchemaVersion"] != "joint-typed-route-execution-scope-v1":
+            raise ValueError("native preparation execution scope is unsupported")
+        _DiagnosticDeadline(Scope["DeadlineAtMonotonicSeconds"])
+        _DiagnosticFields(Scope["Context"], {
+            "SchemaVersion": (str,), "Bounds": (list,), "PlacementBounds": (list,),
+            "ContextGraphIdentity": (str,), "NodeIdentity": (str,), "EdgeIdentity": (str,),
+        }, Closed=True)
+        _DiagnosticFields(Scope["CallerSnapshot"], {
+            "SchemaVersion": (str,), "Bindings": (list,),
+        }, Closed=True)
+        if (
+            Scope["Context"]["SchemaVersion"] != "joint-typed-route-context-v2"
+            or Scope["CallerSnapshot"]["SchemaVersion"] != "joint-typed-route-caller-snapshot-v1"
+        ):
+            raise ValueError("native execution scope contains an unsupported recorded scope")
+    Outcomes = [_ValidateNativeOutcome(Value) for Value in Record["NativeOutcomes"]]
+    if [Value["NativeOrdinal"] for Value in Outcomes] != list(range(len(Outcomes))):
+        raise ValueError("native outcomes are not in original ordinal order")
+    if Outcomes and (Scope is None or Record["PreNativeReason"] is not None):
+        raise ValueError("native outcomes lack execution scope or claim a pre-native stop")
+    if Scope is not None and any(
+        Value["DeadlineAtMonotonicSeconds"] != Scope["DeadlineAtMonotonicSeconds"]
+        for Value in Outcomes
+    ):
+        raise ValueError("native outcome cutoff mismatches its batch scope")
+    OriginsByIdentity = {}
+    for Index, Origin in enumerate(Record["Origins"]):
+        _DiagnosticFields(Origin, {
+            "OriginIdentity": (str,), "CanonicalOriginIdentity": (str,),
+            "OriginalOrdinal": (int,), "CanonicalOriginalOrdinal": (int,),
+            "NativeOrdinal": (int, type(None)), "NativeKind": (str,),
+            "CanonicalRequestId": (str, type(None)),
+            "CanonicalReceiptIdentity": (str, type(None)),
+            "NativePayloadIdentity": (str, type(None)),
+            "RouteDomainIdentity": (str, type(None)),
+            "CancellationRequestedBeforeStart": (bool,),
+            "DeadlineAtMonotonicSeconds": (int, float, type(None)),
+            "SchemaVersion": (str,), "OriginDescriptor": (dict,),
+            "OriginDescriptorIdentity": (str,), "ImmutableFragmentIdentity": (str,),
+            "ExecutionScopeIdentity": (str, type(None)), "GeometryIdentity": (str,),
+            "PreNativeReason": (str, type(None)),
+            "ExpansionCap": (int,), "ActualExpansionCount": (int,),
+            "CanonicalExecuted": (bool,), "EquivalentReused": (bool,),
+        }, Closed=True)
+        if Origin["SchemaVersion"] != "joint-typed-route-origin-equivalence-v2":
+            raise ValueError("native origin schema is unsupported")
+        # Preserve opaque canonical portal/seed fragments within the public v3
+        # origin descriptor; no native request or claim codec is reconstructed.
+        JsonTypes = (dict, list, str, int, float, bool, type(None))
+        _DiagnosticFields(Origin["OriginDescriptor"], {
+            "SchemaVersion": (str,), "Signal": (str,), "SourcePortal": JsonTypes,
+            "TargetPortals": (list,), "Guide": (list,), "Layer": (int,),
+            "Axis": (str,), "Lane": (int,), "Variant": (int,),
+            "ImmutableFragments": JsonTypes, "ImmutableFragmentIdentity": (str,),
+        }, Closed=True)
+        if Origin["OriginDescriptor"]["SchemaVersion"] != "joint-typed-route-origin-descriptor-v1":
+            raise ValueError("native origin descriptor schema is unsupported")
+        _DiagnosticCounts(Origin, ("ExpansionCap", "ActualExpansionCount"))
+        if Origin["DeadlineAtMonotonicSeconds"] is not None:
+            _DiagnosticDeadline(Origin["DeadlineAtMonotonicSeconds"])
+        if (
+            Origin["OriginalOrdinal"] != Index
+            or not 0 <= Origin["CanonicalOriginalOrdinal"] <= Index
+            or any(Origin[Name] == "" for Name in (
+                "OriginIdentity", "CanonicalOriginIdentity", "CanonicalRequestId",
+                "CanonicalReceiptIdentity", "ExecutionScopeIdentity", "GeometryIdentity",
+                "NativePayloadIdentity", "RouteDomainIdentity", "OriginDescriptorIdentity",
+                "ImmutableFragmentIdentity",
+            ))
+            or Origin["OriginIdentity"] in OriginsByIdentity
+        ):
+            raise ValueError("native origin identity or ordinal association is invalid")
+        Canonical = Record["Origins"][Origin["CanonicalOriginalOrdinal"]]
+        if Origin["CanonicalOriginIdentity"] != Canonical["OriginIdentity"]:
+            raise ValueError("equivalent origin does not name its canonical representative")
+        Ordinal = Origin["NativeOrdinal"]
+        if (
+            Origin["CanonicalExecuted"] != (Ordinal is not None)
+            or Origin["EquivalentReused"] != (Origin["CanonicalOriginalOrdinal"] != Index)
+        ):
+            raise ValueError("native origin execution flags contradict its ordinal association")
+        if Origin["CanonicalOriginalOrdinal"] != Index:
+            if Ordinal is not None:
+                raise ValueError("equivalent origin copies a native ordinal")
+            Ordinal = Canonical["NativeOrdinal"]
+        if Ordinal is not None:
+            if not 0 <= Ordinal < len(Outcomes):
+                raise ValueError("native origin references an absent outcome")
+            Outcome = Outcomes[Ordinal]
+            Identity = Outcome["Identity"]
+            if any((
+                Origin["CanonicalRequestId"] != Outcome["RequestIdentity"],
+                Origin["NativeKind"] != Outcome["Kind"],
+                Origin["CanonicalReceiptIdentity"] != Identity["ReceiptIdentity"],
+                Origin["NativePayloadIdentity"] != Identity["NativePayloadIdentity"],
+                Origin["RouteDomainIdentity"] != Identity["RouteDomainIdentity"],
+                Origin["ExpansionCap"] != Outcome["ExpansionCap"],
+                Origin["ActualExpansionCount"] != Outcome["ActualExpansionCount"],
+                Origin["DeadlineAtMonotonicSeconds"] != Outcome["DeadlineAtMonotonicSeconds"],
+            )):
+                raise ValueError("native origin and its ordinal outcome disagree")
+        elif Origin["NativeKind"] != "PreNativeIncomplete":
+            raise ValueError("executed origin has no canonical native outcome")
+        OriginsByIdentity[Origin["OriginIdentity"]] = Origin
+    CanonicalOrdinals = [Value["NativeOrdinal"] for Value in Record["Origins"]
+                         if Value["NativeOrdinal"] is not None]
+    if sorted(CanonicalOrdinals) != list(range(len(Outcomes))):
+        raise ValueError("native outcomes and canonical origins do not correspond")
+    Counters = Record["Counters"]
+    TerminalKinds = (
+        "Routed", "CompleteScopedNoPath", "SearchLimitIncomplete", "DeadlineIncomplete",
+        "CancellationIncomplete", "NativeFailure", "PreNativeIncomplete",
+    )
+    if (
+        Counters["Configured"] != Counters["Materialized"] + Counters["Filtered"]
+        or Counters["Materialized"] != len(Record["Origins"])
+        or Counters["CanonicalExecuted"] != len(Outcomes)
+        or Counters["EquivalentReused"] != sum(
+            Origin["EquivalentReused"] for Origin in Record["Origins"]
+        )
+        or Counters["CanonicalExecuted"] + Counters["EquivalentReused"]
+        + Counters["PreNativeIncomplete"] != Counters["Materialized"]
+        or sum(Counters[Name] for Name in TerminalKinds) != Counters["Materialized"]
+        or any(Counters[Kind] != sum(
+            Origin["NativeKind"] == Kind for Origin in Record["Origins"]
+        ) for Kind in TerminalKinds)
+    ):
+        raise ValueError("native batch counters disagree with materialized origins or outcomes")
+    AdmittedOrigins = set()
+    for Admission in Record["Admissions"]:
+        _DiagnosticFields(Admission, {
+            "OriginIdentity": (str,), "NativeKind": (str,),
+            "Admitted": (bool, type(None)),
+            "PhysicalEvidence": (dict, type(None)),
+            "RecoveryAttribution": (dict, type(None)),
+            "SchemaVersion": (str,), "PhysicalEvidenceIdentity": (str, type(None)),
+            "RecoveryAttributionIdentity": (str, type(None)),
+        }, Closed=True)
+        if Admission["SchemaVersion"] != "joint-typed-route-admission-v2":
+            raise ValueError("native admission schema is unsupported")
+        Origin = OriginsByIdentity.get(Admission["OriginIdentity"])
+        if (
+            Origin is None or Admission["NativeKind"] != Origin["NativeKind"]
+            or Admission["OriginIdentity"] in AdmittedOrigins
+        ):
+            raise ValueError("native admission does not match a recorded origin")
+        AdmittedOrigins.add(Admission["OriginIdentity"])
+        if Admission["NativeKind"] != "Routed" and (
+            Admission["Admitted"] is not None or Admission["PhysicalEvidence"] is not None
+            or Admission["RecoveryAttribution"] is not None
+            or Admission["PhysicalEvidenceIdentity"] is not None
+            or Admission["RecoveryAttributionIdentity"] is not None
+        ):
+            raise ValueError("non-routed native origin claims physical admission")
+    if not Outcomes:
+        if (
+            Scope is not None or Record["ContextValidation"] is not None
+            or not Record["PreNativeReason"]
+        ):
+            raise ValueError("pre-native batch requires null scope and a recorded reason")
+        Counters = Record["Counters"]
+        if (
+            Counters["Materialized"] != len(Record["Origins"])
+            or Counters["Configured"] != Counters["Materialized"] + Counters["Filtered"]
+            or any(Counters[Name] != 0 for Name in (
+                "CanonicalExecuted", "EquivalentReused", "Routed", "CompleteScopedNoPath",
+                "SearchLimitIncomplete", "DeadlineIncomplete", "CancellationIncomplete",
+                "NativeFailure", "CandidateProduced", "PhysicallyAccepted", "PhysicallyRejected",
+            )) or Counters["PreNativeIncomplete"] != len(Record["Origins"])
+        ):
+            raise ValueError("pre-native batch claims native or admission work")
+        if AdmittedOrigins != set(OriginsByIdentity):
+            raise ValueError("pre-native batch loses an observed origin admission")
+        for Origin in Record["Origins"]:
+            if (
+                any(Origin[Name] is not None for Name in (
+                    "NativeOrdinal", "CanonicalRequestId", "CanonicalReceiptIdentity",
+                    "ExecutionScopeIdentity", "NativePayloadIdentity", "RouteDomainIdentity",
+                    "DeadlineAtMonotonicSeconds",
+                ))
+                or Origin["CanonicalOriginalOrdinal"] != Origin["OriginalOrdinal"]
+                or Origin["CanonicalOriginIdentity"] != Origin["OriginIdentity"]
+                or Origin["NativeKind"] != "PreNativeIncomplete"
+                or Origin["PreNativeReason"] != Record["PreNativeReason"]
+                or Origin["ActualExpansionCount"] != 0
+                or Origin["CancellationRequestedBeforeStart"] is not False
+                or Origin["CanonicalExecuted"] is not False
+                or Origin["EquivalentReused"] is not False
+            ):
+                raise ValueError("pre-native origin claims execution or loses its recorded reason")
+    return len(Record["Origins"]), len(Outcomes)
+
+
+def _ValidateNativePreparationObservation(Record: dict) -> None:
+    _DiagnosticFields(Record, {
+        "SchemaVersion": (str,),
+        "ObservationState": (str,), "UnavailableReason": (str, type(None)),
+        "CandidateObservations": (list,), "Omissions": (list,),
+    }, Closed=True)
+    if Record["ObservationState"] not in (
+        "Observed", "NoNativeSubmissionObserved", "Unavailable",
+    ):
+        raise ValueError("native preparation observation state is unsupported")
+    if Record["ObservationState"] == "Unavailable" and not Record["UnavailableReason"]:
+        raise ValueError("unavailable native preparation has no recorded reason")
+    _DiagnosticStrings(Record["Omissions"])
+    if Record["Omissions"] != [
+        "raw-native-canonical-input-bytes", "full-raw-domain-values-and-claims",
+        "full-frozen-candidate-input-manifests",
+    ]:
+        raise ValueError("native preparation omissions do not match declared v1 coverage")
+    TotalBatches = 0
+    for Candidate in Record["CandidateObservations"]:
+        _DiagnosticFields(Candidate, {
+            "CandidateId": (str,), "CandidateInputFingerprint": (str, type(None)),
+            "Scope": (dict,), "Coverage": (dict,), "Batches": (list,),
+        }, Closed=True)
+        if not Candidate["CandidateId"] or Candidate["CandidateInputFingerprint"] == "":
+            raise ValueError("native preparation candidate identity is empty")
+        _DiagnosticFields(Candidate["Scope"], {Name: (str,) for Name in (
+            "PlacementFingerprint", "ResourceGraphFingerprint", "PortalDomainFingerprint",
+            "CandidateDomainFingerprint", "LocalClaimDomainFingerprint",
+            "PinAccessDomainFingerprint", "PinAccessWitnessFingerprint",
+        )}, Closed=True)
+        Coverage = _DiagnosticFields(Candidate["Coverage"], {
+            "PreparationObservationComplete": (bool,),
+            "SemanticDomainComplete": (bool, type(None)),
+            "OuterPortfolioComplete": (bool, type(None)),
+            **{Name: (int,) for Name in (
+                "NativeBatchCount", "NativeOriginCount", "CanonicalOutcomeCount",
+            )},
+        }, Closed=True)
+        _DiagnosticCounts(Coverage, (
+            "NativeBatchCount", "NativeOriginCount", "CanonicalOutcomeCount",
+        ))
+        Counts = [_ValidateNativeBatch(Value) for Value in Candidate["Batches"]]
+        if (
+            Coverage["NativeBatchCount"] != len(Counts)
+            or Coverage["NativeOriginCount"] != sum(Value[0] for Value in Counts)
+            or Coverage["CanonicalOutcomeCount"] != sum(Value[1] for Value in Counts)
+        ):
+            raise ValueError("native preparation coverage counts disagree with retained records")
+        TotalBatches += len(Candidate["Batches"])
+    if Record["ObservationState"] == "NoNativeSubmissionObserved" and TotalBatches:
+        raise ValueError("no-submission observation contains recorded batches")
+
+
+def _ProjectFailureDiagnostic(Value: object, Schema: str, Validator) -> dict[str, object]:
+    """Project supplied diagnostics; availability never grants result authority."""
+    Result = {"Status": "Unavailable", "EvidenceCoverage": "Unavailable",
+              "Reason": "diagnostic not retained", "Record": None}
+    try:
+        if Value is None:
+            return Result
+        if type(Value) is not dict:
+            raise ValueError("diagnostic is not an object")
+        if type(Value.get("SchemaVersion")) is not str:
+            raise ValueError("diagnostic schema is missing or malformed")
+        if Value["SchemaVersion"] != Schema:
+            return {**Result, "Reason": "unsupported diagnostic schema"}
+        Validator(Value)
+        Retained = deepcopy(Value)
+        if (
+            Schema == "native-preparation-evidence-v1"
+            and Value["ObservationState"] == "Unavailable"
+        ):
+            return {**Result, "Reason": Value["UnavailableReason"], "Record": Retained}
+        return {"Status": "Available", "EvidenceCoverage": "Partial",
+                "Reason": None, "Record": Retained}
+    except Exception as Error:
+        # These are optional diagnostics inside an already authenticated failure.
+        # Projection/copy errors must never erase that failure or its verdict.
+        return {**Result, "Status": "Malformed", "Reason": str(Error)}
+
+
+def _ProjectPreparationDiagnostics(Failure: dict) -> dict[str, object]:
+    """Contain optional projection errors after the outer failure is verified."""
+    try:
+        Diagnostics = Failure.get("Diagnostics")
+        if Diagnostics is not None and type(Diagnostics) is not dict:
+            raise ValueError("failure diagnostic container is not an object")
+        Diagnostics = Diagnostics if Diagnostics is not None else {}
+        RawObservation = _ProjectFailureDiagnostic(
+            Diagnostics.get("RawTrackAssignmentFailureEnvelope"),
+            "raw-track-assignment-failure-envelope-v1", _ValidateRawAssignmentObservation,
+        )
+        NativeObservation = _ProjectFailureDiagnostic(
+            Diagnostics.get("NativePreparationEvidence"),
+            "native-preparation-evidence-v1", _ValidateNativePreparationObservation,
+        )
+        if RawObservation["Status"] == NativeObservation["Status"] == "Available":
+            RecordedInputs = {
+                Source["CandidateId"]: Source["CandidateInputFingerprint"]
+                for Source in RawObservation["Record"]["SourceIdentities"]
+            }
+            if any(
+                Candidate["CandidateInputFingerprint"] is not None
+                and Candidate["CandidateId"] in RecordedInputs
+                and Candidate["CandidateInputFingerprint"] != RecordedInputs[Candidate["CandidateId"]]
+                for Candidate in NativeObservation["Record"]["CandidateObservations"]
+            ):
+                NativeObservation = {
+                    "Status": "Malformed", "EvidenceCoverage": "Unavailable",
+                    "Reason": "native preparation candidate input disagrees with raw assignment observation",
+                    "Record": None,
+                }
+        return {
+            "RawTrackAssignmentFailureEnvelope": RawObservation,
+            "NativePreparationEvidence": NativeObservation,
+        }
+    except Exception as Error:
+        return {
+            Name: {"Status": "Malformed", "EvidenceCoverage": "Unavailable",
+                   "Reason": str(Error), "Record": None}
+            for Name in ("RawTrackAssignmentFailureEnvelope", "NativePreparationEvidence")
+        }
+
+
 def ReadRunFailureArtifact(
     Run: dict[str, object],
     *,
@@ -1093,6 +1603,7 @@ def ReadRunFailureArtifact(
         ReportEvidence = {"Status": "Rejected", "Reason": "unlisted or duplicate report members in run"}
     return {
         "RoutingFailureReport": ReportEvidence,
+        **_ProjectPreparationDiagnostics(Failure),
         "Resolution": deepcopy(Resolution),
         "Artifact": FailureRecord,
         "Stage": Failure.get("Stage"),

@@ -962,6 +962,7 @@ class AuthoritativeRoutingState:
     TypedNativeRouteAdmissionByOriginIdentity: Any = None
     TypedNativeRouteBatchByOriginIdentity: Any = None
     TypedNativeRouteBatches: Any = None
+    NativePreparationOutcomesByInvocationSequence: Any = None
     TypedNativeRouteRequestOriginDescriptorsById: Any = None
     TypedNativeCurrentContext: Any = None
     TypedNativeCurrentContextScope: Any = None

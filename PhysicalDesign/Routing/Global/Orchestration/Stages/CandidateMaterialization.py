@@ -1,5 +1,7 @@
 """CandidateMaterialization phase of authoritative routing."""
 from __future__ import annotations
+from dataclasses import replace
+from PhysicalDesign.Routing.Global.NativePreparationEvidence import CaptureNativePreparationObservation
 from PhysicalDesign.Routing.Global.TypedRouteConsumer import (
     BuildTypedRouteOriginDescriptor,
     CanonicalAuthority,
@@ -39,9 +41,16 @@ def RunCandidateMaterialization(State: AuthoritativeRoutingState, Services: Auth
     """
     try:
         Outcome = _RunCandidateMaterialization(State, Services)
-    except Exception:
+    except Exception as Error:
         ValidateTypedRouteMaterializationPublication(State, Services)
         PublishTypedPhysicalAdmissions(State)
+        if isinstance(Error, Services.TrackAssignmentPrepared):
+            Error.Preparation = replace(
+                Error.Preparation,
+                Diagnostics=(*Error.Preparation.Diagnostics, (
+                    "NativePreparationObservation", CaptureNativePreparationObservation(State),
+                )),
+            )
         raise
     ValidateTypedRouteMaterializationPublication(State, Services)
     PublishTypedPhysicalAdmissions(State)

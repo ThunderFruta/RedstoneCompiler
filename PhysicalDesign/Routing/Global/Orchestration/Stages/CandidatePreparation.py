@@ -1,6 +1,7 @@
 """CandidatePreparation phase of authoritative routing."""
 from __future__ import annotations
 from PhysicalDesign.Runtime import ExecuteNativeRouteBatchOutcomesV1, NativeRouteResultKind
+from PhysicalDesign.Routing.Global.NativePreparationEvidence import ObserveNativePreparationOutcomes
 from PhysicalDesign.Routing.Global.TypedRouteConsumer import (
     AuthorityIdentity,
     BuildDisabledSelectedAccessAuthority,
@@ -105,6 +106,7 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
     State.TypedNativeRouteAdmissionByOriginIdentity = {}
     State.TypedNativeRouteRequestOriginDescriptorsById = {}
     State.TypedNativeRouteBatches = []
+    State.NativePreparationOutcomesByInvocationSequence = {}
     State.TypedNativeRouteBatchByOriginIdentity = {}
     State.TypedNativeCurrentContext = None
     State.TypedNativeCurrentContextScope = None
@@ -411,6 +413,9 @@ def RunCandidatePreparation(State: AuthoritativeRoutingState, Services: Authorit
                             tuple(TypedRequests),
                             DeadlineAt,
                             Detailed=False,
+                        )
+                        State.NativePreparationOutcomesByInvocationSequence[InvocationSequence] = (
+                            ObserveNativePreparationOutcomes(Typed.Results)
                         )
                         if len(Typed.Results) != len(TypedRequests):
                             raise ValueError(
