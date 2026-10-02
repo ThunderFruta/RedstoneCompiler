@@ -632,8 +632,11 @@ class RoutingResourceGraph:
             for Second in self.Technology.NeighborPositions(First):
                 if Second not in Nodes:
                     continue
+                Edge = NormalizeRoutingEdge(First, Second)
+                if Edge in Edges:
+                    continue
                 if self.CanBuildNeighborPrimitive(First, Second):
-                    Edges.add(NormalizeRoutingEdge(First, Second))
+                    Edges.add(Edge)
         Region = RoutingGraphRegion(Bounds, frozenset(Nodes), frozenset(Edges))
         if WorkCheck is not None:
             WorkCheck({
