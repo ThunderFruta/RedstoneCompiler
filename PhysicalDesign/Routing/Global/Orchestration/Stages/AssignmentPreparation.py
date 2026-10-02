@@ -1,5 +1,6 @@
 """AssignmentPreparation phase of authoritative routing."""
 from __future__ import annotations
+from PhysicalDesign.Routing.Global.NativePreparationEvidence import CaptureNativePreparationObservation
 from ..RunState import AuthoritativeRoutingServices, AuthoritativeRoutingState, PhaseOutcome
 
 def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: AuthoritativeRoutingServices) -> PhaseOutcome:
@@ -461,6 +462,9 @@ def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: Authori
         IncompleteSignals = tuple(sorted({*(Signal for Signal, _Reason in IncompleteReasons), *IncompleteDeferredSignals, *IncompletePhysicalPreSiblingSignals}))
         RawDomainComplete = bool(not State.RouteTreeNativeDeadlineExceeded and (not State.Deadline.IsExpired()) and (not IncompleteSignals))
         RawDomainIncompleteReason = '' if RawDomainComplete else 'candidate-domain-incomplete'
+        RawPlacementFingerprint = Services.BuildRawPortalPlacementGeometryFingerprint(State.Placed)
+        RawResourceFingerprint = Services.BuildRawPortalResourceGeometryFingerprint(State.Resources)
+        RawPortalFingerprint = Services.BuildRawTrackAssignmentPortalDomainFingerprint(State.Portals, State.BoundaryLeaseReservations)
         raise Services.RawTrackAssignmentDomainPrepared(
             Services.BuildRawTrackAssignmentDomain(
                 Signals=tuple(sorted(State.Profiles)),
@@ -474,22 +478,9 @@ def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: Authori
                 LocalClaimDomainFingerprint=(
                     State.PreRouteLocalClaimDomainFingerprint
                 ),
-                PlacementFingerprint=(
-                    Services.BuildRawPortalPlacementGeometryFingerprint(
-                        State.Placed
-                    )
-                ),
-                ResourceGraphFingerprint=(
-                    Services.BuildRawPortalResourceGeometryFingerprint(
-                        State.Resources
-                    )
-                ),
-                PortalDomainFingerprint=(
-                    Services.BuildRawTrackAssignmentPortalDomainFingerprint(
-                        State.Portals,
-                        State.BoundaryLeaseReservations,
-                    )
-                ),
+                PlacementFingerprint=RawPlacementFingerprint,
+                ResourceGraphFingerprint=RawResourceFingerprint,
+                PortalDomainFingerprint=RawPortalFingerprint,
                 Complete=RawDomainComplete,
                 IncompleteReason=RawDomainIncompleteReason,
                 PinAccessDomainFingerprint=str(getattr(
@@ -508,6 +499,12 @@ def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: Authori
                     State.Policy.TrackAssignment.MinimizeMaximumRoutingLayer
                 ),
                 Diagnostics=(
+                    ('NativePreparationObservation', CaptureNativePreparationObservation(State, Scope={
+                        'PlacementFingerprint': RawPlacementFingerprint,
+                        'ResourceGraphFingerprint': RawResourceFingerprint,
+                        'PortalDomainFingerprint': RawPortalFingerprint,
+                        'CandidateDomainFingerprint': CandidateDomainFingerprint,
+                    })),
                     ('CandidateRequestCount', State.CandidateRequestCount),
                     (
                         'RouteTreeNativeDeadlineExceeded',
@@ -630,5 +627,5 @@ def RunAssignmentPreparation(State: AuthoritativeRoutingState, Services: Authori
     if State.PrepareTrackAssignmentOnly:
         SelectedLocalClaimChoiceIds = tuple(sorted(((str(Signal), str(CandidateId)) for Signal, CandidateId in State.Result.SelectedCandidateIds if str(CandidateId) in State.PreRouteLocalClaimChoiceById)))
         SelectedCapacityResourceIds = tuple(sorted({str(ResourceId) for Signal, CandidateId in State.Result.SelectedCandidateIds for ResourceId in (State.PreRouteLocalClaimChoiceById[str(CandidateId)].Claim.Claims.ResourceIds if str(CandidateId) in State.PreRouteLocalClaimChoiceById else State.CandidateLookup[str(CandidateId)].Claims.ResourceIds if str(CandidateId) in State.CandidateLookup else ())}))
-        raise Services.TrackAssignmentPrepared(Services.TrackAssignmentPreparation(Success=bool(State.Result.Success), SelectedCandidateIds=tuple(sorted(((str(Signal), str(CandidateId)) for Signal, CandidateId in State.Result.SelectedCandidateIds if str(CandidateId) not in State.PreRouteLocalClaimChoiceById))), CandidateCounts=tuple(sorted(((str(Signal), len(Candidates) + len(State.PreRouteLocalClaimChoicesBySignal.get(str(Signal), ()))) for Signal, Candidates in State.CandidatesBySignal.items()))), ConflictSignals=tuple(sorted(map(str, getattr(State.Result, 'ConflictSignals', ())))), ConflictResourceIndices=tuple(sorted(map(int, getattr(State.Result, 'ConflictResourceIndices', ())))), ExpansionCount=int(State.Result.ExpansionCount), Complete=not bool(getattr(State.Result, 'BudgetExhausted', False) or getattr(State.Result, 'DeadlineExceeded', False)), Diagnostics=(('PlacementPinAccessWitnessFingerprint', State.PlacementPinAccessWitness.WitnessFingerprint), ('PlacementPinAccessWitnessAccessLength', State.PlacementPinAccessWitness.AccessLength), ('FailureNet', str(getattr(State.Result, 'FailureNet', '') or '')), ('PairwiseIncompatibleSignals', tuple(tuple(map(str, Value)) for Value in getattr(State.Result, 'PairwiseIncompatibleSignals', ())))), SelectedLocalClaimChoiceIds=SelectedLocalClaimChoiceIds, LocalClaimDomainFingerprint=State.PreRouteLocalClaimDomainFingerprint, CandidateDomainFingerprint=CandidateDomainFingerprint, SelectedCapacityResourceIds=SelectedCapacityResourceIds, PinAccessHandoffObservation=(Services.PlacementPinAccessStageObservation.FromWitness('RawAssignment', State.PlacementPinAccessWitness, State.Policy.PolicyVersion) if State.Policy.PlacementAccess.Enabled else None), PinAccessDomainFingerprint=str(getattr(State.PlacementPinAccessWitness, 'DomainFingerprint', '')) if State.Policy.PlacementAccess.Enabled else '', PinAccessWitnessFingerprint=State.PlacementPinAccessWitness.WitnessFingerprint if State.Policy.PlacementAccess.Enabled else ''))
+        raise Services.TrackAssignmentPrepared(Services.TrackAssignmentPreparation(Success=bool(State.Result.Success), SelectedCandidateIds=tuple(sorted(((str(Signal), str(CandidateId)) for Signal, CandidateId in State.Result.SelectedCandidateIds if str(CandidateId) not in State.PreRouteLocalClaimChoiceById))), CandidateCounts=tuple(sorted(((str(Signal), len(Candidates) + len(State.PreRouteLocalClaimChoicesBySignal.get(str(Signal), ()))) for Signal, Candidates in State.CandidatesBySignal.items()))), ConflictSignals=tuple(sorted(map(str, getattr(State.Result, 'ConflictSignals', ())))), ConflictResourceIndices=tuple(sorted(map(int, getattr(State.Result, 'ConflictResourceIndices', ())))), ExpansionCount=int(State.Result.ExpansionCount), Complete=not bool(getattr(State.Result, 'BudgetExhausted', False) or getattr(State.Result, 'DeadlineExceeded', False)), Diagnostics=(('NativePreparationObservation', CaptureNativePreparationObservation(State, Scope={'CandidateDomainFingerprint': CandidateDomainFingerprint})), ('PlacementPinAccessWitnessFingerprint', State.PlacementPinAccessWitness.WitnessFingerprint), ('PlacementPinAccessWitnessAccessLength', State.PlacementPinAccessWitness.AccessLength), ('FailureNet', str(getattr(State.Result, 'FailureNet', '') or '')), ('PairwiseIncompatibleSignals', tuple(tuple(map(str, Value)) for Value in getattr(State.Result, 'PairwiseIncompatibleSignals', ())))), SelectedLocalClaimChoiceIds=SelectedLocalClaimChoiceIds, LocalClaimDomainFingerprint=State.PreRouteLocalClaimDomainFingerprint, CandidateDomainFingerprint=CandidateDomainFingerprint, SelectedCapacityResourceIds=SelectedCapacityResourceIds, PinAccessHandoffObservation=(Services.PlacementPinAccessStageObservation.FromWitness('RawAssignment', State.PlacementPinAccessWitness, State.Policy.PolicyVersion) if State.Policy.PlacementAccess.Enabled else None), PinAccessDomainFingerprint=str(getattr(State.PlacementPinAccessWitness, 'DomainFingerprint', '')) if State.Policy.PlacementAccess.Enabled else '', PinAccessWitnessFingerprint=State.PlacementPinAccessWitness.WitnessFingerprint if State.Policy.PlacementAccess.Enabled else ''))
     return PhaseOutcome()

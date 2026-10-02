@@ -1,6 +1,11 @@
 """Initialization, candidate generation, and pre-route setup phases."""
 
 from __future__ import annotations
+from dataclasses import replace
+from .NativePreparationEvidence import (
+    ProjectCoordinatorNativePreparationEvidence,
+    RetainCandidateNativePreparationEvidence,
+)
 
 from typing import Any
 from PhysicalDesign.Contracts.Placement import ClusterInterfaceAssignment
@@ -54,6 +59,7 @@ def InitializePlacementFlow(Context):
     Context.LastPlacementAccessUnsatisfiableFailure: RoutingFailure | None = None
     Context.PlacementAccessDomainsByProblemFingerprint: dict[str, tuple[Any, ...]] = {}
     Context.PlacementAccessSolveResultsByProblemFingerprint: dict[str, Any] = {}
+    Context.NativePreparationObservationsByCandidateId: dict[str, str] = {}
     Context.PlacementAccessSolveBindingsByPlacementFingerprint: dict[
         str, tuple[Any, ...]
     ] = {}
@@ -547,6 +553,20 @@ from .RoutingAttempts import (
 
 
 def PreparePlacementRouting(Context):
+    """Publish preparation observations while preserving the original failure."""
+    try:
+        return _PreparePlacementRouting(Context)
+    except RoutingStageError as Error:
+        raise RoutingStageError(replace(
+            Error.Failure,
+            Diagnostics={
+                **(Error.Failure.Diagnostics or {}),
+                "NativePreparationEvidence": ProjectCoordinatorNativePreparationEvidence(Context),
+            },
+        )) from Error
+
+
+def _PreparePlacementRouting(Context):
     Context.PreRouteTemplates: list[PreRouteInterfaceTemplate] = []
     Context.PreRouteObjectiveByCandidateId: dict[str, tuple[int, ...]] = {}
     if Context.SinglePackedComponent:
@@ -656,7 +676,18 @@ def PreparePlacementRouting(Context):
                         DeferClusterBoundaryLeaseUntilCapacityPrecheck=False,
                     )
                 except RoutingStageError as Error:
+                    RetainCandidateNativePreparationEvidence(
+                        Context, Context.SelectedPreRouteCandidate,
+                        (Error.Failure.Diagnostics or {}).get("NativePreparationObservation"),
+                        Resources=Context.SelectedCandidateResources,
+                    )
                     raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.ClusterInterfaceSolveIncomplete, Stage='SelectedPreRouteTrackPreparation', AffectedNets=Error.Failure.AffectedNets, Resources=Error.Failure.Resources, Detail='the selected fixed local-access contract could not build one complete authoritative portal/track domain', RepairActions=(), Diagnostics={'PreRouteInterfaceSelection': Context.PreRouteInterfaceResult.ToDictionary(), 'SelectedCandidate': Context.SelectedPreRouteCandidate.ToDictionary(), 'AuthoritativePreparationFailure': Error.Failure.ToDictionary(), 'PrePlacementTrackPreparations': Context.PrePlacementTrackPreparations, 'PlacementDomainComplete': False})) from Error
+                RetainCandidateNativePreparationEvidence(
+                    Context, Context.SelectedPreRouteCandidate,
+                    dict(Context.SelectedTrackPreparation.Diagnostics).get("NativePreparationObservation"),
+                    Preparation=Context.SelectedTrackPreparation,
+                    Resources=Context.SelectedCandidateResources,
+                )
     if (
         Context.SelectedTrackPreparation is not None
         and (
