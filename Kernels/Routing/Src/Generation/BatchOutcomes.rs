@@ -3803,7 +3803,7 @@ pub(crate) fn RegisterBatchOutcomeTypes(Module: &Bound<'_, PyModule>) -> PyResul
 #[cfg(test)]
 mod Tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     const A: Position = (0, 0, 0);
     const B: Position = (1, 0, 0);
@@ -4553,29 +4553,6 @@ mod Tests {
         assert_eq!(Receipt.ProofExpansionCount, 0);
         assert!(Receipt.Candidate.is_none());
         assert!(Receipt.NoPathProof.is_none());
-    }
-
-    #[test]
-    fn IndexedParallelCollectionPreservesSlotsAcrossPermutedCompletion() {
-        let CompletionOrder = Arc::new(Mutex::new(Vec::new()));
-        let Pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .expect("two-thread test pool builds");
-        let Results: Vec<_> = Pool.install(|| {
-            [0usize, 1usize]
-                .into_par_iter()
-                .map(|Ordinal| {
-                    if Ordinal == 0 {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    CompletionOrder.lock().unwrap().push(Ordinal);
-                    Ordinal
-                })
-                .collect()
-        });
-        assert_eq!(*CompletionOrder.lock().unwrap(), vec![1, 0]);
-        assert_eq!(Results, vec![0, 1]);
     }
 
     #[test]

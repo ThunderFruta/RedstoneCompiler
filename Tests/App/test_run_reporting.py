@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from App.RunReporting import CaptureTerminalOutput, FormatResultLines, PromoteRunArtifacts, WriteRunReport
 
 
@@ -50,31 +52,19 @@ class RunReportingTests(unittest.TestCase):
             Lines[1],
             "TIME: total wall=7.385s cpu=8.950s utilization=121.2%",
         )
-        self.assertEqual(
-            Lines[2],
-            "TIME: routing wall=2.500s cpu=4.000s utilization=160.0%",
-        )
-        self.assertEqual(
-            Lines[3],
-            "  authoritative resource graph: wall=0.750s cpu=1.000s average_cores=1.33",
-        )
-        self.assertEqual(
-            len([Line for Line in Lines if Line.startswith("TIME: routing")]),
-            1,
-        )
-        self.assertEqual(
-            Lines[4],
-            "TIME: validation wall=3.000s cpu=0.300s utilization=10.0%",
-        )
-        self.assertEqual(
-            Lines[5],
-            "CPU: user=8.000s system=0.500s child=0.450s "
-            "average_cores=1.21 logical_cpus=32 routing_limit=auto",
-        )
-        self.assertNotIn("os_peak", "\n".join(Lines))
-        self.assertNotIn("python_peak", "\n".join(Lines))
-        self.assertTrue(Lines[6].startswith("OUTPUT: "))
-        self.assertTrue(Lines[7].startswith("RAW REPORT: "))
+        self.assertTrue(Lines[2].startswith("PERF: "))
+        Text = "\n".join(Lines)
+        self.assertIn("average_cores=1.21", Lines[2])
+        self.assertIn("logical_cpus=32 routing_limit=auto", Lines[2])
+        self.assertIn("TIME: routing wall=2.500s cpu=4.000s", Text)
+        self.assertIn("TIME: validation wall=3.000s cpu=0.300s", Text)
+        self.assertIn("authoritative resource graph: wall=0.750s", Text)
+        self.assertEqual(sum(Line.startswith("TIME: routing") for Line in Lines), 1)
+        self.assertIn("X", next(Line for Line in Lines if Line.startswith("STAGES:")))
+        self.assertNotIn("os_peak", Text)
+        self.assertNotIn("python_peak", Text)
+        self.assertTrue(any(Line.startswith("OUTPUT: ") for Line in Lines))
+        self.assertTrue(any(Line.startswith("RAW REPORT: ") for Line in Lines))
 
     def testDetailedTelemetryIsSavedWithoutBeingPrinted(self) -> None:
         with tempfile.TemporaryDirectory() as DirectoryValue:
@@ -93,10 +83,10 @@ class RunReportingTests(unittest.TestCase):
                     TimingDetails=Timing, Details={"CpuTelemetry": Timing},
                 )
             Terminal = "\n".join(Report.ResultLines)
-            self.assertIn("TIME: routing wall=1.000s", Terminal)
-            self.assertIn("CPU: average_cores=1.50", Terminal)
-            self.assertIn("TIME: validation not-run", Terminal)
-            self.assertNotIn("expensive interface preparation", Terminal)
+            self.assertIn("routing wall=1.000s", Terminal)
+            self.assertIn("PERF: average_cores=1.50", Terminal)
+            self.assertIn("validation not-run", Terminal)
+            self.assertNotIn("expensive interface preparation: wall=", Terminal)
             self.assertNotIn("TELEMETRY:", Terminal)
             self.assertNotIn("SampleCount", Terminal)
             Saved = Report.SummaryPath.read_text()
@@ -193,3 +183,56 @@ class RunReportingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_terminal_contract_reports_metrics_then_marks_the_observed_failed_stage():
+    Lines = FormatResultLines(Result="FAILURE", WallSeconds=2.0, CpuSeconds=3.0,
+        Summary="typed route failure", RawReportPath=Path("/tmp/RawDump.txt"),
+        FailureType="route: SupportConflict", TimingDetails={"RoutingStages": [
+            {"Stage": "prepare"}, {"Stage": "assign"}, {"Stage": "route"}]})
+    assert [Line.split(":", 1)[0] for Line in Lines[:3]] == ["RESULT", "TIME", "PERF"]
+    assert "average_cores=1.50" in Lines[2]
+    Flow = next(Line for Line in Lines if Line.startswith("STAGES:"))
+    assert "1 -> 2 -> 3X" in Flow
+    assert "1=prepare" in Flow and "2=assign" in Flow and "3=route" in Flow
+    assert "4" not in Flow
+
+
+def test_terminal_does_not_invent_stage_history_or_performance():
+    Lines = FormatResultLines(Result="FAILURE", WallSeconds=1.0, CpuSeconds=None,
+        Summary="failed", RawReportPath=Path("/tmp/RawDump.txt"), FailureType="Candidate: Incomplete")
+    assert Lines[2] == "PERF: unavailable"
+    Flow = next(Line for Line in Lines if Line.startswith("STAGES:"))
+    assert "X" in Flow and "Candidate" in Flow and "unavailable" in Flow
+    assert "1 ->" not in Flow
+
+
+@pytest.mark.parametrize("Status", ["Saved", "Unavailable", "NotRun", None])
+def test_hook_capture_location_is_visible_without_changing_the_run_verdict(tmp_path, monkeypatch, Status):
+    monkeypatch.setattr("App.RunReporting.BuildGitIdentity", lambda _: {})
+    monkeypatch.setattr("App.RunReporting.BuildRuntimeProvenance", lambda: {})
+    Details = {}
+    if Status is not None:
+        Details["CompilerHooks"] = {"Status": Status, "HookFileCount": 2, "EventCount": 4,
+            "DroppedEvents": 0, "IndexPath": str(tmp_path / "Design.CompilerHooks/Index.json"),
+            "DirectoryPath": str(tmp_path / "Design.CompilerHooks"),
+            "WriteError": "OSError" if Status == "Unavailable" else None}
+    Report = WriteRunReport(RunDirectory=tmp_path, Result="FAILURE", FailureType="Candidate: Incomplete",
+        WallSeconds=1.0, CpuSeconds=1.0, Summary="original typed failure", RepositoryRoot=tmp_path,
+        WorkingDirectory=tmp_path, StartedAtUtc="start", CompletedAtUtc="end", Command=["compiler"],
+        Details=Details)
+    assert Report.ResultLines[0] == "RESULT: FAILURE — Candidate: Incomplete"
+    HookLines = [Line for Line in Report.ResultLines if Line.startswith("HOOKS:")]
+    if Status is None:
+        assert HookLines == []
+        assert "CompilerHooks" not in Report.RawReportPath.read_text()
+    else:
+        assert len(HookLines) == 1
+        assert HookLines[0] in Report.SummaryPath.read_text()
+        assert "CompilerHooks" in Report.RawReportPath.read_text()
+        if Status == "Saved":
+            assert "2 stage files, 4 events" in HookLines[0]
+            assert str(tmp_path / "Design.CompilerHooks/Index.json") in HookLines[0]
+        else:
+            assert "unavailable" in HookLines[0]
+            assert "stage files" not in HookLines[0]

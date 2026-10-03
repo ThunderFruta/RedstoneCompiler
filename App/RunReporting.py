@@ -9,6 +9,7 @@ from hashlib import sha256
 from io import StringIO
 import json
 import os
+import unicodedata
 from pathlib import Path
 import platform
 import shutil
@@ -166,10 +167,44 @@ def _JsonText(Value: object) -> str:
 
 
 def _NormalizeSummary(Value: str, MaximumCharacters: int = 180) -> str:
-    Summary = " ".join(str(Value).split())
+    SafeText = "".join(Char if unicodedata.category(Char) not in ("Cc", "Cf", "Cs") or Char in "\n\t\r"
+                       else "?" for Char in str(Value))
+    Summary = " ".join(SafeText.split())
     if len(Summary) <= MaximumCharacters:
         return Summary
     return Summary[: MaximumCharacters - 3].rstrip() + "..."
+
+
+def FormatStageFlow(Result: str, FailureType: str | None,
+                    TimingDetails: Mapping[str, object] | None) -> str:
+    """Number first-observed stage summaries; X marks only the reported failure."""
+    Observed = TimingDetails.get("RoutingStages", ()) if TimingDetails else ()
+    Names = []
+    if isinstance(Observed, (list, tuple)):
+        for Record in Observed:
+            if isinstance(Record, Mapping) and isinstance(Record.get("Stage"), str):
+                Name = _NormalizeSummary(Record["Stage"], 70)
+                if Name and Name not in Names:
+                    Names.append(Name)
+    Failed = Result in ("FAILURE", "CANCELLED")
+    FailureStage = _NormalizeSummary((FailureType or "stage unavailable").split(":", 1)[0], 70)
+    if not Names:
+        return ("STAGES: X - " + FailureStage + " (stage history unavailable)" if Failed
+                else "STAGES: stage history unavailable")
+    # Timings aggregate repeated stages. Do not present them as a complete trace.
+    Omitted = len(Names) > 6
+    Names = Names[:6]
+    if Failed:
+        if Names[-1] != FailureStage:
+            Names.append(FailureStage)
+        FailedIndex = len(Names)
+    else:
+        FailedIndex = None
+    Chain = " -> ".join(str(Index) + ("X" if Index == FailedIndex else "")
+                        for Index in range(1, len(Names) + 1))
+    Legend = "; ".join(f"{Index}={Name}" for Index, Name in enumerate(Names, 1))
+    return "STAGES: " + Chain + " | " + Legend + " | first-observed summaries" + (
+        "; additional stages omitted" if Omitted else "")
 
 
 def FormatResultLines(
@@ -178,7 +213,7 @@ def FormatResultLines(
     WallSeconds: float,
     CpuSeconds: float | None,
     Summary: str,
-    RawReportPath: Path,
+    RawReportPath: Path | None,
     FailureType: str | None = None,
     CpuDetails: Mapping[str, object] | None = None,
     TimingDetails: Mapping[str, object] | None = None,
@@ -187,7 +222,7 @@ def FormatResultLines(
     """Format concise terminal output or the detailed saved-report variant."""
     ResultLine = f"RESULT: {Result}"
     if FailureType:
-        ResultLine += f" — {FailureType}"
+        ResultLine += f" — {_NormalizeSummary(FailureType)}"
     TimeLine = f"TIME: total wall={max(0.0, WallSeconds):.3f}s"
     CalculatedAverageCores: float | None = None
     if CpuSeconds is not None:
@@ -302,20 +337,37 @@ def FormatResultLines(
     RoutingLimit = Details.get("NativeRoutingLimit")
     if RoutingLimit is not None:
         CpuParts.append(f"routing_limit={RoutingLimit}")
-    if CpuParts:
-        Lines.append("CPU: " + " ".join(CpuParts))
+    if not IncludeRoutingDetails:
+        Times = [Line.removeprefix("TIME: ") for Line in Lines if Line.startswith("TIME: ")]
+        Lines = [ResultLine, "TIME: " + " | ".join(Times)]
+    Lines.insert(2, "PERF: " + (" ".join(CpuParts) if CpuParts else "unavailable"))
+    Lines.insert(3, FormatStageFlow(Result, FailureType, TimingDetails))
     Detailed = TimingDetails.get("Detailed") if TimingDetails else None
     if IncludeRoutingDetails and isinstance(Detailed, Mapping):
         Lines.append(
             "TELEMETRY: " + str(Detailed.get("Status", "unavailable"))
             + f" samples={Detailed.get('SampleCount', 0)}"
-            + f" raw={RawReportPath.parent / 'RoutingTelemetry.samples.jsonl'}"
+            + f" raw={RawReportPath.parent / 'RoutingTelemetry.samples.jsonl' if RawReportPath is not None else 'unavailable'}"
         )
     Lines.extend([
         f"OUTPUT: {_NormalizeSummary(Summary)}",
-        f"RAW REPORT: {RawReportPath.resolve(strict=False)}",
+        f"RAW REPORT: {RawReportPath.resolve(strict=False) if RawReportPath is not None else 'unavailable'}",
     ])
     return Lines
+
+
+def FormatCompilerHooksLine(Evidence: Mapping[str, object]) -> str:
+    """Present saved hook files as diagnostics, independent of the run verdict."""
+    if Evidence.get("Status") != "Saved":
+        Reason = Evidence.get("WriteError") or "capture was not published"
+        return "HOOKS: unavailable - " + _NormalizeSummary(str(Reason))
+    Count = Evidence.get("HookFileCount", 0)
+    Events = Evidence.get("EventCount", 0)
+    Dropped = Evidence.get("DroppedEvents", 0)
+    Line = f"HOOKS: {Count} stage files, {Events} events"
+    if Dropped:
+        Line += f", {Dropped} dropped"
+    return Line + " - " + _NormalizeSummary(str(Evidence.get("IndexPath", "unavailable")), 512)
 
 
 def _AtomicWriteText(PathValue: Path, Text: str) -> None:
@@ -420,11 +472,16 @@ def WriteRunReport(
             for Record in Records.values():
                 Inventory.append({"Path": Record["Path"], "Bytes": Record["SizeBytes"],
                                   "Sha256": Record["Sha256"]})
-            Line += " — " + str(Records[ReportName]["Path"])
+            Line += " — " + str(Records[Evidence["Report"]["Name"]]["Path"])
         else:
             Line += " — " + str(Evidence.get("Reason", "not retained"))
         ResultLines.append(Line)
         SavedLines.append(Line)
+    HookEvidence = ReportDetails.get("CompilerHooks")
+    if isinstance(HookEvidence, Mapping):
+        HookLine = FormatCompilerHooksLine(HookEvidence)
+        ResultLines.append(HookLine)
+        SavedLines.append(HookLine)
     Inventory.sort(key=lambda Entry: str(Entry.get("Path", "")))
     Sections: list[tuple[str, str]] = [
         ("RUN", "\n".join(SavedLines)),

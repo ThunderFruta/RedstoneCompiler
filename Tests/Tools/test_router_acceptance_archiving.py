@@ -226,7 +226,7 @@ def test_main_interruption_retains_an_interrupted_archive(tmp_path: Path):
 
 
 def test_reporting_failure_is_archived_as_partial_and_returns_nonzero(
-    tmp_path: Path,
+    tmp_path: Path, capsys,
 ):
     OutputRoot = tmp_path / "reporting-failure"
 
@@ -247,6 +247,10 @@ def test_reporting_failure_is_archived_as_partial_and_returns_nonzero(
     assert ReturnCode == 1
     assert ArchiveManifest["Publication"]["Status"] == "PARTIAL"
     assert ArchiveManifest["Benchmark"]["ExitClassification"] == "reporting-failure"
+    Lines = capsys.readouterr().out.splitlines()
+    assert [Line.split(":", 1)[0] for Line in Lines[:3]] == ["RESULT", "TIME", "PERF"]
+    assert "PERF: unavailable" in Lines
+    assert any("stage history unavailable" in Line for Line in Lines)
 
 
 def test_archive_write_failure_changes_success_to_nonzero(tmp_path: Path):
@@ -269,6 +273,10 @@ def test_archive_write_failure_changes_success_to_nonzero(tmp_path: Path):
 
     assert ReturnCode == 1
     assert "Archiving: write-failed" in StandardOutput.getvalue()
+    Lines = StandardOutput.getvalue().splitlines()
+    assert [Line.split(":", 1)[0] for Line in Lines[:3]] == ["RESULT", "TIME", "PERF"]
+    assert "PERF: unavailable" in Lines
+    assert any("stage history unavailable" in Line for Line in Lines)
 
 
 @pytest.mark.parametrize("Mode", ("capture", "compare"))
@@ -319,12 +327,15 @@ def test_baseline_modes_keep_fixed_recovery_and_receive_separate_archive_mirror(
 
 # Report integrity cases use independent bytes and explicitly retained identities.
 from hashlib import sha256
-from Tests.App.test_routing_failure_artifacts import WriteLiteralPair, LITERAL_HTML, HTML_NAME, RECEIPT_NAME
+from Tests.App.test_routing_failure_artifacts import WriteLiteralPair, LITERAL_HTML, HTML_NAME, RECEIPT_NAME, LITERAL_MARKDOWN, MARKDOWN_NAME
 from Tests.Tools.test_router_acceptance_harness import BuildTestAcceptanceCommand, WriteNestedRoutingFailureArtifact
 from Tools.Routing import CaptureRoutingDesignSnapshot as SnapshotTool
 
 
-def test_acceptance_evaluator_observes_report_without_changing_failure(tmp_path):
+@pytest.mark.parametrize("Markdown", [False, True], ids=["legacy-html", "markdown"])
+def test_acceptance_evaluator_observes_report_without_changing_failure(tmp_path, Markdown):
+    Content = LITERAL_MARKDOWN if Markdown else LITERAL_HTML
+    Name = MARKDOWN_NAME if Markdown else HTML_NAME
     Case = next(Value for Value in Harness.AcceptanceCases if Value.Name == "FullAdder")
     Artifacts = Harness.BuildRunArtifacts(tmp_path / "FullAdder-Run1", "FullAdder-Run1")
     Command = BuildTestAcceptanceCommand(Case, Artifacts)
@@ -336,13 +347,13 @@ def test_acceptance_evaluator_observes_report_without_changing_failure(tmp_path)
         DirectArtifactAbsentBeforeInvocation=True, PriorNestedRunDirectoryNames=frozenset(), ExpectedCommand=Command)
     Missing, _ = Harness.EvaluateRun(**Arguments)
     assert Missing["Observed"]["RoutingFailureReport"]["Status"] == "Unavailable"
-    WriteLiteralPair(Source.parent, Source.name, Source.read_bytes())
+    WriteLiteralPair(Source.parent, Source.name, Source.read_bytes(), Markdown=Markdown)
     Present, _ = Harness.EvaluateRun(**Arguments)
     assert Present["Observed"]["RoutingFailureReport"]["Status"] == "Available"
-    assert Present["Artifacts"]["RoutingFailureReport"]["Sha256"] == sha256(LITERAL_HTML).hexdigest()
+    assert Present["Artifacts"]["RoutingFailureReport"]["Sha256"] == sha256(Content).hexdigest()
     assert Present["Failures"] == Missing["Failures"]
     assert Present["Accepted"] is Missing["Accepted"] is False
-    (Source.parent / HTML_NAME).write_bytes(LITERAL_HTML + b"changed")
+    (Source.parent / Name).write_bytes(Content + b"changed")
     Changed, _ = Harness.EvaluateRun(**Arguments)
     assert Changed["Observed"]["RoutingFailureReport"]["Status"] == "Rejected"
     assert Changed["Failures"] == Missing["Failures"]
@@ -467,7 +478,7 @@ def test_captured_self_conflict_survives_real_report_publisher_and_archive(tmp_p
         assert Pair["Status"] == "Available"
         Records = {"RoutingFailure": {"Path": str(Source), "Exists": True,
                     "SizeBytes": len(Data), "Sha256": sha256(Data).hexdigest()},
-                   "RoutingFailureReport": Pair["Artifacts"][HTML_NAME],
+                   "RoutingFailureReport": Pair["Artifacts"][MARKDOWN_NAME],
                    "RoutingFailureReportReceipt": Pair["Artifacts"][RECEIPT_NAME]}
         Evaluation = Manifest["Runs"][0]["Evaluation"]
         Evaluation["Artifacts"] = Records
@@ -478,9 +489,21 @@ def test_captured_self_conflict_survives_real_report_publisher_and_archive(tmp_p
         assert Harness.Main(_Arguments(tmp_path)) == 1
     Archive = _ArchiveDirectories(tmp_path)[0]
     Sealed = SnapshotTool.BuildSealedArchiveEvidence(Archive / "AcceptanceManifest.json")
-    Report = Sealed.ObservationsByRelativePath["FullAdder-Run1/Runs/compiler/" + HTML_NAME].Data
+    Report = Sealed.ObservationsByRelativePath["FullAdder-Run1/Runs/compiler/" + MARKDOWN_NAME].Data
     Source = json.loads(Sealed.ObservationsByRelativePath["FullAdder-Run1/Runs/compiler/Design.RoutingFailure.json"].Data)
     assert Source["Failure"]["Diagnostics"]["Admission"]["SelfClaimConflictEvidence"] == LiteralEvidence()
     assert b"(4, 2, -1)" in Report and b"Support, Air" in Report
     assert b"ContributorProvenance" in Report and b"Unavailable" in Report
     assert b"not a proven upstream root cause" in Report
+
+
+def test_archive_identity_failure_uses_shared_summary_without_inventing_a_report(tmp_path, capsys):
+    with (patch.object(Harness, "BuildBenchmarkArchiveIdentity", side_effect=RuntimeError("no identity")),
+          patch.object(Harness, "RunAcceptance") as Run):
+        assert Harness.Main(_Arguments(tmp_path)) == 1
+    Run.assert_not_called()
+    Lines = capsys.readouterr().out.splitlines()
+    assert [Line.split(":", 1)[0] for Line in Lines[:3]] == ["RESULT", "TIME", "PERF"]
+    assert "PERF: unavailable" in Lines
+    assert "RAW REPORT: unavailable" in Lines
+    assert any("stage history unavailable" in Line for Line in Lines)

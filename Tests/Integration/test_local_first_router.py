@@ -228,11 +228,10 @@ class LocalFirstRouterTests(unittest.TestCase):
             StandardOutput.getvalue(),
         )
         self.assertIn("RESULT: FAILURE", StandardOutput.getvalue())
-        self.assertIn("Operation failed:", ErrorOutput.getvalue())
-        self.assertIn(
-            "controlled routing failure",
-            ErrorOutput.getvalue(),
-        )
+        self.assertNotIn("Operation failed:", ErrorOutput.getvalue())
+        self.assertIn("controlled routing failure", StandardOutput.getvalue())
+        self.assertIn("PERF:", StandardOutput.getvalue())
+        self.assertIn("STAGES: X - PortalGeneration", StandardOutput.getvalue())
         self.assertEqual(
             Compile.call_args.kwargs["RoutingDeadlineSeconds"],
             3.5,

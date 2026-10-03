@@ -54,8 +54,8 @@ from App.BenchmarkArchive import (
     PublishBenchmarkArchive,
     ValidateExactAcceptanceVerdicts,
 )
-from App.RunReporting import CaptureTerminalOutput, UtcTimestamp, WriteRunReport
-from App.RoutingFailureArtifacts import (ObserveReportPair, ReportName, ReceiptName,
+from App.RunReporting import CaptureTerminalOutput, FormatResultLines, UtcTimestamp, WriteRunReport
+from App.RoutingFailureArtifacts import (ObserveReportPair, ReportName, LegacyReportName, ReceiptName,
     DiscoverReportMembers, UniqueReportMembers)
 from PhysicalDesign.Policy import (
     ExecutionStrategyForRequest,
@@ -2914,7 +2914,7 @@ def EvaluateRun(
                       "Reason": "no authoritative routing failure selected"}
     if ResolvedRoutingFailurePath is not None and VerifiedRoutingFailure is not None:
         ReportEvidence = ObserveReportPair(ResolvedRoutingFailurePath, VerifiedRoutingFailure.Data)
-        for MemberName, Key in ((ReportName, "RoutingFailureReport"),
+        for MemberName, Key in ((ReportEvidence.get("Report", {}).get("Name", ReportName), "RoutingFailureReport"),
                                 (ReceiptName, "RoutingFailureReportReceipt")):
             Record = ReportEvidence["Artifacts"].get(MemberName)
             if Record is not None:
@@ -2960,6 +2960,9 @@ def EvaluateRun(
 
 def ClearPriorRunArtifacts(Artifacts: dict[str, Path]) -> None:
     """Remove only exact prior outputs that could masquerade as this run."""
+    ReportPath = Artifacts.get("RoutingFailureReport")
+    if ReportPath is not None:
+        (ReportPath.parent / LegacyReportName).unlink(missing_ok=True)
     for Name in (
         "Schematic",
         "FabricFixture",
@@ -5518,12 +5521,10 @@ def RunAcceptance(
             Evaluation["Accepted"] = False
             Completed["Accepted"] = False
             Completed["Status"] = "FAILED"
-            print("RESULT: FAILURE — Reporting: write-failed")
-            print(f"TIME: wall={Process.RuntimeSeconds:.3f}s")
-            print(
-                f"OUTPUT: {RunName} finished, but its report could not be saved."
-            )
-            print(f"RAW REPORT: {RunDirectory / 'RawDump.txt'}")
+            print("\n".join(FormatResultLines(Result="FAILURE", FailureType="Reporting: write-failed",
+                WallSeconds=Process.RuntimeSeconds, CpuSeconds=None,
+                RawReportPath=RunDirectory / "RawDump.txt",
+                Summary=f"{RunName} finished, but its report could not be saved.")))
         else:
             print("\n".join(Report.ResultLines))
         return Completed
@@ -6357,12 +6358,10 @@ def Main(Arguments: list[str] | None = None) -> int:
             )
             EnsureArchiveTargetAvailable(ArchiveDirectory)
         except (OSError, RuntimeError, FileExistsError) as Error:
-            print("RESULT: FAILURE — Archiving: identity-failed")
-            print("TIME: wall=0.000s")
-            print(
-                "OUTPUT: Benchmark was not launched because a unique Git-"
-                f"stamped archive could not be reserved: {Error}"
-            )
+            print("\n".join(FormatResultLines(Result="FAILURE", FailureType="Archiving: identity-failed",
+                WallSeconds=0.0, CpuSeconds=None, RawReportPath=None,
+                Summary="Benchmark was not launched because a unique Git-"
+                        f"stamped archive could not be reserved: {Error}")))
             if ArchiveDirectory is not None:
                 print(f"ARCHIVE: {ArchiveDirectory}")
             return 1
@@ -6564,23 +6563,18 @@ def Main(Arguments: list[str] | None = None) -> int:
                 PublicationFailure=PublicationFailure,
             )
         except Exception as Error:
-            print("RESULT: FAILURE — Archiving: write-failed")
-            print(f"TIME: wall={SessionWallSeconds:.3f}s")
-            print(
-                "OUTPUT: Benchmark evidence could not be sealed in its "
-                f"archive: {Error}"
-            )
+            print("\n".join(FormatResultLines(Result="FAILURE", FailureType="Archiving: write-failed",
+                WallSeconds=SessionWallSeconds, CpuSeconds=None,
+                RawReportPath=Configuration.RecoveryRoot / "RawDump.txt",
+                Summary=f"Benchmark evidence could not be sealed in its archive: {Error}")))
             print(f"ARCHIVE: {ArchiveContext.ArchiveDirectory}")
             return 1
 
     if ReportingError is not None:
-        print("RESULT: FAILURE — Reporting: write-failed")
-        print(f"TIME: wall={SessionWallSeconds:.3f}s")
-        print(
-            "OUTPUT: Acceptance finished, but its session report could not "
-            f"be saved: {ReportingError}"
-        )
-        print(f"RAW REPORT: {Configuration.RecoveryRoot / 'RawDump.txt'}")
+        print("\n".join(FormatResultLines(Result="FAILURE", FailureType="Reporting: write-failed",
+            WallSeconds=SessionWallSeconds, CpuSeconds=None,
+            RawReportPath=Configuration.RecoveryRoot / "RawDump.txt",
+            Summary=f"Acceptance finished, but its session report could not be saved: {ReportingError}")))
     elif SessionReport is not None:
         print("\n".join(SessionReport.ResultLines))
     print(f"Acceptance manifest: {Configuration.ManifestPath}")

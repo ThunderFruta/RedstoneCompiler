@@ -402,6 +402,13 @@ def ParseTraceSupportBlocks(Value: object | None) -> tuple[str, ...]:
     return tuple(Item for Item in Values if Item)
 
 
+def ParseCompilerHookStage(Value: str) -> str:
+    """Validate an explicit stage selector before starting a compiler run."""
+    if not Value or len(Value) > 128:
+        raise argparse.ArgumentTypeError("compiler hook stage must be a nonempty string of at most 128 characters")
+    return Value
+
+
 def BuildParser() -> argparse.ArgumentParser:
     Parser = argparse.ArgumentParser(
         description="Compile scalar combinational SystemVerilog to NAND logic and Litematica"
@@ -436,6 +443,11 @@ def BuildParser() -> argparse.ArgumentParser:
         default=None,
         help="Override Rust routing worker count (RC_ROUTING_THREADS)",
     )
+    Parser.add_argument("--compiler-hooks", action="store_true",
+                        help="Enable a bounded compiler action trace; without stage selectors, trace all stages")
+    Parser.add_argument("--compiler-hook-stage", action="append", type=ParseCompilerHookStage,
+                        default=[], metavar="STAGE",
+                        help="Enable hooks for this stage and its dotted descendants; repeat to select several stages")
     Parser.add_argument(
         "--routing-telemetry",
         action=argparse.BooleanOptionalAction,
@@ -634,19 +646,11 @@ def RunPytest() -> int:
             },
         )
     except OSError as Error:
-        print("RESULT: FAILURE — Reporting: write-failed", file=sys.stderr)
-        CpuSeconds = float(CpuInterval["CpuSeconds"])
-        Utilization = CpuSeconds / WallSeconds * 100.0 if WallSeconds else 0.0
-        print(
-            f"TIME: total wall={WallSeconds:.3f}s cpu={CpuSeconds:.3f}s "
-            f"utilization={Utilization:.1f}% "
-            f"average_cores={CpuSeconds / WallSeconds if WallSeconds else 0.0:.2f}",
-            file=sys.stderr,
-        )
-        print(
-            f"OUTPUT: Pytest finished, but its report could not be saved: {Error}",
-            file=sys.stderr,
-        )
+        Lines = FormatResultLines(Result="FAILURE", FailureType="Reporting: write-failed",
+            WallSeconds=WallSeconds, CpuSeconds=float(CpuInterval["CpuSeconds"]),
+            CpuDetails=CpuInterval, RawReportPath=RunDirectory / "RawDump.txt",
+            Summary=f"Pytest finished, but its report could not be saved: {Error}")
+        print("\n".join(Lines), file=sys.stderr)
         return 1
     print("\n".join(Report.ResultLines))
     return ReturnCode
@@ -1213,6 +1217,18 @@ def _AtomicCopy(SourcePath: Path, DestinationPath: Path) -> None:
     TemporaryPath.replace(DestinationPath)
 
 
+def BuildCompilerHookDetails(Hooks) -> dict[str, object]:
+    """Copy confirmed publication without inferring compiler success."""
+    try:
+        Details = dict(Hooks.Publication)
+        for Key in ("IndexPath", "DirectoryPath"):
+            if isinstance(Details.get(Key), str):
+                Details[Key] = os.path.abspath(Details[Key])
+        return Details
+    except Exception as Error:
+        return {"Status": "Unavailable", "WriteError": type(Error).__name__}
+
+
 def _CompileResultDetails(Result, CpuTelemetry: dict[str, object]) -> dict[str, object]:
     """Serialize the detailed success evidence formerly printed to terminal."""
     Composition = Result.BlockComposition
@@ -1366,6 +1382,7 @@ def Main(Args: list[str] | None = None) -> int:
     Error: BaseException | None = None
     ExceptionText = ""
     Result = None
+    CompilerHookCollector = None
 
     def RecordPipelineTimingEvent(Name: str, Event: str) -> None:
         CpuTelemetry.RecordPipelineTimingEvent(Name, Event)
@@ -1382,6 +1399,11 @@ def Main(Args: list[str] | None = None) -> int:
             )
             try:
                 CpuTelemetry.BeginCompilation()
+                HookArguments = {}
+                if Parsed.compiler_hooks or Parsed.compiler_hook_stage:
+                    from Compilation.Hooks import CompilerHooks
+                    CompilerHookCollector = CompilerHooks(Stages=tuple(Parsed.compiler_hook_stage))
+                    HookArguments["Hooks"] = CompilerHookCollector
                 Result = CompileSvToLitematic(
                     InputPath=InputPath,
                     OutputPath=RunOutputPath,
@@ -1394,6 +1416,7 @@ def Main(Args: list[str] | None = None) -> int:
                     TraceSupportBlocks=TraceSupportBlocks,
                     TimingCallback=RecordPipelineTimingEvent,
                     ValidationProgressCallback=ValidationProgressReporter,
+                    **HookArguments,
                 )
             finally:
                 CpuTelemetry.FinishCompilation()
@@ -1507,6 +1530,9 @@ def Main(Args: list[str] | None = None) -> int:
         }
         ExitCode = 130 if isinstance(Error, KeyboardInterrupt) else 1
 
+    if CompilerHookCollector is not None:
+        Details["CompilerHooks"] = BuildCompilerHookDetails(CompilerHookCollector)
+
     try:
         Report = WriteRunReport(
             RunDirectory=RunDirectory,
@@ -1565,13 +1591,16 @@ def Main(Args: list[str] | None = None) -> int:
             },
             TimingDetails=Telemetry,
         )
+        if CompilerHookCollector is not None:
+            from App.RunReporting import FormatCompilerHooksLine
+            FallbackLines.append(FormatCompilerHooksLine(Details["CompilerHooks"]))
         print("\n".join(FallbackLines), file=sys.stderr)
         if Error is not None:
             PrintOperationFailure(Error, FailureDiagnostics)
         return 1
     print("\n".join(Report.ResultLines))
-    if Error is not None:
-        PrintOperationFailure(Error, FailureDiagnostics)
+    # The structured result already includes the failure. Full diagnostics and
+    # traceback remain in RawDump.txt instead of a second terminal dump.
     return ExitCode
 
 

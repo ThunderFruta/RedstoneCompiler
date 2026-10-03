@@ -8,6 +8,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 import App.CompilerCli as CompilerMainModule
 import App.Main as RootMain
 from Validation.Fabric import FabricValidationProgress
@@ -59,7 +61,7 @@ class MainPathTests(unittest.TestCase):
             ResultLines=(
                 "RESULT: SUCCESS",
                 "TIME: total wall=0.010s cpu=0.010s utilization=100.0%",
-                "CPU: average_cores=1.00",
+                "PERF: average_cores=1.00",
                 "OUTPUT: 1 passed in 0.01s",
                 "RAW REPORT: /tmp/RawDump.txt",
             )
@@ -194,7 +196,8 @@ class MainPathTests(unittest.TestCase):
             ResultLines = StandardOutput.getvalue().splitlines()
             self.assertEqual(ResultLines[0], "RESULT: SUCCESS")
             self.assertTrue(ResultLines[1].startswith("TIME: total wall="))
-            self.assertTrue(ResultLines[2].startswith("TIME: routing wall="))
+            self.assertTrue(ResultLines[2].startswith("PERF: "))
+            self.assertIn("routing wall=", ResultLines[1])
             self.assertFalse(any(
                 Line.startswith("  physical component interface planning:")
                 for Line in ResultLines
@@ -206,12 +209,12 @@ class MainPathTests(unittest.TestCase):
             self.assertEqual(
                 len([
                     Line for Line in ResultLines
-                    if Line.startswith("TIME: routing")
+                    if "routing wall=" in Line
                 ]),
                 1,
             )
             self.assertTrue(any(
-                Line.startswith("TIME: validation wall=")
+                "validation wall=" in Line
                 for Line in ResultLines
             ))
             self.assertIn("VALIDATION [", StandardError.getvalue())
@@ -308,3 +311,102 @@ class MainPathTests(unittest.TestCase):
                 "Operation failed: controlled compile failure",
                 Text,
             )
+
+
+def test_guided_pytest_report_failure_uses_the_shared_terminal_contract(monkeypatch, capsys):
+    Process = SimpleNamespace(stdout=StringIO("1 passed\n"), stderr=StringIO(), wait=lambda: 0)
+    monkeypatch.setattr(CompilerMainModule.subprocess, "Popen", lambda *Args, **Keywords: Process)
+    def FailReport(**Arguments):
+        raise OSError("controlled report failure")
+    monkeypatch.setattr(CompilerMainModule, "WriteRunReport", FailReport)
+    assert RunPytest() == 1
+    Text = capsys.readouterr().err
+    assert [Line.split(":", 1)[0] for Line in Text.splitlines()[:3]] == ["RESULT", "TIME", "PERF"]
+    assert "Reporting: write-failed" in Text
+    assert "stage history unavailable" in Text
+    assert "controlled report failure" in Text
+
+
+@pytest.mark.parametrize("Flags,Selected", [([], None), (["--compiler-hooks"], ()),
+    (["--compiler-hook-stage", "physical"], ("physical",)),
+    (["--compiler-hooks", "--compiler-hook-stage", "synthesis", "--compiler-hook-stage", "physical"], ("physical", "synthesis"))])
+def test_cli_hooks_are_explicit_and_preserve_the_original_failure(tmp_path, monkeypatch, capsys, Flags, Selected):
+    from Compilation.Hooks import CompilerHooks
+    from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
+    Seen = {}
+    Failure = RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.NoBoundaryEscape,
+        Stage="PortalGeneration", Detail="controlled observer wiring failure"))
+    def Compile(**Arguments):
+        Seen.update(Arguments)
+        raise Failure
+    monkeypatch.setattr(CompilerMainModule, "CompileSvToLitematic", Compile)
+    assert Main(["--input", "Assets/Examples/FullAdder.sv", "--output", str(tmp_path / "Design.litematic"),
+        "--defaults-file", str(tmp_path / "Defaults.json"), "--no-routing-telemetry", *Flags]) == 1
+    if Selected is None:
+        assert "Hooks" not in Seen
+    else:
+        assert isinstance(Seen["Hooks"], CompilerHooks)
+        assert Seen["Hooks"].Stages == Selected
+    Output = capsys.readouterr().out
+    assert "RESULT: FAILURE" in Output and "PortalGeneration: NoBoundaryEscape" in Output
+    assert "controlled observer wiring failure" in Output
+
+
+@pytest.mark.parametrize("Selector", ["", "x" * 129])
+def test_cli_rejects_invalid_hook_selectors_before_compiling(monkeypatch, Selector):
+    with pytest.raises(SystemExit) as Error:
+        CompilerMainModule.BuildParser().parse_args(["--compiler-hook-stage", Selector])
+    assert Error.value.code == 2
+
+
+@pytest.mark.parametrize("Flags,ExpectedStages", [(["--compiler-hooks"], {"compile", "frontend.parse", "physical.test"}),
+    (["--compiler-hook-stage", "physical"], {"physical.test"})])
+def test_cli_exposes_the_published_stage_files_and_preserves_typed_failure(tmp_path, monkeypatch, capsys, Flags, ExpectedStages):
+    import json
+    from Compilation.Hooks import ObserveCompilerRun, RunCompilerOperation, ReadCompilerTrace
+    from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
+    Failure = RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.NoBoundaryEscape,
+        Stage="PortalGeneration", Detail="controlled split trace failure"))
+    @ObserveCompilerRun
+    def Compile(**Arguments):
+        RunCompilerOperation("frontend.parse", lambda: None)
+        def Fail():
+            raise Failure
+        return RunCompilerOperation("physical.test", Fail)
+    monkeypatch.setattr(CompilerMainModule, "CompileSvToLitematic", Compile)
+    monkeypatch.setattr(CompilerMainModule, "BuildRunId", lambda: "split-hook-run")
+    assert Main(["--input", "Assets/Examples/FullAdder.sv", "--output", str(tmp_path / "Design.litematic"),
+        "--defaults-file", str(tmp_path / "Defaults.json"), "--no-routing-telemetry", *Flags]) == 1
+    Root = tmp_path / "Runs/split-hook-run"
+    Directory = Root / "Design.CompilerHooks"
+    Index = json.loads((Directory / "Index.json").read_text())
+    assert {Entry["Stage"] for Entry in Index["Files"]} == ExpectedStages
+    for Entry in Index["Files"]:
+        Member = json.loads((Directory / Entry["Name"]).read_text())
+        assert all(Event["Stage"] == Entry["Stage"] for Event in Member["Events"])
+    Trace = ReadCompilerTrace(Directory)
+    assert Trace["Outcome"] == "failed" and Trace["Failure"]["Stage"] == "PortalGeneration"
+    assert not (Root / "Design.CompilerTrace.json").exists()
+    Output = capsys.readouterr().out
+    assert "RESULT: FAILURE — PortalGeneration: NoBoundaryEscape" in Output
+    assert "HOOKS:" in Output and str(Directory / "Index.json") in Output
+    assert "HOOKS:" in (Root / "Summary.txt").read_text()
+    assert str(Directory / "Index.json") in (Root / "RawDump.txt").read_text()
+
+
+def test_hook_publication_metadata_error_cannot_replace_the_original_compile_failure(tmp_path, monkeypatch, capsys):
+    from Compilation.Hooks import CompilerHooks
+    from PhysicalDesign.Contracts.Failures import RoutingFailure, RoutingFailureReason, RoutingStageError
+    def BrokenPublication(Self):
+        raise RuntimeError("controlled observation metadata failure")
+    monkeypatch.setattr(CompilerHooks, "Publication", property(BrokenPublication))
+    def Compile(**Arguments):
+        raise RoutingStageError(RoutingFailure(Reason=RoutingFailureReason.NoBoundaryEscape,
+            Stage="PortalGeneration", Detail="original compile failure"))
+    monkeypatch.setattr(CompilerMainModule, "CompileSvToLitematic", Compile)
+    assert Main(["--input", "Assets/Examples/FullAdder.sv", "--output", str(tmp_path / "Design.litematic"),
+        "--defaults-file", str(tmp_path / "Defaults.json"), "--no-routing-telemetry", "--compiler-hooks"]) == 1
+    Output = capsys.readouterr().out
+    assert "RESULT: FAILURE — PortalGeneration: NoBoundaryEscape" in Output
+    assert "original compile failure" in Output
+    assert "HOOKS: unavailable - RuntimeError" in Output

@@ -12,6 +12,9 @@ RECEIPT_NAME = "RoutingFailureReport.receipt.json"
 LITERAL_HTML = b'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>Routing failure report</title></head><body><h1>Observed rejection</h1><pre>Signal T; Support, Air at (4, 2, -1); ContributorProvenance: Unavailable. &lt;script&gt;fetch(&quot;https://example.invalid&quot;)&lt;/script&gt;</pre><p>Not a proven upstream root cause. MCHPRS: not-run. Fabric: not-run.</p></body></html>'''
 
 
+MARKDOWN_NAME = "RoutingFailureReport.md"
+LITERAL_MARKDOWN = b"# Routing failure report\n\n## Data-flow graph\n\n```text\n[Signal T] --> [Support, Air at (4, 2, -1)] --> [FAILURE]\nContributorProvenance: Unavailable\nMCHPRS: not-run\nFabric: not-run\n```\n"
+
 def LiteralIdentity(Name, Data):
     return {"Name": Name, "SizeBytes": len(Data), "Sha256": sha256(Data).hexdigest()}
 
@@ -22,15 +25,21 @@ def LiteralReceipt(FailureName, FailureBytes, Html=LITERAL_HTML):
                        "Report": LiteralIdentity(HTML_NAME, Html)}, sort_keys=True).encode()
 
 
-def WriteLiteralPair(Root, Name="Design.RoutingFailure.json", FailureBytes=None):
+def WriteLiteralPair(Root, Name="Design.RoutingFailure.json", FailureBytes=None, *, Markdown=False):
     Root.mkdir(parents=True, exist_ok=True)
     FailureBytes = FailureBytes or b'{"SchemaVersion":"routing-failure-v1","Failure":{"Stage":"Candidate","Reason":"SupportConflict","Diagnostics":{}}}'
     Source = Root / Name
     Source.write_bytes(FailureBytes)
-    (Root / HTML_NAME).write_bytes(LITERAL_HTML)
-    (Root / RECEIPT_NAME).write_bytes(LiteralReceipt(Name, FailureBytes))
+    ReportName = MARKDOWN_NAME if Markdown else HTML_NAME
+    Content = LITERAL_MARKDOWN if Markdown else LITERAL_HTML
+    Receipt = (json.dumps({"SchemaVersion": "routing-failure-report-receipt-v2",
+                           "Source": LiteralIdentity(Name, FailureBytes),
+                           "Report": LiteralIdentity(ReportName, Content)}, sort_keys=True).encode()
+               if Markdown else LiteralReceipt(Name, FailureBytes))
+    (Root / ReportName).write_bytes(Content)
+    (Root / RECEIPT_NAME).write_bytes(Receipt)
     Records = {}
-    for Key, PathValue in (("RoutingFailure", Source), ("RoutingFailureReport", Root / HTML_NAME),
+    for Key, PathValue in (("RoutingFailure", Source), ("RoutingFailureReport", Root / ReportName),
                            ("RoutingFailureReportReceipt", Root / RECEIPT_NAME)):
         Data = PathValue.read_bytes()
         Records[Key] = {"Path": str(PathValue), "Exists": True, "SizeBytes": len(Data), "Sha256": sha256(Data).hexdigest()}
@@ -129,3 +138,89 @@ def test_observer_does_not_accept_oversized_report(tmp_path):
     Source, _ = WriteLiteralPair(tmp_path)
     (tmp_path / HTML_NAME).write_bytes(b"x" * (256 * 1024 + 1))
     assert ObserveReportPair(Source, Source.read_bytes())["Status"] == "Rejected"
+
+
+def test_literal_markdown_pair_projects_through_public_inventory_without_html(tmp_path):
+    Source, Records = WriteLiteralPair(tmp_path, Markdown=True)
+    Bytes = {str(PathValue): PathValue.read_bytes() for PathValue in tmp_path.iterdir()}
+    Result = ProjectListedReport(Records["RoutingFailure"], Records, Bytes.get)
+    assert Result["Status"] == "Available"
+    assert Result["Report"] == LiteralIdentity(MARKDOWN_NAME, LITERAL_MARKDOWN)
+    assert Result["Source"] == LiteralIdentity(Source.name, Source.read_bytes())
+    assert not (tmp_path / HTML_NAME).exists()
+
+
+@pytest.mark.parametrize("Damage", ["content", "source", "format", "active-markdown", "raw-html", "autolink", "control", "unclosed-fence"])
+def test_markdown_pair_rejects_corruption_and_unsafe_display_even_if_rehashed(tmp_path, Damage):
+    Source, Records = WriteLiteralPair(tmp_path, Markdown=True)
+    Report = LITERAL_MARKDOWN
+    Receipt = json.loads((tmp_path / RECEIPT_NAME).read_bytes())
+    Failure = Source.read_bytes()
+    if Damage == "content":
+        Report += b"changed"
+    elif Damage == "source":
+        Failure += b"changed"
+    elif Damage == "format":
+        Receipt["SchemaVersion"] = "routing-failure-report-receipt-v1"
+    else:
+        Additions = {"active-markdown": b"![remote](https://example.invalid)\n",
+                     "raw-html": b"<script>alert(1)</script>\n",
+                     "autolink": b"https://example.invalid/secret\n", "control": b"\x1b[31m\n",
+                     "unclosed-fence": b"```text\nmissing close\n"}
+        Report += Additions[Damage]
+        Receipt["Report"] = LiteralIdentity(MARKDOWN_NAME, Report)
+    Result = ValidateReportPair(FailureName=Source.name, FailureData=Failure,
+        ReportData=Report, ReceiptData=json.dumps(Receipt).encode())
+    assert Result["Status"] in ("Rejected", "Malformed")
+
+
+def test_mixed_legacy_and_markdown_report_is_not_ambiguous_evidence(tmp_path):
+    Source, _ = WriteLiteralPair(tmp_path, Markdown=True)
+    (tmp_path / HTML_NAME).write_bytes(LITERAL_HTML)
+    assert ObserveReportPair(Source, Source.read_bytes())["Status"] == "Rejected"
+
+
+@pytest.mark.parametrize("Damage", ["top-level-extra", "source-extra", "report-extra", "legacy-size", "dual-size", "float-size", "bool-size", "bad-hash"])
+def test_markdown_v2_receipt_has_closed_identity_schema_even_with_trusted_source_identity(tmp_path, Damage):
+    Source, _ = WriteLiteralPair(tmp_path, Markdown=True)
+    Receipt = json.loads((tmp_path / RECEIPT_NAME).read_bytes())
+    if Damage == "top-level-extra":
+        Receipt["Accepted"] = True
+    elif Damage == "source-extra":
+        Receipt["Source"]["Authority"] = "eligible"
+    elif Damage == "report-extra":
+        Receipt["Report"]["Authority"] = "eligible"
+    elif Damage == "legacy-size":
+        Receipt["Source"]["Bytes"] = Receipt["Source"].pop("SizeBytes")
+    elif Damage == "dual-size":
+        Receipt["Source"]["Bytes"] = Receipt["Source"]["SizeBytes"]
+    elif Damage == "float-size":
+        Receipt["Source"]["SizeBytes"] = float(Receipt["Source"]["SizeBytes"])
+    elif Damage == "bool-size":
+        Receipt["Source"]["SizeBytes"] = True
+    else:
+        Receipt["Source"]["Sha256"] = "G" * 64
+    Result = ValidateReportPair(FailureName=Source.name, FailureData=Source.read_bytes(),
+        SourceIdentity=LiteralIdentity(Source.name, Source.read_bytes()),
+        ReportData=LITERAL_MARKDOWN, ReceiptData=json.dumps(Receipt).encode())
+    assert Result["Status"] == "Malformed"
+
+
+@pytest.mark.parametrize("Damage", [None, "link", "image", "html", "split-cell", "outside-span", "v2-format"])
+def test_compact_markdown_v3_keeps_literal_table_values_in_one_inert_cell(Damage):
+    Source = b"literal original failure"
+    Report = b"# Routing failure report\n\n| Field | Value |\n| :--- | :--- |\n| Stage | `Candidate` |\n\n```text\ninput --> Candidate --> X Incomplete\n```\n"
+    Version = "routing-failure-report-receipt-v3"
+    Additions = {"link": b"[remote](https://example.invalid)\n", "image": b"![remote](https://example.invalid)\n",
+                 "html": b"<img src=x>\n", "split-cell": b"| Stage | `value | [remote](https://example.invalid)` |\n",
+                 "outside-span": b"`https://example.invalid`\n"}
+    if Damage == "v2-format":
+        Version = "routing-failure-report-receipt-v2"
+    elif Damage is not None:
+        Report += Additions[Damage]
+    Receipt = json.dumps({"SchemaVersion": Version,
+        "Source": LiteralIdentity("X.RoutingFailure.json", Source),
+        "Report": LiteralIdentity(MARKDOWN_NAME, Report)}).encode()
+    Result = ValidateReportPair(FailureName="X.RoutingFailure.json", FailureData=Source,
+                                ReportData=Report, ReceiptData=Receipt)
+    assert Result["Status"] == ("Available" if Damage is None else "Malformed")

@@ -55,3 +55,20 @@ snapshot-analysis helpers rather than published evidence.
 See [OutcomeFirstTestAudit.md](OutcomeFirstTestAudit.md) for the disposition,
 retained contract ownership, and replacement rationale. The earlier counts in
 this document remain historical migration accounting only.
+
+## October 2026 bounded follow-up
+
+This follow-up removes only demonstrated superseded coverage and incidental
+assertions. Historical collection counts above remain historical evidence.
+
+| Test | Disposition | Retained outcome coverage |
+|---|---|---|
+| `Tests/PhysicalDesign/Routing/test_routing_resources.py::RoutingResourceTests::testRoutingUsesOneAuthoritativeStrictAttempt` | Removed: the single configured attempt plus exact margin, penalty, iteration and ordering defaults repeats the policy-snapshot claim already retired in OutcomeFirstTestAudit. | `testCapacityAwareGuidesAreDeterministicAndBounded`, authoritative access-bound propagation, stoppable routing-resource construction, assignment-cap/deadline tests, and final physical legality. |
+| `Kernels/Routing/Src/Generation/BatchOutcomes.rs::IndexedParallelCollectionPreservesSlotsAcrossPermutedCompletion` | Removed: executes standalone Rayon collection rather than the compiler and assumes a completion order from a sleep. | Public native ordinal/aggregate-work tests, adapter ordinal projection, mixed-batch receipt preservation, and the adjacent production worker-boundary panic/sibling-receipt regression. |
+| `Tests/Structural/test_source_review.py::test_source_review_is_advisory_and_deterministic` | Retained; removed only the exact 1,000-line advisory threshold assertion. | Deterministic advisory output, ownership/definition evidence, absence of pass/fail verdict fields, successful public command, and JSON output consistency remain enforced. |
+
+These removals change no production Python or Rust behavior. Exact proof scope,
+complete/incomplete outcomes, capacity-one ownership, deterministic receipts,
+physical oracles, canonical versioned serialization, current identity,
+deadlines, work bounds and acceptance gates remain strict. Uncertain tuning,
+recipe-domain and traversal-order findings require separate scoped decisions.

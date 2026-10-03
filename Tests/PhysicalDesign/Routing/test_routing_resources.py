@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 from PhysicalDesign.Redstone.Rules import BuildPhysicalGraphs, BuildRoutingResources, ForkRoutingResourcesWithSharedStaticGeometry, FindFlatRouteConflicts, MaterializeReservedRepeaters, ValidatePhysicalRoutes, ValidateTemplateIsolation
 from PhysicalDesign.Resources.ResourceGraph import BuildRoutingEnvelope, FindClaimConflicts, RoutingResourceClaims, RoutingResourceGraph
-from PhysicalDesign.Routing.Pcb import BuildPcbRoutingConfigurations
 from Formats.SystemVerilog.Sv import ParseSvToNetlist
 from PhysicalDesign.Placement.Engine.Construction.Commit import PlacePcbGraph
 from Compilation.Synthesis.LogicOptimization import OptimizeLogic
@@ -362,17 +361,6 @@ class RoutingResourceTests(unittest.TestCase):
         self.assertIn((0, 0, 0), ConflictCells)
         self.assertGreater(ConflictCounts["Upper"], 0)
         self.assertGreater(ConflictCounts["Lower"], 0)
-
-    def testRoutingUsesOneAuthoritativeStrictAttempt(self) -> None:
-        Placement = SimpleNamespace()
-        Configurations = BuildPcbRoutingConfigurations(Placement)
-
-        self.assertEqual(len(Configurations), 1)
-        self.assertEqual(Configurations[0].AttemptId, "Authoritative")
-        self.assertEqual(Configurations[0].SearchMargin, 20)
-        self.assertEqual(Configurations[0].GuidePenalty, 6)
-        self.assertEqual(Configurations[0].MaximumIterations, 4)
-        self.assertEqual(Configurations[0].OrderMode, "Natural")
 
     def testTerminalBanksPreserveDeclaredPortOrder(self) -> None:
         with TemporaryDirectory() as Workdir:

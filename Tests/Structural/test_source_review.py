@@ -23,7 +23,6 @@ def test_source_review_is_advisory_and_deterministic(capsys) -> None:
 
     assert First == Second
     assert First["Status"] == "advisory"
-    assert First["ReviewTargets"]["PythonDefinitionSpanLines"] == 1_000
     assert First["Ownership"]
     assert First["LargestFiles"]
     assert First["LargestPythonDefinitions"]

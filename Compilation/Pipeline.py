@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Any, Callable
 
+from .Hooks import CompilerHooks, EmitCompilerAction, ObserveCompilerRun, RunCompilerOperation
 from Formats.SystemVerilog import Sv
 from .Synthesis.Diagram import WriteNandDiagram
 from .Synthesis.LogicOptimization import OptimizeLogic
@@ -670,6 +671,7 @@ def TryWriteRoutingFailureArtifact(**Arguments: object) -> Path | None:
         return None
 
 
+@ObserveCompilerRun
 def CompileSvToLitematic(
     *,
     InputPath: Path,
@@ -682,6 +684,7 @@ def CompileSvToLitematic(
     RoutingDeadlineSeconds: float | None = None,
     TraceSupportBlocks: tuple[str, ...] | list[str] | None = None,
     TimingCallback: Callable[[str, str], None] | None = None,
+    Hooks: CompilerHooks | None = None,
     ValidationProgressCallback: (
         Callable[[PhysicalValidationProgress], None] | None
     ) = None,
@@ -704,7 +707,7 @@ def CompileSvToLitematic(
     RoutingFailurePath.unlink(missing_ok=True)
     Stages = []
 
-    Netlist = Sv.ParseSvToNetlist(
+    Netlist = RunCompilerOperation("frontend.parse", Sv.ParseSvToNetlist,
         InputPath=InputPath,
         TopModule=TopModule,
         Workdir=Workdir,
@@ -712,27 +715,29 @@ def CompileSvToLitematic(
     Stages.append("parse")
 
     OriginalLogicGateCount = len(Netlist.Modules[Netlist.Top].Gates)
-    OptimizedIR = OptimizeLogic(Netlist)
+    OptimizedIR = RunCompilerOperation("synthesis.optimize", OptimizeLogic, Netlist)
     OptimizedLogicGateCount = len(OptimizedIR.Modules[OptimizedIR.Top].Gates)
     Stages.append("logic_optimization")
 
-    NandIR = ToNandOnly(OptimizedIR)
-    ValidateNandOnlyDesign(NandIR)
+    NandIR = RunCompilerOperation("synthesis.nand", ToNandOnly, OptimizedIR)
+    RunCompilerOperation("synthesis.validate", ValidateNandOnlyDesign, NandIR)
     Stages.append("nand_transform")
 
-    WriteNandDiagram(NandIR, DiagramPath)
+    RunCompilerOperation("synthesis.diagram", WriteNandDiagram, NandIR, DiagramPath)
     Stages.append("nand_diagram")
 
     if TimingCallback is not None:
         TimingCallback("Routing", "begin")
 
     def ReportRoutingStage(Stage: str) -> None:
+        EmitCompilerAction("physical.routing", "stage", Name=Stage)
+        EmitCompilerAction("physical.routing." + Stage.split(" | ")[-1], "entered")
         if TimingCallback is not None:
             TimingCallback("RoutingStage", Stage)
 
     try:
         try:
-            Physical = PlaceAndRoutePcb(
+            Physical = RunCompilerOperation("physical.place_and_route", PlaceAndRoutePcb,
                 NandIR,
                 ProgressCallback=ProgressCallback,
                 Strategy=RequestedStrategy,
@@ -777,11 +782,11 @@ def CompileSvToLitematic(
     Routed = Physical.Routed
     Stages.append("pcb_routing")
     Stages.append("route_cleanup")
-    ValidateNandOnlyDesign(Physical.Placed, NandIR)
+    RunCompilerOperation("physical.validate_nand", ValidateNandOnlyDesign, Physical.Placed, NandIR)
     Routed.TraceSupportBlocks = (
         tuple(TraceSupportBlocks) if TraceSupportBlocks is not None else ()
     )
-    Rendered = Renderer.BuildLitematicBlockMap(
+    Rendered = RunCompilerOperation("rendering.blocks", Renderer.BuildLitematicBlockMap,
         Routed,
         TraceSupportBlocks=Routed.TraceSupportBlocks,
     )
@@ -789,7 +794,7 @@ def CompileSvToLitematic(
     NandModule = NandIR.Modules[NandIR.Top]
     if TimingCallback is not None:
         TimingCallback("Validation", "begin")
-    PhysicalFixture = BuildPhysicalFixture(
+    PhysicalFixture = RunCompilerOperation("validation.fixture", BuildPhysicalFixture,
         RoutedDesign=Routed,
         Rendered=Rendered,
         Module=NandModule,
@@ -818,7 +823,7 @@ def CompileSvToLitematic(
                 / OutputPath.with_suffix(".PhysicalFixture.json").name,
                 PhysicalFixture,
             )
-            MchprsValidation = MchprsValidator().Validate(
+            MchprsValidation = RunCompilerOperation("validation.mchprs", MchprsValidator().Validate,
                 Fixture=ValidationFixture,
                 LogicPath=DiagramPath,
                 ProgressCallback=(
@@ -860,7 +865,7 @@ def CompileSvToLitematic(
                     TopModule=TopModule,
                     EffectivePolicy=EffectivePolicy,
                 )
-                RequirePhysicalValidation(MchprsValidation, "MchprsValidation")
+                RunCompilerOperation("validation.mchprs_verdict", RequirePhysicalValidation, MchprsValidation, "MchprsValidation")
 
             Stages.append("mchprs_validation")
             FabricCanaryVectors = BuildFabricCanaryVectors(
@@ -879,7 +884,7 @@ def CompileSvToLitematic(
                     Stage="waiting for required Fabric final check",
                     Backend="fabric-26.2-canary",
                 ))
-            FabricFinalCheck = ServerSupervisor.Validate(
+            FabricFinalCheck = RunCompilerOperation("validation.fabric", ServerSupervisor.Validate,
                 Fixture=ValidationFixture,
                 Vectors=FabricCanaryVectors,
                 ProgressCallback=(
@@ -933,7 +938,7 @@ def CompileSvToLitematic(
             TopModule=TopModule,
             EffectivePolicy=EffectivePolicy,
         )
-        RequirePhysicalValidation(FabricFinalCheck, "FabricFinalCheck")
+        RunCompilerOperation("validation.fabric_verdict", RequirePhysicalValidation, FabricFinalCheck, "FabricFinalCheck")
 
     GlobalPlan = Routed.GlobalPlan
     Metrics = Routed.RoutingMetrics
@@ -1135,7 +1140,7 @@ def CompileSvToLitematic(
             else None
         ),
     }
-    PhysicalDesignPath = PublishSuccessArtifacts(
+    PhysicalDesignPath = RunCompilerOperation("publication.artifacts", PublishSuccessArtifacts,
         Routed=Routed,
         Rendered=Rendered,
         PhysicalDesignDocument=PhysicalDesignDocument,

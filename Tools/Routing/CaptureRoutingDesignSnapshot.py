@@ -35,7 +35,7 @@ GeneratorPath = Path(__file__).resolve()
 if str(RepositoryRoot) not in sys.path:
     sys.path.insert(0, str(RepositoryRoot))
 from App.RoutingFailureArtifacts import (
-    ReportName, ReceiptName, ReportNames, MaximumReportBytes, MaximumReceiptBytes,
+    ReportName, ReceiptName, ReportNames, ReportFileNames, SelectReportName, MaximumReportBytes, MaximumReceiptBytes,
     ValidateReportPair, ProjectListedReport, UniqueReportMembers, ArchiveRelativeMember,
     OpenEvidenceDirectory, WriteEvidenceMember, VerifyEvidenceDirectory,
 )
@@ -3723,7 +3723,8 @@ def CaptureSelectedFailureReport(FailureObservation: VerifiedFileObservation,
         else:
             Descriptors = _OpenAbsoluteDirectoryWithoutFollowing(FailureObservation.Path.parent)
             try:
-                for Name, Limit in ((ReportName, MaximumReportBytes), (ReceiptName, MaximumReceiptBytes)):
+                for Name in sorted(ReportNames):
+                    Limit = MaximumReceiptBytes if Name == ReceiptName else MaximumReportBytes
                     Value = _ReadVerifiedFileAtRoot(FailureObservation.Path.parent, Descriptors[-1], Name,
                                                    MissingAllowed=True, MaximumBytes=Limit)
                     Values[Name] = Value.Data if Value else None
@@ -3732,8 +3733,11 @@ def CaptureSelectedFailureReport(FailureObservation: VerifiedFileObservation,
             finally:
                 for Descriptor in reversed(Descriptors):
                     os.close(Descriptor)
+            SelectedName = SelectReportName(Name for Name in ReportFileNames if Values.get(Name) is not None)
             Result = ValidateReportPair(FailureName=FailureObservation.Path.name, FailureData=FailureObservation.Data,
-                                        ReportData=Values[ReportName], ReceiptData=Values[ReceiptName])
+                                        ReportData=Values[SelectedName], ReceiptData=Values[ReceiptName])
+            if Result["Status"] == "Available" and Result["Report"]["Name"] != SelectedName:
+                Result = {"Status": "Rejected", "Reason": "report format/name mismatch"}
     except (ValueError, OSError, TypeError):
         Result = {"Status": "Rejected", "Reason": "unsafe selected report evidence"}
     return Result, Observations if Result["Status"] == "Available" else {}
@@ -4253,7 +4257,7 @@ def ReadRoutingDesignSnapshot(Directory: Path) -> dict[str, object]:
             raise ValueError("incomplete snapshot seal")
         Values = {}
         for Name, Digest in Digests.items():
-            Limit = (MaximumReportBytes if Name.endswith("/" + ReportName) else
+            Limit = (MaximumReportBytes if Path(Name).name in ReportFileNames else
                      MaximumReceiptBytes if Name.endswith("/" + ReceiptName) else None)
             Value = _ReadVerifiedFileAtRoot(Root, Descriptors[-1], Name, MaximumBytes=Limit)
             assert Value is not None
@@ -4285,7 +4289,8 @@ def ReadRoutingDesignSnapshot(Directory: Path) -> dict[str, object]:
             if Value.Sha256 != Record.get("Sha256") or Value.SizeBytes != Record.get("SizeBytes"):
                 raise ValueError("snapshot artifact identity mismatch")
             ByName[Name] = Record
-        ReportValue = Values.get("Artifacts/" + ReportName)
+        SelectedName = SelectReportName(Path(Name).name for Name in Values if Path(Name).name in ReportFileNames)
+        ReportValue = Values.get("Artifacts/" + SelectedName)
         ReceiptValue = Values.get("Artifacts/" + ReceiptName)
         if ReportValue is None and ReceiptValue is None:
             Retained = Snapshot.get("RoutingFailureReport", {})
@@ -4312,9 +4317,11 @@ def ReadRoutingDesignSnapshot(Directory: Path) -> dict[str, object]:
                     FailureName=SourceName, FailureData=Source.Data,
                     ReportData=ReportValue.Data if ReportValue else None,
                     ReceiptData=ReceiptValue.Data if ReceiptValue else None,
-                    ExpectedReport=ByName.get("Artifacts/" + ReportName),
+                    ExpectedReport=ByName.get("Artifacts/" + SelectedName),
                     ExpectedReceipt=ByName.get("Artifacts/" + ReceiptName), RequireInventory=True,
                 )
+                if Evidence["Status"] == "Available" and Evidence["Report"]["Name"] != SelectedName:
+                    Evidence = {"Status": "Rejected", "Reason": "report format/name mismatch"}
             except (ValueError, TypeError, AttributeError):
                 Evidence = {"Status": "Rejected", "Reason": "report source binding unavailable"}
         return {"Snapshot": Snapshot, "RoutingFailureReport": Evidence}

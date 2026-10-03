@@ -51,6 +51,80 @@ def PromptPath(Label: str, Default: Path | None = None) -> Path:
         print("A path is required.")
 
 
+def RunDebuggingIoDryRun() -> Path:
+    """Write matching success and simulated-failure reports through real I/O."""
+    import tempfile
+    import time
+    from App.RunReporting import BuildRunId, UtcTimestamp, WriteRunReport
+
+    RepositoryRoot = Path(__file__).resolve().parent.parent
+    OutputRoot = RepositoryRoot / "Output" / "DebuggingIO"
+    OutputRoot.mkdir(parents=True, exist_ok=True)
+    RunRoot = Path(tempfile.mkdtemp(
+        prefix=f"{BuildRunId()}-dry-run-",
+        dir=OutputRoot,
+    ))
+    StartedAt = time.monotonic()
+
+    SuccessDirectory = RunRoot / "Success"
+    SuccessDirectory.mkdir()
+    SuccessOutput = "Dry-run success: standard output was captured.\n"
+    SuccessReport = WriteRunReport(
+        RunDirectory=SuccessDirectory,
+        Result="SUCCESS",
+        WallSeconds=max(0.001, time.monotonic() - StartedAt),
+        CpuSeconds=0.0,
+        Summary="Synthetic success report from the debugging I/O dry run.",
+        RepositoryRoot=RepositoryRoot,
+        StartedAtUtc=UtcTimestamp(),
+        CompletedAtUtc=UtcTimestamp(),
+        Command=[sys.executable, "Main.py", "--synthetic-debugging-io-success"],
+        WorkingDirectory=RepositoryRoot,
+        Stdout=SuccessOutput,
+        Details={"DebuggingDryRun": True, "OutcomeSource": "synthetic"},
+    )
+
+    FailureDirectory = RunRoot / "Failure"
+    FailureDirectory.mkdir()
+    FailureArtifact = FailureDirectory / "DryRun.RoutingFailure.json"
+    FailureArtifact.write_text(json.dumps({
+        "SchemaVersion": "routing-failure-v1",
+        "Failure": {
+            "Stage": "DebuggingIoDryRun",
+            "Reason": "SyntheticFailure",
+            "Detail": "This failure is simulated to exercise report output.",
+        },
+    }, indent=2) + "\n", encoding="utf-8")
+    FailureReport = WriteRunReport(
+        RunDirectory=FailureDirectory,
+        Result="FAILURE",
+        WallSeconds=max(0.001, time.monotonic() - StartedAt),
+        CpuSeconds=0.0,
+        Summary="Synthetic failure report from the debugging I/O dry run.",
+        RepositoryRoot=RepositoryRoot,
+        StartedAtUtc=UtcTimestamp(),
+        CompletedAtUtc=UtcTimestamp(),
+        Command=[sys.executable, "Main.py", "--synthetic-debugging-io-failure"],
+        WorkingDirectory=RepositoryRoot,
+        Stdout="Dry-run failure: captured output before the synthetic failure.\n",
+        Stderr="Synthetic failure output for debugging report display.\n",
+        FailureType="Debugging I/O dry run: SyntheticFailure",
+        ExceptionText="Synthetic exception text; no compiler operation was run.",
+        Details={"DebuggingDryRun": True, "OutcomeSource": "synthetic"},
+        RoutingFailurePath=FailureArtifact,
+    )
+
+    print("DEBUGGING I/O DRY RUN: synthetic success and failure reports saved.")
+    print("SUCCESS REPORT:")
+    print("\n".join(SuccessReport.ResultLines))
+    print(f"SUCCESS REPORT DIRECTORY: {SuccessDirectory}")
+    print("FAILURE REPORT:")
+    print("\n".join(FailureReport.ResultLines))
+    print(f"FAILURE REPORT DIRECTORY: {FailureDirectory}")
+    print(f"DRY RUN FILES: {RunRoot}")
+    return RunRoot
+
+
 def SaveDefaults(
     PathValue: Path,
     Defaults: dict[str, object],
@@ -192,18 +266,25 @@ def MoreOptionsMenu(
     """Run defaults and artifact utilities, returning current defaults."""
     while True:
         print("More options")
-        print("1. Configure defaults")
-        print("2. Show defaults")
-        print("3. Push an existing litematic to Minecraft")
-        print("4. Back")
-        Choice = input("Select an option [4]: ").strip() or "4"
+        print("1. Dry run report I/O (success and failure)")
+        print("2. Configure defaults")
+        print("3. Show defaults")
+        print("4. Push an existing litematic to Minecraft")
+        print("5. Back")
+        Choice = input("Select an option [5]: ").strip() or "5"
         if Choice == "1":
-            Defaults = ConfigureDefaults(Defaults, DefaultsFile)
+            try:
+                RunDebuggingIoDryRun()
+            except (OSError, ValueError) as Error:
+                print(f"Debugging I/O dry run failed: {Error}")
             continue
         if Choice == "2":
-            ShowDefaults(Defaults, DefaultsFile)
+            Defaults = ConfigureDefaults(Defaults, DefaultsFile)
             continue
         if Choice == "3":
+            ShowDefaults(Defaults, DefaultsFile)
+            continue
+        if Choice == "4":
             LitematicPath = PromptPath(
                 "Litematic file",
                 Path(str(Defaults["PushFilePath"])),
@@ -214,9 +295,69 @@ def MoreOptionsMenu(
             )
             print(f"Pushed to Minecraft: {DestinationPath}")
             continue
-        if Choice == "4":
+        if Choice == "5":
             return Defaults
         print(f"Unknown menu option: {Choice}")
+
+
+def DebuggingMenu(
+    Defaults: dict[str, object],
+    DefaultsFile: Path,
+) -> list[str] | None:
+    """Expose hook capture and existing diagnostic tools through guided input."""
+    while True:
+        print("Debugging")
+        print("1. Compile with compiler hooks")
+        print("2. Diagnose a saved compiler trace")
+        print("3. Inspect saved routing CPU telemetry")
+        print("4. Review source structure")
+        print("5. Back")
+        Choice = input("Select an option [5]: ").strip() or "5"
+        try:
+            if Choice == "1":
+                Arguments = BuildGuidedCompileArguments(Defaults, DefaultsFile)
+                while True:
+                    Value = PromptText("Hook stages (comma-separated; Enter for all)")
+                    Stages = [Stage.strip() for Stage in Value.split(",") if Stage.strip()]
+                    try:
+                        for Stage in Stages:
+                            CompilerCli.ParseCompilerHookStage(Stage)
+                    except argparse.ArgumentTypeError as Error:
+                        print(f"Invalid hook stages: {Error}")
+                        continue
+                    break
+                if Stages:
+                    for Stage in Stages:
+                        Arguments.extend(("--compiler-hook-stage", Stage))
+                else:
+                    Arguments.append("--compiler-hooks")
+                return Arguments
+            if Choice == "2":
+                from Compilation.Hooks import ReadCompilerTrace, DiagnoseCompilerTrace
+
+                TracePath = PromptPath("Compiler trace JSON file")
+                Diagnosis = DiagnoseCompilerTrace(ReadCompilerTrace(TracePath))
+                print(json.dumps(Diagnosis, indent=2))
+                continue
+            if Choice == "3":
+                Directory = PromptPath("Compiler run directory")
+                SummaryPath = Directory / "RoutingTelemetry.txt"
+                with SummaryPath.open("rb") as Stream:
+                    Summary = Stream.read(1_000_001)
+                if len(Summary) > 1_000_000:
+                    raise ValueError("saved telemetry summary exceeds display limit")
+                print(Summary.decode("utf-8"))
+                continue
+            if Choice == "4":
+                from Tools.Routing.ReviewSourceStructure import Main as ReviewMain
+
+                ReviewMain([])
+                continue
+            if Choice == "5":
+                return None
+            print(f"Unknown menu option: {Choice}")
+        except (OSError, ValueError) as Error:
+            print(f"Debugging tool failed: {Error}")
 
 
 def RunBenchmark(Args: list[str] | None = None) -> int:
@@ -239,8 +380,9 @@ def GuidedMenu(
         print("1. Compile SystemVerilog")
         print("2. PyTest")
         print("3. Benchmark")
-        print("4. More options")
-        print("5. Exit")
+        print("4. Debugging")
+        print("5. More options")
+        print("6. Exit")
         Choice = input("Select an option [1]: ").strip() or "1"
         if Choice == "1":
             return BuildGuidedCompileArguments(Defaults, DefaultsFile), Defaults
@@ -251,9 +393,14 @@ def GuidedMenu(
             RunBenchmark([])
             continue
         if Choice == "4":
-            Defaults = MoreOptionsMenu(Defaults, DefaultsFile)
+            Arguments = DebuggingMenu(Defaults, DefaultsFile)
+            if Arguments is not None:
+                return Arguments, Defaults
             continue
         if Choice == "5":
+            Defaults = MoreOptionsMenu(Defaults, DefaultsFile)
+            continue
+        if Choice == "6":
             return None, Defaults
         print(f"Unknown menu option: {Choice}")
 

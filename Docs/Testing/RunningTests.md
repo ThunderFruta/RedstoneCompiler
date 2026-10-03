@@ -47,7 +47,7 @@ module-level pytest functions:
 The guided `Run pytest` action runs this deterministic tier, explicitly
 disables `RC_RUN_SCALE_TESTS`, streams output, and retains `Summary.txt` and
 `RawDump.txt` beneath `Output/Pytest/<UTC run id>/`. Its concise terminal
-result is headed by `RESULT`, `TIME`, optional `CPU`, and `OUTPUT`; the saved
+result is headed by `RESULT`, `TIME`, `PERF`, a numbered `STAGES` chain, and `OUTPUT`; the saved
 report also records runtime provenance, Git identity, and artifact evidence.
 
 ## Source-to-NAND semantic gate

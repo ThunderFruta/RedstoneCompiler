@@ -9,17 +9,22 @@ from hashlib import sha256
 from html.parser import HTMLParser
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import secrets
 from typing import Mapping
 
-ReportName = "RoutingFailureReport.html"
+ReportName = "RoutingFailureReport.md"
+LegacyReportName = "RoutingFailureReport.html"
+ReportFileNames = frozenset({ReportName, LegacyReportName})
 ReceiptName = "RoutingFailureReport.receipt.json"
-ReceiptVersion = "routing-failure-report-receipt-v1"
+ReceiptVersion = "routing-failure-report-receipt-v3"
+MarkdownReceiptVersion = "routing-failure-report-receipt-v2"
+LegacyReceiptVersion = "routing-failure-report-receipt-v1"
 MaximumReportBytes = 256 * 1024
 MaximumReceiptBytes = 4096
-ReportNames = frozenset({ReportName, ReceiptName})
+ReportNames = ReportFileNames | {ReceiptName}
 ReportCsp = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
 ReportStyle = """
 body{font:16px/1.5 system-ui,sans-serif;max-width:960px;margin:32px auto;padding:0 24px;color:#17252f;background:#f5f7fa}
@@ -139,22 +144,40 @@ def ValidateReportPair(*, FailureName: str, FailureData: bytes,
             return Result("Rejected", "retained report identity mismatch")
     try:
         Receipt = json.loads(ReceiptData, object_pairs_hook=_UniqueObject)
-        if not isinstance(Receipt, dict) or Receipt.get("SchemaVersion") != ReceiptVersion:
+        if not isinstance(Receipt, dict) or Receipt.get("SchemaVersion") not in (ReceiptVersion, MarkdownReceiptVersion, LegacyReceiptVersion):
             raise ValueError("unsupported receipt schema")
         Source = Receipt.get("Source")
         Report = Receipt.get("Report")
+        ExpectedName = (LegacyReportName if Receipt["SchemaVersion"] == LegacyReceiptVersion else ReportName)
+        if Receipt["SchemaVersion"] in (ReceiptVersion, MarkdownReceiptVersion) and (
+                set(Receipt) != {"SchemaVersion", "Source", "Report"}
+                or not isinstance(Source, dict) or not isinstance(Report, dict)
+                or set(Source) != {"Name", "SizeBytes", "Sha256"}
+                or set(Report) != {"Name", "SizeBytes", "Sha256"}):
+            raise ValueError("noncanonical Markdown receipt fields")
+        if Receipt["SchemaVersion"] in (ReceiptVersion, MarkdownReceiptVersion):
+            for Identity in (Source, Report):
+                Digest = Identity["Sha256"]
+                if (type(Identity["Name"]) is not str
+                        or type(Identity["SizeBytes"]) is not int or Identity["SizeBytes"] < 0
+                        or type(Digest) is not str or len(Digest) != 64
+                        or any(Char not in "0123456789abcdef" for Char in Digest)):
+                    raise ValueError("noncanonical Markdown identity types")
         if (not isinstance(Source, dict) or not isinstance(Report, dict)
-                or Source.get("Name") != FailureName or Report.get("Name") != ReportName
+                or Source.get("Name") != FailureName or Report.get("Name") != ExpectedName
                 or not FailureName.endswith(".RoutingFailure.json")
                 or any(Token in FailureName for Token in ("/", "\\"))
                 or (Source != SourceIdentity if SourceIdentity is not None
                     else not _IdentityMatches(FailureData, Source))
                 or not _IdentityMatches(ReportData, Report)):
             return Result("Rejected", "report source or content binding mismatch")
-        Parser = _InertHtml()
-        Parser.feed(ReportData.decode("utf-8")); Parser.close(); Parser.Check()
+        if ExpectedName == LegacyReportName:
+            Parser = _InertHtml()
+            Parser.feed(ReportData.decode("utf-8")); Parser.close(); Parser.Check()
+        else:
+            ValidateMarkdown(ReportData.decode("utf-8"), Tables=Receipt["SchemaVersion"] == ReceiptVersion)
     except (UnicodeError, ValueError, TypeError, RecursionError):
-        return Result("Malformed", "invalid receipt or unsupported/inert HTML grammar")
+        return Result("Malformed", "invalid receipt or unsupported report grammar")
     return {"Status": "Available", "Reason": None, "Source": Source,
             "Report": Report, "Receipt": FileIdentity(ReceiptName, ReceiptData)}
 
@@ -196,52 +219,90 @@ def ReadReportFile(Directory: Path, Name: str, Limit: int) -> bytes | None:
             os.close(Descriptor)
 
 
+def SelectReportName(Names) -> str:
+    """Select one report format, rejecting ambiguous mixed-format evidence."""
+    Present = set(Names) & ReportFileNames
+    if len(Present) > 1:
+        raise ValueError("multiple report formats beside selected failure")
+    return next(iter(Present), ReportName)
+
+
+def ValidateMarkdown(Text: str, *, Tables: bool = False) -> None:
+    """V2 retains literal blocks; v3 adds bounded literal spans in tables."""
+    if not Text.startswith("# Routing failure report\n"):
+        raise ValueError("missing Markdown report title")
+    InCode = False
+    for Line in Text.split("\n"):
+        if any(ord(Char) < 32 and Char != "\t" for Char in Line) or "<" in Line:
+            raise ValueError("unsafe report text")
+        if Line == "```text" and not InCode:
+            InCode = True
+        elif Line == "```" and InCode:
+            InCode = False
+        elif InCode:
+            if "`" in Line:
+                raise ValueError("unsupported literal delimiter")
+        else:
+            Parts = re.split(r"(`[^`]*`)", Line) if Tables else [Line]
+            for Part in Parts:
+                if Part.startswith("`") and Part.endswith("`") and len(Part) >= 2:
+                    if not Tables or not (Line.startswith("|") and Line.endswith("|")) or "|" in Part:
+                        raise ValueError("literal span must stay inside one table cell")
+                elif any(Token in Part for Token in ("`", "[", "]", "!", "\\", "://", "www.", "@", "javascript:", "data:")):
+                    raise ValueError("unsupported Markdown markup")
+    if InCode:
+        raise ValueError("unclosed literal block")
+
+
 def ObserveReportPair(FailurePath: Path, FailureData: bytes = b"", *, SourceIdentity: object = None, RecheckSource: bool = False) -> dict[str, object]:
-    """Observe the fixed sibling pair; absence never changes routing outcome."""
+    """Observe one source-bound sibling pair, preserving legacy v1 readback."""
     Records = {}
     try:
-        Values = {}
-        for Name, Limit in ((ReportName, MaximumReportBytes), (ReceiptName, MaximumReceiptBytes)):
-            Data = ReadReportFile(FailurePath.parent, Name, Limit)
-            Values[Name] = Data
-            Records[Name] = {"Path": str(Path(os.path.abspath(FailurePath.parent / Name))),
-                             "Exists": Data is not None}
+        Values = {Name: ReadReportFile(FailurePath.parent, Name, MaximumReportBytes)
+                  for Name in sorted(ReportFileNames)}
+        Name = SelectReportName(Key for Key, Data in Values.items() if Data is not None)
+        Values[ReceiptName] = ReadReportFile(FailurePath.parent, ReceiptName, MaximumReceiptBytes)
+        for Member in (Name, ReceiptName):
+            Data = Values[Member]
+            Records[Member] = {"Path": str(Path(os.path.abspath(FailurePath.parent / Member))),
+                               "Exists": Data is not None}
             if Data is not None:
-                Records[Name].update({Key: Value for Key, Value in FileIdentity(Name, Data).items() if Key != "Name"})
+                Records[Member].update({Key: Value for Key, Value in FileIdentity(Member, Data).items() if Key != "Name"})
         if RecheckSource:
             CurrentSource = ReadReportFile(FailurePath.parent, FailurePath.name, 4 * 1024 * 1024)
             if CurrentSource is None or FileIdentity(FailurePath.name, CurrentSource) != SourceIdentity:
                 raise ValueError("retained source changed after report publication")
             FailureData = CurrentSource
         Result = ValidateReportPair(FailureName=FailurePath.name, FailureData=FailureData,
-                                    ReportData=Values[ReportName], ReceiptData=Values[ReceiptName],
+                                    ReportData=Values[Name], ReceiptData=Values[ReceiptName],
                                     SourceIdentity=SourceIdentity)
+        if Result["Status"] == "Available" and Result["Report"]["Name"] != Name:
+            Result = {"Status": "Rejected", "Reason": "receipt selected a different report format"}
     except (OSError, ValueError) as Error:
         Result = {"Status": "Rejected", "Reason": "unsafe report observation: " + type(Error).__name__}
     return {**Result, "Artifacts": Records}
 
 
 def ProjectListedReport(FailureRecord: object, Artifacts: Mapping[str, object], ReadBytes) -> dict[str, object]:
-    """Project report evidence from immutable observations and retained listings.
-
-    ReadBytes receives only the selected failure path or its two fixed siblings;
-    the archive/snapshot owner maps those names into its verified member table.
-    """
+    """Project a unique report pair from immutable observations and inventory."""
     if not isinstance(FailureRecord, dict) or not isinstance(FailureRecord.get("Path"), str):
         return {"Status": "Unavailable", "Reason": "no authoritative failure artifact"}
     FailurePath = Path(FailureRecord["Path"])
-    Expected = []
-    Data = []
     try:
-        Canonical = {ReportName: "RoutingFailureReport", ReceiptName: "RoutingFailureReportReceipt"}
+        Values = {Name: ReadBytes(str(FailurePath.parent / Name)) for Name in sorted(ReportFileNames)}
+        Name = SelectReportName(Key for Key, Data in Values.items() if Data is not None)
+        Canonical = {Member: "RoutingFailureReport" for Member in ReportFileNames}
+        Canonical[ReceiptName] = "RoutingFailureReportReceipt"
         for Key, Record in Artifacts.items():
             if isinstance(Record, dict) and isinstance(Record.get("Path"), str):
-                Name = Path(Record["Path"]).name
-                if Name in ReportNames and (Key != Canonical[Name]
-                        or Record["Path"] != str(FailurePath.parent / Name)):
+                Member = Path(Record["Path"]).name
+                if Member in ReportNames and (Key != Canonical[Member]
+                        or Record["Path"] != str(FailurePath.parent / Member)
+                        or (Member in ReportFileNames and Member != Name)):
                     return {"Status": "Rejected", "Reason": "duplicate or misplaced report inventory record"}
-        for Name, Key in ((ReportName, "RoutingFailureReport"), (ReceiptName, "RoutingFailureReportReceipt")):
-            Sibling = str(FailurePath.parent / Name)
+        Expected, Data = [], []
+        for Member, Key in ((Name, "RoutingFailureReport"), (ReceiptName, "RoutingFailureReportReceipt")):
+            Sibling = str(FailurePath.parent / Member)
             Record = Artifacts.get(Key)
             if Record is not None:
                 if not isinstance(Record, dict) or Record.get("Path") != Sibling:
@@ -249,11 +310,11 @@ def ProjectListedReport(FailureRecord: object, Artifacts: Mapping[str, object], 
                 if sum(isinstance(Value, dict) and Value.get("Path") == Sibling
                        for Value in Artifacts.values()) != 1:
                     return {"Status": "Rejected", "Reason": "duplicate report inventory record"}
-            Member = ReadBytes(Sibling)
-            if Member is not None and (not isinstance(Record, dict) or Record.get("Exists") is not True):
+            Bytes = Values[Member] if Member in ReportFileNames else ReadBytes(Sibling)
+            if Bytes is not None and (not isinstance(Record, dict) or Record.get("Exists") is not True):
                 return {"Status": "Rejected", "Reason": "unlisted report or receipt"}
             Expected.append(Record if isinstance(Record, dict) and Record.get("Exists") is True else None)
-            Data.append(Member)
+            Data.append(Bytes)
         if Data == [None, None] and Expected == [None, None]:
             return {"Status": "Unavailable", "Reason": "report not retained"}
         FailureData = ReadBytes(str(FailurePath))
@@ -263,7 +324,9 @@ def ProjectListedReport(FailureRecord: object, Artifacts: Mapping[str, object], 
                                     ReportData=Data[0], ReceiptData=Data[1],
                                     ExpectedReport=Expected[0], ExpectedReceipt=Expected[1], RequireInventory=True)
         if Result["Status"] == "Available":
-            Result["Path"] = str(FailurePath.parent / ReportName)
+            if Result["Report"]["Name"] != Name:
+                return {"Status": "Rejected", "Reason": "receipt selected a different report format"}
+            Result["Path"] = str(FailurePath.parent / Name)
         return Result
     except (OSError, ValueError, TypeError):
         return {"Status": "Rejected", "Reason": "unsafe report member selection"}
@@ -287,7 +350,7 @@ def UniqueReportMembers(Members, SelectedFailure: str | None) -> bool:
     Actual = {Name for Name in Members if Path(Name).name in ReportNames}
     Expected = ({str(Path(SelectedFailure).parent / Name) for Name in ReportNames}
                 if SelectedFailure is not None else set())
-    return Actual.issubset(Expected)
+    return Actual.issubset(Expected) and len({Path(Name).name for Name in Actual} & ReportFileNames) <= 1
 
 
 def DiscoverReportMembers(Root: Path) -> set[str]:

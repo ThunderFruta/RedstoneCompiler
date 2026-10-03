@@ -28,16 +28,16 @@ not a successful physical design.
 ## Automatic local routing-failure report
 
 The argument and guided compiler CLI now attempts one
-`Runs/<run-id>/RoutingFailureReport.html` after a handled failure reaches the
-existing persisted failure-artifact path. The file is self-contained HTML with
-escaped text and a compact XYZ/claim-role table. It contains no JavaScript,
+`Runs/<run-id>/RoutingFailureReport.md` after a handled failure reaches the
+existing persisted failure-artifact path. The file is Markdown with
+escaped literal text and compact ASCII evidence and XYZ/claim-role graphs. It contains no JavaScript,
 external assets, links derived from diagnostics, browser launch, or server.
 `Summary.txt`, concise terminal output, and `RawDump.txt` name the report;
-RawDump's artifact inventory hashes the HTML using the ordinary reporting
+RawDump's artifact inventory hashes the Markdown using the ordinary reporting
 implementation. A publication error is recorded as `Unavailable` with its
 exception type while preserving the original compiler failure and exit code.
 Success and cancellation do not publish a failure report. Direct callers of
-`CompileSvToLitematic` that do not use CLI run reporting do not receive HTML.
+`CompileSvToLitematic` that do not use CLI run reporting do not receive a report.
 
 The reader consumes only the persisted `routing-failure-v1` artifact, with a
 nonempty typed stage/reason. It displays affected nets/resources/locations,
@@ -69,7 +69,7 @@ Evidence labels are deliberately separate:
   components, contributor provenance, and evaluation identities are not supplied.
 - `Unavailable`, `Malformed`, and `Unsupported` do not imply an empty physical
   world or prove that no conflict exists.
-- The cell table is derived formatting of observed rejection facts, never a
+- The ASCII conflict graph is derived formatting of observed rejection facts, never a
   proven upstream root cause or global impossibility proof.
 - Physical publication, MCHPRS, and Fabric are `not-run` when routing prevented
   them. `MchprsValidation` and `FabricFinalCheck` envelopes instead say their
@@ -78,7 +78,7 @@ Evidence labels are deliberately separate:
 
 Structural safety caps are 4 MiB input parsing, 8,192 discovery values, depth
 24, eight evidence records, 24,000 source text characters, 512 characters per
-string, 24 entries and depth four per displayed field, and a 256 KiB final HTML
+string, 24 entries and depth four per displayed field, and a 256 KiB final Markdown
 ceiling. Search and display truncation are explicit. These are implementation
 resource caps, not a measured latency SLA. The run inventory's existing
 recursive enumeration/hashing and normal provenance/report work remain outside
@@ -94,20 +94,20 @@ does not prove end-to-end producer integration or physical routing acceptance.
 
 ## Sealed report receipts and archive readback
 
-Each new HTML publication also writes `RoutingFailureReport.receipt.json`.
-Receipt schema `routing-failure-report-receipt-v1` contains exactly the source
+Each new Markdown publication also writes `RoutingFailureReport.receipt.json`.
+Current receipt schema `routing-failure-report-receipt-v3` contains exactly the source
 and report byte identities needed for relocation:
 
 ```json
 {
-  "SchemaVersion": "routing-failure-report-receipt-v1",
+  "SchemaVersion": "routing-failure-report-receipt-v3",
   "Source": {"Name": "Design.RoutingFailure.json", "SizeBytes": 123, "Sha256": "<64 lowercase hex characters>"},
-  "Report": {"Name": "RoutingFailureReport.html", "SizeBytes": 456, "Sha256": "<64 lowercase hex characters>"}
+  "Report": {"Name": "RoutingFailureReport.md", "SizeBytes": 456, "Sha256": "<64 lowercase hex characters>"}
 }
 ```
 
 The names are sibling basenames, not paths or URLs to open. The receipt is
-published last. HTML, receipt and ordinary text reports are written using
+published last. Markdown, receipt and ordinary text reports are written using
 retained non-following directory descriptors. The publisher verifies that its
 recorded directory still names the same object before announcing publication;
 ordinary reporting then safely rechecks the retained failure bytes. Existing
@@ -115,9 +115,8 @@ pairs are validated instead of overwritten or regenerated. A report bound to
 an older/different failure is rejected.
 
 `App/RoutingFailureArtifacts.py` owns the shared contract. It validates exact
-byte lengths/hashes, the source binding, a unique listing, the fixed inert HTML
-grammar/CSP/stylesheet, and safe file observations. Receipt parsing is limited
-to 4 KiB; HTML remains limited to 256 KiB and source rechecks to 4 MiB. Membership
+byte lengths/hashes, the source binding, a unique listing, the version-selected inert display grammar, and safe file observations. Receipt parsing is limited
+to 4 KiB; Report content remains limited to 256 KiB and source rechecks to 4 MiB. Membership
 discovery inspects directory names through retained descriptors, with a 50,000
 entry and depth-32 cap; it reads no file contents and follows no links.
 
@@ -150,9 +149,9 @@ Routing-design snapshots automatically include only the validated pair for the
 selected failure, avoiding basename collisions with other acceptance cases.
 Other cases retain their availability in the acceptance summary. Snapshot staging
 copies retained observations through directory descriptors, verifies the copy,
-and includes HTML and receipt in the snapshot seal. `ReadRoutingDesignSnapshot`
+and includes the report and receipt in the snapshot seal. `ReadRoutingDesignSnapshot`
 verifies the seal and source binding after relocation. No reader regenerates
-HTML or adds present-day spatial data to old evidence. Historical archives with
+report content or adds present-day spatial data to old evidence. Historical archives with
 no report remain unavailable; an older HTML without a receipt cannot be upgraded
 to trusted report evidence automatically.
 
@@ -171,8 +170,22 @@ not a digital signature against replacement of the files, receipt and every
 checksum together. No routing, reuse, cache or accepted-state authority is
 introduced by the receipt or by successful integrity validation.
 
-The v1 receipt grammar, CSP and stylesheet are a retained reading contract. A
-future viewer format must introduce a new receipt version and preserve v1
-readback; changing the current viewer must not reinterpret or regenerate old
-report bytes. The archive seal authenticates retained byte identities relative
-to the trusted checksum reference, independently of the current renderer.
+New publications use compact Markdown/v3 only. The report has a bounded ASCII data-flow
+graph of retained input/configuration, the reported failure stage/reason, affected
+signals and supported captured conflict cells. Arrows describe evidence
+relationships; they do not prove successful upstream execution or reconstruct
+uncaptured circuit connectivity. Details retain input identities, policy,
+technology, deadlines, work, diagnostic coverage and downstream state. The failure summary and evidence status use tables with escaped literal code spans.
+Source identity, failure details and configuration are grouped into literal blocks.
+Dynamic text stays in these literal spans or blocks; raw HTML, links, images, external
+URLs outside literal blocks, terminal controls and fence injection are rejected.
+
+Legacy receipt v1 continues to select exactly `RoutingFailureReport.html` and
+its existing inert HTML grammar/CSP/stylesheet. Receipts v2 and v3 select exactly
+`RoutingFailureReport.md`. V2 retains its original literal-block grammar. V3 adds
+literal code spans only within one table cell; raw table separators in dynamic
+values are encoded so they cannot expose active Markdown in another cell. Mixed HTML/Markdown siblings are rejected. Valid
+legacy pairs are read as immutable evidence, never regenerated, converted or
+augmented. Archive and routing-design snapshot v3 readback preserve either
+format's original filename and bytes. Report availability remains independent
+of the compiler failure and acceptance verdict.

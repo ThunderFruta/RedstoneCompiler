@@ -5,7 +5,6 @@ No routing/claim producer is used to manufacture the expected spatial facts.
 """
 
 from hashlib import sha256
-from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
@@ -72,12 +71,12 @@ def test_failed_run_publishes_one_source_bound_report_and_inventories_it(tmp_pat
     Source = SaveFailure(tmp_path, LiteralFailure(LiteralEvidence()))
     Original = Source.read_bytes()
     Report = WriteReport(tmp_path, Source)
-    HtmlPaths = list(tmp_path.glob("*.html"))
+    HtmlPaths = list(tmp_path.glob("*.md"))
     assert len(HtmlPaths) == 1
     Html = HtmlPaths[0].read_text()
     assert str(Source) in Html
     assert sha256(Original).hexdigest() in Html
-    assert f">{len(Original)}<" in Html
+    assert str(len(Original)) in Html
     assert Source.read_bytes() == Original
     assert "(4, 2, -1)" in Html
     assert "Support, Air" in Html
@@ -87,7 +86,7 @@ def test_failed_run_publishes_one_source_bound_report_and_inventories_it(tmp_pat
     assert "19" in Html and "150" in Html
     assert "Suggested repair actions (not proof of execution)" in Html
     assert "reconsider placement" in Html and "RemainingMilliseconds: 17" in Html
-    assert Html.count("not-run — routing failure prevented this phase") == 3
+    assert Html.count("not-run - routing failure prevented this phase") == 3
     assert str(HtmlPaths[0]) in Report.SummaryPath.read_text()
     Raw = Report.RawReportPath.read_text()
     assert str(HtmlPaths[0]) in Raw
@@ -98,11 +97,11 @@ def test_failed_run_publishes_one_source_bound_report_and_inventories_it(tmp_pat
 def test_missing_spatial_evidence_keeps_typed_details_and_explicit_unavailable(tmp_path):
     Source = SaveFailure(tmp_path, LiteralFailure())
     WriteReport(tmp_path, Source)
-    Html = (tmp_path / "RoutingFailureReport.html").read_text()
+    Html = (tmp_path / "RoutingFailureReport.md").read_text()
     assert "ClusterInterfaceSolveIncomplete" in Html and "Candidate" in Html
     assert "Spatial evidence state" in Html and "Unavailable" in Html
     assert "Missing coordinates do not mean no conflict exists" in Html
-    assert "<table>" not in Html
+    assert "Conflicting claim roles:" not in Html
 
 
 @pytest.mark.parametrize("Mutation,Expected", [
@@ -124,10 +123,10 @@ def test_scene_states_do_not_claim_false_completeness(tmp_path, Mutation, Expect
     Evidence.update(Mutation)
     Source = SaveFailure(tmp_path, LiteralFailure(Evidence))
     WriteReport(tmp_path, Source)
-    Html = (tmp_path / "RoutingFailureReport.html").read_text()
-    assert f"<pre>{Expected}</pre>" in Html
+    Html = (tmp_path / "RoutingFailureReport.md").read_text()
+    assert Expected in Html
     if Expected in ("Malformed", "Unsupported", "Unavailable"):
-        assert "<table>" not in Html
+        assert "Conflicting claim roles:" not in Html
     else:
         assert "ConflictRetentionLimit" in Html and "(4, 2, -1)" in Html
 
@@ -145,7 +144,7 @@ def test_cli_failure_and_write_failure_preserve_original_result(tmp_path, monkey
     monkeypatch.setattr("App.CompilerCli.BuildRunId", lambda: "failed-run")
     OriginalReplace = os.replace
     def DenyHtml(Source, Target, **Arguments):
-        if str(Target).endswith(".html"):
+        if str(Target).endswith(".md"):
             raise PermissionError("injected report write failure")
         return OriginalReplace(Source, Target, **Arguments)
     monkeypatch.setattr(os, "replace", DenyHtml)
@@ -154,11 +153,12 @@ def test_cli_failure_and_write_failure_preserve_original_result(tmp_path, monkey
     assert Result == 1
     Root = tmp_path / "Runs" / "failed-run"
     assert json.loads((Root / "Design.RoutingFailure.json").read_text()) == LiteralFailure(LiteralEvidence())
-    assert not list(Root.glob("*.html")) and not list(Root.glob(".RoutingFailureReport-*"))
+    assert not list(Root.glob("*.md")) and not list(Root.glob(".RoutingFailureReport-*"))
     assert "FAILURE REPORT: unavailable (PermissionError)" in (Root / "Summary.txt").read_text()
     assert '"Status": "Unavailable"' in (Root / "RawDump.txt").read_text()
     Output = capsys.readouterr()
-    assert "original physical failure" in Output.err
+    assert "original physical failure" in Output.out
+    assert "original physical failure" in (Root / "RawDump.txt").read_text()
     assert "Candidate: ClusterInterfaceSolveIncomplete" in Output.out
 
 
@@ -173,41 +173,43 @@ def test_cli_automatically_publishes_from_persisted_failure(tmp_path, monkeypatc
     monkeypatch.setattr("App.CompilerCli.BuildRunId", lambda: "failed-run")
     assert Main(["--input", "Assets/Examples/FullAdder.sv", "--output", str(tmp_path / "Design.litematic"),
                  "--defaults-file", str(tmp_path / "missing.json"), "--no-routing-telemetry"]) == 1
-    assert len(list((tmp_path / "Runs" / "failed-run").glob("*.html"))) == 1
+    assert len(list((tmp_path / "Runs" / "failed-run").glob("*.md"))) == 1
 
 
 def test_success_does_not_publish_even_with_a_stale_failure_artifact(tmp_path):
     Source = SaveFailure(tmp_path, LiteralFailure())
     Report = WriteReport(tmp_path, Source, "SUCCESS")
-    assert not list(tmp_path.glob("*.html"))
+    assert not list(tmp_path.glob("*.md"))
     assert "FAILURE REPORT:" not in Report.SummaryPath.read_text()
-
-
-class DocumentTags(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.Tags = []
-        self.Attributes = []
-    def handle_starttag(self, Tag, Attributes):
-        self.Tags.append(Tag)
-        self.Attributes.extend(Attributes)
 
 
 def test_diagnostic_text_is_inert_and_never_used_as_paths_or_urls(tmp_path):
     Evidence = LiteralEvidence()
     Evidence["Signal"] = '<script>fetch("https://example.invalid/secret")</script>'
     Payload = LiteralFailure(Evidence)
-    Payload["Failure"]["Detail"] = '../../escape.html <img src="https://example.invalid/image" onerror="alert(1)">'
-    Payload["Failure"]["RepairActions"] = ['<a href="javascript:alert(1)">go</a>']
+    Payload["Failure"]["Detail"] = '```\n![image](https://example.invalid)\n<img onerror="alert(1)">\x1b[31m'
+    Payload["Failure"]["RepairActions"] = ['[go](javascript:alert(1))']
     Source = SaveFailure(tmp_path, Payload)
+    Original = Source.read_bytes()
     WriteReport(tmp_path, Source)
-    Html = (tmp_path / "RoutingFailureReport.html").read_text()
-    Parser = DocumentTags(); Parser.feed(Html)
-    assert not set(Parser.Tags) & {"script", "img", "iframe", "a", "object", "link"}
-    assert not any(Key in ("href", "src", "onerror") for Key, _ in Parser.Attributes)
-    assert "&lt;script&gt;" in Html and "../../escape.html" in Html
-    assert 'default-src &#x27;none&#x27;' in Html or "default-src 'none'" in Html
-    assert len(list(tmp_path.glob("*.html"))) == 1
+    Markdown = (tmp_path / "RoutingFailureReport.md").read_text()
+    assert "<script>" not in Markdown and "<img" not in Markdown
+    assert "&lt;script&gt;" in Markdown and "\\u0060" in Markdown
+    assert "\x1b" not in Markdown
+    InCode = False
+    for Line in Markdown.splitlines():
+        if Line == "```text":
+            assert not InCode
+            InCode = True
+        elif Line == "```":
+            assert InCode
+            InCode = False
+        elif not InCode:
+            assert "javascript:" not in Line and "https://example.invalid" not in Line
+            assert "![" not in Line and "<" not in Line
+    assert not InCode
+    assert Source.read_bytes() == Original
+    assert not list(tmp_path.glob("*.html"))
 
 
 @pytest.mark.parametrize("Raw,State", [(b"{bad json", "Malformed"),
@@ -215,9 +217,9 @@ def test_diagnostic_text_is_inert_and_never_used_as_paths_or_urls(tmp_path):
 def test_bad_or_unsupported_artifact_still_has_a_metadata_report(tmp_path, Raw, State):
     Source = tmp_path / "Design.RoutingFailure.json"; Source.write_bytes(Raw)
     WriteReport(tmp_path, Source)
-    Html = (tmp_path / "RoutingFailureReport.html").read_text()
+    Html = (tmp_path / "RoutingFailureReport.md").read_text()
     assert State in Html and sha256(Raw).hexdigest() in Html
-    assert "not-run — routing failure prevented this phase" not in Html
+    assert "not-run - routing failure prevented this phase" not in Html
 
 
 def test_reader_and_display_caps_are_visible(tmp_path):
@@ -227,11 +229,11 @@ def test_reader_and_display_caps_are_visible(tmp_path):
                                            "SelfClaimConflictEvidence": LiteralEvidence()}
     Source = SaveFailure(tmp_path, Payload)
     WriteReport(tmp_path, Source)
-    Html = (tmp_path / "RoutingFailureReport.html").read_text()
+    Html = (tmp_path / "RoutingFailureReport.md").read_text()
     assert "Evidence discovery limited: True" in Html
     assert "Display truncated: True" in Html
     assert len(Html.encode()) < 256 * 1024
-    assert "<table>" not in Html
+    assert "Conflicting claim roles:" not in Html
 
 
 def test_reader_rejects_changed_identity_and_external_symlink(tmp_path):
@@ -244,16 +246,16 @@ def test_reader_rejects_changed_identity_and_external_symlink(tmp_path):
     Identity["Sha256"] = sha256(Source.read_bytes()).hexdigest()
     assert PublishRoutingFailureReport(RunDirectory=tmp_path, FailurePath=Link,
                                        SourceIdentity=Identity)["Status"] == "Unavailable"
-    assert not list(tmp_path.glob("*.html"))
+    assert not list(tmp_path.glob("*.md"))
 
 
 @pytest.mark.parametrize("Stage", ["MchprsValidation", "FabricFinalCheck"])
 def test_later_validation_failure_is_not_relabelled_as_unreached(tmp_path, Stage):
     Payload = LiteralFailure(); Payload["Failure"]["Stage"] = Stage
     WriteReport(tmp_path, SaveFailure(tmp_path, Payload))
-    Html = (tmp_path / "RoutingFailureReport.html").read_text()
+    Html = (tmp_path / "RoutingFailureReport.md").read_text()
     assert "later validation failure" in Html
-    assert "not-run — routing failure prevented this phase" not in Html
+    assert "not-run - routing failure prevented this phase" not in Html
 
 
 def test_oversize_source_fails_closed_even_after_same_size_replacement(tmp_path):
@@ -266,7 +268,7 @@ def test_oversize_source_fails_closed_even_after_same_size_replacement(tmp_path)
                                               SourceIdentity=Identity)
     assert Publication["Status"] == "Unavailable"
     assert Publication["ErrorType"] == "ArtifactReadLimit"
-    assert not list(tmp_path.glob("*.html"))
+    assert not list(tmp_path.glob("*.md"))
     Report = WriteReport(tmp_path, Source)
     assert "FAILURE REPORT: unavailable (ArtifactReadLimit)" in Report.SummaryPath.read_text()
 
@@ -277,7 +279,7 @@ def test_producer_shaped_nested_evidence_is_discovered(tmp_path):
         "TypedNativeRouteP1Evidence": [{"MaterializationDiagnostics": {
             "SelfClaimConflictEvidence": LiteralEvidence()}}]}}
     WriteReport(tmp_path, SaveFailure(tmp_path, Payload))
-    Html = (tmp_path / "RoutingFailureReport.html").read_text()
+    Html = (tmp_path / "RoutingFailureReport.md").read_text()
     assert "(4, 2, -1)" in Html and "Support, Air" in Html
     assert "CandidateDiagnostics/TypedNativeRouteP1Evidence/0/MaterializationDiagnostics/SelfClaimConflictEvidence" in Html
 
@@ -289,7 +291,7 @@ def test_publication_cancellation_propagates_and_cleans_temporary_file(tmp_path,
     monkeypatch.setattr(os, "replace", Cancel)
     with pytest.raises(KeyboardInterrupt):
         WriteReport(tmp_path, Source)
-    assert not list(tmp_path.glob("*.html"))
+    assert not list(tmp_path.glob("*.md"))
     assert not list(tmp_path.glob(".RoutingFailureReport-*"))
     assert json.loads(Source.read_text()) == LiteralFailure()
 
@@ -297,7 +299,7 @@ def test_publication_cancellation_propagates_and_cleans_temporary_file(tmp_path,
 def test_repeated_reporting_rejects_report_bound_to_previous_failure(tmp_path):
     Source = SaveFailure(tmp_path, LiteralFailure())
     WriteReport(tmp_path, Source)
-    Html = tmp_path / "RoutingFailureReport.html"
+    Html = tmp_path / "RoutingFailureReport.md"
     OriginalHtml = Html.read_bytes()
     Source = SaveFailure(tmp_path, LiteralFailure(LiteralEvidence()))
     Report = WriteReport(tmp_path, Source)
@@ -305,7 +307,7 @@ def test_repeated_reporting_rejects_report_bound_to_previous_failure(tmp_path):
     assert "FAILURE REPORT: rejected" in Report.SummaryPath.read_text()
     Raw = Report.RawReportPath.read_text()
     Inventory = json.loads(Raw.split("===== ARTIFACT INVENTORY =====\n", 1)[1])
-    assert not any(Entry["Path"].endswith(".html") for Entry in Inventory)
+    assert not any(Entry["Path"].endswith(".md") for Entry in Inventory)
 
 
 def test_normal_output_parent_segments_match_canonical_inventory(tmp_path):
@@ -315,19 +317,19 @@ def test_normal_output_parent_segments_match_canonical_inventory(tmp_path):
     Source = SaveFailure(Root, LiteralFailure(LiteralEvidence()))
     SpelledRoot = tmp_path / "intermediate" / ".." / "run"
     Report = WriteReport(SpelledRoot, SpelledRoot / Source.name)
-    Html = Root / "RoutingFailureReport.html"
+    Html = Root / "RoutingFailureReport.md"
     assert Html.is_file()
     assert sha256(Source.read_bytes()).hexdigest() in Html.read_text()
     assert str(Html) in Report.SummaryPath.read_text()
 
 
-def test_source_change_during_html_publication_is_rejected_in_ordinary_report(tmp_path, monkeypatch):
+def test_source_change_during_markdown_publication_is_rejected_in_ordinary_report(tmp_path, monkeypatch):
     Source = SaveFailure(tmp_path, LiteralFailure())
     Before = Source.read_bytes()
     Replace = os.replace
     def ReplaceAndChange(PathValue, Destination, **Arguments):
         Result = Replace(PathValue, Destination, **Arguments)
-        if str(Destination).endswith("RoutingFailureReport.html"):
+        if str(Destination).endswith("RoutingFailureReport.md"):
             Source.write_bytes(Before.replace(b"Candidate", b"Corrupted"))
         return Result
     monkeypatch.setattr(os, "replace", ReplaceAndChange)
@@ -343,7 +345,7 @@ def test_directory_swap_during_publication_never_writes_outside_run(tmp_path, mo
     OriginalSource = Source.read_bytes()
     Identity = {"Path": str(Source), "Bytes": len(OriginalSource), "Sha256": sha256(OriginalSource).hexdigest()}
     Outside = tmp_path / "outside"; Outside.mkdir()
-    Sentinel = Outside / "RoutingFailureReport.html"; Sentinel.write_bytes(b"must not overwrite")
+    Sentinel = Outside / "RoutingFailureReport.md"; Sentinel.write_bytes(b"must not overwrite")
     Moved = tmp_path / "original-run"
     Open = os.open
     Swapped = False
@@ -359,7 +361,7 @@ def test_directory_swap_during_publication_never_writes_outside_run(tmp_path, mo
     assert Swapped
     assert Result["Status"] in ("Unavailable", "Rejected")
     assert Sentinel.read_bytes() == b"must not overwrite"
-    assert set(PathValue.name for PathValue in Outside.iterdir()) == {"RoutingFailureReport.html"}
+    assert set(PathValue.name for PathValue in Outside.iterdir()) == {"RoutingFailureReport.md"}
     assert (Moved / Source.name).read_bytes() == OriginalSource
 
 
@@ -383,3 +385,35 @@ def test_preexisting_pair_directory_swap_is_rejected_before_returning_published(
     assert Result["Status"] in ("Unavailable", "Rejected")
     assert list(Outside.iterdir()) == []
     assert (Moved / Source.name).read_bytes() == SourceBytes
+
+
+def test_compact_report_groups_source_identity_and_keeps_the_failure_visible(tmp_path):
+    Source = SaveFailure(tmp_path, LiteralFailure())
+    Original = Source.read_bytes()
+    WriteReport(tmp_path, Source)
+    Text = (tmp_path / "RoutingFailureReport.md").read_text()
+    Summary = Text.split("## Failure at a glance", 1)[1].split("## Data-flow graph", 1)[0]
+    assert "| Stage | `Candidate` |" in Summary
+    assert "| Reason | `ClusterInterfaceSolveIncomplete` |" in Summary
+    assert "Detail:" in Summary
+    Metadata = Text.split("## Source artifact", 1)[1].split("## Failure details", 1)[0]
+    Blocks = [Part.split("\n```", 1)[0] for Part in Metadata.split("```text\n")[1:]]
+    assert any(all(Item in Block for Item in (str(Source), sha256(Original).hexdigest(), str(len(Original))))
+               for Block in Blocks)
+    assert Text.index("## Failure details") < Text.index("## Inputs and configuration")
+    assert Source.read_bytes() == Original
+    assert json.loads((tmp_path / "RoutingFailureReport.receipt.json").read_text())["SchemaVersion"] == "routing-failure-report-receipt-v3"
+
+
+def test_compact_summary_cannot_escape_a_table_cell_into_active_markdown(tmp_path):
+    Payload = LiteralFailure()
+    Payload["Failure"]["Stage"] = 'value|[remote](https://example.invalid)`<img src=x>\x1b[31m'
+    Source = SaveFailure(tmp_path, Payload)
+    WriteReport(tmp_path, Source)
+    Text = (tmp_path / "RoutingFailureReport.md").read_text()
+    assert "<img" not in Text and "\x1b" not in Text
+    assert "\\u007c" in Text
+    Row = next(Line for Line in Text.splitlines() if Line.startswith("| Stage |"))
+    assert Row.count("|") == 3
+    assert Row.count("`") == 2
+    assert "&lt;img" in Row

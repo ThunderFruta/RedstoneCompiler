@@ -6,38 +6,41 @@ from pathlib import Path
 
 import pytest
 
-from Tests.App.test_routing_failure_artifacts import WriteLiteralPair, HTML_NAME, RECEIPT_NAME, LITERAL_HTML
+from Tests.App.test_routing_failure_artifacts import WriteLiteralPair, HTML_NAME, RECEIPT_NAME, LITERAL_HTML, MARKDOWN_NAME, LITERAL_MARKDOWN
 from Tests.Structural.test_routing_design_snapshot import WriteSyntheticFailure
 from Tools.Routing import CaptureRoutingDesignSnapshot as Snap
 
 RepositoryRoot = Path(__file__).resolve().parents[2]
 
 
-def BuildSnapshotWithReport(Root, Present=True):
+def BuildSnapshotWithReport(Root, Present=True, *, Markdown=False):
     SourceRoot = Root / "source"; SourceRoot.mkdir(parents=True)
     Source = WriteSyntheticFailure(SourceRoot)
     if Present:
-        WriteLiteralPair(SourceRoot, Source.name, Source.read_bytes())
+        WriteLiteralPair(SourceRoot, Source.name, Source.read_bytes(), Markdown=Markdown)
     Config = Snap.SnapshotConfiguration(RepositoryRoot=RepositoryRoot, OutputRoot=Root / "snapshots",
         CapturedAtUtc=datetime(2026, 9, 27, 3, 0, tzinfo=timezone.utc), Cla4FailurePath=Source)
     Snapshot = Snap.BuildRoutingDesignSnapshot(Config)
     return Source, Config, Snapshot
 
 
-def test_snapshot_copies_verified_pair_and_uses_retained_bytes_after_replacement(tmp_path):
-    Source, Config, Snapshot = BuildSnapshotWithReport(tmp_path)
+@pytest.mark.parametrize("Markdown", [False, True], ids=["legacy-html", "markdown"])
+def test_snapshot_copies_verified_pair_and_uses_retained_bytes_after_replacement(tmp_path, Markdown):
+    Source, Config, Snapshot = BuildSnapshotWithReport(tmp_path, Markdown=Markdown)
+    Name = MARKDOWN_NAME if Markdown else HTML_NAME
+    OriginalReport = LITERAL_MARKDOWN if Markdown else LITERAL_HTML
     OriginalFailure = Source.read_bytes()
     assert Snapshot["RoutingFailureReport"]["Status"] == "Available"
-    (Source.parent / HTML_NAME).write_bytes(b"changed after observation")
+    (Source.parent / Name).write_bytes(b"changed after observation")
     (Source.parent / RECEIPT_NAME).write_bytes(b"changed receipt")
     Bundle = Snap.WriteSnapshotStaged(Config, Snapshot)
-    assert (Bundle / "Artifacts" / HTML_NAME).read_bytes() == LITERAL_HTML
+    assert (Bundle / "Artifacts" / Name).read_bytes() == OriginalReport
     assert (Bundle / "Artifacts" / Source.name).read_bytes() == OriginalFailure
     Moved = tmp_path / "relocated-snapshot"; Bundle.rename(Moved)
     Readback = Snap.ReadRoutingDesignSnapshot(Moved)
     assert Readback["RoutingFailureReport"]["Status"] == "Available"
-    assert Readback["RoutingFailureReport"]["Report"]["Sha256"] == sha256(LITERAL_HTML).hexdigest()
-    assert b"(4, 2, -1)" in (Moved / "Artifacts" / HTML_NAME).read_bytes()
+    assert Readback["RoutingFailureReport"]["Report"]["Sha256"] == sha256(OriginalReport).hexdigest()
+    assert b"(4, 2, -1)" in (Moved / "Artifacts" / Name).read_bytes()
 
 
 def test_old_failure_does_not_acquire_scene_or_report_from_current_code(tmp_path):
